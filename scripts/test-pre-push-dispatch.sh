@@ -744,6 +744,19 @@ case "$mode" in
     printf 'Passed\n'
     exit 3
     ;;
+  timed)
+    sleep 1
+    printf 'workspace unit lane\t7\tpassed\n' >> "$MEERKAT_PRE_PUSH_LANE_TIMINGS"
+    printf 'Passed\n'
+    exit 0
+    ;;
+  slow-hook-failure)
+    sleep 1
+    printf 'Failed\n'
+    printf -- '- hook id: cargo-test\n'
+    printf -- '- exit code: 101\n'
+    exit 1
+    ;;
   undeletable-residue)
     printf 'Passed\n'
     for scratch in "$TMPDIR"/meerkat-pre-push-exact.*; do
@@ -834,6 +847,86 @@ if [[ "$attribution_status" -ne 0 ]]; then
   exit 1
 fi
 assert_output_contains "residue" "$residue_log" "left behind"
+
+# Every hooked push reports each hook's wall time and the lane times the
+# deterministic gate recorded, and keeps them in the hook cache.
+timed_log="${ATTRIBUTION_ROOT}/timed.log"
+run_attribution_dispatch timed "$timed_log"
+if [[ "$attribution_status" -ne 0 ]]; then
+  echo "dispatcher failed a passing timed push (exit ${attribution_status})" >&2
+  sed -n '1,120p' "$timed_log" >&2
+  exit 1
+fi
+assert_output_contains "timed" "$timed_log" "pre-push hook timings (wall seconds):"
+assert_output_contains "timed" "$timed_log" "gitleaks (Passed)"
+assert_output_contains "timed" "$timed_log" "lane: workspace unit lane (passed)"
+if ! grep -Eq '^ +[1-9][0-9]*  workspace deterministic unit \+ integration \+ e2e gate \(Passed\)$' "$timed_log"; then
+  echo "dispatcher did not time the deterministic gate hook" >&2
+  sed -n '1,120p' "$timed_log" >&2
+  exit 1
+fi
+timed_common_dir="$(git -C "$ATTRIBUTION_REPO" rev-parse --path-format=absolute --git-common-dir)"
+timed_tsv="${timed_common_dir}/meerkat-hook-cache/timings.tsv"
+if ! grep -Fq "${attribution_head_sha}"$'\thook\t' "$timed_tsv" ||
+  ! grep -Fq $'\tlane\t7\tworkspace unit lane\tpassed' "$timed_tsv"; then
+  echo "dispatcher did not keep the hook and lane timings in ${timed_tsv}" >&2
+  cat "$timed_tsv" >&2 || true
+  exit 1
+fi
+assert_output_contains "hook-failure timings" "$hook_failure_log" "pre-push hook timings (wall seconds):"
+
+# Timing is optional and the gate log only attributes failures: a sink that
+# cannot be opened must not stop the transcript. A capture that exits early
+# leaves a producer that is still writing to die on the closed pipe, and its
+# exit status, which decides the push, would then be the broken pipe's. A
+# scripted perl points one sink of the capture filter (`perl -e SCRIPT
+# GATE_LOG TIMING_LOG`) below a regular file, so opening it fails; the hook
+# output above pauses before it writes again, as a streaming producer does.
+REAL_PERL="$(command -v perl)"
+sink_blocker="${ATTRIBUTION_ROOT}/sink-blocker"
+: > "$sink_blocker"
+install_unavailable_sink_perl() {
+  local sink="$1"
+  printf '#!/usr/bin/env bash\nreal_perl=%q\nsink=%q\nblocker=%q\n' \
+    "$REAL_PERL" "$sink" "$sink_blocker" > "${ATTRIBUTION_BIN}/perl"
+  cat >> "${ATTRIBUTION_BIN}/perl" <<'PERLEOF'
+args=("$@")
+last=$((${#args[@]} - 1))
+case "$sink" in
+  timing) args[last]="${blocker}/push-stage-times.log" ;;
+  gate) args[last-1]="${blocker}/push-stage-hooks.log" ;;
+esac
+exec "$real_perl" "${args[@]}"
+PERLEOF
+  chmod +x "${ATTRIBUTION_BIN}/perl"
+}
+for unavailable_sink in timing gate; do
+  install_unavailable_sink_perl "$unavailable_sink"
+  sink_pass_log="${ATTRIBUTION_ROOT}/${unavailable_sink}-sink-pass.log"
+  run_attribution_dispatch timed "$sink_pass_log"
+  if [[ "$attribution_status" -ne 0 ]]; then
+    rm -f -- "${ATTRIBUTION_BIN}/perl"
+    echo "an unavailable ${unavailable_sink} sink failed a passing push (exit ${attribution_status})" >&2
+    sed -n '1,120p' "$sink_pass_log" >&2
+    exit 1
+  fi
+  assert_output_contains "${unavailable_sink}-sink pass" "$sink_pass_log" \
+    "workspace deterministic unit + integration + e2e gate.....................Passed"
+  sink_failure_log="${ATTRIBUTION_ROOT}/${unavailable_sink}-sink-failure.log"
+  run_attribution_dispatch slow-hook-failure "$sink_failure_log"
+  rm -f -- "${ATTRIBUTION_BIN}/perl"
+  if [[ "$attribution_status" -ne 1 ]]; then
+    echo "an unavailable ${unavailable_sink} sink turned a failing hook's exit 1 into ${attribution_status}" >&2
+    sed -n '1,120p' "$sink_failure_log" >&2
+    exit 1
+  fi
+  assert_output_contains "${unavailable_sink}-sink failure" "$sink_failure_log" "hook id: cargo-test"
+done
+assert_output_contains "timing-sink pass" "${ATTRIBUTION_ROOT}/timing-sink-pass.log" "timing log unavailable"
+assert_output_contains "timing-sink failure" "${ATTRIBUTION_ROOT}/timing-sink-failure.log" \
+  "pre-commit run --hook-stage pre-push --all-files cargo-test"
+assert_output_contains "gate-sink pass" "${ATTRIBUTION_ROOT}/gate-sink-pass.log" \
+  "could not capture the hook transcript"
 
 # An internal dispatcher failure must announce itself as such: the operator
 # otherwise reads a screen of passing hooks and a push that failed anyway.

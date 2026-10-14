@@ -3318,10 +3318,13 @@ impl SessionRuntime {
                 .await?;
             return Ok(None);
         }
-        if stale {
-            return self.discard_stale_live_session(session_id).await;
-        }
-        Ok(None)
+        let rematerialization_hosting = if stale {
+            self.discard_stale_live_session(session_id).await?
+        } else {
+            None
+        };
+        self.refuse_cold_help_session(session_id).await?;
+        Ok(rematerialization_hosting)
     }
 
     fn session_not_found_rpc(session_id: &SessionId) -> RpcError {
@@ -5584,12 +5587,42 @@ impl SessionRuntime {
         }
     }
 
+    /// Refuse to rebuild `session` from storage when it is a help session:
+    /// its help tools exist only in the live session that ran it (see
+    /// [`meerkat::help::HelpSessionNotResumable`]).
+    fn refuse_help_session_rebuild(session: &Session) -> Result<(), RpcError> {
+        meerkat::help::HelpSessionNotResumable::check(session).map_err(|refusal| RpcError {
+            code: refusal.error_code().jsonrpc_code(),
+            message: refusal.to_string(),
+            data: Some(refusal.data()),
+        })
+    }
+
+    /// Refuse an input that would rebuild a help session from storage, before
+    /// the input is admitted: a session that is neither live nor staged is
+    /// rebuilt from its stored state.
+    async fn refuse_cold_help_session(&self, session_id: &SessionId) -> Result<(), RpcError> {
+        let live = self
+            .service
+            .has_live_session(session_id)
+            .await
+            .map_err(session_error_to_rpc)?;
+        if live || self.staged_sessions.contains(session_id).await {
+            return Ok(());
+        }
+        match self.load_persisted_session(session_id).await? {
+            Some(session) => Self::refuse_help_session_rebuild(&session),
+            None => Ok(()),
+        }
+    }
+
     async fn recovered_create_request(
         &self,
         session_id: &SessionId,
         session: Session,
         overrides: SurfaceSessionRecoveryOverrides,
     ) -> Result<RecoveredCreateRequest, RpcError> {
+        Self::refuse_help_session_rebuild(&session)?;
         let snapshot = self.realm_context_snapshot();
         self.recovery_context(&snapshot, Some(session_id))
             .recovered_create_request(session_id, session, overrides)
@@ -5604,6 +5637,7 @@ impl SessionRuntime {
         overrides: SurfaceSessionRecoveryOverrides,
         binding_mode: RecoveryRuntimeBindingMode,
     ) -> Result<RecoveredCreateRequest, RpcError> {
+        Self::refuse_help_session_rebuild(&session)?;
         let snapshot = self.realm_context_snapshot();
         self.recovery_context(&snapshot, Some(session_id))
             .recovered_create_request_with_runtime_binding_mode(
@@ -6070,8 +6104,9 @@ impl SessionRuntime {
         &self,
         identity: &SessionLlmIdentity,
     ) -> Option<meerkat_contracts::WireResolvedModelCapabilities> {
-        let registry = self.model_registry().await.ok()?;
-        let profile = registry.profile_for_provider(identity.provider, &identity.model)?;
+        let config = self.effective_config().await.ok()?;
+        let registry = config.model_registry(meerkat_models::canonical()).ok()?;
+        let profile = registry.profile_for_identity(&config, identity)?;
         Some(profile_to_capability_surface(&profile).to_wire_resolved())
     }
 
@@ -7971,6 +8006,26 @@ impl SessionRuntime {
         use meerkat_runtime::input::{Input, PromptInput};
         #[allow(unused_mut)]
         let mut prompt = prompt;
+        // Build settings have no carrier on a runtime-routed turn: refuse
+        // them before any session work, deferred sessions included. A
+        // system_prompt is not one: it is an ordinary ordered System append
+        // applied by the shared StartTurn boundary.
+        if let Some(setting) = overrides.as_ref().and_then(|ov| {
+            crate::handlers::turn::first_build_setting_on_turn(
+                ov.max_tokens.is_some(),
+                ov.output_schema.is_some(),
+                ov.structured_output_retries.is_some(),
+            )
+        }) {
+            return Err(RpcError {
+                code: error::INVALID_PARAMS,
+                message: crate::handlers::turn::build_setting_on_turn_message(
+                    setting,
+                    crate::handlers::turn::SET_BUILD_SETTINGS_ON_CREATE,
+                ),
+                data: None,
+            });
+        }
         if request_context
             .as_ref()
             .is_some_and(RequestContext::cancel_already_requested)
@@ -8000,30 +8055,9 @@ impl SessionRuntime {
         } else {
             None
         };
-
-        // Reject build-only overrides before taking active capacity. A
-        // system_prompt is not build config: it is an ordinary ordered System
-        // append applied by the shared StartTurn boundary.
-        if let Some(ref ov) = overrides {
-            let rejected = [
-                ov.max_tokens.map(|_| "max_tokens"),
-                ov.output_schema.as_ref().map(|_| "output_schema"),
-                ov.structured_output_retries
-                    .map(|_| "structured_output_retries"),
-            ];
-            let rejected: Vec<&str> = rejected.into_iter().flatten().collect();
-            if !rejected.is_empty() {
-                return Err(RpcError {
-                    code: error::INVALID_PARAMS,
-                    message: format!(
-                        "Cannot override {} on a runtime-routed turn; \
-                         set these at session/create time or use a deferred session",
-                        rejected.join(", ")
-                    ),
-                    data: None,
-                });
-            }
-        }
+        // A help session continues only on its live session: refuse to
+        // rebuild it from storage before the turn is admitted.
+        self.refuse_cold_help_session(session_id).await?;
 
         let runtime_registration_lock = self.runtime_registration_lock(session_id);
         let runtime_registration_guard = runtime_registration_lock.mutex().lock().await;
@@ -8474,6 +8508,7 @@ impl SessionRuntime {
         } else {
             None
         };
+        self.refuse_cold_help_session(session_id).await?;
         if let Err(primary) = self.ensure_runtime_executor(session_id).await {
             return Err(self
                 .unregister_new_runtime_registration_after_rpc_error(
@@ -9281,6 +9316,9 @@ impl SessionRuntime {
                 message: format!("session not found: {session_id}"),
                 data: None,
             })?;
+        // A help session continues only on its live session: refuse the
+        // rebuild before the turn is admitted or any tool is composed.
+        Self::refuse_help_session_rebuild(&stored_session)?;
         let recovery_overrides =
             self.recovery_overrides_from_turn(overrides.as_ref(), keep_alive)?;
         let active_turn = match pre_admission.as_mut() {
@@ -9446,6 +9484,28 @@ impl SessionRuntime {
             labels,
             deferred_prompt,
             deferred_injected_context,
+            true,
+        )
+        .await
+    }
+
+    /// [`Self::create_session`] for a session whose tools are exactly its
+    /// build's external tools, such as a help session: it gets no live MCP
+    /// adapter, so no MCP server or catalog control tool joins them.
+    pub(crate) async fn create_session_without_live_mcp(
+        self: &Arc<Self>,
+        build_config: AgentBuildConfig,
+        labels: Option<BTreeMap<String, String>>,
+        deferred_prompt: Option<ContentInput>,
+        deferred_injected_context: Vec<ContentInput>,
+    ) -> Result<SessionId, RpcError> {
+        self.create_session_from_seed(
+            Session::new(),
+            build_config,
+            labels,
+            deferred_prompt,
+            deferred_injected_context,
+            false,
         )
         .await
     }
@@ -9669,6 +9729,7 @@ impl SessionRuntime {
     ) -> Result<meerkat::LiveSessionActorWitnessSlot, RpcError> {
         self.arm_schedule_host_for_agent_tools().await;
         let mut request = if recovering {
+            Self::refuse_help_session_rebuild(&session)?;
             let snapshot = self.realm_context_snapshot();
             let mut request = self
                 .recovery_context(&snapshot, Some(session.id()))
@@ -9773,7 +9834,10 @@ impl SessionRuntime {
         labels: Option<BTreeMap<String, String>>,
         deferred_prompt: Option<ContentInput>,
         deferred_injected_context: Vec<ContentInput>,
+        attach_live_mcp: bool,
     ) -> Result<SessionId, RpcError> {
+        #[cfg(not(feature = "mcp"))]
+        let _ = attach_live_mcp;
         // A session can author schedules on its first turn; the firing host
         // for this runtime's store must be live in the same process.
         self.arm_schedule_host_for_agent_tools().await;
@@ -9894,21 +9958,29 @@ impl SessionRuntime {
         }
 
         #[cfg(feature = "mcp")]
-        let build_config = match self
-            .attach_mcp_adapter_for_pending_session(session_id.clone(), build_config, Vec::new())
-            .await
-        {
-            Ok(build_config) => build_config,
-            Err(err) => {
-                return Err(self
-                    .combine_with_recovered_runtime_cleanup(
-                        &session_id,
-                        false,
-                        err,
-                        "clean up prepared runtime after MCP attachment failure",
-                    )
-                    .await);
+        let build_config = if attach_live_mcp {
+            match self
+                .attach_mcp_adapter_for_pending_session(
+                    session_id.clone(),
+                    build_config,
+                    Vec::new(),
+                )
+                .await
+            {
+                Ok(build_config) => build_config,
+                Err(err) => {
+                    return Err(self
+                        .combine_with_recovered_runtime_cleanup(
+                            &session_id,
+                            false,
+                            err,
+                            "clean up prepared runtime after MCP attachment failure",
+                        )
+                        .await);
+                }
             }
+        } else {
+            build_config
         };
 
         let now = now_unix_secs();
@@ -12455,6 +12527,12 @@ impl SessionRuntime {
         *self.mcp_attempt_admission.read().await
     }
 
+    /// Whether `session_id` has a live MCP router.
+    #[cfg(all(test, feature = "mcp"))]
+    pub(crate) async fn has_live_mcp_session_for_testing(&self, session_id: &SessionId) -> bool {
+        self.mcp_sessions.read().await.contains_key(session_id)
+    }
+
     #[cfg(test)]
     pub(crate) fn mcp_wire_attempt_count_for_testing(&self) -> usize {
         self.mcp_wire_attempts
@@ -14160,42 +14238,9 @@ pub(crate) fn session_error_to_rpc(err: SessionError) -> RpcError {
             data: meerkat_contracts::error::session_error_details(&err),
         };
     }
-    let code = match err.primary_error() {
-        SessionError::NotFound { .. } => error::SESSION_NOT_FOUND,
-        // Another runtime owner hosts the session (#1813): the busy class,
-        // with `kind = "session_served_elsewhere"` in the data.
-        SessionError::Busy { .. } | SessionError::ServedElsewhere { .. } => error::SESSION_BUSY,
-        SessionError::FailedWithData { .. } if err.is_runtime_teardown_in_progress() => {
-            error::SESSION_BUSY
-        }
-        SessionError::NotRunning { .. } => error::INTERNAL_ERROR,
-        // A durable resume hold is not a service fault: the session exists,
-        // its content is retained intact, and no runnable authority may be
-        // handed out until reconciliation promotes or repairs it. Classify it
-        // as "durably present, not runnable" and let the typed
-        // `durable_resume_hold` payload carry which hold applies.
-        SessionError::DurableTailHeldForRecovery { .. }
-        | SessionError::DurableTailRecoveryRefused { .. }
-        | SessionError::DurableEvidenceQuarantined { .. }
-        | SessionError::WholeBlobAuditedEndpointDivergence { .. } => error::SESSION_NOT_RUNNING,
-        SessionError::Agent(agent_err) => match agent_err.primary_error() {
-            meerkat_core::AgentError::TokenBudgetExceeded { .. }
-            | meerkat_core::AgentError::TimeBudgetExceeded { .. }
-            | meerkat_core::AgentError::ToolCallBudgetExceeded { .. } => error::BUDGET_EXHAUSTED,
-            meerkat_core::AgentError::ConfigError(_) => error::INVALID_PARAMS,
-            meerkat_core::AgentError::HookDenied { .. } => error::HOOK_DENIED,
-            meerkat_core::AgentError::Llm { .. } => error::PROVIDER_ERROR,
-            meerkat_core::AgentError::SessionNotFound(_) => error::SESSION_NOT_FOUND,
-            meerkat_core::AgentError::BuildError(_) => error::PROVIDER_ERROR,
-            meerkat_core::AgentError::Cancelled => error::REQUEST_CANCELLED,
-            meerkat_core::AgentError::SkillResolutionFailed { .. } => {
-                error::SKILL_RESOLUTION_FAILED
-            }
-            meerkat_core::AgentError::InternalError(_) => error::INTERNAL_ERROR,
-            _ => error::INTERNAL_ERROR,
-        },
-        _ => error::INTERNAL_ERROR,
-    };
+    // The session transport mapping is owned by the contracts crate and
+    // shared with the `rkat` exit status.
+    let code = meerkat_contracts::error::session_transport_error_code(&err).jsonrpc_code();
     let core_apply_failure_cause = match err.primary_error() {
         SessionError::Agent(agent_err) => {
             use meerkat_core::lifecycle::core_executor::{
@@ -14280,6 +14325,26 @@ fn rpc_error_to_session_error(err: RpcError, session_id: &SessionId) -> SessionE
     }
 }
 
+/// The JSON-RPC code of a failed turn's typed terminal cause: the code
+/// [`session_error_to_rpc`] gives the equivalent agent error, so a turn that
+/// fails through the runtime reports the same class as one that fails
+/// through the session service.
+fn turn_failure_rpc_code(turn_error: &meerkat_core::TurnErrorMetadata) -> i32 {
+    use meerkat_core::TurnTerminalCauseKind as Cause;
+    match turn_error.kind {
+        Cause::LlmFailure | Cause::RetryExhausted => error::PROVIDER_ERROR,
+        Cause::BudgetExhausted | Cause::TimeBudgetExceeded => error::BUDGET_EXHAUSTED,
+        Cause::HookDenied => error::HOOK_DENIED,
+        Cause::Unknown
+        | Cause::HookFailure
+        | Cause::ToolFailure
+        | Cause::StructuredOutputValidationFailed
+        | Cause::TurnLimitReached
+        | Cause::RuntimeApplyFailure
+        | Cause::FatalFailure => error::INTERNAL_ERROR,
+    }
+}
+
 fn completion_outcome_to_rpc_result(
     outcome: meerkat_runtime::completion::CompletionOutcome,
     session_id: &SessionId,
@@ -14332,7 +14397,7 @@ fn completion_outcome_to_rpc_result(
             reason,
             error: turn_error,
         } => Err(RpcError {
-            code: error::INTERNAL_ERROR,
+            code: turn_failure_rpc_code(&turn_error),
             message: format!("turn abandoned: {reason}"),
             data: Some(serde_json::json!({
                 "error": turn_error,
@@ -14342,7 +14407,7 @@ fn completion_outcome_to_rpc_result(
             reason,
             error: turn_error,
         } => Err(RpcError {
-            code: error::INTERNAL_ERROR,
+            code: turn_failure_rpc_code(&turn_error),
             message: format!("turn abandoned: {reason}"),
             data: Some(serde_json::json!({
                 "error": turn_error,
@@ -14367,7 +14432,7 @@ fn completion_outcome_to_rpc_result(
             reason,
             error: turn_error,
         } => Err(RpcError {
-            code: error::INTERNAL_ERROR,
+            code: turn_failure_rpc_code(&turn_error),
             message: format!("runtime terminated: {reason}"),
             data: Some(serde_json::json!({
                 "error": turn_error,
@@ -20629,6 +20694,384 @@ mod tests {
         runtime.try_shutdown().await.unwrap();
     }
 
+    /// Records the tool names each model request offers. An armed tool call
+    /// is asked for by the next request only; every other request answers
+    /// with text.
+    #[derive(Default)]
+    struct ToolCallScriptLlmClient {
+        tool_names: StdMutex<Vec<Vec<String>>>,
+        armed_call: StdMutex<Option<(String, serde_json::Value)>>,
+    }
+
+    impl ToolCallScriptLlmClient {
+        fn arm_call(&self, name: &str, args: serde_json::Value) {
+            *self
+                .armed_call
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                Some((name.to_string(), args));
+        }
+
+        fn requests(&self) -> Vec<Vec<String>> {
+            self.tool_names
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        }
+
+        fn last_offered(&self) -> std::collections::BTreeSet<String> {
+            self.requests()
+                .last()
+                .expect("a model request was recorded")
+                .iter()
+                .cloned()
+                .collect()
+        }
+    }
+
+    #[async_trait]
+    impl LlmClient for ToolCallScriptLlmClient {
+        fn project_replay_messages(
+            &self,
+            messages: &[meerkat_core::Message],
+        ) -> Result<Vec<meerkat_core::Message>, meerkat_client::LlmError> {
+            Ok(messages.to_vec())
+        }
+
+        fn stream<'a>(
+            &'a self,
+            request: &'a meerkat_client::LlmRequest,
+        ) -> Pin<
+            Box<dyn futures::Stream<Item = Result<meerkat_client::LlmEvent, LlmError>> + Send + 'a>,
+        > {
+            self.tool_names
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(
+                    request
+                        .tools
+                        .iter()
+                        .map(|tool| tool.name.to_string())
+                        .collect(),
+                );
+            let usage = meerkat_client::LlmEvent::UsageUpdate {
+                usage: meerkat_core::TurnUsage::host_declared(
+                    provider_for_successful_rpc_test_model(&request.model),
+                    &request.model,
+                    meerkat_core::Usage::default(),
+                ),
+            };
+            let armed = self
+                .armed_call
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            let events = match armed {
+                Some((name, args)) => vec![
+                    Ok(meerkat_client::LlmEvent::ToolCallComplete {
+                        id: format!("call_{name}"),
+                        name,
+                        args,
+                        meta: None,
+                    }),
+                    Ok(usage),
+                    Ok(meerkat_client::LlmEvent::Done {
+                        outcome: meerkat_client::LlmDoneOutcome::Success {
+                            stop_reason: StopReason::ToolUse,
+                        },
+                    }),
+                ],
+                None => vec![
+                    Ok(meerkat_client::LlmEvent::TextDelta {
+                        delta: "recorded".to_string(),
+                        meta: None,
+                    }),
+                    Ok(usage),
+                    Ok(meerkat_client::LlmEvent::Done {
+                        outcome: meerkat_client::LlmDoneOutcome::Success {
+                            stop_reason: StopReason::EndTurn,
+                        },
+                    }),
+                ],
+            };
+            Box::pin(stream::iter(events))
+        }
+
+        fn provider(&self) -> meerkat_core::Provider {
+            meerkat_core::Provider::Other
+        }
+
+        async fn health_check(&self) -> Result<(), LlmError> {
+            Ok(())
+        }
+    }
+
+    /// The launch policy of a help session: only the two help tools.
+    fn help_launch_policy() -> meerkat_core::ops::ToolAccessPolicy {
+        meerkat_core::ops::ToolAccessPolicy::AllowList(
+            ["skill_list_resources", "skill_read_resource"]
+                .into_iter()
+                .collect(),
+        )
+    }
+
+    /// Asserts that the call `tool_use_id` was refused as `access_denied`.
+    fn assert_refused_as_access_denied(messages: &[Message], tool_use_id: &str) {
+        let result = messages
+            .iter()
+            .rev()
+            .find_map(|message| match message {
+                Message::ToolResults { results, .. } => results
+                    .iter()
+                    .find(|result| result.tool_use_id == tool_use_id)
+                    .cloned(),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no tool result for {tool_use_id}"));
+        assert!(result.is_error, "{tool_use_id} must fail: {result:?}");
+        let payload: serde_json::Value =
+            serde_json::from_str(&result.text_content()).expect("typed tool error payload");
+        assert_eq!(
+            payload["error"], "access_denied",
+            "{tool_use_id} must be refused by the session's policy: {payload}"
+        );
+    }
+
+    async fn run_rpc_turn(
+        runtime: &Arc<SessionRuntime>,
+        session_id: &SessionId,
+        prompt: &str,
+    ) -> Result<RunResult, RpcError> {
+        let (event_tx, _event_rx) = mpsc::channel(100);
+        tokio::time::timeout(
+            Duration::from_secs(60),
+            runtime.start_turn_via_runtime(
+                session_id,
+                prompt.into(),
+                Vec::new(),
+                event_tx,
+                None,
+                None,
+                None,
+                None,
+            ),
+        )
+        .await
+        .expect("the turn must not wait on a client tool")
+    }
+
+    /// Ask JSON-RPC `help/ask` a question; returns the help session.
+    async fn rpc_help_ask(runtime: &Arc<SessionRuntime>) -> SessionId {
+        let params = serde_json::value::to_raw_value(&serde_json::json!({
+            "question": "How do I add an MCP server?",
+            "model": "claude-sonnet-4-5",
+            "provider": "anthropic",
+        }))
+        .unwrap();
+        let response = crate::handlers::help::handle_ask(
+            None,
+            Some(&params),
+            Arc::clone(runtime),
+            &crate::router::NotificationSink::noop(),
+            &runtime.runtime_adapter(),
+            None,
+        )
+        .await;
+        assert!(response.error.is_none(), "help/ask failed: {response:?}");
+        let result: serde_json::Value =
+            serde_json::from_str(response.result.as_ref().expect("help result").get()).unwrap();
+        SessionId::parse(result["session_id"].as_str().expect("help session id")).unwrap()
+    }
+
+    fn help_tool_names() -> std::collections::BTreeSet<String> {
+        ["skill_list_resources", "skill_read_resource"]
+            .into_iter()
+            .map(String::from)
+            .collect()
+    }
+
+    /// A help session continues only on the live session `help/ask` built.
+    /// While that runs, a further `turn/start` keeps the help tools. After a
+    /// restart, `turn/start` refuses to rebuild it from storage with a typed
+    /// error before the turn is admitted: no model call, no callback (neither
+    /// a client tool nor one named like a help tool), no MCP router. An
+    /// ordinary session resumed the same way gets the callback tools.
+    #[tokio::test]
+    async fn a_saved_help_session_runs_warm_and_is_refused_cold_through_turn_start() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = no_turn_disk_runtime(temp.path()).await;
+        let warm_llm = Arc::new(ToolCallScriptLlmClient::default());
+        runtime.set_default_llm_client(Some(Arc::clone(&warm_llm) as Arc<dyn LlmClient>));
+        let help_session = rpc_help_ask(&runtime).await;
+        let saved = runtime
+            .load_persisted_session(&help_session)
+            .await
+            .unwrap()
+            .unwrap();
+        run_rpc_turn(&runtime, &help_session, "And how do I remove it?")
+            .await
+            .expect("the live help session takes a further turn");
+        assert_eq!(
+            warm_llm.last_offered(),
+            help_tool_names(),
+            "a live help session keeps its help tools"
+        );
+        let ordinary = runtime
+            .create_or_resume_session_without_turn(
+                mock_build_config(),
+                None,
+                None,
+                Default::default(),
+            )
+            .await
+            .unwrap();
+        runtime.try_shutdown().await.unwrap();
+        drop(runtime);
+
+        // A restarted runtime whose process-default callback route offers a
+        // client tool and a client tool named like a help tool.
+        let runtime = no_turn_disk_runtime(temp.path()).await;
+        let llm = Arc::new(ToolCallScriptLlmClient::default());
+        runtime.set_default_llm_client(Some(Arc::clone(&llm) as Arc<dyn LlmClient>));
+        let mut callback_requests = runtime.init_callback_channel();
+        runtime
+            .callback_tool_registry()
+            .replace_or_add(vec![
+                meerkat_core::ToolDef::new(
+                    "client_tool",
+                    "A tool the RPC client serves",
+                    serde_json::json!({"type": "object", "properties": {}}),
+                ),
+                meerkat_core::ToolDef::new(
+                    "skill_read_resource",
+                    "A client tool named like a help tool",
+                    serde_json::json!({"type": "object", "properties": {}}),
+                ),
+            ])
+            .unwrap();
+
+        let refusal = run_rpc_turn(&runtime, &help_session, "Read the MCP reference.")
+            .await
+            .expect_err("a help session is not rebuilt from storage");
+        assert_eq!(refusal.code, error::SESSION_NOT_RUNNING, "{refusal:?}");
+        assert_eq!(
+            refusal.data.as_ref().map(|data| data["kind"].clone()),
+            Some(serde_json::json!("help_session_not_resumable")),
+            "{refusal:?}"
+        );
+        assert!(llm.requests().is_empty(), "no model call");
+        assert!(
+            callback_requests.try_recv().is_err(),
+            "no callback tool ran for the help session"
+        );
+        #[cfg(feature = "mcp")]
+        assert!(
+            !runtime
+                .mcp_sessions
+                .read()
+                .await
+                .contains_key(&help_session),
+            "no MCP router was attached to the help session"
+        );
+        assert_eq!(
+            saved.metadata().get("meerkat.help_session"),
+            Some(&serde_json::json!(true)),
+            "help/ask marks its session as a help session"
+        );
+
+        // Control: an ordinary session resumed the same way gets the
+        // callback tools.
+        run_rpc_turn(&runtime, &ordinary, "hello again")
+            .await
+            .expect("the ordinary session resumes");
+        let offered = llm.last_offered();
+        assert!(
+            offered.contains("client_tool") && offered.contains("skill_read_resource"),
+            "an ordinary cold-resumed session offers the callback tools: {offered:?}"
+        );
+        runtime.try_shutdown().await.unwrap();
+    }
+
+    /// The help launch policy is the second line: a session that carries it
+    /// but no help marker, as a help session saved before the marker existed
+    /// would, is rebuilt under the restored policy. The model is offered no
+    /// composed tool but the catalog control plane; a call to the client's
+    /// tool is refused and never runs, and a catalog load is refused and
+    /// attaches nothing.
+    #[tokio::test]
+    async fn a_cold_rebuild_under_the_help_launch_policy_offers_and_runs_no_composed_tool() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = no_turn_disk_runtime(temp.path()).await;
+        let mut build = mock_build_config();
+        build.tool_access_policy = Some(help_launch_policy());
+        let session = runtime
+            .create_or_resume_session_without_turn(build, None, None, Default::default())
+            .await
+            .unwrap();
+        runtime.try_shutdown().await.unwrap();
+        drop(runtime);
+
+        let runtime = no_turn_disk_runtime(temp.path()).await;
+        let llm = Arc::new(ToolCallScriptLlmClient::default());
+        runtime.set_default_llm_client(Some(Arc::clone(&llm) as Arc<dyn LlmClient>));
+        let mut callback_requests = runtime.init_callback_channel();
+        runtime
+            .callback_tool_registry()
+            .replace_or_add(vec![meerkat_core::ToolDef::new(
+                "client_tool",
+                "A tool the RPC client serves",
+                serde_json::json!({"type": "object", "properties": {}}),
+            )])
+            .unwrap();
+        let control_plane: std::collections::BTreeSet<String> =
+            ["tool_catalog_search", "tool_catalog_load"]
+                .into_iter()
+                .map(String::from)
+                .collect();
+
+        run_rpc_turn(&runtime, &session, "hello again")
+            .await
+            .expect("the session resumes");
+        assert_eq!(
+            llm.last_offered(),
+            control_plane,
+            "the restored policy hides every composed tool but the control plane"
+        );
+        llm.arm_call("client_tool", serde_json::json!({}));
+        run_rpc_turn(&runtime, &session, "Call the client tool.")
+            .await
+            .expect("the turn completes");
+        let saved = runtime
+            .load_persisted_session(&session)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_refused_as_access_denied(saved.messages(), "call_client_tool");
+        llm.arm_call(
+            "tool_catalog_load",
+            serde_json::json!({"names": ["client_tool"]}),
+        );
+        run_rpc_turn(&runtime, &session, "Load the client tool.")
+            .await
+            .expect("the turn completes");
+        let saved = runtime
+            .load_persisted_session(&session)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_refused_as_access_denied(saved.messages(), "call_tool_catalog_load");
+        assert_eq!(
+            llm.last_offered(),
+            control_plane,
+            "the refused load attaches no tool"
+        );
+        assert!(
+            callback_requests.try_recv().is_err(),
+            "no callback tool ran"
+        );
+        runtime.try_shutdown().await.unwrap();
+    }
+
     fn test_auth_binding(realm: &str, binding: &str) -> meerkat_core::AuthBindingRef {
         meerkat_core::AuthBindingRef {
             realm: meerkat_core::connection::RealmId::parse(realm).expect("valid realm fixture"),
@@ -20678,6 +21121,51 @@ mod tests {
             },
         );
         section.default_binding = Some("default_openai".into());
+        config.realm.insert("dev".into(), section);
+        config
+    }
+
+    /// Realm `dev` whose `chatgpt` binding serves OpenAI models through the
+    /// private ChatGPT backend.
+    fn config_with_chatgpt_backend_binding() -> meerkat_core::Config {
+        let mut config = meerkat_core::Config::default();
+        let mut section = meerkat_core::RealmConfigSection::default();
+        section.backend.insert(
+            "chatgpt_backend".into(),
+            meerkat_core::BackendProfileConfig {
+                provider: "openai".into(),
+                backend_kind: meerkat_core::provider_matrix::OpenAiBackendKind::ChatGptBackend
+                    .as_str()
+                    .into(),
+                base_url: None,
+                options: serde_json::Value::Null,
+                server: None,
+            },
+        );
+        section.auth.insert(
+            "chatgpt_oauth".into(),
+            meerkat_core::AuthProfileConfig {
+                provider: "openai".into(),
+                auth_method: meerkat_core::provider_matrix::OpenAiAuthMethod::ManagedChatGptOauth
+                    .as_str()
+                    .into(),
+                source: meerkat_core::CredentialSourceSpec::ManagedStore,
+                constraints: Default::default(),
+                metadata_defaults: Default::default(),
+            },
+        );
+        section.binding.insert(
+            "chatgpt".into(),
+            meerkat_core::ProviderBindingConfig {
+                backend_profile: "chatgpt_backend".into(),
+                auth_profile: "chatgpt_oauth".into(),
+                credential_account: None,
+                default_model: None,
+                policy: Default::default(),
+                provider_default: false,
+            },
+        );
+        section.default_binding = Some("chatgpt".into());
         config.realm.insert("dev".into(), section);
         config
     }
@@ -23539,6 +24027,361 @@ mod tests {
                 .unwrap()
                 .model,
             "claude-opus-5"
+        );
+    }
+
+    /// The ChatGPT backend serves the GPT catalog rows, which accept ordered
+    /// System messages after the leading prefix, but its Responses wire takes
+    /// one leading System row and refuses any later one. The session's
+    /// capability is the backend's, so an instruction activation (an ordered
+    /// mid-conversation System message) is refused at admission, before the
+    /// wire, and the session's next turn still reaches the wire.
+    #[tokio::test]
+    async fn a_chatgpt_backend_session_refuses_an_instruction_activation_before_the_wire() {
+        use axum::{Json, Router, extract::State, response::IntoResponse, routing::post};
+
+        const RESPONSES_SSE: &str = concat!(
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",",
+            "\"usage\":{\"input_tokens\":4,\"output_tokens\":1}}}\n",
+            "data: [DONE]\n",
+        );
+        async fn capture(
+            State(bodies): State<Arc<std::sync::Mutex<Vec<serde_json::Value>>>>,
+            Json(body): Json<serde_json::Value>,
+        ) -> impl IntoResponse {
+            bodies.lock().unwrap().push(body);
+            ([("content-type", "text/event-stream")], RESPONSES_SSE)
+        }
+        let bodies = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let app = Router::new()
+            .route("/responses", post(capture))
+            .with_state(Arc::clone(&bodies));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let temp = tempfile::tempdir().unwrap();
+        // The session build reads the runtime's config; a hot swap reads the
+        // config runtime. Both see the ChatGPT-backend binding.
+        let runtime = make_runtime_with_config(
+            temp_factory(&temp),
+            10,
+            config_with_chatgpt_backend_binding(),
+        );
+        runtime.set_config_runtime(Arc::new(meerkat_core::ConfigRuntime::new(
+            Arc::new(meerkat_core::MemoryConfigStore::new(
+                config_with_chatgpt_backend_binding(),
+                meerkat_models::canonical(),
+            )),
+            temp.path().join("config_state.json"),
+        )));
+        let build_config = AgentBuildConfig {
+            llm_client_override: Some(Arc::new(
+                meerkat_client::OpenAiClient::new_with_base_url("test-token".to_string(), base_url)
+                    .with_chatgpt_backend_wire(),
+            )),
+            auth_binding: Some(test_auth_binding("dev", "chatgpt")),
+            ..AgentBuildConfig::new("gpt-5.6-sol")
+        };
+        let session_id = runtime
+            .create_session(build_config, None, None, Vec::new())
+            .await
+            .unwrap();
+        let (event_tx, _event_rx) = mpsc::channel(100);
+        runtime
+            .start_turn(
+                &session_id,
+                "Hello".into(),
+                event_tx.clone(),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let body = "Policy";
+        let refused = runtime
+            .activate_instruction(
+                &session_id,
+                InstructionActivationRequest {
+                    revision: meerkat_core::InstructionRevisionRef {
+                        namespace: meerkat_core::InstructionNamespace::new("app.example").unwrap(),
+                        key: meerkat_core::InstructionKey::new("primary").unwrap(),
+                        revision_id: meerkat_core::InstructionRevisionId::new("revision-1")
+                            .unwrap(),
+                        content_sha256: meerkat_core::InstructionContentDigest::for_body(body),
+                    },
+                    activation_id: meerkat_core::InstructionActivationId::new("activation-1")
+                        .unwrap(),
+                    expectation: meerkat_core::InstructionActivationExpectation::Absent,
+                    supersedes: None,
+                    body: body.to_string(),
+                },
+            )
+            .await
+            .expect_err("the ChatGPT backend wire carries no mid-conversation System message");
+        assert_eq!(refused.code, error::INVALID_PARAMS);
+        assert_eq!(
+            refused.data,
+            Some(serde_json::json!({
+                "instruction_activation_code":
+                    InstructionActivationAdmissionErrorCode::UnsupportedCurrentLowering,
+            }))
+        );
+
+        runtime
+            .start_turn(
+                &session_id,
+                "Again".into(),
+                event_tx,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("nothing the wire refuses was appended");
+        server.abort();
+        let bodies = bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 2, "both turns reached the wire");
+        for body in bodies.iter() {
+            assert!(
+                body["input"]
+                    .as_array()
+                    .expect("Responses input")
+                    .iter()
+                    .all(|item| !matches!(item["role"].as_str(), Some("system" | "developer"))),
+                "only the leading System row is carried, as instructions: {body}"
+            );
+        }
+    }
+
+    /// The `global` realm (the head an identity naming no binding resolves
+    /// on) with a public OpenAI API binding (`public`) beside the
+    /// ChatGPT-backend one (`chatgpt`); `default_binding` names the one such
+    /// an identity selects.
+    fn config_with_public_and_chatgpt_bindings(default_binding: &str) -> meerkat_core::Config {
+        let mut config = config_with_chatgpt_backend_binding();
+        let mut section = config.realm.remove("dev").expect("dev realm");
+        section.backend.insert(
+            "openai_api".into(),
+            meerkat_core::BackendProfileConfig {
+                provider: "openai".into(),
+                backend_kind: meerkat_core::provider_matrix::OpenAiBackendKind::OpenAiApi
+                    .as_str()
+                    .into(),
+                base_url: None,
+                options: serde_json::Value::Null,
+                server: None,
+            },
+        );
+        section.auth.insert(
+            "openai_key".into(),
+            meerkat_core::AuthProfileConfig {
+                provider: "openai".into(),
+                auth_method: meerkat_core::provider_matrix::OpenAiAuthMethod::ApiKey
+                    .as_str()
+                    .into(),
+                source: meerkat_core::CredentialSourceSpec::InlineSecret {
+                    secret: "sk-public-test".into(),
+                },
+                constraints: Default::default(),
+                metadata_defaults: Default::default(),
+            },
+        );
+        section.binding.insert(
+            "public".into(),
+            meerkat_core::ProviderBindingConfig {
+                backend_profile: "openai_api".into(),
+                auth_profile: "openai_key".into(),
+                credential_account: None,
+                default_model: None,
+                policy: Default::default(),
+                provider_default: false,
+            },
+        );
+        section.default_binding = Some(default_binding.into());
+        config.realm.insert("global".into(), section);
+        config
+    }
+
+    /// A public-API OpenAI session that holds an instruction activation, then
+    /// a hot swap that clears its binding, so the binding the session's client
+    /// resolution selects (the realm's `default_binding`) serves it. Returns
+    /// the hot swap's result, the identity before it and the identity after.
+    async fn clear_binding_hot_swap_with_a_recorded_activation(
+        default_binding: &str,
+    ) -> (Result<(), RpcError>, SessionLlmIdentity, SessionLlmIdentity) {
+        let temp = tempfile::tempdir().unwrap();
+        let config = config_with_public_and_chatgpt_bindings(default_binding);
+        let token_store = Arc::new(meerkat_providers::auth_store::EphemeralTokenStore::new());
+        let factory = temp_factory(&temp).with_provider_auth_persistence(
+            meerkat_providers::auth_store::ProviderAuthPersistence::new(
+                token_store.clone(),
+                Arc::new(meerkat_providers::auth_store::InMemoryCoordinator::new()),
+            ),
+        );
+        let runtime = make_runtime_with_config(factory, 10, config.clone());
+        runtime.set_config_runtime(Arc::new(meerkat_core::ConfigRuntime::new(
+            Arc::new(meerkat_core::MemoryConfigStore::new(
+                config,
+                meerkat_models::canonical(),
+            )),
+            temp.path().join("config_state.json"),
+        )));
+        // The ChatGPT binding holds a current login, so the resolution can
+        // select it.
+        let chatgpt = test_auth_binding("global", "chatgpt");
+        // Whole seconds: the store keeps token timestamps at that precision.
+        let now = chrono::Utc::now().timestamp();
+        let tokens = meerkat_providers::auth_store::PersistedTokens {
+            auth_mode: meerkat_providers::auth_store::PersistedAuthMode::ChatgptOauth,
+            primary_secret: Some("chatgpt-access".into()),
+            refresh_token: Some("chatgpt-refresh".into()),
+            id_token: None,
+            expires_at: chrono::DateTime::from_timestamp(now + 3600, 0),
+            last_refresh: chrono::DateTime::from_timestamp(now, 0),
+            scopes: Vec::new(),
+            account_id: Some("acct-1".into()),
+            metadata: serde_json::Value::Null,
+        };
+        // As a login does: acquire the lease, then persist the tokens marked
+        // with that acquisition.
+        let transition = meerkat_core::publish_token_lifecycle_acquired(
+            &runtime.generated_auth_lease_handle(),
+            &chatgpt,
+            &tokens,
+        )
+        .expect("the ChatGPT login is acquired");
+        let key = meerkat_providers::auth_store::TokenKey::from_auth_binding(&chatgpt);
+        let marked = meerkat_core::mark_tokens_lifecycle_published_for_transition(
+            &key,
+            &tokens,
+            &transition,
+        )
+        .expect("the login's tokens are marked");
+        token_store.save(&key, &marked).await.unwrap();
+        // What the scenario relies on: the ChatGPT binding resolves, so a
+        // target naming no binding can be served by it.
+        runtime
+            .llm_reconfigure_host()
+            .build_adapter_for_llm_identity(&SessionLlmIdentity {
+                model: "gpt-5.6-sol".to_string(),
+                provider: meerkat_core::Provider::OpenAI,
+                self_hosted_server_id: None,
+                provider_params: None,
+                auth_binding: Some(chatgpt.clone()),
+            })
+            .await
+            .expect("the ChatGPT binding resolves");
+
+        let build_config = AgentBuildConfig {
+            llm_client_override: Some(Arc::new(MockLlmClient)),
+            auth_binding: Some(test_auth_binding("global", "public")),
+            ..AgentBuildConfig::new("gpt-5.6-sol")
+        };
+        let session_id = runtime
+            .create_session(build_config, None, None, Vec::new())
+            .await
+            .unwrap();
+        let (event_tx, _event_rx) = mpsc::channel(100);
+        runtime
+            .start_turn(
+                &session_id,
+                "Hello".into(),
+                event_tx,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let body = "Policy";
+        runtime
+            .activate_instruction(
+                &session_id,
+                InstructionActivationRequest {
+                    revision: meerkat_core::InstructionRevisionRef {
+                        namespace: meerkat_core::InstructionNamespace::new("app.example").unwrap(),
+                        key: meerkat_core::InstructionKey::new("primary").unwrap(),
+                        revision_id: meerkat_core::InstructionRevisionId::new("revision-1")
+                            .unwrap(),
+                        content_sha256: meerkat_core::InstructionContentDigest::for_body(body),
+                    },
+                    activation_id: meerkat_core::InstructionActivationId::new("activation-1")
+                        .unwrap(),
+                    expectation: meerkat_core::InstructionActivationExpectation::Absent,
+                    supersedes: None,
+                    body: body.to_string(),
+                },
+            )
+            .await
+            .expect("the public API carries the activation");
+
+        let before = runtime
+            .current_materialized_llm_identity(&session_id)
+            .await
+            .unwrap();
+        let swapped = runtime
+            .hot_swap_llm_client(
+                &session_id,
+                &crate::handlers::turn::TurnOverrides {
+                    auth_binding: Some(
+                        meerkat_core::lifecycle::run_primitive::TurnMetadataOverride::Clear,
+                    ),
+                    ..Default::default()
+                },
+            )
+            .await;
+        let after = runtime
+            .current_materialized_llm_identity(&session_id)
+            .await
+            .unwrap();
+        (swapped, before, after)
+    }
+
+    /// Clearing the binding of a session that holds an activation, when the
+    /// binding the resolution selects is the ChatGPT backend: the capability
+    /// of the backend that would serve the session refuses the swap before
+    /// anything changes.
+    #[tokio::test]
+    async fn a_binding_clear_onto_the_chatgpt_backend_is_refused_while_activations_are_recorded() {
+        let (swapped, before, after) =
+            clear_binding_hot_swap_with_a_recorded_activation("chatgpt").await;
+        let Err(error) = swapped else {
+            panic!(
+                "the swap was admitted onto {:?}, a backend that cannot carry the recorded activation",
+                after.auth_binding
+            );
+        };
+        assert!(
+            error
+                .message
+                .contains("cannot represent the ordered instruction activations"),
+            "unexpected reconfigure error: {error:?}"
+        );
+        assert_eq!(after, before, "a refused swap changes nothing");
+        assert_eq!(
+            after.auth_binding,
+            Some(test_auth_binding("global", "public"))
+        );
+    }
+
+    /// The control: clearing the binding onto a backend that carries the
+    /// activation is admitted, and the applied identity names that binding.
+    #[tokio::test]
+    async fn a_binding_clear_onto_a_backend_that_carries_activations_is_admitted() {
+        let (swapped, _before, after) =
+            clear_binding_hot_swap_with_a_recorded_activation("public").await;
+        swapped.expect("the public API carries the recorded activation");
+        assert_eq!(after.model, "gpt-5.6-sol");
+        assert_eq!(
+            after.auth_binding,
+            Some(test_auth_binding("global", "public"))
         );
     }
 
@@ -33353,7 +34196,9 @@ mod tests {
         }
     }
 
-    /// StartTurnParams deserializes with all fields.
+    /// StartTurnParams deserializes with all fields. The build settings
+    /// accept only `null` (inherit) on a turn; a value is refused while
+    /// parsing (see `start_turn_params_reject_build_settings_while_parsing`).
     #[test]
     fn turn_start_params_deserialize_with_all_fields() {
         use crate::handlers::turn::StartTurnParams;
@@ -33365,10 +34210,10 @@ mod tests {
             "keep_alive": true,
             "model": "claude-opus-4-8",
             "provider": "anthropic",
-            "max_tokens": 4096,
+            "max_tokens": null,
             "system_prompt": "You are helpful",
-            "output_schema": {"type": "object"},
-            "structured_output_retries": 3,
+            "output_schema": null,
+            "structured_output_retries": null,
             "provider_params": {"temperature": 0.3},
             "auth_binding": {"action": "clear"}
         });
@@ -33378,10 +34223,10 @@ mod tests {
         assert_eq!(params.keep_alive, Some(true));
         assert_eq!(params.model.as_deref(), Some("claude-opus-4-8"));
         assert_eq!(params.provider.as_deref(), Some("anthropic"));
-        assert_eq!(params.max_tokens, Some(4096));
+        assert_eq!(params.max_tokens, None);
         assert_eq!(params.system_prompt.as_deref(), Some("You are helpful"));
-        assert!(params.output_schema.is_some());
-        assert_eq!(params.structured_output_retries, Some(3));
+        assert!(params.output_schema.is_none());
+        assert_eq!(params.structured_output_retries, None);
         // Canonical tri-state: an untagged value is a Set; the tagged clear
         // is a Clear.
         assert_eq!(

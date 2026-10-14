@@ -176,14 +176,13 @@ The `Session` methods are thin conveniences over canonical runtime calls:
 first turn later through `await deferred.startTurn(...)`, or streams it through
 `deferred.stream(...) -> EventStream`. Although deferred creation reuses
 `SessionOptions`, the server rejects `transientTurnContext` because no
-immediate turn exists. Current `DeferredTurnOptions` omits `injectedContext`,
-`transientTurnContext`, and `selfHostedServerId`. Set injected context during
-deferred creation; transient first-turn context and a self-hosted server route
-are not expressible through the current deferred TypeScript wrapper. Both
-deferred turn methods accept `skillRefs`, `turnToolOverlay`,
-`additionalInstructions`, `keepAlive`, `model`, `provider`, `maxTokens`,
-`systemPrompt`, `outputSchema`, `structuredOutputRetries`, and
-`providerParams`.
+immediate turn exists; pass it to the first turn instead. Both deferred turn
+methods accept `injectedContext`, `transientTurnContext`, `skillRefs`,
+`turnToolOverlay`, `additionalInstructions`, `keepAlive`, `model`, `provider`,
+`selfHostedServerId`, `systemPrompt`, `providerParams`, and `authBinding`.
+Their `maxTokens`, `outputSchema`, and `structuredOutputRetries` options are
+refused by the server on a turn (`INVALID_PARAMS`): set those build settings
+at creation.
 
 ### LiveChannel
 
@@ -861,6 +860,31 @@ class SkillNotFoundError extends MeerkatError {}
 | `STREAM_NOT_CONSUMED` | `stream.result` accessed before iteration completed |
 | `BINARY_NOT_FOUND` | `rkat-rpc` not found and auto-download failed |
 | `UNKNOWN_EVENT_TYPE` | Streamed event `type` not in the generated known-event inventory |
+
+### Typed comms/send errors
+
+A failed `session.send()` carries the server's typed `CommsSendErrorData` in
+`err.details`, tagged on `code`: `peer_not_found_or_not_trusted`,
+`peer_unreachable` (`reason` is `offline_or_no_ack` or `transport_error`; a
+transport error's text is in `details`), `peer_admission_dropped`,
+`peer_input_rejected` (with the `envelope_id`), `send_ambiguous` (the
+delivery may already have landed: `retry_safe` is `false` and
+`required_action` is `"reconcile"`, so reconcile by its `envelope_id` before
+any new attempt, since a retry can duplicate it), `send_failed` and
+`invalid_command`. `commsSendError(err)` returns it typed, or `undefined` for
+any other error. Branch on `code`, never on the message text.
+
+```typescript
+import { commsSendError } from "@rkat/sdk";
+
+try {
+  await session.send({ kind: "peer_message", to: peerId, body: "Hello!", handling_mode: "queue" });
+} catch (err) {
+  const failure = commsSendError(err);
+  if (failure?.code !== "peer_unreachable") throw err;
+  console.error(`${failure.peer} is unreachable: ${failure.reason}`);
+}
+```
 
 ---
 

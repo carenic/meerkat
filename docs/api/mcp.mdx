@@ -792,8 +792,7 @@ Start a new Meerkat agent session with the given prompt.
   ],
   "enable_builtins": false,
   "builtin_config": {
-    "enable_shell": false,
-    "shell_timeout_secs": 30
+    "enable_shell": false
   },
   "keep_alive": null,
   "comms_name": null,
@@ -886,8 +885,9 @@ extraction calls.
   Shell-tools override. Omit / `null` to use the default on run or inherit the persisted session value on resume.
 </ParamField>
 
-<ParamField body="builtin_config.shell_timeout_secs" type="u64 | null" default="30">
-  Default shell command timeout.
+<ParamField body="builtin_config.shell_timeout_secs" type="u64 | null" default="null">
+  Accepted and ignored in 0.9.1. Set the shell's default command timeout with
+  `[shell] timeout_secs` in the realm config.
 </ParamField>
 
 <ParamField body="keep_alive" type="bool | null" default="null">
@@ -1064,6 +1064,15 @@ even when several pending calls invoke the same tool.
 
 <ParamField body="hooks_override" type="HookRunOverrides | null" default="null">
   Run-scoped hook overrides.
+</ParamField>
+
+<ParamField body="turn_tool_overlay" type="object | null" default="null">
+  Per-turn tool overlay, the same shape `turn/start` takes: `allowed_tools`,
+  `blocked_tools`, and `tool_choice_plan` (entry `k` is the tool choice of the
+  turn's `k`-th provider call, for example `[{"mode": "required"}]`). It
+  applies to this turn only, on a live session and on a resume that rebuilds
+  the session's agent. Keys it does not know are ignored and logged by the
+  server.
 </ParamField>
 
 ### Response format

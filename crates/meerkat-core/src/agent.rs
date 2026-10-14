@@ -6,6 +6,8 @@
 mod assistant_message_identity_tests;
 #[cfg(test)]
 mod brain_swap_promotion_tests;
+#[cfg(test)]
+mod budget_warning_tests;
 mod builder;
 pub mod comms_impl;
 pub mod compact;

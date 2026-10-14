@@ -60,6 +60,8 @@ import {
   type ConfigWriteResult,
   type CommsPeersResult,
   type CommsSendResult,
+  type PeerDeliveryOutcome,
+  type PeerIngressTerminalOutcomeKind,
   type InterruptResult,
   type MobStopMemberRunResult,
   type StopRunResult,
@@ -393,6 +395,7 @@ import {
   type MobUnreachablePeer,
 } from "./mob.js";
 import { parseAgentEventEnvelope } from "./event-envelope.js";
+import { isCommsSendErrorCode } from "./comms-errors.js";
 import { EventStream, AsyncQueue } from "./streaming.js";
 import { parseUsage } from "./events.js";
 import type { RealtimeMessageOrigin } from "./events.js";
@@ -566,25 +569,20 @@ const SETTLEMENT_FIELD_DOMAINS = {
   failure_kind: Object.keys(SETTLEMENT_FAILURE_KINDS),
 } as const;
 
-// `delivery` on every peer `comms/send` receipt is the server's
-// `PeerDeliveryOutcome` (crates/meerkat-core/src/comms.rs): a unit variant is
-// its snake_case name, and `durably_resolved` carries the receiver's
-// `PeerIngressTerminalOutcomeKind` (crates/meerkat-core/src/interaction.rs),
-// which the generated type leaves untyped.
+// `delivery` on every peer `comms/send` receipt is the generated
+// `PeerDeliveryOutcome`: a unit variant name, or `durably_resolved` carrying a
+// `PeerIngressTerminalOutcomeKind`.
 const PEER_DELIVERY_UNIT_OUTCOMES = {
   acked: true,
   volatile_handed_off: true,
   queued: true,
-} as const satisfies Record<
-  Extract<Extract<CommsSendResult, { delivery: unknown }>["delivery"], string>,
-  true
->;
+} as const satisfies Record<Extract<PeerDeliveryOutcome, string>, true>;
 
-const PEER_INGRESS_TERMINAL_OUTCOMES: ReadonlySet<string> = new Set([
-  "accepted",
-  "deduplicated",
-  "rejected",
-]);
+const PEER_INGRESS_TERMINAL_OUTCOMES = {
+  accepted: true,
+  deduplicated: true,
+  rejected: true,
+} as const satisfies Record<PeerIngressTerminalOutcomeKind, true>;
 
 const MEERKAT_REPO = "lukacf/meerkat";
 const MEERKAT_RELEASE_BINARY = "rkat-rpc";
@@ -937,7 +935,11 @@ function mobTurnStartPayload(
   setIfDefined(payload, "output_schema", options?.outputSchema);
   setIfDefined(payload, "structured_output_retries", options?.structuredOutputRetries);
   setIfDefined(payload, "provider_params", options?.providerParams);
-  setIfDefined(payload, "auth_binding", options?.authBinding);
+  setIfDefined(
+    payload,
+    "auth_binding",
+    options?.authBinding as MobTurnStartParams["auth_binding"],
+  );
   return payload;
 }
 
@@ -3993,6 +3995,7 @@ export class MeerkatClient {
       params.structured_output_retries = options.structuredOutputRetries;
     }
     if (options?.providerParams) params.provider_params = options.providerParams;
+    if (options?.authBinding != null) params.auth_binding = options.authBinding;
     const raw = await this.request("turn/start", params);
     return MeerkatClient.parseRunResult(raw);
   }
@@ -4047,6 +4050,7 @@ export class MeerkatClient {
       params.structured_output_retries = options.structuredOutputRetries;
     }
     if (options?.providerParams) params.provider_params = options.providerParams;
+    if (options?.authBinding != null) params.auth_binding = options.authBinding;
 
     const rpcRequest = { jsonrpc: "2.0", id: requestId, method: "turn/start", params };
     this.process.stdin!.write(JSON.stringify(rpcRequest) + "\n");
@@ -4545,11 +4549,12 @@ export class MeerkatClient {
 
   // -- Auth + realm (Phase 4d) --------------------------------------------
   //
-  // These wrappers cover the RPC catalog's auth/* and realm/* methods.
-  // Write-side methods (auth/profile/create, delete, login/start,
-  // login/complete, login/device_start, logout) are currently server-stubbed
-  // with typed INVALID_REQUEST pointing to the CLI; the wrappers surface
-  // whatever the server returns so they stay honest about the state.
+  // These wrappers cover the RPC catalog's auth/* and realm/* methods. The
+  // server implements the write-side methods (auth/profile/create, delete,
+  // login/start, login/complete, login/device_start, logout) itself; a
+  // refusal arrives as a typed error whose `error.data.reason` is read with
+  // `authErrorReason`. The wrappers surface whatever the server returns, so
+  // they stay honest about its state.
 
   async realmList(): Promise<unknown> {
     return this.request("realm/list", {});
@@ -4695,8 +4700,12 @@ export class MeerkatClient {
   }
 
   /**
-   * Remove an MCP server target's stored credential via `auth/logout`.
-   * Nothing is revoked at the provider; a pending attempt is unaffected.
+   * Disconnect an MCP server target via `auth/logout`. The target must name
+   * a server configured for this host. Logout retires the login attempt
+   * pending for the server, removes its stored credential, and stops
+   * offering the server to this runtime's sessions until a later login.
+   * Nothing is revoked at the provider; `cleared` is true even when no
+   * credential was stored.
    */
   async authMcpLogout(
     mcp: RpcWireMcpAuthTarget,
@@ -4869,7 +4878,10 @@ export class MeerkatClient {
         // `kind` for any payload that happened to also carry "reason" (e.g.
         // `mob_member_reload_required`). The whole object survives as
         // `details` unless the server explicitly nests one under "details".
-        details: parsed.details ?? rawData,
+        // A typed `comms/send` failure is such a bare payload: its own
+        // optional `details` field (a transport error's text) is part of it,
+        // not an envelope.
+        details: isCommsSendErrorCode(parsed.code) ? rawData : (parsed.details ?? rawData),
       };
     }
     // The server's typed error projection is `error.data` ({code, message,
@@ -6628,7 +6640,10 @@ export class MeerkatClient {
       );
     }
     const outcome = (resolved as Record<string, unknown>).outcome;
-    if (typeof outcome !== "string" || !PEER_INGRESS_TERMINAL_OUTCOMES.has(outcome)) {
+    if (
+      typeof outcome !== "string" ||
+      !Object.prototype.hasOwnProperty.call(PEER_INGRESS_TERMINAL_OUTCOMES, outcome)
+    ) {
       throw new MeerkatError(
         "INVALID_RESPONSE",
         `${context}: invalid delivery.durably_resolved.outcome`,

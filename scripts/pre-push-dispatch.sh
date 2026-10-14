@@ -145,7 +145,7 @@ hook_stamp="${hook_cache_dir}/${CACHE_VERSION}-${pushed_tree}.ok"
 skip_set="$(normalize_skip_set "${SKIP:-}")"
 # Hooks that are the only local check of their contract and are cheap enough
 # never to need skipping. machine-codegen-drift is the one machine/protocol
-# drift check: the clippy hook's governance gate leaves drift to it.
+# drift check: the ratchets hook's governance gate leaves drift to it.
 unskippable_hooks="machine-codegen-drift"
 for unskippable in ${unskippable_hooks}; do
   case ",${skip_set}," in
@@ -441,7 +441,111 @@ cd "$validation_tree"
 # it. Python buffers block-wise when its stdout is a pipe; unbuffering keeps
 # the operator's terminal live through the long deterministic lanes.
 gate_log="${validation_run_root}/push-stage-hooks.log"
+timing_log="${validation_run_root}/push-stage-times.log"
+lane_timings="${validation_run_root}/lane-times.tsv"
+# pre-push-unit.sh appends "<lane>\t<seconds>\t<status>" lines here.
+export MEERKAT_PRE_PUSH_LANE_TIMINGS="$lane_timings"
+# The transcript also goes to a timing log, each line prefixed with the epoch
+# second it arrived. pre-commit prints a hook's result line when the hook ends,
+# so consecutive result lines give each hook's wall time. perl relays whatever
+# it reads at once, partial lines included, so the terminal stays live; without
+# perl the transcript is captured untimed.
+#
+# Neither log may stop the relay. pre-commit is still writing while this runs,
+# and a reader that exits early kills it with a broken pipe, so the push would
+# take the pipe's status instead of the hooks'. Like tee, a gate log that
+# cannot be written is reported by a nonzero exit after every byte is relayed;
+# the timing log is optional and only warns.
+capture_transcript() {
+  if command -v perl >/dev/null 2>&1; then
+    perl -e '
+      $| = 1;
+      my $status = 0;
+      my ($log, $times);
+      unless (open($log, ">", $ARGV[0])) {
+        warn "gate log: $!\n";
+        undef $log;
+        $status = 1;
+      }
+      unless (open($times, ">", $ARGV[1])) {
+        warn "timing log unavailable ($!); hook timings are not recorded\n";
+        undef $times;
+      }
+      my $pending = "";
+      while (1) {
+        my $read = sysread(STDIN, my $chunk, 65536);
+        unless (defined $read) {
+          next if $!{EINTR};
+          warn "transcript read: $!\n";
+          $status = 1;
+          last;
+        }
+        last if $read == 0;
+        print STDOUT $chunk;
+        print {$log} $chunk if $log;
+        next unless $times;
+        $pending .= $chunk;
+        while ($pending =~ s/^([^\n]*)\n//) {
+          print {$times} time(), " ", $1, "\n";
+        }
+      }
+      print {$times} time(), " ", $pending, "\n" if $times && length $pending;
+      if ($log && !close($log)) {
+        warn "gate log: $!\n";
+        $status = 1;
+      }
+      close($times) if $times;
+      exit $status;
+    ' "$gate_log" "$timing_log"
+  else
+    tee "$gate_log"
+  fi
+}
+
+# Prints each hook's wall time from the timed transcript, then the lane times
+# the deterministic gate recorded, and appends both to the hook cache's
+# timings.tsv. Reporting never decides the push.
+report_hook_timings() {
+  [[ -s "$timing_log" ]] || return 0
+  local timings_tsv="${hook_cache_root}/timings.tsv"
+  touch "$timings_tsv" 2>/dev/null || timings_tsv=/dev/null
+  awk -v start="$gate_started" -v lanes="$lane_timings" -v tree="$pushed_tree" \
+    -v commit="$pushed_commit" -v now="$(date -u +%Y-%m-%dT%H:%M:%SZ)" -v tsv="$timings_tsv" '
+    BEGIN { prev = start; hooks = 0; total = 0 }
+    {
+      stamp = $1
+      line = substr($0, length($1) + 2)
+      gsub(/\033\[[0-9;]*[A-Za-z]/, "", line)
+      if (match(line, /[.][.]+(\(no files to check\))?(Passed|Failed|Skipped)$/)) {
+        hooks += 1
+        names[hooks] = substr(line, 1, RSTART - 1)
+        status = substr(line, RSTART)
+        sub(/^[.]+(\(no files to check\))?/, "", status)
+        statuses[hooks] = status
+        seconds[hooks] = stamp - prev
+        prev = stamp
+      }
+    }
+    END {
+      if (hooks == 0) exit
+      print "pre-push hook timings (wall seconds):"
+      for (i = 1; i <= hooks; i++) {
+        printf "  %6d  %s (%s)\n", seconds[i], names[i], statuses[i]
+        printf "%s\t%s\t%s\thook\t%d\t%s\t%s\n", now, tree, commit, seconds[i], names[i], statuses[i] >> tsv
+        total += seconds[i]
+      }
+      while ((getline row < lanes) > 0) {
+        split(row, field, "\t")
+        printf "          %6d  lane: %s (%s)\n", field[2], field[1], field[3]
+        printf "%s\t%s\t%s\tlane\t%d\t%s\t%s\n", now, tree, commit, field[2], field[1], field[3] >> tsv
+      }
+      printf "  %6d  total\n", total
+    }
+  ' "$timing_log"
+}
+
 dispatch_step="running push-stage validation hooks"
+gate_started="$(date +%s)"
 # Hook failure is a reported outcome, not a dispatcher fault: the ERR trap fires
 # even with errexit disabled, so it is lifted for exactly this pipeline. Capture
 # the whole PIPESTATUS array at once; any later command resets it.
@@ -449,12 +553,12 @@ trap - ERR
 set +e
 if [[ "$PRE_COMMIT_FROM_REF" == "$empty_tree" ]]; then
   PYTHONUNBUFFERED=1 pre-commit run --config .pre-commit-config.yaml \
-    --hook-stage pre-push --all-files 2>&1 | tee "$gate_log"
+    --hook-stage pre-push --all-files 2>&1 | capture_transcript
 else
   PYTHONUNBUFFERED=1 pre-commit run --config .pre-commit-config.yaml \
     --hook-stage pre-push --from-ref "$PRE_COMMIT_FROM_REF" \
     --to-ref "$pushed_commit" \
-    2>&1 | tee "$gate_log"
+    2>&1 | capture_transcript
 fi
 gate_pipeline_status=("${PIPESTATUS[@]}")
 set -e
@@ -463,11 +567,12 @@ gate_status="${gate_pipeline_status[0]}"
 capture_status="${gate_pipeline_status[1]:-0}"
 
 if [[ "$capture_status" -ne 0 ]]; then
-  echo "note: could not capture the hook transcript (tee exit ${capture_status});" >&2
+  echo "note: could not capture the hook transcript (capture exit ${capture_status});" >&2
   echo "      failure attribution below may be incomplete." >&2
 fi
 
 if [[ "$gate_status" -ne 0 ]]; then
+  report_hook_timings || true
   gate_plain="$(sed -E $'s/\x1b\\[[0-9;]*[A-Za-z]//g' "$gate_log" 2>/dev/null || true)"
   failed_names="$(printf '%s\n' "$gate_plain" | sed -n -E 's/^(.+[^.])[.]{2,}Failed$/\1/p')"
   failed_ids="$(printf '%s\n' "$gate_plain" | sed -n -E 's/^- hook id: (.+)$/\1/p')"
@@ -509,6 +614,8 @@ else
   echo "note: SKIP=${skip_set} reduced this gate's coverage; recorded partial evidence only." >&2
   echo "      A push of this tree without that SKIP re-runs the skipped hooks." >&2
 fi
+
+report_hook_timings || true
 
 # Retention runs only here, after a passed gate, while this lane's lock is
 # still held so no peer can mistake it for an idle lane. It never decides the

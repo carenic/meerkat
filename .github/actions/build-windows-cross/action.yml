@@ -109,6 +109,8 @@ runs:
       env:
         VERSION: ${{ inputs.version }}
         TARGET: x86_64-pc-windows-msvc
+        # The workflow-ref checkout this action is loaded from.
+        MARKER_GUARD: ${{ github.action_path }}/../../../scripts/check-release-binary-markers
       run: |
         set -euo pipefail
         BINARIES=("rkat" "rkat-rpc" "rkat-rest" "rkat-mcp")
@@ -126,6 +128,8 @@ runs:
             echo "Binary ${bin} for ${TARGET} does not embed release version ${VERSION}" >&2
             exit 1
           fi
+          # No release binary may carry compiled-in test code.
+          "${MARKER_GUARD}" "$src"
           # The exe sits at the archive root, matching the previous 7z layout.
           zip -j -q "dist/${artifact_name}" "$src"
           echo "packaged=${bin} -> dist/${artifact_name}"

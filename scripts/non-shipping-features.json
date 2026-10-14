@@ -1,0 +1,19 @@
+{
+  "$comment": [
+    "Cargo features that compile test-only code: fixture hooks, fault seams,",
+    "oracles and harnesses. No release binary may be built with one of them,",
+    "nor with a dependency feature they forward (`dep/feature`, `dep?/feature`).",
+    "scripts/generate-bazel-rust-builds.mjs strips them from every production",
+    "Bazel rust_library and rust_binary (tests keep them through the generated",
+    "*_test_support variants), and scripts/check-bazel-release-features.py",
+    "fails when one of them reaches a release binary's Bazel graph."
+  ],
+  "features": [
+    "experimental-gpt-live-gate0-harness",
+    "integration-real-tests",
+    "test-mcp-oauth-fixtures",
+    "test-oracle",
+    "test-realtime-fixtures",
+    "test-support"
+  ]
+}

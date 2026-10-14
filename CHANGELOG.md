@@ -35,6 +35,30 @@ them.
 
 ## [Unreleased]
 
+### Breaking
+
+- `meerkat-core`: `LimitsConfig` gains `max_tool_calls: Option<usize>`, the
+  configuration twin of `BudgetLimits::max_tool_calls` (see Fixed).
+  Struct-literal constructors must add the field (`None` keeps the previous
+  unlimited behaviour). It is skipped when unset, so existing realm config
+  documents keep their bytes.
+- Behaviour-only (not measured by the gate): `Config::apply_cli_overrides`
+  writes the `CliOverrides` budget fields to the enforced `[limits]`
+  dimensions: `max_tokens` to `limits.budget`, `max_duration` to
+  `limits.max_duration` and `max_tool_calls` to `limits.max_tool_calls`.
+  They used to land in the legacy `[budget]` table (`Config::budget`), which
+  no runtime reads, and that table no longer receives them.
+- `meerkat-contracts`: `CommsSendErrorData` has a new variant,
+  `SendAmbiguous { envelope_id, message, retry_safe, required_action }`
+  (code `send_ambiguous`), for a `comms/send` whose delivery outcome is
+  unknown. Exhaustive matches over `CommsSendErrorData` need an arm for it.
+  `required_action` is the new `CommsSendRequiredAction` enum (`Reconcile`),
+  and the new `CommsSendErrorData::ambiguous_delivery` and
+  `CommsSendErrorData::peer_input_rejected` constructors build the shared
+  payloads. Rust clients that deserialize CommsSendErrorData with
+  meerkat-contracts 0.9.0 must upgrade to 0.9.1 to decode send_ambiguous; the
+  Python and TS SDKs pass unknown error data through.
+
 ### Fixed
 
 - Python and TypeScript SDK `comms/send` now accept the `delivery` outcome the
@@ -2455,7 +2479,7 @@ them.
   names no binding is likewise switched to with the binding and credential its
   client resolved.
 
-- `rkat run` and `rkat resume` work in a governed realm: the CLI's runtime
+- `rkat run` and `rkat run --resume` work in a governed realm: the CLI's runtime
   executor declares and forwards the native work context of each governed
   turn, as the shared runtime-backed executor does, instead of every
   governed prompt being refused as "governed executor support is
@@ -2463,7 +2487,7 @@ them.
 
 - The CLI launches a realm-defined MCP stdio server with the service secrets
   its realm stored for the server's declared `secret_env` slots. It refused
-  every declared slot before: the MCP loader of `rkat run` and `rkat resume`
+  every declared slot before: the MCP loader of `rkat run` and `rkat run --resume`
   on an ordinary realm held no service-secret custody, and the servers
   launched through the CLI's runtime-backed composition (such as a governed
   realm's configured servers) were refused as ownerless, because that
@@ -2481,7 +2505,7 @@ them.
   reviewed operation on such a server. A source that states no account
   still states none through the custody.
 
-- The MCP credential source of `rkat run` and `rkat resume` states the
+- The MCP credential source of `rkat run` and `rkat run --resume` states the
   account the native MCP OAuth owner selected for a server
   (`oauth_account`). It stated none, so in a governed realm the stock policy
   refused each reviewed operation on such a server.

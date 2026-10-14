@@ -196,13 +196,16 @@ async fn chat_roundtrip_all_models() {
 /// Anthropic: `{ effort: <level> }` → client forwards into `output_config.effort`.
 /// OpenAI: `{ reasoning_effort: <level> }` → client forwards into
 /// `reasoning.effort` on the Responses API.
-/// Gemini: effort levels are not a concept; this test is skipped for Gemini.
+/// Gemini: `{ thinking_level: <level> }` → client forwards into
+/// `generationConfig.thinkingConfig.thinkingLevel`; Gemini rows record the
+/// thinking levels the model accepts in `effort_levels`.
 fn effort_provider_params(
     provider: &str,
     level: &str,
 ) -> Option<meerkat_core::lifecycle::run_primitive::ProviderTag> {
     use meerkat_core::lifecycle::run_primitive::{
-        AnthropicEffort, AnthropicProviderTag, OpenAiProviderTag, ProviderTag, ReasoningEffort,
+        AnthropicEffort, AnthropicProviderTag, GeminiProviderTag, GeminiThinkingLevel,
+        OpenAiProviderTag, ProviderTag, ReasoningEffort,
     };
     match provider {
         "anthropic" => {
@@ -231,6 +234,19 @@ fn effort_provider_params(
             };
             Some(ProviderTag::OpenAi(OpenAiProviderTag {
                 reasoning_effort: Some(effort),
+                ..Default::default()
+            }))
+        }
+        "gemini" => {
+            let thinking_level = match level {
+                "minimal" => GeminiThinkingLevel::Minimal,
+                "low" => GeminiThinkingLevel::Low,
+                "medium" => GeminiThinkingLevel::Medium,
+                "high" => GeminiThinkingLevel::High,
+                _ => return None,
+            };
+            Some(ProviderTag::Gemini(GeminiProviderTag {
+                thinking_level: Some(thinking_level),
                 ..Default::default()
             }))
         }
@@ -335,9 +351,10 @@ async fn thinking_modes_per_capability() {
         };
         let configs: Vec<(&'static str, ProviderTag)> = match caps.thinking {
             ThinkingSupport::None | ThinkingSupport::GeminiThinkingLevel => {
-                // Gemini thinking goes through a separate knob (thinking_level)
-                // that our client does not forward today — skip here to keep
-                // the lane narrow.
+                // Gemini thinking goes through a separate knob
+                // (thinking_level); `effort_levels_accepted` exercises every
+                // level a Gemini row records. Skip here to keep the lane
+                // narrow.
                 continue;
             }
             ThinkingSupport::AnthropicEnabledOnly => vec![(

@@ -49,6 +49,7 @@ from .types import (
     TranscriptRewriteInputMessage,
     TranscriptRewriteReason,
     TranscriptRewriteSelection,
+    TurnAuthBindingOverride,
     WireToolAccessPolicy,
 )
 
@@ -152,6 +153,7 @@ class Session:
         output_schema: dict[str, Any] | None = None,
         structured_output_retries: int | None = None,
         provider_params: dict[str, Any] | None = None,
+        auth_binding: TurnAuthBindingOverride | None = None,
     ) -> RunResult:
         """Run another turn on this session (non-streaming).
 
@@ -175,6 +177,7 @@ class Session:
             output_schema=output_schema,
             structured_output_retries=structured_output_retries,
             provider_params=provider_params,
+            auth_binding=auth_binding,
         )
         self._last_result = result
         return result
@@ -197,6 +200,7 @@ class Session:
         output_schema: dict[str, Any] | None = None,
         structured_output_retries: int | None = None,
         provider_params: dict[str, Any] | None = None,
+        auth_binding: TurnAuthBindingOverride | None = None,
     ) -> EventStream:
         """Run another turn on this session with streaming events.
 
@@ -226,6 +230,7 @@ class Session:
             output_schema=output_schema,
             structured_output_retries=structured_output_retries,
             provider_params=provider_params,
+            auth_binding=auth_binding,
             _session=self,
         )
 
@@ -554,6 +559,7 @@ class DeferredSession:
         output_schema: dict[str, Any] | None = None,
         structured_output_retries: int | None = None,
         provider_params: dict[str, Any] | None = None,
+        auth_binding: TurnAuthBindingOverride | None = None,
     ) -> RunResult:
         """Run the first turn on this deferred session.
 
@@ -577,6 +583,7 @@ class DeferredSession:
             output_schema=output_schema,
             structured_output_retries=structured_output_retries,
             provider_params=provider_params,
+            auth_binding=auth_binding,
         )
 
     async def interrupt(self) -> None:

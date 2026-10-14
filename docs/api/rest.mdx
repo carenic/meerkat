@@ -1514,6 +1514,16 @@ the recipient's agent turn; a queued send does not prove receiver admission.
 This is distinct from the webhook routes' `202`/`{"queued":true}` admission
 response.
 
+#### Send errors
+
+A failed send returns HTTP `500` whose `code` and `details.code` name the
+failure with the JSON-RPC vocabulary: `peer_not_found_or_not_trusted`,
+`peer_unreachable`, `peer_admission_dropped`, `peer_input_rejected`,
+`send_ambiguous` or `send_failed`. `send_ambiguous` means the envelope may
+already be delivered: its `details` carry the `envelope_id`,
+`retry_safe: false` and `required_action: "reconcile"`. Reconcile by that
+envelope before any new attempt; a retry can duplicate it.
+
 <Note>
 Unlike the two webhook ingress routes (which optionally check
 `X-Webhook-Secret` against `RKAT_WEBHOOK_SECRET`), `/comms/send` has **no

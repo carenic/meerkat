@@ -1,21 +1,15 @@
 // ═══════════════════════════════════════════════════════════
-// Bubbles — Speech bubbles + thought indicators
+// Bubbles - pixel speech bubbles + thought clouds
+// Speech bubbles show their full text immediately and choose a spot
+// that avoids other agents and bubbles. All in art space.
 // ═══════════════════════════════════════════════════════════
 
-import { AGENT_IDS } from "../types";
+import { AGENTS, AGENT_IDS } from "../types";
 import type { AgentId } from "../types";
-import { CANVAS_H, CANVAS_W, DESKS } from "./layout";
-import { addRenderHook, addUpdateHook } from "./canvas";
-
-// ── Speech Bubbles ──
-
-interface ActiveBubble {
-  agentId: AgentId;
-  text: string;
-  startTime: number;
-  duration: number;
-  elapsed: number;
-}
+import { ART_H, ART_W, DESKS } from "./layout";
+import { agentHitRect, headPoint } from "./sprites";
+import { addRenderHook, addUpdateHook, Layer } from "./canvas";
+import { INK, PAPER, clamp, easeOutBack, pixelFont, pixelPanel, pixelShadow } from "./pixel";
 
 interface Rect {
   x: number;
@@ -24,65 +18,55 @@ interface Rect {
   h: number;
 }
 
-type BubbleBias = "left" | "right" | "center";
-
-interface SpeakerHint {
-  dx: number;
-  dy: number;
-  bias: BubbleBias;
+interface ActiveBubble {
+  agentId: AgentId;
+  text: string;
+  duration: number;
+  elapsed: number;
 }
 
 interface BubbleLayout extends Rect {
   lines: string[];
   speakerX: number;
   speakerY: number;
-  tailBaseX: number;
-  tailBaseY: number;
-  tailTipX: number;
-  tailTipY: number;
 }
 
 const speechBubbles = new Map<AgentId, ActiveBubble>();
+const thinkingAgents = new Set<AgentId>();
+let clock = 0;
 
-const SPEAKER_HINTS: Record<AgentId, SpeakerHint> = {
-  triage: { dx: 26, dy: -64, bias: "right" },
-  archivist: { dx: -24, dy: -64, bias: "left" },
-  "it-dept": { dx: -8, dy: -66, bias: "left" },
-  "hr-dept": { dx: 8, dy: -66, bias: "right" },
-  facilities: { dx: -10, dy: -66, bias: "left" },
-  finance: { dx: 10, dy: -66, bias: "right" },
-  "alex-pa": { dx: -8, dy: -66, bias: "left" },
-  "sam-pa": { dx: 0, dy: -66, bias: "center" },
-  "pat-pa": { dx: 8, dy: -66, bias: "right" },
-  gate: { dx: 0, dy: -64, bias: "center" },
-};
+const FONT = pixelFont(7, 500);
+const LINE_H = 8;
+const PAD_X = 5;
+const PAD_Y = 3;
+const MAX_TEXT_W = 116;
+const MAX_LINES = 3;
+const MARGIN = 3;
+/** Most speech bubbles shown at once; more than this buries the room. */
+const MAX_VISIBLE = 4;
+/** A quick scale pop; the full text is visible from the first frame. */
+const POP_TIME = 0.08;
+const FADE_TIME = 0.35;
 
-const BUBBLE_MARGIN = 8;
-const BUBBLE_FONT = "700 20px 'Space Grotesk', sans-serif";
-const BUBBLE_LINE_H = 25;
-const BUBBLE_PAD_X = 12;
-const BUBBLE_PAD_Y = 10;
-const BUBBLE_MAX_TEXT_W = 300;
+// ── Public API ──
 
 export function showSpeechBubble(agentId: AgentId, text: string, durationMs = 4000): void {
-  const truncated = text.length > 80 ? text.slice(0, 77) + "..." : text;
-  speechBubbles.set(agentId, {
-    agentId,
-    text: truncated,
-    startTime: performance.now(),
-    duration: durationMs / 1000,
-    elapsed: 0,
-  });
+  const clean = text.replace(/\s+/g, " ").trim();
+  const truncated = clean.length > 96 ? clean.slice(0, 93) + "..." : clean;
+  // At most MAX_VISIBLE bubbles at once: a new speaker retires the oldest.
+  if (!speechBubbles.has(agentId)) {
+    const live = [...speechBubbles.values()].filter((b) => b.duration - b.elapsed > FADE_TIME);
+    if (live.length >= MAX_VISIBLE) {
+      const oldest = live.reduce((a, b) => (b.elapsed > a.elapsed ? b : a));
+      oldest.elapsed = oldest.duration - FADE_TIME;
+    }
+  }
+  speechBubbles.set(agentId, { agentId, text: truncated, duration: durationMs / 1000, elapsed: 0 });
 }
 
 export function hideSpeechBubble(agentId: AgentId): void {
   speechBubbles.delete(agentId);
 }
-
-// ── Thought Bubbles ──
-
-const thinkingAgents = new Set<AgentId>();
-let thinkDotPhase = 0;
 
 export function showThinkBubble(agentId: AgentId): void {
   thinkingAgents.add(agentId);
@@ -99,368 +83,250 @@ export function isThinking(agentId: AgentId): boolean {
 // ── Update ──
 
 function update(dt: number): void {
+  clock += dt;
   for (const [id, b] of speechBubbles) {
     b.elapsed += dt;
-    if (b.elapsed >= b.duration) {
-      speechBubbles.delete(id);
-    }
+    if (b.elapsed >= b.duration) speechBubbles.delete(id);
   }
-  thinkDotPhase += dt * 3;
 }
 
 // ── Render ──
 
-function render(ctx: CanvasRenderingContext2D, _dt: number): void {
-  const placed: BubbleLayout[] = [];
-  const occupants = buildAgentBodyRects();
+function render(ctx: CanvasRenderingContext2D): void {
+  const placed: Rect[] = [];
   const ordered = [...speechBubbles.values()].sort((a, b) => DESKS[a.agentId].y - DESKS[b.agentId].y);
-
   for (const bubble of ordered) {
-    const layout = computeSpeechLayout(ctx, bubble, placed, occupants);
-    drawSpeechBubble(ctx, bubble, layout);
+    const layout = layoutSpeech(ctx, bubble, placed);
+    drawSpeech(ctx, bubble, layout);
     placed.push(layout);
   }
-
-  for (const agentId of thinkingAgents) {
-    if (speechBubbles.has(agentId)) continue;
-    renderThinkBubble(ctx, agentId, placed);
+  for (const id of thinkingAgents) {
+    if (!speechBubbles.has(id)) drawThink(ctx, id, placed);
   }
 }
 
-function computeSpeechLayout(
-  ctx: CanvasRenderingContext2D,
-  bubble: ActiveBubble,
-  placed: BubbleLayout[],
-  occupants: Rect[],
-): BubbleLayout {
-  const speaker = getSpeakerPoint(bubble.agentId);
-  ctx.font = BUBBLE_FONT;
-  const lines = wrapText(ctx, bubble.text, BUBBLE_MAX_TEXT_W, 3);
+function layoutSpeech(ctx: CanvasRenderingContext2D, bubble: ActiveBubble, placed: Rect[]): BubbleLayout {
+  const head = headPoint(bubble.agentId);
+  const sx = head.x;
+  const sy = head.y - 1;
+  ctx.font = FONT;
+  const lines = wrapText(ctx, bubble.text, MAX_TEXT_W, MAX_LINES);
   const textW = Math.max(...lines.map((line) => ctx.measureText(line).width));
-  const w = Math.ceil(textW + BUBBLE_PAD_X * 2);
-  const h = Math.ceil(lines.length * BUBBLE_LINE_H + BUBBLE_PAD_Y * 2 - 4);
+  const w = Math.ceil(textW) + PAD_X * 2;
+  const h = lines.length * LINE_H + PAD_Y * 2 + 1;
 
-  const candidates = makeCandidates(speaker.x, speaker.y, w, h, speaker.bias);
-  let bestRect = candidates[0];
-  let bestScore = Number.POSITIVE_INFINITY;
-
-  for (let i = 0; i < candidates.length; i++) {
-    const score = scoreCandidateRect(candidates[i], i, speaker.x, speaker.y, placed, occupants);
+  // Faces (everyone's, the speaker's included) and other bubbles are
+  // near-hard obstacles; desks and nameplates are soft ones.
+  const desks = AGENT_IDS.filter((id) => id !== bubble.agentId).map(agentHitRect);
+  const faces = AGENT_IDS.map((id) => {
+    const r = agentHitRect(id);
+    return { x: r.x + 12, y: r.y - 2, w: r.w - 24, h: 30 };
+  });
+  const options = candidates(sx, sy, w, h);
+  let best = clampRect(options[0]);
+  let bestScore = Infinity;
+  for (let i = 0; i < options.length; i++) {
+    const c = options[i];
+    const r = clampRect(c);
+    const displacement = Math.abs(r.x - c.x) + Math.abs(r.y - c.y);
+    let overlap = 0;
+    for (const o of desks) overlap += intersection(r, o) * 0.5;
+    for (const f of faces) overlap += intersection(r, f) * 12;
+    for (const p of placed) overlap += intersection(r, p) * 12;
+    const score = overlap + displacement * 4 + i * 30;
     if (score < bestScore) {
       bestScore = score;
-      bestRect = candidates[i];
+      best = r;
     }
   }
-
-  const clamped = clampRect(bestRect, BUBBLE_MARGIN);
-  const tail = computeTail(clamped, speaker.x, speaker.y);
-  return {
-    ...clamped,
-    lines,
-    speakerX: speaker.x,
-    speakerY: speaker.y,
-    tailBaseX: tail.baseX,
-    tailBaseY: tail.baseY,
-    tailTipX: speaker.x,
-    tailTipY: speaker.y,
-  };
+  return { ...best, lines, speakerX: sx, speakerY: sy };
 }
 
-function drawSpeechBubble(ctx: CanvasRenderingContext2D, bubble: ActiveBubble, layout: BubbleLayout): void {
-  const fadeStart = bubble.duration - 0.5;
-  const alpha = bubble.elapsed > fadeStart ? 1 - (bubble.elapsed - fadeStart) / 0.5 : 1;
+function candidates(sx: number, sy: number, w: number, h: number): Rect[] {
+  const above = sy - h - 5;
+  return [
+    { x: sx - w / 2, y: above, w, h },
+    { x: sx - w + 14, y: above, w, h },
+    { x: sx - 14, y: above, w, h },
+    { x: sx - w / 2, y: above - 22, w, h },
+    { x: sx + 20, y: sy + 4, w, h },
+    { x: sx - w - 20, y: sy + 4, w, h },
+  ].map((r) => ({ x: Math.round(r.x), y: Math.round(r.y), w, h }));
+}
+
+function drawSpeech(ctx: CanvasRenderingContext2D, bubble: ActiveBubble, l: BubbleLayout): void {
+  const remaining = bubble.duration - bubble.elapsed;
+  const alpha = remaining < FADE_TIME ? Math.max(0, remaining / FADE_TIME) : 1;
+  const pop = 0.85 + 0.15 * easeOutBack(Math.min(1, bubble.elapsed / POP_TIME));
+  const tail = tailAnchor(l);
+
   ctx.save();
-  ctx.globalAlpha = Math.max(0, alpha);
+  ctx.globalAlpha = alpha;
+  // Pop in around the tail so the bubble seems to come out of the speaker.
+  ctx.translate(tail.x, tail.y);
+  ctx.scale(pop, pop);
+  ctx.translate(-tail.x, -tail.y);
 
-  ctx.shadowColor = "rgba(4, 8, 18, 0.3)";
-  ctx.shadowBlur = 10;
-  ctx.shadowOffsetY = 2;
-  ctx.fillStyle = "rgba(255, 255, 255, 0.99)";
-  roundRect(ctx, layout.x, layout.y, layout.w, layout.h, 7);
-  ctx.fill();
-  ctx.shadowBlur = 0;
-  ctx.shadowOffsetY = 0;
+  drawLeader(ctx, bubble.agentId, l, tail);
+  pixelShadow(ctx, l.x, l.y, l.w, l.h);
+  drawTail(ctx, l, tail);
+  pixelPanel(ctx, l.x, l.y, l.w, l.h, PAPER);
+  // Accent stripe in the speaker's colour.
+  ctx.fillStyle = AGENTS[bubble.agentId].color;
+  ctx.fillRect(l.x + 2, l.y + l.h - 2, l.w - 4, 1);
 
-  ctx.strokeStyle = "rgba(18, 28, 45, 0.38)";
-  ctx.lineWidth = 1.35;
-  roundRect(ctx, layout.x, layout.y, layout.w, layout.h, 7);
-  ctx.stroke();
-
-  drawTail(ctx, layout);
-
-  ctx.fillStyle = "#111D31";
-  ctx.font = BUBBLE_FONT;
+  ctx.font = FONT;
+  ctx.fillStyle = INK;
   ctx.textAlign = "left";
-  for (let i = 0; i < layout.lines.length; i++) {
-    ctx.fillText(
-      layout.lines[i],
-      layout.x + BUBBLE_PAD_X,
-      layout.y + BUBBLE_PAD_Y + (i + 1) * BUBBLE_LINE_H - 6,
-    );
+  for (let i = 0; i < l.lines.length; i++) {
+    ctx.fillText(l.lines[i], l.x + PAD_X, l.y + PAD_Y + (i + 1) * LINE_H - 1.5);
   }
-
   ctx.restore();
 }
 
-function drawTail(ctx: CanvasRenderingContext2D, layout: BubbleLayout): void {
-  const vx = layout.tailTipX - layout.tailBaseX;
-  const vy = layout.tailTipY - layout.tailBaseY;
-  const len = Math.max(1, Math.hypot(vx, vy));
-  const nx = -vy / len;
-  const ny = vx / len;
-  const half = 6;
-
-  const p1x = layout.tailBaseX + nx * half;
-  const p1y = layout.tailBaseY + ny * half;
-  const p2x = layout.tailBaseX - nx * half;
-  const p2y = layout.tailBaseY - ny * half;
-
-  ctx.fillStyle = "rgba(255, 255, 255, 0.99)";
-  ctx.beginPath();
-  ctx.moveTo(p1x, p1y);
-  ctx.lineTo(layout.tailTipX, layout.tailTipY);
-  ctx.lineTo(p2x, p2y);
-  ctx.closePath();
-  ctx.fill();
-  ctx.strokeStyle = "rgba(18, 28, 45, 0.38)";
-  ctx.lineWidth = 1.1;
-  ctx.stroke();
+/** When a bubble had to move away from its speaker, a dotted leader keeps ownership clear. */
+function drawLeader(ctx: CanvasRenderingContext2D, id: AgentId, l: BubbleLayout, tail: { x: number; y: number }): void {
+  const dx = l.speakerX - tail.x;
+  const dy = l.speakerY - tail.y;
+  const dist = Math.hypot(dx, dy);
+  if (dist < 10) return;
+  ctx.fillStyle = AGENTS[id].color;
+  for (let d = 4; d < dist - 2; d += 3) {
+    ctx.fillRect(Math.round(tail.x + (dx * d) / dist), Math.round(tail.y + (dy * d) / dist), 1, 1);
+  }
 }
 
-function renderThinkBubble(ctx: CanvasRenderingContext2D, agentId: AgentId, placed: BubbleLayout[]): void {
-  const speaker = getSpeakerPoint(agentId);
-  let cx = speaker.x + (speaker.bias === "left" ? -22 : speaker.bias === "right" ? 22 : 0);
-  let cy = speaker.y - 20;
-  let rect: Rect = { x: cx - 22, y: cy - 12, w: 44, h: 24 };
+type TailSide = "bottom" | "top" | "left" | "right";
 
+function tailAnchor(l: BubbleLayout): { x: number; y: number; side: TailSide } {
+  if (l.y + l.h <= l.speakerY) {
+    return { x: clamp(Math.round(l.speakerX), l.x + 5, l.x + l.w - 6), y: l.y + l.h, side: "bottom" };
+  }
+  if (l.y >= l.speakerY) {
+    if (l.x >= l.speakerX) return { x: l.x, y: clamp(l.speakerY, l.y + 4, l.y + l.h - 5), side: "left" };
+    if (l.x + l.w <= l.speakerX) return { x: l.x + l.w, y: clamp(l.speakerY, l.y + 4, l.y + l.h - 5), side: "right" };
+    return { x: clamp(Math.round(l.speakerX), l.x + 5, l.x + l.w - 6), y: l.y, side: "top" };
+  }
+  return l.x >= l.speakerX
+    ? { x: l.x, y: l.y + 5, side: "left" }
+    : { x: l.x + l.w, y: l.y + 5, side: "right" };
+}
+
+/**
+ * A stepped pixel wedge leaning toward the speaker. Row 0 sits on the
+ * panel outline and opens it; each later row narrows to a 1px tip.
+ */
+function drawTail(ctx: CanvasRenderingContext2D, l: BubbleLayout, t: { x: number; y: number; side: TailSide }): void {
+  const vertical = t.side === "bottom" || t.side === "top";
+  const dir = t.side === "bottom" || t.side === "right" ? 1 : -1;
+  const lean = vertical ? Math.sign(l.speakerX - t.x) : Math.sign(l.speakerY - t.y);
+  // Row 0 overlaps the panel's outline row/column.
+  const origin = t.side === "bottom" || t.side === "right" ? -1 : 0;
   for (let i = 0; i < 4; i++) {
-    const overlaps = placed.some((b) => rectsOverlap(rect, b));
-    if (!overlaps) break;
-    cy -= 14;
-    rect = { x: cx - 22, y: cy - 12, w: 44, h: 24 };
+    const half = 3 - i;
+    const along = (vertical ? t.y : t.x) + origin + dir * i;
+    const across = (vertical ? t.x : t.y) + lean * Math.floor(i / 2);
+    const fill = (from: number, len: number, color: string) => {
+      ctx.fillStyle = color;
+      if (vertical) ctx.fillRect(from, along, len, 1);
+      else ctx.fillRect(along, from, 1, len);
+    };
+    fill(across - half, half * 2 + 1, INK);
+    if (half >= 1) fill(across - half + 1, half * 2 - 1, PAPER);
   }
+}
 
-  cx = clamp(cx, 24, CANVAS_W - 24);
-  cy = clamp(cy, 20, CANVAS_H - 20);
+/** A small pixel cloud with three cycling dots, trailing puffs toward the head. */
+function drawThink(ctx: CanvasRenderingContext2D, id: AgentId, placed: Rect[]): void {
+  const head = headPoint(id);
+  const w = 21;
+  const h = 10;
+  let x = Math.round(head.x + 4);
+  let y = Math.round(head.y - h - 9);
+  for (let i = 0; i < 4 && placed.some((p) => intersection({ x, y: y - 3, w, h: h + 3 }, p) > 0); i++) y -= 10;
+  x = clamp(x, MARGIN, ART_W - w - MARGIN);
+  y = clamp(y, MARGIN + 3, ART_H - h - MARGIN);
 
-  const dotA = lerpPoint(speaker.x, speaker.y, cx, cy + 2, 0.35);
-  const dotB = lerpPoint(speaker.x, speaker.y, cx, cy + 2, 0.7);
+  const bob = Math.sin(clock * 2.4) > 0 ? 0 : -1;
+  y += bob;
 
-  ctx.save();
+  // Trailing puffs.
+  pixelPanel(ctx, head.x + 1, head.y - 5 + bob, 3, 3, PAPER);
+  pixelPanel(ctx, head.x + 4, head.y - 9 + bob, 4, 4, PAPER);
+  // Cloud: body plus two bumps on top.
+  pixelShadow(ctx, x, y, w, h);
+  pixelPanel(ctx, x + 3, y - 3, 7, 5, PAPER);
+  pixelPanel(ctx, x + 10, y - 2, 8, 4, PAPER);
+  pixelPanel(ctx, x, y, w, h, PAPER);
+  ctx.fillStyle = PAPER;
+  ctx.fillRect(x + 4, y, 5, 1);
+  ctx.fillRect(x + 11, y, 6, 1);
 
-  for (const [idx, d] of [dotA, dotB].entries()) {
-    ctx.beginPath();
-    ctx.arc(d.x, d.y, idx === 0 ? 2.2 : 3, 0, Math.PI * 2);
-    ctx.fillStyle = "rgba(255, 255, 255, 0.86)";
-    ctx.fill();
-    ctx.strokeStyle = "rgba(18, 28, 45, 0.24)";
-    ctx.lineWidth = 0.8;
-    ctx.stroke();
-  }
-
-  ctx.fillStyle = "rgba(255, 255, 255, 0.97)";
-  roundRect(ctx, cx - 20, cy - 10, 40, 22, 10);
-  ctx.fill();
-  ctx.strokeStyle = "rgba(18, 28, 45, 0.28)";
-  ctx.lineWidth = 1;
-  roundRect(ctx, cx - 20, cy - 10, 40, 22, 10);
-  ctx.stroke();
-
-  const phase = thinkDotPhase % 3;
+  const active = Math.floor(clock * 3) % 3;
   for (let i = 0; i < 3; i++) {
-    const alpha = i <= Math.floor(phase) ? 0.8 : 0.28;
-    ctx.beginPath();
-    ctx.arc(cx - 8 + i * 8, cy + 1, 2.4, 0, Math.PI * 2);
-    ctx.fillStyle = `rgba(67, 80, 105, ${alpha})`;
-    ctx.fill();
+    ctx.fillStyle = i === active ? INK : "#b7adc2";
+    ctx.fillRect(x + 5 + i * 4, y + 4, 2, 2);
   }
-
-  ctx.restore();
 }
 
-// ── Placement Helpers ──
+// ── Geometry / text helpers ──
 
-function getSpeakerPoint(agentId: AgentId): { x: number; y: number; bias: BubbleBias } {
-  const desk = DESKS[agentId];
-  const hint = SPEAKER_HINTS[agentId];
-  return { x: desk.x + hint.dx, y: desk.y + hint.dy, bias: hint.bias };
-}
-
-function makeCandidates(sx: number, sy: number, w: number, h: number, bias: BubbleBias): Rect[] {
-  const top = { x: sx - w / 2, y: sy - h - 24, w, h };
-  const leftTop = { x: sx - w - 20, y: sy - h - 16, w, h };
-  const rightTop = { x: sx + 20, y: sy - h - 16, w, h };
-  const leftMid = { x: sx - w - 24, y: sy - h * 0.62, w, h };
-  const rightMid = { x: sx + 24, y: sy - h * 0.62, w, h };
-  const leftHigh = { x: sx - w - 16, y: sy - h - 48, w, h };
-  const rightHigh = { x: sx + 16, y: sy - h - 48, w, h };
-
-  if (bias === "left") {
-    return [leftTop, top, rightTop, leftMid, rightMid, leftHigh, rightHigh];
-  }
-  if (bias === "right") {
-    return [rightTop, top, leftTop, rightMid, leftMid, rightHigh, leftHigh];
-  }
-  return [top, rightTop, leftTop, rightMid, leftMid, rightHigh, leftHigh];
-}
-
-function scoreCandidateRect(
-  rect: Rect,
-  orderIdx: number,
-  sx: number,
-  sy: number,
-  placed: BubbleLayout[],
-  occupants: Rect[],
-): number {
-  const clamped = clampRect(rect, BUBBLE_MARGIN);
-  const displacement = Math.abs(clamped.x - rect.x) + Math.abs(clamped.y - rect.y);
-  const overflow = overflowDistance(rect, BUBBLE_MARGIN);
-
-  let overlapAgents = 0;
-  for (const occ of occupants) overlapAgents += rectIntersectionArea(clamped, occ);
-
-  let overlapBubbles = 0;
-  for (const other of placed) overlapBubbles += rectIntersectionArea(clamped, other);
-
-  const nearestX = clamp(sx, clamped.x, clamped.x + clamped.w);
-  const nearestY = clamp(sy, clamped.y, clamped.y + clamped.h);
-  const tailLen = Math.hypot(sx - nearestX, sy - nearestY);
-
-  return (
-    displacement * 20 +
-    overflow * 120 +
-    overlapAgents * 0.07 +
-    overlapBubbles * 0.12 +
-    tailLen * 0.8 +
-    orderIdx * 12
-  );
-}
-
-function computeTail(rect: Rect, sx: number, sy: number): { baseX: number; baseY: number } {
-  const left = rect.x;
-  const right = rect.x + rect.w;
-  const top = rect.y;
-  const bottom = rect.y + rect.h;
-
-  const toLeft = Math.abs(sx - left);
-  const toRight = Math.abs(sx - right);
-  const toTop = Math.abs(sy - top);
-  const toBottom = Math.abs(sy - bottom);
-  const min = Math.min(toLeft, toRight, toTop, toBottom);
-
-  if (min === toBottom) {
-    return { baseX: clamp(sx, left + 14, right - 14), baseY: bottom };
-  }
-  if (min === toTop) {
-    return { baseX: clamp(sx, left + 14, right - 14), baseY: top };
-  }
-  if (min === toLeft) {
-    return { baseX: left, baseY: clamp(sy, top + 14, bottom - 14) };
-  }
-  return { baseX: right, baseY: clamp(sy, top + 14, bottom - 14) };
-}
-
-function buildAgentBodyRects(): Rect[] {
-  const rects: Rect[] = [];
-  for (const id of AGENT_IDS) {
-    const d = DESKS[id];
-    rects.push({ x: d.x - 34, y: d.y - 84, w: 68, h: 96 });
-  }
-  return rects;
-}
-
-function clampRect(rect: Rect, margin: number): Rect {
+function clampRect(r: Rect): Rect {
   return {
-    x: clamp(rect.x, margin, CANVAS_W - margin - rect.w),
-    y: clamp(rect.y, margin, CANVAS_H - margin - rect.h),
-    w: rect.w,
-    h: rect.h,
+    x: clamp(r.x, MARGIN, ART_W - MARGIN - r.w),
+    y: clamp(r.y, MARGIN, ART_H - MARGIN - r.h),
+    w: r.w,
+    h: r.h,
   };
 }
 
-function overflowDistance(rect: Rect, margin: number): number {
-  const left = Math.max(0, margin - rect.x);
-  const top = Math.max(0, margin - rect.y);
-  const right = Math.max(0, rect.x + rect.w - (CANVAS_W - margin));
-  const bottom = Math.max(0, rect.y + rect.h - (CANVAS_H - margin));
-  return left + top + right + bottom;
+function intersection(a: Rect, b: Rect): number {
+  const w = Math.min(a.x + a.w, b.x + b.w) - Math.max(a.x, b.x);
+  const h = Math.min(a.y + a.h, b.y + b.h) - Math.max(a.y, b.y);
+  return w > 0 && h > 0 ? w * h : 0;
 }
 
-function rectIntersectionArea(a: Rect, b: Rect): number {
-  const x1 = Math.max(a.x, b.x);
-  const y1 = Math.max(a.y, b.y);
-  const x2 = Math.min(a.x + a.w, b.x + b.w);
-  const y2 = Math.min(a.y + a.h, b.y + b.h);
-  const w = x2 - x1;
-  const h = y2 - y1;
-  if (w <= 0 || h <= 0) return 0;
-  return w * h;
-}
-
-function rectsOverlap(a: Rect, b: Rect): boolean {
-  return !(a.x + a.w <= b.x || b.x + b.w <= a.x || a.y + a.h <= b.y || b.y + b.h <= a.y);
-}
-
-// ── Text / Geometry Helpers ──
-
-function wrapText(
-  ctx: CanvasRenderingContext2D,
-  text: string,
-  maxWidth: number,
-  maxLines = 3,
-): string[] {
-  const words = text.split(" ");
+function wrapText(ctx: CanvasRenderingContext2D, text: string, maxWidth: number, maxLines: number): string[] {
   const lines: string[] = [];
   let current = "";
-
-  for (const word of words) {
+  for (const word of text.split(" ")) {
     const next = current ? `${current} ${word}` : word;
-    if (ctx.measureText(next).width > maxWidth && current) {
+    if (ctx.measureText(next).width <= maxWidth || !current) {
+      current = next;
+    } else {
       lines.push(current);
       current = word;
-    } else {
-      current = next;
     }
   }
   if (current) lines.push(current);
 
-  if (lines.length > maxLines) {
-    lines.length = maxLines;
-    let tail = lines[maxLines - 1].trimEnd();
-    while (tail.length > 1 && ctx.measureText(`${tail}...`).width > maxWidth) {
-      tail = tail.slice(0, -1);
+  // Hard-break any single word that is still too wide.
+  const broken = lines.flatMap((line) => {
+    if (ctx.measureText(line).width <= maxWidth) return [line];
+    const parts: string[] = [];
+    let part = "";
+    for (const ch of line) {
+      if (ctx.measureText(part + ch).width > maxWidth && part) {
+        parts.push(part);
+        part = ch;
+      } else {
+        part += ch;
+      }
     }
-    lines[maxLines - 1] = `${tail}...`;
+    if (part) parts.push(part);
+    return parts;
+  });
+
+  if (broken.length > maxLines) {
+    broken.length = maxLines;
+    let tail = broken[maxLines - 1];
+    while (tail.length > 1 && ctx.measureText(`${tail}...`).width > maxWidth) tail = tail.slice(0, -1);
+    broken[maxLines - 1] = `${tail.trimEnd()}...`;
   }
-
-  return lines;
+  return broken;
 }
-
-function roundRect(ctx: CanvasRenderingContext2D, x: number, y: number, w: number, h: number, r: number): void {
-  ctx.beginPath();
-  ctx.moveTo(x + r, y);
-  ctx.lineTo(x + w - r, y);
-  ctx.quadraticCurveTo(x + w, y, x + w, y + r);
-  ctx.lineTo(x + w, y + h - r);
-  ctx.quadraticCurveTo(x + w, y + h, x + w - r, y + h);
-  ctx.lineTo(x + r, y + h);
-  ctx.quadraticCurveTo(x, y + h, x, y + h - r);
-  ctx.lineTo(x, y + r);
-  ctx.quadraticCurveTo(x, y, x + r, y);
-  ctx.closePath();
-}
-
-function lerpPoint(x1: number, y1: number, x2: number, y2: number, t: number): { x: number; y: number } {
-  return { x: x1 + (x2 - x1) * t, y: y1 + (y2 - y1) * t };
-}
-
-function clamp(v: number, lo: number, hi: number): number {
-  return Math.max(lo, Math.min(hi, v));
-}
-
-// ── Register ──
 
 export function initBubbles(): void {
   addUpdateHook(update);
-  addRenderHook(render);
+  addRenderHook(render, Layer.Bubbles);
 }

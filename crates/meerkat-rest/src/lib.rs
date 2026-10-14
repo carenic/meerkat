@@ -3685,6 +3685,18 @@ async fn comms_send(
     }
 }
 
+/// A REST error carrying the typed `comms/send` error data RPC and MCP share.
+fn typed_rest_comms_send_error(data: &CommsSendErrorData) -> ApiError {
+    match serde_json::to_value(data) {
+        Ok(details) => ApiError::InternalWithData {
+            message: format!("{}: {}", data.code(), data.message()),
+            code: data.code().to_string(),
+            details,
+        },
+        Err(error) => ApiError::Internal(format!("failed to serialize comms error data: {error}")),
+    }
+}
+
 fn normalize_rest_comms_send_error(
     peer_name: Option<&str>,
     error: &meerkat_core::comms::SendError,
@@ -3752,23 +3764,10 @@ fn normalize_rest_comms_send_error(
             }
         }
         meerkat_core::comms::SendError::DurableAdmissionRejected { envelope_id } => {
-            let peer = peer_name.unwrap_or("<unknown>");
-            let message = format!("peer '{peer}' durably rejected envelope {envelope_id}");
-            let data = CommsSendErrorData::PeerInputRejected {
-                peer: peer.to_string(),
-                envelope_id: envelope_id.to_string(),
-                message: message.clone(),
-            };
-            match serde_json::to_value(data) {
-                Ok(details) => ApiError::InternalWithData {
-                    message: format!("peer_input_rejected: {message}"),
-                    code: "peer_input_rejected".to_string(),
-                    details,
-                },
-                Err(error) => {
-                    ApiError::Internal(format!("failed to serialize comms error data: {error}"))
-                }
-            }
+            typed_rest_comms_send_error(&CommsSendErrorData::peer_input_rejected(
+                peer_name.unwrap_or("<unknown>"),
+                *envelope_id,
+            ))
         }
         // An ambiguous delivery is NOT a failed send, and it must not arrive at
         // a caller under a code that says it was. The envelope may already be on
@@ -3782,24 +3781,10 @@ fn normalize_rest_comms_send_error(
         meerkat_core::comms::SendError::AmbiguousDelivery {
             envelope_id,
             detail,
-        } => {
-            let message = format!(
-                "delivery outcome for envelope {envelope_id} is unknown; it may already be \
-                 delivered. Reconcile against durable work truth before any new attempt - a \
-                 retry can duplicate. ({detail})"
-            );
-            ApiError::InternalWithData {
-                message: format!("send_ambiguous: {message}"),
-                code: "send_ambiguous".to_string(),
-                details: json!({
-                    "code": "send_ambiguous",
-                    "message": message,
-                    "envelope_id": envelope_id.to_string(),
-                    "retry_safe": false,
-                    "required_action": "reconcile",
-                }),
-            }
-        }
+        } => typed_rest_comms_send_error(&CommsSendErrorData::ambiguous_delivery(
+            *envelope_id,
+            detail,
+        )),
         other => ApiError::InternalWithData {
             message: format!("send_failed: {other}"),
             code: "send_failed".to_string(),
@@ -5369,7 +5354,7 @@ async fn create_session(
 ) -> Result<Json<SessionResponse>, ApiError> {
     let req_ctx = extract_request_context(&headers, &state.request_executor)?;
     let executor = state.request_executor.clone();
-    let outcome = Box::pin(create_session_inner(&state, req, req_ctx.clone())).await;
+    let outcome = Box::pin(create_session_inner(&state, req, req_ctx.clone(), None)).await;
     with_request_lifecycle(&executor, req_ctx, outcome).await
 }
 
@@ -5378,15 +5363,28 @@ async fn help(
     headers: axum::http::HeaderMap,
     Json(req): Json<meerkat_contracts::HelpRequest>,
 ) -> Result<Json<SessionResponse>, ApiError> {
-    let create_req = help_request_to_create_session(req)?;
+    // Like every help entry point, POST /help builds its session from the one
+    // shared help session: the embedded skills whole in the system prompt and
+    // the read-only reference tools as the session's only tools.
+    let help = meerkat::help::help_session();
+    let create_req = help_request_to_create_session(req, help.system_prompt)?;
     let req_ctx = extract_request_context(&headers, &state.request_executor)?;
     let executor = state.request_executor.clone();
-    let outcome = Box::pin(create_session_inner(&state, create_req, req_ctx.clone())).await;
+    let outcome = Box::pin(create_session_inner(
+        &state,
+        create_req,
+        req_ctx.clone(),
+        Some((help.tools, help.tool_access_policy)),
+    ))
+    .await;
     with_request_lifecycle(&executor, req_ctx, outcome).await
 }
 
+/// The create request of a help session: the help system prompt, no
+/// preloaded skills, and every tool category off.
 fn help_request_to_create_session(
     req: meerkat_contracts::HelpRequest,
+    system_prompt: String,
 ) -> Result<CreateSessionRequest, ApiError> {
     let prompt = meerkat::help::render_help_prompt(&req)
         .map_err(|err| ApiError::BadRequest(err.to_string()))?;
@@ -5403,9 +5401,7 @@ fn help_request_to_create_session(
         prompt: prompt.into(),
         injected_context: None,
         transient_turn_context: None,
-        system_prompt: meerkat::SystemPromptOverride::Set(
-            meerkat::help::help_system_prompt().to_string(),
-        ),
+        system_prompt: meerkat::SystemPromptOverride::Set(system_prompt),
         model: req.model,
         provider,
         max_tokens: req.max_tokens,
@@ -5426,7 +5422,7 @@ fn help_request_to_create_session(
         enable_workgraph: Some(false),
         budget_limits: None,
         provider_params: None,
-        preload_skills: Some(meerkat::help::platform_preload_skills()),
+        preload_skills: None,
         skill_refs: None,
         labels: None,
         additional_instructions: None,
@@ -5458,10 +5454,18 @@ fn create_session_error_to_api(err: SessionError) -> ApiError {
 }
 
 /// Create and run a new session (typed-terminal inner body).
+/// `help_tools` are a help session's only tools, with the launch tool access
+/// policy that admits only them: the tools replace the per-session live MCP
+/// adapter every other session gets, and the session persists the policy, so
+/// a later resume keeps it.
 async fn create_session_inner(
     state: &AppState,
     req: CreateSessionRequest,
     req_ctx: Option<RequestContext>,
+    help_tools: Option<(
+        Arc<dyn meerkat_core::AgentToolDispatcher>,
+        meerkat_core::ops::ToolAccessPolicy,
+    )>,
 ) -> RequestTerminal<Result<Json<SessionResponse>, ApiError>> {
     // --- Validation (pre-stateful work) ---
     if let Err(e) = validate_public_peer_meta(req.peer_meta.as_ref()) {
@@ -5545,9 +5549,12 @@ async fn create_session_inner(
         req.verbose,
     );
 
-    // Create MCP adapter and compose with external tools.
+    // Create MCP adapter and compose with external tools. A help session's
+    // only tools are its help tools, so it gets no live MCP adapter.
     #[cfg(feature = "mcp")]
-    let mcp_external_tools = {
+    let mcp_external_tools = if help_tools.is_some() {
+        None
+    } else {
         let adapter = Arc::new(McpRouterAdapter::new(session_mcp_router(state)));
         let adapter_dispatcher: Arc<dyn AgentToolDispatcher> = adapter.clone();
         let (lifecycle_tx, lifecycle_rx) = mpsc::unbounded_channel();
@@ -5605,9 +5612,11 @@ async fn create_session_inner(
                 return RequestTerminal::RespondWithoutPublish(Err(error));
             }
         };
+    let help_run = help_tools.is_some();
+    let (help_tools, help_tool_access_policy) = help_tools.unzip();
     let mut build = SessionBuildOptions {
         model_fallback: None,
-        tool_access_policy: None,
+        tool_access_policy: help_tool_access_policy,
         declared_tool_restriction: None,
         tool_dispatch_admission: None,
         application_tool_policy: meerkat_core::ApplicationToolPolicyBinding::Unmanaged,
@@ -5629,7 +5638,7 @@ async fn create_session_inner(
         resume_session_intent: meerkat_core::SessionBuildIntent::Mint,
         budget_limits: req.budget_limits,
         provider_params: req.provider_params.clone().map(Into::into),
-        external_tools: mcp_external_tools,
+        external_tools: help_tools.or(mcp_external_tools),
         // The session service decides hosting when it creates the actor.
         hosting: meerkat_core::session_hosting::SessionHostingIntent::default(),
         mcp_servers: Vec::new(),
@@ -5670,7 +5679,12 @@ async fn create_session_inner(
         app_context: req.app_context,
         fork_source: None,
         additional_instructions: req.additional_instructions,
-        initial_metadata_entries: std::collections::BTreeMap::new(),
+        // The help marker makes every rebuild of a help session from storage
+        // refuse it.
+        initial_metadata_entries: help_run
+            .then(meerkat::help::help_session_metadata_entry)
+            .into_iter()
+            .collect(),
         initial_tool_filter: None,
         initial_tool_visibility_state: None,
         shell_env: req.shell_env,
@@ -6641,6 +6655,28 @@ async fn continue_session_inner(
                     "Failed to load session archive state: {err}"
                 ))));
             }
+        }
+    }
+    // A help session continues only on the live session its help entry point
+    // built, where its help tools are: a rebuild, or a continue that would
+    // recover it from storage, is refused before any input is admitted or
+    // any tool is composed.
+    if let Some(refusal) = loaded_session
+        .as_ref()
+        .and_then(|session| meerkat::help::HelpSessionNotResumable::check(session).err())
+    {
+        let live = matches!(
+            state.session_service.has_live_session(&session_id).await,
+            Ok(true)
+        );
+        if rest_continue_requires_rebuild(&req) || !live {
+            drop(caller_event_tx);
+            drain_event_forwarder(&session_id, forward_task).await;
+            return RequestTerminal::RespondWithoutPublish(Err(ApiError::BadRequestWithData {
+                message: refusal.to_string(),
+                code: "SESSION_NOT_RUNNING".to_string(),
+                details: refusal.data(),
+            }));
         }
     }
     let mut turn_prompt = req.prompt.clone();
@@ -10124,7 +10160,7 @@ mod tests {
         }))
         .expect("valid REST create request fixture");
 
-        let outcome = Box::pin(create_session_inner(&state, req, None)).await;
+        let outcome = Box::pin(create_session_inner(&state, req, None, None)).await;
         match outcome {
             RequestTerminal::RespondWithoutPublish(Err(ApiError::BadRequest(message))) => {
                 assert!(
@@ -10759,6 +10795,95 @@ mod tests {
             release.available_permits(),
             0,
             "the LLM call was never released; the stop ended the run"
+        );
+    }
+
+    /// A continue that arrives while another turn on the same session is
+    /// running waits behind it and then runs its own turn; it is not refused
+    /// as busy or conflicting.
+    #[tokio::test]
+    async fn rest_continue_while_a_turn_runs_waits_instead_of_busy() {
+        // Bounds a failure only; the passing path never waits for it.
+        const FAILURE_BOUND: std::time::Duration = std::time::Duration::from_secs(30);
+
+        let temp = TempDir::new().unwrap();
+        let mut state = load_rest_state_with_capacity(&temp, 4).await;
+        let calls = Arc::new(tokio::sync::watch::channel(0).0);
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        state.llm_client_override = Some(Arc::new(BlockingMockLlmClient {
+            calls: Arc::clone(&calls),
+            release: Arc::clone(&release),
+        }));
+        let session_id = create_deferred_rest_runtime_session(&state).await;
+        let continue_turn = |prompt: &'static str| {
+            let state = state.clone();
+            let session_id = session_id.to_string();
+            tokio::spawn(async move {
+                Box::pin(continue_session_inner(
+                    &state,
+                    &session_id,
+                    ContinueSessionRequest {
+                        injected_context: None,
+                        transient_turn_context: None,
+                        session_id: session_id.clone(),
+                        prompt: ContentInput::Text(prompt.to_string()),
+                        system_prompt: None,
+                        output_schema: None,
+                        structured_output_retries: None,
+                        keep_alive: None,
+                        comms_name: None,
+                        peer_meta: None,
+                        verbose: false,
+                        model: None,
+                        provider: None,
+                        auth_binding: None,
+                        max_tokens: None,
+                        hooks_override: None,
+                        enable_web_search: None,
+                        skill_refs: None,
+                        turn_tool_overlay: None,
+                        additional_instructions: None,
+                    },
+                    None,
+                ))
+                .await
+            })
+        };
+
+        let first = continue_turn("first running turn");
+        wait_for_rest_llm_calls(&calls, 1, "the first turn reaches the LLM").await;
+        let mut second = continue_turn("second continue");
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(300), &mut second)
+                .await
+                .is_err(),
+            "a continue on a running session waits behind the running turn \
+             instead of answering at once"
+        );
+
+        // The mock returns each permit after use, so one permit releases
+        // both calls in turn.
+        release.add_permits(1);
+        let first = tokio::time::timeout(FAILURE_BOUND, first)
+            .await
+            .expect("the first turn finishes once released")
+            .expect("first turn task");
+        assert!(
+            matches!(first, RequestTerminal::Publish(Ok(_))),
+            "the first turn publishes its result: {first:?}"
+        );
+        let second = tokio::time::timeout(FAILURE_BOUND, second)
+            .await
+            .expect("the waiting continue finishes after the first turn")
+            .expect("second turn task");
+        assert!(
+            matches!(second, RequestTerminal::Publish(Ok(_))),
+            "the waiting continue publishes its own result: {second:?}"
+        );
+        assert_eq!(
+            *calls.borrow(),
+            2,
+            "the waiting continue ran its own turn after the first one"
         );
     }
 
@@ -12471,6 +12596,47 @@ mod tests {
         }
     }
 
+    // REST's `send_ambiguous` payload, byte for byte. RPC and MCP build it from
+    // the same `CommsSendErrorData::ambiguous_delivery` constructor.
+    #[cfg(feature = "comms")]
+    #[test]
+    fn test_normalize_rest_comms_send_error_names_ambiguous_delivery() {
+        let envelope_id = uuid::Uuid::new_v4();
+        let err = normalize_rest_comms_send_error(
+            Some("peer-a"),
+            &meerkat_core::comms::SendError::AmbiguousDelivery {
+                envelope_id,
+                detail: "ack timed out".to_string(),
+            },
+        );
+        let expected_message = format!(
+            "delivery outcome for envelope {envelope_id} is unknown; it may already be \
+             delivered. Reconcile against durable work truth before any new attempt - a \
+             retry can duplicate. (ack timed out)"
+        );
+        match err {
+            ApiError::InternalWithData {
+                message,
+                code,
+                details,
+            } => {
+                assert_eq!(code, "send_ambiguous");
+                assert_eq!(message, format!("send_ambiguous: {expected_message}"));
+                assert_eq!(
+                    details,
+                    json!({
+                        "code": "send_ambiguous",
+                        "message": expected_message,
+                        "envelope_id": envelope_id.to_string(),
+                        "retry_safe": false,
+                        "required_action": "reconcile",
+                    })
+                );
+            }
+            other => panic!("expected structured internal error, got {other:?}"),
+        }
+    }
+
     #[cfg(feature = "comms")]
     #[test]
     fn test_rest_comms_send_result_uses_contract_peer_request_projection() {
@@ -12986,7 +13152,7 @@ requirement = { baseline = "command_runtime_v1", read = { kind = "paths", paths 
     }
 
     #[test]
-    fn test_help_request_to_create_session_preloads_platform_skill() {
+    fn test_help_request_to_create_session_carries_the_help_session_prompt() {
         let req = meerkat_contracts::HelpRequest {
             question: "How do I add an MCP server?".to_string(),
             prompt: Some("Write a game".to_string()),
@@ -12995,26 +13161,36 @@ requirement = { baseline = "command_runtime_v1", read = { kind = "paths", paths 
             provider: Some("anthropic".to_string()),
             max_tokens: Some(512),
         };
+        let help = meerkat::help::help_session();
 
-        let create = help_request_to_create_session(req).expect("valid help request");
+        let create = help_request_to_create_session(req, help.system_prompt.clone())
+            .expect("valid help request");
         assert!(
             matches!(create.prompt, ContentInput::Text(ref text) if text.contains("Write a game"))
         );
-        assert!(
-            create
-                .system_prompt
-                .as_set_prompt()
-                .is_some_and(|prompt| prompt.contains("dedicated help surface"))
+        assert_eq!(
+            create.system_prompt.as_set_prompt(),
+            Some(help.system_prompt.as_str())
         );
+        assert!(help.system_prompt.contains("dedicated help surface"));
+        assert!(help.system_prompt.contains("Meerkat Platform Guide"));
         assert_eq!(create.model.as_deref(), Some("claude-sonnet-4-5"));
         assert_eq!(create.provider, Some(Provider::Anthropic));
         assert_eq!(create.max_tokens, Some(512));
-        assert_eq!(
-            create.preload_skills,
-            Some(meerkat::help::platform_preload_skills())
-        );
-        assert_eq!(create.enable_builtins, Some(false));
-        assert_eq!(create.enable_shell, Some(false));
+        // The skills are in the system prompt whole; preloading them would
+        // inject them again at the realm's limit.
+        assert_eq!(create.preload_skills, None);
+        for enabled in [
+            create.enable_builtins,
+            create.enable_shell,
+            create.enable_memory,
+            create.enable_mob,
+            create.enable_schedule,
+            create.enable_web_search,
+            create.enable_workgraph,
+        ] {
+            assert_eq!(enabled, Some(false));
+        }
     }
 
     #[cfg(feature = "mob")]
@@ -14403,6 +14579,234 @@ requirement = { baseline = "command_runtime_v1", read = { kind = "paths", paths 
                 .await,
             "archived REST continue must not register runtime state"
         );
+    }
+
+    /// `POST /help` runs with exactly the two read-only reference tools and
+    /// no live MCP adapter, and persists the launch policy that admits only
+    /// them and the help marker; an ordinary `POST /sessions` is unchanged
+    /// and keeps its adapter.
+    #[cfg(feature = "mcp")]
+    #[tokio::test]
+    async fn test_help_route_runs_with_only_the_help_tools_and_no_live_mcp() {
+        use axum::body::Body;
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+
+        async fn post(app: &axum::Router, uri: &str, body: serde_json::Value) -> serde_json::Value {
+            let response = tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                app.clone().oneshot(
+                    axum::http::Request::builder()
+                        .method("POST")
+                        .uri(uri)
+                        .header("content-type", "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                ),
+            )
+            .await
+            .expect("route timed out")
+            .unwrap();
+            let status = response.status();
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "{uri} failed: {}",
+                String::from_utf8_lossy(&bytes)
+            );
+            serde_json::from_slice(&bytes).unwrap()
+        }
+
+        let temp = TempDir::new().unwrap();
+        let mut state = AppState::load_from(temp.path().to_path_buf())
+            .await
+            .unwrap();
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        state.llm_client_override = Some(Arc::new(ScriptedStructuredOutputClient {
+            replies: vec!["ok", "ok"],
+            requests: Arc::clone(&requests),
+        }));
+        let app = router(state.clone());
+
+        let help = post(
+            &app,
+            "/help",
+            serde_json::json!({ "question": "How do I add an MCP server?" }),
+        )
+        .await;
+        let help_session = SessionId::parse(help["session_id"].as_str().unwrap()).unwrap();
+        let mut tools: Vec<String> = requests.lock().unwrap()[0]
+            .tools
+            .iter()
+            .map(|tool| tool.name.to_string())
+            .collect();
+        tools.sort();
+        assert_eq!(tools, ["skill_list_resources", "skill_read_resource"]);
+        assert!(!state.mcp_sessions.read().await.contains_key(&help_session));
+        let help_policy = meerkat_core::ops::ToolAccessPolicy::AllowList(
+            ["skill_list_resources", "skill_read_resource"]
+                .into_iter()
+                .collect(),
+        );
+        let saved = state
+            .session_service
+            .load_authoritative_session(&help_session)
+            .await
+            .unwrap()
+            .unwrap();
+        let tooling = saved.session_metadata().unwrap().tooling;
+        assert_eq!(
+            tooling.spawn_tool_access_policy,
+            Some(meerkat_core::ops::SpawnToolAccessPolicy::Restricted {
+                policy: help_policy.clone()
+            }),
+            "POST /help persists the launch policy that admits only the help tools"
+        );
+        assert_eq!(tooling.tool_access_policy, Some(help_policy));
+        assert_eq!(
+            saved.metadata().get("meerkat.help_session"),
+            Some(&serde_json::json!(true)),
+            "POST /help marks its session as a help session"
+        );
+
+        let created = post(&app, "/sessions", serde_json::json!({ "prompt": "hello" })).await;
+        let session = SessionId::parse(created["session_id"].as_str().unwrap()).unwrap();
+        assert!(state.mcp_sessions.read().await.contains_key(&session));
+    }
+
+    /// A help session continues only on the live session `POST /help` built:
+    /// while that runs, `POST /sessions/{id}/messages` takes the turn there
+    /// with the help tools. Once the live session and its runtime are gone, a
+    /// continue that would rebuild it from storage is refused with a typed
+    /// error before any model call, and no MCP adapter is attached. An
+    /// ordinary session continued the same way runs.
+    #[cfg(feature = "mcp")]
+    #[tokio::test]
+    async fn test_a_help_session_continues_live_and_is_refused_cold() {
+        use axum::body::Body;
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+
+        async fn post(
+            app: &axum::Router,
+            uri: &str,
+            body: serde_json::Value,
+        ) -> (StatusCode, serde_json::Value) {
+            let response = tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                app.clone().oneshot(
+                    axum::http::Request::builder()
+                        .method("POST")
+                        .uri(uri)
+                        .header("content-type", "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                ),
+            )
+            .await
+            .expect("route timed out")
+            .unwrap();
+            let status = response.status();
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            (status, serde_json::from_slice(&bytes).unwrap())
+        }
+
+        async fn end_live_session(state: &AppState, session_id: &SessionId) {
+            state
+                .session_service
+                .discard_live_session(session_id)
+                .await
+                .expect("discard the live session");
+            unregister_rest_runtime_until_terminal(&state.runtime_adapter, session_id).await;
+        }
+
+        let temp = TempDir::new().unwrap();
+        let mut state = AppState::load_from(temp.path().to_path_buf())
+            .await
+            .unwrap();
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        state.llm_client_override = Some(Arc::new(ScriptedStructuredOutputClient {
+            replies: vec!["ok", "ok", "ok", "ok", "ok"],
+            requests: Arc::clone(&requests),
+        }));
+        let app = router(state.clone());
+
+        let (status, help) = post(
+            &app,
+            "/help",
+            serde_json::json!({ "question": "How do I add an MCP server?" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{help}");
+        let help_session = SessionId::parse(help["session_id"].as_str().unwrap()).unwrap();
+        let help_messages = format!("/sessions/{help_session}/messages");
+        let (status, body) = post(
+            &app,
+            &help_messages,
+            serde_json::json!({
+                "session_id": help_session.to_string(),
+                "prompt": "And how do I remove it?",
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let mut tools: Vec<String> = requests
+            .lock()
+            .unwrap()
+            .last()
+            .expect("the live help session asked the model")
+            .tools
+            .iter()
+            .map(|tool| tool.name.to_string())
+            .collect();
+        tools.sort();
+        assert_eq!(
+            tools,
+            ["skill_list_resources", "skill_read_resource"],
+            "a live help session keeps its help tools"
+        );
+        let (status, created) =
+            post(&app, "/sessions", serde_json::json!({ "prompt": "hello" })).await;
+        assert_eq!(status, StatusCode::OK, "{created}");
+        let ordinary = SessionId::parse(created["session_id"].as_str().unwrap()).unwrap();
+
+        end_live_session(&state, &help_session).await;
+        let model_calls = requests.lock().unwrap().len();
+        let (status, body) = post(
+            &app,
+            &help_messages,
+            serde_json::json!({
+                "session_id": help_session.to_string(),
+                "prompt": "Read the MCP reference.",
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["code"], "SESSION_NOT_RUNNING", "{body}");
+        assert_eq!(
+            body["details"]["kind"], "help_session_not_resumable",
+            "{body}"
+        );
+        assert_eq!(requests.lock().unwrap().len(), model_calls, "no model call");
+        assert!(
+            !state.mcp_sessions.read().await.contains_key(&help_session),
+            "no MCP adapter was attached to the help session"
+        );
+
+        // Control: an ordinary session continued the same way runs.
+        end_live_session(&state, &ordinary).await;
+        let (status, body) = post(
+            &app,
+            &format!("/sessions/{ordinary}/messages"),
+            serde_json::json!({
+                "session_id": ordinary.to_string(),
+                "prompt": "hello again",
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(requests.lock().unwrap().len(), model_calls + 1);
     }
 
     #[tokio::test]

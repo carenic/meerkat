@@ -110,18 +110,12 @@ This especially affects:
 - MCP builtins/shell toggles
 - structured output retry counts
 
-### Rust deferred first-turn `system_prompt`
+### Per-turn `system_prompt` (superseded in 0.8.11)
 
-Rust now supports `system_prompt` on `StartTurnRequest`, but only for a deferred session’s first turn.
-
-Allowed:
-
-- create deferred session
-- first `start_turn()` supplies `system_prompt`
-
-Rejected:
-
-- changing `system_prompt` after the session already has history
+Since 0.8.11 `StartTurnRequest.system_prompt` (RPC `turn/start`
+`system_prompt`) is accepted on every turn and appends exactly one ordinary
+System message at that turn boundary. It never replaces earlier System
+messages. Keyed replacement uses `session/update_system_prompt`.
 
 ## Rust embedding migration
 
@@ -211,4 +205,4 @@ Only uncommitted work should be cancelled away. If a create or turn already comm
 
 - use runtime-backed persistent flow as the default story
 - treat `build_ephemeral_service` as a narrower substrate API
-- use deferred first-turn `system_prompt` correctly
+- per-turn `system_prompt` appends a System message on any turn (0.8.11+)

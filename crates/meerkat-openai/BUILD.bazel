@@ -63,13 +63,21 @@ rust_library(
     aliases = aliases(package_name = "crates/meerkat-openai"),
     crate_name = "meerkat_openai",
     crate_root = "src/lib.rs",
-    crate_features = [
-        "copilot",
-        "live",
-        "oauth",
-        "realtime",
-        "test-realtime-fixtures",
-    ],
+    crate_features = select({
+        "//tools/bazel:release_build": [
+            "copilot",
+            "live",
+            "oauth",
+            "realtime",
+        ],
+        "//conditions:default": [
+            "copilot",
+            "live",
+            "oauth",
+            "realtime",
+            "test-realtime-fixtures",
+        ],
+    }),
     edition = "2024",
     rustc_flags = WORKSPACE_LINT_RUSTC_FLAGS,
     compile_data = [
@@ -103,13 +111,21 @@ rust_library(
     aliases = aliases(package_name = "crates/meerkat-openai"),
     crate_name = "meerkat_openai",
     crate_root = "src/lib.rs",
-    crate_features = [
-        "copilot",
-        "live",
-        "oauth",
-        "realtime",
-        "test-realtime-fixtures",
-    ],
+    crate_features = select({
+        "//tools/bazel:release_build": [
+            "copilot",
+            "live",
+            "oauth",
+            "realtime",
+        ],
+        "//conditions:default": [
+            "copilot",
+            "live",
+            "oauth",
+            "realtime",
+            "test-realtime-fixtures",
+        ],
+    }),
     edition = "2024",
     rustc_flags = WORKSPACE_LINT_RUSTC_FLAGS,
     compile_data = [

@@ -86,6 +86,7 @@ mod tests {
         assert!(!supports_temperature("claude-opus-4-8"));
         assert!(!supports_temperature("claude-sonnet-5-5"));
         assert!(!supports_temperature("claude-sonnet-5"));
+        assert!(!supports_temperature("claude-haiku-5-5"));
         assert!(supports_temperature("claude-sonnet-4-6"));
     }
 
@@ -102,6 +103,9 @@ mod tests {
         assert!(supports_mid_conversation_system_messages("claude-opus-4-8"));
         assert!(supports_mid_conversation_system_messages(
             "claude-sonnet-5-5"
+        ));
+        assert!(supports_mid_conversation_system_messages(
+            "claude-haiku-5-5"
         ));
         // Sonnet 5 keeps instructions in the top-level system field.
         assert!(!supports_mid_conversation_system_messages(
@@ -324,6 +328,50 @@ mod sonnet_5_5_request_shaping {
             )
             .is_err()
         );
+    }
+
+    /// Claude Haiku 5.5 shares the adaptive-only request surface of its
+    /// catalog row: no sampling parameters, no thinking budget, no
+    /// `between_tools`, no `top_k`.
+    #[test]
+    fn haiku_5_5_request_shaping_follows_its_catalog_row() {
+        let model = "claude-haiku-5-5";
+        let default = body(model, Some(0.7), None).unwrap();
+        assert_clean(&default);
+        assert!(
+            default.get("thinking").is_none(),
+            "the provider default (adaptive) applies"
+        );
+
+        let message = refusal(body(
+            model,
+            None,
+            Some(AnthropicProviderTag {
+                thinking_budget_tokens: Some(4096),
+                ..Default::default()
+            }),
+        ));
+        assert!(message.contains("thinking_budget_tokens"), "{message}");
+
+        let message = refusal(body(
+            model,
+            None,
+            Some(AnthropicProviderTag {
+                thinking: Some(AnthropicThinkingConfig::BetweenTools),
+                ..Default::default()
+            }),
+        ));
+        assert!(message.contains("'between_tools'"), "{message}");
+
+        let message = refusal(body(
+            model,
+            None,
+            Some(AnthropicProviderTag {
+                top_k: Some(40),
+                ..Default::default()
+            }),
+        ));
+        assert!(message.contains("top_k"), "{message}");
     }
 
     /// The portable per-turn overrides (what mob profiles, skills, and turn

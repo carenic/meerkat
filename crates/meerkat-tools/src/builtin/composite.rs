@@ -401,6 +401,46 @@ impl CompositeDispatcher {
         self.skill_tools = Some(tool_set);
     }
 
+    /// A dispatcher that serves only the read-only skill resource tools,
+    /// `skill_list_resources` and `skill_read_resource`, over `engine`.
+    ///
+    /// It carries no other builtin (no task, utility, file, shell or skill
+    /// discovery tool) and no external tools, for hosts whose sessions may
+    /// read skill resources and nothing else, such as the help surfaces.
+    #[cfg(all(feature = "skills", not(target_arch = "wasm32")))]
+    pub fn skill_resources_only(engine: Arc<meerkat_core::skills::SkillRuntime>) -> Self {
+        use crate::builtin::skills::{
+            SKILL_LIST_RESOURCES_TOOL_NAME, SKILL_READ_RESOURCE_TOOL_NAME,
+        };
+        use crate::builtin::{MemoryTaskStore, ToolMode, ToolPolicyLayer};
+
+        let mut dispatcher = Self {
+            builtin_tools: Vec::new(),
+            skill_tools: None,
+            external: None,
+            builtin_config: BuiltinToolConfig {
+                policy: ToolPolicyLayer::new()
+                    .with_mode(ToolMode::AllowList)
+                    .enable_tool(SKILL_LIST_RESOURCES_TOOL_NAME)
+                    .enable_tool(SKILL_READ_RESOURCE_TOOL_NAME),
+                ..BuiltinToolConfig::default()
+            },
+            task_store: Arc::new(MemoryTaskStore::new()),
+            project_root: None,
+            shell_config: None,
+            session_id: None,
+            job_manager: None,
+            durable_shell_runtime: None,
+            image_generation_runtime: None,
+            brain_swap_runtime: None,
+            web_search_runtime: None,
+            blob_tools: None,
+            allowed_tools: HashSet::new(),
+        };
+        dispatcher.register_skill_tools(SkillToolSet::new(engine));
+        dispatcher
+    }
+
     /// Register the session-owned assistant image generation builtin.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn register_image_generation_tool(
@@ -3618,6 +3658,30 @@ mod tests {
             names.contains(&"load_skill".to_string()),
             "explicitly enabled load_skill must appear: {names:?}"
         );
+    }
+
+    #[cfg(feature = "skills")]
+    #[test]
+    fn skill_resources_only_serves_exactly_the_read_only_resource_tools() {
+        let runtime = Arc::new(meerkat_core::skills::SkillRuntime::new(Arc::new(
+            StubSkillEngine,
+        )));
+        let dispatcher = CompositeDispatcher::skill_resources_only(runtime);
+
+        let mut names: Vec<String> = dispatcher
+            .tools()
+            .iter()
+            .map(|tool| tool.name.to_string())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["skill_list_resources", "skill_read_resource"]);
+        for name in &names {
+            assert_eq!(
+                dispatcher.tool_mutation_class(name),
+                meerkat_core::ToolMutationClass::ReadOnly,
+                "{name} must be read-only"
+            );
+        }
     }
 
     #[tokio::test]

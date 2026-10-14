@@ -28,6 +28,42 @@ runs:
       with:
         profile: ${{ inputs.profile }}
 
+    # The self-hosted control plane has no public ingress: submitters reach
+    # its gRPCS port through an IAP tunnel on 127.0.0.1 and trust only its
+    # per-boot CA (BUILDBUDDY_TLS_CA_B64 from control-plane-up).
+    - name: Authenticate to GCP for the control-plane tunnel
+      if: ${{ env.MEERKAT_BAZEL_BACKEND == 'gcp-buildbuddy' && env.MEERKAT_GCP_WORKLOAD_IDENTITY_PROVIDER != '' && env.MEERKAT_GCP_SERVICE_ACCOUNT != '' }}
+      uses: google-github-actions/auth@v3
+      with:
+        workload_identity_provider: ${{ env.MEERKAT_GCP_WORKLOAD_IDENTITY_PROVIDER }}
+        service_account: ${{ env.MEERKAT_GCP_SERVICE_ACCOUNT }}
+        project_id: ${{ env.MEERKAT_GCP_PROJECT_ID }}
+
+    - name: Setup gcloud for the control-plane tunnel
+      if: ${{ env.MEERKAT_BAZEL_BACKEND == 'gcp-buildbuddy' }}
+      uses: google-github-actions/setup-gcloud@v3
+
+    - name: Authenticate to GCP with JSON fallback
+      if: ${{ env.MEERKAT_BAZEL_BACKEND == 'gcp-buildbuddy' }}
+      shell: bash
+      run: |
+        if gcloud auth list --filter=status:ACTIVE --format='value(account)' | grep -q .; then
+          exit 0
+        fi
+        if [[ -z "${GOOGLE_APPLICATION_CREDENTIALS_JSON:-}" ]]; then
+          echo "GCP auth is required to reach the self-hosted BuildBuddy control plane." >&2
+          exit 1
+        fi
+        key_file="${RUNNER_TEMP}/gcp-key.json"
+        printf '%s' "${GOOGLE_APPLICATION_CREDENTIALS_JSON}" > "${key_file}"
+        gcloud auth activate-service-account --key-file "${key_file}"
+        rm -f "${key_file}"
+
+    - name: Open the IAP tunnel to the control plane
+      if: ${{ env.MEERKAT_BAZEL_BACKEND == 'gcp-buildbuddy' }}
+      shell: bash
+      run: scripts/gcp-buildbuddy-control-plane tunnel
+
     - name: Run BuildBuddy lane batch
       shell: bash
       env:

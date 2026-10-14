@@ -432,23 +432,43 @@ servers in their sessions; hosts attach servers with `mcp/add`.
 
 ## Exit codes
 
+A command that fails with a typed error exits with the CLI code of that
+error's public `ErrorCode`, the same code JSON-RPC reports for it (see the
+[error code reference](/reference/api-reference#error-code-reference)). A
+failure without a typed error, such as an argument, configuration, or lookup
+check made by the CLI itself, exits 1.
+
 | Code | Meaning |
 |------|---------|
-| 0 | Success |
-| 1 | Generic command failure, including configuration and internal errors |
-| 2 | Usage/argument errors, host-runtime startup failure, or the graceful agent-budget error mapping |
+| 0 | Success, including a run that stopped at its token or tool-call budget (the result reports `terminal_cause_kind` `budget_exhausted`) |
+| 1 | Generic failure: configuration, lookup, and internal errors, and a turn that ended in failure, such as reaching the `--max-duration` time budget or the configured turn limit |
+| 2 | Usage or argument errors, host-runtime startup failure, or invalid parameters (`INVALID_PARAMS`) |
+| 10 | Session not found |
+| 11 | Session busy, including a session another runtime owner hosts |
+| 12 | Session not runnable: a durable resume hold |
+| 14 | Request cancelled: the turn was interrupted |
+| 20 | Provider error |
+| 21 | Budget exhausted |
+| 22 | Hook denied |
+| 40 | Capability unavailable |
+| 42 | Skill resolution failed |
+| 44 | Supervisor rotation incomplete |
 | 45 | Mob control scope denied |
 | 46 | Mob member host unavailable |
 | 47 | Mob event cursor is stale |
 | 48 | Mob fence or generation is stale |
+| 49 | Mob member reload required |
+| 50 | Input refused: the governed realm's owner declined the prompt |
+| 51 | Input readiness unavailable |
+| 52 | Session runtime unavailable |
+| 56 | Mob delivery scope is stale |
 
-Codes 45-48 are used only by mob-family commands that carry the matching typed
-multi-host error. Code 2 alone does not establish budget exhaustion, and not
-every budget/deadline stop necessarily maps to 2. Inspect the diagnostic or an
-available typed error payload rather than classifying the failure solely by its
-numeric code; not every CLI error has structured JSON. In particular, session
-persistence/compaction disabled conditions are informational at the CLI
-transport layer and do not map to dedicated non-zero exit codes.
+A mob error with a typed console detail (codes 45-48 and 56) also prints one
+`detail:` line with that detail as JSON. Inspect the diagnostic or an
+available typed error payload rather than classifying a failure solely by its
+numeric code; not every CLI error has structured JSON, and code 2 is shared
+by usage errors and `INVALID_PARAMS`. Session persistence and compaction
+disabled conditions exit 1 like other internal errors.
 
 ## See also
 

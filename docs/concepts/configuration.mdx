@@ -315,6 +315,7 @@ separate owner:
 ```toml
 [limits]
 budget = 200000              # max tokens, agent lifetime
+max_tool_calls = 500         # max tool calls, agent lifetime
 max_duration = "4h"          # wall-clock ceiling for the AGENT'S LIFETIME
 max_turn_duration = "30m"    # aggregate wall-clock ceiling for ONE TURN
 ```
@@ -340,6 +341,20 @@ deployment declares a ceiling. The bound is enforced at segment boundaries, so
 it never tears down a tool call that is already running; the effective ceiling
 is `max_turn_duration` plus the longest segment already in flight (at most one
 per-tool-call timeout, since calls in a batch run their clocks together).
+
+Before a limit stops a run, the agent warns once: when tokens, tool calls, or
+a time horizon reach `[agent] budget_warning_threshold` of their limit (`0.8`
+by default), it emits a `budget_warning` event whose `percent` is the fraction
+used. The per-turn horizon warns again each turn. The value takes effect when
+it is greater than 0 and at most 1; `1.0` keeps only the `budget_warning`
+emitted when a limit is reached. A config with a value outside that range
+still loads, with a warning, and keeps the inherited threshold (the default if
+no parent realm sets one).
+
+```toml
+[agent]
+budget_warning_threshold = 0.8
+```
 
 `limits.max_sessions` controls active-session admission; persisted history
 does not consume the limit. RPC, REST, and MCP snapshot this value when their

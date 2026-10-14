@@ -25,10 +25,14 @@ auth leases, scheduling, or wake coordination automatically.
 | List | List visible sessions in the active realm |
 | Archive | Commit the archived verdict, retire the live handle, and block later mutation |
 
-Only one turn can run on a session at a time. A competing start fails with
-`SESSION_BUSY`; Meerkat does not silently queue it. Use runtime ingress,
-scheduling, comms handling modes, or an application queue when queued delivery
-is part of the product contract.
+Only one turn runs on a session at a time. On the runtime-backed surfaces, a
+plain follow-up turn that arrives while another turn is running waits behind
+it in the session's runtime queue and then runs: JSON-RPC `turn/start`, and a
+REST `POST /sessions/{id}/messages` or MCP `meerkat_resume` that changes no
+build setting. The call returns that turn's own result, not `SESSION_BUSY`.
+The in-process Rust `SessionService::start_turn` does not queue: a concurrent
+call fails with `SESSION_BUSY`. When delivery must not hold a caller open, use
+runtime ingress, scheduling, comms handling modes, or an application queue.
 
 ## Transcript Contract
 

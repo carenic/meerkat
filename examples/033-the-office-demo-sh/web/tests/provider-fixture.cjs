@@ -21,7 +21,7 @@ function createProviderFixture({ maxRequests = 80 } = {}) {
       assert.equal(request.method, "POST", "Only the Anthropic messages API is synthesized");
       assert(requests.length < maxRequests, "Synthetic provider request budget exceeded");
       const body = JSON.parse(request.postData);
-      assert.equal(body.model, "claude-sonnet-4-6");
+      assert.equal(body.model, "claude-sonnet-5-5");
       assert(Array.isArray(body.messages) && body.messages.length > 0);
       const id = `msg_offline_${requests.length}`;
       const text = JSON.stringify({ headline: "Synthetic offline cycle complete", category: "response" });

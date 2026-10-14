@@ -398,6 +398,56 @@ fn session_error_code(err: &meerkat_core::SessionError) -> ErrorCode {
     }
 }
 
+/// The [`ErrorCode`] a session-facing transport reports for a
+/// [`meerkat_core::SessionError`]: the JSON-RPC error code of a session
+/// method and the `rkat` exit status ([`ErrorCode::cli_exit_code`]).
+///
+/// This is the session transport mapping. It is not the [`WireError`]
+/// envelope view built by `From<SessionError>`, which classifies some
+/// variants differently.
+pub fn session_transport_error_code(error: &meerkat_core::SessionError) -> ErrorCode {
+    use meerkat_core::SessionError;
+    match error.primary_error() {
+        SessionError::RuntimeUnavailable { .. } | SessionError::HostingUnavailable { .. } => {
+            ErrorCode::SessionRuntimeUnavailable
+        }
+        SessionError::NotFound { .. } => ErrorCode::SessionNotFound,
+        // Another runtime owner hosts the session (#1813): the busy class.
+        SessionError::Busy { .. } | SessionError::ServedElsewhere { .. } => ErrorCode::SessionBusy,
+        SessionError::FailedWithData { .. } if error.is_runtime_teardown_in_progress() => {
+            ErrorCode::SessionBusy
+        }
+        // A durable resume hold is not a service fault: the session exists,
+        // its content is retained intact, and it is not runnable until
+        // reconciliation promotes or repairs it.
+        SessionError::DurableTailHeldForRecovery { .. }
+        | SessionError::DurableTailRecoveryRefused { .. }
+        | SessionError::DurableEvidenceQuarantined { .. }
+        | SessionError::WholeBlobAuditedEndpointDivergence { .. } => ErrorCode::SessionNotRunning,
+        SessionError::Agent(error) => agent_transport_error_code(error),
+        _ => ErrorCode::InternalError,
+    }
+}
+
+/// The [`ErrorCode`] a session-facing transport reports for an
+/// [`meerkat_core::AgentError`], by typed cause (see
+/// [`session_transport_error_code`]).
+pub fn agent_transport_error_code(error: &meerkat_core::AgentError) -> ErrorCode {
+    use meerkat_core::AgentError;
+    match error.primary_error() {
+        AgentError::TokenBudgetExceeded { .. }
+        | AgentError::TimeBudgetExceeded { .. }
+        | AgentError::ToolCallBudgetExceeded { .. } => ErrorCode::BudgetExhausted,
+        AgentError::ConfigError(_) => ErrorCode::InvalidParams,
+        AgentError::HookDenied { .. } => ErrorCode::HookDenied,
+        AgentError::Llm { .. } | AgentError::BuildError(_) => ErrorCode::ProviderError,
+        AgentError::SessionNotFound(_) => ErrorCode::SessionNotFound,
+        AgentError::Cancelled => ErrorCode::RequestCancelled,
+        AgentError::SkillResolutionFailed { .. } => ErrorCode::SkillResolutionFailed,
+        _ => ErrorCode::InternalError,
+    }
+}
+
 /// Convert from [`meerkat_core::SessionError`] to [`WireError`].
 impl From<meerkat_core::SessionError> for WireError {
     fn from(err: meerkat_core::SessionError) -> Self {
@@ -599,6 +649,110 @@ mod tests {
             );
             assert!(cli > 0, "CLI exit code should be positive");
         }
+    }
+
+    /// The session transport mapping (JSON-RPC session methods and the
+    /// `rkat` exit status): one representative per `SessionError` class and
+    /// per typed `AgentError` cause, through a settlement wrapper too.
+    #[test]
+    fn session_transport_error_code_classifies_each_typed_cause() {
+        use meerkat_core::{AgentError, SessionError, SessionId};
+
+        let id = SessionId::new();
+        let cases = [
+            (
+                SessionError::NotFound { id: id.clone() },
+                ErrorCode::SessionNotFound,
+            ),
+            (
+                SessionError::Busy { id: id.clone() },
+                ErrorCode::SessionBusy,
+            ),
+            (
+                SessionError::ServedElsewhere { id: id.clone() },
+                ErrorCode::SessionBusy,
+            ),
+            (
+                SessionError::HostingUnavailable { id: id.clone() },
+                ErrorCode::SessionRuntimeUnavailable,
+            ),
+            (
+                SessionError::RuntimeUnavailable {
+                    reason:
+                        meerkat_core::authorization::ControllerReadinessFailure::AuthorityChanged,
+                },
+                ErrorCode::SessionRuntimeUnavailable,
+            ),
+            (
+                SessionError::NotRunning { id: id.clone() },
+                ErrorCode::InternalError,
+            ),
+            (
+                SessionError::DurableTailHeldForRecovery { id: id.clone() },
+                ErrorCode::SessionNotRunning,
+            ),
+            (
+                SessionError::Store(Box::new(std::io::Error::other("store failed"))),
+                ErrorCode::InternalError,
+            ),
+            (
+                SessionError::Agent(AgentError::TokenBudgetExceeded { used: 2, limit: 1 }),
+                ErrorCode::BudgetExhausted,
+            ),
+            (
+                SessionError::Agent(AgentError::TimeBudgetExceeded {
+                    elapsed_secs: 2,
+                    limit_secs: 1,
+                }),
+                ErrorCode::BudgetExhausted,
+            ),
+            (
+                SessionError::Agent(AgentError::ToolCallBudgetExceeded { count: 2, limit: 1 }),
+                ErrorCode::BudgetExhausted,
+            ),
+            (
+                SessionError::Agent(AgentError::MaxTurnsReached { turns: 3 }),
+                ErrorCode::InternalError,
+            ),
+            (
+                SessionError::Agent(AgentError::ConfigError("bad config".into())),
+                ErrorCode::InvalidParams,
+            ),
+            (
+                SessionError::Agent(AgentError::BuildError("no provider key".into())),
+                ErrorCode::ProviderError,
+            ),
+            (
+                SessionError::Agent(AgentError::SessionNotFound(id.clone())),
+                ErrorCode::SessionNotFound,
+            ),
+            (
+                SessionError::Agent(AgentError::Cancelled),
+                ErrorCode::RequestCancelled,
+            ),
+            (
+                SessionError::Agent(AgentError::InternalError("internal".into())),
+                ErrorCode::InternalError,
+            ),
+        ];
+        for (error, code) in cases {
+            assert_eq!(session_transport_error_code(&error), code, "{error}");
+            if let SessionError::Agent(agent) = &error {
+                assert_eq!(agent_transport_error_code(agent), code, "{agent}");
+            }
+        }
+
+        let marker = meerkat_core::ToolDispatchSettlementFailure {
+            admission_source: meerkat_core::ToolDispatchAdmissionSource::ConfiguredGate,
+            effect_kind: meerkat_core::LiveBridgeEffectKind::ToolDispatch,
+            physical_outcome: meerkat_core::LiveBridgeEffectOutcome::Unknown,
+            failure_kind: meerkat_core::ToolDispatchTerminalErrorKind::ExecutionFailed,
+        };
+        let wrapped = SessionError::NotFound { id }.with_settlement_failures(vec![marker]);
+        assert_eq!(
+            session_transport_error_code(&wrapped),
+            ErrorCode::SessionNotFound
+        );
     }
 
     /// #1105: `MemberReloadRequired` gets its own dedicated code — exact

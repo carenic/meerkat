@@ -71,7 +71,7 @@ Primary crates:
 ### Core Rust types
 
 - `MobDefinition`
-- `MobStorage` (SQLite persistent via `SqliteMobStores`, in-memory for tests/WASM)
+- `MobStorage` (SQLite persistent via `SqliteMobStores`, in-memory for tests, WASM and `rkat mob deploy`)
 - `MobBuilder`
 - `MobHandle`
 - `MobSessionService`
@@ -86,21 +86,45 @@ Primary crates:
 - `MobBuilder::for_resume(storage)`
 - `.with_session_service(Arc<dyn MobSessionService>)`
 - `.allow_ephemeral_sessions(bool)`
-- `.notify_orchestrator_on_resume(bool)`
+- `.notify_orchestrator_on_resume(bool)` (a notification that fails after the resume returned is recorded as an `OrchestratorResumeNotificationFailed` mob event; the mob keeps running)
 - `.with_default_llm_client(client)` — override LLM client (primarily for testing)
-- `.register_tool_bundle(name, dispatcher)`
+- `.register_tool_bundle(name, dispatcher)` / `.register_tool_bundle_with_account(name, account, dispatcher)` (states the `OperationAccount` the bundle's operations act with)
 - `.create().await`
 - `.resume().await`
 
 ### `MobHandle` API
 
-- inspection: `status()`, `definition()`, `mob_id()`, `roster()`, `list_members()`, `list_all_members()`, `get_member()`, `events()`, `mcp_server_states()`
+- inspection: `status()`, `definition()`, `mob_id()`, `roster()`, `list_members()`, `list_all_members()`, `get_member()`, `events()`
 - membership: `spawn_spec(spec)`, `spawn_many(specs)`, `retire(identity)`, `respawn(identity)`, `retire_all()`, `set_spawn_policy()` — all identity-keyed via `AgentIdentity`
 - graph: `wire()`, `unwire()`
-- turns: `member(id).send(...)`, `internal_turn()`
-- lifecycle: `stop()`, `resume()`, `complete()`, `reset()`, `destroy()`, `shutdown()`
+- turns: `member(id)` returns a `MemberHandle` with `send(content, handling_mode)` and `internal_turn(content)`
+- lifecycle: `stop()` (returns a `MobStopReport`), `resume()`, `complete()`, `reset()`, `destroy()`, `shutdown()`, `shutdown_with_report(options)`
 - flows: `list_flows()`, `run_flow()`, `run_flow_with_stream()`, `flow_status()`, `cancel_flow()`
 - subscriptions: `subscribe_agent_events()`, `subscribe_all_agent_events()`, `subscribe_mob_events()`, `subscribe_mob_events_with_config()`
+- admission: `close_if_idle()`, `close_admission(reason)`, `admission_closed()`, `observer()`, `acquire_owner()`, `is_public_owner()`
+- delivery scope: `capture_member_delivery_scope(identity)`, `submit_work_with_mode_and_delivery_identity_bounded(&scope, ...)`, `recover_bounded_work_at_scope(&scope, ...)`
+- held spawns (native, `runtime-adapter`): `spawn_held_within(spec, deadline)` / `spawn_held_until(spec, deadline)`; publish the `HeldSpawn` with `activate()` or abort it with `abort()`
+
+Admission close: every exported `MobHandle` clone shares one public-owner
+token. When the last owner (or `acquire_owner()` lease) drops, the mob closes
+admission as soon as it is idle; the builder's internal clones, `observer()`,
+`read_handle()` and `events()` do not count as owners. A closed mob refuses
+spawn, respawn, work submission, flow runs, resume, reset, peer messages,
+live opens, wiring and host binds with `MobError::AdmissionClosed { mob_id,
+reason }`; stop, shutdown, destroy, retirement, cancellation and reads stay
+available, and admitted work is never stopped. Keep a `MobHandle` clone for
+as long as the mob must keep admitting work. `close_if_idle()` answers
+`Closed`, `AlreadyClosed(reason)` or `Busy(MobBusy)`.
+
+Delivery scope: a host that persists effect-bearing deliveries captures the
+member's `MemberDeliveryScope` (runtime incarnation, fence and session; it
+serializes with a `version` field), persists it, then submits against it. A
+member session that moved under a current fence is refused as
+`MobError::StaleDeliveryScope` (wire `STALE_DELIVERY_SCOPE`) with zero effects
+and is never retargeted: re-capture the scope. `recover_bounded_work_at_scope`
+reads only the scope's session and returns a `ScopedWorkState` (`Absent` is
+never retry permission). A member with no session binding has no scope
+(`DeliveryScopeUnavailable`, wire `CAPABILITY_UNAVAILABLE`).
 
 Scratch `task_create` / `task_update` / `task_list` / `task_get` are separately
 enabled agent tools, not `MobHandle` methods. Durable shared commitments belong
@@ -222,11 +246,10 @@ use meerkat_mob_mcp::{AgentMobToolSurfaceFactory, MobMcpState};
 
 fn with_mob_tools(
     session_service: Arc<dyn MobSessionService>,
-) -> SessionBuildOptions {
-    let state = Arc::new(MobMcpState::new(
-        session_service,
-        MobControlPrincipal::Owner,
-    ));
+) -> Result<SessionBuildOptions, Box<dyn std::error::Error>> {
+    // `new` is fallible (runtime adapter acquisition); `into_shared()` lets the
+    // state run its own council recovery sweep.
+    let state = MobMcpState::new(session_service, MobControlPrincipal::Owner)?.into_shared();
     let factory: Arc<dyn MobToolsFactory> =
         Arc::new(AgentMobToolSurfaceFactory::new(state));
     let mut build = SessionBuildOptions {
@@ -234,11 +257,11 @@ fn with_mob_tools(
         ..Default::default()
     };
     build.apply_generated_create_only_mob_operator_access(ToolCategoryOverride::Enable);
-    build
+    Ok(build)
 }
 ```
 
-Pass this result as `CreateSessionRequest.build` to a factory-backed service.
+Pass the returned options as `CreateSessionRequest.build` to a factory-backed service.
 It supplies both dispatcher infrastructure and explicit per-build enablement;
 the factory/runtime handoff mints generated create-only operator authority.
 It does not grant access to arbitrary existing mobs. `.mob(true)` alone is
@@ -284,17 +307,33 @@ The generic session `live/*` family can negotiate WebRTC only when the session
 is local to that RPC host; a controlling host cannot use `session/*` or
 `live/*` to proxy a placed member's remote session.
 
-All console surfaces consume the same four classified failures:
-`scope_denied`, `host_unavailable`, `stale_cursor`, and `stale_fence`, plus
-`stale_delivery_scope` for a scope-bound submit whose member session moved
-under a current fence (re-capture the scope; `stale_fence` means re-resolve
-the member).
+All console surfaces consume the same four classified failures (wire codes
+`SCOPE_DENIED`, `HOST_UNAVAILABLE`, `STALE_CURSOR`, and `STALE_FENCE`), plus
+`STALE_DELIVERY_SCOPE` (JSON-RPC -32036, HTTP 409) for a scope-bound submit
+whose member session moved under a current fence (re-capture the scope;
+`STALE_FENCE` means re-resolve the member).
 Unclassified failures keep each route or protocol's legacy rendering.
 
 Runtime-mode behavior is shared across these surfaces because dispatch comes from the same mob runtime:
 
 - autonomous members: event injection/subscription dispatch
 - turn-driven members: direct `start_turn` dispatch
+
+### Destroy completion
+
+A destroy (`MobMcpState::mob_destroy`, RPC `mob/destroy`, the lifecycle
+destroy on RPC, MCP and Web, the agent `mob_destroy` tool, and the cleanup of
+a session's owned mobs on session archive) removes the mob's database files
+only after its actor task ended and its database observer drained. While a
+store, storage bundle, handle or reader in the same process still owns that
+observer (including a `MobHandle` the caller kept across the destroy, or one
+held by another `MobMcpState`), it keeps the files and answers
+`MobMcpDestroyError::Incomplete`, reported on every surface with
+`code: "mob_destroy_incomplete"`, the `destroy_report` and `retryable: true`
+(JSON-RPC and MCP: internal-error data; REST session archive: HTTP 500). Drop
+those handles and retry as the same caller; the retry continues the owed
+cleanup and answers the canonical report. Creating, restoring or inserting a
+mob under that id is refused until the cleanup is done.
 
 ## External members
 
@@ -316,11 +355,18 @@ For a remote `rkat` member, generate that binding from the target process:
 rkat run \
   --comms-name remote-worker \
   --comms-listen-tcp 0.0.0.0:4200 \
-  --comms-advertise-tcp worker.example.com:4200 \
+  --comms-advertise-tcp 203.0.113.7:4200 \
   --comms-binding-out ./remote-worker.binding.json \
   --keep-alive \
   "You are a remote worker."
 ```
+`--comms-advertise-tcp`
+takes `HOST:PORT` or `tcp://HOST:PORT` (0.9.1); HOST is a DNS name, an IPv4
+address or a bracketed IPv6 address, resolved when a peer connects, and it is
+advertised as `tcp://HOST:PORT`. A wildcard host and a missing or zero port
+are refused (0.9.0 accepted only IP literals). A wildcard
+`--comms-listen-tcp 0.0.0.0:...` needs the flag or a realm `[comms]
+advertise_address`.
 
 Use `rkat run --comms-listen-tcp` for the signed Meerkat peer channel.
 `rkat-rpc --tcp` is only JSON-RPC host transport and does not make an agent
@@ -402,15 +448,16 @@ Requests for exclusions return `CAPABILITY_UNAVAILABLE` with typed clearing
 actions; inspect the profile for the complete current capability set.
 
 **WASM API:**
-See the meerkat-wasm skill (`references/api_surface.md`) for the authoritative export list. Key mob-related exports:
+Key mob-related exports (a partial list; the full WASM export reference is not part of `rkat help`):
 ```
 mob_create(definition_json) → mob_id string  [async]
 mob_spawn(mob_id, specs_json) → result JSON  [async]
 mob_wire / mob_unwire / mob_wire_peer / mob_unwire_peer / mob_retire / mob_respawn  [async]
-mob_list_members / mob_member_send / mob_events(mob_id, after_cursor: string, limit: u32) / mob_status / mob_list
+mob_list_members / mob_member_send / mob_events(mob_id, after_cursor: string, limit: u32) / mob_status / mob_list  [async]
+mob_member_status / mob_spawn_helper / mob_fork_helper / mob_force_cancel / mob_stop_member_run / mob_append_system_context  [async]
 mob_lifecycle(mob_id, action)  [async]
-mob_run_flow → run_id string  [async] / mob_flow_status / mob_cancel_flow  [async]
-mob_member_subscribe [async] / mob_subscribe_events [async] → stream_id string / poll_subscription / close_subscription
+mob_run_flow → run_id string / mob_flow_status / mob_cancel_flow  [async]
+mob_member_subscribe / mob_subscribe_events → stream_id string  [async]; poll_subscription / close_subscription  [sync]
 ```
 There is no `wire_cross_mob` export.
 There is also no browser `mob_run_result` export: `mob_flow_status` returns a
@@ -425,6 +472,11 @@ surface contracts.
 {"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}
 {"jsonrpc":"2.0","id":2,"method":"session/create","params":{"prompt":"Use mob_* tools to create a lead/worker mob and return status.","enable_mob":true}}
 ```
+
+A mob's members reach the callback tools registered on the JSON-RPC
+connection whose `mob/create` created that mob. A mob restored after a
+restart, or created any other way, has no callback route; re-create it to
+bind a live connection.
 
 ### REST
 
@@ -597,17 +649,21 @@ lifetime token counters are not copied into the child.
 `fork_off` is detached where the host can deliver a later completion: it
 declares `DetachedCompletionDelivery::Available` and has a runtime adapter
 (the default for hosts built with one: the JSON-RPC, REST and MCP servers,
-Meta; also `rkat run --keep-alive` and `rkat mob deploy --surface rpc`). It
-returns once the child is seated and its turn admitted: `status: "running"`,
+Meta; also `rkat run --keep-alive` and `rkat mob deploy --surface rpc`), and
+it has bound its runtime delivery inbox with `MobMcpState::bind_continuations`
+(the Core hosts above do). It returns once the child is seated and its turn
+admitted: `status: "running"`,
 `agent_identity`, `member_ref`, `fork_session_id`, a `job_id`, and a `note`
 (no `cache_inheritance`: that host-side accounting stays on
 `ForkMemberResult`). When the child's turn ends, its outcome is recorded
 once in the forker's transcript as a durable `BackgroundJob` system notice
 (header "Background fork_off job <id> finished (<status>):" with status
 `completed`, `terminated` for an autokill, or `failed`; the outcome JSON is the
-typed block's `detail`, with `persisted: true`), delivered as a runtime input with
-steer handling and idempotency key `fork_off:<job_id>`: a forker mid-turn sees
-it at that turn's next model call (a durable in-turn append, saved once, no
+typed block's `detail`, with `persisted: true`). The outcome is committed once
+as a `ForkJobTerminal` event in the child's mob, then submitted to the forker
+as a durable continuation under the idempotency key `fork_off:<job_id>` and
+applied as a runtime input with steer handling: a forker mid-turn sees it at
+that turn's next model call (a durable in-turn append, saved once, no
 second turn; one follow-up turn only if the turn ends first), an idle forker
 runs one wake turn that sees it, and a non-live forker is revived through its
 mob first. It is
@@ -625,12 +681,13 @@ carries no job. The re-link routes by the job's `owner_session_id` (never the
 child's roster entry); a limit already elapsed delivers `max_run_elapsed` at
 once and retires the child only after delivery settles (no
 `retirement_error` on the re-linked outcome); a respawned forker is
-`OwnerGone`; a deferred owner is `AwaitingOwner { mob_id, reason }` and each
-such job waits on its own owner's mob with its own budget. The `rkat` CLI
-declares `Unavailable` unless it stays alive, so `rkat run` without
+`OwnerGone`; a forker that cannot be served yet (its mob not running, or its
+resume still in progress) receives the durable continuation once it is. The
+`rkat` CLI declares `Unavailable` unless it stays alive, so `rkat run` without
 `--keep-alive` and one-shot `rkat mob` commands block and return the child's
-result directly, with `blocked_because` (`host_declared_unavailable` or
-`no_runtime_adapter`). Neither form has a default deadline, and the agent
+result directly, with `blocked_because` (`host_declared_unavailable`,
+`no_runtime_adapter`, `no_owner_revival_host`, or `no_continuation_owner` on a
+host that never bound its delivery inbox). Neither form has a default deadline, and the agent
 loop's default tool deadline does not cut it (an explicit
 `tools.tool_timeouts.fork_off` still does); `max_run_secs` is an opt-in
 autokill, honored in both forms, that cancels the run and retires the child.
@@ -681,6 +738,20 @@ sealed outcome, so no detached job is owed.
 `timeout_seconds` bounds it; the agent loop's default tool deadline does not.
 
 Visibility alone satisfies none of these per-call prerequisites.
+
+Model-facing inputs decode through the public contract: `mob_create` takes a
+`MobDefinitionInput`, and the profile tools and an inline `tooling` profile
+take a `MobProfileInput`, so host-only fields such as `mcp_servers` or
+`rust_bundles` are refused with `InvalidArguments`, as are host-path skill
+sources. `tooling` on `delegate` and `mob_spawn_member` is `inherit_parent`
+(default; `allow_overlay`/`deny_overlay` narrow it), `minimal` (comms tools
+only), or `profile` (`realm_profile` or `inline`), and a profile is capped by
+the spawning agent's visible tools. On a managed host
+(`MobMcpState::with_tool_consequence_policy_registry`), members of
+agent-created child mobs and `delegate` helpers run under
+`MobMcpState::with_child_application_tool_policy`; without one, `mob_create`,
+`delegate` and spawns into child mobs are refused
+(`child_tool_policy_required`).
 
 A realm profile store adds five profile-management tools for reusable,
 versioned member templates:

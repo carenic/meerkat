@@ -371,7 +371,12 @@ GitHub-hosted runners and sized to a 25-minute lane execution budget:
   TLC install for every lane: an immutable repository mirror of the tlaplus
   v1.8.0 jar pinned by sha256); the `CI gate` requires them on such a change. The `machine-verify --all` sweep is not in PR CI.
 - `clippy`: one lane per shard of every directly changed package
-  (`clippy --no-deps --all-targets --all-features -D warnings`).
+  (`clippy --no-deps --all-targets --all-features -D warnings`); a
+  whole-workspace plan gives the heads of the long check chains fixed
+  shards of their own (`CLIPPY_HEAD_SHARDS`) and packs the rest. Its
+  `RUSTC_WRAPPER` is `scripts/ci-clippy-sccache-wrapper`, which sends the
+  crates Clippy does not lint to sccache as plain rustc so they are cached;
+  the lane's own packages still go through clippy-driver.
 - `unit`: `nextest --lib --bins --profile ci-pr` (`fast` plus a 4-minute hung-test kill) for
   the changed packages outside the meerkat-mob compile chain; crates that
   compile `meerkat-mob` (mob, mob-adaptive, mob-mcp, mob-pack, rpc, rest,
@@ -397,8 +402,31 @@ GitHub-hosted runners and sized to a 25-minute lane execution budget:
   xtask with machine-authority, also on any `.github/workflows/` or `sdks/`
   edit, because its tests pin the workflows and read the SDK manifests and
   generated types), on PRs and main pushes.
-  The unit lanes run `--lib --bins` only, so no other PR lane runs a
-  crate's integration tests.
+  The unit lanes run `--lib --bins` only; `closure-tests` runs the
+  integration tests of every package in its test scope.
+- `closure-tests`: the pre-push hook's cargo-test coverage as required rows
+  for the test scope: the reverse-dependency closure of the changed packages
+  (every member on a global change) plus the packages whose tests read a
+  changed non-Rust input (`scripts/ci-non-rust-readers.json`, kept complete
+  by `scripts/ci-non-rust-readers-guard.mjs` in `make ci-lanes-selftest`).
+  Rows (`closure_test_rows` in `scripts/ci-cargo-lanes.mjs`) select the whole
+  workspace and name only their targets, so they compile the hook's own
+  units: every `tests/*.rs` target the hook builds (by name, `ci-integration`
+  profile, the fast selection), `e2e-fast`, and HeadCanonical with the
+  hook's own package-scoped command, all on the hook's 32 MiB test-thread
+  stack. The lib tests stay in the hook's `kind(lib)` lane: one
+  `--workspace --lib` row (filtered to the scope's packages) is planned only
+  with `--lib-row-runner LABEL`, for a runner that builds it in time (a
+  hosted 4-vCPU runner needs about 64 min), and the plan otherwise records
+  the lane it leaves to the hook (`hook_retained_lanes`). Each row lists and
+  runs one shared selection and first checks that nextest selects exactly
+  its planned binaries (`scripts/ci-verify-row-binaries.mjs`). The plan
+  fails when `scripts/ci-hook-coverage.mjs` finds a hook binary in scope
+  without a row (other than a lib binary the plan leaves to the hook): it
+  reads the hook's lanes from `scripts/pre-push-unit.sh`, binds every line
+  of the executing step that names a row input, the exported test-thread
+  stack, the selection, nextest or the binary check (so none can reassign
+  an input or the stack), and credits only whole-workspace rows.
 - `closure-check`: `cargo check --all-features` (lib and bin targets) over
   the reverse-dependency closure of the changed packages.
 - `feature-check` (two jobs per clippy shard, Bazel set and matrix): compile-only checks of the
@@ -432,9 +460,10 @@ GitHub-hosted runners and sized to a 25-minute lane execution budget:
   pushes. It runs under
   `!cancelled()` so superseded runs surface as cancelled.
 
-Integration-fast, e2e-fast, the dense Mob topology stress, the bounded TLC
-`machine-verify --all` sweep, the feature-matrix test runs, audit, the SDK
-suites, and the whole BuildBuddy/Bazel graph do not run in PR CI. `cargo.yml`
+The dense Mob topology stress, the bounded TLC `machine-verify --all` sweep,
+the feature-matrix test runs, audit, the SDK suites, and the whole
+BuildBuddy/Bazel graph do not run in PR CI; integration-fast and e2e-fast run
+there for the test scope only (`closure-tests`). `cargo.yml`
 remains a separate reusable/manually dispatchable Cargo workflow with its own
 `Cargo lane gate`; `ci.yml` does not call it. Local Make commands still
 default to Cargo.
@@ -443,7 +472,11 @@ default to Cargo.
 PR CI does not. A dispatch with `graph_only=true` runs only `gcp-buildbuddy`:
 the release final gate runs it on the release branch tip before the tag
 (`gh workflow run nightly.yml --ref release/X -f graph_only=true`), which
-also warms the remote cache for the tag run. The full nightly set is:
+also warms the remote cache for the tag run. The self-hosted graph is
+default off behind the repository variable `MEERKAT_GCP_BUILDBUDDY_ENABLED`:
+unless it is `true`, scheduled runs skip `gcp-buildbuddy` (nothing in GCP
+starts; the other nightly jobs still run) and a `graph_only` dispatch fails
+in `buildbuddy.yml`'s gate instead of finishing green. The full nightly set is:
 `workspace-unit` (`make test-unit`), `workspace-int` (`make test-int`),
 `e2e-fast`, `dense-topology` (`mob-dense-topology.yml`),
 `machine-verify` (bounded TLC, including every non-skipped composition
@@ -458,8 +491,10 @@ existing `lint` (clippy `--all-targets`), `lint-feature-matrix`,
 and cargo-deny sweep.
 
 The release tag path requires successful exact-main CI (schema-4 attestation)
-and then runs the full BuildBuddy graph (`release_validate_buildbuddy_full`)
-as its validation gate; Cargo validation remains the manual-dispatch fallback.
+and then, while `MEERKAT_GCP_BUILDBUDDY_ENABLED` is `true`, runs the full
+BuildBuddy graph (`release_validate_buildbuddy_full`) as its validation gate;
+while it is off (the default) the tag validates with `release_validate_cargo`
+instead. Cargo validation is also the manual-dispatch fallback.
 The owner-selected BuildBuddy release backend (remote.buildbuddy.io) covers
 Linux/macOS binaries. Windows release binaries are cross-compiled with
 cargo-xwin (clang-cl, lld-link, the Windows SDK) on a GitHub-hosted Ubuntu
@@ -480,9 +515,9 @@ release semver gate; PR and manual artifacts are previews.
 | Job | Trigger | What it does |
 |-----|---------|-------------|
 | `require_ci_green` | Always | Requires successful exact-main CI for the release commit; tag runs also verify its retained exact-tree attestation (schema 4, backend `github-hosted-cargo`; legacy schemas accepted) |
-| `release_validate_buildbuddy_full` | Tag runs | Runs the whole BuildBuddy/Bazel graph (`buildbuddy.yml`, `full-fresh`) on the release tree |
-| `release_validate_cargo` / `release_validate_buildbuddy` | Eligible manual dispatches only | Validate release state through the selected lane; tag runs reuse exact-tree CI and skip both jobs |
-| `release_validate_gate` | Tags and full/package dispatches | On tags require the full BuildBuddy graph plus exact-tree CI; on manual dispatches accept the selected validation lane; Web-only and asset-only recovery skip it |
+| `release_validate_buildbuddy_full` | Tag runs while `MEERKAT_GCP_BUILDBUDDY_ENABLED` is `true` | Runs the whole BuildBuddy/Bazel graph (`buildbuddy.yml`, `full-fresh`) on the release tree |
+| `release_validate_cargo` / `release_validate_buildbuddy` | Eligible manual dispatches; `release_validate_cargo` also on tags while the self-hosted graph is off | Validate release state through the selected lane; with the graph on, tag runs reuse exact-tree CI and skip both jobs |
+| `release_validate_gate` | Tags and full/package dispatches | On tags require exact-tree CI plus the full BuildBuddy graph (graph on) or `release_validate_cargo` (graph off); on manual dispatches accept the selected validation lane; Web-only and asset-only recovery skip it |
 | `release_semver_gate` | Tags and full/package dispatches | After `require_ci_green`, verifies unexpired exact-tree, exact-version main-push readiness evidence on the normal tag/explicit-tag path; narrower manual measurement/recovery exceptions are described in the release guide |
 | `build_binaries` / `build_binaries_buildbuddy` / `build_binaries_windows_cross` / `verify_windows_binaries` / `build_binaries_gate` | Tags or manual asset recovery | The selected BuildBuddy or GitHub-hosted lane builds Linux/macOS (4 targets); `build_binaries_windows_cross` cross-compiles Windows from Linux with cargo-xwin and `verify_windows_binaries` runs the result on windows-latest; each target packages 4 binaries (`rkat`, `rkat-rpc`, `rkat-rest`, `rkat-mcp`); the gate requires the selected lanes plus both Windows jobs |
 | `build_web_sdk_package` | Tags or package/Web recovery without a reused artifact | Builds the `@rkat/web` package artifact |
@@ -533,18 +568,20 @@ Installed via `make install-hooks`. Two stages:
 - Secret detection (gitleaks)
 - Trailing whitespace, end-of-file, YAML/TOML validation, merge conflict check, large file check
 - `repo-cargo fmt --all -- --check`
-- `scripts/pre-push-clippy.sh` (clippy on changed crates only with `--all-targets`; falls back to full workspace when root `Cargo.toml`/`Cargo.lock` changes)
+- `scripts/pre-push-ratchets.sh` (the agent gate's changed-path ratchets: formal/governance targets, generated contract freshness, Web SDK tests, wasm check; no Clippy, which is a required CI check: the CI planner gives every package the hook used to lint a Clippy lane with the same flags, pinned by `scripts/test-pre-push-ratchets.sh`)
 - `scripts/pre-push-machines.sh`, as two hooks behind the machine-authority classifier and the exact pushed refs: `machine-codegen-drift` (`--codegen-only`: machine and protocol codegen under the clean-tree contract, the only local drift check; the dispatcher refuses `SKIP=machine-codegen-drift`) and `machine-codegen-verify` (`--verify-only`: the canonical TLC lane)
 - `scripts/pre-push-audit-generated-headers.sh`
 - `scripts/pre-push-bridge-no-responsestatus.sh` (thin wrapper over `xtask bridge-classifier`)
-- `scripts/pre-push-bazel-locks.sh` (generated BUILD freshness, offline MODULE.bazel.lock recorded-input check, `bb mod deps --lockfile_mode=error` when the pinned CLI is present; `--require-bb` makes that last gate mandatory and the release preflight passes it)
-- `scripts/test-lock-consistency-gate.sh`, `scripts/test-bazel-module-lock-gate.sh`, `scripts/test-crate-enumeration-gate.sh`, `scripts/test-crate-license-files-gate.sh`, `scripts/test-release-doctor-workflow-contract.sh` (contract tests: each new release-infra gate must still fail on the defect it was written for; the last one also proves the release doctor's `release.yml` assertions survive rewording)
+- `scripts/pre-push-bazel-locks.sh` (generated BUILD freshness, offline MODULE.bazel.lock recorded-input check, the release test-code gate `scripts/check-bazel-release-features.py` (every Bazel release build passes `--define=meerkat_release_build=1`, under which no target the shipped binaries link enables a feature from `scripts/non-shipping-features.json`), `bb mod deps --lockfile_mode=error` when the pinned CLI is present; `--require-bb` makes that last gate mandatory and the release preflight passes it)
+- `scripts/test-lock-consistency-gate.sh`, `scripts/test-bazel-module-lock-gate.sh`, `scripts/test-crate-enumeration-gate.sh`, `scripts/test-crate-license-files-gate.sh`, `scripts/test-release-test-code-guards.sh`, `scripts/test-release-doctor-workflow-contract.sh` (contract tests: each new release-infra gate must still fail on the defect it was written for; the last one also proves the release doctor's `release.yml` assertions survive rewording)
+- `scripts/test-gcp-buildbuddy-workflow-gate.sh` (plans nightly, release and `buildbuddy.yml` jobs with `MEERKAT_GCP_BUILDBUDDY_ENABLED` unset and `true`: unset starts nothing in GCP and tags validate with Cargo; `true` keeps the full-graph route)
+- `scripts/test-gcp-buildbuddy-hardening.sh` (stubbed `gcloud`/`bb`, no network: the self-hosted control plane renders authenticated, TLS-only, executor-authorized config and installs exactly it; `ensure` creates only IAP/executor allows behind an explicit deny, never edits or re-enables a firewall rule, and refuses open, legacy, disabled or drifted rules, VMs, disks and digest-less images; executors get per-secret IAM and gRPCS only; the wrapper never sends an API key to a non-TLS endpoint, and the self-hosted path never uses the BuildBuddy Cloud key)
 - `scripts/pre-push-unit.sh` (deterministic Cargo/nextest gate: when fresh execution is needed, runs workspace unit, integration-fast, HeadCanonical cold-restart, and `e2e-fast` lanes; serializes identical source evidence and retries a timed-out lane once. `MEERKAT_BUILDBUDDY` does not switch this hook's backend)
 - `scripts/pre-push-prune-lanes.sh` (runs from the dispatcher only after a PASSED gate: keeps at most `MEERKAT_PRE_PUSH_KEEP_LANES` (default 2) `pre-push-<hash>` hook worktrees and Cargo target lanes per repo, never touching the current lane, a lane whose dispatcher lock is live, a lane referenced by any live process, a lane with any file activity inside `MEERKAT_PRE_PUSH_LANE_IDLE_SECS` (default 21600), or any non-lane name; logs one `kept:`/`pruned:` line per lane with its reason; `MEERKAT_PRE_PUSH_KEEP_LANES=all` disables it)
 
 The inner deterministic-test cache uses a source fingerprint that excludes
 root `Cargo.lock` and `MODULE.bazel.lock`. On a lock-only cache hit, the current
-lock graph has been compiled by pre-push Clippy but is not re-tested locally;
+lock graph is compiled by the required CI Clippy lanes but is not re-tested locally;
 the reused tests ran against the prior lock graph, and CI remains
 authoritative. Fail-closed `release-projection-only` and
 `pre-push-harness-only` classifiers can also reuse existing parent source-test
@@ -553,6 +590,10 @@ stamp, which is keyed to the entire pushed Git tree and written only when no
 hook was skipped. A push with `SKIP=<hook ids>` records partial evidence labeled
 with the skipped set, reusable only by a later push of that tree that skips the
 same hooks; a push without that `SKIP` re-runs them.
+
+After the gate, passed or failed, the dispatcher prints each hook's wall time
+and the deterministic gate's lane times, and appends them to
+`.git/meerkat-hook-cache/timings.tsv`.
 
 **Manual local preflight**:
 - `pre-commit run --hook-stage manual agent-check-changed` (runs `scripts/agent-gate --staged`)
@@ -568,10 +609,12 @@ push will run, retain an appropriate standalone gate before declaring the work
 qualified. This changes scheduling, not required coverage or hook behavior.
 
 Only deduplicate an inventory actually covered by the selected push backend,
-paths, test targets and features. The Cargo push lint hook uses
-`agent-gate --committed --clippy-only --machine-drift-by-hook`; its governance
-(drift is left to `machine-codegen-drift`) and generated-contract
-ratchets still run. Its path base is `CARGO_AGENT_BASE` or `origin/main` (then
+paths, test targets and features. The push runs no Clippy: its
+`changed-path-ratchets` hook runs
+`agent-gate --committed --ratchets-only --machine-drift-by-hook` (governance,
+generated-contract, Web SDK and wasm ratchets; drift is left to
+`machine-codegen-drift`), and the required CI Clippy lanes lint every package
+it used to. Its path base is `CARGO_AGENT_BASE` or `origin/main` (then
 `main`/HEAD), which can differ from the dispatcher's remote-ref range. Check that
 the committed selection includes the intended delta. The deterministic push
 lane covers workspace default-feature `kind(lib)` and `kind(test)` inventories,
@@ -723,8 +766,8 @@ When running tests or demos that involve multiple LLM providers/models, use thes
 | Provider | Model Name |
 |----------|------------|
 | OpenAI | `gpt-5.6-sol` or `gpt-5.6-terra` or `gpt-5.6-luna` or `gpt-5.6` or `gpt-5.5` or `gpt-5.5-pro` or `gpt-5.4` or `gpt-5.4-mini` or `gpt-5.3-codex` |
-| Gemini | `gemini-3.5-flash` or `gemini-3.1-pro-preview` or `gemini-3.1-flash-lite-preview` |
-| Anthropic | `claude-opus-5-5` or `claude-opus-5` or `claude-fable-5` or `claude-opus-4-8` or `claude-sonnet-5-5` or `claude-sonnet-4-6` or `claude-sonnet-4-5` |
+| Gemini | `gemini-4-argon` (paid Gemini API tier) or `gemini-3.8-flash` or `gemini-3.6-flash` or `gemini-3.5-flash-lite` or `gemini-3.1-flash-lite` or `gemini-3.5-flash` or `gemini-3.1-pro-preview` or `gemini-3.1-flash-lite-preview` |
+| Anthropic | `claude-opus-5-5` or `claude-opus-5` or `claude-fable-5` or `claude-opus-4-8` or `claude-sonnet-5-5` or `claude-sonnet-4-6` or `claude-sonnet-4-5` or `claude-haiku-5-5` |
 
 These are catalog text-model ids (`meerkat-models` is the source of truth; `rkat models` prints the live list); models outside the catalog require a config `[models.<id>]` entry.
 GPT-5.6 is a limited preview; use `gpt-5.5` for generally runnable OpenAI

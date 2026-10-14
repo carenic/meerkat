@@ -92,7 +92,9 @@ const GOOGLE_SCOPES: &[&str] = &[
     "https://www.googleapis.com/auth/userinfo.profile",
 ];
 
+#[cfg(all(debug_assertions, not(target_arch = "wasm32")))]
 const TEST_OAUTH_ENDPOINT_OVERRIDE_ENV: &str = "MEERKAT_TEST_OAUTH_ENDPOINT_OVERRIDE";
+#[cfg(all(debug_assertions, not(target_arch = "wasm32")))]
 const TEST_OAUTH_BASE_URL_ENV: &str = "MEERKAT_TEST_OAUTH_BASE_URL";
 
 /// Single, provider-owned declaration of the static OAuth provider facts:
@@ -332,37 +334,57 @@ pub fn oauth_provider_resolution(
     }
 }
 
-/// Apply the local OAuth fixture endpoint override used by release-grade auth
-/// smoke tests. Production code only observes this when both explicit
-/// `MEERKAT_TEST_*` environment variables are set.
+/// Test hook for the e2e auth lane and the provider managed-lifetime tests:
+/// with `MEERKAT_TEST_OAUTH_ENDPOINT_OVERRIDE` true and
+/// `MEERKAT_TEST_OAUTH_BASE_URL` set, the OAuth authorize, token and device
+/// endpoints point at that local fixture. Debug builds only: release builds
+/// (`cargo build --release`, `bazel build -c opt`) compile it out and ignore
+/// both variables.
 #[doc(hidden)]
 pub fn apply_test_oauth_endpoint_override(
     identity: OAuthProviderIdentity,
+    endpoints: OAuthEndpoints,
+) -> OAuthEndpoints {
+    #[cfg(all(debug_assertions, not(target_arch = "wasm32")))]
+    {
+        test_oauth_fixture_endpoints(identity, endpoints)
+    }
+    #[cfg(not(all(debug_assertions, not(target_arch = "wasm32"))))]
+    {
+        let _ = identity;
+        endpoints
+    }
+}
+
+#[cfg(all(debug_assertions, not(target_arch = "wasm32")))]
+fn test_oauth_fixture_endpoints(
+    identity: OAuthProviderIdentity,
     mut endpoints: OAuthEndpoints,
 ) -> OAuthEndpoints {
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        let enabled = std::env::var(TEST_OAUTH_ENDPOINT_OVERRIDE_ENV)
-            .map(|value| {
-                matches!(
-                    value.as_str(),
-                    "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"
-                )
-            })
-            .unwrap_or(false);
-        if !enabled {
-            return endpoints;
-        }
-        let Ok(base_url) = std::env::var(TEST_OAUTH_BASE_URL_ENV) else {
-            return endpoints;
-        };
-        let base_url = base_url.trim_end_matches('/');
-        let provider = identity.canonical_alias();
-        endpoints.authorize_url = format!("{base_url}/{provider}/authorize");
-        endpoints.token_url = format!("{base_url}/{provider}/token");
-        if endpoints.device_code_url.is_some() {
-            endpoints.device_code_url = Some(format!("{base_url}/{provider}/device/code"));
-        }
+    let enabled = std::env::var(TEST_OAUTH_ENDPOINT_OVERRIDE_ENV)
+        .map(|value| {
+            matches!(
+                value.as_str(),
+                "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"
+            )
+        })
+        .unwrap_or(false);
+    if !enabled {
+        return endpoints;
+    }
+    let Ok(base_url) = std::env::var(TEST_OAUTH_BASE_URL_ENV) else {
+        return endpoints;
+    };
+    let base_url = base_url.trim_end_matches('/');
+    let provider = identity.canonical_alias();
+    tracing::debug!(
+        provider,
+        "MEERKAT_TEST_OAUTH_ENDPOINT_OVERRIDE test hook: OAuth endpoints redirected to the local test fixture"
+    );
+    endpoints.authorize_url = format!("{base_url}/{provider}/authorize");
+    endpoints.token_url = format!("{base_url}/{provider}/token");
+    if endpoints.device_code_url.is_some() {
+        endpoints.device_code_url = Some(format!("{base_url}/{provider}/device/code"));
     }
     endpoints
 }
@@ -3037,6 +3059,56 @@ mod tests {
                 .collect();
             assert_eq!(endpoints.extra_authorize_params, expected_params);
         }
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+#[allow(clippy::expect_used)]
+mod fixture_endpoint_override_tests {
+    use super::*;
+
+    const FIXTURE: &str = "http://127.0.0.1:9/oauth-fixture";
+    const CHILD: &str =
+        "oauth_flow::fixture_endpoint_override_tests::fixture_endpoint_override_child";
+
+    /// Child half of the test below: prints the authorize endpoint its own
+    /// process environment resolves.
+    #[test]
+    #[ignore = "spawned by the_fixture_endpoint_override_is_a_debug_build_hook"]
+    fn fixture_endpoint_override_child() {
+        let endpoints = oauth_provider_endpoints(
+            OAuthProviderIdentity::OpenAiChatGpt,
+            "http://127.0.0.1:1/oauth/callback",
+        );
+        println!("AUTHORIZE={}", endpoints.authorize_url);
+    }
+
+    /// The local OAuth fixture override is a debug-build test hook: with both
+    /// variables set, a debug build redirects to the fixture, while a release
+    /// build keeps the provider's own endpoints.
+    #[test]
+    fn the_fixture_endpoint_override_is_a_debug_build_hook() {
+        let output = std::process::Command::new(std::env::current_exe().expect("test binary path"))
+            .args(["--exact", CHILD, "--ignored", "--nocapture"])
+            .env("MEERKAT_TEST_OAUTH_ENDPOINT_OVERRIDE", "1")
+            .env("MEERKAT_TEST_OAUTH_BASE_URL", FIXTURE)
+            .output()
+            .expect("spawn the child test");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("running 1 test"),
+            "child test failed: {stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let authorize = stdout
+            .lines()
+            .find_map(|line| line.strip_prefix("AUTHORIZE="))
+            .expect("the child printed its authorize endpoint");
+        assert_eq!(
+            authorize.starts_with(FIXTURE),
+            cfg!(debug_assertions),
+            "authorize endpoint {authorize}: only a debug build may honour the fixture override"
+        );
     }
 }
 

@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
+# Bash >= 4.4 (see scripts/lib/require-bash.sh).
+. "$(dirname "${BASH_SOURCE[0]}")/lib/require-bash.sh"
 
 usage() {
   cat <<'EOF'
@@ -9,12 +11,21 @@ Manages the burst GCP BuildBuddy executor pool used by CI. GitHub Actions is a
 thin submitter; this script owns the GCP managed instance group that runs the
 actual BuildBuddy executors.
 
+Executors reach the control plane only over TLS at its internal address
+(gRPCS, trusting the control plane's per-boot CA) and register with an
+executor key of the self-hosted org. The executor and action images must be
+pinned by digest. The instance template name is derived from everything the
+template renders, so a change always makes a new template; `ensure` refuses an
+existing template (derived or explicitly named) whose metadata, service
+account, scopes, network, tags, machine type or boot image differ, and `up`
+refuses while any pool instance was made from another template. The executor
+key, endpoint and CA secret names must all differ.
+
 Environment:
   MEERKAT_GCP_PROJECT_ID                 GCP project (default: king-dnn-training-dev)
-  MEERKAT_GCP_REGION                     GCP region (default: europe-west1)
   MEERKAT_GCP_ZONE                       GCP zone (default: europe-west1-b)
   MEERKAT_GCP_BUILDBUDDY_MIG             MIG name (default: meerkat-bb-exec)
-  MEERKAT_GCP_BUILDBUDDY_TEMPLATE        Instance template name
+  MEERKAT_GCP_BUILDBUDDY_TEMPLATE        Instance template name (default: derived)
   MEERKAT_GCP_BUILDBUDDY_TARGET_SIZE     Executor VM count for up (default: 12)
   MEERKAT_GCP_BUILDBUDDY_MACHINE_TYPE    Executor machine (default: c3d-standard-30)
   MEERKAT_GCP_BUILDBUDDY_BOOT_DISK_GB    Boot disk size (default: 100)
@@ -22,87 +33,152 @@ Environment:
   MEERKAT_GCP_BUILDBUDDY_CACHE_DISK_TYPE Stateful cache disk type (default: pd-ssd)
   MEERKAT_GCP_BUILDBUDDY_DOWN_MODE       stopped or delete (default: stopped)
   MEERKAT_BUILDBUDDY_EXECUTOR_POOL       BuildBuddy pool name (default: meerkat-ci)
-  MEERKAT_BUILDBUDDY_EXECUTOR_IMAGE      BuildBuddy executor image
-  MEERKAT_BUILDBUDDY_CI_IMAGE            Bazel action container image
+  MEERKAT_BUILDBUDDY_EXECUTOR_IMAGE      BuildBuddy executor image, pinned by digest
+  MEERKAT_BUILDBUDDY_CI_IMAGE            Bazel action image, pinned by digest
   MEERKAT_GCP_BUILDBUDDY_MANAGE_IAM      Create/bind executor IAM (default: 0)
-  BUILDBUDDY_GRPC_URL                    Self-hosted BuildBuddy gRPC URL
+  BUILDBUDDY_GRPC_URL                    Control plane gRPCS URL for executors
+                                         (grpcs://<private IPv4>:<port>)
   BUILDBUDDY_ENDPOINT                    Back-compat endpoint URL
-  BUILDBUDDY_API_KEY                     API key to sync to Secret Manager
+  BUILDBUDDY_TLS_CA_B64                  Control plane CA certificate (base64 PEM)
+  MEERKAT_BUILDBUDDY_API_KEY_SECRET      Executor key secret
+                                         (default: meerkat-bb-executor-api-key)
+  MEERKAT_BUILDBUDDY_ENDPOINT_SECRET     Endpoint secret (default: meerkat-bb-control-endpoint)
+  MEERKAT_BUILDBUDDY_CA_SECRET           CA secret (default: meerkat-bb-control-ca)
+
+sync-secrets writes only the endpoint and CA secrets. The executor key secret
+holds an executor key of the self-hosted control plane; the operator adds it
+in Secret Manager, CI never writes it, and the BuildBuddy Cloud key never
+belongs there. With MEERKAT_GCP_BUILDBUDDY_MANAGE_IAM=1 the executor service
+account gets secretAccessor on exactly those three secrets, and a
+project-wide secretAccessor binding for it is removed.
 EOF
 }
 
 project="${MEERKAT_GCP_PROJECT_ID:-${GCP_PROJECT_ID:-king-dnn-training-dev}}"
-region="${MEERKAT_GCP_REGION:-europe-west1}"
 zone="${MEERKAT_GCP_ZONE:-europe-west1-b}"
 mig="${MEERKAT_GCP_BUILDBUDDY_MIG:-meerkat-bb-exec}"
-template="${MEERKAT_GCP_BUILDBUDDY_TEMPLATE:-${mig}-template-v4}"
+template=""
 target_size="${MEERKAT_GCP_BUILDBUDDY_TARGET_SIZE:-12}"
 machine_type="${MEERKAT_GCP_BUILDBUDDY_MACHINE_TYPE:-c3d-standard-30}"
 boot_disk_gb="${MEERKAT_GCP_BUILDBUDDY_BOOT_DISK_GB:-100}"
 cache_disk_gb="${MEERKAT_GCP_BUILDBUDDY_CACHE_DISK_GB:-1000}"
 cache_disk_type="${MEERKAT_GCP_BUILDBUDDY_CACHE_DISK_TYPE:-pd-ssd}"
 cache_disk_device="${MEERKAT_GCP_BUILDBUDDY_CACHE_DISK_DEVICE:-bb-exec-cache}"
+local_cache_bytes="${MEERKAT_GCP_BUILDBUDDY_LOCAL_CACHE_BYTES:-700000000000}"
 down_mode="${MEERKAT_GCP_BUILDBUDDY_DOWN_MODE:-stopped}"
 pool="${MEERKAT_BUILDBUDDY_EXECUTOR_POOL:-meerkat-ci}"
-executor_image="${MEERKAT_BUILDBUDDY_EXECUTOR_IMAGE:-buildbuddy.bbcr.io/public/buildbuddy-executor-enterprise:enterprise-v2.265.0}"
-ci_image="${MEERKAT_BUILDBUDDY_CI_IMAGE:-europe-west1-docker.pkg.dev/king-dnn-training-dev/meerkat-ci/meerkat-ci-rust:1.94.0}"
-api_key_secret="${MEERKAT_BUILDBUDDY_API_KEY_SECRET:-buildbuddy-api-key}"
-endpoint_secret="${MEERKAT_BUILDBUDDY_ENDPOINT_SECRET:-buildbuddy-endpoint}"
+executor_image="${MEERKAT_BUILDBUDDY_EXECUTOR_IMAGE:-}"
+intended_executor_image="buildbuddy.bbcr.io/public/buildbuddy-executor-enterprise:enterprise-v2.265.0"
+ci_image="${MEERKAT_BUILDBUDDY_CI_IMAGE:-}"
+ci_image="${ci_image#docker://}"
+intended_ci_image="europe-west1-docker.pkg.dev/king-dnn-training-dev/meerkat-ci/meerkat-ci-rust:1.94.0"
+api_key_secret="${MEERKAT_BUILDBUDDY_API_KEY_SECRET:-meerkat-bb-executor-api-key}"
+endpoint_secret="${MEERKAT_BUILDBUDDY_ENDPOINT_SECRET:-meerkat-bb-control-endpoint}"
+ca_secret="${MEERKAT_BUILDBUDDY_CA_SECRET:-meerkat-bb-control-ca}"
 service_account_name="${MEERKAT_GCP_BUILDBUDDY_SERVICE_ACCOUNT_NAME:-meerkat-bb-executor}"
 service_account="${MEERKAT_GCP_BUILDBUDDY_SERVICE_ACCOUNT:-${service_account_name}@${project}.iam.gserviceaccount.com}"
 manage_iam="${MEERKAT_GCP_BUILDBUDDY_MANAGE_IAM:-0}"
 labels="purpose=buildbuddy-executor,repo=meerkat,pool=${pool}"
+startup_script_file=""
+trap 'if [[ -n "${startup_script_file}" ]]; then rm -f "${startup_script_file}"; fi' EXIT
+
+die() {
+  echo "error: $*" >&2
+  exit 1
+}
 
 require_gcloud() {
-  if ! command -v gcloud >/dev/null 2>&1; then
-    echo "error: gcloud is required" >&2
-    exit 1
+  command -v gcloud >/dev/null 2>&1 || die "gcloud is required"
+  command -v python3 >/dev/null 2>&1 || die "python3 is required"
+}
+
+sha256_hex() {
+  python3 -c 'import hashlib,sys; print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest())'
+}
+
+# Prints every security-relevant way an existing instance template differs
+# from what this script renders: its metadata (only the rendered startup
+# script, which carries both image digests), service account and scopes,
+# network and tags, machine type and boot image.
+template_problems() {
+  python3 -c 'import hashlib,json,re,sys
+want_digest, want_account, want_machine = sys.argv[1:4]
+props = json.load(sys.stdin).get("properties") or {}
+items = (props.get("metadata") or {}).get("items") or []
+keys = sorted(str(item.get("key")) for item in items)
+if keys != ["startup-script"]:
+    print("metadata keys " + ",".join(keys) + ", rendered startup-script only")
+script = next((item.get("value", "") for item in items if item.get("key") == "startup-script"), None)
+digest = "" if script is None else hashlib.sha256(script.rstrip("\n").encode()).hexdigest()
+if digest != want_digest:
+    print("startup script digest " + (digest or "none") + ", rendered " + want_digest)
+accounts = props.get("serviceAccounts") or []
+emails = [account.get("email") for account in accounts]
+if emails != [want_account]:
+    print(f"service accounts {emails}, rendered [{want_account}]")
+scopes = sorted({scope for account in accounts for scope in account.get("scopes") or []})
+if scopes != ["https://www.googleapis.com/auth/cloud-platform"]:
+    print(f"scopes {scopes}, rendered cloud-platform")
+networks = [str(nic.get("network", "")).rstrip("/").rsplit("/", 1)[-1] for nic in props.get("networkInterfaces") or []]
+if networks != ["default"]:
+    print(f"networks {networks}, rendered [default]")
+tags = (props.get("tags") or {}).get("items") or []
+if tags:
+    print(f"network tags {tags}")
+machine = str(props.get("machineType", "")).rsplit("/", 1)[-1]
+if machine != want_machine:
+    print(f"machine type {machine}, rendered {want_machine}")
+boot = [disk for disk in props.get("disks") or [] if disk.get("boot")]
+image = str(((boot[0] if boot else {}).get("initializeParams") or {}).get("sourceImage", ""))
+if not re.search(r"(^|/)projects/debian-cloud/global/images/(family/debian-12|debian-12-[a-z0-9-]+)$", image):
+    print("boot image " + (image or "none") + ", rendered debian-cloud debian-12")' "$@"
+}
+
+# The executor key, endpoint and CA live in three different secrets; an
+# aliased name would publish the endpoint or CA over the executor key.
+require_distinct_secrets() {
+  local name
+  for name in "${api_key_secret}" "${endpoint_secret}" "${ca_secret}"; do
+    [[ "${name}" =~ ^[A-Za-z0-9_-]+$ ]] || die "invalid Secret Manager secret name '${name}'"
+  done
+  if [[ "${api_key_secret}" == "${endpoint_secret}" || "${api_key_secret}" == "${ca_secret}" ||
+    "${endpoint_secret}" == "${ca_secret}" ]]; then
+    die "the executor key, endpoint and CA secrets must be three different secrets (got ${api_key_secret}, ${endpoint_secret}, ${ca_secret})"
   fi
 }
 
-canonical_grpc_url() {
-  local endpoint="$1"
-  endpoint="${endpoint%/}"
-  case "${endpoint}" in
-    grpc://*|grpcs://*)
-      printf '%s\n' "${endpoint}"
-      ;;
-    http://*)
-      printf 'grpc://%s\n' "${endpoint#http://}"
-      ;;
-    https://*)
-      printf 'grpcs://%s\n' "${endpoint#https://}"
-      ;;
-    *)
-      printf 'grpcs://%s\n' "${endpoint}"
-      ;;
-  esac
+require_pinned_images() {
+  [[ "${pool}" =~ ^[A-Za-z0-9._-]+$ ]] || die "invalid executor pool name '${pool}'"
+  [[ "${local_cache_bytes}" =~ ^[0-9]+$ ]] || die "invalid local cache size '${local_cache_bytes}'"
+  if ! [[ "${executor_image}" =~ ^[A-Za-z0-9._/:-]+@sha256:[0-9a-f]{64}$ ]]; then
+    die "MEERKAT_BUILDBUDDY_EXECUTOR_IMAGE must pin the executor image by digest (<repository>[:tag]@sha256:<64 hex>); got '${executor_image}'. Resolve the digest of ${intended_executor_image} and set it."
+  fi
+  if ! [[ "${ci_image}" =~ ^[A-Za-z0-9._/:-]+@sha256:[0-9a-f]{64}$ ]]; then
+    die "MEERKAT_BUILDBUDDY_CI_IMAGE must pin the action image by digest (<repository>[:tag]@sha256:<64 hex>); got '${ci_image}'. Resolve the digest of ${intended_ci_image} and set it."
+  fi
 }
 
-endpoint_host() {
-  local endpoint="$1"
-  endpoint="${endpoint#grpc://}"
-  endpoint="${endpoint#grpcs://}"
-  endpoint="${endpoint#http://}"
-  endpoint="${endpoint#https://}"
-  endpoint="${endpoint%%/*}"
-  endpoint="${endpoint%%:*}"
-  printf '%s\n' "${endpoint}"
-}
-
-ensure_not_hosted_endpoint() {
-  local host
-  host="$(endpoint_host "$1")"
-  case "${host}" in
-    buildbuddy.io|*.buildbuddy.io)
-      echo "error: refusing to configure hosted BuildBuddy endpoint for GCP CI: ${host}" >&2
-      exit 1
-      ;;
-  esac
+# grpcs:// to a private IPv4 address: executors reach the control plane only
+# over TLS on the VPC.
+require_private_tls_endpoint() {
+  local endpoint="$1" host
+  if ! [[ "${endpoint}" =~ ^grpcs://([0-9.]+):([0-9]+)$ ]]; then
+    die "the executor endpoint must be grpcs://<private IPv4>:<port>; got '${endpoint}'"
+  fi
+  host="${BASH_REMATCH[1]}"
+  python3 -c 'import ipaddress,sys
+address = ipaddress.IPv4Address(sys.argv[1])
+private = ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")
+sys.exit(0 if any(address in ipaddress.IPv4Network(net) for net in private) else 1)' "${host}" 2>/dev/null ||
+    die "the executor endpoint host ${host} is not a private IPv4 address"
 }
 
 secret_exists() {
   gcloud secrets describe "$1" --project "${project}" >/dev/null 2>&1
+}
+
+secret_has_version() {
+  [[ -n "$(gcloud secrets versions list "$1" --project "${project}" --filter='state:ENABLED' --limit=1 --format='value(name)' 2>/dev/null)" ]]
 }
 
 secret_latest() {
@@ -136,20 +212,33 @@ sync_secret_value() {
 
 sync_secrets() {
   require_gcloud
-  local grpc_url
+  require_distinct_secrets
+  local grpc_url ca_pem
   grpc_url="${BUILDBUDDY_GRPC_URL:-${BUILDBUDDY_ENDPOINT:-}}"
   if [[ -z "${grpc_url}" ]]; then
     echo "error: BUILDBUDDY_GRPC_URL is required to sync executor secrets" >&2
     exit 1
   fi
-  if [[ -z "${BUILDBUDDY_API_KEY:-}" ]]; then
-    echo "error: BUILDBUDDY_API_KEY is required to sync executor secrets" >&2
-    exit 1
-  fi
-  grpc_url="$(canonical_grpc_url "${grpc_url}")"
-  ensure_not_hosted_endpoint "${grpc_url}"
+  require_private_tls_endpoint "${grpc_url}"
+  [[ -n "${BUILDBUDDY_TLS_CA_B64:-}" ]] || die "BUILDBUDDY_TLS_CA_B64 (the control plane CA) is required to sync executor secrets"
+  ca_pem="$(python3 -c 'import base64,sys
+pem = base64.b64decode(sys.argv[1], validate=True).decode()
+if not (pem.startswith("-----BEGIN CERTIFICATE-----") and pem.rstrip().endswith("-----END CERTIFICATE-----")):
+    sys.exit(1)
+sys.stdout.write(pem)' "${BUILDBUDDY_TLS_CA_B64}" 2>/dev/null)" || die "BUILDBUDDY_TLS_CA_B64 is not a base64 PEM certificate"
   sync_secret_value "${endpoint_secret}" "${grpc_url}"
-  sync_secret_value "${api_key_secret}" "${BUILDBUDDY_API_KEY}"
+  sync_secret_value "${ca_secret}" "${ca_pem}"
+  # The executor key is deliberately not synced: it is the self-hosted control
+  # plane's executor key, added by the operator (see usage).
+}
+
+project_secret_accessor_bound() {
+  gcloud projects get-iam-policy "${project}" --format=json |
+    python3 -c 'import json,sys
+member = sys.argv[1]
+bindings = json.load(sys.stdin).get("bindings") or []
+sys.exit(0 if any(b.get("role") == "roles/secretmanager.secretAccessor" and member in (b.get("members") or []) for b in bindings) else 1)' \
+      "serviceAccount:${service_account}"
 }
 
 ensure_service_account() {
@@ -174,19 +263,39 @@ ensure_service_account() {
   for role in \
     roles/artifactregistry.reader \
     roles/logging.logWriter \
-    roles/monitoring.metricWriter \
-    roles/secretmanager.secretAccessor; do
+    roles/monitoring.metricWriter; do
     gcloud projects add-iam-policy-binding "${project}" \
       --member "serviceAccount:${service_account}" \
       --role "${role}" \
       --condition=None \
       --quiet >/dev/null
   done
+  # Secret Manager access only to the three secrets the executors read.
+  local secret
+  for secret in "${api_key_secret}" "${endpoint_secret}" "${ca_secret}"; do
+    if ! secret_exists "${secret}"; then
+      gcloud secrets create "${secret}" \
+        --project "${project}" \
+        --replication-policy=automatic \
+        --quiet >/dev/null
+    fi
+    gcloud secrets add-iam-policy-binding "${secret}" \
+      --project "${project}" \
+      --member "serviceAccount:${service_account}" \
+      --role roles/secretmanager.secretAccessor \
+      --quiet >/dev/null
+  done
+  if project_secret_accessor_bound; then
+    gcloud projects remove-iam-policy-binding "${project}" \
+      --member "serviceAccount:${service_account}" \
+      --role roles/secretmanager.secretAccessor \
+      --all \
+      --quiet >/dev/null
+  fi
 }
 
-write_startup_script() {
-  local path="$1"
-  cat >"${path}" <<EOF
+render_startup_script() {
+  cat <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
 
@@ -196,17 +305,20 @@ PROJECT="${project}"
 POOL="${pool}"
 API_KEY_SECRET="${api_key_secret}"
 ENDPOINT_SECRET="${endpoint_secret}"
+CA_SECRET="${ca_secret}"
 EXECUTOR_IMAGE="${executor_image}"
 CI_IMAGE="${ci_image}"
 CACHE_DISK_DEVICE="${cache_disk_device}"
-LOCAL_CACHE_SIZE_BYTES="${MEERKAT_GCP_BUILDBUDDY_LOCAL_CACHE_BYTES:-700000000000}"
+LOCAL_CACHE_SIZE_BYTES="${local_cache_bytes}"
+EOF
+  cat <<'EOF'
 
 apt-get update -y
 DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates curl docker.io e2fsprogs python3
 systemctl enable --now docker
 
 metadata() {
-  curl -fsS -H "Metadata-Flavor: Google" "http://metadata.google.internal/computeMetadata/v1/\$1"
+  curl -fsS -H "Metadata-Flavor: Google" "http://metadata.google.internal/computeMetadata/v1/$1"
 }
 
 access_token() {
@@ -215,70 +327,76 @@ access_token() {
 }
 
 secret_value() {
-  local secret="\$1"
+  local secret="$1"
   local token
-  token="\$(access_token)"
-  curl -fsS -H "Authorization: Bearer \${token}" \
-    "https://secretmanager.googleapis.com/v1/projects/\${PROJECT}/secrets/\${secret}/versions/latest:access" |
+  token="$(access_token)"
+  curl -fsS -H "Authorization: Bearer ${token}" \
+    "https://secretmanager.googleapis.com/v1/projects/${PROJECT}/secrets/${secret}/versions/latest:access" |
     python3 -c 'import base64,json,sys; print(base64.b64decode(json.load(sys.stdin)["payload"]["data"]).decode(), end="")'
 }
 
-app_target="\$(secret_value "\${ENDPOINT_SECRET}")"
-api_key="\$(secret_value "\${API_KEY_SECRET}")"
-app_target="\${app_target%/}"
-case "\${app_target}" in
-  grpc://*|grpcs://*) ;;
-  http://*) app_target="grpc://\${app_target#http://}" ;;
-  https://*) app_target="grpcs://\${app_target#https://}" ;;
-  *) app_target="grpcs://\${app_target}" ;;
+app_target="$(secret_value "${ENDPOINT_SECRET}")"
+api_key="$(secret_value "${API_KEY_SECRET}")"
+control_ca="$(secret_value "${CA_SECRET}")"
+case "${app_target}" in
+  grpcs://*) ;;
+  *)
+    echo "Refusing a non-TLS BuildBuddy app target: ${app_target}" >&2
+    exit 1
+    ;;
 esac
-endpoint_host="\${app_target#grpc://}"
-endpoint_host="\${endpoint_host#grpcs://}"
-endpoint_host="\${endpoint_host%%/*}"
-endpoint_host="\${endpoint_host%%:*}"
-case "\${endpoint_host}" in
-  buildbuddy.io|*.buildbuddy.io)
-    echo "Refusing hosted BuildBuddy endpoint for self-hosted GCP executor: \${endpoint_host}" >&2
+app_host="${app_target#grpcs://}"
+app_host="${app_host%%:*}"
+if ! python3 -c 'import ipaddress,sys
+address = ipaddress.IPv4Address(sys.argv[1])
+private = ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")
+sys.exit(0 if any(address in ipaddress.IPv4Network(net) for net in private) else 1)' "${app_host}" 2>/dev/null; then
+  echo "Refusing a BuildBuddy app target outside the private network: ${app_target}" >&2
+  exit 1
+fi
+case "${control_ca}" in
+  "-----BEGIN CERTIFICATE-----"*) ;;
+  *)
+    echo "The control plane CA secret does not hold a PEM certificate" >&2
     exit 1
     ;;
 esac
 
-registry_host="\${CI_IMAGE#docker://}"
-registry_host="\${registry_host%%/*}"
-registry_token="\$(access_token)"
-printf '%s' "\${registry_token}" |
-  docker login "https://\${registry_host}" \
+registry_host="${CI_IMAGE%%/*}"
+registry_token="$(access_token)"
+printf '%s' "${registry_token}" |
+  docker login "https://${registry_host}" \
     --username oauth2accesstoken \
     --password-stdin
 
 mount_cache_disk() {
-  local device="/dev/disk/by-id/google-\${CACHE_DISK_DEVICE}"
+  local device="/dev/disk/by-id/google-${CACHE_DISK_DEVICE}"
   local mount_point="/buildbuddy"
 
   for _ in {1..60}; do
-    if [[ -e "\${device}" ]]; then
+    if [[ -e "${device}" ]]; then
       break
     fi
     sleep 2
   done
 
-  if [[ ! -e "\${device}" ]]; then
-    echo "Stateful cache disk device is missing: \${device}" >&2
+  if [[ ! -e "${device}" ]]; then
+    echo "Stateful cache disk device is missing: ${device}" >&2
     exit 1
   fi
 
-  if ! blkid "\${device}" >/dev/null 2>&1; then
-    mkfs.ext4 -F -m 0 "\${device}"
+  if ! blkid "${device}" >/dev/null 2>&1; then
+    mkfs.ext4 -F -m 0 "${device}"
   fi
 
-  mkdir -p "\${mount_point}"
-  if ! grep -q " \${mount_point} " /etc/fstab; then
-    uuid="\$(blkid -s UUID -o value "\${device}")"
-    printf 'UUID=%s %s ext4 discard,defaults,nofail 0 2\n' "\${uuid}" "\${mount_point}" >> /etc/fstab
+  mkdir -p "${mount_point}"
+  if ! grep -q " ${mount_point} " /etc/fstab; then
+    uuid="$(blkid -s UUID -o value "${device}")"
+    printf 'UUID=%s %s ext4 discard,defaults,nofail 0 2\n' "${uuid}" "${mount_point}" >> /etc/fstab
   fi
 
-  if ! findmnt -rn "\${mount_point}" >/dev/null 2>&1; then
-    mount "\${mount_point}"
+  if ! findmnt -rn "${mount_point}" >/dev/null 2>&1; then
+    mount "${mount_point}"
   fi
 }
 
@@ -286,47 +404,75 @@ mount_cache_disk
 mkdir -p /etc/buildbuddy /buildbuddy/remotebuilds /buildbuddy/filecache
 chmod -R a+rwX /buildbuddy
 
-cat >/etc/buildbuddy/config.yaml <<CONFIG
+# Trust the control plane's CA in addition to the public roots (Go reads
+# SSL_CERT_FILE); the executor config holds credentials, so it is root-only.
+printf '%s\n' "${control_ca}" >/etc/buildbuddy/control-ca.pem
+cat /etc/ssl/certs/ca-certificates.crt /etc/buildbuddy/control-ca.pem >/etc/buildbuddy/ca-bundle.pem
+(
+  umask 077
+  cat >/etc/buildbuddy/config.yaml <<CONFIG
 executor:
-  api_key: "\${api_key}"
-  app_target: "\${app_target}"
+  api_key: "${api_key}"
+  app_target: "${app_target}"
   root_directory: "/buildbuddy/remotebuilds/"
   local_cache_directory: "/buildbuddy/filecache/"
-  local_cache_size_bytes: \${LOCAL_CACHE_SIZE_BYTES}
+  local_cache_size_bytes: ${LOCAL_CACHE_SIZE_BYTES}
   enable_oci: true
   default_isolation_type: "oci"
-  default_image: "\${CI_IMAGE#docker://}"
+  default_image: "${CI_IMAGE}"
   container_registries:
     - hostnames:
-        - "\${registry_host}"
+        - "${registry_host}"
       username: "oauth2accesstoken"
-      password: "\${registry_token}"
+      password: "${registry_token}"
 CONFIG
+)
 
-docker pull "\${EXECUTOR_IMAGE}"
-docker pull "\${CI_IMAGE#docker://}" || true
+docker pull "${EXECUTOR_IMAGE}"
+docker pull "${CI_IMAGE}" || true
 docker rm -f buildbuddy-executor >/dev/null 2>&1 || true
 
-millicpu="\$(nproc)"
-millicpu="\$((millicpu * 1000))"
-memory_bytes="\$(awk '/MemTotal/ { printf "%.0f", \$2 * 1024 }' /proc/meminfo)"
+millicpu="$(nproc)"
+millicpu="$((millicpu * 1000))"
+memory_bytes="$(awk '/MemTotal/ { printf "%.0f", $2 * 1024 }' /proc/meminfo)"
 
 docker run -d \
   --name buildbuddy-executor \
   --restart unless-stopped \
   --privileged \
   --network host \
-  -e "MY_POOL=\${POOL}" \
-  -e "MY_NODENAME=\$(hostname)" \
-  -e "MY_HOSTNAME=\$(hostname -I | awk '{print \$1}')" \
-  -e "SYS_MILLICPU=\${millicpu}" \
-  -e "SYS_MEMORY_BYTES=\${memory_bytes}" \
+  -e "MY_POOL=${POOL}" \
+  -e "MY_NODENAME=$(hostname)" \
+  -e "MY_HOSTNAME=$(hostname -I | awk '{print $1}')" \
+  -e "SYS_MILLICPU=${millicpu}" \
+  -e "SYS_MEMORY_BYTES=${memory_bytes}" \
+  -e SSL_CERT_FILE=/etc/buildbuddy/ca-bundle.pem \
   -e PODMAN_IGNORE_CGROUPSV1_WARNING=true \
   -v /buildbuddy:/buildbuddy \
   -v /etc/buildbuddy/config.yaml:/config.yaml:ro \
-  "\${EXECUTOR_IMAGE}" \
+  -v /etc/buildbuddy/ca-bundle.pem:/etc/buildbuddy/ca-bundle.pem:ro \
+  "${EXECUTOR_IMAGE}" \
   --server_type=buildbuddy-executor
 EOF
+}
+
+# Everything the template renders; its hash names the default template.
+template_spec() {
+  printf '%s\n' \
+    "machine_type=${machine_type}" \
+    "boot_disk=${boot_disk_gb}GB:pd-ssd:debian-12" \
+    "cache_disk=${cache_disk_device}:${cache_disk_gb}GB:${cache_disk_type}" \
+    "service_account=${service_account}" \
+    "labels=${labels}"
+  render_startup_script
+}
+
+resolve_template() {
+  if [[ -n "${MEERKAT_GCP_BUILDBUDDY_TEMPLATE:-}" ]]; then
+    template="${MEERKAT_GCP_BUILDBUDDY_TEMPLATE}"
+  else
+    template="${mig}-template-$(template_spec | sha256_hex | cut -c1-12)"
+  fi
 }
 
 template_exists() {
@@ -361,20 +507,32 @@ ensure_mig_template() {
 
 ensure_template_and_mig() {
   require_gcloud
+  require_distinct_secrets
+  require_pinned_images
   ensure_service_account
-  if ! secret_exists "${api_key_secret}"; then
-    echo "error: Secret Manager secret ${api_key_secret} is missing; run sync-secrets first" >&2
+  if ! secret_exists "${api_key_secret}" || ! secret_has_version "${api_key_secret}"; then
+    echo "error: Secret Manager secret ${api_key_secret} has no version; add the self-hosted control plane's executor key to it (CI never writes it)" >&2
     exit 1
   fi
-  if ! secret_exists "${endpoint_secret}"; then
-    echo "error: Secret Manager secret ${endpoint_secret} is missing; run sync-secrets first" >&2
+  if ! secret_exists "${endpoint_secret}" || ! secret_exists "${ca_secret}"; then
+    echo "error: Secret Manager secrets ${endpoint_secret} and ${ca_secret} are missing; run sync-secrets first" >&2
     exit 1
   fi
 
-  if ! template_exists; then
-    startup_script="$(mktemp)"
-    trap 'rm -f "${startup_script}"' EXIT
-    write_startup_script "${startup_script}"
+  resolve_template
+  startup_script_file="$(mktemp)"
+  render_startup_script >"${startup_script_file}"
+  local rendered_digest problems
+  rendered_digest="$(python3 -c 'import hashlib,sys; print(hashlib.sha256(sys.stdin.read().rstrip("\n").encode()).hexdigest())' <"${startup_script_file}")"
+  if template_exists; then
+    problems="$(gcloud compute instance-templates describe "${template}" --project "${project}" --format=json |
+      template_problems "${rendered_digest}" "${service_account}" "${machine_type}")"
+    if [[ -n "${problems}" ]]; then
+      echo "error: instance template ${template} exists but differs from the rendering; templates are never reused across changes:" >&2
+      printf '%s\n' "${problems}" | sed 's/^/  - /' >&2
+      die "delete the template (or unset MEERKAT_GCP_BUILDBUDDY_TEMPLATE) and rerun"
+    fi
+  else
     gcloud compute instance-templates create "${template}" \
       --project "${project}" \
       --machine-type "${machine_type}" \
@@ -388,7 +546,7 @@ ensure_template_and_mig() {
       --service-account "${service_account}" \
       --scopes cloud-platform \
       --labels "${labels}" \
-      --metadata-from-file startup-script="${startup_script}" \
+      --metadata-from-file startup-script="${startup_script_file}" \
       --quiet
   fi
 
@@ -418,9 +576,34 @@ ensure_mig_stateful_policy() {
     --quiet >/dev/null
 }
 
+# Stopped pool instances keep the startup script of the template they were
+# made from, so a template change reaches them only when they are recreated.
+# Refuse to start any of them while that has not happened.
+refuse_stale_instances() {
+  local stale
+  stale="$(gcloud compute instance-groups managed list-instances "${mig}" \
+    --project "${project}" \
+    --zone "${zone}" \
+    --format=json |
+    python3 -c 'import json,sys
+want = sys.argv[1]
+for item in json.load(sys.stdin) or []:
+    used = (item.get("version") or {}).get("instanceTemplate") or item.get("instanceTemplate") or ""
+    if used.rstrip("/").rsplit("/", 1)[-1] != want:
+        print(str(item.get("instance", "?")).rstrip("/").rsplit("/", 1)[-1] + " (" + (used.rsplit("/", 1)[-1] or "unknown template") + ")")' \
+      "${template}")"
+  if [[ -n "${stale}" ]]; then
+    echo "error: refusing to start executors made from a template other than ${template}:" >&2
+    printf '%s\n' "${stale}" | sed 's/^/  - /' >&2
+    echo "Recreate them (delete the instances and their stateful cache disks) before scaling up; see the rebuild runbook." >&2
+    exit 1
+  fi
+}
+
 resume_pool() {
   local size="$1"
   ensure_template_and_mig
+  refuse_stale_instances
   gcloud compute instance-groups managed update "${mig}" \
     --project "${project}" \
     --zone "${zone}" \
@@ -506,7 +689,7 @@ wait_stable() {
 
 status() {
   require_gcloud
-  echo "project=${project} zone=${zone} mig=${mig} template=${template} pool=${pool} cache_disk=${cache_disk_device}:${cache_disk_gb}GB:${cache_disk_type} down_mode=${down_mode}"
+  echo "project=${project} zone=${zone} mig=${mig} template=${template:-<derived on ensure>} pool=${pool} cache_disk=${cache_disk_device}:${cache_disk_gb}GB:${cache_disk_type} down_mode=${down_mode}"
   if mig_exists; then
     gcloud compute instance-groups managed describe "${mig}" \
       --project "${project}" \

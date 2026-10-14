@@ -245,7 +245,6 @@ rust_binary(
         "//crates/meerkat:meerkat_mcp_agent_factory_build",
         "//crates/meerkat:meerkat_models_agent_factory_build",
         "//crates/meerkat:meerkat_runtime_agent_factory_build",
-        "//crates/meerkat:meerkat_session_agent_factory_build",
         "//crates/meerkat:meerkat_store_agent_factory_build",
         "//crates/meerkat:meerkat_tools_agent_factory_build",
     ] + all_crate_deps(

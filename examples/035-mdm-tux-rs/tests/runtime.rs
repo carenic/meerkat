@@ -54,13 +54,16 @@ async fn isolated_runtime(
     .await
     .unwrap();
     let factory = meerkat::AgentFactory::new(persistence.store_path().unwrap());
-    let runtime = Arc::new(meerkat_rpc::session_runtime::SessionRuntime::new(
-        factory,
-        Default::default(),
-        capacity,
-        persistence,
-        meerkat_rpc::router::NotificationSink::noop(),
-    ));
+    let runtime = Arc::new(
+        meerkat_rpc::session_runtime::SessionRuntime::new(
+            factory,
+            Default::default(),
+            capacity,
+            persistence,
+            meerkat_rpc::router::NotificationSink::noop(),
+        )
+        .unwrap(),
+    );
     runtime.set_realm_context(
         Some(manifest.realm),
         None,

@@ -317,7 +317,11 @@ impl MeerkatMachine {
             .await?;
 
         let resolved = host
-            .resolve_target_session_llm_identity(&request, &hydrated.current_identity)
+            .resolve_target_session_llm_identity_for_session(
+                session_id,
+                &request,
+                &hydrated.current_identity,
+            )
             .await?;
 
         let visibility_plan = Self::propose_reconfigured_visibility_plan(

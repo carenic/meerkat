@@ -1,0 +1,1 @@
+../../../../../.claude/skills/meerkat-platform/references/hooks_models_model_operations.md

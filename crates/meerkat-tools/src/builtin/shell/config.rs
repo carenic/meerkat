@@ -277,14 +277,16 @@ impl ShellConfig {
     /// Project the config-layer shell vocabulary into a tool config.
     ///
     /// This is the single seam through which a loaded `[shell]` section
-    /// (program, security mode, security patterns) reaches the shell tool;
-    /// [`ShellConfig::default`] only sees the embedded template defaults.
-    /// `timeout_secs` is deliberately not mapped here: the per-call default
-    /// timeout is owned by `ToolTimeoutPolicy` / `config.tools`, and mapping
-    /// it again would create a second owner.
+    /// (program, timeout, security mode, security patterns) reaches the shell
+    /// tool; [`ShellConfig::default`] only sees the embedded template
+    /// defaults. The default command timeout is read through
+    /// `ToolTimeoutPolicy`, its one owner, never copied from `timeout_secs`
+    /// directly.
     pub fn from_defaults(defaults: &ShellDefaults, project_root: PathBuf) -> Self {
         Self {
             enabled: true,
+            default_timeout_secs: crate::timeout::ToolTimeoutPolicy::from_shell_defaults(defaults)
+                .default_timeout_secs(),
             shell: defaults.program.clone(),
             security_mode: defaults.security_mode,
             security_patterns: defaults.security_patterns.clone(),
@@ -670,8 +672,8 @@ mod tests {
     // ==================== from_defaults Projection Test ====================
 
     #[test]
-    fn from_defaults_projects_config_shell_vocabulary_without_timeout() {
-        let defaults = ShellDefaults {
+    fn from_defaults_projects_config_shell_vocabulary() {
+        let mut defaults = ShellDefaults {
             program: "sh".to_string(),
             timeout_secs: 999,
             security_mode: SecurityMode::AllowList,
@@ -699,9 +701,18 @@ mod tests {
         );
         assert_eq!(config.project_root, PathBuf::from("/tmp/project"));
         assert_eq!(
+            config.default_timeout_secs, 999,
+            "configured timeout must reach the shell tool"
+        );
+
+        // A zero timeout would refuse every call that does not request one;
+        // it keeps the template default.
+        defaults.timeout_secs = 0;
+        let config = ShellConfig::from_defaults(&defaults, PathBuf::from("/tmp/project"));
+        assert_eq!(
             config.default_timeout_secs,
-            crate::timeout::ToolTimeoutPolicy::default().default_timeout_secs(),
-            "timeout stays owned by ToolTimeoutPolicy, not the [shell] section"
+            ShellDefaults::default().timeout_secs,
+            "a zero timeout keeps the template default"
         );
     }
 

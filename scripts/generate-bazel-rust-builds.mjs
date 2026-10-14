@@ -154,37 +154,156 @@ for (const pkg of localPackages.values()) {
   }
 }
 
-let changed = true;
-while (changed) {
-  changed = false;
-  for (const pkg of localPackages.values()) {
-    for (const dep of pkg.dependencies) {
-      if (dep.source !== null) continue;
-      const local = byName.get(dep.name);
-      if (!local) continue;
-      for (const feature of dep.features ?? []) {
-        changed = addFeature(local, feature) || changed;
-      }
-      if (dep.uses_default_features) {
-        for (const feature of defaultFeatures(local)) {
-          changed = addFeature(local, feature) || changed;
+// Close a per-package feature union over every workspace dependency edge
+// (normal, build and dev) and every feature expansion, as one Bazel target
+// per crate must carry the union of what all its consumers enable.
+function closeFeatureUnion(features, add) {
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const pkg of localPackages.values()) {
+      for (const dep of pkg.dependencies) {
+        if (dep.source !== null) continue;
+        const local = byName.get(dep.name);
+        if (!local) continue;
+        for (const feature of dep.features ?? []) {
+          changed = add(local, feature) || changed;
+        }
+        if (dep.uses_default_features) {
+          for (const feature of defaultFeatures(local)) {
+            changed = add(local, feature) || changed;
+          }
         }
       }
-    }
 
-    for (const feature of [...activeFeatures.get(pkg.id)]) {
-      for (const expansion of pkg.features?.[feature] ?? []) {
-        const [depName, depFeature] = expansion.split("/", 2);
-        const local = depFeature ? localPackageForDependency(pkg, depName) : null;
-        if (local) {
-          changed = addFeature(local, depFeature) || changed;
-        } else {
-          changed = addFeature(pkg, expansion) || changed;
+      for (const feature of [...features.get(pkg.id)]) {
+        for (const expansion of pkg.features?.[feature] ?? []) {
+          const [depName, depFeature] = expansion.split("/", 2);
+          const local = depFeature ? localPackageForDependency(pkg, depName) : null;
+          if (local) {
+            changed = add(local, depFeature) || changed;
+          } else {
+            changed = add(pkg, expansion) || changed;
+          }
         }
       }
     }
   }
 }
+
+closeFeatureUnion(activeFeatures, addFeature);
+
+// The one list of test-only Cargo features: fixture hooks, fault seams,
+// oracles and harnesses. A feature string is non-shipping when it names one
+// of them or forwards one to a dependency (`dep/feature`, `dep?/feature`).
+const NON_SHIPPING_FEATURES_FILE = "scripts/non-shipping-features.json";
+const nonShippingFeatures = new Set(
+  JSON.parse(readFileSync(resolve(root, NON_SHIPPING_FEATURES_FILE), "utf8")).features ?? [],
+);
+
+function isNonShippingFeature(feature) {
+  const slash = feature.indexOf("/");
+  return nonShippingFeatures.has(slash === -1 ? feature : feature.slice(slash + 1));
+}
+
+function isPublishable(pkg) {
+  return pkg.publish === null || pkg.publish === undefined || pkg.publish.length > 0;
+}
+
+{
+  const declared = new Set(
+    [...localPackages.values()].flatMap((pkg) => Object.keys(pkg.features ?? {})),
+  );
+  const unknown = [...nonShippingFeatures].filter((feature) => !declared.has(feature));
+  if (nonShippingFeatures.size === 0 || unknown.length) {
+    throw new Error(
+      `${NON_SHIPPING_FEATURES_FILE} must list features some workspace crate declares; `
+        + `unknown: ${unknown.join(", ") || "(empty list)"}`,
+    );
+  }
+  // A new test-only feature must not ship by missing the list: a feature whose
+  // name says it is test code is listed, or renamed.
+  const testNamed = /(^|-)(tests?|fixtures?|harness|oracle|mocks?|fakes?)(-|$)/;
+  const unlisted = [...declared].filter((feature) => testNamed.test(feature) && !nonShippingFeatures.has(feature));
+  if (unlisted.length) {
+    throw new Error(
+      `features named as test code are missing from ${NON_SHIPPING_FEATURES_FILE}: ${unlisted.sort().join(", ")}`,
+    );
+  }
+  // Cargo's own release builds (`cargo build -p <surface> --release`) never
+  // activate dev-dependencies, so a published crate reaches a non-shipping
+  // feature only through a normal or build dependency or through one of its
+  // ordinary features forwarding one. Either would also ship it from Cargo.
+  const violations = [];
+  for (const pkg of localPackages.values()) {
+    if (!isPublishable(pkg)) continue;
+    for (const [feature, expansions] of Object.entries(pkg.features ?? {})) {
+      if (isNonShippingFeature(feature)) continue;
+      for (const expansion of expansions) {
+        if (isNonShippingFeature(expansion)) {
+          violations.push(`${pkg.name} feature ${q(feature)} forwards ${q(expansion)}`);
+        }
+      }
+    }
+    for (const dep of pkg.dependencies) {
+      if (dep.kind === "dev") continue;
+      for (const feature of dep.features ?? []) {
+        if (isNonShippingFeature(feature)) {
+          violations.push(
+            `${pkg.name} enables ${dep.name}/${feature} through a ${dep.kind ?? "normal"} dependency`,
+          );
+        }
+      }
+    }
+  }
+  if (violations.length) {
+    throw new Error(
+      `published crates must reach non-shipping features only through [dev-dependencies]:\n  `
+        + violations.join("\n  "),
+    );
+  }
+}
+
+// Production feature union: the same closure without the non-shipping
+// features, so nothing they forward is enabled unless an ordinary feature
+// enables it too. Production rust_library and rust_binary targets build with
+// it in the release configuration (see productionCrateFeaturesExpr); the
+// default configuration, which the test lanes build, keeps the full union.
+const productionActiveFeatures = new Map(
+  [...localPackages.values()].map((pkg) => [pkg.id, new Set()]),
+);
+
+function addProductionFeature(pkg, feature) {
+  if (!feature || feature.startsWith("dep:") || isNonShippingFeature(feature)) return false;
+  const features = productionActiveFeatures.get(pkg.id);
+  const previousSize = features.size;
+  features.add(feature);
+  return features.size !== previousSize;
+}
+
+for (const pkg of localPackages.values()) {
+  for (const feature of defaultFeatures(pkg)) addProductionFeature(pkg, feature);
+  for (const feature of requiredTargetFeatures.get(pkg.id)) addProductionFeature(pkg, feature);
+}
+closeFeatureUnion(productionActiveFeatures, addProductionFeature);
+
+// Packages whose normal dependencies enable a non-shipping feature on a
+// workspace crate (the integration-test and DSL-test crates; published crates
+// cannot, see above). They exist only for tests and never reach a release
+// binary (scripts/check-bazel-release-features.py), so their targets keep one
+// feature set in every configuration.
+const testOnlyConsumerKeys = new Set(
+  [...localPackages.values()]
+    .filter((pkg) =>
+      pkg.dependencies.some((dep) =>
+        dep.source === null
+        && dep.kind !== "dev"
+        && byName.has(dep.name)
+        && (dep.features ?? []).some(isNonShippingFeature)
+      )
+    )
+    .map((pkg) => packageKey(pkg)),
+);
 
 function targetRule(target) {
   if (target.kind.includes("proc-macro")) return "rust_proc_macro";
@@ -262,8 +381,8 @@ function localDeps(
   return [...new Set(labels)].sort();
 }
 
-function crateFeaturesFor(key, pkg, extra = []) {
-  const features = new Set(activeFeatures.get(pkg.id));
+function crateFeatureSet(key, base, extra = []) {
+  const features = new Set(base);
   if (key === "meerkat-mcp-server") {
     features.add("mob");
   }
@@ -276,30 +395,47 @@ function crateFeaturesFor(key, pkg, extra = []) {
   return [...features].sort();
 }
 
-function publicCoreCrateFeatures(key, pkg) {
-  const features = new Set(crateFeaturesFor(key, pkg));
+// The full feature union: what the crate's tests and its *_test_support
+// variants build with.
+function crateFeaturesFor(key, pkg, extra = []) {
+  return crateFeatureSet(key, activeFeatures.get(pkg.id), extra);
+}
+
+// The union without the non-shipping features: what a release build compiles.
+function productionCrateFeaturesFor(key, pkg) {
+  return crateFeatureSet(key, productionActiveFeatures.get(pkg.id));
+}
+
+function publicCoreCrateFeatures(key, features) {
+  const result = new Set(features);
   if (key === "meerkat-core") {
-    features.delete("standalone-agent-builder");
-    features.delete("__meerkat-facade-agent-factory-build");
+    result.delete("standalone-agent-builder");
+    result.delete("__meerkat-facade-agent-factory-build");
   }
-  return [...features].sort();
+  return [...result].sort();
 }
 
 // Crates whose production rust_library targets strip the `test-support`
-// feature. Cargo enables it only through dev-dependencies, so a release build
-// never compiles its test-only hooks; the unified feature set here would
-// otherwise compile them into every production target. Their generated test
-// variants keep the full feature set (see `testVariantCrateFeaturesFor`).
+// feature in every configuration. Cargo enables it only through
+// dev-dependencies, so a release build never compiles its test-only hooks;
+// the unified feature set here would otherwise compile them into every
+// production target. Their generated test variants keep the full feature set
+// (see `testVariantCrateFeaturesFor`).
 const productionTestSupportStrippedKeys = new Set(["meerkat-runtime", "meerkat-mcp", "meerkat-mob"]);
 
+// A production rust_library's features in the default configuration, which
+// the test lanes build and the tests outside the variant closure link.
 function rustLibraryCrateFeaturesFor(key, pkg) {
-  const features = new Set(
-    key === "meerkat-core" ? publicCoreCrateFeatures(key, pkg) : crateFeaturesFor(key, pkg),
-  );
+  const features = new Set(publicCoreCrateFeatures(key, crateFeaturesFor(key, pkg)));
   if (productionTestSupportStrippedKeys.has(key)) {
     features.delete("test-support");
   }
   return [...features].sort();
+}
+
+// Its features in the release configuration: no non-shipping feature.
+function releaseRustLibraryCrateFeaturesFor(key, pkg) {
+  return publicCoreCrateFeatures(key, productionCrateFeaturesFor(key, pkg));
 }
 
 // Features of a generated `_test_support` / `_with_runtime_test_support`
@@ -309,6 +445,32 @@ function testVariantCrateFeaturesFor(key, pkg) {
   return testSupportSeedKeys.has(key) || productionTestSupportStrippedKeys.has(key)
     ? crateFeaturesFor(key, pkg)
     : rustLibraryCrateFeaturesFor(key, pkg);
+}
+
+// Release builds of the shipped binaries pass
+// --define=meerkat_release_build=1 (scripts/buildbuddy-bazel-poc
+// release-build-*), which selects this config_setting.
+const RELEASE_BUILD_SETTING = "//tools/bazel:release_build";
+
+// crate_features of a production rust_library or rust_binary: the default
+// configuration keeps the set the test lanes have always built with, and the
+// release configuration drops every non-shipping feature and what only they
+// forward. A test-only consumer never ships and keeps one set.
+function productionCrateFeaturesExpr(key, defaultFeatures, releaseFeatures) {
+  const defaults = new Set(defaultFeatures);
+  const extra = releaseFeatures.filter((feature) => !defaults.has(feature));
+  if (extra.length) {
+    throw new Error(`${key}: release features ${extra.join(", ")} are missing from the default configuration`);
+  }
+  if (testOnlyConsumerKeys.has(key) || releaseFeatures.length === defaultFeatures.length) {
+    return listExpr(defaultFeatures);
+  }
+  return [
+    `select({`,
+    `        ${q(RELEASE_BUILD_SETTING)}: ${listExpr(releaseFeatures, 12)},`,
+    `        "//conditions:default": ${listExpr(defaultFeatures, 12)},`,
+    `    })`,
+  ].join("\n");
 }
 
 const runtimePackage = byName.get("meerkat-runtime") ?? null;
@@ -1510,8 +1672,25 @@ function writeRootBuild(fastTestLabels, e2eSystemTestLabels, surfaceFeatureMatri
     `        ".claude/skills/meerkat-cli-reference/SKILL.md",`,
     `        ".claude/skills/meerkat-platform/SKILL.md",`,
     `        ".claude/skills/meerkat-platform/references/api_reference.md",`,
+    `        ".claude/skills/meerkat-platform/references/hooks_models_hooks.md",`,
+    `        ".claude/skills/meerkat-platform/references/hooks_models_model_operations.md",`,
+    `        ".claude/skills/meerkat-platform/references/hooks_models_turn_control.md",`,
+    `        ".claude/skills/meerkat-platform/references/live_comms_mobs_comms.md",`,
+    `        ".claude/skills/meerkat-platform/references/live_comms_mobs_live.md",`,
+    `        ".claude/skills/meerkat-platform/references/live_comms_mobs_mobs.md",`,
+    `        ".claude/skills/meerkat-platform/references/mcp_tools_skills_mcp.md",`,
+    `        ".claude/skills/meerkat-platform/references/mcp_tools_skills_skills.md",`,
+    `        ".claude/skills/meerkat-platform/references/mcp_tools_skills_tools.md",`,
     `        ".claude/skills/meerkat-platform/references/migration_0_5.md",`,
+    `        ".claude/skills/meerkat-platform/references/migration_0_9.md",`,
     `        ".claude/skills/meerkat-platform/references/mobs.md",`,
+    `        ".claude/skills/meerkat-platform/references/providers_and_auth_credentials.md",`,
+    `        ".claude/skills/meerkat-platform/references/providers_and_auth_models.md",`,
+    `        ".claude/skills/meerkat-platform/references/security.md",`,
+    `        ".claude/skills/meerkat-platform/references/security_governance.md",`,
+    `        ".claude/skills/meerkat-platform/references/sessions_runtime_surfaces_api_changes.md",`,
+    `        ".claude/skills/meerkat-platform/references/sessions_runtime_surfaces_sessions.md",`,
+    `        ".claude/skills/meerkat-platform/references/sessions_runtime_surfaces_storage_config.md",`,
     `    ],`,
     `    visibility = ["//visibility:public"],`,
     `)`,
@@ -1982,14 +2161,19 @@ for (const pkg of localPackages.values()) {
     const targetCrateFeatures = rule === "rust_library"
       ? rustLibraryCrateFeaturesFor(key, pkg)
       : crateFeaturesFor(key, pkg);
+    const crateFeaturesExpr = rule === "rust_library"
+      ? productionCrateFeaturesExpr(key, targetCrateFeatures, releaseRustLibraryCrateFeaturesFor(key, pkg))
+      : rule === "rust_binary"
+      ? productionCrateFeaturesExpr(key, targetCrateFeatures, productionCrateFeaturesFor(key, pkg))
+      : listExpr(targetCrateFeatures);
     const optionalExternal = optionalExternalDeps(pkg, targetCrateFeatures);
     const selfLibraryLabel = packageLabel(pkg);
+    // A binary links its own library and normal dependencies only: Cargo never
+    // gives a bin target its package's dev-dependencies.
     const rawDeps = isTest
       ? [...new Set([...(libOrMacro ? [selfLibraryLabel] : []), ...localDeps(pkg, false, true)])].sort()
       : target.kind.includes("bin") && libOrMacro
-      ? [...new Set([selfLibraryLabel, ...localDeps(pkg, false, true)])].sort()
-      : target.kind.includes("bin")
-      ? localDeps(pkg, false, true)
+      ? [...new Set([selfLibraryLabel, ...localDeps(pkg, false)])].sort()
       : localDeps(pkg, false);
     const deps = shouldRewriteAgentFactoryDepsFor(key, isTest)
       ? rewriteAgentFactoryDeps(rawDeps)
@@ -2054,7 +2238,7 @@ for (const pkg of localPackages.values()) {
       `    aliases = ${aliasesExpr},`,
       `    crate_name = ${q(crateName(target.name))},`,
       `    crate_root = ${q(relative(dir, target.src_path))},`,
-      `    crate_features = ${listExpr(targetCrateFeatures)},`,
+      `    crate_features = ${crateFeaturesExpr},`,
       `    edition = "2024",`,
       `    compile_data = ${compileDataExpr},`,
       `    srcs = ${srcsExpr},`,

@@ -515,7 +515,8 @@ pub struct DeclaredToolRestriction {
     /// vocabularies and [`Self::vocabulary`]. A known name the build did not
     /// mount is inert; any other name fails the build as `DeclaredToolUnknown`.
     /// The execution gate matches by name, so a denied name refuses whichever
-    /// mounted tool carries it while the tool stays listed.
+    /// mounted tool carries it, and the same name leaves the session's visible
+    /// tool scope ([`crate::ToolExecutionPolicy::static_visibility_filter`]).
     pub deny: ToolNameSet,
     /// The tool names the declaring configuration owns, by source: the mob
     /// operator and agent mob tools, the exposed names of the MCP servers it

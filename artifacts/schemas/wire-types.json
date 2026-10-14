@@ -88034,6 +88034,16 @@
           "transport_error"
         ],
         "type": "string"
+      },
+      "CommsSendRequiredAction": {
+        "description": "The caller's next safe move after an ambiguous `comms/send`.",
+        "oneOf": [
+          {
+            "const": "reconcile",
+            "description": "Reconcile against durable work truth by envelope id before any new\nattempt.",
+            "type": "string"
+          }
+        ]
       }
     },
     "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -88134,6 +88144,36 @@
           "peer",
           "envelope_id",
           "message"
+        ],
+        "type": "object"
+      },
+      {
+        "description": "The delivery outcome is unknown: the envelope may already be\ndelivered, so this is not a failed send. Reconcile against durable\nwork truth by `envelope_id` before any new attempt; a retry can\nduplicate the delivery.",
+        "properties": {
+          "code": {
+            "const": "send_ambiguous",
+            "type": "string"
+          },
+          "envelope_id": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "required_action": {
+            "$ref": "#/$defs/CommsSendRequiredAction"
+          },
+          "retry_safe": {
+            "description": "Always `false`: a blind retry can duplicate the delivery.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "code",
+          "envelope_id",
+          "message",
+          "retry_safe",
+          "required_action"
         ],
         "type": "object"
       },

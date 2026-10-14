@@ -165,10 +165,11 @@ Provider tags also carry provider cache policy: OpenAI can override Responses
 `prompt_cache_retention`. Factory-built public OpenAI API GPT-5.6 sessions default to
 `prompt_cache_options: {"mode":"explicit","ttl":"30m"}` plus
 `prompt_cache_key: "meerkat:profile:openai:<model>"`; a caller-supplied key
-wins. These defaults are not applied automatically to the private ChatGPT
-or Azure OpenAI backend wires. In `explicit` mode Meerkat authors
-append-monotone breakpoints at deterministic message boundaries for Responses
-and Chat Completions. Set `prompt_cache_enabled: false` for a durable opt-out; it emits
+wins. These cache fields, defaults or explicit, reach only the public OpenAI
+API: requests through the private ChatGPT backend, Azure OpenAI, GitHub
+Copilot or a self-hosted OpenAI-compatible server carry none of them. In
+`explicit` mode Meerkat authors append-monotone breakpoints at deterministic
+message boundaries. Set `prompt_cache_enabled: false` for a durable opt-out; it emits
 explicit-only mode without a breakpoint and incurs no cache-write charges.
 
 The default key is per model, not per session: every session on the same

@@ -213,7 +213,9 @@ rkat run --model "$COPILOT_MODEL" \
 ```
 
 The generated routes are `global:copilot_openai`,
-`global:copilot_anthropic`, and `global:copilot_gemini`. They remain ordinary
+`global:copilot_anthropic`, and `global:copilot_gemini`; the Gemini route's
+`default_model` is `gemini-3.8-flash` rather than the API-key Gemini default.
+They remain ordinary
 OpenAI, Anthropic, and Gemini provider identities; `credential_account =
 "github_copilot"` only makes their GitHub token, derived Copilot token cache,
 AuthMachine lifecycle, status, and logout shared. Meerkat queries the signed-in
