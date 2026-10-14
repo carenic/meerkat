@@ -350,8 +350,10 @@ surface, not the old live-adapter/docs-refresh snapshot:
     EOF (with `--tcp`, connections drain first).
 - Default hosted text selections are OpenAI `gpt-6-astra` (backend availability
   remains independent; Azure, Copilot, and custom support are not implied),
-  Anthropic `claude-opus-5-5`, and Gemini `gemini-3.8-flash` (default and
-  recommended; `gemini-3.5-flash` remains supported).
+  Anthropic `claude-opus-5-5`, and Gemini `gemini-4-argon` (default; paid
+  Gemini API tiers only; `gemini-3.8-flash` is the recommended Flash model,
+  the free-tier choice, and the `rkat auth login google` / Copilot Gemini route
+  default).
 - WorkGraph is available through agent `workgraph_*` tools plus host
   observability (`workgraph/list`, `ready`, `snapshot`, `events`,
   `goal/status`, `attention/list`, REST and SDK equivalents). CLI and trusted
@@ -451,7 +453,7 @@ surface, not the old live-adapter/docs-refresh snapshot:
   Treat these as "session intact, not runnable yet", not as service faults.
 - `rkat run --output html` / `--html` writes standalone HTML artifacts.
 - Image generation uses `generate_image` with OpenAI `gpt-image-2` and Gemini
-  `gemini-3.1-flash-image-preview` as provider defaults.
+  `gemini-nano-banana-2.1` as provider defaults.
 - Mob host surfaces include batch wiring, helper/fork/respawn/cancel/wait
   operations, profile CRUD when a profile store is present, store-issued
   resume verdicts, and certified bounded helper results for SDK consumers.

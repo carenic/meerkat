@@ -105,7 +105,8 @@ JSON-RPC `turn/start` (SDK `Session.turn`) accepts:
   messages. From the second turn on it sits mid-conversation, which only
   models with `supports_mid_conversation_system_messages` accept:
   claude-fable-5-1, claude-fable-5, claude-opus-5-5, claude-opus-5,
-  claude-opus-4-8, claude-sonnet-5-5, and OpenAI API models except
+  claude-opus-4-8, claude-sonnet-5-5, claude-haiku-5-5 (0.9.1), and OpenAI
+  API models except
   `gpt-live-1` and `gpt-live-1-codex`. Gemini, other Anthropic models and the
   ChatGPT-account backend refuse the request as a non-retryable invalid
   request (`InvalidInputShape`); history is not rewritten. On create, `system_prompt` is a policy: omit or `null` to inherit,

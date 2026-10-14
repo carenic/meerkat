@@ -210,7 +210,7 @@ Defaults:
 
 - `--tools safe`
 - default model is OpenAI `gpt-6-astra` unless `-m`/`-p`, `--auth-binding` (the binding's `default_model`), `[agent] model` or `[models] <provider>` selects another; an Anthropic or Gemini env key alone does not change it. Catalog support does not imply access through Azure, Copilot, or custom backends
-- current default/recommended Gemini model is `gemini-3.8-flash`; `gemini-3.5-flash` remains a supported alternative
+- current default Gemini model is `gemini-4-argon` (paid Gemini API tiers only); `gemini-3.8-flash` is the recommended Flash model and the free-tier choice (`--model gemini-3.8-flash` or `[models] gemini = "gemini-3.8-flash"`), and `rkat auth login google` and Copilot Gemini route bindings start on it
 - CLI realm state is project-local by default: `<project-root>/.rkat/realms/<ws-...>/`, where the project root is the nearest ancestor containing `.rkat` and falls back to the context root outside a project; that head realm's config composes over its parent chain and the HOME-rooted `global` doc (`~/.rkat/config.toml`)
 - `--verbose` also prints the active realm root
 - provider-native web search is on for models that support it; `--no-web-search` turns it off

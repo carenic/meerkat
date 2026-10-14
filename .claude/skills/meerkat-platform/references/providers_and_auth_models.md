@@ -73,14 +73,14 @@ Rules:
 
 ## Default models
 
-| Scope | 0.9.0 default |
+| Scope | 0.9.1 default |
 |---|---|
 | No hints at all (global default) | `gpt-6-astra` |
 | Anthropic | `claude-opus-5-5` |
 | OpenAI | `gpt-6-astra` |
-| Gemini | `gemini-3.8-flash` |
+| Gemini | `gemini-4-argon` (paid Gemini API tiers; on the free tier select `gemini-3.8-flash`, for example `[models] gemini = "gemini-3.8-flash"`) |
 | Self-hosted | `[self_hosted] default_model`, or the only configured alias |
-| Image generation (OpenAI / Gemini) | `gpt-image-2` / `gemini-3.1-flash-image-preview` |
+| Image generation (OpenAI / Gemini) | `gpt-image-2` / `gemini-nano-banana-2.1` |
 
 Change defaults:
 
@@ -126,6 +126,7 @@ recommended, S = supported):
 | `claude-sonnet-5-5` | R | 1M / 128K | adaptive or `between_tools` | low..max |
 | `claude-sonnet-5` | S | 1M / 128K | adaptive only | low..max |
 | `claude-sonnet-4-6` | R | 1M / 64K | adaptive or enabled (budget) | low, medium, high, max |
+| `claude-haiku-5-5` (0.9.1) | R | 1M / 128K | adaptive only | low..max |
 | `claude-haiku-4-5`, `claude-haiku-4-5-20251001` | R | 200K / 64K | enabled (budget) | - |
 | `claude-sonnet-4-5` | S | 200K / 64K | enabled (budget) | - |
 | `claude-opus-4-5` | S | 200K / 64K | enabled (budget) | low, medium, high |
@@ -145,8 +146,16 @@ recommended, S = supported):
 | `gpt-live-1-codex` (experimental) | S | not published | - |
 
 Gemini (all 1,048,576 / 65,536 tokens, thinking via `thinking_level`):
-`gemini-3.8-flash` (default, R), then `gemini-3.7-flash`, `gemini-3.5-flash`,
-`gemini-3.1-pro-preview` and `gemini-3.1-flash-lite-preview` (S).
+`gemini-4-argon` (default, R; paid Gemini API tiers only; levels `low`,
+`medium`, `high`, default `medium`), `gemini-3.8-flash` (R; the recommended
+Flash model, also on the free tier), then `gemini-3.7-flash`,
+`gemini-3.6-flash`, `gemini-3.5-flash`, `gemini-3.5-flash-lite`,
+`gemini-3.1-pro-preview`, `gemini-3.1-flash-lite` and
+`gemini-3.1-flash-lite-preview` (S). `gemini-4-argon`, `gemini-3.8-flash`,
+`gemini-3.7-flash` and `gemini-3.1-pro-preview` accept only `low`, `medium`
+and `high` (Google refuses `minimal` for them); the other rows also accept
+`minimal`, which is the default on `gemini-3.5-flash-lite` and the 3.1
+Flash-Lite rows.
 
 Custom hosted models (an API provider serves an id the catalog lacks):
 
@@ -185,13 +194,15 @@ Capability flags come from the catalog row, never from the model name:
 - Forced tool choice (`required` or a named tool) is refused locally on
   `claude-opus-5-5` and `claude-sonnet-5-5`
   (`ModelDoesNotSupportForcedToolChoice`).
-- Sampling: the Claude 5 family, Claude Opus 4.8/4.7, all GPT-5.x and GPT-6
-  rows, `gemini-3.8-flash` and `gemini-3.7-flash` take no `temperature`,
-  `top_p` or `top_k` (`supports_temperature: false`). The Anthropic and
+- Sampling: the Claude 5 family (including `claude-haiku-5-5`), Claude Opus
+  4.8/4.7, all GPT-5.x and GPT-6 rows, `gemini-4-argon`, `gemini-3.8-flash`,
+  `gemini-3.7-flash`, `gemini-3.6-flash` and `gemini-3.5-flash-lite` take no
+  `temperature`, `top_p` or `top_k` (`supports_temperature: false`). The Anthropic and
   OpenAI clients drop a generic `temperature` for them.
 - Default per-call timeout (catalog `call_timeout_secs`): 300 s for Claude
-  Opus and Fable rows, 120 s for Sonnet rows and the Gemini Flash rows, 60 s
-  for Haiku, 600 s for OpenAI rows and `gemini-3.1-pro-preview`, 7200 s for
+  Opus and Fable rows, 120 s for Sonnet rows, `claude-haiku-5-5` and the
+  Gemini Flash and Flash-Lite rows, 60 s for Haiku 4.5, 600 s for OpenAI rows
+  and `gemini-3.1-pro-preview`, 900 s for `gemini-4-argon`, 7200 s for
   `gpt-5.5-pro`. Custom and self-hosted entries set their own.
 
 Thinking and effort are typed per model (tables above); `between_tools` is
@@ -239,7 +250,9 @@ Rust `AgentBuildConfig.provider_params`. A realm-level
   forwarded verbatim.
 - Gemini (`"provider": "gemini"`): `thinking` (`include_thoughts`,
   `thinking_level`, `thinking_budget`), `thinking_level` (`minimal`, `low`,
-  `medium`, `high`), `thinking_budget`, `top_k`, `top_p`,
+  `medium`, `high`; each model's `params_schema` lists the levels it accepts:
+  `gemini-4-argon`, `gemini-3.8-flash`, `gemini-3.7-flash` and
+  `gemini-3.1-pro-preview` refuse `minimal`), `thinking_budget`, `top_k`, `top_p`,
   `cached_content_name`.
 
 ```bash
@@ -307,8 +320,9 @@ run with `rkat run --no-web-search`, or in config with
   deprecated since 0.8.38; use `gpt-live-1`.
 - Image generation (`generate_image` builtin) models: OpenAI `gpt-image-2`
   (default), `gpt-image-1`, `dall-e-3`, `dall-e-2`; Gemini
-  `gemini-3.1-flash-image-preview` (default), `gemini-3-pro-image-preview`,
-  `gemini-2.5-flash-image`.
+  `gemini-nano-banana-2.1` (default since 0.9.1),
+  `gemini-3.1-flash-image-preview` (the 0.9.0 default; select it by model to
+  keep it), `gemini-3-pro-image-preview`, `gemini-2.5-flash-image`.
 
 ## Self-hosted and OpenAI-compatible endpoints
 
