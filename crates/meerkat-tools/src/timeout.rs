@@ -11,9 +11,11 @@
 //! Each hardcoded "30 seconds" independently, so a change in one place silently
 //! diverged from the others. [`ToolTimeoutPolicy`] collapses this into one typed
 //! authority: the dispatcher and the shell config both *read* their default from
-//! the policy rather than each owning a literal. The policy seeds itself from the
-//! single canonical config-layer default ([`ShellDefaults::timeout_secs`]), so
-//! there is exactly one source value flowing to both enforcement points.
+//! the policy rather than each owning a literal. The policy is derived from the
+//! single canonical config-layer value ([`ShellDefaults::timeout_secs`]): the
+//! embedded template's for `ToolTimeoutPolicy::default()`, a loaded config's
+//! `[shell]` section's for [`ToolTimeoutPolicy::from_shell_defaults`]. A
+//! configured timeout reaches an enforcement point only through the policy.
 
 use std::time::Duration;
 
@@ -35,6 +37,18 @@ impl ToolTimeoutPolicy {
         Self { default_timeout }
     }
 
+    /// The policy a config's `[shell]` section sets: its `timeout_secs`, or
+    /// the embedded template's when that is 0. A zero timeout would fail every
+    /// call that does not request its own, and releases through 0.9.0 ignored
+    /// the key, so a document may still carry one.
+    pub fn from_shell_defaults(defaults: &ShellDefaults) -> Self {
+        let timeout_secs = match defaults.timeout_secs {
+            0 => ShellDefaults::default().timeout_secs,
+            configured => configured,
+        };
+        Self::new(Duration::from_secs(timeout_secs))
+    }
+
     /// The default per-call timeout enforced when a tool call does not request
     /// its own.
     pub const fn default_timeout(self) -> Duration {
@@ -53,9 +67,7 @@ impl Default for ToolTimeoutPolicy {
     /// Seed the policy from the single canonical config-layer default so that
     /// the dispatcher and shell call sites cannot diverge.
     fn default() -> Self {
-        Self {
-            default_timeout: Duration::from_secs(ShellDefaults::default().timeout_secs),
-        }
+        Self::from_shell_defaults(&ShellDefaults::default())
     }
 }
 

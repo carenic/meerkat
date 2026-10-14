@@ -882,7 +882,7 @@ Tool execution has layered deadlines; the narrowest applicable layer wins.
 
 | Layer | Default/current contract | Meaning |
 |---|---:|---|
-| Foreground shell command | 30 seconds | Shell-internal command deadline |
+| Foreground shell command | 30 seconds (`[shell] timeout_secs`) | Shell-internal command deadline |
 | SDK/builder `ToolDispatcher` | 30 seconds | Enforced dispatcher-layer deadline when this wrapper is composed |
 | Schedule occurrence lease | 60 seconds | Scheduling/redelivery ownership lease; not a long-job execution deadline |
 | Normal Meerkat tool batch | 600 seconds | Agent-loop outer deadline; per-tool overrides may narrow it |
@@ -894,7 +894,8 @@ Tool execution has layered deadlines; the narrowest applicable layer wins.
 Changing the normal Meerkat tool timeout cannot extend a narrower shell,
 SDK/builder `ToolDispatcher`, or Meta callback deadline. The foreground shell
 and dispatcher deadlines are distinct enforced layers, even though both
-defaults currently come from `ToolTimeoutPolicy`. Background shell submission
+defaults come from `ToolTimeoutPolicy`; a config's `[shell] timeout_secs` sets
+the shell's. Background shell submission
 returns within the normal tool call, but the spawned command keeps its own shell
 timeout. The command runs under one fenced non-resumable attempt; terminal state
 is committed before runtime notification delivery.
@@ -905,7 +906,7 @@ Shell behavior is controlled by `ShellConfig`:
 | Config Field | Type | Default | Description |
 |-------------|------|---------|-------------|
 | `enabled` | `bool` | `false` | Master switch for shell tools |
-| `default_timeout_secs` | `u64` | `30` | Default command timeout |
+| `default_timeout_secs` | `u64` | `30` | Default command timeout. Set with `[shell] timeout_secs`. |
 | `restrict_to_project` | `bool` | `true` | Restrict working dirs to project root |
 | `shell` | `String` | `"nu"` | Shell binary name (Nushell by default; falls back to bash/zsh/sh) |
 | `shell_path` | `PathBuf?` | `None` | Explicit shell binary path |

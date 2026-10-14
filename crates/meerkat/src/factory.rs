@@ -20330,6 +20330,67 @@ mod tests {
         );
     }
 
+    /// The loaded config's `[shell] timeout_secs` is the composed shell tool's
+    /// default command timeout: a command that outlives it is terminated,
+    /// where the template default (30 s) would let it finish.
+    #[cfg(all(unix, not(target_arch = "wasm32")))]
+    #[tokio::test]
+    async fn factory_shell_tool_honors_configured_shell_timeout() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_root = temp.path().join("workspace");
+        tokio::fs::create_dir_all(&project_root).await.unwrap();
+        let factory = AgentFactory::new(temp.path().join("sessions")).project_root(&project_root);
+        let ops_lifecycle: Arc<dyn OpsLifecycleRegistry> =
+            Arc::new(RuntimeOpsLifecycleRegistry::new());
+
+        let mut effective_config = Config::default();
+        effective_config.shell.program = "sh".to_string();
+        effective_config.shell.timeout_secs = 1;
+
+        let dispatcher = factory
+            .build_tool_dispatcher_for_agent_with_overrides(
+                &effective_config,
+                None,
+                false,
+                true,
+                None,
+                None,
+                SessionId::new().to_string(),
+                ops_lifecycle,
+                None,
+                None,
+                None,
+                None,
+                ToolCategoryOverride::Inherit,
+                None,
+                ToolCategoryOverride::Inherit,
+                None,
+                Vec::new(),
+                false,
+                None,
+            )
+            .await
+            .expect("shell-only composition should succeed");
+
+        let call_json =
+            serde_json::value::RawValue::from_string(r#"{"command":"sleep 5"}"#.to_string())
+                .unwrap();
+        let call = ToolCallView {
+            id: "shell-timeout-probe",
+            name: "shell",
+            args: &call_json,
+        };
+        let outcome = dispatcher
+            .dispatch(call)
+            .await
+            .expect("shell dispatch should succeed");
+        let text = outcome.result.text_content();
+        assert!(
+            text.starts_with("timed out after "),
+            "the configured 1 s [shell] timeout must stop a 5 s command: {text}"
+        );
+    }
+
     #[cfg(not(target_arch = "wasm32"))]
     #[allow(clippy::panic)]
     mod prepared_controller;
@@ -20400,9 +20461,9 @@ impl AgentFactory {
         };
 
         // Create shell config if shell is enabled. The loaded config's
-        // `[shell]` vocabulary (program, security mode/patterns) is projected
-        // through `ShellConfig::from_defaults`; `ShellConfig::default` only
-        // ever sees the embedded template defaults.
+        // `[shell]` vocabulary (program, timeout, security mode/patterns) is
+        // projected through `ShellConfig::from_defaults`; `ShellConfig::default`
+        // only ever sees the embedded template defaults.
         let shell_config = if effective_shell {
             let project_root = self.shell_project_root();
             let mut shell_tool_config = ShellConfig::from_defaults(&config.shell, project_root);
