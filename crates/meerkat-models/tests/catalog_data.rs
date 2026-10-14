@@ -9,7 +9,9 @@
 
 use meerkat_core::Provider;
 use meerkat_core::model_profile::capabilities::{EffortLevel, ThinkingSupport};
-use meerkat_core::model_profile::catalog::{ImageGenerationModelRoute, ModelTier};
+use meerkat_core::model_profile::catalog::{
+    ImageGenerationModelRoute, ImageGenerationSizeParameter, ModelTier,
+};
 use meerkat_models::capabilities::{all_capabilities, capabilities_for};
 use meerkat_models::catalog::{
     allowed_models, canonical, catalog, catalog_providers, default_image_generation_model,
@@ -21,7 +23,7 @@ use meerkat_models::profile::{inline_video_support_for, profile_for};
 use std::collections::HashSet;
 
 const IMAGE_DEFAULT_OPENAI: &str = "gpt-image-2";
-const IMAGE_DEFAULT_GEMINI: &str = "gemini-3.1-flash-image-preview";
+const IMAGE_DEFAULT_GEMINI: &str = "gemini-nano-banana-2.1";
 
 fn provider_from_catalog(provider: &str) -> Provider {
     Provider::parse_strict(provider)
@@ -724,6 +726,32 @@ fn image_generation_defaults_are_catalog_owned_and_typed() {
 
     assert!(default_image_generation_model(Provider::Anthropic).is_none());
     assert!(default_image_generation_model(Provider::Other).is_none());
+}
+
+#[test]
+fn gemini_nano_banana_21_owns_the_gemini_image_default() {
+    let default = default_image_generation_model(Provider::Gemini)
+        .expect("Gemini must have an image-generation default");
+    assert_eq!(default.model_id, "gemini-nano-banana-2.1");
+    assert_eq!(default.display_name, "Gemini Nano Banana 2.1");
+    assert_eq!(default.tier, ModelTier::Recommended);
+    assert!(matches!(
+        default.route,
+        ImageGenerationModelRoute::GeminiNativeModel {
+            image_size_parameter: ImageGenerationSizeParameter::Supported,
+        }
+    ));
+
+    // The previous default stays resolvable on the same route.
+    let previous = image_generation_model(Provider::Gemini, "gemini-3.1-flash-image-preview")
+        .expect("the previous Gemini image default must stay cataloged");
+    assert_eq!(previous.tier, ModelTier::Supported);
+    assert!(matches!(
+        previous.route,
+        ImageGenerationModelRoute::GeminiNativeModel {
+            image_size_parameter: ImageGenerationSizeParameter::Supported,
+        }
+    ));
 }
 
 #[test]

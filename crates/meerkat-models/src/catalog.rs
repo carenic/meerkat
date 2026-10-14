@@ -45,7 +45,7 @@ const DEFAULT_MODELS: &[(Provider, &str)] = &[
 
 /// Image-generation default model ID per provider.
 const IMAGE_DEFAULT_OPENAI: &str = "gpt-image-2";
-const IMAGE_DEFAULT_GEMINI: &str = "gemini-3.1-flash-image-preview";
+const IMAGE_DEFAULT_GEMINI: &str = "gemini-nano-banana-2.1";
 
 /// Image-generation default table consumed by
 /// [`ModelCatalog::default_image_generation_model`].
@@ -103,11 +103,26 @@ const IMAGE_GENERATION_MODELS: &[ImageGenerationModelProfile] = &[
             request_shape: OpenAiImageGenerationRequestShape::DallE,
         },
     },
+    // Gemini Nano Banana 2.1 (GA 2026-10-06), the successor of Nano Banana 2
+    // (gemini-3.1-flash-image); 1K (default), 2K and 4K output.
+    // Source: https://ai.google.dev/gemini-api/docs/models/gemini-nano-banana-2.1
     ImageGenerationModelProfile {
         provider: Provider::Gemini,
         model_id: IMAGE_DEFAULT_GEMINI,
-        display_name: "Gemini 3.1 Flash Image Preview",
+        display_name: "Gemini Nano Banana 2.1",
         tier: ModelTier::Recommended,
+        route: ImageGenerationModelRoute::GeminiNativeModel {
+            image_size_parameter: ImageGenerationSizeParameter::Supported,
+        },
+    },
+    // Gemini image default until 0.9.1. Google announced its shutdown
+    // (2026-06-25) and deprecated its GA successor in favor of Nano Banana
+    // 2.1; the row stays so recorded selections keep resolving.
+    ImageGenerationModelProfile {
+        provider: Provider::Gemini,
+        model_id: "gemini-3.1-flash-image-preview",
+        display_name: "Gemini 3.1 Flash Image Preview",
+        tier: ModelTier::Supported,
         route: ImageGenerationModelRoute::GeminiNativeModel {
             image_size_parameter: ImageGenerationSizeParameter::Supported,
         },
