@@ -287,6 +287,14 @@ repos:
         always_run: true
         stages: [pre-push]
 
+      - id: gcp-buildbuddy-hardening-contract
+        name: BuildBuddy keys travel only over TLS and the self-hosted path keeps its own key
+        entry: scripts/test-gcp-buildbuddy-hardening.sh
+        language: script
+        pass_filenames: false
+        always_run: true
+        stages: [pre-push]
+
       - id: release-packaging-isolation-contract
         name: parallel release packaging isolates outputs and preserves failures
         entry: scripts/test-release-packaging-isolation.sh

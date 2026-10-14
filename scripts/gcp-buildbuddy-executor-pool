@@ -27,7 +27,12 @@ Environment:
   MEERKAT_GCP_BUILDBUDDY_MANAGE_IAM      Create/bind executor IAM (default: 0)
   BUILDBUDDY_GRPC_URL                    Self-hosted BuildBuddy gRPC URL
   BUILDBUDDY_ENDPOINT                    Back-compat endpoint URL
-  BUILDBUDDY_API_KEY                     API key to sync to Secret Manager
+  MEERKAT_BUILDBUDDY_API_KEY_SECRET      Secret Manager secret holding the
+                                         executor key (default buildbuddy-api-key)
+
+sync-secrets writes only the endpoint secret. The executor key secret holds an
+executor key of the self-hosted control plane; the operator adds it in Secret
+Manager, CI never writes it, and the BuildBuddy Cloud key never belongs there.
 EOF
 }
 
@@ -142,14 +147,11 @@ sync_secrets() {
     echo "error: BUILDBUDDY_GRPC_URL is required to sync executor secrets" >&2
     exit 1
   fi
-  if [[ -z "${BUILDBUDDY_API_KEY:-}" ]]; then
-    echo "error: BUILDBUDDY_API_KEY is required to sync executor secrets" >&2
-    exit 1
-  fi
   grpc_url="$(canonical_grpc_url "${grpc_url}")"
   ensure_not_hosted_endpoint "${grpc_url}"
   sync_secret_value "${endpoint_secret}" "${grpc_url}"
-  sync_secret_value "${api_key_secret}" "${BUILDBUDDY_API_KEY}"
+  # The executor key is deliberately not synced: it is the self-hosted control
+  # plane's executor key, added by the operator (see usage).
 }
 
 ensure_service_account() {
@@ -363,7 +365,7 @@ ensure_template_and_mig() {
   require_gcloud
   ensure_service_account
   if ! secret_exists "${api_key_secret}"; then
-    echo "error: Secret Manager secret ${api_key_secret} is missing; run sync-secrets first" >&2
+    echo "error: Secret Manager secret ${api_key_secret} is missing; add the self-hosted control plane's executor key to it (CI never writes it)" >&2
     exit 1
   fi
   if ! secret_exists "${endpoint_secret}"; then

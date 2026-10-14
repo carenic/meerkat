@@ -1127,6 +1127,53 @@ if [[ "${#enforced_args[@]}" -gt 0 ]]; then
   bb_args+=("${enforced_args[@]}")
 fi
 
+# --- The API key travels only over TLS ----------------------------------------
+# The x-buildbuddy-api-key header in the private bazelrc above goes to every
+# remote endpoint of the run (cache, executor, BES, downloader). While it is
+# set, each endpoint must be TLS: grpcs://, https://, no scheme (Bazel reads
+# that as grpcs) or a local unix: socket. The endpoints come from
+# BUILDBUDDY_GRPC_URL/BUILDBUDDY_ENDPOINT, explicit flags and the repository
+# .bazelrc; a plaintext grpc:// or http:// one is refused before the client
+# starts.
+remote_endpoint_is_tls() {
+  case "$1" in
+    "" | grpcs://* | https://* | unix:*) return 0 ;;
+    *://*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+if [[ -n "${secret_bazelrc}" ]]; then
+  plaintext_endpoints=()
+  previous_arg=""
+  for bb_arg in "${bb_args[@]}"; do
+    endpoint_value=""
+    case "${previous_arg}" in
+      --remote_cache | --remote_executor | --bes_backend | --remote_downloader)
+        endpoint_value="${bb_arg}"
+        ;;
+    esac
+    case "${bb_arg}" in
+      --remote_cache=* | --remote_executor=* | --bes_backend=* | --remote_downloader=*)
+        endpoint_value="${bb_arg#*=}"
+        ;;
+    esac
+    if [[ -n "${endpoint_value}" ]] && ! remote_endpoint_is_tls "${endpoint_value}"; then
+      plaintext_endpoints+=("${endpoint_value}")
+    fi
+    previous_arg="${bb_arg}"
+  done
+  while IFS= read -r rc_endpoint; do
+    plaintext_endpoints+=("${rc_endpoint}")
+  done < <(sed -n -E 's/.*--(remote_cache|remote_executor|bes_backend|remote_downloader)[= ]+([A-Za-z][A-Za-z0-9+.-]*:\/\/[^[:space:]]*).*/\2/p' "${workspace_root}/.bazelrc" |
+    while IFS= read -r rc_value; do
+      remote_endpoint_is_tls "${rc_value}" || printf '%s\n' "${rc_value}"
+    done)
+  if [[ "${#plaintext_endpoints[@]}" -gt 0 ]]; then
+    echo "error: refusing to send the BuildBuddy API key to non-TLS endpoint(s): ${plaintext_endpoints[*]}; use grpcs:// (or https://)" >&2
+    exit 1
+  fi
+fi
+
 # --- Corrupt external-repo state detection and auto-repair -------------------
 # Bazel 9's shared repo contents cache (now disabled above) used to symlink
 # every external repo in a lane output base into /tmp shared state. If those

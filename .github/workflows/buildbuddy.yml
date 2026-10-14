@@ -29,7 +29,10 @@ on:
         default: ""
         type: string
     secrets:
-      BUILDBUDDY_API_KEY:
+      # The self-hosted control plane's own org API key for the CI
+      # submitters. This workflow never reads the BuildBuddy Cloud key
+      # (BUILDBUDDY_API_KEY), which callers pass along with `secrets: inherit`.
+      MEERKAT_GCP_BUILDBUDDY_API_KEY:
         required: false
       BUILDBUDDY_ENDPOINT:
         required: false
@@ -73,7 +76,7 @@ env:
   RUSTUP_TOOLCHAIN: 1.94.1
   MEERKAT_BAZEL_BACKEND: gcp-buildbuddy
   BUILDBUDDY_BAZEL_CONFIG: buildbuddy-linux-gcp-ci-rbe
-  BUILDBUDDY_API_KEY: ${{ secrets.BUILDBUDDY_API_KEY }}
+  BUILDBUDDY_API_KEY: ${{ secrets.MEERKAT_GCP_BUILDBUDDY_API_KEY }}
   BUILDBUDDY_ENDPOINT: ${{ secrets.BUILDBUDDY_ENDPOINT }}
   BUILDBUDDY_GRPC_URL: ""
   BUILDBUDDY_HTTP_URL: ""
