@@ -4514,6 +4514,16 @@ impl AgentFactory {
         self
     }
 
+    /// The host's local MCP launch boundary
+    /// ([`Self::with_mcp_stdio_launch_profile`]). A surface that builds its
+    /// own session router (a live `mcp/add` target) installs this same
+    /// profile, so no router this factory's host serves launches a stdio
+    /// server outside the boundary.
+    #[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
+    pub fn mcp_stdio_launch_profile(&self) -> &meerkat_mcp::McpStdioLaunchProfile {
+        &self.mcp_stdio_launch_profile
+    }
+
     /// Install the host's HTTP egress profile in newly built routers. Every
     /// later add, reload and restore of a remote MCP server retains it. A
     /// required profile is an execution boundary, not tool permission; the

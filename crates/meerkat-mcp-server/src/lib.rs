@@ -1213,6 +1213,11 @@ pub struct MeerkatMcpState {
     /// model / self-hosted alias resolves like the agent build path.
     realm_config_source: Arc<dyn meerkat_core::RealmConfigSource>,
     skill_runtime: Option<Arc<meerkat_core::skills::SkillRuntime>>,
+    /// The host's local MCP launch boundary, owned here once for the life of
+    /// the state: every router this server builds (fresh creation, a resume
+    /// whose router is missing, schedule seeding) retains it. This server's
+    /// agent factory builds no MCP router of its own.
+    mcp_stdio_launch_profile: meerkat_mcp::McpStdioLaunchProfile,
     #[cfg(feature = "mob")]
     mob_state: Arc<meerkat_mob_mcp::MobMcpState>,
     sidecars: runtime_ingress::SharedMcpSidecars,
@@ -1560,6 +1565,7 @@ impl MeerkatMcpState {
             config_runtime,
             realm_config_source,
             skill_runtime,
+            mcp_stdio_launch_profile: meerkat_mcp::McpStdioLaunchProfile::trusted_host(),
             #[cfg(feature = "mob")]
             mob_state,
             sidecars: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
@@ -1745,6 +1751,7 @@ impl MeerkatMcpState {
             config_runtime,
             realm_config_source,
             skill_runtime: None,
+            mcp_stdio_launch_profile: meerkat_mcp::McpStdioLaunchProfile::trusted_host(),
             #[cfg(feature = "mob")]
             mob_state: meerkat_mob_mcp::MobMcpState::new_in_memory(),
             sidecars: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
@@ -4218,6 +4225,7 @@ async fn handle_meerkat_run(
     let callback_tools_for_plan = callback_tools.clone();
     let event_tx_for_plan = event_tx.clone();
     let request_context_for_plan = request_context.clone();
+    let stdio_profile_for_plan = state.mcp_stdio_launch_profile.clone();
     let materialization = materialize_mcp_actor_transaction(
         &state.service,
         &state.runtime_adapter,
@@ -4232,8 +4240,13 @@ async fn handle_meerkat_run(
             {
                 return Err(request_cancelled_tool_error());
             }
+            // The session's router launches local stdio servers inside the
+            // host's own launch boundary.
             let adapter = Arc::new(meerkat_mcp::McpRouterAdapter::new(
-                McpRouter::new_with_surface_handle(Arc::clone(bindings.external_tool_surface())),
+                McpRouter::new_with_surface_handle_and_stdio_profile(
+                    Arc::clone(bindings.external_tool_surface()),
+                    stdio_profile_for_plan,
+                ),
             ));
             let mcp_tools: Arc<dyn AgentToolDispatcher> = adapter.clone();
             let external_tools =
@@ -4802,6 +4815,7 @@ async fn handle_meerkat_resume(
         let skill_references_for_plan = skill_references.clone();
         let requested_callback_tools_for_plan = requested_callback_tools.clone();
         let request_context_for_plan = request_context.clone();
+        let stdio_profile_for_plan = state.mcp_stdio_launch_profile.clone();
         materialize_mcp_actor_transaction(
             &state.service,
             &state.runtime_adapter,
@@ -4821,11 +4835,14 @@ async fn handle_meerkat_resume(
                 } else {
                     exact_config.callback_tools.clone()
                 };
+                // A missing router is rebuilt inside the host's launch
+                // boundary, as the fresh path builds it.
                 let adapter = exact_config.router.clone().unwrap_or_else(|| {
                     Arc::new(meerkat_mcp::McpRouterAdapter::new(
-                        McpRouter::new_with_surface_handle(Arc::clone(
-                            resume_bindings.external_tool_surface(),
-                        )),
+                        McpRouter::new_with_surface_handle_and_stdio_profile(
+                            Arc::clone(resume_bindings.external_tool_surface()),
+                            stdio_profile_for_plan,
+                        ),
                     ))
                 });
                 let mcp_tools: Arc<dyn AgentToolDispatcher> = adapter.clone();
@@ -5759,6 +5776,193 @@ mod tests {
         store.save(&session).await.expect("persisted session");
         seed_runtime_authority_session(&runtime_store, &session).await;
         (state, session_id)
+    }
+
+    /// A launch boundary over `root` that no platform backend enforces
+    /// (`require_descendant_termination` is unsupported on every backend),
+    /// so every stdio launch under it is refused before its program runs.
+    #[cfg(unix)]
+    fn unenforceable_stdio_profile(root: &std::path::Path) -> meerkat_mcp::McpStdioLaunchProfile {
+        use meerkat_core::confinement::{
+            ConfinementSpec, FilesystemAccess, IpNetworkAccess, PathAccess, PlatformBaseline,
+        };
+        let requirement = ConfinementSpec {
+            baseline: PlatformBaseline::CommandRuntimeV1,
+            read: FilesystemAccess::Paths(vec![PathAccess::Subtree(root.to_path_buf())]),
+            write: FilesystemAccess::Paths(vec![PathAccess::Subtree(root.to_path_buf())]),
+            deny_read: vec![],
+            deny_write: vec![],
+            network: IpNetworkAccess::Denied,
+            unix_connect: vec![],
+            require_descendant_termination: true,
+        }
+        .try_into()
+        .expect("structurally valid requirement");
+        meerkat_mcp::McpStdioLaunchProfile::required(requirement, root.to_path_buf())
+    }
+
+    /// Stage a stdio server on `router` and assert the launch boundary
+    /// refused it, typed, without starting its process.
+    #[cfg(unix)]
+    async fn assert_router_refuses_stdio_launch(
+        router: &meerkat_mcp::McpRouterAdapter,
+        root: &std::path::Path,
+    ) {
+        let marker = root.join("launch-marker");
+        router
+            .stage_add(meerkat_core::McpServerConfig::stdio(
+                "confined-server",
+                "/bin/sh",
+                vec!["-c".into(), "printf entered > \"$MARKER\"".into()],
+                HashMap::from([("MARKER".into(), marker.display().to_string())]),
+            ))
+            .await
+            .expect("stage the server");
+        router.apply_staged().await.expect("apply the staged add");
+        let deltas = router
+            .wait_until_ready(std::time::Duration::from_secs(15))
+            .await
+            .expect("the add settles");
+        assert!(
+            deltas.iter().any(|delta| {
+                delta.target == "confined-server"
+                    && delta.phase == meerkat_core::ExternalToolDeltaPhase::Failed
+                    && delta.confinement_refusal
+                        == Some(
+                            meerkat_core::confinement::ConfinementRefusal::UnsupportedRequirement,
+                        )
+            }),
+            "the launch is refused by the state's boundary: {deltas:?}"
+        );
+        assert!(!marker.exists(), "a refused server never starts");
+    }
+
+    /// A fresh `meerkat_run` builds its session's router inside the state's
+    /// MCP stdio launch profile.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fresh_run_router_launches_inside_the_state_stdio_launch_profile() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let mut state = MeerkatMcpState::new_with_store_options_and_llm(
+            Arc::new(meerkat::MemoryStore::new()),
+            Arc::new(meerkat_runtime::InMemoryRuntimeStore::new()),
+            None,
+            Some(Arc::new(TestClient::for_provider(Provider::Anthropic))),
+        )
+        .await;
+        state.mcp_stdio_launch_profile = unenforceable_stdio_profile(&root);
+        let input: MeerkatRunInput = serde_json::from_value(json!({
+            "prompt": "Hello",
+            "model": "claude-opus-4-8",
+            "provider": "anthropic"
+        }))
+        .expect("run input");
+        let result = Box::pin(handle_meerkat_run(&state, input, None, None))
+            .await
+            .expect("the fresh run completes");
+        let session_id = meerkat::SessionId::parse(
+            unwrap_payload(result)["session_id"]
+                .as_str()
+                .expect("run result names its session"),
+        )
+        .expect("valid session id");
+        let router = state
+            .runtime_ingress_context()
+            .logical_router(&session_id)
+            .await
+            .expect("the fresh session publishes its router");
+        assert_router_refuses_stdio_launch(&router, &root).await;
+    }
+
+    /// A resume whose session has no live router rebuilds it inside the
+    /// state's MCP stdio launch profile, as the fresh path builds it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn resume_without_a_router_rebuilds_it_inside_the_state_stdio_launch_profile() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let (mut state, session_id) = state_with_persisted_session().await;
+        state.mcp_stdio_launch_profile = unenforceable_stdio_profile(&root);
+        let parsed = meerkat::SessionId::parse(&session_id).expect("valid session id");
+        assert!(
+            state
+                .runtime_ingress_context()
+                .logical_router(&parsed)
+                .await
+                .is_none(),
+            "the cold session has no router before its resume"
+        );
+        let result = Box::pin(handle_meerkat_resume(
+            &state,
+            bounded_resume_input(session_id, vec![]),
+            None,
+            None,
+        ))
+        .await;
+        assert!(
+            result.is_ok()
+                || result.as_ref().is_err_and(|error| {
+                    error
+                        .message
+                        .contains("failed to update peer ingress context")
+                }),
+            "the resume reaches its post-completion boundary: {result:?}"
+        );
+        let router = state
+            .runtime_ingress_context()
+            .logical_router(&parsed)
+            .await
+            .expect("the resume publishes the rebuilt router");
+        assert_router_refuses_stdio_launch(&router, &root).await;
+    }
+
+    /// Schedule seeding builds its router inside the state's MCP stdio
+    /// launch profile, so a realm's configured server is refused too.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn schedule_seeding_launches_inside_the_state_stdio_launch_profile() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let marker = root.join("seeded-launch-marker");
+        let mut state =
+            MeerkatMcpState::new_with_store(Arc::new(meerkat::MemoryStore::new())).await;
+        state.mcp_stdio_launch_profile = unenforceable_stdio_profile(&root);
+        let server = meerkat_core::McpServerConfig::stdio(
+            "confined-seeded",
+            "/bin/sh",
+            vec!["-c".into(), "printf entered > \"$MARKER\"".into()],
+            HashMap::from([("MARKER".into(), marker.display().to_string())]),
+        );
+        state
+            .config_runtime
+            .patch(
+                meerkat_core::ConfigDelta(json!({"tools": {"mcp_servers": [server]}})),
+                None,
+            )
+            .await
+            .expect("the realm configures its server");
+        let adapter = schedule_host::seed_realm_mcp_adapter_for_test(
+            &state,
+            Arc::new(meerkat_runtime::handles::RuntimeExternalToolSurfaceHandle::ephemeral()),
+        )
+        .await
+        .expect("schedule seeding stages the realm's server");
+        let deltas = adapter
+            .wait_until_ready(std::time::Duration::from_secs(15))
+            .await
+            .expect("the seeded add settles");
+        assert!(
+            deltas.iter().any(|delta| {
+                delta.target == "confined-seeded"
+                    && delta.confinement_refusal
+                        == Some(
+                            meerkat_core::confinement::ConfinementRefusal::UnsupportedRequirement,
+                        )
+            }),
+            "the seeded launch is refused by the state's boundary: {deltas:?}"
+        );
+        assert!(!marker.exists(), "a refused seeded server never starts");
     }
 
     async fn materialize_test_mcp_fixture<F>(

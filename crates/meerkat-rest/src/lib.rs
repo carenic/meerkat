@@ -213,6 +213,12 @@ pub struct AppState {
     /// Per-session MCP adapter state (live MCP mutation).
     #[cfg(feature = "mcp")]
     pub mcp_sessions: Arc<RwLock<std::collections::HashMap<SessionId, SessionMcpState>>>,
+    /// The host's local MCP launch boundary: the
+    /// [`meerkat::AgentFactory::mcp_stdio_launch_profile`] of the factory
+    /// that builds this state's sessions. Each session's live router retains
+    /// it, so a live `mcp/add` never launches a stdio server outside it.
+    #[cfg(feature = "mcp")]
+    pub mcp_stdio_launch_profile: meerkat::McpStdioLaunchProfile,
     /// Request-level cancellation executor.
     pub request_executor: Arc<SurfaceRequestExecutor>,
     /// Complete provider-auth persistence capability shared with the
@@ -674,6 +680,10 @@ impl AppState {
 
         let skill_runtime = factory.build_skill_runtime(&config).await?;
         let provider_registry = factory.provider_runtime_registry();
+        // Each session's live router launches inside the factory's own
+        // local MCP launch boundary.
+        #[cfg(feature = "mcp")]
+        let mcp_stdio_launch_profile = factory.mcp_stdio_launch_profile().clone();
 
         let max_sessions = config.max_sessions();
         #[cfg(feature = "mob")]
@@ -790,6 +800,8 @@ impl AppState {
             },
             #[cfg(feature = "mcp")]
             mcp_sessions: Arc::new(RwLock::new(std::collections::HashMap::new())),
+            #[cfg(feature = "mcp")]
+            mcp_stdio_launch_profile,
             request_executor: Arc::new(SurfaceRequestExecutor::new(
                 std::time::Duration::from_secs(5),
             )),
@@ -7912,10 +7924,12 @@ async fn apply_mcp_boundary_to_turn_prompt(
 
 /// The live MCP router of one REST session. Live `mcp/add` servers use the
 /// same interactive MCP auth as factory-built sessions: stored credentials,
-/// or the typed human-authorization status. Never a browser.
+/// or the typed human-authorization status. Never a browser. They launch
+/// inside the host's local MCP launch boundary, as a factory-built router's
+/// servers do.
 #[cfg(feature = "mcp")]
 fn session_mcp_router(state: &AppState) -> McpRouter {
-    McpRouter::new().with_mcp_auth(
+    McpRouter::new_with_stdio_profile(state.mcp_stdio_launch_profile.clone()).with_mcp_auth(
         meerkat::McpAuthMode::Interactive,
         meerkat::default_mcp_auth_resolver_in_realm(
             Some(state.provider_auth_persistence.clone()),
@@ -16449,6 +16463,77 @@ matching the required schema. Output ONLY the JSON, no additional text or markdo
                 .await
                 .unwrap();
             (state, temp)
+        }
+
+        /// A REST session's live router launches local stdio servers inside
+        /// the host's MCP stdio launch profile, as a factory-built router
+        /// does. Under a required profile the backend refuses
+        /// (`require_descendant_termination` is unsupported on every
+        /// backend), so the server is refused typed and never starts.
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn live_mcp_router_launches_inside_the_host_stdio_launch_profile() {
+            use meerkat_core::confinement::{
+                ConfinementRefusal, ConfinementSpec, FilesystemAccess, IpNetworkAccess, PathAccess,
+                PlatformBaseline,
+            };
+
+            let (mut state, temp) = make_test_state().await;
+            let root = temp.path().canonicalize().unwrap();
+            let marker = root.join("rest-live-add-launch-marker");
+            let requirement = ConfinementSpec {
+                baseline: PlatformBaseline::CommandRuntimeV1,
+                read: FilesystemAccess::Paths(vec![PathAccess::Subtree(root.clone())]),
+                write: FilesystemAccess::Paths(vec![PathAccess::Subtree(root.clone())]),
+                deny_read: vec![],
+                deny_write: vec![],
+                network: IpNetworkAccess::Denied,
+                unix_connect: vec![],
+                require_descendant_termination: true,
+            }
+            .try_into()
+            .unwrap();
+            state.mcp_stdio_launch_profile =
+                meerkat::McpStdioLaunchProfile::required(requirement, root.clone());
+
+            let adapter = McpRouterAdapter::new(session_mcp_router(&state));
+            // Session build binds the session's surface handle the same way.
+            meerkat_core::AgentToolDispatcher::bind_external_tool_surface_handle(
+                &adapter,
+                Arc::new(meerkat_runtime::handles::RuntimeExternalToolSurfaceHandle::ephemeral()),
+            );
+            adapter
+                .stage_add(meerkat_core::McpServerConfig::stdio(
+                    "confined-live-add",
+                    "/bin/sh",
+                    vec!["-c".into(), "printf entered > \"$MARKER\"".into()],
+                    std::collections::HashMap::from([(
+                        "MARKER".into(),
+                        marker.display().to_string(),
+                    )]),
+                ))
+                .await
+                .unwrap();
+            adapter.apply_staged().await.unwrap();
+            let deltas = adapter
+                .wait_until_ready(std::time::Duration::from_secs(15))
+                .await
+                .unwrap();
+
+            assert!(
+                deltas.iter().any(|delta| {
+                    delta.target == "confined-live-add"
+                        && delta.phase == meerkat_core::ExternalToolDeltaPhase::Failed
+                        && delta.confinement_refusal
+                            == Some(ConfinementRefusal::UnsupportedRequirement)
+                }),
+                "the live add is refused by the host's launch boundary: {deltas:?}"
+            );
+            assert!(
+                !marker.exists(),
+                "a refused live add never starts the server process"
+            );
+            adapter.shutdown().await;
         }
 
         #[tokio::test]
