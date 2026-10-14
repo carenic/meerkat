@@ -1,56 +1,60 @@
 // ═══════════════════════════════════════════════════════════
-// Office Layout — Precise positions from 3x-zoom grid analysis
-// Anchor = bottom-center (chair wheels on floor below desk)
-// All coordinates in 1376x768 canvas space
+// Office Layout - art-space geometry
+// Everything in the office is authored on a 640x360 pixel-art
+// grid; the canvas scales that grid to the display.
+// Desk anchor = bottom-centre of the desk's front panel.
 // ═══════════════════════════════════════════════════════════
 
 import type { AgentId } from "../types";
 
-export const CANVAS_W = 1376;
-export const CANVAS_H = 768;
+export const ART_W = 640;
+export const ART_H = 360;
 
 export interface DeskPos {
   x: number;
   y: number;
-  phoneX: number;
-  phoneY: number;
   label: string;
   zone: string;
 }
 
 export const DESKS: Record<AgentId, DeskPos> = {
-  // Mail Room (top-left office)
-  triage:     { x: 404,  y: 198, phoneX: 506,  phoneY: 106, label: "Triage", zone: "Mail Room" },
-
-  // Archive (top-right office)
-  archivist:  { x: 923,  y: 198, phoneX: 976,  phoneY: 106, label: "Archivist", zone: "Archive" },
-
-  // Dept Row (middle-left offices)
-  "it-dept":  { x: 96,   y: 435, phoneX: 166,  phoneY: 343, label: "IT Support", zone: "Dept Row" },
-  "hr-dept":  { x: 435,  y: 435, phoneX: 488,  phoneY: 343, label: "HR", zone: "Dept Row" },
-
-  // Dept Row (bottom-left offices)
-  facilities: { x: 96,   y: 666, phoneX: 168,  phoneY: 611, label: "Facilities", zone: "Dept Row" },
-  finance:    { x: 264,  y: 666, phoneX: 334,  phoneY: 611, label: "Finance", zone: "Dept Row" },
-
-  // PA Bullpen (middle-right row of desks)
-  "alex-pa":  { x: 962,  y: 435, phoneX: 1015, phoneY: 354, label: "PA Alex", zone: "PA Bullpen" },
-  "sam-pa":   { x: 1088, y: 435, phoneX: 1115, phoneY: 354, label: "PA Sam", zone: "PA Bullpen" },
-  "pat-pa":   { x: 1217, y: 435, phoneX: 1245, phoneY: 354, label: "PA Pat", zone: "PA Bullpen" },
-
-  // Compliance desk (center)
-  gate:       { x: 688,  y: 622, phoneX: 762,  phoneY: 541, label: "Compliance", zone: "Compliance" },
+  triage:     { x: 110, y: 150, label: "Triage",     zone: "Mail Room" },
+  archivist:  { x: 530, y: 150, label: "Archivist",  zone: "Archive" },
+  "it-dept":  { x: 62,  y: 245, label: "IT Support", zone: "Dept Row" },
+  "hr-dept":  { x: 168, y: 245, label: "HR",         zone: "Dept Row" },
+  "alex-pa":  { x: 452, y: 245, label: "PA Alex",    zone: "PA Bullpen" },
+  "sam-pa":   { x: 528, y: 245, label: "PA Sam",     zone: "PA Bullpen" },
+  "pat-pa":   { x: 604, y: 245, label: "PA Pat",     zone: "PA Bullpen" },
+  facilities: { x: 62,  y: 340, label: "Facilities", zone: "Dept Row" },
+  finance:    { x: 168, y: 340, label: "Finance",    zone: "Dept Row" },
+  gate:       { x: 320, y: 340, label: "Compliance", zone: "Compliance" },
 };
 
-export const MAIL_SLOT = { x: 45, y: 55 };
-export const FILING_CABINET = { x: 920, y: 40, w: 180, h: 120 };
+/** How far behind (above) the desk anchor the seated character's chair base sits. */
+export const CHAR_BACK = 18;
 
-export const ZONES: { label: string; x: number; y: number; w: number; h: number; color: string }[] = [
-  { label: "Mail Room",   x: 10,  y: 10,  w: 430, h: 225, color: "rgba(68,136,204,0.08)" },
-  { label: "Archive",     x: 560, y: 10,  w: 540, h: 225, color: "rgba(102,170,136,0.08)" },
-  { label: "Dept Row",    x: 10,  y: 245, w: 480, h: 250, color: "rgba(170,136,68,0.08)" },
-  { label: "PA Bullpen",  x: 420, y: 245, w: 620, h: 180, color: "rgba(204,68,102,0.08)" },
-  { label: "Compliance",  x: 450, y: 460, w: 400, h: 240, color: "rgba(204,68,68,0.08)" },
-  { label: "Work Area",   x: 10,  y: 500, w: 440, h: 260, color: "rgba(100,100,100,0.06)" },
-  { label: "rkat.ai",     x: 860, y: 460, w: 500, h: 300, color: "rgba(100,100,100,0.06)" },
+/** Wall-mounted mail box in the Mail Room. */
+export const MAIL_SLOT = { x: 26, y: 26 };
+
+/** Filing cabinets + archive shelf; clicking opens the Records tab. */
+export const FILING_CABINET = { x: 440, y: 2, w: 172, h: 66 };
+/** Where filed folders disappear into. */
+export const CABINET_DRAWER = { x: 477, y: 34 };
+
+export interface ZoneSign {
+  label: string;
+  x: number;
+  y: number;
+}
+
+/**
+ * Zone plaques for the two rooms with interactive fixtures (the mail
+ * slot and the records cabinet). Desk nameplates label everyone else.
+ */
+export const ZONE_SIGNS: ZoneSign[] = [
+  { label: "MAIL ROOM", x: 182, y: 80 },
+  { label: "ARCHIVE", x: 616, y: 80 },
 ];
+
+/** Sunlight falling through the three windows (dust motes drift here). */
+export const SUNBEAM = { x: 236, y: 52, w: 180, h: 110 };

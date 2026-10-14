@@ -1,193 +1,117 @@
 // ═══════════════════════════════════════════════════════════
-// Sprites — Multi-frame animated character sprites
-// Each character has typing (idle) and phone (on_call) animations
-// with 4-6 frames each. Anchor: bottom-center.
+// Sprites - pixel-art assets and the geometry derived from them
+//   office/bg.png            640x360 room shell
+//   office/chars/<id>.png    4 frames: typing A, typing B, phone, thinking
+//   office/desks/<id>.png    desk, anchor = bottom-centre
+//   office/props/*.png       phone, phone_off, envelope, folder
 // ═══════════════════════════════════════════════════════════
 
-import { AGENTS, AGENT_IDS } from "../types";
-import type { AgentId, CharacterState } from "../types";
-import { CANVAS_W } from "./layout";
+import { AGENT_IDS } from "../types";
+import type { AgentId } from "../types";
+import { CHAR_BACK, DESKS } from "./layout";
+import { pixelFont } from "./pixel";
 
-// ── Animation data ──
+export const Frame = {
+  TypingA: 0,
+  TypingB: 1,
+  Phone: 2,
+  Thinking: 3,
+} as const;
+export type Frame = (typeof Frame)[keyof typeof Frame];
 
-type AnimFrames = HTMLImageElement[];
+const FRAME_COUNT = 4;
 
-interface CharacterAnims {
-  typing: AnimFrames;
-  phone: AnimFrames;
+export interface CharSprite {
+  img: HTMLImageElement;
+  frameW: number;
+  frameH: number;
 }
 
-const animations = new Map<AgentId, CharacterAnims>();
+export type PropName = "phone" | "phone_off" | "envelope" | "folder";
 
-function loadImage(src: string): Promise<HTMLImageElement | null> {
-  return new Promise((resolve) => {
+let background: HTMLImageElement | null = null;
+const chars = new Map<AgentId, CharSprite>();
+const desks = new Map<AgentId, HTMLImageElement>();
+const props = new Map<PropName, HTMLImageElement>();
+
+// Fallback sizes keep geometry stable before the art has loaded.
+const DEFAULT_CHAR_H = 60;
+const DEFAULT_DESK = { w: 66, h: 43 };
+
+function loadImage(src: string): Promise<HTMLImageElement> {
+  return new Promise((resolve, reject) => {
     const img = new Image();
     img.onload = () => resolve(img);
-    img.onerror = () => resolve(null);
+    img.onerror = () => reject(new Error(`Failed to load ${src}`));
     img.src = src;
   });
 }
 
-export async function loadSprites(): Promise<void> {
-  // Discover and load all sprite frames: {agentId}_{action}_{frameNum}.png
+export async function loadSprites(base = "./office"): Promise<void> {
+  const jobs: Promise<void>[] = [
+    loadImage(`${base}/bg.png`).then((img) => { background = img; }),
+  ];
+  // Canvas text only uses a web font once it has loaded; a failure falls back.
+  void document.fonts?.load(pixelFont(7)).catch(() => undefined);
   for (const id of AGENT_IDS) {
-    const anims: CharacterAnims = { typing: [], phone: [] };
-
-    for (const action of ["typing", "phone"] as const) {
-      // Try loading up to 6 frames per action (00–05)
-      for (let i = 0; i < 6; i++) {
-        const padded = String(i).padStart(2, "0");
-        const img = await loadImage(`./sprites/${id}_${action}_${padded}.png`);
-        if (img) {
-          anims[action].push(img);
-        }
-      }
-    }
-
-    animations.set(id, anims);
+    jobs.push(loadImage(`${base}/chars/${id}.png`).then((img) => {
+      chars.set(id, { img, frameW: img.width / FRAME_COUNT, frameH: img.height });
+    }));
+    jobs.push(loadImage(`${base}/desks/${id}.png`).then((img) => { desks.set(id, img); }));
   }
-
-  let total = 0;
-  for (const [, a] of animations) {
-    total += a.typing.length + a.phone.length;
+  for (const name of ["phone", "phone_off", "envelope", "folder"] as const) {
+    jobs.push(loadImage(`${base}/props/${name}.png`).then((img) => { props.set(name, img); }));
   }
-  console.log(`Loaded ${total} sprite frames across ${animations.size} characters`);
+  const results = await Promise.allSettled(jobs);
+  const failed = results.filter((r) => r.status === "rejected").length;
+  if (failed > 0) throw new Error(`${failed} office sprite(s) failed to load`);
 }
 
-/**
- * Draw a character at (x, y) = bottom-center anchor (floor level).
- * Selects animation based on state, advances frame based on frame counter.
- */
-export function drawCharacter(
-  ctx: CanvasRenderingContext2D,
-  agentId: AgentId,
-  x: number,
-  y: number,
-  state: CharacterState,
-  frame: number,
-  selected: boolean,
-): void {
-  const meta = AGENTS[agentId];
-  const color = meta.color;
-  const anims = animations.get(agentId);
+export function getBackground(): HTMLImageElement | null { return background; }
+export function getChar(id: AgentId): CharSprite | undefined { return chars.get(id); }
+export function getDesk(id: AgentId): HTMLImageElement | undefined { return desks.get(id); }
+export function getProp(name: PropName): HTMLImageElement | undefined { return props.get(name); }
 
-  ctx.save();
+// ── Geometry derived from sprite sizes (all in art pixels) ──
 
-  // Pick the right animation sequence
-  let frames: AnimFrames = [];
-  if (anims) {
-    if (state === "on_call" && anims.phone.length > 0) {
-      frames = anims.phone;
-    } else if (anims.typing.length > 0) {
-      frames = anims.typing;  // typing for both idle and thinking
-    }
-  }
-
-  // Draw the current frame
-  if (frames.length > 0) {
-    const idx = frame % frames.length;
-    const img = frames[idx];
-    const drawX = Math.round(x - img.width / 2);
-    const drawY = Math.round(y - img.height);
-    ctx.drawImage(img, drawX, drawY);
-  } else {
-    // Fallback: colored dot
-    ctx.beginPath();
-    ctx.arc(x, y - 20, 8, 0, Math.PI * 2);
-    ctx.fillStyle = color;
-    ctx.fill();
-  }
-
-  // ── Selection ring ──
-  if (selected) {
-    ctx.beginPath();
-    ctx.ellipse(x, y - 2, 24, 9, 0, 0, Math.PI * 2);
-    ctx.strokeStyle = color;
-    ctx.lineWidth = 2;
-    ctx.globalAlpha = 0.6 + 0.2 * Math.sin(Date.now() / 300);
-    ctx.stroke();
-    ctx.globalAlpha = 1;
-  }
-
-  // ── Activity indicator ──
-  const indicatorY = frames.length > 0 ? y - (frames[0]?.height ?? 50) - 6 : y - 50;
-  if (state === "on_call") {
-    const pulse = 0.6 + 0.4 * Math.sin(Date.now() / 200);
-    ctx.beginPath();
-    ctx.arc(x, indicatorY, 5, 0, Math.PI * 2);
-    ctx.fillStyle = `rgba(68, 255, 100, ${pulse})`;
-    ctx.fill();
-    ctx.strokeStyle = "#2A8A3A";
-    ctx.lineWidth = 1;
-    ctx.stroke();
-  } else if (state === "thinking") {
-    const pulse = 0.5 + 0.5 * Math.sin(Date.now() / 250);
-    ctx.beginPath();
-    ctx.arc(x, indicatorY, 5, 0, Math.PI * 2);
-    ctx.fillStyle = `rgba(255, 180, 60, ${pulse})`;
-    ctx.fill();
-    ctx.strokeStyle = "#AA7722";
-    ctx.lineWidth = 1;
-    ctx.stroke();
-  }
-
-  // ── Name label ──
-  const title = meta.name;
-  const subtitle = meta.role;
-  ctx.textAlign = "center";
-
-  ctx.font = "700 21px 'Chakra Petch', 'Space Grotesk', sans-serif";
-  const titleW = ctx.measureText(title).width;
-  ctx.font = "600 15px 'Space Grotesk', sans-serif";
-  const subW = ctx.measureText(subtitle).width;
-
-  const contentW = Math.max(titleW, selected ? subW : 0);
-  const padX = 10;
-  const pillW = Math.ceil(contentW + padX * 2);
-  const pillH = selected ? 42 : 28;
-  const unclampedX = x - pillW / 2;
-  const pillX = Math.min(CANVAS_W - 6 - pillW, Math.max(6, unclampedX));
-  const textX = pillX + pillW / 2;
-  const pillY = y + 7;
-
-  ctx.fillStyle = selected ? "rgba(12, 17, 26, 0.9)" : "rgba(12, 17, 26, 0.76)";
-  roundRect(ctx, pillX, pillY, pillW, pillH, 5);
-  ctx.fill();
-  ctx.strokeStyle = selected ? "rgba(255,255,255,0.26)" : "rgba(255,255,255,0.16)";
-  ctx.lineWidth = 1;
-  roundRect(ctx, pillX, pillY, pillW, pillH, 5);
-  ctx.stroke();
-
-  ctx.fillStyle = color;
-  ctx.fillRect(pillX + 2, pillY + 2, 3, pillH - 4);
-
-  ctx.font = "700 21px 'Chakra Petch', 'Space Grotesk', sans-serif";
-  ctx.strokeStyle = "rgba(0, 0, 0, 0.55)";
-  ctx.lineWidth = 4;
-  ctx.strokeText(title, textX, pillY + 20);
-  ctx.fillStyle = "rgba(245, 250, 255, 0.98)";
-  ctx.fillText(title, textX, pillY + 20);
-
-  if (selected) {
-    ctx.font = "600 15px 'Space Grotesk', sans-serif";
-    ctx.fillStyle = "rgba(210, 220, 235, 0.92)";
-    ctx.fillText(subtitle, textX, pillY + 35);
-  }
-
-  ctx.textAlign = "left";
-  ctx.restore();
+function deskSize(id: AgentId): { w: number; h: number } {
+  const img = desks.get(id);
+  return img ? { w: img.width, h: img.height } : DEFAULT_DESK;
 }
 
-function roundRect(ctx: CanvasRenderingContext2D, x: number, y: number, w: number, h: number, r: number): void {
-  ctx.beginPath();
-  ctx.moveTo(x + r, y);
-  ctx.lineTo(x + w - r, y);
-  ctx.quadraticCurveTo(x + w, y, x + w, y + r);
-  ctx.lineTo(x + w, y + h - r);
-  ctx.quadraticCurveTo(x + w, y + h, x + w - r, y + h);
-  ctx.lineTo(x + r, y + h);
-  ctx.quadraticCurveTo(x, y + h, x, y + h - r);
-  ctx.lineTo(x, y + r);
-  ctx.quadraticCurveTo(x, y, x + r, y);
-  ctx.closePath();
+/** Top-centre of the character's head. */
+export function headPoint(id: AgentId): { x: number; y: number } {
+  const d = DESKS[id];
+  const h = chars.get(id)?.frameH ?? DEFAULT_CHAR_H;
+  return { x: d.x, y: d.y - CHAR_BACK - h + 2 };
+}
+
+/** Where the desk phone sits on the desktop (its bottom-left corner). */
+export function phoneSlot(id: AgentId): { x: number; y: number } {
+  const d = DESKS[id];
+  const size = deskSize(id);
+  const phoneW = props.get("phone")?.width ?? 14;
+  return { x: d.x + Math.floor(size.w / 2) - phoneW - 5, y: d.y - size.h + 15 };
+}
+
+/** Centre of the desk phone, for call lines. */
+export function phonePoint(id: AgentId): { x: number; y: number } {
+  const slot = phoneSlot(id);
+  const img = props.get("phone");
+  return { x: slot.x + (img ? img.width / 2 : 7), y: slot.y - (img ? img.height / 2 : 6) };
+}
+
+/** A spot on the left of the desktop where incoming mail lands. */
+export function inTrayPoint(id: AgentId): { x: number; y: number } {
+  const d = DESKS[id];
+  const size = deskSize(id);
+  return { x: d.x - Math.floor(size.w / 2) + 12, y: d.y - size.h + 10 };
+}
+
+/** Clickable body of an agent: chair, torso and head down to the desk front. */
+export function agentHitRect(id: AgentId): { x: number; y: number; w: number; h: number } {
+  const d = DESKS[id];
+  const size = deskSize(id);
+  const head = headPoint(id);
+  return { x: d.x - size.w / 2, y: head.y, w: size.w, h: d.y - head.y };
 }
