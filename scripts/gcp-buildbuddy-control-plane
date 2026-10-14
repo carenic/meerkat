@@ -31,11 +31,13 @@ scripts/test-gcp-buildbuddy-hardening.sh):
 
 Commands:
   ensure | start        Check, then create or start the control plane. Refuses,
-                        changing nothing, when a firewall rule could admit
-                        0.0.0.0/0, a managed rule is disabled or differs from
-                        its rendering, the legacy rule exists, or the existing
-                        VM or data disk was not made from this rendering.
-                        Never re-enables or edits an existing firewall rule.
+                        changing nothing, when an enabled firewall rule lets
+                        anything but IAP or the executors reach the VM ahead of
+                        the deny rule, an open rule is aimed at it, a managed
+                        rule is disabled or differs from its rendering, the
+                        legacy rule exists, or the existing VM (tags included)
+                        or data disk was not made from this rendering. Never
+                        re-enables or edits an existing firewall rule.
   verify [--wait SECS]  Check the VM's startup script and the config hash and
                         readiness it reports for this boot.
   endpoint [plain|shell|github-output]
@@ -199,6 +201,32 @@ def cmd_audit_firewall(args):
         rule = by_name[legacy_rule]
         refusals.append(f"legacy firewall rule {legacy_rule} exists (disabled={bool(rule.get('disabled'))}, "
                         f"sources={show(set(rule.get('sourceRanges') or []))}); it is never reused or re-enabled")
+    # Every other ALLOW rule that can reach the VM must stay within the two
+    # intended allows: sources inside the IAP range on IAP ports, or the
+    # executor service account on the executor port. A rule reaches the VM
+    # when it targets every instance or the control-plane service account
+    # (the VM carries no network tags; ensure refuses a tagged VM) and is not
+    # shadowed by the deny rule: it is shadowed only at a priority number at
+    # or above the deny's (equal priorities go to the deny) and with IPv4
+    # sources alone (the deny covers 0.0.0.0/0).
+    iap_network = ipaddress.ip_network(iap_range)
+    iap_perms = spec_perms(iap_rules)
+    executor_perms = spec_perms(executor_rules)
+
+    def within(perms, allowed):
+        for proto, port in perms:
+            low, _, high = port.partition("-")
+            if not low or (high and high != low) or (proto, low) not in allowed:
+                return False
+        return bool(perms)
+
+    def inside_iap(sources):
+        try:
+            networks = [ipaddress.ip_network(s, strict=False) for s in sources]
+        except ValueError:
+            return False
+        return bool(networks) and all(n.version == 4 and n.subnet_of(iap_network) for n in networks)
+
     for rule in rules:
         name = rule.get("name")
         if name in managed or name == legacy_rule:
@@ -206,18 +234,32 @@ def cmd_audit_firewall(args):
         if (last_segment(rule.get("network")) != network or rule.get("direction", "INGRESS") != "INGRESS"
                 or rule_action(rule) != "ALLOW"):
             continue
-        open_sources = sorted(s for s in rule.get("sourceRanges") or [] if str(s).endswith("/0"))
-        if not open_sources:
-            continue
         tags = set(rule.get("targetTags") or [])
         accounts = set(rule.get("targetServiceAccounts") or [])
+        sources = [str(s) for s in rule.get("sourceRanges") or []]
+        source_accounts = set(rule.get("sourceServiceAccounts") or [])
+        source_tags = set(rule.get("sourceTags") or [])
         priority = int(rule.get("priority", 1000))
-        if legacy_tag in tags or control_sa in accounts:
+        disabled = bool(rule.get("disabled"))
+        open_sources = sorted(s for s in sources if s.endswith("/0"))
+        if open_sources and (legacy_tag in tags or control_sa in accounts):
             refusals.append(f"firewall rule {name} admits {', '.join(open_sources)} to the control plane "
-                            f"(disabled={bool(rule.get('disabled'))})")
-        elif not tags and not accounts and not rule.get("disabled") and priority < deny_priority:
-            refusals.append(f"firewall rule {name} admits {', '.join(open_sources)} to every instance at "
-                            f"priority {priority}, ahead of {deny_rule} ({deny_priority})")
+                            f"(disabled={disabled})")
+            continue
+        if disabled or not ((not tags and not accounts) or control_sa in accounts):
+            continue
+        if priority >= deny_priority and not any(":" in s for s in sources):
+            continue
+        perms = rule_perms(rule)
+        if inside_iap(sources) and not source_accounts and not source_tags and within(perms, iap_perms):
+            continue
+        if (not sources and source_accounts and source_accounts <= {executor_sa} and not source_tags
+                and within(perms, executor_perms)):
+            continue
+        reach = ", ".join(sources + sorted(source_accounts) + sorted("tag:" + t for t in source_tags)) or "any source"
+        refusals.append(f"firewall rule {name} lets {reach} reach the control plane on {show(perms)} at "
+                        f"priority {priority}, ahead of {deny_rule} ({deny_priority}) and outside the IAP "
+                        f"and executor allows")
     for refusal in refusals:
         print(f"REFUSE\t{refusal}")
 
@@ -229,7 +271,8 @@ def cmd_instance(_):
     accounts = [a.get("email", "") for a in instance.get("serviceAccounts") or []]
     started = ""
     try:
-        started = str(int(datetime.datetime.fromisoformat(instance["lastStartTimestamp"]).timestamp()))
+        stamp = instance.get("lastStartTimestamp") or instance["creationTimestamp"]
+        started = str(int(datetime.datetime.fromisoformat(stamp).timestamp()))
     except (KeyError, TypeError, ValueError):
         pass
     print("status=" + str(instance.get("status", "")))
@@ -238,6 +281,7 @@ def cmd_instance(_):
     print("guest_attributes=" + str(items.get("enable-guest-attributes", "")))
     print("startup_script_digest=" + (digest(items["startup-script"]) if "startup-script" in items else ""))
     print("last_start_epoch=" + started)
+    print("tags=" + ",".join((instance.get("tags") or {}).get("items") or []))
 
 
 def cmd_label(args):
@@ -635,6 +679,9 @@ ensure_instance() {
     if [[ "$(summary_field guest_attributes "${summary}")" != "TRUE" ]]; then
       refusals+=("instance ${instance} does not enable guest attributes, so its config hash cannot be verified")
     fi
+    if [[ -n "$(summary_field tags "${summary}")" ]]; then
+      refusals+=("instance ${instance} carries network tags ($(summary_field tags "${summary}")), so tag-targeted firewall rules could reach it")
+    fi
   fi
 
   local disk_present=0 disk_json disk_baseline
@@ -731,6 +778,7 @@ verify() {
   fi
   local last_start
   last_start="$(summary_field last_start_epoch "${summary}")"
+  [[ "${last_start}" =~ ^[0-9]+$ ]] || die "instance ${instance} reports no start time, so this boot's report cannot be told from an earlier one"
 
   local deadline attributes ready installed booted ca
   deadline=$(($(date +%s) + wait_seconds))
@@ -744,9 +792,10 @@ verify() {
     installed="$(summary_field config-sha256 "${attributes}")"
     booted="$(summary_field boot-started "${attributes}")"
     ca="$(summary_field tls-ca "${attributes}")"
-    # A report from an earlier boot does not count for this one.
-    if [[ -n "${last_start}" && -n "${booted}" && "${booted}" =~ ^[0-9]+$ ]] && ((booted + 60 < last_start)); then
-      ready="stale"
+    # Only a well-formed report written after this boot started counts; a
+    # missing, malformed or earlier one is not this boot's.
+    if ! [[ "${booted}" =~ ^[0-9]+$ ]] || ((booted < last_start || booted > $(date +%s) + 300)); then
+      ready="not-this-boot"
     fi
     case "${ready}" in
       ok)

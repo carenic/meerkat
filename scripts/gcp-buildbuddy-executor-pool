@@ -15,9 +15,11 @@ Executors reach the control plane only over TLS at its internal address
 (gRPCS, trusting the control plane's per-boot CA) and register with an
 executor key of the self-hosted org. The executor and action images must be
 pinned by digest. The instance template name is derived from everything the
-template renders, so a change always makes a new template; `ensure` refuses a
-template of that name that differs, and `up` refuses while any pool instance
-was made from another template.
+template renders, so a change always makes a new template; `ensure` refuses an
+existing template (derived or explicitly named) whose metadata, service
+account, scopes, network, tags, machine type or boot image differ, and `up`
+refuses while any pool instance was made from another template. The executor
+key, endpoint and CA secret names must all differ.
 
 Environment:
   MEERKAT_GCP_PROJECT_ID                 GCP project (default: king-dnn-training-dev)
@@ -94,12 +96,55 @@ sha256_hex() {
   python3 -c 'import hashlib,sys; print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest())'
 }
 
-# The startup-script metadata value of an instance template, from its JSON.
-template_startup_digest() {
-  python3 -c 'import hashlib,json,sys
-items = ((json.load(sys.stdin).get("properties") or {}).get("metadata") or {}).get("items") or []
+# Prints every security-relevant way an existing instance template differs
+# from what this script renders: its metadata (only the rendered startup
+# script, which carries both image digests), service account and scopes,
+# network and tags, machine type and boot image.
+template_problems() {
+  python3 -c 'import hashlib,json,re,sys
+want_digest, want_account, want_machine = sys.argv[1:4]
+props = json.load(sys.stdin).get("properties") or {}
+items = (props.get("metadata") or {}).get("items") or []
+keys = sorted(str(item.get("key")) for item in items)
+if keys != ["startup-script"]:
+    print("metadata keys " + ",".join(keys) + ", rendered startup-script only")
 script = next((item.get("value", "") for item in items if item.get("key") == "startup-script"), None)
-print("" if script is None else hashlib.sha256(script.rstrip("\n").encode()).hexdigest())'
+digest = "" if script is None else hashlib.sha256(script.rstrip("\n").encode()).hexdigest()
+if digest != want_digest:
+    print("startup script digest " + (digest or "none") + ", rendered " + want_digest)
+accounts = props.get("serviceAccounts") or []
+emails = [account.get("email") for account in accounts]
+if emails != [want_account]:
+    print(f"service accounts {emails}, rendered [{want_account}]")
+scopes = sorted({scope for account in accounts for scope in account.get("scopes") or []})
+if scopes != ["https://www.googleapis.com/auth/cloud-platform"]:
+    print(f"scopes {scopes}, rendered cloud-platform")
+networks = [str(nic.get("network", "")).rstrip("/").rsplit("/", 1)[-1] for nic in props.get("networkInterfaces") or []]
+if networks != ["default"]:
+    print(f"networks {networks}, rendered [default]")
+tags = (props.get("tags") or {}).get("items") or []
+if tags:
+    print(f"network tags {tags}")
+machine = str(props.get("machineType", "")).rsplit("/", 1)[-1]
+if machine != want_machine:
+    print(f"machine type {machine}, rendered {want_machine}")
+boot = [disk for disk in props.get("disks") or [] if disk.get("boot")]
+image = str(((boot[0] if boot else {}).get("initializeParams") or {}).get("sourceImage", ""))
+if not re.search(r"(^|/)projects/debian-cloud/global/images/(family/debian-12|debian-12-[a-z0-9-]+)$", image):
+    print("boot image " + (image or "none") + ", rendered debian-cloud debian-12")' "$@"
+}
+
+# The executor key, endpoint and CA live in three different secrets; an
+# aliased name would publish the endpoint or CA over the executor key.
+require_distinct_secrets() {
+  local name
+  for name in "${api_key_secret}" "${endpoint_secret}" "${ca_secret}"; do
+    [[ "${name}" =~ ^[A-Za-z0-9_-]+$ ]] || die "invalid Secret Manager secret name '${name}'"
+  done
+  if [[ "${api_key_secret}" == "${endpoint_secret}" || "${api_key_secret}" == "${ca_secret}" ||
+    "${endpoint_secret}" == "${ca_secret}" ]]; then
+    die "the executor key, endpoint and CA secrets must be three different secrets (got ${api_key_secret}, ${endpoint_secret}, ${ca_secret})"
+  fi
 }
 
 require_pinned_images() {
@@ -167,6 +212,7 @@ sync_secret_value() {
 
 sync_secrets() {
   require_gcloud
+  require_distinct_secrets
   local grpc_url ca_pem
   grpc_url="${BUILDBUDDY_GRPC_URL:-${BUILDBUDDY_ENDPOINT:-}}"
   if [[ -z "${grpc_url}" ]]; then
@@ -299,6 +345,15 @@ case "${app_target}" in
     exit 1
     ;;
 esac
+app_host="${app_target#grpcs://}"
+app_host="${app_host%%:*}"
+if ! python3 -c 'import ipaddress,sys
+address = ipaddress.IPv4Address(sys.argv[1])
+private = ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")
+sys.exit(0 if any(address in ipaddress.IPv4Network(net) for net in private) else 1)' "${app_host}" 2>/dev/null; then
+  echo "Refusing a BuildBuddy app target outside the private network: ${app_target}" >&2
+  exit 1
+fi
 case "${control_ca}" in
   "-----BEGIN CERTIFICATE-----"*) ;;
   *)
@@ -452,6 +507,7 @@ ensure_mig_template() {
 
 ensure_template_and_mig() {
   require_gcloud
+  require_distinct_secrets
   require_pinned_images
   ensure_service_account
   if ! secret_exists "${api_key_secret}" || ! secret_has_version "${api_key_secret}"; then
@@ -466,12 +522,15 @@ ensure_template_and_mig() {
   resolve_template
   startup_script_file="$(mktemp)"
   render_startup_script >"${startup_script_file}"
-  local rendered_digest existing_digest
+  local rendered_digest problems
   rendered_digest="$(python3 -c 'import hashlib,sys; print(hashlib.sha256(sys.stdin.read().rstrip("\n").encode()).hexdigest())' <"${startup_script_file}")"
   if template_exists; then
-    existing_digest="$(gcloud compute instance-templates describe "${template}" --project "${project}" --format=json | template_startup_digest)"
-    if [[ "${existing_digest}" != "${rendered_digest}" ]]; then
-      die "instance template ${template} exists with a different startup script (digest ${existing_digest:-none}, rendered ${rendered_digest}); templates are never reused across changes. Delete it or unset MEERKAT_GCP_BUILDBUDDY_TEMPLATE."
+    problems="$(gcloud compute instance-templates describe "${template}" --project "${project}" --format=json |
+      template_problems "${rendered_digest}" "${service_account}" "${machine_type}")"
+    if [[ -n "${problems}" ]]; then
+      echo "error: instance template ${template} exists but differs from the rendering; templates are never reused across changes:" >&2
+      printf '%s\n' "${problems}" | sed 's/^/  - /' >&2
+      die "delete the template (or unset MEERKAT_GCP_BUILDBUDDY_TEMPLATE) and rerun"
     fi
   else
     gcloud compute instance-templates create "${template}" \

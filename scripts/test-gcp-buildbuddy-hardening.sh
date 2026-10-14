@@ -219,6 +219,9 @@ chmod +x "${FAKE_BIN}/bb"
 # --- scripts/buildbuddy-bazel-poc -------------------------------------------
 
 # run_wrapper NAME [VAR=value ...] -- [wrapper args ...]
+# Runs the wrapper of ${wrapper_root} (the repository unless a case points it
+# at a scratch workspace with its own .bazelrc).
+wrapper_root="${REPO_ROOT}"
 run_wrapper() {
   local name="$1"
   shift
@@ -233,7 +236,7 @@ run_wrapper() {
   : >"${work}/secrets.env"
   set +e
   (
-    cd "${REPO_ROOT}" &&
+    cd "${wrapper_root}" &&
       env -i \
         PATH="${PATH}" HOME="${work}/home" TMPDIR="${work}/tmp" XDG_CACHE_HOME="${work}/cache" \
         MEERKAT_SECRETS_ENV="${work}/secrets.env" MEERKAT_IMPORT_LOGIN_ZSH_ENV=0 \
@@ -284,7 +287,7 @@ expect_ran() {
   fi
 }
 
-NON_TLS="refusing to send the BuildBuddy API key to non-TLS endpoint"
+NON_TLS="refusing to send the BuildBuddy API key to non-TLS or unscannable endpoint configuration"
 GCP=(MEERKAT_BAZEL_BACKEND=gcp-buildbuddy BUILDBUDDY_BAZEL_CONFIG=buildbuddy-linux-gcp-ci-rbe)
 printf '%s\n' "-----BEGIN CERTIFICATE-----" "fake" "-----END CERTIFICATE-----" >"${TEST_ROOT}/control-ca.pem"
 
@@ -302,6 +305,35 @@ expect_refused "the API key for an explicit two-token --bes_backend grpc:// flag
 
 run_wrapper hosted --
 expect_ran "the hosted default (grpcs:// from .bazelrc)" "--config=buildbuddy"
+
+# A scratch copy of the repository whose .bazelrc gets one extra line.
+scratch_workspace() {
+  local name="$1" line="$2"
+  local ws="${TEST_ROOT}/workspace-${name}"
+  mkdir -p "${ws}"
+  cp -R "${REPO_ROOT}/scripts" "${ws}/scripts"
+  cp "${REPO_ROOT}/.bazelrc" "${REPO_ROOT}/MODULE.bazel.lock" "${REPO_ROOT}/.bazelversion" "${ws}/"
+  printf '%s\n' "${line}" >>"${ws}/.bazelrc"
+  git -C "${ws}" init -q
+  wrapper_root="${ws}"
+}
+
+scratch_workspace mixed-line "build:buildbuddy --remote_cache=grpc://plain.example.invalid:9092 --bes_backend=grpcs://tls.example.invalid"
+run_wrapper rc-mixed-line --
+expect_refused "a .bazelrc line with a plaintext endpoint before a TLS one" "grpc://plain.example.invalid:9092"
+scratch_workspace split-line "build:buildbuddy --bes_backend grpcs://tls.example.invalid --remote_executor grpc://plain.example.invalid:1985"
+run_wrapper rc-split-line --
+expect_refused "a .bazelrc line with a two-token plaintext endpoint after a TLS one" "grpc://plain.example.invalid:1985"
+scratch_workspace import-line "try-import %workspace%/user.bazelrc"
+run_wrapper rc-import --
+expect_refused "a .bazelrc that imports an unscanned rc file" "imported rc files are not scanned"
+scratch_workspace quoted-line "build:buildbuddy \"--remote_cache=grpc://plain.example.invalid:9092\""
+run_wrapper rc-quoted --
+expect_refused "a .bazelrc line with a quoted endpoint flag" "quoted endpoint flags are not scanned"
+scratch_workspace tls-line "build:buildbuddy --remote_cache=grpcs://a.example.invalid --bes_backend=grpcs://b.example.invalid"
+run_wrapper rc-tls-line --
+expect_ran "a .bazelrc line with only TLS endpoints" "--config=buildbuddy"
+wrapper_root="${REPO_ROOT}"
 
 run_wrapper gcp-no-ca "${GCP[@]}" BUILDBUDDY_GRPC_URL=grpcs://127.0.0.1:1986 \
   MEERKAT_BUILDBUDDY_CI_IMAGE="${FAKE_CI_IMAGE}" --
@@ -456,7 +488,7 @@ def instance(script, status="TERMINATED", account=CONTROL_SA, ip="10.132.0.7", g
 
 
 def attributes(ready="ok", config=None, booted=LAST_START_EPOCH + 5, ca=CA_B64):
-    values = {"ready": ready, "config-sha256": config, "boot-started": str(booted), "tls-ca": ca}
+    values = {"ready": ready, "config-sha256": config, "boot-started": None if booted is None else str(booted), "tls-ca": ca}
     return [{"namespace": "meerkat", "key": key, "value": value} for key, value in values.items() if value is not None]
 
 
@@ -633,6 +665,28 @@ refusals = [
     ("an open all-instance rule ahead of the deny rule",
      {"firewall_rules": DEFAULTS + MANAGED + [rule("all-open", perms=(("tcp", None),), sources=["0.0.0.0/0"], priority=500)]},
      "ahead of meerkat-bb-control-deny-ingress"),
+    ("a narrower public range on the gRPCS port ahead of the deny",
+     {"firewall_rules": DEFAULTS + MANAGED + [rule("partner-grpcs", perms=(("tcp", ["1986"]),), sources=["203.0.113.0/24"],
+                                                   target_sas=[CONTROL_SA], priority=900)]},
+     "firewall rule partner-grpcs lets 203.0.113.0/24 reach the control plane"),
+    ("a single public address on every instance ahead of the deny",
+     {"firewall_rules": DEFAULTS + MANAGED + [rule("office-ssh", perms=(("tcp", ["22"]),), sources=["198.51.100.7/32"], priority=500)]},
+     "firewall rule office-ssh lets 198.51.100.7/32 reach the control plane"),
+    ("the IAP range on a port outside the IAP allow",
+     {"firewall_rules": DEFAULTS + MANAGED + [rule("iap-metrics", perms=(("tcp", ["9090"]),), sources=["35.235.240.0/20"],
+                                                   target_sas=[CONTROL_SA], priority=900)]},
+     "firewall rule iap-metrics lets 35.235.240.0/20 reach the control plane"),
+    ("an IPv6 source the IPv4 deny does not shadow",
+     {"firewall_rules": DEFAULTS + MANAGED + [rule("v6-open", perms=(("tcp", ["8081"]),), sources=["2001:db8::/32"], priority=65534)]},
+     "firewall rule v6-open lets 2001:db8::/32 reach the control plane"),
+    ("another service account on the gRPCS port ahead of the deny",
+     {"firewall_rules": DEFAULTS + MANAGED + [rule("other-sa", perms=(("tcp", ["1986"]),), source_sas=[f"other@{PROJECT}.iam.gserviceaccount.com"],
+                                                   target_sas=[CONTROL_SA], priority=900)]},
+     "firewall rule other-sa lets other@"),
+    ("a VM with network tags",
+     {"firewall_rules": DEFAULTS + MANAGED, "instances": {"meerkat-bb-control": dict(instance(STARTUP), tags={"items": ["http-server"]})},
+      "disks": {"meerkat-bb-control-data": DISK_OK}},
+     "carries network tags (http-server)"),
     ("a VM made from another startup script",
      {"firewall_rules": DEFAULTS + MANAGED, "instances": {"meerkat-bb-control": old_vm}, "disks": {"meerkat-bb-control-data": DISK_OK}},
      "runs a startup script"),
@@ -653,7 +707,13 @@ for label, state, message in refusals:
 
 # --- ensure: existing hardened resources -------------------------------------------
 
-benign = DEFAULTS + MANAGED + [rule("all-open-shadowed", perms=(("tcp", None),), sources=["0.0.0.0/0"], priority=1000)]
+benign = DEFAULTS + MANAGED + [
+    rule("all-open-shadowed", perms=(("tcp", None),), sources=["0.0.0.0/0"], priority=1000),
+    rule("partner-shadowed", perms=(("tcp", ["443"]),), sources=["203.0.113.0/24"], priority=2000),
+    rule("iap-ssh-everywhere", perms=(("tcp", ["22"]),), sources=["35.235.240.0/20"], priority=900),
+    rule("executors-again", perms=(("tcp", ["1986"]),), source_sas=[EXECUTOR_SA], target_sas=[CONTROL_SA], priority=800),
+    rule("other-target", perms=(("tcp", ["8081"]),), sources=["203.0.113.0/24"], target_sas=[f"other@{PROJECT}.iam.gserviceaccount.com"], priority=100),
+]
 proc, calls = run(CONTROL, ["ensure"], {"firewall_rules": benign,
                                         "instances": {"meerkat-bb-control": instance(STARTUP)},
                                         "disks": {"meerkat-bb-control-data": DISK_OK}}, **CONTROL_ENV)
@@ -661,7 +721,7 @@ changes = mutating(calls)
 if proc.returncode != 0 or len(changes) != 1 or not changes[0].startswith("compute instances start meerkat-bb-control"):
     fail(f"ensure on the hardened plane: exit {proc.returncode}, changes {changes}: {proc.stderr[-300:]}")
 else:
-    ok("ensure only starts a stopped VM made from the rendering (default rules and shadowed rules are fine)")
+    ok("ensure only starts a stopped VM made from the rendering (shadowed, intended and unrelated rules are fine)")
 proc, calls = run(CONTROL, ["ensure"], {"firewall_rules": MANAGED,
                                         "instances": {"meerkat-bb-control": instance(STARTUP, status="RUNNING")},
                                         "disks": {"meerkat-bb-control-data": DISK_OK}}, **CONTROL_ENV)
@@ -675,6 +735,12 @@ for label, attrs, args, good, message in (
     ("the rendered config hash", attributes(config=config_sha), ["verify"], True, "verified meerkat-bb-control"),
     ("another config hash", attributes(config="0" * 64), ["verify"], False, "reports config sha256 '" + "0" * 64),
     ("a report from an earlier boot", attributes(config=config_sha, booted=LAST_START_EPOCH - 3600),
+     ["verify", "--wait", "0"], False, "did not report ready"),
+    ("a report from a boot just before this one", attributes(config=config_sha, booted=LAST_START_EPOCH - 30),
+     ["verify", "--wait", "0"], False, "did not report ready"),
+    ("a report without a boot time", attributes(config=config_sha, booted=None),
+     ["verify", "--wait", "0"], False, "did not report ready"),
+    ("a malformed boot time", attributes(config=config_sha, booted="1760461200.5"),
      ["verify", "--wait", "0"], False, "did not report ready"),
     ("a config mismatch", attributes(ready="config-mismatch", config=config_sha), ["verify"], False,
      "reports ready=config-mismatch"),
@@ -815,29 +881,84 @@ if not re.fullmatch(r"meerkat-bb-exec-template-[0-9a-f]{12}", template_name):
 for needle in ('API_KEY_SECRET="meerkat-bb-executor-api-key"', 'ENDPOINT_SECRET="meerkat-bb-control-endpoint"',
                'CA_SECRET="meerkat-bb-control-ca"', f'EXECUTOR_IMAGE="{EXECUTOR_IMAGE}"', f'CI_IMAGE="{CI_IMAGE}"',
                'case "${app_target}" in\n  grpcs://*) ;;\n  *)\n    echo "Refusing a non-TLS BuildBuddy app target',
-               "SSL_CERT_FILE=/etc/buildbuddy/ca-bundle.pem", "umask 077"):
+               "SSL_CERT_FILE=/etc/buildbuddy/ca-bundle.pem", "umask 077",
+               "Refusing a BuildBuddy app target outside the private network"):
     if needle not in script:
         problems.append(f"executor startup script lacks {needle!r}")
 migs = find(calls, "compute", "instance-groups", "managed", "create")
 if len(migs) != 1 or flag(migs[0], "template") != template_name:
     problems.append("the MIG is not created from the derived template")
+# Run the executor's own app-target guard: gRPCS to a private IPv4 only.
+guard_lines = script.splitlines()
+try:
+    first = guard_lines.index('case "${app_target}" in')
+    host = next(i for i in range(first, len(guard_lines)) if guard_lines[i].startswith('app_host='))
+    last = next(i for i in range(host, len(guard_lines)) if guard_lines[i] == "fi")
+    guard = "\n".join(guard_lines[first:last + 1])
+except (ValueError, StopIteration):
+    guard = None
+if guard is None:
+    problems.append("executor startup script has no app-target guard")
+else:
+    for target, accepted in (("grpcs://10.132.0.7:1986", True), ("grpcs://203.0.113.9:1986", False),
+                             ("grpc://10.132.0.7:1985", False), ("grpcs://bb.example.invalid:1986", False)):
+        verdict = subprocess.run(["bash", "-c", f"set -euo pipefail\napp_target='{target}'\n{guard}\n"],
+                                 capture_output=True, text=True).returncode == 0
+        if verdict != accepted:
+            problems.append(f"executor app-target guard {'refuses' if accepted else 'accepts'} {target}")
 if proc.returncode != 0 or problems:
     fail(f"executor pool ensure: exit {proc.returncode}: {problems}: {proc.stderr[-300:]}")
 else:
     ok("executor pool ensure grants Secret Manager access per secret, drops the project-wide grant, and derives the template")
 
-drifted_template = {"properties": {"metadata": {"items": [{"key": "startup-script", "value": "#!/bin/bash\necho other\n"}]}}}
-proc, calls = run(POOL, ["ensure"], {"secrets": SECRETS_OK, "instance_templates": {template_name: drifted_template}}, **POOL_ENV)
-if proc.returncode == 0 or "exists with a different startup script" not in proc.stderr or mutating(calls):
-    fail(f"executor pool ensure reused a drifted template: {proc.stderr[-300:]}")
-else:
-    ok("executor pool ensure refuses a template of the derived name that differs")
+def template_body(script_text, account=EXECUTOR_SA, network="default", tags=None,
+                  image="projects/debian-cloud/global/images/family/debian-12", extra_metadata=None):
+    items = [{"key": "startup-script", "value": script_text}] + (extra_metadata or [])
+    body = {
+        "metadata": {"items": items},
+        "serviceAccounts": [{"email": account, "scopes": ["https://www.googleapis.com/auth/cloud-platform"]}],
+        "networkInterfaces": [{"network": f"https://www.googleapis.com/compute/v1/projects/{PROJECT}/global/networks/{network}"}],
+        "machineType": "c3d-standard-30",
+        "disks": [{"boot": True, "initializeParams": {"sourceImage": image}},
+                  {"boot": False, "deviceName": "bb-exec-cache"}],
+    }
+    if tags:
+        body["tags"] = {"items": tags}
+    return {"name": template_name, "properties": body,
+            "selfLink": f"https://compute/projects/{PROJECT}/global/instanceTemplates/{template_name}"}
 
-mig = {"name": "meerkat-bb-exec", "instanceTemplate": f"https://compute/projects/{PROJECT}/global/instanceTemplates/{template_name}"}
+
+template_ok = template_body(script)
+for label, body, message, extra_env in (
+    ("a different startup script", template_body("#!/bin/bash\necho other\n"), "startup script digest", {}),
+    ("the wrong service account", template_body(script, account=f"other@{PROJECT}.iam.gserviceaccount.com"),
+     "service accounts", {}),
+    ("network tags", template_body(script, tags=["http-server"]), "network tags", {}),
+    ("extra metadata", template_body(script, extra_metadata=[{"key": "ssh-keys", "value": "x"}]), "metadata keys", {}),
+    ("another boot image", template_body(script, image="projects/other/global/images/family/custom"), "boot image", {}),
+):
+    proc, calls = run(POOL, ["ensure"], {"secrets": SECRETS_OK, "instance_templates": {template_name: body}},
+                      **POOL_ENV, **extra_env)
+    if proc.returncode == 0 or message not in proc.stderr or mutating(calls):
+        fail(f"executor pool ensure reused a template with {label}: {proc.stderr[-300:]}")
+    else:
+        ok(f"executor pool ensure refuses a template of the derived name with {label}")
+override = dict(template_body(script, account=f"other@{PROJECT}.iam.gserviceaccount.com"), name="custom-template")
+proc, calls = run(POOL, ["ensure"], {"secrets": SECRETS_OK, "instance_templates": {"custom-template": override}},
+                  MEERKAT_GCP_BUILDBUDDY_TEMPLATE="custom-template", **POOL_ENV)
+if proc.returncode == 0 or "service accounts" not in proc.stderr or mutating(calls):
+    fail(f"executor pool ensure reused an explicitly named template with the wrong service account: {proc.stderr[-300:]}")
+else:
+    ok("executor pool ensure refuses an explicitly named template with the wrong service account")
+proc, calls = run(POOL, ["ensure"], {"secrets": SECRETS_OK, "instance_templates": {template_name: template_ok}}, **POOL_ENV)
+if proc.returncode != 0 or find(calls, "compute", "instance-templates", "create"):
+    fail(f"executor pool ensure did not reuse a matching template: {proc.stderr[-300:]}")
+else:
+    ok("executor pool ensure reuses a template whose security-relevant properties match")
+
+mig = {"name": "meerkat-bb-exec", "instanceTemplate": template_ok["selfLink"]}
 stale = [{"instance": "https://compute/zones/z/instances/meerkat-bb-exec-abcd", "instanceStatus": "TERMINATED",
           "version": {"instanceTemplate": "https://compute/global/instanceTemplates/meerkat-bb-exec-template-v4"}}]
-template_ok = {"properties": {"metadata": {"items": [{"key": "startup-script", "value": script}]}},
-               "selfLink": mig["instanceTemplate"]}
 proc, calls = run(POOL, ["up"], {"secrets": SECRETS_OK, "instance_templates": {template_name: template_ok},
                                  "migs": {"meerkat-bb-exec": mig}, "mig_instances": {"meerkat-bb-exec": stale}}, **POOL_ENV)
 resized = [c for c in find(calls, "compute", "instance-groups", "managed", "update") if flag_values(c, "size")]
@@ -845,6 +966,19 @@ if proc.returncode == 0 or "meerkat-bb-exec-template-v4" not in proc.stderr or r
     fail(f"up started executors made from another template: {proc.stderr[-300:]}")
 else:
     ok("up refuses while pool instances come from another template")
+
+for label, env in (
+    ("the endpoint secret aliasing the executor key", {"MEERKAT_BUILDBUDDY_ENDPOINT_SECRET": "meerkat-bb-executor-api-key"}),
+    ("the CA secret aliasing the executor key", {"MEERKAT_BUILDBUDDY_CA_SECRET": "meerkat-bb-executor-api-key"}),
+    ("the CA secret aliasing the endpoint secret", {"MEERKAT_BUILDBUDDY_CA_SECRET": "meerkat-bb-control-endpoint"}),
+):
+    for command, extra in ((["sync-secrets"], {"BUILDBUDDY_GRPC_URL": "grpcs://10.20.30.40:1986", "BUILDBUDDY_TLS_CA_B64": CA_B64}),
+                           (["ensure"], dict(POOL_ENV, MEERKAT_GCP_BUILDBUDDY_MANAGE_IAM="1"))):
+        proc, calls = run(POOL, command, {"secrets": SECRETS_OK}, **extra, **env)
+        if proc.returncode == 0 or "must be three different secrets" not in proc.stderr or mutating(calls):
+            fail(f"{command[0]} accepted {label}: {mutating(calls)} {proc.stderr[-200:]}")
+        else:
+            ok(f"{command[0]} refuses {label} before any write")
 
 proc, calls = run(POOL, ["ensure"], {"secrets": dict(SECRETS_OK, **{"meerkat-bb-executor-api-key": []})}, **POOL_ENV)
 if (proc.returncode == 0 or find(calls, "compute", "instance-templates", "create")

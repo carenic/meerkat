@@ -1153,10 +1153,11 @@ fi
 # The x-buildbuddy-api-key header in the private bazelrc above goes to every
 # remote endpoint of the run (cache, executor, BES, downloader). While it is
 # set, each endpoint must be TLS: grpcs://, https://, no scheme (Bazel reads
-# that as grpcs) or a local unix: socket. The endpoints come from
-# BUILDBUDDY_GRPC_URL/BUILDBUDDY_ENDPOINT, explicit flags and the repository
-# .bazelrc; a plaintext grpc:// or http:// one is refused before the client
-# starts.
+# that as grpcs) or a local unix: socket. Every endpoint token is checked: the
+# client argv (BUILDBUDDY_GRPC_URL/BUILDBUDDY_ENDPOINT and explicit flags, in
+# both `--flag=value` and `--flag value` form) and every line of the
+# repository .bazelrc. A .bazelrc shape this scan cannot read exactly (an
+# import, or a quoted endpoint flag) is refused rather than guessed at.
 remote_endpoint_is_tls() {
   case "$1" in
     "" | grpcs://* | https://* | unix:*) return 0 ;;
@@ -1164,34 +1165,67 @@ remote_endpoint_is_tls() {
     *) return 0 ;;
   esac
 }
+# Prints every non-TLS endpoint value among the given tokens.
+non_tls_endpoint_tokens() {
+  local previous="" token value
+  for token in "$@"; do
+    value=""
+    case "${previous}" in
+      --remote_cache | --remote_executor | --bes_backend | --remote_downloader)
+        value="${token}"
+        ;;
+    esac
+    case "${token}" in
+      --remote_cache=* | --remote_executor=* | --bes_backend=* | --remote_downloader=*)
+        value="${token#*=}"
+        ;;
+    esac
+    if [[ -n "${value}" ]] && ! remote_endpoint_is_tls "${value}"; then
+      printf '%s\n' "${value}"
+    fi
+    previous="${token}"
+  done
+}
+# Prints every non-TLS endpoint and every unscannable line of a bazelrc.
+non_tls_rc_endpoints() {
+  local rc_file="$1" raw line="" stripped
+  local -a rc_tokens
+  [[ -f "${rc_file}" ]] || return 0
+  while IFS= read -r raw || [[ -n "${raw}" ]]; do
+    if [[ "${raw}" == *\\ ]]; then
+      line+="${raw%\\} "
+      continue
+    fi
+    line+="${raw}"
+    stripped="${line#"${line%%[![:space:]]*}"}"
+    line=""
+    case "${stripped}" in
+      "" | "#"*) ;;
+      import[[:space:]]* | try-import[[:space:]]*)
+        printf '%s\n' "${stripped} (imported rc files are not scanned)"
+        ;;
+      *)
+        if [[ "${stripped}" =~ --(remote_cache|remote_executor|bes_backend|remote_downloader) &&
+          "${stripped}" == *[\"\']* ]]; then
+          printf '%s\n' "${stripped} (quoted endpoint flags are not scanned)"
+        else
+          read -r -a rc_tokens <<<"${stripped}"
+          non_tls_endpoint_tokens ${rc_tokens[@]+"${rc_tokens[@]}"}
+        fi
+        ;;
+    esac
+  done <"${rc_file}"
+}
 if [[ -n "${secret_bazelrc}" ]]; then
   plaintext_endpoints=()
-  previous_arg=""
-  for bb_arg in "${bb_args[@]}"; do
-    endpoint_value=""
-    case "${previous_arg}" in
-      --remote_cache | --remote_executor | --bes_backend | --remote_downloader)
-        endpoint_value="${bb_arg}"
-        ;;
-    esac
-    case "${bb_arg}" in
-      --remote_cache=* | --remote_executor=* | --bes_backend=* | --remote_downloader=*)
-        endpoint_value="${bb_arg#*=}"
-        ;;
-    esac
-    if [[ -n "${endpoint_value}" ]] && ! remote_endpoint_is_tls "${endpoint_value}"; then
-      plaintext_endpoints+=("${endpoint_value}")
-    fi
-    previous_arg="${bb_arg}"
-  done
-  while IFS= read -r rc_endpoint; do
-    plaintext_endpoints+=("${rc_endpoint}")
-  done < <(sed -n -E 's/.*--(remote_cache|remote_executor|bes_backend|remote_downloader)[= ]+([A-Za-z][A-Za-z0-9+.-]*:\/\/[^[:space:]]*).*/\2/p' "${workspace_root}/.bazelrc" |
-    while IFS= read -r rc_value; do
-      remote_endpoint_is_tls "${rc_value}" || printf '%s\n' "${rc_value}"
-    done)
+  while IFS= read -r plaintext_endpoint; do
+    plaintext_endpoints+=("${plaintext_endpoint}")
+  done < <(
+    non_tls_endpoint_tokens "${bb_args[@]}"
+    non_tls_rc_endpoints "${workspace_root}/.bazelrc"
+  )
   if [[ "${#plaintext_endpoints[@]}" -gt 0 ]]; then
-    echo "error: refusing to send the BuildBuddy API key to non-TLS endpoint(s): ${plaintext_endpoints[*]}; use grpcs:// (or https://)" >&2
+    echo "error: refusing to send the BuildBuddy API key to non-TLS or unscannable endpoint configuration: ${plaintext_endpoints[*]}; use grpcs:// (or https://)" >&2
     exit 1
   fi
 fi
