@@ -6399,6 +6399,140 @@ mod tests {
         );
     }
 
+    /// Holds every provider call until the test releases it.
+    struct GatedLlmClient {
+        calls: Arc<tokio::sync::watch::Sender<usize>>,
+        release: Arc<tokio::sync::Semaphore>,
+    }
+
+    #[async_trait]
+    impl LlmClient for GatedLlmClient {
+        fn project_replay_messages(
+            &self,
+            messages: &[meerkat_core::Message],
+        ) -> Result<Vec<meerkat_core::Message>, meerkat_client::LlmError> {
+            Ok(messages.to_vec())
+        }
+
+        fn stream<'a>(
+            &'a self,
+            request: &'a LlmRequest,
+        ) -> Pin<Box<dyn futures::Stream<Item = Result<LlmEvent, LlmError>> + Send + 'a>> {
+            self.calls.send_modify(|calls| *calls += 1);
+            let release = Arc::clone(&self.release);
+            let usage = meerkat_core::TurnUsage::host_declared(
+                provider_for_successful_mcp_test_model(&request.model),
+                &request.model,
+                meerkat_core::Usage::default(),
+            );
+            Box::pin(stream::unfold(0u8, move |step| {
+                let release = Arc::clone(&release);
+                let usage = usage.clone();
+                async move {
+                    match step {
+                        0 => {
+                            release
+                                .acquire()
+                                .await
+                                .expect("release semaphore stays open")
+                                .forget();
+                            Some((
+                                Ok(LlmEvent::TextDelta {
+                                    delta: "ok".to_string(),
+                                    meta: None,
+                                }),
+                                1,
+                            ))
+                        }
+                        1 => Some((Ok(LlmEvent::UsageUpdate { usage }), 2)),
+                        2 => Some((
+                            Ok(LlmEvent::Done {
+                                outcome: LlmDoneOutcome::Success {
+                                    stop_reason: meerkat_core::StopReason::EndTurn,
+                                },
+                            }),
+                            3,
+                        )),
+                        _ => None,
+                    }
+                }
+            }))
+        }
+
+        fn provider(&self) -> meerkat_core::Provider {
+            meerkat_core::Provider::Other
+        }
+
+        async fn health_check(&self) -> Result<(), LlmError> {
+            Ok(())
+        }
+    }
+
+    /// A `meerkat_resume` that arrives while another turn on the same live
+    /// session is running waits behind it and then runs; it is not refused
+    /// as busy.
+    #[tokio::test]
+    async fn resume_while_a_turn_runs_waits_instead_of_busy() {
+        // Bounds a failure only; the passing path never waits for it.
+        const FAILURE_BOUND: Duration = Duration::from_secs(30);
+        let calls = Arc::new(tokio::sync::watch::channel(0usize).0);
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let (state, session_id) = state_with_live_session(Arc::new(GatedLlmClient {
+            calls: Arc::clone(&calls),
+            release: Arc::clone(&release),
+        }))
+        .await;
+        let state = Arc::new(state);
+        let resume = |prompt: &'static str| {
+            let state = Arc::clone(&state);
+            let session_id = session_id.to_string();
+            tokio::spawn(async move {
+                Box::pin(handle_tools_call(
+                    &state,
+                    "meerkat_resume",
+                    &json!({ "session_id": session_id, "prompt": prompt }),
+                ))
+                .await
+            })
+        };
+        let mut seen = calls.subscribe();
+
+        let first = resume("first running turn");
+        timeout(FAILURE_BOUND, seen.wait_for(|calls| *calls >= 1))
+            .await
+            .expect("the first resume reaches the provider")
+            .expect("call counter stays open");
+        let mut second = resume("second resume");
+        assert!(
+            timeout(Duration::from_millis(300), &mut second)
+                .await
+                .is_err(),
+            "a resume on a running session waits behind the running turn \
+             instead of answering at once"
+        );
+
+        release.add_permits(1);
+        let first = timeout(FAILURE_BOUND, first)
+            .await
+            .expect("the first resume finishes once released")
+            .expect("first resume task");
+        assert!(first.is_ok(), "first resume: {:?}", first.err());
+        timeout(FAILURE_BOUND, seen.wait_for(|calls| *calls >= 2))
+            .await
+            .expect("the waiting resume runs its turn after the first one")
+            .expect("call counter stays open");
+        release.add_permits(1);
+        let second = timeout(FAILURE_BOUND, second)
+            .await
+            .expect("the waiting resume finishes once released")
+            .expect("second resume task");
+        assert!(
+            second.is_ok(),
+            "the waiting resume returns its own result: {:?}",
+            second.err()
+        );
+    }
+
     #[tokio::test]
     async fn plain_resume_resolves_foreign_attachment_before_running_a_turn() {
         let store: Arc<dyn SessionStore> = Arc::new(meerkat::MemoryStore::new());

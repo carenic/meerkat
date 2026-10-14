@@ -463,11 +463,17 @@ Events emitted: `CompactionStarted`, `CompactionCompleted`, `CompactionFailed`.
 
 ## Concurrency
 
+These are the in-process `SessionService` rules:
+
 - At most one turn runs per session at a time.
 - Second `start_turn` while one is in-flight returns `SESSION_BUSY`.
 - `interrupt()` cancels the in-flight turn.
 - `read()` and `list()` are non-blocking.
 - No queueing: callers retry on `Busy`.
+
+Runtime-backed surfaces admit each turn through the session's runtime queue
+instead, so a surface turn that arrives while another is running waits and
+then runs (see [Sessions](/concepts/sessions#lifecycle)).
 
 ## Durability
 

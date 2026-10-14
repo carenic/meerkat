@@ -1152,7 +1152,10 @@ Start a new turn on an existing session.
 ```
 </CodeGroup>
 
-Returns the same run-result shape as `session/create`. Fails with error code `-32002` (SESSION_BUSY) if a turn is already in progress.
+Returns the same run-result shape as `session/create`. A `turn/start` that
+arrives while another turn on the same session is running is queued behind
+it: it runs once the running turn finishes, and the call returns its own
+result. It is not refused with `-32002` (`SESSION_BUSY`).
 
 A turn that fails returns the JSON-RPC code of its typed cause, as the
 [session error mapping](/reference/capability-matrix#error-codes) does for the
@@ -3103,7 +3106,7 @@ Standard JSON-RPC codes plus Meerkat-specific application codes:
 | -32602 | Invalid params | Missing or invalid parameters |
 | -32603 | Internal error | Server error |
 | -32001 | Session not found | Session ID does not exist |
-| -32002 | Session busy | Turn already in progress |
+| -32002 | Session busy | The session cannot take this request now, for example a `turn/interrupt` while a deferred session is being materialized, a session hosted by another process, or a runtime teardown still in progress. A `turn/start` on a session with a running turn is queued, not refused |
 | -32003 | Session not running | Session not in running state |
 | -32004 | Duplicate input | The request or input was already admitted; a deduplicated runtime input carries `data.existing_id` |
 | -32005 | Request cancelled | Cancelled before the response was published (see above) |

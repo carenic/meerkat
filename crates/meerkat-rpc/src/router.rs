@@ -13264,6 +13264,180 @@ mod tests {
         assert_eq!(data["error"]["kind"], "llm_failure", "{data}");
     }
 
+    /// Holds every provider call until the test releases it, and records the
+    /// transcript each call saw.
+    struct GatedLlmClient {
+        calls: Arc<tokio::sync::watch::Sender<usize>>,
+        release: Arc<tokio::sync::Semaphore>,
+        requests: Arc<StdMutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl LlmClient for GatedLlmClient {
+        fn project_replay_messages(
+            &self,
+            messages: &[meerkat_core::Message],
+        ) -> Result<Vec<meerkat_core::Message>, meerkat_client::LlmError> {
+            Ok(messages.to_vec())
+        }
+
+        fn stream<'a>(
+            &'a self,
+            request: &'a meerkat_client::LlmRequest,
+        ) -> Pin<
+            Box<dyn futures::Stream<Item = Result<meerkat_client::LlmEvent, LlmError>> + Send + 'a>,
+        > {
+            self.requests
+                .lock()
+                .expect("recorded requests lock poisoned")
+                .push(serde_json::to_string(&request.messages).expect("serialize messages"));
+            self.calls.send_modify(|calls| *calls += 1);
+            let release = Arc::clone(&self.release);
+            let usage = meerkat_core::TurnUsage::host_declared(
+                meerkat_core::Provider::Anthropic,
+                &request.model,
+                meerkat_core::Usage::default(),
+            );
+            Box::pin(stream::unfold(0u8, move |state| {
+                let release = Arc::clone(&release);
+                let usage = usage.clone();
+                async move {
+                    match state {
+                        0 => {
+                            release
+                                .acquire()
+                                .await
+                                .expect("release semaphore stays open")
+                                .forget();
+                            Some((
+                                Ok(meerkat_client::LlmEvent::TextDelta {
+                                    delta: "gated reply".to_string(),
+                                    meta: None,
+                                }),
+                                1,
+                            ))
+                        }
+                        1 => Some((Ok(meerkat_client::LlmEvent::UsageUpdate { usage }), 2)),
+                        2 => Some((
+                            Ok(meerkat_client::LlmEvent::Done {
+                                outcome: meerkat_client::LlmDoneOutcome::Success {
+                                    stop_reason: StopReason::EndTurn,
+                                },
+                            }),
+                            3,
+                        )),
+                        _ => None,
+                    }
+                }
+            }))
+        }
+
+        fn provider(&self) -> meerkat_core::Provider {
+            meerkat_core::Provider::Anthropic
+        }
+
+        async fn health_check(&self) -> Result<(), LlmError> {
+            Ok(())
+        }
+    }
+
+    /// A `turn/start` that arrives while another turn on the same session is
+    /// running is queued behind it, not refused with SESSION_BUSY: it runs
+    /// once the running turn finishes and returns its own result.
+    #[tokio::test]
+    async fn turn_start_while_a_turn_runs_queues_instead_of_session_busy() {
+        // Bounds a failure only; the passing path never waits for it.
+        const FAILURE_BOUND: Duration = Duration::from_secs(30);
+        let calls = Arc::new(tokio::sync::watch::channel(0usize).0);
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let (router, _notif_rx) = test_router_with_llm(Arc::new(GatedLlmClient {
+            calls: Arc::clone(&calls),
+            release: Arc::clone(&release),
+            requests: Arc::clone(&requests),
+        }))
+        .await;
+        let created = router
+            .dispatch(make_request(
+                "session/create",
+                serde_json::json!({ "prompt": "seed", "initial_turn": "deferred" }),
+            ))
+            .await
+            .unwrap();
+        let session_id = result_value(&created)["session_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let turn = |id: i64, prompt: &'static str| {
+            let router = router.clone();
+            let session_id = session_id.clone();
+            tokio::spawn(async move {
+                let mut request = make_request(
+                    "turn/start",
+                    serde_json::json!({ "session_id": session_id, "prompt": prompt }),
+                );
+                request.id = Some(RpcId::Num(id));
+                router.dispatch(request).await.expect("turn/start response")
+            })
+        };
+        let mut seen = calls.subscribe();
+
+        let first = turn(1, "first running turn");
+        tokio::time::timeout(FAILURE_BOUND, seen.wait_for(|calls| *calls >= 1))
+            .await
+            .expect("the first turn reaches the provider")
+            .expect("call counter stays open");
+
+        let mut second = turn(2, "second queued turn");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), &mut second)
+                .await
+                .is_err(),
+            "a turn/start on a running session waits behind the running turn \
+             instead of answering at once (no SESSION_BUSY)"
+        );
+
+        release.add_permits(1);
+        let first = tokio::time::timeout(FAILURE_BOUND, first)
+            .await
+            .expect("the first turn finishes once released")
+            .expect("first turn task");
+        assert!(first.error.is_none(), "first turn: {:?}", first.error);
+        tokio::time::timeout(FAILURE_BOUND, seen.wait_for(|calls| *calls >= 2))
+            .await
+            .expect("the queued turn runs after the first one")
+            .expect("call counter stays open");
+        release.add_permits(1);
+        let second = tokio::time::timeout(FAILURE_BOUND, second)
+            .await
+            .expect("the queued turn finishes once released")
+            .expect("second turn task");
+        assert!(
+            second.error.is_none(),
+            "the queued turn returns its own result, not SESSION_BUSY: {:?}",
+            second.error
+        );
+        assert_eq!(result_value(&second)["session_id"], session_id.as_str());
+
+        let requests = requests.lock().expect("recorded requests lock poisoned");
+        assert_eq!(
+            requests.len(),
+            2,
+            "one provider call per turn: {requests:?}"
+        );
+        assert!(
+            requests[0].contains("first running turn")
+                && !requests[0].contains("second queued turn"),
+            "the first call sees only the first turn: {}",
+            requests[0]
+        );
+        assert!(
+            requests[1].contains("second queued turn"),
+            "the second call is the queued turn: {}",
+            requests[1]
+        );
+    }
+
     /// 8. `turn/start` emits notifications via the notification sink.
     #[tokio::test]
     async fn turn_start_emits_notifications() {
