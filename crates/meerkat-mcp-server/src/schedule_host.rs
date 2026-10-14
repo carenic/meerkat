@@ -52,6 +52,8 @@ struct McpScheduleContext {
     sidecars: runtime_ingress::SharedMcpSidecars,
     runtime_registration_locks: runtime_ingress::SharedMcpRuntimeRegistrationLocks,
     workgraph_service: meerkat::WorkGraphService,
+    /// The state's local MCP launch boundary, retained by seeded routers.
+    mcp_stdio_launch_profile: meerkat_mcp::McpStdioLaunchProfile,
     #[cfg(test)]
     test_llm_client_override: Option<Arc<dyn meerkat_client::LlmClient>>,
     #[cfg(test)]
@@ -71,6 +73,7 @@ impl McpScheduleContext {
             sidecars: Arc::clone(&state.sidecars),
             runtime_registration_locks: Arc::clone(&state.runtime_registration_locks),
             workgraph_service: state.workgraph_service.clone(),
+            mcp_stdio_launch_profile: state.mcp_stdio_launch_profile.clone(),
             #[cfg(test)]
             test_llm_client_override: None,
             #[cfg(test)]
@@ -419,9 +422,14 @@ impl McpScheduleContext {
             Arc<dyn meerkat_core::mcp_attachment::ConfiguredMcpAttachmentAuthority>,
         >,
     ) -> Result<Arc<McpRouterAdapter>, ScheduleDomainError> {
-        let adapter = Arc::new(McpRouterAdapter::new(McpRouter::new_with_surface_handle(
-            external_tool_surface,
-        )));
+        // Scheduled sessions launch local stdio servers inside the host's
+        // own launch boundary, as interactive sessions do.
+        let adapter = Arc::new(McpRouterAdapter::new(
+            McpRouter::new_with_surface_handle_and_stdio_profile(
+                external_tool_surface,
+                self.mcp_stdio_launch_profile.clone(),
+            ),
+        ));
         let server_configs = scheduled_realm_mcp_servers(
             &self.config_runtime,
             &self.realm_config_source,
@@ -456,6 +464,18 @@ impl McpScheduleContext {
 
         Ok(adapter)
     }
+}
+
+/// The router schedule seeding builds for `state` over `external_tool_surface`
+/// with no configured-attachment authority (tests only).
+#[cfg(test)]
+pub(crate) async fn seed_realm_mcp_adapter_for_test(
+    state: &MeerkatMcpState,
+    external_tool_surface: Arc<dyn ExternalToolSurfaceHandle>,
+) -> Result<Arc<McpRouterAdapter>, ScheduleDomainError> {
+    McpScheduleContext::from_state(state)
+        .seed_realm_mcp_adapter(external_tool_surface, None)
+        .await
 }
 
 /// The MCP servers a scheduled session in `realm_id` is seeded with: the

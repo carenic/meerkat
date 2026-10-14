@@ -13023,12 +13023,19 @@ impl SessionRuntime {
         mut build_config: AgentBuildConfig,
         intents: Vec<meerkat_core::McpSessionAttachmentIntent>,
     ) -> Result<AgentBuildConfig, RpcError> {
+        // The live router launches local stdio servers inside the host
+        // factory's own launch boundary, exactly as a factory-built router
+        // does: a live `mcp/add` never starts a server outside it.
+        let stdio_profile = self.factory.mcp_stdio_launch_profile().clone();
         let router = match &build_config.runtime_build_mode {
             meerkat_core::RuntimeBuildMode::SessionOwned(bindings) => {
-                McpRouter::new_with_surface_handle(Arc::clone(bindings.external_tool_surface()))
+                McpRouter::new_with_surface_handle_and_stdio_profile(
+                    Arc::clone(bindings.external_tool_surface()),
+                    stdio_profile,
+                )
             }
             meerkat_core::RuntimeBuildMode::StandaloneEphemeral => {
-                meerkat::mcp::standalone_router()
+                meerkat::mcp::standalone_router_with_stdio_profile(stdio_profile)
             }
         }
         // Live `mcp/add` servers use the same interactive MCP auth as
@@ -32038,6 +32045,80 @@ mod tests {
                 .is_some_and(|state| state.pending_restore.is_empty()),
             "the boundary restored the queued request"
         );
+    }
+
+    /// A live `mcp/add` launches through the host factory's MCP stdio launch
+    /// profile, as a factory-built router does. Under a required profile the
+    /// backend refuses (`require_descendant_termination` is unsupported on
+    /// every backend), so the server is refused typed and its process never
+    /// starts: the live router never launches outside the host's boundary.
+    #[cfg(all(feature = "mcp", unix))]
+    #[tokio::test]
+    async fn live_mcp_add_launches_inside_the_factory_stdio_launch_profile() {
+        use meerkat_core::confinement::{
+            ConfinementRefusal, ConfinementSpec, FilesystemAccess, IpNetworkAccess, PathAccess,
+            PlatformBaseline,
+        };
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let marker = root.join("live-add-launch-marker");
+        let requirement = ConfinementSpec {
+            baseline: PlatformBaseline::CommandRuntimeV1,
+            read: FilesystemAccess::Paths(vec![PathAccess::Subtree(root.clone())]),
+            write: FilesystemAccess::Paths(vec![PathAccess::Subtree(root.clone())]),
+            deny_read: vec![],
+            deny_write: vec![],
+            network: IpNetworkAccess::Denied,
+            unix_connect: vec![],
+            require_descendant_termination: true,
+        }
+        .try_into()
+        .unwrap();
+        let factory = temp_factory(&temp).with_mcp_stdio_launch_profile(
+            meerkat::McpStdioLaunchProfile::required(requirement, root.clone()),
+        );
+        let runtime = make_runtime(factory, 10);
+        let session_id = runtime
+            .create_session(mock_build_config(), None, None, Vec::new())
+            .await
+            .unwrap();
+        let adapter = runtime
+            .mcp_sessions
+            .read()
+            .await
+            .get(&session_id)
+            .map(|state| Arc::clone(&state.adapter))
+            .expect("the session's live MCP adapter");
+
+        adapter
+            .stage_add(McpServerConfig::stdio(
+                "confined-live-add",
+                "/bin/sh",
+                vec!["-c".into(), "printf entered > \"$MARKER\"".into()],
+                HashMap::from([("MARKER".into(), marker.display().to_string())]),
+            ))
+            .await
+            .unwrap();
+        adapter.apply_staged().await.unwrap();
+        let deltas = adapter
+            .wait_until_ready(Duration::from_secs(15))
+            .await
+            .unwrap();
+
+        assert!(
+            deltas.iter().any(|delta| {
+                delta.target == "confined-live-add"
+                    && delta.phase == meerkat_core::ExternalToolDeltaPhase::Failed
+                    && delta.confinement_refusal == Some(ConfinementRefusal::UnsupportedRequirement)
+            }),
+            "the live add is refused by the factory's launch boundary: {deltas:?}"
+        );
+        assert!(
+            !marker.exists(),
+            "a refused live add never starts the server process"
+        );
+        adapter.shutdown().await;
     }
 
     #[cfg(feature = "mcp")]

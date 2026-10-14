@@ -194,6 +194,8 @@ async fn runtime_backed_external_events_stay_queued_without_waking_idle_sessions
         mob_state,
         #[cfg(feature = "mcp")]
         mcp_sessions: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+        #[cfg(feature = "mcp")]
+        mcp_stdio_launch_profile: meerkat::McpStdioLaunchProfile::trusted_host(),
     };
 
     let app = router(state);
