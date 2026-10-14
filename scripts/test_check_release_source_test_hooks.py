@@ -120,6 +120,46 @@ NAME_ONLY_IN_TEXT_FACTORY = """
 const DOC: &str = r#"set "RKAT_TEST_CLIENT" to 1"#;
 """
 
+# An ungated raw-string read beside a test-gated plain occurrence: the
+# gated one must not vouch for the raw read.
+RAW_UNGATED_READ_FACTORY = """
+fn test_client_shim_requested() -> bool {
+    std::env::var(r"RKAT_TEST_CLIENT").ok().as_deref() == Some("1")
+}
+
+#[cfg(test)]
+mod tests {
+    const SHIM: &str = "RKAT_TEST_CLIENT";
+}
+"""
+
+GATED_RAW_READ_FACTORY = """
+#[cfg(debug_assertions)]
+fn test_client_shim_requested() -> bool {
+    std::env::var(r#"RKAT_TEST_CLIENT"#).ok().as_deref() == Some("1")
+}
+"""
+
+# An ungated read spelled with an escape is still the hook's name.
+ESCAPED_UNGATED_READ_FACTORY = """
+fn test_client_shim_requested() -> bool {
+    std::env::var("RKAT\\x5fTEST_CLIENT").ok().as_deref() == Some("1")
+}
+"""
+
+RAW_UNGATED_OAUTH = """
+const TEST_OAUTH_ENDPOINT_OVERRIDE_ENV: &str = r"MEERKAT_TEST_OAUTH_ENDPOINT_OVERRIDE";
+const TEST_OAUTH_BASE_URL_ENV: &str = r##"MEERKAT_TEST_OAUTH_BASE_URL"##;
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    #[test]
+    fn child() {
+        let _ = ("MEERKAT_TEST_OAUTH_ENDPOINT_OVERRIDE", "MEERKAT_TEST_OAUTH_BASE_URL");
+    }
+}
+"""
+
 FACTORY = "crates/meerkat/src/factory.rs"
 OAUTH = "crates/meerkat-auth-core/src/oauth_flow.rs"
 
@@ -201,6 +241,32 @@ class SourceTestHookCheckTests(unittest.TestCase):
         sha = self.commit({FACTORY: MULTI_LINE_GATED_FACTORY, OAUTH: GATED_OAUTH})
         result = self.check(sha)
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_ungated_raw_string_read_fails_beside_a_gated_plain_one(self) -> None:
+        sha = self.commit({FACTORY: RAW_UNGATED_READ_FACTORY, OAUTH: GATED_OAUTH})
+        result = self.check(sha)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn(f'{FACTORY}:3 at {sha} reads "RKAT_TEST_CLIENT" in release builds', result.stderr)
+        self.assertNotIn(f"{FACTORY}:9 ", result.stderr)
+
+    def test_gated_raw_string_read_passes(self) -> None:
+        sha = self.commit({FACTORY: GATED_RAW_READ_FACTORY, OAUTH: GATED_OAUTH})
+        result = self.check(sha)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_ungated_escaped_read_fails(self) -> None:
+        sha = self.commit({FACTORY: ESCAPED_UNGATED_READ_FACTORY, OAUTH: GATED_OAUTH})
+        result = self.check(sha)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn(f'{FACTORY}:3 at {sha} reads "RKAT_TEST_CLIENT" in release builds', result.stderr)
+
+    def test_ungated_raw_oauth_reads_fail_beside_gated_plain_ones(self) -> None:
+        sha = self.commit({FACTORY: GATED_FACTORY, OAUTH: RAW_UNGATED_OAUTH})
+        result = self.check(sha)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn(f'{OAUTH}:2 at {sha} reads "MEERKAT_TEST_OAUTH_ENDPOINT_OVERRIDE" in release builds', result.stderr)
+        self.assertIn(f'{OAUTH}:3 at {sha} reads "MEERKAT_TEST_OAUTH_BASE_URL" in release builds', result.stderr)
+        self.assertNotIn(f"{OAUTH}:9 ", result.stderr)
 
     def test_raw_string_lines_inside_a_gated_module_are_not_code(self) -> None:
         sha = self.commit({FACTORY: RAW_STRING_IN_GATED_MODULE_FACTORY, OAUTH: GATED_OAUTH})

@@ -13,13 +13,15 @@ that tree compiles each hook only under debug assertions or tests, so
 archives built from an older tree (asset recovery of an old tag, or the
 reused archives of an earlier run) fail closed.
 
-Each string literal that is exactly a hook's variable name must sit in a
-statement or item that is itself, or inside a construct that is, attributed
-#[cfg(debug_assertions)], #[cfg(test)] or #[cfg(all(...))] with one of those
-as a conjunct. String literals and comments are found by lexing; enclosing
-constructs by rustfmt indentation. cfg(any(...)), a negation or a cfg_attr
-does not gate. A hook that no longer appears where it is listed fails too:
-move the entry with the code.
+Each string literal whose value is exactly a hook's variable name, plain
+(escapes decoded) or raw, must sit in a statement or item that is itself, or
+inside a construct that is, attributed #[cfg(debug_assertions)],
+#[cfg(test)] or #[cfg(all(...))] with one of those as a conjunct. String
+literals and comments are found by lexing; enclosing constructs by rustfmt
+indentation. cfg(any(...)), a negation or a cfg_attr does not gate. A hook
+that no longer appears where it is listed fails too: move the entry with the
+code. A name assembled at run time from pieces is outside what a literal
+scan can see.
 
 Usage: check-release-source-test-hooks <commit-ish>
 Exit 0 = every hook is gated, 1 = a hook reaches release builds, 2 = usage.
@@ -40,13 +42,47 @@ HOOKS = (
 GATE_NAMES = {"debug_assertions", "test"}
 # One not(...), with at most one level of parentheses inside.
 NEGATION = re.compile(r"not\((?:[^()]|\([^()]*\))*\)")
-RAW_STRING_START = re.compile(r'b?r(#*)"')
+RAW_STRING_START = re.compile(r'[bc]?r(#*)"')
+SIMPLE_ESCAPES = {"n": "\n", "r": "\r", "t": "\t", "0": "\0", "\\": "\\", '"': '"', "'": "'"}
 IDENTIFIER_CHAR = re.compile(r"[A-Za-z0-9_]")
+
+
+def unescape(body: str) -> str:
+    """The value of an ordinary string literal's body; an escape it cannot
+    decode stays as written."""
+    value = []
+    index = 0
+    while index < len(body):
+        char = body[index]
+        if char != "\\" or index + 1 >= len(body):
+            value.append(char)
+            index += 1
+            continue
+        escape = body[index + 1]
+        if escape in SIMPLE_ESCAPES:
+            value.append(SIMPLE_ESCAPES[escape])
+            index += 2
+        elif escape == "\n":
+            # A line continuation skips the newline and leading whitespace.
+            index += 2
+            while index < len(body) and body[index] in " \t\r\n":
+                index += 1
+        elif escape == "x" and re.fullmatch(r"[0-7][0-9A-Fa-f]", body[index + 2:index + 4]):
+            value.append(chr(int(body[index + 2:index + 4], 16)))
+            index += 4
+        elif escape == "u" and (match := re.match(r"\{([0-9A-Fa-f_]{1,8})\}", body[index + 2:])):
+            value.append(chr(int(match.group(1).replace("_", ""), 16)))
+            index += 2 + match.end()
+        else:
+            value.append(char)
+            index += 1
+    return "".join(value)
 
 
 def lex(text: str) -> tuple[list[bool], list[tuple[int, str]]]:
     """Which lines begin in code rather than inside a string literal or block
-    comment, and every plain string literal as (line index, raw content)."""
+    comment, and the value of every string literal, plain or raw, as (line
+    index, value)."""
     in_code = [True]
     strings: list[tuple[int, str]] = []
     index, end = 0, len(text)
@@ -59,7 +95,7 @@ def lex(text: str) -> tuple[list[bool], list[tuple[int, str]]]:
     while index < end:
         char = text[index]
         raw = None
-        if char in "br" and (index == 0 or not IDENTIFIER_CHAR.match(text[index - 1])):
+        if char in "bcr" and (index == 0 or not IDENTIFIER_CHAR.match(text[index - 1])):
             raw = RAW_STRING_START.match(text, index)
         if char == "\n":
             in_code.append(True)
@@ -80,12 +116,14 @@ def lex(text: str) -> tuple[list[bool], list[tuple[int, str]]]:
         elif raw:
             closing = '"' + raw.group(1)
             stop = text.find(closing, raw.end())
-            skip_to(end if stop < 0 else stop + len(closing))
+            stop = end if stop < 0 else stop
+            strings.append((len(in_code) - 1, text[raw.end():stop]))
+            skip_to(min(stop + len(closing), end))
         elif char == '"':
             cursor = index + 1
             while cursor < end and text[cursor] != '"':
                 cursor += 2 if text[cursor] == "\\" else 1
-            strings.append((len(in_code) - 1, text[index + 1:cursor]))
+            strings.append((len(in_code) - 1, unescape(text[index + 1:cursor])))
             skip_to(min(cursor + 1, end))
         elif char == "'":
             if text.startswith("\\", index + 1):
