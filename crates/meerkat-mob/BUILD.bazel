@@ -68,12 +68,19 @@ rust_library(
     aliases = aliases(package_name = "crates/meerkat-mob"),
     crate_name = "meerkat_mob",
     crate_root = "src/lib.rs",
-    crate_features = [
-        "integration-real-tests",
-        "openai-live",
-        "runtime-adapter",
-        "schema",
-    ],
+    crate_features = select({
+        "//tools/bazel:release_build": [
+            "openai-live",
+            "runtime-adapter",
+            "schema",
+        ],
+        "//conditions:default": [
+            "integration-real-tests",
+            "openai-live",
+            "runtime-adapter",
+            "schema",
+        ],
+    }),
     edition = "2024",
     rustc_flags = WORKSPACE_LINT_RUSTC_FLAGS + [
         "-Ccodegen-units=256",

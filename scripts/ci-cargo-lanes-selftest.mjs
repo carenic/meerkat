@@ -879,6 +879,18 @@ for (const path of [
     rows(mob).some((row) => /^-p meerkat-mob --no-default-features --features \S+ --lib$/.test(row) && !row.includes("test-support")),
     "the production library set without test-support is checked",
   );
+  // A production target selects its release feature set (no test-only
+  // feature) under //tools/bazel:release_build; both branches are checked.
+  const core = planFor(["crates/meerkat-core/src/lib.rs"]);
+  const coreRows = rows(core).filter((row) => row.startsWith("-p meerkat-core ") && row.endsWith(" --lib"));
+  assert.ok(
+    coreRows.some((row) => !row.includes("test-support")),
+    "the release-configuration feature set of meerkat-core is checked",
+  );
+  assert.ok(
+    coreRows.some((row) => row.includes("test-support")),
+    "the default-configuration feature set of meerkat-core is checked",
+  );
   // A bin-only package gets no --lib; weak dependency features stay out.
   const cli = planFor(["crates/meerkat-cli/src/main.rs"]);
   assert.match(rows(cli)[0], /^-p rkat --no-default-features --features \S+ --bins --tests$/);

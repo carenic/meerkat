@@ -47,11 +47,17 @@ rust_library(
     aliases = aliases(package_name = "crates/meerkat-live"),
     crate_name = "meerkat_live",
     crate_root = "src/lib.rs",
-    crate_features = [
-        "__meerkat-generated-authority-bridge",
-        "test-support",
-        "webrtc",
-    ],
+    crate_features = select({
+        "//tools/bazel:release_build": [
+            "__meerkat-generated-authority-bridge",
+            "webrtc",
+        ],
+        "//conditions:default": [
+            "__meerkat-generated-authority-bridge",
+            "test-support",
+            "webrtc",
+        ],
+    }),
     edition = "2024",
     rustc_flags = [
         "--cfg=meerkat_internal_generated_authority_bridge",
@@ -89,11 +95,17 @@ rust_library(
     aliases = aliases(package_name = "crates/meerkat-live"),
     crate_name = "meerkat_live",
     crate_root = "src/lib.rs",
-    crate_features = [
-        "__meerkat-generated-authority-bridge",
-        "test-support",
-        "webrtc",
-    ],
+    crate_features = select({
+        "//tools/bazel:release_build": [
+            "__meerkat-generated-authority-bridge",
+            "webrtc",
+        ],
+        "//conditions:default": [
+            "__meerkat-generated-authority-bridge",
+            "test-support",
+            "webrtc",
+        ],
+    }),
     edition = "2024",
     rustc_flags = [
         "--cfg=meerkat_internal_generated_authority_bridge",

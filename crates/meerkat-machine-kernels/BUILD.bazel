@@ -64,9 +64,12 @@ rust_library(
     aliases = aliases(package_name = "crates/meerkat-machine-kernels"),
     crate_name = "meerkat_machine_kernels",
     crate_root = "src/lib.rs",
-    crate_features = [
-        "test-oracle",
-    ],
+    crate_features = select({
+        "//tools/bazel:release_build": [],
+        "//conditions:default": [
+            "test-oracle",
+        ],
+    }),
     edition = "2024",
     rustc_flags = WORKSPACE_LINT_RUSTC_FLAGS,
     compile_data = [
@@ -97,9 +100,12 @@ rust_library(
     aliases = aliases(package_name = "crates/meerkat-machine-kernels"),
     crate_name = "meerkat_machine_kernels",
     crate_root = "src/lib.rs",
-    crate_features = [
-        "test-oracle",
-    ],
+    crate_features = select({
+        "//tools/bazel:release_build": [],
+        "//conditions:default": [
+            "test-oracle",
+        ],
+    }),
     edition = "2024",
     rustc_flags = WORKSPACE_LINT_RUSTC_FLAGS,
     compile_data = [
