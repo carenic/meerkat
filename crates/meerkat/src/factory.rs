@@ -709,6 +709,27 @@ fn skill_inventory_prompt_section_enabled(
     matches!(sections, meerkat_core::service::HostPromptSections::Full)
 }
 
+/// Built-binary test shim: `RKAT_TEST_CLIENT=1` swaps the provider LLM client
+/// for the deterministic `meerkat_client::TestClient`, so tests that drive a
+/// built `rkat`, `rkat-rpc`, `rkat-rest` or `rkat-mcp` need no provider
+/// credentials. Debug builds only: release builds (`cargo build --release`,
+/// `bazel build -c opt`) compile it out and ignore the variable.
+#[cfg(debug_assertions)]
+fn test_client_shim_requested() -> bool {
+    let requested = std::env::var("RKAT_TEST_CLIENT").ok().as_deref() == Some("1");
+    if requested {
+        tracing::debug!(
+            "RKAT_TEST_CLIENT test shim: the deterministic TestClient replaces the provider client"
+        );
+    }
+    requested
+}
+
+#[cfg(not(debug_assertions))]
+const fn test_client_shim_requested() -> bool {
+    false
+}
+
 /// Full configuration for building an agent via [`AgentFactory::build_agent()`].
 #[derive(Clone)]
 pub struct AgentBuildConfig {
@@ -5138,7 +5159,7 @@ impl AgentFactory {
                     identity.model
                 ))
             })?;
-        if std::env::var("RKAT_TEST_CLIENT").ok().as_deref() == Some("1") {
+        if test_client_shim_requested() {
             return Ok(LlmClientForIdentity {
                 client: Arc::new(meerkat_client::TestClient::for_provider(identity.provider)),
                 selection: None,
@@ -9608,10 +9629,10 @@ impl AgentFactory {
         } else {
             Some(match build_config.llm_client_override.as_ref() {
                 Some(client) => Arc::clone(client),
-                None if std::env::var("RKAT_TEST_CLIENT").ok().as_deref() == Some("1") => {
-                    // Test shim: when RKAT_TEST_CLIENT=1 is set by integration
-                    // tests, short-circuit to an in-process TestClient so tests
-                    // don't need real provider credentials.
+                None if test_client_shim_requested() => {
+                    // Debug-build test shim (see `test_client_shim_requested`):
+                    // tests that set RKAT_TEST_CLIENT=1 get an in-process
+                    // TestClient and need no real provider credentials.
                     Arc::new(meerkat_client::TestClient::for_provider(provider))
                 }
                 None => {
