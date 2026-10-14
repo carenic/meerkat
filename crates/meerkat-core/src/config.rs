@@ -320,6 +320,7 @@ impl Config {
         self.merge_self_hosted_from_toml_presence(&parsed, &self_hosted_layer);
         self.merge_provider_tools_from_toml_presence(&parsed, &provider_tools_layer);
         self.merge_skills_from_toml_presence(&parsed, &skills_layer);
+        self.merge_agent_from_toml_presence(&parsed);
         Ok(warnings)
     }
 
@@ -619,6 +620,22 @@ impl Config {
         }
         if other.workgraph_enabled != defaults.workgraph_enabled {
             self.tools.workgraph_enabled = other.workgraph_enabled;
+        }
+    }
+
+    /// `[agent] budget_warning_threshold` by presence: an explicit value wins
+    /// even when it equals the template default, which the value merge
+    /// cannot tell from an omitted key. A value outside its range loaded as
+    /// the default with a warning and is ignored, so the inherited threshold
+    /// stays.
+    fn merge_agent_from_toml_presence(&mut self, parsed: &toml::Value) {
+        if let Some(threshold) = parsed
+            .get("agent")
+            .and_then(|agent| agent.get("budget_warning_threshold"))
+            .and_then(|threshold| threshold.clone().try_into::<f32>().ok())
+            .filter(|threshold| AgentConfig::budget_warning_threshold_applies(*threshold))
+        {
+            self.agent.budget_warning_threshold = threshold;
         }
     }
 
@@ -1254,12 +1271,16 @@ impl AgentConfig {
             .unwrap_or(DEFAULT_MAX_TOKENS_PER_TURN)
     }
 
+    /// Whether a `budget_warning_threshold` takes effect: one in `(0, 1]`.
+    fn budget_warning_threshold_applies(threshold: f32) -> bool {
+        threshold > 0.0 && threshold <= 1.0
+    }
+
     /// Load normalization for `[agent]`: a `budget_warning_threshold` outside
     /// `(0, 1]` loads as the default. Releases through 0.9.0 never read the
     /// key, so documents they wrote may hold any value.
     fn normalize_persisted(&mut self) -> Option<ConfigWarning> {
-        let threshold = self.budget_warning_threshold;
-        if threshold > 0.0 && threshold <= 1.0 {
+        if Self::budget_warning_threshold_applies(self.budget_warning_threshold) {
             return None;
         }
         self.budget_warning_threshold = Self::default().budget_warning_threshold;
@@ -3348,6 +3369,7 @@ pub(crate) fn compose_effective_config_with_chain(
                 effective.merge_provider_tools_from_toml_presence(raw, &doc.provider_tools);
                 effective.merge_self_hosted_from_toml_presence(raw, &doc.self_hosted);
                 effective.merge_skills_from_toml_presence(raw, &doc.skills);
+                effective.merge_agent_from_toml_presence(raw);
             } else {
                 // No raw TOML for this doc (e.g. a non-filesystem source): fall
                 // back to a whole-section child-wins swap so self_hosted /
@@ -3811,6 +3833,59 @@ model = "custom-model"
             base.agent.budget_warning_threshold, 0.5,
             "budget_warning_threshold must survive merge when absent in later layer"
         );
+
+        // An explicit child value wins even when it equals the template
+        // default; an omitted or out-of-range one keeps the parent's. Realm
+        // composition follows the same rule.
+        for (child_agent, expected) in [
+            ("budget_warning_threshold = 0.8\n", 0.8),
+            ("model = \"custom-model\"\n", 1.0),
+            ("budget_warning_threshold = 7.0\n", 1.0),
+        ] {
+            let mut layered = Config::default();
+            layered
+                .merge_toml_str("[agent]\nbudget_warning_threshold = 1.0\n")
+                .expect("merge the parent layer");
+            layered
+                .merge_toml_str(&format!("[agent]\n{child_agent}"))
+                .expect("merge the child layer");
+            assert_eq!(
+                layered.agent.budget_warning_threshold, expected,
+                "merged {child_agent}"
+            );
+
+            let parent_id =
+                crate::connection::RealmId::parse("parent").expect("valid parent realm");
+            let child_id = crate::connection::RealmId::parse("child").expect("valid child realm");
+            let mut parent = Config::default();
+            parent.agent.budget_warning_threshold = 1.0;
+            parent.realm.insert(
+                parent_id.to_string(),
+                crate::connection::RealmConfigSection::default(),
+            );
+            // Every child document loads with the default threshold: an
+            // explicit 0.8, an omitted key, and an out-of-range value alike.
+            let mut child = Config::default();
+            child.realm.insert(
+                child_id.to_string(),
+                crate::connection::RealmConfigSection {
+                    parent: Some(parent_id.clone()),
+                    ..Default::default()
+                },
+            );
+            let docs =
+                std::collections::BTreeMap::from([(parent_id, parent), (child_id.clone(), child)]);
+            let raw_docs = std::collections::BTreeMap::from([(
+                child_id.clone(),
+                toml::from_str(&format!("[agent]\n{child_agent}")).expect("raw child config"),
+            )]);
+            let effective = compose_effective_config(&docs, &raw_docs, &child_id)
+                .expect("realm composition should succeed");
+            assert_eq!(
+                effective.agent.budget_warning_threshold, expected,
+                "composed {child_agent}"
+            );
+        }
     }
 
     /// Releases through 0.9.0 never read `[agent] budget_warning_threshold`,
