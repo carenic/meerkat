@@ -159,7 +159,9 @@ authorization. A working directory is not a filesystem sandbox. A selected
 `Required` confinement profile must be enforceable by the host or the launch is
 refused. An explicit `TrustedHost` path retains host access; there is no automatic
 downgrade from required confinement. Untrusted native code must run outside the
-trusted host process.
+trusted host process. The stock hosts select confinement with the
+[`[confinement]` config section](/concepts/configuration#os-process-confinement)
+or their `--confinement` flags.
 
 **Human consent** adds approval for an otherwise permitted exact action. An
 authenticated eligible approver decides on a retained candidate, account,

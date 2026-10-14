@@ -16,6 +16,9 @@ The top-level CLI parser exposes these realm scope and config flags:
 - `--context-root <path>`
 - `--user-config-root <path>`
 - `--default-model <model>`
+- `--confinement <trusted-host|workspace>`, with `--confinement-network
+  <denied|unrestricted>`, `--confinement-read <path>` and
+  `--confinement-write <path>` (see [OS process confinement](#os-process-confinement))
 
 The scope flags decide which realm config and state are used.
 `--user-config-root` overrides the user-level convention root.
@@ -128,8 +131,9 @@ shell = { secs = 120, nanos = 0 }
 These settings control tool availability. Realm selection chooses configuration
 and state, and provider credentials enable provider authentication; none installs
 native permission owners or selects OS confinement. Native governance requires
-explicit composition by a trusted embedding host, and shell confinement is a
-separate host setting. See [authorization integration](/guides/authorization-integration)
+explicit composition by a trusted embedding host. OS process confinement is the
+`[confinement]` section and the `--confinement` flags
+([below](#os-process-confinement)). See [authorization integration](/guides/authorization-integration)
 for the current supported profiles and [native governed embedding](/rust/native-authorization)
 for Rust setup.
 </Note>
@@ -149,6 +153,56 @@ stream_inactivity_timeout = "2m"
 
 # Or: stream_inactivity_timeout = "disabled"
 ```
+
+## OS process confinement
+
+`rkat` confines the shell, command hooks and MCP stdio servers its agents
+launch as the composed `[confinement]` section states (see
+[OS process confinement](/concepts/configuration#os-process-confinement) for
+the section, its modes and how documents compose). The workspace preset's root
+is the project root: `--context-root`, else the nearest ancestor of the
+working directory containing `.rkat`, else the working directory.
+
+```toml
+# ~/.rkat/config.toml: confine every launch kind of every realm.
+[confinement.all]
+mode = "workspace"
+write = ["/tmp/build"]
+```
+
+The `--confinement` flags replace the section for one invocation, for every
+launch kind:
+
+```bash
+# Workspace preset with IP network access and one extra read-only directory.
+rkat --confinement workspace --confinement-network unrestricted \
+  --confinement-read /opt/toolchain run "Build and test the project"
+
+# The operator's explicit opt-out for this invocation.
+rkat --confinement trusted-host run "Inspect the system"
+```
+
+`--confinement-network`, `--confinement-read` and `--confinement-write` need
+`--confinement workspace`; relative paths resolve against the working
+directory. A launch the platform cannot confine as required is refused with
+typed feedback to the model and never runs unconfined; `rkat` warns once on
+stderr for each launch kind this host cannot confine.
+
+`rkat` refuses a command whose confined processes could change its realm
+state or user config document (see
+[the host's own inputs](/concepts/configuration#the-hosts-own-inputs)). On
+macOS the workspace preset protects `<project>/.rkat`, where the default
+realm state lives. On Linux it cannot, so start with `--state-root <dir>`
+outside the project:
+
+```bash
+rkat --state-root ~/.local/share/meerkat/realms --confinement workspace \
+  run "Build and test the project"
+```
+
+A project `mcp.toml` or `.rkat/config.toml` that a confined process can write
+is not trusted: its MCP servers and hooks are refused, and `rkat` says so on
+stderr.
 
 ## Custom model registry entries
 

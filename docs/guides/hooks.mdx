@@ -233,6 +233,12 @@ the factory rejects that configuration before constructing an agent. Without
 the factory setting, command hooks retain legacy trusted-host compatibility,
 including ambient environment inheritance. This default is not OS confinement.
 
+The stock hosts (`rkat`, `rkat-rpc`, `rkat-rest` and `rkat-mcp`) install this
+requirement from the `command_hooks` launch kind of the `[confinement]`
+section, or from their `--confinement` flags, with the workspace root or the
+`custom` working directory as the hooks' working directory. See
+[OS process confinement](/concepts/configuration#os-process-confinement).
+
 Hosts implementing `CommandHookProcessCustody` must implement its closed `spawn`
 method. The default refuses with typed `UnsupportedRequirement`; implementing
 only the legacy mutable-command `prepare` method no longer enables execution.

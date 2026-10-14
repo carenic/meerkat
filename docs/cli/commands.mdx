@@ -36,8 +36,16 @@ rkat [--realm <id>] [--isolated] [--instance <id>] \
   [--context-root <path>] \
   [--user-config-root <path>] \
   [--default-model <model>] \
+  [--confinement <trusted-host|workspace>] \
+  [--confinement-network <denied|unrestricted>] \
+  [--confinement-read <path>]... [--confinement-write <path>]... \
   <command>
 ```
+
+The `--confinement` flags select the OS process confinement of the shell,
+command hooks and MCP stdio servers this invocation launches, replacing the
+`[confinement]` config section for every launch kind; see
+[OS process confinement](/cli/configuration#os-process-confinement).
 
 `--default-model <model>` persists the default agent model into the
 scope-resolved config (project/user/realm resolution included) and exits when
