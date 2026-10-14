@@ -676,6 +676,14 @@ pub enum CommsSendErrorData {
         envelope_id: String,
         message: String,
     },
+    /// The delivery outcome is unknown: the envelope may already be
+    /// delivered, so this is not a failed send. Reconcile against durable
+    /// work truth by `envelope_id` before any new attempt; a retry can
+    /// duplicate the delivery.
+    SendAmbiguous {
+        envelope_id: String,
+        message: String,
+    },
     SendFailed {
         message: String,
     },
@@ -693,6 +701,7 @@ impl CommsSendErrorData {
             | Self::PeerUnreachable { message, .. }
             | Self::PeerAdmissionDropped { message, .. }
             | Self::PeerInputRejected { message, .. }
+            | Self::SendAmbiguous { message, .. }
             | Self::SendFailed { message }
             | Self::InvalidCommand { message } => message,
         }
@@ -914,6 +923,29 @@ mod tests {
                 envelope_id: projected_id,
                 ..
             } if peer == "peer-a" && projected_id == envelope_id.to_string()
+        ));
+    }
+
+    #[test]
+    fn comms_send_error_data_names_ambiguous_delivery() {
+        let envelope_id = uuid::Uuid::new_v4();
+        let value = serde_json::to_value(CommsSendErrorData::SendAmbiguous {
+            envelope_id: envelope_id.to_string(),
+            message: format!("delivery outcome for envelope {envelope_id} is unknown"),
+        })
+        .expect("ambiguous delivery should serialize");
+
+        assert_eq!(value["code"], "send_ambiguous");
+        assert_eq!(value["envelope_id"], envelope_id.to_string());
+
+        let roundtrip: CommsSendErrorData =
+            serde_json::from_value(value).expect("ambiguous delivery should deserialize");
+        assert!(matches!(
+            roundtrip,
+            CommsSendErrorData::SendAmbiguous {
+                envelope_id: projected_id,
+                ..
+            } if projected_id == envelope_id.to_string()
         ));
     }
 

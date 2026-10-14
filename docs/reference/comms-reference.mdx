@@ -162,9 +162,10 @@ interaction identity; a newly generated retry id is new peer work. A higher
 layer can make a retry safe only when its durable idempotency key is coarser
 than the attempt. Per-attempt or timestamped keys provide no such protection.
 
-REST preserves this uncertainty as `send_ambiguous`, with the `envelope_id`,
-`retry_safe: false`, and `required_action: "reconcile"`. It does not flatten
-the result into `send_failed`.
+REST and JSON-RPC `comms/send` preserve this uncertainty as `send_ambiguous`
+with the `envelope_id`; REST also adds `retry_safe: false` and
+`required_action: "reconcile"`. Neither flattens the result into
+`send_failed`.
 
 External events use `session/external_event`, stdin, REST webhook, or an
 explicit plain TCP/UDS event listener. Plain listeners are separate from the

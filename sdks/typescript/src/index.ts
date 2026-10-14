@@ -355,6 +355,7 @@ export type {
   CommsSendErrorDataPeerInputRejected,
   CommsSendErrorDataPeerNotFoundOrNotTrusted,
   CommsSendErrorDataPeerUnreachable,
+  CommsSendErrorDataSendAmbiguous,
   CommsSendErrorDataSendFailed,
 } from "./generated/types.js";
 export { COMMS_SEND_ERROR_CODES, commsSendError } from "./comms-errors.js";

@@ -66,6 +66,21 @@ pub(crate) fn normalize_send_error(
                 message: format!("peer '{peer}' durably rejected envelope {envelope_id}"),
             }
         }
+        // Not a failed send: the envelope may already be delivered, and a
+        // caller told "failed" retries, which can duplicate the delivery. Name
+        // the ambiguity and carry the envelope id for reconciliation, as REST's
+        // `send_ambiguous` does.
+        meerkat_core::comms::SendError::AmbiguousDelivery {
+            envelope_id,
+            detail,
+        } => CommsSendErrorData::SendAmbiguous {
+            envelope_id: envelope_id.to_string(),
+            message: format!(
+                "delivery outcome for envelope {envelope_id} is unknown; it may already be \
+                 delivered. Reconcile against durable work truth before any new attempt - a \
+                 retry can duplicate. ({detail})"
+            ),
+        },
         other => CommsSendErrorData::SendFailed {
             message: other.to_string(),
         },
@@ -361,6 +376,29 @@ mod tests {
         assert_eq!(json["code"], "peer_input_rejected");
         assert_eq!(json["peer"], "peer-a");
         assert_eq!(json["envelope_id"], envelope_id.to_string());
+    }
+
+    // An ambiguous delivery may already have landed, so it must reach the
+    // caller as `send_ambiguous` with its envelope id, never as `send_failed`:
+    // a caller told "failed" retries, and the retry can duplicate the delivery.
+    #[test]
+    fn normalize_send_error_names_ambiguous_delivery() {
+        let envelope_id = uuid::Uuid::new_v4();
+        let data = normalize_send_error(
+            Some("peer-a"),
+            &meerkat_core::comms::SendError::AmbiguousDelivery {
+                envelope_id,
+                detail: "ack timed out".to_string(),
+            },
+        );
+
+        let message = data.message().to_string();
+        let json = serde_json::to_value(data).unwrap();
+        assert_eq!(json["code"], "send_ambiguous");
+        assert_eq!(json["envelope_id"], envelope_id.to_string());
+        assert!(message.contains(&envelope_id.to_string()), "{message}");
+        assert!(message.contains("may already be delivered"), "{message}");
+        assert!(!message.contains("failed"), "{message}");
     }
 
     // Gate (#62): `send_receipt_json` returns a typed `Result` and no longer

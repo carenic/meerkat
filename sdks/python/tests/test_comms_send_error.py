@@ -55,6 +55,13 @@ def test_comms_send_error_is_none_for_other_exceptions() -> None:
     assert comms_send_error(ValueError("not a meerkat error")) is None
 
 
+_ENVELOPE_ID = "00000000-0000-4000-8000-000000000001"
+_AMBIGUOUS_MESSAGE = (
+    f"delivery outcome for envelope {_ENVELOPE_ID} is unknown; it may already be "
+    "delivered. Reconcile against durable work truth before any new attempt - a "
+    "retry can duplicate. (ack timed out)"
+)
+
 # The JSON-RPC error responses `comms/send` returns
 # (crates/meerkat-rpc/src/handlers/comms.rs): the typed data is `error.data`.
 _WIRE_FAILURES = [
@@ -91,6 +98,16 @@ _WIRE_FAILURES = [
             "message": "peer 'alice' rejected envelope at ingress: inbox_full",
         },
         id="peer_admission_dropped",
+    ),
+    pytest.param(
+        -32603,
+        _AMBIGUOUS_MESSAGE,
+        {
+            "code": "send_ambiguous",
+            "envelope_id": _ENVELOPE_ID,
+            "message": _AMBIGUOUS_MESSAGE,
+        },
+        id="send_ambiguous",
     ),
     pytest.param(
         -32602,

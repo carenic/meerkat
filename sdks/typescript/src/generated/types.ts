@@ -5430,6 +5430,12 @@ export interface CommsSendErrorDataPeerInputRejected {
   peer: string;
 }
 
+export interface CommsSendErrorDataSendAmbiguous {
+  code: "send_ambiguous";
+  envelope_id: string;
+  message: string;
+}
+
 export interface CommsSendErrorDataSendFailed {
   code: "send_failed";
   message: string;
@@ -5440,7 +5446,7 @@ export interface CommsSendErrorDataInvalidCommand {
   message: string;
 }
 
-export type CommsSendErrorData = CommsSendErrorDataPeerNotFoundOrNotTrusted | CommsSendErrorDataPeerUnreachable | CommsSendErrorDataPeerAdmissionDropped | CommsSendErrorDataPeerInputRejected | CommsSendErrorDataSendFailed | CommsSendErrorDataInvalidCommand;
+export type CommsSendErrorData = CommsSendErrorDataPeerNotFoundOrNotTrusted | CommsSendErrorDataPeerUnreachable | CommsSendErrorDataPeerAdmissionDropped | CommsSendErrorDataPeerInputRejected | CommsSendErrorDataSendAmbiguous | CommsSendErrorDataSendFailed | CommsSendErrorDataInvalidCommand;
 
 export type CommsChecksumTokenResultIntent = "checksum_token";
 

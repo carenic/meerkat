@@ -37,6 +37,12 @@ describe("commsSendError", () => {
     assert.equal(commsSendError(undefined), undefined);
   });
 
+  const ENVELOPE_ID = "00000000-0000-4000-8000-000000000001";
+  const AMBIGUOUS_MESSAGE =
+    `delivery outcome for envelope ${ENVELOPE_ID} is unknown; it may already be ` +
+    "delivered. Reconcile against durable work truth before any new attempt - a " +
+    "retry can duplicate. (ack timed out)";
+
   // The JSON-RPC error responses `comms/send` returns
   // (crates/meerkat-rpc/src/handlers/comms.rs): the typed data is `error.data`.
   const WIRE_FAILURES = [
@@ -73,6 +79,12 @@ describe("commsSendError", () => {
         reason: "inbox_full",
         message: "peer 'alice' rejected envelope at ingress: inbox_full",
       },
+    },
+    {
+      name: "send_ambiguous",
+      rpcCode: -32603,
+      rpcMessage: AMBIGUOUS_MESSAGE,
+      data: { code: "send_ambiguous", envelope_id: ENVELOPE_ID, message: AMBIGUOUS_MESSAGE },
     },
     {
       name: "invalid_command",

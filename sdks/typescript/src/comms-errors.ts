@@ -7,6 +7,7 @@ const COMMS_SEND_ERROR_CODE_TABLE = {
   peer_unreachable: true,
   peer_admission_dropped: true,
   peer_input_rejected: true,
+  send_ambiguous: true,
   send_failed: true,
   invalid_command: true,
 } as const satisfies Record<CommsSendErrorData["code"], true>;

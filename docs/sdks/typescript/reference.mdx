@@ -868,7 +868,9 @@ A failed `session.send()` carries the server's typed `CommsSendErrorData` in
 `err.details`, tagged on `code`: `peer_not_found_or_not_trusted`,
 `peer_unreachable` (`reason` is `offline_or_no_ack` or `transport_error`; a
 transport error's text is in `details`), `peer_admission_dropped`,
-`peer_input_rejected` (with the `envelope_id`), `send_failed` and
+`peer_input_rejected` (with the `envelope_id`), `send_ambiguous` (the
+delivery may already have landed: reconcile by its `envelope_id` before any
+new attempt, since a retry can duplicate it), `send_failed` and
 `invalid_command`. `commsSendError(err)` returns it typed, or `undefined` for
 any other error. Branch on `code`, never on the message text.
 

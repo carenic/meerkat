@@ -88132,6 +88132,27 @@
         "type": "object"
       },
       {
+        "description": "The delivery outcome is unknown: the envelope may already be\ndelivered, so this is not a failed send. Reconcile against durable\nwork truth by `envelope_id` before any new attempt; a retry can\nduplicate the delivery.",
+        "properties": {
+          "code": {
+            "const": "send_ambiguous",
+            "type": "string"
+          },
+          "envelope_id": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "code",
+          "envelope_id",
+          "message"
+        ],
+        "type": "object"
+      },
+      {
         "properties": {
           "code": {
             "const": "send_failed",

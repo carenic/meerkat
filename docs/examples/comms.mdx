@@ -197,6 +197,9 @@ If REST cannot prove the terminal delivery outcome, it returns typed
 }
 ```
 
+JSON-RPC `comms/send` fails with the same `send_ambiguous` code in
+`error.data`, with the `envelope_id` and a `message`.
+
 Reconcile that envelope against durable work truth before creating another
 attempt. A new envelope id is new peer work; only a higher-level durable
 idempotency key that is coarser than the retry can make a replay collapse.
