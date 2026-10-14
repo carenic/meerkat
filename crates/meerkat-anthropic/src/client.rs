@@ -46,7 +46,11 @@ const CLAUDE_AI_OAUTH_AUTHORIZER_LABEL: &str = "claude-ai-oauth";
 pub struct AnthropicClient {
     api_key: String,
     base_url: String,
-    http: reqwest::Client,
+    /// The provider HTTP client built for `base_url`, or why it could not be
+    /// built. A failed build fails each request with that error; no other
+    /// client (a default one, or the one built for a previous base URL)
+    /// stands in for it.
+    http: Result<reqwest::Client, LlmError>,
     #[cfg(not(target_arch = "wasm32"))]
     checked_http: std::sync::OnceLock<Result<reqwest::Client, LlmError>>,
     connect_timeout: Duration,
@@ -173,7 +177,7 @@ impl AnthropicClientBuilder {
         Ok(AnthropicClient {
             api_key: self.api_key,
             base_url,
-            http,
+            http: Ok(http),
             #[cfg(not(target_arch = "wasm32"))]
             checked_http: std::sync::OnceLock::new(),
             connect_timeout,
@@ -545,6 +549,11 @@ fn project_anthropic_system_message_order<'a>(
 }
 
 impl AnthropicClient {
+    /// The provider HTTP client; a failed build fails the request.
+    fn http(&self) -> Result<&reqwest::Client, LlmError> {
+        self.http.as_ref().map_err(Clone::clone)
+    }
+
     fn model_supports_temperature(model: &str) -> bool {
         crate::request_support::supports_temperature(model)
     }
@@ -566,7 +575,7 @@ impl AnthropicClient {
     }
 
     /// Set custom base URL
-    pub fn with_base_url(mut self, url: String) -> Self {
+    pub fn with_base_url(self, url: String) -> Self {
         #[cfg(not(target_arch = "wasm32"))]
         let builder = reqwest::Client::builder()
             .connect_timeout(self.connect_timeout)
@@ -576,9 +585,20 @@ impl AnthropicClient {
             .tcp_keepalive(Duration::from_secs(30));
         #[cfg(target_arch = "wasm32")]
         let builder = reqwest::Client::builder();
-        if let Ok(http) = http::build_http_client_for_base_url(builder, &url) {
-            self.http = http;
-        }
+        let http = http::build_http_client_for_base_url(builder, &url);
+        self.with_base_url_and_http(url, http)
+    }
+
+    /// Point this client at `url`, served by `http`: the HTTP client built
+    /// for that URL, or why it could not be built. A failure is kept, so each
+    /// request fails with it; the client built for the previous URL is
+    /// dropped either way.
+    fn with_base_url_and_http(
+        mut self,
+        url: String,
+        http: Result<reqwest::Client, LlmError>,
+    ) -> Self {
+        self.http = http;
         self.base_url = url;
         #[cfg(not(target_arch = "wasm32"))]
         {
@@ -1357,10 +1377,10 @@ impl AnthropicClient {
                 .as_ref()
                 .map_err(Clone::clone)?
         } else {
-            &self.http
+            self.http()?
         };
         #[cfg(target_arch = "wasm32")]
-        let http = &self.http;
+        let http = self.http()?;
         #[cfg(target_arch = "wasm32")]
         let _ = has_images;
         #[cfg(not(target_arch = "wasm32"))]
@@ -4779,6 +4799,67 @@ mod tests {
             2
         );
         server.abort();
+    }
+
+    /// A base URL whose HTTP client could not be built fails each request
+    /// with that error. The client built for the previous base URL is never
+    /// used for the new one: its proxy decision belongs to the old endpoint,
+    /// and the governed-HTTP contract substitutes no other client for one
+    /// that failed to build.
+    #[tokio::test]
+    async fn a_failed_base_url_rebuild_fails_requests_without_a_fallback_client() {
+        let payload = [
+            r#"data: {"type":"message_start","message":{"usage":{"input_tokens":1,"output_tokens":0}}}"#,
+            r#"data: {"type":"content_block_start","content_block":{"type":"text","text":""}}"#,
+            r#"data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"ok"}}"#,
+            r#"data: {"type":"content_block_stop"}"#,
+            r#"data: {"type":"message_delta","usage":{"output_tokens":1},"delta":{"stop_reason":"end_turn"}}"#,
+            r#"data: {"type":"message_stop"}"#,
+            "",
+        ]
+        .join("\n");
+        let (previous_url, previous_bodies, previous_server) =
+            spawn_anthropic_replay_capture_server(payload.clone()).await;
+        let (rebound_url, rebound_bodies, rebound_server) =
+            spawn_anthropic_replay_capture_server(payload).await;
+        let client = AnthropicClient::builder("test-key".to_string())
+            .base_url(previous_url)
+            .build()
+            .expect("client for the previous base URL")
+            .with_base_url_and_http(
+                rebound_url,
+                Err(LlmError::Unknown {
+                    message: "Failed to build HTTP client: synthetic build failure".to_string(),
+                }),
+            );
+        let request = LlmRequest::new(
+            "claude-sonnet-4-5",
+            vec![Message::User(UserMessage::text("hello"))],
+        );
+
+        let mut stream = client.stream(&request);
+        let first = stream.next().await;
+        drop(stream);
+        previous_server.abort();
+        rebound_server.abort();
+
+        let sent = previous_bodies.lock().expect("capture lock").len()
+            + rebound_bodies.lock().expect("capture lock").len();
+        assert_eq!(
+            sent, 0,
+            "a request went out through the client built for the previous base URL"
+        );
+        assert!(
+            matches!(
+                &first,
+                Some(Ok(LlmEvent::Done {
+                    outcome: LlmDoneOutcome::Error {
+                        error: LlmError::Unknown { message }
+                    }
+                })) if message.contains("synthetic build failure")
+            ),
+            "the request fails with the rebuild error: {first:?}"
+        );
     }
 
     /// What a redirect target saw: one `(method, x-api-key)` per request.
