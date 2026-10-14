@@ -39,8 +39,9 @@ OpenAI account, explicitly select `gpt-5.5` or set a compatible binding
 the free tier, select `gemini-3.8-flash` explicitly (`--model
 gemini-3.8-flash`) or keep it as the Gemini default with
 `[models] gemini = "gemini-3.8-flash"` in config.
-Catalog-default changes alone do not migrate arbitrary configured models or
-binding defaults. The CLI has a separate, narrow built-in OAuth repair.
+Catalog-default changes alone do not rewrite configured models, binding
+defaults, or the model an existing session recorded (a resumed session keeps
+its recorded model). The CLI has a separate, narrow built-in OAuth repair.
 </Warning>
 
 During interactive login, or read preparation when a matching stored token
@@ -50,9 +51,8 @@ the login route's current default: the provider's catalog default, except
 because the catalog's Gemini default is not verified on Code Assist. A new
 `rkat auth login google` binding also starts on `gemini-3.8-flash`, as does
 the `copilot_gemini` route binding that `rkat auth login copilot` creates. This
-applies
-only to the following reserved `global` binding/backend/auth profile IDs and
-frozen legacy values:
+applies only to the following reserved `global` binding/backend/auth profile
+IDs and frozen legacy values:
 
 | Binding | Backend profile | Auth profile | Legacy `default_model` values repaired |
 |---------|-----------------|--------------|----------------------------------------|
