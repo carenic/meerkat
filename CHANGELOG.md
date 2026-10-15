@@ -89,12 +89,15 @@ them.
   (as after a release version bump, when no compiled unit can be reused)
   completes on a hosted 4-vCPU runner.
 - The live provider matrix (`meerkat-client` test
-  `live_client_provider_matrix`, lanes `e2e-live` and `e2e-smoke`) sends
-  current catalog models, the cheapest per provider (`claude-haiku-5-5`,
-  `gpt-6-luna`, `gemini-3.1-flash-lite`), and the catalog's image-generation
-  defaults. It sent retired ids such as `claude-3-haiku-20240307`, so its live
-  tests failed. A test that needs no provider keys now fails when the matrix
-  names a model outside Core's catalog.
+  `live_client_provider_matrix`, which needs provider keys and the
+  `integration-real-tests` feature and is run by hand with `--ignored`; no
+  lane runs it) sends current catalog models, the cheapest per provider
+  (`claude-haiku-5-5`, `gpt-6-luna`, `gemini-3.1-flash-lite`), and the
+  catalog's image-generation defaults. It sent retired ids such as
+  `claude-3-haiku-20240307`, so its live tests failed. A new `meerkat-client`
+  test, `provider_matrix_catalog`, needs no keys or features and runs in the
+  ordinary test lanes: it fails when the matrix names a model outside Core's
+  catalog.
 - A turn's reasoning-effort preference (set on a live channel's delegated
   member turns) is now lowered onto Gemini requests too, as it already was
   for OpenAI and Anthropic. When the selected model's catalog row lists the

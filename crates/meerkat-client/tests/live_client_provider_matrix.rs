@@ -41,8 +41,8 @@ use tokio::net::{TcpListener, TcpStream};
 /// The text model each provider's tests send: the cheapest current catalog
 /// model of that provider by input and output price when chosen (Claude
 /// Haiku 5.5, GPT-6 Luna, Gemini 3.1 Flash-Lite). The image smokes use the
-/// catalog's image-generation defaults.
-/// `live_matrix_names_only_catalog_models` keeps every model id this file
+/// catalog's image-generation defaults. `provider_matrix_catalog.rs`, a test
+/// that needs no provider keys or features, keeps every model id this file
 /// names in Core's catalog.
 const ANTHROPIC_MODEL: &str = "claude-haiku-5-5";
 const OPENAI_MODEL: &str = "gpt-6-luna";
@@ -201,45 +201,6 @@ fn image_capabilities() -> ImageGenerationTargetCapabilities {
         image_search_grounding: false,
         image_continuity_tokens: ImageContinuityTokenSupport::Unsupported,
     }
-}
-
-/// Every provider model id this matrix names is a model of Core's catalog:
-/// a text model, or an image-generation model. A retired id (the live lanes
-/// once sent `claude-3-haiku-20240307`, which the provider no longer serves)
-/// fails here, without provider keys, instead of breaking the live lanes.
-#[test]
-fn live_matrix_names_only_catalog_models() {
-    let source = include_str!("live_client_provider_matrix.rs");
-    let mut named = Vec::new();
-    for prefix in ["claude-", "gpt-", "gemini-", "dall-e-"] {
-        let opening = format!("\"{prefix}");
-        let mut rest = source;
-        while let Some(at) = rest.find(&opening) {
-            let literal = &rest[at + 1..];
-            let end = literal.find('"').expect("a model id literal closes");
-            let id = &literal[..end];
-            // The prefix list above names only the prefixes themselves.
-            if id.len() > prefix.len() {
-                named.push(id.to_string());
-            }
-            rest = &literal[end + 1..];
-        }
-    }
-    assert!(
-        !named.is_empty(),
-        "the scan must find the matrix's model ids"
-    );
-    let uncatalogued: Vec<&String> = named
-        .iter()
-        .filter(|id| {
-            meerkat_models::infer_provider(id).is_none()
-                && meerkat_models::image_generation_provider_for_model(id).is_none()
-        })
-        .collect();
-    assert!(
-        uncatalogued.is_empty(),
-        "the live matrix names model ids outside Core's catalog: {uncatalogued:?}"
-    );
 }
 
 #[tokio::test]
