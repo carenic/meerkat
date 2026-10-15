@@ -95,6 +95,33 @@ them.
   after narrowing on `kind`. `MobTurnStartOptions.authBinding` is typed as
   `TurnAuthBindingOverride` (a binding ref, `{ action: "set", value }` or
   `{ action: "clear" }`) instead of an untyped object (see Fixed).
+- `meerkat_rest::AppState` has a new `mcp_stdio_launch_profile` field (with
+  the `mcp` feature): the launch boundary its sessions' live MCP routers
+  retain. A struct literal must add it; pass the factory's
+  `mcp_stdio_launch_profile()`, or `McpStdioLaunchProfile::trusted_host()`
+  for the previous behavior.
+- `meerkat_core::confinement::ConfinementRefusal` has a new variant,
+  `UntrustedConfigurationSource` (`untrusted_configuration_source` on the
+  wire). An exhaustive match needs an arm for it. A 0.9.0 client can receive
+  the value where typed confinement refusals already appear (an MCP server's
+  failed setup notice, a `confinement_refused` tool error, a hook launch
+  refusal), only from a host that confines every launch kind and finds a
+  convention source its confined processes can write. A 0.9.0 Python or
+  TypeScript SDK client rejects an MCP setup status or tool-config event
+  that carries it (`INVALID_RESPONSE`, or an event parse error for an
+  unknown `confinement_refusal`); the 0.9.1 SDKs accept it, and their
+  `ConfinementRefusal` literal unions (Python, TypeScript, Web) gain the
+  value.
+- `meerkat_core::Config` and `meerkat_core::config::CliOverrides` have a new
+  `confinement` field; a struct literal must add it (or use
+  `..Default::default()`).
+- `meerkat_core::ConfigError` has new `ConfinementAdministration` and
+  `ConfinementLayerConflict` variants, and
+  `meerkat_contracts::wire::WireConfigWriteRefusal` a new
+  `ConfinementAdministrationRequired` variant; exhaustive matches need arms.
+- `meerkat_rpc::governed_jsonl::GovernedJsonlSetup` has a new
+  `host_confinement` field; pass `meerkat::HostConfinement::trusted_host()`
+  for the previous behavior.
 
 ### Security
 
@@ -173,6 +200,65 @@ them.
   lists the codes. Both SDKs export `CommsSendErrorData`, its per-code
   variants, `CommsPeerUnreachableReason`, `AdmissionDropReason` and
   `CommsSendRequiredAction`.
+- `AgentFactory::mcp_stdio_launch_profile` returns the factory's MCP stdio
+  launch profile. `meerkat::mcp::standalone_router_with_stdio_profile` and
+  `McpRouter::new_with_stdio_profile` build a standalone or an unbound router
+  that retains a given profile.
+- OS process confinement in the stock binaries, through configuration and
+  flags. The `[confinement]` config section selects the confinement of each
+  launch kind the host's agents use: `all`, or `shell` (foreground calls,
+  background jobs and monitors), `command_hooks` and `mcp_stdio`, each
+  `trusted_host` (the default), `workspace` (the workspace root plus listed
+  read and write subtrees, the platform baseline, and IP sockets only with
+  `network = "unrestricted"`) or `custom` (an explicit requirement and
+  working directory). `rkat`, `rkat-rpc`, `rkat-rest` and `rkat-mcp` accept
+  `--confinement <trusted-host|workspace>`, `--confinement-network`,
+  `--confinement-read` and `--confinement-write`, which replace the section
+  for every launch kind of that process. A launch the platform cannot
+  confine as required is refused with typed feedback and never runs
+  unconfined. A config without the section behaves exactly as before.
+- Across the documents a realm composes (the user document, then the realm
+  chain from its root), a confinement requirement only holds or is added: a
+  less trusted document that states a required launch kind differently is
+  refused with `ConfigError::ConfinementLayerConflict`.
+- Ordinary config writes cannot add, change or remove `[confinement]`; they
+  are refused with `confinement_administration_required`
+  (`WireConfigWriteRefusal::ConfinementAdministrationRequired`) on JSON-RPC,
+  REST and MCP, and nothing is written.
+- A host that confines every launch kind keeps its own inputs from its
+  confined processes. A start in which a confined process could change the
+  realm state or the user config document (by writing it, creating it, or
+  replacing a directory on the way to it) is refused, naming the input, the
+  launch kind and the remedy (`--state-root`, `--user-config-root`). An
+  `mcp.toml` or project `.rkat/config.toml` that a confined process can
+  write is not trusted: its MCP servers are refused before they are
+  expanded, authorized, connected or spawned, and its hooks keep their
+  place and are refused at every invocation, all with the typed reason
+  `untrusted_configuration_source`. A host that runs any launch kind as the
+  trusted host reports that it gives no such guarantee. On macOS the
+  `workspace` preset protects `<root>/.rkat`; on Linux the host's realm
+  state must live outside the workspace. Known limitation: on a governed
+  realm, `rkat`'s configured MCP route leaves an untrusted file's servers
+  out with a warning on stderr instead of reporting each refusal to the
+  model.
+- Each host reports at startup the requested and effective confinement of
+  every launch kind, the inputs it keeps from confined processes, and each
+  convention source it does not trust.
+- Rust API: `meerkat::HostConfinement` (with `HostAuthority`, `HostInput`,
+  `HostConfinementNotice` and `HostConfinementError`) resolves a selection
+  once; `AgentFactory::with_host_confinement` installs it,
+  `AgentFactory::host_confinement` and `AgentFactory::shell_confinement`
+  read it back. `meerkat_core` exports the section's vocabulary
+  (`ConfinementConfig`, `ConfinementLaunchKind`, `LaunchConfinement`,
+  `WorkspaceConfinement`, `WorkspaceNetwork`, `CustomConfinement`,
+  `ConfinementFlags`, `ConfinementLayerConflict`), and
+  `McpConfig::effective_servers_from_roots_trusting` and
+  `McpConfig::load_with_scopes_from_roots_trusting` load MCP servers
+  without trusting a file a confined process can write.
+  `McpRouter::stage_add_refused` stages a typed refused add and
+  `DefaultHookEngine::with_refused_entries` refuses hook entries at every
+  invocation. The config contract schema describes the section's closed
+  shapes.
 
 ### Changed
 
@@ -269,6 +355,10 @@ them.
   `-32011` for `budget_exhausted` and `time_budget_exceeded`, `-32012` for
   `hook_denied`) instead of `-32603`, and keeps the typed turn error in
   `error.data.error`. Other causes stay `-32603`.
+- REST `PUT`/`PATCH /config` refuses a write that would change, remove or
+  restate `[governance]` with HTTP 400, code `CONFIG_WRITE_REFUSED` and
+  `details.type = "governance_administration_required"`, instead of a 500
+  `CONFIGURATION_ERROR`.
 
 ### Deprecated
 
@@ -575,6 +665,14 @@ them.
 - TypeScript SDK: `MobTurnStartOptions.authBinding` is typed as
   `TurnAuthBindingOverride` (a binding ref, `{ action: "set", value }` or
   `{ action: "clear" }`) instead of an untyped object.
+- Live and configured MCP stdio servers now launch inside the host's MCP
+  stdio launch profile (`AgentFactory::with_mcp_stdio_launch_profile`) on
+  every route. JSON-RPC `mcp/add` (on a created, promoted or cold-recovered
+  session), REST live MCP and the `rkat run` loader each built their own
+  router with the trusted-host profile, so a Rust host that required
+  confinement still had those stdio servers launched unconfined. `rkat-mcp`
+  sessions (fresh, resumed without a router, and scheduled) take one profile
+  from the server's state.
 
 ### Known issues
 
