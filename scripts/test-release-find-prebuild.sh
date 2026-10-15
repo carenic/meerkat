@@ -2,11 +2,12 @@
 # Self-test for scripts/release-find-prebuild with a stubbed `gh` (no network).
 #
 # The lookup decides whether a tag run rebuilds every release artifact or
-# publishes a pre-tag prebuild's: it must select only a complete prebuild of
-# exactly the release commit (release.yml, workflow_dispatch, main, this
-# repository, a successful "Release prebuild gate", downloadable artifacts),
-# prefer the newest, wait for one still running, and fail loudly when the API
-# fails instead of reporting "no prebuild".
+# publishes a pre-tag prebuild's: it must select only a prebuild of exactly
+# the release commit (release.yml, workflow_dispatch, main, this repository,
+# a successful "Release prebuild gate", downloadable critical artifacts), as
+# soon as that gate passed even while the run's trailing lanes still build,
+# prefer the newest, wait for a gate that has not concluded, and fail loudly
+# when the API fails instead of reporting "no prebuild".
 
 set -euo pipefail
 
@@ -92,14 +93,16 @@ runs() {
   printf '{"workflow_runs": [%s]}\n' "${joined}" >"${FIXTURES}/$(key_for "${runs_url}")${suffix}.json"
 }
 
-# jobs <run id> <prebuild gate conclusion or "absent">
+# jobs <run id> <prebuild gate conclusion, "pending" or "absent"> [variant suffix]
 jobs() {
   local gate=""
-  if [[ "$2" != "absent" ]]; then
-    gate=", {\"name\": \"Release prebuild gate\", \"conclusion\": \"$2\"}"
-  fi
-  printf '{"jobs": [{"name": "Release binary build gate", "conclusion": "success"}%s]}\n' "${gate}" \
-    >"${FIXTURES}/$(key_for "repos/${REPO}/actions/runs/$1/jobs?per_page=100").json"
+  case "$2" in
+    absent) ;;
+    pending) gate=', {"name": "Release prebuild gate", "conclusion": null}' ;;
+    *) gate=", {\"name\": \"Release prebuild gate\", \"conclusion\": \"$2\"}" ;;
+  esac
+  printf '{"jobs": [{"name": "Release binary build gate", "conclusion": null}%s]}\n' "${gate}" \
+    >"${FIXTURES}/$(key_for "repos/${REPO}/actions/runs/$1/jobs?per_page=100")${3:-}.json"
 }
 
 # artifacts <run id> <name:expired>...
@@ -172,19 +175,26 @@ jobs 103 failure
 complete_artifacts 103
 lookup failed-gate "" 0
 
-# 5. An expired archive, or a missing Windows or Web SDK artifact, is not
-#    reusable.
+# 5. An expired archive, a missing critical target or a missing Web SDK
+#    package is not reusable; the trailing Intel macOS and Windows archives
+#    are not required.
 reset
 runs "" "$(run_json 104 completed)"
 jobs 104 success
-artifacts 104 "meerkat-x86_64-unknown-linux-gnu-buildbuddy:true" \
-  "meerkat-x86_64-pc-windows-msvc-windows-latest:false" "rkat-web-package:false"
+critical_only=(
+  "meerkat-x86_64-unknown-linux-gnu-buildbuddy:false"
+  "meerkat-aarch64-unknown-linux-gnu-buildbuddy:false"
+  "meerkat-aarch64-apple-darwin-buildbuddy:false"
+)
+artifacts 104 "${critical_only[@]}" "meerkat-x86_64-apple-darwin-macos-15-rkat:true" "rkat-web-package:false"
 lookup expired-archive "" 0
-artifacts 104 "meerkat-x86_64-unknown-linux-gnu-buildbuddy:false" "rkat-web-package:false"
-lookup missing-windows "" 0
 artifacts 104 "meerkat-x86_64-unknown-linux-gnu-buildbuddy:false" \
-  "meerkat-x86_64-pc-windows-msvc-windows-latest:false"
+  "meerkat-aarch64-apple-darwin-buildbuddy:false" "rkat-web-package:false"
+lookup missing-critical "" 0
+artifacts 104 "${critical_only[@]}"
 lookup missing-web-sdk "" 0
+artifacts 104 "${critical_only[@]}" "rkat-web-package:false"
+lookup trailing-not-required 104 0
 
 # 6. Runs the API returns that are not exactly this commit's release.yml
 #    dispatch on main in this repository are ignored, whatever their jobs.
@@ -210,20 +220,29 @@ for run_id in 301 303 305; do
 done
 lookup newest-prebuild 305 0
 
-# 8. A prebuild still running is waited for and then selected.
+# 8. A prebuild whose gate has not concluded is waited for, and selected as
+#    soon as the gate passes, while its trailing lanes still run.
 reset
-runs ".1" "$(run_json 401 in_progress)"
-runs ".3" "$(run_json 401 completed)"
-jobs 401 success
+runs "" "$(run_json 401 in_progress)"
+jobs 401 absent ".1"
+jobs 401 pending ".2"
+jobs 401 success ".3"
 complete_artifacts 401
-lookup waits-for-running 401 0
+lookup waits-for-gate 401 0
 calls="$(cat "${FIXTURES}/.calls-$(key_for "${runs_url}")")"
-[[ "${calls}" -eq 3 ]] || fail "waits-for-running: expected three listings while waiting, got ${calls}"
+[[ "${calls}" -eq 3 ]] || fail "waits-for-gate: expected three listings while waiting, got ${calls}"
+reset
+runs "" "$(run_json 402 in_progress)"
+jobs 402 success
+artifacts 402 "${critical_only[@]}" "rkat-web-package:false"
+lookup critical-ready-while-trailing-run 402 0
 
-# 9. A run still going past the wait budget is not waited for forever.
+# 9. A run whose gate has not concluded past the wait budget is not waited
+#    for forever.
 reset
 runs "" "$(run_json 501 in_progress .github/workflows/release.yml workflow_dispatch main "${SHA}" "${REPO}" \
   "$(date -u -d '-3 hours' +%Y-%m-%dT%H:%M:%SZ)")"
+jobs 501 pending
 WAIT_SECONDS=600 lookup stale-running "" 0
 
 # 10. An API failure fails the lookup instead of reading as "no prebuild".

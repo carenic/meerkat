@@ -8,15 +8,17 @@
 #   - a workflow_dispatch run of .github/workflows/release.yml on main in this
 #     repository (GITHUB_REPOSITORY) whose head is that commit;
 #   - whose "Release prebuild gate" job succeeded (only a
-#     prebuild_release_artifacts dispatch has that job, and it passes only when
-#     every binary lane and the Web SDK package succeeded);
-#   - whose release artifacts are all still downloadable: the Windows archive,
-#     at least one Linux/macOS archive artifact, no expired meerkat-* artifact,
-#     and rkat-web-package.
-# A matching run that is still in progress is waited for, polling every
-# MEERKAT_PREBUILD_POLL_SECONDS (default 60), until it completes or
-# MEERKAT_PREBUILD_WAIT_SECONDS (default 6000) have passed since it started: a
-# prebuild already under way finishes no later than a fresh build would.
+#     prebuild_release_artifacts dispatch has that job, and it passes once the
+#     critical Linux and macOS arm64 binaries and the Web SDK package are
+#     built; the run's trailing Intel macOS and Windows lanes may still be
+#     running, and the tag's trailing publisher waits for them);
+#   - whose critical artifacts are still downloadable: an unexpired archive
+#     artifact for each critical target, no expired meerkat-* artifact, and
+#     rkat-web-package.
+# A matching run whose gate has not concluded yet is waited for, polling every
+# MEERKAT_PREBUILD_POLL_SECONDS (default 60), until the gate concludes or
+# MEERKAT_PREBUILD_WAIT_SECONDS (default 6000) have passed since the run
+# started: a prebuild already under way finishes no later than a fresh build.
 #
 # The id is only a pointer. The publishing jobs verify every archive and the
 # Web SDK package against their build attestations before anything is
@@ -27,7 +29,7 @@ set -euo pipefail
 shopt -s inherit_errexit
 
 PREBUILD_GATE_JOB="Release prebuild gate"
-WINDOWS_ARTIFACT="meerkat-x86_64-pc-windows-msvc-windows-latest"
+CRITICAL_TARGETS=(x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu aarch64-apple-darwin)
 WEB_SDK_ARTIFACT="rkat-web-package"
 
 usage() {
@@ -72,16 +74,19 @@ candidate_runs() {
   done <<<"${listing}" | sort -t $'\t' -k1,1nr
 }
 
-prebuild_gate_succeeded() {
-  local run_id="$1" conclusion
-  conclusion="$(gh api --paginate "repos/${repository}/actions/runs/${run_id}/jobs?per_page=100" \
-    --jq ".jobs[] | select(.name == \"${PREBUILD_GATE_JOB}\") | .conclusion")" ||
+# The prebuild gate's conclusion: success, failure, ..., "pending" while it
+# has not concluded, or "absent" when the run has no such job.
+prebuild_gate_state() {
+  local run_id="$1" state
+  state="$(gh api --paginate "repos/${repository}/actions/runs/${run_id}/jobs?per_page=100" \
+    --jq ".jobs[] | select(.name == \"${PREBUILD_GATE_JOB}\") | (.conclusion // \"pending\")")" ||
     { log "cannot list the jobs of run ${run_id}"; exit 1; }
-  [[ "${conclusion}" == "success" ]]
+  printf '%s\n' "${state:-absent}"
 }
 
 artifacts_downloadable() {
-  local run_id="$1" listing name expired unix=0 windows=0 web=0
+  local run_id="$1" listing name expired target web=0 missing=()
+  local -A critical=()
   listing="$(gh api --paginate "repos/${repository}/actions/runs/${run_id}/artifacts?per_page=100" \
     --jq '.artifacts[] | [.name, (.expired | tostring)] | @tsv')" ||
     { log "cannot list the artifacts of run ${run_id}"; exit 1; }
@@ -91,20 +96,23 @@ artifacts_downloadable() {
       "${WEB_SDK_ARTIFACT}")
         [[ "${expired}" == "false" ]] && web=1
         ;;
-      "${WINDOWS_ARTIFACT}")
-        [[ "${expired}" == "false" ]] && windows=1
-        ;;
       meerkat-*)
         if [[ "${expired}" != "false" ]]; then
           log "run ${run_id}: artifact ${name} has expired"
           return 1
         fi
-        unix=$((unix + 1))
+        for target in "${CRITICAL_TARGETS[@]}"; do
+          [[ "${name}" == "meerkat-${target}-"* ]] && critical["${target}"]=1
+        done
         ;;
     esac
   done <<<"${listing}"
-  if [[ "${unix}" -eq 0 || "${windows}" -eq 0 || "${web}" -eq 0 ]]; then
-    log "run ${run_id}: release artifacts incomplete (Linux/macOS: ${unix}, Windows: ${windows}, Web SDK: ${web})"
+  for target in "${CRITICAL_TARGETS[@]}"; do
+    [[ -n "${critical[${target}]:-}" ]] || missing+=("${target}")
+  done
+  [[ "${web}" -eq 1 ]] || missing+=("${WEB_SDK_ARTIFACT}")
+  if [[ "${#missing[@]}" -gt 0 ]]; then
+    log "run ${run_id}: critical artifacts missing: ${missing[*]}"
     return 1
   fi
 }
@@ -114,28 +122,29 @@ while true; do
   pending=0
   while IFS=$'\t' read -r run_id status started; do
     [[ -n "${run_id}" ]] || continue
-    if [[ "${status}" != "completed" ]]; then
+    gate="$(prebuild_gate_state "${run_id}")"
+    if [[ "${gate}" == "pending" || ( "${gate}" == "absent" && "${status}" != "completed" ) ]]; then
       if (($(date -u +%s) - started < wait_seconds)); then
-        log "run ${run_id} for ${release_sha} is ${status}; waiting for it"
+        log "run ${run_id} for ${release_sha} is ${status} and its ${PREBUILD_GATE_JOB} has not concluded; waiting for it"
         pending=1
       else
-        log "run ${run_id} for ${release_sha} is still ${status} ${wait_seconds}s after it started; not waiting longer"
+        log "run ${run_id} for ${release_sha}: no ${PREBUILD_GATE_JOB} conclusion ${wait_seconds}s after it started; not waiting longer"
       fi
       continue
     fi
-    if ! prebuild_gate_succeeded "${run_id}"; then
-      log "run ${run_id}: no successful ${PREBUILD_GATE_JOB} job (not a complete prebuild)"
+    if [[ "${gate}" != "success" ]]; then
+      log "run ${run_id}: ${PREBUILD_GATE_JOB} ${gate} (not a usable prebuild)"
       continue
     fi
     if ! artifacts_downloadable "${run_id}"; then
       continue
     fi
-    log "run ${run_id} prebuilt the release artifacts of ${release_sha}"
+    log "run ${run_id} prebuilt the critical release artifacts of ${release_sha} (run ${status})"
     printf '%s\n' "${run_id}"
     exit 0
   done <<<"${runs}"
   if [[ "${pending}" -eq 0 ]]; then
-    log "no complete prebuild of ${release_sha}"
+    log "no usable prebuild of ${release_sha}"
     exit 0
   fi
   sleep "${poll_seconds}"

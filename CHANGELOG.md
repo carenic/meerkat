@@ -71,6 +71,10 @@ them.
   Homebrew follows it. Intel macOS binaries are now cross-compiled on Apple
   silicon (`macos-15`) on both release backends, instead of BuildBuddy or the
   `macos-15-intel` runner.
+- A pre-tag prebuild is reusable as soon as its critical binaries and Web
+  SDK package are built: the tag publishes those right away, and its
+  trailing publisher waits for the prebuild's Intel macOS and Windows lanes
+  (the prebuild run's full binary build gate) before adding their archives.
 - CI's `Closure tests` rows have 60 minutes instead of 40, and the
   `ci-integration` profile gives its four slow nested-Cargo and
   whole-workspace tests 16 slow periods (960 s) instead of 8, so a cold row

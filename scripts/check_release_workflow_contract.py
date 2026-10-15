@@ -1360,14 +1360,14 @@ def check_prebuild(text: str) -> list[str]:
                 "(github.sha): a moving main would be built instead"
             )
 
-    # 4. The prebuild gate passes only on every artifact, and the lookup
-    #    requires exactly that job.
+    # 4. The prebuild gate passes only on the critical binaries and the Web
+    #    SDK package, and the lookup requires exactly that job.
     gate_steps = [step for step in job_steps(job_block(text, PREBUILD_GATE_JOB)) if step.run]
     gate_name = parse_mapping(job_block(text, PREBUILD_GATE_JOB), 4).get("name", "")
     if len(gate_steps) != 1:
         violations.append(f"job `{PREBUILD_GATE_JOB}` must have exactly one run step")
     else:
-        for failed in ("build_binaries_gate", WEB_SDK_BUILD_JOB):
+        for failed in ("build_binaries_critical_gate", WEB_SDK_BUILD_JOB):
             context = EventContext(**{**realistic.__dict__, "job_results": {failed: "failure"}})
             status, _ = _run_gate_script(gate_steps[0], context)
             if status == 0:
@@ -1455,6 +1455,32 @@ def check_prebuild(text: str) -> list[str]:
                 f"step `{verify_steps[0].name}` verifies {fresh.label} with {fresh_calls}; "
                 "expected the exact-tag verification"
             )
+
+    # The trailing publisher downloads the prebuild's archives only after
+    # that run's full binary build gate passed (the trailing lanes may still
+    # be running when the prebuild is selected).
+    publisher_steps = _running_steps(text, ASSET_PUBLISH_JOB, reused)
+    wait_index = next(
+        (
+            index
+            for index, step in publisher_steps
+            if "Release binary build gate" in step.run and "PREBUILD_RUN_ID" in step.run
+        ),
+        None,
+    )
+    download_index = next(
+        (
+            index
+            for index, step in publisher_steps
+            if "actions/download-artifact" in step.fields.get("uses", "")
+        ),
+        None,
+    )
+    if wait_index is None or download_index is None or wait_index > download_index:
+        violations.append(
+            f"job `{ASSET_PUBLISH_JOB}` must wait for the prebuild run's `Release binary build gate` "
+            f"before downloading its archives on {reused.label}"
+        )
 
     web_steps = _running_steps(text, WEB_SDK_PUBLISH_JOB, reused)
     verify_index = next(
@@ -1646,12 +1672,15 @@ def check_trailing_platforms(text: str) -> list[str]:
             frontier.extend(needs[upstream])
         return seen
 
-    waits = sorted(set(TRAILING_BUILD_JOBS + ("build_binaries_gate",)) & closure(CRITICAL_PUBLISH_JOB))
-    if waits:
-        violations.append(
-            f"job `{CRITICAL_PUBLISH_JOB}` waits for {', '.join(f'`{job}`' for job in waits)}; "
-            "the trailing Intel macOS and Windows lanes must not gate the critical assets"
-        )
+    for job in (CRITICAL_PUBLISH_JOB, PREBUILD_GATE_JOB):
+        if job not in needs:
+            continue
+        waits = sorted(set(TRAILING_BUILD_JOBS + ("build_binaries_gate",)) & closure(job))
+        if waits:
+            violations.append(
+                f"job `{job}` waits for {', '.join(f'`{upstream}`' for upstream in waits)}; "
+                "the trailing Intel macOS and Windows lanes must not gate the critical assets"
+            )
     if not _job_runs(text, CRITICAL_PUBLISH_JOB, TAG_PUSH):
         violations.append(f"job `{CRITICAL_PUBLISH_JOB}` does not run on {TAG_PUSH.label}")
 

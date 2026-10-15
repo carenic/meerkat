@@ -471,6 +471,22 @@ elif name == "trailing-critical-if-reflowed":
         "      needs.build_binaries_critical_gate.result == 'success' &&\n"
         "      needs.release_semver_gate.result == 'success'\n",
     )
+elif name == "prebuild-gate-waits-trailing":
+    # The prebuild is reusable only once its trailing lanes finished too.
+    replace_once(
+        "    needs: [require_ci_green, build_binaries_critical_gate, build_web_sdk_package]\n",
+        "    needs: [require_ci_green, build_binaries_gate, build_web_sdk_package]\n",
+    )
+elif name == "prebuild-reuse-no-wait":
+    # The trailing publisher downloads before the prebuild's trailing lanes finished.
+    match = re.search(
+        r"      - name: Wait for the prebuild's trailing lanes\n"
+        r"(?:        .*\n|          .*\n|\n)*?(?=      - name: |      # |\Z)",
+        text,
+    )
+    if match is None:
+        raise SystemExit(f"fixture `{name}` expects the trailing-lane wait step")
+    text = text[: match.start()] + text[match.end() :]
 elif name == "both-defects":
     replace_once(
         MEASUREMENT_STEP_IF,
@@ -635,6 +651,12 @@ expect_fail_named prebuild-reuse-unverified "${TEST_ROOT}/prebuild-reuse-unverif
 mutate prebuild-web-unverified "${TEST_ROOT}/prebuild-web-unverified.yml"
 expect_fail_named prebuild-web-unverified "${TEST_ROOT}/prebuild-web-unverified.yml" \
   "must verify the prebuilt package's attestation" prebuild
+mutate prebuild-reuse-no-wait "${TEST_ROOT}/prebuild-reuse-no-wait.yml"
+expect_fail_named prebuild-reuse-no-wait "${TEST_ROOT}/prebuild-reuse-no-wait.yml" \
+  "must wait for the prebuild run's \`Release binary build gate\`" prebuild
+mutate prebuild-gate-waits-trailing "${TEST_ROOT}/prebuild-gate-waits-trailing.yml"
+expect_fail_named prebuild-gate-waits-trailing "${TEST_ROOT}/prebuild-gate-waits-trailing.yml" \
+  "job \`release_prebuild_gate\` waits for \`build_binaries_gate\`" trailing-platforms
 mutate prebuild-gate-renamed "${TEST_ROOT}/prebuild-gate-renamed.yml"
 expect_fail_named prebuild-gate-renamed "${TEST_ROOT}/prebuild-gate-renamed.yml" \
   "does not require the \`Prebuild complete\` job" prebuild

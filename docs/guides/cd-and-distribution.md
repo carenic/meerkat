@@ -286,29 +286,34 @@ embedding a separate runtime implementation.
 `make release-prebuild VERSION=vX.Y.Z` dispatches `release.yml` on `main` with
 `prebuild_release_artifacts=true`. The run refuses any other ref, any
 publishing or recovery input, and a version whose tag already exists. It
-does not wait for CI: it builds every release binary (BuildBuddy or the
-GitHub-hosted lane for Linux/macOS, cargo-xwin for Windows, verified on a
-Windows runner) and the Web SDK package from exactly the dispatched commit,
-stamps each archive with that commit, attests and uploads everything, and
-publishes nothing. Its `Release prebuild gate` job passes only when every
-binary lane and the Web SDK package succeeded.
+does not wait for CI: it builds every release binary (the critical Linux and
+macOS arm64 ones on BuildBuddy or the GitHub-hosted lane, Intel macOS
+cross-compiled on Apple silicon, Windows cross-compiled with cargo-xwin and
+verified on a Windows runner) and the Web SDK package from exactly the
+dispatched commit, stamps each archive with that commit, attests and uploads
+everything, and publishes nothing. Its `Release prebuild gate` job passes
+once the critical binaries and the Web SDK package succeeded; the trailing
+Intel macOS and Windows lanes keep running in the same run.
 
 The tag run looks the prebuild up after `require_ci_green`
 (`release_prebuild`, `scripts/release-find-prebuild`): a `release.yml`
 dispatch on `main` at exactly the tag commit, in this repository, whose
-`Release prebuild gate` passed and whose artifacts have not expired; one
-still running is waited for, because it finishes no later than a fresh build
-would. When it finds one, the tag run skips every build job,
-`publish_github_release` verifies that run's archives exactly like an
-`--assets-run-id` recovery (`verify-release-asset-provenance --source-run`:
-every archive and its stamp attested by `release.yml` at that commit on
-`refs/heads/main`, the stamp naming the tag commit, the run's
-`Release binary build gate` green) and checks that every binary embeds the
-release version, and `publish_web_sdk` verifies the package's attestation
-and version before publishing. Without a complete prebuild the tag builds
-everything as before. The prebuild never relaxes a publication gate: exact-main
-CI, semver evidence and registry credentials are still required by the tag
-run itself.
+`Release prebuild gate` passed and whose critical artifacts have not expired;
+a gate that has not concluded yet is waited for, because the prebuild
+finishes no later than a fresh build would. When it finds one, the tag run
+skips every build job and publishes that run's artifacts after the same
+verification as an `--assets-run-id` recovery
+(`verify-release-asset-provenance --source-run`: every archive and its stamp
+attested by `release.yml` at that commit on `refs/heads/main`, the stamp
+naming the tag commit, every binary embedding the release version):
+`publish_critical_release_assets` publishes the critical archives at once,
+and `publish_github_release` adds the trailing ones after the prebuild's
+`Release binary build gate` passed (if that run's trailing lanes failed, an
+asset recovery publishes them). `publish_web_sdk` verifies the package's
+attestation and version before publishing. Without a usable prebuild the tag
+builds everything as before. The prebuild never relaxes a publication gate:
+exact-main CI, semver evidence and registry credentials are still required by
+the tag run itself.
 
 The default `./scripts/repo-cargo release patch --execute` flow combines
 bump, commit, tag, and push; that command summary alone does not establish

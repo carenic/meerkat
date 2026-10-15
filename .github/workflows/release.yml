@@ -820,9 +820,10 @@ jobs:
   # A tag run publishes the artifacts of a successful pre-tag prebuild of
   # exactly its commit instead of rebuilding them: a release.yml run
   # dispatched on main at the tag commit with prebuild_release_artifacts,
-  # whose Release prebuild gate succeeded and whose artifacts have not
-  # expired (scripts/release-find-prebuild; a prebuild still running is
-  # waited for). Its run id is the only thing reused: publish_github_release
+  # whose Release prebuild gate succeeded (critical binaries and Web SDK
+  # package ready; its trailing lanes may still be running) and whose
+  # critical artifacts have not expired (scripts/release-find-prebuild; a
+  # gate that has not concluded is waited for). Its run id is the only thing reused: publish_github_release
   # verifies every archive exactly as for an assets_run_id recovery (each one
   # and its source stamp attested by release.yml at that commit on
   # refs/heads/main, the run's binary build gate green, every binary
@@ -1954,12 +1955,14 @@ jobs:
           path: web-sdk-package/rkat-web-*.tgz
           if-no-files-found: error
 
-  # The marker release_prebuild requires of a prebuild run: every binary lane
-  # (the binary build gate, Windows verified on Windows) and the Web SDK
-  # package succeeded for the dispatched commit.
+  # The marker release_prebuild requires of a prebuild run: the critical
+  # binaries (Linux x86_64 and aarch64, macOS arm64) and the Web SDK package
+  # succeeded for the dispatched commit. The trailing Intel macOS and Windows
+  # lanes do not hold it back: they keep running in this run, and the tag's
+  # trailing publisher waits for this run's full binary build gate.
   release_prebuild_gate:
     name: Release prebuild gate
-    needs: [require_ci_green, build_binaries_gate, build_web_sdk_package]
+    needs: [require_ci_green, build_binaries_critical_gate, build_web_sdk_package]
     if: >-
       always() &&
       github.event_name == 'workflow_dispatch' &&
@@ -1974,13 +1977,13 @@ jobs:
         run: |
           set -euo pipefail
           request="${{ needs.require_ci_green.result }}"
-          binaries="${{ needs.build_binaries_gate.result }}"
+          binaries="${{ needs.build_binaries_critical_gate.result }}"
           web_sdk="${{ needs.build_web_sdk_package.result }}"
           echo "Prebuild request: ${request}"
-          echo "Release binary build gate: ${binaries}"
+          echo "Release critical binary build gate: ${binaries}"
           echo "Web SDK package: ${web_sdk}"
           [[ "${request}" == "success" && "${binaries}" == "success" && "${web_sdk}" == "success" && -n "${PREBUILD_TAG}" ]]
-          echo "Prebuilt every ${PREBUILD_TAG} release artifact of ${GITHUB_SHA}; the ${PREBUILD_TAG} tag run of exactly this commit publishes them instead of rebuilding."
+          echo "Prebuilt the critical ${PREBUILD_TAG} release artifacts of ${GITHUB_SHA}; the ${PREBUILD_TAG} tag run of exactly this commit publishes them instead of rebuilding, and the trailing ones once this run's binary build gate passes."
 
   # The critical platforms (Linux x86_64 and aarch64, macOS arm64): the
   # selected lane built them, or the archives come from an earlier run (a
@@ -2142,6 +2145,41 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: release-artifacts
+
+      # The prebuild was selected once its critical artifacts were ready; its
+      # trailing Intel macOS and Windows lanes may still be running. Their
+      # archives exist once that run's full binary build gate passed, which
+      # --source-run below requires anyway. If they failed, the trailing
+      # assets come from an asset recovery (make release-assets).
+      - name: Wait for the prebuild's trailing lanes
+        if: ${{ needs.release_prebuild.outputs.run_id != '' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PREBUILD_RUN_ID: ${{ needs.release_prebuild.outputs.run_id }}
+        run: |
+          set -euo pipefail
+          deadline=$(( $(date +%s) + 9000 ))
+          while true; do
+            state="$(gh api --paginate "repos/${GITHUB_REPOSITORY}/actions/runs/${PREBUILD_RUN_ID}/jobs?per_page=100" \
+              --jq '.jobs[] | select(.name == "Release binary build gate") | (.conclusion // "pending")')"
+            case "${state:-pending}" in
+              success)
+                echo "Release run ${PREBUILD_RUN_ID}: every binary lane, trailing ones included, succeeded"
+                break
+                ;;
+              pending) ;;
+              *)
+                echo "::error::Release run ${PREBUILD_RUN_ID}: Release binary build gate ${state}; publish the trailing assets with an asset recovery (make release-assets)"
+                exit 1
+                ;;
+            esac
+            if (( $(date +%s) >= deadline )); then
+              echo "::error::Release run ${PREBUILD_RUN_ID}: no binary build gate result after 150 minutes"
+              exit 1
+            fi
+            sleep 60
+          done
 
       # A tag whose commit was prebuilt: the prebuild run's archives, stamps
       # and attestations; verify-release-asset-provenance --source-run binds
