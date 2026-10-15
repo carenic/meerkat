@@ -35,6 +35,22 @@ them.
 
 ## [Unreleased]
 
+### Breaking
+
+- Behaviour-only (not measured by the gate): a config write that changes a
+  realm's own parent edge is refused (`confinement_administration_required`,
+  or invalid params when the new edge does not resolve) when the realm would
+  compose a different `[confinement]`, and a section one config document
+  states for another realm no longer replaces that realm's own edge (see
+  Fixed). Re-parent such a realm by editing its document as its host.
+
+### Added
+
+- `FileConfigStore::with_realm_chain` declares a store's document a realm's
+  own document, composed with the other documents a `RealmConfigSource`
+  supplies, so its writes keep the `[confinement]` the realm composes (see
+  Fixed).
+
 ### Changed
 
 - CI's `Closure tests` rows have 60 minutes instead of 40, and the
@@ -42,6 +58,26 @@ them.
   whole-workspace tests 16 slow periods (960 s) instead of 8, so a cold row
   (as after a release version bump, when no compiled unit can be reused)
   completes on a hosted 4-vCPU runner.
+
+### Fixed
+
+- An ordinary config write can no longer cut a realm from the ancestors
+  whose `[confinement]` it composes. A write that changes or removes the
+  realm's own `[realm.<id>].parent` edge (`config/set`, `config/patch`,
+  `PUT`/`PATCH /config`, the MCP config tool, `rkat config set`/`patch`) is
+  refused with `confinement_administration_required` when the realm would
+  compose a different `[confinement]` through the new edge, and nothing is
+  written; an edge whose chain does not resolve is refused as invalid. In
+  0.9.1 such a write made the realm drop its former ancestors'
+  requirements from the next start, so a config writer could turn
+  confinement an ancestor realm required into unconfined launches. The
+  refusal message now also names the parent edge.
+- A realm's own config document decides its own parent edge. A section
+  another document states for the realm (an ordinary write to an ancestor
+  realm's document could add one) applies only when the realm's own
+  document states none. Before, such a section in a document that sorted
+  after the realm's own replaced its edge during composition and cut the
+  realm from that ancestor and its `[confinement]`.
 
 ## [0.9.1] - 2026-10-15
 
@@ -700,12 +736,6 @@ them.
   `--max-total-tokens`, `--max-duration`, `--max-tool-calls`) nor the pack's
   deploy defaults (`[budget]`, `[models]`, `max_tokens`, `[compaction]`)
   apply to those members.
-- An ordinary config write can change or remove a realm's
-  `[realm.<id>].parent` edge. From the next start that realm no longer
-  composes the `[confinement]` of its former ancestors (governance
-  inheritance follows the same edge). A requirement in the user document or
-  set with the `--confinement` flags is not affected; put confinement that
-  must hold there.
 
 ## [0.9.0] - 2026-10-13
 

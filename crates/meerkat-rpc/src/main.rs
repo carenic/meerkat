@@ -408,10 +408,12 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     let realm_config_source: Arc<dyn meerkat_core::RealmConfigSource> =
         Arc::new(fs_realm_config_source);
 
-    let base_store: Arc<dyn ConfigStore> = Arc::new(FileConfigStore::new(
-        head_config_doc.clone(),
-        meerkat_models::canonical(),
-    ));
+    // The head document composes with the same ancestors as at start, so a
+    // config write cannot cut the realm from their `[confinement]`.
+    let base_store: Arc<dyn ConfigStore> = Arc::new(
+        FileConfigStore::new(head_config_doc.clone(), meerkat_models::canonical())
+            .with_realm_chain(locator.realm.clone(), Arc::clone(&realm_config_source)),
+    );
     let tagged = TaggedConfigStore::new(
         base_store,
         meerkat_core::ConfigStoreMetadata {

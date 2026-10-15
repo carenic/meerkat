@@ -600,10 +600,12 @@ impl AppState {
             sessions_sqlite_path: Some(realm_paths.sessions_sqlite_path.display().to_string()),
             sessions_jsonl_dir: realm_paths.sessions_jsonl_dir.display().to_string(),
         };
-        let base_config_store: Arc<dyn ConfigStore> = Arc::new(FileConfigStore::new(
-            head_config_doc,
-            meerkat_models::canonical(),
-        ));
+        // The head document composes with the same ancestors as at start, so
+        // a config write cannot cut the realm from their `[confinement]`.
+        let base_config_store: Arc<dyn ConfigStore> = Arc::new(
+            FileConfigStore::new(head_config_doc, meerkat_models::canonical())
+                .with_realm_chain(realm.clone(), Arc::clone(&realm_config_source)),
+        );
         let config_store: Arc<dyn ConfigStore> = Arc::new(meerkat_core::TaggedConfigStore::new(
             base_config_store,
             meerkat_core::ConfigStoreMetadata {
@@ -12984,6 +12986,93 @@ requirement = { baseline = "command_runtime_v1", read = { kind = "paths", paths 
             meerkat_core::ConfinementConfig::for_all(meerkat_core::LaunchConfinement::Workspace(
                 meerkat_core::WorkspaceConfinement::default()
             ))
+        );
+    }
+
+    /// A REST config write cannot cut the served realm from the parent whose
+    /// `[confinement]` it composes: a patch or a full replace that removes
+    /// the realm's parent edge is refused (HTTP 400, the confinement
+    /// discriminator) and the document keeps its bytes. A write that keeps
+    /// the edge commits.
+    #[tokio::test]
+    async fn test_config_writes_cannot_drop_inherited_confinement() {
+        let temp = TempDir::new().unwrap();
+        let realms = temp.path().join("realms");
+        let team_text = "[realm.team]\nparent = \"org\"\n";
+        let org_text = format!("[realm.org]\n\n{UNENFORCEABLE_CONFINEMENT}");
+        for (realm, text) in [("org", org_text.as_str()), ("team", team_text)] {
+            let path = meerkat_store::realm_paths_in(&realms, realm).config_path;
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, text).unwrap();
+        }
+        let mut bootstrap = RuntimeBootstrap::default();
+        bootstrap.realm.selection = RealmSelection::Explicit {
+            realm_id: "team".to_string(),
+        };
+        bootstrap.realm.state_root = Some(realms.clone());
+        bootstrap.context.user_config_root = Some(temp.path().join("user"));
+        let credentials = test_credential_store(temp.path());
+        let state = AppState::load_from_with_bootstrap(
+            temp.path().to_path_buf(),
+            bootstrap,
+            false,
+            credentials,
+        )
+        .await
+        .unwrap();
+        let team_doc = meerkat_store::realm_paths_in(&realms, "team").config_path;
+
+        for patch in [
+            serde_json::json!({"realm": {"team": {"parent": null}}}),
+            serde_json::json!({"realm": {"team": null}}),
+        ] {
+            let refused = patch_config(
+                State(state.clone()),
+                Json(PatchConfigRequest::Wrapped {
+                    patch: patch.clone(),
+                    expected_generation: None,
+                }),
+            )
+            .await
+            .expect_err("a patch cannot drop the inherited confinement");
+            assert!(
+                is_administration_refusal(&refused, "confinement_administration_required"),
+                "{patch}: {refused:?}"
+            );
+        }
+        let Json(current) = get_config(State(state.clone())).await.unwrap();
+        let mut detached = current.config.clone();
+        detached.realm.remove("team");
+        let refused = set_config(
+            State(state.clone()),
+            Json(SetConfigRequest::Wrapped {
+                config: detached,
+                expected_generation: None,
+            }),
+        )
+        .await
+        .expect_err("a full replace cannot drop the parent edge");
+        assert!(
+            is_administration_refusal(&refused, "confinement_administration_required"),
+            "{refused:?}"
+        );
+        assert_eq!(std::fs::read_to_string(&team_doc).unwrap(), team_text);
+
+        let Json(kept) = patch_config(
+            State(state),
+            Json(PatchConfigRequest::Wrapped {
+                patch: serde_json::json!({"max_tokens": 2048}),
+                expected_generation: None,
+            }),
+        )
+        .await
+        .expect("a patch that keeps the edge commits");
+        assert_eq!(
+            kept.config.realm["team"]
+                .parent
+                .as_ref()
+                .map(|parent| parent.as_str()),
+            Some("org")
         );
     }
 

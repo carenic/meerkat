@@ -2691,7 +2691,11 @@ async fn cli_realm_doc_store(
             .await
             .map_err(|e| anyhow::anyhow!("Failed to create realm config directory: {e}"))?;
     }
-    Ok(Arc::new(CliConfigDocStore::new(config_path, realm.clone())))
+    Ok(Arc::new(CliConfigDocStore::new(
+        config_path,
+        realm.clone(),
+        Arc::new(source),
+    )))
 }
 
 async fn handle_connector_client_command(
@@ -5547,6 +5551,7 @@ async fn resolve_config_store(
         Arc::new(CliConfigDocStore::new(
             config_path,
             scope.locator.realm.clone(),
+            Arc::new(source),
         )),
         base_dir,
     ))
@@ -5583,6 +5588,7 @@ fn cli_global_config_doc_store(scope: &RuntimeScope) -> CliConfigDocStore {
     CliConfigDocStore::new(
         cli_global_config_path(scope),
         meerkat_core::connection::RealmId::global(),
+        cli_realm_config_source(scope),
     )
 }
 
@@ -5738,15 +5744,22 @@ fn report_config_load_warnings(
 
 /// A realm's own persisted config document as the CLI reads and writes it:
 /// a [`FileConfigStore`] whose load and patch warnings go to the CLI sink.
+/// It composes with the realm's other documents (`documents`) as a run
+/// does, so a write cannot cut the realm from their `[confinement]`.
 struct CliConfigDocStore {
     inner: FileConfigStore,
     realm: meerkat_core::connection::RealmId,
 }
 
 impl CliConfigDocStore {
-    fn new(path: PathBuf, realm: meerkat_core::connection::RealmId) -> Self {
+    fn new(
+        path: PathBuf,
+        realm: meerkat_core::connection::RealmId,
+        documents: Arc<dyn meerkat_core::RealmConfigSource>,
+    ) -> Self {
         Self {
-            inner: FileConfigStore::new(path, meerkat_models::canonical()),
+            inner: FileConfigStore::new(path, meerkat_models::canonical())
+                .with_realm_chain(realm.clone(), documents),
             realm,
         }
     }
@@ -21378,10 +21391,12 @@ where
     let session_store = persistence.session_store();
     let paths =
         meerkat_store::realm_paths_in(&scope.locator.state_root, scope.locator.realm.as_str());
-    let base_store: Arc<dyn ConfigStore> = Arc::new(FileConfigStore::new(
-        paths.config_path.clone(),
-        meerkat_models::canonical(),
-    ));
+    // The head document composes with the realm's ancestors as a run does,
+    // so a config write cannot cut the realm from their `[confinement]`.
+    let base_store: Arc<dyn ConfigStore> = Arc::new(
+        FileConfigStore::new(paths.config_path.clone(), meerkat_models::canonical())
+            .with_realm_chain(scope.locator.realm.clone(), cli_realm_config_source(scope)),
+    );
     let tagged = meerkat_core::TaggedConfigStore::new(
         base_store,
         meerkat_core::ConfigStoreMetadata {
@@ -34450,6 +34465,72 @@ supports_reasoning = true
             .await
             .expect("read config")
             .generation
+    }
+
+    /// `config patch` and `config set` cannot cut the realm from the parent
+    /// whose `[confinement]` it composes: a write that removes or changes
+    /// the realm's parent edge is refused as confinement administration and
+    /// leaves the document as it was, so the next start still composes the
+    /// parent's requirement. A write that keeps the edge commits.
+    #[tokio::test]
+    async fn test_config_writes_cannot_drop_inherited_confinement() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let scope = test_scope(dir.path().to_path_buf(), "child");
+        write_policy_parent_and_child_realm_docs(
+            dir.path(),
+            "\n[confinement.shell]\nmode = \"workspace\"\n",
+        )
+        .await;
+        let (before, _) = realm_doc(dir.path(), "child").await;
+
+        for patch in [
+            serde_json::json!({"realm": {"child": {"parent": null}}}),
+            serde_json::json!({"realm": {"child": null}}),
+            serde_json::json!({"realm": {"child": {"parent": "global"}}}),
+        ] {
+            let refused = handle_config_patch(None, Some(patch.to_string()), None, &scope)
+                .await
+                .expect_err("a patch cannot drop the inherited confinement");
+            assert!(
+                format!("{refused:#}").contains("confinement"),
+                "{patch}: {refused:#}"
+            );
+        }
+        let refused = handle_config_set(
+            None,
+            Some(serde_json::json!({"max_tokens": 1024}).to_string()),
+            None,
+            None,
+            &scope,
+        )
+        .await
+        .expect_err("a full replace cannot drop the parent edge");
+        assert!(
+            format!("{refused:#}").contains("confinement"),
+            "{refused:#}"
+        );
+        assert_eq!(realm_doc(dir.path(), "child").await.0, before);
+
+        let (config, _) = load_config(&scope).await.expect("reload config");
+        assert!(
+            config
+                .confinement
+                .statement(meerkat_core::ConfinementLaunchKind::Shell)
+                .is_some_and(meerkat_core::LaunchConfinement::requires_confinement),
+            "the child still composes its parent's requirement"
+        );
+
+        handle_config_patch(
+            None,
+            Some(serde_json::json!({"max_tokens": 2048}).to_string()),
+            None,
+            &scope,
+        )
+        .await
+        .expect("a patch that keeps the edge commits");
+        let (_, child) = realm_doc(dir.path(), "child").await;
+        assert_eq!(child["realm"]["child"]["parent"].as_str(), Some("parent"));
+        assert_eq!(child["max_tokens"].as_integer(), Some(2048));
     }
 
     /// `config set` refuses a wrapped config in every input form: a

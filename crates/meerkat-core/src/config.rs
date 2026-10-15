@@ -3053,11 +3053,13 @@ pub enum ConfigError {
     GovernanceAdministration,
 
     /// A write would add, change or remove the document's `[confinement]`
-    /// section ([`crate::ConfinementConfig`]). Ordinary config write
-    /// permission is not confinement administration: the host administers
-    /// the section in the document itself. Nothing is written.
+    /// section ([`crate::ConfinementConfig`]), or change the realm's parent
+    /// edge so that the realm composes a different `[confinement]` from its
+    /// ancestors. Ordinary config write permission is not confinement
+    /// administration: the host administers the section in the documents
+    /// themselves. Nothing is written.
     #[error(
-        "the confinement section is administered by the host in the config document; a config write cannot add, change or remove it"
+        "the confinement section is administered by the host in the config documents; a config write cannot add, change or remove it, or change the realm parent edge it is composed through"
     )]
     ConfinementAdministration,
 
@@ -3418,11 +3420,7 @@ pub(crate) fn compose_effective_config_with_chain(
     }
     // Confinement folds over its own layer order, from the most trusted
     // document: the user document first even when it is not on the chain.
-    let mut confinement = crate::ConfinementConfig::default();
-    for (_, layer) in confinement_layers(docs, &chain) {
-        confinement.fold_less_trusted(layer);
-    }
-    effective.confinement = confinement;
+    effective.confinement = fold_confinement(docs, &chain);
     // NOTE (Finding D, non-blocking per adversarial review): `effective.realm`
     // is the outer-key union of every folded doc's sections (via Config::merge),
     // so a doc that hand-places a foreign `[realm.X]` (X != its owning realm)
@@ -3459,6 +3457,31 @@ pub(crate) fn confinement_layers<'a>(
     layers
 }
 
+/// The `[confinement]` a composition over `chain` folds from `docs`, each
+/// layer under the more trusted ones ([`confinement_layers`]).
+fn fold_confinement(
+    docs: &std::collections::BTreeMap<crate::connection::RealmId, Config>,
+    chain: &crate::connection::RealmChain,
+) -> crate::ConfinementConfig {
+    let mut confinement = crate::ConfinementConfig::default();
+    for (_, layer) in confinement_layers(docs, chain) {
+        confinement.fold_less_trusted(layer);
+    }
+    confinement
+}
+
+/// The `[confinement]` [`compose_effective_config`] composes for `head`
+/// from `docs`, over the same chain, without the rest of the configuration
+/// and without the layer check ([`check_composed_confinement`]).
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn compose_confinement(
+    docs: &std::collections::BTreeMap<crate::connection::RealmId, Config>,
+    head: &crate::connection::RealmId,
+) -> Result<crate::ConfinementConfig, crate::connection::RealmChainError> {
+    let chain = composition_chain(docs, head)?;
+    Ok(fold_confinement(docs, &chain))
+}
+
 /// Refuse a composition in which a less trusted document weakens or
 /// replaces a confinement requirement ([`crate::check_confinement_layers`]).
 #[cfg(not(target_arch = "wasm32"))]
@@ -3476,7 +3499,11 @@ pub(crate) fn check_composed_confinement(
 /// The chain [`compose_effective_config`] folds for `head`: the chain
 /// authority over the union of every fetched document's realm sections, so it
 /// sees each member's parent edge regardless of which document carried it.
-/// Outer-key only: sub-maps are never merged across realms.
+/// A realm's own document decides its own section: a section another
+/// document states for the realm applies only when the realm's own document
+/// states none, so no other document replaces the parent edge the realm's
+/// own document names (the edge discovery followed). Outer-key only:
+/// sub-maps are never merged across realms.
 fn composition_chain(
     docs: &std::collections::BTreeMap<crate::connection::RealmId, Config>,
     head: &crate::connection::RealmId,
@@ -3485,6 +3512,13 @@ fn composition_chain(
     for doc in docs.values() {
         for (realm_id, section) in &doc.realm {
             topology.realm.insert(realm_id.clone(), section.clone());
+        }
+    }
+    for (owner, doc) in docs {
+        if let Some(section) = doc.realm.get(owner.as_str()) {
+            topology
+                .realm
+                .insert(owner.as_str().to_owned(), section.clone());
         }
     }
     crate::connection::RealmChain::resolve(&topology, head)

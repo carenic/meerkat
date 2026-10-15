@@ -673,6 +673,15 @@ add, change or remove it, including a full replace that omits it, and is
 refused with `confinement_administration_required`. Restating it unchanged is
 allowed. The section stays readable through the ordinary config reads.
 
+A realm composes its ancestors' `[confinement]` through its own
+`[realm.<id>].parent` edge, so the edge is covered too: a write that changes
+or removes it is refused with `confinement_administration_required` when the
+realm would compose a different section through the new edge, adding or
+dropping a requirement alike, and a new edge whose chain does not resolve is
+refused as invalid. A changed edge that composes the same section, such as a
+parent stating the same requirement, is ordinary config. Re-parent a confined
+realm by editing its document as its host.
+
 ### Operator flags
 
 Each stock binary accepts `--confinement <trusted-host|workspace>`, with

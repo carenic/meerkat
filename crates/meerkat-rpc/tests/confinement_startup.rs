@@ -11,6 +11,7 @@
 
 #![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 
+use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
@@ -56,6 +57,18 @@ struct Run {
 /// and close its stdin once it answers, so a booted server shuts down on EOF.
 /// A server that refuses to start exits without answering.
 fn run_rkat_rpc(binary: &Path, cwd: &Path, args: &[&str]) -> Run {
+    run_rkat_rpc_with_requests(binary, cwd, args, &[]).0
+}
+
+/// [`run_rkat_rpc`], handing the server `requests` (ids 2, 3, ...) once it
+/// answered `initialize` and closing its stdin once it answered every one.
+/// Returns each answered request's response by id.
+fn run_rkat_rpc_with_requests(
+    binary: &Path,
+    cwd: &Path,
+    args: &[&str],
+    requests: &[(&str, serde_json::Value)],
+) -> (Run, BTreeMap<u64, serde_json::Value>) {
     let mut child = Command::new(binary)
         .current_dir(cwd)
         .args(args)
@@ -93,10 +106,33 @@ fn run_rkat_rpc(binary: &Path, cwd: &Path, args: &[&str]) -> Run {
 
     let deadline = Instant::now() + EXIT_DEADLINE;
     let mut answered = false;
+    let mut responses: BTreeMap<u64, serde_json::Value> = BTreeMap::new();
+    let last_id = 1 + requests.len() as u64;
     let status = loop {
         while let Ok(line) = stdout_rx.try_recv() {
-            if line.contains("\"id\":1") {
+            let Ok(message) = serde_json::from_str::<serde_json::Value>(&line) else {
+                continue;
+            };
+            let Some(id) = message.get("id").and_then(serde_json::Value::as_u64) else {
+                continue;
+            };
+            responses.insert(id, message);
+            if id == 1 && !answered {
                 answered = true;
+                if let Some(pipe) = stdin.as_mut() {
+                    for (offset, (method, params)) in requests.iter().enumerate() {
+                        let request = serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": 2 + offset as u64,
+                            "method": method,
+                            "params": params,
+                        });
+                        let _ = pipe.write_all(format!("{request}\n").as_bytes());
+                    }
+                    let _ = pipe.flush();
+                }
+            }
+            if answered && (1..=last_id).all(|id| responses.contains_key(&id)) {
                 // EOF on stdin shuts the booted server down.
                 drop(stdin.take());
             }
@@ -123,11 +159,14 @@ fn run_rkat_rpc(binary: &Path, cwd: &Path, args: &[&str]) -> Run {
     stdout_reader
         .join()
         .expect("stdout reader thread should finish");
-    Run {
-        answered,
-        status,
-        stderr,
-    }
+    (
+        Run {
+            answered,
+            status,
+            stderr,
+        },
+        responses,
+    )
 }
 
 /// The scope arguments of one isolated run: a memory realm under `temp`,
@@ -278,4 +317,74 @@ fn the_user_documents_confinement_reaches_the_rkat_rpc_startup_report() {
         "the operator's flag replaces the documents; stderr:\n{}",
         flagged.stderr
     );
+}
+
+/// A `config/patch` or `config/set` cannot cut the served realm from the
+/// parent whose `[confinement]` it composes: the real server refuses the
+/// write with the confinement discriminator and the realm document keeps its
+/// bytes. A write that keeps the edge commits.
+#[test]
+fn rkat_rpc_config_writes_cannot_drop_inherited_confinement() {
+    let Some(binary) = rkat_rpc_binary() else {
+        eprintln!(
+            "skipping: rkat-rpc binary not advertised (CARGO_BIN_EXE_rkat-rpc unset or missing)"
+        );
+        return;
+    };
+    let temp = TempDir::new().expect("temp dir");
+    let state_root = temp.path().join("state");
+    let user_root = temp.path().join("user");
+    std::fs::create_dir_all(&user_root).expect("user root should initialize");
+    let team_text = "[realm.team]\nparent = \"org\"\n";
+    let org_text = format!("[realm.org]\n\n{UNENFORCEABLE_CONFINEMENT}");
+    for (realm, text) in [("org", org_text.as_str()), ("team", team_text)] {
+        let document = state_root.join(realm).join("config.toml");
+        std::fs::create_dir_all(document.parent().expect("realm dir"))
+            .expect("realm dir should initialize");
+        std::fs::write(&document, text).expect("realm document should be written");
+    }
+
+    let args = scope_args("team", &state_root, &user_root);
+    let (run, responses) = run_rkat_rpc_with_requests(
+        &binary,
+        temp.path(),
+        &args,
+        &[
+            (
+                "config/patch",
+                serde_json::json!({ "patch": { "realm": { "team": { "parent": null } } } }),
+            ),
+            (
+                "config/patch",
+                serde_json::json!({ "patch": { "realm": { "team": null } } }),
+            ),
+            (
+                "config/patch",
+                serde_json::json!({ "patch": { "max_tokens": 2048 } }),
+            ),
+        ],
+    );
+    assert!(
+        run.answered,
+        "the team realm serves; exit={:?} stderr:\n{}",
+        run.status, run.stderr
+    );
+    for id in [2, 3] {
+        let error = &responses[&id]["error"];
+        assert_eq!(
+            error["data"],
+            serde_json::json!({ "type": "confinement_administration_required" }),
+            "request {id}: {}",
+            responses[&id]
+        );
+    }
+    assert!(
+        responses[&4].get("error").is_none(),
+        "a patch that keeps the edge commits: {}",
+        responses[&4]
+    );
+    let committed = std::fs::read_to_string(state_root.join("team").join("config.toml"))
+        .expect("team document");
+    assert!(committed.contains("parent = \"org\""), "{committed}");
+    assert!(committed.contains("max_tokens = 2048"), "{committed}");
 }

@@ -1157,18 +1157,21 @@ fn tagged_realm_config_store(
     realm_id: &meerkat_core::connection::RealmId,
     backend: meerkat_store::RealmBackend,
     instance_id: Option<&str>,
-    source: &meerkat_store::FilesystemRealmConfigSource,
+    source: &Arc<meerkat_store::FilesystemRealmConfigSource>,
 ) -> Arc<dyn ConfigStore> {
     let paths = meerkat_store::realm_paths_in(realms_root, realm_id.as_str());
     // Head doc routed through the shared source mapping: the reserved
     // `global` realm reads/writes the user-global document, so an explicit
     // state root cannot shadow global config with
-    // `<state_root>/global/config.toml`.
+    // `<state_root>/global/config.toml`. It composes with the same ancestors
+    // as at start, so a config write cannot cut the realm from their
+    // `[confinement]`.
     let config_doc = source.config_doc_path(realm_id);
-    let base: Arc<dyn ConfigStore> = Arc::new(FileConfigStore::new(
-        config_doc.clone(),
-        meerkat_models::canonical(),
-    ));
+    let documents: Arc<dyn meerkat_core::RealmConfigSource> = source.clone();
+    let base: Arc<dyn ConfigStore> = Arc::new(
+        FileConfigStore::new(config_doc.clone(), meerkat_models::canonical())
+            .with_realm_chain(realm_id.clone(), documents),
+    );
     let tagged = meerkat_core::TaggedConfigStore::new(
         base,
         meerkat_core::ConfigStoreMetadata {
@@ -1193,7 +1196,7 @@ async fn realm_config_store(
     backend_hint: Option<meerkat_store::RealmBackend>,
     origin_hint: Option<meerkat_store::RealmOrigin>,
     instance_id: Option<&str>,
-    source: &meerkat_store::FilesystemRealmConfigSource,
+    source: &Arc<meerkat_store::FilesystemRealmConfigSource>,
 ) -> Result<Arc<dyn ConfigStore>, String> {
     let manifest = meerkat_store::ensure_realm_manifest_in(
         realms_root,
@@ -8354,6 +8357,73 @@ mode = "custom"
 working_directory = "/"
 requirement = { baseline = "command_runtime_v1", read = { kind = "paths", paths = [] }, write = { kind = "paths", paths = [] }, deny_read = [], deny_write = [], network = { kind = "denied" }, unix_connect = [], require_descendant_termination = true }
 "#;
+
+    /// A `meerkat_config` write cannot cut the served realm from the parent
+    /// whose `[confinement]` it composes: a patch that removes the realm's
+    /// parent edge, or a full replace without it, is refused with the
+    /// confinement discriminator and writes nothing. A write that keeps the
+    /// edge commits.
+    #[tokio::test]
+    async fn test_config_writes_cannot_drop_inherited_confinement() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let realms = temp.path().join("realms");
+        let team_text = "[realm.team]\nparent = \"org\"\n";
+        let org_text = format!("[realm.org]\n\n{UNENFORCEABLE_CONFINEMENT}");
+        for (realm, text) in [("org", org_text.as_str()), ("team", team_text)] {
+            let path = meerkat_store::realm_paths_in(&realms, realm).config_path;
+            std::fs::create_dir_all(path.parent().expect("realm dir")).expect("realm dir");
+            std::fs::write(&path, text).expect("realm document");
+        }
+        let mut bootstrap = RuntimeBootstrap::default();
+        bootstrap.realm.selection = RealmSelection::Explicit {
+            realm_id: "team".into(),
+        };
+        bootstrap.realm.state_root = Some(realms.clone());
+        bootstrap.context.user_config_root = Some(temp.path().join("user"));
+        let state = MeerkatMcpState::new_with_bootstrap_options_and_llm(
+            bootstrap,
+            false,
+            Some(Arc::new(TestClient::for_provider(Provider::Anthropic))),
+            None,
+        )
+        .await
+        .expect("the team realm serves");
+        let team_doc = meerkat_store::realm_paths_in(&realms, "team").config_path;
+        let generation = config_generation(&state).await;
+
+        let detached = Config {
+            max_tokens: Some(1024),
+            ..Config::default()
+        };
+        for arguments in [
+            json!({"action": "patch", "patch": {"realm": {"team": {"parent": null}}}}),
+            json!({"action": "patch", "patch": {"realm": {"team": null}}}),
+            json!({"action": "set", "config": detached}),
+        ] {
+            let refused = Box::pin(handle_tools_call(&state, "meerkat_config", &arguments))
+                .await
+                .expect_err("a write cannot drop the inherited confinement");
+            assert_eq!(refused.code, -32602, "{arguments}");
+            assert_eq!(
+                refused.data,
+                Some(json!({"type": "confinement_administration_required"})),
+                "{arguments}: {}",
+                refused.message
+            );
+        }
+        assert_eq!(std::fs::read_to_string(&team_doc).expect("team"), team_text);
+        assert_eq!(config_generation(&state).await, generation);
+
+        Box::pin(handle_tools_call(
+            &state,
+            "meerkat_config",
+            &json!({"action": "patch", "patch": {"max_tokens": 2048}}),
+        ))
+        .await
+        .expect("a patch that keeps the edge commits");
+        let committed = std::fs::read_to_string(&team_doc).expect("team");
+        assert!(committed.contains("parent = \"org\""), "{committed}");
+    }
 
     /// A start whose confined processes could change the realm state is
     /// refused before the server serves, naming the input and its remedy.

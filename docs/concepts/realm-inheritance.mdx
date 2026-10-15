@@ -28,6 +28,9 @@ parent = "org"
 Rules:
 
 - The chain is head-first and follows exactly one parent at each step.
+- A realm's own document decides its own parent edge. A section another
+  document states for the realm applies only when the realm's own document
+  states none.
 - A terminal non-global realm appends `global` when a global config section is
   present.
 - An explicit parent of `global` is allowed even when no global section has
