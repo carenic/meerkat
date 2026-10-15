@@ -1758,6 +1758,13 @@ pub trait MobProvisioner: Send + Sync {
             reason: "this provisioner serves no tracked placed-input cancellation lane".to_string(),
         })
     }
+    /// Run one turn on the member and report its outcome.
+    ///
+    /// For a runtime-backed member the outcome is the admitted input's
+    /// terminal. An execution attempt that fails while the runtime still owes
+    /// the input a run (it retries the input within its bounded attempts)
+    /// does not end the call: an error is the input's final failure, and an
+    /// attempt that fails before a retry delivers the turn is a success.
     async fn start_turn(
         &self,
         member_ref: &MemberRef,
@@ -6022,22 +6029,18 @@ impl SessionBackend {
         // parent-session projection. In-flight and terminal dedup followers
         // may observe the same completion but must never enqueue it again.
         let owns_committed_parent_projection = outcome.is_accepted();
+        // For in-flight dedup, runtime primitives are keyed by the existing
+        // canonical input id, not the newly attempted one.
+        let canonical_input_id = match &outcome {
+            meerkat_runtime::AcceptOutcome::Accepted { input_id, .. } => input_id.clone(),
+            meerkat_runtime::AcceptOutcome::Deduplicated { existing_id, .. } => existing_id.clone(),
+            _ => requested_input_id.clone(),
+        };
 
-        if let Some(queued_context) = queued_context.as_mut() {
-            let canonical_input_id = match &outcome {
-                meerkat_runtime::AcceptOutcome::Accepted { input_id, .. } => Some(input_id),
-                // For in-flight dedup, runtime primitives are keyed by the existing
-                // canonical input id, not the newly attempted one.
-                meerkat_runtime::AcceptOutcome::Deduplicated { existing_id, .. } => {
-                    Some(existing_id)
-                }
-                _ => None,
-            };
-            if let Some(input_id) = canonical_input_id
-                && input_id != &requested_input_id
-            {
-                let _ = queued_context.rekey(input_id.clone());
-            }
+        if let Some(queued_context) = queued_context.as_mut()
+            && canonical_input_id != requested_input_id
+        {
+            let _ = queued_context.rekey(canonical_input_id.clone());
         }
         drop(operation_guard);
 
@@ -6053,7 +6056,10 @@ impl SessionBackend {
             return Ok(());
         };
 
-        let completion = handle.wait().await;
+        // The turn's outcome is its input's terminal, not a failed attempt
+        // the runtime still retries.
+        let completion =
+            wait_for_runtime_input_terminal(adapter, session_id, &canonical_input_id, handle).await;
         drop(queued_context);
         let delivery_outcome = deferred_turn_outcome_from_completion(&completion);
         let committed_projection = enqueue_committed_parent_projection_after_runtime_completion(
@@ -6398,6 +6404,49 @@ impl SessionBackend {
 
             Ok(admission)
         }
+    }
+}
+
+/// Wait for an admitted input's terminal outcome.
+///
+/// The runtime resolves a completion waiter at an execution attempt that
+/// fails while it still owes the input a run: it requeues the input and
+/// retries it within its bounded attempts. That resolution carries no
+/// committed input terminal, and the failed attempt is not the input's
+/// outcome, since a later attempt may still deliver it. The input's terminal
+/// receipt is the outcome, so the wait continues to it. When no run answered
+/// the input (a terminal without a receipt), or the runtime no longer holds
+/// it or its live registration, the failed attempt stays the last outcome
+/// observed.
+#[cfg(feature = "runtime-adapter")]
+async fn wait_for_runtime_input_terminal(
+    adapter: &MeerkatMachine,
+    session_id: &SessionId,
+    input_id: &InputId,
+    handle: meerkat_runtime::completion::CompletionHandle,
+) -> Result<
+    meerkat_runtime::completion::CompletionOutcome,
+    meerkat_runtime::completion::CompletionWaitError,
+> {
+    use meerkat_runtime::terminal_status::{InputTerminalReceiptRead, InputTerminalReceiptWait};
+    let (attempt, input_terminal) = handle.try_wait_with_terminal_outcome().await?.into_parts();
+    if input_terminal.is_some() {
+        return Ok(attempt);
+    }
+    match adapter
+        .wait_input_terminal_receipt(session_id, input_id)
+        .await
+    {
+        Ok(Some(InputTerminalReceiptWait::Resolved(read))) => match read.report {
+            InputTerminalReceiptRead::Finalized(receipt) => Ok(receipt.into_outcome()),
+            _ => Ok(attempt),
+        },
+        Ok(_) => Ok(attempt),
+        Err(error) => Err(
+            meerkat_runtime::completion::CompletionWaitError::AuthorityUnavailable(format!(
+                "the terminal receipt of retried input '{input_id}' is unavailable: {error}"
+            )),
+        ),
     }
 }
 

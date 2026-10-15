@@ -43,6 +43,20 @@ them.
   (as after a release version bump, when no compiled unit can be reused)
   completes on a hosted 4-vCPU runner.
 
+### Fixed
+
+- `meerkat-mob`: an orchestrator resume notification's failure is reported
+  only once it is final. The runtime retries a failed notification input
+  within its bounded attempts; `OrchestratorResumeNotificationFailed` used to
+  be recorded after the first failed attempt while those retries still ran.
+  It is now recorded once, after the input's terminal failure, and not at
+  all when a retry delivers the notification. An explicit `MobHandle::resume`
+  and the orchestrator lifecycle notifications report the same final outcome:
+  for a runtime-backed member, `MobProvisioner::start_turn` now resolves at
+  the admitted input's terminal (Behaviour-only: an attempt the runtime
+  retries no longer ends the call, so a turn whose retry succeeds returns
+  success).
+
 ## [0.9.1] - 2026-10-15
 
 ### Breaking
