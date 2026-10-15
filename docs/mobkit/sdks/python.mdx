@@ -4,7 +4,7 @@ description: "Meta Python SDK — typed builder API, async runtime, and streamin
 icon: "python"
 ---
 
-*Mirrored from MobKit main at [e4240a78a0a5](https://github.com/lukacf/meerkat-meta/commit/e4240a78a0a552c7595b734dc0d68f0e28be825c) on 2026-10-14; MobKit workspace version 0.9.0 at that commit.*
+*Mirrored from MobKit main at [16cf534277c6](https://github.com/lukacf/meerkat-meta/commit/16cf534277c63f5a684abb62206fa690ccf74d72) on 2026-10-15; MobKit workspace version 0.9.1 at that commit.*
 
 The Meta Python SDK provides a typed host API for launching and operating
 Meerkat mobs through the SDK-facing gateway. Apps own policy. Meerkat and
@@ -607,7 +607,7 @@ rt = await (
 | `.identity_bootstrap_mode(mode)` | Eager, lazy, or bounded background-warm identity materialization; requires `.roster(...)` |
 | `.role_migrations(declarations)` | Authorize durable member role migrations for THIS boot. Takes an iterable of `RoleMigrationDeclaration` dataclasses or equivalent `identity` / `from_role` dicts, validating either form; a conflicting pair for one identity raises `ValueError`, an identical repeat is accepted, and leaving the setter unused emits no `role_migrations` init-params key at all |
 | `.session_service(builder, store)` | Session agent builder and optional store |
-| `.gating(path)` | Gating config path |
+| `.gating(path)` | Gating config path (`config/gating.toml` is discovered when present). An empty path raises `ValueError`: it no longer switches gating off. To keep gating off, do not call it and keep nothing at `config/gating.toml` under the working directory |
 | `.routing(path)` | Routing config path |
 | `.event_log(config)` | Operational event log declaration (`event_log.memory()` / `event_log.null()`) |
 | `.runtime_store(config)` | Explicit ephemeral runtime-store declaration (`runtime_store.memory()`) |
@@ -730,6 +730,11 @@ except CompositionProvenanceError as err:
         print("mob.toml differs from the stored definition in", err.fields)
     raise
 ```
+
+The comparison is over the parsed definition, so a profile key the TOML parse
+warns about and ignores (for example `tools.mob_tasks` in a config written for
+an earlier release) is never one of the `fields`: removing it to act on the
+warning, or adding it, does not cause this refusal.
 
 ### Console access
 
