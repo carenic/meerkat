@@ -197,6 +197,96 @@
         ]
       }
     ],
+    ".claude/skills/meerkat-platform/references/hooks_models_hooks.md": [
+      {
+        "package": "meerkat",
+        "target": "lib",
+        "scope": "package",
+        "sources": [
+          "crates/meerkat/src/help.rs"
+        ]
+      }
+    ],
+    ".claude/skills/meerkat-platform/references/hooks_models_model_operations.md": [
+      {
+        "package": "meerkat",
+        "target": "lib",
+        "scope": "package",
+        "sources": [
+          "crates/meerkat/src/help.rs"
+        ]
+      }
+    ],
+    ".claude/skills/meerkat-platform/references/hooks_models_turn_control.md": [
+      {
+        "package": "meerkat",
+        "target": "lib",
+        "scope": "package",
+        "sources": [
+          "crates/meerkat/src/help.rs"
+        ]
+      }
+    ],
+    ".claude/skills/meerkat-platform/references/live_comms_mobs_comms.md": [
+      {
+        "package": "meerkat",
+        "target": "lib",
+        "scope": "package",
+        "sources": [
+          "crates/meerkat/src/help.rs"
+        ]
+      }
+    ],
+    ".claude/skills/meerkat-platform/references/live_comms_mobs_live.md": [
+      {
+        "package": "meerkat",
+        "target": "lib",
+        "scope": "package",
+        "sources": [
+          "crates/meerkat/src/help.rs"
+        ]
+      }
+    ],
+    ".claude/skills/meerkat-platform/references/live_comms_mobs_mobs.md": [
+      {
+        "package": "meerkat",
+        "target": "lib",
+        "scope": "package",
+        "sources": [
+          "crates/meerkat/src/help.rs"
+        ]
+      }
+    ],
+    ".claude/skills/meerkat-platform/references/mcp_tools_skills_mcp.md": [
+      {
+        "package": "meerkat",
+        "target": "lib",
+        "scope": "package",
+        "sources": [
+          "crates/meerkat/src/help.rs"
+        ]
+      }
+    ],
+    ".claude/skills/meerkat-platform/references/mcp_tools_skills_skills.md": [
+      {
+        "package": "meerkat",
+        "target": "lib",
+        "scope": "package",
+        "sources": [
+          "crates/meerkat/src/help.rs"
+        ]
+      }
+    ],
+    ".claude/skills/meerkat-platform/references/mcp_tools_skills_tools.md": [
+      {
+        "package": "meerkat",
+        "target": "lib",
+        "scope": "package",
+        "sources": [
+          "crates/meerkat/src/help.rs"
+        ]
+      }
+    ],
     ".claude/skills/meerkat-platform/references/migration_0_5.md": [
       {
         "package": "meerkat",
@@ -207,7 +297,87 @@
         ]
       }
     ],
+    ".claude/skills/meerkat-platform/references/migration_0_9.md": [
+      {
+        "package": "meerkat",
+        "target": "lib",
+        "scope": "package",
+        "sources": [
+          "crates/meerkat/src/help.rs"
+        ]
+      }
+    ],
     ".claude/skills/meerkat-platform/references/mobs.md": [
+      {
+        "package": "meerkat",
+        "target": "lib",
+        "scope": "package",
+        "sources": [
+          "crates/meerkat/src/help.rs"
+        ]
+      }
+    ],
+    ".claude/skills/meerkat-platform/references/providers_and_auth_credentials.md": [
+      {
+        "package": "meerkat",
+        "target": "lib",
+        "scope": "package",
+        "sources": [
+          "crates/meerkat/src/help.rs"
+        ]
+      }
+    ],
+    ".claude/skills/meerkat-platform/references/providers_and_auth_models.md": [
+      {
+        "package": "meerkat",
+        "target": "lib",
+        "scope": "package",
+        "sources": [
+          "crates/meerkat/src/help.rs"
+        ]
+      }
+    ],
+    ".claude/skills/meerkat-platform/references/security.md": [
+      {
+        "package": "meerkat",
+        "target": "lib",
+        "scope": "package",
+        "sources": [
+          "crates/meerkat/src/help.rs"
+        ]
+      }
+    ],
+    ".claude/skills/meerkat-platform/references/security_governance.md": [
+      {
+        "package": "meerkat",
+        "target": "lib",
+        "scope": "package",
+        "sources": [
+          "crates/meerkat/src/help.rs"
+        ]
+      }
+    ],
+    ".claude/skills/meerkat-platform/references/sessions_runtime_surfaces_api_changes.md": [
+      {
+        "package": "meerkat",
+        "target": "lib",
+        "scope": "package",
+        "sources": [
+          "crates/meerkat/src/help.rs"
+        ]
+      }
+    ],
+    ".claude/skills/meerkat-platform/references/sessions_runtime_surfaces_sessions.md": [
+      {
+        "package": "meerkat",
+        "target": "lib",
+        "scope": "package",
+        "sources": [
+          "crates/meerkat/src/help.rs"
+        ]
+      }
+    ],
+    ".claude/skills/meerkat-platform/references/sessions_runtime_surfaces_storage_config.md": [
       {
         "package": "meerkat",
         "target": "lib",
@@ -2105,6 +2275,11 @@
       "source": "crates/meerkat-contracts/src/bin/emit-schemas.rs",
       "literal": "artifacts/schemas",
       "why": "The schema emitter (make regen-schemas) writes artifacts/schemas; no test reads it through this binary."
+    },
+    {
+      "source": "crates/meerkat/src/host_confinement.rs",
+      "literal": "lower_workspace(workspace_root)",
+      "why": "Lowers the configured workspace confinement for the host's runtime workspace; reads nothing in the checkout."
     },
     {
       "source": "crates/xtask/src/protocol_codegen.rs",
