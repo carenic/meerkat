@@ -66,12 +66,17 @@ type ArchiveDisposalFuture<'a> = std::pin::Pin<
 #[cfg(feature = "runtime-adapter")]
 const DEFERRED_TURN_EVENT_CHANNEL_CAPACITY: usize = 1024;
 
-/// How long a retried input may go with no run holding it and no new
-/// execution attempt before its turn stops waiting for the input's terminal.
-/// The runtime stages a requeued input again within its bounded attempts; an
-/// input that neither runs nor gains an attempt for this long is parked, and
+/// How often a retried input's terminal wait checks that its session is
+/// still making progress. At each check the input is parked only when
+/// nothing progressed in its session: no run holds the input (it is not
+/// staged or applied), it gained no execution attempt since the last check,
+/// and the session has no running turn. A parked input ends the wait, and
 /// the turn reports the failed attempt it observed. A run that holds the
-/// input is waited for however long it takes, as the first attempt is.
+/// input is waited for however long it takes, as the first attempt is, and
+/// so is a retry queued behind another run of the session. The session's
+/// running turn is read at the check, so a session that ran other inputs
+/// during the period but is idle at the check, with this input still queued,
+/// counts as parked: an idle session is not working the input.
 #[cfg(all(feature = "runtime-adapter", not(test)))]
 const RETRIED_INPUT_PROGRESS_BOUND: Duration = Duration::from_secs(120);
 
@@ -6460,7 +6465,7 @@ async fn wait_for_runtime_input_terminal(
             ..
         } = read.report
     {
-        progress.still_worked(phase, attempt_count);
+        progress.still_worked(phase, attempt_count, false);
     }
     loop {
         match tokio::time::timeout(
@@ -6484,13 +6489,14 @@ async fn wait_for_runtime_input_terminal(
                         attempt_count,
                         ..
                     } => {
-                        if !progress.still_worked(phase, attempt_count) {
+                        let session_runs = adapter.current_run(session_id).await.is_some();
+                        if !progress.still_worked(phase, attempt_count, session_runs) {
                             tracing::warn!(
                                 session_id = %session_id,
                                 input_id = %input_id,
                                 phase = ?phase,
                                 attempt_count,
-                                "retried input made no progress within its bound; reporting its failed attempt"
+                                "retried input's session made no progress within its bound; reporting its failed attempt"
                             );
                             return Ok(attempt);
                         }
@@ -6517,18 +6523,21 @@ struct RetriedInputProgress {
 
 #[cfg(feature = "runtime-adapter")]
 impl RetriedInputProgress {
-    /// Record a pending read of the input, and say whether the runtime is
-    /// still working it: a run holds it now, or it gained an execution
-    /// attempt since the last read.
+    /// Record a pending read of the input, and say whether its session is
+    /// still making progress: a run holds the input now, it gained an
+    /// execution attempt since the last read, or the session has a running
+    /// turn (`session_runs`) that the input may be queued behind.
     fn still_worked(
         &mut self,
         phase: meerkat_runtime::InputLifecycleState,
         attempt_count: u32,
+        session_runs: bool,
     ) -> bool {
         use meerkat_runtime::InputLifecycleState as Phase;
         let gained_attempt = self.attempt_count.is_some_and(|seen| attempt_count > seen);
         self.attempt_count = Some(attempt_count);
         gained_attempt
+            || session_runs
             || matches!(
                 phase,
                 Phase::Staged | Phase::Applied | Phase::AppliedPendingConsumption
@@ -9401,19 +9410,45 @@ mod tests {
         use meerkat_runtime::InputLifecycleState as Phase;
         let mut progress = super::RetriedInputProgress::default();
         // The read taken when the first attempt failed sets the baseline.
-        progress.still_worked(Phase::Queued, 1);
-        assert!(progress.still_worked(Phase::Staged, 2), "a run holds it");
+        progress.still_worked(Phase::Queued, 1, false);
         assert!(
-            progress.still_worked(Phase::Applied, 2),
+            progress.still_worked(Phase::Staged, 2, false),
+            "a run holds it"
+        );
+        assert!(
+            progress.still_worked(Phase::Applied, 2, false),
             "the run continues"
         );
         assert!(
-            progress.still_worked(Phase::Queued, 3),
+            progress.still_worked(Phase::Queued, 3, false),
             "requeued after another attempt"
         );
         assert!(
-            !progress.still_worked(Phase::Queued, 3),
-            "requeued with no attempt since the last read"
+            !progress.still_worked(Phase::Queued, 3, false),
+            "requeued with no attempt since the last read and nothing running"
+        );
+    }
+
+    /// A retry queued behind another run of a busy session keeps waiting,
+    /// however long that run takes; once the session runs nothing and the
+    /// input is still queued, it is parked.
+    #[cfg(feature = "runtime-adapter")]
+    #[test]
+    fn a_retry_queued_behind_a_busy_session_keeps_waiting() {
+        use meerkat_runtime::InputLifecycleState as Phase;
+        let mut progress = super::RetriedInputProgress::default();
+        progress.still_worked(Phase::Queued, 1, false);
+        assert!(
+            progress.still_worked(Phase::Queued, 1, true),
+            "queued behind another running turn"
+        );
+        assert!(
+            progress.still_worked(Phase::Queued, 1, true),
+            "still queued behind a long run"
+        );
+        assert!(
+            !progress.still_worked(Phase::Queued, 1, false),
+            "queued while the session runs nothing"
         );
     }
 

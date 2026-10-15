@@ -49,9 +49,14 @@ them.
 - Behaviour-only (not measured by the gate): `meerkat-mob`'s
   `MobProvisioner::start_turn` for a runtime-backed member resolves at the
   admitted input's terminal, not at an execution attempt the runtime
-  retries, so a turn whose retry succeeds returns success (see Fixed). A
-  retried input that stops progressing (no run holds it and it gains no
-  attempt for 120 s) ends the call with the failed attempt.
+  retries, so a turn whose retry succeeds returns success (see Fixed). The
+  wait checks every 120 s that the input's session is still progressing,
+  and a retried input counts as parked, ending the call with the failed
+  attempt, only when at a check no run holds it, it gained no attempt since
+  the last check, and its session has no running turn. A retry queued
+  behind another run of the session keeps waiting; a session that ran other
+  inputs during the period but is idle at the check, with the retry still
+  queued, counts as parked.
 - Behaviour-only (not measured by the gate): `meerkat-rpc` answers a turn or
   event its session's runtime refuses to admit with the refusal's typed
   JSON-RPC code instead of `-32603` (see Fixed), and its not-ready refusal
