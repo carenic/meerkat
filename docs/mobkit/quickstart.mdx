@@ -4,7 +4,7 @@ description: "Start a Meta application runtime with a matching gateway and SDK, 
 icon: "rocket"
 ---
 
-*Mirrored from MobKit main at [16cf534277c6](https://github.com/lukacf/meerkat-meta/commit/16cf534277c63f5a684abb62206fa690ccf74d72) on 2026-10-15; MobKit workspace version 0.9.1 at that commit.*
+*Mirrored from MobKit main at [1fc1338dd988](https://github.com/lukacf/meerkat-meta/commit/1fc1338dd988f661e464e354496957651580fc87) on 2026-10-15; MobKit workspace version 0.9.1 at that commit.*
 
 This guide starts with the Meta application runtime. If you only need to run an
 agent or a mob, [Core's quickstart](https://docs.rkat.ai/quickstart) is enough.
@@ -36,8 +36,11 @@ has a complete `asyncio.run` example that reads status and shuts down cleanly.
 When native release archives are available, use `rpc_gateway` from the matching
 `meta-rpc-gateway-<version>-<target>` archive and install the matching
 `meerkat-meta` Python package or `@rkat/meta-sdk` TypeScript package. Follow that
-release's platform and checksum instructions. Rust hosts use the `meerkat-meta`
-crate directly:
+release's platform and checksum instructions. Linux x86_64 and aarch64 and macOS
+arm64 archives are published with the release, listed in `index.json` and
+`checksums.sha256`; macOS x86_64 and Windows archives may arrive later, listed in
+`index-trailing.json` and `checksums-trailing.sha256`. Rust hosts use the
+`meerkat-meta` crate directly:
 
 ```toml
 [dependencies]
