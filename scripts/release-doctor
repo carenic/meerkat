@@ -313,8 +313,14 @@ else
   bad "Release workflow grants write or OIDC scopes beyond the jobs that need them (${token_contract//$'\n'/; })"
 fi
 
+if web_tools_contract="$(workflow_contract web-sdk-tools)"; then
+  pass "The Web SDK release build checks every download's sha256 and wasm-pack installs nothing: wasm-bindgen (Cargo.lock's version) and wasm-opt are pinned"
+else
+  bad "The Web SDK release build may run a tool it downloaded unchecked (${web_tools_contract//$'\n'/; })"
+fi
+
 if caches_contract="$(workflow_contract release-caches)"; then
-  pass "Release caches in release.yml jobs and the local actions they call are never saved on a dispatch and never cache ~/.cargo/bin; token jobs restore none, and OIDC or attesting jobs restore none that a dispatch-like run of any workflow saves (reusable workflows are not read and never run on a dispatch)"
+  pass "GitHub Actions caches in release.yml jobs and the local actions they call are never saved on a dispatch and never cache ~/.cargo/bin; token jobs restore none, and OIDC or attesting jobs restore none that a dispatch-like run of any workflow saves (reusable workflows are not read and never run on a dispatch)"
 else
   bad "A release cache can be saved on a dispatch, cache ~/.cargo/bin, or reach a token, OIDC or attesting job (${caches_contract//$'\n'/; })"
 fi

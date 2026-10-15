@@ -467,20 +467,24 @@ build jobs may mint OIDC tokens and write build attestations, only the
 release publishers may write the GitHub release, and neither the build nor
 the publisher checkouts persist the token. The full-graph validation passes
 `buildbuddy.yml` only the `MEERKAT_GCP_BUILDBUDDY_API_KEY` secret, never
-`secrets: inherit` (`scripts/release-doctor` checks all of this). No cache step in
-its jobs, or in the local actions they call (the Windows SDK cache of
-`build-windows-cross`, the Bazel repository cache of `setup-buildbuddy-ci`),
-is saved by a dispatch, which would write the `main` scope every tag run
-restores from; no rust-cache stores `~/.cargo/bin`, so no restored binary can
-shadow a tool on `PATH`; the jobs that hold registry or publish tokens
-restore no cache at all; and the jobs that mint OIDC tokens or attest
-artifacts restore only caches that no workflow in the repository saves on a
-dispatch-like run (a dispatch, `repository_dispatch`, `pull_request_target`,
-`workflow_run`, or a workflow call). The BuildBuddy release binary build
-passes `repository-cache: "false"`. The doctor reads release.yml and its
-local actions, not the reusable `buildbuddy.yml`, which the full-graph
-validation calls only on tag pushes. The macOS checks call the Apple tools by
-absolute path.
+`secrets: inherit` (`scripts/release-doctor` checks all of this). No GitHub
+Actions cache step in its jobs, or in the local actions they call (the
+Windows SDK cache of `build-windows-cross`, the Bazel repository cache of
+`setup-buildbuddy-ci`), is saved by a dispatch, which would write the `main`
+scope every tag run restores from; no rust-cache stores `~/.cargo/bin`, so no
+restored binary can shadow a tool on `PATH`; the jobs that hold registry or
+publish tokens restore no cache at all; and the jobs that mint OIDC tokens or
+attest artifacts restore only caches that no workflow in the repository saves
+on a dispatch-like run (any trigger but `push`, `pull_request`, `schedule`
+and `merge_group`). The BuildBuddy release binary build passes
+`repository-cache: "false"`. The doctor reads release.yml and its local
+actions, not the reusable `buildbuddy.yml`, which the full-graph validation
+calls only on tag pushes, and it does not cover the BuildBuddy remote cache.
+The macOS checks call the Apple tools by absolute path. The Web SDK package
+job installs wasm-pack, wasm-bindgen (the version Cargo.lock locks) and
+wasm-opt pinned by sha256 and runs wasm-pack with `--mode no-install`
+(`MEERKAT_WEB_WASM_PACK_MODE`), so wasm-pack downloads nothing; a wasm-bindgen
+bump in Cargo.lock must bump that pin (the doctor's `web-sdk-tools` check).
 
 ## Hard Rules
 
