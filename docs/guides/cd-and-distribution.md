@@ -17,16 +17,20 @@ Meerkat publishes one source project across several consumer surfaces:
 | TypeScript SDK | Node applications | `@rkat/sdk` on npm |
 | Web SDK | Browser applications | `@rkat/web` on npm |
 
-The public release path is GitHub Actions. Tag-triggered Linux/macOS
-packaging selects BuildBuddy only for the literal actor `lukacf` when
+The public release path is GitHub Actions. Tag-triggered packaging of the
+critical platforms (Linux x86_64 and aarch64, macOS arm64) selects BuildBuddy only for the literal actor `lukacf` when
 `MEERKAT_RELEASE_BUILDBUDDY` is `true` or `1`; other actors use the hosted
 fallback. Eligible manual dispatches select release validation and packaging
 under the [BuildBuddy rules below](#buildbuddy). Both release backends still
 require exact-main GitHub Actions CI (the Cargo-only pull-request lanes),
 and the tag path additionally runs the full BuildBuddy graph as its
 validation gate while the self-hosted graph is enabled
-(`MEERKAT_GCP_BUILDBUDDY_ENABLED` is `true`); otherwise the tag validates
-with the Cargo validation job. Windows binaries are cross-compiled
+(`MEERKAT_GCP_BUILDBUDDY_ENABLED` is `true`); otherwise the tag skips the
+Cargo validation job only when its verified exact-tree CI attestation proves
+that exact-main run ran every lane the job repeats (the generated-contract
+ratchets, which main CI runs only when its plan selects them, and the SDK
+suites); any other tag, and every eligible manual dispatch that selects it,
+still validates with Cargo. Windows binaries are cross-compiled
 and packaged on hosted Ubuntu, then verified on Windows; credentialed registry
 publishing stays GitHub-hosted.
 
@@ -254,20 +258,87 @@ embedding a separate runtime implementation.
    and the tests that read the changed files, and reuses the parent's
    whole-workspace run for everything else instead of rebuilding every crate
    at the new version.
+   Dispatch the [pre-tag prebuild](#pre-tag-prebuild)
+   (`make release-prebuild VERSION=vX.Y.Z`) as soon as the release commit is
+   on `main`, so the binaries and the Web SDK package build while CI and
+   readiness run, and wait for it too.
 3. The tag path verifies the exact-tree CI attestation instead of recomputing
-   the broad CI graph. After `require_ci_green`, `release_semver_gate` looks
+   the broad CI graph: with the self-hosted graph off, an attestation that
+   records the generated-contract ratchets and a green `sdk-host` job (a
+   release commit's normally does) passes `release_validate_gate` without
+   `release_validate_cargo`, so publication starts minutes after the tag when
+   CI is already green.
+   After `require_ci_green`, `release_semver_gate` looks
    up `meerkat-semver-attestation-main-<tree_sha>` and requires unexpired
    evidence for that tree and version from a successful readiness `main` push.
 4. In parallel, verify registry credentials, consume declared-break evidence,
-   build platform binaries, and build the Web SDK package artifact.
-5. Publish the macOS/Linux assets early when available, then complete the
-   GitHub release with every platform archive, `checksums.sha256`, and
-   `index.json`.
-6. Update the Homebrew tap from the published assets.
+   and either find the complete prebuild of the tag commit or build the
+   platform binaries and the Web SDK package artifact.
+5. Publish the critical Linux (x86_64, aarch64) and macOS arm64 archives as
+   soon as their lane passes (`publish_critical_release_assets`), without
+   waiting for the trailing Intel macOS and Windows lanes. Those archives
+   follow when their lanes finish (`publish_github_release`): added to the
+   release, never replacing an asset already on it, then `checksums.sha256`
+   and `index.json` for the complete set, written once and never replaced (a
+   rerun checks a published manifest instead of uploading it). Until then
+   the release is public with the critical archives and no manifest: a few
+   minutes when a prebuild's trailing lanes already finished, otherwise
+   until the Intel macOS and Windows lanes finish (or an asset recovery adds
+   them). Every archive carries a build attestation meanwhile.
+6. Update the Homebrew tap from the complete release's published checksums.
 7. Publish Rust crates plus the Python and TypeScript SDKs on GitHub-hosted
-   runners. Their publish jobs build and smoke-test the package artifacts before
-   upload.
+   runners. The Rust crates publish by dependency level, derived from the
+   canonical order in `scripts/release-rust-crates.sh` and `cargo metadata`:
+   a level's crates upload concurrently and the next level starts once all of
+   them are in the crates.io index. The SDK publish jobs build and smoke-test
+   their package artifacts before upload.
 8. Publish the prebuilt Web SDK artifact on a GitHub-hosted runner.
+9. Off the publication path, build the rustdoc JSON baseline the next
+   release's semver gate compares against (`publish_semver_baseline`, which
+   starts with the release) and attach it as
+   `semver-rustdoc-<version>.tar.zst` once the GitHub release is published
+   (`attach_semver_baseline`, add-only: a baseline already attached stays).
+   No job waits for either; if it fails, the next measurement rebuilds the
+   baseline from the tag instead.
+
+### Pre-tag prebuild
+
+`make release-prebuild VERSION=vX.Y.Z` dispatches `release.yml` on `main` with
+`prebuild_release_artifacts=true`. The run refuses any other ref, any
+publishing or recovery input, and a version whose tag already exists. It
+does not wait for CI: it builds every release binary (the critical Linux and
+macOS arm64 ones on BuildBuddy or the GitHub-hosted lane, Intel macOS
+cross-compiled on Apple silicon, Windows cross-compiled with cargo-xwin and
+verified on a Windows runner) and the Web SDK package from exactly the
+dispatched commit, stamps each archive with that commit, attests and uploads
+everything, and publishes nothing. Its `Release prebuild gate` job passes
+once the critical binaries and the Web SDK package succeeded; the trailing
+Intel macOS and Windows lanes keep running in the same run.
+
+The tag run looks the prebuild up after `require_ci_green`
+(`release_prebuild`, `scripts/release-find-prebuild`): a `release.yml`
+dispatch on `main` at exactly the tag commit, in this repository, started
+and triggered by the repository owner, whose `Release prebuild gate` passed
+and whose critical artifacts have not expired; the publishers verify the run
+attempt the lookup examined and refuse it if the run was re-run since;
+a gate that has not concluded yet is waited for, because the prebuild
+finishes no later than a fresh build would. When it finds one, the tag run
+skips every build job and publishes that run's artifacts after the same
+verification as an `--assets-run-id` recovery
+(`verify-release-asset-provenance --source-run`: every archive and its stamp
+attested by `release.yml` at that commit on `refs/heads/main`, the stamp
+naming the tag commit, every binary embedding the release version; a
+prebuild run is accepted as a source only by the tag run of exactly its
+commit, never by an asset recovery, because a prebuild does not wait for
+exact-main CI):
+`publish_critical_release_assets` publishes the critical archives at once,
+and `publish_github_release` adds the trailing ones after the prebuild's
+`Release binary build gate` passed (if that run's trailing lanes failed, an
+asset recovery publishes them). `publish_web_sdk` verifies the package's
+attestation and version before publishing. Without a usable prebuild the tag
+builds everything as before. The prebuild never relaxes a publication gate:
+exact-main CI, semver evidence and registry credentials are still required by
+the tag run itself.
 
 The default `./scripts/repo-cargo release patch --execute` flow combines
 bump, commit, tag, and push; that command summary alone does not establish
@@ -346,7 +417,7 @@ Automatic tag packaging selects BuildBuddy only when `github.actor` is
 literally `lukacf` and the repository variable
 `MEERKAT_RELEASE_BUILDBUDDY` is `true` or `1`. For eligible manual dispatches,
 explicit `release_backend=buildbuddy` selects BuildBuddy validation and
-Linux/macOS packaging only for that same literal actor; it does not also
+Linux and macOS arm64 packaging only for that same literal actor; it does not also
 require the automatic-selection variable. This is a named-actor condition,
 not a general owner/admin permission check.
 
@@ -357,9 +428,9 @@ RELEASE_BACKEND=buildbuddy make release-workflow VERSION=vX.Y.Z
 ```
 
 On eligible manual dispatches, other actors use GitHub-hosted Cargo validation
-and Linux/macOS packaging even when they request `release_backend=buildbuddy`.
-Windows packaging and every credentialed registry publish still run on
-GitHub-hosted runners, and the exact-main GitHub Actions CI requirement remains
+and Linux and macOS arm64 packaging even when they request
+`release_backend=buildbuddy`. Windows and Intel macOS packaging and every
+credentialed registry publish still run on GitHub-hosted runners, and the exact-main GitHub Actions CI requirement remains
 in force. This release
 backend selection is separate from per-push CI, which is Cargo-only on
 GitHub-hosted runners; the full BuildBuddy graph runs nightly and on the tag
@@ -390,6 +461,26 @@ Registry credentials are independent:
 
 Keep tokens in CI secrets or a local secret store. Do not commit registry
 tokens, private BuildBuddy endpoints, or enterprise infrastructure names.
+
+The release workflow's own `GITHUB_TOKEN` is read-only by default: only the
+build jobs may mint OIDC tokens and write build attestations, only the
+release publishers may write the GitHub release, and neither the build nor
+the publisher checkouts persist the token. The full-graph validation passes
+`buildbuddy.yml` only the `MEERKAT_GCP_BUILDBUDDY_API_KEY` secret, never
+`secrets: inherit` (`scripts/release-doctor` checks all of this). No cache step in
+its jobs, or in the local actions they call (the Windows SDK cache of
+`build-windows-cross`, the Bazel repository cache of `setup-buildbuddy-ci`),
+is saved by a dispatch, which would write the `main` scope every tag run
+restores from; no rust-cache stores `~/.cargo/bin`, so no restored binary can
+shadow a tool on `PATH`; the jobs that hold registry or publish tokens
+restore no cache at all; and the jobs that mint OIDC tokens or attest
+artifacts restore only caches that no workflow in the repository saves on a
+dispatch-like run (a dispatch, `repository_dispatch`, `pull_request_target`,
+`workflow_run`, or a workflow call). The BuildBuddy release binary build
+passes `repository-cache: "false"`. The doctor reads release.yml and its
+local actions, not the reusable `buildbuddy.yml`, which the full-graph
+validation calls only on tag pushes. The macOS checks call the Apple tools by
+absolute path.
 
 ## Hard Rules
 

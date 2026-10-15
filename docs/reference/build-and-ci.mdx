@@ -415,14 +415,23 @@ attestations are still accepted for older commits). While the repository
 variable `MEERKAT_GCP_BUILDBUDDY_ENABLED` is `true` it then runs the whole
 BuildBuddy/Bazel graph in `full-fresh` mode (`release_validate_buildbuddy_full`)
 as the release validation gate; while that self-hosted graph is off (the
-default) the tag validates with the Cargo validation lane
-(`release_validate_cargo`), which is also the fallback for manual dispatches
-on the GitHub-hosted backend. It still builds
+default) the tag skips the Cargo validation lane (`release_validate_cargo`)
+only when the attestation proves that exact-`main` run ran every lane it
+repeats (the plan's `generated_contract` ratchets and a green `sdk-host`);
+otherwise, and for manual dispatches on the GitHub-hosted backend, the tag
+validates with Cargo. It still builds
 and publishes the platform-specific release artifacts from the attested
-source; Windows binaries are cross-compiled and packaged with cargo-xwin
-(clang-cl, lld-link, the Windows SDK) on a hosted Ubuntu runner, then
-executed for verification on a windows-latest runner. Registry publication
-remains GitHub-hosted.
+source. The critical Linux and macOS arm64 archives publish first; Windows
+binaries are cross-compiled and packaged with cargo-xwin (clang-cl, lld-link,
+the Windows SDK) on a hosted Ubuntu runner, then executed for verification on
+a windows-latest runner, and Intel macOS binaries are cross-compiled on an
+Apple silicon runner; those trailing archives are added afterwards, never
+replacing a published asset. A pre-tag prebuild
+(`make release-prebuild`, a `release.yml` dispatch on `main` that publishes
+nothing) can build all of those artifacts for the release commit before the
+tag; the tag run of exactly that commit then publishes them after the same
+attestation checks as an asset recovery instead of rebuilding. Registry
+publication remains GitHub-hosted.
 
 The repository pre-push dispatcher follows the same identity rule. A complete
 successful hook run writes a local Git-tree-keyed evidence stamp. A later push
@@ -430,7 +439,7 @@ of the identical tree, including its release tag, validates the pushed object
 and checked-out `HEAD` identity and then reuses the complete gate result.
 
 BuildBuddy remains an opt-in developer backend, the nightly full graph, and
-the release-tag validation and Linux/macOS packaging backend.
+the release-tag validation and Linux and macOS arm64 packaging backend.
 `.github/workflows/buildbuddy.yml` is `workflow_call`-only; `nightly.yml` and
 `release.yml` call it, `ci.yml` never does.
 

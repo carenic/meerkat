@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+# Check a cross-compiled x86_64-apple-darwin release binary on an Apple
+# silicon runner, where the release builds it.
+#
+# Usage: check-macos-x86-release-binary <binary> <release-version>
+#
+# The binary must be a single-architecture x86_64 Mach-O, run under Rosetta
+# (installed first when the runner lacks it) and report the release version
+# from `--version`, link only system libraries (/usr/lib, /System/Library),
+# and declare a minimum macOS version no newer than
+# MEERKAT_MACOS_X86_MAX_MINOS (default 11.0), so every supported Intel Mac
+# can start it.
+#
+# The Apple tools run from MEERKAT_MACOS_TOOL_DIR (default /usr/bin), never
+# from PATH, so nothing earlier on PATH can stand in for them.
+
+set -euo pipefail
+
+if [[ "$#" -ne 2 ]]; then
+  echo "usage: check-macos-x86-release-binary <binary> <release-version>" >&2
+  exit 2
+fi
+binary="$1"
+version="$2"
+max_minos="${MEERKAT_MACOS_X86_MAX_MINOS:-11.0}"
+tools="${MEERKAT_MACOS_TOOL_DIR:-/usr/bin}"
+name="$(basename "${binary}")"
+
+fail() {
+  echo "${name}: $*" >&2
+  exit 1
+}
+
+[[ -f "${binary}" ]] || fail "no such binary"
+
+archs="$("${tools}/lipo" -archs "${binary}")"
+[[ "${archs}" == "x86_64" ]] || fail "architectures '${archs}', expected exactly x86_64"
+
+if ! "${tools}/arch" -x86_64 /usr/bin/true 2>/dev/null; then
+  echo "Rosetta is missing; installing it to run the x86_64 binary"
+  "${tools}/sudo" /usr/sbin/softwareupdate --install-rosetta --agree-to-license
+fi
+if ! output="$("${tools}/arch" -x86_64 "${binary}" --version 2>&1)"; then
+  fail "\`--version\` under Rosetta failed: ${output}"
+fi
+grep -qF -- "${version}" <<<"${output}" || fail "\`--version\` does not report ${version}: ${output}"
+
+# otool -L lists the binary itself on its first line, then each library.
+while IFS= read -r library; do
+  [[ -n "${library}" ]] || continue
+  case "${library}" in
+    /usr/lib/*|/System/Library/*) ;;
+    *) fail "links a non-system library: ${library}" ;;
+  esac
+done < <("${tools}/otool" -L "${binary}" | tail -n +2 | awk '{ print $1 }')
+
+minos="$("${tools}/vtool" -show-build "${binary}" | awk '$1 == "minos" || $1 == "version" { print $2; exit }')"
+[[ -n "${minos}" ]] || fail "declares no minimum macOS version"
+if [[ "$(printf '%s\n%s\n' "${minos}" "${max_minos}" | sort -V | head -n 1)" != "${minos}" ]]; then
+  fail "requires macOS ${minos}, newer than the supported ${max_minos}"
+fi
+
+echo "${name}: x86_64, runs under Rosetta ($(head -n 1 <<<"${output}")), system libraries only, minimum macOS ${minos}"

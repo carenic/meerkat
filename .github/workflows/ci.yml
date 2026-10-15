@@ -469,6 +469,20 @@ jobs:
       - name: Release doctor workflow assertions still bind
         run: scripts/test-release-doctor-workflow-contract.sh
 
+      - name: Release prebuild lookup selects only usable exact-commit prebuilds
+        run: scripts/test-release-find-prebuild.sh
+
+      - name: Release asset provenance accepts an earlier run only through its build gate
+        run: scripts/test-verify-release-asset-provenance.sh
+
+      - name: Intel macOS release binary check refuses each defect
+        run: scripts/test-check-macos-x86-release-binary.sh
+
+      # Stubbed cargo and a file:// index: levels in order, bounded overlap,
+      # skip of a published version, and stop at the first failing crate.
+      - name: Level-parallel crate publisher keeps its order and failure semantics
+        run: scripts/test-release-publish-rust-crates.sh
+
       # The tombstone scans (retired public names, session-control routes,
       # the deprecated backend) are ripgrep text scans. The hosted image
       # does not ship ripgrep, and each scan refuses to run without it
@@ -2612,6 +2626,10 @@ jobs:
           EXAMPLE_WEB_RESULT: ${{ needs.example-web.result }}
           BAZEL_GRAPH_RESULT: ${{ needs.bazel-graph.result }}
           WASM_TIMERS_RESULT: ${{ needs.wasm-timers.result }}
+          # Whether the ratchets job ran its generated-contract lanes (schema,
+          # SDK codegen, wrapper and RPC/REST surface freshness): a release
+          # tag skips its own Cargo validation only when this run did.
+          GENERATED_CONTRACT: ${{ needs.changes.outputs.generated_contract }}
           MODE: ${{ needs.changes.outputs.mode }}
           PACKAGE_COUNT: ${{ needs.changes.outputs.package_count }}
           CLOSURE_COUNT: ${{ needs.changes.outputs.closure_count }}
@@ -2709,6 +2727,7 @@ jobs:
             --argjson shard_count "${SHARD_COUNT:-0}" \
             --argjson unit_shard_count "${UNIT_SHARD_COUNT:-0}" \
             --argjson main_unit_shard_count "${MAIN_UNIT_SHARD_COUNT:-0}" \
+            --argjson generated_contract "$([[ "${GENERATED_CONTRACT}" == "true" ]] && echo true || echo false)" \
             --argjson reused "${reused}" \
             '{
               schema_version: 4,
@@ -2728,7 +2747,8 @@ jobs:
                 closure_count: $closure_count,
                 clippy_shard_count: $shard_count,
                 unit_shard_count: $unit_shard_count,
-                main_unit_shard_count: $main_unit_shard_count
+                main_unit_shard_count: $main_unit_shard_count,
+                generated_contract: $generated_contract
               },
               component_results: {
                 changes: $changes,

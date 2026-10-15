@@ -211,7 +211,7 @@ if awk '
     in_job && /--version/ { version = 1 }
     END { exit (native && version) ? 0 : 1 }
   ' "${release_workflow}" &&
-  grep -Fq 'needs: [build_binaries, build_binaries_buildbuddy, build_binaries_windows_cross, verify_windows_binaries]' "${release_workflow}" &&
+  grep -Eq '^    needs: \[build_binaries, build_binaries_buildbuddy, build_binaries_windows_cross, verify_windows_binaries(, [a-z0-9_]+)*\]$' "${release_workflow}" &&
   grep -Fq '[[ "${windows_cross_result}" == "success" && "${windows_verify_result}" == "success" ]] || exit 1' "${release_workflow}" &&
   ! grep -Eq 'runs-on: *"?windows-latest"?.*target' "${release_workflow}" &&
   ! grep -Fq '"runs-on":"windows-latest","target":"x86_64-pc-windows-msvc"' "${release_workflow}" &&
@@ -262,6 +262,14 @@ else
   bad "Rust crate publish script is missing crates.io rate-limit retry handling"
 fi
 
+if grep -Fq 'scripts/release-rust-crates.sh" --levels' scripts/release-publish-rust-crates.sh &&
+  grep -Fq 'wait_for_index "$level"' scripts/release-publish-rust-crates.sh &&
+  levels_summary="$(scripts/release-rust-crates.sh --levels --format summary 2>&1)"; then
+  pass "Rust crates publish by dependency level ($(wc -l <<<"${levels_summary}" | tr -d ' ') levels), each level visible in the index before the next"
+else
+  bad "Rust crate publishing must walk the dependency levels of scripts/release-rust-crates.sh and wait for each level in the index (${levels_summary:-no level plan})"
+fi
+
 # The semver-gate and SLO assertions evaluate workflow behaviour under concrete
 # events instead of grepping literal lines, so reflowing a condition cannot
 # fail the doctor while removing the behaviour still does (#1091).
@@ -279,6 +287,42 @@ if dispatch_contract="$(workflow_contract dispatch-binding)"; then
   pass "Publishing dispatches are bound to their version's tag"
 else
   bad "A publishing dispatch without release_tag could publish a branch tip as the tagged version (${dispatch_contract//$'\n'/; })"
+fi
+
+if prebuild_contract="$(workflow_contract prebuild)"; then
+  pass "Pre-tag prebuilds publish nothing, and a tag publishes its own commit's prebuild only through the attested-archive verification"
+else
+  bad "A pre-tag prebuild must publish nothing, and a tag may publish its commit's prebuild only through the attested-archive verification (${prebuild_contract//$'\n'/; })"
+fi
+
+if baseline_contract="$(workflow_contract semver-baseline)"; then
+  pass "Semver baseline rustdoc builds alongside the release and gates nothing; it attaches only to a published release, never replacing an attached one"
+else
+  bad "The semver baseline rustdoc must stay off every path a user waits on (${baseline_contract//$'\n'/; })"
+fi
+
+if trailing_contract="$(workflow_contract trailing-platforms)"; then
+  pass "Linux and macOS arm64 assets publish without waiting for the trailing Intel macOS and Windows lanes; no upload replaces a published asset"
+else
+  bad "The trailing Intel macOS and Windows lanes must not gate the critical assets, and no upload may replace a published asset (${trailing_contract//$'\n'/; })"
+fi
+
+if token_contract="$(workflow_contract token-permissions)"; then
+  pass "Release workflow token is read-only except for the jobs that attest or publish, which never persist it in a checkout; no reusable workflow inherits every secret"
+else
+  bad "Release workflow grants write or OIDC scopes beyond the jobs that need them (${token_contract//$'\n'/; })"
+fi
+
+if caches_contract="$(workflow_contract release-caches)"; then
+  pass "Release caches in release.yml jobs and the local actions they call are never saved on a dispatch and never cache ~/.cargo/bin; token jobs restore none, and OIDC or attesting jobs restore none that a dispatch-like run of any workflow saves (reusable workflows are not read and never run on a dispatch)"
+else
+  bad "A release cache can be saved on a dispatch, cache ~/.cargo/bin, or reach a token, OIDC or attesting job (${caches_contract//$'\n'/; })"
+fi
+
+if tag_validation_contract="$(workflow_contract tag-validation)"; then
+  pass "Tag releases skip Cargo validation only on an exact-tree CI attestation that proves its lanes ran"
+else
+  bad "Tag releases may skip Cargo validation only on an exact-tree CI attestation that proves its lanes ran, keeping Cargo validation for every other attestation and manual dispatches (${tag_validation_contract//$'\n'/; })"
 fi
 
 registry_job="$(workflow_job publish_registries)"

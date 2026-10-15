@@ -3,7 +3,7 @@ set -euo pipefail
 
 usage() {
   cat >&2 <<'EOF'
-Usage: verify-release-asset-provenance [--recovery-source <sha> | --source-run <run-id>] [--stamps <dir>] <artifact-dir> <release-tag> [signer-workflow]
+Usage: verify-release-asset-provenance [--recovery-source <sha> | --source-run <run-id> [--source-attempt <n>] [--source-gate <job>] [--prebuild]] [--stamps <dir>] <artifact-dir> <release-tag> [signer-workflow]
 
 Verify every release archive in artifact-dir against GitHub's signed build
 provenance. signer-workflow defaults to the release workflow.
@@ -22,17 +22,31 @@ under <dir>, itself attested the same way, whose content is the tag's commit
 --source-run <run-id> --stamps <dir>: publish the archives of an earlier
 asset recovery run without rebuilding. The run must be this repository's
 release.yml, dispatched on main, at a commit in main's history, and its
-Release binary build gate job must have succeeded; its head_sha becomes the
+Release binary build gate job (or the job named by --source-gate, for
+example "Release critical binary build gate" when only the critical
+platforms' archives are verified) must have succeeded; its head_sha becomes the
 recovery source above. A run built before archives were stamped
 has no stamps: then the tag must be an ancestor of that head_sha and every
 path changed between them must be under .github/ or CHANGELOG.md, so the
 compiled sources are the tag's whichever of the two trees the run checked out.
+
+--source-attempt <n> pins the run attempt whose jobs are checked, and refuses
+the run if it was re-run since (its latest attempt is not <n>).
+
+A pre-tag prebuild run (one with a "Release prebuild gate" job) never waited
+for exact-main CI, so it is refused as a source run unless --prebuild says the
+caller is the tag run of exactly that prebuild's commit: GITHUB_REF must be
+refs/tags/<release-tag>, the run's head must be the tag commit itself (not an
+ancestor), and its Release prebuild gate must have succeeded.
 EOF
   exit 2
 }
 
 recovery_source=""
 source_run=""
+source_gate="Release binary build gate"
+source_attempt=""
+prebuild=false
 stamps_dir=""
 while [[ "$#" -gt 0 ]]; do
   case "$1" in
@@ -42,6 +56,18 @@ while [[ "$#" -gt 0 ]]; do
       ;;
     --source-run)
       source_run="${2:?--source-run requires a run id}"
+      shift 2
+      ;;
+    --source-gate)
+      source_gate="${2:?--source-gate requires a job name}"
+      shift 2
+      ;;
+    --prebuild)
+      prebuild=true
+      shift
+      ;;
+    --source-attempt)
+      source_attempt="${2:?--source-attempt requires an attempt number}"
       shift 2
       ;;
     --stamps)
@@ -63,8 +89,17 @@ if [[ -n "${source_run}" ]]; then
   [[ "${source_run}" =~ ^[0-9]+$ ]] || { echo "--source-run must be a run id: ${source_run}" >&2; exit 2; }
   repository_for_run="${GITHUB_REPOSITORY:-lukacf/meerkat}"
   run_meta="$(gh api "repos/${repository_for_run}/actions/runs/${source_run}" \
-    --jq '[.path, .event, .head_branch, .head_sha, .repository.full_name] | @tsv')"
-  IFS=$'\t' read -r run_path run_event run_branch run_sha run_repo <<<"${run_meta}"
+    --jq '[.path, .event, .head_branch, .head_sha, .repository.full_name, .run_attempt] | @tsv')"
+  IFS=$'\t' read -r run_path run_event run_branch run_sha run_repo run_attempt <<<"${run_meta}"
+  jobs_path="repos/${repository_for_run}/actions/runs/${source_run}/jobs?per_page=100"
+  if [[ -n "${source_attempt}" ]]; then
+    [[ "${source_attempt}" =~ ^[0-9]+$ ]] || { echo "--source-attempt must be a number: ${source_attempt}" >&2; exit 2; }
+    if [[ "${run_attempt}" != "${source_attempt}" ]]; then
+      echo "run ${source_run} is at attempt ${run_attempt}, not the pinned attempt ${source_attempt}" >&2
+      exit 1
+    fi
+    jobs_path="repos/${repository_for_run}/actions/runs/${source_run}/attempts/${source_attempt}/jobs?per_page=100"
+  fi
   if [[ "${run_path}" != ".github/workflows/release.yml" || "${run_event}" != "workflow_dispatch" \
         || "${run_branch}" != "main" || "${run_repo}" != "${repository_for_run}" ]]; then
     echo "run ${source_run} is not a release.yml workflow_dispatch on main in ${repository_for_run} (path=${run_path} event=${run_event} branch=${run_branch} repo=${run_repo})" >&2
@@ -76,14 +111,44 @@ if [[ -n "${source_run}" ]]; then
   }
   # That run's own build gate covers what this run skips: every lane built,
   # each binary embedded the version, Windows binaries ran on Windows.
-  build_gate="$(gh api "repos/${repository_for_run}/actions/runs/${source_run}/jobs?per_page=100" --paginate \
-    --jq '.jobs[] | select(.name == "Release binary build gate") | .conclusion')"
+  case "${source_gate}" in
+    "Release binary build gate"|"Release critical binary build gate") ;;
+    *) echo "--source-gate must name a release binary build gate job: ${source_gate}" >&2; exit 2 ;;
+  esac
+  jobs_json="$(gh api "${jobs_path}" --paginate \
+    --jq '.jobs[] | [.name, (.conclusion // "pending")] | @tsv')"
+  build_gate="$(awk -F '\t' -v name="${source_gate}" '$1 == name { print $2 }' <<<"${jobs_json}")"
   if [[ "${build_gate}" != "success" ]]; then
-    echo "run ${source_run}: Release binary build gate did not succeed (${build_gate:-absent})" >&2
+    echo "run ${source_run}: ${source_gate} did not succeed (${build_gate:-absent})" >&2
     exit 1
   fi
+  # A prebuild never waited for exact-main CI: only the tag run of exactly
+  # its commit, which required that CI itself, may publish its archives.
+  # Every release.yml dispatch lists the gate, but only a prebuild runs it
+  # (its always() condition never skips there): a skipped gate marks an
+  # ordinary dispatch, whose archives an asset recovery may reuse.
+  prebuild_gate="$(awk -F '\t' '$1 == "Release prebuild gate" { print $2 }' <<<"${jobs_json}")"
+  if [[ -n "${prebuild_gate}" && "${prebuild_gate}" != "skipped" && "${prebuild}" != "true" ]]; then
+    echo "run ${source_run} is a pre-tag prebuild; only the tag run of its exact commit may publish its archives (--prebuild)" >&2
+    exit 1
+  fi
+  if [[ "${prebuild}" == "true" ]]; then
+    tag_commit="$(git rev-parse "${2:-}^{commit}" 2>/dev/null || true)"
+    if [[ "${prebuild_gate}" != "success" ]]; then
+      echo "run ${source_run}: --prebuild needs a successful Release prebuild gate (${prebuild_gate:-absent})" >&2
+      exit 1
+    fi
+    if [[ "${GITHUB_REF:-}" != "refs/tags/${2:-}" ]]; then
+      echo "--prebuild is accepted only in the tag run of ${2:-the release tag} (GITHUB_REF=${GITHUB_REF:-unset})" >&2
+      exit 1
+    fi
+    if [[ "${run_sha}" != "${tag_commit}" ]]; then
+      echo "run ${source_run} built ${run_sha}, not the ${2:-} commit ${tag_commit:-unknown}" >&2
+      exit 1
+    fi
+  fi
   recovery_source="${run_sha}"
-  echo "source run ${source_run}: release.yml on main at ${run_sha}, build gate passed"
+  echo "source run ${source_run}: release.yml on main at ${run_sha}, ${source_gate} passed"
 fi
 if [[ -n "${recovery_source}" || -n "${stamps_dir}" ]]; then
   [[ "${recovery_source}" =~ ^[0-9a-f]{40}$ ]] || {

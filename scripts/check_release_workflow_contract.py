@@ -14,7 +14,13 @@ push, a package-recovery dispatch, an explicit historical-evidence dispatch).
 Reflowing a condition across lines, collapsing it onto one line, or rewriting
 an expression into an equivalent one all pass; gating a step off tag pushes,
 re-enabling the long measurement on tags, relaxing the 30 minute publication
-SLO, or making the SDK packages wait on it all fail and name the defect.
+SLO, making the SDK packages wait on it, re-running Cargo validation on a
+tag whose exact-tree CI attestation already covers it, or letting a pre-tag
+prebuild publish anything or a tag publish a prebuild's artifacts without the
+attested-archive verification, making a job wait for the semver baseline
+rustdoc, or letting a dispatch save a cache (also inside a local action, or
+from another workflow) that a token-holding or attesting job restores all
+fail and name the defect.
 
 Only the Python standard library is used, so the doctor and its contract test
 run wherever `python3` does.
@@ -23,6 +29,7 @@ run wherever `python3` does.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import subprocess
@@ -38,6 +45,13 @@ TAG_SLO_SECONDS = 1800
 
 SEMVER_GATE_JOB = "release_semver_gate"
 CI_GREEN_JOB = "require_ci_green"
+CARGO_VALIDATION_JOB = "release_validate_cargo"
+VALIDATION_GATE_JOB = "release_validate_gate"
+# require_ci_green's output naming the verified exact-tree attestation schema.
+ATTESTATION_SCHEMA_OUTPUT = "ci_attestation_schema"
+# require_ci_green's output: the attestation proves the Cargo validation lanes ran.
+COVERS_OUTPUT = "ci_covers_release_validation"
+GCP_GRAPH_VARIABLE = "MEERKAT_GCP_BUILDBUDDY_ENABLED"
 RELEASE_VERSION_STEP_ID = "release_version"
 REGISTRY_JOB = "publish_registries"
 # The evidence step is the one that resolves the exact-tree readiness artifact.
@@ -152,6 +166,27 @@ class Step:
         return self.fields.get("run", "")
 
     @property
+    def raw_run(self) -> str:
+        """The `run:` block scalar with its relative indentation kept.
+
+        `run` strips every line, which is enough for shell; an embedded
+        heredoc in an indentation-sensitive language needs the original
+        layout.
+        """
+        for index, line in enumerate(self.lines):
+            match = KEY_LINE.match(line)
+            if not (match and len(match.group(1)) == 8 and match.group(2) == "run"):
+                continue
+            body: list[str] = []
+            for candidate in self.lines[index + 1 :]:
+                if candidate.strip() and _indent(candidate) <= 8:
+                    break
+                body.append(candidate)
+            width = min((_indent(line) for line in body if line.strip()), default=0)
+            return "\n".join(line[width:] for line in body).strip("\n") + "\n"
+        return ""
+
+    @property
     def env(self) -> dict[str, str]:
         """The step's `env:` mapping, values unquoted."""
         return self.nested("env")
@@ -250,6 +285,16 @@ class EventContext:
     # `<step id>.<output>` -> value, for the outputs this context models. Any
     # other `steps.*.outputs.*` reference raises UnsupportedExpression.
     step_outputs: dict[str, str] = field(default_factory=dict)
+    actor: str = "release-bot"
+    sha: str = "0" * 40
+    run_id: str = "1"
+    # Repository variables; an unset variable reads as empty, as on GitHub.
+    variables: dict[str, str] = field(default_factory=dict)
+    # job -> result, for upstream jobs whose result differs from needs_result.
+    job_results: dict[str, str] = field(default_factory=dict)
+    # `<job>.<output>` -> value, for the upstream outputs this context models.
+    # Any other `needs.*.outputs.*` reference raises UnsupportedExpression.
+    job_outputs: dict[str, str] = field(default_factory=dict)
 
     def resolve(self, path: str) -> str:
         if path == "github.event_name":
@@ -258,12 +303,27 @@ class EventContext:
             return self.ref
         if path == "github.ref_name":
             return github_ref_name(self.ref)
+        if path == "github.actor":
+            return self.actor
+        if path == "github.sha":
+            return self.sha
+        if path == "github.run_id":
+            return self.run_id
+        if path == "github.token":
+            # Never a real credential: scripts run here only against stubs.
+            return "contract-check-token"
         if path.startswith("github.event.inputs."):
             # Unset dispatch inputs and push events both read as empty.
             return self.inputs.get(path[len("github.event.inputs.") :], "")
-        needs = re.fullmatch(r"needs\.[A-Za-z0-9_-]+\.result", path)
+        variable = re.fullmatch(r"vars\.([A-Za-z0-9_]+)", path)
+        if variable:
+            return self.variables.get(variable.group(1), "")
+        needs = re.fullmatch(r"needs\.([A-Za-z0-9_-]+)\.result", path)
         if needs:
-            return self.needs_result
+            return self.job_results.get(needs.group(1), self.needs_result)
+        output = re.fullmatch(r"needs\.([A-Za-z0-9_-]+)\.outputs\.([A-Za-z0-9_-]+)", path)
+        if output and f"{output.group(1)}.{output.group(2)}" in self.job_outputs:
+            return self.job_outputs[f"{output.group(1)}.{output.group(2)}"]
         # Earlier steps of the same job are evaluated on the happy path, the
         # same assumption `needs_result` makes for upstream jobs.
         if re.fullmatch(r"steps\.[A-Za-z0-9_-]+\.(?:outcome|conclusion)", path):
@@ -934,6 +994,1513 @@ def check_registry_slo(text: str) -> list[str]:
     return violations
 
 
+def _attested_tag(covers: str, schema: str = "4", **kwargs: object) -> EventContext:
+    """A tag push whose require_ci_green verified an attestation of `schema`
+    that does (covers == "true") or does not cover the Cargo lanes."""
+    return EventContext(
+        label=kwargs.pop("label", f"a tag push whose attestation covers the Cargo lanes ({covers})"),
+        event_name="push",
+        job_outputs={
+            f"{CI_GREEN_JOB}.{ATTESTATION_SCHEMA_OUTPUT}": schema,
+            f"{CI_GREEN_JOB}.{COVERS_OUTPUT}": covers,
+        },
+        **kwargs,
+    )
+
+
+def _runner_env(context: EventContext) -> dict[str, str]:
+    """The default environment a runner gives every step of `context`."""
+    return {
+        "PATH": os.environ.get("PATH", ""),
+        "GITHUB_SHA": context.sha,
+        "GITHUB_REF": context.ref,
+        "GITHUB_REF_NAME": github_ref_name(context.ref),
+        "GITHUB_EVENT_NAME": context.event_name,
+        "GITHUB_REPOSITORY": "example/meerkat",
+        "GITHUB_RUN_ID": context.run_id,
+    }
+
+
+def _run_gate_script(step: Step, context: EventContext) -> tuple[int, str]:
+    """Run a gate job's shell step as the runner would."""
+    env = {key: render_strict(value, context) for key, value in step.env.items()}
+    script = render_strict(step.run, context)
+    result = subprocess.run(
+        ["bash", "-c", script],
+        env={**_runner_env(context), **env},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return result.returncode, result.stdout + result.stderr
+
+
+def _attestation(**overrides: object) -> dict:
+    """A schema-4 attestation for the binding scenario, every lane green."""
+    document: dict = {
+        "schema_version": 4,
+        "repository": "example/meerkat",
+        "commit_sha": "1" * 40,
+        "tree_sha": "2" * 40,
+        "workflow": "CI",
+        "workflow_run_id": "11",
+        "workflow_run_attempt": "1",
+        "event": "push",
+        "ref": "refs/heads/main",
+        "validation_backend": "github-hosted-cargo",
+        "validation_result": "success",
+        "plan": {"mode": "workspace", "generated_contract": True},
+        "component_results": {
+            "changes": "success",
+            "fmt_governance": "success",
+            "ratchets": "success",
+            "sdk_host": "success",
+        },
+    }
+    for path, value in overrides.items():
+        target = document
+        keys = path.split("__")
+        for key in keys[:-1]:
+            target = target.setdefault(key, {})
+        if value is None:
+            target.pop(keys[-1], None)
+        else:
+            target[keys[-1]] = value
+    return document
+
+
+def _reused_evidence(**overrides: str) -> dict:
+    """reused_test_evidence as CI writes it for a release-projection plan."""
+    return {
+        "classifier": "release-projection-only",
+        "from_version": "0.0.0",
+        "to_version": "0.0.1",
+        "base_commit_sha": "3" * 40,
+        "base_tree_sha": "4" * 40,
+        "workflow": "CI",
+        "workflow_run_id": "9",
+        "workflow_run_attempt": "1",
+        "attestation_artifact": "meerkat-ci-attestation-" + "3" * 40 + "-1",
+        **overrides,
+    }
+
+
+def _coverage_of(step: Step, attestation: dict) -> tuple[int, dict[str, str]]:
+    """Run the attestation step on `attestation`; its exit and outputs."""
+    context = EventContext(
+        label=TAG_PUSH.label,
+        event_name="push",
+        step_outputs={
+            "ci_run.run_id": "11",
+            "ci_run.run_attempt": "1",
+            "release_ref.sha": "1" * 40,
+            "release_ref.tree": "2" * 40,
+        },
+    )
+    env = {key: render_strict(value, context) for key, value in step.env.items()}
+    with tempfile.TemporaryDirectory(prefix="release-attestation-") as scratch:
+        directory = Path(scratch, "meerkat-ci-attestation")
+        directory.mkdir()
+        Path(directory, "attestation.json").write_text(json.dumps(attestation), encoding="utf-8")
+        output = Path(scratch, "github-output")
+        output.write_text("", encoding="utf-8")
+        result = subprocess.run(
+            ["bash", "-c", render_strict(step.raw_run, context)],
+            cwd=scratch,
+            env={
+                **_runner_env(context),
+                "GITHUB_REPOSITORY": "example/meerkat",
+                "RUNNER_TEMP": scratch,
+                "GITHUB_OUTPUT": str(output),
+                **env,
+            },
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        outputs = dict(
+            line.split("=", 1) for line in output.read_text(encoding="utf-8").splitlines() if "=" in line
+        )
+        return result.returncode, outputs
+
+
+def check_tag_validation(text: str) -> list[str]:
+    """A tag skips Cargo validation only on an attestation that covers it.
+
+    `release_validate_cargo` repeats fmt-governance, the generated-contract
+    ratchets (which main CI runs only when its plan selects them) and the SDK
+    suites. require_ci_green verifies the exact-tree attestation and exposes
+    whether it proves all of those ran (`ci_covers_release_validation`); only
+    then, while the self-hosted graph is off, is the job skipped and does the
+    gate pass on the attestation. Otherwise, a legacy attestation included,
+    the tag validates with Cargo, and manual dispatches keep their lane.
+    """
+    violations: list[str] = []
+
+    # 1. The attestation step computes the coverage from the attestation it
+    #    verified, and require_ci_green exposes it.
+    ci_block = job_block(text, CI_GREEN_JOB)
+    outputs = parse_mapping(ci_block, 4).get("outputs", "")
+    wiring = re.search(
+        rf"\b{COVERS_OUTPUT}:\s*\$\{{\{{\s*steps\.([A-Za-z0-9_-]+)\.outputs\.([A-Za-z0-9_-]+)\s*\}}\}}",
+        outputs,
+    )
+    if wiring is None:
+        return [f"job `{CI_GREEN_JOB}` does not expose `{COVERS_OUTPUT}` from a step output"]
+    step_id, output = wiring.groups()
+    producers = [step for step in job_steps(ci_block) if step.fields.get("id") == step_id]
+    if len(producers) != 1:
+        return [f"job `{CI_GREEN_JOB}` has {len(producers)} steps with `id: {step_id}`"]
+    producer = producers[0]
+    if not step_runs(producer, TAG_PUSH):
+        violations.append(f"step `{producer.name}` does not run on {TAG_PUSH.label}")
+    cases = (
+        ("every lane ran", _attestation(), "true"),
+        ("the generated-contract ratchets did not run", _attestation(plan__generated_contract=False), "false"),
+        ("the plan does not record the ratchets", _attestation(plan__generated_contract=None), "false"),
+        ("the SDK suites were skipped", _attestation(component_results__sdk_host="skipped"), "false"),
+        (
+            "a release-projection plan reused a verified parent run for the SDK lanes",
+            _attestation(
+                plan__mode="release-projection",
+                component_results__sdk_host="skipped",
+                reused_test_evidence=_reused_evidence(),
+            ),
+            "true",
+        ),
+        (
+            "a release-projection plan names no reused run",
+            _attestation(plan__mode="release-projection", component_results__sdk_host="skipped"),
+            "false",
+        ),
+        (
+            "a release-projection plan whose evidence comes from another classifier",
+            _attestation(
+                plan__mode="release-projection",
+                component_results__sdk_host="skipped",
+                reused_test_evidence=_reused_evidence(classifier="something-else"),
+            ),
+            "false",
+        ),
+        (
+            "a release-projection plan whose evidence names no run attempt",
+            _attestation(
+                plan__mode="release-projection",
+                component_results__sdk_host="skipped",
+                reused_test_evidence=_reused_evidence(workflow_run_attempt=""),
+            ),
+            "false",
+        ),
+    )
+    for label, attestation, expected in cases:
+        status, written = _coverage_of(producer, attestation)
+        if status != 0:
+            violations.append(f"step `{producer.name}` rejects a valid attestation where {label}")
+            continue
+        if written.get(output) != expected:
+            violations.append(
+                f"step `{producer.name}` writes {output}={written.get(output, '<nothing>')} where {label}; "
+                f"expected {expected}"
+            )
+    status, written = _coverage_of(producer, _attestation(component_results__ratchets="failure"))
+    if status == 0 and written.get(output) == "true":
+        violations.append(f"step `{producer.name}` reports coverage for an attestation it should refuse")
+
+    # 2. The Cargo validation job is skipped exactly where the attestation
+    #    stands in for it.
+    cargo_if = parse_mapping(job_block(text, CARGO_VALIDATION_JOB), 4).get("if")
+    graph_on = {GCP_GRAPH_VARIABLE: "true"}
+    manual = EventContext(
+        label="a package dispatch on the GitHub-hosted backend",
+        event_name="workflow_dispatch",
+        inputs={
+            "release_tag": "v0.0.0",
+            "publish_release_packages": "true",
+            "release_backend": "github-hosted",
+        },
+        job_outputs={f"{CI_GREEN_JOB}.{ATTESTATION_SCHEMA_OUTPUT}": "", f"{CI_GREEN_JOB}.{COVERS_OUTPUT}": ""},
+    )
+    routes = (
+        (_attested_tag("true"), False),
+        (_attested_tag("false", label="a tag push whose schema-4 attestation does not cover the Cargo lanes"), True),
+        (_attested_tag("false", "1", label="a tag push with a verified legacy (schema 1) attestation"), True),
+        (_attested_tag("true", label="a tag push while the self-hosted graph is enabled", variables=graph_on), False),
+        (manual, True),
+    )
+    for context, must_run in routes:
+        runs = cargo_if is None or truthy(evaluate(cargo_if, context))
+        if runs and not must_run:
+            violations.append(
+                f"job `{CARGO_VALIDATION_JOB}` runs on {context.label}; the exact-tree CI "
+                "attestation already covers it"
+            )
+        if must_run and not runs:
+            violations.append(f"job `{CARGO_VALIDATION_JOB}` is skipped on {context.label}")
+
+    # 3. The gate accepts the attestation route and nothing weaker.
+    gate_steps = [step for step in job_steps(job_block(text, VALIDATION_GATE_JOB)) if step.run]
+    if len(gate_steps) != 1:
+        violations.append(
+            f"job `{VALIDATION_GATE_JOB}` has {len(gate_steps)} run steps; expected one gate script"
+        )
+        return violations
+    gate = gate_steps[0]
+    skipped = {
+        CARGO_VALIDATION_JOB: "skipped",
+        "release_validate_buildbuddy": "skipped",
+        "release_validate_buildbuddy_full": "skipped",
+    }
+    ran = {**skipped, CARGO_VALIDATION_JOB: "success"}
+    gate_cases = (
+        (_attested_tag("true", job_results=skipped), True),
+        (_attested_tag("true", label="a covering attestation with Cargo validation run", job_results=ran), False),
+        (_attested_tag("false", label="a non-covering attestation with Cargo validation run", job_results=ran), True),
+        (
+            _attested_tag(
+                "false",
+                label="a tag push whose attestation does not cover the Cargo lanes and Cargo validation skipped",
+                job_results=skipped,
+            ),
+            False,
+        ),
+        (
+            _attested_tag(
+                "false", "1",
+                label="a tag push with a verified legacy (schema 1) attestation and Cargo validation skipped",
+                job_results=skipped,
+            ),
+            False,
+        ),
+        (
+            _attested_tag(
+                "true",
+                label="a tag push whose exact-main CI did not succeed",
+                job_results={**skipped, CI_GREEN_JOB: "failure"},
+            ),
+            False,
+        ),
+    )
+    for context, must_accept in gate_cases:
+        status, output_text = _run_gate_script(gate, context)
+        if must_accept and status != 0:
+            violations.append(
+                f"step `{gate.name}` refuses {context.label}: "
+                + " | ".join(line for line in output_text.splitlines() if line.strip())
+            )
+        if not must_accept and status == 0:
+            violations.append(f"step `{gate.name}` accepts {context.label}")
+    return violations
+
+
+PREBUILD_INPUT = "prebuild_release_artifacts"
+PREBUILD_LOOKUP_JOB = "release_prebuild"
+PREBUILD_GATE_JOB = "release_prebuild_gate"
+PREBUILD_LOOKUP_SCRIPT = "scripts/release-find-prebuild"
+PROVENANCE_VERIFIER = "scripts/verify-release-asset-provenance"
+BINARY_BUILD_JOBS = (
+    "build_binaries",
+    "build_binaries_buildbuddy",
+    "build_binaries_windows_cross",
+    "build_binaries_macos_x86_cross",
+)
+CRITICAL_PUBLISH_JOB = "publish_critical_release_assets"
+WEB_SDK_BUILD_JOB = "build_web_sdk_package"
+WEB_SDK_PUBLISH_JOB = "publish_web_sdk"
+ASSET_PUBLISH_JOB = "publish_github_release"
+# A job whose block contains one of these writes to a public surface.
+PUBLISHING_MARKERS = (
+    "softprops/action-gh-release",
+    "gh release upload",
+    "update-homebrew",
+    "release-publish-rust-crates.sh",
+    "twine upload",
+    "npm publish",
+    "release-publish-web-sdk-package.sh",
+)
+PREBUILD_RUN = "424242"
+PREBUILD_ATTEMPT = "2"
+
+
+def _job_names(text: str) -> list[str]:
+    lines = text.splitlines()
+    try:
+        start = lines.index("jobs:")
+    except ValueError as error:
+        raise ContractError("the workflow has no top-level `jobs:`") from error
+    return [
+        match.group(1)
+        for line in lines[start + 1 :]
+        if (match := JOB_HEADER.match(line))
+    ]
+
+
+def _job_runs(text: str, job: str, context: EventContext) -> bool:
+    condition = parse_mapping(job_block(text, job), 4).get("if")
+    return condition is None or truthy(evaluate(condition, context))
+
+
+def _running_steps(text: str, job: str, context: EventContext) -> list[tuple[int, Step]]:
+    return [
+        (index, step)
+        for index, step in enumerate(job_steps(job_block(text, job)))
+        if step_runs(step, context)
+    ]
+
+
+def _checkout_ref(text: str, job: str, context: EventContext) -> str | None:
+    for step in job_steps(job_block(text, job)):
+        if CHECKOUT_ACTION in step.fields.get("uses", "") and "ref" in step.nested("with"):
+            return render_strict(step.nested("with")["ref"], context)
+    return None
+
+
+def _verifier_invocations(step: Step, context: EventContext) -> list[list[str]]:
+    """Run the step with a stub verifier and return the argv of each call."""
+    env = {key: render_strict(value, context) for key, value in step.env.items()}
+    script = render_strict(step.run, context)
+    with tempfile.TemporaryDirectory(prefix="release-prebuild-") as scratch:
+        record = Path(scratch, "calls")
+        stub = Path(scratch, PROVENANCE_VERIFIER)
+        stub.parent.mkdir(parents=True)
+        stub.write_text(
+            "#!/usr/bin/env bash\n"
+            f"printf '%s\\x1f' \"$@\" >> '{record}'\n"
+            f"printf '\\n' >> '{record}'\n",
+            encoding="utf-8",
+        )
+        stub.chmod(0o755)
+        subprocess.run(
+            ["bash", "-c", script],
+            cwd=scratch,
+            env={**_runner_env(context), **env},
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if not record.exists():
+            return []
+        return [
+            [arg for arg in line.split("\x1f") if arg]
+            for line in record.read_text(encoding="utf-8").splitlines()
+        ]
+
+
+def check_prebuild(text: str) -> list[str]:
+    """A pre-tag prebuild publishes nothing; a tag reuses it only verified.
+
+    A `prebuild_release_artifacts` dispatch on main builds every release
+    binary and the Web SDK package of the exact dispatched commit, runs no
+    release validation or semver measurement, and publishes nothing. A tag
+    push looks the prebuild of its own commit up (`release_prebuild`); when
+    one is found it builds nothing, publishes that run's archives only after
+    `verify-release-asset-provenance --source-run` (the assets_run_id trust
+    path) and the Web SDK package only after its attestation is verified;
+    when none is found it builds as before.
+    """
+    violations: list[str] = []
+    names = _job_names(text)
+    for job in (PREBUILD_LOOKUP_JOB, PREBUILD_GATE_JOB, *BINARY_BUILD_JOBS, WEB_SDK_BUILD_JOB):
+        if job not in names:
+            return [f"job `{job}` is not defined in the workflow"]
+
+    prebuild_outputs = {
+        f"{PREBUILD_LOOKUP_JOB}.run_id": "",
+        f"{PREBUILD_LOOKUP_JOB}.run_attempt": "",
+        f"{CI_GREEN_JOB}.{ATTESTATION_SCHEMA_OUTPUT}": "",
+        f"{CI_GREEN_JOB}.{COVERS_OUTPUT}": "",
+        f"{CI_GREEN_JOB}.prebuild_tag": "v0.0.0",
+    }
+    prebuild = EventContext(
+        label="a prebuild dispatch on main",
+        event_name="workflow_dispatch",
+        ref="refs/heads/main",
+        sha="1" * 40,
+        inputs={PREBUILD_INPUT: "true", "release_backend": "github-hosted"},
+        job_outputs=prebuild_outputs,
+    )
+
+    # 1. A prebuild publishes nothing, whatever its upstream jobs report.
+    for job in names:
+        block = "\n".join(job_block(text, job))
+        if any(marker in block for marker in PUBLISHING_MARKERS) and _job_runs(text, job, prebuild):
+            violations.append(f"job `{job}` publishes on {prebuild.label}")
+
+    # 2. It runs no release validation or semver measurement, does not wait
+    #    for CI, and verifies its request.
+    for job in ("release_validate_cargo", "release_validate_buildbuddy", "release_validate_gate", SEMVER_GATE_JOB):
+        if job in names and _job_runs(text, job, prebuild):
+            violations.append(f"job `{job}` runs on {prebuild.label}, which validates nothing")
+    ci_steps = job_steps(job_block(text, CI_GREEN_JOB))
+    for step in ci_steps:
+        if step.fields.get("id") == "ci_run" and step_runs(step, prebuild):
+            violations.append(f"step `{step.name}` waits for exact-main CI on {prebuild.label}")
+    requests = [step for step in ci_steps if step.fields.get("id") == "prebuild_request"]
+    if len(requests) != 1 or not step_runs(requests[0], prebuild) or "tag" not in requests[0].written_outputs():
+        violations.append(
+            f"job `{CI_GREEN_JOB}` must verify the request with one step `id: prebuild_request` "
+            f"that runs on {prebuild.label} and writes its `tag`"
+        )
+    elif "refs/heads/main" not in requests[0].run:
+        violations.append(f"step `{requests[0].name}` does not refuse a prebuild off refs/heads/main")
+
+    # 3. It builds every artifact from exactly the dispatched commit.
+    realistic = EventContext(
+        **{
+            **prebuild.__dict__,
+            "job_results": {
+                "release_validate_gate": "skipped",
+                SEMVER_GATE_JOB: "skipped",
+                PREBUILD_LOOKUP_JOB: "skipped",
+            },
+        }
+    )
+    for job in (
+        "build_binaries",
+        "build_binaries_windows_cross",
+        "build_binaries_macos_x86_cross",
+        WEB_SDK_BUILD_JOB,
+        "build_binaries_critical_gate",
+        "build_binaries_gate",
+        PREBUILD_GATE_JOB,
+    ):
+        if not _job_runs(text, job, realistic):
+            violations.append(f"job `{job}` is skipped on {prebuild.label}")
+    for job in (*BINARY_BUILD_JOBS, WEB_SDK_BUILD_JOB):
+        ref = _checkout_ref(text, job, prebuild)
+        if ref != prebuild.sha:
+            violations.append(
+                f"job `{job}` checks out `{ref}` on {prebuild.label}, not the dispatched commit "
+                "(github.sha): a moving main would be built instead"
+            )
+
+    # 4. The prebuild gate passes only on the critical binaries and the Web
+    #    SDK package, and the lookup requires exactly that job.
+    gate_steps = [step for step in job_steps(job_block(text, PREBUILD_GATE_JOB)) if step.run]
+    gate_name = parse_mapping(job_block(text, PREBUILD_GATE_JOB), 4).get("name", "")
+    if len(gate_steps) != 1:
+        violations.append(f"job `{PREBUILD_GATE_JOB}` must have exactly one run step")
+    else:
+        for failed in ("build_binaries_critical_gate", WEB_SDK_BUILD_JOB):
+            context = EventContext(**{**realistic.__dict__, "job_results": {failed: "failure"}})
+            status, _ = _run_gate_script(gate_steps[0], context)
+            if status == 0:
+                violations.append(f"job `{PREBUILD_GATE_JOB}` passes although `{failed}` failed")
+        status, output = _run_gate_script(gate_steps[0], realistic)
+        if status != 0:
+            violations.append(f"job `{PREBUILD_GATE_JOB}` refuses a complete prebuild: {output.strip()}")
+    lookup_script = Path(__file__).resolve().with_name(Path(PREBUILD_LOOKUP_SCRIPT).name)
+    try:
+        lookup_text = lookup_script.read_text(encoding="utf-8")
+    except OSError:
+        lookup_text = ""
+    if f'PREBUILD_GATE_JOB="{gate_name}"' not in lookup_text:
+        violations.append(
+            f"{PREBUILD_LOOKUP_SCRIPT} does not require the `{gate_name}` job that marks a complete prebuild"
+        )
+
+    # 5. A tag looks its own commit's prebuild up; dispatches never do.
+    if not _job_runs(text, PREBUILD_LOOKUP_JOB, TAG_PUSH):
+        violations.append(f"job `{PREBUILD_LOOKUP_JOB}` does not run on {TAG_PUSH.label}")
+    for context in (PACKAGE_RECOVERY, prebuild):
+        if _job_runs(text, PREBUILD_LOOKUP_JOB, context):
+            violations.append(f"job `{PREBUILD_LOOKUP_JOB}` runs on {context.label}")
+    if not any(PREBUILD_LOOKUP_SCRIPT in step.run for step in job_steps(job_block(text, PREBUILD_LOOKUP_JOB))):
+        violations.append(f"job `{PREBUILD_LOOKUP_JOB}` does not run `{PREBUILD_LOOKUP_SCRIPT}`")
+
+    # 6. A tag whose commit was prebuilt builds nothing and publishes the
+    #    prebuild's artifacts only through the attested-archive verification.
+    def tag_push(run_id: str) -> EventContext:
+        return EventContext(
+            label=f"a tag push {'with a prebuild found' if run_id else 'without a prebuild'}",
+            event_name="push",
+            step_outputs={"manifest.upload": "true"},
+            job_outputs={
+                f"{PREBUILD_LOOKUP_JOB}.run_id": run_id,
+                f"{PREBUILD_LOOKUP_JOB}.run_attempt": PREBUILD_ATTEMPT if run_id else "",
+                f"{CI_GREEN_JOB}.{ATTESTATION_SCHEMA_OUTPUT}": "4",
+                f"{CI_GREEN_JOB}.{COVERS_OUTPUT}": "true",
+                f"{CI_GREEN_JOB}.prebuild_tag": "",
+            },
+        )
+
+    reused, fresh = tag_push(PREBUILD_RUN), tag_push("")
+
+    # Reusing a prebuild never bypasses a gate: with exact-main CI, release
+    # validation or the semver gate failed, nothing publishes.
+    for failed in (CI_GREEN_JOB, VALIDATION_GATE_JOB, SEMVER_GATE_JOB):
+        context = EventContext(
+            **{**reused.__dict__, "label": f"{reused.label} and `{failed}` failed", "job_results": {failed: "failure"}}
+        )
+        for job in (CRITICAL_PUBLISH_JOB, ASSET_PUBLISH_JOB, WEB_SDK_PUBLISH_JOB, REGISTRY_JOB):
+            if job in names and _job_runs(text, job, context):
+                violations.append(f"job `{job}` publishes on {context.label}")
+    for job in (*BINARY_BUILD_JOBS, WEB_SDK_BUILD_JOB):
+        if _job_runs(text, job, reused):
+            violations.append(f"job `{job}` builds on {reused.label}")
+    for job in ("build_binaries_windows_cross", "build_binaries_macos_x86_cross", WEB_SDK_BUILD_JOB):
+        if not _job_runs(text, job, fresh):
+            violations.append(f"job `{job}` is skipped on {fresh.label}")
+
+    for job in (CRITICAL_PUBLISH_JOB, ASSET_PUBLISH_JOB, WEB_SDK_PUBLISH_JOB):
+        if not _job_runs(text, job, reused):
+            violations.append(f"job `{job}` does not run on {reused.label}")
+            continue
+        steps = _running_steps(text, job, reused)
+        downloads = [
+            step for _, step in steps if "actions/download-artifact" in step.fields.get("uses", "")
+        ]
+        if not downloads:
+            violations.append(f"job `{job}` downloads nothing on {reused.label}")
+        for step in downloads:
+            run_id = render_strict(step.nested("with").get("run-id", ""), reused)
+            if run_id != PREBUILD_RUN:
+                violations.append(
+                    f"step `{step.name}` downloads from run `{run_id or 'this run'}` on "
+                    f"{reused.label}, not the prebuild run"
+                )
+
+    for job in (CRITICAL_PUBLISH_JOB, ASSET_PUBLISH_JOB):
+        verify_steps = [
+            step for _, step in _running_steps(text, job, reused) if PROVENANCE_VERIFIER in step.run
+        ]
+        if len(verify_steps) != 1:
+            violations.append(
+                f"job `{job}` must run `{PROVENANCE_VERIFIER}` in exactly one step on {reused.label}"
+            )
+            continue
+        calls = _verifier_invocations(verify_steps[0], reused)
+        if (
+            len(calls) != 1
+            or calls[0][:2] != ["--source-run", PREBUILD_RUN]
+            or "--stamps" not in calls[0]
+            or "--prebuild" not in calls[0]
+            or "--source-attempt" not in calls[0]
+            or calls[0][calls[0].index("--source-attempt") + 1] != PREBUILD_ATTEMPT
+        ):
+            violations.append(
+                f"step `{verify_steps[0].name}` verifies {reused.label} with {calls}; expected "
+                f"`{PROVENANCE_VERIFIER} --source-run {PREBUILD_RUN} --source-attempt {PREBUILD_ATTEMPT} "
+                "--prebuild --stamps ...`, the assets_run_id trust path for the tag's own prebuild, "
+                "pinned to the attempt the lookup examined"
+            )
+        else:
+            # The critical archives are verified against the prebuild's
+            # critical gate (its trailing lanes may still run); the complete
+            # set against its full binary build gate, the default.
+            args = calls[0]
+            gate = args[args.index("--source-gate") + 1] if "--source-gate" in args else "Release binary build gate"
+            wanted = (
+                "Release critical binary build gate" if job == CRITICAL_PUBLISH_JOB else "Release binary build gate"
+            )
+            if gate != wanted:
+                violations.append(
+                    f"step `{verify_steps[0].name}` requires the prebuild's `{gate}` on {reused.label}; "
+                    f"expected `{wanted}`"
+                )
+        fresh_calls = _verifier_invocations(verify_steps[0], fresh)
+        if len(fresh_calls) != 1 or "--source-run" in fresh_calls[0]:
+            violations.append(
+                f"step `{verify_steps[0].name}` verifies {fresh.label} with {fresh_calls}; "
+                "expected the exact-tag verification"
+            )
+
+    # The trailing publisher downloads the prebuild's archives only after
+    # that run's full binary build gate passed (the trailing lanes may still
+    # be running when the prebuild is selected).
+    publisher_steps = _running_steps(text, ASSET_PUBLISH_JOB, reused)
+    wait_index = next(
+        (
+            index
+            for index, step in publisher_steps
+            if "Release binary build gate" in step.run
+            and "PREBUILD_RUN_ID" in step.run
+            and "PREBUILD_RUN_ATTEMPT" in step.run
+        ),
+        None,
+    )
+    download_index = next(
+        (
+            index
+            for index, step in publisher_steps
+            if "actions/download-artifact" in step.fields.get("uses", "")
+        ),
+        None,
+    )
+    if wait_index is None or download_index is None or wait_index > download_index:
+        violations.append(
+            f"job `{ASSET_PUBLISH_JOB}` must wait for the prebuild run's `Release binary build gate` "
+            f"before downloading its archives on {reused.label}"
+        )
+
+    web_steps = _running_steps(text, WEB_SDK_PUBLISH_JOB, reused)
+    verify_index = next(
+        (
+            index
+            for index, step in web_steps
+            if "gh attestation verify" in step.run and "--source-ref refs/heads/main" in step.run
+        ),
+        None,
+    )
+    publish_index = next(
+        (index for index, step in web_steps if "release-publish-web-sdk-package.sh" in step.run),
+        None,
+    )
+    if verify_index is None or publish_index is None or verify_index > publish_index:
+        violations.append(
+            f"job `{WEB_SDK_PUBLISH_JOB}` must verify the prebuilt package's attestation "
+            f"(`gh attestation verify ... --source-ref refs/heads/main`) before publishing on {reused.label}"
+        )
+    return violations
+
+SEMVER_BASELINE_JOB = "publish_semver_baseline"
+SEMVER_BASELINE_ATTACH_JOB = "attach_semver_baseline"
+
+
+def _job_needs(text: str, job: str) -> list[str]:
+    raw = parse_mapping(job_block(text, job), 4).get("needs", "").strip()
+    if raw.startswith("[") and raw.endswith("]"):
+        raw = raw[1:-1]
+    return [item for item in re.split(r"[\s,]+", raw) if item and item != "-"]
+
+
+def check_semver_baseline(text: str) -> list[str]:
+    """The semver baseline rustdoc is off every path a user waits on.
+
+    Its rustdoc build starts with the release (it waits for nothing that
+    publishes), no job waits for it except the attach job, nothing waits for
+    the attach job, and only the attach job writes to the GitHub release,
+    after the release is published, from the artifact the build uploaded.
+    """
+    violations: list[str] = []
+    names = _job_names(text)
+    for job in (SEMVER_BASELINE_JOB, SEMVER_BASELINE_ATTACH_JOB):
+        if job not in names:
+            return [f"job `{job}` is not defined in the workflow"]
+    needs = {job: _job_needs(text, job) for job in names}
+
+    for job, upstream in needs.items():
+        if job != SEMVER_BASELINE_ATTACH_JOB and SEMVER_BASELINE_JOB in upstream:
+            violations.append(f"job `{job}` waits for the semver baseline rustdoc (`{SEMVER_BASELINE_JOB}`)")
+        if SEMVER_BASELINE_ATTACH_JOB in upstream:
+            violations.append(f"job `{job}` waits for the semver baseline attachment (`{SEMVER_BASELINE_ATTACH_JOB}`)")
+
+    closure: set[str] = set()
+    frontier = list(needs[SEMVER_BASELINE_JOB])
+    while frontier:
+        job = frontier.pop()
+        if job in closure or job not in needs:
+            continue
+        closure.add(job)
+        frontier.extend(needs[job])
+    blocking = sorted(
+        job
+        for job in closure
+        if any(marker in "\n".join(job_block(text, job)) for marker in PUBLISHING_MARKERS)
+        or job.startswith("build_")
+    )
+    if blocking:
+        violations.append(
+            f"job `{SEMVER_BASELINE_JOB}` waits for {', '.join(f'`{job}`' for job in blocking)}; "
+            "the rustdoc build must run in parallel with publication, not after it"
+        )
+
+    if "publish_github_release" not in needs[SEMVER_BASELINE_ATTACH_JOB]:
+        violations.append(
+            f"job `{SEMVER_BASELINE_ATTACH_JOB}` does not wait for `publish_github_release`, "
+            "so it could attach to a release that is not published"
+        )
+    build_steps = job_steps(job_block(text, SEMVER_BASELINE_JOB))
+    attach_steps = job_steps(job_block(text, SEMVER_BASELINE_ATTACH_JOB))
+    if any("gh release upload" in step.run for step in build_steps):
+        violations.append(f"job `{SEMVER_BASELINE_JOB}` writes to the GitHub release itself")
+    if not any("gh release upload" in step.run for step in attach_steps):
+        violations.append(f"job `{SEMVER_BASELINE_ATTACH_JOB}` does not attach the baseline")
+    if any(GH_UPLOAD_CLOBBER.search(step.run) for step in attach_steps):
+        violations.append(
+            f"job `{SEMVER_BASELINE_ATTACH_JOB}` attaches with `--clobber`, replacing a baseline "
+            "already on the release"
+        )
+    uploaded = {
+        step.nested("with").get("name")
+        for step in build_steps
+        if "actions/upload-artifact" in step.fields.get("uses", "")
+    }
+    downloaded = {
+        step.nested("with").get("name")
+        for step in attach_steps
+        if "actions/download-artifact" in step.fields.get("uses", "")
+    }
+    if not uploaded or not downloaded or not downloaded <= uploaded:
+        violations.append(
+            f"job `{SEMVER_BASELINE_ATTACH_JOB}` must attach the artifact `{SEMVER_BASELINE_JOB}` "
+            f"uploads (uploads {sorted(filter(None, uploaded))}, downloads {sorted(filter(None, downloaded))})"
+        )
+    for job in (SEMVER_BASELINE_JOB, SEMVER_BASELINE_ATTACH_JOB):
+        if not _job_runs(text, job, TAG_PUSH):
+            violations.append(f"job `{job}` does not run on {TAG_PUSH.label}")
+    return violations
+
+# A `gh release upload` that replaces an asset of the same name.
+GH_UPLOAD_CLOBBER = re.compile(r"gh release upload(?:[^\n]|\\\n)*--clobber")
+CRITICAL_TARGETS = ("x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu", "aarch64-apple-darwin")
+TRAILING_TARGETS = ("x86_64-apple-darwin", "x86_64-pc-windows-msvc")
+TRAILING_BUILD_JOBS = ("build_binaries_windows_cross", "verify_windows_binaries", "build_binaries_macos_x86_cross")
+RELEASE_BINARIES = ("rkat", "rkat-rpc", "rkat-rest", "rkat-mcp")
+GH_RELEASE_ACTION = "softprops/action-gh-release"
+
+
+def _published_archives(text: str, job: str, context: EventContext, version: str) -> set[str]:
+    """Which archives the job's release upload would publish under `context`.
+
+    Every release archive name (critical and trailing targets) is laid out
+    where the job's artifact downloads put them; the job's shell steps run in
+    order up to its provenance verification (selection precedes
+    verification), and the release upload's `files` patterns are then
+    resolved against the result.
+    """
+    steps = [step for step in job_steps(job_block(text, job)) if step_runs(step, context)]
+    with tempfile.TemporaryDirectory(prefix="release-trailing-") as scratch:
+        for step in steps:
+            if "actions/download-artifact" not in step.fields.get("uses", ""):
+                continue
+            root = Path(scratch, step.nested("with").get("path", "."))
+            for target in (*CRITICAL_TARGETS, *TRAILING_TARGETS):
+                extension = "zip" if "windows" in target else "tar.gz"
+                for binary in RELEASE_BINARIES:
+                    lane = root / f"meerkat-{target}-{binary}"
+                    lane.mkdir(parents=True, exist_ok=True)
+                    Path(lane, f"{binary}-{version}-{target}.{extension}").write_bytes(b"archive")
+        for step in steps:
+            if PROVENANCE_VERIFIER in step.run:
+                break
+            if not step.raw_run.strip():
+                continue
+            env = {key: render_strict(value, context) for key, value in step.env.items()}
+            subprocess.run(
+                ["bash", "-c", render_strict(step.raw_run, context)],
+                cwd=scratch,
+                env={**_runner_env(context), **env},
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        published: set[str] = set()
+        for step in steps:
+            if GH_RELEASE_ACTION not in step.fields.get("uses", ""):
+                continue
+            for pattern in step.nested("with").get("files", "").split():
+                published.update(path.name for path in Path(scratch).glob(pattern))
+        return published
+
+
+def _steps_of(text: str, job: str) -> list[Step]:
+    """The job's steps; none for a job that calls a reusable workflow."""
+    try:
+        return job_steps(job_block(text, job))
+    except ContractError:
+        return []
+
+
+def check_trailing_platforms(text: str) -> list[str]:
+    """Intel macOS and Windows trail; nothing replaces a published asset.
+
+    The critical publisher puts exactly the Linux (x86_64, aarch64) and macOS
+    arm64 archives on the release as soon as their lane passes, waiting for no
+    trailing (Intel macOS, Windows) job. Every archive upload is add-only, the
+    complete manifest is written only by publish_github_release after every
+    lane (and refuses to change a published one), and Homebrew is updated only
+    after that trailing publisher.
+    """
+    violations: list[str] = []
+    names = _job_names(text)
+    for job in (CRITICAL_PUBLISH_JOB, ASSET_PUBLISH_JOB, "build_binaries_critical_gate", "update_homebrew"):
+        if job not in names:
+            return [f"job `{job}` is not defined in the workflow"]
+    needs = {job: _job_needs(text, job) for job in names}
+
+    def closure(job: str) -> set[str]:
+        seen: set[str] = set()
+        frontier = list(needs[job])
+        while frontier:
+            upstream = frontier.pop()
+            if upstream in seen or upstream not in needs:
+                continue
+            seen.add(upstream)
+            frontier.extend(needs[upstream])
+        return seen
+
+    for job in (CRITICAL_PUBLISH_JOB, PREBUILD_GATE_JOB):
+        if job not in needs:
+            continue
+        waits = sorted(set(TRAILING_BUILD_JOBS + ("build_binaries_gate",)) & closure(job))
+        if waits:
+            violations.append(
+                f"job `{job}` waits for {', '.join(f'`{upstream}`' for upstream in waits)}; "
+                "the trailing Intel macOS and Windows lanes must not gate the critical assets"
+            )
+    if not _job_runs(text, CRITICAL_PUBLISH_JOB, TAG_PUSH):
+        violations.append(f"job `{CRITICAL_PUBLISH_JOB}` does not run on {TAG_PUSH.label}")
+
+    tag = EventContext(
+        label=TAG_PUSH.label,
+        event_name="push",
+        job_outputs={f"{PREBUILD_LOOKUP_JOB}.run_id": ""},
+    )
+    expected = {
+        f"{binary}-0.0.0-{target}.tar.gz" for binary in RELEASE_BINARIES for target in CRITICAL_TARGETS
+    }
+    published = _published_archives(text, CRITICAL_PUBLISH_JOB, tag, "0.0.0")
+    if published != expected:
+        violations.append(
+            f"job `{CRITICAL_PUBLISH_JOB}` publishes {sorted(published - expected) or 'no extra archive'} "
+            f"beyond the critical set and misses {sorted(expected - published) or 'none of it'}; "
+            "it must publish exactly the Linux and macOS arm64 archives"
+        )
+
+    for job in names:
+        for step in _steps_of(text, job):
+            if GH_UPLOAD_CLOBBER.search(step.raw_run):
+                violations.append(
+                    f"step `{step.name}` uploads with `gh release upload --clobber`; "
+                    "release uploads are add-only and never replace an asset"
+                )
+            if GH_RELEASE_ACTION not in step.fields.get("uses", ""):
+                continue
+            files = step.nested("with").get("files", "")
+            overwrite = step.nested("with").get("overwrite_files", "")
+            manifest = "checksums.sha256" in files or "index.json" in files
+            if manifest and job != ASSET_PUBLISH_JOB:
+                violations.append(f"job `{job}` writes the release manifest; only `{ASSET_PUBLISH_JOB}` may")
+            if overwrite != "false":
+                violations.append(
+                    f"step `{step.name}` uploads with overwrite_files `{overwrite or 'unset'}`; "
+                    "release uploads are add-only (`overwrite_files: false`) and never replace an asset"
+                )
+            if manifest and "steps." not in (step.condition or ""):
+                violations.append(
+                    f"step `{step.name}` writes the manifest unconditionally; it must run only when "
+                    "the manifest is absent from the release"
+                )
+    if "build_binaries_gate" not in closure(ASSET_PUBLISH_JOB):
+        violations.append(f"job `{ASSET_PUBLISH_JOB}` writes the manifest before every lane finished")
+    publisher = job_steps(job_block(text, ASSET_PUBLISH_JOB))
+    guard = next((i for i, step in enumerate(publisher) if "cmp -s" in step.run and "gh release download" in step.run), None)
+    upload = next(
+        (
+            i
+            for i, step in enumerate(publisher)
+            if GH_RELEASE_ACTION in step.fields.get("uses", "") and "checksums.sha256" in step.nested("with").get("files", "")
+        ),
+        None,
+    )
+    if guard is None or upload is None or guard > upload:
+        violations.append(
+            f"job `{ASSET_PUBLISH_JOB}` must refuse to change a published manifest before writing it"
+        )
+
+    for job in names:
+        uses_homebrew = any("update-homebrew" in step.fields.get("uses", "") for step in _steps_of(text, job))
+        if uses_homebrew and ASSET_PUBLISH_JOB not in closure(job):
+            violations.append(f"job `{job}` updates Homebrew before the trailing publisher `{ASSET_PUBLISH_JOB}`")
+    return violations
+
+# Jobs allowed each elevated token scope (everything else is read-only).
+WRITE_SCOPES_ALLOWED = {
+    "contents": {"publish_critical_release_assets", "publish_github_release", "attach_semver_baseline"},
+    "id-token": {*BINARY_BUILD_JOBS, WEB_SDK_BUILD_JOB, "release_validate_buildbuddy_full"},
+    "attestations": {*BINARY_BUILD_JOBS, WEB_SDK_BUILD_JOB},
+}
+
+
+def _permission_scopes(lines: list[str], indent: int) -> dict[str, str]:
+    """`scope: level` pairs of a permissions mapping at `indent`."""
+    for index, line in enumerate(lines):
+        if line == " " * indent + "permissions:":
+            scopes: dict[str, str] = {}
+            for candidate in lines[index + 1 :]:
+                if candidate.strip() and _indent(candidate) <= indent:
+                    break
+                match = re.match(r"^\s+([a-z-]+):\s*([a-z]+)\s*$", candidate)
+                if match:
+                    scopes[match.group(1)] = match.group(2)
+            return scopes
+    return {}
+
+
+def check_token_permissions(text: str) -> list[str]:
+    """The workflow token is read-only except where a job needs more.
+
+    The workflow default grants no write scope. Only the build jobs (and the
+    full-graph caller, for buildbuddy.yml's OIDC) may mint OIDC tokens, only
+    the build jobs may write attestations, and only the release publishers
+    may write repository contents. No checkout in a job granted a write
+    scope persists the token, and no reusable workflow receives every secret
+    (`secrets: inherit`).
+    """
+    violations: list[str] = []
+    lines = text.splitlines()
+    top = _permission_scopes(lines[: lines.index("jobs:")], 0)
+    for scope, level in sorted(top.items()):
+        if level == "write":
+            violations.append(f"the workflow default grants `{scope}: write` to every job")
+    for job in _job_names(text):
+        block = job_block(text, job)
+        scopes = _permission_scopes(block, 4)
+        for scope, level in sorted(scopes.items()):
+            if level == "write" and job not in WRITE_SCOPES_ALLOWED.get(scope, set()):
+                violations.append(f"job `{job}` is granted `{scope}: write`")
+        if parse_mapping(block, 4).get("secrets", "").strip() == "inherit":
+            violations.append(f"job `{job}` passes every repository secret to a reusable workflow (`secrets: inherit`)")
+        if "write" not in scopes.values():
+            continue
+        for step in _steps_of(text, job):
+            inputs = step.nested("with")
+            if CHECKOUT_ACTION in step.fields.get("uses", "") and inputs.get("persist-credentials") != "false":
+                violations.append(f"job `{job}` step `{step.name}` persists the workflow token in its checkout")
+    return violations
+
+# Jobs that hold a registry or publish token (or write the GitHub release):
+# they run no cache step at all. Any job granted `contents: write` counts too.
+TOKEN_JOBS = (
+    "registry_credentials_preflight",
+    REGISTRY_JOB,
+    WEB_SDK_PUBLISH_JOB,
+    CRITICAL_PUBLISH_JOB,
+    ASSET_PUBLISH_JOB,
+    "update_homebrew",
+    "attach_semver_baseline",
+)
+# setup-* actions that restore and save a package cache when given a `cache`
+# input (setup-go by default, setup-node also when package.json names a
+# package manager).
+SETUP_CACHE_ACTIONS = (
+    "actions/setup-node",
+    "actions/setup-python",
+    "actions/setup-java",
+    "actions/setup-go",
+    "actions/setup-dotnet",
+)
+# Triggers whose runs save into the default branch's cache scope, which every
+# tag run restores, without being a reviewed push to main: a dispatch, an
+# external event, a pull_request_target or workflow_run follow-up, or a
+# workflow call (whose caller's event is unknown here).
+DISPATCH_LIKE_TRIGGERS = (
+    "workflow_dispatch",
+    "repository_dispatch",
+    "pull_request_target",
+    "workflow_run",
+    "workflow_call",
+)
+# The tree the local actions and the other workflows are read from; the
+# release doctor's fixtures point it at a mutated copy (--repo-root).
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+@dataclass(frozen=True)
+class _Unknown:
+    """A value a static reading cannot know (a dispatch input, a repository
+    variable, a step output, the runner); `truthy` is set when only its
+    truthiness is known."""
+
+    truthy: bool | None = None
+
+
+UNKNOWN = _Unknown()
+
+
+def _known_truthy(value: object) -> bool | None:
+    if isinstance(value, _Unknown):
+        return value.truthy
+    return truthy(value)
+
+
+@dataclass(frozen=True)
+class OpenFrame:
+    """One run as the cache check reads it: its event (None for a reusable
+    workflow, whose caller's event is unknown), its ref, and the inputs of
+    the local action being read (None outside one). Everything else is
+    unknown, so a condition counts as false only when it is false whatever
+    the unknowns are."""
+
+    label: str
+    event_name: str | None
+    ref: str = "refs/heads/main"
+    inputs: dict[str, object] | None = None
+
+    def resolve(self, path: str) -> object:
+        if path == "github.event_name":
+            return UNKNOWN if self.event_name is None else self.event_name
+        if path == "github.ref":
+            return self.ref
+        if path == "github.ref_name":
+            return github_ref_name(self.ref)
+        if path.startswith("inputs.") and self.inputs is not None:
+            # An input the action does not declare reads as empty.
+            return self.inputs.get(path[len("inputs.") :], "")
+        return UNKNOWN
+
+
+class _OpenParser(_Parser):
+    """`_Parser` over three values: what the frame cannot know stays unknown."""
+
+    def parse_or(self) -> object:
+        left = self.parse_and()
+        while self.peek() == ("op", "||"):
+            self.take()
+            right = self.parse_and()
+            known = _known_truthy(left)
+            if known is None:
+                left = _Unknown(True) if _known_truthy(right) is True else UNKNOWN
+            elif not known:
+                left = right
+        return left
+
+    def parse_and(self) -> object:
+        left = self.parse_equality()
+        while self.peek() == ("op", "&&"):
+            self.take()
+            right = self.parse_equality()
+            known = _known_truthy(left)
+            if known is None:
+                left = _Unknown(False) if _known_truthy(right) is False else UNKNOWN
+            elif known:
+                left = right
+        return left
+
+    def parse_equality(self) -> object:
+        left = self.parse_unary()
+        while self.peek() in (("op", "=="), ("op", "!=")):
+            _, op = self.take()
+            right = self.parse_unary()
+            if isinstance(left, _Unknown) or isinstance(right, _Unknown):
+                left = UNKNOWN
+            else:
+                equal = _equal(left, right)
+                left = equal if op == "==" else not equal
+        return left
+
+    def parse_unary(self) -> object:
+        if self.peek() == ("op", "!"):
+            self.take()
+            known = _known_truthy(self.parse_unary())
+            return UNKNOWN if known is None else not known
+        return self.parse_primary()
+
+    def parse_primary(self) -> object:
+        token = self.peek()
+        following = self.tokens[self.index + 1] if self.index + 1 < len(self.tokens) else None
+        if token is None or token[0] != "ident" or following != ("op", "("):
+            return super().parse_primary()
+        name = self.take()[1]
+        self.take()
+        args: list[object] = []
+        if self.peek() != ("op", ")"):
+            args.append(self.parse_or())
+            while self.peek() == ("op", ","):
+                self.take()
+                args.append(self.parse_or())
+        self.expect_op(")")
+        if name == "always":
+            return True
+        if name in ("startsWith", "endsWith", "contains") and not any(
+            isinstance(arg, _Unknown) for arg in args
+        ):
+            return FUNCTIONS[name](args)
+        # success(), failure(), hashFiles(), format(), fromJSON(), ...
+        return UNKNOWN
+
+
+def _open_evaluate(expression: str, frame: OpenFrame) -> object:
+    expression = " ".join(expression.split())
+    match = re.fullmatch(r"\$\{\{(.*)\}\}", expression)
+    if match and "}}" not in match.group(1):
+        expression = match.group(1)
+    try:
+        return _OpenParser(expression, frame).parse()
+    except UnsupportedExpression:
+        # Syntax this reader does not model (an index, a filter) is unknown.
+        return UNKNOWN
+
+
+def _may_hold(condition: str | None, frame: OpenFrame) -> bool:
+    """False only when `condition` is false whatever the unknowns are."""
+    if condition is None:
+        return True
+    return _known_truthy(_open_evaluate(condition, frame)) is not False
+
+
+def _as_input(value: object) -> object:
+    """A value as an action input receives it (`true`, not True)."""
+    if isinstance(value, _Unknown):
+        return value
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return str(value)
+
+
+def _open_template(template: str, frame: OpenFrame, unknown: str | None) -> object:
+    """Render a `with:` value: a lone expression keeps its value; otherwise
+    each unknown part becomes `unknown` (a `*` for a cache-key pattern), or
+    the whole value is unknown when `unknown` is None."""
+    pieces = EXPRESSION.split(template.strip())
+    if unknown is None and len(pieces) == 3 and pieces[0] == "" and pieces[2] == "":
+        return _as_input(_open_evaluate(pieces[1], frame))
+    rendered: list[str] = []
+    for index, piece in enumerate(pieces):
+        if index % 2 == 0:
+            rendered.append(piece)
+            continue
+        value = _as_input(_open_evaluate(piece, frame))
+        if isinstance(value, _Unknown):
+            if unknown is None:
+                return UNKNOWN
+            rendered.append(unknown)
+        else:
+            rendered.append(value)
+    return "".join(rendered)
+
+
+def _specs_overlap(restored: tuple[str, str], saved: tuple[str, str]) -> bool:
+    """Whether an entry saved under `saved` can be restored under `restored`.
+
+    Two families match only when equal (the suffix after them has the same
+    shape for both); a family matches a whole key that starts with it.
+    """
+    (left_kind, left), (right_kind, right) = restored, saved
+    if left_kind == "family" and right_kind == "key":
+        left += "-*"
+    elif left_kind == "key" and right_kind == "family":
+        right += "-*"
+    return _globs_overlap(left, right)
+
+
+def _globs_overlap(left: str, right: str) -> bool:
+    """Whether two `*` patterns match one common string (case-insensitive)."""
+    left, right = left.lower(), right.lower()
+    memo: dict[tuple[int, int], bool] = {}
+
+    def match(i: int, j: int) -> bool:
+        if (i, j) in memo:
+            return memo[(i, j)]
+        if i == len(left) and j == len(right):
+            result = True
+        elif i < len(left) and left[i] == "*":
+            result = match(i + 1, j) or (j < len(right) and match(i, j + 1))
+        elif j < len(right) and right[j] == "*":
+            result = match(i, j + 1) or (i < len(left) and match(i + 1, j))
+        else:
+            result = i < len(left) and j < len(right) and left[i] == right[j] and match(i + 1, j + 1)
+        memo[(i, j)] = result
+        return result
+
+    return match(0, 0)
+
+
+@dataclass(frozen=True)
+class _LocalAction:
+    """A local composite action: where it lives, its input defaults, its steps."""
+
+    name: str
+    defaults: dict[str, str]
+    steps: tuple[Step, ...]
+
+
+def _local_action(uses: str, root: Path) -> _LocalAction | None:
+    """The composite action a `uses: ./...` step runs, read from `root`.
+
+    `./.release-tooling/` is release.yml's checkout of its own commit, so it
+    resolves to the same tree.
+    """
+    if not uses.startswith("./"):
+        return None
+    relative = uses[2:].rstrip("/")
+    if relative.startswith(".release-tooling/"):
+        relative = relative[len(".release-tooling/") :]
+    for candidate in ("action.yml", "action.yaml"):
+        path = root / relative / candidate
+        if path.is_file():
+            break
+    else:
+        raise ContractError(f"local action `{uses}` has no action.yml under {root}")
+    lines = path.read_text(encoding="utf-8").splitlines()
+
+    defaults: dict[str, str] = {}
+    current: str | None = None
+    section: str | None = None
+    for line in lines:
+        if line.strip() and not line.startswith(" "):
+            section = line.split(":", 1)[0]
+            continue
+        if section != "inputs":
+            continue
+        name = re.match(r"^  ([A-Za-z0-9_-]+):\s*$", line)
+        if name:
+            current = name.group(1)
+            continue
+        default = re.match(r"^    default:\s*(.*?)\s*$", line)
+        if default and current is not None:
+            defaults[current] = default.group(1).strip("'\"")
+
+    try:
+        start = lines.index("runs:")
+        steps_at = next(
+            index for index in range(start + 1, len(lines)) if lines[index] == "  steps:"
+        )
+    except (ValueError, StopIteration) as error:
+        raise ContractError(f"local action `{uses}` is not a composite action with steps") from error
+    body: list[str] = []
+    for line in lines[steps_at + 1 :]:
+        if line.strip() and _indent(line) < 4:
+            break
+        # The workflow layout one level deeper, which job_steps reads.
+        body.append("  " + line if line.strip() else line)
+    steps = job_steps(["    steps:", *body])
+    return _LocalAction(relative, defaults, tuple(steps))
+
+
+@dataclass(frozen=True)
+class _CacheUse:
+    """One cache step a job runs, directly or through local actions."""
+
+    workflow: str
+    job: str
+    via: tuple[str, ...]
+    step: Step
+    kind: str  # cache | restore | save | rust-cache | setup
+    frame: OpenFrame
+
+    @property
+    def where(self) -> str:
+        chain = " > ".join(f"`{name}`" for name in self.via)
+        return f"job `{self.job}`" + (f" (in {chain})" if chain else "")
+
+    @property
+    def uses(self) -> str:
+        return self.step.fields.get("uses", "").strip()
+
+    def _with(self, name: str, unknown: str | None = None) -> object:
+        value = self.step.nested("with").get(name)
+        return None if value is None else _open_template(value, self.frame, unknown)
+
+    def key_specs(self) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
+        """What it may restore and what it may save, as (`key`, pattern) for
+        `*` patterns over a whole cache key, or (`family`, pattern) for the
+        part of a rust-cache or setup-* key before the runner and
+        environment suffix every such key ends with."""
+        if self.kind == "rust-cache":
+            # Swatinem/rust-cache: <prefix-key>-<shared-key | key-job>-<os>-...
+            prefix = self._with("prefix-key", "*") or "v0-rust"
+            shared = self._with("shared-key", "*")
+            if shared:
+                family = f"{prefix}-{shared}"
+            else:
+                family = str(prefix)
+                key = self._with("key", "*")
+                if key:
+                    family += f"-{key}"
+                if str(self._with("add-job-id-key") or "true").lower() != "false":
+                    family += f"-{self.job}"
+            return [("family", family)], [("family", family)]
+        if self.kind == "setup":
+            family = f"setup-{self.uses.split('@', 1)[0]}"
+            return [("family", family)], [("family", family)]
+        key = str(self._with("key", "*") or "*")
+        restores = [("key", key)]
+        for line in (self.step.nested("with").get("restore-keys") or "").splitlines():
+            if line.strip():
+                restores.append(("key", f"{_open_template(line.strip(), self.frame, '*')}*"))
+        return (restores if self.kind != "save" else []), ([("key", key)] if self.kind != "restore" else [])
+
+    def may_save(self) -> bool:
+        if self.kind in ("cache", "save", "setup"):
+            return True
+        if self.kind == "rust-cache":
+            save_if = self.step.nested("with").get("save-if")
+            return save_if is None or _may_hold(save_if, self.frame)
+        return False
+
+    def may_restore(self) -> bool:
+        return self.kind != "save"
+
+
+def _cache_kind(uses: str, step: Step, root: Path) -> str | None:
+    action = uses.split("@", 1)[0]
+    if action == "actions/cache":
+        return "cache"
+    if action == "actions/cache/restore":
+        return "restore"
+    if action == "actions/cache/save":
+        return "save"
+    if action == "Swatinem/rust-cache":
+        return "rust-cache"
+    if action in SETUP_CACHE_ACTIONS:
+        inputs = step.nested("with")
+        cache = inputs.get("cache", "")
+        if action == "actions/setup-go":
+            return None if cache.lower() == "false" else "setup"
+        if cache:
+            return "setup"
+        if action == "actions/setup-node" and inputs.get("package-manager-cache", "").lower() != "false":
+            package = root / "package.json"
+            if package.is_file() and re.search(
+                r'"(?:packageManager|devEngines)"', package.read_text(encoding="utf-8")
+            ):
+                return "setup"
+    return None
+
+
+def _walk_cache_steps(
+    steps: Iterable[Step],
+    frame: OpenFrame,
+    root: Path,
+    workflow: str,
+    job: str,
+    via: tuple[str, ...] = (),
+) -> Iterable[_CacheUse]:
+    for step in steps:
+        if not _may_hold(step.condition, frame):
+            continue
+        uses = step.fields.get("uses", "").strip()
+        kind = _cache_kind(uses, step, root)
+        if kind is not None:
+            yield _CacheUse(workflow, job, via, step, kind, frame)
+            continue
+        action = _local_action(uses, root)
+        if action is None:
+            continue
+        if action.name in via or len(via) > 8:
+            raise ContractError(f"local action `{action.name}` calls itself")
+        inputs: dict[str, object] = dict(action.defaults)
+        for name, value in step.nested("with").items():
+            inputs[name] = _open_template(value, frame, None)
+        inner = OpenFrame(frame.label, frame.event_name, frame.ref, inputs)
+        yield from _walk_cache_steps(action.steps, inner, root, workflow, job, (*via, action.name))
+
+
+def _workflow_triggers(text: str) -> set[str]:
+    lines = text.splitlines()
+    for index, line in enumerate(lines):
+        match = re.match(r"""^["']?on["']?:\s*(.*?)\s*(?:#.*)?$""", line)
+        if not match:
+            continue
+        if match.group(1):
+            return {name.strip() for name in match.group(1).strip("[]").split(",") if name.strip()}
+        triggers: set[str] = set()
+        for candidate in lines[index + 1 :]:
+            if candidate.strip() and not candidate.startswith(" "):
+                break
+            named = re.match(r"^  (?:- )?([A-Za-z_]+):?\s*(?:#.*)?$", candidate)
+            if named:
+                triggers.add(named.group(1))
+        return triggers
+    raise ContractError("the workflow has no `on:` triggers")
+
+
+def _job_cache_uses(
+    text: str, workflow: str, job: str, frame: OpenFrame, root: Path
+) -> list[_CacheUse] | None:
+    """The cache steps `job` may run under `frame`; None for a reusable-workflow call."""
+    block = job_block(text, job)
+    fields = parse_mapping(block, 4)
+    if "uses" in fields:
+        return None
+    if not _may_hold(fields.get("if"), frame):
+        return []
+    return list(_walk_cache_steps(job_steps(block), frame, root, workflow, job))
+
+
+def check_release_caches(text: str) -> list[str]:
+    """What release.yml's caches can carry, read through every local action.
+
+    Covers each release.yml job and the local composite actions it calls,
+    recursively (not a reusable workflow: such a job must never run on a
+    dispatch). A dispatch on main saves into the default branch's cache
+    scope, which every tag run restores, so no cache step saves on a
+    dispatch; no rust-cache caches ~/.cargo/bin, so a restored binary cannot
+    shadow a tool on PATH; a job holding a registry or publish token (or
+    `contents: write`) runs no cache step; and a job that mints OIDC tokens
+    or attests artifacts (`id-token` or `attestations: write`) restores only
+    caches that no workflow in the repository saves on a dispatch-like run
+    (dispatch, repository_dispatch, pull_request_target, workflow_run, or a
+    workflow call), through the same local action or an overlapping key.
+    """
+    root = REPO_ROOT
+    violations: list[str] = []
+    dispatch = OpenFrame(label="a dispatch", event_name="workflow_dispatch")
+    tag = OpenFrame(label="a tag push", event_name="push", ref="refs/tags/v0.0.0")
+    names = _job_names(text)
+    scopes = {job: _permission_scopes(job_block(text, job), 4) for job in names}
+    token_jobs = set(TOKEN_JOBS) | {job for job in names if scopes[job].get("contents") == "write"}
+    sensitive = {
+        job
+        for job in names
+        if scopes[job].get("id-token") == "write" or scopes[job].get("attestations") == "write"
+    }
+
+    def report(message: str) -> None:
+        if message not in violations:
+            violations.append(message)
+
+    restored: list[tuple[_CacheUse, str]] = []
+    for job in names:
+        for frame in (dispatch, tag):
+            uses = _job_cache_uses(text, DEFAULT_WORKFLOW.name, job, frame, root)
+            if uses is None:
+                fields = parse_mapping(job_block(text, job), 4)
+                if job in token_jobs:
+                    report(f"job `{job}` holds a registry or publish token and calls a reusable workflow")
+                if frame is dispatch and _may_hold(fields.get("if"), dispatch):
+                    report(
+                        f"job `{job}` calls a reusable workflow on a dispatch, whose cache saves "
+                        "this check does not read"
+                    )
+                break
+            for use in uses:
+                if job in token_jobs:
+                    report(f"{use.where} holds a registry or publish token and restores a cache (`{use.uses}`)")
+                    continue
+                if use.kind == "rust-cache" and str(use._with("cache-bin")).lower() != "false":
+                    report(f"{use.where} caches ~/.cargo/bin (`cache-bin` is not false)")
+                if frame is dispatch and use.may_save():
+                    if use.kind == "rust-cache":
+                        report(f"{use.where} saves its rust-cache on a dispatch")
+                    else:
+                        saved = ", ".join(f"`{pattern}`" for _, pattern in use.key_specs()[1])
+                        report(f"{use.where} saves cache {saved} on a dispatch (`{use.uses}`)")
+                if job in sensitive and use.may_restore():
+                    restored.extend((use, spec) for spec in use.key_specs()[0])
+
+    if not restored:
+        return violations
+    workflows = sorted((root / ".github" / "workflows").glob("*.y*ml"))
+    sources = {path.name: path.read_text(encoding="utf-8") for path in workflows}
+    # The workflow under check, which may be a mutated copy.
+    sources[DEFAULT_WORKFLOW.name] = text
+    for workflow, source in sorted(sources.items()):
+        triggers = _workflow_triggers(source)
+        for trigger in DISPATCH_LIKE_TRIGGERS:
+            if trigger not in triggers:
+                continue
+            frame = OpenFrame(
+                label=f"a {trigger} run",
+                event_name=None if trigger == "workflow_call" else trigger,
+            )
+            for job in _job_names(source):
+                for writer in _job_cache_uses(source, workflow, job, frame, root) or []:
+                    if not writer.may_save():
+                        continue
+                    for saved in writer.key_specs()[1]:
+                        for use, spec in restored:
+                            if _specs_overlap(spec, saved):
+                                report(
+                                    f"{use.where} restores `{spec[1]}`, which {workflow} "
+                                    f"{writer.where} saves on {frame.label}"
+                                )
+    return violations
+
+
 def _readiness_push(needed: str, baseline: str) -> EventContext:
     return EventContext(
         label=f"a main push with needed={needed!r} and notes baseline {baseline!r}",
@@ -1002,6 +2569,12 @@ CHECKS: dict[str, Callable[[str], list[str]]] = {
     "semver-evidence": check_semver_evidence,
     "registry-slo": check_registry_slo,
     "dispatch-binding": check_dispatch_binding,
+    "tag-validation": check_tag_validation,
+    "prebuild": check_prebuild,
+    "semver-baseline": check_semver_baseline,
+    "trailing-platforms": check_trailing_platforms,
+    "token-permissions": check_token_permissions,
+    "release-caches": check_release_caches,
 }
 
 # Checks of release-semver-readiness.yml; run them by name with
@@ -1022,12 +2595,19 @@ def run_checks(text: str, names: Iterable[str]) -> list[str]:
 
 
 def main(argv: list[str] | None = None) -> int:
+    global REPO_ROOT
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument(
         "--workflow",
         type=Path,
         default=DEFAULT_WORKFLOW,
         help=f"release workflow to inspect (default: {DEFAULT_WORKFLOW})",
+    )
+    parser.add_argument(
+        "--repo-root",
+        type=Path,
+        default=REPO_ROOT,
+        help="tree the local actions and the other workflows are read from (default: this checkout)",
     )
     parser.add_argument(
         "checks",
@@ -1037,6 +2617,7 @@ def main(argv: list[str] | None = None) -> int:
         help="which contract checks to run (default: all release.yml checks)",
     )
     args = parser.parse_args(argv)
+    REPO_ROOT = args.repo_root.resolve()
     names = list(CHECKS) if "all" in args.checks else args.checks
     try:
         text = args.workflow.read_text(encoding="utf-8")

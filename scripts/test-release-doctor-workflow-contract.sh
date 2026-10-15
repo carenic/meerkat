@@ -29,6 +29,17 @@ SLO_PASS="PASS Rust registry publication reads crates back before the SDKs and e
 SLO_FAIL="FAIL Rust registry publication does not read crates back before the SDKs or enforce the 30 minute publication SLO"
 DISPATCH_PASS="PASS Publishing dispatches are bound to their version's tag"
 DISPATCH_FAIL="FAIL A publishing dispatch without release_tag could publish a branch tip as the tagged version"
+TAG_VALIDATION_PASS="PASS Tag releases skip Cargo validation only on an exact-tree CI attestation that proves its lanes ran"
+TAG_VALIDATION_FAIL="FAIL Tag releases may skip Cargo validation only on an exact-tree CI attestation that proves its lanes ran"
+PREBUILD_PASS="PASS Pre-tag prebuilds publish nothing, and a tag publishes its own commit's prebuild only through the attested-archive verification"
+PREBUILD_FAIL="FAIL A pre-tag prebuild must publish nothing, and a tag may publish its commit's prebuild only through the attested-archive verification"
+BASELINE_PASS="PASS Semver baseline rustdoc builds alongside the release and gates nothing; it attaches only to a published release, never replacing an attached one"
+BASELINE_FAIL="FAIL The semver baseline rustdoc must stay off every path a user waits on"
+TRAILING_PASS="PASS Linux and macOS arm64 assets publish without waiting for the trailing Intel macOS and Windows lanes; no upload replaces a published asset"
+TRAILING_FAIL="FAIL The trailing Intel macOS and Windows lanes must not gate the critical assets, and no upload may replace a published asset"
+TOKEN_PASS="PASS Release workflow token is read-only except for the jobs that attest or publish, which never persist it in a checkout; no reusable workflow inherits every secret"
+CACHES_PASS="PASS Release caches in release.yml jobs and the local actions they call are never saved on a dispatch and never cache ~/.cargo/bin; token jobs restore none, and OIDC or attesting jobs restore none that a dispatch-like run of any workflow saves (reusable workflows are not read and never run on a dispatch)"
+CACHES_FAIL="FAIL A release cache can be saved on a dispatch, cache ~/.cargo/bin, or reach a token, OIDC or attesting job"
 
 fail() {
   echo "release doctor workflow contract violated: $1" >&2
@@ -335,6 +346,239 @@ elif name == "dispatch-reflowed":
         "            github.event.inputs.publish_release_assets_only == 'true'))\n",
         "          (github.event_name == 'workflow_dispatch' && (github.event.inputs.publish_release_assets_only == 'true' || github.event.inputs.publish_web_sdk_only == 'true' || github.event.inputs.publish_release_packages == 'true' || github.event.inputs.release_tag != ''))\n",
     )
+elif name == "tag-validation-cargo-on-attested-tags":
+    # The pre-change route: a tag re-runs Cargo validation whenever the
+    # self-hosted graph is off, whatever its exact-tree CI already covered.
+    replace_once(
+        " &&\n       needs.require_ci_green.outputs.ci_covers_release_validation != 'true') ||\n",
+        ") ||\n",
+    )
+elif name == "tag-validation-gate-any-schema":
+    # The gate trusts any verified attestation, so one that does not prove
+    # the Cargo lanes ran skips Cargo validation too.
+    replace_once(
+        '            if [[ "${ci_covers}" == "true" ]]; then\n',
+        '            if [[ -n "${ci_attestation_schema}" ]]; then\n',
+    )
+elif name == "tag-validation-schema-unwritten":
+    # The verifier no longer exposes whether the attestation covers the lanes.
+    replace_once('          echo "covers_release_validation=${covers}" >> "${GITHUB_OUTPUT}"\n', "")
+elif name == "tag-validation-ignores-sdk-host":
+    # The pre-review coverage: any schema-4 attestation, SDK suites or not.
+    pattern = re.compile(
+        r"              \(\.component_results\.sdk_host == \"success\" or\n(?:.*\n)*?"
+        r"                \(\(\.reused_test_evidence\.workflow_run_attempt // \"\"\) \| test\(\"\^\[1-9\]\[0-9\]\*\$\"\)\)\)\)' \\\n"
+    )
+    text, count = pattern.subn("              true' \\\n", text)
+    if count != 1:
+        raise SystemExit(f"fixture `{name}` expects one SDK-lane clause, found {count}")
+elif name == "tag-validation-reflowed":
+    # Equivalent: the tag disjunct on one line, its operands reordered.
+    replace_once(
+        "      (github.event_name != 'workflow_dispatch' &&\n"
+        "       vars.MEERKAT_GCP_BUILDBUDDY_ENABLED != 'true' &&\n"
+        "       needs.require_ci_green.outputs.ci_covers_release_validation != 'true') ||\n",
+        "      (needs.require_ci_green.outputs.ci_covers_release_validation != 'true' && "
+        "vars.MEERKAT_GCP_BUILDBUDDY_ENABLED != 'true' && "
+        "github.event_name != 'workflow_dispatch') ||\n",
+    )
+elif name == "prebuild-publishes":
+    # A prebuild dispatch reaches the GitHub release publisher.
+    replace_once(
+        "  publish_github_release:\n    name: Publish GitHub release assets\n    if: >-\n",
+        "  publish_github_release:\n    name: Publish GitHub release assets\n    if: >-\n"
+        "      github.event.inputs.prebuild_release_artifacts == 'true' ||\n",
+    )
+elif name == "prebuild-moving-checkout":
+    # The Web SDK prebuild checks out main's moving tip, not the dispatched commit.
+    job = text.index("  build_web_sdk_package:\n")
+    needle = (
+        "          ref: ${{ github.event_name == 'workflow_dispatch' && "
+        "github.event.inputs.prebuild_release_artifacts == 'true' && github.sha || "
+    )
+    at = text.index(needle, job)
+    text = text[:at] + "          ref: ${{ " + text[at + len(needle):]
+elif name == "prebuild-builds-anyway":
+    # A tag whose commit was prebuilt rebuilds every binary anyway.
+    needle = "      needs.release_prebuild.outputs.run_id == '' &&\n"
+    if text.count(needle) != 4:
+        raise SystemExit(f"fixture `{name}` expects four binary build guards, found {text.count(needle)}")
+    text = text.replace(needle, "")
+elif name == "prebuild-reuse-unverified":
+    # The publisher takes the prebuild's archives through the exact-tag
+    # verification, which a main-attested archive cannot pass honestly, and
+    # drops the --source-run binding.
+    pattern = re.compile(
+        r'          if \[\[ -n "\$\{PREBUILD_RUN_ID\}" \]\]; then\n'
+        r"            # The tag commit's pre-tag prebuild(?:.*\n)*?          elif "
+    )
+    text, count = pattern.subn("          if ", text)
+    if count != 1:
+        raise SystemExit(f"fixture `{name}` expects one prebuild verification branch, found {count}")
+elif name == "prebuild-web-unverified":
+    match = re.search(
+        r"      - name: Verify the prebuilt Web SDK package\n" + STEP_BODY, text
+    )
+    if match is None:
+        raise SystemExit(f"fixture `{name}` expects the Web SDK verification step")
+    text = text[: match.start()] + text[match.end() :]
+elif name == "prebuild-gate-renamed":
+    replace_once("    name: Release prebuild gate\n", "    name: Prebuild complete\n")
+elif name == "prebuild-lookup-if-reflowed":
+    # Equivalent: the lookup's condition folded, its operands reordered.
+    replace_once(
+        "    if: ${{ startsWith(github.ref, 'refs/tags/v') && github.event_name != 'workflow_dispatch' }}\n",
+        "    if: >-\n      github.event_name != 'workflow_dispatch' &&\n      startsWith(github.ref, 'refs/tags/v')\n",
+    )
+elif name == "semver-baseline-gates-homebrew":
+    # The Homebrew update waits for the 17-minute baseline rustdoc build.
+    job = text.index("  update_homebrew:\n")
+    needle = "    needs: [publish_github_release]\n"
+    at = text.index(needle, job)
+    text = text[:at] + "    needs: [publish_github_release, publish_semver_baseline]\n" + text[at + len(needle):]
+elif name == "semver-baseline-after-release":
+    # The pre-change shape: the rustdoc build starts only after publication.
+    replace_once(
+        "    name: Generate semver baseline rustdoc\n    needs: [require_ci_green]\n",
+        "    name: Generate semver baseline rustdoc\n    needs: [publish_github_release]\n",
+    )
+elif name == "semver-baseline-needs-block-list":
+    # Equivalent: the attach job's needs as a block sequence.
+    replace_once(
+        "    needs: [publish_github_release, publish_semver_baseline]\n",
+        "    needs:\n      - publish_github_release\n      - publish_semver_baseline\n",
+    )
+elif name == "trailing-gates-critical":
+    # The critical publisher waits for every lane again.
+    replace_once(
+        "    needs: [require_ci_green, release_validate_gate, release_semver_gate, build_binaries_critical_gate, release_prebuild]\n",
+        "    needs: [require_ci_green, release_validate_gate, release_semver_gate, build_binaries_gate, release_prebuild]\n",
+    )
+elif name == "trailing-overwrites":
+    # The critical upload replaces archives already on the release.
+    replace_once(
+        "            critical-release-artifacts/*.tar.gz\n"
+        "          draft: false\n"
+        "          fail_on_unmatched_files: true\n"
+        "          generate_release_notes: true\n"
+        "          overwrite_files: false\n",
+        "            critical-release-artifacts/*.tar.gz\n"
+        "          draft: false\n"
+        "          fail_on_unmatched_files: true\n"
+        "          generate_release_notes: true\n"
+        "          overwrite_files: true\n",
+    )
+elif name == "trailing-selects-intel":
+    # The critical set grows an Intel macOS archive.
+    replace_once(
+        '              "aarch64-apple-darwin",\n          )\n          wanted = sorted(\n',
+        '              "aarch64-apple-darwin",\n              "x86_64-apple-darwin",\n          )\n'
+        "          wanted = sorted(\n",
+    )
+elif name == "trailing-critical-if-reflowed":
+    # Equivalent: the critical publisher's conditions in another order.
+    replace_once(
+        "      needs.release_semver_gate.result == 'success' &&\n"
+        "      needs.build_binaries_critical_gate.result == 'success'\n",
+        "      needs.build_binaries_critical_gate.result == 'success' &&\n"
+        "      needs.release_semver_gate.result == 'success'\n",
+    )
+elif name == "prebuild-gate-waits-trailing":
+    # The prebuild is reusable only once its trailing lanes finished too.
+    replace_once(
+        "    needs: [require_ci_green, build_binaries_critical_gate, build_web_sdk_package]\n",
+        "    needs: [require_ci_green, build_binaries_gate, build_web_sdk_package]\n",
+    )
+elif name == "prebuild-reuse-no-wait":
+    # The trailing publisher downloads before the prebuild's trailing lanes finished.
+    match = re.search(
+        r"      - name: Wait for the prebuild's trailing lanes\n"
+        r"(?:        .*\n|          .*\n|\n)*?(?=      - name: |      # |\Z)",
+        text,
+    )
+    if match is None:
+        raise SystemExit(f"fixture `{name}` expects the trailing-lane wait step")
+    text = text[: match.start()] + text[match.end() :]
+elif name == "prebuild-critical-full-gate":
+    # The critical publisher waits on the prebuild's full gate, which its
+    # still-running trailing lanes hold back.
+    replace_once('              --source-gate "Release critical binary build gate" \\\n', "")
+elif name == "prebuild-web-ungated":
+    # The pre-fix publish_web_sdk: a reused prebuild's package publishes
+    # whatever release validation and the semver gate concluded.
+    replace_once(
+        "      (needs.release_validate_gate.result == 'success' ||\n"
+        "       (github.event_name == 'workflow_dispatch' &&\n"
+        "        github.event.inputs.publish_web_sdk_only == 'true' &&\n"
+        "        needs.release_validate_gate.result == 'skipped')) &&\n"
+        "      (needs.release_semver_gate.result == 'success' ||\n"
+        "       (github.event_name == 'workflow_dispatch' &&\n"
+        "        github.event.inputs.publish_web_sdk_only == 'true' &&\n"
+        "        needs.release_semver_gate.result == 'skipped')) &&\n",
+        "",
+    )
+elif name == "trailing-manifest-replaced":
+    # The pre-review manifest upload: every run re-uploads it, replacing it.
+    replace_once(
+        "      - name: Publish complete release manifest\n"
+        "        if: ${{ steps.manifest.outputs.upload == 'true' }}\n",
+        "      - name: Publish complete release manifest\n",
+    )
+elif name == "token-write-default":
+    # The pre-review default: every job gets a write token and OIDC.
+    replace_once(
+        "permissions:\n  actions: read\n  checks: read\n  contents: read\n",
+        "permissions:\n  actions: read\n  checks: read\n  contents: write\n  id-token: write\n",
+    )
+elif name == "token-publisher-persisted":
+    # The pre-review publishers kept the contents: write token in .git/config.
+    job = text.index("  publish_github_release:\n")
+    needle = "          persist-credentials: false\n"
+    at = text.index(needle, job)
+    text = text[:at] + text[at + len(needle):]
+elif name == "secrets-inherit":
+    replace_once(
+        "    secrets:\n      MEERKAT_GCP_BUILDBUDDY_API_KEY: ${{ secrets.MEERKAT_GCP_BUILDBUDDY_API_KEY }}\n",
+        "    secrets: inherit\n",
+    )
+elif name == "cache-registry-restore":
+    # The pre-review registry publisher restored a cache with its tokens.
+    job = text.index("  publish_registries:\n")
+    needle = "      - name: Install Python + Node tooling\n"
+    at = text.index(needle, job)
+    text = text[:at] + "      - name: Cache cargo registry\n        uses: Swatinem/rust-cache@v2\n\n" + text[at:]
+elif name == "cache-dispatch-save":
+    # A build cache saved by dispatch runs, which tag runs restore.
+    job = text.index("  build_binaries_windows_cross:\n")
+    needle = "          save-if: ${{ github.event_name != 'workflow_dispatch' }}\n"
+    at = text.index(needle, job)
+    text = text[:at] + text[at + len(needle):]
+elif name == "semver-baseline-clobber":
+    # The pre-review attach replaced a baseline already on the release.
+    replace_once(
+        '          gh release upload "${RELEASE_TAG}" \\\n'
+        '            --repo "${GITHUB_REPOSITORY}" \\\n'
+        '            "semver-baseline/${asset}"\n',
+        '          gh release upload "${RELEASE_TAG}" \\\n'
+        '            --repo "${GITHUB_REPOSITORY}" \\\n'
+        '            --clobber \\\n'
+        '            "semver-baseline/${asset}"\n',
+    )
+elif name == "cache-xwin-dispatch-save":
+    # The Windows SDK cache saved by dispatch runs too.
+    replace_once(
+        "          save-sdk-cache: ${{ github.event_name != 'workflow_dispatch' }}\n",
+        "          save-sdk-cache: \"true\"\n",
+    )
+elif name == "cache-buildbuddy-repository":
+    # The pre-review release binary build restored and saved the Bazel
+    # repository cache.
+    replace_once('          repository-cache: "false"\n', "")
+elif name == "reusable-on-dispatch":
+    replace_once(
+        "    if: ${{ github.event_name != 'workflow_dispatch' && vars.MEERKAT_GCP_BUILDBUDDY_ENABLED == 'true' }}\n",
+        "    if: ${{ vars.MEERKAT_GCP_BUILDBUDDY_ENABLED == 'true' }}\n",
+    )
 elif name == "both-defects":
     replace_once(
         MEASUREMENT_STEP_IF,
@@ -346,6 +590,65 @@ else:
     raise SystemExit(f"unknown fixture `{name}`")
 
 pathlib.Path(destination).write_text(text)
+PYEOF
+}
+
+# mutate_tree <name> <root>: copy the committed .github tree under <root>
+# and mutate one of its workflows or local actions; the checker reads local
+# actions and the other workflows from there (--repo-root).
+mutate_tree() {
+  local name="$1"
+  local root="$2"
+  mkdir -p "$root"
+  cp -R "${REPO_ROOT}/.github" "${root}/.github"
+  "$PYTHON" - "$root" "$name" <<'PYEOF'
+import pathlib
+import sys
+
+root, name = pathlib.Path(sys.argv[1]), sys.argv[2]
+
+
+def replace_once(relative: str, needle: str, replacement: str) -> None:
+    path = root / relative
+    text = path.read_text()
+    count = text.count(needle)
+    if count != 1:
+        raise SystemExit(
+            f"fixture `{name}` expects exactly one occurrence of {needle!r} "
+            f"in {relative}, found {count}; update the fixture"
+        )
+    path.write_text(text.replace(needle, replacement))
+
+
+if name == "cache-xwin-save-ungated":
+    # The pre-review action saved the Windows SDK cache from any run.
+    replace_once(
+        ".github/actions/build-windows-cross/action.yml",
+        "      if: ${{ inputs.save-sdk-cache == 'true' && steps.sdk-cache.outputs.cache-hit != 'true' }}\n",
+        "      if: ${{ steps.sdk-cache.outputs.cache-hit != 'true' }}\n",
+    )
+elif name == "cache-xwin-validate-dispatch-save":
+    # Another workflow's dispatch saves the cache the release build restores.
+    replace_once(
+        ".github/workflows/windows-cross-validate.yml",
+        "          save-sdk-cache: ${{ github.event_name != 'workflow_dispatch' }}\n",
+        '          save-sdk-cache: "true"\n',
+    )
+elif name == "cache-token-job-action":
+    # A cache inside the local action a token job calls.
+    replace_once(
+        ".github/actions/update-homebrew/action.yml",
+        "    - name: Checkout tap\n",
+        "    - name: Cache tap\n"
+        "      uses: actions/cache@v4\n"
+        "      with:\n"
+        "        path: homebrew-meerkat\n"
+        "        key: homebrew-tap\n"
+        "\n"
+        "    - name: Checkout tap\n",
+    )
+else:
+    raise SystemExit(f"unknown tree fixture `{name}`")
 PYEOF
 }
 
@@ -370,6 +673,27 @@ expect_pass() {
   status="$(run_check "$fixture" "$log" "$@")"
   if [[ "$status" -ne 0 ]]; then
     fail "${label}: an equivalent workflow spelling was rejected" "$(cat "$log")"
+  fi
+}
+
+# expect_tree_fail_named <label> <root> <needle> <check...>: the mutated
+# tree's release workflow fails the named check and names the defect.
+expect_tree_fail_named() {
+  local label="$1"
+  local root="$2"
+  local needle="$3"
+  shift 3
+  local log="${TEST_ROOT}/${label}.log"
+  local status
+  set +e
+  "$PYTHON" "$CHECKER" --repo-root "$root" --workflow "${root}/.github/workflows/release.yml" "$@" >"$log" 2>&1
+  status=$?
+  set -e
+  if [[ "$status" -eq 0 ]]; then
+    fail "${label}: a tree that dropped the behaviour was accepted"
+  fi
+  if ! grep -Fq "$needle" "$log"; then
+    fail "${label}: failure does not name the defect (expected: ${needle})" "$(cat "$log")"
   fi
 }
 
@@ -405,6 +729,14 @@ mutate dispatch-ref-name "${TEST_ROOT}/dispatch-ref-name.yml"
 expect_pass dispatch-ref-name "${TEST_ROOT}/dispatch-ref-name.yml" dispatch-binding
 mutate dispatch-ref-name-expression "${TEST_ROOT}/dispatch-ref-name-expression.yml"
 expect_pass dispatch-ref-name-expression "${TEST_ROOT}/dispatch-ref-name-expression.yml" dispatch-binding
+mutate tag-validation-reflowed "${TEST_ROOT}/tag-validation-reflowed.yml"
+expect_pass tag-validation-reflowed "${TEST_ROOT}/tag-validation-reflowed.yml" tag-validation
+mutate prebuild-lookup-if-reflowed "${TEST_ROOT}/prebuild-lookup-if-reflowed.yml"
+expect_pass prebuild-lookup-if-reflowed "${TEST_ROOT}/prebuild-lookup-if-reflowed.yml" prebuild
+mutate semver-baseline-needs-block-list "${TEST_ROOT}/semver-baseline-needs-block-list.yml"
+expect_pass semver-baseline-needs-block-list "${TEST_ROOT}/semver-baseline-needs-block-list.yml" semver-baseline
+mutate trailing-critical-if-reflowed "${TEST_ROOT}/trailing-critical-if-reflowed.yml"
+expect_pass trailing-critical-if-reflowed "${TEST_ROOT}/trailing-critical-if-reflowed.yml" trailing-platforms
 
 # 3. Dropping the behaviour fails and names the defect.
 mutate evidence-step-removed "${TEST_ROOT}/evidence-step-removed.yml"
@@ -466,6 +798,112 @@ mutate dispatch-branch-name "${TEST_ROOT}/dispatch-branch-name.yml"
 expect_fail_named dispatch-branch-name "${TEST_ROOT}/dispatch-branch-name.yml" \
   "accepts a package dispatch from refs/heads/release/v0.0.0 without release_tag" dispatch-binding
 
+mutate tag-validation-cargo-on-attested-tags "${TEST_ROOT}/tag-validation-cargo-on-attested-tags.yml"
+expect_fail_named tag-validation-cargo-on-attested-tags "${TEST_ROOT}/tag-validation-cargo-on-attested-tags.yml" \
+  "runs on a tag push whose attestation covers the Cargo lanes (true)" tag-validation
+mutate tag-validation-gate-any-schema "${TEST_ROOT}/tag-validation-gate-any-schema.yml"
+expect_fail_named tag-validation-gate-any-schema "${TEST_ROOT}/tag-validation-gate-any-schema.yml" \
+  "accepts a tag push whose attestation does not cover the Cargo lanes and Cargo validation skipped" tag-validation
+mutate tag-validation-schema-unwritten "${TEST_ROOT}/tag-validation-schema-unwritten.yml"
+expect_fail_named tag-validation-schema-unwritten "${TEST_ROOT}/tag-validation-schema-unwritten.yml" \
+  "writes covers_release_validation=<nothing> where every lane ran" tag-validation
+mutate tag-validation-ignores-sdk-host "${TEST_ROOT}/tag-validation-ignores-sdk-host.yml"
+expect_fail_named tag-validation-ignores-sdk-host "${TEST_ROOT}/tag-validation-ignores-sdk-host.yml" \
+  "writes covers_release_validation=true where the SDK suites were skipped" tag-validation
+
+mutate prebuild-publishes "${TEST_ROOT}/prebuild-publishes.yml"
+expect_fail_named prebuild-publishes "${TEST_ROOT}/prebuild-publishes.yml" \
+  "job \`publish_github_release\` publishes on a prebuild dispatch on main" prebuild
+mutate prebuild-moving-checkout "${TEST_ROOT}/prebuild-moving-checkout.yml"
+expect_fail_named prebuild-moving-checkout "${TEST_ROOT}/prebuild-moving-checkout.yml" \
+  "job \`build_web_sdk_package\` checks out \`refs/heads/main\` on a prebuild dispatch on main" prebuild
+mutate prebuild-builds-anyway "${TEST_ROOT}/prebuild-builds-anyway.yml"
+expect_fail_named prebuild-builds-anyway "${TEST_ROOT}/prebuild-builds-anyway.yml" \
+  "job \`build_binaries_windows_cross\` builds on a tag push with a prebuild found" prebuild
+mutate prebuild-reuse-unverified "${TEST_ROOT}/prebuild-reuse-unverified.yml"
+expect_fail_named prebuild-reuse-unverified "${TEST_ROOT}/prebuild-reuse-unverified.yml" \
+  "expected \`scripts/verify-release-asset-provenance --source-run 424242 --source-attempt 2 --prebuild --stamps ...\`" prebuild
+mutate prebuild-web-unverified "${TEST_ROOT}/prebuild-web-unverified.yml"
+expect_fail_named prebuild-web-unverified "${TEST_ROOT}/prebuild-web-unverified.yml" \
+  "must verify the prebuilt package's attestation" prebuild
+mutate prebuild-reuse-no-wait "${TEST_ROOT}/prebuild-reuse-no-wait.yml"
+expect_fail_named prebuild-reuse-no-wait "${TEST_ROOT}/prebuild-reuse-no-wait.yml" \
+  "must wait for the prebuild run's \`Release binary build gate\`" prebuild
+mutate prebuild-gate-waits-trailing "${TEST_ROOT}/prebuild-gate-waits-trailing.yml"
+expect_fail_named prebuild-gate-waits-trailing "${TEST_ROOT}/prebuild-gate-waits-trailing.yml" \
+  "job \`release_prebuild_gate\` waits for \`build_binaries_gate\`" trailing-platforms
+mutate prebuild-critical-full-gate "${TEST_ROOT}/prebuild-critical-full-gate.yml"
+expect_fail_named prebuild-critical-full-gate "${TEST_ROOT}/prebuild-critical-full-gate.yml" \
+  "expected \`Release critical binary build gate\`" prebuild
+mutate prebuild-web-ungated "${TEST_ROOT}/prebuild-web-ungated.yml"
+expect_fail_named prebuild-web-ungated "${TEST_ROOT}/prebuild-web-ungated.yml" \
+  "job \`publish_web_sdk\` publishes on a tag push with a prebuild found and \`release_validate_gate\` failed" prebuild
+mutate prebuild-gate-renamed "${TEST_ROOT}/prebuild-gate-renamed.yml"
+expect_fail_named prebuild-gate-renamed "${TEST_ROOT}/prebuild-gate-renamed.yml" \
+  "does not require the \`Prebuild complete\` job" prebuild
+
+mutate semver-baseline-gates-homebrew "${TEST_ROOT}/semver-baseline-gates-homebrew.yml"
+expect_fail_named semver-baseline-gates-homebrew "${TEST_ROOT}/semver-baseline-gates-homebrew.yml" \
+  "job \`update_homebrew\` waits for the semver baseline rustdoc" semver-baseline
+mutate semver-baseline-clobber "${TEST_ROOT}/semver-baseline-clobber.yml"
+expect_fail_named semver-baseline-clobber "${TEST_ROOT}/semver-baseline-clobber.yml" \
+  "job \`attach_semver_baseline\` attaches with \`--clobber\`" semver-baseline
+expect_fail_named semver-baseline-clobber-add-only "${TEST_ROOT}/semver-baseline-clobber.yml" \
+  "step \`Attach baseline rustdoc to the GitHub release\` uploads with \`gh release upload --clobber\`" trailing-platforms
+mutate semver-baseline-after-release "${TEST_ROOT}/semver-baseline-after-release.yml"
+expect_fail_named semver-baseline-after-release "${TEST_ROOT}/semver-baseline-after-release.yml" \
+  "the rustdoc build must run in parallel with publication, not after it" semver-baseline
+
+mutate trailing-gates-critical "${TEST_ROOT}/trailing-gates-critical.yml"
+expect_fail_named trailing-gates-critical "${TEST_ROOT}/trailing-gates-critical.yml" \
+  "waits for \`build_binaries_gate\`, \`build_binaries_macos_x86_cross\`" trailing-platforms
+mutate trailing-overwrites "${TEST_ROOT}/trailing-overwrites.yml"
+expect_fail_named trailing-overwrites "${TEST_ROOT}/trailing-overwrites.yml" \
+  "release uploads are add-only" trailing-platforms
+mutate trailing-manifest-replaced "${TEST_ROOT}/trailing-manifest-replaced.yml"
+expect_fail_named trailing-manifest-replaced "${TEST_ROOT}/trailing-manifest-replaced.yml" \
+  "writes the manifest unconditionally" trailing-platforms
+mutate trailing-selects-intel "${TEST_ROOT}/trailing-selects-intel.yml"
+expect_fail_named trailing-selects-intel "${TEST_ROOT}/trailing-selects-intel.yml" \
+  "rkat-0.0.0-x86_64-apple-darwin.tar.gz" trailing-platforms
+
+mutate token-write-default "${TEST_ROOT}/token-write-default.yml"
+expect_fail_named token-write-default "${TEST_ROOT}/token-write-default.yml" \
+  "the workflow default grants \`contents: write\` to every job" token-permissions
+mutate token-publisher-persisted "${TEST_ROOT}/token-publisher-persisted.yml"
+expect_fail_named token-publisher-persisted "${TEST_ROOT}/token-publisher-persisted.yml" \
+  "job \`publish_github_release\` step \`Checkout workflow helpers\` persists the workflow token in its checkout" token-permissions
+mutate secrets-inherit "${TEST_ROOT}/secrets-inherit.yml"
+expect_fail_named secrets-inherit "${TEST_ROOT}/secrets-inherit.yml" \
+  "job \`release_validate_buildbuddy_full\` passes every repository secret to a reusable workflow" token-permissions
+
+mutate cache-registry-restore "${TEST_ROOT}/cache-registry-restore.yml"
+expect_fail_named cache-registry-restore "${TEST_ROOT}/cache-registry-restore.yml" \
+  "job \`publish_registries\` holds a registry or publish token and restores a cache" release-caches
+mutate cache-dispatch-save "${TEST_ROOT}/cache-dispatch-save.yml"
+expect_fail_named cache-dispatch-save "${TEST_ROOT}/cache-dispatch-save.yml" \
+  "job \`build_binaries_windows_cross\` saves its rust-cache on a dispatch" release-caches
+mutate cache-xwin-dispatch-save "${TEST_ROOT}/cache-xwin-dispatch-save.yml"
+expect_fail_named cache-xwin-dispatch-save "${TEST_ROOT}/cache-xwin-dispatch-save.yml" \
+  "job \`build_binaries_windows_cross\` (in \`.github/actions/build-windows-cross\`) saves cache \`xwin-sdk-*-cargo-xwin-0.23.1\` on a dispatch" release-caches
+mutate cache-buildbuddy-repository "${TEST_ROOT}/cache-buildbuddy-repository.yml"
+expect_fail_named cache-buildbuddy-repository "${TEST_ROOT}/cache-buildbuddy-repository.yml" \
+  "job \`build_binaries_buildbuddy\` (in \`.github/actions/setup-buildbuddy-ci\`) saves cache \`buildbuddy-bazel-repository-*-*\` on a dispatch" release-caches
+expect_fail_named cache-buildbuddy-repository-restore "${TEST_ROOT}/cache-buildbuddy-repository.yml" \
+  "job \`build_binaries_buildbuddy\` (in \`.github/actions/setup-buildbuddy-ci\`) restores \`buildbuddy-bazel-repository-*-*\`, which release-binaries-check.yml job" release-caches
+mutate reusable-on-dispatch "${TEST_ROOT}/reusable-on-dispatch.yml"
+expect_fail_named reusable-on-dispatch "${TEST_ROOT}/reusable-on-dispatch.yml" \
+  "job \`release_validate_buildbuddy_full\` calls a reusable workflow on a dispatch" release-caches
+mutate_tree cache-xwin-save-ungated "${TEST_ROOT}/cache-xwin-save-ungated"
+expect_tree_fail_named cache-xwin-save-ungated "${TEST_ROOT}/cache-xwin-save-ungated" \
+  "job \`build_binaries_windows_cross\` (in \`.github/actions/build-windows-cross\`) saves cache \`xwin-sdk-*-cargo-xwin-0.23.1\` on a dispatch" release-caches
+mutate_tree cache-xwin-validate-dispatch-save "${TEST_ROOT}/cache-xwin-validate-dispatch-save"
+expect_tree_fail_named cache-xwin-validate-dispatch-save "${TEST_ROOT}/cache-xwin-validate-dispatch-save" \
+  "restores \`xwin-sdk-*-cargo-xwin-0.23.1\`, which windows-cross-validate.yml job \`build_windows_cross\` (in \`.github/actions/build-windows-cross\`) saves on a workflow_dispatch run" release-caches
+mutate_tree cache-token-job-action "${TEST_ROOT}/cache-token-job-action"
+expect_tree_fail_named cache-token-job-action "${TEST_ROOT}/cache-token-job-action" \
+  "job \`update_homebrew\` (in \`.github/actions/update-homebrew\`) holds a registry or publish token and restores a cache" release-caches
+
 mutate readback-step-removed "${TEST_ROOT}/readback-step-removed.yml"
 expect_fail_named readback-step-removed "${TEST_ROOT}/readback-step-removed.yml" \
   "no step that reads every crate back" registry-slo
@@ -485,7 +923,7 @@ run_doctor() {
 }
 
 run_doctor "$WORKFLOW" "${TEST_ROOT}/doctor-committed.log"
-for line in "$SEMVER_PASS" "$SLO_PASS" "$DISPATCH_PASS"; do
+for line in "$SEMVER_PASS" "$SLO_PASS" "$DISPATCH_PASS" "$TAG_VALIDATION_PASS" "$PREBUILD_PASS" "$BASELINE_PASS" "$TRAILING_PASS" "$TOKEN_PASS" "$CACHES_PASS"; do
   if ! grep -Fxq "$line" "${TEST_ROOT}/doctor-committed.log"; then
     fail "doctor does not report \`${line}\` for the committed workflow" \
       "$(cat "${TEST_ROOT}/doctor-committed.log")"
@@ -506,6 +944,41 @@ run_doctor "${TEST_ROOT}/doctor-dispatch-unbound.yml" "${TEST_ROOT}/doctor-dispa
 if ! grep -Fq "$DISPATCH_FAIL" "${TEST_ROOT}/doctor-dispatch.log"; then
   fail "doctor does not report \`${DISPATCH_FAIL}\` for a workflow whose branch dispatch is unbound" \
     "$(cat "${TEST_ROOT}/doctor-dispatch.log")"
+fi
+
+mutate tag-validation-cargo-on-attested-tags "${TEST_ROOT}/doctor-tag-validation.yml"
+run_doctor "${TEST_ROOT}/doctor-tag-validation.yml" "${TEST_ROOT}/doctor-tag-validation.log"
+if ! grep -Fq "$TAG_VALIDATION_FAIL" "${TEST_ROOT}/doctor-tag-validation.log"; then
+  fail "doctor does not report \`${TAG_VALIDATION_FAIL}\` for a workflow that re-runs Cargo validation on attested tags" \
+    "$(cat "${TEST_ROOT}/doctor-tag-validation.log")"
+fi
+
+mutate prebuild-publishes "${TEST_ROOT}/doctor-prebuild.yml"
+run_doctor "${TEST_ROOT}/doctor-prebuild.yml" "${TEST_ROOT}/doctor-prebuild.log"
+if ! grep -Fq "$PREBUILD_FAIL" "${TEST_ROOT}/doctor-prebuild.log"; then
+  fail "doctor does not report \`${PREBUILD_FAIL}\` for a workflow whose prebuild publishes" \
+    "$(cat "${TEST_ROOT}/doctor-prebuild.log")"
+fi
+
+mutate semver-baseline-gates-homebrew "${TEST_ROOT}/doctor-baseline.yml"
+run_doctor "${TEST_ROOT}/doctor-baseline.yml" "${TEST_ROOT}/doctor-baseline.log"
+if ! grep -Fq "$BASELINE_FAIL" "${TEST_ROOT}/doctor-baseline.log"; then
+  fail "doctor does not report \`${BASELINE_FAIL}\` for a workflow that waits for the baseline" \
+    "$(cat "${TEST_ROOT}/doctor-baseline.log")"
+fi
+
+mutate trailing-gates-critical "${TEST_ROOT}/doctor-trailing.yml"
+run_doctor "${TEST_ROOT}/doctor-trailing.yml" "${TEST_ROOT}/doctor-trailing.log"
+if ! grep -Fq "$TRAILING_FAIL" "${TEST_ROOT}/doctor-trailing.log"; then
+  fail "doctor does not report \`${TRAILING_FAIL}\` for a workflow whose critical assets wait for the trailing lanes" \
+    "$(cat "${TEST_ROOT}/doctor-trailing.log")"
+fi
+
+mutate cache-xwin-dispatch-save "${TEST_ROOT}/doctor-caches.yml"
+run_doctor "${TEST_ROOT}/doctor-caches.yml" "${TEST_ROOT}/doctor-caches.log"
+if ! grep -Fq "$CACHES_FAIL" "${TEST_ROOT}/doctor-caches.log"; then
+  fail "doctor does not report \`${CACHES_FAIL}\` for a workflow whose Windows SDK cache is saved by a dispatch" \
+    "$(cat "${TEST_ROOT}/doctor-caches.log")"
 fi
 
 echo "release doctor workflow contract holds"

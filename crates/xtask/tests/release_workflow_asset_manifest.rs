@@ -57,6 +57,7 @@ fn release_workflows_use_the_repository_pinned_rust_toolchain() {
         "release_semver_gate",
         "build_binaries",
         "build_binaries_windows_cross",
+        "build_binaries_macos_x86_cross",
         "build_web_sdk_package",
         "publish_semver_baseline",
         "publish_registries",
@@ -66,7 +67,7 @@ fn release_workflows_use_the_repository_pinned_rust_toolchain() {
             .matches("uses: ./.github/actions/setup-rust-ci")
             .count(),
         rust_jobs.len(),
-        "all Rust-using release jobs, including the semver gate and Windows cross-build, must use the pinned setup action"
+        "all Rust-using release jobs, including the semver gate and the Windows and Intel macOS cross-builds, must use the pinned setup action"
     );
     let workflow = read_workflow(&release_path);
     for job in rust_jobs {
@@ -145,36 +146,49 @@ fn published_assets_are_manifest_authority_on_reruns() {
     let path = workflow_yml_path();
     let workflow = read_workflow(&path);
 
-    let early_download = step_script(
+    // The critical-platform publisher (Linux, macOS arm64) runs before the
+    // trailing Intel macOS and Windows lanes finish: it uploads archives
+    // add-only and never writes the manifest, which only the complete
+    // publisher below derives from the live assets.
+    let critical_upload = workflow_step(
         &workflow,
         &path,
-        "publish_unix_release_and_homebrew",
-        "Download published macOS/Linux release assets",
+        "publish_critical_release_assets",
+        "Publish Linux and macOS arm64 release assets",
     );
-    for contract in [
-        "gh release download",
-        "--pattern '*.tar.gz'",
-        "scripts/release-build-asset-manifest published-release-artifacts",
-    ] {
-        assert!(
-            early_download.contains(contract),
-            "early release path must preserve `{contract}`; script:\n{early_download}"
-        );
-    }
-
-    let early_homebrew = workflow_step(
-        &workflow,
-        &path,
-        "publish_unix_release_and_homebrew",
-        "Update Homebrew tap from published macOS/Linux assets",
-    );
+    let critical_inputs = critical_upload
+        .get("with")
+        .expect("critical publisher must declare its upload inputs");
     assert_eq!(
-        early_homebrew
+        critical_inputs
+            .get("overwrite_files")
+            .and_then(serde_yaml::Value::as_bool),
+        Some(false),
+        "critical archives are uploaded add-only"
+    );
+    let critical_files = critical_inputs
+        .get("files")
+        .and_then(serde_yaml::Value::as_str)
+        .expect("critical publisher must declare files");
+    assert!(
+        !critical_files.contains("checksums.sha256") && !critical_files.contains("index.json"),
+        "only the complete publisher writes the release manifest; files:\n{critical_files}"
+    );
+
+    // Homebrew follows the complete publisher and reads the published
+    // checksums.sha256, so it hashes the bytes users download.
+    let homebrew = workflow_step(
+        &workflow,
+        &path,
+        "update_homebrew",
+        "Update Homebrew tap from complete release",
+    );
+    assert!(
+        homebrew
             .get("with")
             .and_then(|inputs| inputs.get("checksums_path"))
-            .and_then(serde_yaml::Value::as_str),
-        Some("published-release-artifacts/checksums.sha256"),
-        "Homebrew must use checksums derived from live release assets"
+            .is_none(),
+        "Homebrew must use the published checksums.sha256 of the complete release"
     );
 
     let final_download = step_script(
@@ -284,9 +298,9 @@ fn release_archives_require_exact_tag_build_provenance_before_publication() {
 
     for (job, step, directory) in [
         (
-            "publish_unix_release_and_homebrew",
-            "Verify exact-tag macOS/Linux build provenance",
-            "release-artifacts",
+            "publish_critical_release_assets",
+            "Verify exact-tag Linux and macOS arm64 build provenance",
+            "critical-release-artifacts",
         ),
         (
             "publish_github_release",

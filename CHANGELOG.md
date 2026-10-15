@@ -66,6 +66,61 @@ them.
   instead of 7.40 MB with brotli 11) and the unpacked module larger
   (41.6 MB instead of 36.9 MB), and the pass takes about a minute instead of
   nine (16 in the v0.9.1 tag run).
+- A release tag no longer re-runs "Validate release state with Cargo" (25
+  minutes on 0.9.1) while the self-hosted BuildBuddy graph is off when its
+  verified exact-main CI attestation proves that run ran every lane the job
+  repeats: the attestation now records the plan's `generated_contract` flag,
+  and the tag requires it with green `ratchets` and `sdk-host` jobs (or a
+  release-projection plan that reused a verified parent run).
+  `release_validate_gate` then passes on the attestation. Any other
+  attestation and manual dispatches keep Cargo validation; the graph-on
+  route is unchanged.
+- `release.yml` gains a pre-tag prebuild (`make release-prebuild
+  VERSION=vX.Y.Z`, a `prebuild_release_artifacts` dispatch on `main`): it
+  builds, stamps, attests and uploads every release binary and the Web SDK
+  package of the release commit while CI runs, and publishes nothing. The
+  tag run of exactly that commit then skips every build and publishes those
+  artifacts after the same checks as an `--assets-run-id` recovery (each
+  archive and stamp attested by `release.yml` at that commit on
+  `refs/heads/main`, the run's binary build gate green, every binary
+  embedding the release version; the Web SDK package's attestation and
+  version). Without a complete prebuild the tag builds as before.
+- Rust crates publish by dependency level, derived from the canonical order
+  in `scripts/release-rust-crates.sh` and `cargo metadata`
+  (`scripts/release-rust-crates.sh --levels`): a level's crates publish
+  concurrently (`MEERKAT_CRATE_PUBLISH_JOBS`, default 6) and the next level
+  starts once the whole level is in the crates.io index. crates.io's rate
+  limit for new versions still bounds a full release.
+- The semver baseline rustdoc for the next release builds alongside the
+  release instead of after it, and `attach_semver_baseline` attaches it once
+  the GitHub release is published, never replacing a baseline already
+  attached; no job waits for either.
+- Intel macOS and Windows release archives trail: the Linux (x86_64,
+  aarch64) and macOS arm64 archives publish as soon as their lane passes
+  (`publish_critical_release_assets`, add-only), and `publish_github_release`
+  adds the Intel macOS and Windows archives when their lanes finish, never
+  replacing a published asset, before it writes the complete
+  `checksums.sha256` and `index.json` (refusing to change a published one);
+  Homebrew follows it. Intel macOS binaries are now cross-compiled on Apple
+  silicon (`macos-15`) on both release backends, instead of BuildBuddy or the
+  `macos-15-intel` runner.
+- The release workflow's caches are never saved by a dispatch (which writes
+  the `main` scope every tag run restores from), including the Windows SDK
+  cache inside the Windows cross-build action and the Bazel repository cache
+  of the BuildBuddy setup, and never cache `~/.cargo/bin`; the registry
+  publisher, which holds the crates.io, PyPI and npm tokens, restores no
+  cache at all. The BuildBuddy release binary build no longer restores the
+  Bazel repository cache (its build never read that directory), and
+  `windows-cross-validate.yml` no longer saves the Windows SDK cache from a
+  dispatch, so the attesting build jobs restore nothing a dispatch saved. The
+  workflow token is read-only by default, with OIDC and attestation writes
+  only on the build jobs and release writes only on the publishers, whose
+  checkouts no longer persist it; the full BuildBuddy graph validation passes
+  `buildbuddy.yml` only its control-plane key instead of every secret.
+- A pre-tag prebuild is reusable as soon as its critical binaries and Web
+  SDK package are built: the tag publishes those right away, and its
+  trailing publisher waits for the prebuild's Intel macOS and Windows lanes
+  (the prebuild run's full binary build gate) before adding their archives.
 - CI's `Closure tests` rows have 60 minutes instead of 40, and the
   `ci-integration` profile gives its four slow nested-Cargo and
   whole-workspace tests 16 slow periods (960 s) instead of 8, so a cold row

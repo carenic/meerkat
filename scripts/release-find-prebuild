@@ -1,0 +1,160 @@
+#!/usr/bin/env bash
+# Find the pre-tag prebuild of a release commit.
+#
+# Usage: release-find-prebuild <release-commit-sha>
+#
+# Prints "<run id> <run attempt>" of the newest release.yml run that prebuilt
+# the release artifacts of exactly <release-commit-sha>, or nothing when there
+# is none:
+#   - a workflow_dispatch run of .github/workflows/release.yml on main in this
+#     repository (GITHUB_REPOSITORY) whose head is that commit, started and
+#     triggered by the repository owner (or an account listed in
+#     MEERKAT_PREBUILD_ACTORS);
+#   - whose "Release prebuild gate" job succeeded (only a
+#     prebuild_release_artifacts dispatch has that job, and it passes once the
+#     critical Linux and macOS arm64 binaries and the Web SDK package are
+#     built; the run's trailing Intel macOS and Windows lanes may still be
+#     running, and the tag's trailing publisher waits for them);
+#   - whose critical artifacts are still downloadable: an unexpired archive
+#     artifact for each critical target, no expired meerkat-* artifact, and
+#     rkat-web-package.
+# A matching run whose gate has not concluded yet is waited for, polling every
+# MEERKAT_PREBUILD_POLL_SECONDS (default 60), until the gate concludes or
+# MEERKAT_PREBUILD_WAIT_SECONDS (default 6000) have passed since the run
+# started: a prebuild already under way finishes no later than a fresh build.
+#
+# The id is only a pointer, pinned to the attempt examined here: the
+# publishing jobs verify every archive and the Web SDK package against their
+# build attestations, and that attempt's gates, before anything is published.
+# "No prebuild" exits 0 with empty output; an API failure exits non-zero.
+
+set -euo pipefail
+shopt -s inherit_errexit
+
+PREBUILD_GATE_JOB="Release prebuild gate"
+CRITICAL_TARGETS=(x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu aarch64-apple-darwin)
+WEB_SDK_ARTIFACT="rkat-web-package"
+
+usage() {
+  sed -n '2,/^$/s/^# \{0,1\}//p' "$0" >&2
+  exit 2
+}
+
+[[ "$#" -eq 1 ]] || usage
+release_sha="$1"
+[[ "${release_sha}" =~ ^[0-9a-f]{40}$ ]] || {
+  echo "release-find-prebuild: expected a full commit sha, got ${release_sha}" >&2
+  exit 2
+}
+repository="${GITHUB_REPOSITORY:?GITHUB_REPOSITORY must name the repository}"
+poll_seconds="${MEERKAT_PREBUILD_POLL_SECONDS:-60}"
+wait_seconds="${MEERKAT_PREBUILD_WAIT_SECONDS:-6000}"
+[[ "${poll_seconds}" =~ ^[0-9]+$ && "${wait_seconds}" =~ ^[0-9]+$ ]] || {
+  echo "release-find-prebuild: poll and wait seconds must be integers" >&2
+  exit 2
+}
+
+log() {
+  printf '%s\n' "$*" >&2
+}
+
+# id<TAB>status<TAB>started-epoch<TAB>attempt for every candidate run, newest
+# first.
+candidate_runs() {
+  local listing
+  listing="$(gh api \
+    "repos/${repository}/actions/workflows/release.yml/runs?event=workflow_dispatch&branch=main&head_sha=${release_sha}&per_page=100" \
+    --jq '.workflow_runs[] | [.id, .status, .path, .event, .head_branch, .head_sha, .repository.full_name, (.run_started_at // .created_at), .run_attempt, (.actor.login // ""), (.triggering_actor.login // ""), (.repository.owner.login // "")] | @tsv')" ||
+    { log "cannot list release.yml runs of ${release_sha}"; return 1; }
+  local id status path event branch sha repo started attempt actor trigger owner allowed
+  while IFS=$'\t' read -r id status path event branch sha repo started attempt actor trigger owner; do
+    [[ -n "${id}" ]] || continue
+    # The query parameters filter server-side; check every field again.
+    if [[ "${path}" != ".github/workflows/release.yml" || "${event}" != "workflow_dispatch" ||
+          "${branch}" != "main" || "${sha}" != "${release_sha}" || "${repo}" != "${repository}" ]]; then
+      continue
+    fi
+    allowed=" ${MEERKAT_PREBUILD_ACTORS:-${owner}} "
+    if [[ -z "${actor}" || -z "${trigger}" || "${allowed}" != *" ${actor} "* || "${allowed}" != *" ${trigger} "* ]]; then
+      log "run ${id}: started by ${actor:-unknown}, triggered by ${trigger:-unknown}; only${allowed%% }may prebuild a release"
+      continue
+    fi
+    printf '%s\t%s\t%s\t%s\n' "${id}" "${status}" "$(date -u -d "${started}" +%s)" "${attempt}"
+  done <<<"${listing}" | sort -t $'\t' -k1,1nr
+}
+
+# The prebuild gate's conclusion: success, failure, ..., "pending" while it
+# has not concluded, or "absent" when the run has no such job.
+prebuild_gate_state() {
+  local run_id="$1" state
+  state="$(gh api --paginate "repos/${repository}/actions/runs/${run_id}/jobs?per_page=100" \
+    --jq ".jobs[] | select(.name == \"${PREBUILD_GATE_JOB}\") | (.conclusion // \"pending\")")" ||
+    { log "cannot list the jobs of run ${run_id}"; exit 1; }
+  printf '%s\n' "${state:-absent}"
+}
+
+artifacts_downloadable() {
+  local run_id="$1" listing name expired target web=0 missing=()
+  local -A critical=()
+  listing="$(gh api --paginate "repos/${repository}/actions/runs/${run_id}/artifacts?per_page=100" \
+    --jq '.artifacts[] | [.name, (.expired | tostring)] | @tsv')" ||
+    { log "cannot list the artifacts of run ${run_id}"; exit 1; }
+  while IFS=$'\t' read -r name expired; do
+    [[ -n "${name}" ]] || continue
+    case "${name}" in
+      "${WEB_SDK_ARTIFACT}")
+        [[ "${expired}" == "false" ]] && web=1
+        ;;
+      meerkat-*)
+        if [[ "${expired}" != "false" ]]; then
+          log "run ${run_id}: artifact ${name} has expired"
+          return 1
+        fi
+        for target in "${CRITICAL_TARGETS[@]}"; do
+          [[ "${name}" == "meerkat-${target}-"* ]] && critical["${target}"]=1
+        done
+        ;;
+    esac
+  done <<<"${listing}"
+  for target in "${CRITICAL_TARGETS[@]}"; do
+    [[ -n "${critical[${target}]:-}" ]] || missing+=("${target}")
+  done
+  [[ "${web}" -eq 1 ]] || missing+=("${WEB_SDK_ARTIFACT}")
+  if [[ "${#missing[@]}" -gt 0 ]]; then
+    log "run ${run_id}: critical artifacts missing: ${missing[*]}"
+    return 1
+  fi
+}
+
+while true; do
+  runs="$(candidate_runs)"
+  pending=0
+  while IFS=$'\t' read -r run_id status started attempt; do
+    [[ -n "${run_id}" ]] || continue
+    gate="$(prebuild_gate_state "${run_id}")"
+    if [[ "${gate}" == "pending" || ( "${gate}" == "absent" && "${status}" != "completed" ) ]]; then
+      if (($(date -u +%s) - started < wait_seconds)); then
+        log "run ${run_id} for ${release_sha} is ${status} and its ${PREBUILD_GATE_JOB} has not concluded; waiting for it"
+        pending=1
+      else
+        log "run ${run_id} for ${release_sha}: no ${PREBUILD_GATE_JOB} conclusion ${wait_seconds}s after it started; not waiting longer"
+      fi
+      continue
+    fi
+    if [[ "${gate}" != "success" ]]; then
+      log "run ${run_id}: ${PREBUILD_GATE_JOB} ${gate} (not a usable prebuild)"
+      continue
+    fi
+    if ! artifacts_downloadable "${run_id}"; then
+      continue
+    fi
+    log "run ${run_id} attempt ${attempt} prebuilt the critical release artifacts of ${release_sha} (run ${status})"
+    printf '%s %s\n' "${run_id}" "${attempt}"
+    exit 0
+  done <<<"${runs}"
+  if [[ "${pending}" -eq 0 ]]; then
+    log "no usable prebuild of ${release_sha}"
+    exit 0
+  fi
+  sleep "${poll_seconds}"
+done

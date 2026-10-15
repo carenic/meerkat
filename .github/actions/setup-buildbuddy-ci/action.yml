@@ -6,6 +6,16 @@ inputs:
     description: "Setup profile: submitter, native, doctor, lint, sdk, rust, wasm, audit, or full."
     required: false
     default: native
+  repository-cache:
+    description: >-
+      Bazel external repository cache: 'true' restores it and, outside the
+      gcp-buildbuddy backend, saves it when the job ends; 'restore' only
+      restores it; 'false' neither restores nor saves it. The release binary
+      build passes 'false' (its archives are attested), and a release
+      validation dispatch 'restore' (a dispatch on main would save into the
+      default branch's scope, which every tag run restores).
+    required: false
+    default: "true"
 
 runs:
   using: composite
@@ -97,7 +107,7 @@ runs:
         echo "$(dirname "${bb_bin}")" >> "${GITHUB_PATH}"
 
     - name: Restore Bazel external repositories
-      if: ${{ env.MEERKAT_BAZEL_BACKEND == 'gcp-buildbuddy' }}
+      if: ${{ inputs.repository-cache == 'restore' || (inputs.repository-cache == 'true' && env.MEERKAT_BAZEL_BACKEND == 'gcp-buildbuddy') }}
       uses: actions/cache/restore@v5
       with:
         path: ${{ runner.temp }}/buildbuddy-repository-cache
@@ -106,7 +116,7 @@ runs:
           buildbuddy-bazel-repository-${{ runner.os }}-
 
     - name: Cache Bazel external repositories
-      if: ${{ env.MEERKAT_BAZEL_BACKEND != 'gcp-buildbuddy' }}
+      if: ${{ inputs.repository-cache == 'true' && env.MEERKAT_BAZEL_BACKEND != 'gcp-buildbuddy' }}
       uses: actions/cache@v5
       with:
         path: ${{ runner.temp }}/buildbuddy-repository-cache

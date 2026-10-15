@@ -56,6 +56,11 @@ on:
         required: false
         default: ""
         type: string
+      prebuild_release_artifacts:
+        description: "Pre-tag prebuild, dispatched on main: build, attest and upload every release binary and the Web SDK package of the dispatched commit, publishing nothing; the tag run of exactly that commit publishes them instead of rebuilding"
+        required: false
+        default: false
+        type: boolean
       release_backend:
         description: "Release backend for validation and binary builds"
         required: false
@@ -65,12 +70,16 @@ on:
           - github-hosted
           - buildbuddy
 
+# Read-only by default. Only the jobs that need more get it: the build jobs
+# mint OIDC tokens to attest their archives (id-token, attestations: write),
+# the release publishers write the GitHub release (contents: write), the
+# verifiers read attestations, and the full-graph caller passes id-token on
+# to buildbuddy.yml. No checkout in a job with a write scope persists the
+# token.
 permissions:
   actions: read
   checks: read
-  contents: write
-  id-token: write
-  attestations: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -89,6 +98,15 @@ jobs:
     timeout-minutes: 130
     runs-on: ${{ fromJSON(vars.MEERKAT_CI_RUNNER || '"ubuntu-24.04"') }}
     outputs:
+      # The verified attestation's schema_version on a tag run; empty on
+      # manual dispatches, which do not read the attestation.
+      ci_attestation_schema: ${{ steps.ci_attestation.outputs.schema }}
+      # 'true' when that attestation proves the exact-tree CI run ran every
+      # lane release_validate_cargo repeats (see the step); the tag then
+      # validates on it alone. Empty on manual dispatches.
+      ci_covers_release_validation: ${{ steps.ci_coverage.outputs.covers_release_validation }}
+      # The tag (v<workspace version>) a pre-tag prebuild builds for.
+      prebuild_tag: ${{ steps.prebuild_request.outputs.tag }}
       # The release commit; publish_web_sdk binds the package artifact to it.
       sha: ${{ steps.release_ref.outputs.sha }}
     steps:
@@ -109,6 +127,71 @@ jobs:
           echo "Release tree: ${release_tree}"
           echo "sha=${release_sha}" >> "${GITHUB_OUTPUT}"
           echo "tree=${release_tree}" >> "${GITHUB_OUTPUT}"
+
+      # A pre-tag prebuild (prebuild_release_artifacts) builds the release
+      # artifacts of the dispatched main commit before its tag exists and
+      # publishes nothing, so it neither binds a tag nor waits for CI: the
+      # tag run that may later publish its artifacts requires exact-main CI
+      # itself, and reuses them only for exactly its own commit (see
+      # release_prebuild). It runs on main only, because only main's
+      # attestations are trusted by the tag run, and takes no publishing or
+      # recovery input.
+      - name: Verify release prebuild request
+        id: prebuild_request
+        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.prebuild_release_artifacts == 'true' }}
+        shell: bash
+        env:
+          RELEASE_TAG_INPUT: ${{ github.event.inputs.release_tag }}
+          PUBLISH_RELEASE_PACKAGES: ${{ github.event.inputs.publish_release_packages }}
+          REGISTRY_DRY_RUN: ${{ github.event.inputs.registry_dry_run }}
+          ALPHA_CRATES_ONLY: ${{ github.event.inputs.alpha_crates_only }}
+          PUBLISH_WEB_SDK_ONLY: ${{ github.event.inputs.publish_web_sdk_only }}
+          WEB_SDK_ARTIFACT_RUN_ID: ${{ github.event.inputs.web_sdk_artifact_run_id }}
+          ASSETS_RUN_ID: ${{ github.event.inputs.assets_run_id }}
+          PUBLISH_RELEASE_ASSETS_ONLY: ${{ github.event.inputs.publish_release_assets_only }}
+          SEMVER_EVIDENCE_RUN_ID: ${{ github.event.inputs.semver_evidence_run_id }}
+          SEMVER_EVIDENCE_JOB_ID: ${{ github.event.inputs.semver_evidence_job_id }}
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF}" != "refs/heads/main" ]]; then
+            echo "A release prebuild runs on refs/heads/main only, got ${GITHUB_REF}: a tag run trusts only archives attested on main." >&2
+            exit 1
+          fi
+          conflicting=()
+          [[ -z "${RELEASE_TAG_INPUT}" ]] || conflicting+=(release_tag)
+          [[ "${PUBLISH_RELEASE_PACKAGES}" != "true" ]] || conflicting+=(publish_release_packages)
+          [[ "${REGISTRY_DRY_RUN}" != "true" ]] || conflicting+=(registry_dry_run)
+          [[ "${ALPHA_CRATES_ONLY}" != "true" ]] || conflicting+=(alpha_crates_only)
+          [[ "${PUBLISH_WEB_SDK_ONLY}" != "true" ]] || conflicting+=(publish_web_sdk_only)
+          [[ -z "${WEB_SDK_ARTIFACT_RUN_ID}" ]] || conflicting+=(web_sdk_artifact_run_id)
+          [[ -z "${ASSETS_RUN_ID}" ]] || conflicting+=(assets_run_id)
+          [[ "${PUBLISH_RELEASE_ASSETS_ONLY}" != "true" ]] || conflicting+=(publish_release_assets_only)
+          [[ -z "${SEMVER_EVIDENCE_RUN_ID}" ]] || conflicting+=(semver_evidence_run_id)
+          [[ -z "${SEMVER_EVIDENCE_JOB_ID}" ]] || conflicting+=(semver_evidence_job_id)
+          if [[ "${#conflicting[@]}" -gt 0 ]]; then
+            echo "A release prebuild publishes nothing and takes no publishing or recovery input; unset: ${conflicting[*]}" >&2
+            exit 1
+          fi
+          version="$(git show "${GITHUB_SHA}:Cargo.toml" | awk '
+            /^\[workspace.package\]/ { in_workspace_package = 1; next }
+            /^\[/ { in_workspace_package = 0 }
+            in_workspace_package && $1 == "version" {
+              gsub(/"/, "", $3)
+              print $3
+              exit
+            }
+          ')"
+          if [[ -z "${version}" ]]; then
+            echo "Cannot read workspace.package.version at ${GITHUB_SHA}" >&2
+            exit 1
+          fi
+          tag="v${version}"
+          if git rev-parse -q --verify "refs/tags/${tag}" >/dev/null; then
+            echo "${tag} already exists; its tag run builds or reuses its own artifacts (asset recovery: make release-assets)." >&2
+            exit 1
+          fi
+          echo "tag=${tag}" >> "${GITHUB_OUTPUT}"
+          echo "Prebuilding the ${tag} release artifacts of ${GITHUB_SHA}; nothing is published."
 
       # Every publishing run is bound to a TAG from an explicit allowlist:
       # v<version> for every mode, and alpha/v<version> only for the
@@ -177,6 +260,7 @@ jobs:
 
       - name: Require successful exact-main CI
         id: ci_run
+        if: ${{ !(github.event_name == 'workflow_dispatch' && github.event.inputs.prebuild_release_artifacts == 'true') }}
         uses: actions/github-script@v7
         env:
           RELEASE_SHA: ${{ steps.release_ref.outputs.sha }}
@@ -271,6 +355,7 @@ jobs:
             --dir "${destination}"
 
       - name: Verify exact-tree CI attestation
+        id: ci_attestation
         if: ${{ github.event_name != 'workflow_dispatch' }}
         shell: bash
         env:
@@ -311,7 +396,9 @@ jobs:
                .component_results.fmt_governance == "success" and
                .component_results.ratchets == "success"))' \
             "${attestation}"
-          echo "Verified exact-tree CI attestation for ${RELEASE_SHA} (${RELEASE_TREE})"
+          schema="$(jq -r '.schema_version' "${attestation}")"
+          echo "schema=${schema}" >> "${GITHUB_OUTPUT}"
+          echo "Verified exact-tree CI attestation (schema ${schema}) for ${RELEASE_SHA} (${RELEASE_TREE})"
 
       # A release commit whose diff from its first parent is only the
       # forward patch projection (scripts/release-projection-only.mjs) gets a
@@ -384,20 +471,61 @@ jobs:
             --run-id "$(jq -r .reused_test_evidence.workflow_run_id "${attestation}")" \
             --run-attempt "$(jq -r .reused_test_evidence.workflow_run_attempt "${attestation}")"
 
+      # release_validate_cargo repeats fmt-governance (fmt, version parity,
+      # lock and MODULE.bazel.lock consistency, release config, crate license
+      # files), the generated-contract ratchets (schema, SDK codegen, wrapper
+      # and RPC/REST surface freshness), which run only when the plan
+      # selected them, and both SDK suites (sdk-host). The attestation, already
+      # verified above, covers it only when it proves all three ran: the
+      # plan's generated_contract flag with green fmt-governance and ratchets
+      # jobs, and a green sdk-host job, or a release-projection plan whose
+      # reused_test_evidence the step above verified (the parent run planned
+      # the whole workspace, sdk-host included, with every lane successful).
+      - name: Decide whether the attestation covers Cargo release validation
+        id: ci_coverage
+        if: ${{ github.event_name != 'workflow_dispatch' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          attestation="${RUNNER_TEMP}/meerkat-ci-attestation/attestation.json"
+          if jq -e '
+              .schema_version == 4 and
+              .plan.generated_contract == true and
+              .component_results.fmt_governance == "success" and
+              .component_results.ratchets == "success" and
+              (.component_results.sdk_host == "success" or
+               (.plan.mode == "release-projection" and
+                .reused_test_evidence.classifier == "release-projection-only" and
+                .reused_test_evidence.workflow == "CI" and
+                ((.reused_test_evidence.workflow_run_id // "") | test("^[1-9][0-9]*$")) and
+                ((.reused_test_evidence.workflow_run_attempt // "") | test("^[1-9][0-9]*$"))))' \
+              "${attestation}" >/dev/null; then
+            covers=true
+          else
+            covers=false
+          fi
+          echo "covers_release_validation=${covers}" >> "${GITHUB_OUTPUT}"
+          echo "Attestation covers the Cargo release validation lanes: ${covers}"
+
   # Manual dispatches pick Cargo or the hosted BuildBuddy lane below. A tag
-  # push runs this job only while the self-hosted GCP graph is disabled
-  # (repository variable MEERKAT_GCP_BUILDBUDDY_ENABLED is not 'true'); it
-  # is then the tag's release validation instead of
-  # release_validate_buildbuddy_full.
+  # push skips this job only when its verified exact-tree CI attestation
+  # proves that the successful main CI run on exactly this tree ran every
+  # check it repeats (require_ci_green's ci_covers_release_validation:
+  # fmt-governance, the generated-contract ratchets, which run only when the
+  # plan selected them, and the SDK suites). Otherwise, a legacy attestation
+  # included, the tag runs it while the self-hosted GCP graph is disabled
+  # (repository variable MEERKAT_GCP_BUILDBUDDY_ENABLED is not 'true').
   release_validate_cargo:
     name: Validate release state with Cargo
     needs: [require_ci_green]
     if: >-
       (github.event_name != 'workflow_dispatch' &&
-       vars.MEERKAT_GCP_BUILDBUDDY_ENABLED != 'true') ||
+       vars.MEERKAT_GCP_BUILDBUDDY_ENABLED != 'true' &&
+       needs.require_ci_green.outputs.ci_covers_release_validation != 'true') ||
       (github.event_name == 'workflow_dispatch' &&
        github.event.inputs.publish_web_sdk_only != 'true' &&
        github.event.inputs.publish_release_assets_only != 'true' &&
+       github.event.inputs.prebuild_release_artifacts != 'true' &&
        !(github.actor == 'lukacf' &&
          github.event.inputs.release_backend == 'buildbuddy'))
     runs-on: ubuntu-24.04
@@ -412,6 +540,13 @@ jobs:
 
       - name: Cache cargo registry
         uses: Swatinem/rust-cache@v2
+        with:
+          # Release caches never come from a dispatch: a dispatch runs on main
+          # and would save into the default branch's scope, which every later
+          # tag run restores from. ~/.cargo/bin is never cached, so no restored
+          # binary can shadow cargo, git or the platform tools on PATH.
+          save-if: ${{ github.event_name != 'workflow_dispatch' }}
+          cache-bin: "false"
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -476,6 +611,7 @@ jobs:
       github.event_name == 'workflow_dispatch' &&
       github.event.inputs.publish_web_sdk_only != 'true' &&
       github.event.inputs.publish_release_assets_only != 'true' &&
+      github.event.inputs.prebuild_release_artifacts != 'true' &&
       github.actor == 'lukacf' &&
       github.event.inputs.release_backend == 'buildbuddy'
     runs-on: ${{ fromJSON(vars.MEERKAT_CI_RUNNER || '"ubuntu-24.04"') }}
@@ -494,6 +630,9 @@ jobs:
           lane: release-validate
           profile: native
           mode: release-validate
+          # Dispatch-only: restore, never save into the default branch's
+          # cache scope, which every tag run restores.
+          repository-cache: restore
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -513,16 +652,24 @@ jobs:
   # BuildBuddy/Bazel graph (prebuild, static, native nextest, governance, SDK
   # suites, wasm-check, minimal-feature, feature matrix, audit) in
   # `full-fresh` mode as its release gate. While it is disabled this job is
-  # skipped and release_validate_cargo validates the tag. Pull-request CI
-  # never runs that graph.
+  # skipped and the tag validates on its exact-tree CI attestation when it
+  # covers the Cargo validation lanes, with release_validate_cargo otherwise.
+  # Pull-request CI never runs that graph.
   release_validate_buildbuddy_full:
     name: Validate release tree with the full BuildBuddy graph
     needs: [require_ci_green]
     if: ${{ github.event_name != 'workflow_dispatch' && vars.MEERKAT_GCP_BUILDBUDDY_ENABLED == 'true' }}
+    permissions:
+      contents: read
+      id-token: write
     uses: ./.github/workflows/buildbuddy.yml
     with:
       mode: full-fresh
-    secrets: inherit
+    # Only the self-hosted control plane's key: GCP access is the job's OIDC
+    # token (workload identity), and no registry or publish secret reaches
+    # the called workflow.
+    secrets:
+      MEERKAT_GCP_BUILDBUDDY_API_KEY: ${{ secrets.MEERKAT_GCP_BUILDBUDDY_API_KEY }}
 
   release_validate_gate:
     name: Release validation gate
@@ -530,7 +677,8 @@ jobs:
       always() &&
       (github.event_name != 'workflow_dispatch' ||
        (github.event.inputs.publish_web_sdk_only != 'true' &&
-        github.event.inputs.publish_release_assets_only != 'true'))
+        github.event.inputs.publish_release_assets_only != 'true' &&
+        github.event.inputs.prebuild_release_artifacts != 'true'))
     needs: [require_ci_green, release_validate_cargo, release_validate_buildbuddy, release_validate_buildbuddy_full]
     runs-on: ${{ fromJSON(vars.MEERKAT_CI_RUNNER || '"ubuntu-24.04"') }}
     steps:
@@ -539,6 +687,8 @@ jobs:
         run: |
           set -euo pipefail
           ci_result="${{ needs.require_ci_green.result }}"
+          ci_attestation_schema="${{ needs.require_ci_green.outputs.ci_attestation_schema }}"
+          ci_covers="${{ needs.require_ci_green.outputs.ci_covers_release_validation }}"
           bb_selected="${{ github.actor == 'lukacf' && ((github.event_name == 'workflow_dispatch' && github.event.inputs.release_backend == 'buildbuddy') || (github.event_name != 'workflow_dispatch' && (vars.MEERKAT_RELEASE_BUILDBUDDY == 'true' || vars.MEERKAT_RELEASE_BUILDBUDDY == '1'))) }}"
           gcp_graph_enabled="${{ vars.MEERKAT_GCP_BUILDBUDDY_ENABLED == 'true' }}"
           cargo_result="${{ needs.release_validate_cargo.result }}"
@@ -557,7 +707,16 @@ jobs:
               exit $?
             fi
             echo "Self-hosted GCP graph disabled (MEERKAT_GCP_BUILDBUDDY_ENABLED is not 'true'); full graph: ${buildbuddy_full_result}"
-            echo "Cargo release validation of the tag: ${cargo_result}"
+            if [[ "${ci_covers}" == "true" ]]; then
+              # The successful exact-main CI run on this tree is the tag's
+              # validation: require_ci_green verified its schema-4
+              # attestation and that it ran every lane Cargo validation
+              # repeats.
+              echo "Exact-tree CI attestation (schema ${ci_attestation_schema}) covers the Cargo validation lanes; Cargo release validation: ${cargo_result}"
+              [[ "${cargo_result}" == "skipped" && "${buildbuddy_result}" == "skipped" && "${buildbuddy_full_result}" == "skipped" ]]
+              exit $?
+            fi
+            echo "Exact-tree CI attestation (schema ${ci_attestation_schema:-missing}) does not cover the Cargo validation lanes; Cargo release validation of the tag: ${cargo_result}"
             [[ "${cargo_result}" == "success" && "${buildbuddy_result}" == "skipped" && "${buildbuddy_full_result}" == "skipped" ]]
             exit $?
           fi
@@ -614,16 +773,18 @@ jobs:
 
   # Public-API breaks are allowed in 0.x patch releases and must be DECLARED.
   # This is its own job rather than a step in release_validate_cargo because
-  # that job is not the tag's validation whenever the self-hosted GCP graph
-  # is enabled: release_validate_gate then asserts it is `skipped`, so a step
-  # added there would not run for those releases. Everything that makes a
-  # release public depends on this job below.
+  # that job is not the tag's validation whenever the tag's exact-tree CI
+  # attestation covers its lanes or the self-hosted GCP graph is enabled:
+  # release_validate_gate then asserts it is `skipped`, so a step added there
+  # would not run for those releases. Everything that makes a release public
+  # depends on this job below.
   release_semver_gate:
     name: Breaks declared and notes stamped
     needs: [require_ci_green]
     if: >-
       github.event.inputs.publish_web_sdk_only != 'true' &&
-      github.event.inputs.publish_release_assets_only != 'true'
+      github.event.inputs.publish_release_assets_only != 'true' &&
+      github.event.inputs.prebuild_release_artifacts != 'true'
     runs-on: ubuntu-24.04
     # The measurement belongs before the tag. Tag-triggered releases consume
     # exact-tree evidence from Release semver readiness. Manual recovery may
@@ -669,6 +830,12 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: release-semver-breaks
+          # Release caches never come from a dispatch: a dispatch runs on main
+          # and would save into the default branch's scope, which every later
+          # tag run restores from. ~/.cargo/bin is never cached, so no restored
+          # binary can shadow cargo, git or the platform tools on PATH.
+          save-if: ${{ github.event_name != 'workflow_dispatch' }}
+          cache-bin: "false"
 
       - name: Install cargo-semver-checks
         if: >-
@@ -787,25 +954,95 @@ jobs:
             --release-sha "${release_sha}" \
             --changelog .semver-recovery-policy/CHANGELOG.md
 
+  # A tag run publishes the artifacts of a successful pre-tag prebuild of
+  # exactly its commit instead of rebuilding them: a release.yml run
+  # dispatched on main at the tag commit with prebuild_release_artifacts,
+  # whose Release prebuild gate succeeded (critical binaries and Web SDK
+  # package ready; its trailing lanes may still be running) and whose
+  # critical artifacts have not expired (scripts/release-find-prebuild; a
+  # gate that has not concluded is waited for). Its run id is the only thing reused: publish_github_release
+  # verifies every archive exactly as for an assets_run_id recovery (each one
+  # and its source stamp attested by release.yml at that commit on
+  # refs/heads/main, the run's binary build gate green, every binary
+  # embedding the release version), and publish_web_sdk verifies the package
+  # attestation and version. No prebuild: the tag builds as before.
+  release_prebuild:
+    name: Find exact-commit release prebuild
+    needs: [require_ci_green]
+    if: ${{ startsWith(github.ref, 'refs/tags/v') && github.event_name != 'workflow_dispatch' }}
+    runs-on: ubuntu-24.04
+    # Bounded by the lookup's own wait for a running prebuild.
+    timeout-minutes: 130
+    outputs:
+      run_id: ${{ steps.lookup.outputs.run_id }}
+      # The attempt whose gates the lookup examined; the publishers verify
+      # that attempt and refuse a prebuild re-run after the lookup.
+      run_attempt: ${{ steps.lookup.outputs.run_attempt }}
+    steps:
+      - name: Checkout release tooling
+        uses: actions/checkout@v6
+        with:
+          sparse-checkout: |
+            scripts/release-find-prebuild
+          sparse-checkout-cone-mode: false
+
+      - name: Find a successful prebuild of the tag commit
+        id: lookup
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          release_sha="$(git rev-parse HEAD)"
+          # A failed lookup is not a reason to stop the release: it only means
+          # this run builds everything, as without a prebuild.
+          if ! found="$(scripts/release-find-prebuild "${release_sha}")"; then
+            echo "::warning::The prebuild lookup failed; this run builds every release artifact."
+            found=""
+          fi
+          read -r run_id run_attempt <<<"${found}" || true
+          if [[ -n "${run_id:-}" && ! "${run_attempt:-}" =~ ^[0-9]+$ ]]; then
+            echo "::warning::The prebuild lookup returned no attempt for run ${run_id}; this run builds every release artifact."
+            run_id=""
+          fi
+          run_id="${run_id:-}"
+          echo "run_attempt=${run_attempt:-}" >> "${GITHUB_OUTPUT}"
+          if [[ -n "${run_id}" ]]; then
+            echo "Publishing the prebuilt artifacts of release run ${run_id} (${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${run_id}); no binary or Web SDK build in this run."
+          else
+            echo "No complete prebuild of ${release_sha}; this run builds every release artifact."
+          fi
+          echo "run_id=${run_id}" >> "${GITHUB_OUTPUT}"
+
   build_binaries:
     name: Build and package surface binaries with GitHub-hosted runners (${{ matrix.surface.bin }}, ${{ matrix.platform.target }})
-    needs: [require_ci_green, release_validate_gate]
-    # Linux/macOS fallback lane only. Under the owner BuildBuddy split those
-    # four targets come from build_binaries_buildbuddy, and Windows is always
-    # cross-compiled by build_binaries_windows_cross, so this job is skipped.
+    needs: [require_ci_green, release_validate_gate, release_prebuild]
+    # Fallback lane for the critical platforms (Linux x86_64 and aarch64,
+    # macOS arm64). Under the owner BuildBuddy split those three targets come
+    # from build_binaries_buildbuddy and this job is skipped. The trailing
+    # platforms build in their own jobs whichever lane is selected: Windows
+    # (build_binaries_windows_cross) and Intel macOS
+    # (build_binaries_macos_x86_cross).
     if: >-
       always() &&
       !(github.actor == 'lukacf' && ((github.event_name == 'workflow_dispatch' && github.event.inputs.release_backend == 'buildbuddy') || (github.event_name != 'workflow_dispatch' && (vars.MEERKAT_RELEASE_BUILDBUDDY == 'true' || vars.MEERKAT_RELEASE_BUILDBUDDY == '1')))) &&
       needs.require_ci_green.result == 'success' &&
       (needs.release_validate_gate.result == 'success' ||
        (github.event_name == 'workflow_dispatch' &&
-        github.event.inputs.publish_release_assets_only == 'true' &&
+        (github.event.inputs.publish_release_assets_only == 'true' ||
+         github.event.inputs.prebuild_release_artifacts == 'true') &&
         needs.release_validate_gate.result == 'skipped')) &&
       (startsWith(github.ref, 'refs/tags/v') ||
        (github.event_name == 'workflow_dispatch' &&
-        github.event.inputs.publish_release_assets_only == 'true')) &&
+        (github.event.inputs.publish_release_assets_only == 'true' ||
+         github.event.inputs.prebuild_release_artifacts == 'true'))) &&
+      needs.release_prebuild.outputs.run_id == '' &&
       (github.event_name != 'workflow_dispatch' || github.event.inputs.assets_run_id == '')
     runs-on: ${{ matrix.platform.runs-on }}
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     # Linux GNU binaries must keep the same glibc floor as the BuildBuddy lane
     # (buildpack-deps:bullseye = glibc 2.31, see tools/bazel/platforms/BUILD.bazel);
     # building directly on the hosted runner (Ubuntu 24.04, glibc 2.39) would
@@ -836,12 +1073,6 @@ jobs:
           - runs-on: macos-15
             target: aarch64-apple-darwin
             archive_ext: tar.gz
-          # x86_64 macOS builds natively on the free standard Intel label. It
-          # used to build on macos-15-large, a billed larger runner (257 min
-          # per release on v0.8.50, sequential).
-          - runs-on: macos-15-intel
-            target: x86_64-apple-darwin
-            archive_ext: tar.gz
         surface:
           - package: rkat
             bin: rkat
@@ -856,7 +1087,8 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
         with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag != '' && github.event.inputs.release_tag || github.ref }}
+          ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.prebuild_release_artifacts == 'true' && github.sha || github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag != '' && github.event.inputs.release_tag || github.ref }}
+          persist-credentials: false
 
       # actions/checkout marks the workspace safe in the host user's Git
       # config. Linux release builds run inside the Bullseye container as a
@@ -879,6 +1111,12 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           key: release-${{ matrix.platform.target }}
+          # Release caches never come from a dispatch: a dispatch runs on main
+          # and would save into the default branch's scope, which every later
+          # tag run restores from. ~/.cargo/bin is never cached, so no restored
+          # binary can shadow cargo, git or the platform tools on PATH.
+          save-if: ${{ github.event_name != 'workflow_dispatch' }}
+          cache-bin: "false"
 
       # The workspace is trusted for Git in the step after Checkout (see
       # there). audiopus-sys falls back to building bundled Opus and requires
@@ -969,7 +1207,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          codesign --force --sign - "target/${{ matrix.platform.target }}/release/${{ matrix.surface.bin }}"
+          /usr/bin/codesign --force --sign - "target/${{ matrix.platform.target }}/release/${{ matrix.surface.bin }}"
 
       # The test-code marker guard comes from the workflow ref: an asset
       # recovery of an older tag builds a tree that predates it. Sparse, so
@@ -988,7 +1226,7 @@ jobs:
         shell: bash
         env:
           TARGET: ${{ matrix.platform.target }}
-          VERSION: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag || github.ref_name }}
+          VERSION: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.prebuild_release_artifacts == 'true' && needs.require_ci_green.outputs.prebuild_tag || github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag || github.ref_name }}
           ARCHIVE_EXT: ${{ matrix.platform.archive_ext }}
         run: |
           set -euo pipefail
@@ -1024,22 +1262,32 @@ jobs:
       # its attestations name main's commit, not the tag. Each archive
       # therefore carries a stamp of the tree it was built from, written only
       # after checking that the checkout is the tag's commit, and attested
-      # with it (see scripts/verify-release-asset-provenance --stamps).
+      # with it (see scripts/verify-release-asset-provenance --stamps). A
+      # pre-tag prebuild runs before the tag exists: its stamp names the
+      # dispatched main commit, which a tag run accepts only as its own.
       - name: Stamp archives with the checked-out release commit
         id: source_commit
         shell: bash
         env:
-          RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag || github.ref_name }}
+          RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.prebuild_release_artifacts == 'true' && needs.require_ci_green.outputs.prebuild_tag || github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag || github.ref_name }}
+          PREBUILD: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.prebuild_release_artifacts == 'true' }}
         run: |
           set -euo pipefail
           tree="$(git rev-parse HEAD)"
-          if ! tag_commit="$(git rev-parse --verify --quiet "refs/tags/${RELEASE_TAG}^{commit}")"; then
-            git fetch --no-tags --depth=1 origin "+refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}"
-            tag_commit="$(git rev-parse --verify "refs/tags/${RELEASE_TAG}^{commit}")"
-          fi
-          if [[ "${tree}" != "${tag_commit}" ]]; then
-            echo "checked-out tree ${tree} is not the ${RELEASE_TAG} commit ${tag_commit}" >&2
-            exit 1
+          if [[ "${PREBUILD}" == "true" ]]; then
+            if [[ "${tree}" != "${GITHUB_SHA}" ]]; then
+              echo "checked-out tree ${tree} is not the dispatched prebuild commit ${GITHUB_SHA}" >&2
+              exit 1
+            fi
+          else
+            if ! tag_commit="$(git rev-parse --verify --quiet "refs/tags/${RELEASE_TAG}^{commit}")"; then
+              git fetch --no-tags --depth=1 origin "+refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}"
+              tag_commit="$(git rev-parse --verify "refs/tags/${RELEASE_TAG}^{commit}")"
+            fi
+            if [[ "${tree}" != "${tag_commit}" ]]; then
+              echo "checked-out tree ${tree} is not the ${RELEASE_TAG} commit ${tag_commit}" >&2
+              exit 1
+            fi
           fi
           echo "source_commit=${tree}" >> "${GITHUB_OUTPUT}"
           stamped=0
@@ -1068,17 +1316,20 @@ jobs:
 
   build_binaries_windows_cross:
     name: Cross-compile and package Windows surface binaries on Linux
-    needs: [require_ci_green, release_validate_gate]
+    needs: [require_ci_green, release_validate_gate, release_prebuild]
     if: >-
       always() &&
       needs.require_ci_green.result == 'success' &&
       (needs.release_validate_gate.result == 'success' ||
        (github.event_name == 'workflow_dispatch' &&
-        github.event.inputs.publish_release_assets_only == 'true' &&
+        (github.event.inputs.publish_release_assets_only == 'true' ||
+         github.event.inputs.prebuild_release_artifacts == 'true') &&
         needs.release_validate_gate.result == 'skipped')) &&
       (startsWith(github.ref, 'refs/tags/v') ||
        (github.event_name == 'workflow_dispatch' &&
-        github.event.inputs.publish_release_assets_only == 'true')) &&
+        (github.event.inputs.publish_release_assets_only == 'true' ||
+         github.event.inputs.prebuild_release_artifacts == 'true'))) &&
+      needs.release_prebuild.outputs.run_id == '' &&
       (github.event_name != 'workflow_dispatch' || github.event.inputs.assets_run_id == '')
     # Windows binaries are cross-compiled from Linux with cargo-xwin (clang-cl,
     # lld-link, the Windows SDK). The native windows-latest build ran 190 to
@@ -1088,6 +1339,10 @@ jobs:
     # about 20 minutes at four jobs on Linux; verify_windows_binaries then
     # proves the result on a real Windows runner.
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     timeout-minutes: 90
     outputs:
       version: ${{ steps.version.outputs.version }}
@@ -1095,7 +1350,8 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
         with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag != '' && github.event.inputs.release_tag || github.ref }}
+          ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.prebuild_release_artifacts == 'true' && github.sha || github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag != '' && github.event.inputs.release_tag || github.ref }}
+          persist-credentials: false
 
       # The published source is always the release tag, but a recovery
       # dispatch runs this workflow definition from main, and a tag cut
@@ -1115,12 +1371,18 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           key: release-x86_64-pc-windows-msvc-cross
+          # Release caches never come from a dispatch: a dispatch runs on main
+          # and would save into the default branch's scope, which every later
+          # tag run restores from. ~/.cargo/bin is never cached, so no restored
+          # binary can shadow cargo, git or the platform tools on PATH.
+          save-if: ${{ github.event_name != 'workflow_dispatch' }}
+          cache-bin: "false"
 
       - name: Resolve release version
         id: version
         shell: bash
         env:
-          VERSION: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag || github.ref_name }}
+          VERSION: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.prebuild_release_artifacts == 'true' && needs.require_ci_green.outputs.prebuild_tag || github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag || github.ref_name }}
         run: |
           set -euo pipefail
           VERSION="${VERSION#v}"
@@ -1131,27 +1393,40 @@ jobs:
         uses: ./.release-tooling/.github/actions/build-windows-cross
         with:
           version: ${{ steps.version.outputs.version }}
+          # The SDK cache is linked into attested binaries: a dispatch on main
+          # would save it into the scope every tag run restores.
+          save-sdk-cache: ${{ github.event_name != 'workflow_dispatch' }}
 
       # An asset recovery runs this workflow from main against the tag, so
       # its attestations name main's commit, not the tag. Each archive
       # therefore carries a stamp of the tree it was built from, written only
       # after checking that the checkout is the tag's commit, and attested
-      # with it (see scripts/verify-release-asset-provenance --stamps).
+      # with it (see scripts/verify-release-asset-provenance --stamps). A
+      # pre-tag prebuild runs before the tag exists: its stamp names the
+      # dispatched main commit, which a tag run accepts only as its own.
       - name: Stamp archives with the checked-out release commit
         id: source_commit
         shell: bash
         env:
-          RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag || github.ref_name }}
+          RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.prebuild_release_artifacts == 'true' && needs.require_ci_green.outputs.prebuild_tag || github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag || github.ref_name }}
+          PREBUILD: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.prebuild_release_artifacts == 'true' }}
         run: |
           set -euo pipefail
           tree="$(git rev-parse HEAD)"
-          if ! tag_commit="$(git rev-parse --verify --quiet "refs/tags/${RELEASE_TAG}^{commit}")"; then
-            git fetch --no-tags --depth=1 origin "+refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}"
-            tag_commit="$(git rev-parse --verify "refs/tags/${RELEASE_TAG}^{commit}")"
-          fi
-          if [[ "${tree}" != "${tag_commit}" ]]; then
-            echo "checked-out tree ${tree} is not the ${RELEASE_TAG} commit ${tag_commit}" >&2
-            exit 1
+          if [[ "${PREBUILD}" == "true" ]]; then
+            if [[ "${tree}" != "${GITHUB_SHA}" ]]; then
+              echo "checked-out tree ${tree} is not the dispatched prebuild commit ${GITHUB_SHA}" >&2
+              exit 1
+            fi
+          else
+            if ! tag_commit="$(git rev-parse --verify --quiet "refs/tags/${RELEASE_TAG}^{commit}")"; then
+              git fetch --no-tags --depth=1 origin "+refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}"
+              tag_commit="$(git rev-parse --verify "refs/tags/${RELEASE_TAG}^{commit}")"
+            fi
+            if [[ "${tree}" != "${tag_commit}" ]]; then
+              echo "checked-out tree ${tree} is not the ${RELEASE_TAG} commit ${tag_commit}" >&2
+              exit 1
+            fi
           fi
           echo "source_commit=${tree}" >> "${GITHUB_OUTPUT}"
           stamped=0
@@ -1217,19 +1492,198 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "rkat --help exited $LASTEXITCODE" }
           Write-Host "all four Windows binaries run on windows-latest"
 
-  build_binaries_buildbuddy:
-    name: Build and package surface binaries via BuildBuddy
-    needs: [require_ci_green, release_validate_gate]
+  # Intel macOS is a trailing platform: its archives may reach the release
+  # after the critical Linux and macOS arm64 ones (publish_github_release
+  # adds them, add-only). It is cross-compiled on an Apple silicon runner
+  # (macos-15) whichever lane builds the critical targets, one job per
+  # surface package so each binary keeps the feature set its own package
+  # resolves, as in the GitHub-hosted lane.
+  build_binaries_macos_x86_cross:
+    name: Cross-compile and package Intel macOS surface binaries on Apple silicon (${{ matrix.surface.bin }})
+    needs: [require_ci_green, release_validate_gate, release_prebuild]
     if: >-
       always() &&
       needs.require_ci_green.result == 'success' &&
       (needs.release_validate_gate.result == 'success' ||
        (github.event_name == 'workflow_dispatch' &&
-        github.event.inputs.publish_release_assets_only == 'true' &&
+        (github.event.inputs.publish_release_assets_only == 'true' ||
+         github.event.inputs.prebuild_release_artifacts == 'true') &&
         needs.release_validate_gate.result == 'skipped')) &&
       (startsWith(github.ref, 'refs/tags/v') ||
        (github.event_name == 'workflow_dispatch' &&
-        github.event.inputs.publish_release_assets_only == 'true')) &&
+        (github.event.inputs.publish_release_assets_only == 'true' ||
+         github.event.inputs.prebuild_release_artifacts == 'true'))) &&
+      needs.release_prebuild.outputs.run_id == '' &&
+      (github.event_name != 'workflow_dispatch' || github.event.inputs.assets_run_id == '')
+    runs-on: macos-15
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        surface:
+          - package: rkat
+            bin: rkat
+          - package: meerkat-rpc
+            bin: rkat-rpc
+          - package: meerkat-rest
+            bin: rkat-rest
+          - package: meerkat-mcp-server
+            bin: rkat-mcp
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.prebuild_release_artifacts == 'true' && github.sha || github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag != '' && github.event.inputs.release_tag || github.ref }}
+          persist-credentials: false
+
+      - uses: ./.github/actions/setup-rust-ci
+
+      - name: Add the Intel macOS target
+        run: rustup target add x86_64-apple-darwin
+
+      - name: Cache cargo registry
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: release-x86_64-apple-darwin-cross
+          # Release caches never come from a dispatch: a dispatch runs on main
+          # and would save into the default branch's scope, which every later
+          # tag run restores from. ~/.cargo/bin is never cached, so no restored
+          # binary can shadow cargo, git or the platform tools on PATH.
+          save-if: ${{ github.event_name != 'workflow_dispatch' }}
+          cache-bin: "false"
+
+      - name: Cross-compile the surface binary
+        shell: bash
+        env:
+          CARGO_TARGET_DIR: target
+        run: |
+          set -euo pipefail
+          ./scripts/repo-cargo build --locked -p "${{ matrix.surface.package }}" --release --target x86_64-apple-darwin
+
+      - name: Ad-hoc codesign the binary
+        shell: bash
+        run: /usr/bin/codesign --force --sign - "target/x86_64-apple-darwin/release/${{ matrix.surface.bin }}"
+
+      # The test-code marker guard comes from the workflow ref: an asset
+      # recovery of an older tag builds a tree that predates it. Sparse, so
+      # the checkout adds no Cargo or Bazel package to the build.
+      - name: Checkout release binary guard
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+          path: .release-tooling
+          persist-credentials: false
+          sparse-checkout: |
+            scripts/check-release-binary-markers
+            scripts/check-macos-x86-release-binary
+          sparse-checkout-cone-mode: false
+
+      - name: Package artifacts
+        shell: bash
+        env:
+          TARGET: x86_64-apple-darwin
+          VERSION: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.prebuild_release_artifacts == 'true' && needs.require_ci_green.outputs.prebuild_tag || github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          bin="${{ matrix.surface.bin }}"
+          mkdir -p dist
+          VERSION="${VERSION#v}"
+          VERSION="${VERSION//\//-}"
+          src="target/${TARGET}/release/${bin}"
+          artifact_name="${bin}-${VERSION}-${TARGET}.tar.gz"
+          if [[ ! -f "$src" ]]; then
+            echo "Missing expected binary at $src" >&2
+            exit 1
+          fi
+          if ! grep -aF -- "$VERSION" "$src" >/dev/null; then
+            echo "Binary ${bin} for ${TARGET} does not embed release version ${VERSION}" >&2
+            exit 1
+          fi
+          # Nothing else in the release runs this binary: x86_64 only, run it
+          # under Rosetta for its version, system libraries only, and a
+          # minimum macOS version every supported Intel Mac meets.
+          .release-tooling/scripts/check-macos-x86-release-binary "$src" "$VERSION"
+          # No release binary may carry compiled-in test code.
+          .release-tooling/scripts/check-release-binary-markers "$src"
+          tar -czf "dist/${artifact_name}" -C "$(dirname "$src")" "$(basename "$src")"
+          echo "packaged=${bin} -> dist/${artifact_name}"
+
+      # An asset recovery runs this workflow from main against the tag, so
+      # its attestations name main's commit, not the tag. Each archive
+      # therefore carries a stamp of the tree it was built from, written only
+      # after checking that the checkout is the tag's commit, and attested
+      # with it (see scripts/verify-release-asset-provenance --stamps). A
+      # pre-tag prebuild runs before the tag exists: its stamp names the
+      # dispatched main commit, which a tag run accepts only as its own.
+      - name: Stamp archives with the checked-out release commit
+        id: source_commit
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.prebuild_release_artifacts == 'true' && needs.require_ci_green.outputs.prebuild_tag || github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag || github.ref_name }}
+          PREBUILD: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.prebuild_release_artifacts == 'true' }}
+        run: |
+          set -euo pipefail
+          tree="$(git rev-parse HEAD)"
+          if [[ "${PREBUILD}" == "true" ]]; then
+            if [[ "${tree}" != "${GITHUB_SHA}" ]]; then
+              echo "checked-out tree ${tree} is not the dispatched prebuild commit ${GITHUB_SHA}" >&2
+              exit 1
+            fi
+          else
+            if ! tag_commit="$(git rev-parse --verify --quiet "refs/tags/${RELEASE_TAG}^{commit}")"; then
+              git fetch --no-tags --depth=1 origin "+refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}"
+              tag_commit="$(git rev-parse --verify "refs/tags/${RELEASE_TAG}^{commit}")"
+            fi
+            if [[ "${tree}" != "${tag_commit}" ]]; then
+              echo "checked-out tree ${tree} is not the ${RELEASE_TAG} commit ${tag_commit}" >&2
+              exit 1
+            fi
+          fi
+          echo "source_commit=${tree}" >> "${GITHUB_OUTPUT}"
+          stamped=0
+          for archive in dist/*.tar.gz dist/*.zip; do
+            [[ -f "${archive}" ]] || continue
+            printf '%s\n' "${tree}" > "${archive}.source-commit"
+            stamped=$((stamped + 1))
+          done
+          if [[ "${stamped}" -eq 0 ]]; then
+            echo "no release archives under dist/ to stamp" >&2
+            exit 1
+          fi
+          echo "stamped ${stamped} archive(s) with ${RELEASE_TAG} ${tree}"
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: dist/*
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: meerkat-x86_64-apple-darwin-macos-15-${{ matrix.surface.bin }}
+          path: dist/*
+          if-no-files-found: error
+
+  build_binaries_buildbuddy:
+    name: Build and package surface binaries via BuildBuddy
+    needs: [require_ci_green, release_validate_gate, release_prebuild]
+    if: >-
+      always() &&
+      needs.require_ci_green.result == 'success' &&
+      (needs.release_validate_gate.result == 'success' ||
+       (github.event_name == 'workflow_dispatch' &&
+        (github.event.inputs.publish_release_assets_only == 'true' ||
+         github.event.inputs.prebuild_release_artifacts == 'true') &&
+        needs.release_validate_gate.result == 'skipped')) &&
+      (startsWith(github.ref, 'refs/tags/v') ||
+       (github.event_name == 'workflow_dispatch' &&
+        (github.event.inputs.publish_release_assets_only == 'true' ||
+         github.event.inputs.prebuild_release_artifacts == 'true'))) &&
+      needs.release_prebuild.outputs.run_id == '' &&
       (github.actor == 'lukacf' &&
        ((github.event_name == 'workflow_dispatch' &&
          github.event.inputs.release_backend == 'buildbuddy') ||
@@ -1238,6 +1692,10 @@ jobs:
           vars.MEERKAT_RELEASE_BUILDBUDDY == '1')))) &&
       (github.event_name != 'workflow_dispatch' || github.event.inputs.assets_run_id == '')
     runs-on: ${{ fromJSON(vars.MEERKAT_CI_RUNNER || '"ubuntu-24.04"') }}
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     env:
       BUILDBUDDY_API_KEY: ${{ secrets.BUILDBUDDY_API_KEY }}
     strategy:
@@ -1253,19 +1711,22 @@ jobs:
           - bb_command: release-build-macos-arm64
             target: aarch64-apple-darwin
             archive_ext: tar.gz
-          - bb_command: release-build-macos-x86
-            target: x86_64-apple-darwin
-            archive_ext: tar.gz
 
     steps:
       - name: Checkout
         uses: actions/checkout@v6
         with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag != '' && github.event.inputs.release_tag || github.ref }}
+          ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.prebuild_release_artifacts == 'true' && github.sha || github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag != '' && github.event.inputs.release_tag || github.ref }}
+          persist-credentials: false
 
       - uses: ./.github/actions/setup-buildbuddy-ci
         with:
           profile: native
+          # The archives are attested: no cache entry another run (a
+          # dispatch included) saved may reach them. Costs nothing: this
+          # job's Bazel wrapper uses /tmp/meerkat-bazel-repository-cache, so
+          # the restored directory never reached the build.
+          repository-cache: "false"
 
       - name: Build release binaries via BuildBuddy
         shell: bash
@@ -1325,7 +1786,7 @@ jobs:
         shell: bash
         env:
           TARGET: ${{ matrix.target }}
-          VERSION: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag || github.ref_name }}
+          VERSION: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.prebuild_release_artifacts == 'true' && needs.require_ci_green.outputs.prebuild_tag || github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag || github.ref_name }}
           ARCHIVE_EXT: ${{ matrix.archive_ext }}
           BB_OUTPUT_BASE: ${{ runner.temp }}/bb-release-${{ matrix.target }}
         run: |
@@ -1400,22 +1861,32 @@ jobs:
       # its attestations name main's commit, not the tag. Each archive
       # therefore carries a stamp of the tree it was built from, written only
       # after checking that the checkout is the tag's commit, and attested
-      # with it (see scripts/verify-release-asset-provenance --stamps).
+      # with it (see scripts/verify-release-asset-provenance --stamps). A
+      # pre-tag prebuild runs before the tag exists: its stamp names the
+      # dispatched main commit, which a tag run accepts only as its own.
       - name: Stamp archives with the checked-out release commit
         id: source_commit
         shell: bash
         env:
-          RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag || github.ref_name }}
+          RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.prebuild_release_artifacts == 'true' && needs.require_ci_green.outputs.prebuild_tag || github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag || github.ref_name }}
+          PREBUILD: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.prebuild_release_artifacts == 'true' }}
         run: |
           set -euo pipefail
           tree="$(git rev-parse HEAD)"
-          if ! tag_commit="$(git rev-parse --verify --quiet "refs/tags/${RELEASE_TAG}^{commit}")"; then
-            git fetch --no-tags --depth=1 origin "+refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}"
-            tag_commit="$(git rev-parse --verify "refs/tags/${RELEASE_TAG}^{commit}")"
-          fi
-          if [[ "${tree}" != "${tag_commit}" ]]; then
-            echo "checked-out tree ${tree} is not the ${RELEASE_TAG} commit ${tag_commit}" >&2
-            exit 1
+          if [[ "${PREBUILD}" == "true" ]]; then
+            if [[ "${tree}" != "${GITHUB_SHA}" ]]; then
+              echo "checked-out tree ${tree} is not the dispatched prebuild commit ${GITHUB_SHA}" >&2
+              exit 1
+            fi
+          else
+            if ! tag_commit="$(git rev-parse --verify --quiet "refs/tags/${RELEASE_TAG}^{commit}")"; then
+              git fetch --no-tags --depth=1 origin "+refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}"
+              tag_commit="$(git rev-parse --verify "refs/tags/${RELEASE_TAG}^{commit}")"
+            fi
+            if [[ "${tree}" != "${tag_commit}" ]]; then
+              echo "checked-out tree ${tree} is not the ${RELEASE_TAG} commit ${tag_commit}" >&2
+              exit 1
+            fi
           fi
           echo "source_commit=${tree}" >> "${GITHUB_OUTPUT}"
           stamped=0
@@ -1442,75 +1913,141 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
-  publish_unix_release_and_homebrew:
-    name: Publish macOS/Linux release assets and update Homebrew
-    needs: [release_validate_gate, release_semver_gate, build_binaries_buildbuddy]
+  # Linux (x86_64, aarch64) and macOS arm64 archives publish as soon as the
+  # critical gate passes, on either lane: they are what the CLI install, the
+  # SDKs' rkat-rpc bootstrap and a paired Meta release need. The trailing
+  # Intel macOS and Windows archives follow: publish_github_release adds them
+  # once their lanes finish, add-only, writes the complete manifest
+  # (checksums.sha256, index.json), and update_homebrew follows it. No
+  # publisher replaces an asset that is already on the release.
+  publish_critical_release_assets:
+    name: Publish Linux and macOS arm64 release assets
+    needs: [require_ci_green, release_validate_gate, release_semver_gate, build_binaries_critical_gate, release_prebuild]
     if: >-
       always() &&
       startsWith(github.ref, 'refs/tags/v') &&
+      needs.require_ci_green.result == 'success' &&
       needs.release_validate_gate.result == 'success' &&
       needs.release_semver_gate.result == 'success' &&
-      needs.build_binaries_buildbuddy.result == 'success' &&
-      github.actor == 'lukacf' &&
-      (vars.MEERKAT_RELEASE_BUILDBUDDY == 'true' ||
-       vars.MEERKAT_RELEASE_BUILDBUDDY == '1')
+      needs.build_binaries_critical_gate.result == 'success'
     runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+      attestations: read
+      contents: write
     steps:
       - name: Checkout
         uses: actions/checkout@v6
         with:
           fetch-depth: 0
+          persist-credentials: false
 
-      - name: Download macOS/Linux artifacts
+      - name: Download this run's release archives
+        if: ${{ needs.release_prebuild.outputs.run_id == '' }}
         uses: actions/download-artifact@v4
         with:
-          pattern: meerkat-*-buildbuddy
+          pattern: meerkat-*
           path: release-artifacts
 
-      - name: Build macOS/Linux checksum manifest
-        env:
-          RELEASE_TAG: ${{ github.ref_name }}
-        run: scripts/release-build-asset-manifest release-artifacts "${RELEASE_TAG}"
+      - name: Download the archives of the exact-commit prebuild
+        if: ${{ needs.release_prebuild.outputs.run_id != '' }}
+        uses: actions/download-artifact@v4
+        with:
+          pattern: meerkat-*
+          path: release-artifacts
+          run-id: ${{ needs.release_prebuild.outputs.run_id }}
+          github-token: ${{ github.token }}
 
-      - name: Require complete Homebrew archive set
+      # Exactly the critical archives, whatever trailing ones were already
+      # uploaded when this job started.
+      - name: Select the critical archive set
         env:
           RELEASE_TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          python3 - "${RELEASE_TAG}" release-artifacts/index.json <<'PY'
-          import json
+          python3 - "${RELEASE_TAG}" release-artifacts critical-release-artifacts <<'PY'
+          import shutil
           import sys
+          from pathlib import Path
 
-          tag, index_path = sys.argv[1:]
-          version = tag.removeprefix("v")
+          tag, source, output = sys.argv[1:]
+          version = tag.removeprefix("v").replace("/", "-")
           binaries = ("rkat", "rkat-rpc", "rkat-rest", "rkat-mcp")
           targets = (
-              "aarch64-apple-darwin",
-              "x86_64-apple-darwin",
-              "aarch64-unknown-linux-gnu",
               "x86_64-unknown-linux-gnu",
+              "aarch64-unknown-linux-gnu",
+              "aarch64-apple-darwin",
           )
-          expected = {
+          wanted = sorted(
               f"{binary}-{version}-{target}.tar.gz"
               for binary in binaries
               for target in targets
-          }
-          with open(index_path, encoding="utf-8") as source:
-              actual = set(json.load(source)["artifacts"])
-          if actual != expected:
-              missing = sorted(expected - actual)
-              extra = sorted(actual - expected)
-              raise SystemExit(
-                  f"Homebrew release asset mismatch: missing={missing}, extra={extra}"
-              )
-          print(f"Verified {len(actual)} macOS/Linux release archives")
+          )
+          found = {}
+          for path in sorted(Path(source).rglob("*.tar.gz")):
+              if path.name not in wanted:
+                  continue
+              if path.name in found:
+                  raise SystemExit(f"duplicate critical release archive {path.name}")
+              found[path.name] = path
+          missing = [name for name in wanted if name not in found]
+          if missing:
+              raise SystemExit(f"critical release archives missing: {missing}")
+          Path(output).mkdir()
+          for name in wanted:
+              shutil.copy2(found[name], Path(output) / name)
+          print(f"Selected {len(wanted)} critical release archives")
           PY
 
-      - name: Verify exact-tag macOS/Linux build provenance
+      # This run's archives must be attested from exactly the tag commit; a
+      # prebuild's are verified like an assets_run_id recovery.
+      - name: Verify exact-tag Linux and macOS arm64 build provenance
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ github.ref_name }}
-        run: scripts/verify-release-asset-provenance release-artifacts "${RELEASE_TAG}"
+          PREBUILD_RUN_ID: ${{ needs.release_prebuild.outputs.run_id }}
+          PREBUILD_RUN_ATTEMPT: ${{ needs.release_prebuild.outputs.run_attempt }}
+        run: |
+          set -euo pipefail
+          if [[ -n "${PREBUILD_RUN_ID}" ]]; then
+            # The prebuild's trailing lanes may still be running: its
+            # critical gate covers the archives verified here.
+            scripts/verify-release-asset-provenance \
+              --source-run "${PREBUILD_RUN_ID}" \
+              --source-attempt "${PREBUILD_RUN_ATTEMPT}" \
+              --source-gate "Release critical binary build gate" \
+              --prebuild \
+              --stamps release-artifacts \
+              critical-release-artifacts "${RELEASE_TAG}"
+          else
+            scripts/verify-release-asset-provenance critical-release-artifacts "${RELEASE_TAG}"
+          fi
+
+      - name: Require the release version in every critical binary
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          version="${RELEASE_TAG#v}"
+          version="${version//\//-}"
+          checked=0
+          for archive in critical-release-artifacts/*.tar.gz; do
+            unpacked="$(mktemp -d)"
+            tar -xzf "${archive}" -C "${unpacked}"
+            binaries=0
+            while IFS= read -r -d '' binary; do
+              binaries=$((binaries + 1))
+              grep -aqF -- "${version}" "${binary}" || {
+                echo "$(basename "${archive}"): $(basename "${binary}") does not embed release version ${version}" >&2
+                exit 1
+              }
+              scripts/check-release-binary-markers "${binary}"
+            done < <(find "${unpacked}" -type f -print0)
+            [[ "${binaries}" -gt 0 ]] || { echo "$(basename "${archive}") is empty" >&2; exit 1; }
+            checked=$((checked + 1))
+          done
+          [[ "${checked}" -eq 12 ]] || { echo "expected 12 critical archives, checked ${checked}" >&2; exit 1; }
+          echo "Every binary in ${checked} critical archives embeds ${version} and passes the test-code marker guard"
 
       # The archives just verified were compiled from the tag's tree. Its
       # built-binary test hooks must reach debug builds only: an older tree's
@@ -1520,54 +2057,29 @@ jobs:
           RELEASE_TAG: ${{ github.ref_name }}
         run: scripts/check-release-source-test-hooks "${RELEASE_TAG}"
 
-      # Never churn already-published archives on a rerun. Missing archives
-      # are still added, while the final publisher handles the cross-compiled
-      # Windows archives later.
-      - name: Publish macOS/Linux release assets
+      # Add-only: an archive already on the release (an earlier attempt) is
+      # never replaced. The manifest is not written here: it describes the
+      # complete set, which only publish_github_release sees.
+      - name: Publish Linux and macOS arm64 release assets
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            release-artifacts/**/*.tar.gz
+            critical-release-artifacts/*.tar.gz
           draft: false
           fail_on_unmatched_files: true
           generate_release_notes: true
           overwrite_files: false
           tag_name: ${{ github.ref_name }}
 
-      # `overwrite_files: false` can preserve an archive from an earlier run.
-      # Re-read the live assets so Homebrew always receives hashes for the
-      # bytes users will actually download, not for a fresh local rebuild.
-      - name: Download published macOS/Linux release assets
-        env:
-          GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ github.ref_name }}
-        run: |
-          set -euo pipefail
-          rm -rf published-release-artifacts
-          mkdir -p published-release-artifacts
-          gh release download "${RELEASE_TAG}" \
-            --repo "${GITHUB_REPOSITORY}" \
-            --pattern '*.tar.gz' \
-            --dir published-release-artifacts
-          scripts/release-build-asset-manifest published-release-artifacts "${RELEASE_TAG}"
-
-      - name: Update Homebrew tap from published macOS/Linux assets
-        continue-on-error: true
-        uses: ./.github/actions/update-homebrew
-        with:
-          release_tag: ${{ github.ref_name }}
-          github_token: ${{ github.token }}
-          tap_token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
-          checksums_path: published-release-artifacts/checksums.sha256
-
   # The package build runs no code from the release tree before Require
   # green CI has checked the release ref; it then runs beside the release
   # validation and the semver gate instead of after them. Building
   # publishes nothing: publish_web_sdk requires green CI, the release
   # validation, the semver gate, the registry credentials and this build.
+  # A tag whose commit was prebuilt reuses the prebuild's package instead.
   build_web_sdk_package:
     name: Build Web SDK package
-    needs: [require_ci_green]
+    needs: [require_ci_green, release_prebuild]
     if: >-
       !cancelled() &&
       needs.require_ci_green.result == 'success' &&
@@ -1575,28 +2087,36 @@ jobs:
        github.event.inputs.web_sdk_artifact_run_id == '') &&
       (startsWith(github.ref, 'refs/tags/v') ||
        (github.event_name == 'workflow_dispatch' &&
-        github.event.inputs.publish_release_packages == 'true' &&
-        github.event.inputs.alpha_crates_only != 'true'))
+        ((github.event.inputs.publish_release_packages == 'true' &&
+          github.event.inputs.alpha_crates_only != 'true') ||
+         github.event.inputs.prebuild_release_artifacts == 'true'))) &&
+      needs.release_prebuild.outputs.run_id == ''
     runs-on: ${{ fromJSON(vars.MEERKAT_CI_RUNNER || '"ubuntu-24.04"') }}
-    timeout-minutes: 180
     permissions:
       contents: read
+      id-token: write
+      attestations: write
+    timeout-minutes: 180
     steps:
       - name: Checkout
         uses: actions/checkout@v6
         with:
           # Recovery dispatches run the workflow definition from main, but the
           # package must always be built from the explicitly selected release.
-          ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag != '' && github.event.inputs.release_tag || github.ref }}
+          ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.prebuild_release_artifacts == 'true' && github.sha || github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag != '' && github.event.inputs.release_tag || github.ref }}
+          persist-credentials: false
 
       - uses: ./.github/actions/setup-rust-ci
 
       - name: Cache cargo registry
         uses: Swatinem/rust-cache@v2
         with:
-          # A dispatch runs on main and would save into the default branch's
-          # scope, which every later tag run restores from.
+          # Release caches never come from a dispatch: a dispatch runs on main
+          # and would save into the default branch's scope, which every later
+          # tag run restores from. ~/.cargo/bin is never cached, so no restored
+          # binary can shadow cargo, git or the platform tools on PATH.
           save-if: ${{ github.event_name != 'workflow_dispatch' }}
+          cache-bin: "false"
 
       - name: Install Python + Node tooling
         uses: actions/setup-python@v5
@@ -1613,10 +2133,13 @@ jobs:
         run: |
           set -euo pipefail
           version="0.13.1"
+          # Pinned: this job attests the package wasm-pack builds.
+          sha256="c539d91ccab2591a7e975bcf82c82e1911b03335c80aa83d67ad25ed2ad06539"
           archive="wasm-pack-v${version}-x86_64-unknown-linux-musl.tar.gz"
           curl --fail --location --retry 5 --retry-delay 2 \
             "https://github.com/wasm-bindgen/wasm-pack/releases/download/v${version}/${archive}" \
             --output "/tmp/${archive}"
+          echo "${sha256}  /tmp/${archive}" | sha256sum --check --strict
           tar -xzf "/tmp/${archive}" -C /tmp
           install -m 0755 "/tmp/wasm-pack-v${version}-x86_64-unknown-linux-musl/wasm-pack" "$HOME/.cargo/bin/wasm-pack"
           wasm-pack --version
@@ -1631,7 +2154,7 @@ jobs:
       # script refuses a packed wasm below 8 MiB and runs one turn from it.
       - name: Build and pack Web SDK
         env:
-          VERSION: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag || github.ref_name }}
+          VERSION: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.prebuild_release_artifacts == 'true' && needs.require_ci_green.outputs.prebuild_tag || github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag || github.ref_name }}
           CARGO_INCREMENTAL: "0"
         run: |
           set -euo pipefail
@@ -1682,6 +2205,13 @@ jobs:
             > web-sdk-package/rkat-web-package.json
           cat web-sdk-package/rkat-web-package.json
 
+      # A tag run that reuses a prebuild's package verifies this attestation
+      # (release.yml at the tag commit on refs/heads/main) before publishing.
+      - name: Attest Web SDK package provenance
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: web-sdk-package/rkat-web-*.tgz
+
       - name: Upload Web SDK package
         uses: actions/upload-artifact@v4
         with:
@@ -1691,28 +2221,117 @@ jobs:
             web-sdk-package/rkat-web-package.json
           if-no-files-found: error
 
+  # The marker release_prebuild requires of a prebuild run: the critical
+  # binaries (Linux x86_64 and aarch64, macOS arm64) and the Web SDK package
+  # succeeded for the dispatched commit. The trailing Intel macOS and Windows
+  # lanes do not hold it back: they keep running in this run, and the tag's
+  # trailing publisher waits for this run's full binary build gate.
+  release_prebuild_gate:
+    name: Release prebuild gate
+    needs: [require_ci_green, build_binaries_critical_gate, build_web_sdk_package]
+    if: >-
+      always() &&
+      github.event_name == 'workflow_dispatch' &&
+      github.event.inputs.prebuild_release_artifacts == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Require every prebuilt release artifact
+        shell: bash
+        env:
+          PREBUILD_TAG: ${{ needs.require_ci_green.outputs.prebuild_tag }}
+        run: |
+          set -euo pipefail
+          request="${{ needs.require_ci_green.result }}"
+          binaries="${{ needs.build_binaries_critical_gate.result }}"
+          web_sdk="${{ needs.build_web_sdk_package.result }}"
+          echo "Prebuild request: ${request}"
+          echo "Release critical binary build gate: ${binaries}"
+          echo "Web SDK package: ${web_sdk}"
+          [[ "${request}" == "success" && "${binaries}" == "success" && "${web_sdk}" == "success" && -n "${PREBUILD_TAG}" ]]
+          echo "Prebuilt the critical ${PREBUILD_TAG} release artifacts of ${GITHUB_SHA}; the ${PREBUILD_TAG} tag run of exactly this commit publishes them instead of rebuilding, and the trailing ones once this run's binary build gate passes."
+
+  # The critical platforms (Linux x86_64 and aarch64, macOS arm64): the
+  # selected lane built them, or the archives come from an earlier run (a
+  # prebuild of the tag commit, or assets_run_id). The critical publisher waits
+  # for this gate only, never for the trailing Intel macOS and Windows lanes,
+  # which build_binaries_gate adds.
+  build_binaries_critical_gate:
+    name: Release critical binary build gate
+    if: >-
+      always() &&
+      (startsWith(github.ref, 'refs/tags/v') ||
+       (github.event_name == 'workflow_dispatch' &&
+        (github.event.inputs.publish_release_assets_only == 'true' ||
+         github.event.inputs.prebuild_release_artifacts == 'true')))
+    needs: [build_binaries, build_binaries_buildbuddy, release_prebuild]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Check the selected critical-platform lane
+        shell: bash
+        env:
+          ASSETS_RUN_ID: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.assets_run_id || '' }}
+          PREBUILD_RUN_ID: ${{ needs.release_prebuild.outputs.run_id }}
+        run: |
+          set -euo pipefail
+          github_result="${{ needs.build_binaries.result }}"
+          buildbuddy_result="${{ needs.build_binaries_buildbuddy.result }}"
+          source_run="${PREBUILD_RUN_ID:-${ASSETS_RUN_ID}}"
+          if [[ -n "${source_run}" ]]; then
+            [[ "${github_result}" == "skipped" && "${buildbuddy_result}" == "skipped" ]] || {
+              echo "the archives come from release run ${source_run}, but a build job ran (${github_result}, ${buildbuddy_result})" >&2
+              exit 1
+            }
+            echo "Critical archives come from release run ${source_run}; no build in this run."
+            exit 0
+          fi
+          bb_selected="${{ github.actor == 'lukacf' && ((github.event_name == 'workflow_dispatch' && github.event.inputs.release_backend == 'buildbuddy') || (github.event_name != 'workflow_dispatch' && (vars.MEERKAT_RELEASE_BUILDBUDDY == 'true' || vars.MEERKAT_RELEASE_BUILDBUDDY == '1'))) }}"
+          if [[ "${bb_selected}" == "true" ]]; then
+            echo "BuildBuddy critical-platform build selected: ${buildbuddy_result}; GitHub-hosted fallback: ${github_result}"
+            [[ "${buildbuddy_result}" == "success" && "${github_result}" == "skipped" ]]
+            exit $?
+          fi
+          echo "GitHub-hosted critical-platform build selected: ${github_result}; BuildBuddy: ${buildbuddy_result}"
+          [[ "${github_result}" == "success" && "${buildbuddy_result}" == "skipped" ]]
+
   build_binaries_gate:
     name: Release binary build gate
     if: >-
       always() &&
       (startsWith(github.ref, 'refs/tags/v') ||
        (github.event_name == 'workflow_dispatch' &&
-        github.event.inputs.publish_release_assets_only == 'true'))
-    needs: [build_binaries, build_binaries_buildbuddy, build_binaries_windows_cross, verify_windows_binaries]
+        (github.event.inputs.publish_release_assets_only == 'true' ||
+         github.event.inputs.prebuild_release_artifacts == 'true')))
+    needs: [build_binaries, build_binaries_buildbuddy, build_binaries_windows_cross, verify_windows_binaries, build_binaries_macos_x86_cross, release_prebuild]
     runs-on: ${{ fromJSON(vars.MEERKAT_CI_RUNNER || '"ubuntu-24.04"') }}
     steps:
       - name: Check selected release binary backend
         shell: bash
         env:
           ASSETS_RUN_ID: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.assets_run_id || '' }}
+          PREBUILD_RUN_ID: ${{ needs.release_prebuild.outputs.run_id }}
         run: |
           set -euo pipefail
+          # A tag whose commit was prebuilt: nothing is built here; the
+          # publisher verifies the prebuild run's archives and that its own
+          # build gate passed (see publish_github_release).
+          if [[ -n "${PREBUILD_RUN_ID}" ]]; then
+            for result in "${{ needs.build_binaries.result }}" "${{ needs.build_binaries_buildbuddy.result }}" \
+                          "${{ needs.build_binaries_windows_cross.result }}" "${{ needs.verify_windows_binaries.result }}" \
+                          "${{ needs.build_binaries_macos_x86_cross.result }}"; do
+              [[ "${result}" == "skipped" ]] || { echo "release_prebuild found run ${PREBUILD_RUN_ID}, but a build job ran (${result})" >&2; exit 1; }
+            done
+            echo "Publishing the prebuilt archives of release run ${PREBUILD_RUN_ID}; no build in this run."
+            exit 0
+          fi
           # Asset recovery from an earlier run: nothing is built here; the
           # publisher verifies that run's archives and that its own build
           # gate passed (see publish_github_release).
           if [[ -n "${ASSETS_RUN_ID}" ]]; then
             for result in "${{ needs.build_binaries.result }}" "${{ needs.build_binaries_buildbuddy.result }}" \
-                          "${{ needs.build_binaries_windows_cross.result }}" "${{ needs.verify_windows_binaries.result }}"; do
+                          "${{ needs.build_binaries_windows_cross.result }}" "${{ needs.verify_windows_binaries.result }}" \
+                          "${{ needs.build_binaries_macos_x86_cross.result }}"; do
               [[ "${result}" == "skipped" ]] || { echo "assets_run_id set, but a build job ran (${result})" >&2; exit 1; }
             done
             echo "Publishing the archives of release run ${ASSETS_RUN_ID}; no build in this run."
@@ -1723,23 +2342,28 @@ jobs:
           buildbuddy_result="${{ needs.build_binaries_buildbuddy.result }}"
           windows_cross_result="${{ needs.build_binaries_windows_cross.result }}"
           windows_verify_result="${{ needs.verify_windows_binaries.result }}"
+          macos_x86_result="${{ needs.build_binaries_macos_x86_cross.result }}"
 
-          # Windows is always cross-compiled on Linux and then verified on a
-          # Windows runner, whichever lane builds Linux/macOS.
+          # The trailing platforms build in their own jobs whichever lane
+          # builds the critical ones: Windows is cross-compiled on Linux and
+          # verified on a Windows runner, Intel macOS is cross-compiled on
+          # Apple silicon.
           echo "Windows cross-compile (Linux, cargo-xwin): ${windows_cross_result}"
           echo "Windows binary verification (windows-latest): ${windows_verify_result}"
           [[ "${windows_cross_result}" == "success" && "${windows_verify_result}" == "success" ]] || exit 1
+          echo "Intel macOS cross-compile (Apple silicon): ${macos_x86_result}"
+          [[ "${macos_x86_result}" == "success" ]] || exit 1
 
           if [[ "${bb_selected}" == "true" ]]; then
-            # Owner lane split: BuildBuddy builds Linux/macOS; the hosted
-            # fallback matrix is skipped.
-            echo "BuildBuddy release binary build (Linux/macOS) selected: ${buildbuddy_result}"
-            echo "GitHub-hosted Linux/macOS fallback skipped: ${github_result}"
+            # Owner lane split: BuildBuddy builds the critical platforms;
+            # the hosted fallback matrix is skipped.
+            echo "BuildBuddy release binary build (Linux, macOS arm64) selected: ${buildbuddy_result}"
+            echo "GitHub-hosted fallback skipped: ${github_result}"
             [[ "${buildbuddy_result}" == "success" && "${github_result}" == "skipped" ]]
             exit $?
           fi
 
-          echo "GitHub-hosted Linux/macOS release binary build selected: ${github_result}"
+          echo "GitHub-hosted release binary build (Linux, macOS arm64) selected: ${github_result}"
           echo "BuildBuddy release binary build skipped: ${buildbuddy_result}"
           [[ "${github_result}" == "success" && "${buildbuddy_result}" == "skipped" ]]
 
@@ -1747,6 +2371,7 @@ jobs:
     name: Publish GitHub release assets
     if: >-
       always() &&
+      needs.require_ci_green.result == 'success' &&
       (startsWith(github.ref, 'refs/tags/v') ||
        (github.event_name == 'workflow_dispatch' &&
         github.event.inputs.publish_release_assets_only == 'true')) &&
@@ -1759,18 +2384,29 @@ jobs:
         github.event.inputs.publish_release_assets_only == 'true' &&
         needs.release_semver_gate.result == 'skipped')) &&
       needs.build_binaries_gate.result == 'success'
-    # Waiting for the early publisher prevents manifest upload races if the
-    # Windows cross-build happens to finish before the Unix release job.
-    # `always()` above keeps this authoritative path available if that early
-    # optimization is skipped or fails.
+    # The trailing publisher: once every lane finished (build_binaries_gate,
+    # Intel macOS and Windows included) it adds the archives the critical
+    # publisher did not, add-only, and only then writes the complete
+    # manifest; update_homebrew follows it. Waiting for the critical
+    # publisher keeps the two uploads ordered, and `always()` above keeps
+    # this authoritative path available if that publisher failed.
+    # require_ci_green: every published archive, an asset recovery's from an
+    # earlier run included, belongs to a release commit whose exact-main CI
+    # succeeded (a prebuild run never waited for it).
     needs:
       [
+        require_ci_green,
         release_validate_gate,
         release_semver_gate,
         build_binaries_gate,
-        publish_unix_release_and_homebrew,
+        publish_critical_release_assets,
+        release_prebuild,
       ]
     runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+      attestations: read
+      contents: write
     steps:
       # Recovery runs execute the current workflow against an older release
       # tag, so load helpers from the workflow ref rather than that old tag.
@@ -1778,12 +2414,61 @@ jobs:
         uses: actions/checkout@v6
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Download all artifacts
-        if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.assets_run_id == '' }}
+        if: ${{ (github.event_name != 'workflow_dispatch' || github.event.inputs.assets_run_id == '') && needs.release_prebuild.outputs.run_id == '' }}
         uses: actions/download-artifact@v4
         with:
           path: release-artifacts
+
+      # The prebuild was selected once its critical artifacts were ready; its
+      # trailing Intel macOS and Windows lanes may still be running. Their
+      # archives exist once that run's full binary build gate passed, which
+      # --source-run below requires anyway. If they failed, the trailing
+      # assets come from an asset recovery (make release-assets).
+      - name: Wait for the prebuild's trailing lanes
+        if: ${{ needs.release_prebuild.outputs.run_id != '' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PREBUILD_RUN_ID: ${{ needs.release_prebuild.outputs.run_id }}
+          PREBUILD_RUN_ATTEMPT: ${{ needs.release_prebuild.outputs.run_attempt }}
+        run: |
+          set -euo pipefail
+          deadline=$(( $(date +%s) + 9000 ))
+          while true; do
+            state="$(gh api --paginate "repos/${GITHUB_REPOSITORY}/actions/runs/${PREBUILD_RUN_ID}/attempts/${PREBUILD_RUN_ATTEMPT}/jobs?per_page=100" \
+              --jq '.jobs[] | select(.name == "Release binary build gate") | (.conclusion // "pending")')"
+            case "${state:-pending}" in
+              success)
+                echo "Release run ${PREBUILD_RUN_ID}: every binary lane, trailing ones included, succeeded"
+                break
+                ;;
+              pending) ;;
+              *)
+                echo "::error::Release run ${PREBUILD_RUN_ID}: Release binary build gate ${state}; publish the trailing assets with an asset recovery (make release-assets)"
+                exit 1
+                ;;
+            esac
+            if (( $(date +%s) >= deadline )); then
+              echo "::error::Release run ${PREBUILD_RUN_ID}: no binary build gate result after 150 minutes"
+              exit 1
+            fi
+            sleep 60
+          done
+
+      # A tag whose commit was prebuilt: the prebuild run's archives, stamps
+      # and attestations; verify-release-asset-provenance --source-run binds
+      # them to that run before anything is published.
+      - name: Download the archives of the exact-commit prebuild
+        if: ${{ needs.release_prebuild.outputs.run_id != '' }}
+        uses: actions/download-artifact@v4
+        with:
+          path: release-artifacts
+          pattern: meerkat-*
+          run-id: ${{ needs.release_prebuild.outputs.run_id }}
+          github-token: ${{ github.token }}
 
       # Asset recovery from an earlier run (assets_run_id): its archives,
       # stamps and attestations; verify-release-asset-provenance --source-run
@@ -1851,24 +2536,40 @@ jobs:
       # runs main's workflow against the tag, so its attestations name the
       # run's commit: then each archive must be attested by release.yml at
       # that commit on refs/heads/main, and carry an attested stamp proving
-      # its build job checked out the tag commit. With assets_run_id the
-      # archives come from that earlier run: --source-run binds them to its
-      # commit, requires its build gate to have passed, and accepts an
-      # unstamped run only if nothing outside .github/ and CHANGELOG.md
-      # changed between the tag and that commit.
+      # its build job checked out the tag commit. With assets_run_id, or on a
+      # tag whose commit was prebuilt (release_prebuild), the archives come
+      # from that earlier run: --source-run binds them to its commit,
+      # requires its build gate to have passed, and accepts an unstamped run
+      # only if nothing outside .github/ and CHANGELOG.md changed between the
+      # tag and that commit.
       - name: Verify exact-tag release build provenance
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag || github.ref_name }}
           RECOVERY_FROM_MAIN: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.publish_release_assets_only == 'true' && github.ref == 'refs/heads/main' }}
           ASSETS_RUN_ID: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.assets_run_id || '' }}
+          PREBUILD_RUN_ID: ${{ needs.release_prebuild.outputs.run_id }}
+          PREBUILD_RUN_ATTEMPT: ${{ needs.release_prebuild.outputs.run_attempt }}
         run: |
           set -euo pipefail
           if [[ -n "${ASSETS_RUN_ID}" && "${RECOVERY_FROM_MAIN}" != "true" ]]; then
             echo "assets_run_id requires publish_release_assets_only dispatched on main" >&2
             exit 1
           fi
-          if [[ -n "${ASSETS_RUN_ID}" ]]; then
+          if [[ -n "${PREBUILD_RUN_ID}" ]]; then
+            # The tag commit's pre-tag prebuild, verified exactly like an
+            # assets_run_id recovery: release.yml dispatched on main at a
+            # commit in this tag's history with a green binary build gate,
+            # every archive and its stamp attested by release.yml at that
+            # commit on refs/heads/main, and every stamp naming this tag's
+            # commit (release_prebuild only selects a run at exactly it).
+            scripts/verify-release-asset-provenance \
+              --source-run "${PREBUILD_RUN_ID}" \
+              --source-attempt "${PREBUILD_RUN_ATTEMPT}" \
+              --prebuild \
+              --stamps release-artifacts \
+              prepared-release-artifacts "${RELEASE_TAG}"
+          elif [[ -n "${ASSETS_RUN_ID}" ]]; then
             scripts/verify-release-asset-provenance \
               --source-run "${ASSETS_RUN_ID}" \
               --stamps release-artifacts \
@@ -1923,9 +2624,50 @@ jobs:
             --output-dir published-release-artifacts \
             --release-tag "${RELEASE_TAG}"
 
+      # The manifest is written once, from the complete set of published,
+      # never-replaced archives, and never deleted or replaced: a rerun finds
+      # it present, checks that it equals the one regenerated from the same
+      # archives, and uploads nothing. A published manifest that differs
+      # means the archive set changed, and the run fails. Listing the release
+      # assets tells a missing manifest from an API error, which fails too.
+      #
+      # Window: the critical publisher makes the release public with the
+      # Linux and macOS arm64 archives before this job writes
+      # checksums.sha256 and index.json. With a prebuild whose trailing lanes
+      # already finished that is the few minutes between the two publishers;
+      # when the tag builds, it lasts until the Intel macOS and Windows lanes
+      # finish (or until an asset recovery if they fail). Every archive is
+      # attested meanwhile (`gh attestation verify`).
+      - name: Check the published manifest
+        id: manifest
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          assets="$(gh release view "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" --json assets --jq '.assets[].name')"
+          mkdir -p published-manifest
+          upload=false
+          for name in checksums.sha256 index.json; do
+            if ! grep -Fxq -- "${name}" <<<"${assets}"; then
+              echo "${name} is not on the release yet"
+              upload=true
+              continue
+            fi
+            gh release download "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" \
+              --pattern "${name}" --dir published-manifest
+            if ! cmp -s "published-manifest/${name}" "published-release-artifacts/${name}"; then
+              echo "the published ${name} differs from the one regenerated from the published archives; refusing to replace it" >&2
+              exit 1
+            fi
+            echo "published ${name} is unchanged"
+          done
+          echo "upload=${upload}" >> "${GITHUB_OUTPUT}"
+
       # Publish checksums and index.json only after every platform archive is
       # present, keeping the public manifest a complete release authority.
       - name: Publish complete release manifest
+        if: ${{ steps.manifest.outputs.upload == 'true' }}
         uses: softprops/action-gh-release@v2
         with:
           files: |
@@ -1933,7 +2675,7 @@ jobs:
             published-release-artifacts/index.json
           draft: false
           fail_on_unmatched_files: true
-          overwrite_files: true
+          overwrite_files: false
           tag_name: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag || github.ref_name }}
 
   update_homebrew:
@@ -1950,8 +2692,9 @@ jobs:
       - name: Checkout workflow helpers
         uses: actions/checkout@v6
 
-      # This is the authoritative fallback for GitHub-hosted releases and for
-      # any transient failure in the early BuildBuddy/Homebrew path.
+      # The only Homebrew update: the formula needs every Unix archive, Intel
+      # macOS included, so it follows the trailing publisher and reads the
+      # complete release's published checksums.sha256.
       - name: Update Homebrew tap from complete release
         uses: ./.github/actions/update-homebrew
         with:
@@ -1964,15 +2707,20 @@ jobs:
   # hosted runner. Generated on the release tag with the pinned rustc; the
   # manifest records that rustc so a consumer on another compiler falls back
   # to rebuilding rather than reading an incompatible format.
+  #
+  # Nothing a user waits for depends on it. The rustdoc build (17 minutes on
+  # 0.9.1) starts as soon as require_ci_green passes, in parallel with
+  # publication, instead of after the GitHub release; no job needs it except
+  # attach_semver_baseline, which uploads the result once the release is
+  # published and which nothing needs. A failure here leaves the next
+  # release's semver measurement to rebuild this baseline from the tag.
   publish_semver_baseline:
-    name: Publish semver baseline rustdoc
+    name: Generate semver baseline rustdoc
+    needs: [require_ci_green]
     if: >-
-      always() &&
-      needs.publish_github_release.result == 'success' &&
-      (startsWith(github.ref, 'refs/tags/v') ||
-       (github.event_name == 'workflow_dispatch' &&
-        github.event.inputs.publish_release_assets_only == 'true'))
-    needs: [publish_github_release]
+      startsWith(github.ref, 'refs/tags/v') ||
+      (github.event_name == 'workflow_dispatch' &&
+       github.event.inputs.publish_release_assets_only == 'true')
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
@@ -1987,6 +2735,12 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: release-semver-rustdoc
+          # Release caches never come from a dispatch: a dispatch runs on main
+          # and would save into the default branch's scope, which every later
+          # tag run restores from. ~/.cargo/bin is never cached, so no restored
+          # binary can shadow cargo, git or the platform tools on PATH.
+          save-if: ${{ github.event_name != 'workflow_dispatch' }}
+          cache-bin: "false"
 
       - name: Generate rustdoc JSON for every publishable library crate
         shell: bash
@@ -2004,8 +2758,38 @@ jobs:
           fi
           # rustdoc JSON compresses about 50:1; pay for the high level once here
           # so every later measurement downloads a few megabytes.
-          tar -I 'zstd -19 -T0' -cf "${RUNNER_TEMP}/semver-rustdoc-${version}.tar.zst" -C "${out}" .
-          ls -la "${RUNNER_TEMP}/semver-rustdoc-${version}.tar.zst"
+          mkdir -p "${RUNNER_TEMP}/semver-baseline"
+          tar -I 'zstd -19 -T0' -cf "${RUNNER_TEMP}/semver-baseline/semver-rustdoc-${version}.tar.zst" -C "${out}" .
+          ls -la "${RUNNER_TEMP}/semver-baseline/semver-rustdoc-${version}.tar.zst"
+
+      - name: Upload baseline rustdoc for the release attachment
+        uses: actions/upload-artifact@v4
+        with:
+          name: semver-rustdoc-baseline
+          path: ${{ runner.temp }}/semver-baseline/semver-rustdoc-*.tar.zst
+          if-no-files-found: error
+          retention-days: 7
+
+  attach_semver_baseline:
+    name: Attach semver baseline rustdoc to the GitHub release
+    if: >-
+      always() &&
+      needs.publish_github_release.result == 'success' &&
+      needs.publish_semver_baseline.result == 'success' &&
+      (startsWith(github.ref, 'refs/tags/v') ||
+       (github.event_name == 'workflow_dispatch' &&
+        github.event.inputs.publish_release_assets_only == 'true'))
+    needs: [publish_github_release, publish_semver_baseline]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    timeout-minutes: 10
+    steps:
+      - name: Download baseline rustdoc
+        uses: actions/download-artifact@v4
+        with:
+          name: semver-rustdoc-baseline
+          path: semver-baseline
 
       - name: Attach baseline rustdoc to the GitHub release
         shell: bash
@@ -2014,10 +2798,19 @@ jobs:
           RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag || github.ref_name }}
         run: |
           set -euo pipefail
+          asset="semver-rustdoc-${RELEASE_TAG#v}.tar.zst"
+          # Add-only, like every release upload: a baseline already attached
+          # (by the tag run, before an asset recovery of the same tag) stays
+          # as published, and a concurrent upload fails instead of replacing.
+          attached="$(gh release view "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" \
+            --json assets --jq '.assets[].name')"
+          if grep -Fxq -- "${asset}" <<<"${attached}"; then
+            echo "${asset} is already on ${RELEASE_TAG}; leaving it in place"
+            exit 0
+          fi
           gh release upload "${RELEASE_TAG}" \
             --repo "${GITHUB_REPOSITORY}" \
-            --clobber \
-            "${RUNNER_TEMP}/semver-rustdoc-${RELEASE_TAG#v}.tar.zst"
+            "semver-baseline/${asset}"
 
   # Registry publishing runs automatically on tag pushes alongside binary
   # builds. For recovery (e.g. npm was down during the tag-triggered run),
@@ -2054,9 +2847,11 @@ jobs:
 
       - uses: ./.github/actions/setup-rust-ci
 
-      - name: Cache cargo registry
-        uses: Swatinem/rust-cache@v2
-
+      # No cache: this job holds the crates.io, PyPI and npm tokens, and a
+      # restored cache (written by any earlier run on main, a dispatch
+      # included) could put a binary ahead of cargo or python on PATH. It
+      # packages without compiling (cargo publish --no-verify), so a cold
+      # registry costs only the index and source downloads.
       - name: Install Python + Node tooling
         uses: actions/setup-python@v5
         with:
@@ -2217,14 +3012,22 @@ jobs:
         github.event.inputs.publish_web_sdk_only == 'true' &&
         needs.release_semver_gate.result == 'skipped')) &&
       (needs.build_web_sdk_package.result == 'success' ||
+       needs.release_prebuild.outputs.run_id != '' ||
        (github.event_name == 'workflow_dispatch' &&
         github.event.inputs.web_sdk_artifact_run_id != '')) &&
       (startsWith(github.ref, 'refs/tags/v') ||
        (github.event_name == 'workflow_dispatch' &&
         github.event.inputs.publish_release_packages == 'true' &&
         github.event.inputs.alpha_crates_only != 'true'))
-    needs: [require_ci_green, release_validate_gate, release_semver_gate, build_web_sdk_package, registry_credentials_preflight]
+    # A tag publishes @rkat/web only after release validation and the semver
+    # gate passed, whether the package was built here or reused from a
+    # prebuild; only the Web-SDK-only recovery skips both gates.
+    needs: [require_ci_green, release_validate_gate, release_semver_gate, build_web_sdk_package, registry_credentials_preflight, release_prebuild]
     runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+      attestations: read
+      contents: read
     timeout-minutes: 15
     steps:
       - name: Checkout
@@ -2304,6 +3107,8 @@ jobs:
           path: web-sdk-package
           run-id: >-
             ${{
+              needs.release_prebuild.outputs.run_id != '' &&
+              needs.release_prebuild.outputs.run_id ||
               github.event_name == 'workflow_dispatch' &&
               github.event.inputs.web_sdk_artifact_run_id != '' &&
               github.event.inputs.web_sdk_artifact_run_id ||
@@ -2349,6 +3154,37 @@ jobs:
             exit 1
           fi
           echo "Web SDK package ${expected} built from ${head} (sha256 ${tarball_sha256})"
+
+      # A package from the tag commit's pre-tag prebuild must be attested by
+      # release.yml at exactly this commit on refs/heads/main (the prebuild
+      # ran there) and pack this release's version.
+      - name: Verify the prebuilt Web SDK package
+        if: ${{ needs.release_prebuild.outputs.run_id != '' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          packages=(web-sdk-package/rkat-web-*.tgz)
+          if [[ "${#packages[@]}" -ne 1 ]]; then
+            echo "expected exactly one prebuilt @rkat/web package, found ${#packages[@]}" >&2
+            exit 1
+          fi
+          release_sha="$(git rev-parse HEAD)"
+          gh attestation verify "${packages[0]}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --source-digest "${release_sha}" \
+            --source-ref refs/heads/main \
+            --signer-workflow "github.com/${GITHUB_REPOSITORY}/.github/workflows/release.yml" \
+            >/dev/null
+          expected="$(node -p "require('./sdks/web/package.json').version")"
+          packed="$(tar -xzOf "${packages[0]}" package/package.json | node -e 'let s = ""; process.stdin.on("data", (d) => (s += d)).on("end", () => console.log(JSON.parse(s).version))')"
+          if [[ "${packed}" != "${expected}" ]]; then
+            echo "prebuilt @rkat/web packs ${packed}, this release is ${expected}" >&2
+            exit 1
+          fi
+          echo "Verified prebuilt @rkat/web ${packed}: attested by release.yml at ${release_sha} on refs/heads/main"
 
       - name: Publish Web SDK
         env:

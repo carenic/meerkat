@@ -523,12 +523,23 @@ and cargo-deny sweep.
 The release tag path requires successful exact-main CI (schema-4 attestation)
 and then, while `MEERKAT_GCP_BUILDBUDDY_ENABLED` is `true`, runs the full
 BuildBuddy graph (`release_validate_buildbuddy_full`) as its validation gate;
-while it is off (the default) the tag validates with `release_validate_cargo`
-instead. Cargo validation is also the manual-dispatch fallback.
+while it is off (the default) the tag skips `release_validate_cargo` only when
+its verified attestation proves that exact-main run ran every lane the job
+repeats: the plan's `generated_contract` flag with a green `ratchets` job
+(main CI runs those ratchets only when its plan selects them) and a green
+`sdk-host` job (or a release-projection plan that reused a verified
+workspace-mode parent run for it). Any other attestation, legacy schemas
+included, keeps Cargo validation on the tag. Cargo validation is also the
+manual-dispatch fallback.
 The owner-selected BuildBuddy release backend (remote.buildbuddy.io) covers
-Linux/macOS binaries. Windows release binaries are cross-compiled with
-cargo-xwin (clang-cl, lld-link, the Windows SDK) on a GitHub-hosted Ubuntu
-runner and then executed for verification on a windows-latest runner.
+the critical Linux (x86_64, aarch64) and macOS arm64 binaries. The trailing
+platforms build in their own jobs on either backend: Windows release
+binaries are cross-compiled with cargo-xwin (clang-cl, lld-link, the Windows
+SDK) on a GitHub-hosted Ubuntu runner and then executed for verification on a
+windows-latest runner, and Intel macOS binaries are cross-compiled on an
+Apple silicon runner (macos-15). The critical archives publish as soon as
+their lane passes; the trailing ones are added afterwards, add-only, with the
+complete manifest and the Homebrew formula.
 
 **Release semver readiness** (`.github/workflows/release-semver-readiness.yml`)
 is a separate workflow triggered by `Cargo.toml`/`CHANGELOG.md` changes on
@@ -544,28 +555,32 @@ release semver gate; PR and manual artifacts are previews.
 
 | Job | Trigger | What it does |
 |-----|---------|-------------|
-| `require_ci_green` | Always | Requires successful exact-main CI for the release commit; tag runs also verify its retained exact-tree attestation (schema 4, backend `github-hosted-cargo`; legacy schemas accepted) and, for a `release-projection` attestation, re-verify the reused first-parent run and its attestation with the parent's copies of the scripts |
+| `require_ci_green` | Always | Requires successful exact-main CI for the release commit; tag runs also verify its retained exact-tree attestation (schema 4, backend `github-hosted-cargo`; legacy schemas accepted) and, for a `release-projection` attestation, re-verify the reused first-parent run and its attestation with the parent's copies of the scripts; a prebuild dispatch instead verifies its request (on main, no publishing or recovery input, tag not yet created) and waits for nothing |
 | `release_validate_buildbuddy_full` | Tag runs while `MEERKAT_GCP_BUILDBUDDY_ENABLED` is `true` | Runs the whole BuildBuddy/Bazel graph (`buildbuddy.yml`, `full-fresh`) on the release tree |
-| `release_validate_cargo` / `release_validate_buildbuddy` | Eligible manual dispatches; `release_validate_cargo` also on tags while the self-hosted graph is off | Validate release state through the selected lane; with the graph on, tag runs reuse exact-tree CI and skip both jobs |
-| `release_validate_gate` | Tags and full/package dispatches | On tags require exact-tree CI plus the full BuildBuddy graph (graph on) or `release_validate_cargo` (graph off); on manual dispatches accept the selected validation lane; Web-only and asset-only recovery skip it |
+| `release_validate_cargo` / `release_validate_buildbuddy` | Eligible manual dispatches; `release_validate_cargo` also on tags whose attestation does not prove its lanes ran, while the self-hosted graph is off | Validate release state through the selected lane; tag runs whose attestation covers those lanes (or with the graph on) reuse exact-tree CI and skip both jobs |
+| `release_validate_gate` | Tags and full/package dispatches | On tags require exact-tree CI plus the full BuildBuddy graph (graph on), or with the graph off pass on a verified attestation that covers the Cargo validation lanes (`release_validate_cargo` otherwise); on manual dispatches accept the selected validation lane; Web-only and asset-only recovery skip it |
 | `release_semver_gate` | Tags and full/package dispatches | After `require_ci_green`, verifies unexpired exact-tree, exact-version main-push readiness evidence on the normal tag/explicit-tag path; narrower manual measurement/recovery exceptions are described in the release guide |
-| `build_binaries` / `build_binaries_buildbuddy` / `build_binaries_windows_cross` / `verify_windows_binaries` / `build_binaries_gate` | Tags or manual asset recovery | The selected BuildBuddy or GitHub-hosted lane builds Linux/macOS (4 targets); `build_binaries_windows_cross` cross-compiles Windows from Linux with cargo-xwin and `verify_windows_binaries` runs the result on windows-latest; each target packages 4 binaries (`rkat`, `rkat-rpc`, `rkat-rest`, `rkat-mcp`); the gate requires the selected lanes plus both Windows jobs |
-| `build_web_sdk_package` | Tags or package/Web recovery without a reused artifact | After `require_ci_green`, beside the release validation and the semver gate, builds the `@rkat/web` package artifact and stamps it with its commit, package and tarball digest; Cargo runs four jobs while the tree's `scripts/release-web-sdk-rustc-wrapper` keeps the memory-heavy wasm32 crates off the catalog's rustc, or one job for a tree without a matching wrapper |
-| `publish_github_release` | Tags or manual asset recovery | Downloads artifacts, generates `checksums.sha256` + `index.json`, publishes or repairs the GitHub Release |
-| `update_homebrew` | After GitHub release or asset recovery | Updates the Homebrew tap formula |
-| `publish_semver_baseline` | After GitHub release or asset recovery | Generates rustdoc JSON for every publishable library crate on the release tag and attaches `semver-rustdoc-<version>.tar.zst`, the baseline the next release's semver gate compares against |
-| `publish_registries` | Tags or manual `publish_release_packages=true` | Publishes 46 Rust crates → crates.io, Python SDK → PyPI, TypeScript SDK → npm |
-| `publish_web_sdk` | Tags or manual package/Web recovery | After `require_ci_green`, `release_validate_gate` and `release_semver_gate` (both skipped only on Web-only recovery), the registry credential preflight and the build, checks the artifact's stamp against the release commit (and a reused artifact's source run), then publishes `@rkat/web` → npm |
+| `release_prebuild` | Tag runs | Finds a usable pre-tag prebuild of exactly the tag commit (`scripts/release-find-prebuild`: a `release.yml` dispatch on main at that commit whose `Release prebuild gate` passed, so its critical binaries and Web SDK package are ready while its trailing lanes may still run, and whose critical artifacts have not expired; a gate that has not concluded is waited for); when found, the build jobs below are skipped and the publishers use that run's artifacts |
+| `build_binaries` / `build_binaries_buildbuddy` / `build_binaries_critical_gate` | Tags without a prebuild, manual asset recovery, or a prebuild dispatch | The selected BuildBuddy or GitHub-hosted lane builds the critical platforms (Linux x86_64 and aarch64, macOS arm64); each target packages 4 binaries (`rkat`, `rkat-rpc`, `rkat-rest`, `rkat-mcp`); the critical gate requires the selected lane (or, when the archives come from a prebuild or `assets_run_id`, that every build job was skipped) |
+| `build_binaries_windows_cross` / `verify_windows_binaries` / `build_binaries_macos_x86_cross` / `build_binaries_gate` | Same | The trailing platforms on either backend: Windows cross-compiled from Linux with cargo-xwin and run on windows-latest, Intel macOS cross-compiled on Apple silicon (`macos-15`); the full gate requires the selected critical lane plus every trailing job |
+| `build_web_sdk_package` | Tags without a prebuild, package/Web recovery without a reused artifact, or a prebuild dispatch | After `require_ci_green`, beside the release validation and the semver gate, builds the `@rkat/web` package artifact, stamps it with its commit, package and tarball digest, and attests it; Cargo runs four jobs while the tree's `scripts/release-web-sdk-rustc-wrapper` keeps the memory-heavy wasm32 crates off the catalog's rustc, or one job for a tree without a matching wrapper |
+| `release_prebuild_gate` | Prebuild dispatches | Passes once the critical binary build gate and the Web SDK package succeeded (the run's trailing lanes continue); the marker `release_prebuild` requires of a prebuild run |
+| `publish_critical_release_assets` | Tags | As soon as the critical gate passes, verifies and publishes exactly the Linux and macOS arm64 archives (add-only, no manifest); waits for no trailing job |
+| `publish_github_release` | Tags or manual asset recovery | The trailing publisher: after exact-main CI (`require_ci_green`) and the full gate, downloads artifacts (a prebuild's once that run's full binary build gate passed, verified exactly like an `assets_run_id` recovery), adds the archives not yet on the release (never replacing one), then writes the complete `checksums.sha256` + `index.json` once (refusing to change a published one) |
+| `update_homebrew` | After the trailing publisher | Updates the Homebrew tap formula from the complete release's published checksums |
+| `publish_semver_baseline` / `attach_semver_baseline` | Tags or asset recovery, alongside publication | `publish_semver_baseline` generates rustdoc JSON for every publishable library crate on the release tag as soon as `require_ci_green` passes; `attach_semver_baseline` attaches it as `semver-rustdoc-<version>.tar.zst` once the GitHub release is published (add-only: a baseline already attached stays). It is the baseline the next release's semver gate compares against; no job waits for either |
+| `publish_registries` | Tags or manual `publish_release_packages=true` | Publishes 46 Rust crates → crates.io by dependency level (concurrently within a level), Python SDK → PyPI, TypeScript SDK → npm |
+| `publish_web_sdk` | Tags or manual package/Web recovery | After `require_ci_green`, `release_validate_gate` and `release_semver_gate` (both skipped only on Web-only recovery), the registry credential preflight and the build (or a found prebuild), checks the artifact's stamp against the release commit (and a reused artifact's source run), verifies a prebuild's package attestation and version, then publishes `@rkat/web` → npm |
 
 **Build matrix:**
 
-| Platform | Target |
-|----------|--------|
-| Linux x86_64 | `x86_64-unknown-linux-gnu` |
-| Linux ARM64 | `aarch64-unknown-linux-gnu` |
-| macOS ARM64 | `aarch64-apple-darwin` |
-| macOS x86_64 | `x86_64-apple-darwin` |
-| Windows x86_64 | `x86_64-pc-windows-msvc` |
+| Platform | Target | Publication |
+|----------|--------|-------------|
+| Linux x86_64 | `x86_64-unknown-linux-gnu` | critical |
+| Linux ARM64 | `aarch64-unknown-linux-gnu` | critical |
+| macOS ARM64 | `aarch64-apple-darwin` | critical |
+| macOS x86_64 | `x86_64-apple-darwin` | trailing (cross-compiled on Apple silicon) |
+| Windows x86_64 | `x86_64-pc-windows-msvc` | trailing (cross-compiled on Linux) |
 
 **Manual recovery through the release facade:**
 ```bash
@@ -584,6 +599,17 @@ VERSION=v0.8.24 make release-assets
 `make release-workflow` is the full release mode, not a recovery shortcut.
 Recovery modes run the current workflow definition from `main` while binding
 artifacts and package metadata to the selected existing tag.
+
+**Pre-tag prebuild** (`make release-prebuild VERSION=vX.Y.Z`, dry run with
+`RELEASE_WORKFLOW_DRY_RUN=true`): once the release commit is on `main`,
+dispatch `release.yml` with `prebuild_release_artifacts=true` on `main`. It
+builds, stamps, attests and uploads every release binary and the Web SDK
+package of that commit while CI and semver readiness run, and publishes
+nothing. The tag run of exactly that commit then skips every build and
+publishes those artifacts after the `assets_run_id` verification (each
+archive and its source stamp attested by `release.yml` at that commit on
+`refs/heads/main`, the run's binary build gate green, every binary embedding
+the release version); without a complete prebuild it builds as before.
 
 ### Pre-commit Hooks
 
@@ -604,7 +630,10 @@ Installed via `make install-hooks`. Two stages:
 - `scripts/pre-push-bridge-no-responsestatus.sh` (thin wrapper over `xtask bridge-classifier`)
 - `scripts/pre-push-bazel-locks.sh` (generated BUILD freshness, offline MODULE.bazel.lock recorded-input check, the release test-code gate `scripts/check-bazel-release-features.py` (every Bazel release build passes `--define=meerkat_release_build=1`, under which no target the shipped binaries link enables a feature from `scripts/non-shipping-features.json`), `bb mod deps --lockfile_mode=error` when the pinned CLI is present; `--require-bb` makes that last gate mandatory and the release preflight passes it)
 - `scripts/test-lock-consistency-gate.sh`, `scripts/test-bazel-module-lock-gate.sh`, `scripts/test-crate-enumeration-gate.sh`, `scripts/test-crate-license-files-gate.sh`, `scripts/test-release-test-code-guards.sh`, `scripts/test-release-doctor-workflow-contract.sh` (contract tests: each new release-infra gate must still fail on the defect it was written for; the last one also proves the release doctor's `release.yml` assertions survive rewording)
-- `scripts/test-gcp-buildbuddy-workflow-gate.sh` (plans nightly, release and `buildbuddy.yml` jobs with `MEERKAT_GCP_BUILDBUDDY_ENABLED` unset and `true`: unset starts nothing in GCP and tags validate with Cargo; `true` keeps the full-graph route)
+- `scripts/test-release-find-prebuild.sh` (stubbed `gh`, no network: the tag run's prebuild lookup selects only a prebuild of exactly the tag commit whose critical artifacts are ready, the newest one, waits for a gate that has not concluded within its budget, and fails instead of reading an API error as "no prebuild")
+- `scripts/test-check-macos-x86-release-binary.sh` (stubbed Apple tools: the Intel macOS cross-build check refuses a non-x86_64 binary, a wrong or failing `--version` under Rosetta, a non-system library and a too-new minimum macOS)
+- `scripts/test-verify-release-asset-provenance.sh` (stubbed `gh`: archives of an earlier run are accepted only through that run's named build gate, the full one by default and the critical one for a prebuild's critical archives, with stamps naming the tag commit)
+- `scripts/test-gcp-buildbuddy-workflow-gate.sh` (plans nightly, release and `buildbuddy.yml` jobs with `MEERKAT_GCP_BUILDBUDDY_ENABLED` unset and `true`: unset starts nothing in GCP and tags validate on an exact-tree CI attestation that covers the Cargo validation lanes, with Cargo otherwise; `true` keeps the full-graph route)
 - `scripts/test-gcp-buildbuddy-hardening.sh` (stubbed `gcloud`/`bb`, no network: the self-hosted control plane renders authenticated, TLS-only, executor-authorized config and installs exactly it; `ensure` creates only IAP/executor allows behind an explicit deny, never edits or re-enables a firewall rule, and refuses open, legacy, disabled or drifted rules, VMs, disks and digest-less images; executors get per-secret IAM and gRPCS only; the wrapper never sends an API key to a non-TLS endpoint, and the self-hosted path never uses the BuildBuddy Cloud key)
 - `scripts/pre-push-unit.sh` (deterministic Cargo/nextest gate: when fresh execution is needed, runs workspace unit, integration-fast, HeadCanonical cold-restart, and `e2e-fast` lanes; serializes identical source evidence and retries a timed-out lane once. `MEERKAT_BUILDBUDDY` does not switch this hook's backend)
 - `scripts/pre-push-prune-lanes.sh` (runs from the dispatcher only after a PASSED gate: keeps at most `MEERKAT_PRE_PUSH_KEEP_LANES` (default 2) `pre-push-<hash>` hook worktrees and Cargo target lanes per repo, never touching the current lane, a lane whose dispatcher lock is live, a lane referenced by any live process, a lane with any file activity inside `MEERKAT_PRE_PUSH_LANE_IDLE_SECS` (default 21600), or any non-lane name; logs one `kept:`/`pruned:` line per lane with its reason; `MEERKAT_PRE_PUSH_KEEP_LANES=all` disables it)
@@ -741,7 +770,10 @@ land the bump as its own commit on top (a bump-only PR or push): CI plans
 only the release checks and the readers of the changed files and reuses the
 rest of that run. A bump merged together with source changes, as v0.9.1's
 release branch merge was, or on a parent whose main run was not a
-whole-workspace run, gets the full plan. Keep
+whole-workspace run, gets the full plan. For the fast tag path, also dispatch
+`make release-prebuild VERSION=vX.Y.Z` as soon as the release commit is on
+`main` and push the tag once CI, readiness and the prebuild are green: the
+tag run then validates on the CI attestation and builds nothing. Keep
 version/changelog generation hook-owned; see the
 [release guide](docs/guides/cd-and-distribution.md#release-workflow) for the
 separate manual measurement and completed-measurement recovery paths.
@@ -785,6 +817,21 @@ Required GitHub Actions secrets for full release:
 
 The canonical publish order lives in `scripts/release-rust-crates.sh` (46 crates, dependency order):
 `meerkat-sqlite` → `meerkat-machine-derive` → `meerkat-machine-dsl-core` → `meerkat-agent-build-authority` → `meerkat-core` → `meerkat-sandbox` → `meerkat-authorization-contracts` → `meerkat-atif` → `meerkat-store-conformance` → `meerkat-models` → `meerkat-capabilities` → `meerkat-machine-dsl` → `meerkat-machine-schema` → `meerkat-authorization` → `meerkat-machine-kernels` → `meerkat-skills` → `meerkat-schedule` → `meerkat-jobs` → `meerkat-workgraph` → `meerkat-contracts` → `meerkat-store` → `meerkat-llm-core` → `meerkat-live` → `meerkat-auth-core` → `meerkat-memory` → `meerkat-mcp` → `meerkat-hooks` → `meerkat-comms` → `meerkat-runtime` → `meerkat-copilot` → `meerkat-anthropic` → `meerkat-openai` → `meerkat-gemini` → `meerkat-providers` → `meerkat-tools` → `meerkat-session` → `meerkat-client` → `meerkat` → `meerkat-mob` → `meerkat-mob-adaptive` → `meerkat-mob-mcp` → `meerkat-mob-pack` → `meerkat-mcp-server` → `meerkat-rpc` → `meerkat-rest` → `rkat`
+
+Publication walks the dependency levels derived from this order and
+`cargo metadata` (`scripts/release-rust-crates.sh --levels`, computed by
+`scripts/release_crate_levels.py`; `--format summary` prints them): every
+crate of a level publishes concurrently (`MEERKAT_CRATE_PUBLISH_JOBS`,
+default 6 for uploads, 1 for dry runs), and the next level starts only once
+the whole level is visible in the crates.io sparse index. The order stays the
+only hand-written enumeration; `make check-rust-release-config` fails when a
+release crate depends on one listed after it, and
+`scripts/test-release-publish-rust-crates.sh` (part of
+`make check-rust-release-packaging-contract`) proves the level order, the
+bounded overlap, the skip of a published version and the stop at the first
+failure.
+crates.io's own publish rate limit for new versions (a burst, then about one
+per minute) still bounds a full release.
 
 ### Key Rules for AI Agents
 
