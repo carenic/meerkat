@@ -75,10 +75,11 @@ them.
   connection-owned server such as `rkat-rpc` (an embedding host that
   installed the process-default callback channel keeps it held by that
   route), and the claim fills it for the mob's live members and later ones
-  alike. The claim is admitted like `mob/create`, and refused with `-32002`
-  (`data.reason`: `held_by_open_connection`) while the connection that holds
-  the route is open. When that connection closes, or before any claim, a
-  member's callback fails `tool_unavailable` with the
+  alike. The claim needs the console owner and the mob state's admission
+  (the host's create hook is not asked, since a claim creates nothing), and
+  is refused with `-32002` (`data.reason`: `held_by_open_connection`) while
+  the connection that holds the route is open. When that connection closes,
+  or before any claim, a member's callback fails `tool_unavailable` with the
   `CallbackRouteUnclaimed` reason ("no connected client holds the callback
   route that serves it") instead of reaching a closed route, and a detached
   callback call writes nothing durable. Once the holder has closed, the

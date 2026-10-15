@@ -2108,10 +2108,11 @@ struct MobCallbackRouteClaimRefusedData {
 /// to the calling connection's `route`, so the mob's live and future
 /// members call the callback tools that connection registered.
 ///
-/// Admitted like `mob/create`. A mob whose route no open connection holds
-/// (one restored after a restart, or one whose connection closed) is
-/// claimed; while another open connection holds it, the claim is refused
-/// with `-32002`.
+/// Needs the console owner and the mob state's admission; the host's create
+/// hook is not asked, since a claim creates nothing. A mob whose route no
+/// open connection holds (one restored after a restart, or one whose
+/// connection closed) is claimed; while another open connection holds it,
+/// the claim is refused with `-32002`.
 pub(crate) async fn handle_claim_callback_route(
     id: Option<RpcId>,
     params: Option<&RawValue>,
