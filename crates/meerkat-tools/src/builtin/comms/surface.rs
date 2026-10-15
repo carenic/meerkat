@@ -672,6 +672,58 @@ mod tests {
         );
     }
 
+    /// An embedder's wrapper that implements only `tools` and `dispatch`:
+    /// its plans carry no target, and it drops the dispatch context before
+    /// the comms owner.
+    struct ContextDroppingWrapper(Arc<dyn AgentToolDispatcher>);
+
+    #[async_trait]
+    impl AgentToolDispatcher for ContextDroppingWrapper {
+        fn tools(&self) -> Arc<[Arc<ToolDef>]> {
+            self.0.tools()
+        }
+
+        async fn dispatch(
+            &self,
+            call: ToolCallView<'_>,
+        ) -> Result<meerkat_core::ops::ToolDispatchOutcome, ToolError> {
+            self.0.dispatch(call).await
+        }
+    }
+
+    /// Governed work through a wrapper that drops the dispatch context
+    /// before the comms owner, which then could no longer check it, is
+    /// refused at the fenced dispatch: its plan carries no peer target.
+    #[tokio::test]
+    async fn governed_delivery_through_a_context_dropping_wrapper_is_refused() {
+        let (router, trusted_peers) = make_tool_context();
+        let wrapper: Arc<dyn AgentToolDispatcher> = Arc::new(ContextDroppingWrapper(Arc::new(
+            CommsToolSurface::new(router, trusted_peers),
+        )));
+        let governed = governed();
+        let args = send_args(meerkat_core::comms::PeerId::new());
+        let call = ToolCallView {
+            id: "send-1",
+            name: "send_message",
+            args: &args,
+        };
+        let plan = meerkat_core::agent::resolve_tool_execution_plan_fenced(
+            &wrapper,
+            call,
+            &governed,
+            &resolution(),
+        )
+        .expect("wrapper plan");
+        let result = meerkat_core::agent::dispatch_tool_execution_plan_fenced(
+            &wrapper, call, &governed, &plan,
+        )
+        .await;
+        assert!(
+            matches!(result, Err(ToolError::AuthorizationRefused { .. })),
+            "a governed delivery through a context-dropping wrapper must not run: {result:?}"
+        );
+    }
+
     #[tokio::test]
     async fn non_object_args_are_rejected_as_invalid_arguments() {
         let (router, trusted_peers) = make_tool_context();

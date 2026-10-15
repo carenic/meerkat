@@ -121,14 +121,17 @@ pub enum GrantTarget {
     /// to its mob's operator, carry no peer target and stay on the base
     /// lineage, which a peer's lineage neither widens nor narrows. A
     /// `send_response` addressee is the caller's assertion, not a verified
-    /// requester.
+    /// requester. Holds when every wrapper between the root and the owner
+    /// forwards plan resolution and resolved dispatch with its context; a
+    /// governed comms plan without the owner's target is refused.
     Peer { peer: meerkat_core::comms::PeerId },
     /// Reads of the session's own trusted-peer directory: the target of the
     /// owner-produced `PeerDirectoryRead`. Its lineage covers no delivery.
     PeerDirectory,
     /// Operations on exactly one memory scope, as its memory owner names
     /// it: the target of the owner-produced `MemoryOperation`. Each scope is
-    /// its own target; the base never covers a memory operation.
+    /// its own target; the base never covers a memory operation. Holds on
+    /// the same forwarding as `Peer`.
     Memory {
         scope: meerkat_core::memory::MemoryScopeRef,
     },

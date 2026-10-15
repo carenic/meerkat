@@ -59,7 +59,19 @@ them.
   cover), or with another one, is now refused with `authorization_refused`
   (malformed facts) before any delivery or memory read. Forward
   `resolve_execution_plan` and `dispatch_resolved_with_context` to the
-  owning dispatcher instead. Ungoverned dispatch is unchanged.
+  owning dispatcher instead. A context that carries work authorization
+  without its prepared check, or the reverse, is malformed for them (as for
+  `ToolDispatchContext::check_tool_authorization`), never ungoverned.
+  Ungoverned dispatch is unchanged.
+- Behaviour-only (not measured by the gate): under governed work the fenced
+  tool dispatch (`dispatch_tool_execution_plan_fenced`, which the agent
+  loop uses) refuses, before preparation, a plan for a tool whose root
+  catalog provenance is comms or memory that carries no owner-produced
+  operation target, with `authorization_refused` (malformed facts). Such a
+  plan comes from a wrapper that does not forward `resolve_execution_plan`
+  to the owner and may also drop the dispatch context, where the owner
+  could no longer check its target. This includes the deprecated
+  `SendTool` and `PeersTool` builtins (see Deprecated).
 - Behaviour-only (not measured by the gate): the comms dispatchers
   (`CommsToolSurface`, `CommsToolDispatcher`, `DynCommsToolDispatcher`) and
   `MemorySearchDispatcher` own their execution plans: their
@@ -156,7 +168,11 @@ them.
   each runs only when the prepared authorization names exactly that target,
   through the new `ToolDispatchContext::require_authorized_operation_target`
   (for any owner whose effect a typed target selects) and
-  `CommsExecutionAuthority::require_authorized_target`.
+  `CommsExecutionAuthority::require_authorized_target`. These guarantees
+  hold when every wrapper between the root dispatcher and the owner
+  forwards `resolve_execution_plan` and `dispatch_resolved_with_context`
+  with its context; the fenced dispatch refuses a governed comms or memory
+  plan that carries no owner target.
   `meerkat-authorization-contracts`: `GrantTarget` gains `Peer { peer }`,
   `PeerDirectory` and `Memory { scope }`, and `meerkat-authorization`'s
   `operation_grant_target` selects them on the normal targeted grant path:
