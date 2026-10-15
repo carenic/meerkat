@@ -43,6 +43,20 @@ them.
   (as after a release version bump, when no compiled unit can be reused)
   completes on a hosted 4-vCPU runner.
 
+### Fixed
+
+- `meerkat-mob-mcp`: a host can now release what it holds of a mob that
+  `MobMcpState` destroys before the destroy's storage cleanup runs. The new
+  `MobMcpState::set_after_destroy` installs a `MobAfterDestroy` hook that gets
+  the mob's id once its native destroy completed, before the storage cleanup
+  that destroy owes, and again before each retry of an outstanding cleanup.
+  A host that kept the read handle its `set_before_activation` hook received
+  had no such point: the handle kept the mob's database observer alive, so
+  the destroy answered `Incomplete` ("storage cleanup outstanding: the
+  observer drain refused: 3 owner handle(s) still observe this mob
+  database"), and the destroyed mob's database, file watch and threads stayed
+  while its id could not be reused.
+
 ## [0.9.1] - 2026-10-15
 
 ### Breaking

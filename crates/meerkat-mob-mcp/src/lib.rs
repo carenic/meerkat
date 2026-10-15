@@ -406,6 +406,8 @@ struct AdmittedDestroy {
     mobs: Arc<RwLock<BTreeMap<MobId, ManagedMob>>>,
     retired_mobs: Arc<std::sync::Mutex<BTreeMap<MobId, Arc<RetiredMob>>>>,
     mob_set_epoch: tokio::sync::watch::Sender<u64>,
+    /// The host's release hook, run once the native destroy completed.
+    after_destroy: Option<MobAfterDestroy>,
 }
 
 impl AdmittedDestroy {
@@ -426,6 +428,7 @@ impl AdmittedDestroy {
             mobs,
             retired_mobs,
             mob_set_epoch,
+            after_destroy,
         } = self;
         let destroy_result = bound.destroy().await;
         // The authority-bound clone retains the SQLite event bus. Release it
@@ -466,6 +469,12 @@ impl AdmittedDestroy {
             {
                 records.insert(mob_id.clone(), Arc::clone(&retired));
             }
+        }
+        // Destroyed natively and recorded: the host releases what it still
+        // holds of the mob before the storage cleanup drains its database
+        // observer.
+        if let Some(release) = &after_destroy {
+            release(&mob_id);
         }
         // Remove the managed entry only while it is still the destroyed mob:
         // a handle registered under the id while the destroy ran is another
@@ -795,6 +804,11 @@ pub enum DetachedCompletionDelivery {
     Unavailable,
 }
 
+/// Host release hook for the mobs a [`MobMcpState`] destroys: called with a
+/// destroyed mob's id once its native destroy completed, before the storage
+/// cleanup that destroy owes. See [`MobMcpState::set_after_destroy`].
+pub type MobAfterDestroy = Arc<dyn Fn(&MobId) + Send + Sync>;
+
 pub struct MobMcpState {
     session_service: Arc<dyn MobSessionService>,
     runtime_adapter: Option<Arc<meerkat_runtime::MeerkatMachine>>,
@@ -805,6 +819,9 @@ pub struct MobMcpState {
     /// Host selection of member destinations, inherited by every child mob.
     member_runtime_registration_hook: Option<Arc<dyn meerkat_mob::MemberRuntimeRegistrationHook>>,
     before_activation: std::sync::OnceLock<meerkat_mob::MobBeforeActivation>,
+    /// Host release hook for the mobs this state destroys; see
+    /// [`MobMcpState::set_after_destroy`].
+    after_destroy: std::sync::OnceLock<MobAfterDestroy>,
     /// Host bundles; only the child-available ones reach child mob builders.
     child_tool_bundles: ChildToolBundles,
     additional_child_tool_bundles: std::sync::OnceLock<ChildToolBundles>,
@@ -1007,6 +1024,7 @@ impl MobMcpState {
             external_tools_provider: None,
             member_runtime_registration_hook: None,
             before_activation: std::sync::OnceLock::new(),
+            after_destroy: std::sync::OnceLock::new(),
             child_tool_bundles: ChildToolBundles::default(),
             additional_child_tool_bundles: std::sync::OnceLock::new(),
             child_mcp_servers: std::sync::RwLock::new(ChildMcpServers::default()),
@@ -1485,12 +1503,18 @@ impl MobMcpState {
     }
 
     /// Continue the destroy recorded as `retired` for its own caller: settle
-    /// the storage cleanup it still owes and answer with its report.
+    /// the storage cleanup it still owes and answer with its report. A retry
+    /// of an outstanding cleanup runs the host's release hook again first.
     pub(crate) async fn continue_retired_destroy(
         &self,
         mob_id: &MobId,
         retired: &RetiredMob,
     ) -> Result<meerkat_mob::MobDestroyReport, MobMcpDestroyError> {
+        if retired.cleanup_owed()
+            && let Some(release) = self.after_destroy.get()
+        {
+            release(mob_id);
+        }
         Self::settle_retired_destroy(&self.mobs, mob_id, retired).await
     }
 
@@ -2256,6 +2280,23 @@ impl MobMcpState {
         self.before_activation
             .set(callback)
             .map_err(|_| MobError::Internal("before-activation callback already bound".into()))
+    }
+
+    /// Release host services bound to a mob this state destroys. Once a
+    /// destroy completed natively, the hook gets the mob's id before the
+    /// storage cleanup that destroy owes, and again before each retry of an
+    /// outstanding cleanup. A handle of the mob the host still holds then,
+    /// such as the read handle [`Self::set_before_activation`] handed it,
+    /// keeps that cleanup outstanding, so the host drops it here.
+    ///
+    /// By the time the hook runs, another mob may be managed under the same
+    /// id: release only what observes the destroyed mob, such as a handle
+    /// whose phase is `Destroyed`. The hook runs on the destroy's own task
+    /// and must not block. Install once before any destroy is admitted.
+    pub fn set_after_destroy(&self, hook: MobAfterDestroy) -> Result<(), MobError> {
+        self.after_destroy
+            .set(hook)
+            .map_err(|_| MobError::Internal("after-destroy hook already bound".into()))
     }
 
     /// Add provider-opened host bundles before child create/restore is admitted.
@@ -4175,6 +4216,7 @@ impl MobMcpState {
             mobs: Arc::clone(&self.mobs),
             retired_mobs: Arc::clone(&self.retired_mobs),
             mob_set_epoch: self.mob_set_epoch.clone(),
+            after_destroy: self.after_destroy.get().cloned(),
         };
         drop(managed);
         // The destroy is the state's own task, so its caller holds nothing of
@@ -16172,6 +16214,160 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&again).expect("report json"),
             canonical
+        );
+    }
+
+    /// A host binding, as an activation hook takes one: every mob that
+    /// activates leaves its read handle in the returned map.
+    fn bind_activated_mobs(
+        state: &MobMcpState,
+    ) -> Arc<std::sync::Mutex<BTreeMap<MobId, meerkat_mob::MobReadHandle>>> {
+        let bound = Arc::new(std::sync::Mutex::new(BTreeMap::new()));
+        let binder = Arc::clone(&bound);
+        let hook: meerkat_mob::MobBeforeActivation = Arc::new(move |handle| {
+            binder
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(handle.mob_id().clone(), handle);
+            Box::pin(async { Ok(()) })
+        });
+        state
+            .set_before_activation(hook)
+            .expect("bind the activation hook");
+        bound
+    }
+
+    /// The after-destroy hook gets the destroyed mob's id once the native
+    /// destroy completed (the host's read handle observes `Destroyed`) and
+    /// before the storage cleanup that destroy owes (the database is still
+    /// there). A host that drops the read handle there leaves nothing
+    /// outstanding: the destroy removes the mob's files.
+    #[tokio::test]
+    async fn an_after_destroy_hook_releases_a_host_binding_before_the_storage_cleanup() {
+        let svc = Arc::new(MockSessionSvc::new());
+        let root = tempfile::tempdir().expect("tempdir");
+        let state = persistent_destroy_state(&svc, root.path());
+        let bound = bind_activated_mobs(&state);
+        let released = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (releaser, seen) = (Arc::clone(&bound), Arc::clone(&released));
+        let storage_root = root.path().to_path_buf();
+        let hook: MobAfterDestroy = Arc::new(move |mob_id: &MobId| {
+            let handle = releaser
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(mob_id)
+                .expect("the host bound the mob it is told was destroyed");
+            seen.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push((
+                    mob_id.clone(),
+                    handle.status_observation_snapshot(),
+                    destroy_test_storage_path(&storage_root, mob_id).exists(),
+                ));
+        });
+        state
+            .set_after_destroy(hook)
+            .expect("bind the destroy hook");
+        assert!(
+            state.set_after_destroy(Arc::new(|_: &MobId| {})).is_err(),
+            "the destroy hook binds once"
+        );
+        let mob_id = state
+            .mob_create_definition(explicit_definition("released-binding-destroy"))
+            .await
+            .expect("create explicit mob");
+        let storage_path = destroy_test_storage_path(root.path(), &mob_id);
+        assert!(
+            bound
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains_key(&mob_id),
+            "the activation hook bound the mob"
+        );
+
+        let report = state
+            .mob_destroy(&mob_id)
+            .await
+            .expect("the released binding leaves no storage cleanup outstanding");
+        assert!(report.errors.is_empty(), "{report:?}");
+        assert_eq!(
+            *released
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            vec![(mob_id.clone(), meerkat_mob::MobState::Destroyed, true)],
+            "the hook ran once, after the native destroy and before the cleanup"
+        );
+        assert!(existing_storage_files(&storage_path).is_empty());
+    }
+
+    /// A host that still holds the mob when the after-destroy hook first
+    /// runs keeps the storage cleanup outstanding. The same caller's retry
+    /// runs the hook again before its own cleanup attempt, and once the host
+    /// releases there, the retry removes the mob's files.
+    #[tokio::test]
+    async fn a_destroy_cleanup_retry_runs_the_after_destroy_hook_again() {
+        let svc = Arc::new(MockSessionSvc::new());
+        let root = tempfile::tempdir().expect("tempdir");
+        let state = persistent_destroy_state(&svc, root.path());
+        let bound = bind_activated_mobs(&state);
+        let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (releaser, releasing, counted) =
+            (Arc::clone(&bound), Arc::clone(&release), Arc::clone(&calls));
+        let hook: MobAfterDestroy = Arc::new(move |mob_id: &MobId| {
+            counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if releasing.load(std::sync::atomic::Ordering::SeqCst) {
+                releaser
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(mob_id);
+            }
+        });
+        state
+            .set_after_destroy(hook)
+            .expect("bind the destroy hook");
+        let mob_id = state
+            .mob_create_definition(explicit_definition("held-binding-destroy"))
+            .await
+            .expect("create explicit mob");
+        let storage_path = destroy_test_storage_path(root.path(), &mob_id);
+
+        let incomplete = state
+            .mob_destroy(&mob_id)
+            .await
+            .expect_err("the host's held binding keeps the storage cleanup outstanding");
+        let MobMcpDestroyError::Incomplete { report } = incomplete else {
+            panic!("only the storage cleanup may be outstanding: {incomplete:?}");
+        };
+        assert!(
+            report.errors.iter().any(|error| {
+                error.starts_with("storage cleanup outstanding: ") && error.contains("owner handle")
+            }),
+            "{report:?}"
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(
+            tokio::fs::metadata(&storage_path).await.is_ok(),
+            "the held database is kept"
+        );
+
+        release.store(true, std::sync::atomic::Ordering::SeqCst);
+        let report = state
+            .mob_destroy(&mob_id)
+            .await
+            .expect("the retry releases the binding first and completes the cleanup");
+        assert!(report.errors.is_empty(), "{report:?}");
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the retry ran the hook again before its cleanup"
+        );
+        assert!(existing_storage_files(&storage_path).is_empty());
+        assert!(
+            bound
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty()
         );
     }
 
