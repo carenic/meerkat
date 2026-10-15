@@ -1,62 +1,43 @@
 #!/usr/bin/env node
+// Fail-closed release-projection classifier: does <head> differ from <base>
+// only by the version projection scripts/release-hook.sh writes for a
+// cargo-release version bump?
+//
+// Exit status: 0 projection only, 1 not a projection (or not provably one),
+// 2 classification error. One implementation serves the pre-push hooks
+// (scripts/pre-push-unit.sh, pre-push-ratchets.sh, pre-push-machines.sh) and
+// CI (scripts/ci-cargo-lanes.mjs and scripts/ci-release-evidence.mjs, which
+// the CI gate and the release workflow's require_ci_green run), so the hook
+// and CI accept exactly the same diffs.
+//
+// Every changed path must be a modification of a projection surface, and
+// every changed byte must be a version substitution:
+//   - Cargo.toml: [workspace.package] version and the versions of
+//     [workspace.dependencies] path entries;
+//   - Cargo.lock and standalone example locks (examples/<name>/Cargo.lock,
+//     refreshed by scripts/example-locks.py): versions of source-less (path)
+//     packages only;
+//   - the documentation the docs stamper (scripts/stamp-docs-contract-version.sh)
+//     owns: an old-version token may become the new version, every other
+//     byte stays identical, so historical mentions of either version are
+//     kept verbatim;
+//   - every other projection surface (SDK manifests and generated types,
+//     schemas, BUILD.bazel, ContractVersion::CURRENT): every occurrence of
+//     the old version becomes the new one;
+//   - CHANGELOG.md must carry the new release heading; MODULE.bazel.lock is
+//     proven by its own freshness gate.
 
 import { spawnSync } from "node:child_process";
+import { realpathSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 
-const args = process.argv.slice(2);
-let base = "";
-let head = "";
-let verbose = false;
+// CHANGELOG.md alone is over 1.6 MiB; spawnSync's 1 MiB default buffer made
+// `git show` fail on it.
+const GIT_MAX_BUFFER = 1024 * 1024 * 1024;
 
-for (let i = 0; i < args.length; i += 1) {
-  switch (args[i]) {
-    case "--base":
-      base = args[++i] ?? "";
-      break;
-    case "--head":
-      head = args[++i] ?? "";
-      break;
-    case "--verbose":
-      verbose = true;
-      break;
-    case "-h":
-    case "--help":
-      console.log("usage: release-projection-only.mjs --base <rev> --head <rev> [--verbose]");
-      process.exit(0);
-    default:
-      console.error(`unknown argument: ${args[i]}`);
-      process.exit(2);
-  }
-}
+export class ReleaseProjectionError extends Error {}
 
-if (!base || !head) {
-  console.error("error: --base and --head are required");
-  process.exit(2);
-}
-
-function gitText(gitArgs, { allowFailure = false } = {}) {
-  const result = spawnSync("git", gitArgs, { encoding: "utf8" });
-  if (result.status !== 0) {
-    if (allowFailure) return null;
-    const detail = result.stderr.trim();
-    console.error(`git ${gitArgs.join(" ")} failed${detail ? `: ${detail}` : ""}`);
-    process.exit(2);
-  }
-  return result.stdout;
-}
-
-function notProjection(reason) {
-  if (verbose) console.error(`not a release projection: ${reason}`);
-  process.exit(1);
-}
-
-function workspaceVersion(revision) {
-  const manifest = gitText(["show", `${revision}:Cargo.toml`], { allowFailure: true });
-  if (manifest === null) return null;
-  const section = manifest.match(/(?:^|\n)\[workspace\.package\]\s*\n([\s\S]*?)(?=\n\[|$)/);
-  if (!section) return null;
-  const version = section[1].match(/^version\s*=\s*"([^"]+)"\s*$/m);
-  return version?.[1] ?? null;
-}
+class NotProjection extends Error {}
 
 function escapeRegExp(value) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -140,11 +121,69 @@ function normalizeCargoLock(text, version) {
     .join("");
 }
 
+function isCargoLockPath(path) {
+  return path === "Cargo.lock" || /^examples\/[^/]+\/Cargo\.lock$/.test(path);
+}
+
+// The files scripts/stamp-docs-contract-version.sh rewrites: Markdown and
+// MDX under docs/ (never the independently released MobKit mirror or the
+// unpublished docs/internal notes), the README and the platform skill. Their
+// prose also names past and upcoming releases ("0.9.0 accepted only IP
+// literals", "since 0.9.1"), which the stamper leaves alone.
+function isStampedDocument(path) {
+  if (path === "README.md" || path === ".claude/skills/meerkat-platform/SKILL.md") return true;
+  return (
+    path.startsWith("docs/") &&
+    !path.startsWith("docs/mobkit/") &&
+    !path.startsWith("docs/internal/") &&
+    /\.mdx?$/.test(path)
+  );
+}
+
+// A version token: the version not inside a longer dotted number or a
+// prerelease/build-suffixed version ("10.9.0", "0.9.0.1", "0.9.0-rc.1").
+function versionTokenPattern(version) {
+  return new RegExp(
+    `(?<![0-9.])${escapeRegExp(version)}(?![0-9]|\\.[0-9]|[-+][0-9A-Za-z])`,
+    "g",
+  );
+}
+
+// True when `after` is `before` with some old-version tokens replaced by the
+// new version and every other byte identical. Each token of `before` admits
+// either version, so the alignment tracks every reachable offset in `after`
+// (one version may be a prefix of the other).
+export function isVersionTokenSubstitution(before, after, oldVersion, newVersion) {
+  const segments = [];
+  let last = 0;
+  for (const match of before.matchAll(versionTokenPattern(oldVersion))) {
+    segments.push(before.slice(last, match.index));
+    last = match.index + match[0].length;
+  }
+  segments.push(before.slice(last));
+  let offsets = new Set([0]);
+  for (let index = 0; index < segments.length; index += 1) {
+    const segment = segments[index];
+    const afterSegment = new Set();
+    for (const offset of offsets) {
+      if (after.startsWith(segment, offset)) afterSegment.add(offset + segment.length);
+    }
+    if (index === segments.length - 1) return afterSegment.has(after.length);
+    offsets = new Set();
+    for (const offset of afterSegment) {
+      if (after.startsWith(oldVersion, offset)) offsets.add(offset + oldVersion.length);
+      if (after.startsWith(newVersion, offset)) offsets.add(offset + newVersion.length);
+    }
+    if (offsets.size === 0) return false;
+  }
+  return false;
+}
+
 function normalizeProjection(path, text, version, parts) {
   let normalized;
   if (path === "Cargo.toml") {
     normalized = normalizeCargoManifest(text, version);
-  } else if (path === "Cargo.lock") {
+  } else if (isCargoLockPath(path)) {
     normalized = normalizeCargoLock(text, version);
   } else {
     normalized = text.split(version).join("@@MEERKAT_RELEASE_VERSION@@");
@@ -159,7 +198,7 @@ function normalizeProjection(path, text, version, parts) {
 function isProjectedPath(path) {
   return (
     path === "Cargo.toml" ||
-    path === "Cargo.lock" ||
+    isCargoLockPath(path) ||
     path === "README.md" ||
     path === ".claude/skills/meerkat-platform/SKILL.md" ||
     path === "crates/meerkat-contracts/src/version.rs" ||
@@ -177,68 +216,161 @@ function isProjectedPath(path) {
   );
 }
 
-if (
-  spawnSync("git", ["merge-base", "--is-ancestor", base, head], {
-    stdio: "ignore",
-  }).status !== 0
-) {
-  notProjection("base is not an ancestor of head");
+function projectionMatches(path, before, after, versions) {
+  const { oldVersion, newVersion, oldParts, newParts } = versions;
+  if (isStampedDocument(path)) {
+    // Struct-form contract versions in docs are always restamped; dotted
+    // versions are aligned token by token.
+    return isVersionTokenSubstitution(
+      normalizeStructuredContractVersion(before, oldParts),
+      normalizeStructuredContractVersion(after, newParts),
+      oldVersion,
+      newVersion,
+    );
+  }
+  return (
+    normalizeProjection(path, before, oldVersion, oldParts) ===
+    normalizeProjection(path, after, newVersion, newParts)
+  );
 }
 
-const oldVersion = workspaceVersion(base);
-const newVersion = workspaceVersion(head);
-const oldParts = oldVersion ? versionParts(oldVersion) : null;
-const newParts = newVersion ? versionParts(newVersion) : null;
-if (!oldVersion || !newVersion || !oldParts || !newParts) {
-  notProjection("workspace package version is missing or not semantic");
-}
-if (oldVersion === newVersion) {
-  notProjection("workspace package version did not change");
-}
-
-const statusText = gitText(["diff", "--name-status", "--diff-filter=ACDMRT", base, head, "--"]);
-const changes = statusText
-  .trim()
-  .split("\n")
-  .filter(Boolean)
-  .map((line) => {
-    const fields = line.split("\t");
-    return { status: fields[0], path: fields.at(-1) };
-  });
-
-if (changes.length === 0) notProjection("no tracked files changed");
-if (!changes.some(({ path }) => path === "Cargo.toml")) {
-  notProjection("Cargo.toml did not change");
-}
-if (!changes.some(({ path }) => path === "CHANGELOG.md")) {
-  notProjection("CHANGELOG.md did not change");
+function makeGit(cwd) {
+  const run = (gitArgs, { allowFailure = false } = {}) => {
+    const result = spawnSync("git", gitArgs, { cwd, encoding: "utf8", maxBuffer: GIT_MAX_BUFFER });
+    if (result.status !== 0) {
+      if (allowFailure) return null;
+      const detail = (result.stderr ?? "").trim() || result.error?.message || "";
+      throw new ReleaseProjectionError(`git ${gitArgs.join(" ")} failed${detail ? `: ${detail}` : ""}`);
+    }
+    return result.stdout;
+  };
+  const succeeds = (gitArgs) => spawnSync("git", gitArgs, { cwd, stdio: "ignore" }).status === 0;
+  return { run, succeeds };
 }
 
-for (const { status, path } of changes) {
-  if (status !== "M") notProjection(`${path} has non-modification status ${status}`);
-  if (path === "CHANGELOG.md") continue;
-  // MODULE.bazel.lock embeds content hashes for Cargo.toml, Cargo.lock, and
-  // generated repository data. Its dedicated freshness gate proves the whole
-  // lock against the candidate tree, so it is intentionally not normalized
-  // here.
-  if (path === "MODULE.bazel.lock") continue;
-  if (!isProjectedPath(path)) notProjection(`${path} is not a release projection surface`);
+function workspaceVersion(git, revision) {
+  const manifest = git.run(["show", `${revision}:Cargo.toml`], { allowFailure: true });
+  if (manifest === null) return null;
+  const section = manifest.match(/(?:^|\n)\[workspace\.package\]\s*\n([\s\S]*?)(?=\n\[|$)/);
+  if (!section) return null;
+  const version = section[1].match(/^version\s*=\s*"([^"]+)"\s*$/m);
+  return version?.[1] ?? null;
+}
 
-  const before = gitText(["show", `${base}:${path}`], { allowFailure: true });
-  const after = gitText(["show", `${head}:${path}`], { allowFailure: true });
-  if (before === null || after === null) notProjection(`${path} is not present at both revisions`);
-  const normalizedBefore = normalizeProjection(path, before, oldVersion, oldParts);
-  const normalizedAfter = normalizeProjection(path, after, newVersion, newParts);
-  if (normalizedBefore !== normalizedAfter) {
-    notProjection(`${path} contains changes beyond the version projection`);
+// Classify base..head. Returns { projection: true, oldVersion, newVersion,
+// paths } for a release projection, { projection: false, reason } otherwise;
+// throws ReleaseProjectionError when git cannot answer.
+export function classifyReleaseProjection({ base, head, cwd = process.cwd() }) {
+  if (!base || !head) throw new ReleaseProjectionError("base and head revisions are required");
+  const git = makeGit(cwd);
+  const notProjection = (reason) => {
+    throw new NotProjection(reason);
+  };
+  try {
+    if (!git.succeeds(["merge-base", "--is-ancestor", base, head])) {
+      notProjection("base is not an ancestor of head");
+    }
+
+    const oldVersion = workspaceVersion(git, base);
+    const newVersion = workspaceVersion(git, head);
+    const oldParts = oldVersion ? versionParts(oldVersion) : null;
+    const newParts = newVersion ? versionParts(newVersion) : null;
+    if (!oldVersion || !newVersion || !oldParts || !newParts) {
+      notProjection("workspace package version is missing or not semantic");
+    }
+    if (oldVersion === newVersion) {
+      notProjection("workspace package version did not change");
+    }
+    const versions = { oldVersion, newVersion, oldParts, newParts };
+
+    const statusText = git.run(["diff", "--no-renames", "--name-status", "-z", base, head, "--"]);
+    const fields = statusText.split("\0");
+    const changes = [];
+    for (let index = 0; index + 1 < fields.length; index += 2) {
+      changes.push({ status: fields[index], path: fields[index + 1] });
+    }
+
+    if (changes.length === 0) notProjection("no tracked files changed");
+    if (!changes.some(({ path }) => path === "Cargo.toml")) {
+      notProjection("Cargo.toml did not change");
+    }
+    if (!changes.some(({ path }) => path === "CHANGELOG.md")) {
+      notProjection("CHANGELOG.md did not change");
+    }
+
+    for (const { status, path } of changes) {
+      if (status !== "M") notProjection(`${path} has non-modification status ${status}`);
+      if (path === "CHANGELOG.md") continue;
+      // MODULE.bazel.lock embeds content hashes for Cargo.toml, Cargo.lock, and
+      // generated repository data. Its dedicated freshness gate proves the whole
+      // lock against the candidate tree, so it is intentionally not normalized
+      // here.
+      if (path === "MODULE.bazel.lock") continue;
+      if (!isProjectedPath(path)) notProjection(`${path} is not a release projection surface`);
+
+      const before = git.run(["show", `${base}:${path}`], { allowFailure: true });
+      const after = git.run(["show", `${head}:${path}`], { allowFailure: true });
+      if (before === null || after === null) notProjection(`${path} is not present at both revisions`);
+      if (!projectionMatches(path, before, after, versions)) {
+        notProjection(`${path} contains changes beyond the version projection`);
+      }
+    }
+
+    const changelog = git.run(["show", `${head}:CHANGELOG.md`]);
+    if (!changelog.includes(`## [${newVersion}]`)) {
+      notProjection(`CHANGELOG.md does not contain a ${newVersion} release heading`);
+    }
+    return { projection: true, oldVersion, newVersion, paths: changes.map(({ path }) => path) };
+  } catch (error) {
+    if (error instanceof NotProjection) return { projection: false, reason: error.message };
+    throw error;
   }
 }
 
-const changelog = gitText(["show", `${head}:CHANGELOG.md`]);
-if (!changelog.includes(`## [${newVersion}]`)) {
-  notProjection(`CHANGELOG.md does not contain a ${newVersion} release heading`);
+function main(argv) {
+  let base = "";
+  let head = "";
+  let verbose = false;
+  for (let i = 0; i < argv.length; i += 1) {
+    switch (argv[i]) {
+      case "--base":
+        base = argv[++i] ?? "";
+        break;
+      case "--head":
+        head = argv[++i] ?? "";
+        break;
+      case "--verbose":
+        verbose = true;
+        break;
+      case "-h":
+      case "--help":
+        console.log("usage: release-projection-only.mjs --base <rev> --head <rev> [--verbose]");
+        return 0;
+      default:
+        console.error(`unknown argument: ${argv[i]}`);
+        return 2;
+    }
+  }
+  if (!base || !head) {
+    console.error("error: --base and --head are required");
+    return 2;
+  }
+  let result;
+  try {
+    result = classifyReleaseProjection({ base, head });
+  } catch (error) {
+    console.error(error?.message ?? String(error));
+    return 2;
+  }
+  if (!result.projection) {
+    if (verbose) console.error(`not a release projection: ${result.reason}`);
+    return 1;
+  }
+  if (verbose) console.log(`release projection only: ${result.oldVersion} -> ${result.newVersion}`);
+  return 0;
 }
 
-if (verbose) {
-  console.log(`release projection only: ${oldVersion} -> ${newVersion}`);
+const invokedPath = process.argv[1] ? realpathSync(process.argv[1]) : "";
+if (invokedPath === realpathSync(fileURLToPath(import.meta.url))) {
+  process.exit(main(process.argv.slice(2)));
 }
