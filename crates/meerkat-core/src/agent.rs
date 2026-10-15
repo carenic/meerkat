@@ -1475,8 +1475,8 @@ impl ToolDispatchContext {
     /// when every wrapper between the root dispatcher and the owner forwards
     /// `resolve_execution_plan` and `dispatch_resolved_with_context` with
     /// its context. The fenced dispatch refuses a governed comms or memory
-    /// plan that carries no owner target, which a wrapper that does not
-    /// forward the owner's plan resolution produces.
+    /// plan that carries no target of its owner's kind, which a wrapper that
+    /// does not forward the owner's plan resolution produces.
     ///
     /// # Errors
     /// Governed work authorized for another call, another target or none,
@@ -2372,43 +2372,59 @@ fn validate_fenced_root_dispatch<T: AgentToolDispatcher + ?Sized + 'static>(
     Ok(())
 }
 
-/// Under governed work, a comms or memory tool's plan must carry its
-/// owner's typed operation target. Those owners attach one to every plan
+/// Under governed work, a comms or memory tool's plan must carry targets of
+/// its owner's kind only: a peer delivery or the peer directory for comms,
+/// a memory operation for memory. Those owners attach one to every plan
 /// they resolve and require it again at their leaf, which they can do only
 /// when every wrapper forwards the dispatch context to them. A plan without
 /// one was resolved by a wrapper that did not forward the owner's plan
-/// resolution, and that wrapper may drop the context too, so the plan is
-/// refused here, before preparation and before any wrapper runs. The source
-/// kind is the root catalog entry's own provenance for the call.
+/// resolution (another owner's target, such as the one a registered bundle
+/// attaches to a plan that names none, does not stand in for it), and that
+/// wrapper may drop the context too, so the plan is refused here, before
+/// preparation and before any wrapper runs. The source kind is the root
+/// catalog entry's own provenance for the call.
 fn require_owner_target_for_targeted_sources<T: AgentToolDispatcher + ?Sized>(
     dispatcher: &T,
     call: ToolCallView<'_>,
     plan: &crate::ResolvedToolExecutionPlan,
 ) -> Result<(), crate::error::ToolError> {
-    let targeted_source = dispatcher
-        .tool_catalog()
+    let catalog = dispatcher.tool_catalog();
+    let Some(provenance) = catalog
         .iter()
         .find(|entry| entry.tool.name == call.name)
         .and_then(|entry| entry.tool.provenance.as_ref())
-        .is_some_and(|provenance| {
+    else {
+        return Ok(());
+    };
+    let owners_kind: fn(&crate::ToolOperationTarget) -> bool = match &provenance.kind {
+        crate::types::ToolSourceKind::Comms => |target| {
             matches!(
-                provenance.kind,
-                crate::types::ToolSourceKind::Comms | crate::types::ToolSourceKind::Memory
+                target,
+                crate::ToolOperationTarget::PeerSend { .. }
+                    | crate::ToolOperationTarget::PeerDirectoryRead
             )
-        });
-    let carries_owner_target = plan
+        },
+        crate::types::ToolSourceKind::Memory => {
+            |target| matches!(target, crate::ToolOperationTarget::MemoryOperation { .. })
+        }
+        _ => return Ok(()),
+    };
+    let mut targets = plan
         .owner_witnesses()
         .iter()
-        .any(|witness| witness.operation_target().is_some());
-    if targeted_source && !carries_owner_target {
-        return Err(governed_malformed());
+        .filter_map(crate::ToolExecutionOwnerWitness::operation_target)
+        .peekable();
+    let carries_its_owners_target = targets.peek().is_some() && targets.all(owners_kind);
+    if carries_its_owners_target {
+        Ok(())
+    } else {
+        Err(governed_malformed())
     }
-    Ok(())
 }
 
 /// Dispatch a plan only through the exact root allocation and exact canonical
 /// call identity used during resolution. Under governed work a comms or
-/// memory plan without its owner's typed target is refused first (see
+/// memory plan without a target of its owner's kind is refused first (see
 /// [`ToolDispatchContext::require_authorized_operation_target`]).
 pub async fn dispatch_tool_execution_plan_fenced<T: AgentToolDispatcher + ?Sized + 'static>(
     dispatcher: &Arc<T>,
@@ -5671,8 +5687,8 @@ mod governed_operation_tests {
         }
     }
 
-    async fn fenced(
-        dispatcher: &Arc<SourceKindDispatcher>,
+    async fn fenced<T: AgentToolDispatcher + ?Sized + 'static>(
+        dispatcher: &Arc<T>,
         name: &str,
         context: &ToolDispatchContext,
     ) -> Result<crate::ops::ToolDispatchOutcome, crate::ToolError> {
@@ -5727,6 +5743,34 @@ mod governed_operation_tests {
             .expect("a builtin keeps its target-less plan");
         assert!(!outcome.result.is_error);
         assert_eq!(dispatcher.0.load(Ordering::SeqCst), 3);
+    }
+
+    /// A registered bundle attaches its own operation target to a plan that
+    /// names none, which does not stand in for a comms or memory owner's
+    /// target: a bundle whose dispatcher wraps such a tool without
+    /// forwarding its plan resolution (and may drop the context before it)
+    /// is refused at the fenced dispatch, while the bundle's builtin
+    /// dispatches under the bundle's target.
+    #[tokio::test]
+    async fn a_bundle_target_does_not_stand_in_for_a_comms_or_memory_owner_target() {
+        let inner = Arc::new(SourceKindDispatcher::default());
+        let bundle = Arc::new(crate::RegisteredToolBundleDispatcher::new(
+            "host-bundle",
+            Arc::clone(&inner) as Arc<dyn AgentToolDispatcher>,
+        ));
+        let governed =
+            ToolDispatchContext::default().with_work_authorization(Some(governed_work()));
+        for name in ["send_message", "memory_search"] {
+            let refused = fenced(&bundle, name, &governed).await;
+            assert!(is_malformed(&refused), "{name}: {refused:?}");
+        }
+        assert_eq!(inner.0.load(Ordering::SeqCst), 0, "no body ran");
+
+        let outcome = fenced(&bundle, "read_file", &governed)
+            .await
+            .expect("a builtin under the bundle's own target");
+        assert!(!outcome.result.is_error);
+        assert_eq!(inner.0.load(Ordering::SeqCst), 1);
     }
 
     /// A leaf's target requirement reads the context as the authorization
