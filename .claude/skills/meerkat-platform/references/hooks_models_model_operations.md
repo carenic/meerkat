@@ -246,7 +246,7 @@ initial_delay = "500ms"
 max_delay = "30s"
 multiplier = 2.0
 # call_timeout = "10m"                # omitted: model default; "disabled": none
-# stream_inactivity_timeout = "120s"  # omitted: 300s; "disabled": off
+# stream_inactivity_timeout = "120s"  # omitted: model window, else 300s; "disabled": off
 ```
 
 - Retried: rate limits, network and call timeouts, stalled streams, overload
@@ -267,8 +267,13 @@ multiplier = 2.0
   300s, Sonnet, `claude-haiku-5-5` and Gemini Flash 120s, Haiku 4.5 60s, most
   OpenAI models and `gemini-3.1-pro-preview` 600s, `gemini-4-argon` 900s;
   custom models: `[models.<id>] call_timeout_secs`). No per-request setting.
-- Stream watchdog: a stream silent for the window (default 300s) is aborted as
-  a retryable stall. The compaction summary call has none of these guards.
+- Stream watchdog: a stream silent for the window is aborted as a retryable
+  stall. The window is `[retry] stream_inactivity_timeout`, else the model's
+  own (`gemini-4-argon` 900s, `gpt-5.5-pro` 7200s; self-hosted models:
+  `[self_hosted.models.<id>] stream_inactivity_timeout_secs`, at least 60),
+  else 300s. It is resolved for each call, so a model switch or fallback uses
+  the new model's window. The compaction summary call has none of these
+  guards.
 - Tools: `[tools] default_timeout = "10m"`; per tool `[tools.tool_timeouts]
   shell = { secs = 120, nanos = 0 }` (not humantime). A timed-out tool returns
     a `timeout` error result and the run goes on. Since 0.9.1 a call that hits

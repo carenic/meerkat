@@ -407,9 +407,12 @@ surface, not the old live-adapter/docs-refresh snapshot:
   declarations; `rkat storage doctor|migrate|prune` offline verbs; the
   published `meerkat-store-conformance` harness. See the Storage architecture
   section above.
-- The stream-inactivity watchdog (`[retry] stream_inactivity_timeout`) defaults
-  to 300s for clients reporting a monotonic raw-event count through
-  `stream_activity_count()`; `"disabled"` opts out. Stalls surface as retryable
+- The stream-inactivity watchdog (`[retry] stream_inactivity_timeout`) covers
+  clients reporting a monotonic raw-event count through
+  `stream_activity_count()`; `"disabled"` opts out. An explicit window applies
+  to every model; omitted, each call uses the current model's own window
+  (`gemini-4-argon` 900s, `gpt-5.5-pro` 7200s, a self-hosted model's
+  `stream_inactivity_timeout_secs`), else 300s. Stalls surface as retryable
   `StreamStalled`. A custom client returning the default `None` has no
   inactivity watchdog, only any configured hard call/turn deadlines.
 - `ToolAccessPolicy::ReadOnly` is a call-level, name-independent policy: only
@@ -1322,18 +1325,26 @@ wedging it forever. Config is the tri-state `[retry] stream_inactivity_timeout`:
 
 ```toml
 [retry]
-stream_inactivity_timeout = "120s"       # explicit window
+stream_inactivity_timeout = "120s"       # explicit window, every model
 # stream_inactivity_timeout = "disabled" # opt out
-# omitted = the built-in default window (300s) — ON by default
+# omitted = the model's own window, else 300s; ON by default
 ```
+
+The window is resolved for each model call, so a model switch or fallback
+uses the new model's window. The catalog sets one where a provider documents
+long silent responses (`gemini-4-argon` 900s, `gpt-5.5-pro` 7200s); a
+self-hosted model can set `stream_inactivity_timeout_secs` in
+`[self_hosted.models.<id>]` (at least 60, for a long prefill, for example).
+Custom `[models.<id>]` entries have no window of their own.
 
 The client must implement `AgentLlmClient::stream_activity_count()` with a
 monotonic count advanced for every raw provider event, including non-visible
 events. Unlike `call_timeout` (which caps the whole call), the watchdog resets
 on that activity, so long streams that keep producing are unaffected. A silent
-liveness-reporting call exceeding five minutes is aborted and retried by
-default. A custom client returning the default `None` has no inactivity
-watchdog; only any configured hard call/turn deadlines remain.
+liveness-reporting call is aborted and retried by default once its window
+passes (five minutes for most models). A custom client returning the default
+`None` has no inactivity watchdog; only any configured hard call/turn
+deadlines remain.
 
 ### Mid-session model hot-swap
 
