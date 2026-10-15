@@ -116,9 +116,17 @@ them.
 - `meerkat_core::HostLaunchExemption`: the typed list of the processes a
   stock host runs as itself, outside its OS process confinement (the Git
   skill source, the credential command, the browser opener, `stty` and
-  `wasm-pack`), each with its reason and a `command` constructor, and
-  `meerkat_core::confinement::program_routes`, the files a launch of a
-  program could execute.
+  `wasm-pack`), each with its reason and one fixed-program constructor
+  (`git`, `credential_command`, `browser_opener`, `terminal_control`,
+  `wasm_pack`), and `meerkat_core::confinement::program_routes`, the files
+  a launch of a program could execute. Each constructor launches with a
+  `PATH` cleaned by `meerkat_core::confinement::trusted_search_path`, which
+  drops relative directories and the directories an `UntrustedPathFn`
+  judgement does not trust.
+- `meerkat::open_system_browser_trusting` opens a URL with the platform
+  browser opener under a host's `UntrustedPathFn`, and
+  `CommandCredentialRunner::with_untrusted_paths` runs a credential command
+  under one.
 - `ResolverEnvironment::with_host_launch_guard` (a `HostLaunchGuard`) makes
   credential resolution refuse a credential command a confined process could
   change.
@@ -128,9 +136,9 @@ them.
   `StdioSkillOutput`, the default `TrustedHostStdioSkillRunner` and
   `StdioExternalClient::with_runner`) is the launch seam of stdio skill
   sources.
-- `FilesystemSkillSource::with_untrusted_targets` and
-  `GitSkillSource::with_untrusted_targets` judge a linked skill where its
-  link leads.
+- `FilesystemSkillSource::with_untrusted_targets` judges a linked skill
+  where its link leads, and `GitSkillSource::with_untrusted_paths` runs
+  `git` from a `PATH` without the directories a host does not trust.
 - `McpServerRefusal::reported_name`: the name a session reports a refused
   server under.
 - `SdkConfigStore::with_realm_document` builds a realm document store that
@@ -208,14 +216,12 @@ them.
 - A credential command (an auth profile's `source = { kind = "command" }`)
   runs as the host, outside its confinement; on a host that confines every
   launch kind it is now refused, before it runs, when a confined process
-  could change its program (or a `PATH` directory a bare name is searched
-  in) or its working directory, on every resolution path (sessions, `rkat
-  auth test`/`refresh`, `rkat doctor`, REST `POST /auth/bindings/{id}/test`).
+  could change its program, the interpreter its `#!` line names by path, or
+  its working directory, on every resolution path (sessions, `rkat auth
+  test`/`refresh`, `rkat doctor`, REST `POST /auth/bindings/{id}/test`).
   Before, a confined process could replace the program and have the host
-  run it unconfined with the host's credentials. A Git skill repository is
-  likewise not loaded when a confined process could change the `git`
-  program. The processes a host runs as itself are now a typed, tested list
-  (`HostLaunchExemption`).
+  run it unconfined with the host's credentials. The processes a host runs
+  as itself are now a typed, tested list (`HostLaunchExemption`).
 - A symbolic link no longer carries a confined process past a trusted input:
   a skill linked out of a trusted skills directory (or out of a Git
   checkout) to a path a confined process could change is not loaded, and a
@@ -255,6 +261,19 @@ them.
   project skills directory. In 0.9.1 neither was checked, so a confined
   process could plant credentials the host then used, or skills whose
   instructions reached the model.
+- The programs a host runs as itself, outside its confinement (the browser
+  opener of `rkat run --browser`, `rkat mcp login` and provider OAuth
+  login, `stty`, `wasm-pack` for `rkat doctor`, a credential command and
+  `git`), and every program they start by name (an interpreter named
+  through `env`, a wrapper's helpers, `ssh` or `git-lfs` under Git), run
+  from a `PATH` without relative directories and without the directories a
+  confined process could change. `rkat` opens a browser with the platform
+  opener (`xdg-open`, `/usr/bin/open`, the system `rundll32.exe`) instead of
+  the `webbrowser` crate, and runs `stty` by absolute path. Before, with a
+  directory a confined process can write on `PATH` (an activated virtual
+  environment, `node_modules/.bin`, a relative entry), a confined process
+  could plant a program there, such as `xdg-open`, that the host then ran
+  unconfined.
 
 ## [0.9.1] - 2026-10-15
 

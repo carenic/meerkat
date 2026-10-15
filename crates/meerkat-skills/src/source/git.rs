@@ -79,7 +79,7 @@ pub struct GitSkillSource {
     checkout_dir: PathBuf,
     cache: Arc<RwLock<RemoteCache>>,
     failure_streak: Arc<RwLock<u32>>,
-    untrusted_targets: Option<crate::UntrustedPaths>,
+    untrusted: Option<crate::UntrustedPaths>,
 }
 
 impl GitSkillSource {
@@ -99,16 +99,18 @@ impl GitSkillSource {
             checkout_dir,
             cache: Arc::new(RwLock::new(RemoteCache::default())),
             failure_streak: Arc::new(RwLock::new(0)),
-            untrusted_targets: None,
+            untrusted: None,
         }
     }
 
-    /// Judge each skill a link leads out of the checkout where the link
-    /// leads: one at a path `untrusted` names is not read, so a repository
-    /// cannot hand a confined process the skill it links to.
+    /// Run `git`, and every program it starts by name (`ssh`, `git-lfs`, a
+    /// credential helper), from a `PATH` without relative directories or the
+    /// directories `untrusted` names
+    /// ([`meerkat_core::HostLaunchExemption::git`]), so none is a program a
+    /// confined process put there.
     #[must_use]
-    pub fn with_untrusted_targets(mut self, untrusted: crate::UntrustedPaths) -> Self {
-        self.untrusted_targets = Some(untrusted);
+    pub fn with_untrusted_paths(mut self, untrusted: crate::UntrustedPaths) -> Self {
+        self.untrusted = Some(untrusted);
         self
     }
 
@@ -221,7 +223,7 @@ impl GitSkillSource {
         let mut documents = std::collections::BTreeMap::new();
         let mut quarantined = Vec::new();
         for skill_dir in discover_skill_directories(&root) {
-            if let Some(untrusted) = &self.untrusted_targets
+            if let Some(untrusted) = &self.untrusted
                 && (super::leads_out_to_untrusted(&self.checkout_dir, &skill_dir, true, untrusted)
                     || super::leads_out_to_untrusted(
                         &self.checkout_dir,
@@ -302,7 +304,7 @@ impl GitSkillSource {
             }
             _ => None,
         };
-        run_command("git", args, cwd, ssh_command.as_deref())
+        run_git_command(args, cwd, ssh_command.as_deref(), self.untrusted.as_deref())
     }
 
     fn authenticated_url(&self) -> String {
@@ -363,15 +365,17 @@ impl SkillSource for GitSkillSource {
     }
 }
 
-fn run_command(
-    program: &str,
+fn run_git_command(
     args: &[&str],
     cwd: Option<&Path>,
     git_ssh_command: Option<&str>,
+    untrusted: Option<&meerkat_core::confinement::UntrustedPathFn>,
 ) -> Result<(), SkillError> {
-    // A host launch exemption: git runs as the host. Resolution refuses a
-    // repository whose git program or cache a confined process could change.
-    let mut command = meerkat_core::HostLaunchExemption::GitSkillSource.command(program);
+    // A host launch exemption: git runs as the host, it and every program it
+    // starts by name from a `PATH` without the directories a confined process
+    // could change. Resolution refuses a repository whose skill cache such a
+    // process could change.
+    let mut command = meerkat_core::HostLaunchExemption::git(untrusted);
     command.args(args);
     if let Some(cwd) = cwd {
         command.current_dir(cwd);

@@ -260,21 +260,28 @@ stderr is discarded. Environment names starting `LD_`, `DYLD_`, `_RLD_`,
 Every process a stock host starts runs under its launch kind's confinement
 except these, which it runs as itself (`meerkat_core::HostLaunchExemption`):
 
-- Git skill source (`git`): fetches with the host's Git credentials and
-  network; a repository is not loaded when a confined process could change
-  the `git` program (or a `PATH` directory searched first) or the skill
-  cache.
-- Credential command (auth profile `source = { kind = "command" }`):
-  produces the host's provider credentials; refused before it runs
+- Git skill source (`HostLaunchExemption::git`): fetches with the host's
+  Git credentials and network; a repository is not loaded when a confined
+  process could change the skill cache.
+- Credential command (auth profile `source = { kind = "command" }`,
+  `HostLaunchExemption::credential_command`): produces the host's provider
+  credentials; it is refused before it runs
   (`ProviderAuthError::HostLaunchRefused`) when a confined process could
-  change its program (or a `PATH` directory a bare name is searched in) or
-  its working directory (the host's own when it names none).
-- Browser opener (`open`, `xdg-open`, `rundll32`; the CLI's HTML artifact
-  opener): must reach the user's desktop session; only the platform opener
-  runs, with the URL as one argument.
-- `stty`: host terminal control (hiding a client secret typed at `rkat`).
-- `wasm-pack`: developer build tooling (`rkat doctor`); no model or
-  configuration reaches it.
+  change its program, the interpreter its `#!` line names by path, or its
+  working directory (the host's own when it names none).
+- Browser opener (`HostLaunchExemption::browser_opener`: `/usr/bin/open`,
+  `xdg-open`, the system `rundll32.exe`; OAuth logins and the CLI's HTML
+  artifact): must reach the user's desktop session; the URL is one argument.
+- `stty` by absolute path (`HostLaunchExemption::terminal_control`): host
+  terminal control (hiding a client secret typed at `rkat`).
+- `wasm-pack` (`HostLaunchExemption::wasm_pack`): developer build tooling
+  (`rkat doctor`).
+
+Each runs, with every program it starts by name (an interpreter named
+through `env`, `ssh` or `git-lfs` under Git, the programs a browser opener
+tries), from a `PATH` without relative directories and, under a confining
+host, without the directories a confined process could change
+(`meerkat_core::confinement::trusted_search_path`).
 
 A source test fails on any process launch in shipped code that is neither
 confined nor in this list.

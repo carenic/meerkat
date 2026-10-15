@@ -898,3 +898,54 @@ async fn preflight_command(
         .await
         .map_err(|error| error.to_string())
 }
+
+/// A credential command runs as the host with a `PATH` from which every
+/// directory a confined process could change is gone, so an interpreter or
+/// helper it starts by name (here through `#!/usr/bin/env`) is never one a
+/// confined process planted, even when its configured `PATH` names one.
+#[cfg(all(unix, feature = "openai"))]
+#[tokio::test]
+async fn a_credential_command_never_runs_an_interpreter_planted_on_its_path() {
+    use std::collections::BTreeMap;
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let base = temp.path().canonicalize().unwrap();
+    let writable = base.join("writable");
+    let trusted = base.join("trusted");
+    for dir in [&writable, &trusted] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    let planted_ran = base.join("planted-interpreter-ran");
+    let interpreter = writable.join("meerkat-test-interpreter");
+    std::fs::write(
+        &interpreter,
+        format!(
+            "#!/bin/sh\nprintf ran > '{}'\nprintf sk-from-planted\n",
+            planted_ran.display()
+        ),
+    )
+    .unwrap();
+    let helper = trusted.join("helper");
+    std::fs::write(&helper, "#!/usr/bin/env meerkat-test-interpreter\n").unwrap();
+    for program in [&interpreter, &helper] {
+        std::fs::set_permissions(program, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let result = preflight_command(
+        &base,
+        &writing_host(&writable),
+        helper,
+        Vec::new(),
+        Some(trusted.clone()),
+        BTreeMap::from([(
+            "PATH".to_string(),
+            format!("{}:/usr/bin:/bin", writable.display()),
+        )]),
+    )
+    .await;
+    assert!(
+        !planted_ran.exists(),
+        "the planted interpreter never ran: {result:?}"
+    );
+}

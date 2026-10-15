@@ -727,15 +727,23 @@ as its parent.
 ### Launches outside confinement
 
 Every process a stock host starts runs under its launch kind's confinement
-except these, which the host runs as itself (`HostLaunchExemption`):
+except these, which the host runs as itself (`HostLaunchExemption`, one
+constructor per program):
 
 | Launch | Why it runs as the host |
 |---|---|
-| `git` for a Git skill repository | It fetches with the host's own Git credentials and network. A repository is not loaded when a confined process could change the `git` program (including a `PATH` directory searched before it) or the skill cache. |
-| A credential command (an auth profile's `source = { kind = "command" }`) | It produces the host's own provider credentials, which no confined process may read. It is refused before it runs when a confined process could change its program (including a `PATH` directory a bare name is searched in) or its working directory (the host's own when it names none). |
-| The browser opener (`open`, `xdg-open` or `rundll32`, and the CLI's HTML artifact opener) | It shows an OAuth authorization page or an HTML artifact in the user's desktop session, which a confined process cannot reach. It runs only the platform opener, with the URL as one argument. |
-| `stty` | Host terminal control: `rkat` hides a client secret typed at its own terminal. |
-| `wasm-pack` | Developer build tooling: `rkat doctor` reports its version. No model or configuration reaches it. |
+| `git` for a Git skill repository | It fetches with the host's own Git credentials and network. A repository is not loaded when a confined process could change the skill cache. |
+| A credential command (an auth profile's `source = { kind = "command" }`) | It produces the host's own provider credentials, which no confined process may read. It is refused before it runs when a confined process could change its program, the interpreter its `#!` line names by path, or its working directory (the host's own when it names none). |
+| The browser opener (`/usr/bin/open` on macOS, `xdg-open` on Linux, the system `rundll32.exe` on Windows) | It shows an OAuth authorization page or an HTML artifact in the user's desktop session, which a confined process cannot reach. The URL is one argument. |
+| `stty`, by absolute path (`/bin/stty`, else `/usr/bin/stty`) | Host terminal control: `rkat` hides a client secret typed at its own terminal. |
+| `wasm-pack` | Developer build tooling: `rkat doctor` reports its version. |
+
+Each of these runs, with every program it starts by name (an interpreter
+named through `env`, `ssh` or `git-lfs` under Git, the programs a browser
+opener tries), from a `PATH` without relative directories and, under a host
+that confines its agents' launches, without the directories a confined
+process could change. None of them is a program a confined process put on
+the `PATH`.
 
 A test of the source enumerates every process launch in shipped code and
 fails on one that is neither confined nor in this list.

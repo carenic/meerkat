@@ -23,10 +23,23 @@ enum Launch {
     TrustedHostBranch(ConfinementLaunchKind),
     /// A host launch exemption: the host runs the program as itself.
     Exempt(HostLaunchExemption),
-    /// The command constructor of every exemption
-    /// ([`HostLaunchExemption::command`]); each use is listed as its own
+    /// The command every exemption's fixed-program constructor builds (with
+    /// its cleaned `PATH`); each constructor use is listed as its own
     /// exemption.
     ExemptionConstructor,
+}
+
+/// Each exemption's fixed-program constructor
+/// (`HostLaunchExemption::<constructor>(`).
+fn constructor(exemption: HostLaunchExemption) -> &'static str {
+    match exemption {
+        HostLaunchExemption::GitSkillSource => "git",
+        HostLaunchExemption::CredentialHelper => "credential_command",
+        HostLaunchExemption::BrowserOpener => "browser_opener",
+        HostLaunchExemption::TerminalControl => "terminal_control",
+        HostLaunchExemption::DeveloperBuildTooling => "wasm_pack",
+        other => panic!("{other:?} has no constructor listed here"),
+    }
 }
 
 /// Expressions that start a process.
@@ -45,36 +58,30 @@ const LAUNCH_PATTERNS: &[&str] = &[
 
 /// Every launch site in shipped code: the file, the expression, how many
 /// times the file has it, and how it starts its process. Exempt launches
-/// that build a `Command` name their exemption in code
-/// (`HostLaunchExemption::<exemption>.command(`).
+/// name their exemption's fixed-program constructor in code
+/// (`HostLaunchExemption::<constructor>(`).
 const SITES: &[(&str, &str, usize, Launch)] = &[
     (
         "crates/meerkat-auth-core/src/auth_store/command.rs",
-        "HostLaunchExemption::CredentialHelper.command(",
+        "HostLaunchExemption::credential_command(",
         1,
         Launch::Exempt(HostLaunchExemption::CredentialHelper),
     ),
     (
         "crates/meerkat-auth-core/src/mcp_oauth.rs",
-        "HostLaunchExemption::BrowserOpener.command(",
-        3,
+        "HostLaunchExemption::browser_opener(",
+        2,
         Launch::Exempt(HostLaunchExemption::BrowserOpener),
     ),
     (
         "crates/meerkat-cli/src/main.rs",
-        "webbrowser::open",
-        1,
-        Launch::Exempt(HostLaunchExemption::BrowserOpener),
-    ),
-    (
-        "crates/meerkat-cli/src/main.rs",
-        "HostLaunchExemption::TerminalControl.command(",
+        "HostLaunchExemption::terminal_control(",
         2,
         Launch::Exempt(HostLaunchExemption::TerminalControl),
     ),
     (
         "crates/meerkat-cli/src/main.rs",
-        "HostLaunchExemption::DeveloperBuildTooling.command(",
+        "HostLaunchExemption::wasm_pack(",
         1,
         Launch::Exempt(HostLaunchExemption::DeveloperBuildTooling),
     ),
@@ -86,7 +93,7 @@ const SITES: &[(&str, &str, usize, Launch)] = &[
     ),
     (
         "crates/meerkat-skills/src/source/git.rs",
-        "HostLaunchExemption::GitSkillSource.command(",
+        "HostLaunchExemption::git(",
         1,
         Launch::Exempt(HostLaunchExemption::GitSkillSource),
     ),
@@ -425,7 +432,7 @@ fn identifier_continues(chars: &[char], index: usize) -> bool {
 }
 
 /// Every launch expression in `code` with its count: each launch pattern,
-/// and each `HostLaunchExemption::<exemption>.command(`.
+/// and each exemption's `HostLaunchExemption::<constructor>(`.
 fn launches(code: &str) -> BTreeMap<String, usize> {
     let mut found = BTreeMap::new();
     for pattern in LAUNCH_PATTERNS {
@@ -436,7 +443,7 @@ fn launches(code: &str) -> BTreeMap<String, usize> {
     }
     let compact: String = code.chars().filter(|c| !c.is_whitespace()).collect();
     for exemption in HostLaunchExemption::ALL {
-        let expression = format!("HostLaunchExemption::{exemption:?}.command(");
+        let expression = format!("HostLaunchExemption::{}(", constructor(exemption));
         let count = compact.matches(&expression).count();
         if count > 0 {
             found.insert(expression, count);
@@ -514,8 +521,8 @@ fn every_host_launch_exemption_is_in_use_and_named_where_it_launches() {
         {
             assert_eq!(
                 *expression,
-                format!("HostLaunchExemption::{exemption:?}.command("),
-                "{file}: the site names its own exemption"
+                format!("HostLaunchExemption::{}(", constructor(*exemption)),
+                "{file}: the site names its own exemption's constructor"
             );
         }
     }
@@ -533,7 +540,7 @@ mod tests { fn t() { let _ = std::process::Command::new("test"); } }
 #[cfg(all(unix, test))]
 fn gated() { let _ = std::process::Command::new("gated"); }
 #[cfg(not(test))]
-fn not_test() { let _ = HostLaunchExemption::BrowserOpener.command("open"); }
+fn not_test() { let _ = HostLaunchExemption::browser_opener("https://example.invalid", None); }
 #[tokio::test]
 async fn async_test() { let _ = std::process::Command::new("async test"); }
 fn lifetime<'a>(value: &'a str) -> &'a str { value }
@@ -542,7 +549,7 @@ fn lifetime<'a>(value: &'a str) -> &'a str { value }
     assert_eq!(found.get("Command::new("), Some(&1), "{found:?}");
     assert_eq!(found.get("webbrowser::open"), None, "{found:?}");
     assert_eq!(
-        found.get("HostLaunchExemption::BrowserOpener.command("),
+        found.get("HostLaunchExemption::browser_opener("),
         Some(&1),
         "{found:?}"
     );

@@ -235,10 +235,14 @@ pub enum ConfinementRefusal {
 /// A process a stock host launches as itself, outside the OS process
 /// confinement it applies to the processes its agents launch (the
 /// `[confinement]` launch kinds). Each runs a program the host or its
-/// operator chose, for a reason no confinement serves. The host refuses a
-/// Git skill source or credential command launch that a confined process
-/// could redirect: one whose program ([`program_routes`]), working directory
-/// or cache that process could change.
+/// operator chose, for a reason no confinement serves, through its own
+/// fixed-program constructor. Under a host that confines its launches, each
+/// runs (and every program it starts by name: an interpreter named through
+/// `env`, `ssh` under Git, the programs a browser opener tries) from a
+/// `PATH` without relative directories or directories a confined process
+/// could change ([`trusted_search_path`]); the host also refuses a Git
+/// skill source or credential command whose cache, program, interpreter or
+/// working directory that process could change.
 ///
 /// Every other process a stock host starts runs under its launch kind's
 /// confinement.
@@ -251,12 +255,12 @@ pub enum HostLaunchExemption {
     /// A configured credential command (an auth profile's
     /// `source = { kind = "command" }`) producing a provider credential.
     CredentialHelper,
-    /// The platform browser opener (`open`, `xdg-open` or `rundll32`), and
-    /// the CLI's opener for an HTML artifact, showing a URL in the user's
-    /// desktop session.
+    /// The platform browser opener (`/usr/bin/open`, `xdg-open` or
+    /// `rundll32`) showing a URL, an OAuth authorization page or an HTML
+    /// artifact, in the user's desktop session.
     BrowserOpener,
-    /// `stty`, which the CLI runs on its own terminal to hide a secret typed
-    /// at it.
+    /// `stty` by absolute path (`/bin/stty`, else `/usr/bin/stty`), which
+    /// the CLI runs on its own terminal to hide a secret typed at it.
     TerminalControl,
     /// `wasm-pack`, whose version `rkat doctor` reports.
     DeveloperBuildTooling,
@@ -289,35 +293,165 @@ impl HostLaunchExemption {
     pub const fn reason(self) -> &'static str {
         match self {
             Self::GitSkillSource => {
-                "it fetches with the host's own Git credentials and network; it is refused when a \
-                 confined process could change the git program or the skill cache"
+                "it fetches with the host's own Git credentials and network; a skill cache a \
+                 confined process could change refuses the repository"
             }
             Self::CredentialHelper => {
                 "it produces the host's own provider credentials, which no confined process may \
-                 read; it is refused when a confined process could change its program or its \
-                 working directory"
+                 read; it is refused when a confined process could change its program, the \
+                 interpreter its #! line names, or its working directory"
             }
             Self::BrowserOpener => {
                 "it shows a URL in the user's desktop session, which a confined process cannot \
-                 reach; it runs only the platform opener, with the URL as one argument"
+                 reach; the platform opener gets the URL as one argument"
             }
             Self::TerminalControl => {
-                "host terminal control: it sets the mode of the terminal the operator runs the \
-                 CLI on"
+                "host terminal control: stty, by absolute path, sets the mode of the terminal \
+                 the operator runs the CLI on"
             }
             Self::DeveloperBuildTooling => {
-                "developer build tooling an operator command runs; no model or configuration \
-                 reaches it"
+                "developer build tooling: rkat doctor reports the version of wasm-pack"
             }
         }
     }
 
-    /// A command for `program` that this exemption runs as the host,
-    /// outside every confinement.
+    /// `git`, for a Git skill source.
     #[cfg(not(target_arch = "wasm32"))]
     #[must_use]
-    pub fn command(self, program: impl AsRef<std::ffi::OsStr>) -> std::process::Command {
-        std::process::Command::new(program)
+    pub fn git(untrusted: Option<&UntrustedPathFn>) -> std::process::Command {
+        Self::GitSkillSource.launch("git", untrusted)
+    }
+
+    /// A configured credential command's `program`.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[must_use]
+    pub fn credential_command(
+        program: &Path,
+        untrusted: Option<&UntrustedPathFn>,
+    ) -> std::process::Command {
+        Self::CredentialHelper.launch(program, untrusted)
+    }
+
+    /// The platform browser opener showing `url`, as one argument:
+    /// `/usr/bin/open` on macOS, the system `rundll32.exe
+    /// url.dll,FileProtocolHandler` on Windows, `xdg-open` elsewhere.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[must_use]
+    pub fn browser_opener(url: &str, untrusted: Option<&UntrustedPathFn>) -> std::process::Command {
+        Self::browser_opener_in(url, std::env::var_os("PATH").as_deref(), untrusted)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn browser_opener_in(
+        url: &str,
+        search_path: Option<&std::ffi::OsStr>,
+        untrusted: Option<&UntrustedPathFn>,
+    ) -> std::process::Command {
+        #[cfg(target_os = "macos")]
+        let mut command = Self::BrowserOpener.launch_in("/usr/bin/open", search_path, untrusted);
+        #[cfg(target_os = "windows")]
+        let mut command = {
+            let program = std::env::var_os("SystemRoot").map_or_else(
+                || PathBuf::from("rundll32"),
+                |root| PathBuf::from(root).join("System32").join("rundll32.exe"),
+            );
+            let mut command = Self::BrowserOpener.launch_in(program, search_path, untrusted);
+            command.arg("url.dll,FileProtocolHandler");
+            command
+        };
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        let mut command = Self::BrowserOpener.launch_in("xdg-open", search_path, untrusted);
+        command.arg(url);
+        command
+    }
+
+    /// `stty` by absolute path (`/bin/stty`, else `/usr/bin/stty`): no
+    /// `PATH` lookup finds it, and it starts no program of its own.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[must_use]
+    pub fn terminal_control() -> std::process::Command {
+        let program = ["/bin/stty", "/usr/bin/stty"]
+            .into_iter()
+            .find(|program| Path::new(program).is_file())
+            .unwrap_or("/bin/stty");
+        Self::TerminalControl.launch(program, None)
+    }
+
+    /// `wasm-pack`.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[must_use]
+    pub fn wasm_pack(untrusted: Option<&UntrustedPathFn>) -> std::process::Command {
+        Self::DeveloperBuildTooling.launch("wasm-pack", untrusted)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn launch(
+        self,
+        program: impl AsRef<std::ffi::OsStr>,
+        untrusted: Option<&UntrustedPathFn>,
+    ) -> std::process::Command {
+        self.launch_in(program, std::env::var_os("PATH").as_deref(), untrusted)
+    }
+
+    /// The command of this exemption for `program`, found and running with
+    /// `search_path` as its `PATH`, cleaned by [`trusted_search_path`]: its
+    /// relative directories are always dropped, and the directories
+    /// `untrusted` names when the host names what it does not trust.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn launch_in(
+        self,
+        program: impl AsRef<std::ffi::OsStr>,
+        search_path: Option<&std::ffi::OsStr>,
+        untrusted: Option<&UntrustedPathFn>,
+    ) -> std::process::Command {
+        let _ = self;
+        let mut command = std::process::Command::new(program);
+        if let Some(search_path) = search_path {
+            apply_trusted_search_path(&mut command, search_path, untrusted);
+        }
+        command
+    }
+}
+
+/// Whether a confined process could change what the host reads at a path
+/// (`true`: anything under it as well): the judgement a host launch
+/// exemption takes its `PATH`, program and working directory by.
+pub type UntrustedPathFn = dyn Fn(&Path, bool) -> bool + Send + Sync;
+
+/// `search_path` (a `PATH` value) without its relative entries and without
+/// each directory `untrusted` names as a whole, so that a program,
+/// interpreter or helper a host launch exemption (or a process it starts)
+/// finds by name is one no confined process could put there.
+#[cfg(not(target_arch = "wasm32"))]
+#[must_use]
+pub fn trusted_search_path(
+    search_path: &std::ffi::OsStr,
+    untrusted: &UntrustedPathFn,
+) -> std::ffi::OsString {
+    let kept: Vec<PathBuf> = std::env::split_paths(search_path)
+        .filter(|directory| directory.is_absolute() && !untrusted(directory, true))
+        .collect();
+    std::env::join_paths(kept).unwrap_or_default()
+}
+
+/// Give `command` the `PATH` `search_path` cleaned by
+/// [`trusted_search_path`] of its relative directories and of the
+/// directories `untrusted` names (none: only relative ones). When no
+/// directory is left `PATH` is removed, so the platform's default system
+/// directories apply: an empty `PATH` reads as the working directory on
+/// some platforms.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn apply_trusted_search_path(
+    command: &mut std::process::Command,
+    search_path: &std::ffi::OsStr,
+    untrusted: Option<&UntrustedPathFn>,
+) {
+    let trust_all = |_: &Path, _: bool| false;
+    let cleaned = trusted_search_path(search_path, untrusted.unwrap_or(&trust_all));
+    if cleaned.is_empty() {
+        command.env_remove("PATH");
+    } else {
+        command.env("PATH", cleaned);
     }
 }
 
@@ -619,5 +753,76 @@ mod tests {
             assert!(!exemption.reason().is_empty());
             assert!(!exemption.to_string().is_empty());
         }
+    }
+
+    /// A host launch exemption's `PATH` keeps only absolute directories the
+    /// host trusts as a whole.
+    #[cfg(unix)]
+    #[test]
+    fn the_trusted_search_path_drops_relative_and_untrusted_directories() {
+        let search_path =
+            std::env::join_paths(["/usr/bin", "bin", "/work/node_modules/.bin", "", "/bin"])
+                .unwrap();
+        let untrusted = |path: &Path, subtree: bool| subtree && path.starts_with("/work");
+        assert_eq!(
+            trusted_search_path(&search_path, &untrusted),
+            std::env::join_paths(["/usr/bin", "/bin"]).unwrap()
+        );
+    }
+
+    /// A program planted in a directory a confined process can write, ahead
+    /// of the trusted one on the host's `PATH`, never runs: the exemption
+    /// (here the browser opener) finds the trusted program, and a program
+    /// only the untrusted directory holds is not found at all.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_program_planted_on_the_path_is_not_run() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().canonicalize().unwrap();
+        let writable = base.join("writable");
+        let trusted = base.join("trusted");
+        let mut markers = Vec::new();
+        for (dir, name) in [
+            (&writable, "xdg-open"),
+            (&trusted, "xdg-open"),
+            (&writable, "only-planted"),
+        ] {
+            std::fs::create_dir_all(dir).unwrap();
+            let marker = base.join(format!(
+                "{}-{name}",
+                dir.file_name().unwrap().to_string_lossy()
+            ));
+            let program = dir.join(name);
+            std::fs::write(
+                &program,
+                format!("#!/bin/sh\nprintf ran > '{}'\n", marker.display()),
+            )
+            .unwrap();
+            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+            markers.push(marker);
+        }
+        let search_path = std::env::join_paths([&writable, &trusted]).unwrap();
+        let untrusted = move |path: &Path, _: bool| path.starts_with(&writable);
+
+        let status = HostLaunchExemption::browser_opener_in(
+            "https://example.invalid/authorize",
+            Some(&search_path),
+            Some(&untrusted),
+        )
+        .status()
+        .unwrap();
+        assert!(status.success());
+        assert!(!markers[0].exists(), "the planted opener never ran");
+        assert!(markers[1].exists(), "the trusted opener ran");
+
+        assert!(
+            HostLaunchExemption::GitSkillSource
+                .launch_in("only-planted", Some(&search_path), Some(&untrusted))
+                .status()
+                .is_err(),
+            "a program only an untrusted directory holds is not found"
+        );
+        assert!(!markers[2].exists());
     }
 }

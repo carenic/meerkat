@@ -690,32 +690,37 @@ pub enum McpOAuthBrowserLaunch {
 /// Open `url` in the system browser without logging it.
 ///
 /// The URL is passed as one process argument (no shell) to the platform
-/// opener (`open`, `xdg-open`, or `rundll32 url.dll,FileProtocolHandler`),
-/// whose output is discarded. Nothing here logs the command line, so the
-/// authorize URL and state never reach `log` or `tracing` records.
+/// opener (`/usr/bin/open`, `xdg-open`, or the system `rundll32.exe
+/// url.dll,FileProtocolHandler`), whose output is discarded, run from a
+/// `PATH` without relative directories
+/// ([`meerkat_core::HostLaunchExemption::browser_opener`]). Nothing here
+/// logs the command line, so the authorize URL and state never reach `log`
+/// or `tracing` records. A host that confines its agents' launches opens
+/// with [`open_system_browser_trusting`].
 pub fn open_system_browser(url: &str) -> std::io::Result<()> {
-    use meerkat_core::HostLaunchExemption;
-    use std::process::Stdio;
     // A host launch exemption: the opener must reach the user's desktop
     // session, which a confined process cannot.
-    #[cfg(target_os = "macos")]
-    let mut command = {
-        let mut command = HostLaunchExemption::BrowserOpener.command("open");
-        command.arg(url);
-        command
-    };
-    #[cfg(target_os = "windows")]
-    let mut command = {
-        let mut command = HostLaunchExemption::BrowserOpener.command("rundll32");
-        command.arg("url.dll,FileProtocolHandler").arg(url);
-        command
-    };
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    let mut command = {
-        let mut command = HostLaunchExemption::BrowserOpener.command("xdg-open");
-        command.arg(url);
-        command
-    };
+    run_browser_opener(meerkat_core::HostLaunchExemption::browser_opener(url, None))
+}
+
+/// [`open_system_browser`] for a host that confines its agents' launches:
+/// the opener, and every program it starts by name, come from a `PATH`
+/// without relative directories or the directories `untrusted` names
+/// ([`meerkat_core::confinement::trusted_search_path`]), so none is one a
+/// confined process planted.
+pub fn open_system_browser_trusting(
+    url: &str,
+    untrusted: &meerkat_core::confinement::UntrustedPathFn,
+) -> std::io::Result<()> {
+    run_browser_opener(meerkat_core::HostLaunchExemption::browser_opener(
+        url,
+        Some(untrusted),
+    ))
+}
+
+/// Run a browser opener without logging its URL, discarding its output.
+fn run_browser_opener(mut command: std::process::Command) -> std::io::Result<()> {
+    use std::process::Stdio;
     let status = command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -867,7 +872,8 @@ impl McpOAuthPendingLogin {
     }
 
     /// [`launch_browser`](Self::launch_browser) with
-    /// [`open_system_browser`].
+    /// [`open_system_browser`]. A host that confines its agents' launches
+    /// passes [`open_system_browser_trusting`] to `launch_browser`.
     pub async fn launch_system_browser(&self) -> McpOAuthBrowserLaunch {
         self.launch_browser(|url| open_system_browser(&url)).await
     }
