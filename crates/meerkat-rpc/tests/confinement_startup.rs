@@ -69,9 +69,17 @@ fn run_rkat_rpc_with_requests(
     args: &[&str],
     requests: &[(&str, serde_json::Value)],
 ) -> (Run, BTreeMap<u64, serde_json::Value>) {
-    let mut child = Command::new(binary)
-        .current_dir(cwd)
-        .args(args)
+    let mut command = Command::new(binary);
+    command.current_dir(cwd).args(args);
+    run_rpc_command(command, requests)
+}
+
+/// Run the server `command` starts as [`run_rkat_rpc_with_requests`] does.
+fn run_rpc_command(
+    mut command: Command,
+    requests: &[(&str, serde_json::Value)],
+) -> (Run, BTreeMap<u64, serde_json::Value>) {
+    let mut child = command
         .env_remove("RUST_LOG")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -387,4 +395,41 @@ fn rkat_rpc_config_writes_cannot_drop_inherited_confinement() {
         .expect("team document");
     assert!(committed.contains("parent = \"org\""), "{committed}");
     assert!(committed.contains("max_tokens = 2048"), "{committed}");
+}
+
+/// Without a confinement flag that names a relative path the server never
+/// reads its working directory, so it serves from one that was removed.
+#[cfg(unix)]
+#[test]
+fn rkat_rpc_starts_without_a_working_directory_when_no_flag_needs_it() {
+    let Some(binary) = rkat_rpc_binary() else {
+        eprintln!(
+            "skipping: rkat-rpc binary not advertised (CARGO_BIN_EXE_rkat-rpc unset or missing)"
+        );
+        return;
+    };
+    let temp = TempDir::new().expect("temp dir");
+    let state_root = temp.path().join("state");
+    let user_root = temp.path().join("user");
+    let removed = temp.path().join("removed");
+    for dir in [&user_root, &removed] {
+        std::fs::create_dir_all(dir).expect("directory should initialize");
+    }
+
+    // The shell removes its working directory, then becomes the server.
+    let mut command = Command::new("/bin/sh");
+    command
+        .arg("-c")
+        .arg("cd \"$1\" && rmdir \"$1\" && shift && exec \"$@\"")
+        .arg("sh")
+        .arg(&removed)
+        .arg(&binary)
+        .args(scope_args("rpc-removed-cwd", &state_root, &user_root));
+    let (run, _) = run_rpc_command(command, &[]);
+    assert!(
+        run.answered,
+        "a server without confinement flags serves from a removed working directory; \
+         exit={:?} stderr:\n{}",
+        run.status, run.stderr
+    );
 }

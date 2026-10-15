@@ -50,6 +50,9 @@ them.
   own document, composed with the other documents a `RealmConfigSource`
   supplies, so its writes keep the `[confinement]` the realm composes (see
   Fixed).
+- `ConfinementFlags::needs_working_directory` says whether a
+  `--confinement*` selection resolves a relative path against the working
+  directory.
 
 ### Changed
 
@@ -78,6 +81,10 @@ them.
   document states none. Before, such a section in a document that sorted
   after the realm's own replaced its edge during composition and cut the
   realm from that ancestor and its `[confinement]`.
+- `rkat-rpc`, `rkat-rest` and `rkat-mcp` read their working directory at
+  startup only for a relative `--confinement-read` or `--confinement-write`
+  path. They read it on every start, so a server whose working directory had
+  been removed failed to start even without a confinement flag.
 
 ## [0.9.1] - 2026-10-15
 

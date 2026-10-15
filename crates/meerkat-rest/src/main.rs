@@ -141,14 +141,21 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         args.isolated,
         RealmSelection::Isolated,
     )?;
-    // Relative confinement paths resolve against the working directory.
-    let confinement = meerkat_core::ConfinementFlags {
+    // Relative confinement paths resolve against the working directory, read
+    // only when a flag needs it: a server started without one does not
+    // depend on its working directory, which may have been removed.
+    let flags = meerkat_core::ConfinementFlags {
         mode: args.confinement.map(Into::into),
         network: args.confinement_network.map(Into::into),
         read: args.confinement_read.clone(),
         write: args.confinement_write.clone(),
-    }
-    .selection(&std::env::current_dir()?)?;
+    };
+    let working_directory = if flags.needs_working_directory() {
+        std::env::current_dir()?
+    } else {
+        PathBuf::new()
+    };
+    let confinement = flags.selection(&working_directory)?;
 
     // Initialize tracing
     tracing_subscriber::registry()

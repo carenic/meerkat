@@ -691,7 +691,7 @@ preset. The flags replace the composed section for every launch kind of that
 process, after composition: `--confinement trusted-host` is the operator's
 explicit opt-out. They are never persisted, and no session, turn or API
 parameter can carry them. Relative flag paths resolve against the working
-directory.
+directory; a server reads its working directory only for such a path.
 
 ## See also
 

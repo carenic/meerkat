@@ -148,13 +148,21 @@ impl From<ConfinementNetworkArg> for meerkat_core::WorkspaceNetwork {
 fn cli_confinement(
     cli: &Cli,
 ) -> Result<Option<meerkat_core::LaunchConfinement>, Box<dyn std::error::Error>> {
-    Ok(meerkat_core::ConfinementFlags {
+    let flags = meerkat_core::ConfinementFlags {
         mode: cli.confinement.map(Into::into),
         network: cli.confinement_network.map(Into::into),
         read: cli.confinement_read.clone(),
         write: cli.confinement_write.clone(),
-    }
-    .selection(&std::env::current_dir()?)?)
+    };
+    // Relative flag paths resolve against the working directory, read only
+    // when a flag needs it: a server started without one does not depend on
+    // its working directory, which may have been removed.
+    let working_directory = if flags.needs_working_directory() {
+        std::env::current_dir()?
+    } else {
+        PathBuf::new()
+    };
+    Ok(flags.selection(&working_directory)?)
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
