@@ -42,6 +42,13 @@ them.
   whole-workspace tests 16 slow periods (960 s) instead of 8, so a cold row
   (as after a release version bump, when no compiled unit can be reused)
   completes on a hosted 4-vCPU runner.
+- The live provider matrix (`meerkat-client` test
+  `live_client_provider_matrix`, lanes `e2e-live` and `e2e-smoke`) sends
+  current catalog models, the cheapest per provider (`claude-haiku-5-5`,
+  `gpt-6-luna`, `gemini-3.1-flash-lite`), and the catalog's image-generation
+  defaults. It sent retired ids such as `claude-3-haiku-20240307`, so its live
+  tests failed. A test that needs no provider keys now fails when the matrix
+  names a model outside Core's catalog.
 
 ## [0.9.1] - 2026-10-15
 
