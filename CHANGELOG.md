@@ -37,12 +37,15 @@ them.
 
 ### Changed
 
-- A release tag whose exact-main CI produced a verified schema-4 attestation
-  no longer re-runs "Validate release state with Cargo" (25 minutes on
-  0.9.1) while the self-hosted BuildBuddy graph is off: every check of that
-  job already ran in the attested CI run, and `release_validate_gate` passes
-  on the attestation. A legacy (schema 1-3) attestation and manual
-  dispatches keep Cargo validation; the graph-on route is unchanged.
+- A release tag no longer re-runs "Validate release state with Cargo" (25
+  minutes on 0.9.1) while the self-hosted BuildBuddy graph is off when its
+  verified exact-main CI attestation proves that run ran every lane the job
+  repeats: the attestation now records the plan's `generated_contract` flag,
+  and the tag requires it with green `ratchets` and `sdk-host` jobs (or a
+  release-projection plan that reused a verified parent run).
+  `release_validate_gate` then passes on the attestation. Any other
+  attestation and manual dispatches keep Cargo validation; the graph-on
+  route is unchanged.
 - `release.yml` gains a pre-tag prebuild (`make release-prebuild
   VERSION=vX.Y.Z`, a `prebuild_release_artifacts` dispatch on `main`): it
   builds, stamps, attests and uploads every release binary and the Web SDK

@@ -2473,6 +2473,10 @@ jobs:
           EXAMPLE_WEB_RESULT: ${{ needs.example-web.result }}
           BAZEL_GRAPH_RESULT: ${{ needs.bazel-graph.result }}
           WASM_TIMERS_RESULT: ${{ needs.wasm-timers.result }}
+          # Whether the ratchets job ran its generated-contract lanes (schema,
+          # SDK codegen, wrapper and RPC/REST surface freshness): a release
+          # tag skips its own Cargo validation only when this run did.
+          GENERATED_CONTRACT: ${{ needs.changes.outputs.generated_contract }}
           MODE: ${{ needs.changes.outputs.mode }}
           PACKAGE_COUNT: ${{ needs.changes.outputs.package_count }}
           CLOSURE_COUNT: ${{ needs.changes.outputs.closure_count }}
@@ -2529,6 +2533,7 @@ jobs:
             --argjson shard_count "${SHARD_COUNT:-0}" \
             --argjson unit_shard_count "${UNIT_SHARD_COUNT:-0}" \
             --argjson main_unit_shard_count "${MAIN_UNIT_SHARD_COUNT:-0}" \
+            --argjson generated_contract "$([[ "${GENERATED_CONTRACT}" == "true" ]] && echo true || echo false)" \
             '{
               schema_version: 4,
               repository: $repository,
@@ -2547,7 +2552,8 @@ jobs:
                 closure_count: $closure_count,
                 clippy_shard_count: $shard_count,
                 unit_shard_count: $unit_shard_count,
-                main_unit_shard_count: $main_unit_shard_count
+                main_unit_shard_count: $main_unit_shard_count,
+                generated_contract: $generated_contract
               },
               component_results: {
                 changes: $changes,

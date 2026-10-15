@@ -95,10 +95,12 @@ jobs:
     runs-on: ${{ fromJSON(vars.MEERKAT_CI_RUNNER || '"ubuntu-24.04"') }}
     outputs:
       # The verified attestation's schema_version on a tag run; empty on
-      # manual dispatches, which do not read the attestation. A tag whose
-      # exact-tree CI produced a schema-4 attestation validates on it alone
-      # (release_validate_cargo is skipped, release_validate_gate accepts it).
+      # manual dispatches, which do not read the attestation.
       ci_attestation_schema: ${{ steps.ci_attestation.outputs.schema }}
+      # 'true' when that attestation proves the exact-tree CI run ran every
+      # lane release_validate_cargo repeats (see the step); the tag then
+      # validates on it alone. Empty on manual dispatches.
+      ci_covers_release_validation: ${{ steps.ci_attestation.outputs.covers_release_validation }}
       # The tag (v<workspace version>) a pre-tag prebuild builds for.
       prebuild_tag: ${{ steps.prebuild_request.outputs.tag }}
     steps:
@@ -391,25 +393,46 @@ jobs:
           schema="$(jq -r '.schema_version' "${attestation}")"
           echo "schema=${schema}" >> "${GITHUB_OUTPUT}"
           echo "Verified exact-tree CI attestation (schema ${schema}) for ${RELEASE_SHA} (${RELEASE_TREE})"
+          # release_validate_cargo repeats fmt-governance (fmt, version
+          # parity, lock and MODULE.bazel.lock consistency, release config,
+          # crate license files), the generated-contract ratchets (schema, SDK
+          # codegen, wrapper and RPC/REST surface freshness), which run only
+          # when the plan selected them, and both SDK suites (sdk-host). The
+          # attestation covers it only when it proves all three ran: the
+          # plan's generated_contract flag with a green ratchets job, and a
+          # green sdk-host job, or a release-projection plan that reused a
+          # verified workspace-mode parent run for the SDK lanes.
+          if jq -e '
+              .schema_version == 4 and
+              .plan.generated_contract == true and
+              .component_results.fmt_governance == "success" and
+              .component_results.ratchets == "success" and
+              (.component_results.sdk_host == "success" or
+               (.plan.mode == "release-projection" and
+                ((.reused_test_evidence.workflow_run_id // "") != "")))' \
+              "${attestation}" >/dev/null; then
+            covers=true
+          else
+            covers=false
+          fi
+          echo "covers_release_validation=${covers}" >> "${GITHUB_OUTPUT}"
+          echo "Attestation covers the Cargo release validation lanes: ${covers}"
 
   # Manual dispatches pick Cargo or the hosted BuildBuddy lane below. A tag
-  # push trusts its exact-tree CI: a verified schema-4 attestation means the
-  # successful main CI run on exactly this tree already ran every check this
-  # job repeats (fmt, version parity, lock consistency, MODULE.bazel.lock
-  # inputs, Rust release config and crate license files in fmt-governance;
-  # schema, SDK codegen, wrapper and RPC/REST surface freshness in ratchets,
-  # which a release commit always selects because it restamps the contract
-  # version and schemas; both SDK suites in sdk-host), so the tag skips it.
-  # A tag runs it only while the self-hosted GCP graph is disabled
-  # (repository variable MEERKAT_GCP_BUILDBUDDY_ENABLED is not 'true') and
-  # its attestation is a legacy schema (1-3) that does not name those lanes.
+  # push skips this job only when its verified exact-tree CI attestation
+  # proves that the successful main CI run on exactly this tree ran every
+  # check it repeats (require_ci_green's ci_covers_release_validation:
+  # fmt-governance, the generated-contract ratchets, which run only when the
+  # plan selected them, and the SDK suites). Otherwise, a legacy attestation
+  # included, the tag runs it while the self-hosted GCP graph is disabled
+  # (repository variable MEERKAT_GCP_BUILDBUDDY_ENABLED is not 'true').
   release_validate_cargo:
     name: Validate release state with Cargo
     needs: [require_ci_green]
     if: >-
       (github.event_name != 'workflow_dispatch' &&
        vars.MEERKAT_GCP_BUILDBUDDY_ENABLED != 'true' &&
-       needs.require_ci_green.outputs.ci_attestation_schema != '4') ||
+       needs.require_ci_green.outputs.ci_covers_release_validation != 'true') ||
       (github.event_name == 'workflow_dispatch' &&
        github.event.inputs.publish_web_sdk_only != 'true' &&
        github.event.inputs.publish_release_assets_only != 'true' &&
@@ -530,9 +553,9 @@ jobs:
   # BuildBuddy/Bazel graph (prebuild, static, native nextest, governance, SDK
   # suites, wasm-check, minimal-feature, feature matrix, audit) in
   # `full-fresh` mode as its release gate. While it is disabled this job is
-  # skipped and the tag validates on its schema-4 attestation (or, for a
-  # legacy attestation, with release_validate_cargo). Pull-request CI never
-  # runs that graph.
+  # skipped and the tag validates on its exact-tree CI attestation when it
+  # covers the Cargo validation lanes, with release_validate_cargo otherwise.
+  # Pull-request CI never runs that graph.
   release_validate_buildbuddy_full:
     name: Validate release tree with the full BuildBuddy graph
     needs: [require_ci_green]
@@ -559,6 +582,7 @@ jobs:
           set -euo pipefail
           ci_result="${{ needs.require_ci_green.result }}"
           ci_attestation_schema="${{ needs.require_ci_green.outputs.ci_attestation_schema }}"
+          ci_covers="${{ needs.require_ci_green.outputs.ci_covers_release_validation }}"
           bb_selected="${{ github.actor == 'lukacf' && ((github.event_name == 'workflow_dispatch' && github.event.inputs.release_backend == 'buildbuddy') || (github.event_name != 'workflow_dispatch' && (vars.MEERKAT_RELEASE_BUILDBUDDY == 'true' || vars.MEERKAT_RELEASE_BUILDBUDDY == '1'))) }}"
           gcp_graph_enabled="${{ vars.MEERKAT_GCP_BUILDBUDDY_ENABLED == 'true' }}"
           cargo_result="${{ needs.release_validate_cargo.result }}"
@@ -577,15 +601,16 @@ jobs:
               exit $?
             fi
             echo "Self-hosted GCP graph disabled (MEERKAT_GCP_BUILDBUDDY_ENABLED is not 'true'); full graph: ${buildbuddy_full_result}"
-            if [[ "${ci_attestation_schema}" == "4" ]]; then
+            if [[ "${ci_covers}" == "true" ]]; then
               # The successful exact-main CI run on this tree is the tag's
               # validation: require_ci_green verified its schema-4
-              # attestation (changes, fmt-governance and ratchets green).
-              echo "Exact-tree CI attestation (schema 4) is the tag's validation; Cargo release validation: ${cargo_result}"
+              # attestation and that it ran every lane Cargo validation
+              # repeats.
+              echo "Exact-tree CI attestation (schema ${ci_attestation_schema}) covers the Cargo validation lanes; Cargo release validation: ${cargo_result}"
               [[ "${cargo_result}" == "skipped" && "${buildbuddy_result}" == "skipped" && "${buildbuddy_full_result}" == "skipped" ]]
               exit $?
             fi
-            echo "Exact-tree CI attestation schema ${ci_attestation_schema:-missing} predates schema 4; Cargo release validation of the tag: ${cargo_result}"
+            echo "Exact-tree CI attestation (schema ${ci_attestation_schema:-missing}) does not cover the Cargo validation lanes; Cargo release validation of the tag: ${cargo_result}"
             [[ "${cargo_result}" == "success" && "${buildbuddy_result}" == "skipped" && "${buildbuddy_full_result}" == "skipped" ]]
             exit $?
           fi
@@ -643,7 +668,7 @@ jobs:
   # Public-API breaks are allowed in 0.x patch releases and must be DECLARED.
   # This is its own job rather than a step in release_validate_cargo because
   # that job is not the tag's validation whenever the tag's exact-tree CI
-  # attestation is schema 4 or the self-hosted GCP graph is enabled:
+  # attestation covers its lanes or the self-hosted GCP graph is enabled:
   # release_validate_gate then asserts it is `skipped`, so a step added there
   # would not run for those releases. Everything that makes a release public
   # depends on this job below.

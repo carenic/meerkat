@@ -11,9 +11,9 @@
 #
 #   variable unset: no job that starts, syncs or scales anything in GCP is
 #     planned; nightly skips gcp-buildbuddy and still runs its chains; a tag
-#     whose exact-tree CI attestation is schema 4 validates on that
-#     attestation alone ("Validate release state with Cargo" is skipped), a
-#     tag with a legacy attestation validates with Cargo, and the release
+#     whose exact-tree CI attestation proves the Cargo validation lanes ran
+#     validates on that attestation alone ("Validate release state with
+#     Cargo" is skipped), any other tag validates with Cargo, and the release
 #     validation gate accepts exactly the planned route; buildbuddy.yml, if
 #     called anyway, fails its gate instead of passing.
 #   variable 'true': the previous route is unchanged (the full graph on tags,
@@ -544,18 +544,19 @@ def release_route(scenario):
     return {job: results[job] for job in VALIDATION + ("release_validate_gate",)}, results
 
 
-def attested(schema):
-    """require_ci_green's outputs on a tag run whose attestation has `schema`."""
-    return {"require_ci_green": {"ci_attestation_schema": schema}}
+def attested(schema, covers):
+    """require_ci_green's outputs on a tag run whose attestation has `schema`
+    and does (covers == "true") or does not prove the Cargo lanes ran."""
+    return {"require_ci_green": {"ci_attestation_schema": schema, "ci_covers_release_validation": covers}}
 
 
 for gate in (False, True):
-    for schema in ("4", "1"):
-        scenario = Scenario("push", gate, outputs=attested(schema))
-        label = f"{scenario.describe()} attestation schema {schema}"
+    for schema, covers in (("4", "true"), ("4", "false"), ("1", "false")):
+        scenario = Scenario("push", gate, outputs=attested(schema, covers))
+        label = f"{scenario.describe()} attestation schema {schema} covering={covers}"
         before = len(FAILURES)
         route, results = release_route(scenario)
-        cargo_validates = not gate and schema != "4"
+        cargo_validates = not gate and covers != "true"
         expected = {
             "release_validate_cargo": "success" if cargo_validates else "skipped",
             "release_validate_buildbuddy": "skipped",
@@ -571,7 +572,7 @@ for gate in (False, True):
             validator = (
                 "the full BuildBuddy graph" if gate
                 else "Cargo" if cargo_validates
-                else "the schema-4 exact-tree CI attestation (Cargo skipped)"
+                else "the covering exact-tree CI attestation (Cargo skipped)"
             )
             ok(f"release tag push ({label}) validates with {validator} and the gate accepts it")
         # The gate must not accept another route for the same state: each
@@ -590,12 +591,13 @@ for gate in (False, True):
                 fail(f"release validation gate accepts a failed validation for {label}")
         else:
             # The attestation is the validation: the same skipped route is
-            # refused when the verified attestation is not schema 4, and when
-            # require_ci_green did not succeed.
-            legacy = Scenario("push", gate, outputs=attested("1"))
-            accepted, _ = release_gate_accepts(legacy, results)
-            if accepted:
-                fail(f"release validation gate accepts a skipped Cargo validation with a legacy attestation ({legacy.describe()})")
+            # refused when the verified attestation does not cover the Cargo
+            # lanes, and when require_ci_green did not succeed.
+            for other in (attested("4", "false"), attested("1", "false")):
+                uncovered = Scenario("push", gate, outputs=other)
+                accepted, _ = release_gate_accepts(uncovered, results)
+                if accepted:
+                    fail(f"release validation gate accepts a skipped Cargo validation with a non-covering attestation ({other})")
             red_ci = dict(results)
             red_ci["require_ci_green"] = "failure"
             accepted, _ = release_gate_accepts(scenario, red_ci)

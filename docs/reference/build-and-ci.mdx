@@ -415,11 +415,11 @@ attestations are still accepted for older commits). While the repository
 variable `MEERKAT_GCP_BUILDBUDDY_ENABLED` is `true` it then runs the whole
 BuildBuddy/Bazel graph in `full-fresh` mode (`release_validate_buildbuddy_full`)
 as the release validation gate; while that self-hosted graph is off (the
-default) the verified schema-4 attestation is the tag's validation: that
-exact-`main` run already covered every check of the Cargo validation lane
-(`release_validate_cargo`), which therefore runs on a tag only for a legacy
-attestation and stays the fallback for manual dispatches on the GitHub-hosted
-backend. It still builds
+default) the tag skips the Cargo validation lane (`release_validate_cargo`)
+only when the attestation proves that exact-`main` run ran every lane it
+repeats (the plan's `generated_contract` ratchets and a green `sdk-host`);
+otherwise, and for manual dispatches on the GitHub-hosted backend, the tag
+validates with Cargo. It still builds
 and publishes the platform-specific release artifacts from the attested
 source. The critical Linux and macOS arm64 archives publish first; Windows
 binaries are cross-compiled and packaged with cargo-xwin (clang-cl, lld-link,

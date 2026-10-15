@@ -347,26 +347,34 @@ elif name == "tag-validation-cargo-on-attested-tags":
     # The pre-change route: a tag re-runs Cargo validation whenever the
     # self-hosted graph is off, whatever its exact-tree CI already covered.
     replace_once(
-        " &&\n       needs.require_ci_green.outputs.ci_attestation_schema != '4') ||\n",
+        " &&\n       needs.require_ci_green.outputs.ci_covers_release_validation != 'true') ||\n",
         ") ||\n",
     )
 elif name == "tag-validation-gate-any-schema":
-    # The gate trusts any verified attestation, so a legacy schema that does
-    # not name the CI lanes skips Cargo validation too.
+    # The gate trusts any verified attestation, so one that does not prove
+    # the Cargo lanes ran skips Cargo validation too.
     replace_once(
-        '            if [[ "${ci_attestation_schema}" == "4" ]]; then\n',
+        '            if [[ "${ci_covers}" == "true" ]]; then\n',
         '            if [[ -n "${ci_attestation_schema}" ]]; then\n',
     )
 elif name == "tag-validation-schema-unwritten":
-    # The verifier no longer exposes the schema it verified.
-    replace_once('          echo "schema=${schema}" >> "${GITHUB_OUTPUT}"\n', "")
+    # The verifier no longer exposes whether the attestation covers the lanes.
+    replace_once('          echo "covers_release_validation=${covers}" >> "${GITHUB_OUTPUT}"\n', "")
+elif name == "tag-validation-ignores-sdk-host":
+    # The pre-review coverage: any schema-4 attestation, SDK suites or not.
+    replace_once(
+        "              (.component_results.sdk_host == \"success\" or\n"
+        "               (.plan.mode == \"release-projection\" and\n"
+        "                ((.reused_test_evidence.workflow_run_id // \"\") != \"\")))' \\\n",
+        "              true' \\\n",
+    )
 elif name == "tag-validation-reflowed":
     # Equivalent: the tag disjunct on one line, its operands reordered.
     replace_once(
         "      (github.event_name != 'workflow_dispatch' &&\n"
         "       vars.MEERKAT_GCP_BUILDBUDDY_ENABLED != 'true' &&\n"
-        "       needs.require_ci_green.outputs.ci_attestation_schema != '4') ||\n",
-        "      (needs.require_ci_green.outputs.ci_attestation_schema != '4' && "
+        "       needs.require_ci_green.outputs.ci_covers_release_validation != 'true') ||\n",
+        "      (needs.require_ci_green.outputs.ci_covers_release_validation != 'true' && "
         "vars.MEERKAT_GCP_BUILDBUDDY_ENABLED != 'true' && "
         "github.event_name != 'workflow_dispatch') ||\n",
     )
@@ -646,13 +654,16 @@ expect_fail_named dispatch-branch-name "${TEST_ROOT}/dispatch-branch-name.yml" \
 
 mutate tag-validation-cargo-on-attested-tags "${TEST_ROOT}/tag-validation-cargo-on-attested-tags.yml"
 expect_fail_named tag-validation-cargo-on-attested-tags "${TEST_ROOT}/tag-validation-cargo-on-attested-tags.yml" \
-  "runs on a tag push with a verified schema-4 attestation" tag-validation
+  "runs on a tag push whose attestation covers the Cargo lanes (true)" tag-validation
 mutate tag-validation-gate-any-schema "${TEST_ROOT}/tag-validation-gate-any-schema.yml"
 expect_fail_named tag-validation-gate-any-schema "${TEST_ROOT}/tag-validation-gate-any-schema.yml" \
-  "accepts a tag push with a verified legacy (schema 1) attestation and Cargo validation skipped" tag-validation
+  "accepts a tag push whose attestation does not cover the Cargo lanes and Cargo validation skipped" tag-validation
 mutate tag-validation-schema-unwritten "${TEST_ROOT}/tag-validation-schema-unwritten.yml"
 expect_fail_named tag-validation-schema-unwritten "${TEST_ROOT}/tag-validation-schema-unwritten.yml" \
-  "does not write \`schema\` to \$GITHUB_OUTPUT" tag-validation
+  "writes covers_release_validation=<nothing> where every lane ran" tag-validation
+mutate tag-validation-ignores-sdk-host "${TEST_ROOT}/tag-validation-ignores-sdk-host.yml"
+expect_fail_named tag-validation-ignores-sdk-host "${TEST_ROOT}/tag-validation-ignores-sdk-host.yml" \
+  "writes covers_release_validation=true where the SDK suites were skipped" tag-validation
 
 mutate prebuild-publishes "${TEST_ROOT}/prebuild-publishes.yml"
 expect_fail_named prebuild-publishes "${TEST_ROOT}/prebuild-publishes.yml" \

@@ -27,6 +27,7 @@ run wherever `python3` does.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import subprocess
@@ -46,6 +47,8 @@ CARGO_VALIDATION_JOB = "release_validate_cargo"
 VALIDATION_GATE_JOB = "release_validate_gate"
 # require_ci_green's output naming the verified exact-tree attestation schema.
 ATTESTATION_SCHEMA_OUTPUT = "ci_attestation_schema"
+# require_ci_green's output: the attestation proves the Cargo validation lanes ran.
+COVERS_OUTPUT = "ci_covers_release_validation"
 GCP_GRAPH_VARIABLE = "MEERKAT_GCP_BUILDBUDDY_ENABLED"
 RELEASE_VERSION_STEP_ID = "release_version"
 REGISTRY_JOB = "publish_registries"
@@ -989,12 +992,16 @@ def check_registry_slo(text: str) -> list[str]:
     return violations
 
 
-def _attested_tag(schema: str, **kwargs: object) -> EventContext:
-    """A tag push whose require_ci_green verified an attestation of `schema`."""
+def _attested_tag(covers: str, schema: str = "4", **kwargs: object) -> EventContext:
+    """A tag push whose require_ci_green verified an attestation of `schema`
+    that does (covers == "true") or does not cover the Cargo lanes."""
     return EventContext(
-        label=kwargs.pop("label", f"a tag push with a verified schema-{schema} attestation"),
+        label=kwargs.pop("label", f"a tag push whose attestation covers the Cargo lanes ({covers})"),
         event_name="push",
-        job_outputs={f"{CI_GREEN_JOB}.{ATTESTATION_SCHEMA_OUTPUT}": schema},
+        job_outputs={
+            f"{CI_GREEN_JOB}.{ATTESTATION_SCHEMA_OUTPUT}": schema,
+            f"{CI_GREEN_JOB}.{COVERS_OUTPUT}": covers,
+        },
         **kwargs,
     )
 
@@ -1026,67 +1033,146 @@ def _run_gate_script(step: Step, context: EventContext) -> tuple[int, str]:
     return result.returncode, result.stdout + result.stderr
 
 
-def check_tag_validation(text: str) -> list[str]:
-    """A tag validates on its verified schema-4 exact-tree CI attestation.
+def _attestation(**overrides: object) -> dict:
+    """A schema-4 attestation for the binding scenario, every lane green."""
+    document: dict = {
+        "schema_version": 4,
+        "repository": "example/meerkat",
+        "commit_sha": "1" * 40,
+        "tree_sha": "2" * 40,
+        "workflow": "CI",
+        "workflow_run_id": "11",
+        "workflow_run_attempt": "1",
+        "event": "push",
+        "ref": "refs/heads/main",
+        "validation_backend": "github-hosted-cargo",
+        "validation_result": "success",
+        "plan": {"mode": "workspace", "generated_contract": True},
+        "component_results": {
+            "changes": "success",
+            "fmt_governance": "success",
+            "ratchets": "success",
+            "sdk_host": "success",
+        },
+    }
+    for path, value in overrides.items():
+        target = document
+        keys = path.split("__")
+        for key in keys[:-1]:
+            target = target.setdefault(key, {})
+        if value is None:
+            target.pop(keys[-1], None)
+        else:
+            target[keys[-1]] = value
+    return document
 
-    The successful exact-main CI run on the tag's tree already ran everything
-    `release_validate_cargo` repeats, so while the self-hosted graph is off a
-    tag whose attestation `require_ci_green` verified as schema 4 skips that
-    job and `release_validate_gate` passes on the attestation alone. A legacy
-    attestation (schema 1-3) still validates with Cargo, manual dispatches
-    keep their selected validation lane, and the gate refuses a skipped Cargo
-    validation unless the verified attestation is schema 4.
+
+def _coverage_of(step: Step, attestation: dict) -> tuple[int, dict[str, str]]:
+    """Run the attestation step on `attestation`; its exit and outputs."""
+    context = EventContext(
+        label=TAG_PUSH.label,
+        event_name="push",
+        step_outputs={
+            "ci_run.run_id": "11",
+            "ci_run.run_attempt": "1",
+            "release_ref.sha": "1" * 40,
+            "release_ref.tree": "2" * 40,
+        },
+    )
+    env = {key: render_strict(value, context) for key, value in step.env.items()}
+    with tempfile.TemporaryDirectory(prefix="release-attestation-") as scratch:
+        directory = Path(scratch, "meerkat-ci-attestation")
+        directory.mkdir()
+        Path(directory, "attestation.json").write_text(json.dumps(attestation), encoding="utf-8")
+        output = Path(scratch, "github-output")
+        output.write_text("", encoding="utf-8")
+        result = subprocess.run(
+            ["bash", "-c", render_strict(step.raw_run, context)],
+            cwd=scratch,
+            env={
+                **_runner_env(context),
+                "GITHUB_REPOSITORY": "example/meerkat",
+                "RUNNER_TEMP": scratch,
+                "GITHUB_OUTPUT": str(output),
+                **env,
+            },
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        outputs = dict(
+            line.split("=", 1) for line in output.read_text(encoding="utf-8").splitlines() if "=" in line
+        )
+        return result.returncode, outputs
+
+
+def check_tag_validation(text: str) -> list[str]:
+    """A tag skips Cargo validation only on an attestation that covers it.
+
+    `release_validate_cargo` repeats fmt-governance, the generated-contract
+    ratchets (which main CI runs only when its plan selects them) and the SDK
+    suites. require_ci_green verifies the exact-tree attestation and exposes
+    whether it proves all of those ran (`ci_covers_release_validation`); only
+    then, while the self-hosted graph is off, is the job skipped and does the
+    gate pass on the attestation. Otherwise, a legacy attestation included,
+    the tag validates with Cargo, and manual dispatches keep their lane.
     """
     violations: list[str] = []
 
-    # 1. require_ci_green exposes the schema of the attestation it verified,
-    #    written only after the verification passed.
+    # 1. The attestation step computes the coverage from the attestation it
+    #    verified, and require_ci_green exposes it.
     ci_block = job_block(text, CI_GREEN_JOB)
     outputs = parse_mapping(ci_block, 4).get("outputs", "")
     wiring = re.search(
-        rf"\b{ATTESTATION_SCHEMA_OUTPUT}:\s*\$\{{\{{\s*steps\.([A-Za-z0-9_-]+)\.outputs\.([A-Za-z0-9_-]+)\s*\}}\}}",
+        rf"\b{COVERS_OUTPUT}:\s*\$\{{\{{\s*steps\.([A-Za-z0-9_-]+)\.outputs\.([A-Za-z0-9_-]+)\s*\}}\}}",
         outputs,
     )
     if wiring is None:
-        violations.append(
-            f"job `{CI_GREEN_JOB}` does not expose `{ATTESTATION_SCHEMA_OUTPUT}` from a step output"
-        )
-    else:
-        step_id, output = wiring.groups()
-        producers = [
-            step for step in job_steps(ci_block) if step.fields.get("id") == step_id
-        ]
-        if len(producers) != 1:
+        return [f"job `{CI_GREEN_JOB}` does not expose `{COVERS_OUTPUT}` from a step output"]
+    step_id, output = wiring.groups()
+    producers = [step for step in job_steps(ci_block) if step.fields.get("id") == step_id]
+    if len(producers) != 1:
+        return [f"job `{CI_GREEN_JOB}` has {len(producers)} steps with `id: {step_id}`"]
+    producer = producers[0]
+    if not step_runs(producer, TAG_PUSH):
+        violations.append(f"step `{producer.name}` does not run on {TAG_PUSH.label}")
+    cases = (
+        ("every lane ran", _attestation(), "true"),
+        ("the generated-contract ratchets did not run", _attestation(plan__generated_contract=False), "false"),
+        ("the plan does not record the ratchets", _attestation(plan__generated_contract=None), "false"),
+        ("the SDK suites were skipped", _attestation(component_results__sdk_host="skipped"), "false"),
+        (
+            "a release-projection plan reused a parent run for the SDK lanes",
+            _attestation(
+                plan__mode="release-projection",
+                component_results__sdk_host="skipped",
+                reused_test_evidence={"workflow_run_id": "9"},
+            ),
+            "true",
+        ),
+        (
+            "a release-projection plan names no reused run",
+            _attestation(plan__mode="release-projection", component_results__sdk_host="skipped"),
+            "false",
+        ),
+    )
+    for label, attestation, expected in cases:
+        status, written = _coverage_of(producer, attestation)
+        if status != 0:
+            violations.append(f"step `{producer.name}` rejects a valid attestation where {label}")
+            continue
+        if written.get(output) != expected:
             violations.append(
-                f"job `{CI_GREEN_JOB}` has {len(producers)} steps with `id: {step_id}`; "
-                f"exactly one must write `{ATTESTATION_SCHEMA_OUTPUT}`"
+                f"step `{producer.name}` writes {output}={written.get(output, '<nothing>')} where {label}; "
+                f"expected {expected}"
             )
-        else:
-            producer = producers[0]
-            run = producer.run
-            if ".schema_version == 4" not in run or "jq -e" not in run:
-                violations.append(
-                    f"step `{producer.name}` writes `{ATTESTATION_SCHEMA_OUTPUT}` but does not "
-                    "verify the exact-tree attestation (`jq -e` over its schema-4 fields)"
-                )
-            elif output not in producer.written_outputs():
-                violations.append(
-                    f"step `{producer.name}` does not write `{output}` to $GITHUB_OUTPUT"
-                )
-            else:
-                write = re.search(rf"""echo\s+["']?{re.escape(output)}=""", run)
-                if write is not None and write.start() < run.index("jq -e"):
-                    violations.append(
-                        f"step `{producer.name}` writes `{output}` before it verifies the "
-                        "attestation, so an unverified schema would reach the gate"
-                    )
-            if not step_runs(producer, TAG_PUSH):
-                violations.append(f"step `{producer.name}` does not run on {TAG_PUSH.label}")
+    status, written = _coverage_of(producer, _attestation(component_results__ratchets="failure"))
+    if status == 0 and written.get(output) == "true":
+        violations.append(f"step `{producer.name}` reports coverage for an attestation it should refuse")
 
     # 2. The Cargo validation job is skipped exactly where the attestation
     #    stands in for it.
-    cargo_block = job_block(text, CARGO_VALIDATION_JOB)
-    cargo_if = parse_mapping(cargo_block, 4).get("if")
+    cargo_if = parse_mapping(job_block(text, CARGO_VALIDATION_JOB), 4).get("if")
     graph_on = {GCP_GRAPH_VARIABLE: "true"}
     manual = EventContext(
         label="a package dispatch on the GitHub-hosted backend",
@@ -1096,12 +1182,13 @@ def check_tag_validation(text: str) -> list[str]:
             "publish_release_packages": "true",
             "release_backend": "github-hosted",
         },
-        job_outputs={f"{CI_GREEN_JOB}.{ATTESTATION_SCHEMA_OUTPUT}": ""},
+        job_outputs={f"{CI_GREEN_JOB}.{ATTESTATION_SCHEMA_OUTPUT}": "", f"{CI_GREEN_JOB}.{COVERS_OUTPUT}": ""},
     )
     routes = (
-        (_attested_tag("4"), False),
-        (_attested_tag("1", label="a tag push with a verified legacy (schema 1) attestation"), True),
-        (_attested_tag("4", label="a tag push while the self-hosted graph is enabled", variables=graph_on), False),
+        (_attested_tag("true"), False),
+        (_attested_tag("false", label="a tag push whose schema-4 attestation does not cover the Cargo lanes"), True),
+        (_attested_tag("false", "1", label="a tag push with a verified legacy (schema 1) attestation"), True),
+        (_attested_tag("true", label="a tag push while the self-hosted graph is enabled", variables=graph_on), False),
         (manual, True),
     )
     for context, must_run in routes:
@@ -1127,27 +1214,22 @@ def check_tag_validation(text: str) -> list[str]:
         "release_validate_buildbuddy": "skipped",
         "release_validate_buildbuddy_full": "skipped",
     }
-    cases = (
-        (_attested_tag("4", job_results=skipped), True),
+    ran = {**skipped, CARGO_VALIDATION_JOB: "success"}
+    gate_cases = (
+        (_attested_tag("true", job_results=skipped), True),
+        (_attested_tag("true", label="a covering attestation with Cargo validation run", job_results=ran), False),
+        (_attested_tag("false", label="a non-covering attestation with Cargo validation run", job_results=ran), True),
         (
             _attested_tag(
-                "4",
-                label="a tag push with a verified schema-4 attestation and Cargo validation run",
-                job_results={**skipped, CARGO_VALIDATION_JOB: "success"},
+                "false",
+                label="a tag push whose attestation does not cover the Cargo lanes and Cargo validation skipped",
+                job_results=skipped,
             ),
             False,
         ),
         (
             _attested_tag(
-                "1",
-                label="a tag push with a verified legacy (schema 1) attestation",
-                job_results={**skipped, CARGO_VALIDATION_JOB: "success"},
-            ),
-            True,
-        ),
-        (
-            _attested_tag(
-                "1",
+                "false", "1",
                 label="a tag push with a verified legacy (schema 1) attestation and Cargo validation skipped",
                 job_results=skipped,
             ),
@@ -1155,27 +1237,19 @@ def check_tag_validation(text: str) -> list[str]:
         ),
         (
             _attested_tag(
-                "",
-                label="a tag push with no verified attestation and Cargo validation skipped",
-                job_results=skipped,
-            ),
-            False,
-        ),
-        (
-            _attested_tag(
-                "4",
+                "true",
                 label="a tag push whose exact-main CI did not succeed",
                 job_results={**skipped, CI_GREEN_JOB: "failure"},
             ),
             False,
         ),
     )
-    for context, must_accept in cases:
-        status, output = _run_gate_script(gate, context)
+    for context, must_accept in gate_cases:
+        status, output_text = _run_gate_script(gate, context)
         if must_accept and status != 0:
             violations.append(
                 f"step `{gate.name}` refuses {context.label}: "
-                + " | ".join(line for line in output.splitlines() if line.strip())
+                + " | ".join(line for line in output_text.splitlines() if line.strip())
             )
         if not must_accept and status == 0:
             violations.append(f"step `{gate.name}` accepts {context.label}")
@@ -1295,6 +1369,7 @@ def check_prebuild(text: str) -> list[str]:
     prebuild_outputs = {
         f"{PREBUILD_LOOKUP_JOB}.run_id": "",
         f"{CI_GREEN_JOB}.{ATTESTATION_SCHEMA_OUTPUT}": "",
+        f"{CI_GREEN_JOB}.{COVERS_OUTPUT}": "",
         f"{CI_GREEN_JOB}.prebuild_tag": "v0.0.0",
     }
     prebuild = EventContext(
@@ -1403,6 +1478,7 @@ def check_prebuild(text: str) -> list[str]:
             job_outputs={
                 f"{PREBUILD_LOOKUP_JOB}.run_id": run_id,
                 f"{CI_GREEN_JOB}.{ATTESTATION_SCHEMA_OUTPUT}": "4",
+                f"{CI_GREEN_JOB}.{COVERS_OUTPUT}": "true",
                 f"{CI_GREEN_JOB}.prebuild_tag": "",
             },
         )
