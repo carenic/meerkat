@@ -27,14 +27,26 @@
 # wrapper runs rustc unchanged; with it but without flock it refuses to run.
 #
 # `release-web-sdk-rustc-wrapper --check-heavy-crates` exits 0 when every crate
-# named here is a package of this checkout's workspace. The release job builds
-# at four jobs with this wrapper only then, and at one job otherwise.
+# named here is a package of this checkout's workspace and flock(1) can take a
+# --no-fork lock. The release job builds at four jobs with this wrapper only
+# then, and at one job otherwise.
 set -euo pipefail
 
 exclusive_crate="meerkat_machine_schema"
 shared_crates=(meerkat_runtime meerkat_mob meerkat_machine_kernels meerkat_core meerkat_contracts)
 
 if [[ "${1:-}" == "--check-heavy-crates" ]]; then
+  if ! command -v flock >/dev/null 2>&1; then
+    echo "release-web-sdk-rustc-wrapper: flock(1) is not installed" >&2
+    exit 1
+  fi
+  probe="$(mktemp)"
+  if ! flock --no-fork --shared "${probe}" true; then
+    rm -f -- "${probe}"
+    echo "release-web-sdk-rustc-wrapper: flock --no-fork does not work here" >&2
+    exit 1
+  fi
+  rm -f -- "${probe}"
   root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
   packages="$(cargo metadata --manifest-path "${root}/Cargo.toml" --format-version 1 --no-deps \
     | node -e 'let s = ""; process.stdin.on("data", (d) => (s += d)).on("end", () => {

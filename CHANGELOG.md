@@ -52,9 +52,14 @@ them.
   name and version, tarball digest) names its own checkout and the commit
   `Require green CI` passed; packages built before stamping are refused. A
   package reused through `web_sdk_artifact_run_id` must come from a
-  release.yml tag-push or dispatch run whose `Require green CI` passed, and
-  `scripts/release-publish-web-sdk-package.sh` refuses a tarball whose name
-  or version differs from the checkout's package or the release tag.
+  release.yml run at the release commit (the tag push, or a dispatch on the
+  tag) or from a dispatch on main at a commit in main's history, never from
+  another branch or a pull request; its `Require green CI` must have passed,
+  and for a tag push also its release validation and semver gates. The
+  stamp is not attested, so this pinning of the producing workflow is what
+  vouches for it. `scripts/release-publish-web-sdk-package.sh` refuses a
+  tarball whose name or version differs from the checkout's package or the
+  release tag.
 - `@rkat/web`: the release wasm is optimized with `wasm-opt -O1` instead of
   wasm-pack's default `-O` (binaryen's `-Os`). On the 0.9.1 module the
   download gets smaller (11.06 MB instead of 11.40 MB with gzip -9, 6.93 MB

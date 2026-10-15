@@ -1498,7 +1498,7 @@ jobs:
     name: Build Web SDK package
     needs: [require_ci_green]
     if: >-
-      always() &&
+      !cancelled() &&
       needs.require_ci_green.result == 'success' &&
       (github.event_name != 'workflow_dispatch' ||
        github.event.inputs.web_sdk_artifact_run_id == '') &&
@@ -2168,35 +2168,63 @@ jobs:
         with:
           node-version: "22"
 
-      # A reused package comes from an earlier run of this workflow: it must
-      # be this repository's release.yml, run by a tag push or a dispatch
-      # (never a pull request), and its Require green CI job must have
-      # passed (as scripts/verify-release-asset-provenance --source-run
-      # checks for reused release archives). The stamp check below then
-      # binds its package to this release's commit.
+      # A reused package comes from an earlier run of this workflow, whose
+      # own release.yml decided what it built and stamped, so that run is
+      # pinned to a trusted workflow version: this repository's release.yml
+      # run either at the release commit (the tag push, or a dispatch on the
+      # tag) or by a dispatch on main at a commit in main's history; never a
+      # pull request or any other branch. Its Require green CI job must have
+      # passed and, for a tag push, also its release validation and semver
+      # gates. These are the run checks of
+      # scripts/verify-release-asset-provenance --source-run, without its
+      # attestations: release archives carry attested stamps, while the Web
+      # SDK stamp is a plain file, which the pinned workflow version vouches
+      # for. The stamp check below binds the package to this release's commit.
       - name: Verify Web SDK artifact source run
         if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.web_sdk_artifact_run_id != '' }}
         env:
           GH_TOKEN: ${{ github.token }}
           SOURCE_RUN: ${{ github.event.inputs.web_sdk_artifact_run_id }}
+          RELEASE_SHA: ${{ needs.require_ci_green.outputs.sha }}
         run: |
           set -euo pipefail
           [[ "${SOURCE_RUN}" =~ ^[0-9]+$ ]] || { echo "web_sdk_artifact_run_id must be a run id: ${SOURCE_RUN}" >&2; exit 1; }
+          [[ "${RELEASE_SHA}" =~ ^[0-9a-f]{40}$ ]] || { echo "Require green CI reported no release commit (${RELEASE_SHA:-empty})" >&2; exit 1; }
           run_meta="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_RUN}" \
-            --jq '[.path, .event, .repository.full_name] | @tsv')"
-          IFS=$'\t' read -r run_path run_event run_repo <<<"${run_meta}"
+            --jq '[.path, .event, .repository.full_name, .head_branch, .head_sha] | @tsv')"
+          IFS=$'\t' read -r run_path run_event run_repo run_branch run_sha <<<"${run_meta}"
           if [[ "${run_path}" != ".github/workflows/release.yml" || "${run_repo}" != "${GITHUB_REPOSITORY}" ]] ||
             [[ "${run_event}" != "push" && "${run_event}" != "workflow_dispatch" ]]; then
             echo "run ${SOURCE_RUN} is not a release.yml push or workflow_dispatch run of ${GITHUB_REPOSITORY} (path=${run_path} event=${run_event} repo=${run_repo})" >&2
             exit 1
           fi
-          ci_gate="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_RUN}/jobs?per_page=100" --paginate \
-            --jq '.jobs[] | select(.name == "Require green CI") | .conclusion')"
-          if [[ "${ci_gate}" != "success" ]]; then
-            echo "run ${SOURCE_RUN}: Require green CI did not succeed (${ci_gate:-absent})" >&2
+          if [[ "${run_sha}" == "${RELEASE_SHA}" ]]; then
+            pinned="at the release commit ${run_sha}"
+          elif [[ "${run_event}" == "workflow_dispatch" && "${run_branch}" == "main" ]]; then
+            main_status="$(gh api "repos/${GITHUB_REPOSITORY}/compare/${run_sha}...main" --jq .status)"
+            if [[ "${main_status}" != "identical" && "${main_status}" != "ahead" ]]; then
+              echo "run ${SOURCE_RUN} dispatched main at ${run_sha}, which is not in main's history (compare status ${main_status})" >&2
+              exit 1
+            fi
+            pinned="dispatched on main at ${run_sha}, in main's history"
+          else
+            echo "run ${SOURCE_RUN} ran release.yml from ${run_branch} at ${run_sha}: neither the release commit ${RELEASE_SHA} nor a dispatch on main" >&2
             exit 1
           fi
-          echo "source run ${SOURCE_RUN}: release.yml ${run_event} run, Require green CI passed"
+          run_jobs="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_RUN}/jobs?per_page=100" --paginate \
+            --jq '.jobs[] | [.name, (.conclusion // "none")] | @tsv')"
+          required=("Require green CI")
+          if [[ "${run_event}" == "push" ]]; then
+            required+=("Release validation gate" "Breaks declared and notes stamped")
+          fi
+          for job in "${required[@]}"; do
+            conclusion="$(awk -F'\t' -v job="${job}" '$1 == job { print $2 }' <<<"${run_jobs}")"
+            if [[ "${conclusion}" != "success" ]]; then
+              echo "run ${SOURCE_RUN}: ${job} did not succeed (${conclusion:-absent})" >&2
+              exit 1
+            fi
+          done
+          echo "source run ${SOURCE_RUN}: release.yml ${run_event} run ${pinned}; passed: $(printf '%s, ' "${required[@]}" | sed 's/, $//')"
 
       - name: Download Web SDK package
         uses: actions/download-artifact@v4
