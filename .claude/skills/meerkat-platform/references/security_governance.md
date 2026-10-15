@@ -186,8 +186,10 @@ max_output_tokens = 1024
 - Rust hosts attach review with `AgentFactory::with_operation_review` /
   `AgentBuilder::with_operation_review` (`BoundOperationReview`). A tool
   without a reviewed entry point (for example `web_search` and comms `send`)
-  settles a required R2 as `unsupported_entry` and R3 as
-  `human_consent_required`; it never runs unreviewed.
+  never runs under a required review: R2 settles as `reviewer_missing`
+  without a reviewer and as `unsupported_entry` with one; R3 settles as
+  `human_consent_required` without a human consent route and as
+  `unsupported_entry` with one.
 - What the reviewer sees (0.9.0): for an R2 or R3 operation the owners state
   its action account and current mandate (the grant that admits it, with its
   bounds and expiry), read once after R1 is ruled out and sent to the R2
