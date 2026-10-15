@@ -35,6 +35,16 @@ them.
 
 ## [Unreleased]
 
+### Security
+
+- Cargo.lock moves quinn-proto from 0.11.14 to 0.11.19, clearing
+  RUSTSEC-2026-0185, RUSTSEC-2026-0338, RUSTSEC-2026-0339, RUSTSEC-2026-0340
+  and RUSTSEC-2026-0342. No build compiled it: it is reachable only through
+  reqwest's weak `quinn` feature, which nothing enables
+  (`cargo tree --workspace --all-features --target all -i quinn-proto` is
+  empty), but lockfile scanners flagged it. Lockfile only; the new version
+  also locks the unused rand_pcg 0.10.2.
+
 ### Changed
 
 - CI's `Closure tests` rows have 60 minutes instead of 40, and the
