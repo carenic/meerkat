@@ -331,6 +331,148 @@
         ]
       },
       {
+        "product": "Connect",
+        "description": "Agent-led integration discovery and setup",
+        "icon": "plug",
+        "tabs": [
+          {
+            "tab": "Documentation",
+            "groups": [
+              {
+                "group": "Getting started",
+                "pages": [
+                  "connect/introduction",
+                  "connect/availability",
+                  "connect/quickstart",
+                  "connect/roadmap"
+                ]
+              },
+              {
+                "group": "Integration library",
+                "pages": [
+                  "connect/library/adoption",
+                  "connect/library/slack-gmail",
+                  "connect/library/candidates",
+                  "connect/library/playwright",
+                  "connect/library/github"
+                ]
+              },
+              {
+                "group": "Concepts",
+                "pages": [
+                  "connect/concepts/ownership",
+                  "connect/concepts/roles",
+                  "connect/concepts/acquisition",
+                  "connect/concepts/authentication",
+                  "connect/concepts/readiness"
+                ]
+              },
+              {
+                "group": "Using integrations",
+                "pages": [
+                  "connect/guides/request-an-integration",
+                  "connect/guides/manage-connections"
+                ]
+              },
+              {
+                "group": "Advanced host setup",
+                "pages": [
+                  "connect/library/local-install",
+                  "connect/acquisition/local-install",
+                  "connect/guides/native-mcp",
+                  "connect/guides/host-composition",
+                  "connect/guides/setup-a-frontend"
+                ]
+              },
+              {
+                "group": "Building integrations",
+                "pages": [
+                  "connect/guides/service-connectors",
+                  "connect/guides/agent-frontends",
+                  "connect/guides/port-an-integration"
+                ]
+              },
+              {
+                "group": "Examples and advanced host scenarios",
+                "pages": [
+                  "connect/examples/remembered-tool",
+                  "connect/examples/slack-summary",
+                  "connect/examples/reachy-extension",
+                  "connect/examples/organizational-host"
+                ]
+              }
+            ]
+          },
+          {
+            "tab": "SDKs and APIs",
+            "groups": [
+              {
+                "group": "Rust",
+                "pages": [
+                  "connect/sdks/rust"
+                ]
+              },
+              {
+                "group": "Python",
+                "pages": [
+                  "connect/sdks/python",
+                  "connect/sdks/python-connectors",
+                  "connect/sdks/python-frontends"
+                ]
+              },
+              {
+                "group": "TypeScript",
+                "pages": [
+                  "connect/sdks/typescript",
+                  "connect/sdks/typescript-connectors",
+                  "connect/sdks/activepieces",
+                  "connect/sdks/ui"
+                ]
+              },
+              {
+                "group": "Tool surfaces",
+                "pages": [
+                  "connect/api/discovery",
+                  "connect/api/acquisition"
+                ]
+              }
+            ]
+          },
+          {
+            "tab": "Reference",
+            "groups": [
+              {
+                "group": "Integration contracts",
+                "pages": [
+                  "connect/reference/packages",
+                  "connect/reference/catalog",
+                  "connect/reference/configuration",
+                  "connect/reference/continuation",
+                  "connect/reference/deployment",
+                  "connect/reference/stores"
+                ]
+              },
+              {
+                "group": "Architecture",
+                "pages": [
+                  "connect/reference/architecture",
+                  "connect/reference/portability",
+                  "connect/reference/access-control"
+                ]
+              },
+              {
+                "group": "Operations and contribution",
+                "pages": [
+                  "connect/operations/runbook",
+                  "connect/operations/troubleshooting",
+                  "connect/contributing/validation"
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      {
         "product": "Recall",
         "description": "Shared, evidence-backed knowledge for applications and agents through HTTP and MCP.",
         "icon": "brain",

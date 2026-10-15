@@ -1,0 +1,115 @@
+---
+title: "Agent-led discovery and installation"
+description: "Required product outcome B: acquire integrations beyond the library and continue the original task."
+icon: "compass"
+---
+
+**Required product outcome B.** Agents must discover and install integrations beyond the prepackaged library, verify that the needed service or frontend works, and continue the original task. This is equal in importance to the [100-integration adoption target](/connect/library/adoption).
+
+**Current status: final release qualification pending.** Enrolled native hosts
+have an implemented `find_and_install` admission path; hosts without that
+composition report unavailable. Installed component checks do not yet establish
+the complete first-release journey on the final Core/Meta pair. See the
+[API boundary](/connect/api/acquisition), [availability](/connect/availability) and
+[release scope](/connect/roadmap). The broader frontend and host cases below remain
+end-state requirements.
+
+The current macOS library also accepts ordinary Agent Plugins as investigation
+material. With `--enable-plugin-inspection`, `setup_inspect_plugin` reads
+explicit public skill/MCP files below host staging through the canonical
+reader. The agent supplies missing Toolkit declarations and installs through
+the existing selected-package path. `setup_plugin_source` can retrieve the
+retained evidence after restart without the original files. No Toolkit
+namespace is required in the imported plugin. Linux's existing inspector does
+not yet supply this option. This is a bounded acquisition component, not the
+complete native workflow below.
+
+A released RPC/SDK 0.8.50 host has also completed a narrower live composition:
+the original session installed a supplied ordinary plugin, the host added its
+emitted connector through `mcp_add`, and the same session used it to answer the
+task. The setup service stayed alive throughout. See
+[live native attachment](/connect/guides/native-mcp#add-tools-to-a-live-session).
+This verifies the existing single-session mechanism; protected sign-in,
+governed setup-agent delegation and durable process-loss recovery remain open.
+
+A further fresh native trial starts with a vague Fetch clue and empty staging.
+The agent researches public sources, acquires and inspects a real package absent
+from the catalog, authors its metadata and installs it. Explicit host attachment
+then lets the original session correctly answer its task through that connector.
+Independent review checks the source, shell actions and answer; root verifies a
+withheld oracle. The business data is synthetic and read-only. See
+`docs/verification/20261004-native-acquisition-gap/REPORT.md` for the exact scope
+and preserved test-host failure. No runtime or current library change was needed.
+
+The current [combined library](/connect/library/local-install) supports optional acquired
+archive inspection: `--enable-acquired-inspection` exposes
+`setup_inspect_acquired` for successful live Python/Node acquisitions. It lists
+and reads the primary archive without executing package code. The agent still
+chooses the integration, entrypoint and metadata. In a guided fresh macOS trial,
+an agent received a vague Python Fetch clue but no exact package, version or
+entrypoint, inspected the archive in seven calls, installed its choice and
+answered the local task with 82 net units. Both retained requests passed
+recovery. The `docs/verification/20261004-acquired-inspection/REPORT.md`
+and `docs/verification/20261004-acquired-inspection/DOWNSTREAM-HANDOFF.md`
+record this bounded evidence. Linux verification is static only; the trial
+provides no live authentication or native attachment/continuation evidence.
+
+The [standalone local path](/connect/acquisition/local-install) has a narrower complete-task proof: one fresh agent independently chose and installed an outside-catalog database server, inspected its schema through MCP and answered the original question with its own SQL. Independent review matched the answer to a preexisting oracle. That trial retained a test-host sandbox correction; it used no account authentication or native agent handoff.
+
+The original agent forwards the user's full request, supplied context and labeled observations. Dedicated setup agents determine which integrations are needed. The user does not need to know a package name, MCP endpoint or capability vocabulary first.
+
+<Steps>
+  <Step title="Understand and investigate">
+    Inspect existing connections and grants, browse maintained recipes, or research supplied URLs, repositories and setup skills. Treat external descriptions as evidence to evaluate.
+  </Step>
+  <Step title="Choose a concrete strategy">
+    Select exact package/version/strategy and service or frontend exports. Record missing prerequisites, required host services and material unresolved choices. Failure never triggers an implicit strategy fallback.
+  </Step>
+  <Step title="Prepare within the host's permitted path">
+    Configure an active package, request immediate activation where allowed, or prepare a deployment proposal. Include the actual executable/policy changes, cost and disruption that require the deployment owner's decision.
+  </Step>
+  <Step title="Obtain account and role authority">
+    Reuse an eligible selected connection or queue the necessary human action. Establish a service grant or frontend exposure under application policy. Installation and authentication alone do not authorize use.
+  </Step>
+  <Step title="Verify and resume">
+    Collect current role-specific runtime acknowledgments, return the result to the original task and resume at a supported runtime boundary. The original agent completes the business work.
+  </Step>
+</Steps>
+
+## Catalog to custom extension
+
+| Starting material | Setup work |
+| --- | --- |
+| Vague memory of a tool | Research clues, compare evidence and resolve material ambiguity |
+| Known service or endpoint | Inspect exact contracts and choose a supported strategy |
+| Repository or skill | Review source, license, dependencies and installation effects |
+| Partial recipe | Fill unresolved configuration and host prerequisites explicitly |
+| New device or custom extension | Author package exports and domain contracts, then validate the full lifecycle |
+
+The catalog accelerates this work. It is not a closed allowlist of all possible integrations or an automatic intent resolver.
+
+## What proves this outcome
+
+Run an actual request whose needed integration is absent from the prepackaged library. Preserve the agent's investigation, exact selected implementation and performed setup actions. Demonstrate the supported host authentication/configuration path, actual role availability and continuation in the original task.
+
+Successful acceptance must show the continuation performing the requested business work. Pending, denied, unsupported and uncertain paths also need honest results, but cannot substitute for that successful chain. Catalog lookup, a manually prepared final binding or installation alone is insufficient. Include both a known-recipe short path and an outside-library investigation in acceptance, with restart, cancellation and pending-owner recovery.
+
+Agents can save an exact verified local recipe for reuse. That does not silently publish it, label it maintained support or add it to the adopted integration count. [Promotion into the library](/connect/library/adoption) has its own evidence contract.
+
+The source setup MCP adapter also has optional `setup_recipes` and
+`setup_recipe` tools for recalling those investigations without shell access.
+The host fixes the store account and permits disclosure of its nonsecret
+metadata; the agent chooses from summaries and requests an exact identity and
+digest. Saved documents are historical evidence, not current permission or
+proof of readiness. The source implementation also retains a bound ordinary
+plugin's original instructions with the recipe, so a later setup session can
+read them after the original workspace is removed. This source addition is
+still awaiting compiled persistence and distribution verification. See
+`sdk/consumer-setup/RECIPES.md` in the Toolkit checkout for the host profile and
+use the capability set recorded by the selected archive.
+
+## Pending is a useful result
+
+A pending operation identifies what is waiting, who owns the next action and which task will continue. Waiting for an administrator rollout is different from waiting for OAuth. Several tasks may depend on one exact preparation without sharing their own grants or continuation destinations.
+
+Closing a UI does not cancel durable setup. Stopping one setup waiter does not revoke an existing account, cancel unrelated waiters or automatically retract a shared deployment proposal. See [continuation and delivery](/connect/reference/continuation).
