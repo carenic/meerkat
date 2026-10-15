@@ -305,7 +305,10 @@ skips every build job and publishes that run's artifacts after the same
 verification as an `--assets-run-id` recovery
 (`verify-release-asset-provenance --source-run`: every archive and its stamp
 attested by `release.yml` at that commit on `refs/heads/main`, the stamp
-naming the tag commit, every binary embedding the release version):
+naming the tag commit, every binary embedding the release version; a
+prebuild run is accepted as a source only by the tag run of exactly its
+commit, never by an asset recovery, because a prebuild does not wait for
+exact-main CI):
 `publish_critical_release_assets` publishes the critical archives at once,
 and `publish_github_release` adds the trailing ones after the prebuild's
 `Release binary build gate` passed (if that run's trailing lanes failed, an

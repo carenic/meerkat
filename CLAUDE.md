@@ -532,11 +532,11 @@ release semver gate; PR and manual artifacts are previews.
 | `build_web_sdk_package` | Tags without a prebuild, package/Web recovery without a reused artifact, or a prebuild dispatch | Builds and attests the `@rkat/web` package artifact |
 | `release_prebuild_gate` | Prebuild dispatches | Passes once the critical binary build gate and the Web SDK package succeeded (the run's trailing lanes continue); the marker `release_prebuild` requires of a prebuild run |
 | `publish_critical_release_assets` | Tags | As soon as the critical gate passes, verifies and publishes exactly the Linux and macOS arm64 archives (add-only, no manifest); waits for no trailing job |
-| `publish_github_release` | Tags or manual asset recovery | The trailing publisher: after the full gate, downloads artifacts (a prebuild's once that run's full binary build gate passed, verified exactly like an `assets_run_id` recovery), adds the archives not yet on the release (never replacing one), then writes the complete `checksums.sha256` + `index.json` once (refusing to change a published one) |
+| `publish_github_release` | Tags or manual asset recovery | The trailing publisher: after exact-main CI (`require_ci_green`) and the full gate, downloads artifacts (a prebuild's once that run's full binary build gate passed, verified exactly like an `assets_run_id` recovery), adds the archives not yet on the release (never replacing one), then writes the complete `checksums.sha256` + `index.json` once (refusing to change a published one) |
 | `update_homebrew` | After the trailing publisher | Updates the Homebrew tap formula from the complete release's published checksums |
 | `publish_semver_baseline` / `attach_semver_baseline` | Tags or asset recovery, alongside publication | `publish_semver_baseline` generates rustdoc JSON for every publishable library crate on the release tag as soon as `require_ci_green` passes; `attach_semver_baseline` attaches it as `semver-rustdoc-<version>.tar.zst` once the GitHub release is published. It is the baseline the next release's semver gate compares against; no job waits for either |
 | `publish_registries` | Tags or manual `publish_release_packages=true` | Publishes 46 Rust crates → crates.io by dependency level (concurrently within a level), Python SDK → PyPI, TypeScript SDK → npm |
-| `publish_web_sdk` | Tags or manual package/Web recovery | Publishes `@rkat/web` → npm (a prebuild's package only after verifying its attestation and version) |
+| `publish_web_sdk` | Tags or manual package/Web recovery | Publishes `@rkat/web` → npm after exact-main CI, release validation and the semver gate passed (only Web-only recovery skips the two gates); a prebuild's package only after verifying its attestation and version |
 
 **Build matrix:**
 

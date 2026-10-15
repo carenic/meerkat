@@ -439,8 +439,8 @@ elif name == "semver-baseline-needs-block-list":
 elif name == "trailing-gates-critical":
     # The critical publisher waits for every lane again.
     replace_once(
-        "    needs: [release_validate_gate, release_semver_gate, build_binaries_critical_gate, release_prebuild]\n",
-        "    needs: [release_validate_gate, release_semver_gate, build_binaries_gate, release_prebuild]\n",
+        "    needs: [require_ci_green, release_validate_gate, release_semver_gate, build_binaries_critical_gate, release_prebuild]\n",
+        "    needs: [require_ci_green, release_validate_gate, release_semver_gate, build_binaries_gate, release_prebuild]\n",
     )
 elif name == "trailing-overwrites":
     # The critical upload replaces archives already on the release.
@@ -491,6 +491,20 @@ elif name == "prebuild-critical-full-gate":
     # The critical publisher waits on the prebuild's full gate, which its
     # still-running trailing lanes hold back.
     replace_once('              --source-gate "Release critical binary build gate" \\\n', "")
+elif name == "prebuild-web-ungated":
+    # The pre-fix publish_web_sdk: a reused prebuild's package publishes
+    # whatever release validation and the semver gate concluded.
+    replace_once(
+        "      (needs.release_validate_gate.result == 'success' ||\n"
+        "       (github.event_name == 'workflow_dispatch' &&\n"
+        "        github.event.inputs.publish_web_sdk_only == 'true' &&\n"
+        "        needs.release_validate_gate.result == 'skipped')) &&\n"
+        "      (needs.release_semver_gate.result == 'success' ||\n"
+        "       (github.event_name == 'workflow_dispatch' &&\n"
+        "        github.event.inputs.publish_web_sdk_only == 'true' &&\n"
+        "        needs.release_semver_gate.result == 'skipped')) &&\n",
+        "",
+    )
 elif name == "both-defects":
     replace_once(
         MEASUREMENT_STEP_IF,
@@ -651,7 +665,7 @@ expect_fail_named prebuild-builds-anyway "${TEST_ROOT}/prebuild-builds-anyway.ym
   "job \`build_binaries_windows_cross\` builds on a tag push with a prebuild found" prebuild
 mutate prebuild-reuse-unverified "${TEST_ROOT}/prebuild-reuse-unverified.yml"
 expect_fail_named prebuild-reuse-unverified "${TEST_ROOT}/prebuild-reuse-unverified.yml" \
-  "expected \`scripts/verify-release-asset-provenance --source-run 424242 --stamps ...\`" prebuild
+  "expected \`scripts/verify-release-asset-provenance --source-run 424242 --prebuild --stamps ...\`" prebuild
 mutate prebuild-web-unverified "${TEST_ROOT}/prebuild-web-unverified.yml"
 expect_fail_named prebuild-web-unverified "${TEST_ROOT}/prebuild-web-unverified.yml" \
   "must verify the prebuilt package's attestation" prebuild
@@ -664,6 +678,9 @@ expect_fail_named prebuild-gate-waits-trailing "${TEST_ROOT}/prebuild-gate-waits
 mutate prebuild-critical-full-gate "${TEST_ROOT}/prebuild-critical-full-gate.yml"
 expect_fail_named prebuild-critical-full-gate "${TEST_ROOT}/prebuild-critical-full-gate.yml" \
   "expected \`Release critical binary build gate\`" prebuild
+mutate prebuild-web-ungated "${TEST_ROOT}/prebuild-web-ungated.yml"
+expect_fail_named prebuild-web-ungated "${TEST_ROOT}/prebuild-web-ungated.yml" \
+  "job \`publish_web_sdk\` publishes on a tag push with a prebuild found and \`release_validate_gate\` failed" prebuild
 mutate prebuild-gate-renamed "${TEST_ROOT}/prebuild-gate-renamed.yml"
 expect_fail_named prebuild-gate-renamed "${TEST_ROOT}/prebuild-gate-renamed.yml" \
   "does not require the \`Prebuild complete\` job" prebuild

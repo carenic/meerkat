@@ -1408,6 +1408,16 @@ def check_prebuild(text: str) -> list[str]:
         )
 
     reused, fresh = tag_push(PREBUILD_RUN), tag_push("")
+
+    # Reusing a prebuild never bypasses a gate: with exact-main CI, release
+    # validation or the semver gate failed, nothing publishes.
+    for failed in (CI_GREEN_JOB, VALIDATION_GATE_JOB, SEMVER_GATE_JOB):
+        context = EventContext(
+            **{**reused.__dict__, "label": f"{reused.label} and `{failed}` failed", "job_results": {failed: "failure"}}
+        )
+        for job in (CRITICAL_PUBLISH_JOB, ASSET_PUBLISH_JOB, WEB_SDK_PUBLISH_JOB, REGISTRY_JOB):
+            if job in names and _job_runs(text, job, context):
+                violations.append(f"job `{job}` publishes on {context.label}")
     for job in (*BINARY_BUILD_JOBS, WEB_SDK_BUILD_JOB):
         if _job_runs(text, job, reused):
             violations.append(f"job `{job}` builds on {reused.label}")
@@ -1443,11 +1453,16 @@ def check_prebuild(text: str) -> list[str]:
             )
             continue
         calls = _verifier_invocations(verify_steps[0], reused)
-        if len(calls) != 1 or calls[0][:2] != ["--source-run", PREBUILD_RUN] or "--stamps" not in calls[0]:
+        if (
+            len(calls) != 1
+            or calls[0][:2] != ["--source-run", PREBUILD_RUN]
+            or "--stamps" not in calls[0]
+            or "--prebuild" not in calls[0]
+        ):
             violations.append(
                 f"step `{verify_steps[0].name}` verifies {reused.label} with {calls}; expected "
-                f"`{PROVENANCE_VERIFIER} --source-run {PREBUILD_RUN} --stamps ...`, the "
-                "assets_run_id trust path"
+                f"`{PROVENANCE_VERIFIER} --source-run {PREBUILD_RUN} --prebuild --stamps ...`, the "
+                "assets_run_id trust path for the tag's own prebuild"
             )
         else:
             # The critical archives are verified against the prebuild's

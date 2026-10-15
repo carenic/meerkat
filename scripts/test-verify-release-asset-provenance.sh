@@ -7,7 +7,9 @@
 # each stamp names the tag commit. The default gate is the full
 # "Release binary build gate"; --source-gate "Release critical binary build
 # gate" accepts the critical archives of a prebuild whose trailing lanes are
-# still running, and no other job name is accepted.
+# still running, and no other job name is accepted. A prebuild run (one with
+# a "Release prebuild gate" job) never waited for exact-main CI: it is refused
+# unless --prebuild comes from the tag run of exactly its commit.
 
 set -euo pipefail
 
@@ -39,15 +41,20 @@ git_in_repo add file
 git_in_repo commit -q -m release
 git_in_repo tag v0.0.0
 SHA="$(git_in_repo rev-parse HEAD)"
+echo later >"${TEST_ROOT}/repo/file"
+git_in_repo commit -q -am later
+LATER_SHA="$(git_in_repo rev-parse HEAD)"
+echo "${SHA}" >"${TEST_ROOT}/run_sha"
 
 # gh api runs/<id> and runs/<id>/jobs, through real jq; gh attestation verify
-# passes for --source-digest ${SHA} with --source-ref refs/heads/main.
+# passes for --source-digest <the run's head> with --source-ref refs/heads/main.
 cat >"${TEST_ROOT}/bin/gh" <<STUB
 #!/usr/bin/env bash
 set -euo pipefail
+run_sha="\$(cat "${TEST_ROOT}/run_sha")"
 if [[ "\$1" == "attestation" ]]; then
   args="\$*"
-  [[ "\${args}" == *"--source-digest ${SHA}"* && "\${args}" == *"--source-ref refs/heads/main"* ]]
+  [[ "\${args}" == *"--source-digest \${run_sha}"* && "\${args}" == *"--source-ref refs/heads/main"* ]]
   exit
 fi
 [[ "\$1" == "api" ]] || exit 2
@@ -62,7 +69,7 @@ while [[ "\$#" -gt 0 ]]; do
 done
 case "\${url}" in
   "repos/${REPO}/actions/runs/${RUN_ID}")
-    printf '{"path": ".github/workflows/release.yml", "event": "workflow_dispatch", "head_branch": "main", "head_sha": "${SHA}", "repository": {"full_name": "${REPO}"}}' | jq -r "\${filter}"
+    printf '{"path": ".github/workflows/release.yml", "event": "workflow_dispatch", "head_branch": "main", "head_sha": "%s", "repository": {"full_name": "${REPO}"}}' "\${run_sha}" | jq -r "\${filter}"
     ;;
   "repos/${REPO}/actions/runs/${RUN_ID}/jobs?per_page=100")
     jq -r "\${filter}" "${TEST_ROOT}/jobs.json"
@@ -76,18 +83,22 @@ mkdir -p "${TEST_ROOT}/artifacts" "${TEST_ROOT}/stamps"
 echo archive >"${TEST_ROOT}/artifacts/rkat-0.0.0-x86_64-unknown-linux-gnu.tar.gz"
 echo "${SHA}" >"${TEST_ROOT}/stamps/rkat-0.0.0-x86_64-unknown-linux-gnu.tar.gz.source-commit"
 
-# gates <full gate conclusion> <critical gate conclusion>
+# gates <full gate conclusion> <critical gate conclusion> [prebuild gate conclusion]
 gates() {
-  printf '{"jobs": [{"name": "Release binary build gate", "conclusion": %s}, {"name": "Release critical binary build gate", "conclusion": %s}]}\n' \
-    "$1" "$2" >"${TEST_ROOT}/jobs.json"
+  local prebuild=""
+  [[ -z "${3:-}" ]] || prebuild=", {\"name\": \"Release prebuild gate\", \"conclusion\": $3}"
+  printf '{"jobs": [{"name": "Release binary build gate", "conclusion": %s}, {"name": "Release critical binary build gate", "conclusion": %s}%s]}\n' \
+    "$1" "$2" "${prebuild}" >"${TEST_ROOT}/jobs.json"
 }
 
-# verify <label> <expected status> [extra verifier options]
+# verify <label> <expected status> [extra verifier options]; GITHUB_REF from
+# CALLER_REF (an asset recovery dispatched on main by default).
 verify() {
   local label="$1" expected="$2" status
   shift 2
   set +e
   (cd "${TEST_ROOT}/repo" && PATH="${TEST_ROOT}/bin:${PATH}" GITHUB_REPOSITORY="${REPO}" \
+    GITHUB_REF="${CALLER_REF:-refs/heads/main}" \
     "${VERIFIER}" --source-run "${RUN_ID}" "$@" --stamps "${TEST_ROOT}/stamps" \
     "${TEST_ROOT}/artifacts" v0.0.0) >"${TEST_ROOT}/${label}.log" 2>&1
   status=$?
@@ -100,13 +111,33 @@ gates '"success"' '"success"'
 verify complete-run 0
 gates null '"success"'
 verify full-gate-pending 1
-grep -Fq "Release binary build gate did not succeed (null)" "${TEST_ROOT}/full-gate-pending.log" ||
+grep -Fq "Release binary build gate did not succeed (pending)" "${TEST_ROOT}/full-gate-pending.log" ||
   fail "full-gate-pending: the pending gate is not named" "$(cat "${TEST_ROOT}/full-gate-pending.log")"
 verify critical-gate-accepts-running-trailing-lanes 0 --source-gate "Release critical binary build gate"
 gates null '"failure"'
 verify critical-gate-failed 1 --source-gate "Release critical binary build gate"
 gates '"success"' '"success"'
 verify unknown-gate 2 --source-gate "Release prebuild gate"
+
+# A prebuild run: refused for an asset recovery, accepted only by the tag run
+# of exactly its commit.
+gates '"success"' '"success"' '"success"'
+verify prebuild-refused-for-recovery 1
+grep -Fq "is a pre-tag prebuild" "${TEST_ROOT}/prebuild-refused-for-recovery.log" ||
+  fail "prebuild-refused-for-recovery: the refusal is not named" "$(cat "${TEST_ROOT}/prebuild-refused-for-recovery.log")"
+verify prebuild-flag-outside-tag-run 1 --prebuild
+CALLER_REF=refs/tags/v0.0.0 verify prebuild-in-its-tag-run 0 --prebuild
+gates '"success"' '"success"' '"failure"'
+CALLER_REF=refs/tags/v0.0.0 verify prebuild-gate-failed 1 --prebuild
+gates '"success"' '"success"' '"success"'
+echo "${LATER_SHA}" >"${TEST_ROOT}/run_sha"
+echo "${LATER_SHA}" >"${TEST_ROOT}/stamps/rkat-0.0.0-x86_64-unknown-linux-gnu.tar.gz.source-commit"
+CALLER_REF=refs/tags/v0.0.0 verify prebuild-of-another-commit 1 --prebuild
+grep -Fq "not the v0.0.0 commit" "${TEST_ROOT}/prebuild-of-another-commit.log" ||
+  fail "prebuild-of-another-commit: the commit mismatch is not named" "$(cat "${TEST_ROOT}/prebuild-of-another-commit.log")"
+echo "${SHA}" >"${TEST_ROOT}/run_sha"
+gates '"success"' '"success"'
+
 echo "${SHA%?}0" >"${TEST_ROOT}/stamps/rkat-0.0.0-x86_64-unknown-linux-gnu.tar.gz.source-commit"
 verify stamp-names-another-commit 1
 

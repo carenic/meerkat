@@ -1728,10 +1728,11 @@ jobs:
   # publisher replaces an asset that is already on the release.
   publish_critical_release_assets:
     name: Publish Linux and macOS arm64 release assets
-    needs: [release_validate_gate, release_semver_gate, build_binaries_critical_gate, release_prebuild]
+    needs: [require_ci_green, release_validate_gate, release_semver_gate, build_binaries_critical_gate, release_prebuild]
     if: >-
       always() &&
       startsWith(github.ref, 'refs/tags/v') &&
+      needs.require_ci_green.result == 'success' &&
       needs.release_validate_gate.result == 'success' &&
       needs.release_semver_gate.result == 'success' &&
       needs.build_binaries_critical_gate.result == 'success'
@@ -1814,6 +1815,7 @@ jobs:
             scripts/verify-release-asset-provenance \
               --source-run "${PREBUILD_RUN_ID}" \
               --source-gate "Release critical binary build gate" \
+              --prebuild \
               --stamps release-artifacts \
               critical-release-artifacts "${RELEASE_TAG}"
           else
@@ -2108,6 +2110,7 @@ jobs:
     name: Publish GitHub release assets
     if: >-
       always() &&
+      needs.require_ci_green.result == 'success' &&
       (startsWith(github.ref, 'refs/tags/v') ||
        (github.event_name == 'workflow_dispatch' &&
         github.event.inputs.publish_release_assets_only == 'true')) &&
@@ -2126,8 +2129,12 @@ jobs:
     # manifest; update_homebrew follows it. Waiting for the critical
     # publisher keeps the two uploads ordered, and `always()` above keeps
     # this authoritative path available if that publisher failed.
+    # require_ci_green: every published archive, an asset recovery's from an
+    # earlier run included, belongs to a release commit whose exact-main CI
+    # succeeded (a prebuild run never waited for it).
     needs:
       [
+        require_ci_green,
         release_validate_gate,
         release_semver_gate,
         build_binaries_gate,
@@ -2290,6 +2297,7 @@ jobs:
             # commit (release_prebuild only selects a run at exactly it).
             scripts/verify-release-asset-provenance \
               --source-run "${PREBUILD_RUN_ID}" \
+              --prebuild \
               --stamps release-artifacts \
               prepared-release-artifacts "${RELEASE_TAG}"
           elif [[ -n "${ASSETS_RUN_ID}" ]]; then
@@ -2688,6 +2696,14 @@ jobs:
       always() &&
       needs.require_ci_green.result == 'success' &&
       needs.registry_credentials_preflight.result == 'success' &&
+      (needs.release_validate_gate.result == 'success' ||
+       (github.event_name == 'workflow_dispatch' &&
+        github.event.inputs.publish_web_sdk_only == 'true' &&
+        needs.release_validate_gate.result == 'skipped')) &&
+      (needs.release_semver_gate.result == 'success' ||
+       (github.event_name == 'workflow_dispatch' &&
+        github.event.inputs.publish_web_sdk_only == 'true' &&
+        needs.release_semver_gate.result == 'skipped')) &&
       (needs.build_web_sdk_package.result == 'success' ||
        needs.release_prebuild.outputs.run_id != '' ||
        (github.event_name == 'workflow_dispatch' &&
@@ -2696,7 +2712,10 @@ jobs:
        (github.event_name == 'workflow_dispatch' &&
         github.event.inputs.publish_release_packages == 'true' &&
         github.event.inputs.alpha_crates_only != 'true'))
-    needs: [require_ci_green, build_web_sdk_package, registry_credentials_preflight, release_prebuild]
+    # A tag publishes @rkat/web only after release validation and the semver
+    # gate passed, whether the package was built here or reused from a
+    # prebuild; only the Web-SDK-only recovery skips both gates.
+    needs: [require_ci_green, release_validate_gate, release_semver_gate, build_web_sdk_package, registry_credentials_preflight, release_prebuild]
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
