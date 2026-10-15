@@ -464,11 +464,20 @@ tokens, private BuildBuddy endpoints, or enterprise infrastructure names.
 The release workflow's own `GITHUB_TOKEN` is read-only by default: only the
 build jobs may mint OIDC tokens and write build attestations, only the
 release publishers may write the GitHub release, and build checkouts do not
-persist the token (`scripts/release-doctor` checks this). Its Cargo caches are
-never saved by a dispatch, which would write the `main` scope every tag run
-restores from, never cache `~/.cargo/bin`, so no restored binary can shadow a
-tool on `PATH`, and the jobs that hold registry or publish tokens restore no
-cache at all; the macOS checks call the Apple tools by absolute path.
+persist the token (`scripts/release-doctor` checks this). No cache step in
+its jobs, or in the local actions they call (the Windows SDK cache of
+`build-windows-cross`, the Bazel repository cache of `setup-buildbuddy-ci`),
+is saved by a dispatch, which would write the `main` scope every tag run
+restores from; no rust-cache stores `~/.cargo/bin`, so no restored binary can
+shadow a tool on `PATH`; the jobs that hold registry or publish tokens
+restore no cache at all; and the jobs that mint OIDC tokens or attest
+artifacts restore only caches that no workflow in the repository saves on a
+dispatch-like run (a dispatch, `repository_dispatch`, `pull_request_target`,
+`workflow_run`, or a workflow call). The BuildBuddy release binary build
+passes `repository-cache: "false"`. The doctor reads release.yml and its
+local actions, not the reusable `buildbuddy.yml`, which the full-graph
+validation calls only on tag pushes. The macOS checks call the Apple tools by
+absolute path.
 
 ## Hard Rules
 

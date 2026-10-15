@@ -17,8 +17,10 @@ re-enabling the long measurement on tags, relaxing the 30 minute publication
 SLO, making the SDK packages wait on it, re-running Cargo validation on a
 tag whose exact-tree CI attestation already covers it, or letting a pre-tag
 prebuild publish anything or a tag publish a prebuild's artifacts without the
-attested-archive verification, or making a job wait for the semver baseline
-rustdoc all fail and name the defect.
+attested-archive verification, making a job wait for the semver baseline
+rustdoc, or letting a dispatch save a cache (also inside a local action, or
+from another workflow) that a token-holding or attesting job restores all
+fail and name the defect.
 
 Only the Python standard library is used, so the doctor and its contract test
 run wherever `python3` does.
@@ -1939,7 +1941,8 @@ def check_token_permissions(text: str) -> list[str]:
                 violations.append(f"job `{job}` step `{step.name}` persists the workflow token in its checkout")
     return violations
 
-# Jobs that hold a registry or publish token (or write the GitHub release).
+# Jobs that hold a registry or publish token (or write the GitHub release):
+# they run no cache step at all. Any job granted `contents: write` counts too.
 TOKEN_JOBS = (
     "registry_credentials_preflight",
     REGISTRY_JOB,
@@ -1949,38 +1952,536 @@ TOKEN_JOBS = (
     "update_homebrew",
     "attach_semver_baseline",
 )
-CACHE_ACTIONS = ("Swatinem/rust-cache", "actions/cache")
+# setup-* actions that restore and save a package cache when given a `cache`
+# input (setup-go by default, setup-node also when package.json names a
+# package manager).
+SETUP_CACHE_ACTIONS = (
+    "actions/setup-node",
+    "actions/setup-python",
+    "actions/setup-java",
+    "actions/setup-go",
+    "actions/setup-dotnet",
+)
+# Triggers whose runs save into the default branch's cache scope, which every
+# tag run restores, without being a reviewed push to main: a dispatch, an
+# external event, a pull_request_target or workflow_run follow-up, or a
+# workflow call (whose caller's event is unknown here).
+DISPATCH_LIKE_TRIGGERS = (
+    "workflow_dispatch",
+    "repository_dispatch",
+    "pull_request_target",
+    "workflow_run",
+    "workflow_call",
+)
+# The tree the local actions and the other workflows are read from; the
+# release doctor's fixtures point it at a mutated copy (--repo-root).
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+@dataclass(frozen=True)
+class _Unknown:
+    """A value a static reading cannot know (a dispatch input, a repository
+    variable, a step output, the runner); `truthy` is set when only its
+    truthiness is known."""
+
+    truthy: bool | None = None
+
+
+UNKNOWN = _Unknown()
+
+
+def _known_truthy(value: object) -> bool | None:
+    if isinstance(value, _Unknown):
+        return value.truthy
+    return truthy(value)
+
+
+@dataclass(frozen=True)
+class OpenFrame:
+    """One run as the cache check reads it: its event (None for a reusable
+    workflow, whose caller's event is unknown), its ref, and the inputs of
+    the local action being read (None outside one). Everything else is
+    unknown, so a condition counts as false only when it is false whatever
+    the unknowns are."""
+
+    label: str
+    event_name: str | None
+    ref: str = "refs/heads/main"
+    inputs: dict[str, object] | None = None
+
+    def resolve(self, path: str) -> object:
+        if path == "github.event_name":
+            return UNKNOWN if self.event_name is None else self.event_name
+        if path == "github.ref":
+            return self.ref
+        if path == "github.ref_name":
+            return github_ref_name(self.ref)
+        if path.startswith("inputs.") and self.inputs is not None:
+            # An input the action does not declare reads as empty.
+            return self.inputs.get(path[len("inputs.") :], "")
+        return UNKNOWN
+
+
+class _OpenParser(_Parser):
+    """`_Parser` over three values: what the frame cannot know stays unknown."""
+
+    def parse_or(self) -> object:
+        left = self.parse_and()
+        while self.peek() == ("op", "||"):
+            self.take()
+            right = self.parse_and()
+            known = _known_truthy(left)
+            if known is None:
+                left = _Unknown(True) if _known_truthy(right) is True else UNKNOWN
+            elif not known:
+                left = right
+        return left
+
+    def parse_and(self) -> object:
+        left = self.parse_equality()
+        while self.peek() == ("op", "&&"):
+            self.take()
+            right = self.parse_equality()
+            known = _known_truthy(left)
+            if known is None:
+                left = _Unknown(False) if _known_truthy(right) is False else UNKNOWN
+            elif known:
+                left = right
+        return left
+
+    def parse_equality(self) -> object:
+        left = self.parse_unary()
+        while self.peek() in (("op", "=="), ("op", "!=")):
+            _, op = self.take()
+            right = self.parse_unary()
+            if isinstance(left, _Unknown) or isinstance(right, _Unknown):
+                left = UNKNOWN
+            else:
+                equal = _equal(left, right)
+                left = equal if op == "==" else not equal
+        return left
+
+    def parse_unary(self) -> object:
+        if self.peek() == ("op", "!"):
+            self.take()
+            known = _known_truthy(self.parse_unary())
+            return UNKNOWN if known is None else not known
+        return self.parse_primary()
+
+    def parse_primary(self) -> object:
+        token = self.peek()
+        following = self.tokens[self.index + 1] if self.index + 1 < len(self.tokens) else None
+        if token is None or token[0] != "ident" or following != ("op", "("):
+            return super().parse_primary()
+        name = self.take()[1]
+        self.take()
+        args: list[object] = []
+        if self.peek() != ("op", ")"):
+            args.append(self.parse_or())
+            while self.peek() == ("op", ","):
+                self.take()
+                args.append(self.parse_or())
+        self.expect_op(")")
+        if name == "always":
+            return True
+        if name in ("startsWith", "endsWith", "contains") and not any(
+            isinstance(arg, _Unknown) for arg in args
+        ):
+            return FUNCTIONS[name](args)
+        # success(), failure(), hashFiles(), format(), fromJSON(), ...
+        return UNKNOWN
+
+
+def _open_evaluate(expression: str, frame: OpenFrame) -> object:
+    expression = " ".join(expression.split())
+    match = re.fullmatch(r"\$\{\{(.*)\}\}", expression)
+    if match and "}}" not in match.group(1):
+        expression = match.group(1)
+    try:
+        return _OpenParser(expression, frame).parse()
+    except UnsupportedExpression:
+        # Syntax this reader does not model (an index, a filter) is unknown.
+        return UNKNOWN
+
+
+def _may_hold(condition: str | None, frame: OpenFrame) -> bool:
+    """False only when `condition` is false whatever the unknowns are."""
+    if condition is None:
+        return True
+    return _known_truthy(_open_evaluate(condition, frame)) is not False
+
+
+def _as_input(value: object) -> object:
+    """A value as an action input receives it (`true`, not True)."""
+    if isinstance(value, _Unknown):
+        return value
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return str(value)
+
+
+def _open_template(template: str, frame: OpenFrame, unknown: str | None) -> object:
+    """Render a `with:` value: a lone expression keeps its value; otherwise
+    each unknown part becomes `unknown` (a `*` for a cache-key pattern), or
+    the whole value is unknown when `unknown` is None."""
+    pieces = EXPRESSION.split(template.strip())
+    if unknown is None and len(pieces) == 3 and pieces[0] == "" and pieces[2] == "":
+        return _as_input(_open_evaluate(pieces[1], frame))
+    rendered: list[str] = []
+    for index, piece in enumerate(pieces):
+        if index % 2 == 0:
+            rendered.append(piece)
+            continue
+        value = _as_input(_open_evaluate(piece, frame))
+        if isinstance(value, _Unknown):
+            if unknown is None:
+                return UNKNOWN
+            rendered.append(unknown)
+        else:
+            rendered.append(value)
+    return "".join(rendered)
+
+
+def _specs_overlap(restored: tuple[str, str], saved: tuple[str, str]) -> bool:
+    """Whether an entry saved under `saved` can be restored under `restored`.
+
+    Two families match only when equal (the suffix after them has the same
+    shape for both); a family matches a whole key that starts with it.
+    """
+    (left_kind, left), (right_kind, right) = restored, saved
+    if left_kind == "family" and right_kind == "key":
+        left += "-*"
+    elif left_kind == "key" and right_kind == "family":
+        right += "-*"
+    return _globs_overlap(left, right)
+
+
+def _globs_overlap(left: str, right: str) -> bool:
+    """Whether two `*` patterns match one common string (case-insensitive)."""
+    left, right = left.lower(), right.lower()
+    memo: dict[tuple[int, int], bool] = {}
+
+    def match(i: int, j: int) -> bool:
+        if (i, j) in memo:
+            return memo[(i, j)]
+        if i == len(left) and j == len(right):
+            result = True
+        elif i < len(left) and left[i] == "*":
+            result = match(i + 1, j) or (j < len(right) and match(i, j + 1))
+        elif j < len(right) and right[j] == "*":
+            result = match(i, j + 1) or (i < len(left) and match(i + 1, j))
+        else:
+            result = i < len(left) and j < len(right) and left[i] == right[j] and match(i + 1, j + 1)
+        memo[(i, j)] = result
+        return result
+
+    return match(0, 0)
+
+
+@dataclass(frozen=True)
+class _LocalAction:
+    """A local composite action: where it lives, its input defaults, its steps."""
+
+    name: str
+    defaults: dict[str, str]
+    steps: tuple[Step, ...]
+
+
+def _local_action(uses: str, root: Path) -> _LocalAction | None:
+    """The composite action a `uses: ./...` step runs, read from `root`.
+
+    `./.release-tooling/` is release.yml's checkout of its own commit, so it
+    resolves to the same tree.
+    """
+    if not uses.startswith("./"):
+        return None
+    relative = uses[2:].rstrip("/")
+    if relative.startswith(".release-tooling/"):
+        relative = relative[len(".release-tooling/") :]
+    for candidate in ("action.yml", "action.yaml"):
+        path = root / relative / candidate
+        if path.is_file():
+            break
+    else:
+        raise ContractError(f"local action `{uses}` has no action.yml under {root}")
+    lines = path.read_text(encoding="utf-8").splitlines()
+
+    defaults: dict[str, str] = {}
+    current: str | None = None
+    section: str | None = None
+    for line in lines:
+        if line.strip() and not line.startswith(" "):
+            section = line.split(":", 1)[0]
+            continue
+        if section != "inputs":
+            continue
+        name = re.match(r"^  ([A-Za-z0-9_-]+):\s*$", line)
+        if name:
+            current = name.group(1)
+            continue
+        default = re.match(r"^    default:\s*(.*?)\s*$", line)
+        if default and current is not None:
+            defaults[current] = default.group(1).strip("'\"")
+
+    try:
+        start = lines.index("runs:")
+        steps_at = next(
+            index for index in range(start + 1, len(lines)) if lines[index] == "  steps:"
+        )
+    except (ValueError, StopIteration) as error:
+        raise ContractError(f"local action `{uses}` is not a composite action with steps") from error
+    body: list[str] = []
+    for line in lines[steps_at + 1 :]:
+        if line.strip() and _indent(line) < 4:
+            break
+        # The workflow layout one level deeper, which job_steps reads.
+        body.append("  " + line if line.strip() else line)
+    steps = job_steps(["    steps:", *body])
+    return _LocalAction(relative, defaults, tuple(steps))
+
+
+@dataclass(frozen=True)
+class _CacheUse:
+    """One cache step a job runs, directly or through local actions."""
+
+    workflow: str
+    job: str
+    via: tuple[str, ...]
+    step: Step
+    kind: str  # cache | restore | save | rust-cache | setup
+    frame: OpenFrame
+
+    @property
+    def where(self) -> str:
+        chain = " > ".join(f"`{name}`" for name in self.via)
+        return f"job `{self.job}`" + (f" (in {chain})" if chain else "")
+
+    @property
+    def uses(self) -> str:
+        return self.step.fields.get("uses", "").strip()
+
+    def _with(self, name: str, unknown: str | None = None) -> object:
+        value = self.step.nested("with").get(name)
+        return None if value is None else _open_template(value, self.frame, unknown)
+
+    def key_specs(self) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
+        """What it may restore and what it may save, as (`key`, pattern) for
+        `*` patterns over a whole cache key, or (`family`, pattern) for the
+        part of a rust-cache or setup-* key before the runner and
+        environment suffix every such key ends with."""
+        if self.kind == "rust-cache":
+            # Swatinem/rust-cache: <prefix-key>-<shared-key | key-job>-<os>-...
+            prefix = self._with("prefix-key", "*") or "v0-rust"
+            shared = self._with("shared-key", "*")
+            if shared:
+                family = f"{prefix}-{shared}"
+            else:
+                family = str(prefix)
+                key = self._with("key", "*")
+                if key:
+                    family += f"-{key}"
+                if str(self._with("add-job-id-key") or "true").lower() != "false":
+                    family += f"-{self.job}"
+            return [("family", family)], [("family", family)]
+        if self.kind == "setup":
+            family = f"setup-{self.uses.split('@', 1)[0]}"
+            return [("family", family)], [("family", family)]
+        key = str(self._with("key", "*") or "*")
+        restores = [("key", key)]
+        for line in (self.step.nested("with").get("restore-keys") or "").splitlines():
+            if line.strip():
+                restores.append(("key", f"{_open_template(line.strip(), self.frame, '*')}*"))
+        return (restores if self.kind != "save" else []), ([("key", key)] if self.kind != "restore" else [])
+
+    def may_save(self) -> bool:
+        if self.kind in ("cache", "save", "setup"):
+            return True
+        if self.kind == "rust-cache":
+            save_if = self.step.nested("with").get("save-if")
+            return save_if is None or _may_hold(save_if, self.frame)
+        return False
+
+    def may_restore(self) -> bool:
+        return self.kind != "save"
+
+
+def _cache_kind(uses: str, step: Step, root: Path) -> str | None:
+    action = uses.split("@", 1)[0]
+    if action == "actions/cache":
+        return "cache"
+    if action == "actions/cache/restore":
+        return "restore"
+    if action == "actions/cache/save":
+        return "save"
+    if action == "Swatinem/rust-cache":
+        return "rust-cache"
+    if action in SETUP_CACHE_ACTIONS:
+        inputs = step.nested("with")
+        cache = inputs.get("cache", "")
+        if action == "actions/setup-go":
+            return None if cache.lower() == "false" else "setup"
+        if cache:
+            return "setup"
+        if action == "actions/setup-node" and inputs.get("package-manager-cache", "").lower() != "false":
+            package = root / "package.json"
+            if package.is_file() and re.search(
+                r'"(?:packageManager|devEngines)"', package.read_text(encoding="utf-8")
+            ):
+                return "setup"
+    return None
+
+
+def _walk_cache_steps(
+    steps: Iterable[Step],
+    frame: OpenFrame,
+    root: Path,
+    workflow: str,
+    job: str,
+    via: tuple[str, ...] = (),
+) -> Iterable[_CacheUse]:
+    for step in steps:
+        if not _may_hold(step.condition, frame):
+            continue
+        uses = step.fields.get("uses", "").strip()
+        kind = _cache_kind(uses, step, root)
+        if kind is not None:
+            yield _CacheUse(workflow, job, via, step, kind, frame)
+            continue
+        action = _local_action(uses, root)
+        if action is None:
+            continue
+        if action.name in via or len(via) > 8:
+            raise ContractError(f"local action `{action.name}` calls itself")
+        inputs: dict[str, object] = dict(action.defaults)
+        for name, value in step.nested("with").items():
+            inputs[name] = _open_template(value, frame, None)
+        inner = OpenFrame(frame.label, frame.event_name, frame.ref, inputs)
+        yield from _walk_cache_steps(action.steps, inner, root, workflow, job, (*via, action.name))
+
+
+def _workflow_triggers(text: str) -> set[str]:
+    lines = text.splitlines()
+    for index, line in enumerate(lines):
+        match = re.match(r"""^["']?on["']?:\s*(.*?)\s*(?:#.*)?$""", line)
+        if not match:
+            continue
+        if match.group(1):
+            return {name.strip() for name in match.group(1).strip("[]").split(",") if name.strip()}
+        triggers: set[str] = set()
+        for candidate in lines[index + 1 :]:
+            if candidate.strip() and not candidate.startswith(" "):
+                break
+            named = re.match(r"^  (?:- )?([A-Za-z_]+):?\s*(?:#.*)?$", candidate)
+            if named:
+                triggers.add(named.group(1))
+        return triggers
+    raise ContractError("the workflow has no `on:` triggers")
+
+
+def _job_cache_uses(
+    text: str, workflow: str, job: str, frame: OpenFrame, root: Path
+) -> list[_CacheUse] | None:
+    """The cache steps `job` may run under `frame`; None for a reusable-workflow call."""
+    block = job_block(text, job)
+    fields = parse_mapping(block, 4)
+    if "uses" in fields:
+        return None
+    if not _may_hold(fields.get("if"), frame):
+        return []
+    return list(_walk_cache_steps(job_steps(block), frame, root, workflow, job))
 
 
 def check_release_caches(text: str) -> list[str]:
-    """No release cache can be poisoned by a dispatch or reach a token job.
+    """What release.yml's caches can carry, read through every local action.
 
-    A dispatch runs on main and saves into the default branch's cache scope,
-    which every tag run restores from, so no release cache is saved by a
-    dispatch; ~/.cargo/bin is never cached, so a restored binary cannot
-    shadow a tool on PATH; and the jobs holding registry or publish tokens
-    restore no cache at all.
+    Covers each release.yml job and the local composite actions it calls,
+    recursively (not a reusable workflow: such a job must never run on a
+    dispatch). A dispatch on main saves into the default branch's cache
+    scope, which every tag run restores, so no cache step saves on a
+    dispatch; no rust-cache caches ~/.cargo/bin, so a restored binary cannot
+    shadow a tool on PATH; a job holding a registry or publish token (or
+    `contents: write`) runs no cache step; and a job that mints OIDC tokens
+    or attests artifacts (`id-token` or `attestations: write`) restores only
+    caches that no workflow in the repository saves on a dispatch-like run
+    (dispatch, repository_dispatch, pull_request_target, workflow_run, or a
+    workflow call), through the same local action or an overlapping key.
     """
+    root = REPO_ROOT
     violations: list[str] = []
-    dispatch = EventContext(label="a dispatch", event_name="workflow_dispatch", ref="refs/heads/main")
-    for job in _job_names(text):
-        for step in _steps_of(text, job):
-            uses = step.fields.get("uses", "")
-            if not any(action in uses for action in CACHE_ACTIONS):
+    dispatch = OpenFrame(label="a dispatch", event_name="workflow_dispatch")
+    tag = OpenFrame(label="a tag push", event_name="push", ref="refs/tags/v0.0.0")
+    names = _job_names(text)
+    scopes = {job: _permission_scopes(job_block(text, job), 4) for job in names}
+    token_jobs = set(TOKEN_JOBS) | {job for job in names if scopes[job].get("contents") == "write"}
+    sensitive = {
+        job
+        for job in names
+        if scopes[job].get("id-token") == "write" or scopes[job].get("attestations") == "write"
+    }
+
+    def report(message: str) -> None:
+        if message not in violations:
+            violations.append(message)
+
+    restored: list[tuple[_CacheUse, str]] = []
+    for job in names:
+        for frame in (dispatch, tag):
+            uses = _job_cache_uses(text, DEFAULT_WORKFLOW.name, job, frame, root)
+            if uses is None:
+                fields = parse_mapping(job_block(text, job), 4)
+                if job in token_jobs:
+                    report(f"job `{job}` holds a registry or publish token and calls a reusable workflow")
+                if frame is dispatch and _may_hold(fields.get("if"), dispatch):
+                    report(
+                        f"job `{job}` calls a reusable workflow on a dispatch, whose cache saves "
+                        "this check does not read"
+                    )
+                break
+            for use in uses:
+                if job in token_jobs:
+                    report(f"{use.where} holds a registry or publish token and restores a cache (`{use.uses}`)")
+                    continue
+                if use.kind == "rust-cache" and str(use._with("cache-bin")).lower() != "false":
+                    report(f"{use.where} caches ~/.cargo/bin (`cache-bin` is not false)")
+                if frame is dispatch and use.may_save():
+                    if use.kind == "rust-cache":
+                        report(f"{use.where} saves its rust-cache on a dispatch")
+                    else:
+                        saved = ", ".join(f"`{pattern}`" for _, pattern in use.key_specs()[1])
+                        report(f"{use.where} saves cache {saved} on a dispatch (`{use.uses}`)")
+                if job in sensitive and use.may_restore():
+                    restored.extend((use, spec) for spec in use.key_specs()[0])
+
+    if not restored:
+        return violations
+    workflows = sorted((root / ".github" / "workflows").glob("*.y*ml"))
+    sources = {path.name: path.read_text(encoding="utf-8") for path in workflows}
+    # The workflow under check, which may be a mutated copy.
+    sources[DEFAULT_WORKFLOW.name] = text
+    for workflow, source in sorted(sources.items()):
+        triggers = _workflow_triggers(source)
+        for trigger in DISPATCH_LIKE_TRIGGERS:
+            if trigger not in triggers:
                 continue
-            if job in TOKEN_JOBS:
-                violations.append(f"job `{job}` holds a registry or publish token and restores a cache (`{uses}`)")
-                continue
-            inputs = step.nested("with")
-            if "rust-cache" in uses:
-                if inputs.get("cache-bin") != "false":
-                    violations.append(f"job `{job}` caches ~/.cargo/bin (`cache-bin` is not false)")
-                save_if = inputs.get("save-if")
-                if save_if is None or truthy(evaluate(save_if, dispatch)):
-                    violations.append(f"job `{job}` saves its rust-cache on {dispatch.label}")
-            else:
-                violations.append(f"job `{job}` uses `{uses}`, which saves from any run")
+            frame = OpenFrame(
+                label=f"a {trigger} run",
+                event_name=None if trigger == "workflow_call" else trigger,
+            )
+            for job in _job_names(source):
+                for writer in _job_cache_uses(source, workflow, job, frame, root) or []:
+                    if not writer.may_save():
+                        continue
+                    for saved in writer.key_specs()[1]:
+                        for use, spec in restored:
+                            if _specs_overlap(spec, saved):
+                                report(
+                                    f"{use.where} restores `{spec[1]}`, which {workflow} "
+                                    f"{writer.where} saves on {frame.label}"
+                                )
     return violations
+
 
 def _readiness_push(needed: str, baseline: str) -> EventContext:
     return EventContext(
@@ -2076,12 +2577,19 @@ def run_checks(text: str, names: Iterable[str]) -> list[str]:
 
 
 def main(argv: list[str] | None = None) -> int:
+    global REPO_ROOT
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument(
         "--workflow",
         type=Path,
         default=DEFAULT_WORKFLOW,
         help=f"release workflow to inspect (default: {DEFAULT_WORKFLOW})",
+    )
+    parser.add_argument(
+        "--repo-root",
+        type=Path,
+        default=REPO_ROOT,
+        help="tree the local actions and the other workflows are read from (default: this checkout)",
     )
     parser.add_argument(
         "checks",
@@ -2091,6 +2599,7 @@ def main(argv: list[str] | None = None) -> int:
         help="which contract checks to run (default: all release.yml checks)",
     )
     args = parser.parse_args(argv)
+    REPO_ROOT = args.repo_root.resolve()
     names = list(CHECKS) if "all" in args.checks else args.checks
     try:
         text = args.workflow.read_text(encoding="utf-8")

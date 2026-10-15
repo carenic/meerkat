@@ -314,9 +314,9 @@ else
 fi
 
 if caches_contract="$(workflow_contract release-caches)"; then
-  pass "Release caches are never saved by a dispatch, never cache ~/.cargo/bin, and never reach a token-holding job"
+  pass "Release caches in release.yml jobs and the local actions they call are never saved on a dispatch and never cache ~/.cargo/bin; token jobs restore none, and OIDC or attesting jobs restore none that a dispatch-like run of any workflow saves (reusable workflows are not read and never run on a dispatch)"
 else
-  bad "A release cache can be written by a dispatch or reach a token-holding job (${caches_contract//$'\n'/; })"
+  bad "A release cache can be saved on a dispatch, cache ~/.cargo/bin, or reach a token, OIDC or attesting job (${caches_contract//$'\n'/; })"
 fi
 
 if tag_validation_contract="$(workflow_contract tag-validation)"; then

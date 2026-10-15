@@ -37,6 +37,8 @@ BASELINE_PASS="PASS Semver baseline rustdoc builds alongside the release and gat
 BASELINE_FAIL="FAIL The semver baseline rustdoc must stay off every path a user waits on"
 TRAILING_PASS="PASS Linux and macOS arm64 assets publish without waiting for the trailing Intel macOS and Windows lanes; no upload replaces a published asset"
 TRAILING_FAIL="FAIL The trailing Intel macOS and Windows lanes must not gate the critical assets, and no upload may replace a published asset"
+CACHES_PASS="PASS Release caches in release.yml jobs and the local actions they call are never saved on a dispatch and never cache ~/.cargo/bin; token jobs restore none, and OIDC or attesting jobs restore none that a dispatch-like run of any workflow saves (reusable workflows are not read and never run on a dispatch)"
+CACHES_FAIL="FAIL A release cache can be saved on a dispatch, cache ~/.cargo/bin, or reach a token, OIDC or attesting job"
 
 fail() {
   echo "release doctor workflow contract violated: $1" >&2
@@ -539,6 +541,21 @@ elif name == "cache-dispatch-save":
     needle = "          save-if: ${{ github.event_name != 'workflow_dispatch' }}\n"
     at = text.index(needle, job)
     text = text[:at] + text[at + len(needle):]
+elif name == "cache-xwin-dispatch-save":
+    # The Windows SDK cache saved by dispatch runs too.
+    replace_once(
+        "          save-sdk-cache: ${{ github.event_name != 'workflow_dispatch' }}\n",
+        "          save-sdk-cache: \"true\"\n",
+    )
+elif name == "cache-buildbuddy-repository":
+    # The pre-review release binary build restored and saved the Bazel
+    # repository cache.
+    replace_once('          repository-cache: "false"\n', "")
+elif name == "reusable-on-dispatch":
+    replace_once(
+        "    if: ${{ github.event_name != 'workflow_dispatch' && vars.MEERKAT_GCP_BUILDBUDDY_ENABLED == 'true' }}\n",
+        "    if: ${{ vars.MEERKAT_GCP_BUILDBUDDY_ENABLED == 'true' }}\n",
+    )
 elif name == "both-defects":
     replace_once(
         MEASUREMENT_STEP_IF,
@@ -550,6 +567,65 @@ else:
     raise SystemExit(f"unknown fixture `{name}`")
 
 pathlib.Path(destination).write_text(text)
+PYEOF
+}
+
+# mutate_tree <name> <root>: copy the committed .github tree under <root>
+# and mutate one of its workflows or local actions; the checker reads local
+# actions and the other workflows from there (--repo-root).
+mutate_tree() {
+  local name="$1"
+  local root="$2"
+  mkdir -p "$root"
+  cp -R "${REPO_ROOT}/.github" "${root}/.github"
+  "$PYTHON" - "$root" "$name" <<'PYEOF'
+import pathlib
+import sys
+
+root, name = pathlib.Path(sys.argv[1]), sys.argv[2]
+
+
+def replace_once(relative: str, needle: str, replacement: str) -> None:
+    path = root / relative
+    text = path.read_text()
+    count = text.count(needle)
+    if count != 1:
+        raise SystemExit(
+            f"fixture `{name}` expects exactly one occurrence of {needle!r} "
+            f"in {relative}, found {count}; update the fixture"
+        )
+    path.write_text(text.replace(needle, replacement))
+
+
+if name == "cache-xwin-save-ungated":
+    # The pre-review action saved the Windows SDK cache from any run.
+    replace_once(
+        ".github/actions/build-windows-cross/action.yml",
+        "      if: ${{ inputs.save-sdk-cache == 'true' && steps.sdk-cache.outputs.cache-hit != 'true' }}\n",
+        "      if: ${{ steps.sdk-cache.outputs.cache-hit != 'true' }}\n",
+    )
+elif name == "cache-xwin-validate-dispatch-save":
+    # Another workflow's dispatch saves the cache the release build restores.
+    replace_once(
+        ".github/workflows/windows-cross-validate.yml",
+        "          save-sdk-cache: ${{ github.event_name != 'workflow_dispatch' }}\n",
+        '          save-sdk-cache: "true"\n',
+    )
+elif name == "cache-token-job-action":
+    # A cache inside the local action a token job calls.
+    replace_once(
+        ".github/actions/update-homebrew/action.yml",
+        "    - name: Checkout tap\n",
+        "    - name: Cache tap\n"
+        "      uses: actions/cache@v4\n"
+        "      with:\n"
+        "        path: homebrew-meerkat\n"
+        "        key: homebrew-tap\n"
+        "\n"
+        "    - name: Checkout tap\n",
+    )
+else:
+    raise SystemExit(f"unknown tree fixture `{name}`")
 PYEOF
 }
 
@@ -574,6 +650,27 @@ expect_pass() {
   status="$(run_check "$fixture" "$log" "$@")"
   if [[ "$status" -ne 0 ]]; then
     fail "${label}: an equivalent workflow spelling was rejected" "$(cat "$log")"
+  fi
+}
+
+# expect_tree_fail_named <label> <root> <needle> <check...>: the mutated
+# tree's release workflow fails the named check and names the defect.
+expect_tree_fail_named() {
+  local label="$1"
+  local root="$2"
+  local needle="$3"
+  shift 3
+  local log="${TEST_ROOT}/${label}.log"
+  local status
+  set +e
+  "$PYTHON" "$CHECKER" --repo-root "$root" --workflow "${root}/.github/workflows/release.yml" "$@" >"$log" 2>&1
+  status=$?
+  set -e
+  if [[ "$status" -eq 0 ]]; then
+    fail "${label}: a tree that dropped the behaviour was accepted"
+  fi
+  if ! grep -Fq "$needle" "$log"; then
+    fail "${label}: failure does not name the defect (expected: ${needle})" "$(cat "$log")"
   fi
 }
 
@@ -752,6 +849,26 @@ expect_fail_named cache-registry-restore "${TEST_ROOT}/cache-registry-restore.ym
 mutate cache-dispatch-save "${TEST_ROOT}/cache-dispatch-save.yml"
 expect_fail_named cache-dispatch-save "${TEST_ROOT}/cache-dispatch-save.yml" \
   "job \`build_binaries_windows_cross\` saves its rust-cache on a dispatch" release-caches
+mutate cache-xwin-dispatch-save "${TEST_ROOT}/cache-xwin-dispatch-save.yml"
+expect_fail_named cache-xwin-dispatch-save "${TEST_ROOT}/cache-xwin-dispatch-save.yml" \
+  "job \`build_binaries_windows_cross\` (in \`.github/actions/build-windows-cross\`) saves cache \`xwin-sdk-*-cargo-xwin-0.23.1\` on a dispatch" release-caches
+mutate cache-buildbuddy-repository "${TEST_ROOT}/cache-buildbuddy-repository.yml"
+expect_fail_named cache-buildbuddy-repository "${TEST_ROOT}/cache-buildbuddy-repository.yml" \
+  "job \`build_binaries_buildbuddy\` (in \`.github/actions/setup-buildbuddy-ci\`) saves cache \`buildbuddy-bazel-repository-*-*\` on a dispatch" release-caches
+expect_fail_named cache-buildbuddy-repository-restore "${TEST_ROOT}/cache-buildbuddy-repository.yml" \
+  "job \`build_binaries_buildbuddy\` (in \`.github/actions/setup-buildbuddy-ci\`) restores \`buildbuddy-bazel-repository-*-*\`, which release-binaries-check.yml job" release-caches
+mutate reusable-on-dispatch "${TEST_ROOT}/reusable-on-dispatch.yml"
+expect_fail_named reusable-on-dispatch "${TEST_ROOT}/reusable-on-dispatch.yml" \
+  "job \`release_validate_buildbuddy_full\` calls a reusable workflow on a dispatch" release-caches
+mutate_tree cache-xwin-save-ungated "${TEST_ROOT}/cache-xwin-save-ungated"
+expect_tree_fail_named cache-xwin-save-ungated "${TEST_ROOT}/cache-xwin-save-ungated" \
+  "job \`build_binaries_windows_cross\` (in \`.github/actions/build-windows-cross\`) saves cache \`xwin-sdk-*-cargo-xwin-0.23.1\` on a dispatch" release-caches
+mutate_tree cache-xwin-validate-dispatch-save "${TEST_ROOT}/cache-xwin-validate-dispatch-save"
+expect_tree_fail_named cache-xwin-validate-dispatch-save "${TEST_ROOT}/cache-xwin-validate-dispatch-save" \
+  "restores \`xwin-sdk-*-cargo-xwin-0.23.1\`, which windows-cross-validate.yml job \`build_windows_cross\` (in \`.github/actions/build-windows-cross\`) saves on a workflow_dispatch run" release-caches
+mutate_tree cache-token-job-action "${TEST_ROOT}/cache-token-job-action"
+expect_tree_fail_named cache-token-job-action "${TEST_ROOT}/cache-token-job-action" \
+  "job \`update_homebrew\` (in \`.github/actions/update-homebrew\`) holds a registry or publish token and restores a cache" release-caches
 
 mutate readback-step-removed "${TEST_ROOT}/readback-step-removed.yml"
 expect_fail_named readback-step-removed "${TEST_ROOT}/readback-step-removed.yml" \
@@ -772,7 +889,7 @@ run_doctor() {
 }
 
 run_doctor "$WORKFLOW" "${TEST_ROOT}/doctor-committed.log"
-for line in "$SEMVER_PASS" "$SLO_PASS" "$DISPATCH_PASS" "$TAG_VALIDATION_PASS" "$PREBUILD_PASS" "$BASELINE_PASS" "$TRAILING_PASS"; do
+for line in "$SEMVER_PASS" "$SLO_PASS" "$DISPATCH_PASS" "$TAG_VALIDATION_PASS" "$PREBUILD_PASS" "$BASELINE_PASS" "$TRAILING_PASS" "$CACHES_PASS"; do
   if ! grep -Fxq "$line" "${TEST_ROOT}/doctor-committed.log"; then
     fail "doctor does not report \`${line}\` for the committed workflow" \
       "$(cat "${TEST_ROOT}/doctor-committed.log")"
@@ -821,6 +938,13 @@ run_doctor "${TEST_ROOT}/doctor-trailing.yml" "${TEST_ROOT}/doctor-trailing.log"
 if ! grep -Fq "$TRAILING_FAIL" "${TEST_ROOT}/doctor-trailing.log"; then
   fail "doctor does not report \`${TRAILING_FAIL}\` for a workflow whose critical assets wait for the trailing lanes" \
     "$(cat "${TEST_ROOT}/doctor-trailing.log")"
+fi
+
+mutate cache-xwin-dispatch-save "${TEST_ROOT}/doctor-caches.yml"
+run_doctor "${TEST_ROOT}/doctor-caches.yml" "${TEST_ROOT}/doctor-caches.log"
+if ! grep -Fq "$CACHES_FAIL" "${TEST_ROOT}/doctor-caches.log"; then
+  fail "doctor does not report \`${CACHES_FAIL}\` for a workflow whose Windows SDK cache is saved by a dispatch" \
+    "$(cat "${TEST_ROOT}/doctor-caches.log")"
 fi
 
 echo "release doctor workflow contract holds"
