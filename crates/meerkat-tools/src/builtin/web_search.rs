@@ -40,6 +40,17 @@ struct WebSearchToolArgs {
     context: Option<String>,
 }
 
+/// The Meerkat-owned `web_search` builtin: one public web search through its
+/// own hosted-search helper, governed as two operations (the call by its
+/// typed builtin target, the helper as the call's typed delegate).
+///
+/// It keeps the default [`BuiltinTool::review_entry_support`] (unsupported):
+/// operation review of `web_search` is an unsupported slice, not review
+/// coverage. A required R2 or R3 review settles as local feedback and the
+/// search never runs; serving R2 or R3 needs the consuming review entry
+/// first. Its read-only mutation class describes local state only: the
+/// outbound query can carry conversation content, so neither that class nor
+/// the typed target means private information cannot leave.
 #[derive(Clone)]
 pub struct WebSearchTool {
     executor: Arc<dyn WebSearchExecutor>,

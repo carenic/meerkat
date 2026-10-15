@@ -71,6 +71,19 @@ struct DelegateOrigin {
 /// attribution can prepare delegate requests until its run ends; each is its
 /// own operation with a fresh id and needs its own current lineage.
 ///
+/// # Behaviour contract for a call that already entered
+///
+/// Revoking the call's own lineage refuses later calls but does not cancel
+/// an invocation that already entered: that invocation may still make its
+/// authorized delegate request. The delegate passes its own current work,
+/// contributor, route, capability and final entry checks, inherits no grant,
+/// review result or controller authority of the call, and runs no further
+/// authorization or review cycle of the call. Cancelling an entered
+/// invocation on the call's revocation would be a different contract that
+/// needs a live dependency on the call's currentness; this attribution does
+/// not provide one. Neither contract undoes a provider effect that already
+/// began or turns a local refusal into the end of the run.
+///
 /// ```compile_fail
 /// fn requires_serialization<T: serde::Serialize>() {}
 /// requires_serialization::<meerkat_core::authorization::ToolDelegateAttribution>();

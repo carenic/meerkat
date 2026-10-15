@@ -767,3 +767,83 @@ async fn a_required_review_settles_web_search_as_local_feedback_per_tier() {
         .expect("R1 runs the search");
     assert_eq!(searches.load(Ordering::SeqCst), 1);
 }
+
+/// The direct registration-identity control: a plan resolved on web_search
+/// registration A never runs after the same composite replaced A with B
+/// under the same name, schema and typed target. The old plan is an owner
+/// change and neither A's nor B's executor runs; B's own plan runs on B.
+/// The other-instance and changed-target controls do not cover this case.
+#[tokio::test]
+async fn a_plan_of_a_replaced_registration_never_runs_on_its_replacement() {
+    let a_searches = Arc::new(AtomicUsize::new(0));
+    let b_searches = Arc::new(AtomicUsize::new(0));
+    let mut composite = web_search_composite(&a_searches);
+    let args =
+        serde_json::value::RawValue::from_string(json!({"query": "fixed query"}).to_string())
+            .expect("raw arguments");
+    let call = ToolCallView {
+        id: "search-call",
+        name: "web_search",
+        args: &args,
+    };
+    let context = ToolDispatchContext::default();
+    let resolution = meerkat_core::ToolExecutionResolutionContext::new(deadlines());
+    let advertised = |composite: &CompositeDispatcher| {
+        composite
+            .tools()
+            .iter()
+            .find(|tool| tool.name == "web_search")
+            .map(|tool| serde_json::to_value(&**tool).expect("tool definition"))
+            .expect("web_search is advertised")
+    };
+    let a_definition = advertised(&composite);
+    let a_plan = composite
+        .resolve_execution_plan(call, &context, &resolution)
+        .expect("registration A resolves its plan");
+
+    composite.register_web_search_tool(
+        Arc::new(CountingSearch(Arc::clone(&b_searches))),
+        ToolCategoryOverride::Enable,
+    );
+    assert_eq!(
+        advertised(&composite),
+        a_definition,
+        "B has A's name and schema"
+    );
+    let b_plan = composite
+        .resolve_execution_plan(call, &context, &resolution)
+        .expect("registration B resolves its plan");
+    assert_eq!(
+        b_plan.single_operation_target(),
+        a_plan.single_operation_target(),
+        "and A's typed target"
+    );
+
+    let result = composite
+        .dispatch_resolved_with_context(call, &context, &a_plan)
+        .await;
+    assert!(
+        owner_changed(&result),
+        "A's plan after the replacement: {result:?}"
+    );
+    assert_eq!(
+        (
+            a_searches.load(Ordering::SeqCst),
+            b_searches.load(Ordering::SeqCst)
+        ),
+        (0, 0),
+        "neither A's nor B's executor ran"
+    );
+
+    composite
+        .dispatch_resolved_with_context(call, &context, &b_plan)
+        .await
+        .expect("B runs its own plan");
+    assert_eq!(
+        (
+            a_searches.load(Ordering::SeqCst),
+            b_searches.load(Ordering::SeqCst)
+        ),
+        (0, 1)
+    );
+}

@@ -315,22 +315,51 @@ With a `TargetedGrantLineages` basis, select
 helper route, where `route` is
 `ControllerModelFacts::new(selection, endpoint, wire_model).route_key()` of
 the helper's resolved route. Neither uses the base, the catalog or the
-controller lineage, and every contributing original must select the same
-keys. A single `GrantLineage` basis covers both like any other operation.
+controller lineage: the base is neither a substitute nor an implicit
+intersecting ceiling, and every contributing original must select the same
+keys with its own current ceiling. A single `GrantLineage` basis covers both
+like any other operation. Choosing a target does not erase a restriction:
+issue those lineages, and every contributor's ceiling, with the original
+time, operation (including read-only), processor and audience
+(private-data) restrictions, because the base no longer bounds them. A
+typed public-search target or a read-only declaration does not mean that
+private information cannot leave through a query; do not infer it.
 
 The attribution keys the selection and the protected audit record
-(`AuditDelegateAttribution`); it grants nothing. One attribution can prepare
-helper requests until its run ends, and each request is its own operation
-that needs its own current lineage. Revoking the call's lineage refuses
-later calls but does not cancel an invocation that already entered: its
-helper still passes its own current lineage, contributor and entry checks.
-Revoking the helper's or a contributor's lineage before the helper's send
-prevents it, also after the helper's request was prepared. `web_search` has
-no reviewed entry point, so a review its owner requires settles as local
-feedback and the search never runs: R2 is `reviewer_missing` without a
-reviewer and `unsupported_entry` with one; R3 is `human_consent_required`
-without a human consent route and `unsupported_entry` with one. The stock
-governed realm issues neither grant.
+(`AuditDelegateAttribution`, with the call's operation id and the role); it
+grants nothing. The helper's own decision and refusal are recorded under its
+own operation, also when it is refused before its provider send. One
+attribution can prepare helper requests until its run ends, and each request
+is its own operation that needs its own current lineage.
+
+Behaviour contract for a call that already entered: revoking the call's own
+lineage refuses later calls, but it does not cancel an invocation that
+already entered, and that invocation may still make its authorized helper
+request. The helper passes its own current work, contributor, route,
+capability and final entry checks; it inherits no grant, review result or
+controller authority of its call, and no further authorization or review
+cycle of the call runs. Revoking the helper's own lineage, or a
+contributor's, before the helper's send prevents the send, also after the
+helper's request was prepared. Cancelling an entered invocation on the
+call's revocation would be a different contract that needs a live
+dependency on the call's currentness; the stored attribution does not
+provide one. Neither contract undoes a provider effect that already began or
+turns a local refusal into the end of the run: a refusal reaches the model
+as typed tool feedback, and the run continues.
+
+The composite rejects stale, wrong-owner and tampered plans within trusted
+Rust composition. Witness constructors and accessors are public, so this is
+not cryptographic resistance to hostile in-process Rust code.
+
+Operation review of `web_search` is an unsupported slice, not review
+coverage: the builtin has no reviewed entry point, so a review its owner
+requires settles as local feedback and the search never runs. R2 is
+`reviewer_missing` without a reviewer and `unsupported_entry` with one; R3 is
+`human_consent_required` without a human consent route and
+`unsupported_entry` with one. Serving R2 or R3 for it needs the consuming
+review entry first. Stock is unsupported for this route too: the stock
+governed realm issues neither grant and maps neither operation, so a product
+that takes this route through stock policy needs the full stock path first.
 
 ## Attach and pin the controller before submitting work
 

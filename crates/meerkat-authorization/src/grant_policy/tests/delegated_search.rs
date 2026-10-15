@@ -657,3 +657,172 @@ async fn revoking_the_call_lineage_keeps_an_entered_invocations_helper() {
         "a prepared helper is refused at its entry check: {result:?}"
     );
 }
+
+/// One restriction variant of a selected lineage: its label, its bounds,
+/// the decision time and whether the operation is allowed under it.
+type Bound = (&'static str, ExecutionRestrictions, u64, bool);
+
+/// `within` and one variant per restriction dimension that excludes the
+/// operation: time (decided after the lifetime ends), private data (another
+/// processor, another audience) and operation (a read-only action set that
+/// lacks the operation's actions).
+fn bounds(within: ExecutionRestrictions) -> Vec<Bound> {
+    vec![
+        ("within every bound", within.clone(), 100, true),
+        ("after its lifetime", within.clone(), 200, false),
+        (
+            "another processor",
+            ExecutionRestrictions {
+                processors: ExactRestriction::exact([ProcessorRef::Principal {
+                    principal: who("elsewhere"),
+                }]),
+                ..within.clone()
+            },
+            100,
+            false,
+        ),
+        (
+            "another audience",
+            ExecutionRestrictions {
+                audiences: ExactRestriction::exact([AudienceRef::Principal {
+                    principal: who("someone-else"),
+                }]),
+                ..within.clone()
+            },
+            100,
+            false,
+        ),
+        (
+            "a read-only action set",
+            ExecutionRestrictions {
+                actions: ExactRestriction::exact([action("read")]),
+                ..within
+            },
+            100,
+            false,
+        ),
+    ]
+}
+
+/// Choosing a target never erases a restriction (ruling Q5): the call's and
+/// the delegate's selected lineages carry their own time, operation and
+/// private-data bounds, and each bound refuses its operation although the
+/// broad base would allow it. An allowed delegate expires with the earliest
+/// of its own lineage's lifetime, the operation owner's allowance and the
+/// admitted work.
+#[tokio::test]
+async fn a_selected_lineage_keeps_its_time_operation_and_data_restrictions() {
+    let fixture = Fixture::new();
+    let broad = grant(&fixture, "broad-base", &[]);
+    let openai = helper(Provider::OpenAI, ServerToolKind::WebSearch);
+    let (policy, _admitted, _operations) = search_policy(&fixture);
+    let issue = |name: String, restrictions: ExecutionRestrictions| {
+        fixture
+            .grants
+            .issue_root(
+                &who("root"),
+                id(&name),
+                who("executor"),
+                Some(who("subject")),
+                restrictions,
+            )
+            .expect("issued grant")
+    };
+    let within = |actions: &[&str]| ExecutionRestrictions {
+        actions: ExactRestriction::exact(actions.iter().map(|name| action(name))),
+        processors: ExactRestriction::exact([ProcessorRef::Principal {
+            principal: who("executor"),
+        }]),
+        audiences: ExactRestriction::exact([AudienceRef::Principal {
+            principal: who("requester"),
+        }]),
+        lifetime: LifetimeRestriction::window(50, 150),
+        ..ExecutionRestrictions::unrestricted()
+    };
+    let open_call = || ExecutionRestrictions {
+        actions: ExactRestriction::exact([action("web_search")]),
+        ..ExecutionRestrictions::unrestricted()
+    };
+    let at = |now_ms: u64| fixture.clock.0.store(now_ms, Ordering::SeqCst);
+
+    for (index, (label, call_bounds, now_ms, allowed)) in
+        bounds(within(&["web_search"])).into_iter().enumerate()
+    {
+        at(100);
+        let association = work_with(
+            &fixture,
+            selecting(
+                Some(broad.clone()),
+                vec![(builtin(), issue(format!("call-{index}"), call_bounds))],
+            ),
+            &fixture.controller,
+        );
+        let context = fixture.context(&policy, &association);
+        at(now_ms);
+        let minted = meerkat_core::authorization::__test_mint_tool_delegate(
+            &context,
+            None,
+            ToolDelegateRole::HostedSearchInference,
+        )
+        .await;
+        if allowed {
+            minted.expect("the call within every bound is allowed");
+        } else {
+            assert!(
+                matches!(
+                    &minted,
+                    Err(meerkat_core::ToolError::AuthorizationRefused { refusal })
+                        if refusal.kind() == OperationRefusalKind::Denied
+                ),
+                "the call {label}: {minted:?}"
+            );
+        }
+    }
+
+    for (index, (label, delegate_bounds, now_ms, allowed)) in
+        bounds(within(&["infer", "web_search"]))
+            .into_iter()
+            .enumerate()
+    {
+        at(100);
+        let association = work_with(
+            &fixture,
+            selecting(
+                Some(broad.clone()),
+                vec![
+                    (builtin(), issue(format!("open-call-{index}"), open_call())),
+                    (
+                        delegated_search(route(&openai), ServerToolKind::WebSearch),
+                        issue(format!("delegate-{index}"), delegate_bounds),
+                    ),
+                ],
+            ),
+            &fixture.controller,
+        );
+        let context = fixture.context(&policy, &association);
+        let attribution = meerkat_core::authorization::__test_mint_tool_delegate(
+            &context,
+            None,
+            ToolDelegateRole::HostedSearchInference,
+        )
+        .await
+        .expect("the call itself is allowed");
+        at(now_ms);
+        let result = meerkat_core::LlmRequestAuthorization::for_tool_delegate(attribution)
+            .prepare(openai.clone());
+        if allowed {
+            let prepared = result.expect("the delegate within every bound is allowed");
+            assert_eq!(
+                prepared
+                    .validity()
+                    .expect("a bounded decision")
+                    .expires_at_ms,
+                150,
+                "the earliest bound is the selected lineage's own lifetime"
+            );
+        } else {
+            assert!(is_denied(&result), "the delegate {label}: {result:?}");
+        }
+    }
+    at(100);
+}

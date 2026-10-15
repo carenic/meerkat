@@ -91,7 +91,10 @@ them.
   dispatch against its exact registration: another composite, another owner
   key, a plan resolved before the composite replaced its web_search
   executor (even with an identical schema), or a plan whose name another
-  owner now holds is `ExecutionOwnerChanged`, and no executor runs. A tool
+  owner now holds is `ExecutionOwnerChanged`, and no executor runs. This
+  rejects stale, wrong-owner and tampered plans within trusted Rust
+  composition; witness constructors are public, so it is not cryptographic
+  resistance to hostile in-process Rust code. A tool
   merely named web_search (a host dispatcher's, a registered bundle's or an
   undeclared builtin) has no such target unless its owner states it itself,
   which an in-process dispatcher can. The
@@ -112,22 +115,32 @@ them.
   `GrantTarget::DelegatedHostedSearch { route, capability }` for the helper,
   where `route` is the helper's own `ControllerRouteKey`; the work and every
   original (named contributors and further originals) use the same
-  selector, with their current ceilings and the earliest expiry. The
+  selector, with their current ceilings and the earliest expiry. Choosing
+  a target erases no restriction: hosts issue the target lineages and every
+  contributor's ceiling with the original time, operation (including
+  read-only) and private-data restrictions, and a typed public-search
+  target or read-only declaration does not mean private information cannot
+  leave. The
   attribution grants, inherits and exempts nothing: it keys the selection
   and the protected audit record (`AuditDelegateAttribution {
-  parent_operation_id, role }`). Revoking the call's own lineage refuses
-  later calls but does not cancel an invocation that already entered (its
-  helper is decided by its own lineage); revoking the helper's or a
-  contributor's lineage before the helper's entry prevents its send.
+  parent_operation_id, role }`), which also records the helper's own
+  decision and refusal before its provider send. Behaviour contract:
+  revoking the call's own lineage refuses later calls but does not cancel
+  an invocation that already entered, which may still make its authorized
+  helper request (the helper passes its own work, contributor, route,
+  capability and entry checks and inherits nothing of the call); revoking
+  the helper's or a contributor's lineage before the helper's send prevents
+  it. Neither undoes a provider effect or ends the run on a local refusal.
   `ResolvedToolExecutionPlan::single_operation_target` states the one-target
   rule `grant_policy::single_tool_operation_target` now forwards to, and
   `ServerToolKind` derives `PartialOrd`, `Ord` and `Hash`. Stock issues no
-  grant for either target and leaves both unmapped; this is not stock
-  coverage of web_search. Limit: web_search has no reviewed entry point, so
-  a review its owner requires settles as local feedback and the search never
-  runs: R2 is `reviewer_missing` without a reviewer and `unsupported_entry`
-  with one; R3 is `human_consent_required` without a human consent route and
-  `unsupported_entry` with one.
+  grant for either target and leaves both unmapped: stock is unsupported for
+  this route, not stock coverage of web_search. Limit: operation review of
+  web_search is an unsupported slice, not review coverage. It has no
+  reviewed entry point, so a review its owner requires settles as local
+  feedback and the search never runs: R2 is `reviewer_missing` without a
+  reviewer and `unsupported_entry` with one; R3 is `human_consent_required`
+  without a human consent route and `unsupported_entry` with one.
 
 ### Changed
 

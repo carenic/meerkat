@@ -477,7 +477,10 @@ impl EphemeralToolBindingFingerprint {
 /// owner/binding object at dispatch. The witness is valid only for the current
 /// pre-dispatch resolution flow. It must be discarded on restart, recovery,
 /// dispatcher reconstruction, or turn replay; those paths must resolve again.
-/// It is not a job fence, attempt token, or durable authority.
+/// It is not a job fence, attempt token, or durable authority. Revalidation
+/// rejects stale, wrong-owner and tampered plans within trusted Rust
+/// composition; the constructors and accessors are public, so it is not
+/// cryptographic resistance to hostile in-process Rust code.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolExecutionOwnerWitness {
     authority_key: String,
