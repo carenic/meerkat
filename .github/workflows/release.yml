@@ -70,12 +70,15 @@ on:
           - github-hosted
           - buildbuddy
 
+# Read-only by default. Only the jobs that need more get it: the build jobs
+# mint OIDC tokens to attest their archives (id-token, attestations: write),
+# the release publishers write the GitHub release (contents: write), the
+# verifiers read attestations, and the full-graph caller passes id-token on
+# to buildbuddy.yml. Build checkouts do not persist the token.
 permissions:
   actions: read
   checks: read
-  contents: write
-  id-token: write
-  attestations: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -560,6 +563,9 @@ jobs:
     name: Validate release tree with the full BuildBuddy graph
     needs: [require_ci_green]
     if: ${{ github.event_name != 'workflow_dispatch' && vars.MEERKAT_GCP_BUILDBUDDY_ENABLED == 'true' }}
+    permissions:
+      contents: read
+      id-token: write
     uses: ./.github/workflows/buildbuddy.yml
     with:
       mode: full-fresh
@@ -927,6 +933,10 @@ jobs:
       needs.release_prebuild.outputs.run_id == '' &&
       (github.event_name != 'workflow_dispatch' || github.event.inputs.assets_run_id == '')
     runs-on: ${{ matrix.platform.runs-on }}
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     # Linux GNU binaries must keep the same glibc floor as the BuildBuddy lane
     # (buildpack-deps:bullseye = glibc 2.31, see tools/bazel/platforms/BUILD.bazel);
     # building directly on the hosted runner (Ubuntu 24.04, glibc 2.39) would
@@ -972,6 +982,7 @@ jobs:
         uses: actions/checkout@v6
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.prebuild_release_artifacts == 'true' && github.sha || github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag != '' && github.event.inputs.release_tag || github.ref }}
+          persist-credentials: false
 
       # actions/checkout marks the workspace safe in the host user's Git
       # config. Linux release builds run inside the Bullseye container as a
@@ -1216,6 +1227,10 @@ jobs:
     # about 20 minutes at four jobs on Linux; verify_windows_binaries then
     # proves the result on a real Windows runner.
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     timeout-minutes: 90
     outputs:
       version: ${{ steps.version.outputs.version }}
@@ -1224,6 +1239,7 @@ jobs:
         uses: actions/checkout@v6
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.prebuild_release_artifacts == 'true' && github.sha || github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag != '' && github.event.inputs.release_tag || github.ref }}
+          persist-credentials: false
 
       # The published source is always the release tag, but a recovery
       # dispatch runs this workflow definition from main, and a tag cut
@@ -1379,6 +1395,10 @@ jobs:
       needs.release_prebuild.outputs.run_id == '' &&
       (github.event_name != 'workflow_dispatch' || github.event.inputs.assets_run_id == '')
     runs-on: macos-15
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     timeout-minutes: 240
     strategy:
       fail-fast: false
@@ -1397,6 +1417,7 @@ jobs:
         uses: actions/checkout@v6
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.prebuild_release_artifacts == 'true' && github.sha || github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag != '' && github.event.inputs.release_tag || github.ref }}
+          persist-credentials: false
 
       - uses: ./.github/actions/setup-rust-ci
 
@@ -1543,6 +1564,10 @@ jobs:
           vars.MEERKAT_RELEASE_BUILDBUDDY == '1')))) &&
       (github.event_name != 'workflow_dispatch' || github.event.inputs.assets_run_id == '')
     runs-on: ${{ fromJSON(vars.MEERKAT_CI_RUNNER || '"ubuntu-24.04"') }}
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     env:
       BUILDBUDDY_API_KEY: ${{ secrets.BUILDBUDDY_API_KEY }}
     strategy:
@@ -1564,6 +1589,7 @@ jobs:
         uses: actions/checkout@v6
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.prebuild_release_artifacts == 'true' && github.sha || github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag != '' && github.event.inputs.release_tag || github.ref }}
+          persist-credentials: false
 
       - uses: ./.github/actions/setup-buildbuddy-ci
         with:
@@ -1772,6 +1798,10 @@ jobs:
       needs.release_semver_gate.result == 'success' &&
       needs.build_binaries_critical_gate.result == 'success'
     runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+      attestations: read
+      contents: write
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -1927,6 +1957,10 @@ jobs:
          github.event.inputs.prebuild_release_artifacts == 'true'))) &&
       needs.release_prebuild.outputs.run_id == ''
     runs-on: ${{ fromJSON(vars.MEERKAT_CI_RUNNER || '"ubuntu-24.04"') }}
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     timeout-minutes: 180
     steps:
       - name: Checkout
@@ -1935,6 +1969,7 @@ jobs:
           # Recovery dispatches run the workflow definition from main, but the
           # package must always be built from the explicitly selected release.
           ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.prebuild_release_artifacts == 'true' && github.sha || github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag != '' && github.event.inputs.release_tag || github.ref }}
+          persist-credentials: false
 
       - uses: ./.github/actions/setup-rust-ci
 
@@ -2179,6 +2214,10 @@ jobs:
         release_prebuild,
       ]
     runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+      attestations: read
+      contents: write
     steps:
       # Recovery runs execute the current workflow against an older release
       # tag, so load helpers from the workflow ref rather than that old tag.
@@ -2546,6 +2585,8 @@ jobs:
         github.event.inputs.publish_release_assets_only == 'true'))
     needs: [publish_github_release, publish_semver_baseline]
     runs-on: ubuntu-24.04
+    permissions:
+      contents: write
     timeout-minutes: 10
     steps:
       - name: Download baseline rustdoc
@@ -2776,6 +2817,10 @@ jobs:
     # prebuild; only the Web-SDK-only recovery skips both gates.
     needs: [require_ci_green, release_validate_gate, release_semver_gate, build_web_sdk_package, registry_credentials_preflight, release_prebuild]
     runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+      attestations: read
+      contents: read
     timeout-minutes: 15
     steps:
       - name: Checkout

@@ -443,6 +443,11 @@ Registry credentials are independent:
 Keep tokens in CI secrets or a local secret store. Do not commit registry
 tokens, private BuildBuddy endpoints, or enterprise infrastructure names.
 
+The release workflow's own `GITHUB_TOKEN` is read-only by default: only the
+build jobs may mint OIDC tokens and write build attestations, only the
+release publishers may write the GitHub release, and build checkouts do not
+persist the token (`scripts/release-doctor` checks this).
+
 ## Hard Rules
 
 - Release only from tagged versions.

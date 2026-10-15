@@ -1856,6 +1856,55 @@ def check_trailing_platforms(text: str) -> list[str]:
             violations.append(f"job `{job}` updates Homebrew before the trailing publisher `{ASSET_PUBLISH_JOB}`")
     return violations
 
+# Jobs allowed each elevated token scope (everything else is read-only).
+WRITE_SCOPES_ALLOWED = {
+    "contents": {"publish_critical_release_assets", "publish_github_release", "attach_semver_baseline"},
+    "id-token": {*BINARY_BUILD_JOBS, WEB_SDK_BUILD_JOB, "release_validate_buildbuddy_full"},
+    "attestations": {*BINARY_BUILD_JOBS, WEB_SDK_BUILD_JOB},
+}
+
+
+def _permission_scopes(lines: list[str], indent: int) -> dict[str, str]:
+    """`scope: level` pairs of a permissions mapping at `indent`."""
+    for index, line in enumerate(lines):
+        if line == " " * indent + "permissions:":
+            scopes: dict[str, str] = {}
+            for candidate in lines[index + 1 :]:
+                if candidate.strip() and _indent(candidate) <= indent:
+                    break
+                match = re.match(r"^\s+([a-z-]+):\s*([a-z]+)\s*$", candidate)
+                if match:
+                    scopes[match.group(1)] = match.group(2)
+            return scopes
+    return {}
+
+
+def check_token_permissions(text: str) -> list[str]:
+    """The workflow token is read-only except where a job needs more.
+
+    The workflow default grants no write scope. Only the build jobs (and the
+    full-graph caller, for buildbuddy.yml's OIDC) may mint OIDC tokens, only
+    the build jobs may write attestations, and only the release publishers
+    may write repository contents; every build checkout drops the token.
+    """
+    violations: list[str] = []
+    lines = text.splitlines()
+    top = _permission_scopes(lines[: lines.index("jobs:")], 0)
+    for scope, level in sorted(top.items()):
+        if level == "write":
+            violations.append(f"the workflow default grants `{scope}: write` to every job")
+    for job in _job_names(text):
+        scopes = _permission_scopes(job_block(text, job), 4)
+        for scope, level in sorted(scopes.items()):
+            if level == "write" and job not in WRITE_SCOPES_ALLOWED.get(scope, set()):
+                violations.append(f"job `{job}` is granted `{scope}: write`")
+    for job in (*BINARY_BUILD_JOBS, WEB_SDK_BUILD_JOB):
+        for step in _steps_of(text, job):
+            inputs = step.nested("with")
+            if CHECKOUT_ACTION in step.fields.get("uses", "") and inputs.get("persist-credentials") != "false":
+                violations.append(f"job `{job}` step `{step.name}` persists the workflow token in its checkout")
+    return violations
+
 def _readiness_push(needed: str, baseline: str) -> EventContext:
     return EventContext(
         label=f"a main push with needed={needed!r} and notes baseline {baseline!r}",
@@ -1928,6 +1977,7 @@ CHECKS: dict[str, Callable[[str], list[str]]] = {
     "prebuild": check_prebuild,
     "semver-baseline": check_semver_baseline,
     "trailing-platforms": check_trailing_platforms,
+    "token-permissions": check_token_permissions,
 }
 
 # Checks of release-semver-readiness.yml; run them by name with

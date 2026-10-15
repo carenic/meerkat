@@ -307,6 +307,12 @@ else
   bad "The trailing Intel macOS and Windows lanes must not gate the critical assets, and no upload may replace a published asset (${trailing_contract//$'\n'/; })"
 fi
 
+if token_contract="$(workflow_contract token-permissions)"; then
+  pass "Release workflow token is read-only except for the jobs that attest or publish"
+else
+  bad "Release workflow grants write or OIDC scopes beyond the jobs that need them (${token_contract//$'\n'/; })"
+fi
+
 if tag_validation_contract="$(workflow_contract tag-validation)"; then
   pass "Tag releases validate on the verified schema-4 exact-tree CI attestation instead of re-running Cargo validation"
 else

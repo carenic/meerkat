@@ -520,6 +520,12 @@ elif name == "trailing-manifest-replaced":
         "        if: ${{ steps.manifest.outputs.upload == 'true' }}\n",
         "      - name: Publish complete release manifest\n",
     )
+elif name == "token-write-default":
+    # The pre-review default: every job gets a write token and OIDC.
+    replace_once(
+        "permissions:\n  actions: read\n  checks: read\n  contents: read\n",
+        "permissions:\n  actions: read\n  checks: read\n  contents: write\n  id-token: write\n",
+    )
 elif name == "both-defects":
     replace_once(
         MEASUREMENT_STEP_IF,
@@ -722,6 +728,10 @@ expect_fail_named trailing-manifest-replaced "${TEST_ROOT}/trailing-manifest-rep
 mutate trailing-selects-intel "${TEST_ROOT}/trailing-selects-intel.yml"
 expect_fail_named trailing-selects-intel "${TEST_ROOT}/trailing-selects-intel.yml" \
   "rkat-0.0.0-x86_64-apple-darwin.tar.gz" trailing-platforms
+
+mutate token-write-default "${TEST_ROOT}/token-write-default.yml"
+expect_fail_named token-write-default "${TEST_ROOT}/token-write-default.yml" \
+  "the workflow default grants \`contents: write\` to every job" token-permissions
 
 mutate readback-step-removed "${TEST_ROOT}/readback-step-removed.yml"
 expect_fail_named readback-step-removed "${TEST_ROOT}/readback-step-removed.yml" \
