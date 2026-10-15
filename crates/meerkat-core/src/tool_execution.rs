@@ -552,7 +552,12 @@ pub enum ToolOperationTarget {
     /// actually routes to: the explicit `peer_id` of a send, or the sender
     /// of the turn's triggering message a reply selects. Revalidated by that
     /// owner at dispatch, so a plan resolved for one peer never delivers to
-    /// another.
+    /// another. Only the comms tools produce it (with
+    /// [`Self::PeerDirectoryRead`] for `peers`): other tools that reach
+    /// agents, such as `delegate`, `council`, `mob_spawn_member` and a mob
+    /// member's calls up to its mob's operator, carry no peer target. `kind`
+    /// is the delivery the tool makes; a response's addressee is not
+    /// verified against its request (see [`PeerSendKind::Response`]).
     PeerSend {
         peer: crate::comms::PeerId,
         kind: PeerSendKind,
@@ -606,7 +611,12 @@ pub enum PeerSendKind {
     Message,
     /// A typed request that expects a correlated response (`send_request`).
     Request,
-    /// A typed response to a request the peer sent (`send_response`).
+    /// A typed response to a request (`send_response`). Its addressee is
+    /// the caller's assertion, not verified against the request: the
+    /// runtime checks that the request id names a request this session
+    /// received and can still answer, but records no requester for it, so
+    /// nothing checks that the addressed peer sent that request. The
+    /// delivery still reaches only the addressed peer.
     Response,
 }
 

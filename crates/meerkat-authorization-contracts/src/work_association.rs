@@ -114,7 +114,14 @@ pub enum GrantTarget {
     /// routing and trust key, never a display name): the target of the
     /// owner-produced `PeerSend`. Each peer is its own target: one peer's
     /// lineage never covers another peer, the peer directory or the base,
-    /// and the base never covers a delivery.
+    /// and the base never covers a delivery. It covers only the comms
+    /// tools' deliveries (`send_message`, `reply_to_peer`, `send_request`
+    /// and `send_response`): other tools that reach agents, such as
+    /// `delegate`, `council`, `mob_spawn_member` and a mob member's calls up
+    /// to its mob's operator, carry no peer target and stay on the base
+    /// lineage, which a peer's lineage neither widens nor narrows. A
+    /// `send_response` addressee is the caller's assertion, not a verified
+    /// requester.
     Peer { peer: meerkat_core::comms::PeerId },
     /// Reads of the session's own trusted-peer directory: the target of the
     /// owner-produced `PeerDirectoryRead`. Its lineage covers no delivery.

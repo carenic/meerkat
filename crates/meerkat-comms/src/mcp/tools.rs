@@ -456,6 +456,9 @@ pub async fn handle_tools_call_with_context(
 /// message the reply selects), or the session's trusted-peer directory for
 /// `peers`. It is a fact for an operation policy owner, never a permission:
 /// the handler still checks trust, runtime command authority and delivery.
+/// The `send_response` addressee is the caller's own `peer_id`: the runtime
+/// checks that the request id names a request this session received and
+/// can still answer, but not that the addressed peer sent it.
 ///
 /// # Errors
 /// The reason the call names no single addressee: arguments that do not

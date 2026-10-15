@@ -60,10 +60,31 @@ them.
   (malformed facts) before any delivery or memory read. Forward
   `resolve_execution_plan` and `dispatch_resolved_with_context` to the
   owning dispatcher instead. Ungoverned dispatch is unchanged.
+- Behaviour-only (not measured by the gate): the comms dispatchers
+  (`CommsToolSurface`, `CommsToolDispatcher`, `DynCommsToolDispatcher`) and
+  `MemorySearchDispatcher` own their execution plans: their
+  `dispatch_resolved_with_context` refuses, as unavailable
+  (`ExecutionOwnerChanged`), a plan they did not resolve themselves for
+  exactly the call's current target and binding. A wrapper that forwards
+  `dispatch_resolved_with_context` to them but resolves its own plan (does
+  not forward `resolve_execution_plan`) no longer runs these tools; forward
+  both.
+- Behaviour-only (not measured by the gate): a host `OperationPolicyOwner`
+  now reads an owner-produced target for the comms tools and
+  `memory_search`: `single_tool_operation_target` returns
+  `Some(PeerSend { .. })`, `Some(PeerDirectoryRead)` or
+  `Some(MemoryOperation { .. })` where it returned `None`. An owner that
+  mapped these tools in its target-less arm (for example by tool name) no
+  longer reaches that arm for them; map the new targets instead.
 - Persisted format (not measured by the gate): a work association whose
   targeted selection names a `peer`, `peer_directory` or `memory` target
-  cannot be read by a binary without this change. Associations that name
-  none of them are unchanged.
+  cannot be read by a binary without this change (such as 0.9.1), and
+  neither can a `prepared` authorization audit record of any operation of
+  such work, which embeds the work's whole authority basis
+  (`AuditPolicyRead::operation_authorities`). Such a binary fails to decode
+  the record with an unknown-variant error naming the target kind; it never
+  reads it as another target. Associations and audit records that name none
+  of them are unchanged.
 - Audit entries name their boundary (see Added). `meerkat-core`:
   `OperationObservation::Entry` is now `Entry(OperationEntryBoundary)`
   instead of a unit variant, so a match needs `Entry(_)` or a boundary, and
@@ -141,7 +162,17 @@ them.
   `operation_grant_target` selects them on the normal targeted grant path:
   one lineage per peer, per memory scope and for the peer directory, never a
   wildcard and never the base. An embedding host maps the typed facts to its
-  own actions and selects one grant per target.
+  own actions and selects one grant per target. The peer targets cover only
+  the five comms tools (`send_message`, `reply_to_peer`, `send_request` and
+  `send_response` select `Peer`, and `peers` selects `PeerDirectory`).
+  Other tools that reach agents, such as `delegate`, `council`,
+  `mob_spawn_member` and a mob member's calls up to its mob's operator,
+  carry no peer target and stay on the work's base lineage, which a `Peer`
+  lineage neither widens nor narrows. A `send_response` delivery's
+  addressee is the caller's assertion: the runtime checks that its request
+  id names a request this session received and can still answer, but
+  records no requester, so its `Peer` target names the peer the response is
+  delivered to, not a verified requester.
 
 ### Changed
 
