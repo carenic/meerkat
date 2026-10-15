@@ -161,6 +161,27 @@ class Step:
         return self.fields.get("run", "")
 
     @property
+    def raw_run(self) -> str:
+        """The `run:` block scalar with its relative indentation kept.
+
+        `run` strips every line, which is enough for shell; an embedded
+        heredoc in an indentation-sensitive language needs the original
+        layout.
+        """
+        for index, line in enumerate(self.lines):
+            match = KEY_LINE.match(line)
+            if not (match and len(match.group(1)) == 8 and match.group(2) == "run"):
+                continue
+            body: list[str] = []
+            for candidate in self.lines[index + 1 :]:
+                if candidate.strip() and _indent(candidate) <= 8:
+                    break
+                body.append(candidate)
+            width = min((_indent(line) for line in body if line.strip()), default=0)
+            return "\n".join(line[width:] for line in body).strip("\n") + "\n"
+        return ""
+
+    @property
     def env(self) -> dict[str, str]:
         """The step's `env:` mapping, values unquoted."""
         return self.nested("env")
@@ -1166,7 +1187,13 @@ PREBUILD_LOOKUP_JOB = "release_prebuild"
 PREBUILD_GATE_JOB = "release_prebuild_gate"
 PREBUILD_LOOKUP_SCRIPT = "scripts/release-find-prebuild"
 PROVENANCE_VERIFIER = "scripts/verify-release-asset-provenance"
-BINARY_BUILD_JOBS = ("build_binaries", "build_binaries_buildbuddy", "build_binaries_windows_cross")
+BINARY_BUILD_JOBS = (
+    "build_binaries",
+    "build_binaries_buildbuddy",
+    "build_binaries_windows_cross",
+    "build_binaries_macos_x86_cross",
+)
+CRITICAL_PUBLISH_JOB = "publish_critical_release_assets"
 WEB_SDK_BUILD_JOB = "build_web_sdk_package"
 WEB_SDK_PUBLISH_JOB = "publish_web_sdk"
 ASSET_PUBLISH_JOB = "publish_github_release"
@@ -1314,7 +1341,15 @@ def check_prebuild(text: str) -> list[str]:
             },
         }
     )
-    for job in ("build_binaries", "build_binaries_windows_cross", WEB_SDK_BUILD_JOB, "build_binaries_gate", PREBUILD_GATE_JOB):
+    for job in (
+        "build_binaries",
+        "build_binaries_windows_cross",
+        "build_binaries_macos_x86_cross",
+        WEB_SDK_BUILD_JOB,
+        "build_binaries_critical_gate",
+        "build_binaries_gate",
+        PREBUILD_GATE_JOB,
+    ):
         if not _job_runs(text, job, realistic):
             violations.append(f"job `{job}` is skipped on {prebuild.label}")
     for job in (*BINARY_BUILD_JOBS, WEB_SDK_BUILD_JOB):
@@ -1376,11 +1411,11 @@ def check_prebuild(text: str) -> list[str]:
     for job in (*BINARY_BUILD_JOBS, WEB_SDK_BUILD_JOB):
         if _job_runs(text, job, reused):
             violations.append(f"job `{job}` builds on {reused.label}")
-    for job in ("build_binaries_windows_cross", WEB_SDK_BUILD_JOB):
+    for job in ("build_binaries_windows_cross", "build_binaries_macos_x86_cross", WEB_SDK_BUILD_JOB):
         if not _job_runs(text, job, fresh):
             violations.append(f"job `{job}` is skipped on {fresh.label}")
 
-    for job in (ASSET_PUBLISH_JOB, WEB_SDK_PUBLISH_JOB):
+    for job in (CRITICAL_PUBLISH_JOB, ASSET_PUBLISH_JOB, WEB_SDK_PUBLISH_JOB):
         if not _job_runs(text, job, reused):
             violations.append(f"job `{job}` does not run on {reused.label}")
             continue
@@ -1398,14 +1433,15 @@ def check_prebuild(text: str) -> list[str]:
                     f"{reused.label}, not the prebuild run"
                 )
 
-    verify_steps = [
-        step for _, step in _running_steps(text, ASSET_PUBLISH_JOB, reused) if PROVENANCE_VERIFIER in step.run
-    ]
-    if len(verify_steps) != 1:
-        violations.append(
-            f"job `{ASSET_PUBLISH_JOB}` must run `{PROVENANCE_VERIFIER}` in exactly one step on {reused.label}"
-        )
-    else:
+    for job in (CRITICAL_PUBLISH_JOB, ASSET_PUBLISH_JOB):
+        verify_steps = [
+            step for _, step in _running_steps(text, job, reused) if PROVENANCE_VERIFIER in step.run
+        ]
+        if len(verify_steps) != 1:
+            violations.append(
+                f"job `{job}` must run `{PROVENANCE_VERIFIER}` in exactly one step on {reused.label}"
+            )
+            continue
         calls = _verifier_invocations(verify_steps[0], reused)
         if len(calls) != 1 or calls[0][:2] != ["--source-run", PREBUILD_RUN] or "--stamps" not in calls[0]:
             violations.append(
@@ -1523,6 +1559,155 @@ def check_semver_baseline(text: str) -> list[str]:
             violations.append(f"job `{job}` does not run on {TAG_PUSH.label}")
     return violations
 
+CRITICAL_TARGETS = ("x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu", "aarch64-apple-darwin")
+TRAILING_TARGETS = ("x86_64-apple-darwin", "x86_64-pc-windows-msvc")
+TRAILING_BUILD_JOBS = ("build_binaries_windows_cross", "verify_windows_binaries", "build_binaries_macos_x86_cross")
+RELEASE_BINARIES = ("rkat", "rkat-rpc", "rkat-rest", "rkat-mcp")
+GH_RELEASE_ACTION = "softprops/action-gh-release"
+
+
+def _published_archives(text: str, job: str, context: EventContext, version: str) -> set[str]:
+    """Which archives the job's release upload would publish under `context`.
+
+    Every release archive name (critical and trailing targets) is laid out
+    where the job's artifact downloads put them; the job's shell steps run in
+    order up to its provenance verification (selection precedes
+    verification), and the release upload's `files` patterns are then
+    resolved against the result.
+    """
+    steps = [step for step in job_steps(job_block(text, job)) if step_runs(step, context)]
+    with tempfile.TemporaryDirectory(prefix="release-trailing-") as scratch:
+        for step in steps:
+            if "actions/download-artifact" not in step.fields.get("uses", ""):
+                continue
+            root = Path(scratch, step.nested("with").get("path", "."))
+            for target in (*CRITICAL_TARGETS, *TRAILING_TARGETS):
+                extension = "zip" if "windows" in target else "tar.gz"
+                for binary in RELEASE_BINARIES:
+                    lane = root / f"meerkat-{target}-{binary}"
+                    lane.mkdir(parents=True, exist_ok=True)
+                    Path(lane, f"{binary}-{version}-{target}.{extension}").write_bytes(b"archive")
+        for step in steps:
+            if PROVENANCE_VERIFIER in step.run:
+                break
+            if not step.raw_run.strip():
+                continue
+            env = {key: render_strict(value, context) for key, value in step.env.items()}
+            subprocess.run(
+                ["bash", "-c", render_strict(step.raw_run, context)],
+                cwd=scratch,
+                env={**_runner_env(context), **env},
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        published: set[str] = set()
+        for step in steps:
+            if GH_RELEASE_ACTION not in step.fields.get("uses", ""):
+                continue
+            for pattern in step.nested("with").get("files", "").split():
+                published.update(path.name for path in Path(scratch).glob(pattern))
+        return published
+
+
+def _steps_of(text: str, job: str) -> list[Step]:
+    """The job's steps; none for a job that calls a reusable workflow."""
+    try:
+        return job_steps(job_block(text, job))
+    except ContractError:
+        return []
+
+
+def check_trailing_platforms(text: str) -> list[str]:
+    """Intel macOS and Windows trail; nothing replaces a published asset.
+
+    The critical publisher puts exactly the Linux (x86_64, aarch64) and macOS
+    arm64 archives on the release as soon as their lane passes, waiting for no
+    trailing (Intel macOS, Windows) job. Every archive upload is add-only, the
+    complete manifest is written only by publish_github_release after every
+    lane (and refuses to change a published one), and Homebrew is updated only
+    after that trailing publisher.
+    """
+    violations: list[str] = []
+    names = _job_names(text)
+    for job in (CRITICAL_PUBLISH_JOB, ASSET_PUBLISH_JOB, "build_binaries_critical_gate", "update_homebrew"):
+        if job not in names:
+            return [f"job `{job}` is not defined in the workflow"]
+    needs = {job: _job_needs(text, job) for job in names}
+
+    def closure(job: str) -> set[str]:
+        seen: set[str] = set()
+        frontier = list(needs[job])
+        while frontier:
+            upstream = frontier.pop()
+            if upstream in seen or upstream not in needs:
+                continue
+            seen.add(upstream)
+            frontier.extend(needs[upstream])
+        return seen
+
+    waits = sorted(set(TRAILING_BUILD_JOBS + ("build_binaries_gate",)) & closure(CRITICAL_PUBLISH_JOB))
+    if waits:
+        violations.append(
+            f"job `{CRITICAL_PUBLISH_JOB}` waits for {', '.join(f'`{job}`' for job in waits)}; "
+            "the trailing Intel macOS and Windows lanes must not gate the critical assets"
+        )
+    if not _job_runs(text, CRITICAL_PUBLISH_JOB, TAG_PUSH):
+        violations.append(f"job `{CRITICAL_PUBLISH_JOB}` does not run on {TAG_PUSH.label}")
+
+    tag = EventContext(
+        label=TAG_PUSH.label,
+        event_name="push",
+        job_outputs={f"{PREBUILD_LOOKUP_JOB}.run_id": ""},
+    )
+    expected = {
+        f"{binary}-0.0.0-{target}.tar.gz" for binary in RELEASE_BINARIES for target in CRITICAL_TARGETS
+    }
+    published = _published_archives(text, CRITICAL_PUBLISH_JOB, tag, "0.0.0")
+    if published != expected:
+        violations.append(
+            f"job `{CRITICAL_PUBLISH_JOB}` publishes {sorted(published - expected) or 'no extra archive'} "
+            f"beyond the critical set and misses {sorted(expected - published) or 'none of it'}; "
+            "it must publish exactly the Linux and macOS arm64 archives"
+        )
+
+    for job in names:
+        for step in _steps_of(text, job):
+            if GH_RELEASE_ACTION not in step.fields.get("uses", ""):
+                continue
+            files = step.nested("with").get("files", "")
+            overwrite = step.nested("with").get("overwrite_files", "")
+            manifest = "checksums.sha256" in files or "index.json" in files
+            if manifest and job != ASSET_PUBLISH_JOB:
+                violations.append(f"job `{job}` writes the release manifest; only `{ASSET_PUBLISH_JOB}` may")
+            if not manifest and overwrite != "false":
+                violations.append(
+                    f"step `{step.name}` uploads archives with overwrite_files `{overwrite or 'unset'}`; "
+                    "archive uploads are add-only (`overwrite_files: false`)"
+                )
+    if "build_binaries_gate" not in closure(ASSET_PUBLISH_JOB):
+        violations.append(f"job `{ASSET_PUBLISH_JOB}` writes the manifest before every lane finished")
+    publisher = job_steps(job_block(text, ASSET_PUBLISH_JOB))
+    guard = next((i for i, step in enumerate(publisher) if "cmp -s" in step.run and "gh release download" in step.run), None)
+    upload = next(
+        (
+            i
+            for i, step in enumerate(publisher)
+            if GH_RELEASE_ACTION in step.fields.get("uses", "") and "checksums.sha256" in step.nested("with").get("files", "")
+        ),
+        None,
+    )
+    if guard is None or upload is None or guard > upload:
+        violations.append(
+            f"job `{ASSET_PUBLISH_JOB}` must refuse to change a published manifest before writing it"
+        )
+
+    for job in names:
+        uses_homebrew = any("update-homebrew" in step.fields.get("uses", "") for step in _steps_of(text, job))
+        if uses_homebrew and ASSET_PUBLISH_JOB not in closure(job):
+            violations.append(f"job `{job}` updates Homebrew before the trailing publisher `{ASSET_PUBLISH_JOB}`")
+    return violations
+
 def _readiness_push(needed: str, baseline: str) -> EventContext:
     return EventContext(
         label=f"a main push with needed={needed!r} and notes baseline {baseline!r}",
@@ -1594,6 +1779,7 @@ CHECKS: dict[str, Callable[[str], list[str]]] = {
     "tag-validation": check_tag_validation,
     "prebuild": check_prebuild,
     "semver-baseline": check_semver_baseline,
+    "trailing-platforms": check_trailing_platforms,
 }
 
 # Checks of release-semver-readiness.yml; run them by name with

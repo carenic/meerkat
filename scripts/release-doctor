@@ -211,7 +211,7 @@ if awk '
     in_job && /--version/ { version = 1 }
     END { exit (native && version) ? 0 : 1 }
   ' "${release_workflow}" &&
-  grep -Eq '^    needs: \[build_binaries, build_binaries_buildbuddy, build_binaries_windows_cross, verify_windows_binaries(, [a-z_]+)*\]$' "${release_workflow}" &&
+  grep -Eq '^    needs: \[build_binaries, build_binaries_buildbuddy, build_binaries_windows_cross, verify_windows_binaries(, [a-z0-9_]+)*\]$' "${release_workflow}" &&
   grep -Fq '[[ "${windows_cross_result}" == "success" && "${windows_verify_result}" == "success" ]] || exit 1' "${release_workflow}" &&
   ! grep -Eq 'runs-on: *"?windows-latest"?.*target' "${release_workflow}" &&
   ! grep -Fq '"runs-on":"windows-latest","target":"x86_64-pc-windows-msvc"' "${release_workflow}" &&
@@ -299,6 +299,12 @@ if baseline_contract="$(workflow_contract semver-baseline)"; then
   pass "Semver baseline rustdoc builds alongside the release and gates nothing; it attaches only to a published release"
 else
   bad "The semver baseline rustdoc must stay off every path a user waits on (${baseline_contract//$'\n'/; })"
+fi
+
+if trailing_contract="$(workflow_contract trailing-platforms)"; then
+  pass "Linux and macOS arm64 assets publish without waiting for the trailing Intel macOS and Windows lanes; no upload replaces a published asset"
+else
+  bad "The trailing Intel macOS and Windows lanes must not gate the critical assets, and no upload may replace a published asset (${trailing_contract//$'\n'/; })"
 fi
 
 if tag_validation_contract="$(workflow_contract tag-validation)"; then

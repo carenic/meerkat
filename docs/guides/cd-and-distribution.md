@@ -17,8 +17,8 @@ Meerkat publishes one source project across several consumer surfaces:
 | TypeScript SDK | Node applications | `@rkat/sdk` on npm |
 | Web SDK | Browser applications | `@rkat/web` on npm |
 
-The public release path is GitHub Actions. Tag-triggered Linux/macOS
-packaging selects BuildBuddy only for the literal actor `lukacf` when
+The public release path is GitHub Actions. Tag-triggered packaging of the
+critical platforms (Linux x86_64 and aarch64, macOS arm64) selects BuildBuddy only for the literal actor `lukacf` when
 `MEERKAT_RELEASE_BUILDBUDDY` is `true` or `1`; other actors use the hosted
 fallback. Eligible manual dispatches select release validation and packaging
 under the [BuildBuddy rules below](#buildbuddy). Both release backends still
@@ -260,10 +260,13 @@ embedding a separate runtime implementation.
 4. In parallel, verify registry credentials, consume declared-break evidence,
    and either find the complete prebuild of the tag commit or build the
    platform binaries and the Web SDK package artifact.
-5. Publish the macOS/Linux assets early when available, then complete the
-   GitHub release with every platform archive, `checksums.sha256`, and
-   `index.json`.
-6. Update the Homebrew tap from the published assets.
+5. Publish the critical Linux (x86_64, aarch64) and macOS arm64 archives as
+   soon as their lane passes (`publish_critical_release_assets`), without
+   waiting for the trailing Intel macOS and Windows lanes. Those archives
+   follow when their lanes finish (`publish_github_release`): added to the
+   release, never replacing an asset already on it, then `checksums.sha256`
+   and `index.json` for the complete set, written once.
+6. Update the Homebrew tap from the complete release's published checksums.
 7. Publish Rust crates plus the Python and TypeScript SDKs on GitHub-hosted
    runners. The Rust crates publish by dependency level, derived from the
    canonical order in `scripts/release-rust-crates.sh` and `cargo metadata`:
@@ -377,7 +380,7 @@ Automatic tag packaging selects BuildBuddy only when `github.actor` is
 literally `lukacf` and the repository variable
 `MEERKAT_RELEASE_BUILDBUDDY` is `true` or `1`. For eligible manual dispatches,
 explicit `release_backend=buildbuddy` selects BuildBuddy validation and
-Linux/macOS packaging only for that same literal actor; it does not also
+Linux and macOS arm64 packaging only for that same literal actor; it does not also
 require the automatic-selection variable. This is a named-actor condition,
 not a general owner/admin permission check.
 
@@ -388,9 +391,9 @@ RELEASE_BACKEND=buildbuddy make release-workflow VERSION=vX.Y.Z
 ```
 
 On eligible manual dispatches, other actors use GitHub-hosted Cargo validation
-and Linux/macOS packaging even when they request `release_backend=buildbuddy`.
-Windows packaging and every credentialed registry publish still run on
-GitHub-hosted runners, and the exact-main GitHub Actions CI requirement remains
+and Linux and macOS arm64 packaging even when they request
+`release_backend=buildbuddy`. Windows and Intel macOS packaging and every
+credentialed registry publish still run on GitHub-hosted runners, and the exact-main GitHub Actions CI requirement remains
 in force. This release
 backend selection is separate from per-push CI, which is Cargo-only on
 GitHub-hosted runners; the full BuildBuddy graph runs nightly and on the tag

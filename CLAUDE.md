@@ -498,9 +498,14 @@ validation: that exact-main run already ran every check `release_validate_cargo`
 repeats, so the tag skips it (it still validates a tag whose attestation is a
 legacy schema). Cargo validation is also the manual-dispatch fallback.
 The owner-selected BuildBuddy release backend (remote.buildbuddy.io) covers
-Linux/macOS binaries. Windows release binaries are cross-compiled with
-cargo-xwin (clang-cl, lld-link, the Windows SDK) on a GitHub-hosted Ubuntu
-runner and then executed for verification on a windows-latest runner.
+the critical Linux (x86_64, aarch64) and macOS arm64 binaries. The trailing
+platforms build in their own jobs on either backend: Windows release
+binaries are cross-compiled with cargo-xwin (clang-cl, lld-link, the Windows
+SDK) on a GitHub-hosted Ubuntu runner and then executed for verification on a
+windows-latest runner, and Intel macOS binaries are cross-compiled on an
+Apple silicon runner (macos-15). The critical archives publish as soon as
+their lane passes; the trailing ones are added afterwards, add-only, with the
+complete manifest and the Homebrew formula.
 
 **Release semver readiness** (`.github/workflows/release-semver-readiness.yml`)
 is a separate workflow triggered by `Cargo.toml`/`CHANGELOG.md` changes on
@@ -522,24 +527,26 @@ release semver gate; PR and manual artifacts are previews.
 | `release_validate_gate` | Tags and full/package dispatches | On tags require exact-tree CI plus the full BuildBuddy graph (graph on), or with the graph off pass on the verified schema-4 attestation alone (`release_validate_cargo` for a legacy attestation); on manual dispatches accept the selected validation lane; Web-only and asset-only recovery skip it |
 | `release_semver_gate` | Tags and full/package dispatches | After `require_ci_green`, verifies unexpired exact-tree, exact-version main-push readiness evidence on the normal tag/explicit-tag path; narrower manual measurement/recovery exceptions are described in the release guide |
 | `release_prebuild` | Tag runs | Finds a complete pre-tag prebuild of exactly the tag commit (`scripts/release-find-prebuild`: a `release.yml` dispatch on main at that commit whose `Release prebuild gate` passed and whose artifacts have not expired; one still running is waited for); when found, the build jobs below are skipped and the publishers use that run's artifacts |
-| `build_binaries` / `build_binaries_buildbuddy` / `build_binaries_windows_cross` / `verify_windows_binaries` / `build_binaries_gate` | Tags without a prebuild, manual asset recovery, or a prebuild dispatch | The selected BuildBuddy or GitHub-hosted lane builds Linux/macOS (4 targets); `build_binaries_windows_cross` cross-compiles Windows from Linux with cargo-xwin and `verify_windows_binaries` runs the result on windows-latest; each target packages 4 binaries (`rkat`, `rkat-rpc`, `rkat-rest`, `rkat-mcp`); the gate requires the selected lanes plus both Windows jobs (on a tag that reuses a prebuild, that every build job was skipped) |
+| `build_binaries` / `build_binaries_buildbuddy` / `build_binaries_critical_gate` | Tags without a prebuild, manual asset recovery, or a prebuild dispatch | The selected BuildBuddy or GitHub-hosted lane builds the critical platforms (Linux x86_64 and aarch64, macOS arm64); each target packages 4 binaries (`rkat`, `rkat-rpc`, `rkat-rest`, `rkat-mcp`); the critical gate requires the selected lane (or, when the archives come from a prebuild or `assets_run_id`, that every build job was skipped) |
+| `build_binaries_windows_cross` / `verify_windows_binaries` / `build_binaries_macos_x86_cross` / `build_binaries_gate` | Same | The trailing platforms on either backend: Windows cross-compiled from Linux with cargo-xwin and run on windows-latest, Intel macOS cross-compiled on Apple silicon (`macos-15`); the full gate requires the selected critical lane plus every trailing job |
 | `build_web_sdk_package` | Tags without a prebuild, package/Web recovery without a reused artifact, or a prebuild dispatch | Builds and attests the `@rkat/web` package artifact |
 | `release_prebuild_gate` | Prebuild dispatches | Passes only when the binary build gate and the Web SDK package succeeded; the marker `release_prebuild` requires of a prebuild run |
-| `publish_github_release` | Tags or manual asset recovery | Downloads artifacts (a prebuild's, verified exactly like an `assets_run_id` recovery), generates `checksums.sha256` + `index.json`, publishes or repairs the GitHub Release |
-| `update_homebrew` | After GitHub release or asset recovery | Updates the Homebrew tap formula |
+| `publish_critical_release_assets` | Tags | As soon as the critical gate passes, verifies and publishes exactly the Linux and macOS arm64 archives (add-only, no manifest); waits for no trailing job |
+| `publish_github_release` | Tags or manual asset recovery | The trailing publisher: after the full gate, downloads artifacts (a prebuild's, verified exactly like an `assets_run_id` recovery), adds the archives not yet on the release (never replacing one), then writes the complete `checksums.sha256` + `index.json` once (refusing to change a published one) |
+| `update_homebrew` | After the trailing publisher | Updates the Homebrew tap formula from the complete release's published checksums |
 | `publish_semver_baseline` / `attach_semver_baseline` | Tags or asset recovery, alongside publication | `publish_semver_baseline` generates rustdoc JSON for every publishable library crate on the release tag as soon as `require_ci_green` passes; `attach_semver_baseline` attaches it as `semver-rustdoc-<version>.tar.zst` once the GitHub release is published. It is the baseline the next release's semver gate compares against; no job waits for either |
 | `publish_registries` | Tags or manual `publish_release_packages=true` | Publishes 46 Rust crates → crates.io by dependency level (concurrently within a level), Python SDK → PyPI, TypeScript SDK → npm |
 | `publish_web_sdk` | Tags or manual package/Web recovery | Publishes `@rkat/web` → npm (a prebuild's package only after verifying its attestation and version) |
 
 **Build matrix:**
 
-| Platform | Target |
-|----------|--------|
-| Linux x86_64 | `x86_64-unknown-linux-gnu` |
-| Linux ARM64 | `aarch64-unknown-linux-gnu` |
-| macOS ARM64 | `aarch64-apple-darwin` |
-| macOS x86_64 | `x86_64-apple-darwin` |
-| Windows x86_64 | `x86_64-pc-windows-msvc` |
+| Platform | Target | Publication |
+|----------|--------|-------------|
+| Linux x86_64 | `x86_64-unknown-linux-gnu` | critical |
+| Linux ARM64 | `aarch64-unknown-linux-gnu` | critical |
+| macOS ARM64 | `aarch64-apple-darwin` | critical |
+| macOS x86_64 | `x86_64-apple-darwin` | trailing (cross-compiled on Apple silicon) |
+| Windows x86_64 | `x86_64-pc-windows-msvc` | trailing (cross-compiled on Linux) |
 
 **Manual recovery through the release facade:**
 ```bash

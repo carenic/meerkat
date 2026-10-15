@@ -62,6 +62,15 @@ them.
 - The semver baseline rustdoc for the next release builds alongside the
   release instead of after it, and `attach_semver_baseline` attaches it once
   the GitHub release is published; no job waits for either.
+- Intel macOS and Windows release archives trail: the Linux (x86_64,
+  aarch64) and macOS arm64 archives publish as soon as their lane passes
+  (`publish_critical_release_assets`, add-only), and `publish_github_release`
+  adds the Intel macOS and Windows archives when their lanes finish, never
+  replacing a published asset, before it writes the complete
+  `checksums.sha256` and `index.json` (refusing to change a published one);
+  Homebrew follows it. Intel macOS binaries are now cross-compiled on Apple
+  silicon (`macos-15`) on both release backends, instead of BuildBuddy or the
+  `macos-15-intel` runner.
 - CI's `Closure tests` rows have 60 minutes instead of 40, and the
   `ci-integration` profile gives its four slow nested-Cargo and
   whole-workspace tests 16 slow periods (960 s) instead of 8, so a cold row
