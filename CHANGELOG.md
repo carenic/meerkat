@@ -93,6 +93,9 @@ them.
   `HostConfinement::untrusted_directory` judges a convention directory as a
   whole; `meerkat_skills::resolve_repositories_with_roots_trusting` resolves
   skill repositories without the directories a predicate does not trust.
+- `SdkConfigStore::with_realm_document` builds a realm document store that
+  keeps the realm's composed `[confinement]` and `[governance]`
+  (`FileConfigStore::with_realm_chain`).
 
 ### Changed
 
