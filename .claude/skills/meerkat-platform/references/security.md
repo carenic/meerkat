@@ -129,17 +129,42 @@ requirement = { baseline = "command_runtime_v1", read = { kind = "paths", paths 
   or is added: a less trusted document that states a required kind
   differently is refused (`ConfinementLayerConflict`).
 - An ordinary config write cannot add, change or remove the section
-  (`confinement_administration_required`).
+  (`confinement_administration_required`), and, as for `[governance]`
+  (`governance_administration_required`), it cannot change the realm
+  sections of the realm's own document (its `[realm.<id>].parent` edge, or a
+  `[realm.global]` section that puts the user document on its chain) so that
+  the realm would compose a different `[confinement]` or `[governance]`.
+  Only stores that declare the realm chain enforce this: the stock hosts'
+  stores, `FileConfigStore::with_realm_chain` and
+  `SdkConfigStore::with_realm_document`; a `FileConfigStore::new`,
+  `SdkConfigStore::with_path` or in-memory store keeps only the document's
+  own sections. Each ancestor composes from its own document alone, so a
+  chain through a missing ancestor fails (a missing parent), and `rkat realm
+  delete` and `rkat realm prune` keep a realm another realm names as its
+  parent.
 - A host that confines every kind keeps its own inputs out of reach: a start
-  in which a confined process could change the realm state or the user config
-  document (writing it, creating it, or replacing a directory on the way) is
-  refused, naming the input and the remedy. The macOS workspace preset
-  protects `<root>/.rkat`; on Linux the state must live outside the workspace
-  (`--state-root`). An `mcp.toml` or project `.rkat/config.toml` a confined
-  process can write is not trusted: its MCP servers are refused before they
-  are expanded, authorized, connected or spawned, and its hooks are refused
-  at every invocation (`untrusted_configuration_source`). A host that runs
-  any kind as the trusted host claims none of this and says so at startup.
+  in which a confined process could change the realm state, the user config
+  document or the file credential store (`<config dir>/meerkat/credentials`;
+  writing it, creating it, replacing a directory on the way, or through a
+  symbolic link in it) is refused, naming the input and the remedy. The
+  macOS workspace preset protects `<root>/.rkat`; on Linux the state must
+  live outside the workspace (`--state-root`). A convention source a
+  confined process can write is not trusted: an `mcp.toml` (its MCP servers
+  are refused before they are expanded, authorized, connected or spawned;
+  the model sees each as that server's failed setup with
+  `untrusted_configuration_source`, under its name when that is a plain
+  server name, else `refused-mcp-server-<n>`; an MCP auth request naming one
+  is refused as `mcp_server_not_configured`), a project `.rkat/config.toml`
+  (its hooks are refused at every invocation), and a skills directory (the
+  project `.rkat/skills`, a filesystem repository or the Git skill cache: its
+  skills are not loaded, nor is a skill linked to a path a confined process
+  can write). A host that runs any kind as the trusted host claims none of
+  this.
+- At startup each host reports each launch kind's requested and effective
+  confinement, what keeps its own inputs from its confined processes, and
+  each untrusted convention source (`rkat` on stderr, the servers in their
+  log). A server reads its working directory only to resolve a relative
+  `--confinement-read` or `--confinement-write` path.
 
 A Rust embedder resolves a selection with `meerkat::HostConfinement` and
 installs it with `AgentFactory::with_host_confinement`, or selects each kind
@@ -150,6 +175,20 @@ on `AgentFactory`:
 | `with_shell_confinement(ShellConfinement)` | shell tool: foreground calls, background jobs, monitors | `ShellConfinement::TrustedHost` |
 | `with_command_hook_confinement(ExecutionConfinement, working_directory)` | command hooks (absolute `working_directory`, else `invalid_launch`) | unset (trusted host) |
 | `with_mcp_stdio_launch_profile(McpStdioLaunchProfile)` | local MCP stdio servers | `McpStdioLaunchProfile::trusted_host()` |
+
+`with_host_confinement` also confines stdio skill sources under the
+`mcp_stdio` requirement (from the kind's working directory, with only their
+configured environment and an absolute program) and hands the host's
+`HostConfinement::untrusted_paths` to skill resolution and credential
+resolution. `McpRouter::new`, `new_with_surface_handle`,
+`new_with_removal_timeout`, `new_with_surface_handle_and_removal_timeout`
+and `meerkat::mcp::standalone_router` are deprecated (0.9.2): they launch
+stdio servers as the trusted host without naming it. Use
+`McpRouter::new_with_stdio_profile`,
+`new_with_surface_handle_and_stdio_profile` or
+`meerkat::mcp::standalone_router_with_stdio_profile` with the host's profile
+(`AgentFactory::mcp_stdio_launch_profile`) or
+`McpStdioLaunchProfile::trusted_host()`.
 
 `ShellConfinement` is `meerkat_tools::builtin::shell::ShellConfinement`
 (`TrustedHost` or `Required { requirement }`); `McpStdioLaunchProfile` is in
@@ -215,6 +254,30 @@ Programs must be given by absolute path where the launch names them directly
 stderr is discarded. Environment names starting `LD_`, `DYLD_`, `_RLD_`,
 `__XPC_`, `BASH_FUNC_`, or equal to `ENV`, `BASH_ENV`, `SHELLOPTS`, `BASHOPTS`,
 `ZDOTDIR`, `GLIBC_TUNABLES`, are refused (`unsupported_requirement`).
+
+### Launches outside confinement
+
+Every process a stock host starts runs under its launch kind's confinement
+except these, which it runs as itself (`meerkat_core::HostLaunchExemption`):
+
+- Git skill source (`git`): fetches with the host's Git credentials and
+  network; a repository is not loaded when a confined process could change
+  the `git` program (or a `PATH` directory searched first) or the skill
+  cache.
+- Credential command (auth profile `source = { kind = "command" }`):
+  produces the host's provider credentials; refused before it runs
+  (`ProviderAuthError::HostLaunchRefused`) when a confined process could
+  change its program (or a `PATH` directory a bare name is searched in) or
+  its working directory (the host's own when it names none).
+- Browser opener (`open`, `xdg-open`, `rundll32`; the CLI's HTML artifact
+  opener): must reach the user's desktop session; only the platform opener
+  runs, with the URL as one argument.
+- `stty`: host terminal control (hiding a client secret typed at `rkat`).
+- `wasm-pack`: developer build tooling (`rkat doctor`); no model or
+  configuration reaches it.
+
+A source test fails on any process launch in shipped code that is neither
+confined nor in this list.
 
 ### Platforms
 
@@ -500,7 +563,10 @@ explained in `references/security_governance.md`.
   Rust host with
   `with_shell_confinement(ShellConfinement::Required { requirement })`,
   `with_command_hook_confinement(requirement, working_directory)` and
-  `with_mcp_stdio_launch_profile(McpStdioLaunchProfile::required(..))`. macOS
+  `with_mcp_stdio_launch_profile(McpStdioLaunchProfile::required(..))`, or
+  all of them with `with_host_confinement`. Five host launches stay outside
+  it by design (Git skill sources, credential commands, the browser opener,
+  `stty`, `wasm-pack`; see Launches outside confinement). macOS
   uses Seatbelt; Linux (usable from 0.9.0) gives each launch new user, mount
   and IPC namespaces plus a seccomp filter; Windows has no backend and refuses.
   The default is the trusted host (no confinement). `--tools none`, realms,
