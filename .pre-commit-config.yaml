@@ -287,8 +287,16 @@ repos:
         stages: [pre-push]
 
       - id: release-find-prebuild-contract
-        name: release prebuild lookup selects only complete exact-commit prebuilds
+        name: release prebuild lookup selects only usable exact-commit prebuilds
         entry: scripts/test-release-find-prebuild.sh
+        language: script
+        pass_filenames: false
+        always_run: true
+        stages: [pre-push]
+
+      - id: release-asset-provenance-contract
+        name: release asset provenance accepts an earlier run only through its build gate
+        entry: scripts/test-verify-release-asset-provenance.sh
         language: script
         pass_filenames: false
         always_run: true

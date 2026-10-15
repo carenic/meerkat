@@ -487,6 +487,10 @@ elif name == "prebuild-reuse-no-wait":
     if match is None:
         raise SystemExit(f"fixture `{name}` expects the trailing-lane wait step")
     text = text[: match.start()] + text[match.end() :]
+elif name == "prebuild-critical-full-gate":
+    # The critical publisher waits on the prebuild's full gate, which its
+    # still-running trailing lanes hold back.
+    replace_once('              --source-gate "Release critical binary build gate" \\\n', "")
 elif name == "both-defects":
     replace_once(
         MEASUREMENT_STEP_IF,
@@ -657,6 +661,9 @@ expect_fail_named prebuild-reuse-no-wait "${TEST_ROOT}/prebuild-reuse-no-wait.ym
 mutate prebuild-gate-waits-trailing "${TEST_ROOT}/prebuild-gate-waits-trailing.yml"
 expect_fail_named prebuild-gate-waits-trailing "${TEST_ROOT}/prebuild-gate-waits-trailing.yml" \
   "job \`release_prebuild_gate\` waits for \`build_binaries_gate\`" trailing-platforms
+mutate prebuild-critical-full-gate "${TEST_ROOT}/prebuild-critical-full-gate.yml"
+expect_fail_named prebuild-critical-full-gate "${TEST_ROOT}/prebuild-critical-full-gate.yml" \
+  "expected \`Release critical binary build gate\`" prebuild
 mutate prebuild-gate-renamed "${TEST_ROOT}/prebuild-gate-renamed.yml"
 expect_fail_named prebuild-gate-renamed "${TEST_ROOT}/prebuild-gate-renamed.yml" \
   "does not require the \`Prebuild complete\` job" prebuild

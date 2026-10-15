@@ -3,7 +3,7 @@ set -euo pipefail
 
 usage() {
   cat >&2 <<'EOF'
-Usage: verify-release-asset-provenance [--recovery-source <sha> | --source-run <run-id>] [--stamps <dir>] <artifact-dir> <release-tag> [signer-workflow]
+Usage: verify-release-asset-provenance [--recovery-source <sha> | --source-run <run-id> [--source-gate <job>]] [--stamps <dir>] <artifact-dir> <release-tag> [signer-workflow]
 
 Verify every release archive in artifact-dir against GitHub's signed build
 provenance. signer-workflow defaults to the release workflow.
@@ -22,7 +22,9 @@ under <dir>, itself attested the same way, whose content is the tag's commit
 --source-run <run-id> --stamps <dir>: publish the archives of an earlier
 asset recovery run without rebuilding. The run must be this repository's
 release.yml, dispatched on main, at a commit in main's history, and its
-Release binary build gate job must have succeeded; its head_sha becomes the
+Release binary build gate job (or the job named by --source-gate, for
+example "Release critical binary build gate" when only the critical
+platforms' archives are verified) must have succeeded; its head_sha becomes the
 recovery source above. A run built before archives were stamped
 has no stamps: then the tag must be an ancestor of that head_sha and every
 path changed between them must be under .github/ or CHANGELOG.md, so the
@@ -33,6 +35,7 @@ EOF
 
 recovery_source=""
 source_run=""
+source_gate="Release binary build gate"
 stamps_dir=""
 while [[ "$#" -gt 0 ]]; do
   case "$1" in
@@ -42,6 +45,10 @@ while [[ "$#" -gt 0 ]]; do
       ;;
     --source-run)
       source_run="${2:?--source-run requires a run id}"
+      shift 2
+      ;;
+    --source-gate)
+      source_gate="${2:?--source-gate requires a job name}"
       shift 2
       ;;
     --stamps)
@@ -76,14 +83,18 @@ if [[ -n "${source_run}" ]]; then
   }
   # That run's own build gate covers what this run skips: every lane built,
   # each binary embedded the version, Windows binaries ran on Windows.
+  case "${source_gate}" in
+    "Release binary build gate"|"Release critical binary build gate") ;;
+    *) echo "--source-gate must name a release binary build gate job: ${source_gate}" >&2; exit 2 ;;
+  esac
   build_gate="$(gh api "repos/${repository_for_run}/actions/runs/${source_run}/jobs?per_page=100" --paginate \
-    --jq '.jobs[] | select(.name == "Release binary build gate") | .conclusion')"
+    --jq ".jobs[] | select(.name == \"${source_gate}\") | .conclusion")"
   if [[ "${build_gate}" != "success" ]]; then
-    echo "run ${source_run}: Release binary build gate did not succeed (${build_gate:-absent})" >&2
+    echo "run ${source_run}: ${source_gate} did not succeed (${build_gate:-absent})" >&2
     exit 1
   fi
   recovery_source="${run_sha}"
-  echo "source run ${source_run}: release.yml on main at ${run_sha}, build gate passed"
+  echo "source run ${source_run}: release.yml on main at ${run_sha}, ${source_gate} passed"
 fi
 if [[ -n "${recovery_source}" || -n "${stamps_dir}" ]]; then
   [[ "${recovery_source}" =~ ^[0-9a-f]{40}$ ]] || {

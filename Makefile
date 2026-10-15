@@ -833,6 +833,7 @@ release-doctor:
 	@scripts/test-release-npm-publish-preflight.sh
 	@scripts/test-release-doctor-workflow-contract.sh
 	@scripts/test-release-find-prebuild.sh
+	@scripts/test-verify-release-asset-provenance.sh
 	@scripts/test-gcp-buildbuddy-workflow-gate.sh
 	@scripts/release-doctor
 

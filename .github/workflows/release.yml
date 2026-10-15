@@ -1809,8 +1809,11 @@ jobs:
         run: |
           set -euo pipefail
           if [[ -n "${PREBUILD_RUN_ID}" ]]; then
+            # The prebuild's trailing lanes may still be running: its
+            # critical gate covers the archives verified here.
             scripts/verify-release-asset-provenance \
               --source-run "${PREBUILD_RUN_ID}" \
+              --source-gate "Release critical binary build gate" \
               --stamps release-artifacts \
               critical-release-artifacts "${RELEASE_TAG}"
           else

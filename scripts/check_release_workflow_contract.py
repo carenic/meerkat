@@ -1449,6 +1449,20 @@ def check_prebuild(text: str) -> list[str]:
                 f"`{PROVENANCE_VERIFIER} --source-run {PREBUILD_RUN} --stamps ...`, the "
                 "assets_run_id trust path"
             )
+        else:
+            # The critical archives are verified against the prebuild's
+            # critical gate (its trailing lanes may still run); the complete
+            # set against its full binary build gate, the default.
+            args = calls[0]
+            gate = args[args.index("--source-gate") + 1] if "--source-gate" in args else "Release binary build gate"
+            wanted = (
+                "Release critical binary build gate" if job == CRITICAL_PUBLISH_JOB else "Release binary build gate"
+            )
+            if gate != wanted:
+                violations.append(
+                    f"step `{verify_steps[0].name}` requires the prebuild's `{gate}` on {reused.label}; "
+                    f"expected `{wanted}`"
+                )
         fresh_calls = _verifier_invocations(verify_steps[0], fresh)
         if len(fresh_calls) != 1 or "--source-run" in fresh_calls[0]:
             violations.append(

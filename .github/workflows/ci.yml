@@ -405,8 +405,11 @@ jobs:
       - name: Release doctor workflow assertions still bind
         run: scripts/test-release-doctor-workflow-contract.sh
 
-      - name: Release prebuild lookup selects only complete exact-commit prebuilds
+      - name: Release prebuild lookup selects only usable exact-commit prebuilds
         run: scripts/test-release-find-prebuild.sh
+
+      - name: Release asset provenance accepts an earlier run only through its build gate
+        run: scripts/test-verify-release-asset-provenance.sh
 
       # Stubbed cargo and a file:// index: levels in order, bounded overlap,
       # skip of a published version, and stop at the first failing crate.
