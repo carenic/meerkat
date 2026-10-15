@@ -35,6 +35,83 @@ them.
 
 ## [Unreleased]
 
+### Breaking
+
+- Builtin web_search target and delegated hosted search (see Added).
+  `meerkat-authorization`: `grant_policy::operation_grant_target` takes the
+  operation's `&PreparedAuthorizationBinding` instead of its
+  `&OperationAuthorizationFacts`: a delegated hosted search selects its own
+  route's lineage from its binding, where the facts alone would select the
+  base. Callers pass the binding they already hold.
+  `meerkat-authorization-contracts`: `AuthorizationAuditObservation` gains
+  `delegate_attribution: Option<AuditDelegateAttribution>` (struct literals
+  add `delegate_attribution: None`). No exhaustive public enum gains a
+  variant: `ToolOperationTarget` and `GrantTarget` are non-exhaustive.
+  Persisted format (not measured by the gate): `GrantTarget`'s new
+  `BuiltinToolOperation { operation }` and
+  `DelegatedHostedSearch { route, capability }` are ordered after every
+  earlier target kind, so existing selections keep their order and
+  canonical bytes, but a work association whose targeted selection names one
+  of them, and an audit record with a delegate attribution, cannot be read
+  by a binary without this change. Associations and records that use
+  neither are unchanged.
+- Behaviour-only (not measured by the gate): under a targeted grant basis
+  the builtin web_search call selects only its `BuiltinToolOperation`
+  lineage and its helper's model request only its `DelegatedHostedSearch`
+  lineage, never the base, so a host that admitted the helper's inference
+  under the base now sees Denied until it selects the delegate (a single
+  `GrantLineage` basis is unchanged). A governed web_search whose context
+  does not carry the dispatch's own prepared call is refused as malformed
+  facts before its helper runs. A stock realm with a per-target selection
+  refuses web_search as Denied (no lineage is selected for it) instead of
+  Unavailable; a legacy single stock grant still leaves it Unavailable. A
+  web_search plan resolved by one composite dispatcher, or by the same
+  composite before it replaced a builtin registration, is refused at
+  dispatch as `ExecutionOwnerChanged`.
+
+### Added
+
+- Governed builtin web_search: a typed operation target for the call and a
+  delegated hosted-search lineage for its helper. The composite dispatcher
+  states `ToolOperationTarget::BuiltinOperation { operation:
+  BuiltinToolOperation::WebSearch }` for the web_search builtin it
+  registered (the tool declares it through `BuiltinTool::builtin_operation`;
+  tools without a declaration keep their plans) and revalidates it at
+  dispatch against its exact registration: another composite, another owner
+  key, or a plan resolved before the composite replaced its web_search
+  executor (even with an identical schema) is `ExecutionOwnerChanged`, and
+  no executor runs. A tool merely named web_search (a host dispatcher's, a
+  registered bundle's or an undeclared builtin) has no such target. The
+  helper's own model request is the typed delegate of exactly that call:
+  `ToolDispatchContext::tool_delegate_attribution(call,
+  ToolDelegateRole::HostedSearchInference)` mints a `ToolDelegateAttribution`
+  only from the dispatch's own prepared call (matched by identity) whose plan
+  carries that target, `LlmRequestAuthorization::for_tool_delegate` carries
+  it, and `PreparedAuthorizationBinding::delegate_attribution` exposes it to
+  owners. The delegate binds only an inference with exactly one hosted search
+  capability (`WebSearch`, or `GoogleSearch` for a Gemini helper) and no live
+  channel, under the call's work, execution scope, run and context revision
+  with a fresh operation id, and never moves to another run. Under a
+  targeted basis `operation_grant_target` selects
+  `GrantTarget::BuiltinToolOperation { operation }` for the call and
+  `GrantTarget::DelegatedHostedSearch { route, capability }` for the helper,
+  where `route` is the helper's own `ControllerRouteKey`; the work and every
+  original (named contributors and further originals) use the same
+  selector, with their current ceilings and the earliest expiry. The
+  attribution grants, inherits and exempts nothing: it keys the selection
+  and the protected audit record (`AuditDelegateAttribution {
+  parent_operation_id, role }`). Revoking the call's own lineage refuses
+  later calls but does not cancel an invocation that already entered (its
+  helper is decided by its own lineage); revoking the helper's or a
+  contributor's lineage before the helper's entry prevents its send.
+  `ResolvedToolExecutionPlan::single_operation_target` states the one-target
+  rule `grant_policy::single_tool_operation_target` now forwards to, and
+  `ServerToolKind` derives `PartialOrd`, `Ord` and `Hash`. Stock issues no
+  grant for either target and leaves both unmapped; this is not stock
+  coverage of web_search. Limit: web_search has no reviewed entry point, so
+  a call its owner requires R2 review for settles as `unsupported_entry` and
+  R3 as `human_consent_required` (local feedback); it never runs unreviewed.
+
 ### Changed
 
 - CI's `Closure tests` rows have 60 minutes instead of 40, and the

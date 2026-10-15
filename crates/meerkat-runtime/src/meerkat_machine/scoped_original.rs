@@ -212,8 +212,7 @@ pub fn original_operation_grant(
         }
         WorkAuthorityBasis::GrantLineage { lineage } => lineage.as_slice(),
         WorkAuthorityBasis::TargetedGrantLineages { .. } => {
-            let target =
-                meerkat_authorization::grant_policy::operation_grant_target(binding.facts())?;
+            let target = meerkat_authorization::grant_policy::operation_grant_target(binding)?;
             basis.lineage_for(target.as_ref()).ok_or_else(denied)?
         }
     };
@@ -270,8 +269,7 @@ fn contributor_operation_ceiling(
         }
         WorkAuthorityBasis::GrantLineage { lineage } => lineage.as_slice(),
         WorkAuthorityBasis::TargetedGrantLineages { .. } => {
-            let target =
-                meerkat_authorization::grant_policy::operation_grant_target(binding.facts())?;
+            let target = meerkat_authorization::grant_policy::operation_grant_target(binding)?;
             basis.lineage_for(target.as_ref()).ok_or_else(denied)?
         }
     };

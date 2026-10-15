@@ -13,8 +13,8 @@ use meerkat_authorization_contracts::work_association::{
     GrantTarget, InputAuthorityAssociation, WorkAuthorityBasis,
 };
 use meerkat_core::authorization::{
-    AuthorizationOperation, OperationAuthorizationFacts, OperationRefusalKind, OperationRefused,
-    PreparedAuthorizationBinding, ToolAuthorizationTarget, WorkAuthorizationContext,
+    AuthorizationOperation, OperationRefusalKind, OperationRefused, PreparedAuthorizationBinding,
+    ToolAuthorizationTarget, ToolDelegateRole, WorkAuthorizationContext,
 };
 use meerkat_core::exact_operation::OperationExecutionScope;
 use meerkat_core::tool_execution::{ResolvedToolExecutionPlan, ToolOperationTarget};
@@ -25,35 +25,43 @@ use crate::policy::{
 };
 use crate::publication::{LocalPublicationGuard, PublicationError};
 
-/// The one owner-produced operation target of a dispatched tool plan, if any.
+/// The one owner-produced operation target of a dispatched tool plan, if any
+/// ([`ResolvedToolExecutionPlan::single_operation_target`]).
 ///
 /// # Errors
 /// A plan naming more than one owner target is ambiguous and unavailable.
 pub fn single_tool_operation_target(
     plan: &ResolvedToolExecutionPlan,
 ) -> Result<Option<&ToolOperationTarget>, meerkat_core::OperationAuthorizationError> {
-    let mut targets = plan
-        .owner_witnesses()
-        .iter()
-        .filter_map(|witness| witness.operation_target());
-    match (targets.next(), targets.next()) {
-        (target, None) => Ok(target),
-        (_, Some(_)) => Err(meerkat_core::OperationAuthorizationError::Unavailable),
-    }
+    plan.single_operation_target()
 }
 
 /// The typed target an operation's grant lineage is selected by: the single
 /// MCP server a dispatched tool operates on, the exact checked route to that
 /// server it was reached through, the exact registered tool bundle operation
-/// it runs, or `None` for an operation with no typed target or a tool
-/// catalog control, which uses the basis's base lineage. Raw operation
-/// meaning is untouched; this only says which selected lineage applies.
+/// it runs, the builtin operation it is, the hosted-search helper route and
+/// capability of a builtin web_search call's delegate, or `None` for an
+/// operation with no typed target or a tool catalog control, which uses the
+/// basis's base lineage. Raw operation meaning is untouched; this only says
+/// which selected lineage applies.
+///
+/// It reads the whole binding, not only its facts: a delegate's model
+/// operation selects the lineage of its own route and capability, while an
+/// ordinary inference with equal facts keeps the base. The same function
+/// selects the lineage of the work and of every original, so the decision
+/// and every contributor's bound agree on the target.
 ///
 /// # Errors
-/// An ambiguous tool plan target is unavailable.
+/// An ambiguous tool plan target, or a delegate whose own route has no key,
+/// is unavailable; a delegate binding without its role's facts is
+/// malformed.
 pub fn operation_grant_target(
-    facts: &OperationAuthorizationFacts,
+    binding: &PreparedAuthorizationBinding,
 ) -> Result<Option<GrantTarget>, meerkat_core::OperationAuthorizationError> {
+    let facts = binding.facts();
+    if let Some(delegate) = binding.delegate_attribution() {
+        return delegated_grant_target(delegate.role(), &facts.operation).map(Some);
+    }
     let AuthorizationOperation::Tool(tool) = &facts.operation else {
         return Ok(None);
     };
@@ -91,8 +99,47 @@ pub fn operation_grant_target(
                 server: server.clone(),
             }))
         }
+        // A builtin operation (the builtin web_search call) is its own
+        // target: it uses only the lineage selected for exactly that
+        // operation, never the base, the catalog or the controller lineage.
+        Some(ToolOperationTarget::BuiltinOperation { operation }) => {
+            Ok(Some(GrantTarget::BuiltinToolOperation {
+                operation: *operation,
+            }))
+        }
         // Any other target kind selects nothing: unavailable.
         Some(_) => Err(meerkat_core::OperationAuthorizationError::Unavailable),
+    }
+}
+
+/// The target of a builtin tool's delegated operation, from the delegate's
+/// own facts: for the web_search helper, its own lowered route's key and
+/// the one hosted search capability its request enables. Never the
+/// controller's lineage, whatever route the helper runs on.
+fn delegated_grant_target(
+    role: ToolDelegateRole,
+    operation: &AuthorizationOperation,
+) -> Result<GrantTarget, meerkat_core::OperationAuthorizationError> {
+    match role {
+        ToolDelegateRole::HostedSearchInference => {
+            let AuthorizationOperation::Model(model) = operation else {
+                return Err(OperationRefused::new(OperationRefusalKind::MalformedFacts).into());
+            };
+            let [
+                capability @ (meerkat_core::ServerToolKind::WebSearch
+                | meerkat_core::ServerToolKind::GoogleSearch),
+            ] = model.hosted_capabilities.as_ref()
+            else {
+                return Err(OperationRefused::new(OperationRefusalKind::MalformedFacts).into());
+            };
+            let route = model
+                .controller_route_key()
+                .ok_or(meerkat_core::OperationAuthorizationError::Unavailable)?;
+            Ok(GrantTarget::DelegatedHostedSearch {
+                route: route.as_str().to_owned(),
+                capability: capability.clone(),
+            })
+        }
     }
 }
 
@@ -227,6 +274,15 @@ pub trait AdmittedWorkPolicyOwner: Send + Sync {
 /// ControllerInference return every actual hosted-capability tuple; do not add
 /// the separately authorized controller tuple or omit an enabled capability.
 /// For ordinary operations return all their actual tuples.
+///
+/// Classify tools by their owner-produced target, never by name: the builtin
+/// web_search call carries `ToolOperationTarget::BuiltinOperation`. Its
+/// helper's model request is an Operation whose binding carries a
+/// `ToolDelegateAttribution` naming that call; map it from the helper's own
+/// route facts (identity, credential, backend, endpoint, wire model) and
+/// return the inference on that route and one tuple per enabled hosted
+/// capability, never the controller tuple. The attribution grants nothing;
+/// an inference without it is an ordinary alternate-model operation.
 ///
 /// The returned bounds and deadline are current owner facts, read under the
 /// enclosing publication observation. This is a trusted extension seam for
@@ -535,7 +591,7 @@ impl GrantBackedWorkPolicy {
                 // The lineage selected for this operation's typed target
                 // only; a target without one is denied for this operation.
                 basis @ WorkAuthorityBasis::TargetedGrantLineages { .. } => {
-                    let target = operation_grant_target(binding.facts())?;
+                    let target = operation_grant_target(binding)?;
                     basis.lineage_for(target.as_ref()).ok_or_else(denied)?
                 }
             }

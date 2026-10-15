@@ -37,9 +37,14 @@ impl PreparedOperationCheck {
         context: WorkAuthorizationContext,
         binding: PreparedAuthorizationBinding,
     ) -> ObservedAuthorizationResult<Self> {
+        // A review child or a tool delegate is prepared only under the exact
+        // work its origin was prepared in.
         if binding
             .review_attribution()
             .is_some_and(|link| !link.origin().work_authorization().same_context(&context))
+            || binding
+                .delegate_attribution()
+                .is_some_and(|link| !link.work_authorization().same_context(&context))
         {
             return ObservedAuthorizationResult::unobserved(Err(OperationRefused::new(
                 OperationRefusalKind::MalformedFacts,
@@ -263,13 +268,16 @@ impl PreparedOperationCheck {
     /// `work`'s execution scope as `run_id`, decided afresh by that work's
     /// own owners. This is the only cross-run association: the consent owner
     /// uses it to move parked custody into the resumed run its committed
-    /// notice reached. A review child's operation never moves.
+    /// notice reached. A review child's or a tool delegate's operation never
+    /// moves.
     pub(crate) fn prepare_for_resumed_run(
         &self,
         work: WorkAuthorizationContext,
         run_id: &crate::RunId,
     ) -> Result<Self, OperationAuthorizationError> {
-        if self.0.binding.review_attribution().is_some() {
+        if self.0.binding.review_attribution().is_some()
+            || self.0.binding.delegate_attribution().is_some()
+        {
             return Err(OperationRefused::new(OperationRefusalKind::MalformedFacts).into());
         }
         let mut facts = self.0.binding.facts().clone();

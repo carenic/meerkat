@@ -885,6 +885,9 @@ mod stock_persistent;
 #[path = "e1_policy_control/model_reviewer.rs"]
 mod model_reviewer;
 
+#[path = "e1_policy_control/delegated_web_search.rs"]
+mod delegated_web_search;
+
 #[cfg(all(target_os = "macos", feature = "integration-real-tests"))]
 #[path = "e1_policy_control/shell_confinement.rs"]
 mod shell_confinement;

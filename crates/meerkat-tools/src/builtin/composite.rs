@@ -25,6 +25,11 @@ use std::collections::HashSet;
 #[cfg(not(target_arch = "wasm32"))]
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Process-local identities of composite dispatchers as the registration
+/// owners of their builtins.
+static NEXT_BUILTIN_EXECUTION_AUTHORITY_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Error returned by the composite dispatcher.
 #[derive(Debug, thiserror::Error)]
@@ -126,9 +131,66 @@ pub struct CompositeDispatcher {
     #[cfg(not(target_arch = "wasm32"))]
     blob_tools: Option<BlobToolBinding>,
     allowed_tools: HashSet<String>,
+    /// This composite's process-local identity as the registration owner of
+    /// its builtins: the key of the owner witness it attaches to the plan of
+    /// a builtin that declares a typed operation.
+    execution_authority_id: u64,
+    /// Generation of this composite's builtin registrations, advanced by
+    /// every registration change, including a replacement with identical
+    /// name, schema and contract. A builtin operation's plan runs only on
+    /// the exact registration that resolved it.
+    builtin_registration_epoch: u64,
 }
 
 impl CompositeDispatcher {
+    fn next_execution_authority_id() -> u64 {
+        NEXT_BUILTIN_EXECUTION_AUTHORITY_ID.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// The key of the owner witness this composite attaches to the plans of
+    /// its builtin operations.
+    fn builtin_authority_key(&self) -> String {
+        format!("builtin-tools:{}", self.execution_authority_id)
+    }
+
+    /// The live binding of the builtin `tool_name` as this composite's
+    /// current registration owns it: its catalog binding, this composite's
+    /// identity and its current registration generation.
+    fn builtin_registration_fingerprint(
+        &self,
+        tool_name: &str,
+    ) -> Result<
+        meerkat_core::EphemeralToolBindingFingerprint,
+        meerkat_core::ToolExecutionResolutionError,
+    > {
+        Ok(self
+            .execution_binding_fingerprint(tool_name)?
+            .with_live_authority(
+                self.execution_authority_id as usize,
+                self.builtin_registration_epoch,
+            ))
+    }
+
+    /// The plan was resolved by this composite's current registration for
+    /// exactly this call's builtin `operation`.
+    fn builtin_operation_witness_matches(
+        &self,
+        call: ToolCallView<'_>,
+        plan: &meerkat_core::ResolvedToolExecutionPlan,
+        operation: meerkat_core::BuiltinToolOperation,
+    ) -> bool {
+        let Ok(live) = self.builtin_registration_fingerprint(call.name) else {
+            return false;
+        };
+        plan.owner_witness(&self.builtin_authority_key())
+            .is_some_and(|witness| {
+                witness.owner_key() == call.name
+                    && witness.binding_fingerprint() == &live
+                    && witness.operation_target()
+                        == Some(&meerkat_core::ToolOperationTarget::BuiltinOperation { operation })
+            })
+    }
+
     /// Remove the concrete projection of one optional builtin family before a
     /// new registration becomes its canonical owner.
     #[cfg(not(target_arch = "wasm32"))]
@@ -138,6 +200,9 @@ impl CompositeDispatcher {
         for name in names {
             self.allowed_tools.remove(*name);
         }
+        // Every optional registration replaces its family through here: no
+        // plan resolved by an earlier registration runs on a later one.
+        self.builtin_registration_epoch += 1;
     }
 
     /// Keep optional builtins in the factory's canonical blob -> web -> image
@@ -327,6 +392,8 @@ impl CompositeDispatcher {
             web_search_runtime: None,
             blob_tools: None,
             allowed_tools,
+            execution_authority_id: Self::next_execution_authority_id(),
+            builtin_registration_epoch: 0,
         })
     }
 
@@ -385,6 +452,8 @@ impl CompositeDispatcher {
             #[cfg(not(target_arch = "wasm32"))]
             blob_tools: None,
             allowed_tools,
+            execution_authority_id: Self::next_execution_authority_id(),
+            builtin_registration_epoch: 0,
         })
     }
 
@@ -436,6 +505,8 @@ impl CompositeDispatcher {
             web_search_runtime: None,
             blob_tools: None,
             allowed_tools: HashSet::new(),
+            execution_authority_id: Self::next_execution_authority_id(),
+            builtin_registration_epoch: 0,
         };
         dispatcher.register_skill_tools(SkillToolSet::new(engine));
         dispatcher
@@ -1045,7 +1116,24 @@ impl AgentToolDispatcher for CompositeDispatcher {
     {
         match self.resolve_tool_owner(call.name) {
             ResolvedToolOwner::Builtin(tool) => {
-                tool.resolve_execution_plan(call, resolution_context)
+                let plan = tool.resolve_execution_plan(call, resolution_context)?;
+                let Some(operation) = tool.builtin_operation() else {
+                    return Ok(plan);
+                };
+                // The typed operation the builtin itself declares, stated
+                // and revalidated at dispatch only by this registration:
+                // operation policy classifies it from this target, never
+                // from the tool's name.
+                plan.with_owner_witness(
+                    meerkat_core::ToolExecutionOwnerWitness::new(
+                        self.builtin_authority_key(),
+                        call.name,
+                        self.builtin_registration_fingerprint(call.name)?,
+                    )?
+                    .with_operation_target(
+                        meerkat_core::ToolOperationTarget::BuiltinOperation { operation },
+                    ),
+                )
             }
             #[cfg(feature = "skills")]
             ResolvedToolOwner::Skill(tool) => tool.resolve_execution_plan(call, resolution_context),
@@ -1136,6 +1224,17 @@ impl AgentToolDispatcher for CompositeDispatcher {
             })?;
         match self.resolve_tool_owner(call.name) {
             ResolvedToolOwner::Builtin(tool) => {
+                // A builtin operation's plan runs only on the exact
+                // registration that resolved it: another composite, another
+                // owner key or a replaced registration is an owner change.
+                if let Some(operation) = tool.builtin_operation()
+                    && !self.builtin_operation_witness_matches(call, plan, operation)
+                {
+                    return Err(ToolError::unavailable(
+                        call.name,
+                        meerkat_core::ToolUnavailableReason::ExecutionOwnerChanged,
+                    ));
+                }
                 if !tool
                     .execution_contract()
                     .supported_modes()
@@ -1363,6 +1462,9 @@ impl AgentToolDispatcher for CompositeDispatcher {
         }
     }
 }
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod builtin_owner_tests;
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]

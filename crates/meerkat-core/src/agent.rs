@@ -28,6 +28,8 @@ mod structured_output_tests;
 pub(crate) mod test_turn_state_handle;
 mod tool_application_execution;
 #[cfg(test)]
+mod tool_delegate_tests;
+#[cfg(test)]
 mod usage_accounting_tests;
 #[cfg(test)]
 mod usage_degradation_tests;
@@ -1487,6 +1489,43 @@ impl ToolDispatchContext {
             context: self.clone(),
             work: work.clone(),
         })
+    }
+
+    /// The typed delegate attribution of this dispatch's own prepared
+    /// builtin call, for its helper operation in `role` (see
+    /// [`crate::authorization::ToolDelegateAttribution`]). `call` must be
+    /// this dispatch's actual borrowed call, matched by identity against the
+    /// binding-owned call, and the call's plan must carry exactly the
+    /// builtin operation `role` requires, as its registration owner
+    /// produced it. An ungoverned dispatch has none (`Ok(None)`). It grants
+    /// nothing: the helper operation is decided by its own owners.
+    ///
+    /// # Errors
+    /// A governed context without its prepared check (or a check without its
+    /// work), any other call, or a plan with no target, another owner's
+    /// target or more than one target is malformed facts.
+    pub fn tool_delegate_attribution(
+        &self,
+        call: ToolCallView<'_>,
+        role: crate::authorization::ToolDelegateRole,
+    ) -> Result<Option<crate::authorization::ToolDelegateAttribution>, crate::ToolError> {
+        let (work, prepared) = match (self.work_authorization(), self.prepared_authorization()) {
+            (None, None) => return Ok(None),
+            (Some(work), Some(prepared)) => (work, prepared),
+            _ => return Err(governed_malformed()),
+        };
+        let (bound_call, _) = prepared
+            .tool_dispatch_parts()
+            .ok_or_else(governed_malformed)?;
+        if !std::ptr::eq(call.id, bound_call.id)
+            || !std::ptr::eq(call.name, bound_call.name)
+            || !std::ptr::eq(call.args, bound_call.args)
+        {
+            return Err(governed_malformed());
+        }
+        crate::authorization::ToolDelegateAttribution::for_dispatch(prepared, work, role)
+            .map(Some)
+            .map_err(crate::ToolError::from)
     }
 
     /// An owned, single-use entry for a leaf whose effect runs on a worker

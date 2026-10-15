@@ -49,6 +49,7 @@ fn event(sink: &NativeInputAuditSink) -> AuthorizationAuditObservation {
         run_id: Some(sink.run_id.clone()),
         context_revision: None,
         review_attribution: None,
+        delegate_attribution: None,
         observation: AuditObservation::Entry,
     }
 }

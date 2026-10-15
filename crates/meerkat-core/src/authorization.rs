@@ -26,6 +26,11 @@ use crate::types::{SessionId, ToolCallView, ToolName};
 
 mod entry;
 pub use entry::PreparedOperationCheck;
+mod delegate;
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub use delegate::__test_mint_tool_delegate;
+pub use delegate::{ToolDelegateAttribution, ToolDelegateRole};
 mod audit;
 pub use audit::{
     MANDATORY_HOOK_ID_BYTES, MANDATORY_HOOK_PROVIDER_NATIVE_NAME_BYTES,
@@ -244,6 +249,7 @@ pub struct OperationAuthorizationFacts {
 struct BoundOperation {
     facts: OperationAuthorizationFacts,
     review_attribution: Option<Arc<crate::approval::review::ReviewChildAttribution>>,
+    delegate_attribution: Option<ToolDelegateAttribution>,
 }
 
 /// Immutable identity of one actual prepared operation, not permission.
@@ -267,6 +273,7 @@ impl PreparedAuthorizationBinding {
         Self(Arc::new(BoundOperation {
             facts,
             review_attribution: None,
+            delegate_attribution: None,
         }))
     }
 
@@ -277,11 +284,32 @@ impl PreparedAuthorizationBinding {
         Self(Arc::new(BoundOperation {
             facts,
             review_attribution: Some(Arc::new(attribution)),
+            delegate_attribution: None,
+        }))
+    }
+
+    /// The exact binding of a builtin tool's delegated operation, attributed
+    /// to the call that entered the tool (see [`ToolDelegateAttribution`]).
+    pub(crate) fn new_delegate_child(
+        facts: OperationAuthorizationFacts,
+        attribution: ToolDelegateAttribution,
+    ) -> Self {
+        Self(Arc::new(BoundOperation {
+            facts,
+            review_attribution: None,
+            delegate_attribution: Some(attribution),
         }))
     }
 
     pub fn review_attribution(&self) -> Option<&crate::approval::review::ReviewChildAttribution> {
         self.0.review_attribution.as_deref()
+    }
+
+    /// The call whose builtin tool performs this operation as its delegate,
+    /// and the delegate's role. Owners key the delegate's own lineage and
+    /// facts on it; it is data, never a permission.
+    pub fn delegate_attribution(&self) -> Option<&ToolDelegateAttribution> {
+        self.0.delegate_attribution.as_ref()
     }
 
     pub fn facts(&self) -> &OperationAuthorizationFacts {

@@ -81,28 +81,36 @@ impl BuiltinTool for WebSearchTool {
         meerkat_core::ToolMutationClass::ReadOnly
     }
 
+    /// Its registration owner states this as the call's typed operation
+    /// target, so operation policy never classifies a search by its name.
+    fn builtin_operation(&self) -> Option<meerkat_core::BuiltinToolOperation> {
+        Some(meerkat_core::BuiltinToolOperation::WebSearch)
+    }
+
     async fn call(&self, args: Value) -> Result<ToolOutput, BuiltinToolError> {
         self.search(args, None).await
     }
 
-    /// A governed turn carries its admitted work authorization into the
-    /// helper's own model request. The outer `ReadOnly` admission and the tool
-    /// name check do not authorize the helper's model, account, endpoint or
-    /// hosted search; the executor prepares those facts for the actual target.
+    /// A governed call prepares its helper's own model request as the typed
+    /// hosted-search delegate of exactly this call: under the call's work
+    /// and coordinates, decided by the helper's own owners for its own model,
+    /// account, endpoint and hosted search. Neither the call's admission nor
+    /// its tool name authorizes the helper. A governed context that cannot
+    /// name this call's own prepared builtin operation refuses before any
+    /// search. Without admitted work the call is unchanged.
     async fn call_with_context(
         &self,
-        _call: meerkat_core::ToolCallView<'_>,
+        call: meerkat_core::ToolCallView<'_>,
         args: Value,
         context: &meerkat_core::ToolDispatchContext,
     ) -> Result<ToolOutput, BuiltinToolError> {
-        let authorization = context.work_authorization().map(|work| {
-            meerkat_core::LlmRequestAuthorization::new(
-                work.clone(),
-                meerkat_core::OperationId::new(),
-                meerkat_core::authorization::ModelAuthorizationUse::Inference,
+        let authorization = context
+            .tool_delegate_attribution(
+                call,
+                meerkat_core::authorization::ToolDelegateRole::HostedSearchInference,
             )
-            .with_coordinates(context.run_id().cloned(), None)
-        });
+            .map_err(|error| BuiltinToolError::EntryRefused(Box::new(error)))?
+            .map(meerkat_core::LlmRequestAuthorization::for_tool_delegate);
         self.search(args, authorization).await
     }
 }
@@ -360,20 +368,222 @@ mod tests {
         }
     }
 
+    struct Allowed;
+    impl meerkat_core::authorization::PreparedOperationAuthorization for Allowed {
+        fn review_tier(&self) -> meerkat_core::authorization::OperationReviewTier {
+            meerkat_core::authorization::OperationReviewTier::R1
+        }
+
+        fn check_current(
+            &self,
+            _binding: &meerkat_core::authorization::PreparedAuthorizationBinding,
+        ) -> Result<(), meerkat_core::OperationAuthorizationError> {
+            Ok(())
+        }
+    }
+
+    /// Allows every operation and records the bindings it prepares, by kind.
+    #[derive(Default)]
+    struct RecordingWork {
+        tools: std::sync::Mutex<Vec<meerkat_core::authorization::PreparedAuthorizationBinding>>,
+        models: std::sync::Mutex<Vec<meerkat_core::authorization::PreparedAuthorizationBinding>>,
+    }
+
+    impl meerkat_core::authorization::WorkAuthorization for RecordingWork {
+        fn prepare(
+            &self,
+            binding: &meerkat_core::authorization::PreparedAuthorizationBinding,
+        ) -> Result<
+            Arc<dyn meerkat_core::authorization::PreparedOperationAuthorization>,
+            meerkat_core::OperationAuthorizationError,
+        > {
+            let recorded = match &binding.facts().operation {
+                meerkat_core::authorization::AuthorizationOperation::Model(_) => &self.models,
+                _ => &self.tools,
+            };
+            recorded.lock().unwrap().push(binding.clone());
+            Ok(Arc::new(Allowed))
+        }
+    }
+
+    /// One real governed fenced dispatch of a web_search call through a
+    /// composite whose registered web_search uses `executor`.
+    async fn governed_dispatch(
+        executor: Arc<dyn WebSearchExecutor>,
+        work: meerkat_core::WorkAuthorizationContext,
+    ) -> Result<meerkat_core::ToolDispatchOutcome, meerkat_core::ToolError> {
+        let mut composite = crate::builtin::CompositeDispatcher::new(
+            Arc::new(crate::builtin::MemoryTaskStore::new()),
+            &crate::builtin::BuiltinToolConfig::default(),
+            Some(std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        composite.register_web_search_tool(executor, meerkat_core::ToolCategoryOverride::Enable);
+        let dispatcher = Arc::new(composite);
+        let context =
+            meerkat_core::ToolDispatchContext::default().with_work_authorization(Some(work));
+        let args = serde_json::value::RawValue::from_string(
+            serde_json::json!({"query": "fixed query"}).to_string(),
+        )
+        .unwrap();
+        let call = meerkat_core::ToolCallView {
+            id: "search-call",
+            name: WEB_SEARCH_TOOL_NAME,
+            args: &args,
+        };
+        let resolution = meerkat_core::ToolExecutionResolutionContext::new(
+            meerkat_core::ToolDeadlineChain::new(vec![
+                meerkat_core::ToolDeadlineContributor::finite(
+                    meerkat_core::ToolDeadlineOwner::CoreToolDispatch,
+                    std::time::Duration::from_secs(60),
+                ),
+            ])
+            .unwrap(),
+        );
+        let plan = meerkat_core::agent::resolve_tool_execution_plan_fenced(
+            &dispatcher,
+            call,
+            &context,
+            &resolution,
+        )
+        .unwrap();
+        meerkat_core::agent::dispatch_tool_execution_plan_fenced(&dispatcher, call, &context, &plan)
+            .await
+    }
+
+    fn recording_work() -> (Arc<RecordingWork>, meerkat_core::WorkAuthorizationContext) {
+        let recorder = Arc::new(RecordingWork::default());
+        let work = meerkat_core::WorkAuthorizationContext::new(
+            recorder.clone(),
+            meerkat_core::exact_operation::OperationExecutionScope::Domain,
+        );
+        (recorder, work)
+    }
+
+    /// The helper's own route, as a provider adapter reports it.
+    fn helper_facts() -> meerkat_core::authorization::ModelAuthorizationFacts {
+        meerkat_core::authorization::ModelAuthorizationFacts {
+            identity: Arc::new(meerkat_core::SessionLlmIdentity {
+                model: "search-model".into(),
+                provider: Provider::OpenAI,
+                self_hosted_server_id: None,
+                provider_params: None,
+                auth_binding: None,
+            }),
+            wire_model: Arc::from("search-wire-model"),
+            hosted_capabilities: Arc::from([meerkat_core::ServerToolKind::WebSearch]),
+            backend_profile_id: Some(Arc::from("search-profile")),
+            backend_kind: Arc::from("openai"),
+            endpoint: Arc::from("https://search.invalid/responses"),
+            credential: None,
+            usage: meerkat_core::authorization::ModelAuthorizationUse::Inference,
+            live_channel: None,
+        }
+    }
+
+    /// Prepares its own helper request with the authorization it is handed,
+    /// as a provider adapter does for its actual target, and keeps the check.
+    #[derive(Default)]
+    struct PreparingHelper {
+        prepared: Mutex<Vec<meerkat_core::authorization::PreparedOperationCheck>>,
+    }
+
+    #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+    #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+    impl WebSearchExecutor for PreparingHelper {
+        async fn execute_web_search(
+            &self,
+            _request: WebSearchRequest,
+        ) -> Result<WebSearchResult, meerkat_llm_core::LlmError> {
+            Err(meerkat_llm_core::LlmError::InvalidRequest {
+                message: "a governed search binds its helper".to_string(),
+            })
+        }
+
+        async fn execute_web_search_authorized(
+            &self,
+            request: WebSearchRequest,
+            authorization: Option<meerkat_core::LlmRequestAuthorization>,
+        ) -> Result<WebSearchResult, meerkat_llm_core::LlmError> {
+            let Some(authorization) = authorization else {
+                return self.execute_web_search(request).await;
+            };
+            let check = authorization
+                .prepare(helper_facts())
+                .map_err(meerkat_llm_core::LlmError::from_operation_authorization)?;
+            self.prepared.lock().await.push(check);
+            Ok(WebSearchResult {
+                status: WebSearchStatus::Completed,
+                query: request.query,
+                provider: Some(Provider::OpenAI),
+                model: Some(ModelId::new("search-model")),
+                answer: Some("answer".to_string()),
+                evidence: Vec::new(),
+                native_events: Vec::new(),
+                error: None,
+                checked_at: chrono::Utc::now(),
+            })
+        }
+    }
+
+    /// A governed web_search prepares its helper request as the typed
+    /// hosted-search delegate of exactly the call its dispatch prepared:
+    /// under the same work, as an inference operation with a fresh id and
+    /// the parent's coordinates, carrying the parent's binding.
+    #[tokio::test]
+    async fn governed_search_prepares_its_helper_as_a_typed_delegate_of_its_own_call() {
+        let (recorder, work) = recording_work();
+        let helper = Arc::new(PreparingHelper::default());
+        governed_dispatch(helper.clone(), work.clone())
+            .await
+            .expect("the governed search completes");
+        let prepared = helper.prepared.lock().await;
+        assert_eq!(prepared.len(), 1, "one helper request prepared");
+        let binding = prepared[0].binding();
+        let tools = recorder.tools.lock().unwrap();
+        assert_eq!(tools.len(), 1, "the dispatch prepared its own call once");
+        let parent = &tools[0];
+        let link = binding
+            .delegate_attribution()
+            .expect("the helper is a typed delegate of its call");
+        assert!(link.parent_binding().same_operation(parent));
+        assert!(link.work_authorization().same_context(&work));
+        assert_eq!(
+            link.role(),
+            meerkat_core::authorization::ToolDelegateRole::HostedSearchInference
+        );
+        assert!(matches!(
+            &binding.facts().operation,
+            meerkat_core::authorization::AuthorizationOperation::Model(model)
+                if model.usage == meerkat_core::authorization::ModelAuthorizationUse::Inference
+                    && model.hosted_capabilities.as_ref()
+                        == [meerkat_core::ServerToolKind::WebSearch]
+        ));
+        assert_ne!(binding.facts().operation_id, parent.facts().operation_id);
+        assert_eq!(binding.facts().run_id, parent.facts().run_id);
+        let models = recorder.models.lock().unwrap();
+        assert_eq!(models.len(), 1);
+        assert!(models[0].same_operation(binding));
+    }
+
     #[tokio::test]
     async fn governed_turn_forwards_work_authorization_and_keeps_refusal_typed() {
         let executor = Arc::new(RefusedHelper::default());
-        let tool = WebSearchTool::new(executor.clone());
-        let error = call_in(&tool, &governed_context())
+        let (_recorder, work) = recording_work();
+        let error = governed_dispatch(executor.clone(), work)
             .await
             .expect_err("a refused helper is not a search result");
-        assert!(
-            matches!(
-                &error,
-                BuiltinToolError::OperationRefused { refusal }
-                    if refusal.kind() == meerkat_core::authorization::OperationRefusalKind::Denied
-            ),
-            "refusal must not flatten into ExecutionFailed: {error:?}"
+        assert_eq!(
+            error,
+            meerkat_core::ToolError::AuthorizationRefused {
+                refusal: meerkat_core::authorization::OperationRefused::new(
+                    meerkat_core::authorization::OperationRefusalKind::Denied,
+                ),
+            },
+            "refusal must not flatten into ExecutionFailed"
         );
         assert_eq!(*executor.authorized.lock().await, vec![true]);
     }
@@ -381,20 +591,66 @@ mod tests {
     #[tokio::test]
     async fn executor_without_an_authorized_seam_refuses_governed_work_without_searching() {
         let executor = Arc::new(RecordingExecutor::default());
-        let tool = WebSearchTool::new(executor.clone());
-        let error = call_in(&tool, &governed_context())
+        let (_recorder, work) = recording_work();
+        let error = governed_dispatch(executor.clone(), work)
             .await
             .expect_err("an executor that cannot bind the helper must refuse");
         assert!(
-            matches!(error, BuiltinToolError::OperationRefused { .. }),
+            matches!(error, meerkat_core::ToolError::AuthorizationRefused { .. }),
             "{error:?}"
         );
         assert!(executor.seen.lock().await.is_empty(), "zero searches");
 
         // Without admitted work the legacy contract is unchanged.
-        call_in(&tool, &meerkat_core::ToolDispatchContext::default())
-            .await
-            .expect("ungoverned search keeps its existing behavior");
+        call_in(
+            &WebSearchTool::new(executor.clone()),
+            &meerkat_core::ToolDispatchContext::default(),
+        )
+        .await
+        .expect("ungoverned search keeps its existing behavior");
         assert_eq!(executor.seen.lock().await.len(), 1);
+    }
+
+    /// A governed context whose dispatch never prepared this call (a work
+    /// association without its prepared check) refuses before any search,
+    /// whatever executor is installed: no helper request is bound or sent.
+    /// Ungoverned search keeps its existing contract.
+    #[tokio::test]
+    async fn a_governed_context_without_its_prepared_call_refuses_before_searching() {
+        let recording = Arc::new(RecordingExecutor::default());
+        let refusing = Arc::new(RefusedHelper::default());
+        for tool in [
+            WebSearchTool::new(recording.clone()),
+            WebSearchTool::new(refusing.clone()),
+        ] {
+            let error = call_in(&tool, &governed_context())
+                .await
+                .expect_err("an unprepared governed call refuses");
+            assert!(
+                matches!(
+                    &error,
+                    BuiltinToolError::EntryRefused(entry)
+                        if matches!(
+                            entry.as_ref(),
+                            meerkat_core::ToolError::AuthorizationRefused { refusal }
+                                if refusal.kind()
+                                    == meerkat_core::authorization::OperationRefusalKind::MalformedFacts
+                        )
+                ),
+                "refused before the executor as malformed facts: {error:?}"
+            );
+        }
+        assert!(recording.seen.lock().await.is_empty(), "zero searches");
+        assert!(
+            refusing.authorized.lock().await.is_empty(),
+            "the helper was never asked to bind a request"
+        );
+        call_in(
+            &WebSearchTool::new(recording.clone()),
+            &meerkat_core::ToolDispatchContext::default(),
+        )
+        .await
+        .expect("ungoverned search keeps its existing behavior");
+        assert_eq!(recording.seen.lock().await.len(), 1);
     }
 }

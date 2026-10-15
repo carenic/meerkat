@@ -273,6 +273,53 @@ is not evidence that the tool executed. See the
 [review and consent contract](https://github.com/lukacf/meerkat/blob/main/docs/internal/design/adr-001-model-review-and-consent.md)
 for the boundary and remaining acceptance scope.
 
+## Authorize the builtin web_search and its helper
+
+<Note>
+This is an unreleased source preview. Use a checkout containing the builtin
+web_search operation target; earlier releases give the call no target and
+the helper no attribution.
+</Note>
+
+The Meerkat-owned `web_search` builtin is two governed operations. Your
+`OperationPolicyOwner` maps both from typed facts, never from the tool name:
+
+- The call (`AuthorizationOperation::Tool`). Its plan's single owner target,
+  `single_tool_operation_target(plan)`, is
+  `ToolOperationTarget::BuiltinOperation { operation:
+  BuiltinToolOperation::WebSearch }`. The composite dispatcher that
+  registered the builtin states it and revalidates it at dispatch against
+  its exact registration. A tool merely named `web_search` from any other
+  owner (your own dispatcher, a registered bundle) has no such target. The
+  call acts with no account of its own (`target.account()` is `None`).
+- Its helper (`AuthorizationOperation::Model`, usage `Inference`, always the
+  `Operation` purpose). `binding.delegate_attribution()` names the call:
+  `parent_binding()` is the call's binding with the target above, and
+  `role()` is `ToolDelegateRole::HostedSearchInference`. The facts are the
+  helper's own: identity, credential, backend, endpoint, wire model, and
+  `hosted_capabilities` of `[WebSearch]` (OpenAI, Anthropic) or
+  `[GoogleSearch]` (Gemini). Return the inference on that route and one tuple
+  per hosted capability, never the controller's tuple. An inference without
+  an attribution is still an ordinary alternate-model operation.
+
+With a `TargetedGrantLineages` basis, select
+`GrantTarget::BuiltinToolOperation { operation: WebSearch }` for the call and
+`GrantTarget::DelegatedHostedSearch { route, capability }` for each approved
+helper route, where `route` is
+`ControllerModelFacts::new(selection, endpoint, wire_model).route_key()` of
+the helper's resolved route. Neither uses the base, the catalog or the
+controller lineage, and every contributing original must select the same
+keys. A single `GrantLineage` basis covers both like any other operation.
+
+The attribution keys the selection and the protected audit record
+(`AuditDelegateAttribution`); it grants nothing. Revoking the call's lineage
+refuses later calls but does not cancel an invocation that already entered:
+its helper still passes its own current lineage, contributor and entry
+checks. Revoking the helper's or a contributor's lineage before the helper's
+entry prevents its send. `web_search` has no reviewed entry point, so a
+required R2 settles as `unsupported_entry` and R3 as
+`human_consent_required`. The stock governed realm issues neither grant.
+
 ## Attach and pin the controller before submitting work
 
 ### Storeless sessions

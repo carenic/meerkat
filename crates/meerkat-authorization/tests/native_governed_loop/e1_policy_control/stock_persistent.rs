@@ -115,6 +115,7 @@ fn stored_audit_decoder_accepts_only_valid_arrays_or_omitted_empty_prefix() {
             run_id: None,
             context_revision: None,
             review_attribution: None,
+            delegate_attribution: None,
             observation: AuditObservation::Entry,
         },
     };

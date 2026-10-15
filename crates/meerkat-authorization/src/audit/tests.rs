@@ -734,3 +734,143 @@ fn the_rebuild_answers_from_current_owners_not_from_the_changed_read() {
         AuditObservation::Prepared { policy, .. } if policy.publication_sequence == 2
     ));
 }
+
+/// A hosted-search delegate's protected records name its parent operation
+/// and role, projected from its binding; the parent's own records carry no
+/// delegate attribution. The projection is protected history only.
+#[tokio::test]
+async fn a_delegate_observation_names_its_parent_operation() {
+    use meerkat_authorization_contracts::audit::{AuditDelegateAttribution, AuditDelegateRole};
+    use meerkat_core::authorization::{ModelAuthorizationFacts, ToolDelegateRole};
+    struct Allowed;
+    impl PreparedOperationAuthorization for Allowed {
+        fn review_tier(&self) -> meerkat_core::authorization::OperationReviewTier {
+            meerkat_core::authorization::OperationReviewTier::R1
+        }
+
+        fn check_current(
+            &self,
+            _binding: &PreparedAuthorizationBinding,
+        ) -> Result<(), OperationAuthorizationError> {
+            Ok(())
+        }
+    }
+    struct AllowAll;
+    impl WorkAuthorization for AllowAll {
+        fn prepare(
+            &self,
+            _binding: &PreparedAuthorizationBinding,
+        ) -> Result<Arc<dyn PreparedOperationAuthorization>, OperationAuthorizationError> {
+            Ok(Arc::new(Allowed))
+        }
+    }
+    struct FixedClock;
+    impl LocalAuthorizationClock for FixedClock {
+        fn now(
+            &self,
+        ) -> Result<crate::work::LocalAuthorizationTime, crate::clock::LocalClockError> {
+            Ok(crate::work::LocalAuthorizationTime {
+                unix_ms: 100,
+                monotonic: meerkat_core::time_compat::Instant::now(),
+            })
+        }
+    }
+    #[derive(Default)]
+    struct Sink(std::sync::Mutex<Vec<AuthorizationAuditObservation>>);
+    impl AuthorizationAuditSink for Sink {
+        fn append(
+            &self,
+            observation: AuthorizationAuditObservation,
+        ) -> Result<(), OperationObservationError> {
+            self.0.lock().expect("observations").push(observation);
+            Ok(())
+        }
+    }
+    let sink = Arc::new(Sink::default());
+    let work = meerkat_core::WorkAuthorizationContext::new(
+        Arc::new(AuditedWorkAuthorization {
+            inner: Arc::new(AllowAll),
+            associations: Vec::new().into(),
+            publication: LocalAuthorizationPublication::new(),
+            clock: Arc::new(FixedClock),
+            sink: sink.clone(),
+        }),
+        OperationExecutionScope::Domain,
+    );
+    let attribution = meerkat_core::authorization::__test_mint_tool_delegate(
+        &work,
+        None,
+        ToolDelegateRole::HostedSearchInference,
+    )
+    .await
+    .expect("the governed builtin call mints its delegate");
+    let parent = attribution.parent_binding().facts().operation_id.clone();
+    let helper = ModelAuthorizationFacts {
+        identity: Arc::new(meerkat_core::SessionLlmIdentity {
+            model: "search-model".into(),
+            provider: meerkat_core::Provider::OpenAI,
+            self_hosted_server_id: None,
+            provider_params: None,
+            auth_binding: None,
+        }),
+        wire_model: "search-wire-model".into(),
+        hosted_capabilities: Arc::from([meerkat_core::ServerToolKind::WebSearch]),
+        backend_profile_id: Some("search-profile".into()),
+        backend_kind: "openai".into(),
+        endpoint: "https://search.invalid/responses".into(),
+        credential: None,
+        usage: ModelAuthorizationUse::Inference,
+        live_channel: None,
+    };
+    let prepared = meerkat_core::LlmRequestAuthorization::for_tool_delegate(attribution)
+        .prepare(helper)
+        .expect("the delegate is prepared");
+    prepared.observe_entry().expect("entry staged");
+    let delegate = prepared.binding().facts().operation_id.clone();
+    let records = sink.0.lock().expect("observations").clone();
+    let expected = AuditDelegateAttribution {
+        parent_operation_id: parent.clone(),
+        role: AuditDelegateRole::HostedSearchInference,
+    };
+    let helper_records: Vec<_> = records
+        .iter()
+        .filter(|record| record.operation_id == delegate)
+        .collect();
+    assert_eq!(helper_records.len(), 2, "prepared and entry");
+    assert!(matches!(
+        helper_records[0].observation,
+        AuditObservation::Prepared { .. }
+    ));
+    assert!(matches!(
+        helper_records[1].observation,
+        AuditObservation::Entry
+    ));
+    for record in &helper_records {
+        assert_eq!(record.delegate_attribution.as_ref(), Some(&expected));
+        assert!(record.review_attribution.is_none());
+    }
+    let parent_records: Vec<_> = records
+        .iter()
+        .filter(|record| record.operation_id == parent)
+        .collect();
+    assert!(!parent_records.is_empty(), "the parent call's own records");
+    assert!(
+        parent_records
+            .iter()
+            .all(|record| record.delegate_attribution.is_none()),
+        "the parent is not a delegate"
+    );
+    let encoded = serde_json::to_value(helper_records[0]).expect("protected record");
+    assert_eq!(
+        encoded["delegate_attribution"]["role"],
+        serde_json::json!("hosted_search_inference")
+    );
+    assert_eq!(
+        serde_json::from_value::<AuthorizationAuditObservation>(encoded).expect("round trip"),
+        *helper_records[0]
+    );
+    assert_eq!(
+        serde_json::to_value(helper_records[0].safe_projection()).expect("safe projection"),
+        serde_json::json!("prepared")
+    );
+}

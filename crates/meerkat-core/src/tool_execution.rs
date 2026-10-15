@@ -546,19 +546,42 @@ pub enum ToolOperationTarget {
         connector: crate::mcp_config::McpConnectorApproval,
         account: std::sync::Arc<crate::OperationAccount>,
     },
+    /// One operation of a Meerkat builtin tool: the operation the builtin
+    /// implementation itself declares, produced only by the registration
+    /// owner of that builtin (the composite dispatcher that registered it)
+    /// and revalidated by that same registration at dispatch. A tool merely
+    /// named like the builtin, from any other owner (a host dispatcher, a
+    /// registered bundle, an undeclared builtin), has no such target.
+    BuiltinOperation { operation: BuiltinToolOperation },
+}
+
+/// A builtin tool operation that its registration owner states as a typed
+/// operation target ([`ToolOperationTarget::BuiltinOperation`]). The builtin
+/// implementation declares it; it is never derived from a tool name. Later
+/// builtin families are additive.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum BuiltinToolOperation {
+    /// The Meerkat-owned `web_search` builtin: one public web search through
+    /// its own hosted-search helper, a model request the helper's own owners
+    /// decide as the call's typed delegate.
+    WebSearch,
 }
 
 impl ToolOperationTarget {
     /// The account the owner states this exact operation acts with: `None`
-    /// for the session's own catalog control, which acts with no account of
-    /// its own.
+    /// for the session's own catalog control and for a builtin operation,
+    /// which act with no account of their own.
     #[must_use]
     pub fn account(&self) -> Option<&crate::OperationAccount> {
         match self {
             Self::McpServerOperation { account, .. }
             | Self::RegisteredToolBundleOperation { account, .. }
             | Self::CheckedMcpServerOperation { account, .. } => Some(account),
-            Self::CatalogControl { .. } => None,
+            Self::CatalogControl { .. } | Self::BuiltinOperation { .. } => None,
         }
     }
 }
@@ -1499,6 +1522,26 @@ impl ResolvedToolExecutionPlan {
 
     pub fn owner_witnesses(&self) -> &[ToolExecutionOwnerWitness] {
         &self.owner_witnesses
+    }
+
+    /// The one operation target this plan's owners produced, if any: the
+    /// target of the single owner witness that names one.
+    ///
+    /// # Errors
+    /// A plan whose owners name more than one target is ambiguous and
+    /// unavailable, never resolved to one of them.
+    pub fn single_operation_target(
+        &self,
+    ) -> Result<Option<&ToolOperationTarget>, crate::authorization::OperationAuthorizationError>
+    {
+        let mut targets = self
+            .owner_witnesses
+            .iter()
+            .filter_map(ToolExecutionOwnerWitness::operation_target);
+        match (targets.next(), targets.next()) {
+            (target, None) => Ok(target),
+            (_, Some(_)) => Err(crate::authorization::OperationAuthorizationError::Unavailable),
+        }
     }
 
     /// Canonical argument digest bound into this plan at the fenced root

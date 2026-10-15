@@ -6,9 +6,10 @@
 use std::sync::Arc;
 
 use meerkat_authorization_contracts::audit::{
-    AuditModelTarget, AuditModelUse, AuditObservation, AuditPolicyRead, AuditPublicationMode,
-    AuditRecipient, AuditReviewAttribution, AuditReviewRole, AuditSourceUse, AuditTarget,
-    AuditToolOwner, AuthorizationAuditObservation, AuthorizationAuditSink,
+    AuditDelegateAttribution, AuditDelegateRole, AuditModelTarget, AuditModelUse, AuditObservation,
+    AuditPolicyRead, AuditPublicationMode, AuditRecipient, AuditReviewAttribution, AuditReviewRole,
+    AuditSourceUse, AuditTarget, AuditToolOwner, AuthorizationAuditObservation,
+    AuthorizationAuditSink,
 };
 use meerkat_authorization_contracts::constraints::ResourceDomain;
 use meerkat_authorization_contracts::evidence::EvidenceDigest;
@@ -93,6 +94,7 @@ impl WorkAuthorization for AuditedWorkAuthorization {
             run_id: record.run_id().cloned(),
             context_revision: None,
             review_attribution: None,
+            delegate_attribution: None,
             observation: AuditObservation::MandatoryHookWithheld {
                 withholding: record.withholding().clone(),
             },
@@ -343,6 +345,16 @@ fn observation(
                     }
                     meerkat_core::approval::review::ReviewOperationRole::ReviewerInference => {
                         AuditReviewRole::ReviewerInference
+                    }
+                },
+            }),
+        delegate_attribution: binding
+            .delegate_attribution()
+            .map(|link| AuditDelegateAttribution {
+                parent_operation_id: link.parent_binding().facts().operation_id.clone(),
+                role: match link.role() {
+                    meerkat_core::authorization::ToolDelegateRole::HostedSearchInference => {
+                        AuditDelegateRole::HostedSearchInference
                     }
                 },
             }),

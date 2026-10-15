@@ -604,10 +604,10 @@ pub use tool_consequence_policy::{
     ToolConsequencePolicySnapshot, ToolConsequenceRequest, ToolConsequenceVerdict,
 };
 pub use tool_execution::{
-    CatalogOperation, CoreDispatchDeadline, DeadlineChainError, DeadlineChainExtensionError,
-    DetachedToolExecutionPolicy, EphemeralToolBindingFingerprint, IdempotencyScope,
-    ResolvedExecutionKind, ResolvedToolExecutionPlan, RestartClass, RunnerIdentity,
-    StreamingToolExecutionPolicy, ToolCredentialContextRef, ToolDeadlineChain,
+    BuiltinToolOperation, CatalogOperation, CoreDispatchDeadline, DeadlineChainError,
+    DeadlineChainExtensionError, DetachedToolExecutionPolicy, EphemeralToolBindingFingerprint,
+    IdempotencyScope, ResolvedExecutionKind, ResolvedToolExecutionPlan, RestartClass,
+    RunnerIdentity, StreamingToolExecutionPolicy, ToolCredentialContextRef, ToolDeadlineChain,
     ToolDeadlineContributor, ToolDeadlineOwner, ToolDeadlineSource, ToolExecutionApplicability,
     ToolExecutionContract, ToolExecutionContractError, ToolExecutionDeclarationError,
     ToolExecutionMode, ToolExecutionOwnerWitness, ToolExecutionResolutionContext,

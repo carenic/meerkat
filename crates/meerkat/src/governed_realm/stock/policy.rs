@@ -50,13 +50,22 @@
 //! verdict and never a family allowance: that operation alone receives typed
 //! local feedback and the turn continues. They are, explicitly:
 //! - builtin tools and host tools that are not a registered bundle's
-//!   operation (a dispatcher plan with no owner-produced operation target)
-//!   and provider-hosted tool targets;
+//!   operation (a dispatcher plan with no owner-produced operation target),
+//!   the builtin web_search operation (its owner-produced
+//!   [`ToolOperationTarget::BuiltinOperation`] target), and provider-hosted
+//!   tool targets;
 //! - blobs, runtime inputs, transcript ranges and external sources;
 //! - publications;
-//! - hosted capabilities, alternate models and live model channels.
+//! - hosted capabilities, alternate models and live model channels,
+//!   including the web_search helper's own inference as that call's
+//!   attributed delegate.
 //!
-//! Their bounded mappings are follow-up work.
+//! Their bounded mappings are follow-up work. Stock issues no grant for the
+//! builtin web_search operation or its delegated hosted search: under a
+//! per-target stock selection both have no lineage and are refused by the
+//! grant owner (Denied) before this owner is asked; under a single stock
+//! grant this owner leaves them unmapped. This is not stock coverage of the
+//! builtin web_search; an embedding host's own owners map those facts.
 //!
 //! Every mapped operation is R1, which reads no review material. For a
 //! composition that requires review, the mandate is the checked invocation
@@ -416,7 +425,7 @@ impl AdmittedWorkPolicyOwner for StockInvocationPolicy {
         let lineage = match &claims.authority_basis {
             WorkAuthorityBasis::GrantLineage { lineage } => lineage.as_slice(),
             basis @ WorkAuthorityBasis::TargetedGrantLineages { .. } => {
-                let target = operation_grant_target(binding.facts())?;
+                let target = operation_grant_target(binding)?;
                 basis.lineage_for(target.as_ref()).ok_or_else(denied)?
             }
             // Not admitted.
@@ -555,7 +564,8 @@ impl StockInvocationPolicy {
             // A controller request that is not the admitted route.
             (LocalPolicyPurpose::Controller, _) => return Err(denied().into()),
             // Hosted capabilities (the Operation conjunct of a controller
-            // request), alternate models and live channels: unmapped.
+            // request), alternate models (a web_search helper's delegated
+            // inference among them) and live channels: unmapped.
             (LocalPolicyPurpose::Operation, _) => {
                 return Err(OperationAuthorizationError::Unavailable);
             }
@@ -643,8 +653,9 @@ impl StockInvocationPolicy {
             )]),
             // No owner-produced target (a builtin tool, or a host tool
             // named like a catalog tool or a bundle operation), a bundle
-            // target for another operation, or another target kind:
-            // unmapped. An ambiguous one is refused above.
+            // target for another operation, the builtin web_search
+            // operation's own target, or another target kind: unmapped. An
+            // ambiguous one is refused above.
             _ => Err(OperationAuthorizationError::Unavailable),
         }
     }
@@ -1809,8 +1820,58 @@ mod tests {
         }
     }
 
-    #[test]
-    fn unmapped_families_are_unavailable_and_rule_refusals_are_verdicts() {
+    /// A hosted-search delegate's model operation, minted the only way it
+    /// can be: by a real governed dispatch of the builtin web_search call,
+    /// here under a work that allows everything.
+    async fn delegated_search_binding() -> PreparedAuthorizationBinding {
+        struct Allowed;
+        impl meerkat_core::authorization::PreparedOperationAuthorization for Allowed {
+            fn review_tier(&self) -> OperationReviewTier {
+                OperationReviewTier::R1
+            }
+
+            fn check_current(
+                &self,
+                _binding: &PreparedAuthorizationBinding,
+            ) -> Result<(), OperationAuthorizationError> {
+                Ok(())
+            }
+        }
+        struct AllowAll;
+        impl meerkat_core::authorization::WorkAuthorization for AllowAll {
+            fn prepare(
+                &self,
+                _binding: &PreparedAuthorizationBinding,
+            ) -> Result<
+                Arc<dyn meerkat_core::authorization::PreparedOperationAuthorization>,
+                OperationAuthorizationError,
+            > {
+                Ok(Arc::new(Allowed))
+            }
+        }
+        let work = meerkat_core::WorkAuthorizationContext::new(
+            Arc::new(AllowAll),
+            OperationExecutionScope::Domain,
+        );
+        let attribution = meerkat_core::authorization::__test_mint_tool_delegate(
+            &work,
+            None,
+            meerkat_core::authorization::ToolDelegateRole::HostedSearchInference,
+        )
+        .await
+        .expect("the governed builtin call mints its delegate");
+        let mut facts =
+            controller_request("https://search.invalid/v1/messages", "search-wire-model");
+        facts.hosted_capabilities = Arc::from([meerkat_core::ServerToolKind::WebSearch]);
+        meerkat_core::LlmRequestAuthorization::for_tool_delegate(attribution)
+            .prepare(facts)
+            .expect("the delegate is prepared")
+            .binding()
+            .clone()
+    }
+
+    #[tokio::test]
+    async fn unmapped_families_are_unavailable_and_rule_refusals_are_verdicts() {
         let session = SessionId::new();
         let policy = policy();
         let own = association(&session, |_| {});
@@ -1836,6 +1897,19 @@ mod tests {
             tool_binding(&session, "shell", None),
             "a builtin with no owner-produced target",
         );
+        unmapped(
+            tool_binding(
+                &session,
+                "web_search",
+                Some(ToolOperationTarget::BuiltinOperation {
+                    operation: meerkat_core::BuiltinToolOperation::WebSearch,
+                }),
+            ),
+            "the builtin web_search operation",
+        );
+        let delegated = delegated_search_binding().await;
+        assert!(delegated.delegate_attribution().is_some());
+        unmapped(delegated, "a delegated hosted search");
         refused(
             operation_with(
                 &session,
@@ -3210,5 +3284,110 @@ mod tests {
             )
             .expect_err("the operator is no requester here")
         ));
+    }
+
+    /// A web_search call whose plan the real composite resolved, with the
+    /// builtin registered as an agent's dispatcher registers it.
+    fn web_search_binding() -> PreparedAuthorizationBinding {
+        let mut composite = meerkat_tools::builtin::CompositeDispatcher::new(
+            Arc::new(meerkat_tools::builtin::MemoryTaskStore::new()),
+            &meerkat_tools::builtin::BuiltinToolConfig::default(),
+            Some(std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))),
+            None,
+            None,
+            None,
+        )
+        .expect("composite dispatcher");
+        composite.register_web_search_tool(
+            Arc::new(meerkat_tools::builtin::web_search::EmptyWebSearchExecutor),
+            meerkat_core::ToolCategoryOverride::Enable,
+        );
+        let args = serde_json::value::RawValue::from_string(r#"{"query":"stock"}"#.to_string())
+            .expect("raw args");
+        let plan = meerkat_core::AgentToolDispatcher::resolve_execution_plan(
+            &composite,
+            meerkat_core::types::ToolCallView {
+                id: "call-1",
+                name: "web_search",
+                args: args.as_ref(),
+            },
+            &meerkat_core::ToolDispatchContext::default(),
+            &meerkat_core::ToolExecutionResolutionContext::new(deadlines()),
+        )
+        .expect("web_search plan");
+        plan_binding("web_search", plan)
+    }
+
+    /// Stock issues no lineage for the builtin web_search operation, so a
+    /// per-target stock selection has none and the grant owner refuses the
+    /// call as a Denied verdict before the operation owner is asked; the
+    /// selection's base and MCP lineages never stand in for it. Under a
+    /// legacy single stock grant the owner is reached and leaves the family
+    /// unmapped (Unavailable).
+    #[test]
+    fn a_per_target_stock_selection_refuses_web_search_without_a_lineage() {
+        struct Counting(Arc<StockInvocationPolicy>, std::sync::atomic::AtomicUsize);
+        impl OperationPolicyOwner for Counting {
+            fn authorize_operation(
+                &self,
+                association: &InputAuthorityAssociation,
+                binding: &PreparedAuthorizationBinding,
+                purpose: LocalPolicyPurpose,
+                now_ms: u64,
+            ) -> Result<LocalPolicyAllowance, OperationAuthorizationError> {
+                self.1.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                self.0
+                    .authorize_operation(association, binding, purpose, now_ms)
+            }
+        }
+        let session = SessionId::new();
+        let grants = grant_owner();
+        let policy = policy_over(Arc::clone(&grants));
+        let lineage = issue(
+            &grants,
+            "stock-grant",
+            ExecutionRestrictions::unrestricted(),
+        );
+        let owner = Arc::new(Counting(
+            Arc::clone(&policy),
+            std::sync::atomic::AtomicUsize::new(0),
+        ));
+        let installed = Arc::new(
+            meerkat_authorization::grant_policy::GrantBackedWorkPolicy::new(
+                Arc::clone(&grants),
+                Arc::clone(&policy) as Arc<dyn AdmittedWorkPolicyOwner>,
+                owner.clone() as Arc<dyn OperationPolicyOwner>,
+            ),
+        );
+        let search = web_search_binding();
+        let prepare = |association: InputAuthorityAssociation| {
+            installed
+                .work_context(vec![association].into(), OperationExecutionScope::Domain)
+                .expect("context")
+                .authorization()
+                .prepare(&search)
+                .map(|_| ())
+        };
+        let targeted = association(&session, |c| {
+            c.authority_basis = WorkAuthorityBasis::TargetedGrantLineages {
+                base: Some(vec![lineage.clone()]),
+                targets: vec![TargetGrantLineage {
+                    target: GrantTarget::McpServer {
+                        server: "alpha".into(),
+                    },
+                    lineage: vec![lineage.clone()],
+                }],
+            };
+        });
+        let error = prepare(targeted).expect_err("no lineage for web_search");
+        assert!(is_denied_verdict(&error), "{error:?}");
+        assert_eq!(
+            owner.1.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the operation owner is never asked"
+        );
+        let error = prepare(granted(&session, &lineage)).expect_err("unmapped under one grant");
+        assert_eq!(error, OperationAuthorizationError::Unavailable);
+        assert_eq!(owner.1.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 }

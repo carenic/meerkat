@@ -65,6 +65,9 @@ work can use in 0.9.0:
 
 Builtin tools (shell, files, tasks and the like) and provider-hosted tools have
 no stock grant target and are refused (`operation_authorization_unavailable`).
+The builtin `web_search` names its own operation target, which stock never
+grants, so a per-target stock selection refuses it (`operation_refused`)
+before any owner is asked.
 
 ### Commands
 
@@ -285,6 +288,20 @@ exclusive execution custody. Other entry points: `meerkat_rpc::governed_jsonl`
 `meerkat::governed_realm::stock_host` (a host's own stores under a stock
 governed realm), and `StockCallerPosture::HostAuthenticated` for callers a
 host authenticated.
+
+The builtin `web_search` is two operations, each mapped from typed facts and
+never from the tool name. The call's plan carries the owner-produced
+`ToolOperationTarget::BuiltinOperation { operation:
+BuiltinToolOperation::WebSearch }`; its helper's model request is an
+`Inference` whose binding carries a `ToolDelegateAttribution` (role
+`HostedSearchInference`, naming the call), with the helper's own route and its
+`WebSearch` or `GoogleSearch` capability, never the controller's. In a
+`TargetedGrantLineages` basis select `GrantTarget::BuiltinToolOperation` for
+the call and `GrantTarget::DelegatedHostedSearch { route, capability }` (the
+helper's own route key) for the helper; the base, catalog and controller
+lineages never cover either. The attribution grants nothing: revoking the
+call's lineage refuses later calls but not one already entered, whose helper
+still needs its own current lineage.
 
 Typed outcomes (`OperationAuthorizationError`): `Refused` (ordinary denial,
 local feedback), `Unavailable` (owner could not decide; repair it, do not

@@ -640,27 +640,23 @@ fn call_with_target(target: ToolOperationTarget) -> PreparedAuthorizationBinding
 #[test]
 fn a_bundle_operation_selects_its_own_exact_target() {
     assert_eq!(
-        operation_grant_target(
-            call_with_target(ToolOperationTarget::RegisteredToolBundleOperation {
+        operation_grant_target(&call_with_target(
+            ToolOperationTarget::RegisteredToolBundleOperation {
                 bundle: "mail".into(),
                 operation: "send_draft".into(),
                 account: std::sync::Arc::new(meerkat_core::OperationAccount::Unavailable),
-            })
-            .facts()
-        ),
+            }
+        )),
         Ok(Some(bundle_operation("mail", "send_draft")))
     );
     assert_eq!(
-        operation_grant_target(
-            call_with_target(ToolOperationTarget::McpServerOperation {
-                server: "alpha".into(),
-                connection_generation: 1,
-                raw_operation: "read".into(),
-                connector: meerkat_core::McpConnectorApproval::NoConnector,
-                account: std::sync::Arc::new(meerkat_core::OperationAccount::Unavailable),
-            })
-            .facts()
-        ),
+        operation_grant_target(&call_with_target(ToolOperationTarget::McpServerOperation {
+            server: "alpha".into(),
+            connection_generation: 1,
+            raw_operation: "read".into(),
+            connector: meerkat_core::McpConnectorApproval::NoConnector,
+            account: std::sync::Arc::new(meerkat_core::OperationAccount::Unavailable),
+        })),
         Ok(Some(server("alpha")))
     );
 }
@@ -852,7 +848,7 @@ fn checked_call(route: &str, server: &str, operation: &str) -> PreparedAuthoriza
 #[test]
 fn a_checked_route_operation_selects_its_own_exact_target() {
     assert_eq!(
-        operation_grant_target(checked_call("checked", "alpha", "install").facts()),
+        operation_grant_target(&checked_call("checked", "alpha", "install")),
         Ok(Some(checked_route("checked", "alpha")))
     );
 }
