@@ -4,7 +4,7 @@ description: "Meta Python SDK — typed builder API, async runtime, and streamin
 icon: "python"
 ---
 
-*Mirrored from MobKit main at [16cf534277c6](https://github.com/lukacf/meerkat-meta/commit/16cf534277c63f5a684abb62206fa690ccf74d72) on 2026-10-15; MobKit workspace version 0.9.1 at that commit.*
+*Mirrored from MobKit main at [1fc1338dd988](https://github.com/lukacf/meerkat-meta/commit/1fc1338dd988f661e464e354496957651580fc87) on 2026-10-15; MobKit workspace version 0.9.1 at that commit.*
 
 The Meta Python SDK provides a typed host API for launching and operating
 Meerkat mobs through the SDK-facing gateway. Apps own policy. Meerkat and
@@ -24,7 +24,10 @@ pip install meerkat-meta
   `meta-rpc-gateway-<version>-<target>.zip` for Windows, and extract its
   `rpc_gateway` binary (`rpc_gateway.exe` on Windows). Alternatively, follow the
   [source-build instructions](/mobkit/quickstart#prepare-a-matching-sdk-and-gateway). Pass that binary's path to
-  `.gateway(...)`.
+  `.gateway(...)`. Linux x86_64 and aarch64 and macOS arm64 archives are
+  published with the release and listed in `index.json` and `checksums.sha256`;
+  macOS x86_64 and Windows archives may arrive later, listed in
+  `index-trailing.json` and `checksums-trailing.sha256`.
 </Note>
 
 ## Quick start
