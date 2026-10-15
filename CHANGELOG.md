@@ -81,6 +81,16 @@ them.
   (restore), 383,352 (receipt wait) and 371,272 (member disposal) bytes; a
   destroy's member retire admission, the deepest path left, takes 835,688
   (was 1,093,448). No behaviour change.
+- Session construction fits a 1 MiB worker stack in a debug build. A
+  relieved agent build took 1,096,968 bytes of its task's stack and a
+  runtime-backed `create_session` 850,824: `stack_relief::relieve_caller_stack`
+  materialized the build future in its task's poll frame before boxing it,
+  and the facade's agent build seams and the persistent session service's
+  create, actor materialization and full-session save awaited their futures
+  inline. Those futures are now built in their own frames. Measured on the
+  debug test binary, the agent build takes 833,000 bytes
+  (`AgentFactory::assemble_agent`'s own 344,112-byte frame is the largest
+  left) and the create 589,032. No behaviour change.
 
 ## [0.9.1] - 2026-10-15
 

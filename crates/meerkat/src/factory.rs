@@ -6438,11 +6438,15 @@ impl AgentFactory {
         build_config: AgentBuildConfig,
         config: &Config,
     ) -> Result<DynAgent, BuildAgentError> {
-        self.build_agent_inner(
-            build_config,
-            config,
-            ControllerClientRequirement::NotRequested,
-        )
+        // Built in its own frame: at opt-level 0 the awaited build reserved
+        // twice its size in this poll frame, beneath the whole construction.
+        meerkat_runtime::stack_relief::box_in_own_frame(|| {
+            self.build_agent_inner(
+                build_config,
+                config,
+                ControllerClientRequirement::NotRequested,
+            )
+        })
         .await
         .map(|(agent, _)| agent)
     }
@@ -6462,9 +6466,11 @@ impl AgentFactory {
         build_config: AgentBuildConfig,
         config: &Config,
     ) -> Result<(DynAgent, meerkat_core::ControllerModelClient), BuildAgentError> {
-        let (agent, controller) = self
-            .build_agent_inner(build_config, config, ControllerClientRequirement::Required)
-            .await?;
+        // Built in its own frame, as in `build_agent`.
+        let (agent, controller) = meerkat_runtime::stack_relief::box_in_own_frame(|| {
+            self.build_agent_inner(build_config, config, ControllerClientRequirement::Required)
+        })
+        .await?;
         let controller = controller.ok_or(BuildAgentError::ControllerUnavailable)?;
         Ok((agent, controller))
     }
@@ -6482,12 +6488,16 @@ impl AgentFactory {
         build_config: AgentBuildConfig,
         config: &Config,
     ) -> Result<PreparedAgent, BuildAgentError> {
-        Box::pin(self.assemble_agent(
-            build_config,
-            config,
-            ControllerClientRequirement::NotRequested,
-            AgentBuildPhase::Prepare,
-        ))
+        // Built in its own frame: boxed here, the assembly future was first
+        // materialized at its full size in this poll frame.
+        meerkat_runtime::stack_relief::box_in_own_frame(|| {
+            self.assemble_agent(
+                build_config,
+                config,
+                ControllerClientRequirement::NotRequested,
+                AgentBuildPhase::Prepare,
+            )
+        })
         .await
         .map(PreparedAgent::new)
     }
@@ -6499,12 +6509,15 @@ impl AgentFactory {
         build_config: AgentBuildConfig,
         config: &Config,
     ) -> Result<PreparedAgent, BuildAgentError> {
-        Box::pin(self.assemble_agent(
-            build_config,
-            config,
-            ControllerClientRequirement::Required,
-            AgentBuildPhase::Prepare,
-        ))
+        // Built in its own frame, as in `prepare_agent`.
+        meerkat_runtime::stack_relief::box_in_own_frame(|| {
+            self.assemble_agent(
+                build_config,
+                config,
+                ControllerClientRequirement::Required,
+                AgentBuildPhase::Prepare,
+            )
+        })
         .await
         .map(PreparedAgent::new)
     }
@@ -6535,7 +6548,12 @@ impl AgentFactory {
                         .to_string(),
                 ));
             }
-            let (agent, controller) = Self::complete_assembly(assembly, Some(selection)).await?;
+            // Built in its own frame: at opt-level 0 the awaited completion
+            // reserved twice its size in this poll frame.
+            let (agent, controller) = meerkat_runtime::stack_relief::box_in_own_frame(|| {
+                Self::complete_assembly(assembly, Some(selection))
+            })
+            .await?;
             if let Some(outside) = agent
                 .visible_tool_defs()
                 .iter()
@@ -6574,7 +6592,13 @@ impl AgentFactory {
         config: &Config,
         gate: &dyn meerkat_core::ToolSurfaceGate,
     ) -> Result<DynAgent, BuildAgentError> {
-        let prepared = self.prepare_agent(build_config, config).await?;
+        // The preparation and the finish are built in their own frames: at
+        // opt-level 0 each awaited future reserved twice its size in this
+        // poll frame, beneath the whole construction.
+        let prepared = meerkat_runtime::stack_relief::box_in_own_frame(|| {
+            self.prepare_agent(build_config, config)
+        })
+        .await?;
         let selection = match gate.decide(prepared.tool_surface()).await {
             Ok(selection) => selection,
             Err(refusal) => {
@@ -6582,7 +6606,7 @@ impl AgentFactory {
                 return Err(BuildAgentError::Config(refusal.to_string()));
             }
         };
-        self.finish_agent(prepared, selection)
+        meerkat_runtime::stack_relief::box_in_own_frame(|| self.finish_agent(prepared, selection))
             .await
             .map(|(agent, _)| agent)
     }
@@ -6593,15 +6617,24 @@ impl AgentFactory {
         config: &Config,
         controller_requirement: ControllerClientRequirement,
     ) -> Result<(DynAgent, Option<meerkat_core::ControllerModelClient>), BuildAgentError> {
-        let mut assembly = Box::pin(self.assemble_agent(
-            build_config,
-            config,
-            controller_requirement,
-            AgentBuildPhase::Complete,
-        ))
+        // The assembly and its completion are built in their own frames:
+        // boxed here, the assembly future was first materialized at its full
+        // size in this poll frame, and the awaited completion reserved twice
+        // its size, beneath the whole construction.
+        let mut assembly = meerkat_runtime::stack_relief::box_in_own_frame(|| {
+            self.assemble_agent(
+                build_config,
+                config,
+                controller_requirement,
+                AgentBuildPhase::Complete,
+            )
+        })
         .await?;
         let mut cleanup = std::mem::take(&mut assembly.cleanup);
-        let mut built = Self::complete_assembly(assembly, None).await;
+        let mut built = meerkat_runtime::stack_relief::box_in_own_frame(|| {
+            Self::complete_assembly(assembly, None)
+        })
+        .await;
         if let Ok((agent, _)) = &mut built {
             cleanup.install_live_mcp(agent);
             cleanup.disarm(agent);
