@@ -464,6 +464,10 @@ when enabling shell tools. Each automatic agent build inherits that host
 requirement into its own dispatcher. The compatibility default is
 `ShellConfinement::TrustedHost`. A session request or recovered job does not
 select a weaker requirement. This configuration applies to shell tools.
+The stock hosts (`rkat`, `rkat-rpc`, `rkat-rest` and `rkat-mcp`) select the
+shell, command-hook and MCP stdio requirements from the `[confinement]` config
+section or their `--confinement` flags and install them through these factory
+settings; see [OS process confinement](/concepts/configuration#os-process-confinement).
 Source-reviewed factory integration also binds required confinement through the
 native command-hook owner. That integration remains queued source, with full
 hook-locality, protected-audit, and platform qualification open; it does not

@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 
 /// A literal file or directory, or a directory and its descendants.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(
     tag = "kind",
     content = "path",
@@ -34,6 +35,7 @@ impl PathAccess {
 
 /// An empty path list grants no access of this class.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(
     tag = "kind",
     content = "paths",
@@ -48,6 +50,7 @@ pub enum FilesystemAccess {
 /// IP access is independent of Unix sockets and platform service IPC.
 /// Endpoints are resolved by the trusted host, never from child proxy settings.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(
     tag = "kind",
     content = "endpoints",
@@ -64,6 +67,7 @@ pub enum IpNetworkAccess {
 // serialization. Empty struct variants reject even reserved content set to null;
 // adjacent-tag unit variants can otherwise discard that unsupported content.
 #[derive(Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 enum PathAccessWire {
     Literal { path: PathBuf },
@@ -80,6 +84,7 @@ impl From<PathAccessWire> for PathAccess {
 }
 
 #[derive(Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 enum FilesystemAccessWire {
     Unrestricted {},
@@ -96,6 +101,7 @@ impl From<FilesystemAccessWire> for FilesystemAccess {
 }
 
 #[derive(Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 enum IpNetworkAccessWire {
     Denied {},
@@ -116,6 +122,7 @@ impl From<IpNetworkAccessWire> for IpNetworkAccess {
 /// Explicit compatibility privileges, enumerated by each backend's policy.
 /// There is no ambient home-directory, scratch, network, or credential grant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum PlatformBaseline {
     /// Executable loaders, system libraries, CPU/OS queries and null/random
@@ -126,6 +133,7 @@ pub enum PlatformBaseline {
 /// Host configuration before structural validation. Deserializing this value
 /// supplies requirements only; it never supplies caller authorization.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct ConfinementSpec {
     pub baseline: PlatformBaseline,
@@ -145,6 +153,7 @@ pub struct ConfinementSpec {
 /// Validated immutable requirements. Final host-path and backend validation
 /// belongs to the adapter at preparation, not this platform-neutral contract.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(try_from = "ConfinementSpec", into = "ConfinementSpec")]
 pub struct ExecutionConfinement(ConfinementSpec);
 
@@ -215,6 +224,12 @@ pub enum ConfinementRefusal {
     BackendUnavailable,
     #[error("confined process preparation failed")]
     PreparationFailed,
+    // The launch is defined by a configuration source that a confined
+    // process can write, so the host does not run it: it is refused before
+    // its definition is expanded, authorized, connected or spawned. (A plain
+    // comment: a documented variant would split the schema's string enum.)
+    #[error("launch configuration comes from a source a confined process can write")]
+    UntrustedConfigurationSource,
 }
 
 #[cfg(test)]

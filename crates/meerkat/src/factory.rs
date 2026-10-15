@@ -160,8 +160,6 @@ fn brain_swap_available_models_for_resolved_identity(
 
 #[cfg(feature = "comms")]
 use crate::compose_tools_with_comms_and_post_commit_hooks;
-#[cfg(not(target_arch = "wasm32"))]
-use crate::resolve_layered_hooks_config;
 
 /// Ephemeral in-process store used when no storage backend feature is enabled.
 #[cfg(not(feature = "memory-store"))]
@@ -2749,6 +2747,11 @@ pub struct AgentFactory {
     /// Absence preserves legacy trusted-host compatibility.
     #[cfg(not(target_arch = "wasm32"))]
     command_hook_confinement: Option<Arc<crate::command_hook_confinement::CommandHookConfinement>>,
+    /// The stock host confinement installed with
+    /// [`Self::with_host_confinement`]: it decides which convention sources
+    /// this factory's hosts trust.
+    #[cfg(not(target_arch = "wasm32"))]
+    host_confinement: Option<crate::HostConfinement>,
     #[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
     mcp_stdio_launch_profile: meerkat_mcp::McpStdioLaunchProfile,
     /// The host's HTTP egress profile, retained by newly built routers.
@@ -4024,6 +4027,8 @@ impl AgentFactory {
             shell_confinement: Default::default(),
             #[cfg(not(target_arch = "wasm32"))]
             command_hook_confinement: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            host_confinement: None,
             #[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
             mcp_stdio_launch_profile: meerkat_mcp::McpStdioLaunchProfile::trusted_host(),
             #[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
@@ -4214,6 +4219,8 @@ impl AgentFactory {
             shell_confinement: Default::default(),
             #[cfg(not(target_arch = "wasm32"))]
             command_hook_confinement: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            host_confinement: None,
             #[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
             mcp_stdio_launch_profile: meerkat_mcp::McpStdioLaunchProfile::trusted_host(),
             #[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
@@ -4498,6 +4505,65 @@ impl AgentFactory {
         confinement: meerkat_tools::builtin::shell::ShellConfinement,
     ) -> Self {
         self.shell_confinement = confinement;
+        self
+    }
+
+    /// The native host confinement requirement of automatically composed
+    /// shell tools ([`Self::with_shell_confinement`]).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn shell_confinement(&self) -> &meerkat_tools::builtin::shell::ShellConfinement {
+        &self.shell_confinement
+    }
+
+    /// The stock host confinement installed with
+    /// [`Self::with_host_confinement`], if any: what it guarantees and which
+    /// convention sources it trusts.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn host_confinement(&self) -> Option<&crate::HostConfinement> {
+        self.host_confinement.as_ref()
+    }
+
+    /// Install a stock host's resolved OS process confinement: each launch
+    /// kind it requires gets its requirement through the per-kind builder
+    /// (the shell, command hooks with their working directory, local MCP
+    /// stdio servers). A kind the host leaves as the trusted host keeps
+    /// this factory's current setting, so installing the trusted host never
+    /// downgrades a requirement already installed. The factory retains the
+    /// host confinement ([`Self::host_confinement`]): a convention hook
+    /// source it does not trust has every hook refused at invocation.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn with_host_confinement(mut self, confinement: &crate::HostConfinement) -> Self {
+        use meerkat_core::ConfinementLaunchKind;
+        if !confinement.is_trusted_host() || self.host_confinement.is_none() {
+            self.host_confinement = Some(confinement.clone());
+        }
+        if let Some(requirement) = confinement.requirement(ConfinementLaunchKind::Shell) {
+            self = self.with_shell_confinement(
+                meerkat_tools::builtin::shell::ShellConfinement::Required {
+                    requirement: requirement.clone(),
+                },
+            );
+        }
+        if let (Some(requirement), Some(working_directory)) = (
+            confinement.requirement(ConfinementLaunchKind::CommandHooks),
+            confinement.working_directory(ConfinementLaunchKind::CommandHooks),
+        ) {
+            self = self.with_command_hook_confinement(
+                requirement.clone(),
+                working_directory.to_path_buf(),
+            );
+        }
+        #[cfg(feature = "mcp")]
+        if let (Some(requirement), Some(working_directory)) = (
+            confinement.requirement(ConfinementLaunchKind::McpStdio),
+            confinement.working_directory(ConfinementLaunchKind::McpStdio),
+        ) {
+            self =
+                self.with_mcp_stdio_launch_profile(meerkat_mcp::McpStdioLaunchProfile::required(
+                    requirement.clone(),
+                    working_directory.to_path_buf(),
+                ));
+        }
         self
     }
 
@@ -8168,12 +8234,21 @@ impl AgentFactory {
             None => {
                 #[cfg(not(target_arch = "wasm32"))]
                 {
-                    let layered_hooks = resolve_layered_hooks_config(
+                    let layered = crate::sdk::resolve_layered_hooks(
                         _conventions_context_root,
                         _conventions_user_root,
                         config,
                     )
                     .await;
+                    // A hook a confined process could have defined keeps its
+                    // slot and is refused at every invocation.
+                    let refused_hooks = self
+                        .host_confinement
+                        .as_ref()
+                        .map_or_else(Vec::new, |host| {
+                            layered.untrusted_entries(|source| host.untrusted_source(source))
+                        });
+                    let layered_hooks = layered.config;
                     // Run overrides execute through this engine too. With
                     // override entries and no base entries the engine is
                     // still composed, so admission validates and the run
@@ -8183,7 +8258,13 @@ impl AgentFactory {
                     {
                         None
                     } else {
-                        let engine = meerkat_hooks::DefaultHookEngine::new(layered_hooks);
+                        let engine = meerkat_hooks::DefaultHookEngine::new(layered_hooks)
+                            .with_refused_entries(refused_hooks.into_iter().map(|hook| {
+                                (
+                                    hook,
+                                    meerkat_core::confinement::ConfinementRefusal::UntrustedConfigurationSource,
+                                )
+                            }));
                         #[cfg(any(target_os = "linux", target_os = "macos"))]
                         let engine = match session_process_custody.as_ref() {
                             Some(custody) => {

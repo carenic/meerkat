@@ -63,6 +63,14 @@ pub struct ConfigContractSchema {
     /// host).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub governance: Option<meerkat_core::GovernanceConfig>,
+    /// Readable through the ordinary config surfaces; an ordinary write
+    /// cannot add, change or remove it (the host administers OS process
+    /// confinement in the document itself).
+    #[serde(
+        default,
+        skip_serializing_if = "meerkat_core::ConfinementConfig::is_empty"
+    )]
+    pub confinement: meerkat_core::ConfinementConfig,
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub realm: std::collections::BTreeMap<String, Value>,
 }
@@ -177,6 +185,9 @@ pub enum WireConfigWriteRefusal {
     /// The write would change, remove or restate the realm's governance
     /// section, which only the realm's trusted host administers.
     GovernanceAdministrationRequired,
+    /// The write would add, change or remove the document's `[confinement]`
+    /// section, which only the host administers.
+    ConfinementAdministrationRequired,
 }
 
 /// Parameters for the RPC `config/set` method — replace the config (bare
@@ -233,6 +244,40 @@ mod tests {
             serde_json::to_value(WireConfigWriteRefusal::GovernanceAdministrationRequired)?,
             serde_json::json!({ "type": "governance_administration_required" })
         );
+        assert_eq!(
+            serde_json::to_value(WireConfigWriteRefusal::ConfinementAdministrationRequired)?,
+            serde_json::json!({ "type": "confinement_administration_required" })
+        );
+        Ok(())
+    }
+
+    /// The confinement section is described with its closed mode shapes, as
+    /// it reads and as the host writes it.
+    #[test]
+    fn config_contract_schema_describes_the_confinement_section()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let schema = serde_json::to_value(schemars::schema_for!(ConfigContractSchema))?;
+        assert!(schema.pointer("/properties/confinement").is_some());
+        let definitions = schema
+            .get("$defs")
+            .or_else(|| schema.get("definitions"))
+            .ok_or("schema definitions")?;
+        let modes = serde_json::to_string(
+            definitions
+                .get("LaunchConfinement")
+                .ok_or("launch confinement definition")?,
+        )?;
+        for mode in ["trusted_host", "workspace", "custom"] {
+            assert!(modes.contains(mode), "{mode} in {modes}");
+        }
+        let network = serde_json::to_string(
+            definitions
+                .get("WorkspaceNetwork")
+                .ok_or("workspace network definition")?,
+        )?;
+        for access in ["denied", "unrestricted"] {
+            assert!(network.contains(access), "{access} in {network}");
+        }
         Ok(())
     }
 

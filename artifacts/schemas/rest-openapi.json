@@ -8341,6 +8341,10 @@
           "budget": true,
           "comms": true,
           "compaction": true,
+          "confinement": {
+            "$ref": "#/components/schemas/ConfinementConfig",
+            "description": "Readable through the ordinary config surfaces; an ordinary write\ncannot add, change or remove it (the host administers OS process\nconfinement in the document itself)."
+          },
           "governance": {
             "anyOf": [
               {
@@ -8467,6 +8471,53 @@
         ],
         "type": "object"
       },
+      "ConfinementConfig": {
+        "additionalProperties": false,
+        "description": "`[confinement]`: the OS process confinement a host applies to the\nprocesses its agents launch.\n\n`all` covers every launch kind, including kinds a later release adds. A\nkind's own table replaces `all` for that kind within the same document.\nAn empty table states nothing, so the document inherits.",
+        "properties": {
+          "all": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/LaunchConfinement"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "command_hooks": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/LaunchConfinement"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "mcp_stdio": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/LaunchConfinement"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "shell": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/LaunchConfinement"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "type": "object"
+      },
       "ConfinementRefusal": {
         "description": "Bounded operation-local diagnostics. Never expose an environment value,\ncredential path, gate token, or secret-bearing command line in this error.",
         "enum": [
@@ -8474,7 +8525,8 @@
           "invalid_launch",
           "unsupported_requirement",
           "backend_unavailable",
-          "preparation_failed"
+          "preparation_failed",
+          "untrusted_configuration_source"
         ],
         "type": "string"
       },
@@ -9663,6 +9715,59 @@
           }
         ]
       },
+      "ExecutionConfinement": {
+        "additionalProperties": false,
+        "description": "Validated immutable requirements. Final host-path and backend validation\nbelongs to the adapter at preparation, not this platform-neutral contract.",
+        "properties": {
+          "baseline": {
+            "$ref": "#/components/schemas/PlatformBaseline"
+          },
+          "deny_read": {
+            "description": "Exclusions take precedence over all grants, including the baseline.",
+            "items": {
+              "$ref": "#/components/schemas/PathAccess"
+            },
+            "type": "array"
+          },
+          "deny_write": {
+            "items": {
+              "$ref": "#/components/schemas/PathAccess"
+            },
+            "type": "array"
+          },
+          "network": {
+            "$ref": "#/components/schemas/IpNetworkAccess"
+          },
+          "read": {
+            "$ref": "#/components/schemas/FilesystemAccess"
+          },
+          "require_descendant_termination": {
+            "description": "Some backends cannot prove termination of descendants that leave their\nprocess group. Such a backend must refuse when this is required.",
+            "type": "boolean"
+          },
+          "unix_connect": {
+            "description": "Exact local socket paths or explicitly granted socket directories.",
+            "items": {
+              "$ref": "#/components/schemas/PathAccess"
+            },
+            "type": "array"
+          },
+          "write": {
+            "$ref": "#/components/schemas/FilesystemAccess"
+          }
+        },
+        "required": [
+          "baseline",
+          "read",
+          "write",
+          "deny_read",
+          "deny_write",
+          "network",
+          "unix_connect",
+          "require_descendant_termination"
+        ],
+        "type": "object"
+      },
       "ExternalToolDeltaPhase": {
         "description": "Canonical lifecycle phase for external-tool boundary deltas.",
         "enum": [
@@ -9698,6 +9803,44 @@
           "reason"
         ],
         "type": "object"
+      },
+      "FilesystemAccess": {
+        "description": "An empty path list grants no access of this class.",
+        "oneOf": [
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "unrestricted",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "paths",
+                "type": "string"
+              },
+              "paths": {
+                "items": {
+                  "$ref": "#/components/schemas/PathAccess"
+                },
+                "type": "array"
+              }
+            },
+            "required": [
+              "kind",
+              "paths"
+            ],
+            "type": "object"
+          }
+        ]
       },
       "FlowParams": {
         "description": "Wire-opaque flow parameters for a mob flow target, held as canonical JSON\ntext.\n\nSame canonicalization rationale as [`HostRunnableParams`]: serde's\ninternally-tagged enum buffering cannot preserve arbitrary raw text\nbyte-exact, so every ingress (constructor and serde) re-emits the payload\nthrough `serde_json::Value` into one canonical text form. Unlike\nhost-runnable params, JSON `null` is preserved — the Flow contract has\nalways allowed it as an explicit \"no parameters\" payload."
@@ -10781,8 +10924,131 @@
         ],
         "type": "object"
       },
+      "IpNetworkAccess": {
+        "description": "IP access is independent of Unix sockets and platform service IPC.\nEndpoints are resolved by the trusted host, never from child proxy settings.",
+        "oneOf": [
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "denied",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "unrestricted",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "endpoints": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "kind": {
+                "const": "connect",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "endpoints"
+            ],
+            "type": "object"
+          }
+        ]
+      },
       "JsonValue": {
         "description": "Arbitrary JSON value."
+      },
+      "LaunchConfinement": {
+        "description": "One launch kind's confinement.",
+        "oneOf": [
+          {
+            "additionalProperties": false,
+            "properties": {
+              "mode": {
+                "const": "trusted_host",
+                "type": "string"
+              }
+            },
+            "required": [
+              "mode"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "description": "The workspace preset: the launched process reads and writes the host's\nworkspace root and the `write` subtrees, reads the `read` subtrees, has\nthe platform baseline (`command_runtime_v1`), and opens IP sockets only\nwhen `network` allows it. It gets no deny lists, Unix socket grants or\ndescendant-termination requirement; use [`CustomConfinement`] for those.",
+            "properties": {
+              "mode": {
+                "const": "workspace",
+                "type": "string"
+              },
+              "network": {
+                "$ref": "#/components/schemas/WorkspaceNetwork",
+                "default": "denied"
+              },
+              "read": {
+                "default": [],
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "write": {
+                "default": [],
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              }
+            },
+            "required": [
+              "mode"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "description": "An explicit requirement in the [`crate::confinement::ConfinementSpec`]\nwire shape, and the absolute working directory of the command hooks and\nMCP stdio servers it confines. The shell keeps its own working directory.",
+            "properties": {
+              "mode": {
+                "const": "custom",
+                "type": "string"
+              },
+              "requirement": {
+                "$ref": "#/components/schemas/ExecutionConfinement"
+              },
+              "working_directory": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "mode",
+              "working_directory",
+              "requirement"
+            ],
+            "type": "object"
+          }
+        ]
       },
       "ListSessionsResult": {
         "description": "Result for `session/list`.",
@@ -13370,6 +13636,45 @@
         ],
         "type": "string"
       },
+      "PathAccess": {
+        "description": "A literal file or directory, or a directory and its descendants.",
+        "oneOf": [
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "literal",
+                "type": "string"
+              },
+              "path": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "path"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "subtree",
+                "type": "string"
+              },
+              "path": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "path"
+            ],
+            "type": "object"
+          }
+        ]
+      },
       "PeerAddress": {
         "description": "Typed peer address: transport atom plus endpoint string.\n\nThe `endpoint` is transport-specific (path for `Uds`, `host:port` for\n`Tcp`, agent name for `Inproc`) but is carried as a validated `String`\nso the transport atom can be branched on without re-parsing.",
         "properties": {
@@ -13648,6 +13953,16 @@
       },
       "PlainTextResponse": {
         "type": "string"
+      },
+      "PlatformBaseline": {
+        "description": "Explicit compatibility privileges, enumerated by each backend's policy.\nThere is no ambient home-directory, scratch, network, or credential grant.",
+        "oneOf": [
+          {
+            "const": "command_runtime_v1",
+            "description": "Executable loaders, system libraries, CPU/OS queries and null/random\ndevices. User data and optional service IPC require explicit grants.",
+            "type": "string"
+          }
+        ]
       },
       "PortableDefinitionExtract": {
         "additionalProperties": false,
@@ -26765,6 +27080,21 @@
           "failed"
         ],
         "type": "string"
+      },
+      "WorkspaceNetwork": {
+        "description": "IP network access of a workspace-confined launch. Exact connect\nendpoints are not offered: neither platform backend enforces them.",
+        "oneOf": [
+          {
+            "const": "denied",
+            "description": "No IP sockets (the default).",
+            "type": "string"
+          },
+          {
+            "const": "unrestricted",
+            "description": "IP sockets over the host's own network.",
+            "type": "string"
+          }
+        ]
       }
     }
   },

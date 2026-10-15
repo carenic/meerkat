@@ -80,10 +80,12 @@ Shell:
   available". A shell `&` is not a background job.
 - Session param `shell_env` (RPC, REST, SDK) sets env vars for shell commands;
   the model never sees them. `shell` is classed mutating, never read-only.
-- Only `working_dir` is checked; commands are not sandboxed. Launch
-  confinement is a Rust host option (`AgentFactory::with_shell_confinement`,
-  and `with_mcp_stdio_launch_profile` for stdio MCP servers) that the stock
-  binaries do not enable; a refused confined launch is `confinement_refused`.
+- Only `working_dir` is checked, which is not a sandbox. OS launch
+  confinement is off by default: the stock binaries turn it on with the
+  `[confinement]` config section or the `--confinement` flags, a Rust host
+  with `AgentFactory::with_shell_confinement` (and
+  `with_mcp_stdio_launch_profile` for stdio MCP servers). A refused confined
+  launch is `confinement_refused`.
 
 Others: `apply_patch {patch}` takes `*** Begin Patch` ... `*** End Patch` with
 `*** Add File:`, `*** Update File:` (optionally `*** Move to:`) and `*** Delete

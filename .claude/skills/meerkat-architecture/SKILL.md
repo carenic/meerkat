@@ -480,9 +480,15 @@ Since 0.8.52 (the 0.9.0 release):
   refuses (`ConfinementRefusal`). Shell tools, MCP stdio servers, and command
   hooks spawn through it when the host selects a `Required` profile
   (`AgentFactory::with_shell_confinement`, `with_mcp_stdio_launch_profile`,
-  `with_command_hook_confinement`); the default `TrustedHost` profile is
-  unconfined, and no stock surface selects `Required`. Authorization and
-  process-group containment stay with their existing owners.
+  `with_command_hook_confinement`, or a resolved `meerkat::HostConfinement`
+  through `with_host_confinement`); the default `TrustedHost` profile is
+  unconfined. The stock binaries resolve `HostConfinement` once at startup
+  from the composed `[confinement]` section and the `--confinement` flags. A
+  host that confines every kind refuses a start in which a confined process
+  could change its realm state or user config document, and refuses an
+  `mcp.toml` or project hook source such a process can write
+  (`untrusted_configuration_source`). Authorization and process-group
+  containment stay with their existing owners.
 - **MCP host controls.** Per-server access ceilings (`McpServerAccess`),
   checked MCP routes (`ToolOperationTarget::CheckedMcpServerOperation`,
   `GrantTarget::CheckedMcpRoute`), realm service secrets for stdio servers

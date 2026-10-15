@@ -3009,7 +3009,8 @@ def test_parse_event_envelope_preserves_optional_mob_id():
 
 
 @pytest.mark.parametrize("refusal", [None, "invalid_requirement", "invalid_launch",
-    "unsupported_requirement", "backend_unavailable", "preparation_failed"])
+    "unsupported_requirement", "backend_unavailable", "preparation_failed",
+    "untrusted_configuration_source"])
 def test_optional_mcp_setup_refusal_retains_native_reason_and_transcript(refusal):
     from meerkat.events import ExternalToolDeltaToolConfigChangeStatus
     for present in [False, True]:
@@ -8536,7 +8537,7 @@ async def test_mob_turn_start_payload_carries_tool_choice_plan():
 
 @pytest.mark.parametrize("refusal", [
     "invalid_requirement", "invalid_launch", "unsupported_requirement",
-    "backend_unavailable", "preparation_failed",
+    "backend_unavailable", "preparation_failed", "untrusted_configuration_source",
 ])
 def test_hook_launch_refusal_raw_event_retains_cause_and_exact_call_id(refusal):
     from meerkat.generated.event_inventory import KNOWN_AGENT_EVENT_TYPES
@@ -8575,7 +8576,7 @@ def test_hook_failed_canonical_reason_is_not_a_malformed_event():
     {"reason_code": "observe_only_violation"},
     *[{"reason_code": "confinement_refused", "refusal": cause} for cause in [
         "invalid_requirement", "invalid_launch", "unsupported_requirement",
-        "backend_unavailable", "preparation_failed",
+        "backend_unavailable", "preparation_failed", "untrusted_configuration_source",
     ]],
 ])
 def test_hook_failed_preserves_each_canonical_reason(reason):
@@ -8655,6 +8656,7 @@ def test_hook_failed_preserves_unknown_future_causes(reason):
     ("unsupported_requirement", "required execution confinement is unsupported by this backend"),
     ("backend_unavailable", "required execution confinement backend is unavailable"),
     ("preparation_failed", "confined process preparation failed"),
+    ("untrusted_configuration_source", "launch configuration comes from a source a confined process can write"),
 ])
 def test_hook_failed_displays_each_known_confinement_cause_exactly(refusal, message):
     from meerkat.events import HookFailed

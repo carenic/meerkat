@@ -14723,6 +14723,100 @@ provider_params = { provider_tag = { provider = "anthropic", cache_control = "di
         );
     }
 
+    /// `[confinement]` is administered by the host in the realm document: a
+    /// config write that adds, changes or removes it is the caller's error
+    /// (INVALID_PARAMS) carrying confinement's own typed refusal, distinct
+    /// from governance's, and writes nothing. A write that keeps it commits.
+    #[tokio::test]
+    async fn config_writes_cannot_administer_confinement() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("config.toml");
+        let unstated = "max_tokens = 4096\n";
+        tokio::fs::write(&path, unstated).await.unwrap();
+        let (router, _notif_rx) = test_router_with_config_store(Arc::new(
+            meerkat_core::FileConfigStore::new(path.clone(), meerkat_models::canonical()),
+        ))
+        .await;
+        let refusal = |response: &RpcResponse| {
+            (
+                error_code(response),
+                response.error.as_ref().and_then(|error| error.data.clone()),
+            )
+        };
+        let confinement_refusal = (
+            error::INVALID_PARAMS,
+            Some(serde_json::json!({ "type": "confinement_administration_required" })),
+        );
+
+        for (patch, expected) in [
+            (
+                serde_json::json!({ "confinement": { "all": { "mode": "workspace" } } }),
+                confinement_refusal.clone(),
+            ),
+            (
+                serde_json::json!({ "governance": {} }),
+                (
+                    error::INVALID_PARAMS,
+                    Some(serde_json::json!({ "type": "governance_administration_required" })),
+                ),
+            ),
+        ] {
+            let refused = router
+                .dispatch(make_request(
+                    "config/patch",
+                    serde_json::json!({ "patch": patch }),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(refusal(&refused), expected, "{patch}");
+            assert_eq!(tokio::fs::read_to_string(&path).await.unwrap(), unstated);
+        }
+
+        let stated = "max_tokens = 4096\n\n[confinement.all]\nmode = \"workspace\"\n";
+        tokio::fs::write(&path, stated).await.unwrap();
+        let current = router
+            .dispatch(make_request_no_params("config/get"))
+            .await
+            .unwrap();
+        let section = result_value(&current)["config"]["confinement"].clone();
+        assert_eq!(section["all"]["mode"], "workspace", "{section}");
+        let mut omitted = result_value(&current)["config"].clone();
+        omitted.as_object_mut().unwrap().remove("confinement");
+        for (method, params) in [
+            (
+                "config/patch",
+                serde_json::json!({ "patch": { "confinement": { "all": { "mode": "trusted_host" } } } }),
+            ),
+            (
+                "config/patch",
+                serde_json::json!({ "patch": { "confinement": { "mcp_stdio": { "mode": "trusted_host" } } } }),
+            ),
+            (
+                "config/patch",
+                serde_json::json!({ "patch": { "confinement": null } }),
+            ),
+            ("config/set", serde_json::json!({ "config": omitted })),
+        ] {
+            let refused = router
+                .dispatch(make_request(method, params.clone()))
+                .await
+                .unwrap();
+            assert_eq!(refusal(&refused), confinement_refusal, "{method} {params}");
+            assert_eq!(tokio::fs::read_to_string(&path).await.unwrap(), stated);
+        }
+
+        let kept = router
+            .dispatch(make_request(
+                "config/patch",
+                serde_json::json!({ "patch": { "max_tokens": 2048 } }),
+            ))
+            .await
+            .unwrap();
+        let kept = result_value(&kept);
+        assert_eq!(kept["config"]["max_tokens"], 2048);
+        assert_eq!(kept["config"]["confinement"], section);
+    }
+
     /// 13. A notification (request with no id) returns None (no response).
     #[tokio::test]
     async fn notification_is_silently_dropped() {

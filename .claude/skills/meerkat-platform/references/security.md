@@ -1,6 +1,7 @@
 Covers: sandboxing (OS process confinement: macOS Seatbelt, Linux namespaces
-and seccomp, no Windows backend; Rust-only AgentFactory builders) and what is
-not a sandbox, shell command policy, tool access policy and read-only, where
+and seccomp, no Windows backend; the `[confinement]` config section and
+`--confinement` flags of the stock binaries, and the AgentFactory builders)
+and what is not a sandbox, shell command policy, tool access policy and read-only, where
 credentials and secrets live (file store, OS keychain, MCP `secret_env`), MCP
 security boundaries, audit, and the security errors and refusals reference.
 Governed realms, grants, review and approvals: references/security_governance.md
@@ -22,7 +23,7 @@ Each layer answers a different question. None of them substitutes for another.
 | Provider credentials (auth bindings) | Which account pays for and serves model calls? | Realm config and `rkat auth login`; grants no tool permission |
 | Tool selection | Which tools exist for this session? | `rkat run --tools` (`safe`, `workspace`, `full`, `none`), profiles, tool policy |
 | Shell command policy | Which command lines may the shell tool run? | `[shell] security_mode` and `security_patterns` |
-| OS process confinement (preview) | Which files, network and sockets may a launched process touch? | Rust host API only (`AgentFactory` builders); off in stock binaries |
+| OS process confinement (preview) | Which files, network and sockets may a launched process touch? | `[confinement]` config section or `--confinement` flags; Rust `AgentFactory` builders; off by default |
 | Governed realm grants (preview) | May this agent perform this exact operation? | `rkat realm govern` + `rkat realm grant` |
 | Operation review (preview) | Must a model (R2) or a human (R3) review it first? | `[[governance.review.rules]]` in a governed realm |
 | Approvals | Audit records of approval decisions | `approval/*` JSON-RPC on `rkat-rpc` |
@@ -47,7 +48,8 @@ Principles that hold everywhere:
 
 Stock defaults: `rkat run` uses `--tools safe` (no shell); realms are
 ungoverned until `rkat realm govern`; launches run as the trusted host
-(no OS confinement) unless a Rust host installs a requirement.
+(no OS confinement) unless `[confinement]`, `--confinement` or a Rust host
+installs a requirement.
 
 Other protections in 0.8.x-0.9:
 
@@ -99,10 +101,49 @@ is OS confinement:
 
 ### Who can turn it on
 
-Confinement is a trusted-host setting with no `config.toml` key, CLI flag, RPC
-method or SDK option. The stock `rkat`, `rkat-rpc`, `rkat-rest` and `rkat-mcp`
-binaries never install it: their shell tools, command hooks and MCP stdio
-servers run as the trusted host. A Rust embedder selects it on `AgentFactory`:
+The host turns it on; no session, turn, RPC method or SDK option can. The
+stock `rkat`, `rkat-rpc`, `rkat-rest` and `rkat-mcp` binaries read the
+`[confinement]` section of the realm's config documents and accept
+`--confinement <trusted-host|workspace>`, `--confinement-network
+<denied|unrestricted>` and the repeatable `--confinement-read <path>` and
+`--confinement-write <path>`, which replace the section for every launch kind
+of the process:
+
+```toml
+[confinement.all]
+mode = "workspace"        # trusted_host (default) | workspace | custom
+network = "denied"        # or "unrestricted"
+write = ["/tmp/build"]    # extra writable subtrees; read = [...] for read-only
+
+[confinement.mcp_stdio]   # a kind's own table replaces `all` in this document
+mode = "custom"
+working_directory = "/srv/mcp"
+requirement = { baseline = "command_runtime_v1", read = { kind = "paths", paths = [{ kind = "subtree", path = "/srv/mcp" }] }, write = { kind = "paths", paths = [] }, deny_read = [], deny_write = [], network = { kind = "denied" }, unix_connect = [], require_descendant_termination = false }
+```
+
+- `workspace` grants the workspace root (the CLI's project root, a server's
+  `--context-root`) and the listed subtrees, the `command_runtime_v1`
+  baseline, and IP sockets only with `network = "unrestricted"`; a server
+  without `--context-root` refuses to start with it.
+- From the user document through the realm chain, a requirement only holds
+  or is added: a less trusted document that states a required kind
+  differently is refused (`ConfinementLayerConflict`).
+- An ordinary config write cannot add, change or remove the section
+  (`confinement_administration_required`).
+- A host that confines every kind keeps its own inputs out of reach: a start
+  in which a confined process could change the realm state or the user config
+  document (writing it, creating it, or replacing a directory on the way) is
+  refused, naming the input and the remedy. The macOS workspace preset
+  protects `<root>/.rkat`; on Linux the state must live outside the workspace
+  (`--state-root`). An `mcp.toml` or project `.rkat/config.toml` a confined
+  process can write is not trusted: its MCP servers are refused before they
+  are expanded, authorized, connected or spawned, and its hooks are refused
+  at every invocation (`untrusted_configuration_source`). A host that runs
+  any kind as the trusted host claims none of this and says so at startup.
+
+A Rust embedder resolves a selection with `meerkat::HostConfinement` and
+installs it with `AgentFactory::with_host_confinement`, or selects each kind
+on `AgentFactory`:
 
 | Builder | Confines | Default |
 | --- | --- | --- |
@@ -211,8 +252,9 @@ stderr is discarded. Environment names starting `LD_`, `DYLD_`, `_RLD_`,
 
 `ConfinementRefusal` values (wire names): `invalid_requirement`,
 `invalid_launch`, `unsupported_requirement`, `backend_unavailable`,
-`preparation_failed`. A refusal happens before any target code runs and is
-never retried unconfined.
+`preparation_failed`, `untrusted_configuration_source` (0.9.1: the launch is
+defined by a source a confined process can write). A refusal happens before
+any target code runs and is never retried unconfined.
 
 - Shell: tool error `{"error":"confinement_refused","message":"...","data":{"refusal":"backend_unavailable"}}`
   for foreground, background and monitor launches. A command that starts and
@@ -453,16 +495,17 @@ explained in `references/security_governance.md`.
 ## Common questions
 
 - How does sandboxing work in Meerkat? Only OS process confinement is a
-  sandbox, and only a Rust host turns it on, per launch kind:
+  sandbox, and only the host turns it on, per launch kind: the stock binaries
+  with the `[confinement]` config section or the `--confinement` flags, and a
+  Rust host with
   `with_shell_confinement(ShellConfinement::Required { requirement })`,
   `with_command_hook_confinement(requirement, working_directory)` and
   `with_mcp_stdio_launch_profile(McpStdioLaunchProfile::required(..))`. macOS
   uses Seatbelt; Linux (usable from 0.9.0) gives each launch new user, mount
   and IPC namespaces plus a seccomp filter; Windows has no backend and refuses.
-  The default is the trusted host (no confinement), and stock binaries have no
-  config key or CLI flag for it. `--tools none`, realms, `--isolated`, the
-  shell's `restrict_to_project`, `[shell]` patterns and read-only policy are
-  not sandboxes.
+  The default is the trusted host (no confinement). `--tools none`, realms,
+  `--isolated`, the shell's `restrict_to_project`, `[shell]` patterns and
+  read-only policy are not sandboxes.
 - Can the model still see a tool its policy denies? Not if a deny list, the
   complement of an allow list or a profile `deny` rules it out (hidden since
   0.8.52). Read-only intent, application tool policy and dispatch admission

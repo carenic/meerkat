@@ -18265,6 +18265,7 @@ mod tests {
             ConfinementRefusal::UnsupportedRequirement,
             ConfinementRefusal::BackendUnavailable,
             ConfinementRefusal::PreparationFailed,
+            ConfinementRefusal::UntrustedConfigurationSource,
         ] {
             for refused_first in [true, false] {
                 assert_tool_denial_preserves_sibling_and_model_turn(
@@ -18305,6 +18306,7 @@ mod tests {
             ConfinementRefusal::UnsupportedRequirement,
             ConfinementRefusal::BackendUnavailable,
             ConfinementRefusal::PreparationFailed,
+            ConfinementRefusal::UntrustedConfigurationSource,
         ] {
             for refused_first in [true, false] {
                 assert_tool_denial_preserves_sibling_and_model_turn(

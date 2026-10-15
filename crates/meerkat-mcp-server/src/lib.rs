@@ -985,18 +985,27 @@ fn map_config_runtime_error(err: ConfigRuntimeError) -> ToolCallError {
                 "current_generation": current
             })),
         ),
-        // An ordinary write is not governance administration; nothing was
-        // written.
+        // An ordinary write is not administration of a section the realm's
+        // trusted host administers; nothing was written.
         ConfigRuntimeError::Config(
-            refused @ meerkat_core::ConfigError::GovernanceAdministration,
-        ) => match serde_json::to_value(WireConfigWriteRefusal::GovernanceAdministrationRequired) {
-            Ok(data) => ToolCallError::new(-32602, refused.to_string(), Some(data)),
-            Err(serialize_error) => ToolCallError::new(
-                -32603,
-                format!("failed to serialize config refusal data: {serialize_error}"),
-                None,
-            ),
-        },
+            refused @ (meerkat_core::ConfigError::GovernanceAdministration
+            | meerkat_core::ConfigError::ConfinementAdministration),
+        ) => {
+            let refusal = match refused {
+                meerkat_core::ConfigError::ConfinementAdministration => {
+                    WireConfigWriteRefusal::ConfinementAdministrationRequired
+                }
+                _ => WireConfigWriteRefusal::GovernanceAdministrationRequired,
+            };
+            match serde_json::to_value(refusal) {
+                Ok(data) => ToolCallError::new(-32602, refused.to_string(), Some(data)),
+                Err(serialize_error) => ToolCallError::new(
+                    -32603,
+                    format!("failed to serialize config refusal data: {serialize_error}"),
+                    None,
+                ),
+            }
+        }
         // The store refused the caller's candidate config (a new or changed
         // realm MCP server with an environment reference, or an invalid
         // written config); document and store failures stay internal.
@@ -1028,6 +1037,27 @@ fn mcp_realm_config_source(
         global_doc,
         meerkat_models::canonical(),
     ))
+}
+
+/// The one local MCP launch boundary of this server's routers, built once at
+/// construction from the host's resolved confinement: its `mcp_stdio`
+/// requirement, or the trusted host.
+fn host_mcp_stdio_launch_profile(
+    confinement: &meerkat::HostConfinement,
+) -> meerkat_mcp::McpStdioLaunchProfile {
+    let kind = meerkat_core::ConfinementLaunchKind::McpStdio;
+    match (
+        confinement.requirement(kind),
+        confinement.working_directory(kind),
+    ) {
+        (Some(requirement), Some(working_directory)) => {
+            meerkat_mcp::McpStdioLaunchProfile::required(
+                requirement.clone(),
+                working_directory.to_path_buf(),
+            )
+        }
+        _ => meerkat_mcp::McpStdioLaunchProfile::trusted_host(),
+    }
 }
 
 /// Load the effective config for `realm_id`, failing closed on every
@@ -1330,7 +1360,19 @@ impl MeerkatMcpState {
         bootstrap: RuntimeBootstrap,
         expose_paths: bool,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        Self::new_with_bootstrap_options_and_llm(bootstrap, expose_paths, None).await
+        Self::new_with_bootstrap_options_and_confinement(bootstrap, expose_paths, None).await
+    }
+
+    /// [`Self::new_with_bootstrap_and_options`] with the operator's
+    /// `--confinement*` selection, which replaces the realm's composed
+    /// `[confinement]` for every launch kind of this process (`None`: the
+    /// configuration decides).
+    pub async fn new_with_bootstrap_options_and_confinement(
+        bootstrap: RuntimeBootstrap,
+        expose_paths: bool,
+        confinement: Option<meerkat_core::LaunchConfinement>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::new_with_bootstrap_options_and_llm(bootstrap, expose_paths, None, confinement).await
     }
 
     #[doc(hidden)]
@@ -1342,6 +1384,7 @@ impl MeerkatMcpState {
             bootstrap,
             expose_paths,
             Some(Arc::new(TestClient::for_provider(Provider::Anthropic))),
+            None,
         )
         .await
     }
@@ -1350,6 +1393,7 @@ impl MeerkatMcpState {
         bootstrap: RuntimeBootstrap,
         expose_paths: bool,
         default_llm_client: Option<Arc<dyn meerkat::LlmClient>>,
+        confinement: Option<meerkat_core::LaunchConfinement>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         // Realm-id-first dual-root resolution through the storage layout
         // (the single path authority; the layout's realm-root candidates arm
@@ -1412,7 +1456,7 @@ impl MeerkatMcpState {
             .global_config_path()
             .unwrap_or_else(|| realms_root.join("__no_global__").join("config.toml"));
         let fs_realm_config_source = mcp_realm_config_source(&realms_root, global_doc);
-        let config = load_config_async(
+        let mut config = load_config_async(
             &realm_id,
             &realms_root,
             backend_hint,
@@ -1421,6 +1465,11 @@ impl MeerkatMcpState {
             &fs_realm_config_source,
         )
         .await?;
+        // The operator's flags replace the documents' `[confinement]`.
+        config.apply_cli_overrides(meerkat_core::config::CliOverrides {
+            confinement,
+            ..meerkat_core::config::CliOverrides::default()
+        });
         // #1813: a realm that declares multi-process hosting refuses to start
         // when its stores cannot provide it.
         persistence.require_hosting_mode(config.storage.hosting_mode())?;
@@ -1460,6 +1509,29 @@ impl MeerkatMcpState {
         )
         .await?;
 
+        // The host's OS process confinement over --context-root: the
+        // workspace preset never grants the realm's own directory. This
+        // server's routers keep the one MCP stdio profile it lowers to.
+        let host_confinement = meerkat::HostConfinement::resolve(
+            &config.confinement,
+            conventions_context_root.as_deref(),
+        )?;
+        // A start whose confined processes could change the realm state or
+        // the user config document is refused before it serves.
+        let host_inputs = meerkat::HostConfinement::host_inputs(
+            &realms_root,
+            layout.global_config_path().as_deref(),
+        );
+        host_confinement.admit_host_inputs(&host_inputs)?;
+        host_confinement.log_startup(
+            &host_inputs,
+            &meerkat::HostConfinement::convention_sources(
+                conventions_context_root.as_deref(),
+                bootstrap.context.user_config_root.as_deref(),
+            ),
+        );
+        let mcp_stdio_launch_profile = host_mcp_stdio_launch_profile(&host_confinement);
+
         // Create factory with max-permissive flags; per-request overrides
         // in SessionBuildOptions control what tools are actually enabled.
         let mut factory = AgentFactory::new(store_path)
@@ -1469,7 +1541,8 @@ impl MeerkatMcpState {
             .builtins(true)
             .shell(true)
             .workgraph(true)
-            .schedule(true);
+            .schedule(true)
+            .with_host_confinement(&host_confinement);
         if let Some(context_root) = conventions_context_root {
             factory = factory.context_root(context_root);
         }
@@ -1566,7 +1639,7 @@ impl MeerkatMcpState {
             config_runtime,
             realm_config_source,
             skill_runtime,
-            mcp_stdio_launch_profile: meerkat_mcp::McpStdioLaunchProfile::trusted_host(),
+            mcp_stdio_launch_profile,
             #[cfg(feature = "mob")]
             mob_state,
             sidecars: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
@@ -8216,6 +8289,174 @@ mod tests {
         .expect_err("unknown config action string must be rejected before dispatch");
         assert_eq!(err.code, -32602);
         assert!(err.message.contains("unknown variant") || err.message.contains("expected one of"));
+    }
+
+    /// The committed config generation, read through the `meerkat_config` tool.
+    async fn config_generation(state: &MeerkatMcpState) -> u64 {
+        let payload = Box::pin(handle_tools_call(
+            state,
+            "meerkat_config",
+            &json!({"action": "get"}),
+        ))
+        .await
+        .expect("config get");
+        let text = payload["content"][0]["text"]
+            .as_str()
+            .expect("config payload text");
+        serde_json::from_str::<Value>(text).expect("config payload json")["generation"]
+            .as_u64()
+            .expect("config generation")
+    }
+
+    /// A `meerkat_config` write can administer neither the host's
+    /// `[confinement]` nor its governance: invalid params carrying each
+    /// section's own typed refusal, and nothing is written.
+    #[tokio::test]
+    async fn test_config_writes_cannot_administer_host_sections() {
+        let store: Arc<dyn SessionStore> = Arc::new(meerkat::MemoryStore::new());
+        let state = MeerkatMcpState::new_with_store(store).await;
+        let generation = config_generation(&state).await;
+        for (patch, discriminator) in [
+            (
+                json!({"confinement": {"all": {"mode": "workspace"}}}),
+                "confinement_administration_required",
+            ),
+            (
+                json!({"governance": {}}),
+                "governance_administration_required",
+            ),
+        ] {
+            let refused = Box::pin(handle_tools_call(
+                &state,
+                "meerkat_config",
+                &json!({"action": "patch", "patch": patch}),
+            ))
+            .await
+            .expect_err("a config write cannot administer a host section");
+            assert_eq!(refused.code, -32602, "{patch}");
+            assert_eq!(
+                refused.data,
+                Some(json!({"type": discriminator})),
+                "{patch}"
+            );
+        }
+        assert_eq!(
+            config_generation(&state).await,
+            generation,
+            "a refused write commits nothing"
+        );
+    }
+
+    /// A requirement no platform backend enforces (descendant termination),
+    /// so a server that installs it refuses every confined launch on any OS.
+    const UNENFORCEABLE_CONFINEMENT: &str = r#"[confinement.all]
+mode = "custom"
+working_directory = "/"
+requirement = { baseline = "command_runtime_v1", read = { kind = "paths", paths = [] }, write = { kind = "paths", paths = [] }, deny_read = [], deny_write = [], network = { kind = "denied" }, unix_connect = [], require_descendant_termination = true }
+"#;
+
+    /// A start whose confined processes could change the realm state is
+    /// refused before the server serves, naming the input and its remedy.
+    #[tokio::test]
+    async fn test_startup_refuses_confinement_that_could_change_the_realm_state() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let base = temp.path().canonicalize().expect("canonical temp");
+        let state = base.join("realms");
+        std::fs::create_dir_all(&state).expect("state root");
+        let user_root = base.join("user");
+        std::fs::create_dir_all(user_root.join(".rkat")).expect("user root");
+        std::fs::write(user_root.join(".rkat").join("config.toml"), format!(
+            "[confinement.all]\nmode = \"custom\"\nworking_directory = \"{state}\"\nrequirement = {{ baseline = \"command_runtime_v1\", read = {{ kind = \"paths\", paths = [{{ kind = \"subtree\", path = \"{state}\" }}] }}, write = {{ kind = \"paths\", paths = [{{ kind = \"subtree\", path = \"{state}\" }}] }}, deny_read = [], deny_write = [], network = {{ kind = \"denied\" }}, unix_connect = [], require_descendant_termination = false }}\n",
+            state = state.display()
+        ))
+        .expect("user document");
+        let mut bootstrap = RuntimeBootstrap::default();
+        bootstrap.realm.selection = RealmSelection::Explicit {
+            realm_id: "state-writer".into(),
+        };
+        bootstrap.realm.state_root = Some(state);
+        bootstrap.context.context_root = Some(base.clone());
+        bootstrap.context.user_config_root = Some(user_root);
+        let refused = MeerkatMcpState::new_with_bootstrap_options_and_llm(
+            bootstrap,
+            false,
+            Some(Arc::new(TestClient::for_provider(Provider::Anthropic))),
+            None,
+        )
+        .await
+        .err()
+        .expect("a confined process could change the realm state");
+        let message = refused.to_string();
+        assert!(
+            message.contains("the realm state") && message.contains("--state-root"),
+            "{message}"
+        );
+    }
+
+    /// The server's one MCP stdio launch profile comes from the composed
+    /// `[confinement]`: a requirement in the user document applies without a
+    /// `[realm.global]` section, the operator's flag replaces the documents,
+    /// and the workspace preset without --context-root refuses startup
+    /// instead of confining nothing.
+    #[tokio::test]
+    async fn test_startup_takes_the_stdio_profile_from_documents_and_flags() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let user_root = temp.path().join("user");
+        std::fs::create_dir_all(user_root.join(".rkat")).expect("user root");
+        std::fs::write(
+            user_root.join(".rkat").join("config.toml"),
+            UNENFORCEABLE_CONFINEMENT,
+        )
+        .expect("user document");
+        let bootstrap = |realm_id: &str, context_root: Option<PathBuf>| {
+            let mut bootstrap = RuntimeBootstrap::default();
+            bootstrap.realm.selection = RealmSelection::Explicit {
+                realm_id: realm_id.into(),
+            };
+            bootstrap.realm.state_root = Some(temp.path().join("realms"));
+            bootstrap.context.context_root = context_root;
+            bootstrap.context.user_config_root = Some(user_root.clone());
+            bootstrap
+        };
+        let start = |bootstrap, confinement| {
+            MeerkatMcpState::new_with_bootstrap_options_and_llm(
+                bootstrap,
+                false,
+                Some(Arc::new(TestClient::for_provider(Provider::Anthropic))),
+                confinement,
+            )
+        };
+
+        let configured = start(bootstrap("confined", Some(temp.path().to_path_buf())), None)
+            .await
+            .expect("configured server");
+        assert_eq!(
+            configured.mcp_stdio_launch_profile.capabilities().err(),
+            Some(meerkat_core::confinement::ConfinementRefusal::UnsupportedRequirement),
+            "the user document's requirement reaches the server's launch boundary"
+        );
+
+        let flagged = start(
+            bootstrap("flagged", Some(temp.path().to_path_buf())),
+            Some(meerkat_core::LaunchConfinement::TrustedHost),
+        )
+        .await
+        .expect("flagged server");
+        assert!(
+            matches!(flagged.mcp_stdio_launch_profile.capabilities(), Ok(None)),
+            "the operator's flag replaces the documents"
+        );
+
+        let refused = start(
+            bootstrap("unrooted", None),
+            Some(meerkat_core::LaunchConfinement::Workspace(
+                meerkat_core::WorkspaceConfinement::default(),
+            )),
+        )
+        .await
+        .err()
+        .expect("workspace confinement without --context-root refuses startup");
+        assert!(refused.to_string().contains("--context-root"), "{refused}");
     }
 
     #[cfg(feature = "mob")]

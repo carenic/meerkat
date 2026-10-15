@@ -455,9 +455,21 @@ mod tests {
                 "the security reference must carry the sandboxing detail {detail}"
             );
         }
+        for flag in [
+            "--confinement <trusted-host|workspace>",
+            "--confinement-network <denied|unrestricted>",
+            "--confinement-read <PATH>",
+            "--confinement-write <PATH>",
+        ] {
+            assert!(
+                MEERKAT_CLI_REFERENCE_SKILL_BODY.contains(flag),
+                "the CLI reference must document the root confinement flag {flag}"
+            );
+        }
         assert!(
-            MEERKAT_CLI_REFERENCE_SKILL_BODY.contains("There is no sandbox or confinement flag"),
-            "the CLI reference must state that no rkat flag selects OS sandboxing"
+            section.contains("[confinement]")
+                && security.contains("untrusted_configuration_source"),
+            "the corpus must describe the stock confinement section and its refusals"
         );
     }
 

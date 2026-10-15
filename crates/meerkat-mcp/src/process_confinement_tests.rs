@@ -112,6 +112,113 @@ async fn required_mcp_staged_refusal_is_a_failed_notice_not_a_stuck_pending_surf
     assert!(!root.join("entered").exists());
 }
 
+/// Counts every credential read or login an attempt asks for.
+#[derive(Default)]
+struct CountingResolver {
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl McpAuthResolver for CountingResolver {
+    async fn stored_bearer_token(
+        &self,
+        _target: &meerkat_auth_core::McpServerIdentity,
+    ) -> Result<Option<String>, meerkat_auth_core::McpOAuthError> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(None)
+    }
+
+    async fn interactive_login(
+        &self,
+        target: &meerkat_auth_core::McpServerIdentity,
+        _www_authenticate: Option<&str>,
+    ) -> Result<String, meerkat_auth_core::McpOAuthError> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Err(
+            meerkat_auth_core::McpOAuthError::HumanAuthorizationRequired {
+                server_name: target.server_name().to_owned(),
+            },
+        )
+    }
+}
+
+/// A refused add (its definition comes from a source the host does not
+/// trust) fails at its boundary with its typed refusal and the model's
+/// failed-add notice: a remote server is never authorized or connected
+/// (zero credential reads, zero arrivals) and a local one never spawns.
+#[tokio::test]
+async fn a_refused_add_fails_typed_before_resolution_connection_or_spawn() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let remote = McpServerConfig::streamable_http(
+        "untrusted-remote",
+        format!("http://{}/mcp", listener.local_addr().unwrap()),
+        HashMap::from([("Authorization".into(), "Bearer ${HOST_SECRET}".into())]),
+    );
+    let local = marker_config(&root);
+    let resolver = Arc::new(CountingResolver::default());
+    let handle = Arc::new(meerkat_runtime::RuntimeExternalToolSurfaceHandle::ephemeral());
+    let mut router = McpRouter::new_with_surface_handle_and_stdio_profile(
+        handle,
+        McpStdioLaunchProfile::trusted_host(),
+    )
+    .with_mcp_auth(
+        meerkat_auth_core::McpAuthMode::Stored,
+        Some(resolver.clone() as Arc<dyn McpAuthResolver>),
+    );
+    for server in [remote, local] {
+        router
+            .stage_add_refused(server, ConfinementRefusal::UntrustedConfigurationSource)
+            .unwrap();
+    }
+    router.apply_staged().await.unwrap();
+    let mut failed = Vec::new();
+    tokio::time::timeout(BOUND, async {
+        while failed.len() < 2 {
+            let update = router.take_external_updates();
+            failed.extend(
+                update
+                    .notices
+                    .into_iter()
+                    .filter(|notice| notice.phase == crate::McpLifecyclePhase::Failed),
+            );
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("refused adds settle their pending obligations");
+    for name in ["untrusted-remote", "required-child"] {
+        let notice = failed
+            .iter()
+            .find(|notice| notice.target == name)
+            .unwrap_or_else(|| panic!("{name} failed: {failed:?}"));
+        let meerkat_core::Message::SystemNotice(model) =
+            notice.model_setup_failure_notice().unwrap()
+        else {
+            panic!("a refused add projects a model notice");
+        };
+        assert_eq!(
+            serde_json::to_value(&model.blocks[0]).unwrap()["confinement_refusal"],
+            "untrusted_configuration_source",
+            "{name}"
+        );
+    }
+    assert!(router.take_external_updates().pending.is_empty());
+    assert_eq!(
+        resolver.calls.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "no credential was resolved"
+    );
+    assert!(
+        matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+        "no connection arrived"
+    );
+    assert!(!root.join("entered").exists(), "no server was spawned");
+    router.shutdown().await;
+}
+
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 mod supported_native {
     use super::*;

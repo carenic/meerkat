@@ -272,11 +272,16 @@ reason}` with `reason.reason_code` `timeout` (`timeout_ms`),
 
 - Browser/WASM builds compose no hook engine from config, so configured hooks
   do not run there.
-- Rust hosts can require OS confinement for command hooks with
+- OS confinement of command hooks comes from the `[confinement]` config
+  section (`command_hooks` or `all`) or the `--confinement` flags of the
+  stock binaries, or from a Rust host's
   `AgentFactory::with_command_hook_confinement(requirement, working_directory)`
   (absolute program path, no ambient environment, refused when custody is
   missing; not combinable with `hook_engine_override`). Otherwise command
-  hooks run as trusted host processes.
+  hooks run as trusted host processes. A host that confines every kind
+  refuses, at every invocation, a hook from a project `.rkat/config.toml`
+  that a confined process can write (`untrusted_configuration_source`); a
+  mandatory one keeps its slot and is handled as any confinement refusal.
 - On Linux and macOS, factory builds with a realm runtime root run command
   hooks under durable process custody: a hook cut off by a host crash settles
   its run (the invocation carries `run_id`) instead of letting the run replay.

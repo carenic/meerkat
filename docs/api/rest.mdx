@@ -54,6 +54,23 @@ If `--realm` is omitted, the server creates a new isolated opaque realm (`realm-
 `--realm-backend` is a creation hint only; after first open, `realm_manifest.json`
 is authoritative.
 
+OS process confinement flags (see
+[OS process confinement](/concepts/configuration#os-process-confinement)):
+
+```bash
+rkat-rest [--confinement <trusted-host|workspace>] \
+  [--confinement-network <denied|unrestricted>] \
+  [--confinement-read <path>]... [--confinement-write <path>]...
+```
+
+They replace the realm's composed `[confinement]` for every launch kind of
+this process. The workspace preset confines each launch to `--context-root`;
+without `--context-root` the server refuses to start with it. A start in which
+a confined process could change the server's realm state or user config
+document is refused (see [the host's own inputs](/concepts/configuration#the-hosts-own-inputs)).
+At startup the server logs each launch kind's requested and effective
+confinement and warns for each required kind its platform cannot confine.
+
 <Warning>
 The REST server has no general inbound HTTP authentication layer. The `auth/*`
 routes manage outbound provider credentials; they do not authenticate callers
@@ -1076,6 +1093,20 @@ Accepted request forms:
 
 If `expected_generation` is stale, the server returns `400` with a generation-conflict message.
 
+A `PUT` or `PATCH` that would administer a section the host administers in the
+document itself returns `400` with code `CONFIG_WRITE_REFUSED`, and nothing is
+written. `details.type` names the section: `governance_administration_required`
+(change, remove or restate `[governance]`) or
+`confinement_administration_required` (add, change or remove `[confinement]`).
+
+```json
+{
+  "error": "the confinement section is administered by the host in the config document; a config write cannot add, change or remove it",
+  "code": "CONFIG_WRITE_REFUSED",
+  "details": { "type": "confinement_administration_required" }
+}
+```
+
 ### GET /auth/profiles
 
 List the auth profiles, backend profiles, and provider bindings for a realm.
@@ -1565,6 +1596,7 @@ envelope:
 | HTTP Status | Code | When |
 |-------------|------|------|
 | 400 | `BAD_REQUEST` | Invalid parameters, session ID mismatch, keep_alive without comms |
+| 400 | `CONFIG_WRITE_REFUSED` | A config write would administer `[governance]` or `[confinement]`; `details.type` names the section |
 | 401 | `UNAUTHORIZED` | Missing or invalid webhook secret |
 | 404 | `NOT_FOUND` | Resource not found |
 | 409 | `CONFLICT` | Operation conflicts with current state |

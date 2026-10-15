@@ -4942,7 +4942,7 @@ ExternalToolDeltaPhase = Literal['pending', 'applied', 'draining', 'forced', 'fa
 
 # Bounded operation-local diagnostics. Never expose an environment value,
 # credential path, gate token, or secret-bearing command line in this error.
-ConfinementRefusal = Literal['invalid_requirement', 'invalid_launch', 'unsupported_requirement', 'backend_unavailable', 'preparation_failed']
+ConfinementRefusal = Literal['invalid_requirement', 'invalid_launch', 'unsupported_requirement', 'backend_unavailable', 'preparation_failed', 'untrusted_configuration_source']
 
 # The typed outcome a resumed session's recorded MCP attachment reports on
 # the wire when restore did not simply re-stage it.

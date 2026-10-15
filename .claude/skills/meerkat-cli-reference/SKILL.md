@@ -32,13 +32,12 @@ spelling, singular/plural forms, flags, and enum values matter.
   CLI command to set MCP service secrets (`secret_env` values); a Rust host
   uses `meerkat::set_mcp_service_secret`.
 - There is no `--tools all`; valid values are `safe`, `workspace`, `full`, `none`.
-- There is no sandbox or confinement flag, and no config key turns on OS
-  sandboxing. Stock `rkat` runs shell commands, command hooks and stdio MCP
-  servers as trusted host processes; `--tools none`, the shell's
-  `restrict_to_project` check and `--isolated` are not OS sandboxes. OS
-  confinement (macOS Seatbelt, Linux namespaces plus seccomp) is installed by a
-  Rust embedding host; see `references/security.md` of the meerkat-platform
-  skill.
+- OS sandboxing is off unless the `[confinement]` config section or the
+  root `--confinement <trusted-host|workspace>` flag turns it on; without them
+  `rkat` runs shell commands, command hooks and stdio MCP servers as trusted
+  host processes. `--tools none`, the shell's `restrict_to_project` check and
+  `--isolated` are not OS sandboxes. See `references/security.md` of the
+  meerkat-platform skill.
 - `rkat blob get` has no `-o` or `--out`; use `--output <FILE>`.
 - `rkat session show` has no `--json` flag.
 - `rkat models` and `rkat capabilities` take no arguments (no `--json`/`--format`, no `rkat models catalog`) and already print pretty JSON.
@@ -71,7 +70,17 @@ Global/realm options:
 --context-root <PATH>
 --user-config-root <PATH>
 --default-model <MODEL>
+--confinement <trusted-host|workspace>   # OS confinement of shell, hooks, MCP stdio
+--confinement-network <denied|unrestricted>
+--confinement-read <PATH>                # repeatable; needs --confinement workspace
+--confinement-write <PATH>               # repeatable; needs --confinement workspace
 ```
+
+The `--confinement` flags replace the `[confinement]` config section for every
+launch kind of the invocation; `trusted-host` is the operator's opt-out. A
+confined command whose processes could change its realm state or user config
+document is refused: on Linux keep the state outside the workspace with
+`--state-root`.
 
 `-h` prints the basic view and `--help` every option; realm options and
 advanced flags appear only under `--help`. `--as-agent` is a root option

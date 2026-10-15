@@ -124,21 +124,64 @@ pub async fn resolve_layered_hooks_config(
     user_config_root: Option<&Path>,
     active_config: &Config,
 ) -> HooksConfig {
+    resolve_layered_hooks(context_root, user_config_root, active_config)
+        .await
+        .config
+}
+
+/// Layered hooks with the convention file each file entry comes from.
+pub(crate) struct LayeredHooks {
+    pub(crate) config: HooksConfig,
+    /// Each layered entry a convention file states: its id, the file, and
+    /// whether the user file states the same definition.
+    file_entries: Vec<(meerkat_core::HookId, std::path::PathBuf, bool)>,
+    user_file: Option<std::path::PathBuf>,
+}
+
+impl LayeredHooks {
+    /// The layered entries whose definition comes from a file `untrusted`
+    /// names, unless a trusted user file states the same definition (it is
+    /// then that file's entry).
+    pub(crate) fn untrusted_entries(
+        &self,
+        untrusted: impl Fn(&Path) -> bool,
+    ) -> Vec<meerkat_core::HookId> {
+        let user_trusted = self
+            .user_file
+            .as_deref()
+            .is_some_and(|user| !untrusted(user));
+        self.file_entries
+            .iter()
+            .filter(|(_, source, user_duplicate)| {
+                untrusted(source) && !(*user_duplicate && user_trusted)
+            })
+            .map(|(id, _, _)| id.clone())
+            .collect()
+    }
+}
+
+/// [`resolve_layered_hooks_config`], keeping the convention file of each
+/// file entry.
+pub(crate) async fn resolve_layered_hooks(
+    context_root: Option<&Path>,
+    user_config_root: Option<&Path>,
+    active_config: &Config,
+) -> LayeredHooks {
     let mut user_entries = Vec::new();
     let mut context_entries = Vec::new();
+    let user_cfg_path = user_config_root.map(|root| root.join(".rkat").join("config.toml"));
+    let project_cfg_path = context_root.map(|root| root.join(".rkat").join("config.toml"));
 
-    if let Some(user_root) = user_config_root {
-        let user_cfg_path = user_root.join(".rkat").join("config.toml");
-        if let Ok(Some(cfg)) = read_hooks_config_from(&user_cfg_path).await {
-            user_entries = cfg.entries;
-        }
+    if let Some(user_cfg_path) = &user_cfg_path
+        && let Ok(Some(cfg)) = read_hooks_config_from(user_cfg_path).await
+    {
+        user_entries = cfg.entries;
     }
 
-    if let Some(context) = context_root {
-        let project_cfg_path = context.join(".rkat").join("config.toml");
-        if let Ok(Some(cfg)) = read_hooks_config_from(&project_cfg_path).await {
-            context_entries = cfg.entries;
-        }
+    if let Some(project_cfg_path) = &project_cfg_path
+        && let Ok(Some(cfg)) = read_hooks_config_from(project_cfg_path).await
+    {
+        context_entries = cfg.entries;
     }
 
     let active_hooks = &active_config.hooks;
@@ -150,6 +193,7 @@ pub async fn resolve_layered_hooks_config(
     };
 
     // Deterministic precedence: active config > context root > user root.
+    let mut file_entries = Vec::new();
     let mut seen_ids: HashSet<_> = HashSet::new();
     for entry in &active_hooks.entries {
         if seen_ids.insert(entry.id.clone()) {
@@ -159,15 +203,29 @@ pub async fn resolve_layered_hooks_config(
     for entry in &context_entries {
         if seen_ids.insert(entry.id.clone()) {
             layered.entries.push(entry.clone());
+            if let Some(source) = &project_cfg_path {
+                file_entries.push((
+                    entry.id.clone(),
+                    source.clone(),
+                    user_entries.contains(entry),
+                ));
+            }
         }
     }
     for entry in &user_entries {
         if seen_ids.insert(entry.id.clone()) {
             layered.entries.push(entry.clone());
+            if let Some(source) = &user_cfg_path {
+                file_entries.push((entry.id.clone(), source.clone(), false));
+            }
         }
     }
 
-    layered
+    LayeredHooks {
+        config: layered,
+        file_entries,
+        user_file: user_cfg_path,
+    }
 }
 
 async fn read_hooks_config_from(path: &Path) -> Result<Option<HooksConfig>, std::io::Error> {

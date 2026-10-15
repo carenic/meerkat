@@ -56,6 +56,7 @@ pub mod config_runtime;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod config_store;
 pub mod confinement;
+pub mod confinement_config;
 pub mod connection;
 pub mod context_budget;
 mod digest_observability;
@@ -243,6 +244,11 @@ pub use config_store::{
     ConfigResolvedPaths, ConfigStore, ConfigStoreMetadata, EffectiveConfigReader, FileConfigStore,
     MemoryConfigStore, RealmConfigSource, RealmConfigWarning, TaggedConfigStore,
     apply_config_patch_preview, merge_patch,
+};
+pub use confinement_config::{
+    ConfinementConfig, ConfinementFlagMode, ConfinementFlags, ConfinementFlagsError,
+    ConfinementLaunchKind, ConfinementLayerConflict, CustomConfinement, InvalidConfinementPath,
+    LaunchConfinement, WorkspaceConfinement, WorkspaceNetwork, check_confinement_layers,
 };
 pub use context_budget::{
     ContextBudgetEstimateProvenance, ContextBudgetFact, ContextBudgetFactError, ContextBudgetState,

@@ -13603,9 +13603,12 @@ impl SessionRuntime {
             }
         };
         let (context_root, user_root) = self.skill_identity_roots();
-        match meerkat_core::mcp_config::McpConfig::load_with_scopes_from_roots(
+        // An `mcp.toml` a confined process could write installs nothing.
+        let host_confinement = self.factory.host_confinement();
+        match meerkat_core::mcp_config::McpConfig::load_with_scopes_from_roots_trusting(
             context_root.as_deref(),
             user_root.as_deref(),
+            &|path| host_confinement.is_some_and(|host| host.untrusted_source(path)),
         )
         .await
         {
@@ -13944,6 +13947,25 @@ impl SessionRuntime {
             .map_err(|message| RpcError {
                 code: error::INTERNAL_ERROR,
                 message,
+                data: None,
+            })
+    }
+
+    /// Wait until the session's live MCP servers settle, returning the
+    /// deltas they reported.
+    #[cfg(all(test, feature = "mcp"))]
+    pub(crate) async fn mcp_wait_until_ready_for_test(
+        &self,
+        session_id: &SessionId,
+        timeout: Duration,
+    ) -> Result<Vec<meerkat_core::ExternalToolDelta>, RpcError> {
+        let adapter = self.mcp_adapter_for_session(session_id).await?;
+        adapter
+            .wait_until_ready(timeout)
+            .await
+            .map_err(|not_ready| RpcError {
+                code: error::INTERNAL_ERROR,
+                message: not_ready.to_string(),
                 data: None,
             })
     }

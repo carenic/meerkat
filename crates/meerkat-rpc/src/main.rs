@@ -88,6 +88,73 @@ struct Cli {
     /// actual `--live-ws` listener accepts plain WebSocket bytes.
     #[arg(long, value_enum, default_value_t = LiveWsScheme::Ws)]
     live_ws_scheme: LiveWsScheme,
+    /// OS process confinement for the shell, command hooks and MCP stdio
+    /// servers this server launches. `workspace` confines each launch to
+    /// --context-root; `trusted-host` runs them unconfined. Replaces the
+    /// config's `[confinement]` for this process.
+    #[arg(long, value_enum, value_name = "MODE")]
+    confinement: Option<ConfinementModeArg>,
+    /// IP network access of workspace-confined launches (default: denied).
+    #[arg(long, value_enum, value_name = "ACCESS", requires = "confinement")]
+    confinement_network: Option<ConfinementNetworkArg>,
+    /// An extra read-only directory for workspace-confined launches.
+    /// Repeatable.
+    #[arg(long, value_name = "PATH", requires = "confinement")]
+    confinement_read: Vec<PathBuf>,
+    /// An extra writable directory for workspace-confined launches.
+    /// Repeatable.
+    #[arg(long, value_name = "PATH", requires = "confinement")]
+    confinement_write: Vec<PathBuf>,
+}
+
+/// `--confinement`: how this server confines the processes it launches.
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum ConfinementModeArg {
+    /// Launch as the trusted host, with no OS confinement.
+    TrustedHost,
+    /// Confine each launch to --context-root and the extra directories.
+    Workspace,
+}
+
+impl From<ConfinementModeArg> for meerkat_core::ConfinementFlagMode {
+    fn from(value: ConfinementModeArg) -> Self {
+        match value {
+            ConfinementModeArg::TrustedHost => Self::TrustedHost,
+            ConfinementModeArg::Workspace => Self::Workspace,
+        }
+    }
+}
+
+/// `--confinement-network`: IP access of workspace-confined launches.
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum ConfinementNetworkArg {
+    /// No IP sockets.
+    Denied,
+    /// IP sockets over the host's own network.
+    Unrestricted,
+}
+
+impl From<ConfinementNetworkArg> for meerkat_core::WorkspaceNetwork {
+    fn from(value: ConfinementNetworkArg) -> Self {
+        match value {
+            ConfinementNetworkArg::Denied => Self::Denied,
+            ConfinementNetworkArg::Unrestricted => Self::Unrestricted,
+        }
+    }
+}
+
+/// The operator's `--confinement*` selection; relative paths resolve
+/// against the working directory.
+fn cli_confinement(
+    cli: &Cli,
+) -> Result<Option<meerkat_core::LaunchConfinement>, Box<dyn std::error::Error>> {
+    Ok(meerkat_core::ConfinementFlags {
+        mode: cli.confinement.map(Into::into),
+        network: cli.confinement_network.map(Into::into),
+        read: cli.confinement_read.clone(),
+        write: cli.confinement_write.clone(),
+    }
+    .selection(&std::env::current_dir()?)?)
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -393,6 +460,11 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
             )
         })?;
     config.apply_env_overrides()?;
+    // The operator's flags replace the documents' `[confinement]`.
+    config.apply_cli_overrides(meerkat_core::config::CliOverrides {
+        confinement: cli_confinement(&cli)?,
+        ..meerkat_core::config::CliOverrides::default()
+    });
     config
         .validate(meerkat_models::canonical())
         .map_err(|err| std::io::Error::other(format!("invalid runtime config: {err}")))?;
@@ -442,6 +514,25 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(user_root) = cli.user_config_root.clone() {
         factory = factory.user_config_root(user_root);
     }
+    // The host's OS process confinement over --context-root: the workspace
+    // preset never grants the realm's own directory.
+    let host_confinement =
+        meerkat::HostConfinement::resolve(&config.confinement, cli.context_root.as_deref())?;
+    // A start whose confined processes could change the realm state or the
+    // user config document is refused before it serves.
+    let host_inputs = meerkat::HostConfinement::host_inputs(
+        &locator.state_root,
+        layout.global_config_path().as_deref(),
+    );
+    host_confinement.admit_host_inputs(&host_inputs)?;
+    host_confinement.log_startup(
+        &host_inputs,
+        &meerkat::HostConfinement::convention_sources(
+            cli.context_root.as_deref(),
+            cli.user_config_root.as_deref(),
+        ),
+    );
+    factory = factory.with_host_confinement(&host_confinement);
 
     let skill_runtime = factory.build_skill_runtime(&config).await?;
 
@@ -773,6 +864,27 @@ async fn serve_stock_governed_jsonl(
         .effective_config_over_head(&locator.realm, head_config)
         .await?;
     config.apply_env_overrides()?;
+    // The operator's flags replace the documents' `[confinement]`.
+    config.apply_cli_overrides(meerkat_core::config::CliOverrides {
+        confinement: cli_confinement(cli)?,
+        ..meerkat_core::config::CliOverrides::default()
+    });
+    let host_confinement =
+        meerkat::HostConfinement::resolve(&config.confinement, cli.context_root.as_deref())?;
+    // A start whose confined processes could change the realm state or the
+    // user config document is refused before it serves.
+    let host_inputs = meerkat::HostConfinement::host_inputs(
+        &locator.state_root,
+        layout.global_config_path().as_deref(),
+    );
+    host_confinement.admit_host_inputs(&host_inputs)?;
+    host_confinement.log_startup(
+        &host_inputs,
+        &meerkat::HostConfinement::convention_sources(
+            cli.context_root.as_deref(),
+            cli.user_config_root.as_deref(),
+        ),
+    );
     // The fixed governed profile: model, the named callback tools and live
     // MCP attachment only. Skills and schedules are not part of it; every
     // other unsupported setting is refused by the governed setup.
@@ -912,6 +1024,12 @@ async fn serve_stock_governed_jsonl(
     #[cfg(feature = "mcp")]
     let setup = meerkat_rpc::governed_jsonl::GovernedJsonlSetup {
         mcp_attachment_identity_key_custody: Some(identity_key_custody),
+        ..setup
+    };
+    // The governed connection's factory confines its launches as the
+    // ordinary host's would.
+    let setup = meerkat_rpc::governed_jsonl::GovernedJsonlSetup {
+        host_confinement,
         ..setup
     };
     let served = meerkat_rpc::governed_jsonl::serve_governed_jsonl_until(

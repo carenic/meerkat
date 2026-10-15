@@ -1090,6 +1090,7 @@ async fn fixture_with(server: &Server, authentication: &str, mcp: bool) -> Fixtu
             connector_authority: None,
             operation_review: None,
             consent: None,
+            host_confinement: meerkat::HostConfinement::trusted_host(),
         },
         store,
         permissions,
@@ -2672,6 +2673,94 @@ async fn governed_jsonl_mcp_add_stages_under_authenticated_control_on_bound_dest
             before_retired,
             "an unbound destination never reaches the native owners"
         );
+    };
+    let result =
+        std::panic::AssertUnwindSafe(tokio::time::timeout(Duration::from_secs(30), scenario))
+            .catch_unwind()
+            .await;
+    let cleanup_failures = cleanup_jsonl(r, &mut w, server_task, &mut http).await;
+    finish_scenario(result, cleanup_failures);
+}
+
+/// The connection's factory launches its live MCP stdio servers inside the
+/// host's confinement: a staged server whose launch the platform backend
+/// cannot confine is refused, typed, when it is applied, and never spawns.
+#[cfg(all(unix, feature = "mcp"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn governed_jsonl_mcp_add_launches_inside_the_host_confinement() {
+    use meerkat_core::confinement::{
+        ConfinementRefusal, ConfinementSpec, FilesystemAccess, IpNetworkAccess, PathAccess,
+        PlatformBaseline,
+    };
+    let mut http = Server::start().await;
+    let Fixture {
+        mut setup,
+        permissions,
+        ..
+    } = fixture_with(&http, "actual-jsonl-authentication", true).await;
+    let markers = tempfile::tempdir().unwrap();
+    let root = markers.path().canonicalize().unwrap();
+    let marker = root.join("spawned");
+    // Descendant termination is unsupported on every platform backend.
+    let requirement = ConfinementSpec {
+        baseline: PlatformBaseline::CommandRuntimeV1,
+        read: FilesystemAccess::Paths(vec![PathAccess::Subtree(root.clone())]),
+        write: FilesystemAccess::Paths(vec![PathAccess::Subtree(root.clone())]),
+        deny_read: vec![],
+        deny_write: vec![],
+        network: IpNetworkAccess::Denied,
+        unix_connect: vec![],
+        require_descendant_termination: true,
+    }
+    .try_into()
+    .unwrap();
+    setup.host_confinement = meerkat::HostConfinement::resolve(
+        &meerkat_core::ConfinementConfig {
+            mcp_stdio: Some(meerkat_core::LaunchConfinement::Custom(
+                meerkat_core::CustomConfinement {
+                    working_directory: root.clone(),
+                    requirement,
+                },
+            )),
+            ..meerkat_core::ConfinementConfig::default()
+        },
+        None,
+    )
+    .unwrap();
+    let server_config = sentinel_server(&marker);
+    let (client_io, server_io) = tokio::io::duplex(1 << 20);
+    let (r, w) = tokio::io::split(server_io);
+    let (mut server, runtime) = construct(BufReader::new(r), w, setup).unwrap();
+    let server_task = tokio::spawn(async move { server.run().await });
+    let (r, mut w) = tokio::io::split(client_io);
+    let mut r = BufReader::new(r);
+    let effects: Arc<Mutex<Vec<String>>> = Arc::default();
+    let scenario = async {
+        send(
+            &mut w,
+            json!({"jsonrpc":"2.0","id":301,"method":"initialize"}),
+        )
+        .await;
+        let initialized = response(&mut r, &mut w, 301, &effects).await;
+        assert!(initialized.get("error").is_none(), "{initialized}");
+        let sid = governed_session_after_turn(&mut r, &mut w, &effects, &permissions, &http).await;
+
+        send(&mut w, mcp_add(314, &sid, &server_config)).await;
+        let staged = response(&mut r, &mut w, 314, &effects).await;
+        assert_eq!(staged["result"]["status"], "staged", "{staged}");
+        runtime.mcp_apply_staged_for_test(&sid).await.unwrap();
+        let deltas = runtime
+            .mcp_wait_until_ready_for_test(&sid, Duration::from_secs(10))
+            .await
+            .unwrap();
+        assert!(
+            deltas.iter().any(|delta| delta.target == SENTINEL_SERVER
+                && delta.phase == meerkat_core::ExternalToolDeltaPhase::Failed
+                && delta.confinement_refusal == Some(ConfinementRefusal::UnsupportedRequirement)),
+            "the applied launch is refused by the host's confinement: {deltas:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!marker.exists(), "a refused launch never runs unconfined");
     };
     let result =
         std::panic::AssertUnwindSafe(tokio::time::timeout(Duration::from_secs(30), scenario))

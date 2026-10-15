@@ -1444,6 +1444,10 @@ pub struct McpRouter {
     /// The attempt of each scheduled governed add, keyed by its accepted
     /// completion obligation (server, pending task sequence).
     pending_attempts: HashMap<(String, u64), AttemptSender>,
+    /// The typed refusal staged with each refused add's payload
+    /// ([`Self::stage_add_refused`]); it moves with the payload to the
+    /// boundary, where the add fails before anything about it is resolved.
+    refused_payloads: HashMap<String, meerkat_core::confinement::ConfinementRefusal>,
     /// Servers attached under a governed control, and governed adds a
     /// staged removal withdrew. Their descriptor never changes or reconnects
     /// without a new control (no reload) until the removal's actual
@@ -1872,6 +1876,7 @@ impl McpRouter {
             staged_controls: HashMap::new(),
             staged_attempts: HashMap::new(),
             pending_attempts: HashMap::new(),
+            refused_payloads: HashMap::new(),
             governed_servers: std::collections::HashSet::new(),
             pending_tx: tx,
             pending_rx: Mutex::new(rx),
@@ -2207,6 +2212,23 @@ impl McpRouter {
         Ok(observed)
     }
 
+    /// Stage an add the host refuses: its definition comes from a source the
+    /// host does not trust (for example an `mcp.toml` a confined process can
+    /// write). It follows an ordinary add's lifecycle and fails at its
+    /// boundary with `refusal`, the model seeing the ordinary failed-add
+    /// notice; nothing about it is authorized, connected or spawned.
+    pub fn stage_add_refused(
+        &mut self,
+        config: McpServerConfig,
+        refusal: meerkat_core::confinement::ConfinementRefusal,
+    ) -> Result<(), McpError> {
+        self.refuse_ungoverned_change(&config.name)?;
+        let name = config.name.clone();
+        self.stage_add_payload(config)?;
+        self.refused_payloads.insert(name, refusal);
+        Ok(())
+    }
+
     fn refuse_ungoverned_change(&self, server_name: &str) -> Result<(), McpError> {
         if self.staged_controls.contains_key(server_name)
             || self.governed_servers.contains(server_name)
@@ -2219,6 +2241,8 @@ impl McpRouter {
     fn stage_add_payload(&mut self, config: McpServerConfig) -> Result<(), McpError> {
         Self::validate_tool_names(&config)?;
         let server_name = config.name.clone();
+        // A new payload replaces any refused one staged under the name.
+        self.refused_payloads.remove(&server_name);
         let sid = SurfaceId::from(server_name.as_str());
         match self
             .surface_owner
@@ -2263,6 +2287,7 @@ impl McpRouter {
             return Err(error.into());
         }
         self.staged_payloads.remove(&server_name);
+        self.refused_payloads.remove(&server_name);
         // A removal withdraws a staged governed add with its control. The
         // removal is only intent and can itself be replaced before apply, so
         // the name stays governed until its actual disposition.
@@ -2590,6 +2615,7 @@ impl McpRouter {
         obligation: SurfaceCompletionObligation,
     ) {
         let server_name = config.name.clone();
+        let refused = self.refused_payloads.remove(&server_name);
         if let Some(attempt) = attempt {
             self.pending_attempts.insert(
                 (server_name.clone(), obligation.pending_task_sequence),
@@ -2598,6 +2624,10 @@ impl McpRouter {
         }
         self.pending_obligations
             .insert(server_name, obligation.clone());
+        if let Some(refusal) = refused {
+            self.spawn_refused(config, obligation, refusal);
+            return;
+        }
 
         // The attempt's custodies are created and indexed together, under
         // the close index's admission freeze, before anything can spawn or
@@ -2669,6 +2699,34 @@ impl McpRouter {
                 let server_name = error.0.obligation.surface_id.clone();
                 McpRouter::close_result_connection_if_present(server_name, error.0.result).await;
             }
+        });
+    }
+
+    /// Complete a refused add's attempt at once with its typed refusal: no
+    /// custody is admitted and nothing is authorized, connected or spawned.
+    fn spawn_refused(
+        &mut self,
+        config: McpServerConfig,
+        obligation: SurfaceCompletionObligation,
+        refusal: meerkat_core::confinement::ConfinementRefusal,
+    ) {
+        let tx = self.pending_tx.clone();
+        let progress = Arc::clone(&self.progress);
+        let delivered = Arc::clone(&self.connect_results_delivered);
+        self.connect_attempts_spawned = self.connect_attempts_spawned.wrapping_add(1);
+        while self.connect_tasks.try_join_next().is_some() {}
+        self.connect_tasks.spawn(async move {
+            // Nothing was entered, so a router that is gone leaves nothing
+            // to close.
+            let _ = tx
+                .send(PendingResult {
+                    obligation,
+                    config,
+                    result: Err(McpError::Confinement(refusal)),
+                })
+                .await;
+            delivered.fetch_add(1, Ordering::AcqRel);
+            progress.send_modify(|seen| *seen = seen.wrapping_add(1));
         });
     }
 
@@ -4512,6 +4570,7 @@ impl McpRouter {
         self.staged_controls.clear();
         self.staged_attempts.clear();
         self.pending_attempts.clear();
+        self.refused_payloads.clear();
         let (replacement_tx, _replacement_rx) = mpsc::channel(PENDING_CHANNEL_CAPACITY);
         let old_pending_tx = std::mem::replace(&mut self.pending_tx, replacement_tx);
         drop(old_pending_tx);

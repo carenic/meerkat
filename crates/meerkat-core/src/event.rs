@@ -5438,6 +5438,7 @@ mod tests {
                 ConfinementRefusal::UnsupportedRequirement,
                 ConfinementRefusal::BackendUnavailable,
                 ConfinementRefusal::PreparationFailed,
+                ConfinementRefusal::UntrustedConfigurationSource,
             ] {
                 // Exercise the outward wire carrier and the private notice
                 // decoder as well as the in-memory projection.
