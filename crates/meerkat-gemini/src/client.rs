@@ -78,9 +78,19 @@ fn gemini_file_poll_interval() -> Duration {
     }
 }
 
+/// The model the Code Assist wire sends for `model`.
+///
+/// Code Assist serves the GA Gemini models: `gemini-3.1-flash-lite` is the
+/// base flash-lite model the Gemini CLI itself sends there. A preview id
+/// goes out as its GA model, as the public API routes it. Every substitute is
+/// a catalog Gemini model that accepts every thinking level of the requested
+/// model's row, which the request was judged against (pinned by a test).
+///
+/// Until 0.9.2 both flash-lite ids went out as `gemini-2.5-flash`, a model
+/// Google limits to users who had used it before 2026-09-18.
 fn code_assist_model(model: &str) -> &str {
     match model {
-        "gemini-3.1-flash-lite" | "gemini-3.1-flash-lite-preview" => "gemini-2.5-flash",
+        "gemini-3.1-flash-lite-preview" => "gemini-3.1-flash-lite",
         other => other,
     }
 }
@@ -3360,6 +3370,39 @@ mod tests {
         }
     }
 
+    /// The Code Assist wire substitutes only catalog Gemini models, so it
+    /// never sends a model the catalog has dropped: Gemini 2.5 models are
+    /// limited to users who used them before 2026-09-18. The substitute must
+    /// also accept every thinking level of the requested model's row, which
+    /// the request was judged against.
+    #[test]
+    fn code_assist_wire_models_are_catalog_models() {
+        for requested in meerkat_models::allowed_models(Provider::Gemini) {
+            let wire = code_assist_model(requested);
+            let requested_row = meerkat_models::capabilities_for(Provider::Gemini, requested)
+                .expect("an allowed model has a catalog row");
+            let wire_row = meerkat_models::capabilities_for(Provider::Gemini, wire)
+                .unwrap_or_else(|| {
+                    panic!("Code Assist sends '{requested}' as '{wire}', which is not a catalog Gemini model")
+                });
+            for level in requested_row.effort_levels {
+                assert!(
+                    wire_row.effort_levels.contains(level),
+                    "'{wire}' (sent for '{requested}') refuses thinking level {level:?}"
+                );
+            }
+        }
+        // Both flash-lite ids reach Code Assist as the GA model it serves.
+        assert_eq!(
+            code_assist_model("gemini-3.1-flash-lite"),
+            "gemini-3.1-flash-lite"
+        );
+        assert_eq!(
+            code_assist_model("gemini-3.1-flash-lite-preview"),
+            "gemini-3.1-flash-lite"
+        );
+    }
+
     #[tokio::test]
     async fn code_assist_stream_uses_internal_endpoint_and_wrapper()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -3373,16 +3416,16 @@ mod tests {
         let client = GeminiClient::new_with_base_url(String::new(), base_url.clone())
             .with_code_assist_wire();
         let plain = client
-            .plain_model_route("gemini-3.1-flash-lite")
+            .plain_model_route("gemini-3.1-flash-lite-preview")
             .expect("request-free CodeAssist lowering");
         assert!(seen.lock().expect("seen mutex").is_empty());
-        assert_eq!(plain.wire_model(), "gemini-2.5-flash");
+        assert_eq!(plain.wire_model(), "gemini-3.1-flash-lite");
         assert_eq!(
             plain.endpoint(),
-            client.stream_generate_content_url("gemini-3.1-flash-lite")
+            client.stream_generate_content_url("gemini-3.1-flash-lite-preview")
         );
         let request = LlmRequest::new(
-            "gemini-3.1-flash-lite",
+            "gemini-3.1-flash-lite-preview",
             vec![Message::User(UserMessage::text("hello".to_string()))],
         );
 
@@ -3400,7 +3443,7 @@ mod tests {
         assert_eq!(deltas, vec!["hello from code assist"]);
         let bodies = seen.lock().expect("seen mutex");
         let body = bodies.first().expect("captured Code Assist request");
-        assert_eq!(body["model"], "gemini-2.5-flash");
+        assert_eq!(body["model"], "gemini-3.1-flash-lite");
         assert_eq!(body["model"], plain.wire_model());
         assert!(
             body.get("user_prompt_id").and_then(Value::as_str).is_some(),

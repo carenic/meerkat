@@ -50,6 +50,16 @@ them.
   tests failed. A test that needs no provider keys now fails when the matrix
   names a model outside Core's catalog.
 
+### Fixed
+
+- Google Code Assist (the `rkat auth login google` route) requests for
+  `gemini-3.1-flash-lite` and `gemini-3.1-flash-lite-preview` went out as
+  `gemini-2.5-flash`, which Google has limited to users who had used it before
+  2026-09-18, so they failed for newer accounts. Both now go out as
+  `gemini-3.1-flash-lite`, the GA model the Gemini CLI itself sends to Code
+  Assist. Every Code Assist substitute is a catalog Gemini model that accepts
+  the requested model's thinking levels.
+
 ## [0.9.1] - 2026-10-15
 
 ### Breaking
