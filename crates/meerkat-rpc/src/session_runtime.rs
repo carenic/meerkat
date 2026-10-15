@@ -1821,6 +1821,13 @@ impl meerkat_mob::MobSessionService for RpcMobSessionService {
         self.service.tool_scope_snapshot(session_id).await
     }
 
+    async fn tool_catalog_view(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Option<meerkat_core::ToolCatalogView>, SessionError> {
+        self.service.tool_catalog_view(session_id).await
+    }
+
     async fn external_tool_surface_snapshot(
         &self,
         session_id: &SessionId,

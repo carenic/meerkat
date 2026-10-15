@@ -32,7 +32,7 @@ pub async fn execute_with_authorization(
     if let Some(check) = &current {
         unreviewed(check)?;
         check
-            .observe_entry()
+            .observe_entry(meerkat_core::OperationEntryBoundary::ModelRequest)
             .map_err(LlmError::from_operation_observation)?;
     }
     // Observation staging can synchronize with its owner. Recheck after it,
@@ -304,7 +304,11 @@ mod review_entry_tests {
             _: &PreparedAuthorizationBinding,
             observation: OperationObservation,
         ) -> Result<(), OperationObservationError> {
-            if matches!(observation, OperationObservation::Entry) {
+            // The transport names its own boundary.
+            if matches!(
+                observation,
+                OperationObservation::Entry(meerkat_core::OperationEntryBoundary::ModelRequest)
+            ) {
                 self.entries.fetch_add(1, Ordering::AcqRel);
             }
             Ok(())

@@ -4302,7 +4302,7 @@ impl McpRouter {
                             .require_unreviewed_entry()
                             .map_err(|error| McpError::EntryRefused(Box::new(error.into())))?;
                         current
-                            .observe_entry()
+                            .observe_entry(meerkat_core::OperationEntryBoundary::McpResourceRead)
                             .map_err(|_| crate::McpCallContextError::Unavailable)?;
                         entered.0 = Some(current);
                     }

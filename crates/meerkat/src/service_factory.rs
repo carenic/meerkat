@@ -689,6 +689,10 @@ impl SessionAgent for FactoryAgent {
         self.agent.tool_scope_snapshot()
     }
 
+    fn tool_catalog_view(&self) -> Option<meerkat_core::ToolCatalogView> {
+        self.agent.tool_catalog_view()
+    }
+
     fn visible_tool_defs(&self) -> Vec<meerkat_core::ToolDef> {
         self.agent.visible_tool_defs()
     }

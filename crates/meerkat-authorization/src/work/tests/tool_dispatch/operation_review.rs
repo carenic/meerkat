@@ -447,7 +447,7 @@ impl PreparedOperationAuthorization for EntryHookDecision {
         binding: &PreparedAuthorizationBinding,
         observation: OperationObservation,
     ) -> Result<(), OperationObservationError> {
-        if matches!(observation, OperationObservation::Entry)
+        if matches!(observation, OperationObservation::Entry(_))
             && self.edit
             && self.armed.swap(false, Ordering::SeqCst)
         {

@@ -640,7 +640,10 @@ fn assert_review_fault_audit(
     assert_eq!(
         source_records
             .iter()
-            .filter(|record| matches!(record.observation.observation, AuditObservation::Entry))
+            .filter(|record| matches!(
+                record.observation.observation,
+                AuditObservation::Entry { .. }
+            ))
             .count(),
         1
     );
@@ -1502,7 +1505,7 @@ esac"#;
                     == source.observation.operation_id
                     && matches!(
                         record.observation.observation,
-                        AuditObservation::Entry | AuditObservation::Outcome { .. }
+                        AuditObservation::Entry { .. } | AuditObservation::Outcome { .. }
                     )));
             }
             let reviewer_prepares: Vec<_> = audit.iter().filter(|record| matches!(&record.observation.observation,

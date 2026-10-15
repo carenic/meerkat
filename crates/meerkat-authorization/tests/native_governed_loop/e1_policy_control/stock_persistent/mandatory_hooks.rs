@@ -348,7 +348,7 @@ pub(super) fn assert_withheld_stock_turn_audit(
             responder_sequence.as_slice(),
             [
                 AuditObservation::Prepared { .. },
-                AuditObservation::Entry,
+                AuditObservation::Entry { .. },
                 AuditObservation::Outcome {
                     outcome: OperationObservedOutcome::HttpResponse { status: 200 }
                 },

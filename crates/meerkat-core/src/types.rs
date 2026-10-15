@@ -968,7 +968,7 @@ impl TranscriptSource {
 /// and that string IS the typed fact — not a re-derivable label.
 #[non_exhaustive]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ServerToolKind {
     /// Provider-hosted web search (Anthropic `web_search*`, OpenAI
@@ -1417,7 +1417,7 @@ fn is_wrapped_schema(obj: &Map<String, Value>) -> bool {
 
 /// Unique identifier for a session (UUID v7 for time-ordering)
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct SessionId(#[cfg_attr(feature = "schema", schemars(with = "String"))] pub Uuid);
 
 impl SessionId {

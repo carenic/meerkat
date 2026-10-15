@@ -245,6 +245,17 @@ selector enters deferred mode when a source is still pending, at least two
 eligible tools exist, or their combined name, description, and schema volume
 reaches 160 bytes. These tools are not part of the general builtins gate.
 
+A Rust host can read this projection for a live session without a model
+request: `EphemeralSessionService::tool_catalog_view` and
+`PersistentSessionService::tool_catalog_view` (and the
+`MobSessionService` seam) return a typed `ToolCatalogView`. It reports the
+mode the next request takes, sources still connecting, whether a staged
+change waits for the next boundary, and for each catalog entry its
+deferral eligibility, callability and visibility (`Visible`, `Deferred`
+behind the control plane, or `Hidden`). Reading it changes nothing. Like
+the other tool-scope snapshot queries, it is not exposed over JSON-RPC or
+REST.
+
 <Accordion title="tool_catalog_search">
 Search deferred-eligible session tools without loading them.
 

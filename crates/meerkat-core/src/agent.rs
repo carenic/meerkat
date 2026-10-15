@@ -28,6 +28,8 @@ mod structured_output_tests;
 pub(crate) mod test_turn_state_handle;
 mod tool_application_execution;
 #[cfg(test)]
+mod tool_delegate_tests;
+#[cfg(test)]
 mod usage_accounting_tests;
 #[cfg(test)]
 mod usage_degradation_tests;
@@ -1460,6 +1462,60 @@ impl ToolDispatchContext {
             })
     }
 
+    /// For governed work, require that this dispatch was authorized for
+    /// exactly the typed operation `target` its owner is about to perform
+    /// for `call`: the binding-owned call (matched by identity) under a plan
+    /// whose single owner-produced target equals `target`. An owner whose
+    /// effect is selected by a typed target calls this immediately before
+    /// the effect, so work authorized for another target, or for none (a
+    /// wrapper that resolved its own target-less plan, which a base lineage
+    /// would cover), never runs. The context is read as
+    /// [`Self::check_tool_authorization`] reads it: one with neither work
+    /// nor a prepared authorization is ungoverned and unaffected (`target`
+    /// is not computed); one with only one of them is malformed.
+    ///
+    /// The owner sees only the context it is given, so the guarantee holds
+    /// when every wrapper between the root dispatcher and the owner forwards
+    /// `resolve_execution_plan` and `dispatch_resolved_with_context` with
+    /// its context. The fenced dispatch refuses a governed comms or memory
+    /// plan that carries no target of its owner's kind, which a wrapper that
+    /// does not forward the owner's plan resolution produces.
+    ///
+    /// # Errors
+    /// Governed work authorized for another call, another target or none,
+    /// and a context with work but no prepared authorization (or the
+    /// reverse), refuse as malformed facts; an error from `target` is
+    /// returned as is.
+    pub fn require_authorized_operation_target(
+        &self,
+        call: ToolCallView<'_>,
+        target: impl FnOnce() -> Result<crate::ToolOperationTarget, crate::ToolError>,
+    ) -> Result<(), crate::ToolError> {
+        let prepared = match (self.work_authorization(), self.prepared_authorization()) {
+            (None, None) => return Ok(()),
+            (Some(_), Some(prepared)) => prepared,
+            _ => return Err(governed_malformed()),
+        };
+        let target = target()?;
+        let (bound_call, bound_plan) = prepared
+            .tool_dispatch_parts()
+            .ok_or_else(governed_malformed)?;
+        let mut bound_targets = bound_plan
+            .owner_witnesses()
+            .iter()
+            .filter_map(crate::ToolExecutionOwnerWitness::operation_target);
+        let authorized = std::ptr::eq(call.id, bound_call.id)
+            && std::ptr::eq(call.name, bound_call.name)
+            && std::ptr::eq(call.args, bound_call.args)
+            && bound_targets.next() == Some(&target)
+            && bound_targets.next().is_none();
+        if authorized {
+            Ok(())
+        } else {
+            Err(governed_malformed())
+        }
+    }
+
     /// The governed operation this dispatch prepared, for a trusted native
     /// owner that checks it again later (see [`GovernedDispatchOperation`]).
     /// `call` must be this dispatch's actual borrowed call: it is matched by
@@ -1490,6 +1546,43 @@ impl ToolDispatchContext {
             context: self.clone(),
             work: work.clone(),
         })
+    }
+
+    /// The typed delegate attribution of this dispatch's own prepared
+    /// builtin call, for its helper operation in `role` (see
+    /// [`crate::authorization::ToolDelegateAttribution`]). `call` must be
+    /// this dispatch's actual borrowed call, matched by identity against the
+    /// binding-owned call, and the call's plan must carry exactly the
+    /// builtin operation `role` requires, as its registration owner
+    /// produced it. An ungoverned dispatch has none (`Ok(None)`). It grants
+    /// nothing: the helper operation is decided by its own owners.
+    ///
+    /// # Errors
+    /// A governed context without its prepared check (or a check without its
+    /// work), any other call, or a plan with no target, another owner's
+    /// target or more than one target is malformed facts.
+    pub fn tool_delegate_attribution(
+        &self,
+        call: ToolCallView<'_>,
+        role: crate::authorization::ToolDelegateRole,
+    ) -> Result<Option<crate::authorization::ToolDelegateAttribution>, crate::ToolError> {
+        let (work, prepared) = match (self.work_authorization(), self.prepared_authorization()) {
+            (None, None) => return Ok(None),
+            (Some(work), Some(prepared)) => (work, prepared),
+            _ => return Err(governed_malformed()),
+        };
+        let (bound_call, _) = prepared
+            .tool_dispatch_parts()
+            .ok_or_else(governed_malformed)?;
+        if !std::ptr::eq(call.id, bound_call.id)
+            || !std::ptr::eq(call.name, bound_call.name)
+            || !std::ptr::eq(call.args, bound_call.args)
+        {
+            return Err(governed_malformed());
+        }
+        crate::authorization::ToolDelegateAttribution::for_dispatch(prepared, work, role)
+            .map(Some)
+            .map_err(crate::ToolError::from)
     }
 
     /// An owned, single-use entry for a leaf whose effect runs on a worker
@@ -1529,8 +1622,10 @@ impl ToolDispatchContext {
     ///
     /// Call exactly once, after argument and preparation work and any waits,
     /// immediately before the body or handoff, with the context the leaf was
-    /// handed. It runs [`Self::observe_tool_entry`] (staging, the final
-    /// authorization check and the review check point), then spends a
+    /// handed. It runs [`Self::observe_tool_entry_at`] at the effect boundary
+    /// ([`crate::authorization::OperationEntryBoundary::ToolEffect`]:
+    /// staging, the final authorization check and the review check point),
+    /// then spends a
     /// retained review allow once for the exact entering decision. Nothing
     /// external runs between that spend and the caller's effect; the review
     /// `Used` projection is delivered after dispatch returns. A second call
@@ -1557,7 +1652,11 @@ impl ToolDispatchContext {
         plan: Option<&crate::ResolvedToolExecutionPlan>,
     ) -> Result<(Option<Self>, crate::approval::review::ReviewedEntryCustody), crate::ToolError>
     {
-        let entering = self.observe_tool_entry(call, plan)?;
+        let entering = self.observe_tool_entry_at(
+            call,
+            plan,
+            crate::authorization::OperationEntryBoundary::ToolEffect,
+        )?;
         let current = entering.as_ref().unwrap_or(self);
         let custody = match (self.review_entry.as_ref(), current.prepared_authorization()) {
             (Some(entry), Some(check)) => entry.consume_held(check)?,
@@ -1639,15 +1738,36 @@ impl ToolDispatchContext {
     /// synchronous staging work. Adapters call this after their own awaits.
     /// Several adapter boundaries may observe the same operation ID; these
     /// observations do not count physical effects or authorize another call.
+    /// The entry names the dispatch staging boundary
+    /// ([`crate::authorization::OperationEntryBoundary::ToolDispatch`]); a
+    /// staging point with an identity of its own uses
+    /// [`Self::observe_tool_entry_at`].
     pub fn observe_tool_entry(
         &self,
         call: ToolCallView<'_>,
         plan: Option<&crate::ResolvedToolExecutionPlan>,
     ) -> Result<Option<Self>, crate::ToolError> {
+        self.observe_tool_entry_at(
+            call,
+            plan,
+            crate::authorization::OperationEntryBoundary::ToolDispatch,
+        )
+    }
+
+    /// [`Self::observe_tool_entry`] at the named `boundary`, so the entries
+    /// that several boundaries record for one operation stay distinguishable.
+    pub fn observe_tool_entry_at(
+        &self,
+        call: ToolCallView<'_>,
+        plan: Option<&crate::ResolvedToolExecutionPlan>,
+        boundary: crate::authorization::OperationEntryBoundary,
+    ) -> Result<Option<Self>, crate::ToolError> {
         let first = self.check_tool_authorization(call, plan)?;
         let current = first.as_ref().unwrap_or(self);
         if let Some(prepared) = current.prepared_authorization() {
-            prepared.observe_entry().map_err(crate::ToolError::from)?;
+            prepared
+                .observe_entry(boundary)
+                .map_err(crate::ToolError::from)?;
         }
         let final_context = current.check_tool_authorization(call, plan)?;
         let entering = final_context.or(first);
@@ -2255,8 +2375,60 @@ fn validate_fenced_root_dispatch<T: AgentToolDispatcher + ?Sized + 'static>(
     Ok(())
 }
 
+/// Under governed work, a comms or memory tool's plan must carry targets of
+/// its owner's kind only: a peer delivery or the peer directory for comms,
+/// a memory operation for memory. Those owners attach one to every plan
+/// they resolve and require it again at their leaf, which they can do only
+/// when every wrapper forwards the dispatch context to them. A plan without
+/// one was resolved by a wrapper that did not forward the owner's plan
+/// resolution (another owner's target, such as the one a registered bundle
+/// attaches to a plan that names none, does not stand in for it), and that
+/// wrapper may drop the context too, so the plan is refused here, before
+/// preparation and before any wrapper runs. The source kind is the root
+/// catalog entry's own provenance for the call.
+fn require_owner_target_for_targeted_sources<T: AgentToolDispatcher + ?Sized>(
+    dispatcher: &T,
+    call: ToolCallView<'_>,
+    plan: &crate::ResolvedToolExecutionPlan,
+) -> Result<(), crate::error::ToolError> {
+    let catalog = dispatcher.tool_catalog();
+    let Some(provenance) = catalog
+        .iter()
+        .find(|entry| entry.tool.name == call.name)
+        .and_then(|entry| entry.tool.provenance.as_ref())
+    else {
+        return Ok(());
+    };
+    let owners_kind: fn(&crate::ToolOperationTarget) -> bool = match &provenance.kind {
+        crate::types::ToolSourceKind::Comms => |target| {
+            matches!(
+                target,
+                crate::ToolOperationTarget::PeerSend { .. }
+                    | crate::ToolOperationTarget::PeerDirectoryRead
+            )
+        },
+        crate::types::ToolSourceKind::Memory => {
+            |target| matches!(target, crate::ToolOperationTarget::MemoryOperation { .. })
+        }
+        _ => return Ok(()),
+    };
+    let mut targets = plan
+        .owner_witnesses()
+        .iter()
+        .filter_map(crate::ToolExecutionOwnerWitness::operation_target)
+        .peekable();
+    let carries_its_owners_target = targets.peek().is_some() && targets.all(owners_kind);
+    if carries_its_owners_target {
+        Ok(())
+    } else {
+        Err(governed_malformed())
+    }
+}
+
 /// Dispatch a plan only through the exact root allocation and exact canonical
-/// call identity used during resolution.
+/// call identity used during resolution. Under governed work a comms or
+/// memory plan without a target of its owner's kind is refused first (see
+/// [`ToolDispatchContext::require_authorized_operation_target`]).
 pub async fn dispatch_tool_execution_plan_fenced<T: AgentToolDispatcher + ?Sized + 'static>(
     dispatcher: &Arc<T>,
     call: ToolCallView<'_>,
@@ -2268,6 +2440,7 @@ pub async fn dispatch_tool_execution_plan_fenced<T: AgentToolDispatcher + ?Sized
     // checked here after the dispatch queue, and again by adapters after any
     // further preparation waits, such as application consequence policy.
     let governed_context = if let Some(work) = context.work_authorization() {
+        require_owner_target_for_targeted_sources(dispatcher.as_ref(), call, plan)?;
         let binding = crate::authorization::PreparedAuthorizationBinding::new(
             crate::authorization::OperationAuthorizationFacts {
                 operation_id: crate::OperationId::new(),
@@ -5472,6 +5645,202 @@ mod governed_operation_tests {
                 })
             ),
             "the admitted review is spent once"
+        );
+    }
+
+    fn governed_work() -> crate::WorkAuthorizationContext {
+        crate::WorkAuthorizationContext::new(
+            Arc::new(Work(Arc::new(AtomicBool::new(false)))),
+            crate::OperationExecutionScope::Domain,
+        )
+    }
+
+    /// Declares a comms, a memory and a builtin tool, resolves each with the
+    /// default target-less plan, and counts the calls it runs.
+    #[derive(Default)]
+    struct SourceKindDispatcher(std::sync::atomic::AtomicUsize);
+
+    #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+    #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+    impl AgentToolDispatcher for SourceKindDispatcher {
+        fn tools(&self) -> Arc<[Arc<crate::types::ToolDef>]> {
+            [
+                ("send_message", crate::types::ToolSourceKind::Comms),
+                ("memory_search", crate::types::ToolSourceKind::Memory),
+                ("read_file", crate::types::ToolSourceKind::Builtin),
+            ]
+            .map(|(name, kind)| {
+                Arc::new(crate::types::ToolDef {
+                    audience: Default::default(),
+                    name: name.into(),
+                    description: String::new(),
+                    input_schema: serde_json::json!({"type": "object"}),
+                    provenance: Some(crate::types::ToolProvenance {
+                        kind,
+                        source_id: "fixture".into(),
+                        artifact: None,
+                    }),
+                })
+            })
+            .into()
+        }
+
+        async fn dispatch(
+            &self,
+            call: ToolCallView<'_>,
+        ) -> Result<crate::ops::ToolDispatchOutcome, crate::ToolError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(crate::types::ToolResult::new(call.id.to_string(), "ran".to_string(), false).into())
+        }
+    }
+
+    async fn fenced<T: AgentToolDispatcher + ?Sized + 'static>(
+        dispatcher: &Arc<T>,
+        name: &str,
+        context: &ToolDispatchContext,
+    ) -> Result<crate::ops::ToolDispatchOutcome, crate::ToolError> {
+        let args = serde_json::value::RawValue::from_string("{}".to_string()).unwrap();
+        let call = ToolCallView {
+            id: "call-1",
+            name,
+            args: &args,
+        };
+        let resolution = crate::ToolExecutionResolutionContext::new(
+            crate::ToolDeadlineChain::new(vec![crate::ToolDeadlineContributor::finite(
+                crate::ToolDeadlineOwner::CoreToolDispatch,
+                std::time::Duration::from_secs(60),
+            )])
+            .unwrap(),
+        );
+        let plan =
+            crate::resolve_tool_execution_plan_fenced(dispatcher, call, context, &resolution)
+                .unwrap();
+        crate::dispatch_tool_execution_plan_fenced(dispatcher, call, context, &plan).await
+    }
+
+    fn is_malformed<T>(result: &Result<T, crate::ToolError>) -> bool {
+        matches!(result, Err(crate::ToolError::AuthorizationRefused { refusal })
+            if refusal.kind() == OperationRefusalKind::MalformedFacts)
+    }
+
+    /// A governed comms or memory plan must carry its owner's typed target.
+    /// One resolved without it, by a wrapper that did not forward the
+    /// owner's plan resolution and may drop the dispatch context before the
+    /// owner can check it, is refused at the fenced dispatch before any body
+    /// runs. The same plans dispatch ungoverned, and a builtin keeps its
+    /// target-less plan under governed work.
+    #[tokio::test]
+    async fn a_governed_comms_or_memory_plan_without_an_owner_target_is_refused() {
+        let dispatcher = Arc::new(SourceKindDispatcher::default());
+        let governed =
+            ToolDispatchContext::default().with_work_authorization(Some(governed_work()));
+        for name in ["send_message", "memory_search"] {
+            let refused = fenced(&dispatcher, name, &governed).await;
+            assert!(is_malformed(&refused), "{name}: {refused:?}");
+        }
+        assert_eq!(dispatcher.0.load(Ordering::SeqCst), 0, "no body ran");
+
+        let ungoverned = ToolDispatchContext::default();
+        for name in ["send_message", "memory_search"] {
+            let outcome = fenced(&dispatcher, name, &ungoverned).await.expect(name);
+            assert!(!outcome.result.is_error, "{name}");
+        }
+        let outcome = fenced(&dispatcher, "read_file", &governed)
+            .await
+            .expect("a builtin keeps its target-less plan");
+        assert!(!outcome.result.is_error);
+        assert_eq!(dispatcher.0.load(Ordering::SeqCst), 3);
+    }
+
+    /// A registered bundle attaches its own operation target to a plan that
+    /// names none, which does not stand in for a comms or memory owner's
+    /// target: a bundle whose dispatcher wraps such a tool without
+    /// forwarding its plan resolution (and may drop the context before it)
+    /// is refused at the fenced dispatch, while the bundle's builtin
+    /// dispatches under the bundle's target.
+    #[tokio::test]
+    async fn a_bundle_target_does_not_stand_in_for_a_comms_or_memory_owner_target() {
+        let inner = Arc::new(SourceKindDispatcher::default());
+        let bundle = Arc::new(crate::RegisteredToolBundleDispatcher::new(
+            "host-bundle",
+            Arc::clone(&inner) as Arc<dyn AgentToolDispatcher>,
+        ));
+        let governed =
+            ToolDispatchContext::default().with_work_authorization(Some(governed_work()));
+        for name in ["send_message", "memory_search"] {
+            let refused = fenced(&bundle, name, &governed).await;
+            assert!(is_malformed(&refused), "{name}: {refused:?}");
+        }
+        assert_eq!(inner.0.load(Ordering::SeqCst), 0, "no body ran");
+
+        let outcome = fenced(&bundle, "read_file", &governed)
+            .await
+            .expect("a builtin under the bundle's own target");
+        assert!(!outcome.result.is_error);
+        assert_eq!(inner.0.load(Ordering::SeqCst), 1);
+    }
+
+    /// A leaf's target requirement reads the context as the authorization
+    /// check does: neither work nor a prepared check is ungoverned (and no
+    /// target is computed); work without its prepared check, or a prepared
+    /// check without work, is malformed, never ungoverned.
+    #[test]
+    fn a_target_requirement_treats_a_mixed_context_as_malformed() {
+        let args = serde_json::value::RawValue::from_string("{}".to_string()).unwrap();
+        let call = ToolCallView {
+            id: "call-1",
+            name: "peers",
+            args: &args,
+        };
+        let computed = std::cell::Cell::new(0_u32);
+        let target = || {
+            computed.set(computed.get() + 1);
+            Ok(crate::ToolOperationTarget::PeerDirectoryRead)
+        };
+
+        assert_eq!(
+            ToolDispatchContext::default().require_authorized_operation_target(call, target),
+            Ok(())
+        );
+        let work_only =
+            ToolDispatchContext::default().with_work_authorization(Some(governed_work()));
+        let refused = work_only.require_authorized_operation_target(call, target);
+        assert!(
+            is_malformed(&refused),
+            "work without its check: {refused:?}"
+        );
+
+        let plan = crate::ToolExecutionContract::default()
+            .resolve_default(
+                crate::ToolDeadlineChain::new(vec![crate::ToolDeadlineContributor::finite(
+                    crate::ToolDeadlineOwner::CoreToolDispatch,
+                    std::time::Duration::from_secs(1),
+                )])
+                .unwrap(),
+            )
+            .unwrap();
+        let binding = PreparedAuthorizationBinding::new(OperationAuthorizationFacts {
+            operation_id: crate::OperationId::new(),
+            execution_scope: crate::OperationExecutionScope::Domain,
+            run_id: None,
+            context_revision: None,
+            operation: AuthorizationOperation::Tool(ToolAuthorizationFacts {
+                call_id: Arc::from("call-1"),
+                name: "peers".into(),
+                arguments: Arc::from(
+                    serde_json::value::RawValue::from_string("{}".to_string()).unwrap(),
+                ),
+                target: ToolAuthorizationTarget::Dispatcher(Arc::new(plan)),
+            }),
+        });
+        let prepared = PreparedOperationCheck::prepare(governed_work(), binding).unwrap();
+        let check_only = ToolDispatchContext::default().with_prepared_authorization(prepared);
+        let refused = check_only.require_authorized_operation_target(call, target);
+        assert!(is_malformed(&refused), "a check without work: {refused:?}");
+        assert_eq!(
+            computed.get(),
+            0,
+            "a target is computed only for governed work"
         );
     }
 }

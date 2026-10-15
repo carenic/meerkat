@@ -273,6 +273,104 @@ is not evidence that the tool executed. See the
 [review and consent contract](https://github.com/lukacf/meerkat/blob/main/docs/internal/design/adr-001-model-review-and-consent.md)
 for the boundary and remaining acceptance scope.
 
+## Authorize the builtin web_search and its helper
+
+<Note>
+This is an unreleased source preview. Use a checkout containing the builtin
+web_search operation target; earlier releases give the call no target and
+the helper no attribution.
+</Note>
+
+The Meerkat-owned `web_search` builtin is two governed operations. Your
+`OperationPolicyOwner` maps both from typed facts, never from the tool name:
+
+- The call (`AuthorizationOperation::Tool`). Its plan's single owner target,
+  `single_tool_operation_target(plan)`, is
+  `ToolOperationTarget::BuiltinOperation { operation:
+  BuiltinToolOperation::WebSearch }`. The composite dispatcher that
+  registered the builtin states it and revalidates it at dispatch against
+  its exact registration; a plan that carries its witness runs only on that
+  builtin, even after another owner takes the name. A tool merely named
+  `web_search` from any other owner (your own dispatcher, a registered
+  bundle) has no such target unless that owner states it itself: an
+  in-process dispatcher can, so the target is the dispatching owner's
+  statement, never proof that the Meerkat builtin runs. The call acts with
+  no account of its own (`target.account()` is `None`). Every governed
+  `web_search` call carries this target under every grant basis, so an
+  owner that refuses targets it does not map refuses `web_search` until it
+  maps it.
+- Its helper (`AuthorizationOperation::Model`, usage `Inference`, always the
+  `Operation` purpose). `binding.delegate_attribution()` names the call:
+  `parent_binding()` is the call's binding with the target above, and
+  `role()` is `ToolDelegateRole::HostedSearchInference`. The facts are the
+  helper's own: identity, credential, backend, endpoint, wire model, and
+  `hosted_capabilities` of `[WebSearch]` (OpenAI, Anthropic) or
+  `[GoogleSearch]` (Gemini). Return the inference on that route and one tuple
+  per hosted capability, never the controller's tuple. An inference without
+  an attribution is still an ordinary alternate-model operation.
+
+With a `TargetedGrantLineages` basis, select
+`GrantTarget::BuiltinToolOperation { operation: WebSearch }` for the call and
+`GrantTarget::DelegatedHostedSearch { route, capability }` for each approved
+helper route, where `route` is
+`ControllerModelFacts::new(selection, endpoint, wire_model).route_key()` of
+the helper's resolved route. Neither uses the base, the catalog or the
+controller lineage: the base is neither a substitute nor an implicit
+intersecting ceiling, and every contributing original must select the same
+keys with its own current ceiling. A single `GrantLineage` basis covers both
+like any other operation. Choosing a target does not erase a restriction:
+issue those lineages, and every contributor's ceiling, with the original
+time, operation (including read-only), resource domain, processor and
+audience (private-data) restrictions, because the base no longer bounds
+them. Read-only is an action set: `ExecutionRestrictions` has no read-only
+flag, so a read-only lineage is one whose actions are only read actions. A
+typed public-search target or a read-only declaration does not mean that
+private information cannot leave through a query; do not infer it.
+
+The attribution keys the selection and the protected audit record
+(`AuditDelegateAttribution`, with the call's operation id and the role); it
+grants nothing. The helper's own decision and its authorization refusal are
+recorded under its own operation, also when it is refused before its
+provider send. A helper the owner rates R2 or R3 settles at its model entry
+as `unsupported_entry` (R2) or `human_consent_required` (R3), whether or not
+a reviewer exists, because a model request carries no operation review, and
+nothing is sent. Through the web_search executor the model sees that as
+`operation_authorization_unavailable` feedback (the review settlement stays
+in the provider error's details). No audit row records that review refusal
+(a limit of every model request, not only this helper), so the audit shows
+only its preparation. One attribution can prepare helper requests until its
+run ends, and each request is its own operation that needs its own current
+lineage.
+
+Behaviour contract for a call that already entered: revoking the call's own
+lineage refuses later calls, but it does not cancel an invocation that
+already entered, and that invocation may still make its authorized helper
+request. The helper passes its own current work, contributor, route,
+capability and final entry checks; it inherits no grant, review result or
+controller authority of its call, and no further authorization or review
+cycle of the call runs. Revoking the helper's own lineage, or a
+contributor's, before the helper's send prevents the send, also after the
+helper's request was prepared. Cancelling an entered invocation on the
+call's revocation would be a different contract that needs a live
+dependency on the call's currentness; the stored attribution does not
+provide one. Neither contract undoes a provider effect that already began or
+turns a local refusal into the end of the run: a refusal reaches the model
+as typed tool feedback, and the run continues.
+
+The composite rejects stale, wrong-owner and tampered plans within trusted
+Rust composition. Witness constructors and accessors are public, so this is
+not cryptographic resistance to hostile in-process Rust code.
+
+Operation review of `web_search` is an unsupported slice, not review
+coverage: the builtin has no reviewed entry point, so a review its owner
+requires settles as local feedback and the search never runs. R2 is
+`reviewer_missing` without a reviewer and `unsupported_entry` with one; R3 is
+`human_consent_required` without a human consent route and
+`unsupported_entry` with one. Serving R2 or R3 for it needs the consuming
+review entry first. Stock is unsupported for this route too: the stock
+governed realm issues neither grant and maps neither operation, so a product
+that takes this route through stock policy needs the full stock path first.
+
 ## Attach and pin the controller before submitting work
 
 ### Storeless sessions

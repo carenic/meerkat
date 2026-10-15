@@ -322,7 +322,7 @@ re-paired.
 |------|---------|
 | `ExecutionConfinement` / `ConfinementRefusal` | Core-owned mechanical launch requirements (crates/meerkat-core/src/confinement.rs); `meerkat-sandbox` enforces them for an exact native spawn or refuses |
 | `LocalGrantAuthority` / `GrantRefusal` | Process-local generated grant owner (`GrantAuthorityMachine` bridged in `meerkat_authorization::grants::dsl`); `GrantRefusal` gains `Duplicate` |
-| `GrantTarget` / `WorkAuthorityBasis::TargetedGrantLineages` | Portable typed grant targets (`McpServer`, `RegisteredToolBundleOperation`, `CheckedMcpRoute`) and per-target lineage selection - meerkat-authorization-contracts |
+| `GrantTarget` / `WorkAuthorityBasis::TargetedGrantLineages` | Portable typed grant targets (`McpServer`, `RegisteredToolBundleOperation`, `CheckedMcpRoute`, `Peer`, `PeerDirectory`, `Memory`, `BuiltinToolOperation`, `DelegatedHostedSearch`) and per-target lineage selection - meerkat-authorization-contracts |
 | `ApprovalService` / `ApprovalStore::put_if_current` / `ApprovalStoreError` | Review and human-consent approvals with conditional writes and commitment-typed outcomes - crates/meerkat-core/src/approval.rs |
 | `RealmGovernance` / `StockGovernance` | Facade governed-realm posture and stock composition (`local-authorization` feature); unavailable owners leave the realm governed and refusing typed - crates/meerkat/src/governed_realm.rs |
 | `McpServerAccess` / `McpStdioConfig.secret_env` / `HttpEgressRefusal` | MCP server access ceilings, realm service secrets for stdio servers, and typed HTTP egress refusals |

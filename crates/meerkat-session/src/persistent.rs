@@ -7387,6 +7387,16 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
         self.inner.tool_scope_snapshot(id).await
     }
 
+    /// How a live session's next model request projects its tool catalog
+    /// ([`meerkat_core::ToolCatalogView`]); `None` when the session's agent
+    /// cannot report it.
+    pub async fn tool_catalog_view(
+        &self,
+        id: &SessionId,
+    ) -> Result<Option<meerkat_core::ToolCatalogView>, SessionError> {
+        self.inner.tool_catalog_view(id).await
+    }
+
     pub async fn live_visible_tool_defs(
         &self,
         id: &SessionId,

@@ -55,6 +55,128 @@ them.
   model row's profile. A custom `AgentLlmClient` that proposes fallbacks to
   targets that name a binding must mint their witnesses with
   `ModelRegistry::profile_witness_for_identity`.
+- Builtin web_search target and delegated hosted search (see Added).
+  `meerkat-authorization`: `grant_policy::operation_grant_target` takes the
+  operation's `&PreparedAuthorizationBinding` instead of its
+  `&OperationAuthorizationFacts`: a delegated hosted search selects its own
+  route's lineage from its binding, where the facts alone would select the
+  base. Callers pass the binding they already hold.
+  `meerkat-authorization-contracts`: `AuthorizationAuditObservation` gains
+  `delegate_attribution: Option<AuditDelegateAttribution>` (struct literals
+  add `delegate_attribution: None`). No exhaustive public enum gains a
+  variant: `ToolOperationTarget` and `GrantTarget` are non-exhaustive.
+  Persisted format (not measured by the gate; the stored version is
+  unchanged): `GrantTarget`'s new `BuiltinToolOperation { operation }` and
+  `DelegatedHostedSearch { route, capability }` are ordered after every
+  earlier target kind, so existing selections keep their order and
+  canonical bytes. A binary without this change cannot read a work
+  association whose targeted selection names one of them, nor an input row
+  whose audit holds a delegate attribution. Every governed web_search helper
+  decision records one, under any grant basis, so this reaches every
+  governed session that ran web_search. 0.9.1 treats such input rows as
+  corrupt and recovery skips them; drain governed work before downgrading.
+  Associations and rows that use neither are unchanged.
+- Behaviour-only (not measured by the gate): the builtin web_search call's
+  plan now carries a `ToolOperationTarget::BuiltinOperation` target under
+  every grant basis, a single `GrantLineage` included. A host policy owner
+  that refuses operation targets it does not map now refuses web_search
+  where it used to allow it; this fails closed, and mapping the target
+  restores it.
+- Behaviour-only (not measured by the gate): under a targeted grant basis
+  the builtin web_search call selects only its `BuiltinToolOperation`
+  lineage and its helper's model request only its `DelegatedHostedSearch`
+  lineage, never the base, so a host that admitted the helper's inference
+  under the base now sees Denied until it selects the delegate (a single
+  `GrantLineage` basis is unchanged). A governed web_search whose context
+  does not carry the dispatch's own prepared call is refused as malformed
+  facts before its helper runs. A stock realm with a per-target selection
+  refuses web_search as Denied (no lineage is selected for it) instead of
+  Unavailable; a legacy single stock grant still leaves it Unavailable. A
+  web_search plan is refused at dispatch as `ExecutionOwnerChanged` when it
+  reaches another composite dispatcher that registered web_search as its
+  own builtin, when the same composite replaced a
+  builtin registration after resolving it, or when another owner (such as
+  an external tool) now holds the name: a plan that carries the composite's
+  builtin witness runs only on that builtin.
+- Behaviour-only (not measured by the gate): comms and `memory_search`
+  operations carry typed operation targets (see Added). Under a targeted
+  grant basis (`WorkAuthorityBasis::TargetedGrantLineages`) each resolves
+  only the lineage selected for its own target and is denied without one;
+  the base lineage no longer covers them. A stock realm issues no peer,
+  peer-directory or memory grant, so its per-target selections now deny
+  these operations at the grant owner, where the stock policy used to
+  report them unmapped (`operation_authorization_unavailable`).
+- Behaviour-only (not measured by the gate): a comms tool call whose
+  addressee cannot be determined (arguments that do not parse as the tool's
+  input, or a `reply_to_peer` that selects no single delivery of the turn)
+  now fails at execution-plan resolution with `invalid_arguments` and the
+  handler's own reason, where it failed at dispatch with `execution_failed`.
+- Behaviour-only (not measured by the gate): under governed work the comms
+  tools and `memory_search` run only when the dispatch's prepared
+  authorization names exactly the typed target they are about to reach (the
+  peer a delivery reaches, the peer directory, or the read of the memory
+  scope searched). A wrapper that forwards their `dispatch_with_context` but
+  resolves its own plan without that target (which a base lineage would
+  cover), or with another one, is now refused with `authorization_refused`
+  (malformed facts) before any delivery or memory read. Forward
+  `resolve_execution_plan` and `dispatch_resolved_with_context` to the
+  owning dispatcher instead. A context that carries work authorization
+  without its prepared check, or the reverse, is malformed for them (as for
+  `ToolDispatchContext::check_tool_authorization`), never ungoverned.
+  Ungoverned dispatch is unchanged.
+- Behaviour-only (not measured by the gate): under governed work the fenced
+  tool dispatch (`dispatch_tool_execution_plan_fenced`, which the agent
+  loop uses) refuses, before preparation, a plan for a tool whose root
+  catalog provenance is comms or memory unless every operation target it
+  carries is of that owner's kind (a peer delivery or the peer directory
+  for comms, a memory operation for memory) and it carries one, with
+  `authorization_refused` (malformed facts). Another owner's target, such
+  as the bundle target a registered Rust bundle attaches to a plan that
+  names none, does not stand in for it. Such a plan comes from a wrapper
+  that does not forward `resolve_execution_plan` to the owner and may also
+  drop the dispatch context, where the owner could no longer check its
+  target. This includes the deprecated
+  `SendTool` and `PeersTool` builtins (see Deprecated).
+- Behaviour-only (not measured by the gate): the comms dispatchers
+  (`CommsToolSurface`, `CommsToolDispatcher`, `DynCommsToolDispatcher`) and
+  `MemorySearchDispatcher` own their execution plans: their
+  `dispatch_resolved_with_context` refuses, as unavailable
+  (`ExecutionOwnerChanged`), a plan they did not resolve themselves for
+  exactly the call's current target and binding. A wrapper that forwards
+  `dispatch_resolved_with_context` to them but resolves its own plan (does
+  not forward `resolve_execution_plan`) no longer runs these tools; forward
+  both.
+- Behaviour-only (not measured by the gate): a host `OperationPolicyOwner`
+  now reads an owner-produced target for the comms tools and
+  `memory_search`: `single_tool_operation_target` returns
+  `Some(PeerSend { .. })`, `Some(PeerDirectoryRead)` or
+  `Some(MemoryOperation { .. })` where it returned `None`. An owner that
+  mapped these tools in its target-less arm (for example by tool name) no
+  longer reaches that arm for them; map the new targets instead.
+- Persisted format (not measured by the gate): a work association whose
+  targeted selection names a `peer`, `peer_directory` or `memory` target
+  cannot be read by a binary without this change (such as 0.9.1), and
+  neither can a `prepared` authorization audit record of any operation of
+  such work, which embeds the work's whole authority basis
+  (`AuditPolicyRead::operation_authorities`). Such a binary fails to decode
+  the record with an unknown-variant error naming the target kind; it never
+  reads it as another target. Associations and audit records that name none
+  of them are unchanged.
+- Audit entries name their boundary (see Added). `meerkat-core`:
+  `OperationObservation::Entry` is now `Entry(OperationEntryBoundary)`
+  instead of a unit variant, so a match needs `Entry(_)` or a boundary, and
+  `PreparedOperationCheck::observe_entry` takes the observing boundary,
+  `observe_entry(boundary: OperationEntryBoundary)`; a custom model
+  transport (for example an `LlmClient::stream_prepared` fixture) passes
+  `OperationEntryBoundary::ModelRequest`.
+  `meerkat-authorization-contracts`: `AuditObservation::Entry` is now the
+  struct variant `Entry { boundary: Option<OperationEntryBoundary> }`
+  instead of a unit variant, so a match needs `Entry { .. }`. Persisted
+  audit records (not measured by the gate): a new entry record adds the
+  boundary (`{"kind": "entry", "boundary": "tool_effect"}`); a record
+  written before decodes with `boundary: None` and re-encodes unchanged,
+  and a reader built before this change ignores the field and still decodes
+  the record as an entry. `SafeAuditObservation::EntryAttempt` is unchanged.
 
 ### Security
 
@@ -106,6 +228,155 @@ them.
   `MOB_CREATE_REFUSED_KIND`). Restoring a persisted mob never asks it, and
   neither does a handle a host registers itself with `mob_insert_handle` or
   `try_mob_insert_handle`.
+- Governed builtin web_search: a typed operation target for the call and a
+  delegated hosted-search lineage for its helper. The composite dispatcher
+  states `ToolOperationTarget::BuiltinOperation { operation:
+  BuiltinToolOperation::WebSearch }` for the web_search builtin it
+  registered (the tool declares it through `BuiltinTool::builtin_operation`;
+  tools without a declaration keep their plans) and revalidates it at
+  dispatch against its exact registration: another composite that
+  registered web_search as its own builtin, another owner
+  key, a plan resolved before the composite replaced its web_search
+  executor (even with an identical schema), or a plan whose name another
+  owner now holds is `ExecutionOwnerChanged`, and no executor runs. This
+  rejects stale, wrong-owner and tampered plans within trusted Rust
+  composition; witness constructors are public, so it is not cryptographic
+  resistance to hostile in-process Rust code. A tool
+  merely named web_search (a host dispatcher's, a registered bundle's or an
+  undeclared builtin) has no such target unless its owner states it itself,
+  which an in-process dispatcher can. The
+  helper's own model request is the typed delegate of exactly that call:
+  `ToolDispatchContext::tool_delegate_attribution(call,
+  ToolDelegateRole::HostedSearchInference)` mints a `ToolDelegateAttribution`
+  only from the dispatch's own prepared call (matched by identity) whose plan
+  carries that target, `LlmRequestAuthorization::for_tool_delegate` carries
+  it, and `PreparedAuthorizationBinding::delegate_attribution` exposes it to
+  owners. The delegate binds only an inference with exactly one hosted search
+  capability (`WebSearch`, or `GoogleSearch` for a Gemini helper) and no live
+  channel, under the call's work, execution scope, run and context revision
+  with a fresh operation id, and never moves to another run. One
+  attribution can prepare helper requests until its run ends; each is its
+  own operation and needs its own current lineage. Under a
+  targeted basis `operation_grant_target` selects
+  `GrantTarget::BuiltinToolOperation { operation }` for the call and
+  `GrantTarget::DelegatedHostedSearch { route, capability }` for the helper,
+  where `route` is the helper's own `ControllerRouteKey`; the work and every
+  original (named contributors and further originals) use the same
+  selector, with their current ceilings and the earliest expiry. Choosing
+  a target erases no restriction: hosts issue the target lineages and every
+  contributor's ceiling with the original time, operation (including
+  read-only, which is an action set: `ExecutionRestrictions` has no
+  read-only flag), resource-domain and private-data restrictions, and a
+  typed public-search target or read-only declaration does not mean private
+  information cannot leave. The
+  attribution grants, inherits and exempts nothing: it keys the selection
+  and the protected audit record (`AuditDelegateAttribution {
+  parent_operation_id, role }`), which also records the helper's own
+  decision and authorization refusal before its provider send. A helper
+  rated R2 or R3 settles at its model entry as `unsupported_entry` or
+  `human_consent_required` whether or not a reviewer exists, and nothing
+  is sent; the model sees it as `operation_authorization_unavailable`
+  feedback, and no audit row records that review refusal (a limit of every
+  model request). Behaviour contract:
+  revoking the call's own lineage refuses later calls but does not cancel
+  an invocation that already entered, which may still make its authorized
+  helper request (the helper passes its own work, contributor, route,
+  capability and entry checks and inherits nothing of the call); revoking
+  the helper's or a contributor's lineage before the helper's send prevents
+  it. Neither undoes a provider effect or ends the run on a local refusal.
+  `ResolvedToolExecutionPlan::single_operation_target` states the one-target
+  rule `grant_policy::single_tool_operation_target` now forwards to, and
+  `ServerToolKind` derives `PartialOrd`, `Ord` and `Hash`. Stock issues no
+  grant for either target and leaves both unmapped: stock is unsupported for
+  this route, not stock coverage of web_search. Limit: operation review of
+  web_search is an unsupported slice, not review coverage. It has no
+  reviewed entry point, so a review its owner requires settles as local
+  feedback and the search never runs: R2 is `reviewer_missing` without a
+  reviewer and `unsupported_entry` with one; R3 is `human_consent_required`
+  without a human consent route and `unsupported_entry` with one.
+- Typed catalog mode and visibility query. `meerkat_core::ToolCatalogView`
+  (with `ToolCatalogViewEntry` and `ToolCatalogVisibility`: `Visible`,
+  `Deferred` or `Hidden`) reports how a live session's next model request
+  projects its tool catalog: the catalog mode it takes (deferred only when
+  the exact catalog selects it and a catalog control plane exists or may be
+  composed), sources still connecting, whether a staged visibility change
+  waits for the next boundary, and for each catalog entry its deferral
+  eligibility (with its typed source owner), callability and visibility to
+  the model. It is read without changing anything, by the rules each
+  model-call boundary applies; the boundary now computes its control and
+  deferred names through the same projection. `Agent::tool_catalog_view`,
+  `SessionAgent::tool_catalog_view` (defaulted to `None`),
+  `EphemeralSessionService::tool_catalog_view`,
+  `PersistentSessionService::tool_catalog_view` and
+  `MobSessionService::tool_catalog_view` (defaulted to `Ok(None)`) expose it
+  beside the existing tool-scope snapshot queries. Like those siblings it
+  is not exposed over JSON-RPC or REST. A host that attaches a
+  deferred-eligible operation can ask whether the session defers it instead
+  of inferring that from the operation's source kind.
+- Typed boundary identity on authorization audit entries. Several
+  boundaries can record the entry of one operation (each staging point on a
+  tool call's dispatch chain, then its effect), and each now names itself
+  with the new `meerkat_core::OperationEntryBoundary`: `ToolDispatch` (the
+  root dispatch or an adapter staging the call), `ToolExecutionPolicy` (the
+  call-level execution policy gate), `ToolEffect` (the owning leaf's entry
+  immediately before its effect or transport handoff), `McpResourceRead`,
+  `McpAttachment`, `ModelRequest`, `ContextAppend` and `ReviewContextRead`.
+  The new `ToolDispatchContext::observe_tool_entry_at` stages a tool entry
+  at a named boundary; `observe_tool_entry` keeps its signature and names
+  `ToolDispatch`.
+- Typed grant targets for peer (comms) and memory operations.
+  `meerkat-core`: `ToolOperationTarget` gains `PeerSend { peer, kind }` (one
+  delivery to exactly one peer, by its canonical `PeerId`),
+  `PeerDirectoryRead` (a read of the session's own trusted-peer directory)
+  and `MemoryOperation { scope, operation }`, with the new `PeerSendKind`
+  (`Message`, `Request`, `Response`), `MemoryOperation` (`Read`, `Write`,
+  `Delete`, `Propose`) and `MemoryScopeRef` (`Session { session_id }`,
+  `Host { owner, scope }`, with `is_named()`), and
+  `MemorySearchScope::scope_ref()`. `SessionId` implements `PartialOrd` and
+  `Ord`. The default plans of the comms tools carry these targets:
+  `CommsToolSurface` (meerkat-tools) and `CommsToolDispatcher` and
+  `DynCommsToolDispatcher` (meerkat-comms), through the new
+  `meerkat_comms::CommsExecutionAuthority` and
+  `meerkat_comms::comms_tool_operation_target`, attach the peer each
+  delivery reaches (the `peer_id` of `send_message`, `send_request` and
+  `send_response`; for `reply_to_peer`, the sender of the turn's peer
+  message it selects) and the peer directory for `peers`.
+  `MemorySearchDispatcher` attaches a `Read` of the session memory it
+  searches. Each owner revalidates its own target at dispatch, so a plan
+  resolved for one peer never delivers to another, and under governed work
+  each runs only when the prepared authorization names exactly that target,
+  through the new `ToolDispatchContext::require_authorized_operation_target`
+  (for any owner whose effect a typed target selects) and
+  `CommsExecutionAuthority::require_authorized_target`. These guarantees
+  hold when every wrapper between the root dispatcher and the owner
+  forwards `resolve_execution_plan` and `dispatch_resolved_with_context`
+  with its context; the fenced dispatch refuses a governed comms or memory
+  plan that carries no target of its owner's kind.
+  `meerkat-authorization-contracts`: `GrantTarget` gains `Peer { peer }`,
+  `PeerDirectory` and `Memory { scope }`, and `meerkat-authorization`'s
+  `operation_grant_target` selects them on the normal targeted grant path:
+  one lineage per peer, per memory scope and for the peer directory, never a
+  wildcard and never the base. An embedding host maps the typed facts to its
+  own actions and selects one grant per target. The peer targets cover only
+  the five comms tools (`send_message`, `reply_to_peer`, `send_request` and
+  `send_response` select `Peer`, and `peers` selects `PeerDirectory`).
+  Other tools that reach agents, such as `delegate`, `council`,
+  `mob_spawn_member` and a mob member's calls up to its mob's operator,
+  carry no peer target and stay on the work's base lineage, which a `Peer`
+  lineage neither widens nor narrows. A `send_response` delivery's
+  addressee is the caller's assertion: the runtime checks that its request
+  id names a request this session received and can still answer, but
+  records no requester, so its `Peer` target names the peer the response is
+  delivered to, not a verified requester. `PeerSendKind` is descriptive, not
+  an authority boundary: lineage selection ignores it, so a host maps
+  `Response` to the same action as `Message`. A `Peer` lineage fences only
+  this session's own comms-tool deliveries and is not an egress fence for
+  mob members: `mob_spawn_member` delivers a caller-chosen initial message
+  to a member that can inherit tools, and `mob_wire` accepts an external
+  peer binding within the mob's scope, so a member can send to that peer
+  under its own admission. A host that uses `Peer` lineages as an egress
+  fence keeps the mob tools (at least `mob_wire` with external bindings)
+  off the base lineage.
 
 ### Changed
 
@@ -280,6 +551,15 @@ them.
   `budget_conflict`, and a row without recorded levels stays
   `unknown_supported_levels`; each leaves the request unchanged. Every Gemini
   model used to report `unknown_supported_levels`.
+
+### Deprecated
+
+- `meerkat_tools::builtin::comms::{SendTool, PeersTool, CommsToolSet}`. They
+  call the comms handler without the dispatch context and without a typed
+  operation target, so governed work refuses them at the fenced dispatch
+  (see Breaking), and `SendTool`'s `send` has no handler and always fails.
+  Use `CommsToolSurface`, whose plans carry the typed targets. Removal is
+  planned for 0.9.3.
 
 ### Fixed
 

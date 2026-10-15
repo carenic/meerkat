@@ -1077,3 +1077,433 @@ async fn scoped_admission_resolves_no_lineage_of_a_targeted_selection() {
             .is_accepted()
     );
 }
+
+#[derive(Clone, Copy, Debug)]
+enum DelegatedContributor {
+    WithoutSelection,
+    Narrower,
+    Within {
+        own_ms: u64,
+        contributor_ms: u64,
+        owner_ms: u64,
+        expected_ms: u64,
+    },
+    RevokedContributor,
+}
+
+/// The builtin web_search call by its typed target only, its hosted-search
+/// delegate by its own facts (the helper's allowance lasting until
+/// `helper_expires_ms`), and controller inference from the fixture's
+/// mutable controller account.
+struct SearchAndInfer {
+    controller: MutableControllerAccount,
+    domain: ResourceDomain,
+    executor: PrincipalRef,
+    helper_expires_ms: u64,
+}
+impl OperationPolicyOwner for SearchAndInfer {
+    fn authorize_controller_admission(
+        &self,
+        association: &InputAuthorityAssociation,
+        facts: &meerkat_core::ControllerModelFacts,
+        now: u64,
+    ) -> Result<
+        meerkat_authorization::grant_policy::ControllerAdmissionAllowance,
+        meerkat_core::OperationAuthorizationError,
+    > {
+        self.controller
+            .authorize_controller_admission(association, facts, now)
+    }
+    fn authorize_operation(
+        &self,
+        association: &InputAuthorityAssociation,
+        binding: &PreparedAuthorizationBinding,
+        purpose: LocalPolicyPurpose,
+        now: u64,
+    ) -> Result<LocalPolicyAllowance, meerkat_core::OperationAuthorizationError> {
+        use meerkat_core::authorization::{ToolAuthorizationFacts, ToolAuthorizationTarget};
+        let values = |actions: &[&str]| {
+            actions
+                .iter()
+                .map(|action| LocalOperationValues {
+                    action: ActionRef {
+                        feature: "native-test".into(),
+                        action: (*action).into(),
+                    },
+                    resource_domain: self.domain.clone(),
+                    processor: ProcessorRef::Principal {
+                        principal: self.executor.clone(),
+                    },
+                    audience: AudienceRef::Principal {
+                        principal: self.executor.clone(),
+                    },
+                })
+                .collect::<Vec<_>>()
+        };
+        let (operation_values, expires_at_ms) = match &binding.facts().operation {
+            AuthorizationOperation::Model(_) if binding.delegate_attribution().is_none() => {
+                return self
+                    .controller
+                    .authorize_operation(association, binding, purpose, now);
+            }
+            AuthorizationOperation::Model(_) if purpose == LocalPolicyPurpose::Operation => (
+                values(&["search-infer", "hosted-web-search"]),
+                self.helper_expires_ms,
+            ),
+            AuthorizationOperation::Tool(ToolAuthorizationFacts {
+                target: ToolAuthorizationTarget::Dispatcher(plan),
+                ..
+            }) if purpose == LocalPolicyPurpose::Operation
+                && matches!(
+                    plan.single_operation_target(),
+                    Ok(Some(meerkat_core::ToolOperationTarget::BuiltinOperation {
+                        operation: meerkat_core::BuiltinToolOperation::WebSearch,
+                    }))
+                ) =>
+            {
+                (values(&["web-search"]), 10_000)
+            }
+            _ => return Err(denied().into()),
+        };
+        Ok(LocalPolicyAllowance {
+            operation_values,
+            restrictions: ExecutionRestrictions::unrestricted(),
+            expires_at_ms,
+            review_tier: meerkat_core::authorization::OperationReviewTier::R1,
+        })
+    }
+}
+
+/// The helper's own complete route.
+fn search_helper() -> meerkat_core::authorization::ModelAuthorizationFacts {
+    meerkat_core::authorization::ModelAuthorizationFacts {
+        identity: Arc::new(meerkat_core::SessionLlmIdentity {
+            model: "search-model".into(),
+            provider: meerkat_core::Provider::OpenAI,
+            self_hosted_server_id: None,
+            provider_params: None,
+            auth_binding: None,
+        }),
+        wire_model: "search-wire-model".into(),
+        hosted_capabilities: Arc::from([meerkat_core::ServerToolKind::WebSearch]),
+        backend_profile_id: Some("search-profile".into()),
+        backend_kind: "openai".into(),
+        endpoint: "https://search.invalid/v1/responses".into(),
+        credential: Some(meerkat_core::AuthCredentialIdentity::Account(
+            meerkat_core::CredentialAccountRef {
+                realm: meerkat_core::RealmId::parse("native-test").expect("realm"),
+                account: meerkat_core::CredentialAccountId::parse("search-account")
+                    .expect("account"),
+            },
+        )),
+        usage: meerkat_core::authorization::ModelAuthorizationUse::Inference,
+        live_channel: None,
+    }
+}
+
+/// Original A selects lineages for the builtin web_search call and for its
+/// delegate's own route and capability, and names contributor B, which the
+/// source owner holds under its own targeted selection; only A is staged.
+/// The delegate is bounded by B through the same selector: refused when B
+/// selects nothing for it or a narrower lineage, allowed until the earliest
+/// of A's own, B's and the owner's expiry, and refused once B's lineage is
+/// revoked. A further original resolves the same key.
+async fn delegated_contributor(case: DelegatedContributor) {
+    use meerkat_authorization_contracts::constraints::{ExactRestriction, LifetimeRestriction};
+    use meerkat_authorization_contracts::work_association::{GrantTarget, TargetGrantLineage};
+    use meerkat_core::authorization::ToolDelegateRole;
+    let (configuration, prompt, domain) = configuration();
+    let prompt = isolated_credential(prompt);
+    let claims = prompt
+        .header()
+        .authority_association
+        .as_ref()
+        .expect("claims")
+        .candidate()
+        .clone();
+    let grants = Arc::clone(&configuration.grants);
+    let root = claims.controller_grant_lineage[0].root_authority.clone();
+    let issue = |label: &str, restrictions: ExecutionRestrictions| {
+        grants
+            .issue_root(
+                &root,
+                EvidenceId::new(label).expect("id"),
+                claims.logical_executor.clone(),
+                None,
+                restrictions,
+            )
+            .expect("independently issued grant")
+    };
+    let until = |expires_ms: u64| ExecutionRestrictions {
+        lifetime: LifetimeRestriction::window(0, expires_ms),
+        ..ExecutionRestrictions::unrestricted()
+    };
+    let (own_ms, contributor_ms, owner_ms) = match case {
+        DelegatedContributor::Within {
+            own_ms,
+            contributor_ms,
+            owner_ms,
+            ..
+        } => (own_ms, contributor_ms, owner_ms),
+        _ => (6_000, 5_000, 9_000),
+    };
+    let helper = search_helper();
+    let builtin = GrantTarget::BuiltinToolOperation {
+        operation: meerkat_core::BuiltinToolOperation::WebSearch,
+    };
+    let search = GrantTarget::DelegatedHostedSearch {
+        route: helper
+            .controller_route_key()
+            .expect("a complete route")
+            .as_str()
+            .to_owned(),
+        capability: meerkat_core::ServerToolKind::WebSearch,
+    };
+    let selecting =
+        |targets: Vec<(GrantTarget, GrantLineageRef)>| WorkAuthorityBasis::TargetedGrantLineages {
+            base: None,
+            targets: targets
+                .into_iter()
+                .map(|(target, grant)| TargetGrantLineage {
+                    target,
+                    lineage: vec![grant],
+                })
+                .collect(),
+        };
+    let a_basis = selecting(vec![
+        (
+            builtin.clone(),
+            issue("a-call", ExecutionRestrictions::unrestricted()),
+        ),
+        (search.clone(), issue("a-search", until(own_ms))),
+    ]);
+    let b_search = issue(
+        "b-search",
+        if matches!(case, DelegatedContributor::Narrower) {
+            ExecutionRestrictions {
+                actions: ExactRestriction::exact([ActionRef {
+                    feature: "native-test".into(),
+                    action: "hosted-web-search".into(),
+                }]),
+                ..until(contributor_ms)
+            }
+        } else {
+            until(contributor_ms)
+        },
+    );
+    let b_call = issue("b-call", ExecutionRestrictions::unrestricted());
+    let b_basis = if matches!(case, DelegatedContributor::WithoutSelection) {
+        selecting(vec![(builtin.clone(), b_call)])
+    } else {
+        selecting(vec![(builtin.clone(), b_call), (search, b_search.clone())])
+    };
+    let custody = Arc::new(Custody::default());
+    let held = |work: &str, basis: WorkAuthorityBasis| {
+        let original = OriginalWorkRef {
+            authority: claims.original_work.authority.clone(),
+            work: EvidenceId::new(work).expect("work"),
+        };
+        custody.0.lock().expect("fixture").insert(
+            original.work.clone(),
+            AuthenticatedOriginal {
+                original_work: original.clone(),
+                occurrence_scope: EvidenceId::new(format!("occurrence-{work}")).expect("id"),
+                original_authentication: claims.original_authentication.clone(),
+                root_event: claims.root_event.clone(),
+                contributing_work: Vec::new(),
+                target: claims.target.clone(),
+                authority_basis: basis,
+            },
+        );
+        original
+    };
+    let b = held("contributor-b", b_basis);
+    let mut composed = crate::meerkat_machine::ScopedGrantComposition {
+        grants: Arc::clone(&grants),
+        ingress_domain: claims.ingress_namespace.ingress.clone(),
+        originals: custody.clone(),
+        invocation: ScopedInvocation::from_policy(Arc::new(Policy {
+            requester: claims.requester.clone(),
+            executor: claims.logical_executor.clone(),
+        })),
+        operation_owner: Arc::new(SearchAndInfer {
+            controller: MutableControllerAccount {
+                enabled: std::sync::atomic::AtomicBool::new(true),
+                domain: domain.clone(),
+                executor: claims.logical_executor.clone(),
+            },
+            domain: domain.clone(),
+            executor: claims.logical_executor.clone(),
+            helper_expires_ms: owner_ms,
+        }),
+        retained_resume: None,
+    }
+    .into_configuration();
+    // This fixture binds no scoped session document; destination currency
+    // is the S3 binding's and is covered by the integrated test.
+    composed.require_scoped_destination = false;
+    let (machine, session, prompt) = pending_controller_input(composed, prompt).await;
+    install_owner_fixture_credential(&machine, &prompt);
+    let a = scoped_original_with_basis(
+        &prompt,
+        "original-a",
+        a_basis,
+        &custody,
+        std::slice::from_ref(&b),
+    );
+    let a_id = a.id().clone();
+    let driver = Arc::clone(
+        &machine
+            .sessions
+            .read()
+            .await
+            .get(&session)
+            .expect("entry")
+            .driver,
+    );
+    let run = meerkat_core::RunId::new();
+    let context = {
+        let mut locked = driver.lock().await;
+        let DriverEntry::Ephemeral(driver) = &mut *locked else {
+            panic!("storeless")
+        };
+        driver.set_executor_work_authorization_support(true);
+        driver
+            .accept_input(a)
+            .await
+            .expect("A, naming held B, is admitted");
+        let context = driver
+            .batch_work_authorization(&run, std::slice::from_ref(&a_id))
+            .expect("only A")
+            .expect("context");
+        driver
+            .contract_begin_run_authority(run.clone())
+            .expect("actual run");
+        driver
+            .machine_realize_authorized_stage_batch(
+                crate::meerkat_machine::driver::test_authorized_stage_for_run(
+                    vec![a_id.clone()],
+                    run.clone(),
+                ),
+            )
+            .expect("stage only A");
+        context
+    };
+    let attribution = meerkat_core::authorization::__test_mint_tool_delegate(
+        &context,
+        Some(run.clone()),
+        ToolDelegateRole::HostedSearchInference,
+    )
+    .await
+    .expect("A and B both select the builtin call, so its dispatch mints the delegate");
+    let delegate = meerkat_core::LlmRequestAuthorization::for_tool_delegate(attribution);
+    let denied_kind = |result: Result<(), meerkat_core::OperationAuthorizationError>| match result {
+        Err(meerkat_core::OperationAuthorizationError::Refused(refusal)) => Some(refusal.kind()),
+        _ => None,
+    };
+    match case {
+        DelegatedContributor::WithoutSelection => assert_eq!(
+            denied_kind(delegate.prepare(helper).map(|_| ())),
+            Some(OperationRefusalKind::Denied),
+            "B selects no lineage for the delegate's route"
+        ),
+        DelegatedContributor::Narrower => assert_eq!(
+            denied_kind(delegate.prepare(helper).map(|_| ())),
+            Some(OperationRefusalKind::Denied),
+            "B's narrower delegate lineage constrains A's helper"
+        ),
+        DelegatedContributor::Within { expected_ms, .. } => {
+            let prepared = delegate
+                .prepare(helper)
+                .expect("A's, B's and the owner's bounds all allow the helper");
+            assert_eq!(
+                prepared.validity().expect("bounded decision").expires_at_ms,
+                expected_ms,
+                "the earliest of A's own ({own_ms}), B's ({contributor_ms}) and the owner's \
+                 ({owner_ms}) expiry"
+            );
+            let grant = crate::meerkat_machine::original_operation_grant(
+                &grants,
+                custody.as_ref(),
+                &claims.ingress_namespace,
+                &b,
+                prepared.binding(),
+                &claims.logical_executor,
+                None,
+            )
+            .expect("B's own delegate lineage")
+            .expect("a grant-lineage basis");
+            assert_eq!(grant.expires_at_ms(), contributor_ms);
+            let c = held(
+                "further-c",
+                selecting(vec![(
+                    builtin,
+                    issue("c-call", ExecutionRestrictions::unrestricted()),
+                )]),
+            );
+            assert_eq!(
+                denied_kind(
+                    crate::meerkat_machine::original_operation_grant(
+                        &grants,
+                        custody.as_ref(),
+                        &claims.ingress_namespace,
+                        &c,
+                        prepared.binding(),
+                        &claims.logical_executor,
+                        None,
+                    )
+                    .map(|_| ())
+                ),
+                Some(OperationRefusalKind::Denied),
+                "a further original selecting nothing for the delegate's key"
+            );
+        }
+        DelegatedContributor::RevokedContributor => {
+            let prepared = delegate
+                .clone()
+                .prepare(helper.clone())
+                .expect("permitted before B's revocation");
+            grants
+                .revoke(&root, &b_search, &mut AnyCustody)
+                .expect("B's delegate grant is revoked");
+            assert_eq!(
+                denied_kind(prepared.current().map(|_| ())),
+                Some(OperationRefusalKind::Denied),
+                "a helper prepared before B's revocation is refused at its entry check"
+            );
+            assert_eq!(
+                denied_kind(delegate.prepare(helper).map(|_| ())),
+                Some(OperationRefusalKind::Denied),
+                "A's helper is refused once B's delegate grant is gone"
+            );
+            context
+                .authorization()
+                .prepare(&plain_controller_binding(&context, &run))
+                .expect("the run's controller inference still proceeds");
+        }
+    }
+}
+
+/// wsa-design 3.7 and its ruling (Q5) on the actual native owner: every
+/// contributor bounds a delegated hosted search through the same exact
+/// selector as the work's own lineage, with the current ceilings and the
+/// earliest expiry, each case on a credential account of its own.
+#[tokio::test]
+async fn every_contributor_bounds_a_delegated_search_by_the_same_selector() {
+    delegated_contributor(DelegatedContributor::WithoutSelection).await;
+    delegated_contributor(DelegatedContributor::Narrower).await;
+    for (own_ms, contributor_ms, owner_ms, expected_ms) in [
+        (6_000, 5_000, 9_000, 5_000),
+        (4_500, 5_000, 9_000, 4_500),
+        (6_000, 5_000, 4_000, 4_000),
+    ] {
+        delegated_contributor(DelegatedContributor::Within {
+            own_ms,
+            contributor_ms,
+            owner_ms,
+            expected_ms,
+        })
+        .await;
+    }
+    delegated_contributor(DelegatedContributor::RevokedContributor).await;
+}

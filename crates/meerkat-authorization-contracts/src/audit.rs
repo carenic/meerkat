@@ -7,8 +7,8 @@
 use std::sync::Arc;
 
 use meerkat_core::authorization::{
-    MandatoryHookWithholding, OperationObservationError, OperationObservedOutcome,
-    OperationRefusalKind,
+    MandatoryHookWithholding, OperationEntryBoundary, OperationObservationError,
+    OperationObservedOutcome, OperationRefusalKind,
 };
 use meerkat_core::exact_operation::OperationExecutionScope;
 use meerkat_core::{InputId, OperationId, PrincipalRef, RunId, SessionId};
@@ -156,7 +156,14 @@ pub enum AuditObservation {
         target: Arc<AuditTarget>,
     },
     /// A synchronous boundary attempt, not proof the physical body ran.
-    Entry,
+    /// `boundary` names the boundary that observed it: several boundaries
+    /// can record the entry of one operation. Records written before
+    /// boundaries were recorded omit it and read as `None` (unattributed);
+    /// every new record names its boundary.
+    Entry {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        boundary: Option<OperationEntryBoundary>,
+    },
     Outcome {
         outcome: OperationObservedOutcome,
     },
@@ -182,6 +189,11 @@ pub struct AuthorizationAuditObservation {
     /// this field; neither decoding nor replay creates live review authority.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub review_attribution: Option<AuditReviewAttribution>,
+    /// Passive parent of a builtin tool's delegated operation (the
+    /// web_search helper's own model request). Older records omit this
+    /// field; neither decoding nor replay creates a delegate or permission.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delegate_attribution: Option<AuditDelegateAttribution>,
     pub observation: AuditObservation,
 }
 
@@ -198,6 +210,21 @@ pub struct AuditReviewAttribution {
 pub enum AuditReviewRole {
     ContextRead,
     ReviewerInference,
+}
+
+/// The call whose builtin tool performed a delegated operation, projected
+/// from the operation's binding.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuditDelegateAttribution {
+    pub parent_operation_id: OperationId,
+    pub role: AuditDelegateRole,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuditDelegateRole {
+    HostedSearchInference,
 }
 
 /// Parties projected by the actual native owner from its retained row. The
@@ -247,6 +274,7 @@ redacted_debug!(
     AuditObservation,
     AuthorizationAuditObservation,
     AuditReviewAttribution,
+    AuditDelegateAttribution,
     NativeAuditContributor,
     StoredAuthorizationAuditObservation
 );
@@ -276,7 +304,7 @@ impl AuthorizationAuditObservation {
                 SafeAuditObservation::AuthorizationUnavailable
             }
             AuditObservation::Refused { .. } => SafeAuditObservation::Refused,
-            AuditObservation::Entry => SafeAuditObservation::EntryAttempt,
+            AuditObservation::Entry { .. } => SafeAuditObservation::EntryAttempt,
             AuditObservation::Outcome { .. } => SafeAuditObservation::Returned,
             AuditObservation::MandatoryHookWithheld { .. } => {
                 SafeAuditObservation::MandatoryHookWithheld
@@ -308,6 +336,7 @@ mod tests {
             run_id: Some(RunId::new()),
             context_revision: None,
             review_attribution: None,
+            delegate_attribution: None,
             observation: AuditObservation::MandatoryHookWithheld {
                 withholding: MandatoryHookWithholding {
                     sequence: 3,
@@ -380,7 +409,81 @@ mod tests {
         });
         let decoded: AuthorizationAuditObservation = serde_json::from_value(old.clone()).unwrap();
         assert!(decoded.review_attribution.is_none());
+        assert!(decoded.delegate_attribution.is_none());
         assert_eq!(serde_json::to_value(decoded).unwrap(), old);
+    }
+
+    /// An entry record names the boundary that observed it, so the entries
+    /// several boundaries stage for one operation can be told apart. An
+    /// unknown boundary is refused, never read as some other boundary.
+    #[test]
+    fn entry_records_round_trip_their_boundary() {
+        let record = serde_json::json!({
+            "operation_id": OperationId::new(),
+            "execution_scope": OperationExecutionScope::Domain,
+            "run_id": null,
+            "context_revision": null,
+            "observation": {"kind": "entry", "boundary": "tool_effect"},
+        });
+        let decoded: AuthorizationAuditObservation =
+            serde_json::from_value(record.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&decoded).unwrap(), record);
+        assert_eq!(
+            decoded.safe_projection(),
+            SafeAuditObservation::EntryAttempt
+        );
+        let mut unknown = record;
+        unknown["observation"]["boundary"] = serde_json::json!("future_boundary");
+        assert!(serde_json::from_value::<AuthorizationAuditObservation>(unknown).is_err());
+    }
+
+    /// A new record decodes to its typed boundary; a record written before
+    /// boundaries were recorded decodes as an unattributed entry.
+    #[test]
+    fn entry_records_decode_to_their_typed_boundary() {
+        let observation = |value: serde_json::Value| {
+            serde_json::from_value::<AuthorizationAuditObservation>(serde_json::json!({
+                "operation_id": OperationId::new(),
+                "execution_scope": OperationExecutionScope::Domain,
+                "run_id": null,
+                "context_revision": null,
+                "observation": value,
+            }))
+            .unwrap()
+            .observation
+        };
+        assert!(matches!(
+            observation(serde_json::json!({"kind": "entry", "boundary": "tool_dispatch"})),
+            AuditObservation::Entry {
+                boundary: Some(OperationEntryBoundary::ToolDispatch)
+            }
+        ));
+        assert!(matches!(
+            observation(serde_json::json!({"kind": "entry"})),
+            AuditObservation::Entry { boundary: None }
+        ));
+    }
+
+    /// A reader built before entries named their boundary still decodes a
+    /// new entry record, as a plain entry: the added field is ignored, not
+    /// refused.
+    #[test]
+    fn pre_boundary_readers_still_decode_new_entry_records() {
+        #[derive(Deserialize)]
+        #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+        enum PreBoundaryObservation {
+            Entry,
+            Outcome {
+                #[allow(dead_code)]
+                outcome: OperationObservedOutcome,
+            },
+        }
+        let decoded: PreBoundaryObservation = serde_json::from_value(serde_json::json!({
+            "kind": "entry",
+            "boundary": "tool_effect",
+        }))
+        .unwrap();
+        assert!(matches!(decoded, PreBoundaryObservation::Entry));
     }
 
     #[test]
@@ -392,6 +495,7 @@ mod tests {
             run_id: None,
             context_revision: None,
             review_attribution: None,
+            delegate_attribution: None,
             observation: AuditObservation::ReviewAttemptStarted {
                 attempt_ref: "private-attempt".into(),
             },
@@ -407,7 +511,9 @@ mod tests {
                     attempt_ref: "private-attempt".into(),
                     role,
                 }),
-                observation: AuditObservation::Entry,
+                observation: AuditObservation::Entry {
+                    boundary: Some(OperationEntryBoundary::ReviewContextRead),
+                },
                 ..start.clone()
             };
             let value = serde_json::to_value(&child).unwrap();
@@ -435,5 +541,50 @@ mod tests {
             .unwrap(),
             start
         );
+    }
+
+    /// A hosted-search delegate's record names its parent operation and role.
+    /// It round trips, stays out of the safe projection and diagnostics, and
+    /// refuses unknown fields and roles; decoding it recreates no delegate.
+    #[test]
+    fn a_delegate_attribution_round_trips_outside_the_safe_projection() {
+        let parent = OperationId::new();
+        let record = AuthorizationAuditObservation {
+            operation_id: OperationId::new(),
+            execution_scope: OperationExecutionScope::Domain,
+            run_id: Some(RunId::new()),
+            context_revision: None,
+            review_attribution: None,
+            delegate_attribution: Some(AuditDelegateAttribution {
+                parent_operation_id: parent.clone(),
+                role: AuditDelegateRole::HostedSearchInference,
+            }),
+            observation: AuditObservation::Entry {
+                boundary: Some(meerkat_core::OperationEntryBoundary::ModelRequest),
+            },
+        };
+        let value = serde_json::to_value(&record).unwrap();
+        assert_eq!(
+            value["delegate_attribution"],
+            serde_json::json!({
+                "parent_operation_id": parent,
+                "role": "hosted_search_inference",
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<AuthorizationAuditObservation>(value.clone()).unwrap(),
+            record
+        );
+        assert_eq!(
+            serde_json::to_value(record.safe_projection()).unwrap(),
+            "entry_attempt"
+        );
+        assert!(!format!("{record:?}").contains(&parent.to_string()));
+        let mut unknown = value.clone();
+        unknown["delegate_attribution"]["recovered_allowance"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<AuthorizationAuditObservation>(unknown).is_err());
+        let mut unknown_role = value;
+        unknown_role["delegate_attribution"]["role"] = serde_json::json!("controller");
+        assert!(serde_json::from_value::<AuthorizationAuditObservation>(unknown_role).is_err());
     }
 }
