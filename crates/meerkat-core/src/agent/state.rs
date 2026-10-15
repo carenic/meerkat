@@ -5884,39 +5884,16 @@ where
             } else {
                 Arc::from([])
             };
-            let (control_tool_names, deferred_tool_names) =
-                match (exact_catalog, current_catalog.as_ref()) {
-                    (true, Some(catalog)) => {
-                        let control_names = catalog
-                            .iter()
-                            .filter(|entry| entry.plane == ToolPlaneClass::Control)
-                            .map(|entry| entry.tool.name.clone())
-                            .collect::<std::collections::HashSet<_>>();
-                        let deferred_names = if (!control_names.is_empty()
-                            || catalog_capabilities.may_require_catalog_control_plane)
-                            && matches!(catalog_mode, ToolCatalogMode::Deferred)
-                        {
-                            catalog
-                                .iter()
-                                .filter(|entry| entry.plane == ToolPlaneClass::Session)
-                                .filter(|entry| {
-                                    matches!(
-                                        entry.deferred_eligibility,
-                                        ToolCatalogDeferredEligibility::DeferredEligible { .. }
-                                    )
-                                })
-                                .map(|entry| entry.tool.name.clone())
-                                .collect()
-                        } else {
-                            std::collections::HashSet::new()
-                        };
-                        (control_names, deferred_names)
-                    }
-                    _ => (
-                        std::collections::HashSet::new(),
-                        std::collections::HashSet::new(),
-                    ),
-                };
+            // The same projection a host's catalog view previews.
+            let crate::tool_catalog::CatalogBoundaryProjection {
+                control_tool_names,
+                deferred_tool_names,
+                ..
+            } = crate::tool_catalog::catalog_boundary_projection(
+                catalog_capabilities,
+                current_catalog.as_deref(),
+                catalog_mode,
+            );
             let previous_visibility_state = self.tool_scope.visibility_state().ok();
             let apply_result = match self.tool_scope.promote_staged_visibility() {
                 Ok(visibility_state) => {
@@ -21976,6 +21953,92 @@ mod tests {
             vec!["secret".to_string(), "deferred_tool_two".to_string()],
             "boundary recompute must not hide deferred tools when no control plane is available"
         );
+    }
+
+    fn catalog_view_visibility(
+        view: &crate::ToolCatalogView,
+        name: &str,
+    ) -> Option<crate::ToolCatalogVisibility> {
+        view.entries
+            .iter()
+            .find(|entry| entry.name == name)
+            .map(|entry| entry.visibility)
+    }
+
+    /// A host can ask a live agent, without changing it, how its next model
+    /// request projects the tool catalog: the catalog mode, and per tool
+    /// whether the model sees it or finds it behind the deferred catalog.
+    #[tokio::test]
+    async fn tool_catalog_view_reports_the_next_request_projection() {
+        use crate::{ToolCatalogMode, ToolCatalogVisibility};
+        let client = Arc::new(DeferredLoadVisibilityClient::new());
+        let tools = Arc::new(DeferredLoadDispatcher::new());
+        let mut agent = with_test_turn_state_handle(AgentBuilder::new())
+            .with_tool_visibility_owner(explicit_test_visibility_owner())
+            .build_standalone(client.clone(), tools, Arc::new(NoopStore))
+            .await;
+
+        let view = agent.tool_catalog_view().expect("catalog view");
+        assert_eq!(view.mode, ToolCatalogMode::Deferred);
+        assert!(view.exact_catalog);
+        assert!(!view.staged_changes_pending);
+        assert_eq!(
+            catalog_view_visibility(&view, "tool_catalog_load"),
+            Some(ToolCatalogVisibility::Visible)
+        );
+        for name in ["deferred_tool", "deferred_tool_two"] {
+            assert_eq!(
+                catalog_view_visibility(&view, name),
+                Some(ToolCatalogVisibility::Deferred),
+                "{name} is reachable only through the deferred catalog"
+            );
+            assert!(matches!(
+                view.entries
+                    .iter()
+                    .find(|entry| entry.name == name)
+                    .map(|entry| &entry.deferred_eligibility),
+                Some(crate::ToolCatalogDeferredEligibility::DeferredEligible { .. })
+            ));
+        }
+        // Reading the view changes nothing.
+        assert_eq!(agent.tool_catalog_view(), Some(view));
+
+        // The run loads deferred_tool; from the next boundary on the model
+        // sees it, and the view says so.
+        agent.config.max_turns = Some(2);
+        let result = agent.run("prompt".to_string().into()).await.unwrap();
+        assert_eq!(result.text, "done");
+        let view = agent.tool_catalog_view().expect("catalog view after load");
+        assert_eq!(view.mode, ToolCatalogMode::Deferred);
+        assert_eq!(
+            catalog_view_visibility(&view, "deferred_tool"),
+            Some(ToolCatalogVisibility::Visible)
+        );
+        assert_eq!(
+            catalog_view_visibility(&view, "deferred_tool_two"),
+            Some(ToolCatalogVisibility::Deferred)
+        );
+    }
+
+    /// Without a catalog control plane the session never hides a
+    /// deferred-eligible tool: the view reports the inline mode the requests
+    /// actually take, with every tool visible.
+    #[tokio::test]
+    async fn tool_catalog_view_without_a_control_plane_is_inline() {
+        let client = Arc::new(VisibilityRecordingLlmClient::new());
+        let tools = Arc::new(DeferredWithoutControlDispatcher::new());
+        let agent = with_test_turn_state_handle(AgentBuilder::new())
+            .build_standalone(client, tools, Arc::new(NoopStore))
+            .await;
+        let view = agent.tool_catalog_view().expect("catalog view");
+        assert_eq!(view.mode, crate::ToolCatalogMode::Inline);
+        for name in ["secret", "deferred_tool_two"] {
+            assert_eq!(
+                catalog_view_visibility(&view, name),
+                Some(crate::ToolCatalogVisibility::Visible),
+                "{name} stays inline without a control plane"
+            );
+        }
     }
 
     #[tokio::test]

@@ -1827,18 +1827,87 @@ impl ToolScope {
         state
             .base_tools
             .iter()
-            .filter(|tool| tool.audience.allows_model())
             .filter(|tool| {
-                state.control_tool_names.contains(tool.name.as_str())
-                    || (Self::is_requested_session_tool_visible(
-                        state,
-                        visibility_state,
-                        tool.as_ref(),
-                    ) && composed.allows(tool.name.as_str()))
+                Self::tool_visibility(state, visibility_state, &composed, tool)
+                    == crate::tool_catalog::ToolCatalogVisibility::Visible
             })
             .map(Arc::clone)
             .collect::<Vec<_>>()
             .into()
+    }
+
+    /// How one base tool shows to the model: a control-plane tool always,
+    /// any other only when the composed filters allow it and, if it is
+    /// deferred, it was requested. A deferred tool the filters allow but
+    /// nothing requested is behind the deferred catalog.
+    fn tool_visibility(
+        state: &ToolScopeState,
+        visibility_state: &SessionToolVisibilityState,
+        composed: &ComposedToolFilter,
+        tool: &ToolDef,
+    ) -> crate::tool_catalog::ToolCatalogVisibility {
+        use crate::tool_catalog::ToolCatalogVisibility;
+        if !tool.audience.allows_model() {
+            return ToolCatalogVisibility::Hidden;
+        }
+        if state.control_tool_names.contains(tool.name.as_str()) {
+            return ToolCatalogVisibility::Visible;
+        }
+        if !composed.allows(tool.name.as_str()) {
+            return ToolCatalogVisibility::Hidden;
+        }
+        if Self::is_requested_session_tool_visible(state, visibility_state, tool) {
+            ToolCatalogVisibility::Visible
+        } else {
+            ToolCatalogVisibility::Deferred
+        }
+    }
+
+    /// How a boundary that projected `base_tools` with these control-plane
+    /// and deferred names would show each base tool to the model under the
+    /// scope's active state, read without changing the scope. A staged
+    /// change the next boundary promotes is not applied.
+    pub(crate) fn preview_catalog_visibility(
+        &self,
+        base_tools: Arc<[Arc<ToolDef>]>,
+        control_tool_names: HashSet<ToolName>,
+        deferred_tool_names: HashSet<ToolName>,
+    ) -> Result<
+        std::collections::BTreeMap<ToolName, crate::tool_catalog::ToolCatalogVisibility>,
+        ToolScopeApplyError,
+    > {
+        let visibility_state = self.visibility_owner.visibility_state()?;
+        let require_filter_witnesses = self.visibility_owner.requires_filter_witnesses();
+        let preview = {
+            let state = self
+                .state
+                .read()
+                .map_err(|_| ToolScopeApplyError::LockPoisoned)?;
+            ToolScopeState {
+                known_base_names: base_tools
+                    .iter()
+                    .map(|tool| tool.name.to_string())
+                    .collect(),
+                base_tools,
+                control_tool_names: control_tool_names.into_iter().collect(),
+                deferred_tool_names: deferred_tool_names.into_iter().collect(),
+                active_turn_allow: state.active_turn_allow.clone(),
+                active_turn_deny: state.active_turn_deny.clone(),
+                active_turn_deferred_names: state.active_turn_deferred_names.clone(),
+            }
+        };
+        let composed =
+            Self::compose_state_filters(&preview, &visibility_state, require_filter_witnesses);
+        Ok(preview
+            .base_tools
+            .iter()
+            .map(|tool| {
+                (
+                    tool.name.clone(),
+                    Self::tool_visibility(&preview, &visibility_state, &composed, tool),
+                )
+            })
+            .collect())
     }
 
     fn compose_state_filters(

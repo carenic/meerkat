@@ -72,6 +72,25 @@ them.
 
 ### Added
 
+- Typed catalog mode and visibility query. `meerkat_core::ToolCatalogView`
+  (with `ToolCatalogViewEntry` and `ToolCatalogVisibility`: `Visible`,
+  `Deferred` or `Hidden`) reports how a live session's next model request
+  projects its tool catalog: the catalog mode it takes (deferred only when
+  the exact catalog selects it and a catalog control plane exists or may be
+  composed), sources still connecting, whether a staged visibility change
+  waits for the next boundary, and for each catalog entry its deferral
+  eligibility (with its typed source owner), callability and visibility to
+  the model. It is read without changing anything, by the rules each
+  model-call boundary applies; the boundary now computes its control and
+  deferred names through the same projection. `Agent::tool_catalog_view`,
+  `SessionAgent::tool_catalog_view` (defaulted to `None`),
+  `EphemeralSessionService::tool_catalog_view`,
+  `PersistentSessionService::tool_catalog_view` and
+  `MobSessionService::tool_catalog_view` (defaulted to `Ok(None)`) expose it
+  beside the existing tool-scope snapshot queries. Like those siblings it
+  is not exposed over JSON-RPC or REST. A host that attaches a
+  deferred-eligible operation can ask whether the session defers it instead
+  of inferring that from the operation's source kind.
 - Typed boundary identity on authorization audit entries. Several
   boundaries can record the entry of one operation (each staging point on a
   tool call's dispatch chain, then its effect), and each now names itself
