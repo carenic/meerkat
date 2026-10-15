@@ -2764,15 +2764,22 @@ impl MobMcpState {
 
                 // Decide before any actor exists: a child whose owner is
                 // archived is torn down without activation, and one whose
-                // owner is unresolved is held, never resumed.
+                // owner is unresolved is held, never resumed. The resume, the
+                // teardown and the scavenge below are built in their own
+                // frames: at opt-level 0 each awaited future reserved twice
+                // its size in this poll frame, beneath every mob it restores.
                 match self.child_mob_restore_gate(&storage, &path).await? {
                     ChildMobRestoreGate::Resume => {
-                        self.resume_persisted_mob(storage, &path).await?;
+                        meerkat_runtime::stack_relief::box_in_own_frame(|| {
+                            self.resume_persisted_mob(storage, &path)
+                        })
+                        .await?;
                     }
                     ChildMobRestoreGate::Teardown { mob_id, owner } => {
-                        if let Err(error) = self
-                            .tear_down_archived_child_mob(storage, &path, mob_id.clone(), owner)
-                            .await
+                        if let Err(error) = meerkat_runtime::stack_relief::box_in_own_frame(|| {
+                            self.tear_down_archived_child_mob(storage, &path, mob_id.clone(), owner)
+                        })
+                        .await
                         {
                             tracing::warn!(
                                 mob_id = %mob_id,
@@ -2785,9 +2792,10 @@ impl MobMcpState {
                 }
             }
 
-            let _ = self
-                .scavenge_orphaned_bridge_session_scoped_mobs_inner()
-                .await;
+            let _ = meerkat_runtime::stack_relief::box_in_own_frame(|| {
+                self.scavenge_orphaned_bridge_session_scoped_mobs_inner()
+            })
+            .await;
             Ok(())
         }
     }
@@ -2950,17 +2958,26 @@ impl MobMcpState {
         // Like a create, the resume runs to its registration as the state's
         // own task, so a dropped caller cannot leave a resumed actor outside
         // the managed set.
+        // The resume is built in its own frame on either path: at opt-level 0
+        // its future, moved by value into the state task or awaited inline,
+        // reserved its size several times in this poll frame.
         if let Some(state) = self.self_weak.get().and_then(std::sync::Weak::upgrade) {
             let path = path.to_path_buf();
             return self
-                .run_admitted_create("mob resume", async move {
-                    let _hold = hold;
-                    state.resume_persisted_mob_held(storage, &path).await
-                })
+                .run_admitted_create(
+                    "mob resume",
+                    meerkat_runtime::stack_relief::box_in_own_frame(move || async move {
+                        let _hold = hold;
+                        state.resume_persisted_mob_held(storage, &path).await
+                    }),
+                )
                 .await;
         }
         let _hold = hold;
-        self.resume_persisted_mob_held(storage, path).await
+        meerkat_runtime::stack_relief::box_in_own_frame(|| {
+            self.resume_persisted_mob_held(storage, path)
+        })
+        .await
     }
 
     /// The body of [`Self::resume_persisted_mob`] under its hold.
@@ -2971,11 +2988,15 @@ impl MobMcpState {
         path: &Path,
     ) -> Result<MobId, MobError> {
         let scope = child_tool_policy::ChildMobScope::default();
-        let handle = self
-            .configure_builder(MobBuilder::for_resume(storage), scope.clone(), None)
-            .before_activation(self.restore_scope_hook(scope))
-            .resume()
-            .await?;
+        // The builder and its resume are built in their own frame, and so is
+        // the registration: at opt-level 0 each awaited future reserved twice
+        // its size in this poll frame, beneath the mob's whole resume.
+        let handle = meerkat_runtime::stack_relief::box_in_own_frame(|| {
+            self.configure_builder(MobBuilder::for_resume(storage), scope.clone(), None)
+                .before_activation(self.restore_scope_hook(scope))
+                .resume()
+        })
+        .await?;
         #[cfg(test)]
         {
             let hold = self
@@ -2989,7 +3010,8 @@ impl MobMcpState {
                 hold.release.notified().await;
             }
         }
-        self.register_resumed_mob(handle, path).await
+        meerkat_runtime::stack_relief::box_in_own_frame(|| self.register_resumed_mob(handle, path))
+            .await
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -3133,16 +3155,20 @@ impl MobMcpState {
             Some(state) => {
                 let path = path.to_path_buf();
                 let mob_id = mob_id.clone();
+                // The handoff, the direct admission and the destroy below are
+                // built in their own frames: at opt-level 0 each future,
+                // moved by value into the state task or awaited inline,
+                // reserved its size several times in this poll frame.
                 let handoff = self
                     .state_tasks
                     .spawn(
                         state_tasks::StateTaskKind::Owned,
                         "child mob teardown handoff",
-                        async move {
+                        meerkat_runtime::stack_relief::box_in_own_frame(move || async move {
                             state
                                 .admit_child_teardown_into_custody(storage, path, mob_id, owner)
                                 .await
-                        },
+                        }),
                     )
                     .ok_or_else(|| MobMcpDestroyError::Mob(Self::stood_down_error()))?;
                 handoff.await.map_err(|_| {
@@ -3152,21 +3178,24 @@ impl MobMcpState {
                 })??
             }
             None => {
-                self.admit_child_teardown_into_custody(
-                    storage,
-                    path.to_path_buf(),
-                    mob_id.clone(),
-                    owner,
-                )
+                meerkat_runtime::stack_relief::box_in_own_frame(|| {
+                    self.admit_child_teardown_into_custody(
+                        storage,
+                        path.to_path_buf(),
+                        mob_id.clone(),
+                        owner,
+                    )
+                })
                 .await?
             }
         };
         // While `custody` is held, this envelope is the only destroy in
         // flight; once it is dropped, on any path, the actor's own retry
         // recovers whatever cleanup remains.
-        let result = self
-            .mob_destroy_unchecked_loaded(&mob_id, MobDestroyCaller::Console)
-            .await;
+        let result = meerkat_runtime::stack_relief::box_in_own_frame(|| {
+            self.mob_destroy_unchecked_loaded(&mob_id, MobDestroyCaller::Console)
+        })
+        .await;
         drop(custody);
         result
     }
@@ -3212,15 +3241,18 @@ impl MobMcpState {
         }
         let scope = child_tool_policy::ChildMobScope::default();
         let (custody, custody_watch) = meerkat_mob::runtime::start_admitted_destroy_custody();
-        let resumed = self
-            .configure_builder(MobBuilder::for_resume(storage), scope.clone(), None)
-            .before_activation(self.restore_scope_hook(scope))
-            .admit_destroy_before_start(
-                CommandAuthority::principal(self.console_principal.clone()),
-                custody_watch,
-            )
-            .resume()
-            .await;
+        // Built in its own frame, like the resume in
+        // `resume_persisted_mob_held`.
+        let resumed = meerkat_runtime::stack_relief::box_in_own_frame(|| {
+            self.configure_builder(MobBuilder::for_resume(storage), scope.clone(), None)
+                .before_activation(self.restore_scope_hook(scope))
+                .admit_destroy_before_start(
+                    CommandAuthority::principal(self.console_principal.clone()),
+                    custody_watch,
+                )
+                .resume()
+        })
+        .await;
         let handle = match resumed {
             Ok(handle) => handle,
             Err(error) => {
@@ -3228,9 +3260,11 @@ impl MobMcpState {
                 return Err(MobMcpDestroyError::Mob(error));
             }
         };
-        self.register_resumed_mob(handle, &path)
-            .await
-            .map_err(MobMcpDestroyError::Mob)?;
+        meerkat_runtime::stack_relief::box_in_own_frame(|| {
+            self.register_resumed_mob(handle, &path)
+        })
+        .await
+        .map_err(MobMcpDestroyError::Mob)?;
         // Managed custody now holds the child: only now does its hold end.
         self.held_child_mobs.write().await.remove(&mob_id);
         Ok(custody)
@@ -3358,21 +3392,29 @@ impl MobMcpState {
                 }
             };
             // The held row stays until the child is registered as managed.
+            // The teardown and the resume are built in their own frames: at
+            // opt-level 0 each awaited future reserved twice its size in
+            // this poll frame.
             if archived {
-                if self
-                    .tear_down_archived_child_mob(
+                if meerkat_runtime::stack_relief::box_in_own_frame(|| {
+                    self.tear_down_archived_child_mob(
                         storage,
                         &held.storage_path,
                         held.mob_id.clone(),
                         held.owner.clone(),
                     )
-                    .await
-                    .is_ok()
+                })
+                .await
+                .is_ok()
                 {
                     destroyed.push(held.mob_id.clone());
                 }
             } else {
-                match self.resume_persisted_mob(storage, &held.storage_path).await {
+                match meerkat_runtime::stack_relief::box_in_own_frame(|| {
+                    self.resume_persisted_mob(storage, &held.storage_path)
+                })
+                .await
+                {
                     Ok(_) => {
                         self.held_child_mobs.write().await.remove(&held.mob_id);
                     }
@@ -5658,8 +5700,13 @@ impl MobMcpState {
     }
 
     async fn scavenge_orphaned_bridge_session_scoped_mobs_inner(&self) -> Vec<MobId> {
+        // The reobservation and each destroy below are built in their own
+        // frames: at opt-level 0 each awaited future reserved twice its size
+        // in this poll frame.
         #[cfg(not(target_arch = "wasm32"))]
-        let mut scavenged = self.reobserve_held_child_mobs().await;
+        let mut scavenged =
+            meerkat_runtime::stack_relief::box_in_own_frame(|| self.reobserve_held_child_mobs())
+                .await;
         #[cfg(target_arch = "wasm32")]
         let mut scavenged = Vec::new();
         // Collect bridge-session-scoped cleanup candidates under a read lock.
@@ -5698,9 +5745,10 @@ impl MobMcpState {
                 }
             };
             if owner_archived {
-                if let Err(error) = self
-                    .mob_destroy_unchecked_loaded(&mob_id, MobDestroyCaller::Console)
-                    .await
+                if let Err(error) = meerkat_runtime::stack_relief::box_in_own_frame(|| {
+                    self.mob_destroy_unchecked_loaded(&mob_id, MobDestroyCaller::Console)
+                })
+                .await
                 {
                     tracing::warn!(
                         mob_id = %mob_id,

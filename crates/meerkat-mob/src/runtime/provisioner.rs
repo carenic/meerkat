@@ -16930,8 +16930,11 @@ impl MobProvisioner for MultiBackendProvisioner {
             } => {
                 let mut binding = self.direct_member_binding_for_ref(member_ref, None).await?;
                 let peer = self.peer_only_spec(member_ref).await?;
-                let authorization = self
-                    .ensure_supervisor_authorized(
+                // The authorization and both bridge sends are built in their
+                // own frames: at opt-level 0 each awaited future reserved
+                // twice its size in this poll frame, beneath every retirement.
+                let authorization = meerkat_runtime::stack_relief::box_in_own_frame(|| {
+                    self.ensure_supervisor_authorized(
                         &peer,
                         Some((
                             peer_id.as_str(),
@@ -16943,7 +16946,8 @@ impl MobProvisioner for MultiBackendProvisioner {
                         )),
                         None,
                     )
-                    .await?;
+                })
+                .await?;
                 if let Some(observation) = authorization.rebind_required {
                     // No MobMachine authority is reachable on the retire path,
                     // so any rejection is bubbled up uniformly. The recoverable-
@@ -16971,8 +16975,14 @@ impl MobProvisioner for MultiBackendProvisioner {
                         member_fence,
                     },
                 );
-                let retire: super::bridge_protocol::BridgeRetireResponse = self
-                    .send_bridge_command_typed(&peer, &command, Duration::from_secs(10))
+                let retire: super::bridge_protocol::BridgeRetireResponse =
+                    meerkat_runtime::stack_relief::box_in_own_frame(|| {
+                        self.send_bridge_command_typed::<super::bridge_protocol::BridgeRetireResponse>(
+                            &peer,
+                            &command,
+                            Duration::from_secs(10),
+                        )
+                    })
                     .await?;
                 match retire.outcome {
                     super::bridge_protocol::BridgeRetireOutcome::Retired { .. } => {}
@@ -17000,8 +17010,14 @@ impl MobProvisioner for MultiBackendProvisioner {
                                     member_fence: refreshed,
                                 },
                             );
-                            let retry: super::bridge_protocol::BridgeRetireResponse = self
-                                .send_bridge_command_typed(&peer, &retry, Duration::from_secs(10))
+                            let retry: super::bridge_protocol::BridgeRetireResponse =
+                                meerkat_runtime::stack_relief::box_in_own_frame(|| {
+                                    self.send_bridge_command_typed::<
+                                        super::bridge_protocol::BridgeRetireResponse,
+                                    >(
+                                        &peer, &retry, Duration::from_secs(10)
+                                    )
+                                })
                                 .await?;
                             if !matches!(
                                 retry.outcome,

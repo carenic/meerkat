@@ -61,6 +61,26 @@ them.
   Measured on the debug test binary, the three paths now take 191,680,
   886,000 and 264,496 bytes. A child-process regression test runs the
   restart re-link on 2 MiB workers. No behaviour change.
+- A restarted host's mob restore, a delivery's receipt wait and a mob's
+  destroy fit a 1 MiB worker stack in a debug build. At opt-level 0 an
+  awaited future reserves twice its size in the poll frame that awaits it,
+  so the deepest worker stack these paths took was 1,143,512 bytes for the
+  restore of persisted mobs (the restore pass's own frame 542,048),
+  1,070,344 for the receipt wait (its wait, observation and read frames
+  570,240, the runtime's `input_terminal_receipt` 242,352) and 1,211,016 for
+  a destroy's member disposal. The restore and the resume and teardown of
+  held child mobs, the receipt wait's reads and waits, the runtime's
+  terminal receipt read and wait, the destroy, each of its disposal steps
+  and its supervisor authority scrub now build their futures in their own
+  frames (`stack_relief::box_in_own_frame`, the mob actor's
+  `boxed_arm_future`). The runtime's result-matching
+  `SessionServiceRuntimeExt` and `RuntimeControlPlane` methods handle their
+  command's result in a plain helper after their one await, so their poll
+  frames fell from about 37,000 to about 15,000 bytes. Bodies are unchanged.
+  Measured on the debug test binary, those paths now take under 300,000
+  (restore), 383,352 (receipt wait) and 371,272 (member disposal) bytes; a
+  destroy's member retire admission, the deepest path left, takes 835,688
+  (was 1,093,448). No behaviour change.
 
 ## [0.9.1] - 2026-10-15
 

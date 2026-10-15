@@ -92,20 +92,28 @@ impl MeerkatMachine {
             let sessions = self.sessions.read().await;
             sessions.get(session_id).map(|entry| entry.driver.clone())
         };
+        // Every store read below is built in its own frame: at opt-level 0
+        // each awaited future reserved twice its size in this poll frame,
+        // beneath every caller that waits on a delivery's terminal.
         let Some(driver) = driver else {
             let target = match &selector {
                 InteractionSelector::InputId(input_id) => {
-                    self.durable_session_input_witness_by_id(session_id, input_id)
-                        .await?
+                    crate::stack_relief::box_in_own_frame(|| {
+                        self.durable_session_input_witness_by_id(session_id, input_id)
+                    })
+                    .await?
                 }
                 InteractionSelector::IdempotencyKey(key) => {
-                    self.durable_session_input_witness_by_idempotency_key(session_id, key)
-                        .await?
+                    crate::stack_relief::box_in_own_frame(|| {
+                        self.durable_session_input_witness_by_idempotency_key(session_id, key)
+                    })
+                    .await?
                 }
             };
-            return self
-                .durable_input_terminal_receipt_read(session_id, target)
-                .await;
+            return crate::stack_relief::box_in_own_frame(|| {
+                self.durable_input_terminal_receipt_read(session_id, target)
+            })
+            .await;
         };
         let (resolved_input_id, live) = {
             let guard = driver.lock().await;
@@ -131,16 +139,22 @@ impl MeerkatMachine {
         // close; an attached session reads them from its store.
         let target = match (&resolved_input_id, &selector) {
             (Some(input_id), _) | (None, InteractionSelector::InputId(input_id)) => {
-                self.durable_input_witness_by_id(session_id, input_id)
-                    .await?
+                crate::stack_relief::box_in_own_frame(|| {
+                    self.durable_input_witness_by_id(session_id, input_id)
+                })
+                .await?
             }
             (None, InteractionSelector::IdempotencyKey(key)) => {
-                self.durable_input_witness_by_idempotency_key_if_present(session_id, key)
-                    .await?
+                crate::stack_relief::box_in_own_frame(|| {
+                    self.durable_input_witness_by_idempotency_key_if_present(session_id, key)
+                })
+                .await?
             }
         };
-        self.durable_input_terminal_receipt_read(session_id, target)
-            .await
+        crate::stack_relief::box_in_own_frame(|| {
+            self.durable_input_terminal_receipt_read(session_id, target)
+        })
+        .await
     }
 
     /// Wait until one input's terminal receipt resolves.
@@ -192,13 +206,17 @@ impl MeerkatMachine {
                     .get(session_id)
                     .map(|entry| (entry.driver.clone(), entry.completions.clone()))
             };
+            // The store reads are built in their own frames, as in
+            // `input_terminal_receipt`.
             let Some((driver, completions)) = entry else {
-                let target = self
-                    .durable_session_input_witness_by_id(session_id, input_id)
-                    .await?;
-                return self
-                    .durable_input_terminal_receipt_wait(session_id, target)
-                    .await;
+                let target = crate::stack_relief::box_in_own_frame(|| {
+                    self.durable_session_input_witness_by_id(session_id, input_id)
+                })
+                .await?;
+                return crate::stack_relief::box_in_own_frame(|| {
+                    self.durable_input_terminal_receipt_wait(session_id, target)
+                })
+                .await;
             };
             let (completion, observer) = {
                 let guard = driver.lock().await;
@@ -224,12 +242,14 @@ impl MeerkatMachine {
                         drop(guard);
                         // Not held live: a row archived after its durable
                         // obligations closed, or no such input at all.
-                        let target = self
-                            .durable_input_witness_by_id(session_id, input_id)
-                            .await?;
-                        return self
-                            .durable_input_terminal_receipt_wait(session_id, target)
-                            .await;
+                        let target = crate::stack_relief::box_in_own_frame(|| {
+                            self.durable_input_witness_by_id(session_id, input_id)
+                        })
+                        .await?;
+                        return crate::stack_relief::box_in_own_frame(|| {
+                            self.durable_input_terminal_receipt_wait(session_id, target)
+                        })
+                        .await;
                     }
                 }
             };

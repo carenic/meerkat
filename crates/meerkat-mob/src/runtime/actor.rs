@@ -27744,7 +27744,7 @@ impl MobActor {
                     }
                 }
                 MobCommand::Destroy { reply_tx } => {
-                    let result = self.handle_destroy().await;
+                    let result = boxed_arm_future(|| self.handle_destroy()).await;
                     let destroy_succeeded = result.is_ok();
                     if !self.respawn_topology_reply_withheld {
                         let _ = reply_tx.send(result);
@@ -45246,7 +45246,9 @@ impl MobActor {
         let mut archive_disposal = None;
 
         for &step in &DisposalStep::ORDERED {
-            match self.execute_destroy_step(step, ctx).await {
+            // Built in its own frame: at opt-level 0 the awaited step reserved
+            // twice its size in this poll frame, beneath every step.
+            match boxed_arm_future(|| self.execute_destroy_step(step, ctx)).await {
                 Ok(disposal) => {
                     if let Some(disposal) = disposal {
                         archive_disposal = Some(disposal);
@@ -45271,11 +45273,14 @@ impl MobActor {
     /// removes roster state in a finally block, but destroy retries rebuild
     /// cleanup work from the roster after a partial attempt.
     async fn dispose_member_for_destroy(&mut self, ctx: &DisposalContext) -> DisposalReport {
-        let (mut report, archive_disposal) = self.dispose_member_for_destroy_steps(ctx).await;
+        // Both phases are built in their own frames: at opt-level 0 each
+        // awaited future reserved twice its size in this poll frame.
+        let (mut report, archive_disposal) =
+            boxed_arm_future(|| self.dispose_member_for_destroy_steps(ctx)).await;
         if let Some(disposal) = archive_disposal {
-            if let Err(error) = self
-                .record_destroy_member_retirement_archived(ctx, disposal)
-                .await
+            if let Err(error) =
+                boxed_arm_future(|| self.record_destroy_member_retirement_archived(ctx, disposal))
+                    .await
             {
                 report.aborted_at = Some((DisposalStep::ArchiveSession, error));
             } else {
@@ -45302,12 +45307,15 @@ impl MobActor {
         step: DisposalStep,
         ctx: &DisposalContext,
     ) -> Result<Option<mob_dsl::MemberSessionDisposal>, MobError> {
+        // Each step is built in its own frame: at opt-level 0 both awaited
+        // futures reserved twice their size in this poll frame.
         match step {
-            DisposalStep::StopHostLoop => self
-                .dispose_stop_host_loop_for_destroy(ctx)
-                .await
-                .map(|()| None),
-            _ => self.execute_step(step, ctx).await,
+            DisposalStep::StopHostLoop => {
+                boxed_arm_future(|| self.dispose_stop_host_loop_for_destroy(ctx))
+                    .await
+                    .map(|()| None)
+            }
+            _ => boxed_arm_future(|| self.execute_step(step, ctx)).await,
         }
     }
 
@@ -45426,14 +45434,21 @@ impl MobActor {
         step: DisposalStep,
         ctx: &DisposalContext,
     ) -> Result<Option<mob_dsl::MemberSessionDisposal>, MobError> {
+        // Every step is built in its own frame: at opt-level 0 each awaited
+        // future reserved twice its size in this poll frame, whichever step
+        // runs.
         match step {
-            DisposalStep::StopHostLoop => self.dispose_stop_host_loop(ctx).await.map(|()| None),
-            DisposalStep::NotifyPeers => self.dispose_notify_peers(ctx).await.map(|()| None),
+            DisposalStep::StopHostLoop => boxed_arm_future(|| self.dispose_stop_host_loop(ctx))
+                .await
+                .map(|()| None),
+            DisposalStep::NotifyPeers => boxed_arm_future(|| self.dispose_notify_peers(ctx))
+                .await
+                .map(|()| None),
             DisposalStep::CleanupMachineTopology => {
                 if ctx.preserve_machine_topology {
                     Ok(None)
                 } else {
-                    self.cleanup_retiring_external_peer_edges(&ctx.entry)
+                    boxed_arm_future(|| self.cleanup_retiring_external_peer_edges(&ctx.entry))
                         .await?;
                     self.cleanup_retired_member_machine_wiring(ctx)?;
                     Ok(None)
@@ -45450,12 +45465,14 @@ impl MobActor {
                             mob_dsl::MemberSessionDisposal::RuntimeReleasedOnlyHostOwned,
                         ));
                     }
-                    let disposal = self.dispose_archive_session(ctx).await?;
-                    self.record_remote_member_runtime_retired(&ctx.entry)
+                    let disposal = boxed_arm_future(|| self.dispose_archive_session(ctx)).await?;
+                    boxed_arm_future(|| self.record_remote_member_runtime_retired(&ctx.entry))
                         .await?;
                     Ok(Some(disposal))
                 } else {
-                    self.dispose_archive_session(ctx).await.map(Some)
+                    boxed_arm_future(|| self.dispose_archive_session(ctx))
+                        .await
+                        .map(Some)
                 }
             }
         }
@@ -45518,11 +45535,15 @@ impl MobActor {
                     false
                 }
             };
+            // Built in its own frame, like the discharge below: at opt-level 0
+            // each awaited future reserved twice its size in this poll frame.
             if !session_already_gone {
-                self.stop_autonomous_member_for_disposal(
-                    &ctx.agent_identity,
-                    &ctx.entry.member_ref,
-                )
+                boxed_arm_future(|| {
+                    self.stop_autonomous_member_for_disposal(
+                        &ctx.agent_identity,
+                        &ctx.entry.member_ref,
+                    )
+                })
                 .await?;
             }
             // else: A prior partial destroy stopped and unregistered the
@@ -45535,13 +45556,15 @@ impl MobActor {
         // prior-partial-destroy retries (session already gone, loop skipped).
         // KickoffQuiesced is total: the machine self-loops with a no-op when the
         // kickoff is Idle or the member is Destroyed (decision 2, Stage-A notes).
-        self.apply_kickoff_input(
-            &ctx.agent_identity,
-            mob_dsl::MobMachineInput::KickoffQuiesced {
-                member_id: mob_dsl::AgentIdentity::from_domain(&ctx.agent_identity),
-            },
-            "dispose_stop_host_loop_for_destroy",
-        )
+        boxed_arm_future(|| {
+            self.apply_kickoff_input(
+                &ctx.agent_identity,
+                mob_dsl::MobMachineInput::KickoffQuiesced {
+                    member_id: mob_dsl::AgentIdentity::from_domain(&ctx.agent_identity),
+                },
+                "dispose_stop_host_loop_for_destroy",
+            )
+        })
         .await?;
         Ok(())
     }
@@ -46409,30 +46432,37 @@ impl MobActor {
                         "authenticated revoke tombstone certified dormant placed retirement without ReleaseMember"
                     );
                 } else {
-                    self.release_placed_attempt_or_certify_absent(&carrier)
+                    // The release, its event and its custody step are built
+                    // in their own frames: at opt-level 0 each awaited future
+                    // reserved twice its size in this poll frame.
+                    boxed_arm_future(|| self.release_placed_attempt_or_certify_absent(&carrier))
                         .await?;
                 }
                 let disposal = mob_dsl::MemberSessionDisposal::RuntimeReleasedOnlyHostOwned;
-                self.ensure_exact_structural_event(MobEventKind::RemoteMemberReleaseConfirmed {
-                    agent_identity: ctx.agent_identity.clone(),
-                    host_id: host.0.clone(),
-                    member_session_id: member_session_id.0.clone(),
-                    generation: crate::ids::Generation::new(generation.0),
-                    fence_token: crate::ids::FenceToken::new(fence_token.0),
+                boxed_arm_future(|| {
+                    self.ensure_exact_structural_event(MobEventKind::RemoteMemberReleaseConfirmed {
+                        agent_identity: ctx.agent_identity.clone(),
+                        host_id: host.0.clone(),
+                        member_session_id: member_session_id.0.clone(),
+                        generation: crate::ids::Generation::new(generation.0),
+                        fence_token: crate::ids::FenceToken::new(fence_token.0),
+                    })
                 })
                 .await?;
                 // Release admission is exact on identity + generation +
                 // fence, and host authority prunes every matching journal
                 // row before replying. Persist that witness locally before
                 // retirement removes the member or stops its pump.
-                self.dispose_remote_turn_custody_after_host_release(
-                    &ctx.agent_identity,
-                    &host,
-                    carrier.host_binding_generation,
-                    &member_session_id,
-                    generation.0,
-                    fence_token.0,
-                )
+                boxed_arm_future(|| {
+                    self.dispose_remote_turn_custody_after_host_release(
+                        &ctx.agent_identity,
+                        &host,
+                        carrier.host_binding_generation,
+                        &member_session_id,
+                        generation.0,
+                        fence_token.0,
+                    )
+                })
                 .await?;
                 // Keep the durable placement/operator carriers until the
                 // MemberRetired terminal is published. If the journal append
@@ -47854,9 +47884,13 @@ impl MobActor {
             trust_cleanup_plan,
             false,
         );
-        let disposal_already_complete = match self
-            .retire_event_exists(&entry.agent_identity, entry.generation)
-            .await
+        // Every step below is built in its own frame: at opt-level 0 each
+        // awaited future reserved twice its size in this poll frame, beneath
+        // the member's whole disposal.
+        let disposal_already_complete = match boxed_arm_future(|| {
+            self.retire_event_exists(&entry.agent_identity, entry.generation)
+        })
+        .await
         {
             Ok(complete) => complete,
             Err(error) => {
@@ -47870,7 +47904,7 @@ impl MobActor {
             }
         };
         if !disposal_already_complete {
-            let disposal_report = self.dispose_member_for_destroy(&ctx).await;
+            let disposal_report = boxed_arm_future(|| self.dispose_member_for_destroy(&ctx)).await;
             if let Some(error) = Self::destroy_disposal_failure(&disposal_report) {
                 report.push_error(format!("{}: {error}", entry.agent_identity));
                 return Err(super::handle::MobDestroyError::Incomplete {
@@ -47878,9 +47912,10 @@ impl MobActor {
                 });
             }
         }
-        if let Err(error) = self
-            .release_forked_participant_attachments_for_member(&entry.agent_identity)
-            .await
+        if let Err(error) = boxed_arm_future(|| {
+            self.release_forked_participant_attachments_for_member(&entry.agent_identity)
+        })
+        .await
         {
             // Destroy has already torn the member down; the lease it seated is
             // owed a release. Reporting an incomplete destroy keeps the durable
@@ -47893,7 +47928,9 @@ impl MobActor {
                 report: report.clone(),
             });
         }
-        if let Err(error) = self.record_destroy_member_retired_event(&entry).await {
+        if let Err(error) =
+            boxed_arm_future(|| self.record_destroy_member_retired_event(&entry)).await
+        {
             report.push_error(format!(
                 "{}: durable retire event append failed: {error}",
                 entry.agent_identity
@@ -47902,9 +47939,9 @@ impl MobActor {
                 report: report.clone(),
             });
         }
-        if let Err(error) = self
-            .delete_retired_placed_member_carriers(&entry.agent_identity)
-            .await
+        if let Err(error) =
+            boxed_arm_future(|| self.delete_retired_placed_member_carriers(&entry.agent_identity))
+                .await
         {
             report.push_error(format!(
                 "{}: exact placed carrier cleanup failed: {error}",
@@ -47914,16 +47951,17 @@ impl MobActor {
                 report: report.clone(),
             });
         }
-        self.dispose_prune_edge_locks(&ctx).await;
-        if let Err(error) = self.dispose_remove_from_roster(&ctx, true).await {
+        boxed_arm_future(|| self.dispose_prune_edge_locks(&ctx)).await;
+        if let Err(error) = boxed_arm_future(|| self.dispose_remove_from_roster(&ctx, true)).await {
             report.push_error(error.to_string());
             return Err(super::handle::MobDestroyError::Incomplete {
                 report: report.clone(),
             });
         }
-        if let Err(error) = self
-            .delete_external_binding_overlay_for_member(&entry.agent_identity, entry.generation)
-            .await
+        if let Err(error) = boxed_arm_future(|| {
+            self.delete_external_binding_overlay_for_member(&entry.agent_identity, entry.generation)
+        })
+        .await
         {
             report.push_error(error.to_string());
             return Err(super::handle::MobDestroyError::Incomplete {
@@ -47936,10 +47974,13 @@ impl MobActor {
     async fn handle_destroy(
         &mut self,
     ) -> Result<super::handle::MobDestroyReport, super::handle::MobDestroyError> {
-        self.destroy_preflight_and_quiesce().await?;
+        // Both phases are built in their own frames: at opt-level 0 each
+        // awaited future reserved twice its size in this poll frame, beneath
+        // the whole destroy.
+        boxed_arm_future(|| self.destroy_preflight_and_quiesce()).await?;
         let was_active = self.destroy_cleanup_active;
         self.destroy_cleanup_active = true;
-        let result = self.handle_destroy_inner().await;
+        let result = boxed_arm_future(|| self.handle_destroy_inner()).await;
         self.destroy_cleanup_active = was_active;
         result
     }
@@ -48491,6 +48532,46 @@ impl MobActor {
             })
             .await);
         }
+        // The supervisor authority deletion is prepared and committed in its
+        // own frame: at opt-level 0 every move of its prepared machine
+        // transition reserved a slot of that transition's full size in this
+        // poll frame, beneath every member disposal above.
+        boxed_arm_future(|| {
+            self.scrub_supervisor_authority_for_destroy(&mut report, &runtime_metadata_snapshot)
+        })
+        .await?;
+        report.metadata_scrubbed = true;
+        if let Err(error) = boxed_arm_future(|| self.events.clear()).await {
+            return Err(boxed_arm_future(|| {
+                self.incomplete_after_metadata_scrub_error(
+                    report,
+                    &runtime_metadata_snapshot,
+                    error,
+                )
+            })
+            .await);
+        }
+        report.events_cleared = true;
+        boxed_arm_future(|| self.edge_locks.clear()).await;
+        if report.remote_cleanup_deadline_exceeded
+            || !report.orphaned_remote_members.is_empty()
+            || !report.errors.is_empty()
+        {
+            return Err(MobDestroyError::Incomplete { report });
+        }
+        Ok(report)
+    }
+
+    /// The supervisor authority step of [`Self::handle_destroy_inner`]'s
+    /// metadata scrub: prepare the deletion of the snapshot's supervisor
+    /// authority, delete its row, then commit the prepared transition. A
+    /// failed deletion takes `report` into its error, which restores the
+    /// snapshot first; the caller returns that error at once.
+    async fn scrub_supervisor_authority_for_destroy(
+        &mut self,
+        report: &mut super::handle::MobDestroyReport,
+        runtime_metadata_snapshot: &RuntimeMetadataSnapshot,
+    ) -> Result<(), super::handle::MobDestroyError> {
         let supervisor_delete = match runtime_metadata_snapshot.supervisor.as_ref() {
             Some(supervisor) => Some(
                 self.prepare_supervisor_authority_deletion(
@@ -48529,10 +48610,11 @@ impl MobActor {
                     )))
                 }
             }) {
+                let report = std::mem::take(report);
                 return Err(boxed_arm_future(|| {
                     self.incomplete_after_metadata_scrub_error(
                         report,
-                        &runtime_metadata_snapshot,
+                        runtime_metadata_snapshot,
                         error,
                     )
                 })
@@ -48540,26 +48622,7 @@ impl MobActor {
             }
             self.commit_prepared_dsl_transition(prepared.transition)?;
         }
-        report.metadata_scrubbed = true;
-        if let Err(error) = boxed_arm_future(|| self.events.clear()).await {
-            return Err(boxed_arm_future(|| {
-                self.incomplete_after_metadata_scrub_error(
-                    report,
-                    &runtime_metadata_snapshot,
-                    error,
-                )
-            })
-            .await);
-        }
-        report.events_cleared = true;
-        boxed_arm_future(|| self.edge_locks.clear()).await;
-        if report.remote_cleanup_deadline_exceeded
-            || !report.orphaned_remote_members.is_empty()
-            || !report.errors.is_empty()
-        {
-            return Err(MobDestroyError::Incomplete { report });
-        }
-        Ok(report)
+        Ok(())
     }
 
     /// Snapshot every controller-side host bind window Destroy must close.
