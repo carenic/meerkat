@@ -6,7 +6,16 @@
     "scripts/generate-bazel-rust-builds.mjs strips them from every production",
     "Bazel rust_library and rust_binary (tests keep them through the generated",
     "*_test_support variants), and scripts/check-bazel-release-features.py",
-    "fails when one of them reaches a release binary's Bazel graph."
+    "fails when one of them reaches a release binary's Bazel graph.",
+    "external_crate_features lists test-only features of external crates that",
+    "crate_universe enables because a workspace dev-dependency does (it resolves",
+    "one feature set per crate across every dependency kind). The",
+    "tools/third-party/patches/rules_rust-release-stripped-crate-features.patch",
+    "rules_rust patch reads this file and moves each one into a select on",
+    "//tools/bazel:release_build in the crate's rendered BUILD file, so editing",
+    "this file changes MODULE.bazel.lock (make buildbuddy-lock-update).",
+    "scripts/check-bazel-release-features.py fails when a listed feature stays",
+    "enabled in a release build of any rendered repository of that crate."
   ],
   "features": [
     "experimental-gpt-live-gate0-harness",
@@ -15,5 +24,8 @@
     "test-oracle",
     "test-realtime-fixtures",
     "test-support"
-  ]
+  ],
+  "external_crate_features": {
+    "tokio": ["test-util"]
+  }
 }

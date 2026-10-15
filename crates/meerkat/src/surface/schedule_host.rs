@@ -499,6 +499,14 @@ impl meerkat_schedule::ScheduleIdentityTargetProbe for SurfaceIdentityTargetProb
 }
 
 impl SharedScheduleTargetAdapter {
+    /// Compose the delivery adapter for `schedule_service` from the surface's
+    /// session and mob hosts.
+    ///
+    /// This also attaches both hosts to `schedule_service` as its create-time
+    /// identity-target probe, which every clone of the service keeps for as
+    /// long as the clone lives, so whatever the hosts hold (a session service,
+    /// mob state) stays owned while any clone does. See
+    /// [`spawn_schedule_host`] for what an embedder clears after teardown.
     pub fn new(
         schedule_service: ScheduleService,
         session_host: Arc<dyn SurfaceScheduleSessionHost>,
@@ -1646,6 +1654,38 @@ async fn supervise_schedule_host(
     }
 }
 
+/// Spawn the schedule host: the driver that plans and fires
+/// `schedule_service`'s occurrences and delivers them through `adapter`.
+/// Dropping the returned handle stops the host without waiting for it;
+/// [`ScheduleHostHandle::shutdown`] stops it and waits until it has finished.
+///
+/// # Teardown
+///
+/// [`SharedScheduleTargetAdapter::new`] attached the adapter's session and
+/// mob hosts to `schedule_service` as its create-time identity-target probe,
+/// and every clone of the service keeps that probe for as long as the clone
+/// lives: the probe is never detached. The runtime-backed session host (from
+/// `spawn_runtime_backed_schedule_host` and its `_with_mobs` variants) holds
+/// the session service, and a mob host such as the `meerkat-mob-mcp`
+/// schedule host holds the mob state. Agent-facing schedule tools installed
+/// in a factory builder's `default_schedule_tools` slot hold a clone of the
+/// service as well, and the session service owns that builder, so the
+/// session service, the builder and the mob state keep one another alive
+/// after this host stops.
+///
+/// An embedder that tears them down while its process keeps running owns
+/// the last step. Once teardown has succeeded (this host shut down and
+/// joined, every other task that holds the service stopped, and the session
+/// service shut down), clear the builder's `default_schedule_tools` slot and
+/// every other holder of the service or of its hosts, such as a registry
+/// that resolves schedule targets to mob state. The builder moves into the
+/// session service, so keep a clone of the slot (it is an `Arc`) and write
+/// `None` through it, or call `set_default_schedule_tools` with `None` while
+/// the builder is still yours. Clear nothing earlier: agent builds read the
+/// slot until the session service is down. Without this step the session
+/// service and the mob state keep their owners, and a mob store's observer
+/// drain (`SqliteMobStores::drain_observers`) refuses because other owners
+/// are still alive. A process that exits after teardown needs no such step.
 pub fn spawn_schedule_host(
     schedule_service: ScheduleService,
     adapter: Arc<SharedScheduleTargetAdapter>,

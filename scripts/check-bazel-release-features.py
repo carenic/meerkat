@@ -22,6 +22,12 @@ scripts/buildbuddy-bazel-poc builds; they must match the binaries
     string lists, their sums and selects of those; dependencies may also add
     crate_universe's all_crate_deps() (external crates); an alias must name a
     literal label.
+(c) Evaluated the same way, no crate_universe repository that MODULE.bazel.lock
+    renders for an external crate listed under "external_crate_features" in
+    scripts/non-shipping-features.json enables one of that crate's listed
+    features in its library (the rules_rust patch moves them into a select on
+    //tools/bazel:release_build), and every listed crate has such a
+    repository.
 
 Usage: check-bazel-release-features.py [repo-root]
 Exit 0 = clean, 1 = violations, 2 = the inputs cannot be read.
@@ -37,8 +43,16 @@ import sys
 LAUNCHER = "scripts/buildbuddy-bazel-poc"
 RELEASE_WORKFLOW = ".github/workflows/release.yml"
 FEATURES_FILE = "scripts/non-shipping-features.json"
+MODULE_LOCK = "MODULE.bazel.lock"
+CRATE_EXTENSION_SUFFIX = "//crate_universe:extensions.bzl%crate"
+# A crate_universe spoke repository: <hub>__<crate>-<version> ("+" in a
+# version becomes "-").
+CRATE_REPO = re.compile(r"^(?P<hub>[A-Za-z0-9_.]+)__(?P<crate>.+)-(?P<version>\d+\.\d+\.\d+[0-9A-Za-z.-]*)$")
 SETTING_PACKAGE = "tools/bazel"
 SETTING_LABEL = "//tools/bazel:release_build"
+# The same setting as a key in an external repository's BUILD file, which must
+# name the main repository.
+RELEASE_KEYS = {SETTING_LABEL, f"@{SETTING_LABEL}", f"@@{SETTING_LABEL}"}
 DEFINE_NAME = "meerkat_release_build"
 DEFINE_FLAG = f"--define={DEFINE_NAME}=1"
 RUST_RULES = ("rust_library", "rust_binary", "rust_proc_macro", "rust_shared_library", "rust_static_library")
@@ -134,7 +148,7 @@ def release_alternatives(select_body: str, where: str) -> str:
     check keeps every alternative it cannot rule out.
     """
     branches = select_branches(select_body, where)
-    if any(key == SETTING_LABEL for key, _ in branches):
+    if any(key in RELEASE_KEYS for key, _ in branches):
         branches = [(key, value) for key, value in branches if key != DEFAULT_CONDITION]
     items = [item for _, value in branches for item in QUOTED.findall(value)]
     return "[" + ", ".join(f'"{item}"' for item in items) + "]"
@@ -334,6 +348,106 @@ def check_closure(rules, roots: set[str], features: set[str]) -> tuple[list[str]
     return errors, len(seen), selects
 
 
+def external_crate_features(root: pathlib.Path) -> dict[str, set[str]]:
+    """The external crates' test-only features: {crate: {feature}}."""
+    try:
+        external = json.loads(read(root, FEATURES_FILE)).get("external_crate_features", {})
+    except (AttributeError, ValueError) as error:
+        raise GuardError(f"{FEATURES_FILE} cannot be read: {error}") from error
+    if not isinstance(external, dict) or not all(
+        isinstance(crate, str)
+        and crate
+        and isinstance(features, list)
+        and features
+        and all(isinstance(feature, str) and feature for feature in features)
+        for crate, features in external.items()
+    ):
+        raise GuardError(
+            f"{FEATURES_FILE} external_crate_features must map crate names to non-empty feature lists"
+        )
+    return {crate: set(features) for crate, features in external.items()}
+
+
+def strip_comments(text: str) -> str:
+    """Drop `#` comments outside string literals (rendered crate BUILD files
+    annotate select branch items with their platform)."""
+    lines = []
+    for line in text.split("\n"):
+        quoted = False
+        escaped = False
+        for index, char in enumerate(line):
+            if escaped:
+                escaped = False
+            elif char == "\\" and quoted:
+                escaped = True
+            elif char == '"':
+                quoted = not quoted
+            elif char == "#" and not quoted:
+                line = line[:index].rstrip()
+                break
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def crate_universe_build_files(root: pathlib.Path):
+    """(repository, BUILD file content) of every crate_universe repository
+    MODULE.bazel.lock records."""
+    try:
+        lock = json.loads(read(root, MODULE_LOCK))
+    except ValueError as error:
+        raise GuardError(f"{MODULE_LOCK} is not JSON: {error}") from error
+    extensions = lock.get("moduleExtensions") if isinstance(lock, dict) else None
+    if not isinstance(extensions, dict):
+        raise GuardError(f"{MODULE_LOCK} records no module extensions")
+    for key, extension in sorted(extensions.items()):
+        if not key.endswith(CRATE_EXTENSION_SUFFIX) or not isinstance(extension, dict):
+            continue
+        for scope in extension.values():
+            specs = scope.get("generatedRepoSpecs", {}) if isinstance(scope, dict) else {}
+            for repository, spec in sorted(specs.items()):
+                attributes = spec.get("attributes", {}) if isinstance(spec, dict) else {}
+                content = attributes.get("build_file_content")
+                if isinstance(content, str):
+                    yield repository, content
+
+
+def check_external_crates(root: pathlib.Path, external: dict[str, set[str]]) -> tuple[list[str], int]:
+    """No rendered repository of a listed external crate enables a listed
+    feature in a release build of its library."""
+    if not external:
+        return [], 0
+    errors = []
+    checked = 0
+    rendered = {crate: 0 for crate in external}
+    for repository, content in crate_universe_build_files(root):
+        match = CRATE_REPO.match(repository)
+        if match is None or match.group("crate") not in external:
+            continue
+        crate = match.group("crate")
+        library = crate.replace("-", "_")
+        libraries = []
+        for rule in RULE.finditer(strip_comments(content)):
+            kind, attrs = rule.group(1), attributes(rule.group(2))
+            if kind == "rust_library" and QUOTED.findall(attrs.get("name", ""))[:1] == [library]:
+                libraries.append(attrs)
+        if not libraries:
+            raise GuardError(f"@{repository}: cannot find the rendered rust_library {library!r}")
+        rendered[crate] += 1
+        for attrs in libraries:
+            checked += 1
+            label = f"@{repository}//:{library}"
+            for feature in string_list(evaluate(attrs.get("crate_features", "[]"), label), label):
+                if feature in external[crate]:
+                    errors.append(f"{label} enables non-shipping feature {feature!r} in the release configuration")
+    for crate, count in sorted(rendered.items()):
+        if count == 0:
+            raise GuardError(
+                f"{MODULE_LOCK} renders no crate_universe repository of {crate}, which "
+                f"{FEATURES_FILE} lists under external_crate_features"
+            )
+    return errors, checked
+
+
 def main() -> int:
     root = pathlib.Path(sys.argv[1] if len(sys.argv) > 1 else ".").resolve()
     try:
@@ -346,6 +460,8 @@ def main() -> int:
         errors += check_other_opt_builds(root)
         closure_errors, walked, selects = check_closure(rules, roots, features)
         errors += closure_errors
+        external_errors, external_checked = check_external_crates(root, external_crate_features(root))
+        errors += external_errors
     except GuardError as error:
         print(f"error: {error}", file=sys.stderr)
         return 2
@@ -356,7 +472,8 @@ def main() -> int:
         return 1
     print(
         f"Release closure of {', '.join(sorted(roots))}: {walked} targets, "
-        f"{selects} release selects evaluated, no non-shipping feature"
+        f"{selects} release selects evaluated, {external_checked} external crate "
+        f"libraries checked, no non-shipping feature"
     )
     return 0
 

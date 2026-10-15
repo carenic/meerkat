@@ -1,0 +1,84 @@
+diff --git a/crate_universe/extensions.bzl b/crate_universe/extensions.bzl
+--- a/crate_universe/extensions.bzl
++++ b/crate_universe/extensions.bzl
+@@ -425,6 +425,56 @@
+         d[key] = value
+     return d[key]
+ 
++# Meerkat patch: crate_universe resolves one feature set per external crate,
++# unified over every workspace dependency kind (dev included), and a crate
++# annotation can add a feature but never remove one, so a test-only feature
++# that a dev-dependency enables (tokio's `test-util`) reached the release
++# binaries. The root module lists such features under "external_crate_features"
++# in scripts/non-shipping-features.json. For every listed crate, each listed
++# feature that its rendered BUILD file names in a static `crate_features` list
++# moves into a select on @@//tools/bazel:release_build: the default
++# configuration, which the test lanes build, keeps it, and a release build of
++# the shipped binaries drops it. scripts/check-bazel-release-features.py checks
++# the rendered result recorded in MODULE.bazel.lock.
++_MEERKAT_NON_SHIPPING_FEATURES = "@@//:scripts/non-shipping-features.json"
++_MEERKAT_RELEASE_BUILD = "@@//tools/bazel:release_build"
++_MEERKAT_CRATE_FEATURES_OPEN = "    crate_features = [\n"
++_MEERKAT_CRATE_FEATURES_CLOSE = "\n    ]"
++
++def _meerkat_release_stripped_features(module_ctx):
++    policy = json.decode(module_ctx.read(Label(_MEERKAT_NON_SHIPPING_FEATURES)))
++    stripped = policy.get("external_crate_features", {})
++    if type(stripped) != "dict":
++        fail("Meerkat patch: external_crate_features in {} must map crate names to feature lists".format(_MEERKAT_NON_SHIPPING_FEATURES))
++    return stripped
++
++def _meerkat_strip_release_features(crate_name, build_file_content, stripped):
++    features = stripped.get(crate_name, [])
++    if not features:
++        return build_file_content
++    listed_lines = ['"{}",'.format(feature) for feature in features]
++    pieces = build_file_content.split(_MEERKAT_CRATE_FEATURES_OPEN)
++    rendered = [pieces[0]]
++    for piece in pieces[1:]:
++        listed, close, rest = piece.partition(_MEERKAT_CRATE_FEATURES_CLOSE)
++        if not close:
++            fail("Meerkat patch: unterminated crate_features list in the BUILD file of crate {}".format(crate_name))
++        kept = []
++        moved = []
++        for line in listed.split("\n"):
++            if line.strip() in listed_lines:
++                moved.append(line.strip()[1:-2])
++            else:
++                kept.append(line)
++        piece = "\n".join(kept) + close
++        if moved:
++            piece += ' + select({{\n        "{}": [],\n        "//conditions:default": {},\n    }})'.format(
++                _MEERKAT_RELEASE_BUILD,
++                json.encode(moved),
++            )
++        rendered.append(piece + rest)
++    return _MEERKAT_CRATE_FEATURES_OPEN.join(rendered)
++
+ def _generate_repo_impl(repository_ctx):
+     for path, contents in repository_ctx.attr.contents.items():
+         repository_ctx.file(path, contents)
+@@ -726,6 +776,7 @@
+     )
+ 
+     contents = json.decode(module_ctx.read(lockfile).replace(workspace_root_prefix, ""))
++    meerkat_release_stripped = _meerkat_release_stripped_features(module_ctx)
+ 
+     for crate in contents["crates"].values():
+         repo = crate["repository"]
+@@ -744,6 +795,7 @@
+         if "Http" in repo:
+             # Replicates functionality in repo_http.j2.
+             build_file_content = module_ctx.read(crates_dir.get_child("BUILD.%s-%s.bazel" % (name, version)))
++            build_file_content = _meerkat_strip_release_features(name, build_file_content, meerkat_release_stripped)
+             repo = repo["Http"]
+             http_archive(
+                 name = crate_repo_name,
+@@ -760,6 +812,7 @@
+         elif "Git" in repo:
+             # Replicates functionality in repo_git.j2
+             build_file_content = module_ctx.read(crates_dir.get_child("BUILD.%s-%s.bazel" % (name, version)))
++            build_file_content = _meerkat_strip_release_features(name, build_file_content, meerkat_release_stripped)
+             repo = repo["Git"]
+             kwargs = {}
+             for k, v in repo["commitish"].items():

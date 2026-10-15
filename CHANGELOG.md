@@ -35,6 +35,16 @@ them.
 
 ## [Unreleased]
 
+### Security
+
+- Cargo.lock moves quinn-proto from 0.11.14 to 0.11.19, clearing
+  RUSTSEC-2026-0185, RUSTSEC-2026-0338, RUSTSEC-2026-0339, RUSTSEC-2026-0340
+  and RUSTSEC-2026-0342. No build compiled it: it is reachable only through
+  reqwest's weak `quinn` feature, which nothing enables
+  (`cargo tree --workspace --all-features --target all -i quinn-proto` is
+  empty), but lockfile scanners flagged it. Lockfile only; the new version
+  also locks the unused rand_pcg 0.10.2.
+
 ### Changed
 
 - The release workflow's `Build Web SDK package` job runs beside the release
@@ -162,6 +172,116 @@ them.
   strict UTF-8, both sides of every change must be regular non-executable
   files, only a forward patch release qualifies, and a CHANGELOG over 1 MiB
   no longer makes classification fail.
+- meerkat-mcp's protected SSE transport parses event streams with
+  `sse_stream::SseStream::from_bytes_stream`. sse-stream 0.2.4 deprecated the
+  `from_byte_stream` spelling it used, so a lockfile update past 0.2.3 failed
+  `clippy -D warnings`. The requirement is now `0.2.4` (the first release
+  with the new name) and Cargo.lock moves sse-stream from 0.2.3 to 0.2.6,
+  whose rewritten line parser the MCP SSE tests now run against.
+- Release crates require their sibling crates exactly. `[workspace.dependencies]`
+  pinned every internal crate as `version = "0.9.1"`, which Cargo reads as
+  `^0.9.1`, so a published crate (meerkat-runtime 0.9.0, for example)
+  accepted any later 0.9.x of its siblings, and a consumer that pinned one
+  meerkat crate `=0.9.0` could still resolve 0.9.1 of others; 0.x patch
+  releases may break API. Every internal entry is now `=X.Y.Z`, which
+  cargo-release keeps exact when it bumps the workspace.
+  `scripts/check_rust_release_packaging.py` (`make check-rust-release-config`,
+  run in PR CI) fails when a release crate would publish a non-exact
+  requirement on a workspace crate (a path-only dev-dependency, which
+  `cargo package` strips, is exempt), `scripts/check-rust-release-packaging.sh`
+  checks the same in every packaged archive
+  (`scripts/check_packaged_internal_requirements.py`),
+  `scripts/verify-version-parity.sh` requires the `=`, and the
+  release-projection classifier treats `=X.Y.Z` as the version projection.
+  `scripts/test-release-projection-only.sh` bumps this repository's own
+  Cargo.toml, Cargo.lock and CHANGELOG.md to the next patch release and
+  requires the classifier to accept that bump, and to refuse it with one `=`
+  dropped.
+
+### Fixed
+
+- `scripts/rust-lane-doctor` no longer passes its shell entrypoint scan when
+  the scan did not run. The scan ended in `rg ... || true`, so a missing
+  ripgrep or an unreadable scan root read as "no raw Cargo entrypoint", even
+  with one present. The doctor now reads rg's exit status: 0 (a raw Cargo
+  entrypoint) and any status other than 1 (no match) fail, the latter with the
+  rg exit status and its output. `scripts/test-ci-nextest-archive.sh` probes
+  all four outcomes.
+- The Makefile comment on `bridge-no-responsestatus-gate` no longer names the
+  removed `classify_response_terminality`; like the gate, it points at the
+  machine-classified `response_terminality`.
+- meerkat-runtime tests no longer lose the release of a blocked test fake.
+  `notify_waiters()` wakes only a `Notified` that already exists, and the
+  interrupt-yielding executor rig counted its `apply` before it created its
+  release future, so a test that released the next apply as soon as it saw
+  the count could leave that apply parked (with 200 ms injected at that point,
+  7 of the 9 rig tests failed). The rig, the reentrant and external cleanup
+  executors, the destroy-commit store, the archive-publication fake and the
+  six in-memory store test hooks now create the release future before they
+  signal that they started; the archive post-commit hook signals with
+  `notify_one`. The waits that follow a release are bounded at 5 s (the join
+  of the released receipt-CAS archive task at 10 s), so a lost release fails
+  with a message instead of hanging the run.
+- BuildBuddy (Bazel) release builds of the shipped binaries no longer compile
+  tokio's `test-util` feature, the one test-only feature 0.9.1 left in them.
+  crate_universe resolves one feature set per external crate across every
+  dependency kind (26 workspace members dev-depend on tokio with
+  `test-util`), and a crate annotation can add a feature but not remove one.
+  A second rules_rust patch,
+  `tools/third-party/patches/rules_rust-release-stripped-crate-features.patch`,
+  moves each feature that `scripts/non-shipping-features.json` lists under
+  the new `external_crate_features` key out of the crate's rendered static
+  `crate_features` and into a select on `//tools/bazel:release_build`: the
+  test lanes keep it, `--define=meerkat_release_build=1` drops it. The
+  patched extension reads the whole file, so any edit to
+  `scripts/non-shipping-features.json` (a new test-only feature in its
+  `features` list too) changes `MODULE.bazel.lock`: refresh it with
+  `make buildbuddy-lock-update`. `scripts/check-bazel-release-features.py`
+  now also fails when a listed feature stays enabled in a release build of
+  any repository MODULE.bazel.lock renders for the crate (or when a listed
+  crate has none), and `scripts/check-release-binary-markers` allows tokio's
+  test-util marker only in the binaries of a release before 0.9.2, named by
+  `VERSION` (the release workflow's packaging and publishing steps pass the
+  release version), so an asset recovery of an older tag, which runs the
+  current guard, still accepts that tag's BuildBuddy binaries. With `VERSION`
+  unset, unparsable, or 0.9.2 and later, the marker fails a binary like every
+  other one. Cargo-built release binaries never compiled it.
+- Adaptive mobpack validation no longer counts doc-only schema text as a
+  schema change. It compares the bundled `adaptive/layer-decision.schema.json`
+  with the runtime's canonical LayerDecision schema after removing the
+  documentation keywords (`title`, `description`) from both, so on 0.9.2 and
+  later hosts a reworded Rust doc comment, which reaches that schema as
+  description text, no longer makes packs built by another release fail with
+  `StaleAdaptiveSchema`; a structural difference still does. Property names
+  and instance data (`const`, `enum`, `default`, `examples`) are never
+  stripped. 0.9.1 hosts still compare the whole schema exactly, doc text
+  included, so this release's canonical schema is exactly the 0.9.1 one (a
+  meerkat-mob-pack test pins it, whole, against the 0.9.1 schema) and packs
+  it builds validate on 0.9.1 hosts. Rewording the `ToolConfig::deny` doc
+  comment (since #1807 every build removes denied tools from the member's
+  visible tool list) waits for a later release.
+- The meerkat-mob test `durable_cursor_resumes_across_pump_restart` restarts
+  the controlling mob only once the member's durable event cursor covers
+  every row the first turn consumed. The pump writes that cursor after it
+  fans a page out, only while no ACK, obligation or completion waiter holds
+  cursor custody, and a controlling stop aborts a write still in flight; a
+  restart that raced the write re-read the turn's rows, as documented (losing
+  a cursor only re-reads events), which the test misread as a resume defect.
+  With 300 ms injected before the cursor write, the old test failed 10 of 10
+  runs with the CI failure's exact overlap and the new one passed 10 of 10.
+- The schedule embedding docs now state the teardown step a Rust host owns
+  when its process keeps running. A schedule host attaches its session and
+  mob hosts to the `ScheduleService` for as long as any clone of the service
+  lives, and agent schedule tools in a factory builder's
+  `default_schedule_tools` slot hold such a clone while the session service
+  owns that builder, so after teardown the session service and the mob state
+  stay owned (a mob store's `drain_observers` refuses with other owners)
+  until the host clears that slot, and any registry of its own that holds
+  them, once teardown has succeeded. `spawn_schedule_host`, the
+  runtime-backed schedule host spawners, `SharedScheduleTargetAdapter::new`,
+  `set_default_schedule_tools`, `FactoryAgentBuilder::default_schedule_tools`,
+  `ScheduleService::attach_identity_target_probe` and the scheduling guide
+  say so. Behaviour is unchanged; 0.8.51 already worked this way.
 
 ## [0.9.1] - 2026-10-15
 

@@ -134,10 +134,11 @@ EOF
     # Exactly FIXTURE_PATH_DEPS entries carry both a version and a path. The
     # trailing two must NOT count: a path with no version pin is not part of
     # the workspace-version contract, and a registry dep has no path at all.
+    # Internal requirements are exact (`=X.Y.Z`), as every published one must be.
     echo '[workspace.dependencies]'
-    printf 'meerkat-rpc = { version = "%s", path = "crates/meerkat-rpc" }\n' "${FIXTURE_VERSION}"
-    printf 'meerkat-rest = { version = "%s", path = "crates/meerkat-rest" }\n' "${FIXTURE_VERSION}"
-    printf 'meerkat-mcp-server = { version = "%s", path = "crates/meerkat-mcp-server" }\n' "${FIXTURE_VERSION}"
+    printf 'meerkat-rpc = { version = "=%s", path = "crates/meerkat-rpc" }\n' "${FIXTURE_VERSION}"
+    printf 'meerkat-rest = { version = "=%s", path = "crates/meerkat-rest" }\n' "${FIXTURE_VERSION}"
+    printf 'meerkat-mcp-server = { version = "=%s", path = "crates/meerkat-mcp-server" }\n' "${FIXTURE_VERSION}"
     echo 'vendored-thing = { path = "third-party/vendored-thing" }'
     echo 'serde = "1"'
   } > "${FIXTURE}/Cargo.toml"
@@ -289,6 +290,90 @@ status="$(run_gate "${TEST_ROOT}/approx.log" "${fixture_crates[@]}")"
 if [[ "$status" -ne 0 ]]; then
   fail "an approximate \`~\` count was treated as a binding claim" \
     "$(cat "${TEST_ROOT}/approx.log")"
+fi
+
+# 8-11. Every requirement a release crate publishes on a workspace crate is
+#    exact. A caret requirement (`0.0.0` is `^0.0.0`) lets a consumer that
+#    pins one crate exactly resolve a newer patch release of its siblings, and
+#    0.x patch releases may break API. `cargo package` keeps the version of
+#    every normal, build and target dependency and of every dev-dependency
+#    that has one; it strips a path-only dev-dependency.
+SCRATCH_MANIFEST="${FIXTURE}/meerkat-scratch/Cargo.toml"
+EXACT_RULE="a requirement on a workspace crate must be exact (\`=${FIXTURE_VERSION}\`)"
+
+# 8. A caret entry in [workspace.dependencies] is reported once, at the entry,
+#    with the crates that publish it.
+build_fixture "${ALL_CRATES[@]}"
+sed -i.bak "s/^meerkat-rpc = { version = \"=${FIXTURE_VERSION}\"/meerkat-rpc = { version = \"${FIXTURE_VERSION}\"/" \
+  "${FIXTURE}/Cargo.toml"
+rm -f "${FIXTURE}/Cargo.toml.bak"
+printf '\n[dependencies]\nmeerkat-rpc = { workspace = true }\n' >> "${SCRATCH_MANIFEST}"
+status="$(run_gate "${TEST_ROOT}/caret-workspace.log" "${fixture_crates[@]}")"
+if [[ "$status" -eq 0 ]]; then
+  fail "a caret [workspace.dependencies] requirement on a workspace crate was accepted"
+fi
+expect_named "caret workspace entry" "${TEST_ROOT}/caret-workspace.log" \
+  "Cargo.toml [workspace.dependencies] \`meerkat-rpc\` requires \`${FIXTURE_VERSION}\` (published by meerkat-scratch [dependencies]); ${EXACT_RULE}"
+expect_not_named "caret workspace entry" "${TEST_ROOT}/caret-workspace.log" "meerkat-rest"
+expect_not_named "caret workspace entry" "${TEST_ROOT}/caret-workspace.log" "publish order"
+
+# 9. Direct member requirements in build, target and versioned dev tables,
+#    including a stale exact pin; a path-only dev-dependency is not published.
+build_fixture "${ALL_CRATES[@]}"
+cat >> "${SCRATCH_MANIFEST}" <<EOF
+
+[build-dependencies]
+meerkat-rest = { version = "${FIXTURE_VERSION}", path = "../crates/meerkat-rest" }
+
+[dev-dependencies]
+meerkat-rpc = { path = "../crates/meerkat-rpc" }
+meerkat-mcp-server = { version = "~${FIXTURE_VERSION}", path = "../crates/meerkat-mcp-server" }
+
+[target.'cfg(unix)'.dependencies]
+cli = { package = "rkat", version = "=0.0.1", path = "../crates/meerkat-cli" }
+EOF
+status="$(run_gate "${TEST_ROOT}/caret-member.log" "${fixture_crates[@]}")"
+if [[ "$status" -eq 0 ]]; then
+  fail "non-exact member requirements on workspace crates were accepted"
+fi
+expect_named "member build dependency" "${TEST_ROOT}/caret-member.log" \
+  "meerkat-scratch: [build-dependencies] \`meerkat-rest\` publishes \`${FIXTURE_VERSION}\`; ${EXACT_RULE}"
+expect_named "member versioned dev-dependency" "${TEST_ROOT}/caret-member.log" \
+  "meerkat-scratch: [dev-dependencies] \`meerkat-mcp-server\` publishes \`~${FIXTURE_VERSION}\`; ${EXACT_RULE}"
+expect_named "member renamed target dependency" "${TEST_ROOT}/caret-member.log" \
+  "meerkat-scratch: [target.cfg(unix).dependencies] \`cli\` publishes \`=0.0.1\`; ${EXACT_RULE}"
+expect_not_named "path-only dev-dependency" "${TEST_ROOT}/caret-member.log" "\`meerkat-rpc\`"
+
+# 10. A workspace entry is internal by its path too: meerkat-cli's directory
+#     publishes as `rkat`, so no member is named after the key.
+build_fixture "${ALL_CRATES[@]}"
+printf 'meerkat-cli = { version = "%s", path = "crates/meerkat-cli" }\n' "${FIXTURE_VERSION}" \
+  >> "${FIXTURE}/Cargo.toml"
+write_claude_md "${#ALL_CRATES[@]}" $(( FIXTURE_PATH_DEPS + 1 )) "${ALL_CRATES[@]}"
+status="$(run_gate "${TEST_ROOT}/caret-path.log" "${fixture_crates[@]}")"
+if [[ "$status" -eq 0 ]]; then
+  fail "a caret entry for a workspace crate's directory was accepted"
+fi
+expect_named "path-identified workspace entry" "${TEST_ROOT}/caret-path.log" \
+  "Cargo.toml [workspace.dependencies] \`meerkat-cli\` requires \`${FIXTURE_VERSION}\`; ${EXACT_RULE}"
+
+# 11. Exact requirements everywhere pass, a path-only dev-dependency included.
+build_fixture "${ALL_CRATES[@]}"
+cat >> "${SCRATCH_MANIFEST}" <<EOF
+
+[dependencies]
+meerkat-rpc = { workspace = true }
+
+[build-dependencies]
+meerkat-rest = { version = "=${FIXTURE_VERSION}", path = "../crates/meerkat-rest" }
+
+[dev-dependencies]
+meerkat-mcp-server = { path = "../crates/meerkat-mcp-server" }
+EOF
+status="$(run_gate "${TEST_ROOT}/exact.log" "${fixture_crates[@]}")"
+if [[ "$status" -ne 0 ]]; then
+  fail "exact requirements on workspace crates were rejected" \
+    "$(cat "${TEST_ROOT}/exact.log")"
 fi
 
 echo "crate enumeration gate contract holds"

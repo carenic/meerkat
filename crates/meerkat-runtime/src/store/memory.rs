@@ -3215,8 +3215,10 @@ impl RuntimeStore for InMemoryRuntimeStore {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .take();
             if let Some((entered, release)) = gate {
+                // Register before signalling: a test may release with notify_waiters().
+                let released = release.notified();
                 entered.notify_one();
-                release.notified().await;
+                released.await;
             }
         }
         let mut inner = self.inner.lock().await;
@@ -3273,8 +3275,10 @@ impl RuntimeStore for InMemoryRuntimeStore {
         };
         #[cfg(test)]
         if let Some((entered, release)) = before_block {
+            // Register before signalling: a test may release with notify_waiters().
+            let released = release.notified();
             entered.notify_one();
-            release.notified().await;
+            released.await;
         }
 
         let mut inner = self.inner.lock().await;
@@ -3323,8 +3327,10 @@ impl RuntimeStore for InMemoryRuntimeStore {
         };
         #[cfg(test)]
         if let Some((entered, release)) = after_commit_block {
+            // Register before signalling: a test may release with notify_waiters().
+            let released = release.notified();
             entered.notify_one();
-            release.notified().await;
+            released.await;
         }
         Ok(InputStateBatchCasOutcome::Swapped)
     }
@@ -3805,8 +3811,10 @@ impl RuntimeStore for InMemoryRuntimeStore {
             .take();
         #[cfg(test)]
         if let Some((entered, release)) = before_block {
+            // Register before signalling: a test may release with notify_waiters().
+            let released = release.notified();
             entered.notify_one();
-            release.notified().await;
+            released.await;
         }
         let inner = self.inner.lock().await;
         Ok(inner.runtime_lifecycle.get(&runtime_id.0).cloned())
@@ -3923,8 +3931,10 @@ impl RuntimeStore for InMemoryRuntimeStore {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .take();
             if let Some((entered, release)) = gate {
+                // Register before signalling: a test may release with notify_waiters().
+                let released = release.notified();
                 entered.notify_one();
-                release.notified().await;
+                released.await;
             }
         }
         let mut ops = self
@@ -4020,8 +4030,10 @@ impl RuntimeStore for InMemoryRuntimeStore {
             .take();
         #[cfg(any(test, feature = "test-support"))]
         if let Some((entered, release)) = test_block {
+            // Register before signalling: a test may release with notify_waiters().
+            let released = release.notified();
             entered.notify_one();
-            release.notified().await;
+            released.await;
         }
         let mut inner = self.inner.lock().await;
         let current = inner

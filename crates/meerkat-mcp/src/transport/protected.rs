@@ -597,7 +597,7 @@ pub(crate) fn protected_sse_stream(
                 };
                 futures::future::ready(result)
             });
-    sse_stream::SseStream::from_byte_stream(bytes)
+    sse_stream::SseStream::from_bytes_stream(bytes)
         .filter_map(move |event| {
             let result = match event {
                 Err(error) => Some(Err(error)),

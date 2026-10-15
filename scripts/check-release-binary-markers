@@ -12,11 +12,10 @@
 # workspace marker to its gated source and keeps the docs and the embedded
 # help corpus free of them.
 #
-# Usage: check-release-binary-markers <binary>...
+# Usage: [VERSION=X.Y.Z] check-release-binary-markers <binary>...
 #        check-release-binary-markers --list       (marker|source|gate, one per line)
-#        check-release-binary-markers --allowed    (the allowed marker)
-# Exit 0 = no marker but the allowed one, 1 = a binary carries test-only code,
-# 2 = usage or read error.
+# Exit 0 = no marker (but the one a release before 0.9.2 may carry, below),
+# 1 = a binary carries test-only code, 2 = usage or read error.
 
 set -euo pipefail
 
@@ -33,20 +32,35 @@ MARKERS=(
   "OAuth endpoints redirected to the local test fixture|crates/meerkat-auth-core/src/oauth_flow.rs|debug_assertions"
 )
 
-# The one allowed marker, until 0.9.2. tokio's test-util feature reaches the
-# Bazel (BuildBuddy) release binaries because crate_universe resolves one
-# feature set per external crate across every workspace dependency kind, dev
-# included (26 members dev-depend on tokio with test-util), and a crate
-# annotation can add features but never remove one. Its time-control APIs
-# (tokio::time::pause, advance, resume) are not used by production code;
-# runtime bookkeeping remains. The 0.9.2 fix overrides tokio's crate target
-# with one that drops test-util under //tools/bazel:release_build; delete this
-# entry with it.
-# Cargo release builds never contain it.
-ALLOWED_MARKER="time is not frozen"
+# tokio's test-util marker is allowed in the binaries of a release before
+# 0.9.2 and nowhere else. Until 0.9.2 the Bazel (BuildBuddy) release builds
+# compiled tokio's test-util feature: crate_universe resolves one feature set
+# per external crate across every dependency kind, dev included. 0.9.2 moved
+# it behind the release select (scripts/non-shipping-features.json,
+# external_crate_features). Asset recovery of an older tag runs this guard
+# from the workflow's ref, so the release version decides: the release
+# workflow's packaging and publishing steps pass it as VERSION (X.Y.Z or
+# vX.Y.Z; a prerelease counts as its release). With VERSION unset or
+# unparsable, or 0.9.2 and later, the marker fails like every other one, and
+# it never masks another.
+LEGACY_MARKER="time is not frozen"
+LEGACY_MARKER_UNTIL="0.9.2"
+
+# Succeeds when VERSION names a release before LEGACY_MARKER_UNTIL.
+legacy_marker_allowed() {
+  local version="${VERSION-}"
+  local pattern='^v?(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})(-[0-9A-Za-z.-]+)?$'
+  [[ "${version}" =~ ${pattern} ]] || return 1
+  local major="${BASH_REMATCH[1]}" minor="${BASH_REMATCH[2]}" patch="${BASH_REMATCH[3]}"
+  local until_major until_minor until_patch
+  IFS=. read -r until_major until_minor until_patch <<<"${LEGACY_MARKER_UNTIL}"
+  ((major < until_major ||
+    (major == until_major && (minor < until_minor ||
+      (minor == until_minor && patch < until_patch)))))
+}
 
 if [[ $# -eq 0 ]]; then
-  echo "usage: check-release-binary-markers <binary>... | --list | --allowed" >&2
+  echo "usage: check-release-binary-markers <binary>... | --list" >&2
   exit 2
 fi
 
@@ -55,15 +69,15 @@ if [[ "$1" == "--list" ]]; then
   exit 0
 fi
 
-if [[ "$1" == "--allowed" ]]; then
-  printf '%s\n' "${ALLOWED_MARKER}"
-  exit 0
-fi
-
 patterns=()
 for entry in "${MARKERS[@]}"; do
   patterns+=(-e "${entry%%|*}")
 done
+
+legacy_allowed=0
+if legacy_marker_allowed; then
+  legacy_allowed=1
+fi
 
 status=0
 for binary in "$@"; do
@@ -86,19 +100,22 @@ for binary in "$@"; do
       marker="${entry%%|*}"
       rest="${entry#*|}"
       grep -qxF -- "${marker}" <<<"${found}" || continue
-      if [[ "${marker}" == "${ALLOWED_MARKER}" ]]; then
-        echo "notice: ${binary} carries the allowed marker \"${marker}\" (${rest%%|*}, ${rest#*|}; time-control APIs are not used by production code; runtime bookkeeping remains; removed in 0.9.2)"
+      if [[ "${marker}" == "${LEGACY_MARKER}" && "${legacy_allowed}" -eq 1 ]]; then
+        echo "notice: ${binary} carries the allowed marker \"${marker}\" (${rest%%|*}, ${rest#*|}; allowed for release ${VERSION} only: Bazel release builds before ${LEGACY_MARKER_UNTIL} compiled it)"
         allowed=1
         continue
       fi
       failed=1
       echo "error: ${binary} carries test-only code: \"${marker}\" (${rest%%|*}, ${rest#*|})" >&2
+      if [[ "${marker}" == "${LEGACY_MARKER}" ]]; then
+        echo "  only a release before ${LEGACY_MARKER_UNTIL} may carry it, and VERSION (${VERSION-unset}) does not name one" >&2
+      fi
     done
   fi
   if [[ "${failed}" -eq 1 ]]; then
     status=1
   elif [[ "${allowed}" -eq 1 ]]; then
-    echo "no test-only markers in ${binary} beyond the allowed one"
+    echo "no test-only markers in ${binary} beyond the one allowed for ${VERSION}"
   else
     echo "no test-only markers in ${binary}"
   fi
