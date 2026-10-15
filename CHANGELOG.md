@@ -71,6 +71,34 @@ them.
   whole-workspace tests 16 slow periods (960 s) instead of 8, so a cold row
   (as after a release version bump, when no compiled unit can be reused)
   completes on a hosted 4-vCPU runner.
+- CI plans a release commit whose diff from its first parent is only the
+  release hook's forward patch projection as mode `release-projection` when
+  that parent has a completed, successful exact-main CI run that planned the
+  whole workspace with every lane successful: format + governance (version
+  parity, lock consistency, release packaging and configuration, docs), the
+  generation ratchets (schema and SDK freshness), the Bazel graph check and
+  the tests that read the changed files (their integration rows and the
+  lib and bin unit tests of each reader package and of meerkat-contracts)
+  run, and the other lanes reuse the parent's run instead of rebuilding
+  every crate at the new version. A main push waits up to 40 minutes for a
+  running parent run; only the newest run of the parent counts, and a test,
+  snapshot, fixture, SDK or Rust code line that pins the old or new version
+  refuses reuse. The `CI gate`
+  re-verifies the run with the parent's copies of the scripts and records it
+  in the exact-tree attestation (`reused_test_evidence`), and
+  `require_ci_green` verifies it again the same way before a tag publishes.
+  Any other diff, or a parent without that evidence, keeps the ordinary plan.
+- A commit carrying the trailer `CI-Plan: workspace` (or merging a branch
+  whose head carries it) is planned as the whole workspace, so a release's
+  notes-and-fixes merge can give the bump the evidence it reuses.
+- The release-projection classifier shared by the pre-push hook and CI
+  (`scripts/release-projection-only.mjs`) recognizes the real v0.9.1 bump
+  and nothing looser: stamped documents and CHANGELOG.md must be exactly the
+  base's docs and changelog stampers' output, the standalone example locks
+  the release hook refreshes are projection surfaces, blobs are decoded as
+  strict UTF-8, both sides of every change must be regular non-executable
+  files, only a forward patch release qualifies, and a CHANGELOG over 1 MiB
+  no longer makes classification fail.
 
 ## [0.9.1] - 2026-10-15
 

@@ -354,6 +354,29 @@ GitHub-hosted runners and sized to a 25-minute lane execution budget:
 - `changes` classifies the diff with `scripts/ci-cargo-lanes.mjs` (fail
   closed: every Rust-relevant change yields lanes; unmapped Rust paths, a
   missing base, or global build configuration escalate to the workspace).
+  A release projection is the one exception: when the diff from HEAD's
+  first parent is only the forward patch projection `scripts/release-hook.sh`
+  writes (`scripts/release-projection-only.mjs`, the pre-push hook's own
+  fail-closed classifier: regular files only, strict UTF-8, stamped docs and
+  CHANGELOG exactly the base's stampers' output, x.y.z to x.y.(z+1)) and that
+  parent has a completed, successful exact-main CI run that planned the whole
+  workspace with every lane `success` (`scripts/ci-release-evidence.mjs
+  find`, run from the parent's own tree; a main push waits up to 40 minutes
+  for a running parent run, a pull request does not), the plan is mode
+  `release-projection`: `fmt-governance` (version parity, lock consistency,
+  release packaging/config, docs-check, the semver self-test), the
+  generation ratchets (schema/SDK freshness), the Bazel graph check and the
+  readers of the changed files (their `closure-tests` rows, path-selected
+  integration suites, and a `--lib --bins` unit row per reader package plus
+  `meerkat-contracts`) run, and the Clippy, other unit, check, feature, wasm,
+  SDK and example lanes reuse the parent's run. The finder takes the newest
+  run of the parent only, and refuses reuse when any test, snapshot, fixture,
+  SDK or Rust code line outside the projection pins the old or new version
+  (`scripts/release-version-pins.mjs`). Without such evidence, or for any
+  other byte change, the plan is the ordinary one. A commit whose message, or
+  whose merged branch head's message, carries the trailer `CI-Plan: workspace`
+  is planned as the whole workspace (without looking for evidence): the
+  explicit way to give a release's parent that evidence.
 - `fmt-governance` (always): fmt, docs-check, semver self-test, version
   parity, lock consistency, `make ci-lanes-selftest`,
   `make path-classifier-selftest`, and the ripgrep tombstone scans
@@ -457,7 +480,14 @@ GitHub-hosted runners and sized to a 25-minute lane execution budget:
   main push and nightly); the lane table is reported on every non-cancelled
   run, failed runs included; a failure to measure only warns on `main`;
   schema-4 attestation (backend `github-hosted-cargo`) on successful `main`
-  pushes. It runs under
+  pushes. For a `release-projection` plan it re-verifies the reused parent
+  attempt with the parent's copies of the scripts (`ci-release-evidence.mjs
+  verify`: a completed, successful push run of `ci.yml` on `main` at exactly
+  HEAD's first parent, still the run's latest attempt, whose attestation
+  names that commit and tree, planned the whole workspace with every lane
+  `success` and is not itself a reuse)
+  and records the run and attempt in the attestation (`plan.mode:
+  release-projection`, `reused_test_evidence`). It runs under
   `!cancelled()` so superseded runs surface as cancelled.
 
 The dense Mob topology stress, the bounded TLC `machine-verify --all` sweep,
@@ -514,7 +544,7 @@ release semver gate; PR and manual artifacts are previews.
 
 | Job | Trigger | What it does |
 |-----|---------|-------------|
-| `require_ci_green` | Always | Requires successful exact-main CI for the release commit; tag runs also verify its retained exact-tree attestation (schema 4, backend `github-hosted-cargo`; legacy schemas accepted) |
+| `require_ci_green` | Always | Requires successful exact-main CI for the release commit; tag runs also verify its retained exact-tree attestation (schema 4, backend `github-hosted-cargo`; legacy schemas accepted) and, for a `release-projection` attestation, re-verify the reused first-parent run and its attestation with the parent's copies of the scripts |
 | `release_validate_buildbuddy_full` | Tag runs while `MEERKAT_GCP_BUILDBUDDY_ENABLED` is `true` | Runs the whole BuildBuddy/Bazel graph (`buildbuddy.yml`, `full-fresh`) on the release tree |
 | `release_validate_cargo` / `release_validate_buildbuddy` | Eligible manual dispatches; `release_validate_cargo` also on tags while the self-hosted graph is off | Validate release state through the selected lane; with the graph on, tag runs reuse exact-tree CI and skip both jobs |
 | `release_validate_gate` | Tags and full/package dispatches | On tags require exact-tree CI plus the full BuildBuddy graph (graph on) or `release_validate_cargo` (graph off); on manual dispatches accept the selected validation lane; Web-only and asset-only recovery skip it |
@@ -585,7 +615,8 @@ lock graph is compiled by the required CI Clippy lanes but is not re-tested loca
 the reused tests ran against the prior lock graph, and CI remains
 authoritative. Fail-closed `release-projection-only` and
 `pre-push-harness-only` classifiers can also reuse existing parent source-test
-evidence. This is separate from `pre-push-dispatch.sh`'s complete-hook success
+evidence; CI's `release-projection` plan uses the same
+`scripts/release-projection-only.mjs`. This is separate from `pre-push-dispatch.sh`'s complete-hook success
 stamp, which is keyed to the entire pushed Git tree and written only when no
 hook was skipped. A push with `SKIP=<hook ids>` records partial evidence labeled
 with the skipped set, reusable only by a later push of that tree that skips the
@@ -702,7 +733,15 @@ cargo-release publishes the tag. The enforced boundary is the
 `release_semver_gate` artifact lookup after `require_ci_green`: the matching
 main-push semver evidence must exist and be unexpired then. A combined push
 can succeed if readiness finishes before that lookup, but otherwise races it.
-Local preflight and PR/manual readiness previews are not substitutes. Keep
+Local preflight and PR/manual readiness previews are not substitutes. To
+let CI reuse evidence for the bump, merge the release notes and fixes first
+with the trailer `CI-Plan: workspace` (in the merge commit's message or on
+the merged branch's head commit), wait for that main run to succeed, then
+land the bump as its own commit on top (a bump-only PR or push): CI plans
+only the release checks and the readers of the changed files and reuses the
+rest of that run. A bump merged together with source changes, as v0.9.1's
+release branch merge was, or on a parent whose main run was not a
+whole-workspace run, gets the full plan. Keep
 version/changelog generation hook-owned; see the
 [release guide](docs/guides/cd-and-distribution.md#release-workflow) for the
 separate manual measurement and completed-measurement recovery paths.

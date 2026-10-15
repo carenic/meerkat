@@ -313,6 +313,77 @@ jobs:
             "${attestation}"
           echo "Verified exact-tree CI attestation for ${RELEASE_SHA} (${RELEASE_TREE})"
 
+      # A release commit whose diff from its first parent is only the
+      # forward patch projection (scripts/release-projection-only.mjs) gets a
+      # CI plan that reuses the parent's exact-main test evidence instead of
+      # rebuilding the workspace cold; its schema-4 attestation says so
+      # (plan mode release-projection, reused_test_evidence). Such an
+      # attestation is accepted only when the evidence holds now, judged by
+      # the PARENT's copies of the classifier and the evidence script (a
+      # commit cannot certify itself with edited scripts; for an honest
+      # projection they are byte-identical): the release commit is still a
+      # projection of its first parent, and the recorded attempt is a
+      # completed, successful push run of ci.yml on main at exactly that
+      # parent, whose own attestation names the parent's commit and tree,
+      # planned the whole workspace with every lane successful and is not
+      # itself a reuse.
+      - name: Setup Node for reused CI evidence
+        if: ${{ github.event_name != 'workflow_dispatch' }}
+        uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+
+      # The classifier runs the parent's docs and changelog stampers.
+      - name: Setup Python for reused CI evidence
+        if: ${{ github.event_name != 'workflow_dispatch' }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - name: Verify reused release-projection CI evidence
+        if: ${{ github.event_name != 'workflow_dispatch' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_SHA: ${{ steps.release_ref.outputs.sha }}
+        run: |
+          set -euo pipefail
+          attestation="${RUNNER_TEMP}/meerkat-ci-attestation/attestation.json"
+          mode="$(jq -r '.plan.mode // ""' "${attestation}")"
+          reused="$(jq -r 'has("reused_test_evidence")' "${attestation}")"
+          if [[ "${mode}" != "release-projection" && "${reused}" == "false" ]]; then
+            echo "Exact-tree CI ran its own test lanes (plan mode: ${mode:-legacy}); no reused evidence to verify."
+            exit 0
+          fi
+          if [[ "${mode}" != "release-projection" || "${reused}" != "true" ]]; then
+            echo "The CI attestation is inconsistent: plan mode ${mode:-none}, reused_test_evidence present: ${reused}." >&2
+            exit 1
+          fi
+          parent="$(git rev-parse --verify "${RELEASE_SHA}^1")"
+          parent_tree="$(git rev-parse --verify "${parent}^{tree}")"
+          jq -e \
+            --arg parent "${parent}" \
+            --arg parent_tree "${parent_tree}" \
+            '.reused_test_evidence.classifier == "release-projection-only" and
+             .reused_test_evidence.workflow == "CI" and
+             .reused_test_evidence.base_commit_sha == $parent and
+             .reused_test_evidence.base_tree_sha == $parent_tree and
+             (.reused_test_evidence.workflow_run_id | test("^[1-9][0-9]*$")) and
+             (.reused_test_evidence.workflow_run_attempt | test("^[1-9][0-9]*$"))' \
+            "${attestation}" >/dev/null || {
+            echo "The reused CI evidence does not name ${RELEASE_SHA}'s first parent ${parent} (${parent_tree})." >&2
+            exit 1
+          }
+          tools="${RUNNER_TEMP}/release-evidence-tools/scripts"
+          mkdir -p "${tools}"
+          for script in ci-release-evidence.mjs release-projection-only.mjs release-version-pins.mjs; do
+            git show "${parent}:scripts/${script}" > "${tools}/${script}"
+          done
+          node "${tools}/ci-release-evidence.mjs" verify --repository "${GITHUB_REPOSITORY}" \
+            --base "${parent}" --head "${RELEASE_SHA}" \
+            --run-id "$(jq -r .reused_test_evidence.workflow_run_id "${attestation}")" \
+            --run-attempt "$(jq -r .reused_test_evidence.workflow_run_attempt "${attestation}")"
+
   # Manual dispatches pick Cargo or the hosted BuildBuddy lane below. A tag
   # push runs this job only while the self-hosted GCP graph is disabled
   # (repository variable MEERKAT_GCP_BUILDBUDDY_ENABLED is not 'true'); it
