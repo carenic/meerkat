@@ -513,6 +513,13 @@ elif name == "prebuild-web-ungated":
         "        needs.release_semver_gate.result == 'skipped')) &&\n",
         "",
     )
+elif name == "trailing-manifest-replaced":
+    # The pre-review manifest upload: every run re-uploads it, replacing it.
+    replace_once(
+        "      - name: Publish complete release manifest\n"
+        "        if: ${{ steps.manifest.outputs.upload == 'true' }}\n",
+        "      - name: Publish complete release manifest\n",
+    )
 elif name == "both-defects":
     replace_once(
         MEASUREMENT_STEP_IF,
@@ -708,7 +715,10 @@ expect_fail_named trailing-gates-critical "${TEST_ROOT}/trailing-gates-critical.
   "waits for \`build_binaries_gate\`, \`build_binaries_macos_x86_cross\`" trailing-platforms
 mutate trailing-overwrites "${TEST_ROOT}/trailing-overwrites.yml"
 expect_fail_named trailing-overwrites "${TEST_ROOT}/trailing-overwrites.yml" \
-  "archive uploads are add-only" trailing-platforms
+  "release uploads are add-only" trailing-platforms
+mutate trailing-manifest-replaced "${TEST_ROOT}/trailing-manifest-replaced.yml"
+expect_fail_named trailing-manifest-replaced "${TEST_ROOT}/trailing-manifest-replaced.yml" \
+  "writes the manifest unconditionally" trailing-platforms
 mutate trailing-selects-intel "${TEST_ROOT}/trailing-selects-intel.yml"
 expect_fail_named trailing-selects-intel "${TEST_ROOT}/trailing-selects-intel.yml" \
   "rkat-0.0.0-x86_64-apple-darwin.tar.gz" trailing-platforms

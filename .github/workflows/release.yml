@@ -2381,30 +2381,49 @@ jobs:
             --release-tag "${RELEASE_TAG}"
 
       # The manifest is written once, from the complete set of published,
-      # never-replaced archives, so a rerun regenerates the same bytes. A
-      # published manifest that differs means the archive set changed:
-      # refuse rather than replace it.
-      - name: Refuse to change a published manifest
+      # never-replaced archives, and never deleted or replaced: a rerun finds
+      # it present, checks that it equals the one regenerated from the same
+      # archives, and uploads nothing. A published manifest that differs
+      # means the archive set changed, and the run fails. Listing the release
+      # assets tells a missing manifest from an API error, which fails too.
+      #
+      # Window: the critical publisher makes the release public with the
+      # Linux and macOS arm64 archives before this job writes
+      # checksums.sha256 and index.json. With a prebuild whose trailing lanes
+      # already finished that is the few minutes between the two publishers;
+      # when the tag builds, it lasts until the Intel macOS and Windows lanes
+      # finish (or until an asset recovery if they fail). Every archive is
+      # attested meanwhile (`gh attestation verify`).
+      - name: Check the published manifest
+        id: manifest
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag || github.ref_name }}
         run: |
           set -euo pipefail
+          assets="$(gh release view "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" --json assets --jq '.assets[].name')"
           mkdir -p published-manifest
+          upload=false
           for name in checksums.sha256 index.json; do
-            if gh release download "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" \
-                --pattern "${name}" --dir published-manifest 2>/dev/null; then
-              if ! cmp -s "published-manifest/${name}" "published-release-artifacts/${name}"; then
-                echo "the published ${name} differs from the one regenerated from the published archives; refusing to replace it" >&2
-                exit 1
-              fi
-              echo "published ${name} is unchanged"
+            if ! grep -Fxq -- "${name}" <<<"${assets}"; then
+              echo "${name} is not on the release yet"
+              upload=true
+              continue
             fi
+            gh release download "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" \
+              --pattern "${name}" --dir published-manifest
+            if ! cmp -s "published-manifest/${name}" "published-release-artifacts/${name}"; then
+              echo "the published ${name} differs from the one regenerated from the published archives; refusing to replace it" >&2
+              exit 1
+            fi
+            echo "published ${name} is unchanged"
           done
+          echo "upload=${upload}" >> "${GITHUB_OUTPUT}"
 
       # Publish checksums and index.json only after every platform archive is
       # present, keeping the public manifest a complete release authority.
       - name: Publish complete release manifest
+        if: ${{ steps.manifest.outputs.upload == 'true' }}
         uses: softprops/action-gh-release@v2
         with:
           files: |
@@ -2412,7 +2431,7 @@ jobs:
             published-release-artifacts/index.json
           draft: false
           fail_on_unmatched_files: true
-          overwrite_files: true
+          overwrite_files: false
           tag_name: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag || github.ref_name }}
 
   update_homebrew:

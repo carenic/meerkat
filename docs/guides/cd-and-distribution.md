@@ -268,7 +268,12 @@ embedding a separate runtime implementation.
    waiting for the trailing Intel macOS and Windows lanes. Those archives
    follow when their lanes finish (`publish_github_release`): added to the
    release, never replacing an asset already on it, then `checksums.sha256`
-   and `index.json` for the complete set, written once.
+   and `index.json` for the complete set, written once and never replaced (a
+   rerun checks a published manifest instead of uploading it). Until then
+   the release is public with the critical archives and no manifest: a few
+   minutes when a prebuild's trailing lanes already finished, otherwise
+   until the Intel macOS and Windows lanes finish (or an asset recovery adds
+   them). Every archive carries a build attestation meanwhile.
 6. Update the Homebrew tap from the complete release's published checksums.
 7. Publish Rust crates plus the Python and TypeScript SDKs on GitHub-hosted
    runners. The Rust crates publish by dependency level, derived from the

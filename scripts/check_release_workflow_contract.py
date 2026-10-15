@@ -1475,6 +1475,7 @@ def check_prebuild(text: str) -> list[str]:
         return EventContext(
             label=f"a tag push {'with a prebuild found' if run_id else 'without a prebuild'}",
             event_name="push",
+            step_outputs={"manifest.upload": "true"},
             job_outputs={
                 f"{PREBUILD_LOOKUP_JOB}.run_id": run_id,
                 f"{CI_GREEN_JOB}.{ATTESTATION_SCHEMA_OUTPUT}": "4",
@@ -1814,10 +1815,15 @@ def check_trailing_platforms(text: str) -> list[str]:
             manifest = "checksums.sha256" in files or "index.json" in files
             if manifest and job != ASSET_PUBLISH_JOB:
                 violations.append(f"job `{job}` writes the release manifest; only `{ASSET_PUBLISH_JOB}` may")
-            if not manifest and overwrite != "false":
+            if overwrite != "false":
                 violations.append(
-                    f"step `{step.name}` uploads archives with overwrite_files `{overwrite or 'unset'}`; "
-                    "archive uploads are add-only (`overwrite_files: false`)"
+                    f"step `{step.name}` uploads with overwrite_files `{overwrite or 'unset'}`; "
+                    "release uploads are add-only (`overwrite_files: false`) and never replace an asset"
+                )
+            if manifest and "steps." not in (step.condition or ""):
+                violations.append(
+                    f"step `{step.name}` writes the manifest unconditionally; it must run only when "
+                    "the manifest is absent from the release"
                 )
     if "build_binaries_gate" not in closure(ASSET_PUBLISH_JOB):
         violations.append(f"job `{ASSET_PUBLISH_JOB}` writes the manifest before every lane finished")
