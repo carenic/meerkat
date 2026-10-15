@@ -17887,7 +17887,10 @@ async fn hard_cancel_current_run_on_attached_runtime_uses_live_handle_during_app
         .await
         .expect("apply should finish after the executor is released");
 
-    match completion_handle.wait_authorized().await {
+    match tokio::time::timeout(Duration::from_secs(5), completion_handle.wait_authorized())
+        .await
+        .expect("attached steered prompt should complete after its apply is released")
+    {
         CompletionOutcome::CompletedWithoutResult => {}
         other => panic!(
             "expected attached queued prompt to complete normally before queued cancel drains, got {other:?}"
@@ -17963,6 +17966,12 @@ async fn hard_cancel_current_run_on_attached_runtime_uses_live_handle_during_app
     })
     .await
     .expect("newer run should bind");
+    // Running with run B's id is bound before the runtime loop calls apply(),
+    // and allow_finish.notify_waiters() stores no permit. As for run A, wait
+    // until run B's apply() has registered on allow_finish before releasing it.
+    tokio::time::timeout(Duration::from_secs(5), apply_started.notified())
+        .await
+        .expect("newer run's apply should start and register on allow_finish");
 
     assert!(
         !adapter
@@ -17986,7 +17995,10 @@ async fn hard_cancel_current_run_on_attached_runtime_uses_live_handle_during_app
     );
 
     allow_finish.notify_waiters();
-    match completion_b.wait_authorized().await {
+    match tokio::time::timeout(Duration::from_secs(5), completion_b.wait_authorized())
+        .await
+        .expect("newer run should complete after its apply is released")
+    {
         CompletionOutcome::CompletedWithoutResult => {}
         other => panic!("expected newer prompt to complete normally, got {other:?}"),
     }

@@ -433,6 +433,11 @@ for (const path of [
   "scripts/ci-hook-coverage.mjs",
   "scripts/ci-verify-row-binaries.mjs",
   "scripts/ci-non-rust-readers.mjs",
+  // They decide when a release projection reuses its parent's evidence.
+  "scripts/ci-release-evidence.mjs",
+  "scripts/ci-release-projection-selftest.mjs",
+  "scripts/release-projection-only.mjs",
+  "scripts/release-version-pins.mjs",
   "scripts/ci-clippy-sccache-wrapper",
   ".github/workflows/ci.yml",
   ".github/actions/setup-rust-ci/action.yml",
@@ -440,6 +445,15 @@ for (const path of [
   const plan = planFor([path]);
   assert.equal(plan.mode, "workspace", `${path} escalates to the workspace`);
   assertLanes(plan, path);
+}
+
+// A path list is never a release projection: only a --base/--head diff with
+// verified evidence is (scripts/ci-release-projection-selftest.mjs).
+{
+  const plan = planFor(["Cargo.toml", "Cargo.lock", "CHANGELOG.md", "README.md"]);
+  assert.equal(plan.release_projection, null, "a release-shaped path list keeps the ordinary plan");
+  assert.equal(plan.mode, "workspace");
+  assertLanes(plan, "release-shaped path list");
 }
 
 // Machine-authority-only: TLA+ models and machine specs are not Cargo

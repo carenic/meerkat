@@ -1067,6 +1067,22 @@ def _attestation(**overrides: object) -> dict:
     return document
 
 
+def _reused_evidence(**overrides: str) -> dict:
+    """reused_test_evidence as CI writes it for a release-projection plan."""
+    return {
+        "classifier": "release-projection-only",
+        "from_version": "0.0.0",
+        "to_version": "0.0.1",
+        "base_commit_sha": "3" * 40,
+        "base_tree_sha": "4" * 40,
+        "workflow": "CI",
+        "workflow_run_id": "9",
+        "workflow_run_attempt": "1",
+        "attestation_artifact": "meerkat-ci-attestation-" + "3" * 40 + "-1",
+        **overrides,
+    }
+
+
 def _coverage_of(step: Step, attestation: dict) -> tuple[int, dict[str, str]]:
     """Run the attestation step on `attestation`; its exit and outputs."""
     context = EventContext(
@@ -1142,17 +1158,35 @@ def check_tag_validation(text: str) -> list[str]:
         ("the plan does not record the ratchets", _attestation(plan__generated_contract=None), "false"),
         ("the SDK suites were skipped", _attestation(component_results__sdk_host="skipped"), "false"),
         (
-            "a release-projection plan reused a parent run for the SDK lanes",
+            "a release-projection plan reused a verified parent run for the SDK lanes",
             _attestation(
                 plan__mode="release-projection",
                 component_results__sdk_host="skipped",
-                reused_test_evidence={"workflow_run_id": "9"},
+                reused_test_evidence=_reused_evidence(),
             ),
             "true",
         ),
         (
             "a release-projection plan names no reused run",
             _attestation(plan__mode="release-projection", component_results__sdk_host="skipped"),
+            "false",
+        ),
+        (
+            "a release-projection plan whose evidence comes from another classifier",
+            _attestation(
+                plan__mode="release-projection",
+                component_results__sdk_host="skipped",
+                reused_test_evidence=_reused_evidence(classifier="something-else"),
+            ),
+            "false",
+        ),
+        (
+            "a release-projection plan whose evidence names no run attempt",
+            _attestation(
+                plan__mode="release-projection",
+                component_results__sdk_host="skipped",
+                reused_test_evidence=_reused_evidence(workflow_run_attempt=""),
+            ),
             "false",
         ),
     )

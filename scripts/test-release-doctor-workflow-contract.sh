@@ -362,12 +362,13 @@ elif name == "tag-validation-schema-unwritten":
     replace_once('          echo "covers_release_validation=${covers}" >> "${GITHUB_OUTPUT}"\n', "")
 elif name == "tag-validation-ignores-sdk-host":
     # The pre-review coverage: any schema-4 attestation, SDK suites or not.
-    replace_once(
-        "              (.component_results.sdk_host == \"success\" or\n"
-        "               (.plan.mode == \"release-projection\" and\n"
-        "                ((.reused_test_evidence.workflow_run_id // \"\") != \"\")))' \\\n",
-        "              true' \\\n",
+    pattern = re.compile(
+        r"              \(\.component_results\.sdk_host == \"success\" or\n(?:.*\n)*?"
+        r"                \(\(\.reused_test_evidence\.workflow_run_attempt // \"\"\) \| test\(\"\^\[1-9\]\[0-9\]\*\$\"\)\)\)\)' \\\n"
     )
+    text, count = pattern.subn("              true' \\\n", text)
+    if count != 1:
+        raise SystemExit(f"fixture `{name}` expects one SDK-lane clause, found {count}")
 elif name == "tag-validation-reflowed":
     # Equivalent: the tag disjunct on one line, its operands reordered.
     replace_once(

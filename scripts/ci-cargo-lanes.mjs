@@ -20,6 +20,7 @@
 //   ci-cargo-lanes.mjs [--base <rev> --head <rev>] [--max-shards N]
 //                      [--workspace-shards N] [--closure-test-rows N]
 //                      [--lib-row-runner LABEL]
+//                      [--reuse-release-evidence <commit>:<run id>:<attempt>]
 //                      [--format json|github] [--] [changed-path ...]
 //   ci-cargo-lanes.mjs --paths-from-stdin [...]
 //
@@ -99,6 +100,46 @@
 // checkout ran in the hook on every push, so a change to what it reads
 // selects its package's rows, Rust change or not. Readers join the scope
 // themselves; their dependents do not read the file.
+//
+// Release projections. A cargo-release version bump changes every crate's
+// version, so the whole workspace is planned and every compile misses the
+// cache: v0.9.1's main run took about 60 minutes plus a re-run. When the
+// commit's diff from its first parent is only the forward patch projection
+// scripts/release-hook.sh writes (scripts/release-projection-only.mjs, the
+// pre-push hook's own fail-closed classifier) and the parent has a completed,
+// successful, workspace-mode exact-main CI run (scripts/ci-release-evidence.mjs
+// finds it from the parent's own copy; the change classification passes it as
+// --reuse-release-evidence), the plan is mode "release-projection": no
+// Clippy, unit, check, feature, wasm, SDK-suite or example lane, because the
+// parent's run executed them over the whole workspace. What a projection can
+// break still runs: format + governance (version parity, Cargo.lock and
+// example lock consistency, MODULE.bazel.lock recorded inputs, release
+// packaging and configuration, docs-check, the semver self-test, these
+// classifier self-tests), the generation ratchets forced on (schema, SDK
+// codegen and wrapper freshness: the schema emitter compiles meerkat-contracts
+// at the new version), the Bazel graph check (BUILD files and the module lock
+// changed), and the readers of the changed files: the hook-parity rows of
+// every package scripts/ci-non-rust-readers.json names for them and the
+// integration suites their paths select, exactly as an ordinary plan would
+// run them, plus a unit row (`--lib --bins`) for each reader package and for
+// meerkat-contracts, which owns ContractVersion::CURRENT: an ordinary plan
+// leaves lib tests to the pre-push hook, and the hook reuses the parent's
+// evidence for a projection. The SDK and example suites are reused; what a
+// version bump can break in them is a test or source that pins a version,
+// and the evidence finder refuses reuse when anything outside the
+// projection pins the old or new version (scripts/release-version-pins.mjs).
+// No workspace compile check is planned: the bump changes no Rust
+// source and no dependency selection, only version strings
+// (CARGO_PKG_VERSION, ContractVersion::CURRENT), which version parity proves
+// agree. The CI gate re-verifies the evidence before it passes and records it
+// in the exact-tree attestation, and the release workflow's require_ci_green
+// verifies it again. Without evidence, or for any other diff, the plan is the
+// ordinary one.
+//
+// A commit whose message (or whose merged branch head's message) carries the
+// trailer `CI-Plan: workspace` is planned as the whole workspace, whatever it
+// changed: the explicit way to give a release's parent the workspace-mode
+// evidence a release projection reuses. It only ever adds lanes.
 
 import { execFileSync, spawnSync } from "node:child_process";
 import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
@@ -112,6 +153,13 @@ import {
   workspaceFeatures,
 } from "./ci-hook-coverage.mjs";
 import { loadNonRustReaders, readerPackagesFor } from "./ci-non-rust-readers.mjs";
+import {
+  REUSE_CLASSIFIER,
+  RELEASE_PROJECTION_MODE,
+  attestationArtifactName,
+  parseEvidenceArgument,
+  releaseProjectionBase,
+} from "./ci-release-evidence.mjs";
 import {
   normalizePath,
   packageDir,
@@ -553,6 +601,8 @@ function parseArgs(argv) {
     paths: [],
     explicitPaths: false,
     changedPathsOnly: false,
+    releaseEvidence: "",
+    workspacePlanRequested: false,
   };
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
@@ -587,6 +637,11 @@ function parseArgs(argv) {
       }
     } else if (arg === "--changed-paths-only") {
       args.changedPathsOnly = true;
+    } else if (arg === "--reuse-release-evidence") {
+      args.releaseEvidence = argv[++i] ?? "";
+      parseEvidenceArgument(args.releaseEvidence);
+    } else if (arg === "--workspace-plan-requested") {
+      args.workspacePlanRequested = true;
     } else if (arg === "--paths-from-stdin") {
       args.pathsFromStdin = true;
       args.explicitPaths = true;
@@ -596,7 +651,7 @@ function parseArgs(argv) {
       break;
     } else if (arg === "--help" || arg === "-h") {
       process.stdout.write(
-        "usage: ci-cargo-lanes.mjs [--base <rev> --head <rev>] [--max-shards N] [--workspace-shards N] [--closure-test-rows N] [--lib-row-runner LABEL] [--format json|github] [--paths-from-stdin] [--changed-paths-only] [--] [changed-path ...]\n",
+        "usage: ci-cargo-lanes.mjs [--base <rev> --head <rev>] [--max-shards N] [--workspace-shards N] [--closure-test-rows N] [--lib-row-runner LABEL] [--reuse-release-evidence <commit>:<run id>:<attempt>] [--workspace-plan-requested] [--format json|github] [--paths-from-stdin] [--changed-paths-only] [--] [changed-path ...]\n",
       );
       process.exit(0);
     } else if (arg.startsWith("-")) {
@@ -686,7 +741,11 @@ function isLaneDefinitionPath(path) {
     path === "scripts/ci-cargo-lanes-selftest.mjs" ||
     path === "scripts/ci-hook-coverage.mjs" ||
     path === "scripts/ci-verify-row-binaries.mjs" ||
-    path === "scripts/ci-non-rust-readers.mjs"
+    path === "scripts/ci-non-rust-readers.mjs" ||
+    path === "scripts/ci-release-evidence.mjs" ||
+    path === "scripts/ci-release-projection-selftest.mjs" ||
+    path === "scripts/release-projection-only.mjs" ||
+    path === "scripts/release-version-pins.mjs"
   );
 }
 
@@ -760,6 +819,10 @@ function isGlobalPath(path) {
     path === "scripts/ci-hook-coverage.mjs" ||
     path === "scripts/ci-verify-row-binaries.mjs" ||
     path === "scripts/ci-non-rust-readers.mjs" ||
+    path === "scripts/ci-release-evidence.mjs" ||
+    path === "scripts/ci-release-projection-selftest.mjs" ||
+    path === "scripts/release-projection-only.mjs" ||
+    path === "scripts/release-version-pins.mjs" ||
     path === "scripts/rust-test-selector.mjs" ||
     path === "scripts/ci-pin-rust-toolchain-env" ||
     path === "scripts/ci-clippy-sccache-wrapper" ||
@@ -1082,6 +1145,7 @@ function plan(args) {
 
   const { paths: rawPaths, removed: rawRemoved = [], reason: pathReason } = collectChangedPaths(args);
   const changed = rawPaths === null ? null : [...new Set(rawPaths.map(normalizePath))].sort();
+  const releaseProjection = releaseProjectionPlan(args, changed, pathReason);
 
   const result = {
     schema_version: 1,
@@ -1103,12 +1167,20 @@ function plan(args) {
     examples_browser: false,
     example_web: false,
     docs_only: false,
+    release_projection: releaseProjection,
   };
 
   let workspaceReason = "";
   const seeds = new Set();
 
-  if (changed === null) {
+  const requestedBy = !args.explicitPaths && args.base && changed !== null ? workspacePlanRequested(args.head) : null;
+  if (requestedBy) {
+    workspaceReason = `commit ${requestedBy} requests a workspace plan (CI-Plan: workspace)`;
+  }
+  if (releaseProjection) {
+    // Every changed path is a version projection (checked above): nothing
+    // selects a package, and nothing is global.
+  } else if (changed === null) {
     workspaceReason = pathReason;
   } else {
     for (const path of changed) {
@@ -1143,7 +1215,21 @@ function plan(args) {
     }
   }
 
-  if (changed !== null) {
+  if (releaseProjection) {
+    // What a version projection can break: the generated contract surfaces
+    // (schemas, SDK types and wrappers carry the version) and the Bazel
+    // graph (BUILD files and the module lock). It cannot change machine
+    // authority, the web runtime, the SDK suites or the examples.
+    result.generated_contract = true;
+    result.machine_authority = false;
+    result.machine_posters = false;
+    result.sdk_host = false;
+    result.wasm = false;
+    result.removed_paths = [];
+    result.bazel_graph = true;
+    result.examples_browser = false;
+    result.example_web = false;
+  } else if (changed !== null) {
     result.generated_contract = runClassifier("scripts/generated-contract-ratchet-changed", changed);
     result.machine_authority = runClassifier("scripts/machine-authority-changed", changed);
     result.machine_posters = runClassifier("scripts/machine-posters-changed", changed);
@@ -1266,7 +1352,13 @@ function plan(args) {
     }),
   );
 
-  if (workspaceReason) {
+  if (releaseProjection) {
+    result.mode = RELEASE_PROJECTION_MODE;
+    result.reason =
+      `release projection ${releaseProjection.from_version} -> ${releaseProjection.to_version}: ` +
+      `tests reuse exact-main CI run ${releaseProjection.evidence.workflow_run_id} ` +
+      `(attempt ${releaseProjection.evidence.workflow_run_attempt}) of ${releaseProjection.base_commit}`;
+  } else if (workspaceReason) {
     result.rust_changed = true;
     result.mode = "workspace";
     result.reason = workspaceReason;
@@ -1403,6 +1495,8 @@ function plan(args) {
       if (!known) throw new Error(`integration suite ${suite.package} names unknown test target ${test}`);
     }
   }
+  // A release projection keeps the suites its changed paths select (their
+  // tests read those files); the trigger-selected ones need a Rust change.
   const changedPaths = changed ?? [];
   result.integration_suites = INTEGRATION_SUITES.filter(
     (suite) =>
@@ -1422,9 +1516,22 @@ function plan(args) {
   // them against the hook's own selection; a gap fails the plan.
   const nextestText = readFileSync(resolve(root, ".config/nextest.toml"), "utf8");
   const hookText = readFileSync(resolve(root, HOOK_SCRIPT), "utf8");
+  // A release projection keeps the readers of its changed files, as any
+  // plan does: their tests ran on the parent's bytes, not these.
   result.reader_packages = changed === null ? [] : readerPackagesFor(changed, loadNonRustReaders());
   for (const name of result.reader_packages) {
     if (!byName.has(name)) throw new Error(`the non-Rust reader inventory names unknown package ${name}`);
+  }
+  if (releaseProjection) {
+    // The readers' own lib and bin unit tests (an ordinary plan leaves lib
+    // tests to the pre-push hook, which reuses the parent's evidence for a
+    // projection) and meerkat-contracts', the owner of
+    // ContractVersion::CURRENT. No budget split: these are release lanes.
+    if (!byName.has(RELEASE_PROJECTION_UNIT_PACKAGE)) {
+      throw new Error(`release-projection unit package ${RELEASE_PROJECTION_UNIT_PACKAGE} is not a workspace package`);
+    }
+    result.unit_packages = [...new Set([...result.reader_packages, RELEASE_PROJECTION_UNIT_PACKAGE])].sort();
+    result.unit_shards = packWithinBudget(result.unit_packages, weights, args.maxShards, model);
   }
   result.test_scope = [...new Set([...result.closure, ...result.reader_packages])].sort();
   const hook = hookModel(hookText);
@@ -1459,6 +1566,57 @@ function plan(args) {
     );
   }
   return result;
+}
+
+// The package whose lib tests every release-projection plan runs: it owns
+// ContractVersion::CURRENT and the schema version the bump rewrites.
+const RELEASE_PROJECTION_UNIT_PACKAGE = "meerkat-contracts";
+
+// `CI-Plan: workspace` in the head commit's message or in the message of a
+// merged branch head (a parent after the first), as git trailers are
+// written: alone on its line.
+export const WORKSPACE_PLAN_TRAILER = /^CI-Plan:[ \t]*workspace[ \t]*$/im;
+function workspacePlanRequested(head) {
+  const parents = spawnSync("git", ["rev-list", "--parents", "-n", "1", head], { cwd: root, encoding: "utf8" });
+  if (parents.status !== 0) return null;
+  const [commit, , ...merged] = parents.stdout.trim().split(/\s+/);
+  for (const revision of [commit, ...merged]) {
+    const message = spawnSync("git", ["log", "-1", "--format=%B", revision], { cwd: root, encoding: "utf8" });
+    if (message.status === 0 && WORKSPACE_PLAN_TRAILER.test(message.stdout)) return revision;
+  }
+  return null;
+}
+
+// The release-projection plan's evidence (see the header): only with
+// --reuse-release-evidence, only for a --base/--head diff whose head's first
+// parent is the base and whose diff is a release projection, and only for
+// evidence that names that base. Anything else is an error, never a plan
+// with fewer lanes.
+function releaseProjectionPlan(args, changed, pathReason) {
+  if (!args.releaseEvidence) return null;
+  if (args.explicitPaths || !args.base) {
+    throw new Error("--reuse-release-evidence needs a --base/--head diff, not a path list");
+  }
+  if (changed === null) throw new Error(`--reuse-release-evidence needs the diff, but ${pathReason}`);
+  const evidence = parseEvidenceArgument(args.releaseEvidence);
+  // An explicit workspace request outranks reuse.
+  if (workspacePlanRequested(args.head)) return null;
+  const projection = releaseProjectionBase({ base: args.base, head: args.head, cwd: root });
+  if (projection.baseSha !== evidence.commit) {
+    throw new Error(`release evidence names ${evidence.commit}, but the diff base is ${projection.baseSha}`);
+  }
+  return {
+    classifier: REUSE_CLASSIFIER,
+    from_version: projection.fromVersion,
+    to_version: projection.toVersion,
+    base_commit: projection.baseSha,
+    base_tree: projection.baseTree,
+    evidence: {
+      workflow_run_id: evidence.runId,
+      workflow_run_attempt: evidence.runAttempt,
+      attestation_artifact: attestationArtifactName(projection.baseSha, evidence.runAttempt),
+    },
+  };
 }
 
 // Build-once lanes for ARCHIVED_UNIT_LANES: one archive build per package
@@ -1576,6 +1734,12 @@ function githubOutput(result) {
   scalar("examples_browser", String(result.examples_browser));
   scalar("example_web", String(result.example_web));
   scalar("docs_only", String(result.docs_only));
+  const projection = result.release_projection;
+  scalar("release_projection", String(projection !== null));
+  scalar("release_projection_versions", projection ? `${projection.from_version} -> ${projection.to_version}` : "");
+  scalar("release_evidence_commit", projection?.base_commit ?? "");
+  scalar("release_evidence_run_id", projection?.evidence.workflow_run_id ?? "");
+  scalar("release_evidence_run_attempt", projection?.evidence.workflow_run_attempt ?? "");
   scalar("package_count", String(result.packages.length));
   scalar("closure_count", String(result.closure.length));
   scalar("closure_flags", result.closure_flags);
@@ -1619,6 +1783,14 @@ function githubOutput(result) {
 
 function main() {
   const args = parseArgs(process.argv.slice(2));
+  if (args.workspacePlanRequested) {
+    // For the change classification: exit 0 when the head commit (or a
+    // merged branch head) carries `CI-Plan: workspace`, so it skips the
+    // evidence finder and its wait.
+    const requestedBy = workspacePlanRequested(args.head);
+    process.stdout.write(requestedBy ? `CI-Plan: workspace on ${requestedBy}\n` : "");
+    process.exit(requestedBy ? 0 : 1);
+  }
   if (args.changedPathsOnly) {
     // The path collection alone, without Cargo metadata, for the actual-commit
     // controls in scripts/test-release-projection-pre-push.sh.
@@ -1633,7 +1805,7 @@ function main() {
     process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
   }
   process.stderr.write(
-    `ci-cargo-lanes: mode=${result.mode} packages=${result.packages.length} closure=${result.closure.length} clippy_shards=${result.shards.length} unit_shards=${result.unit_shards.length} feature_suites=${result.unit_feature_shards.length}/${result.main_feature_unit_shards.length} unit_deferred=${result.unit_deferred.length} unit_chain_exceptions=${result.unit_chain_exceptions.length} integration=${result.integration_suites.length} feature_check_jobs=${result.feature_check_jobs.length} test_scope=${result.test_scope.length} closure_tests=${result.closure_test_rows.length} hook_binaries=${result.hook_coverage.hook_binaries} hook_retained=${result.hook_coverage.hook_retained} (${result.reason})\n`,
+    `ci-cargo-lanes: mode=${result.mode} release_projection=${result.release_projection !== null} packages=${result.packages.length} closure=${result.closure.length} clippy_shards=${result.shards.length} unit_shards=${result.unit_shards.length} feature_suites=${result.unit_feature_shards.length}/${result.main_feature_unit_shards.length} unit_deferred=${result.unit_deferred.length} unit_chain_exceptions=${result.unit_chain_exceptions.length} integration=${result.integration_suites.length} feature_check_jobs=${result.feature_check_jobs.length} test_scope=${result.test_scope.length} closure_tests=${result.closure_test_rows.length} hook_binaries=${result.hook_coverage.hook_binaries} hook_retained=${result.hook_coverage.hook_retained} (${result.reason})\n`,
   );
 }
 

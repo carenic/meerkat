@@ -76,5 +76,13 @@ ignored = [
     "wasm-bindgen-futures",    # wasm async runtime adapter
 ]
 
+# wasm-pack's release default is `-O` (binaryen's -Os). On the same linked
+# module (2026-10-15, binaryen version_117, four threads) -O1 took 53 s
+# instead of 544 s (945 s in the v0.9.1 release job) and its output is the
+# smaller download: 11.06 MB gzip -9 and 6.93 MB brotli 11 against 11.40 MB
+# and 7.40 MB at -Os. It is larger unpacked: 41.6 MB against 36.9 MB.
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = ["-O1"]
+
 [lints]
 workspace = true
