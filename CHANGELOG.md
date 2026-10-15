@@ -52,6 +52,9 @@ them.
   entrypoint) and any status other than 1 (no match) fail, the latter with the
   rg exit status and its output. `scripts/test-ci-nextest-archive.sh` probes
   all four outcomes.
+- The Makefile comment on `bridge-no-responsestatus-gate` no longer names the
+  removed `classify_response_terminality`; like the gate, it points at the
+  machine-classified `response_terminality`.
 
 ## [0.9.1] - 2026-10-15
 
