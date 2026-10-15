@@ -35,6 +35,17 @@ them.
 
 ## [Unreleased]
 
+### Breaking
+
+- Behaviour-only (not measured by the gate): a model fallback switch
+  (`AgentLlmFallbackSwitch`) whose `target_profile` witness was not judged
+  for the target identity's own binding
+  (`ModelProfileWitness::judged_for_identity`) is refused with
+  `AgentError::ConfigError`; the activation used to replace it with the
+  model row's profile. A custom `AgentLlmClient` that proposes fallbacks to
+  targets that name a binding must mint their witnesses with
+  `ModelRegistry::profile_witness_for_identity`.
+
 ### Added
 
 - `meerkat_core::model_profile::capabilities::ModelCapabilities::gemini_provider_tag_rejection`
@@ -42,6 +53,10 @@ them.
   `GeminiProviderTag` (see Fixed), and
   `meerkat_core::lifecycle::run_primitive::GeminiThinkingLevel::as_effort_level`
   names a Gemini thinking level in the catalog's `EffortLevel` vocabulary.
+- `meerkat_core::ModelRegistry::profile_witness_for_identity` mints a
+  `ModelProfileWitness` for an identity as its binding's backend serves it,
+  and `ModelProfileWitness::judged_for_identity` says whether a witness was
+  judged for exactly that identity, binding included (see Fixed).
 
 ### Changed
 
@@ -85,6 +100,16 @@ them.
   sending with a typed `LlmError::InvalidRequest` naming the levels the model
   accepts, and a build whose provider params carry one fails with
   `BuildAgentError::Config`. Models outside the catalog keep the pass-through.
+- A sticky model fallback onto a target served through the private ChatGPT
+  backend recorded the GPT catalog row's capabilities for the session,
+  including `supports_mid_conversation_system_messages`, which that backend's
+  wire refuses: the factory judged every fallback target by its model row
+  (a target that names no binding before its binding was even selected), and
+  the activation re-minted the target's profile from the row. Instruction
+  activations were then admitted onto a backend that fails every later turn
+  that carries them. Fallback targets are now judged through the binding their
+  client uses, and the activation keeps that judgment. Ordinary System appends
+  stay ungated, as before.
 
 ## [0.9.1] - 2026-10-15
 

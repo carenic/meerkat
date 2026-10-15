@@ -570,10 +570,13 @@ pub struct AgentLlmFallbackSwitch {
     pub previous_identity: crate::SessionLlmIdentity,
     pub new_identity: crate::SessionLlmIdentity,
     pub request_policy: crate::SessionLlmRequestPolicy,
-    /// Proposed effective-registry witness for the exact target provider/model.
-    /// Core rejects foreign authority and freshly resolves all capability and
-    /// token-limit facts through the agent's captured registry. The witness is
-    /// required: unresolved fallback targets fail closed.
+    /// Proposed effective-registry witness for the exact target identity, as
+    /// the target's own binding serves it
+    /// (`ModelRegistry::profile_witness_for_identity`). Core rejects a
+    /// witness its captured registry did not mint, or one judged for another
+    /// provider, model or binding, and keeps the accepted witness as the
+    /// target's capability and token-limit facts. The witness is required:
+    /// unresolved fallback targets fail closed.
     pub target_profile: crate::ModelProfileWitness,
     pub skipped_targets: Vec<AgentLlmFallbackSkippedTarget>,
 }

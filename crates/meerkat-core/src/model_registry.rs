@@ -38,16 +38,22 @@ pub struct ModelRegistryEntry {
 /// Registry-minted provenance for one exact provider/model capability profile.
 ///
 /// The fields are deliberately private: callers can only obtain this witness
-/// through [`ModelRegistry::profile_witness_for_provider`], which validates the
-/// exact typed provider/model pair against one effective-registry authority.
-/// This keeps a [`ModelProfile`] from being detached from either the catalog
-/// identity or the registry instance that minted it when it crosses a
-/// model-fallback commit boundary.
+/// through [`ModelRegistry::profile_witness_for_provider`] or
+/// [`ModelRegistry::profile_witness_for_identity`], which validate the exact
+/// typed provider/model pair against one effective-registry authority. This
+/// keeps a [`ModelProfile`] from being detached from either the catalog
+/// identity, the binding it was judged through, or the registry instance that
+/// minted it when it crosses a model-fallback commit boundary.
 #[derive(Clone)]
 pub struct ModelProfileWitness {
     registry_authority: ModelRegistryAuthority,
     provider: Provider,
     model: String,
+    /// The binding the profile was judged through: the identity's own
+    /// binding for [`ModelRegistry::profile_witness_for_identity`], `None`
+    /// for [`ModelRegistry::profile_witness_for_provider`] (the model row
+    /// alone).
+    judged_binding: Option<crate::AuthBindingRef>,
     profile: ModelProfile,
     context_window: Option<u32>,
     max_input_tokens: Option<u32>,
@@ -63,6 +69,7 @@ impl fmt::Debug for ModelProfileWitness {
             .debug_struct("ModelProfileWitness")
             .field("provider", &self.provider)
             .field("model", &self.model)
+            .field("judged_binding", &self.judged_binding)
             .field("profile", &self.profile)
             .field("context_window", &self.context_window)
             .field("max_input_tokens", &self.max_input_tokens)
@@ -113,6 +120,15 @@ impl ModelProfileWitness {
     /// Whether this witness was minted for the supplied session identity.
     pub fn matches_identity(&self, identity: &crate::SessionLlmIdentity) -> bool {
         self.provider == identity.provider && self.model == identity.model
+    }
+
+    /// Whether this witness states `identity`'s capabilities as its own
+    /// binding serves them: minted for the same provider and model, and
+    /// judged through the binding `identity` names (an identity that names
+    /// none is judged by the model row). See
+    /// [`ModelRegistry::profile_witness_for_identity`].
+    pub fn judged_for_identity(&self, identity: &crate::SessionLlmIdentity) -> bool {
+        self.matches_identity(identity) && self.judged_binding == identity.auth_binding
     }
 
     pub(crate) fn was_minted_by(&self, authority: ModelRegistryAuthority) -> bool {
@@ -402,12 +418,47 @@ impl ModelRegistry {
         provider: Provider,
         model_id: &str,
     ) -> Option<ModelProfileWitness> {
-        let entry = self.entry_for_provider(provider, model_id)?;
         let profile = self.profile_for_provider(provider, model_id)?;
+        self.mint_profile_witness(provider, model_id, None, profile)
+    }
+
+    /// Mint provenance for `identity`'s profile as its backend serves it
+    /// ([`Self::profile_for_identity`]), recording the binding it was judged
+    /// through.
+    ///
+    /// A backend can narrow the model row (the ChatGPT backend refuses the
+    /// mid-conversation System messages the GPT rows declare), so this is the
+    /// witness a model-fallback target is judged by: the agent keeps it when
+    /// it activates the target and refuses one judged for another binding
+    /// ([`ModelProfileWitness::judged_for_identity`]). Unknown pairs and
+    /// provider/model mismatches fail closed.
+    pub fn profile_witness_for_identity(
+        &self,
+        config: &crate::Config,
+        identity: &crate::SessionLlmIdentity,
+    ) -> Option<ModelProfileWitness> {
+        let profile = self.profile_for_identity(config, identity)?;
+        self.mint_profile_witness(
+            identity.provider,
+            &identity.model,
+            identity.auth_binding.clone(),
+            profile,
+        )
+    }
+
+    fn mint_profile_witness(
+        &self,
+        provider: Provider,
+        model_id: &str,
+        judged_binding: Option<crate::AuthBindingRef>,
+        profile: ModelProfile,
+    ) -> Option<ModelProfileWitness> {
+        let entry = self.entry_for_provider(provider, model_id)?;
         Some(ModelProfileWitness {
             registry_authority: self.authority,
             provider,
             model: model_id.to_string(),
+            judged_binding,
             profile,
             context_window: entry.context_window,
             max_input_tokens: entry.max_input_tokens,
