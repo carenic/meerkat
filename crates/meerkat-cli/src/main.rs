@@ -34664,6 +34664,61 @@ supports_reasoning = true
         assert_eq!(child["max_tokens"].as_integer(), Some(2048));
     }
 
+    /// `config patch` and `config set` cannot cut the realm from the parent
+    /// whose `[governance]` it composes: a write that removes the realm's
+    /// parent edge is refused as governance administration and leaves the
+    /// document as it was, so the next start still composes the parent's
+    /// governance. A write that keeps the edge commits.
+    #[tokio::test]
+    async fn test_config_writes_cannot_drop_inherited_governance() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let scope = test_scope(dir.path().to_path_buf(), "child");
+        write_policy_parent_and_child_realm_docs(
+            dir.path(),
+            "\n[[governance.review.rules]]\ntarget = { kind = \"mcp_server\", server = \"mail\" }\ntier = \"r2\"\n",
+        )
+        .await;
+        let (before, _) = realm_doc(dir.path(), "child").await;
+
+        for patch in [
+            serde_json::json!({"realm": {"child": {"parent": null}}}),
+            serde_json::json!({"realm": {"child": null}}),
+        ] {
+            let refused = handle_config_patch(None, Some(patch.to_string()), None, &scope)
+                .await
+                .expect_err("a patch cannot drop the inherited governance");
+            assert!(
+                format!("{refused:#}").contains("governance"),
+                "{patch}: {refused:#}"
+            );
+        }
+        let refused = handle_config_set(
+            None,
+            Some(serde_json::json!({"max_tokens": 1024}).to_string()),
+            None,
+            None,
+            &scope,
+        )
+        .await
+        .expect_err("a full replace cannot drop the parent edge");
+        assert!(format!("{refused:#}").contains("governance"), "{refused:#}");
+        assert_eq!(realm_doc(dir.path(), "child").await.0, before);
+
+        let (config, _) = load_config(&scope).await.expect("reload config");
+        assert!(
+            config.governance.is_some(),
+            "the child still composes its parent's governance"
+        );
+        handle_config_patch(
+            None,
+            Some(serde_json::json!({"max_tokens": 2048}).to_string()),
+            None,
+            &scope,
+        )
+        .await
+        .expect("a patch that keeps the edge commits");
+    }
+
     /// `config set` refuses a wrapped config in every input form: a
     /// `config get --with-generation` read envelope, a set request
     /// `{config, expected_generation}` and a bare `{config}` (each would

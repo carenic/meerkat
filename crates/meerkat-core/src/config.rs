@@ -3470,18 +3470,6 @@ fn fold_confinement(
     confinement
 }
 
-/// The `[confinement]` [`compose_effective_config`] composes for `head`
-/// from `docs`, over the same chain, without the rest of the configuration
-/// and without the layer check ([`check_composed_confinement`]).
-#[cfg(not(target_arch = "wasm32"))]
-pub(crate) fn compose_confinement(
-    docs: &std::collections::BTreeMap<crate::connection::RealmId, Config>,
-    head: &crate::connection::RealmId,
-) -> Result<crate::ConfinementConfig, crate::connection::RealmChainError> {
-    let chain = composition_chain(docs, head)?;
-    Ok(fold_confinement(docs, &chain))
-}
-
 /// Refuse a composition in which a less trusted document weakens or
 /// replaces a confinement requirement ([`crate::check_confinement_layers`]).
 #[cfg(not(target_arch = "wasm32"))]

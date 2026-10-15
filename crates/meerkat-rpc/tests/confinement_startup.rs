@@ -471,3 +471,68 @@ fn confinement_that_could_change_the_credential_store_refuses_rkat_rpc_startup()
         run.stderr
     );
 }
+
+/// A `config/patch` cannot cut the served realm from the parent whose
+/// `[governance]` it composes: the real server refuses the write with the
+/// governance discriminator and the realm document keeps its bytes. A write
+/// that keeps the edge commits.
+#[test]
+fn rkat_rpc_config_writes_cannot_drop_inherited_governance() {
+    let binary = rkat_rpc_binary();
+    let temp = TempDir::new().expect("temp dir");
+    let state_root = temp.path().join("state");
+    let user_root = temp.path().join("user");
+    std::fs::create_dir_all(&user_root).expect("user root should initialize");
+    let team_text = "[realm.team]\nparent = \"org\"\n";
+    let org_text = "[realm.org]\n\n[[governance.review.rules]]\ntarget = { kind = \"mcp_server\", server = \"mail\" }\ntier = \"r2\"\n";
+    for (realm, text) in [("org", org_text), ("team", team_text)] {
+        let document = state_root.join(realm).join("config.toml");
+        std::fs::create_dir_all(document.parent().expect("realm dir"))
+            .expect("realm dir should initialize");
+        std::fs::write(&document, text).expect("realm document should be written");
+    }
+
+    let args = scope_args("team", &state_root, &user_root);
+    let (run, responses) = run_rkat_rpc_with_requests(
+        &binary,
+        temp.path(),
+        &args,
+        &[
+            (
+                "config/patch",
+                serde_json::json!({ "patch": { "realm": { "team": { "parent": null } } } }),
+            ),
+            (
+                "config/patch",
+                serde_json::json!({ "patch": { "realm": { "team": null } } }),
+            ),
+            (
+                "config/patch",
+                serde_json::json!({ "patch": { "max_tokens": 2048 } }),
+            ),
+        ],
+    );
+    assert!(
+        run.answered,
+        "the team realm serves; exit={:?} stderr:\n{}",
+        run.status, run.stderr
+    );
+    for id in [2, 3] {
+        let error = &responses[&id]["error"];
+        assert_eq!(
+            error["data"],
+            serde_json::json!({ "type": "governance_administration_required" }),
+            "request {id}: {}",
+            responses[&id]
+        );
+    }
+    assert!(
+        responses[&4].get("error").is_none(),
+        "a patch that keeps the edge commits: {}",
+        responses[&4]
+    );
+    let committed = std::fs::read_to_string(state_root.join("team").join("config.toml"))
+        .expect("team document");
+    assert!(committed.contains("parent = \"org\""), "{committed}");
+    assert!(committed.contains("max_tokens = 2048"), "{committed}");
+}

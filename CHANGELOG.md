@@ -47,6 +47,11 @@ them.
   have a new `refused_mcp_servers` field (`Vec<McpServerRefusal>`); a struct
   literal must add it (or use `..Default::default()` or
   `AgentBuildConfig::new`).
+- Behaviour-only (not measured by the gate): a config write that changes the
+  realm sections of a realm's own document (its parent edge, or a
+  `[realm.global]` section) is also refused with
+  `governance_administration_required` when the realm would compose a
+  different `[governance]` (see Fixed).
 
 ### Deprecated
 
@@ -116,6 +121,15 @@ them.
   document states none. Before, such a section in a document that sorted
   after the realm's own replaced its edge during composition and cut the
   realm from that ancestor and its `[confinement]`.
+- An ordinary config write can no longer cut a realm from the ancestors
+  whose `[governance]` it composes. A write that changes the realm sections
+  of its own document (the parent edge, or a `[realm.global]` section that
+  puts the user document on its chain) is refused with
+  `governance_administration_required` when the realm would compose a
+  different `[governance]`, on every surface with the realm chain (JSON-RPC,
+  REST, the MCP config tool, `rkat config`, and the governed stock
+  finalization store). In 0.9.1 such a write dropped the ancestors' review
+  rules from the next start.
 - `rkat-rpc`, `rkat-rest` and `rkat-mcp` read their working directory at
   startup only for a relative `--confinement-read` or `--confinement-write`
   path. They read it on every start, so a server whose working directory had

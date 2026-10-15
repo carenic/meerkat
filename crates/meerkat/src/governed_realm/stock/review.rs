@@ -179,6 +179,8 @@ pub(crate) async fn read_realm_review_rules(
         global_doc,
         meerkat_models::canonical(),
     );
+    // A read of the realm's own document; nothing is written through this
+    // store, so it composes no realm chain.
     let head = meerkat_core::FileConfigStore::new(
         source.config_doc_path(realm),
         meerkat_models::canonical(),

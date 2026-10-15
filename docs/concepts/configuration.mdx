@@ -563,6 +563,13 @@ remove or restate the section, including a full replace that omits it, and
 is refused with `governance_administration_required`. The section stays
 readable through the ordinary config reads.
 
+A realm composes its ancestors' governance through its realm sections, so
+those are covered too: a write that changes them in a way that would change
+the governance the realm composes is refused with
+`governance_administration_required` (see
+[confinement administration](#administration) for the rule both sections
+share).
+
 ## OS process confinement
 
 `[confinement]` selects the OS process confinement a stock host (`rkat`,
@@ -677,14 +684,24 @@ add, change or remove it, including a full replace that omits it, and is
 refused with `confinement_administration_required`. Restating it unchanged is
 allowed. The section stays readable through the ordinary config reads.
 
-A realm composes its ancestors' `[confinement]` through its own
-`[realm.<id>].parent` edge, so the edge is covered too: a write that changes
-or removes it is refused with `confinement_administration_required` when the
-realm would compose a different section through the new edge, adding or
-dropping a requirement alike, and a new edge whose chain does not resolve is
-refused as invalid. A changed edge that composes the same section, such as a
-parent stating the same requirement, is ordinary config. Re-parent a confined
-realm by editing its document as its host.
+A realm composes its ancestors' `[confinement]` and `[governance]` through
+the realm sections of its own document: its `[realm.<id>].parent` edge, and
+a `[realm.global]` section that puts the user document on its chain. These
+are covered too: a write that changes them is refused with
+`confinement_administration_required` (or
+`governance_administration_required`) when the realm would compose a
+different `[confinement]` (or `[governance]`) afterwards, adding or dropping
+a requirement alike, and sections whose chain does not resolve are refused
+as invalid. A change that composes the same sections, such as a parent
+stating the same requirement, is ordinary config. Re-parent a confined or
+governed realm by editing its document as its host.
+
+Only a store that declares the realm's chain enforces this, as the stock
+hosts' stores do (`FileConfigStore::with_realm_chain`,
+`SdkConfigStore::with_realm_document`). A store built with
+`FileConfigStore::new` or `SdkConfigStore::with_path` alone, and an
+in-memory store, keep the document's own `[confinement]` and `[governance]`
+sections but not the realm sections that compose an ancestor's.
 
 ### Operator flags
 
