@@ -318,6 +318,11 @@ them.
   `scripts/pre-push-unit.sh` and every line of the executing step that names a
   row input, finds a hook binary in scope that neither a row nor the hook's
   own lib lane runs.
+- CI's `Closure tests` rows have 60 minutes instead of 40, and the
+  `ci-integration` profile gives its four slow nested-Cargo and
+  whole-workspace tests 16 slow periods (960 s) instead of 8, so a cold row
+  (as after a release version bump, when no compiled unit can be reused)
+  completes on a hosted 4-vCPU runner.
 - CI planning now treats both sides of a rename and type-only changes as
   changed paths, so a file moved between crates or renamed out of Rust still
   selects its old crate's lanes.
