@@ -148,13 +148,21 @@ impl From<ConfinementNetworkArg> for meerkat_core::WorkspaceNetwork {
 fn cli_confinement(
     cli: &Cli,
 ) -> Result<Option<meerkat_core::LaunchConfinement>, Box<dyn std::error::Error>> {
-    Ok(meerkat_core::ConfinementFlags {
+    let flags = meerkat_core::ConfinementFlags {
         mode: cli.confinement.map(Into::into),
         network: cli.confinement_network.map(Into::into),
         read: cli.confinement_read.clone(),
         write: cli.confinement_write.clone(),
-    }
-    .selection(&std::env::current_dir()?)?)
+    };
+    // Relative flag paths resolve against the working directory, read only
+    // when a flag needs it: a server started without one does not depend on
+    // its working directory, which may have been removed.
+    let working_directory = if flags.needs_working_directory() {
+        std::env::current_dir()?
+    } else {
+        PathBuf::new()
+    };
+    Ok(flags.selection(&working_directory)?)
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -408,10 +416,12 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     let realm_config_source: Arc<dyn meerkat_core::RealmConfigSource> =
         Arc::new(fs_realm_config_source);
 
-    let base_store: Arc<dyn ConfigStore> = Arc::new(FileConfigStore::new(
-        head_config_doc.clone(),
-        meerkat_models::canonical(),
-    ));
+    // The head document composes with the same ancestors as at start, so a
+    // config write cannot cut the realm from their `[confinement]`.
+    let base_store: Arc<dyn ConfigStore> = Arc::new(
+        FileConfigStore::new(head_config_doc.clone(), meerkat_models::canonical())
+            .with_realm_chain(locator.realm.clone(), Arc::clone(&realm_config_source)),
+    );
     let tagged = TaggedConfigStore::new(
         base_store,
         meerkat_core::ConfigStoreMetadata {
@@ -518,11 +528,18 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     // preset never grants the realm's own directory.
     let host_confinement =
         meerkat::HostConfinement::resolve(&config.confinement, cli.context_root.as_deref())?;
-    // A start whose confined processes could change the realm state or the
-    // user config document is refused before it serves.
-    let host_inputs = meerkat::HostConfinement::host_inputs(
+    // A start whose confined processes could change the realm state, the
+    // user config document or the credential store is refused before it
+    // serves.
+    let mut host_inputs = meerkat::HostConfinement::host_inputs(
         &locator.state_root,
         layout.global_config_path().as_deref(),
+    );
+    host_inputs.extend(
+        meerkat::TokenStoreBackend::default_auto()
+            .ok()
+            .as_ref()
+            .and_then(meerkat::HostConfinement::credential_store_input),
     );
     host_confinement.admit_host_inputs(&host_inputs)?;
     host_confinement.log_startup(
@@ -871,11 +888,18 @@ async fn serve_stock_governed_jsonl(
     });
     let host_confinement =
         meerkat::HostConfinement::resolve(&config.confinement, cli.context_root.as_deref())?;
-    // A start whose confined processes could change the realm state or the
-    // user config document is refused before it serves.
-    let host_inputs = meerkat::HostConfinement::host_inputs(
+    // A start whose confined processes could change the realm state, the
+    // user config document or the credential store is refused before it
+    // serves.
+    let mut host_inputs = meerkat::HostConfinement::host_inputs(
         &locator.state_root,
         layout.global_config_path().as_deref(),
+    );
+    host_inputs.extend(
+        meerkat::TokenStoreBackend::default_auto()
+            .ok()
+            .as_ref()
+            .and_then(meerkat::HostConfinement::credential_store_input),
     );
     host_confinement.admit_host_inputs(&host_inputs)?;
     host_confinement.log_startup(

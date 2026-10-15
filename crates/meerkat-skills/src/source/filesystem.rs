@@ -24,6 +24,7 @@ pub struct FilesystemSkillSource {
     source_uuid: SourceUuid,
     thresholds: SourceHealthThresholds,
     health: Arc<RwLock<SourceHealthSnapshot>>,
+    untrusted_targets: Option<crate::UntrustedPaths>,
 }
 
 impl FilesystemSkillSource {
@@ -48,7 +49,34 @@ impl FilesystemSkillSource {
             source_uuid,
             thresholds,
             health: Arc::new(RwLock::new(SourceHealthSnapshot::default())),
+            untrusted_targets: None,
         }
+    }
+
+    /// Judge each skill a link leads out of this source's directory where
+    /// the link leads: one at a path `untrusted` names is not read. A host
+    /// that confines its launches passes the paths its confined processes
+    /// could change, so such a process cannot supply a skill through a link
+    /// in a directory the host trusts.
+    #[must_use]
+    pub fn with_untrusted_targets(mut self, untrusted: crate::UntrustedPaths) -> Self {
+        self.untrusted_targets = Some(untrusted);
+        self
+    }
+
+    /// Whether the skill in `skill_dir` (the directory or its `SKILL.md`)
+    /// leads through a link out of this source's directory to a path the
+    /// host does not trust.
+    fn links_to_untrusted(&self, skill_dir: &Path) -> bool {
+        self.untrusted_targets.as_ref().is_some_and(|untrusted| {
+            super::leads_out_to_untrusted(&self.root, skill_dir, true, untrusted)
+                || super::leads_out_to_untrusted(
+                    &self.root,
+                    &skill_dir.join("SKILL.md"),
+                    false,
+                    untrusted,
+                )
+        })
     }
 
     fn discover_skill_directories(base: &Path) -> Vec<PathBuf> {
@@ -108,6 +136,13 @@ impl SkillSource for FilesystemSkillSource {
         let mut invalid_count: u32 = 0;
         let mut total_count: u32 = 0;
         for dir in Self::discover_skill_directories(&self.root) {
+            if self.links_to_untrusted(&dir) {
+                tracing::warn!(
+                    ?dir,
+                    "skipping filesystem skill: it links to a path a confined process can change"
+                );
+                continue;
+            }
             total_count = total_count.saturating_add(1);
             let Some(key) = self.skill_key_for_dir(&dir) else {
                 // Directory name is not a valid skill slug — record it as
@@ -143,7 +178,7 @@ impl SkillSource for FilesystemSkillSource {
             return Err(SkillError::NotFound { key: key.clone() });
         }
         let dir = self.root.join(key.skill_name.as_str());
-        if !dir.join("SKILL.md").is_file() {
+        if !dir.join("SKILL.md").is_file() || self.links_to_untrusted(&dir) {
             return Err(SkillError::NotFound { key: key.clone() });
         }
         let content = std::fs::read_to_string(dir.join("SKILL.md"))

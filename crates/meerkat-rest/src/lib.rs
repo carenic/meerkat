@@ -233,6 +233,11 @@ pub struct AppState {
     /// Provider-runtime registry shared with the AgentFactory's auth
     /// resolution path.
     pub provider_registry: Arc<meerkat_providers::ProviderRuntimeRegistry>,
+    /// The host's OS process confinement, as installed on the factory that
+    /// builds this state's sessions: the `mcp.toml` files a confined process
+    /// can write configure no MCP auth target, and a credential command one
+    /// could change is refused. The trusted host by default.
+    pub host_confinement: meerkat::HostConfinement,
 }
 
 #[derive(Debug, Clone)]
@@ -600,10 +605,12 @@ impl AppState {
             sessions_sqlite_path: Some(realm_paths.sessions_sqlite_path.display().to_string()),
             sessions_jsonl_dir: realm_paths.sessions_jsonl_dir.display().to_string(),
         };
-        let base_config_store: Arc<dyn ConfigStore> = Arc::new(FileConfigStore::new(
-            head_config_doc,
-            meerkat_models::canonical(),
-        ));
+        // The head document composes with the same ancestors as at start, so
+        // a config write cannot cut the realm from their `[confinement]`.
+        let base_config_store: Arc<dyn ConfigStore> = Arc::new(
+            FileConfigStore::new(head_config_doc, meerkat_models::canonical())
+                .with_realm_chain(realm.clone(), Arc::clone(&realm_config_source)),
+        );
         let config_store: Arc<dyn ConfigStore> = Arc::new(meerkat_core::TaggedConfigStore::new(
             base_config_store,
             meerkat_core::ConfigStoreMetadata {
@@ -691,6 +698,7 @@ impl AppState {
         // signal to silently run ephemeral: that would launder a real auth
         // backend failure into apparent "no credentials". Propagate the typed
         // TokenStoreError and fail REST startup.
+        let credential_store_input = meerkat::HostConfinement::credential_store_input(&credentials);
         let provider_auth_persistence = credentials.open_with_refresh_authority()?;
         let mut factory = AgentFactory::new(store_path.clone())
             .with_provider_auth_persistence(provider_auth_persistence.clone())
@@ -712,12 +720,14 @@ impl AppState {
             &config.confinement,
             conventions_context_root.as_deref(),
         )?;
-        // A start whose confined processes could change the realm state or
-        // the user config document is refused before it serves.
-        let host_inputs = meerkat::HostConfinement::host_inputs(
+        // A start whose confined processes could change the realm state, the
+        // user config document or the credential store is refused before it
+        // serves.
+        let mut host_inputs = meerkat::HostConfinement::host_inputs(
             &realms_root,
             layout.global_config_path().as_deref(),
         );
+        host_inputs.extend(credential_store_input);
         host_confinement.admit_host_inputs(&host_inputs)?;
         host_confinement.log_startup(
             &host_inputs,
@@ -865,6 +875,7 @@ impl AppState {
             connector_client_auth_profiles: Vec::new(),
             auth_lease,
             provider_registry,
+            host_confinement,
         })
     }
 
@@ -4595,12 +4606,11 @@ fn config_runtime_err_to_api(err: meerkat_core::ConfigRuntimeError) -> ApiError 
         // An ordinary config write is not administration of a section the
         // host administers in the document itself; nothing was written. The
         // refusal keeps its typed discriminator, as on JSON-RPC and MCP.
-        meerkat_core::ConfigRuntimeError::Config(
-            error @ (meerkat_core::ConfigError::GovernanceAdministration
-            | meerkat_core::ConfigError::ConfinementAdministration),
-        ) => {
-            let refusal = match error {
-                meerkat_core::ConfigError::ConfinementAdministration => {
+        meerkat_core::ConfigRuntimeError::Config(error)
+            if error.administered_section().is_some() =>
+        {
+            let refusal = match error.administered_section() {
+                Some(meerkat_core::AdministeredSection::Confinement) => {
                     meerkat_contracts::wire::WireConfigWriteRefusal::ConfinementAdministrationRequired
                 }
                 _ => meerkat_contracts::wire::WireConfigWriteRefusal::GovernanceAdministrationRequired,
@@ -5642,6 +5652,7 @@ async fn create_session_inner(
         // The session service decides hosting when it creates the actor.
         hosting: meerkat_core::session_hosting::SessionHostingIntent::default(),
         mcp_servers: Vec::new(),
+        refused_mcp_servers: Vec::new(),
         recoverable_tool_defs: None,
         llm_client_override: state
             .llm_client_override
@@ -6903,6 +6914,7 @@ async fn continue_session_inner(
             // The session service decides hosting when it creates the actor.
             hosting: meerkat_core::session_hosting::SessionHostingIntent::default(),
             mcp_servers: Vec::new(),
+            refused_mcp_servers: Vec::new(),
             recoverable_tool_defs: None,
             llm_client_override: state
                 .llm_client_override
@@ -11631,7 +11643,9 @@ mod tests {
         state.llm_client_override = Some(Arc::new(MockLlmClient));
 
         let target_session_id = create_completed_rest_runtime_session(&state).await;
-        let adapter = Arc::new(McpRouterAdapter::new(McpRouter::new()));
+        let adapter = Arc::new(McpRouterAdapter::new(McpRouter::new_with_stdio_profile(
+            meerkat_mcp::McpStdioLaunchProfile::trusted_host(),
+        )));
         let (lifecycle_tx, lifecycle_rx) = mpsc::unbounded_channel();
         state.mcp_sessions.write().await.insert(
             target_session_id.clone(),
@@ -11909,7 +11923,9 @@ mod tests {
             .unwrap();
         state.llm_client_override = Some(Arc::new(MockLlmClient));
         let session_id = create_archived_stale_rest_runtime_session(&state).await;
-        let adapter = Arc::new(McpRouterAdapter::new(McpRouter::new()));
+        let adapter = Arc::new(McpRouterAdapter::new(McpRouter::new_with_stdio_profile(
+            meerkat_mcp::McpStdioLaunchProfile::trusted_host(),
+        )));
         let (lifecycle_tx, lifecycle_rx) = mpsc::unbounded_channel();
         state.mcp_sessions.write().await.insert(
             session_id.clone(),
@@ -12986,6 +13002,251 @@ requirement = { baseline = "command_runtime_v1", read = { kind = "paths", paths 
             meerkat_core::ConfinementConfig::for_all(meerkat_core::LaunchConfinement::Workspace(
                 meerkat_core::WorkspaceConfinement::default()
             ))
+        );
+    }
+
+    /// A REST config write cannot cut the served realm from the parent whose
+    /// `[confinement]` it composes: a patch or a full replace that removes
+    /// the realm's parent edge is refused (HTTP 400, the confinement
+    /// discriminator) and the document keeps its bytes. A write that keeps
+    /// the edge commits.
+    #[tokio::test]
+    async fn test_config_writes_cannot_drop_inherited_confinement() {
+        let temp = TempDir::new().unwrap();
+        let realms = temp.path().join("realms");
+        let team_text = "[realm.team]\nparent = \"org\"\n";
+        let org_text = format!("[realm.org]\n\n{UNENFORCEABLE_CONFINEMENT}");
+        for (realm, text) in [("org", org_text.as_str()), ("team", team_text)] {
+            let path = meerkat_store::realm_paths_in(&realms, realm).config_path;
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, text).unwrap();
+        }
+        let mut bootstrap = RuntimeBootstrap::default();
+        bootstrap.realm.selection = RealmSelection::Explicit {
+            realm_id: "team".to_string(),
+        };
+        bootstrap.realm.state_root = Some(realms.clone());
+        bootstrap.context.user_config_root = Some(temp.path().join("user"));
+        let credentials = test_credential_store(temp.path());
+        let state = AppState::load_from_with_bootstrap(
+            temp.path().to_path_buf(),
+            bootstrap,
+            false,
+            credentials,
+        )
+        .await
+        .unwrap();
+        let team_doc = meerkat_store::realm_paths_in(&realms, "team").config_path;
+
+        for patch in [
+            serde_json::json!({"realm": {"team": {"parent": null}}}),
+            serde_json::json!({"realm": {"team": null}}),
+        ] {
+            let refused = patch_config(
+                State(state.clone()),
+                Json(PatchConfigRequest::Wrapped {
+                    patch: patch.clone(),
+                    expected_generation: None,
+                }),
+            )
+            .await
+            .expect_err("a patch cannot drop the inherited confinement");
+            assert!(
+                is_administration_refusal(&refused, "confinement_administration_required"),
+                "{patch}: {refused:?}"
+            );
+        }
+        let Json(current) = get_config(State(state.clone())).await.unwrap();
+        let mut detached = current.config.clone();
+        detached.realm.remove("team");
+        let refused = set_config(
+            State(state.clone()),
+            Json(SetConfigRequest::Wrapped {
+                config: detached,
+                expected_generation: None,
+            }),
+        )
+        .await
+        .expect_err("a full replace cannot drop the parent edge");
+        assert!(
+            is_administration_refusal(&refused, "confinement_administration_required"),
+            "{refused:?}"
+        );
+        assert_eq!(std::fs::read_to_string(&team_doc).unwrap(), team_text);
+
+        let Json(kept) = patch_config(
+            State(state),
+            Json(PatchConfigRequest::Wrapped {
+                patch: serde_json::json!({"max_tokens": 2048}),
+                expected_generation: None,
+            }),
+        )
+        .await
+        .expect("a patch that keeps the edge commits");
+        assert_eq!(
+            kept.config.realm["team"]
+                .parent
+                .as_ref()
+                .map(|parent| parent.as_str()),
+            Some("org")
+        );
+    }
+
+    /// A REST config write cannot cut the served realm from the parent whose
+    /// `[governance]` it composes: a patch or a full replace that removes the
+    /// realm's parent edge is refused (HTTP 400, the governance
+    /// discriminator) and the document keeps its bytes. A write that keeps
+    /// the edge commits.
+    #[tokio::test]
+    async fn test_config_writes_cannot_drop_inherited_governance() {
+        let temp = TempDir::new().unwrap();
+        let realms = temp.path().join("realms");
+        let team_text = "[realm.team]\nparent = \"org\"\n";
+        let org_text = "[realm.org]\n\n[[governance.review.rules]]\ntarget = { kind = \"mcp_server\", server = \"mail\" }\ntier = \"r2\"\n";
+        for (realm, text) in [("org", org_text), ("team", team_text)] {
+            let path = meerkat_store::realm_paths_in(&realms, realm).config_path;
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, text).unwrap();
+        }
+        let mut bootstrap = RuntimeBootstrap::default();
+        bootstrap.realm.selection = RealmSelection::Explicit {
+            realm_id: "team".to_string(),
+        };
+        bootstrap.realm.state_root = Some(realms.clone());
+        bootstrap.context.user_config_root = Some(temp.path().join("user"));
+        let credentials = test_credential_store(temp.path());
+        let state = AppState::load_from_with_bootstrap(
+            temp.path().to_path_buf(),
+            bootstrap,
+            false,
+            credentials,
+        )
+        .await
+        .unwrap();
+        let team_doc = meerkat_store::realm_paths_in(&realms, "team").config_path;
+
+        for patch in [
+            serde_json::json!({"realm": {"team": {"parent": null}}}),
+            serde_json::json!({"realm": {"team": null}}),
+        ] {
+            let refused = patch_config(
+                State(state.clone()),
+                Json(PatchConfigRequest::Wrapped {
+                    patch: patch.clone(),
+                    expected_generation: None,
+                }),
+            )
+            .await
+            .expect_err("a patch cannot drop the inherited governance");
+            assert!(
+                is_administration_refusal(&refused, "governance_administration_required"),
+                "{patch}: {refused:?}"
+            );
+        }
+        let Json(current) = get_config(State(state.clone())).await.unwrap();
+        let mut detached = current.config.clone();
+        detached.realm.remove("team");
+        let refused = set_config(
+            State(state.clone()),
+            Json(SetConfigRequest::Wrapped {
+                config: detached,
+                expected_generation: None,
+            }),
+        )
+        .await
+        .expect_err("a full replace cannot drop the parent edge");
+        assert!(
+            is_administration_refusal(&refused, "governance_administration_required"),
+            "{refused:?}"
+        );
+        assert_eq!(std::fs::read_to_string(&team_doc).unwrap(), team_text);
+
+        let Json(kept) = patch_config(
+            State(state),
+            Json(PatchConfigRequest::Wrapped {
+                patch: serde_json::json!({"max_tokens": 2048}),
+                expected_generation: None,
+            }),
+        )
+        .await
+        .expect("a patch that keeps the edge commits");
+        assert!(
+            kept.config.governance.is_none(),
+            "the realm states none of its own"
+        );
+    }
+
+    /// An MCP auth request on a confining host addresses only servers the
+    /// host installed: a server that only a project `mcp.toml` a confined
+    /// process can write defines is refused as not configured (HTTP 400,
+    /// `mcp_server_not_configured`) before anything is looked up for it, so
+    /// a planted entry cannot point a login at a server of its choosing.
+    #[cfg(feature = "mcp")]
+    #[tokio::test]
+    async fn test_mcp_auth_target_refuses_a_server_only_an_untrusted_mcp_toml_defines() {
+        let temp = TempDir::new().unwrap();
+        let base = temp.path().canonicalize().unwrap();
+        let project = base.join("project");
+        let user = base.join("user");
+        for dir in [project.join(".rkat"), user.join(".rkat")] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        std::fs::write(
+            project.join(".rkat").join("mcp.toml"),
+            "[[servers]]\nname = \"planted\"\nurl = \"https://planted.example/mcp\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            user.join(".rkat").join("config.toml"),
+            format!(
+                "[confinement.all]\nmode = \"custom\"\nworking_directory = \"{dir}\"\nrequirement = {{ baseline = \"command_runtime_v1\", read = {{ kind = \"paths\", paths = [{{ kind = \"subtree\", path = \"{dir}\" }}] }}, write = {{ kind = \"paths\", paths = [{{ kind = \"subtree\", path = \"{dir}\" }}] }}, deny_read = [], deny_write = [], network = {{ kind = \"denied\" }}, unix_connect = [], require_descendant_termination = false }}\n",
+                dir = project.display()
+            ),
+        )
+        .unwrap();
+        let mut bootstrap = RuntimeBootstrap::default();
+        bootstrap.realm.selection = RealmSelection::Explicit {
+            realm_id: "rest-untrusted-mcp".to_string(),
+        };
+        bootstrap.realm.state_root = Some(base.join("realms"));
+        bootstrap.context.context_root = Some(project.clone());
+        bootstrap.context.user_config_root = Some(user);
+        let state = AppState::load_from_with_bootstrap(
+            base.join("instance"),
+            bootstrap,
+            false,
+            test_credential_store(&base),
+        )
+        .await
+        .unwrap();
+
+        let response = crate::auth_endpoints::cancel_login(
+            State(state),
+            Json(crate::auth_endpoints::LoginCancelBody::Mcp(
+                meerkat_contracts::wire::McpLoginCancelParams {
+                    mcp: meerkat_contracts::WireMcpAuthTarget {
+                        server_name: "planted".to_string(),
+                        server_url: "https://planted.example/mcp".to_string(),
+                        oauth_account: None,
+                        oauth_account_selection: None,
+                    },
+                    state: "unknown-attempt".to_string(),
+                },
+            )),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["reason"], "mcp_server_not_configured", "{body}");
+        assert!(
+            body["error"]
+                .as_str()
+                .is_some_and(|text| text.contains("confined process")),
+            "{body}"
         );
     }
 
@@ -17359,7 +17620,9 @@ matching the required schema. Output ONLY the JSON, no additional text or markdo
             let session_id = SessionId::new();
             {
                 let mut map = state.mcp_sessions.write().await;
-                let adapter = Arc::new(McpRouterAdapter::new(McpRouter::new()));
+                let adapter = Arc::new(McpRouterAdapter::new(McpRouter::new_with_stdio_profile(
+                    meerkat_mcp::McpStdioLaunchProfile::trusted_host(),
+                )));
                 let (tx, rx) = mpsc::unbounded_channel();
                 map.insert(
                     session_id.clone(),

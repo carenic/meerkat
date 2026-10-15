@@ -36,6 +36,14 @@ pub type EnvLookup = Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
 /// Closure that returns the current time. Injected for test determinism.
 pub type NowFn = Arc<dyn Fn() -> DateTime<Utc> + Send + Sync>;
 
+/// Whether a confined process could change what the host reads at a path
+/// (`true`: anything under it as well). A host that confines its agents'
+/// launches supplies one, so a program of its own that it runs outside that
+/// confinement (a credential command, [`meerkat_core::HostLaunchExemption`])
+/// is refused when a confined process could change it.
+#[cfg(not(target_arch = "wasm32"))]
+pub type HostLaunchGuard = Arc<dyn Fn(&std::path::Path, bool) -> bool + Send + Sync>;
+
 /// Explicit environment passed to provider resolvers.
 ///
 /// `env_lookup` replaces direct `std::env::var` calls — the resolution
@@ -56,6 +64,8 @@ pub struct ResolverEnvironment {
     pub auth_lease_handle: Option<GeneratedAuthLeaseHandle>,
     #[cfg(not(target_arch = "wasm32"))]
     provider_auth_persistence: Option<meerkat_core::auth::ProviderAuthPersistence>,
+    #[cfg(not(target_arch = "wasm32"))]
+    host_launch_guard: Option<HostLaunchGuard>,
 }
 
 impl ResolverEnvironment {
@@ -70,6 +80,8 @@ impl ResolverEnvironment {
             auth_lease_handle: None,
             #[cfg(not(target_arch = "wasm32"))]
             provider_auth_persistence: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            host_launch_guard: None,
         }
     }
 
@@ -84,6 +96,8 @@ impl ResolverEnvironment {
             auth_lease_handle: None,
             #[cfg(not(target_arch = "wasm32"))]
             provider_auth_persistence: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            host_launch_guard: None,
         }
     }
 
@@ -107,6 +121,22 @@ impl ResolverEnvironment {
         &self,
     ) -> Option<&meerkat_core::auth::ProviderAuthPersistence> {
         self.provider_auth_persistence.as_ref()
+    }
+
+    /// Refuse a credential command a confined process could change: its
+    /// program, or its working directory (see [`HostLaunchGuard`]).
+    #[cfg(not(target_arch = "wasm32"))]
+    #[must_use]
+    pub fn with_host_launch_guard(mut self, guard: HostLaunchGuard) -> Self {
+        self.host_launch_guard = Some(guard);
+        self
+    }
+
+    /// The host's guard for programs it runs outside its confinement, when
+    /// it confines its agents' launches.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn host_launch_guard(&self) -> Option<&HostLaunchGuard> {
+        self.host_launch_guard.as_ref()
     }
 
     /// Register an external auth resolver under a handle name.

@@ -575,13 +575,21 @@ remove or restate the section, including a full replace that omits it, and
 is refused with `governance_administration_required`. The section stays
 readable through the ordinary config reads.
 
+A realm composes its ancestors' governance through its realm sections, so
+those are covered too: a write that changes them in a way that would change
+the governance the realm composes is refused with
+`governance_administration_required` (see
+[confinement administration](#administration) for the rule both sections
+share).
+
 ## OS process confinement
 
 `[confinement]` selects the OS process confinement a stock host (`rkat`,
 `rkat-rpc`, `rkat-rest` and `rkat-mcp`) applies to the processes its agents
 launch: shell tool calls, background jobs and monitors (`shell`), command
-hooks (`command_hooks`) and local MCP stdio servers (`mcp_stdio`). Without
-the section, every launch runs as the trusted host, as before.
+hooks (`command_hooks`), and local MCP stdio servers and stdio skill sources
+(`mcp_stdio`). Without the section, every launch runs as the trusted host,
+as before.
 
 ```toml
 # Every launch kind: the workspace preset.
@@ -625,10 +633,12 @@ user namespaces, and it refuses deny lists, Unix socket grants, nested grants,
 and granted paths that do not exist or pass through a symbolic link. Other
 platforms refuse every confined launch. A confined process finds its program,
 libraries and data only inside its granted subtrees and the platform
-baseline; grant anything else it needs with `read`. A confined command hook
-or MCP stdio server names its program by absolute path and receives only its
-configured environment, never the host's; a relative program name or a loader
-variable such as `LD_PRELOAD` refuses that launch.
+baseline; grant anything else it needs with `read`. A confined command hook,
+MCP stdio server or stdio skill source names its program by absolute path and
+receives only its configured environment, never the host's; a relative
+program name or a loader variable such as `LD_PRELOAD` refuses that launch. A
+confined stdio skill source starts in the kind's working directory, as an MCP
+stdio server does; its own `cwd` does not apply.
 
 ### Composition
 
@@ -651,19 +661,38 @@ A host that confines every launch kind keeps the inputs it reads its own
 administration from out of its confined processes' reach:
 
 - The realm state (every realm config document and the head realm's stores
-  under the state root) and the user config document. A start in which a
-  confined process could change one, by writing it, creating it where it is
-  missing, or replacing a directory on the way to it, is refused, naming the
-  input and the launch kind. Keep the state root and the user config root
-  outside every write grant (`--state-root`, `--user-config-root`).
-- The convention sources: the project and user `mcp.toml` files and the
-  hooks of the project `.rkat/config.toml`. A source a confined process can
-  write is not trusted. Each of its MCP servers is refused with
-  `untrusted_configuration_source` before it is expanded, authorized,
-  connected or spawned, and each of its hooks keeps its place and is refused
-  at every invocation, so a mandatory guardrail withholds what it gates. A
-  definition that a trusted source states identically is used from that
-  source.
+  under the state root), the user config document and the file credential
+  store (the tokens, keys and secrets of the host's providers, MCP servers,
+  connectors and comms identity; by default `meerkat/credentials` under the
+  user's config directory). A start in which a confined process could
+  change one, by writing it, creating it where it is missing, or replacing a
+  directory on the way to it, is refused, naming the input and the launch
+  kind. Keep the state root, the user config root and the user's config
+  directory outside every write grant (`--state-root`, `--user-config-root`).
+- The convention sources: the project and user `mcp.toml` files, the hooks
+  of the project `.rkat/config.toml`, and the skills directories (the
+  project `.rkat/skills`, filesystem skill repositories and the Git skill
+  cache). A source a confined process can write is not trusted. Each of its
+  MCP servers is refused with `untrusted_configuration_source` before it is
+  expanded, authorized, connected or spawned, each of its hooks keeps its
+  place and is refused at every invocation, so a mandatory guardrail
+  withholds what it gates, and its skills are not loaded. A definition that
+  a trusted source states identically is used from that source. An MCP auth
+  request (login, completion, cancel, status or logout over JSON-RPC or
+  REST, and `rkat mcp login`) that names a server only such a file defines
+  is refused as not configured (`mcp_server_not_configured`) before anything
+  is discovered, registered or stored for it. The model sees a refused
+  server under its name when that is a plain server name, else under a
+  `refused-mcp-server-<n>` placeholder (never the name of another server of
+  the session), and a refused definition does not fail the rest of the
+  session's setup. An untrusted `mcp.toml` that does not parse, or that
+  states an invalid access policy, still fails the setup, as a trusted one
+  does.
+- Links: an input or a skills directory is judged with the symbolic links in
+  it. A start whose realm state or credential store links to a path a
+  confined process could change (a target that does not exist yet
+  included) is refused like a writable input, and a skill linked out of a
+  trusted skills directory to such a path is not loaded.
 
 Each launch kind is judged on its own grants and protections: one kind's
 protection does not cover another kind that writes the same place. On macOS
@@ -685,6 +714,64 @@ add, change or remove it, including a full replace that omits it, and is
 refused with `confinement_administration_required`. Restating it unchanged is
 allowed. The section stays readable through the ordinary config reads.
 
+A realm composes its ancestors' `[confinement]` and `[governance]` through
+the realm sections of its own document: its `[realm.<id>].parent` edge, and
+a `[realm.global]` section that puts the user document on its chain. These
+are covered too: a write that changes them is refused with
+`confinement_administration_required` (or
+`governance_administration_required`) when the realm would compose a
+different `[confinement]` (or `[governance]`) afterwards, adding or dropping
+a requirement alike, and sections whose chain does not resolve are refused
+as invalid. A change that composes the same sections, such as a parent
+stating the same requirement, is ordinary config. Re-parent a confined or
+governed realm by editing its document as its host.
+
+The user document decides for other realms too: its `[realm.global]`
+section puts `global`, and with it the user document's `[governance]`, on
+the chain of every realm whose own documents state none, and a realm with no
+document of its own takes the section the user document states for it. A
+write to the user document is also refused when such a realm would compose
+a different section afterwards. Each refusal names the change and the realm,
+for example
+`removing [realm.global] would change the [governance] section a realm whose own document states no parent and no [realm.global] composes`.
+
+Only a store that declares the realm's chain enforces this, as the stock
+hosts' stores do (`FileConfigStore::with_realm_chain`,
+`SdkConfigStore::with_realm_document`). A store built with
+`FileConfigStore::new` or `SdkConfigStore::with_path` alone, and an
+in-memory store, keep the document's own `[confinement]` and `[governance]`
+sections but not the realm sections that compose an ancestor's.
+
+A realm composes only from the documents on its chain, each from its own:
+an ancestor whose own document is missing fails the composition (a missing
+parent) instead of composing as if it required nothing, and `rkat realm
+delete` and `rkat realm prune` keep a realm another realm's document names
+as its parent.
+
+### Launches outside confinement
+
+Every process a stock host starts runs under its launch kind's confinement
+except these, which the host runs as itself (`HostLaunchExemption`, one
+constructor per program):
+
+| Launch | Why it runs as the host |
+|---|---|
+| `git` for a Git skill repository | It fetches with the host's own Git credentials and network. A repository is not loaded when a confined process could change the skill cache, and a skill that a link leads out of the checkout to is not read. |
+| A credential command (an auth profile's `source = { kind = "command" }`) | It produces the host's own provider credentials, which no confined process may read. Without a `cwd` it runs from the user's home directory, never from the host's working directory. It is refused before it runs when a confined process could change its program, the interpreter its `#!` line names by path, or its working directory (the home directory itself, and the files in it, when it names none). A refused command ends the binding's resolution with the refusal: no other credential (another realm's binding, the global realm's, the environment's) stands in for it. |
+| The browser opener (`/usr/bin/open` on macOS, `xdg-open` on Linux, the system `rundll32.exe` on Windows) | It shows an OAuth authorization page or an HTML artifact in the user's desktop session, which a confined process cannot reach. The URL is one argument. |
+| `stty`, by absolute path (`/bin/stty`, else `/usr/bin/stty`) | Host terminal control: `rkat` hides a client secret typed at its own terminal. |
+| `wasm-pack` | Developer build tooling: `rkat doctor` reports its version. |
+
+Each of these runs, with every program it starts by name (an interpreter
+named through `env`, `ssh` or `git-lfs` under Git, the programs a browser
+opener tries), from a `PATH` without relative directories and, under a host
+that confines its agents' launches, without the directories a confined
+process could change. None of them is a program a confined process put on
+the `PATH`.
+
+A test of the source enumerates every process launch in shipped code and
+fails on one that is neither confined nor in this list.
+
 ### Operator flags
 
 Each stock binary accepts `--confinement <trusted-host|workspace>`, with
@@ -694,7 +781,7 @@ preset. The flags replace the composed section for every launch kind of that
 process, after composition: `--confinement trusted-host` is the operator's
 explicit opt-out. They are never persisted, and no session, turn or API
 parameter can carry them. Relative flag paths resolve against the working
-directory.
+directory; a server reads its working directory only for such a path.
 
 ## See also
 

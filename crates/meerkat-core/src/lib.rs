@@ -226,9 +226,9 @@ pub use completion_feed::{
     CompletionFeed, CompletionSeq,
 };
 pub use config::{
-    AgentConfig, BudgetConfig, CallTimeoutOverride, CommandRuntimeConfig, CommsAuthMode,
-    CommsRuntimeConfig, CommsRuntimeMode, Config, ConfigDelta, ConfigError, ConfigScope,
-    ConfigWarning, HookAdapterConfig, HookEntryConfig, HookInProcessHandlerId,
+    AdministeredSection, AgentConfig, BudgetConfig, CallTimeoutOverride, CommandRuntimeConfig,
+    CommsAuthMode, CommsRuntimeConfig, CommsRuntimeMode, Config, ConfigDelta, ConfigError,
+    ConfigScope, ConfigWarning, HookAdapterConfig, HookEntryConfig, HookInProcessHandlerId,
     HookInProcessRuntimeConfig, HookRunOverrides, HookRuntimeKind, HooksConfig, HttpRuntimeConfig,
     LimitsConfig, ModelDefaults, PlainEventSource, ProviderToolsConfig, RetryConfig,
     SelfHostedApiStyle, SelfHostedConfig, SelfHostedModelConfig, SelfHostedServerConfig,
@@ -246,6 +246,7 @@ pub use config_store::{
     MemoryConfigStore, RealmConfigSource, RealmConfigWarning, TaggedConfigStore,
     apply_config_patch_preview, merge_patch,
 };
+pub use confinement::HostLaunchExemption;
 pub use confinement_config::{
     ConfinementConfig, ConfinementFlagMode, ConfinementFlags, ConfinementFlagsError,
     ConfinementLaunchKind, ConfinementLayerConflict, CustomConfinement, InvalidConfinementPath,
@@ -378,8 +379,8 @@ pub use live_execution::{
 pub use mcp_config::{
     EffectiveMcpServersError, McpAccountDeclaration, McpConfig, McpConfigError,
     McpConnectorApproval, McpScope, McpSecretEnvDeclarationError, McpServerAccess,
-    McpServerAccessError, McpServerConfig, McpServerDefinitionConflict, McpServerSource,
-    McpServerWithScope, McpServerWithSource,
+    McpServerAccessError, McpServerConfig, McpServerDefinitionConflict, McpServerRefusal,
+    McpServerSource, McpServerWithScope, McpServerWithSource,
 };
 #[cfg(not(target_arch = "wasm32"))]
 pub use mcp_config::{McpRealmPersistError, McpRealmPersistTarget};

@@ -3782,6 +3782,11 @@ impl SessionRuntime {
         }
     }
 
+    /// The host confinement installed on this runtime's factory, if any.
+    pub(crate) fn host_confinement(&self) -> Option<&meerkat::HostConfinement> {
+        self.factory.host_confinement()
+    }
+
     pub fn skill_identity_roots(&self) -> (Option<PathBuf>, Option<PathBuf>) {
         let context_root = self
             .skill_identity_context_root

@@ -187,8 +187,12 @@ rkat --confinement trusted-host run "Inspect the system"
 `--confinement-network`, `--confinement-read` and `--confinement-write` need
 `--confinement workspace`; relative paths resolve against the working
 directory. A launch the platform cannot confine as required is refused with
-typed feedback to the model and never runs unconfined; `rkat` warns once on
-stderr for each launch kind this host cannot confine.
+typed feedback to the model and never runs unconfined. `rkat` prints its
+confinement report once on stderr: each launch kind's requested and effective
+confinement and what keeps its own inputs from its confined processes
+(`info:` lines), and a `warning:` line for each launch kind this host cannot
+confine, a guarantee it does not claim, and each untrusted convention
+source.
 
 `rkat` refuses a command whose confined processes could change its realm
 state or user config document (see

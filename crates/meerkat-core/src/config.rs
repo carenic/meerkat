@@ -3042,6 +3042,26 @@ pub enum ConfigScope {
 #[serde(transparent)]
 pub struct ConfigDelta(pub serde_json::Value);
 
+/// A config section the host administers in the documents themselves: an
+/// ordinary config write cannot change it, nor change what a realm composes
+/// of it ([`ConfigError::administered_section`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdministeredSection {
+    /// `[confinement]`.
+    Confinement,
+    /// `[governance]`.
+    Governance,
+}
+
+impl std::fmt::Display for AdministeredSection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Confinement => "confinement",
+            Self::Governance => "governance",
+        })
+    }
+}
+
 /// Configuration errors
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -3092,11 +3112,32 @@ pub enum ConfigError {
     /// A write would add, change or remove the document's `[confinement]`
     /// section ([`crate::ConfinementConfig`]). Ordinary config write
     /// permission is not confinement administration: the host administers
-    /// the section in the document itself. Nothing is written.
+    /// the section in the documents themselves. Nothing is written.
     #[error(
-        "the confinement section is administered by the host in the config document; a config write cannot add, change or remove it"
+        "the confinement section is administered by the host in the config documents; a config write cannot add, change or remove it"
     )]
     ConfinementAdministration,
+
+    /// A write would change the realm sections a document states (a realm's
+    /// parent edge, or the `[realm.global]` section that puts the user
+    /// document on the chain of every realm whose own documents state none)
+    /// so that a realm composes a different `[confinement]` or
+    /// `[governance]` from the documents on its chain, adding or dropping a
+    /// requirement alike. Ordinary config write permission is not their
+    /// administration: the host administers them in the documents
+    /// themselves. Nothing is written.
+    #[error(
+        "{change} would change the [{administered}] section {composer} composes; the host administers it in the config documents, so a config write cannot change it"
+    )]
+    CompositionAdministration {
+        /// The section the realm would compose differently.
+        administered: AdministeredSection,
+        /// The realm sections the write changes, for example `removing
+        /// [realm.global]`.
+        change: String,
+        /// The realm that would compose it differently.
+        composer: String,
+    },
 
     /// A less trusted config document states confinement for a launch kind
     /// differently from the more trusted document that decided it.
@@ -3108,6 +3149,22 @@ pub enum ConfigError {
 }
 
 impl ConfigError {
+    /// The administered section a refused write would change, when this
+    /// error is such a refusal ([`Self::ConfinementAdministration`],
+    /// [`Self::GovernanceAdministration`],
+    /// [`Self::CompositionAdministration`]): surfaces report it as
+    /// `confinement_administration_required` or
+    /// `governance_administration_required`.
+    #[must_use]
+    pub fn administered_section(&self) -> Option<AdministeredSection> {
+        match self {
+            Self::ConfinementAdministration => Some(AdministeredSection::Confinement),
+            Self::GovernanceAdministration => Some(AdministeredSection::Governance),
+            Self::CompositionAdministration { administered, .. } => Some(*administered),
+            _ => None,
+        }
+    }
+
     /// A rule refused the document as it is persisted, not a caller's
     /// candidate. The stored state is at fault, so a validation refusal here
     /// becomes an internal error; surfaces keep `Validation` for the caller's
@@ -3455,11 +3512,7 @@ pub(crate) fn compose_effective_config_with_chain(
     }
     // Confinement folds over its own layer order, from the most trusted
     // document: the user document first even when it is not on the chain.
-    let mut confinement = crate::ConfinementConfig::default();
-    for (_, layer) in confinement_layers(docs, &chain) {
-        confinement.fold_less_trusted(layer);
-    }
-    effective.confinement = confinement;
+    effective.confinement = fold_confinement(docs, &chain);
     // NOTE (Finding D, non-blocking per adversarial review): `effective.realm`
     // is the outer-key union of every folded doc's sections (via Config::merge),
     // so a doc that hand-places a foreign `[realm.X]` (X != its owning realm)
@@ -3496,6 +3549,19 @@ pub(crate) fn confinement_layers<'a>(
     layers
 }
 
+/// The `[confinement]` a composition over `chain` folds from `docs`, each
+/// layer under the more trusted ones ([`confinement_layers`]).
+fn fold_confinement(
+    docs: &std::collections::BTreeMap<crate::connection::RealmId, Config>,
+    chain: &crate::connection::RealmChain,
+) -> crate::ConfinementConfig {
+    let mut confinement = crate::ConfinementConfig::default();
+    for (_, layer) in confinement_layers(docs, chain) {
+        confinement.fold_less_trusted(layer);
+    }
+    confinement
+}
+
 /// Refuse a composition in which a less trusted document weakens or
 /// replaces a confinement requirement ([`crate::check_confinement_layers`]).
 #[cfg(not(target_arch = "wasm32"))]
@@ -3510,18 +3576,45 @@ pub(crate) fn check_composed_confinement(
     )
 }
 
-/// The chain [`compose_effective_config`] folds for `head`: the chain
-/// authority over the union of every fetched document's realm sections, so it
-/// sees each member's parent edge regardless of which document carried it.
-/// Outer-key only: sub-maps are never merged across realms.
+/// The chain [`compose_effective_config`] folds for `head`, resolved by the
+/// chain authority over each member's own document. A realm with its own
+/// document is configured by that document alone: its own section decides
+/// its parent edge, and it has none when the section is absent. A section
+/// another document states for a realm never stands in for it, so a chain
+/// through an ancestor whose own document is missing does not resolve (a
+/// missing parent) instead of composing as if that ancestor, and every
+/// realm above it, required nothing. Only the head, which may have no
+/// document, takes a section another document states for it when its own
+/// states none, and any document's `[realm.global]` section configures the
+/// reserved `global` root. Outer-key only: sub-maps are never merged across
+/// realms.
 fn composition_chain(
     docs: &std::collections::BTreeMap<crate::connection::RealmId, Config>,
     head: &crate::connection::RealmId,
 ) -> Result<crate::connection::RealmChain, crate::connection::RealmChainError> {
+    let global = crate::connection::RealmId::global();
     let mut topology = Config::default();
     for doc in docs.values() {
         for (realm_id, section) in &doc.realm {
-            topology.realm.insert(realm_id.clone(), section.clone());
+            if realm_id == head.as_str() || realm_id == global.as_str() {
+                topology.realm.insert(realm_id.clone(), section.clone());
+            }
+        }
+    }
+    for (owner, doc) in docs {
+        match doc.realm.get(owner.as_str()) {
+            Some(section) => {
+                topology
+                    .realm
+                    .insert(owner.as_str().to_owned(), section.clone());
+            }
+            None if owner != head && !owner.is_global() => {
+                topology.realm.insert(
+                    owner.as_str().to_owned(),
+                    crate::connection::RealmConfigSection::default(),
+                );
+            }
+            None => {}
         }
     }
     crate::connection::RealmChain::resolve(&topology, head)

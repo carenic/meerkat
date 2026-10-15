@@ -357,6 +357,8 @@ pub use meerkat_workgraph::{
 mod command_hook_confinement;
 #[cfg(not(target_arch = "wasm32"))]
 mod host_confinement;
+#[cfg(all(feature = "skills", not(target_arch = "wasm32")))]
+mod skill_stdio_confinement;
 #[cfg(not(target_arch = "wasm32"))]
 pub use host_confinement::{
     HostAuthority, HostConfinement, HostConfinementError, HostConfinementNotice, HostInput,
@@ -409,7 +411,9 @@ pub use factory::{
 pub use factory::{
     McpAdapterComposeRefusal, McpAdapterComposer, McpAdapterCustody, McpAdapterCustodyClosed,
 };
+// The untrusted MCP target resolvers stay exported, deprecated.
 #[cfg(not(target_arch = "wasm32"))]
+#[allow(deprecated)]
 pub use host_auth::{
     HostAuthDevicePoll, HostAuthDeviceStart, HostAuthError, HostAuthLoginComplete,
     HostAuthLoginStart, HostAuthService, HostAuthStatus, HostAuthTarget, HostMcpAuthPhase,
@@ -417,6 +421,7 @@ pub use host_auth::{
     connector_slot_to_wire, connector_status_to_wire, connector_target_from_wire,
     mcp_account_verification_to_wire, mcp_auth_target_to_wire, mcp_login_disposition_to_wire,
     resolve_configured_mcp_target, resolve_configured_mcp_target_in_realm,
+    resolve_configured_mcp_target_in_realm_trusting,
 };
 #[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
 pub use host_auth::{default_mcp_auth_resolver, default_mcp_auth_resolver_in_realm};
@@ -438,7 +443,7 @@ pub use meerkat_providers::mcp_oauth::{
     McpOAuthCancelHandle, McpOAuthCeremonyContext, McpOAuthError, McpOAuthListenerCleanup,
     McpOAuthLoginComplete, McpOAuthLoginDisposition, McpOAuthLoginStart, McpOAuthLoopbackBegin,
     McpOAuthPendingAttempt, McpOAuthPendingClose, McpOAuthPendingLogin, McpServerIdentity,
-    OidcUserInfoAccountStrategy, open_system_browser,
+    OidcUserInfoAccountStrategy, open_system_browser, open_system_browser_trusting,
 };
 
 pub mod help;

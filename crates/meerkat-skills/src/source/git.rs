@@ -3,7 +3,6 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime};
 
@@ -80,6 +79,7 @@ pub struct GitSkillSource {
     checkout_dir: PathBuf,
     cache: Arc<RwLock<RemoteCache>>,
     failure_streak: Arc<RwLock<u32>>,
+    untrusted: Option<crate::UntrustedPaths>,
 }
 
 impl GitSkillSource {
@@ -99,7 +99,19 @@ impl GitSkillSource {
             checkout_dir,
             cache: Arc::new(RwLock::new(RemoteCache::default())),
             failure_streak: Arc::new(RwLock::new(0)),
+            untrusted: None,
         }
+    }
+
+    /// Run `git`, and every program it starts by name (`ssh`, `git-lfs`, a
+    /// credential helper), from a `PATH` without relative directories or the
+    /// directories `untrusted` names
+    /// ([`meerkat_core::HostLaunchExemption::git`]), so none is a program a
+    /// confined process put there.
+    #[must_use]
+    pub fn with_untrusted_paths(mut self, untrusted: crate::UntrustedPaths) -> Self {
+        self.untrusted = Some(untrusted);
+        self
     }
 
     fn refresh_if_needed(&self) -> Result<(), SkillError> {
@@ -211,6 +223,18 @@ impl GitSkillSource {
         let mut documents = std::collections::BTreeMap::new();
         let mut quarantined = Vec::new();
         for skill_dir in discover_skill_directories(&root) {
+            // Repository content never reaches into the host's filesystem: a
+            // skill whose directory or SKILL.md a link leads out of the
+            // checkout to is not read, wherever the link leads.
+            if super::leads_out_of(&self.checkout_dir, &skill_dir)
+                || super::leads_out_of(&self.checkout_dir, &skill_dir.join("SKILL.md"))
+            {
+                tracing::warn!(
+                    dir = %skill_dir.display(),
+                    "skipping Git skill: it links out of the checkout"
+                );
+                continue;
+            }
             let Some(file_name) = skill_dir.file_name().and_then(|name| name.to_str()) else {
                 continue;
             };
@@ -277,7 +301,7 @@ impl GitSkillSource {
             }
             _ => None,
         };
-        run_command("git", args, cwd, ssh_command.as_deref())
+        run_git_command(args, cwd, ssh_command.as_deref(), self.untrusted.as_deref())
     }
 
     fn authenticated_url(&self) -> String {
@@ -338,13 +362,17 @@ impl SkillSource for GitSkillSource {
     }
 }
 
-fn run_command(
-    program: &str,
+fn run_git_command(
     args: &[&str],
     cwd: Option<&Path>,
     git_ssh_command: Option<&str>,
+    untrusted: Option<&meerkat_core::confinement::UntrustedPathFn>,
 ) -> Result<(), SkillError> {
-    let mut command = Command::new(program);
+    // A host launch exemption: git runs as the host, it and every program it
+    // starts by name from a `PATH` without the directories a confined process
+    // could change. Resolution refuses a repository whose skill cache such a
+    // process could change.
+    let mut command = meerkat_core::HostLaunchExemption::git(untrusted);
     command.args(args);
     if let Some(cwd) = cwd {
         command.current_dir(cwd);
@@ -503,6 +531,51 @@ fn is_sensitive_query_key(key: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A skill a Git checkout links to outside the checkout is never read,
+    /// wherever the link leads: repository content cannot reach into the
+    /// host's filesystem.
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn a_skill_linked_out_of_the_checkout_is_not_read() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().canonicalize().unwrap();
+        let outside = base.join("outside").join("linked-skill");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(
+            outside.join("SKILL.md"),
+            "---\nname: linked-skill\ndescription: Outside the checkout\n---\n\n# Linked",
+        )
+        .unwrap();
+        let source = GitSkillSource::new(GitSkillConfig {
+            repo_url: "https://example.invalid/skills.git".into(),
+            git_ref: GitRef::Branch("main".into()),
+            cache_dir: base.join("cache"),
+            skills_root: None,
+            refresh_interval: Duration::from_secs(60),
+            auth: None,
+            depth: None,
+            source_uuid: SourceUuid::builtin(),
+            health_thresholds: SourceHealthThresholds::default(),
+        });
+        let inside = source.checkout_dir.join("kept-skill");
+        std::fs::create_dir_all(&inside).unwrap();
+        std::fs::write(
+            inside.join("SKILL.md"),
+            "---\nname: kept-skill\ndescription: Inside the checkout\n---\n\n# Kept",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&outside, source.checkout_dir.join("linked-skill")).unwrap();
+
+        let cache = source.scan_checkout().unwrap();
+        let names: Vec<&str> = cache
+            .descriptors
+            .iter()
+            .map(|descriptor| descriptor.key.skill_name.as_str())
+            .collect();
+        assert_eq!(names, vec!["kept-skill"]);
+    }
 
     #[test]
     fn redact_url_hides_userinfo_and_sensitive_query_values() {

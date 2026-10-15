@@ -201,8 +201,9 @@ fn host_auth_service(state: &AppState) -> meerkat::HostAuthService {
 }
 
 /// Resolve a requested MCP target against this host's configured MCP servers:
-/// the realm's own (from its composed config) and the `mcp.toml` scopes. A
-/// client-supplied name or URL is never an authority.
+/// the realm's own (from its composed config) and the `mcp.toml` scopes the
+/// host trusts. A client-supplied name or URL is never an authority, and
+/// neither is an `mcp.toml` a confined process can write.
 async fn configured_mcp_target(
     state: &AppState,
     mcp: &meerkat_contracts::WireMcpAuthTarget,
@@ -210,11 +211,12 @@ async fn configured_mcp_target(
     let realm_config = crate::effective_config_for_state(state)
         .await
         .map_err(|error| crate::ApiError::Configuration(error.to_string()).into_response())?;
-    meerkat::resolve_configured_mcp_target_in_realm(
+    meerkat::resolve_configured_mcp_target_in_realm_trusting(
         mcp,
         &realm_config.tools.mcp_servers,
         state.context_root.as_deref(),
         state.user_config_root.as_deref(),
+        &|path| state.host_confinement.untrusted_source(path),
     )
     .await
     .map_err(host_auth_error_response)
@@ -1232,9 +1234,12 @@ pub async fn test_auth_binding(
 ) -> impl IntoResponse {
     match resolve_realm(&state, &body.realm_id).await {
         Ok(realm) => {
+            // A credential command a confined process could change is
+            // refused here as in the host's sessions.
             let env = meerkat_providers::ResolverEnvironment::with_process_env()
                 .with_provider_auth_persistence(state.provider_auth_persistence.clone())
-                .with_auth_lease_handle(state.auth_lease.clone());
+                .with_auth_lease_handle(state.auth_lease.clone())
+                .with_host_launch_guard(state.host_confinement.untrusted_paths());
             let auth_binding = AuthBindingRef {
                 realm: body.realm_id.clone(),
                 binding: binding_id.clone(),
@@ -1602,10 +1607,12 @@ pub async fn cancel_login(
                 .map(|()| WireLoginCancelledTarget::Mcp(WireMcpLoginTarget { mcp: body.mcp }))
         }
         LoginCancelBody::McpAttempt(body) => {
-            let target = match meerkat::resolve_configured_mcp_target(
+            let target = match meerkat::resolve_configured_mcp_target_in_realm_trusting(
                 &body.mcp,
+                &[],
                 state.context_root.as_deref(),
                 state.user_config_root.as_deref(),
+                &|path| state.host_confinement.untrusted_source(path),
             )
             .await
             {

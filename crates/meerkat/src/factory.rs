@@ -810,6 +810,12 @@ pub struct AgentBuildConfig {
     /// Declarative MCP server configs materialized by this build into a
     /// session-owned MCP router composed with `external_tools` and builtins.
     pub mcp_servers: Vec<meerkat_core::mcp_config::McpServerConfig>,
+    /// Configured MCP servers the host refused for this build (for example
+    /// an `mcp.toml` a confined process can write), each with its typed
+    /// reason. The build stages each refused in its session-owned router, so
+    /// the model sees the refusal as that server's failed setup in its MCP
+    /// system notice; nothing in it is expanded, connected or spawned.
+    pub refused_mcp_servers: Vec<meerkat_core::mcp_config::McpServerRefusal>,
     /// Serializable tool definitions that can rebuild recoverable
     /// surface-owned dispatchers after persistence or runtime restart.
     pub recoverable_tool_defs: Option<Vec<meerkat_core::ToolDef>>,
@@ -1161,6 +1167,7 @@ impl std::fmt::Debug for AgentBuildConfig {
             .field("additional_instructions", &self.additional_instructions)
             .field("wait_for_mcp", &self.wait_for_mcp)
             .field("mcp_servers", &self.mcp_servers)
+            .field("refused_mcp_servers", &self.refused_mcp_servers)
             .field("runtime_build_mode", &self.runtime_build_mode)
             .field(
                 "initial_tool_visibility_state",
@@ -1254,6 +1261,7 @@ impl AgentBuildConfig {
             additional_instructions: None,
             wait_for_mcp: false,
             mcp_servers: Vec::new(),
+            refused_mcp_servers: Vec::new(),
             shell_env: None,
             shell_timeout_secs: None,
             checkpointer: None,
@@ -1346,6 +1354,7 @@ impl AgentBuildConfig {
         self.provider_params = build.provider_params.clone();
         self.external_tools = build.external_tools.clone();
         self.mcp_servers = build.mcp_servers.clone();
+        self.refused_mcp_servers = build.refused_mcp_servers.clone();
         self.recoverable_tool_defs = build.recoverable_tool_defs.clone();
         self.blob_store_override = build.blob_store_override.clone();
         self.llm_client_override = build
@@ -1435,6 +1444,7 @@ impl AgentBuildConfig {
             // The session service decides hosting when it creates the actor.
             hosting: meerkat_core::session_hosting::SessionHostingIntent::default(),
             mcp_servers: self.mcp_servers.clone(),
+            refused_mcp_servers: self.refused_mcp_servers.clone(),
             recoverable_tool_defs: self.recoverable_tool_defs.clone(),
             blob_store_override: self.blob_store_override.clone(),
             llm_client_override: self
@@ -3710,7 +3720,8 @@ impl AgentFactory {
         auth_binding: &AuthBindingRef,
         auth_lease_handle: meerkat_core::handles::GeneratedAuthLeaseHandle,
     ) -> Result<meerkat_providers::CredentialReadiness, FactoryError> {
-        let mut env = meerkat_providers::ResolverEnvironment::with_process_env()
+        let mut env = self
+            .host_resolver_environment()
             .with_auth_lease_handle(auth_lease_handle);
         if let Some(persistence) = self.resolution_provider_auth_persistence()? {
             env = env.with_provider_auth_persistence(persistence);
@@ -3873,7 +3884,7 @@ impl AgentFactory {
         auth_binding: AuthBindingRef,
         auth_lease_handle: Option<meerkat_core::handles::GeneratedAuthLeaseHandle>,
     ) -> Result<meerkat_providers::ResolvedConnection, FactoryError> {
-        let mut env = meerkat_providers::ResolverEnvironment::with_process_env();
+        let mut env = self.host_resolver_environment();
         if let Some(auth_lease_handle) = auth_lease_handle {
             env = env.with_auth_lease_handle(auth_lease_handle);
         }
@@ -3950,7 +3961,7 @@ impl AgentFactory {
                 "failed to resolve web-search auth binding for provider {search_provider:?}"
             ));
         };
-        let mut env = meerkat_providers::ResolverEnvironment::with_process_env();
+        let mut env = self.host_resolver_environment();
         // A faulted credential backend is a hard typed fault, never folded
         // into the inherit-mode `Ok(None)` degradation.
         if let Some(persistence) = self
@@ -4567,6 +4578,49 @@ impl AgentFactory {
         self.host_confinement.as_ref()
     }
 
+    /// How this factory's skill repositories meet its host confinement: the
+    /// skills directories, Git program and cache, and linked skills a
+    /// confined process could change are not trusted
+    /// ([`crate::HostConfinement::untrusted_paths`]), and a stdio skill
+    /// source launches under the `mcp_stdio` requirement, as a local MCP
+    /// stdio server does. Without a host confinement, the trusted host.
+    #[cfg(all(feature = "skills", not(target_arch = "wasm32")))]
+    fn skill_host_boundary(&self) -> meerkat_skills::SkillHostBoundary {
+        use meerkat_core::ConfinementLaunchKind;
+        let Some(host) = &self.host_confinement else {
+            return meerkat_skills::SkillHostBoundary::trusted_host();
+        };
+        let boundary = meerkat_skills::SkillHostBoundary::trusted_host()
+            .with_untrusted_paths(host.untrusted_paths());
+        match (
+            host.requirement(ConfinementLaunchKind::McpStdio),
+            host.working_directory(ConfinementLaunchKind::McpStdio),
+        ) {
+            (Some(requirement), Some(working_directory)) => {
+                boundary.with_stdio_runner(std::sync::Arc::new(
+                    crate::skill_stdio_confinement::ConfinedStdioSkillRunner::new(
+                        requirement,
+                        working_directory.to_path_buf(),
+                    ),
+                ))
+            }
+            _ => boundary,
+        }
+    }
+
+    /// The resolver environment of this factory's provider resolutions: the
+    /// process environment and, under a host confinement, its guard for the
+    /// programs the host runs as itself, so a credential command a confined
+    /// process could change is refused before it runs.
+    fn host_resolver_environment(&self) -> meerkat_providers::ResolverEnvironment {
+        let env = meerkat_providers::ResolverEnvironment::with_process_env();
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(host) = &self.host_confinement {
+            return env.with_host_launch_guard(host.untrusted_paths());
+        }
+        env
+    }
+
     /// Install a stock host's resolved OS process confinement: each launch
     /// kind it requires gets its requirement through the per-kind builder
     /// (the shell, command hooks with their working directory, local MCP
@@ -4898,11 +4952,12 @@ impl AgentFactory {
                         .clone()
                         .or_else(|| self.project_root.clone())
                         .unwrap_or_else(|| self.store_path.clone());
-                    match meerkat_skills::resolve_repositories_with_roots(
+                    match meerkat_skills::resolve_repositories_with_roots_trusting(
                         &config.skills,
                         conventions_context_root,
                         conventions_user_root,
                         Some(runtime_root.as_path()),
+                        &self.skill_host_boundary(),
                     )
                     .await
                     {
@@ -5299,7 +5354,7 @@ impl AgentFactory {
         .map_err(FactoryError::ConnectionTarget)?;
 
         #[allow(unused_mut)]
-        let mut env = meerkat_providers::ResolverEnvironment::with_process_env();
+        let mut env = self.host_resolver_environment();
         #[cfg(not(target_arch = "wasm32"))]
         {
             if let Some(persistence) = self.resolution_provider_auth_persistence()? {
@@ -5361,6 +5416,15 @@ impl AgentFactory {
                         .map_err(FactoryError::ClientBuild)?;
                     return Ok(LlmClientForIdentity { client, selection });
                 }
+                // A credential command the host refused ends resolution with
+                // the refusal: no later candidate (an ancestor's binding,
+                // the global realm's, the environment's default) silently
+                // stands in for the operator's command.
+                Err(
+                    error @ meerkat_llm_core::provider_runtime::ProviderAuthError::HostLaunchRefused {
+                        ..
+                    },
+                ) => return Err(FactoryError::ProviderAuth(error)),
                 Err(error) => {
                     first_resolution_error.get_or_insert(error);
                     if explicit_auth_binding {
@@ -6018,7 +6082,7 @@ impl AgentFactory {
                 self.resolve_self_hosted_connection(config, identity, &spec, preferred_realm)?;
 
             #[allow(unused_mut)]
-            let mut env = meerkat_providers::ResolverEnvironment::with_process_env();
+            let mut env = self.host_resolver_environment();
             #[cfg(not(target_arch = "wasm32"))]
             {
                 if let Some(persistence) = self.resolution_provider_auth_persistence()? {
@@ -7430,11 +7494,12 @@ impl AgentFactory {
                     } else {
                         #[cfg(not(target_arch = "wasm32"))]
                         {
-                            match meerkat_skills::resolve_repositories_with_roots(
+                            match meerkat_skills::resolve_repositories_with_roots_trusting(
                                 &config.skills,
                                 _conventions_context_root,
                                 _conventions_user_root,
                                 Some(_realm_scope_root.as_path()),
+                                &self.skill_host_boundary(),
                             )
                             .await
                             {
@@ -7763,7 +7828,10 @@ impl AgentFactory {
                 if bindings.configured_mcp_attachment().is_some()
         );
         #[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
-        if !build_config.mcp_servers.is_empty() || live_mcp_attachable {
+        if !build_config.mcp_servers.is_empty()
+            || !build_config.refused_mcp_servers.is_empty()
+            || live_mcp_attachable
+        {
             // A registration's surface outlives this construction: its router
             // borrows it and releases only what it staged. A standalone
             // construction's private surface is its router's own.
@@ -7867,6 +7935,34 @@ impl AgentFactory {
                     ))
                 })?;
             }
+            // A server the host refused before setup is staged refused:
+            // applying it reports the typed refusal to the model as that
+            // server's failed setup, and nothing in it connects or spawns.
+            // Its definition comes from a source the host does not trust, so
+            // it is staged under a name safe to show the model, distinct from
+            // every other server of the session.
+            let reported_names = meerkat_core::mcp_config::refused_server_names(
+                build_config
+                    .mcp_servers
+                    .iter()
+                    .map(|server| server.name.as_str()),
+                build_config
+                    .refused_mcp_servers
+                    .iter()
+                    .map(|refused| &refused.server),
+            );
+            for (refused, name) in build_config.refused_mcp_servers.iter().zip(reported_names) {
+                let mut server = refused.server.clone();
+                server.name = name.clone();
+                adapter
+                    .stage_add_refused(server, refused.refusal)
+                    .await
+                    .map_err(|error| {
+                        BuildAgentError::McpSetup(format!(
+                            "stage refused MCP server '{name}': {error}"
+                        ))
+                    })?;
+            }
             adapter.apply_staged().await.map_err(|error| {
                 BuildAgentError::McpSetup(format!("apply staged MCP servers: {error}"))
             })?;
@@ -7907,7 +8003,7 @@ impl AgentFactory {
             });
         }
         #[cfg(not(all(feature = "mcp", not(target_arch = "wasm32"))))]
-        if !build_config.mcp_servers.is_empty() {
+        if !build_config.mcp_servers.is_empty() || !build_config.refused_mcp_servers.is_empty() {
             // Fail closed: silently dropping requested MCP servers would be
             // a capability downgrade the caller cannot observe.
             return Err(BuildAgentError::McpSetup(
@@ -9882,7 +9978,7 @@ impl AgentFactory {
                         // `rkat auth login`, server-side OAuth completion, etc.)
                         // are read during resolve_binding.
                         #[allow(unused_mut)]
-                        let mut env = meerkat_providers::ResolverEnvironment::with_process_env();
+                        let mut env = self.host_resolver_environment();
                         #[cfg(not(target_arch = "wasm32"))]
                         {
                             if let Some(persistence) = self
@@ -9955,6 +10051,18 @@ impl AgentFactory {
                                         resolved_model,
                                     ));
                                     break;
+                                }
+                                // A refused credential command ends
+                                // resolution with the refusal; no later
+                                // candidate silently stands in for it.
+                                Err(
+                                    err @ meerkat_llm_core::provider_runtime::ProviderAuthError::HostLaunchRefused {
+                                        ..
+                                    },
+                                ) => {
+                                    return Err(BuildAgentError::LlmClient(
+                                        FactoryError::ProviderAuth(err),
+                                    ));
                                 }
                                 Err(err) => {
                                     first_resolution_error.get_or_insert(err);
@@ -10122,7 +10230,7 @@ impl AgentFactory {
                     continue;
                 };
                 #[allow(unused_mut)]
-                let mut env = meerkat_providers::ResolverEnvironment::with_process_env();
+                let mut env = self.host_resolver_environment();
                 #[cfg(not(target_arch = "wasm32"))]
                 {
                     if let Some(persistence) = self

@@ -55,9 +55,12 @@ fn named_config(name: &str, endpoint: &Endpoint, bearer: &str, exposed: &str) ->
 
 fn adapter(bindings: &SessionRuntimeBindings) -> Arc<McpRouterAdapter> {
     assert!(session_runtime_bindings_have_machine_authority(bindings));
-    let adapter = Arc::new(McpRouterAdapter::new(McpRouter::new_with_surface_handle(
-        Arc::clone(bindings.external_tool_surface()),
-    )));
+    let adapter = Arc::new(McpRouterAdapter::new(
+        McpRouter::new_with_surface_handle_and_stdio_profile(
+            Arc::clone(bindings.external_tool_surface()),
+            meerkat_mcp::McpStdioLaunchProfile::trusted_host(),
+        ),
+    ));
     adapter.bind_mcp_server_lifecycle_handle(Arc::clone(bindings.mcp_server_lifecycle()));
     adapter
 }

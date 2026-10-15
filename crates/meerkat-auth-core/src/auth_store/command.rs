@@ -66,6 +66,7 @@ pub enum CommandCredentialError {
 pub struct CommandCredentialRunner {
     spec: CommandCredentialSpec,
     cache: Mutex<Option<(PersistedTokens, Instant)>>,
+    untrusted: Option<std::sync::Arc<meerkat_core::confinement::UntrustedPathFn>>,
 }
 
 impl CommandCredentialRunner {
@@ -73,7 +74,21 @@ impl CommandCredentialRunner {
         Self {
             spec,
             cache: Mutex::new(None),
+            untrusted: None,
         }
+    }
+
+    /// Run the command, and every program it starts by name, from a `PATH`
+    /// (its configured one, else the host's) without relative directories or
+    /// the directories `untrusted` names
+    /// ([`meerkat_core::confinement::trusted_search_path`]).
+    #[must_use]
+    pub fn with_untrusted_paths(
+        mut self,
+        untrusted: std::sync::Arc<meerkat_core::confinement::UntrustedPathFn>,
+    ) -> Self {
+        self.untrusted = Some(untrusted);
+        self
     }
 
     pub fn spec(&self) -> &CommandCredentialSpec {
@@ -97,12 +112,27 @@ impl CommandCredentialRunner {
     }
 
     async fn run_once(&self) -> Result<PersistedTokens, CommandCredentialError> {
-        let mut cmd = Command::new(&self.spec.program);
+        // A host launch exemption: the credential command runs as the host.
+        // A resolver whose host confines its launches refuses one a confined
+        // process could change before it gets here.
+        let mut command = meerkat_core::HostLaunchExemption::credential_command(
+            &self.spec.program,
+            self.untrusted.as_deref(),
+        );
+        command.envs(&self.spec.env);
+        // A configured `PATH` is cleaned like the host's.
+        if let Some(search_path) = self.spec.env.get("PATH") {
+            meerkat_core::confinement::apply_trusted_search_path(
+                &mut command,
+                std::ffi::OsStr::new(search_path),
+                self.untrusted.as_deref(),
+            );
+        }
+        let mut cmd = Command::from(command);
         cmd.args(&self.spec.args)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .envs(&self.spec.env);
+            .stderr(Stdio::piped());
         if let Some(cwd) = &self.spec.cwd {
             cmd.current_dir(cwd);
         }

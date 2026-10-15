@@ -1980,11 +1980,18 @@ impl McpRouter {
         self.with_lifecycle_handle(server_name, |handle| handle.apply_reload(server_name))
     }
 
-    /// Create a new empty router without a generated surface authority.
+    /// Create a new empty router without a generated surface authority, whose
+    /// local stdio servers launch as the trusted host, with no OS
+    /// confinement.
     ///
     /// Lifecycle mutations fail closed until runtime/session construction binds
     /// a generated [`ExternalToolSurfaceHandle`] through
-    /// [`Self::new_with_surface_handle`] or late adapter binding.
+    /// [`Self::new_with_surface_handle_and_stdio_profile`] or late adapter
+    /// binding.
+    #[deprecated(
+        since = "0.9.2",
+        note = "launches local stdio servers as the trusted host without naming it; name the profile with `McpRouter::new_with_stdio_profile(McpStdioLaunchProfile::trusted_host())`, or pass the host's"
+    )]
     pub fn new() -> Self {
         Self::new_with_stdio_profile(crate::McpStdioLaunchProfile::trusted_host())
     }
@@ -1998,7 +2005,13 @@ impl McpRouter {
         Self::with_surface_owner_and_stdio_profile(SurfaceOwner::runtime(surface_handle), profile)
     }
 
-    /// Create a new empty router with a runtime-backed surface handle.
+    /// Create a new empty router with a runtime-backed surface handle, whose
+    /// local stdio servers launch as the trusted host, with no OS
+    /// confinement.
+    #[deprecated(
+        since = "0.9.2",
+        note = "launches local stdio servers as the trusted host without naming it; name the profile with `McpRouter::new_with_surface_handle_and_stdio_profile(handle, McpStdioLaunchProfile::trusted_host())`, or pass the host's"
+    )]
     pub fn new_with_surface_handle(surface_handle: Arc<dyn ExternalToolSurfaceHandle>) -> Self {
         Self::with_surface_owner(SurfaceOwner::runtime(surface_handle))
     }
@@ -2086,9 +2099,14 @@ impl McpRouter {
         self
     }
 
-    /// Create a new router with a custom remove-drain timeout.
+    /// Create a new router with a custom remove-drain timeout, whose local
+    /// stdio servers launch as the trusted host, with no OS confinement.
+    #[deprecated(
+        since = "0.9.2",
+        note = "launches local stdio servers as the trusted host without naming it; name the profile with `McpRouter::new_with_stdio_profile(McpStdioLaunchProfile::trusted_host())`, or pass the host's, and call `set_removal_timeout`"
+    )]
     pub fn new_with_removal_timeout(removal_timeout: Duration) -> Self {
-        let mut router = Self::new();
+        let mut router = Self::new_with_stdio_profile(crate::McpStdioLaunchProfile::trusted_host());
         if let Err(error) = router.set_removal_timeout(removal_timeout) {
             tracing::warn!(
                 timeout_ms = removal_timeout.as_millis(),
@@ -2099,12 +2117,21 @@ impl McpRouter {
         router
     }
 
-    /// Create a new router with a custom remove-drain timeout and runtime-backed surface handle.
+    /// Create a new router with a custom remove-drain timeout and
+    /// runtime-backed surface handle, whose local stdio servers launch as the
+    /// trusted host, with no OS confinement.
+    #[deprecated(
+        since = "0.9.2",
+        note = "launches local stdio servers as the trusted host without naming it; name the profile with `McpRouter::new_with_surface_handle_and_stdio_profile(handle, McpStdioLaunchProfile::trusted_host())`, or pass the host's, and call `set_removal_timeout`"
+    )]
     pub fn new_with_surface_handle_and_removal_timeout(
         surface_handle: Arc<dyn ExternalToolSurfaceHandle>,
         removal_timeout: Duration,
     ) -> Self {
-        let mut router = Self::new_with_surface_handle(surface_handle);
+        let mut router = Self::new_with_surface_handle_and_stdio_profile(
+            surface_handle,
+            crate::McpStdioLaunchProfile::trusted_host(),
+        );
         if let Err(error) = router.set_removal_timeout(removal_timeout) {
             tracing::warn!(
                 timeout_ms = removal_timeout.as_millis(),
@@ -2224,7 +2251,10 @@ impl McpRouter {
     ) -> Result<(), McpError> {
         self.refuse_ungoverned_change(&config.name)?;
         let name = config.name.clone();
-        self.stage_add_payload(config)?;
+        // A refused definition is never connected, so it is not validated:
+        // one that would not validate is reported refused like any other,
+        // and never fails the rest of the session's setup.
+        self.stage_payload(config)?;
         self.refused_payloads.insert(name, refusal);
         Ok(())
     }
@@ -2240,6 +2270,11 @@ impl McpRouter {
 
     fn stage_add_payload(&mut self, config: McpServerConfig) -> Result<(), McpError> {
         Self::validate_tool_names(&config)?;
+        self.stage_payload(config)
+    }
+
+    /// Stage `config`'s add without validating it.
+    fn stage_payload(&mut self, config: McpServerConfig) -> Result<(), McpError> {
         let server_name = config.name.clone();
         // A new payload replaces any refused one staged under the name.
         self.refused_payloads.remove(&server_name);
@@ -4934,9 +4969,13 @@ impl AgentToolDispatcher for McpRouter {
     }
 }
 
+/// An unbound router whose local stdio servers launch as the trusted host,
+/// with no OS confinement, as
+/// `McpRouter::new_with_stdio_profile(McpStdioLaunchProfile::trusted_host())`
+/// names it.
 impl Default for McpRouter {
     fn default() -> Self {
-        Self::new()
+        Self::new_with_stdio_profile(crate::McpStdioLaunchProfile::trusted_host())
     }
 }
 
@@ -5096,14 +5135,21 @@ pub(crate) mod tests {
     }
 
     fn generated_handle_owner_router() -> McpRouter {
-        McpRouter::new_with_surface_handle(generated_surface_handle())
+        McpRouter::new_with_surface_handle_and_stdio_profile(
+            generated_surface_handle(),
+            crate::McpStdioLaunchProfile::trusted_host(),
+        )
     }
 
     fn generated_handle_owner_router_with_timeout(removal_timeout: Duration) -> McpRouter {
-        McpRouter::new_with_surface_handle_and_removal_timeout(
+        let mut router = McpRouter::new_with_surface_handle_and_stdio_profile(
             generated_surface_handle(),
-            removal_timeout,
-        )
+            crate::McpStdioLaunchProfile::trusted_host(),
+        );
+        router
+            .set_removal_timeout(removal_timeout)
+            .expect("the generated surface accepts a removal timeout");
+        router
     }
 
     #[test]
@@ -5933,8 +5979,10 @@ pub(crate) mod tests {
     async fn call_finished_rejection_fails_closed_not_returning_result() {
         let server_path = mcp_test_server::fixture_binary();
 
-        let mut router =
-            McpRouter::new_with_surface_handle(Arc::new(RejectCallFinishedSurfaceHandle::new()));
+        let mut router = McpRouter::new_with_surface_handle_and_stdio_profile(
+            Arc::new(RejectCallFinishedSurfaceHandle::new()),
+            crate::McpStdioLaunchProfile::trusted_host(),
+        );
         router
             .add_server(test_server_config("test-server", &server_path))
             .await
@@ -5957,8 +6005,10 @@ pub(crate) mod tests {
     /// error) instead of warn-and-continuing with router/machine state diverged.
     #[tokio::test]
     async fn finalize_removal_rejection_fails_closed_not_silently_continue() {
-        let mut router =
-            McpRouter::new_with_surface_handle(Arc::new(RejectFinalizeSurfaceHandle::new()));
+        let mut router = McpRouter::new_with_surface_handle_and_stdio_profile(
+            Arc::new(RejectFinalizeSurfaceHandle::new()),
+            crate::McpStdioLaunchProfile::trusted_host(),
+        );
         let sid = SurfaceId::from("reject-finalize");
 
         // Drive the surface to Active, then to Removing with zero inflight calls

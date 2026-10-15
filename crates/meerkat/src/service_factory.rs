@@ -4628,9 +4628,10 @@ mod tests {
             .prepare_bindings(session.id().clone())
             .await
             .map_err(|err| format!("prepare bindings: {err}"))?;
-        let mut router = meerkat_mcp::McpRouter::new_with_surface_handle(Arc::clone(
-            bindings.external_tool_surface(),
-        ));
+        let mut router = meerkat_mcp::McpRouter::new_with_surface_handle_and_stdio_profile(
+            Arc::clone(bindings.external_tool_surface()),
+            meerkat_mcp::McpStdioLaunchProfile::trusted_host(),
+        );
         router
             .stage_add(meerkat_core::McpServerConfig::stdio(
                 "planner",

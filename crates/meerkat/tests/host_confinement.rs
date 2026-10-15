@@ -533,3 +533,558 @@ async fn a_refused_mcp_stdio_launch_never_runs_unconfined() {
     assert_eq!(result.text, "continued");
     assert!(!marker.exists(), "the refused server never started");
 }
+
+/// A host that confines every launch kind does not trust a skills directory
+/// one of its confined processes could change: the project skills directory
+/// under a write grant is not loaded, so a skill planted there never reaches
+/// a session. The same directory outside every grant is loaded.
+#[cfg(all(unix, feature = "skills"))]
+#[tokio::test]
+async fn skills_a_confined_process_can_write_are_not_loaded() {
+    let temp = tempfile::tempdir().unwrap();
+    let base = temp.path().canonicalize().unwrap();
+    let project = base.join("project");
+    let skill = project.join(".rkat").join("skills").join("planted-skill");
+    std::fs::create_dir_all(&skill).unwrap();
+    std::fs::write(
+        skill.join("SKILL.md"),
+        "---\nname: planted-skill\ndescription: A skill a confined process planted\n---\n\n# Planted",
+    )
+    .unwrap();
+    let skill_names = |host: HostConfinement| {
+        let base = base.clone();
+        let project = project.clone();
+        async move {
+            let factory = AgentFactory::new(base.join("sessions"))
+                .session_store(Arc::new(meerkat_store::MemoryStore::new()))
+                .runtime_root(base.join("runtime"))
+                .project_root(&project)
+                .context_root(project.clone())
+                .with_host_confinement(&host);
+            let runtime = factory
+                .build_skill_runtime(&Config::default())
+                .await
+                .unwrap()
+                .expect("a skill runtime");
+            runtime
+                .list_skills(&meerkat_core::skills::SkillFilter::default())
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|skill| skill.name)
+                .collect::<Vec<_>>()
+        }
+    };
+
+    let untrusted = skill_names(writing_host(&project)).await;
+    assert!(
+        !untrusted.iter().any(|name| name == "planted-skill"),
+        "a skills directory a confined process can write is not loaded: {untrusted:?}"
+    );
+    let trusted = skill_names(writing_host(&base.join("elsewhere"))).await;
+    assert!(
+        trusted.iter().any(|name| name == "planted-skill"),
+        "a skills directory outside every grant is loaded: {trusted:?}"
+    );
+}
+
+/// A stdio skill source runs under the host's `mcp_stdio` confinement, as a
+/// local MCP stdio server does: a launch the platform cannot confine as
+/// required is refused, and the source's command never runs as the host.
+#[cfg(all(unix, feature = "skills"))]
+#[tokio::test]
+async fn a_stdio_skill_source_launches_under_the_mcp_stdio_confinement() {
+    let temp = tempfile::tempdir().unwrap();
+    let base = temp.path().canonicalize().unwrap();
+    let marker = base.join("stdio-skill-source-ran");
+    let mut config = Config::default();
+    config
+        .skills
+        .repositories
+        .push(meerkat_core::skills_config::SkillRepositoryConfig {
+            name: "stdio-source".into(),
+            source_uuid: meerkat_core::skills::SourceUuid::from_uuid(uuid::Uuid::new_v4()),
+            transport: meerkat_core::skills_config::SkillRepoTransport::Stdio {
+                command: "/bin/sh".into(),
+                args: vec![
+                    "-c".into(),
+                    format!(
+                        "printf entered > '{}'; cat >/dev/null; printf '{{}}'",
+                        marker.display()
+                    ),
+                ],
+                cwd: None,
+                env: Default::default(),
+                timeout_seconds: 5,
+            },
+        });
+    let factory = AgentFactory::new(base.join("sessions"))
+        .session_store(Arc::new(meerkat_store::MemoryStore::new()))
+        .runtime_root(base.join("runtime"))
+        .project_root(&base)
+        .with_host_confinement(&host_confinement(&base));
+    let runtime = factory
+        .build_skill_runtime(&config)
+        .await
+        .unwrap()
+        .expect("a skill runtime");
+    let _ = runtime
+        .list_skills(&meerkat_core::skills::SkillFilter::default())
+        .await;
+    assert!(
+        !marker.exists(),
+        "the stdio skill source never ran as the host"
+    );
+}
+
+/// A skill that a trusted skills directory links to from elsewhere is
+/// judged where the link leads: a link into a path a confined process can
+/// write is not followed, so that process cannot supply the skill through
+/// it. The same kind of link to a path no confined process can write is
+/// followed.
+#[cfg(all(unix, feature = "skills"))]
+#[tokio::test]
+async fn a_skill_linked_out_of_a_trusted_skills_directory_is_judged_where_it_leads() {
+    let temp = tempfile::tempdir().unwrap();
+    let base = temp.path().canonicalize().unwrap();
+    let project = base.join("project");
+    let skills = project.join(".rkat").join("skills");
+    std::fs::create_dir_all(&skills).unwrap();
+    let writable = base.join("writable");
+    let elsewhere = base.join("elsewhere");
+    for (root, name) in [(&writable, "linked-skill"), (&elsewhere, "kept-skill")] {
+        let skill = root.join(name);
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(
+            skill.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: A linked skill\n---\n\n# Linked"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&skill, skills.join(name)).unwrap();
+    }
+    let factory = AgentFactory::new(base.join("sessions"))
+        .session_store(Arc::new(meerkat_store::MemoryStore::new()))
+        .runtime_root(base.join("runtime"))
+        .project_root(&project)
+        .context_root(project.clone())
+        .with_host_confinement(&writing_host(&writable));
+    let runtime = factory
+        .build_skill_runtime(&Config::default())
+        .await
+        .unwrap()
+        .expect("a skill runtime");
+    let names: Vec<String> = runtime
+        .list_skills(&meerkat_core::skills::SkillFilter::default())
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|skill| skill.name)
+        .collect();
+    assert!(
+        !names.iter().any(|name| name == "linked-skill"),
+        "a link into a write grant is not followed: {names:?}"
+    );
+    assert!(
+        names.iter().any(|name| name == "kept-skill"),
+        "a link outside every grant is followed: {names:?}"
+    );
+}
+
+/// The credential store is judged with the links in it: a store whose
+/// directory is outside every grant but holds a link into a path a
+/// confined process can write (even one that does not exist yet) refuses
+/// the start. A store without such links is admitted.
+#[cfg(unix)]
+#[test]
+fn a_link_in_the_credential_store_to_a_writable_path_refuses_the_start() {
+    let temp = tempfile::tempdir().unwrap();
+    let base = temp.path().canonicalize().unwrap();
+    let writable = base.join("writable");
+    let store = base.join("store");
+    let clean = base.join("clean");
+    for dir in [&writable, &store, &clean] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    std::fs::write(writable.join("token.json"), "{}").unwrap();
+    std::fs::write(clean.join("token.json"), "{}").unwrap();
+    let host = writing_host(&writable);
+
+    std::os::unix::fs::symlink(writable.join("token.json"), store.join("token.json")).unwrap();
+    let refused = host.admit_host_inputs(&[(meerkat::HostInput::CredentialStore, store.clone())]);
+    assert!(
+        matches!(
+            refused,
+            Err(meerkat::HostConfinementError::AdministrationInputWritable {
+                input: meerkat::HostInput::CredentialStore,
+                ..
+            })
+        ),
+        "{refused:?}"
+    );
+
+    std::fs::remove_file(store.join("token.json")).unwrap();
+    std::os::unix::fs::symlink(writable.join("later.json"), store.join("token.json")).unwrap();
+    assert!(
+        host.admit_host_inputs(&[(meerkat::HostInput::CredentialStore, store)])
+            .is_err(),
+        "a dangling link into a write grant refuses the start"
+    );
+    host.admit_host_inputs(&[(meerkat::HostInput::CredentialStore, clean)])
+        .expect("a store without links into a grant is admitted");
+}
+
+/// A credential command is a host launch exemption: the host runs it as
+/// itself, outside its OS process confinement, so it refuses one whose
+/// program or working directory a confined process could change, before
+/// the program runs. The same command outside every grant runs.
+#[cfg(all(unix, feature = "openai"))]
+#[tokio::test]
+async fn a_credential_command_a_confined_process_could_change_is_refused() {
+    use std::collections::BTreeMap;
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let base = temp.path().canonicalize().unwrap();
+    let writable = base.join("writable");
+    let elsewhere = base.join("elsewhere");
+    for dir in [&writable, &elsewhere] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    let marker = base.join("helper-ran");
+    let script = format!(
+        "#!/bin/sh\nprintf ran > '{}'\nprintf sk-from-helper\n",
+        marker.display()
+    );
+    for dir in [&writable, &elsewhere] {
+        let helper = dir.join("helper.sh");
+        std::fs::write(&helper, &script).unwrap();
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let host = writing_host(&writable);
+    let sh_writing_marker = vec![
+        "-c".to_string(),
+        format!("printf ran > '{}'; printf sk-from-helper", marker.display()),
+    ];
+
+    for (program, args, cwd, env) in [
+        // The program lives under a write grant.
+        (
+            writable.join("helper.sh"),
+            Vec::new(),
+            None,
+            BTreeMap::new(),
+        ),
+        // Its working directory does.
+        (
+            Path::new("/bin/sh").to_path_buf(),
+            sh_writing_marker.clone(),
+            Some(writable.clone()),
+            BTreeMap::new(),
+        ),
+        // A bare program name found through a PATH directory under a grant.
+        (
+            Path::new("helper.sh").to_path_buf(),
+            Vec::new(),
+            None,
+            BTreeMap::from([("PATH".to_string(), writable.display().to_string())]),
+        ),
+    ] {
+        let refused = preflight_command(&base, &host, program.clone(), args, cwd, env)
+            .await
+            .expect_err("a credential command a confined process could change is refused");
+        assert!(
+            refused.contains("confined process"),
+            "{program:?}: {refused}"
+        );
+        assert!(
+            !marker.exists(),
+            "{program:?}: the refused command never ran"
+        );
+    }
+
+    preflight_command(
+        &base,
+        &host,
+        elsewhere.join("helper.sh"),
+        Vec::new(),
+        Some(elsewhere.clone()),
+        BTreeMap::new(),
+    )
+    .await
+    .expect("a credential command outside every grant runs");
+    assert!(marker.exists(), "the trusted command ran");
+}
+
+/// Preflight an OpenAI binding whose credential is the command `program`
+/// on a factory installing `host`.
+#[cfg(all(unix, feature = "openai"))]
+async fn preflight_command(
+    base: &Path,
+    host: &HostConfinement,
+    program: std::path::PathBuf,
+    args: Vec<String>,
+    cwd: Option<std::path::PathBuf>,
+    env: std::collections::BTreeMap<String, String>,
+) -> Result<(), String> {
+    use meerkat_core::{
+        AuthProfileConfig, BackendProfileConfig, CredentialSourceSpec, ProviderBindingConfig,
+        RealmConfigSection, SessionLlmIdentity,
+    };
+    let factory = AgentFactory::new(base.join("sessions")).with_host_confinement(host);
+    let mut section = RealmConfigSection::default();
+    section.backend.insert(
+        "openai_api".to_string(),
+        BackendProfileConfig {
+            provider: "openai".to_string(),
+            backend_kind: "openai_api".to_string(),
+            base_url: None,
+            options: serde_json::Value::Null,
+            server: None,
+        },
+    );
+    section.auth.insert(
+        "command_token".to_string(),
+        AuthProfileConfig {
+            provider: "openai".to_string(),
+            auth_method: "api_key".to_string(),
+            source: CredentialSourceSpec::Command {
+                program,
+                args,
+                cwd,
+                env,
+                timeout_ms: 5_000,
+                refresh_interval_ms: None,
+            },
+            constraints: Default::default(),
+            metadata_defaults: Default::default(),
+        },
+    );
+    section.binding.insert(
+        "command_openai".to_string(),
+        ProviderBindingConfig {
+            backend_profile: "openai_api".to_string(),
+            auth_profile: "command_token".to_string(),
+            credential_account: None,
+            default_model: None,
+            policy: Default::default(),
+            provider_default: true,
+        },
+    );
+    let realm = meerkat_core::mob_realm_id("helper").unwrap();
+    let mut config = Config::default();
+    config.realm.insert(realm.as_str().to_string(), section);
+    // The binding is named, so no other credential (such as one in the
+    // process environment) stands in for a refused command.
+    let identity = SessionLlmIdentity {
+        model: "gpt-5.4".to_string(),
+        provider: Provider::OpenAI,
+        self_hosted_server_id: None,
+        provider_params: None,
+        auth_binding: Some(meerkat_core::AuthBindingRef {
+            realm: realm.clone(),
+            binding: meerkat_core::BindingId::parse("command_openai").unwrap(),
+            profile: None,
+            origin: meerkat_core::BindingOrigin::Configured,
+        }),
+    };
+    factory
+        .preflight_llm_identity(
+            &config,
+            &identity,
+            &std::collections::BTreeMap::new(),
+            Some(&realm),
+            Some(meerkat_runtime::MeerkatMachine::ephemeral().generated_auth_lease_handle()),
+        )
+        .await
+        .map_err(|error| error.to_string())
+}
+
+/// A credential command runs as the host with a `PATH` from which every
+/// directory a confined process could change is gone, so an interpreter or
+/// helper it starts by name (here through `#!/usr/bin/env`) is never one a
+/// confined process planted, even when its configured `PATH` names one.
+#[cfg(all(unix, feature = "openai"))]
+#[tokio::test]
+async fn a_credential_command_never_runs_an_interpreter_planted_on_its_path() {
+    use std::collections::BTreeMap;
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let base = temp.path().canonicalize().unwrap();
+    let writable = base.join("writable");
+    let trusted = base.join("trusted");
+    for dir in [&writable, &trusted] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    let planted_ran = base.join("planted-interpreter-ran");
+    let interpreter = writable.join("meerkat-test-interpreter");
+    std::fs::write(
+        &interpreter,
+        format!(
+            "#!/bin/sh\nprintf ran > '{}'\nprintf sk-from-planted\n",
+            planted_ran.display()
+        ),
+    )
+    .unwrap();
+    let helper = trusted.join("helper");
+    std::fs::write(&helper, "#!/usr/bin/env meerkat-test-interpreter\n").unwrap();
+    for program in [&interpreter, &helper] {
+        std::fs::set_permissions(program, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let result = preflight_command(
+        &base,
+        &writing_host(&writable),
+        helper,
+        Vec::new(),
+        Some(trusted.clone()),
+        BTreeMap::from([(
+            "PATH".to_string(),
+            format!("{}:/usr/bin:/bin", writable.display()),
+        )]),
+    )
+    .await;
+    assert!(
+        !planted_ran.exists(),
+        "the planted interpreter never ran: {result:?}"
+    );
+}
+
+/// A credential command without a working directory of its own runs, under
+/// a confining host, from the user's home directory rather than the host's
+/// working directory (which a confined process may be able to change), so
+/// it is neither refused nor exposed by default.
+#[cfg(all(unix, feature = "openai"))]
+#[tokio::test]
+async fn a_credential_command_without_a_working_directory_runs_from_a_protected_one() {
+    use std::collections::BTreeMap;
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let base = temp.path().canonicalize().unwrap();
+    let helper_dir = base.join("helper");
+    std::fs::create_dir_all(&helper_dir).unwrap();
+    let ran_in = base.join("helper-ran-in");
+    let helper = helper_dir.join("helper.sh");
+    std::fs::write(
+        &helper,
+        format!(
+            "#!/bin/sh\npwd -P > '{}'\nprintf sk-from-helper\n",
+            ran_in.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    // A confined process can write the host's working directory.
+    let host = writing_host(&std::env::current_dir().unwrap().canonicalize().unwrap());
+
+    preflight_command(&base, &host, helper, Vec::new(), None, BTreeMap::new())
+        .await
+        .expect("the command runs from a directory no confined process can change");
+    let home = std::path::PathBuf::from(std::env::var_os("HOME").expect("HOME is set"))
+        .canonicalize()
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&ran_in).unwrap().trim(),
+        home.display().to_string()
+    );
+}
+
+/// A credential command the host refuses ends the binding's resolution with
+/// that refusal: no other credential (another realm's binding, the global
+/// realm's, or the process environment's) silently stands in for it.
+#[cfg(all(unix, feature = "openai"))]
+#[tokio::test]
+async fn a_refused_credential_command_is_not_replaced_by_another_credential() {
+    use meerkat_core::{
+        AuthProfileConfig, BackendProfileConfig, CredentialSourceSpec, ProviderBindingConfig,
+        RealmConfigSection, SessionLlmIdentity,
+    };
+    use std::collections::BTreeMap;
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let base = temp.path().canonicalize().unwrap();
+    let writable = base.join("writable");
+    std::fs::create_dir_all(&writable).unwrap();
+    let helper = writable.join("helper.sh");
+    std::fs::write(&helper, "#!/bin/sh\nprintf sk-from-helper\n").unwrap();
+    std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let section = |source: CredentialSourceSpec| {
+        let mut section = RealmConfigSection::default();
+        section.backend.insert(
+            "openai_api".to_string(),
+            BackendProfileConfig {
+                provider: "openai".to_string(),
+                backend_kind: "openai_api".to_string(),
+                base_url: None,
+                options: serde_json::Value::Null,
+                server: None,
+            },
+        );
+        section.auth.insert(
+            "token".to_string(),
+            AuthProfileConfig {
+                provider: "openai".to_string(),
+                auth_method: "api_key".to_string(),
+                source,
+                constraints: Default::default(),
+                metadata_defaults: Default::default(),
+            },
+        );
+        section.binding.insert(
+            "openai".to_string(),
+            ProviderBindingConfig {
+                backend_profile: "openai_api".to_string(),
+                auth_profile: "token".to_string(),
+                credential_account: None,
+                default_model: None,
+                policy: Default::default(),
+                provider_default: true,
+            },
+        );
+        section
+    };
+    let realm = meerkat_core::mob_realm_id("helper").unwrap();
+    let mut config = Config::default();
+    config.realm.insert(
+        realm.as_str().to_string(),
+        section(CredentialSourceSpec::Command {
+            program: helper,
+            args: Vec::new(),
+            cwd: Some(base.clone()),
+            env: BTreeMap::new(),
+            timeout_ms: 5_000,
+            refresh_interval_ms: None,
+        }),
+    );
+    config.realm.insert(
+        "global".to_string(),
+        section(CredentialSourceSpec::InlineSecret {
+            secret: "sk-global-stand-in".into(),
+        }),
+    );
+    let identity = SessionLlmIdentity {
+        model: "gpt-5.4".to_string(),
+        provider: Provider::OpenAI,
+        self_hosted_server_id: None,
+        provider_params: None,
+        auth_binding: None,
+    };
+    let refused = AgentFactory::new(base.join("sessions"))
+        .with_host_confinement(&writing_host(&writable))
+        .preflight_llm_identity(
+            &config,
+            &identity,
+            &BTreeMap::new(),
+            Some(&realm),
+            Some(meerkat_runtime::MeerkatMachine::ephemeral().generated_auth_lease_handle()),
+        )
+        .await
+        .expect_err("the refused command is not replaced by the global realm's credential");
+    assert!(
+        refused.to_string().contains("confined process"),
+        "{refused}"
+    );
+}

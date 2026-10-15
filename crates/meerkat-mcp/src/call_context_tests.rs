@@ -146,9 +146,10 @@ impl Fixture {
         provider: Option<Arc<dyn McpCallContextProvider>>,
         config: McpServerConfig,
     ) -> McpRouter {
-        let mut router = McpRouter::new_with_surface_handle(Arc::new(
-            meerkat_runtime::RuntimeExternalToolSurfaceHandle::ephemeral(),
-        ));
+        let mut router = McpRouter::new_with_surface_handle_and_stdio_profile(
+            Arc::new(meerkat_runtime::RuntimeExternalToolSurfaceHandle::ephemeral()),
+            crate::McpStdioLaunchProfile::trusted_host(),
+        );
         if let Some(provider) = provider {
             router = router.with_call_context_provider(provider);
         }

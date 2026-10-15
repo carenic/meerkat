@@ -1136,7 +1136,10 @@ function workspaceDataLabels(target, source = targetScanSource(target)) {
     labels.add("//tests/fixtures/mcp-test-server:package_runfiles");
     labels.add("//tests/fixtures/surface-build-fixtures:package_runfiles");
   }
-  if (target.name === "protocol_codegen_drift") {
+  // A test that scans the workspace's Rust sources (the process launch site
+  // inventory) reads every package's sources: the root glob cannot see
+  // inside a Bazel package.
+  if (target.name === "protocol_codegen_drift" || source.includes("walk_rust_sources(&root)")) {
     for (const label of packageRunfileLabels) labels.add(label);
   }
   if (source.includes("scan_for_manual_input_schema_literals")) {
@@ -2412,6 +2415,10 @@ for (const pkg of localPackages.values()) {
       if (key === "meerkat-mcp-server") {
         data.push("//crates/meerkat-mcp-server:rkat_mcp_bin");
         env.push(`        "CARGO_BIN_EXE_rkat-mcp": "$(rootpath //crates/meerkat-mcp-server:rkat_mcp_bin)",`);
+      }
+      if (key === "meerkat-rest") {
+        data.push("//crates/meerkat-rest:rkat_rest_bin");
+        env.push(`        "CARGO_BIN_EXE_rkat-rest": "$(rootpath //crates/meerkat-rest:rkat_rest_bin)",`);
       }
       if (key === "xtask") {
         const rustfmt = "@@rules_rust++rust+rustfmt_nightly-2026-04-16__aarch64-apple-darwin_tools//:rustfmt_bin";

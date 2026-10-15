@@ -194,6 +194,7 @@ pub async fn finalize_reviewed_connector(
         Err(refusal) => return Refused(refusal),
     };
     let document = source.config_doc_path(&storage.locator.realm);
+    let source: Arc<dyn meerkat_core::RealmConfigSource> = Arc::new(source);
 
     // One administrative custody for every step below.
     let bundle = match issuance::administrative_custody(realms_root, realm_id).await {
@@ -202,7 +203,7 @@ pub async fn finalize_reviewed_connector(
     };
     // The connector clients the realm's effective configuration declares
     // now, not the ones a host installed earlier.
-    let effective = match meerkat_core::EffectiveConfigReader::new(Arc::new(source))
+    let effective = match meerkat_core::EffectiveConfigReader::new(Arc::clone(&source))
         .effective_config(&storage.locator.realm)
         .await
     {
@@ -242,11 +243,15 @@ pub async fn finalize_reviewed_connector(
         return Refused(Refusal::ClientConfigChanged);
     }
 
+    // The realm's own document, composed with its ancestors as at start:
+    // this write is of the realm's own MCP servers alone, and the realm chain
+    // keeps it from changing the `[confinement]` or `[governance]` the realm
+    // composes all the same.
     let runtime = ConfigRuntime::new(
-        Arc::new(FileConfigStore::new(
-            document.clone(),
-            meerkat_models::canonical(),
-        )),
+        Arc::new(
+            FileConfigStore::new(document.clone(), meerkat_models::canonical())
+                .with_realm_chain(storage.locator.realm.clone(), source),
+        ),
         document.with_file_name(CONFIG_STATE_FILE),
     );
     let generation = match McpRealmPersistTarget::new(&runtime)
