@@ -1,0 +1,89 @@
+#!/usr/bin/env bash
+# RUSTC_WRAPPER for the release Web SDK package build (release.yml
+# `build_web_sdk_package`): Cargo runs every crate as
+#   $RUSTC_WRAPPER rustc ARGS
+#
+# A few crates of the wasm32 release graph of meerkat-web-runtime need
+# gigabytes in one rustc. Sampled peak RssAnon per rustc (4-vCPU scope,
+# CARGO_BUILD_JOBS=4, 2026-10-15): meerkat_machine_schema 12.8 GiB,
+# meerkat_runtime 9.0, meerkat_mob 6.0, meerkat_machine_kernels 3.2,
+# meerkat_core 2.5, meerkat_contracts 1.6; every other crate stayed under
+# 0.8 GiB. Cargo's pipelining starts a dependent as soon as its dependency's
+# metadata exists, so at four plain jobs the catalog's code generation ran
+# beside meerkat_runtime and meerkat_mob: 18.8 GiB at once, more than a 16 GB
+# hosted runner has. One job avoided the overlap, but each rustc then also
+# generated its 256 codegen units on one thread (33m43s of Cargo in the
+# v0.9.1 tag run).
+#
+# While MEERKAT_WEB_WASM_HEAVY_RUSTC_LOCK names a lock file, the catalog
+# (meerkat_machine_schema) compiles under an exclusive flock(1) and the other
+# heavy crates under a shared one: none of them runs beside the catalog, but
+# they may run beside each other. That bounds what runs beside the catalog,
+# not the total: the 13.0 GiB peak of a full build at four jobs was measured
+# (the catalog's rustc plus the light crates beside it), not derived. A heavy
+# rustc waiting for the lock still holds its Cargo job slot, so while the
+# catalog compiles, fewer than CARGO_BUILD_JOBS slots are left for the light
+# crates and for the catalog's own codegen threads. Without the variable the
+# wrapper runs rustc unchanged; with it but without flock it refuses to run.
+#
+# `release-web-sdk-rustc-wrapper --check-heavy-crates` exits 0 when every crate
+# named here is a package of this checkout's workspace and flock(1) can take a
+# --no-fork lock. The release job builds at four jobs with this wrapper only
+# then, and at one job otherwise.
+set -euo pipefail
+
+exclusive_crate="meerkat_machine_schema"
+shared_crates=(meerkat_runtime meerkat_mob meerkat_machine_kernels meerkat_core meerkat_contracts)
+
+if [[ "${1:-}" == "--check-heavy-crates" ]]; then
+  if ! command -v flock >/dev/null 2>&1; then
+    echo "release-web-sdk-rustc-wrapper: flock(1) is not installed" >&2
+    exit 1
+  fi
+  probe="$(mktemp)"
+  if ! flock --no-fork --shared "${probe}" true; then
+    rm -f -- "${probe}"
+    echo "release-web-sdk-rustc-wrapper: flock --no-fork does not work here" >&2
+    exit 1
+  fi
+  rm -f -- "${probe}"
+  root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+  packages="$(cargo metadata --manifest-path "${root}/Cargo.toml" --format-version 1 --no-deps \
+    | node -e 'let s = ""; process.stdin.on("data", (d) => (s += d)).on("end", () => {
+        for (const p of JSON.parse(s).packages) console.log(p.name.replaceAll("-", "_"));
+      });')"
+  missing=0
+  for crate in "${exclusive_crate}" "${shared_crates[@]}"; do
+    if ! grep -qxF "${crate}" <<<"${packages}"; then
+      echo "release-web-sdk-rustc-wrapper: heavy crate ${crate} is not a package of ${root}" >&2
+      missing=1
+    fi
+  done
+  exit "${missing}"
+fi
+
+lock="${MEERKAT_WEB_WASM_HEAVY_RUSTC_LOCK:-}"
+if [[ -n "${lock}" ]]; then
+  if ! command -v flock >/dev/null 2>&1; then
+    echo "release-web-sdk-rustc-wrapper: MEERKAT_WEB_WASM_HEAVY_RUSTC_LOCK is set but flock(1) is not installed" >&2
+    exit 1
+  fi
+  previous=""
+  for arg in "$@"; do
+    if [[ "${previous}" == "--crate-name" ]]; then
+      if [[ "${arg}" == "${exclusive_crate}" ]]; then
+        # --no-fork: rustc replaces flock and keeps the lock, so a rustc the
+        # kernel kills reports its signal to Cargo, not flock's exit code.
+        exec flock --no-fork --exclusive "${lock}" "$@"
+      fi
+      for crate in "${shared_crates[@]}"; do
+        if [[ "${arg}" == "${crate}" ]]; then
+          exec flock --no-fork --shared "${lock}" "$@"
+        fi
+      done
+      break
+    fi
+    previous="${arg}"
+  done
+fi
+exec "$@"

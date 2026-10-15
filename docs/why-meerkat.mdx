@@ -1,0 +1,142 @@
+---
+title: "Why Meerkat?"
+description: "An operational agent platform, from a minimal embedded runtime to persistent teams working across machines."
+icon: "scale-balanced"
+---
+
+Meerkat is an **operational agent platform**. It combines the efficiency of a
+composable Rust runtime with the capabilities to run agents as part of a lasting,
+distributed system. The same foundation serves a small automation executable,
+an agent embedded in a device, and a fleet of agents working together over time.
+Open source and provider agnostic throughout.
+
+## How Is This Different From Claude Code Or Codex?
+
+Codex, Claude Code, Cursor, Copilot and Pi can turn an ambitious brief into
+working software, tackling complex problems for days with little intervention.
+They are built around delivering a result, with a person setting direction and
+judging the outcome.
+
+Meerkat is built for agents that become part of a running operation. They respond
+to events, coordinate work and carry responsibilities for months. Tasks come and
+go; the agents keep their identities, memory and roles. Teams can span machines,
+with agents communicating directly and coordinating shared work. Your application
+controls membership, connections and authority.
+
+That distinction shapes the runtime itself: native asynchronous execution,
+critical lifecycle rules checked mathematically, and scheduling, recovery and
+access control designed into how work proceeds. It also shapes how much of the
+runtime you need to deploy.
+
+## From Minimal Automation To A Thousand Cooperating Agents
+
+### A small runtime for a small job
+
+For a simple automation problem, executable size, startup time and memory use
+matter. A minimal Meerkat configuration can produce an executable of around
+**20 MB, with harness startup measured in milliseconds**. Its Rust runtime
+compiles to native code; you select optional capabilities at build time and
+compose the models, tools and storage your application needs. A command-line
+task can use `rkat`; an embedded application can call the runtime directly,
+in its own process.
+
+This lets you build a compact agent without bringing along an entire interactive
+development environment. Small configurations can target embedded devices such
+as the ESP32. WebAssembly runs the harness in a browser. A full native build
+provides a capable harness in a data center. These are configurations of the
+same foundation, with shared agent and provider contracts.
+
+See [composability](/concepts/composability),
+[build profiles](/reference/capability-matrix) and
+[browser/WASM examples](/examples/wasm).
+
+### A running operation with many agents
+
+At the other end of the spectrum are operations with hundreds or thousands of
+agents: continuously available, communicating and sharing work over months.
+Each agent has an identity, responsibilities, memory and permissions. Individual
+tasks finish; the operation continues.
+
+Meerkat has reached **operational peaks of roughly 1,000 agents**, with
+**synthetic benchmarks exercising 10,000 agents**. Native asynchronous execution
+and distributed coordination are fundamental to its design.
+
+Meerkat provides the machinery for that operating model:
+
+- **Native asynchronous execution.** Agents respond to events and coordinate
+  while other agents wait on models, tools or external systems. Their lifecycle
+  extends beyond an individual request or model call.
+- **Direct communication and distributed teams.** Agents exchange signed peer
+  messages within a host or across machines. Applications define team membership,
+  placement and who can communicate with whom.
+- **Continuity across execution.** A member keeps its identity when it restarts,
+  reconnects or moves to another host. Durable sessions, schedules and work
+  records preserve the state needed to continue; Meta supplies agent memory
+  across tasks.
+- **Shared work and recovery.** Work can arrive from a schedule, an external
+  event, a person or another agent. Runtime services track execution, completion
+  and recovery as part of the same system.
+
+For example, a release coordinator can handle today's build, retain what it
+learned and return for the next release under the same identity. Specialist
+agents handle testing, incidents and dependencies; temporary workers join for
+particular jobs. The application can change the team as its responsibilities
+evolve.
+
+See [mobs](/concepts/mobs), [comms](/concepts/comms),
+[durable jobs](/guides/durable-jobs) and [agent memory](/mobkit/concepts/memory).
+
+## Engineering The Rules That Keep It Running
+
+Long-running systems encounter races, failures and changes of authority. A tool
+finishes as cancellation arrives. A worker restarts after accepting a job. A
+permission changes while delegated work is in flight. The runtime needs precise
+rules for each case.
+
+Meerkat defines critical lifecycle decisions as state machines. Shared
+definitions generate both TLA+ specifications and the Rust kernels used by the
+runtime. Model checking verifies safety properties across the reachable states
+of the configured models. These rules govern session execution, coordination,
+scheduling, authorization lifecycles and recovery.
+
+The result is explicit, mathematically checked behavior around questions such as
+which transitions are legal, who may commit them and what counts as completion.
+The [machine authority reference](/reference/machine-authority) connects those
+rules to their definitions, generated code and verification process.
+
+Identity and access control are part of that operating model. The system
+separates who requested work, which agent executes it, on whose behalf it acts
+and which account supplies credentials. Configured policy can narrow delegated
+authority and evaluate the concrete operation; process confinement controls what
+executed commands can access. Meta adds application policy and approval
+interfaces, while Recall applies access control to shared knowledge.
+
+See [authorization](/concepts/authorization) for attribute-based policy,
+delegation and host integration.
+
+## A Full Platform When You Need It
+
+Composability extends to a complete agent system. Core includes tools, MCP,
+skills, hooks, structured output, compaction, semantic memory, image generation
+and live voice alongside execution and coordination. The integrated platform
+adds:
+
+- **[Meta](/mobkit/introduction):** agent identities and memory, routing,
+  application policy and a console framework you can adapt to your own product.
+- **[Connect](/connect/introduction):** agent-driven integration discovery and
+  preparation, using its library or researching packages for the job.
+- **[Recall](/recall/introduction):** a knowledge system with source evidence,
+  relationships, access-controlled retrieval and maintained views.
+
+Provider independence runs through the platform. Use Anthropic, OpenAI, Gemini,
+cloud-hosted backends or self-hosted OpenAI-compatible models. Choose a model per
+agent, mix providers within a team, and retain control of your tools, data and
+application code. See the [provider catalog](/concepts/providers).
+
+**The range is the point:** a small, fast agent where resources matter; a
+full-featured harness where capability matters; an integrated operational
+platform where agents need to keep working together. You choose how much to use.
+
+Start with the [quickstart](/quickstart),
+[embed Meerkat](/rust/overview), or build an ongoing agent application with
+[Meta](/mobkit/introduction).

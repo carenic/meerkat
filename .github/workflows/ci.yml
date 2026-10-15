@@ -61,6 +61,23 @@ name: CI
 #                     was not cancelled, failed runs included); schema-4
 #                     exact-tree attestation on main
 #
+# Release projections: a push or pull request whose diff from its first
+# parent is only the forward patch projection scripts/release-hook.sh writes
+# (scripts/release-projection-only.mjs, the pre-push hook's fail-closed
+# classifier), with a completed, successful, workspace-mode exact-main CI run
+# of that parent (scripts/ci-release-evidence.mjs, run from the parent's own
+# tree), is planned as mode release-projection: format + governance, the
+# generation ratchets, the Bazel graph check and the readers of the changed
+# files (their closure rows, integration suites and lib/bin unit rows, plus
+# meerkat-contracts' unit row) run, and the other lanes reuse the parent's
+# run, which the gate verifies again and records in the attestation. A test,
+# snapshot, fixture, SDK or Rust code line that pins the old or new version
+# (scripts/release-version-pins.mjs) refuses reuse. Without that evidence the
+# commit gets the ordinary plan. A commit carrying the trailer
+# `CI-Plan: workspace` (or merging a branch whose head carries it) is planned
+# as the whole workspace, the explicit way to give a release's parent that
+# evidence.
+#
 # Push to main only (no wall-clock budget):
 #   main-unit (xN)  - nextest --lib --bins over the whole workspace in eight
 #                     cost-packed shards (this is where the meerkat-mob chain's
@@ -236,7 +253,9 @@ jobs:
   changes:
     name: Change classification
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    # A main push of a release projection waits up to 40 minutes for its
+    # parent's CI run to complete before it can reuse it.
+    timeout-minutes: 50
     outputs:
       rust_changed: ${{ steps.plan.outputs.rust_changed }}
       mode: ${{ steps.plan.outputs.mode }}
@@ -249,6 +268,11 @@ jobs:
       bazel_graph: ${{ steps.plan.outputs.bazel_graph }}
       examples_browser: ${{ steps.plan.outputs.examples_browser }}
       example_web: ${{ steps.plan.outputs.example_web }}
+      release_projection: ${{ steps.plan.outputs.release_projection }}
+      release_projection_versions: ${{ steps.plan.outputs.release_projection_versions }}
+      release_evidence_commit: ${{ steps.plan.outputs.release_evidence_commit }}
+      release_evidence_run_id: ${{ steps.plan.outputs.release_evidence_run_id }}
+      release_evidence_run_attempt: ${{ steps.plan.outputs.release_evidence_run_attempt }}
       package_count: ${{ steps.plan.outputs.package_count }}
       closure_count: ${{ steps.plan.outputs.closure_count }}
       closure_flags: ${{ steps.plan.outputs.closure_flags }}
@@ -287,6 +311,19 @@ jobs:
       - name: Setup Rust
         uses: ./.github/actions/setup-rust-ci
 
+      # The release-projection classifier runs the docs and changelog
+      # stampers (Python) and the evidence scripts (Node) under the same
+      # versions as the CI gate and the release workflow.
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+
       - name: Classify changed paths
         id: plan
         shell: bash
@@ -298,6 +335,10 @@ jobs:
               ''
             }}
           EVENT_NAME: ${{ github.event_name }}
+          GH_TOKEN: ${{ github.token }}
+          # Pull requests never wait (the classification is on every lane's
+          # budgeted path); a push waits for a running parent run.
+          EVIDENCE_WAIT_SECONDS: ${{ github.event_name == 'push' && '2400' || '0' }}
         run: |
           set -euo pipefail
           # A pull_request checkout is refs/pull/N/merge; classify against its
@@ -305,9 +346,32 @@ jobs:
           # queued (main may have moved in between). Fails closed if the
           # checkout is not the expected merge commit.
           classification_base="$(scripts/ci-pr-classification-base "${EVENT_NAME}" "${BASE_SHA}")"
+          # A release projection (the diff from HEAD's first parent is only
+          # the forward patch projection scripts/release-hook.sh writes)
+          # reuses that parent's exact-main CI test evidence. The finder runs
+          # from the parent's own tree, so a commit cannot certify itself with
+          # edited scripts, and prints the evidence only for a completed,
+          # successful, workspace-mode push run of ci.yml on main at the
+          # parent (waiting for a running one up to EVIDENCE_WAIT_SECONDS);
+          # otherwise, or on any lookup failure, the plan stays the ordinary
+          # one.
+          # A commit carrying `CI-Plan: workspace` gets the whole workspace
+          # anyway, so it neither looks for evidence nor waits for it.
+          plan_args=()
+          evidence_tools="${RUNNER_TEMP}/release-evidence-tools/scripts"
+          mkdir -p "${evidence_tools}"
+          if [[ -n "${classification_base}" ]] \
+            && ! node scripts/ci-cargo-lanes.mjs --workspace-plan-requested --head HEAD \
+            && git show "${classification_base}:scripts/ci-release-evidence.mjs" > "${evidence_tools}/ci-release-evidence.mjs" 2>/dev/null \
+            && git show "${classification_base}:scripts/release-projection-only.mjs" > "${evidence_tools}/release-projection-only.mjs" 2>/dev/null \
+            && git show "${classification_base}:scripts/release-version-pins.mjs" > "${evidence_tools}/release-version-pins.mjs" 2>/dev/null \
+            && evidence="$(node "${evidence_tools}/ci-release-evidence.mjs" find --repository "${GITHUB_REPOSITORY}" \
+                --base "${classification_base}" --head HEAD --wait-seconds "${EVIDENCE_WAIT_SECONDS}")"; then
+            plan_args=(--reuse-release-evidence "${evidence}")
+          fi
           # The classifier exits non-zero rather than emit an empty plan for a
           # build-relevant change; a failure here fails the CI gate.
-          node scripts/ci-cargo-lanes.mjs --format github --base "${classification_base}" --head HEAD \
+          node scripts/ci-cargo-lanes.mjs --format github --base "${classification_base}" --head HEAD "${plan_args[@]}" \
             | tee "${RUNNER_TEMP}/ci-cargo-lanes.txt" >> "${GITHUB_OUTPUT}"
           grep -vE '^(closure_flags|shard_matrix|unit_shard_matrix|main_unit_shard_matrix|main_archive_build_matrix|main_archive_run_matrix|integration_matrix|closure_test_matrix|feature_check_matrix)=' "${RUNNER_TEMP}/ci-cargo-lanes.txt"
 
@@ -695,7 +759,8 @@ jobs:
   unit:
     name: Unit tests (${{ matrix.name }})
     needs: changes
-    if: ${{ needs.changes.outputs.rust_changed == 'true' && needs.changes.outputs.unit_shard_count != '0' }}
+    # A release projection runs its readers' and meerkat-contracts' rows.
+    if: ${{ (needs.changes.outputs.rust_changed == 'true' || needs.changes.outputs.release_projection == 'true') && needs.changes.outputs.unit_shard_count != '0' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 40
     strategy:
@@ -1747,10 +1812,11 @@ jobs:
     name: Example web suites
     needs: changes
     # Examples 031, 032 and 033 execute the sdks/web wasm runtime in
-    # Playwright Chromium. Every main push runs them; pull requests run them
-    # when the runtime, the crates it builds from, or those examples change.
+    # Playwright Chromium. Every main push runs them (a release projection
+    # reuses its parent's run); pull requests run them when the runtime, the
+    # crates it builds from, or those examples change.
     # Independent of the Rust lanes, so it stays off the critical path.
-    if: ${{ github.event_name == 'push' || needs.changes.outputs.example_web == 'true' }}
+    if: ${{ (github.event_name == 'push' && needs.changes.outputs.release_projection != 'true') || needs.changes.outputs.example_web == 'true' }}
     runs-on: ubuntu-24.04
     # Sized from measurement (2026-09-29). Warm (sccache 100% hits, e.g. job
     # 109577859270): 4.5 min, 2 min of it the wasm build. Cold, a pull request
@@ -1873,8 +1939,9 @@ jobs:
     name: WASM timer ownership
     needs: changes
     # Compile the Rust regression binaries independently of the example build
-    # so both lanes retain the pull-request wall-clock budget.
-    if: ${{ github.event_name == 'push' || needs.changes.outputs.example_web == 'true' }}
+    # so both lanes retain the pull-request wall-clock budget. Selected with
+    # the example web suites.
+    if: ${{ (github.event_name == 'push' && needs.changes.outputs.release_projection != 'true') || needs.changes.outputs.example_web == 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     env:
@@ -2043,6 +2110,11 @@ jobs:
           UNIT_DEFERRED_COUNT: ${{ needs.changes.outputs.unit_deferred_count }}
           PACKAGE_COUNT: ${{ needs.changes.outputs.package_count }}
           CLOSURE_COUNT: ${{ needs.changes.outputs.closure_count }}
+          GENERATED_CONTRACT: ${{ needs.changes.outputs.generated_contract }}
+          RELEASE_PROJECTION: ${{ needs.changes.outputs.release_projection }}
+          RELEASE_EVIDENCE_COMMIT: ${{ needs.changes.outputs.release_evidence_commit }}
+          RELEASE_EVIDENCE_RUN_ID: ${{ needs.changes.outputs.release_evidence_run_id }}
+          RELEASE_EVIDENCE_RUN_ATTEMPT: ${{ needs.changes.outputs.release_evidence_run_attempt }}
         run: |
           set -euo pipefail
           # Main unit coverage is the packed shards plus the archived lanes
@@ -2095,6 +2167,32 @@ jobs:
           require_success "Change classification" "${CHANGES_RESULT}"
           require_success "Format + governance" "${FMT_GOVERNANCE_RESULT}"
           require_success "Generation ratchets" "${RATCHETS_RESULT}"
+          # A release-projection plan runs no Clippy, unit, check, wasm, SDK or
+          # example lane: it reuses the parent's workspace-mode exact-main run,
+          # which the next step verifies. The readers of the changed files
+          # still run (closure-tests and integration below). The plan must say
+          # so consistently, or nothing below can be trusted either.
+          if [[ "${RELEASE_PROJECTION}" == "true" ]]; then
+            echo "release projection: lanes reuse CI run ${RELEASE_EVIDENCE_RUN_ID} attempt ${RELEASE_EVIDENCE_RUN_ATTEMPT} of ${RELEASE_EVIDENCE_COMMIT} (verified next)"
+            if [[ "${MODE}" != "release-projection" || "${RUST_CHANGED}" != "false" || "${EXAMPLE_WEB}" != "false" || "${GENERATED_CONTRACT}" != "true" || "${BAZEL_GRAPH}" != "true" ]]; then
+              echo "::error::an inconsistent release-projection plan (mode=${MODE} rust_changed=${RUST_CHANGED} example_web=${EXAMPLE_WEB} generated_contract=${GENERATED_CONTRACT} bazel_graph=${BAZEL_GRAPH})."
+              failed=1
+            fi
+            if ! [[ "${RELEASE_EVIDENCE_COMMIT}" =~ ^[0-9a-f]{40}$ && "${RELEASE_EVIDENCE_RUN_ID}" =~ ^[1-9][0-9]*$ && "${RELEASE_EVIDENCE_RUN_ATTEMPT}" =~ ^[1-9][0-9]*$ ]]; then
+              echo "::error::the release-projection plan names no completed CI run to reuse (commit='${RELEASE_EVIDENCE_COMMIT}' run='${RELEASE_EVIDENCE_RUN_ID}' attempt='${RELEASE_EVIDENCE_RUN_ATTEMPT}')."
+              failed=1
+            fi
+            # The readers' and meerkat-contracts' lib and bin unit rows.
+            if [[ "${UNIT_SHARD_COUNT}" =~ ^[0-9]+$ ]] && (( UNIT_SHARD_COUNT > 0 )); then
+              require_ran "Unit tests" "${UNIT_RESULT}"
+            else
+              echo "::error::a release-projection plan must run its readers' unit rows (unit_shard_count='${UNIT_SHARD_COUNT}')."
+              failed=1
+            fi
+          elif [[ "${MODE}" == "release-projection" ]]; then
+            echo "::error::mode release-projection without the release_projection flag."
+            failed=1
+          fi
           if [[ "${MACHINE_AUTHORITY}" == "true" ]]; then
             require_ran "Bounded TLC audits" "${TLC_AUDITS_RESULT}"
           else
@@ -2189,9 +2287,10 @@ jobs:
           else
             forbid_failure "Closure tests" "${CLOSURE_TESTS_RESULT}"
           fi
-          # Example web suites: every main push, and pull requests that touch
-          # the web runtime, its crates, or examples 031-033.
-          if [[ "${IS_MAIN_PUSH}" == "true" || "${EXAMPLE_WEB}" == "true" ]]; then
+          # Example web suites: every main push but a release projection's
+          # (it reuses its parent's), and pull requests that touch the web
+          # runtime, its crates, or examples 031-033.
+          if [[ ( "${IS_MAIN_PUSH}" == "true" && "${RELEASE_PROJECTION}" != "true" ) || "${EXAMPLE_WEB}" == "true" ]]; then
             require_ran "Example web suites" "${EXAMPLE_WEB_RESULT}"
             require_ran "WASM timer ownership" "${WASM_TIMERS_RESULT}"
           else
@@ -2209,6 +2308,57 @@ jobs:
             exit 1
           fi
           echo "All selected lanes succeeded."
+
+      # A release-projection plan skipped the lanes the parent's exact-main
+      # CI ran over the whole workspace. Re-check the projection and the
+      # evidence here, after the lanes, with the parent's own copies of the
+      # scripts: the recorded attempt must be a completed, successful push run
+      # of ci.yml on main at HEAD's first parent, and its schema-4 attestation
+      # must name that commit and tree, plan the whole workspace with every
+      # lane successful and not itself be a reuse. Anything else fails the
+      # gate; the run and attempt are recorded in this run's attestation.
+      - name: Checkout the release projection
+        if: ${{ needs.changes.outputs.release_projection == 'true' }}
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 2
+
+      - name: Setup Python for the release projection
+        if: ${{ needs.changes.outputs.release_projection == 'true' }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - name: Setup Node for the release projection
+        if: ${{ needs.changes.outputs.release_projection == 'true' }}
+        uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+
+      - name: Verify reused release-projection evidence
+        if: ${{ needs.changes.outputs.release_projection == 'true' }}
+        id: release_evidence
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_EVIDENCE_COMMIT: ${{ needs.changes.outputs.release_evidence_commit }}
+          RELEASE_EVIDENCE_RUN_ID: ${{ needs.changes.outputs.release_evidence_run_id }}
+          RELEASE_EVIDENCE_RUN_ATTEMPT: ${{ needs.changes.outputs.release_evidence_run_attempt }}
+        run: |
+          set -euo pipefail
+          parent="$(git rev-parse --verify 'HEAD^1')"
+          if [[ "${parent}" != "${RELEASE_EVIDENCE_COMMIT}" ]]; then
+            echo "::error::the reused evidence names ${RELEASE_EVIDENCE_COMMIT}, not HEAD's first parent ${parent}."
+            exit 1
+          fi
+          tools="${RUNNER_TEMP}/release-evidence-tools/scripts"
+          mkdir -p "${tools}"
+          for script in ci-release-evidence.mjs release-projection-only.mjs release-version-pins.mjs; do
+            git show "${parent}:scripts/${script}" > "${tools}/${script}"
+          done
+          node "${tools}/ci-release-evidence.mjs" verify --repository "${GITHUB_REPOSITORY}" \
+            --base "${parent}" --head HEAD --run-id "${RELEASE_EVIDENCE_RUN_ID}" \
+            --run-attempt "${RELEASE_EVIDENCE_RUN_ATTEMPT}" --github-output "${GITHUB_OUTPUT}"
 
       - name: Enforce lane execution budget
         # Runs on every run that was not cancelled, including runs whose lane
@@ -2468,6 +2618,15 @@ jobs:
           SHARD_COUNT: ${{ needs.changes.outputs.shard_count }}
           UNIT_SHARD_COUNT: ${{ needs.changes.outputs.unit_shard_count }}
           MAIN_UNIT_SHARD_COUNT: ${{ needs.changes.outputs.main_unit_shard_count }}
+          # Set only by a release-projection plan's verified evidence.
+          RELEASE_PROJECTION: ${{ needs.changes.outputs.release_projection }}
+          REUSED_RUN_ID: ${{ steps.release_evidence.outputs.run_id }}
+          REUSED_RUN_ATTEMPT: ${{ steps.release_evidence.outputs.run_attempt }}
+          REUSED_COMMIT: ${{ steps.release_evidence.outputs.commit }}
+          REUSED_TREE: ${{ steps.release_evidence.outputs.tree }}
+          REUSED_ARTIFACT: ${{ steps.release_evidence.outputs.attestation_artifact }}
+          REUSED_FROM_VERSION: ${{ steps.release_evidence.outputs.from_version }}
+          REUSED_TO_VERSION: ${{ steps.release_evidence.outputs.to_version }}
         run: |
           set -euo pipefail
           # Main unit coverage is the packed shards plus the archived lanes
@@ -2487,6 +2646,38 @@ jobs:
           destination="${RUNNER_TEMP}/meerkat-ci-attestation"
           mkdir -p "${destination}"
           tree_sha="$(git rev-parse 'HEAD^{tree}')"
+          # A release-projection run attests its own lanes plus the parent
+          # run whose test evidence it reused (verified by the gate above);
+          # require_ci_green verifies that evidence again.
+          reused='null'
+          if [[ "${RELEASE_PROJECTION}" == "true" ]]; then
+            if [[ "${MODE}" != "release-projection" || -z "${REUSED_RUN_ID}" || -z "${REUSED_RUN_ATTEMPT}" || -z "${REUSED_COMMIT}" || -z "${REUSED_TREE}" ]]; then
+              echo "::error::a release-projection run without verified reused evidence cannot be attested."
+              exit 1
+            fi
+            reused="$(jq -n \
+              --arg base_commit_sha "${REUSED_COMMIT}" \
+              --arg base_tree_sha "${REUSED_TREE}" \
+              --arg workflow_run_id "${REUSED_RUN_ID}" \
+              --arg workflow_run_attempt "${REUSED_RUN_ATTEMPT}" \
+              --arg attestation_artifact "${REUSED_ARTIFACT}" \
+              --arg from_version "${REUSED_FROM_VERSION}" \
+              --arg to_version "${REUSED_TO_VERSION}" \
+              '{
+                classifier: "release-projection-only",
+                from_version: $from_version,
+                to_version: $to_version,
+                base_commit_sha: $base_commit_sha,
+                base_tree_sha: $base_tree_sha,
+                workflow: "CI",
+                workflow_run_id: $workflow_run_id,
+                workflow_run_attempt: $workflow_run_attempt,
+                attestation_artifact: $attestation_artifact
+              }')"
+          elif [[ "${MODE}" == "release-projection" ]]; then
+            echo "::error::mode release-projection without the release_projection flag cannot be attested."
+            exit 1
+          fi
           jq -n \
             --arg repository "${GITHUB_REPOSITORY}" \
             --arg commit_sha "${GITHUB_SHA}" \
@@ -2518,6 +2709,7 @@ jobs:
             --argjson shard_count "${SHARD_COUNT:-0}" \
             --argjson unit_shard_count "${UNIT_SHARD_COUNT:-0}" \
             --argjson main_unit_shard_count "${MAIN_UNIT_SHARD_COUNT:-0}" \
+            --argjson reused "${reused}" \
             '{
               schema_version: 4,
               repository: $repository,
@@ -2556,7 +2748,7 @@ jobs:
                 wasm_timers: $wasm_timers,
                 bazel_graph: $bazel_graph
               }
-            }' > "${destination}/attestation.json"
+            } + (if $reused == null then {} else {reused_test_evidence: $reused} end)' > "${destination}/attestation.json"
           echo "tree_sha=${tree_sha}"
           echo "path=${destination}" >> "${GITHUB_OUTPUT}"
 

@@ -43,9 +43,11 @@ const BUILD_PROFILE = (() => {
     `invalid MEERKAT_WEB_WASM_PROFILE=${value}; expected release, dev, or profiling`,
   );
 })();
-// MEERKAT_WEB_WASM_OPT=0 skips the wasm-opt pass. wasm-opt spends many
-// minutes on the release binary (most of the build); the browser suites that
-// only need a working runtime (the example web suites in CI) skip it.
+// MEERKAT_WEB_WASM_OPT=0 skips the wasm-opt pass. Its level is the one
+// crates/meerkat-web-runtime/Cargo.toml gives wasm-pack (-O1: about a minute
+// on four threads, where wasm-pack's default -Os took 9 to 16 minutes); the
+// browser suites that only need a working runtime (the example web suites in
+// CI) skip it.
 const WASM_OPT = (() => {
   const value = process.env.MEERKAT_WEB_WASM_OPT ?? "1";
   if (value === "0" || value === "1") {
