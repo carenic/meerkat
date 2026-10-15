@@ -2498,6 +2498,71 @@ def check_release_caches(text: str) -> list[str]:
     return violations
 
 
+# Makes build-wasm.mjs run `wasm-pack build --mode no-install`.
+WEB_SDK_PACK_MODE_ENV = "MEERKAT_WEB_WASM_PACK_MODE"
+
+
+def _locked_version(crate: str) -> str | None:
+    """The first version of `crate` in the checkout's Cargo.lock."""
+    lines = (REPO_ROOT / "Cargo.lock").read_text(encoding="utf-8").splitlines()
+    for index, line in enumerate(lines[:-1]):
+        if line == f'name = "{crate}"':
+            match = re.fullmatch(r'version = "([^"]+)"', lines[index + 1])
+            if match:
+                return match.group(1)
+    return None
+
+
+def check_web_sdk_tools(text: str) -> list[str]:
+    """The attesting Web SDK build downloads nothing unchecked.
+
+    Every download in its steps is checked against a pinned sha256, and
+    wasm-pack runs with `--mode no-install` (so it uses the pinned
+    wasm-bindgen and wasm-opt on PATH instead of fetching its own). The
+    pinned wasm-bindgen is the version Cargo.lock locks, since wasm-pack
+    refuses any other: a lock bump without a pin bump fails here, not at
+    release time.
+    """
+    violations: list[str] = []
+    steps = _steps_of(text, WEB_SDK_BUILD_JOB)
+    if not steps:
+        return [f"job `{WEB_SDK_BUILD_JOB}` is not defined in the workflow"]
+    for step in steps:
+        run = step.raw_run
+        downloads = len(re.findall(r"\bcurl\b", run))
+        checks = run.count("sha256sum --check")
+        if downloads > checks:
+            violations.append(
+                f"step `{step.name}` downloads {downloads} file(s) but checks {checks} sha256"
+            )
+    build = [step for step in steps if "release-build-web-sdk-package.sh" in step.run]
+    if len(build) != 1:
+        violations.append(f"job `{WEB_SDK_BUILD_JOB}` has {len(build)} steps that build the package, not one")
+    elif build[0].env.get(WEB_SDK_PACK_MODE_ENV) != "no-install":
+        violations.append(
+            f"step `{build[0].name}` lets wasm-pack download its own wasm-bindgen and wasm-opt "
+            f"(`{WEB_SDK_PACK_MODE_ENV}` is not `no-install`)"
+        )
+    pins = [
+        match.group(1)
+        for step in steps
+        if (match := re.search(r'^bindgen_version="([^"]+)"$', step.raw_run, re.MULTILINE))
+    ]
+    locked = _locked_version("wasm-bindgen")
+    if len(pins) != 1:
+        violations.append(f"job `{WEB_SDK_BUILD_JOB}` pins wasm-bindgen {len(pins)} times, not once")
+    elif locked is None:
+        violations.append("Cargo.lock locks no wasm-bindgen")
+    elif pins[0] != locked:
+        violations.append(
+            f"job `{WEB_SDK_BUILD_JOB}` pins wasm-bindgen {pins[0]}, but Cargo.lock locks {locked}; "
+            "wasm-pack --mode no-install would fail the release"
+        )
+    if not any("bin/wasm-opt" in step.raw_run and "GITHUB_PATH" in step.raw_run for step in steps):
+        violations.append(f"job `{WEB_SDK_BUILD_JOB}` puts no pinned wasm-opt on PATH")
+    return violations
+
+
 def _readiness_push(needed: str, baseline: str) -> EventContext:
     return EventContext(
         label=f"a main push with needed={needed!r} and notes baseline {baseline!r}",
@@ -2572,6 +2637,7 @@ CHECKS: dict[str, Callable[[str], list[str]]] = {
     "trailing-platforms": check_trailing_platforms,
     "token-permissions": check_token_permissions,
     "release-caches": check_release_caches,
+    "web-sdk-tools": check_web_sdk_tools,
 }
 
 # Checks of release-semver-readiness.yml; run them by name with

@@ -37,6 +37,7 @@ BASELINE_PASS="PASS Semver baseline rustdoc builds alongside the release and gat
 BASELINE_FAIL="FAIL The semver baseline rustdoc must stay off every path a user waits on"
 TRAILING_PASS="PASS Linux and macOS arm64 assets publish without waiting for the trailing Intel macOS and Windows lanes; no upload replaces a published asset"
 TRAILING_FAIL="FAIL The trailing Intel macOS and Windows lanes must not gate the critical assets, and no upload may replace a published asset"
+WEB_TOOLS_PASS="PASS The Web SDK release build checks every download's sha256 and wasm-pack installs nothing: wasm-bindgen (Cargo.lock's version) and wasm-opt are pinned"
 TOKEN_PASS="PASS Release workflow token is read-only except for the jobs that attest or publish, which never persist it in a checkout; no reusable workflow inherits every secret"
 CACHES_PASS="PASS GitHub Actions caches in release.yml jobs and the local actions they call are never saved on a dispatch and never cache ~/.cargo/bin; token jobs restore none, and OIDC or attesting jobs restore none that a dispatch-like run of any workflow saves (reusable workflows are not read and never run on a dispatch)"
 CACHES_FAIL="FAIL A release cache can be saved on a dispatch, cache ~/.cargo/bin, or reach a token, OIDC or attesting job"
@@ -564,6 +565,19 @@ elif name == "semver-baseline-clobber":
         '            --clobber \\\n'
         '            "semver-baseline/${asset}"\n',
     )
+elif name == "web-sdk-pack-mode-dropped":
+    # wasm-pack downloads its own wasm-bindgen and wasm-opt again.
+    replace_once("          MEERKAT_WEB_WASM_PACK_MODE: no-install\n", "")
+elif name == "web-sdk-bindgen-mismatch":
+    # A Cargo.lock bump without the pin: wasm-pack would refuse the binary.
+    text, count = re.subn(r'(?m)^          bindgen_version="[^"]+"$', '          bindgen_version="0.0.0-stale"', text)
+    if count != 1:
+        raise SystemExit(f"fixture `{name}` expects one wasm-bindgen pin, found {count}")
+elif name == "web-sdk-unchecked-download":
+    replace_once(
+        '          echo "${binaryen_sha256}  ${tools}/${binaryen_archive}" | sha256sum --check --strict\n',
+        "",
+    )
 elif name == "cache-xwin-dispatch-save":
     # The Windows SDK cache saved by dispatch runs too.
     replace_once(
@@ -915,6 +929,16 @@ mutate secrets-inherit "${TEST_ROOT}/secrets-inherit.yml"
 expect_fail_named secrets-inherit "${TEST_ROOT}/secrets-inherit.yml" \
   "job \`release_validate_buildbuddy_full\` passes every repository secret to a reusable workflow" token-permissions
 
+mutate web-sdk-pack-mode-dropped "${TEST_ROOT}/web-sdk-pack-mode-dropped.yml"
+expect_fail_named web-sdk-pack-mode-dropped "${TEST_ROOT}/web-sdk-pack-mode-dropped.yml" \
+  "step \`Build and pack Web SDK\` lets wasm-pack download its own wasm-bindgen and wasm-opt" web-sdk-tools
+mutate web-sdk-bindgen-mismatch "${TEST_ROOT}/web-sdk-bindgen-mismatch.yml"
+expect_fail_named web-sdk-bindgen-mismatch "${TEST_ROOT}/web-sdk-bindgen-mismatch.yml" \
+  "job \`build_web_sdk_package\` pins wasm-bindgen 0.0.0-stale, but Cargo.lock locks" web-sdk-tools
+mutate web-sdk-unchecked-download "${TEST_ROOT}/web-sdk-unchecked-download.yml"
+expect_fail_named web-sdk-unchecked-download "${TEST_ROOT}/web-sdk-unchecked-download.yml" \
+  "step \`Install pinned wasm-bindgen and wasm-opt\` downloads 2 file(s) but checks 1 sha256" web-sdk-tools
+
 mutate cache-registry-restore "${TEST_ROOT}/cache-registry-restore.yml"
 expect_fail_named cache-registry-restore "${TEST_ROOT}/cache-registry-restore.yml" \
   "job \`publish_registries\` holds a registry or publish token and restores a cache" release-caches
@@ -964,7 +988,7 @@ run_doctor() {
 }
 
 run_doctor "$WORKFLOW" "${TEST_ROOT}/doctor-committed.log"
-for line in "$SEMVER_PASS" "$SLO_PASS" "$DISPATCH_PASS" "$TAG_VALIDATION_PASS" "$PREBUILD_PASS" "$BASELINE_PASS" "$TRAILING_PASS" "$TOKEN_PASS" "$CACHES_PASS"; do
+for line in "$SEMVER_PASS" "$SLO_PASS" "$DISPATCH_PASS" "$TAG_VALIDATION_PASS" "$PREBUILD_PASS" "$BASELINE_PASS" "$TRAILING_PASS" "$TOKEN_PASS" "$WEB_TOOLS_PASS" "$CACHES_PASS"; do
   if ! grep -Fxq "$line" "${TEST_ROOT}/doctor-committed.log"; then
     fail "doctor does not report \`${line}\` for the committed workflow" \
       "$(cat "${TEST_ROOT}/doctor-committed.log")"

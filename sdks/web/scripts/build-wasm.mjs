@@ -55,6 +55,20 @@ const WASM_OPT = (() => {
   }
   throw new Error(`invalid MEERKAT_WEB_WASM_OPT=${value}; expected 0 or 1`);
 })();
+// MEERKAT_WEB_WASM_PACK_MODE=no-install makes wasm-pack use the wasm-bindgen
+// and wasm-opt on PATH instead of downloading them at build time (the release
+// build installs both pinned by sha256). wasm-pack then fails without a
+// wasm-bindgen of the locked version, but silently skips a missing wasm-opt,
+// so this script requires one on PATH first.
+const WASM_PACK_MODE = (() => {
+  const value = process.env.MEERKAT_WEB_WASM_PACK_MODE ?? "";
+  if (value === "" || value === "no-install") {
+    return value;
+  }
+  throw new Error(
+    `invalid MEERKAT_WEB_WASM_PACK_MODE=${value}; expected no-install or unset`,
+  );
+})();
 // Ambient rustflags are folded in ahead of the runtime's own and the result
 // reaches Cargo as a `--config target.wasm32-unknown-unknown.rustflags`
 // array, with no rustflags variable left to outrank it
@@ -434,6 +448,16 @@ async function run() {
 
     await rm(OUT_DIR, { recursive: true, force: true });
 
+    if (WASM_PACK_MODE === "no-install" && WASM_OPT) {
+      try {
+        await runCapture("wasm-opt", ["--version"]);
+      } catch (error) {
+        throw new Error(
+          `MEERKAT_WEB_WASM_PACK_MODE=no-install needs wasm-opt on PATH, or wasm-pack would skip the wasm-opt pass: ${error.message}`,
+        );
+      }
+    }
+
     await new Promise((resolve, reject) => {
       const profileArgs =
         BUILD_PROFILE === "release" ? [] : [`--${BUILD_PROFILE}`];
@@ -448,6 +472,7 @@ async function run() {
           OUT_DIR,
           ...profileArgs,
           ...(WASM_OPT ? [] : ["--no-opt"]),
+          ...(WASM_PACK_MODE ? ["--mode", WASM_PACK_MODE] : []),
           "--",
           ...WASM_BUILD.cargoArgs,
         ],

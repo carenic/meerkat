@@ -480,7 +480,11 @@ and `merge_group`). The BuildBuddy release binary build passes
 `repository-cache: "false"`. The doctor reads release.yml and its local
 actions, not the reusable `buildbuddy.yml`, which the full-graph validation
 calls only on tag pushes, and it does not cover the BuildBuddy remote cache.
-The macOS checks call the Apple tools by absolute path.
+The macOS checks call the Apple tools by absolute path. The Web SDK package
+job installs wasm-pack, wasm-bindgen (the version Cargo.lock locks) and
+wasm-opt pinned by sha256 and runs wasm-pack with `--mode no-install`
+(`MEERKAT_WEB_WASM_PACK_MODE`), so wasm-pack downloads nothing; a wasm-bindgen
+bump in Cargo.lock must bump that pin (the doctor's `web-sdk-tools` check).
 
 ## Hard Rules
 
