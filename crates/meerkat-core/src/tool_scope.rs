@@ -1425,6 +1425,16 @@ impl ToolScopeBoundaryResult {
     }
 }
 
+/// A read-only preview of how the next model-call boundary shows each base
+/// tool to the model, taken from one read of the visibility state.
+#[derive(Debug)]
+pub(crate) struct CatalogVisibilityPreview {
+    pub(crate) visibility:
+        std::collections::BTreeMap<ToolName, crate::tool_catalog::ToolCatalogVisibility>,
+    /// Whether a staged visibility change waits for the next boundary.
+    pub(crate) staged_changes_pending: bool,
+}
+
 impl ToolScope {
     /// Build a scope with no base restriction.
     pub fn new(base_tools: Arc<[Arc<ToolDef>]>) -> Self {
@@ -1865,17 +1875,16 @@ impl ToolScope {
 
     /// How a boundary that projected `base_tools` with these control-plane
     /// and deferred names would show each base tool to the model under the
-    /// scope's active state, read without changing the scope. A staged
-    /// change the next boundary promotes is not applied.
+    /// scope's active state, read without changing the scope, and whether a
+    /// staged change waits for that boundary, from the same single read of
+    /// the visibility state. A staged change the next boundary promotes is
+    /// not applied.
     pub(crate) fn preview_catalog_visibility(
         &self,
         base_tools: Arc<[Arc<ToolDef>]>,
         control_tool_names: HashSet<ToolName>,
         deferred_tool_names: HashSet<ToolName>,
-    ) -> Result<
-        std::collections::BTreeMap<ToolName, crate::tool_catalog::ToolCatalogVisibility>,
-        ToolScopeApplyError,
-    > {
+    ) -> Result<CatalogVisibilityPreview, ToolScopeApplyError> {
         let visibility_state = self.visibility_owner.visibility_state()?;
         let require_filter_witnesses = self.visibility_owner.requires_filter_witnesses();
         let preview = {
@@ -1898,16 +1907,20 @@ impl ToolScope {
         };
         let composed =
             Self::compose_state_filters(&preview, &visibility_state, require_filter_witnesses);
-        Ok(preview
-            .base_tools
-            .iter()
-            .map(|tool| {
-                (
-                    tool.name.clone(),
-                    Self::tool_visibility(&preview, &visibility_state, &composed, tool),
-                )
-            })
-            .collect())
+        Ok(CatalogVisibilityPreview {
+            visibility: preview
+                .base_tools
+                .iter()
+                .map(|tool| {
+                    (
+                        tool.name.clone(),
+                        Self::tool_visibility(&preview, &visibility_state, &composed, tool),
+                    )
+                })
+                .collect(),
+            staged_changes_pending: visibility_state.staged_revision
+                != visibility_state.active_revision,
+        })
     }
 
     fn compose_state_filters(

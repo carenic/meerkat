@@ -22020,6 +22020,47 @@ mod tests {
         );
     }
 
+    /// A staged visibility change is reported as waiting for the next
+    /// boundary, from the same read of the visibility state as the active
+    /// visibility the view still shows; the boundary then applies it.
+    #[tokio::test]
+    async fn tool_catalog_view_reports_a_staged_change_without_applying_it() {
+        use crate::ToolCatalogVisibility;
+        let client = Arc::new(DeferredLoadVisibilityClient::new());
+        let tools = Arc::new(DeferredLoadDispatcher::new());
+        let mut agent = with_test_turn_state_handle(AgentBuilder::new())
+            .with_tool_visibility_owner(explicit_test_visibility_owner())
+            .build_standalone(client.clone(), tools, Arc::new(NoopStore))
+            .await;
+        agent
+            .tool_scope
+            .handle()
+            .stage_external_filter(crate::ToolFilter::Deny(
+                ["deferred_tool_two".to_string()].into_iter().collect(),
+            ))
+            .expect("stage a visibility change");
+
+        let view = agent.tool_catalog_view().expect("catalog view");
+        assert!(view.staged_changes_pending);
+        assert_eq!(
+            catalog_view_visibility(&view, "deferred_tool_two"),
+            Some(ToolCatalogVisibility::Deferred),
+            "a staged change is not applied before its boundary"
+        );
+
+        agent.config.max_turns = Some(2);
+        let result = agent.run("prompt".to_string().into()).await.unwrap();
+        assert_eq!(result.text, "done");
+        let view = agent
+            .tool_catalog_view()
+            .expect("catalog view after the run");
+        assert!(!view.staged_changes_pending);
+        assert_eq!(
+            catalog_view_visibility(&view, "deferred_tool_two"),
+            Some(ToolCatalogVisibility::Hidden)
+        );
+    }
+
     /// Without a catalog control plane the session never hides a
     /// deferred-eligible tool: the view reports the inline mode the requests
     /// actually take, with every tool visible.

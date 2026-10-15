@@ -1414,7 +1414,7 @@ where
         } else {
             crate::ToolCatalogMode::Inline
         };
-        let visibility = self
+        let preview = self
             .tool_scope
             .preview_catalog_visibility(
                 self.tools.tools(),
@@ -1422,7 +1422,6 @@ where
                 projection.deferred_tool_names,
             )
             .ok()?;
-        let visibility_state = self.tool_scope.visibility_state().ok()?;
         Some(crate::ToolCatalogView {
             mode,
             exact_catalog,
@@ -1431,8 +1430,7 @@ where
             } else {
                 Vec::new()
             },
-            staged_changes_pending: visibility_state.staged_revision
-                != visibility_state.active_revision,
+            staged_changes_pending: preview.staged_changes_pending,
             entries: catalog
                 .iter()
                 .map(|entry| crate::ToolCatalogViewEntry {
@@ -1440,7 +1438,8 @@ where
                     plane: entry.plane,
                     deferred_eligibility: entry.deferred_eligibility.clone(),
                     callability: entry.callability,
-                    visibility: visibility
+                    visibility: preview
+                        .visibility
                         .get(&entry.tool.name)
                         .copied()
                         .unwrap_or(crate::ToolCatalogVisibility::Hidden),
