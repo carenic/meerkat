@@ -225,9 +225,9 @@ pub use completion_feed::{
     CompletionFeed, CompletionSeq,
 };
 pub use config::{
-    AgentConfig, BudgetConfig, CallTimeoutOverride, CommandRuntimeConfig, CommsAuthMode,
-    CommsRuntimeConfig, CommsRuntimeMode, Config, ConfigDelta, ConfigError, ConfigScope,
-    ConfigWarning, HookAdapterConfig, HookEntryConfig, HookInProcessHandlerId,
+    AdministeredSection, AgentConfig, BudgetConfig, CallTimeoutOverride, CommandRuntimeConfig,
+    CommsAuthMode, CommsRuntimeConfig, CommsRuntimeMode, Config, ConfigDelta, ConfigError,
+    ConfigScope, ConfigWarning, HookAdapterConfig, HookEntryConfig, HookInProcessHandlerId,
     HookInProcessRuntimeConfig, HookRunOverrides, HookRuntimeKind, HooksConfig, HttpRuntimeConfig,
     LimitsConfig, ModelDefaults, PlainEventSource, ProviderToolsConfig, RetryConfig,
     SelfHostedApiStyle, SelfHostedConfig, SelfHostedModelConfig, SelfHostedServerConfig,

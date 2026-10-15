@@ -133,8 +133,13 @@ requirement = { baseline = "command_runtime_v1", read = { kind = "paths", paths 
   (`governance_administration_required`), it cannot change the realm
   sections of the realm's own document (its `[realm.<id>].parent` edge, or a
   `[realm.global]` section that puts the user document on its chain) so that
-  the realm would compose a different `[confinement]` or `[governance]`.
-  Only stores that declare the realm chain enforce this: the stock hosts'
+  the realm would compose a different `[confinement]` or `[governance]`. A
+  write to the user document is refused too when another realm would
+  compose differently: a realm whose own documents state no
+  `[realm.global]` (the user document's puts `global` on its chain), or one
+  without a document that takes the user document's section for it. The
+  refusal names the change and the realm. Only stores that declare the
+  realm chain enforce this: the stock hosts'
   stores, `FileConfigStore::with_realm_chain` and
   `SdkConfigStore::with_realm_document`; a `FileConfigStore::new`,
   `SdkConfigStore::with_path` or in-memory store keeps only the document's

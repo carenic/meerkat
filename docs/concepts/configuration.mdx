@@ -711,6 +711,15 @@ as invalid. A change that composes the same sections, such as a parent
 stating the same requirement, is ordinary config. Re-parent a confined or
 governed realm by editing its document as its host.
 
+The user document decides for other realms too: its `[realm.global]`
+section puts `global`, and with it the user document's `[governance]`, on
+the chain of every realm whose own documents state none, and a realm with no
+document of its own takes the section the user document states for it. A
+write to the user document is also refused when such a realm would compose
+a different section afterwards. Each refusal names the change and the realm,
+for example
+`removing [realm.global] would change the [governance] section a realm whose own document states no parent and no [realm.global] composes`.
+
 Only a store that declares the realm's chain enforces this, as the stock
 hosts' stores do (`FileConfigStore::with_realm_chain`,
 `SdkConfigStore::with_realm_document`). A store built with

@@ -72,11 +72,23 @@ them.
   directory), and under a host that confines every launch kind, a
   credential command or Git skill cache a confined process could change is
   refused. See Changed and Fixed.
+- `meerkat_core::ConfigError` has a new variant `CompositionAdministration
+  { administered, change, composer }`: a config write that changes realm
+  sections so that a realm would compose a different `[confinement]` or
+  `[governance]` (see Fixed). Refusals of changed realm sections use it
+  instead of `ConfinementAdministration` and `GovernanceAdministration`; an
+  exhaustive match must handle it. `ConfigError::administered_section`
+  gives the section of all three.
 - Behaviour-only (not measured by the gate): a credential command without
   `cwd` runs from the user's home directory on every host, not from the
   host's working directory, and a credential command the host refuses ends
   its binding's resolution with `HostLaunchRefused` instead of falling back
   to the next credential (see Fixed).
+- Behaviour-only (not measured by the gate): a write to the user document
+  that changes its realm sections is refused too when another realm would
+  compose a different `[confinement]` or `[governance]` afterwards, such as
+  removing or adding `[realm.global]` when the user document states
+  `[governance]` (see Fixed).
 
 ### Deprecated
 
@@ -145,6 +157,9 @@ them.
   `git` from a `PATH` without the directories a host does not trust.
 - `McpServerRefusal::reported_name`: the name a session reports a refused
   server under.
+- `meerkat_core::AdministeredSection` (`Confinement`, `Governance`) and
+  `ConfigError::administered_section`, the section a refused config write
+  would change.
 - `SdkConfigStore::with_realm_document` builds a realm document store that
   keeps the realm's composed `[confinement]` and `[governance]`
   (`FileConfigStore::with_realm_chain`).
@@ -278,6 +293,20 @@ them.
   environment, `node_modules/.bin`, a relative entry), a confined process
   could plant a program there, such as `xdg-open`, that the host then ran
   unconfined.
+- A write to the user document (the `global` realm's own, written by `rkat
+  config` and by `rkat-rpc`, `rkat-rest` and `rkat-mcp` serving `global`)
+  can no longer change the `[confinement]` or `[governance]` other realms
+  compose. Its `[realm.global]` section puts `global`, and with it the user
+  document's `[governance]`, on the chain of every realm whose own
+  documents state none, and a realm without a document takes the section
+  the user document states for it. A write that changes either so that
+  such a realm would compose differently is refused
+  (`governance_administration_required` or
+  `confinement_administration_required`), and nothing is written. Before,
+  the check composed only the `global` realm itself, so a patch removing
+  `[realm.global]` dropped the user document's review rules from every
+  realm that did not state `[realm.global]` itself, at its next start. A
+  refusal of changed realm sections names the change and the realm.
 - A credential command without `cwd` runs from the user's home directory,
   judged as that directory and the files in it, instead of from the host's
   working directory, which a host that confines every launch kind refused

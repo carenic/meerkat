@@ -358,24 +358,21 @@ impl EffectiveConfigReader {
         confinement: &crate::ConfinementConfig,
         governance: &Option<crate::GovernanceConfig>,
     ) -> Result<(crate::ConfinementConfig, Option<crate::GovernanceConfig>), ConfigError> {
-        let head_config = Config {
-            confinement: confinement.clone(),
-            governance: governance.clone(),
-            realm: realms
-                .iter()
-                .map(|(realm, parent)| {
-                    (
-                        realm.clone(),
-                        crate::connection::RealmConfigSection {
-                            parent: parent.clone(),
-                            ..Default::default()
-                        },
-                    )
-                })
-                .collect(),
-            ..Config::default()
-        };
+        let head_config = administration_document(realms, confinement, governance);
         let ChainDocs { docs, raw_docs, .. } = self.chain_docs_over_head(head, head_config).await?;
+        let composed = crate::config::compose_effective_config(&docs, &raw_docs, head)?;
+        Ok((composed.confinement, composed.governance))
+    }
+
+    /// The `[confinement]` and `[governance]` `head` composes, from the
+    /// documents and the chain [`Self::effective_config`] discovers and
+    /// resolves (`head` may have no document of its own). The layer check
+    /// is not applied.
+    async fn administered(
+        &self,
+        head: &crate::connection::RealmId,
+    ) -> Result<(crate::ConfinementConfig, Option<crate::GovernanceConfig>), ConfigError> {
+        let ChainDocs { docs, raw_docs, .. } = self.chain_docs(head).await?;
         let composed = crate::config::compose_effective_config(&docs, &raw_docs, head)?;
         Ok((composed.confinement, composed.governance))
     }
@@ -661,11 +658,15 @@ impl FileConfigStore {
     /// sections the document states (the realm's own parent edge, or a
     /// section it states for another realm, such as `[realm.global]`) is
     /// then refused unless the realm composes exactly the same
-    /// `[confinement]` ([`ConfigError::ConfinementAdministration`]) and the
-    /// same `[governance]` ([`ConfigError::GovernanceAdministration`]) after
-    /// it: ordinary config write permission cannot cut the realm from an
-    /// ancestor's requirement or governance, nor add either. Nothing is
-    /// written.
+    /// `[confinement]` and the same `[governance]` after it
+    /// ([`ConfigError::CompositionAdministration`]): ordinary config write
+    /// permission cannot cut the realm from an ancestor's requirement or
+    /// governance, nor add either. A store for the user document (`head` is
+    /// `global`) also refuses a write after which another realm would
+    /// compose either differently: a realm whose own document states no
+    /// parent and no `[realm.global]` (the user document's `[realm.global]`
+    /// decides whether `global` is on its chain), and each realm the user
+    /// document states a section for. Nothing is written.
     ///
     /// Only a store declared this way guards the realm's composition. A
     /// store built with [`Self::new`] alone, and a [`MemoryConfigStore`],
@@ -923,6 +924,125 @@ fn persisted_confinement(content: &str) -> Result<crate::ConfinementConfig, Conf
 /// each names: what the document contributes to the chains it composes.
 type RealmEdges = std::collections::BTreeMap<String, Option<crate::connection::RealmId>>;
 
+/// A document stating only `realms` as its realm sections (each section's
+/// presence and parent edge) and `confinement` and `governance` as its own
+/// sections: all of a document the composition of those sections reads.
+fn administration_document(
+    realms: &RealmEdges,
+    confinement: &crate::ConfinementConfig,
+    governance: &Option<crate::GovernanceConfig>,
+) -> Config {
+    Config {
+        confinement: confinement.clone(),
+        governance: governance.clone(),
+        realm: realms
+            .iter()
+            .map(|(realm, parent)| {
+                (
+                    realm.clone(),
+                    crate::connection::RealmConfigSection {
+                        parent: parent.clone(),
+                        ..Default::default()
+                    },
+                )
+            })
+            .collect(),
+        ..Config::default()
+    }
+}
+
+/// The realm sections a write changes, as an operator reads them: for
+/// example `removing [realm.global]` or `changing the parent of
+/// [realm.team]`.
+fn realm_edge_change(persisted: &RealmEdges, written: &RealmEdges) -> String {
+    let realms: std::collections::BTreeSet<&String> =
+        persisted.keys().chain(written.keys()).collect();
+    let changes: Vec<String> = realms
+        .into_iter()
+        .filter_map(|realm| {
+            let realm_name = realm.escape_debug();
+            match (persisted.get(realm), written.get(realm)) {
+                (Some(_), None) => Some(format!("removing [realm.{realm_name}]")),
+                (None, Some(_)) => Some(format!("adding [realm.{realm_name}]")),
+                (Some(before), Some(after)) if before != after => {
+                    Some(format!("changing the parent of [realm.{realm_name}]"))
+                }
+                _ => None,
+            }
+        })
+        .collect();
+    changes.join(", ")
+}
+
+/// What a realm composes of the administered sections: its `[confinement]`
+/// and its `[governance]`.
+type Administered = (crate::ConfinementConfig, Option<crate::GovernanceConfig>);
+
+/// Refuse a write `change` after which `composer` composes a different
+/// `[confinement]` or `[governance]` than `before`
+/// ([`ConfigError::CompositionAdministration`]).
+fn keep_composition(
+    change: &str,
+    composer: &str,
+    before: &Administered,
+    after: &Administered,
+) -> Result<(), ConfigError> {
+    let administered = if !composes_the_same(&before.0, &after.0) {
+        crate::config::AdministeredSection::Confinement
+    } else if before.1 != after.1 {
+        crate::config::AdministeredSection::Governance
+    } else {
+        return Ok(());
+    };
+    Err(ConfigError::CompositionAdministration {
+        administered,
+        change: change.to_owned(),
+        composer: composer.to_owned(),
+    })
+}
+
+/// `documents` with the user document (the `global` realm's own) replaced
+/// by `user`: the documents a realm composes from after a write to the user
+/// document.
+struct WithUserDocument {
+    documents: Arc<dyn RealmConfigSource>,
+    user: Config,
+}
+
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+impl RealmConfigSource for WithUserDocument {
+    async fn config_for_realm(
+        &self,
+        realm: &crate::connection::RealmId,
+    ) -> Result<Option<Config>, ConfigError> {
+        if realm.is_global() {
+            return Ok(Some(self.user.clone()));
+        }
+        self.documents.config_for_realm(realm).await
+    }
+
+    async fn config_for_realm_with_warnings(
+        &self,
+        realm: &crate::connection::RealmId,
+    ) -> Result<Option<(Config, Vec<ConfigWarning>)>, ConfigError> {
+        if realm.is_global() {
+            return Ok(Some((self.user.clone(), Vec::new())));
+        }
+        self.documents.config_for_realm_with_warnings(realm).await
+    }
+
+    async fn raw_config_for_realm(
+        &self,
+        realm: &crate::connection::RealmId,
+    ) -> Result<Option<toml::Value>, ConfigError> {
+        if realm.is_global() {
+            return Ok(None);
+        }
+        self.documents.raw_config_for_realm(realm).await
+    }
+}
+
 /// The realm sections `config` states, with their parent edges.
 fn realm_edges(config: &Config) -> RealmEdges {
     config
@@ -974,18 +1094,20 @@ struct RealmChainGuard {
 
 impl RealmChainGuard {
     /// Refuse a write whose realm sections would change the `[confinement]`
-    /// ([`ConfigError::ConfinementAdministration`]) or the `[governance]`
-    /// ([`ConfigError::GovernanceAdministration`]) the realm composes:
-    /// ordinary config write permission is not their administration, and a
-    /// realm composes its ancestors' sections through its own parent edge
-    /// and the `global` root a `[realm.global]` section puts on its chain. A
-    /// write that keeps the document's realm sections never composes
-    /// differently (its own `confinement` and `governance` are already kept
-    /// exactly), so only a changed one is composed: from the persisted
-    /// sections and from the written ones, over the documents the host
-    /// composes at start. A persisted chain that does not compose refuses
-    /// the write with its error; written sections whose chain does not
-    /// compose are invalid.
+    /// or the `[governance]` a realm composes
+    /// ([`ConfigError::CompositionAdministration`], naming the change and
+    /// the realm): ordinary config write permission is not their
+    /// administration, and a realm composes its ancestors' sections through
+    /// its own parent edge and the `global` root a `[realm.global]` section
+    /// puts on its chain. A write that keeps the document's realm sections
+    /// never composes differently (its own `confinement` and `governance`
+    /// are already kept exactly), so only a changed one is composed: from
+    /// the persisted sections and from the written ones, over the documents
+    /// the host composes at start. The head realm is composed, and for the
+    /// user document the other realms it decides for
+    /// ([`Self::keep_compositions_over_user_document`]). A persisted chain
+    /// that does not compose refuses the write with its error; written
+    /// sections whose chain does not compose are invalid.
     async fn keep_composed_administration(
         &self,
         persisted: RealmEdges,
@@ -997,11 +1119,12 @@ impl RealmChainGuard {
         if persisted == written {
             return Ok(());
         }
+        let change = realm_edge_change(&persisted, &written);
         let reader = EffectiveConfigReader::new(Arc::clone(&self.documents));
-        let (confinement_before, governance_before) = reader
+        let before = reader
             .administered_with_realms(&self.head, &persisted, confinement, governance)
             .await?;
-        let (confinement_after, governance_after) = reader
+        let after = reader
             .administered_with_realms(&self.head, &written, confinement, governance)
             .await
             .map_err(|error| {
@@ -1009,13 +1132,82 @@ impl RealmChainGuard {
                     "the realm's parent edge does not compose: {error}"
                 ))
             })?;
-        if !composes_the_same(&confinement_before, &confinement_after) {
-            Err(ConfigError::ConfinementAdministration)
-        } else if governance_before != governance_after {
-            Err(ConfigError::GovernanceAdministration)
-        } else {
-            Ok(())
+        keep_composition(
+            &change,
+            &format!("realm '{}'", self.head.as_str()),
+            &before,
+            &after,
+        )?;
+        if self.head.is_global() {
+            self.keep_compositions_over_user_document(
+                &change,
+                &persisted,
+                &written,
+                confinement,
+                governance,
+            )
+            .await?;
         }
+        Ok(())
+    }
+
+    /// For a write to the user document (the `global` realm's own), refuse
+    /// one after which another realm would compose a different
+    /// `[confinement]` or `[governance]`. Any document's `[realm.global]`
+    /// puts `global` on a chain, so the user document's decides it for each
+    /// realm whose own documents state none, and a realm without a document
+    /// of its own takes the section the user document states for it.
+    /// Composed over the persisted and over the written user document: a
+    /// realm with no document (for every realm whose own document states no
+    /// parent and no `[realm.global]`), and each realm the user document
+    /// states a section for, from its own document as the host has it.
+    async fn keep_compositions_over_user_document(
+        &self,
+        change: &str,
+        persisted: &RealmEdges,
+        written: &RealmEdges,
+        confinement: &crate::ConfinementConfig,
+        governance: &Option<crate::GovernanceConfig>,
+    ) -> Result<(), ConfigError> {
+        use crate::connection::RealmId;
+        let probe = RealmId::parse(format!(
+            "composition-probe.{}",
+            crate::time_compat::new_uuid_v7()
+        ))
+        .map_err(|error| ConfigError::InternalError(format!("composition probe realm: {error}")))?;
+        let mut composers = vec![(
+            probe,
+            "a realm whose own document states no parent and no [realm.global]".to_owned(),
+        )];
+        let stated: std::collections::BTreeSet<&String> =
+            persisted.keys().chain(written.keys()).collect();
+        for realm in stated {
+            // A section that names no valid realm configures none.
+            let Ok(realm) = RealmId::parse(realm.as_str()) else {
+                continue;
+            };
+            if !realm.is_global() {
+                let composer = format!("realm '{}'", realm.as_str());
+                composers.push((realm, composer));
+            }
+        }
+        let over = |realms: &RealmEdges| {
+            EffectiveConfigReader::new(Arc::new(WithUserDocument {
+                documents: Arc::clone(&self.documents),
+                user: administration_document(realms, confinement, governance),
+            }))
+        };
+        let (before_reader, after_reader) = (over(persisted), over(written));
+        for (realm, composer) in composers {
+            let before = before_reader.administered(&realm).await?;
+            let after = after_reader.administered(&realm).await.map_err(|error| {
+                ConfigError::Validation(format!(
+                    "the realm sections do not compose for {composer}: {error}"
+                ))
+            })?;
+            keep_composition(change, &composer, &before, &after)?;
+        }
+        Ok(())
     }
 }
 
@@ -1451,7 +1643,13 @@ mod tests {
         let store = chained_store(&path, vec![("org", ORG), ("twin", TWIN), ("loose", LOOSE)]);
         let refused = |result: Result<(), ConfigError>| {
             assert!(
-                matches!(result, Err(ConfigError::ConfinementAdministration)),
+                matches!(
+                    result,
+                    Err(ConfigError::CompositionAdministration {
+                        administered: crate::config::AdministeredSection::Confinement,
+                        ..
+                    })
+                ),
                 "{result:?}"
             );
         };
@@ -1597,7 +1795,13 @@ mod tests {
         );
         let refused = |result: Result<(), ConfigError>| {
             assert!(
-                matches!(result, Err(ConfigError::GovernanceAdministration)),
+                matches!(
+                    result,
+                    Err(ConfigError::CompositionAdministration {
+                        administered: crate::config::AdministeredSection::Governance,
+                        ..
+                    })
+                ),
                 "{result:?}"
             );
         };
@@ -1664,11 +1868,59 @@ mod tests {
         ] {
             let result = store.patch(ConfigDelta(patch)).await.map(|_| ());
             assert!(
-                matches!(result, Err(ConfigError::GovernanceAdministration)),
+                matches!(
+                    result,
+                    Err(ConfigError::CompositionAdministration {
+                        administered: crate::config::AdministeredSection::Governance,
+                        ..
+                    })
+                ),
                 "{result:?}"
             );
         }
         assert_eq!(tokio::fs::read_to_string(&path).await.unwrap(), HEAD);
+    }
+
+    /// The user document's `[realm.global]` section puts the `global` realm,
+    /// and with it the user document's `[governance]`, on the chain of every
+    /// realm that states no parent of its own. A write to the user document
+    /// (through the global realm's own store) that removes it would drop
+    /// that governance from all of them: it is refused, naming the section,
+    /// and nothing is written. An unrelated edit commits.
+    #[tokio::test]
+    async fn a_user_document_write_cannot_take_global_off_the_chains_it_governs() {
+        let user = format!("[realm.global]\n\n{REVIEW_RULE}");
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("config.toml");
+        tokio::fs::write(&path, &user).await.unwrap();
+        let store = FileConfigStore::new(
+            path.clone(),
+            *crate::model_profile::test_catalog::TEST_CATALOG,
+        )
+        .with_realm_chain(
+            crate::connection::RealmId::global(),
+            Arc::new(MapSource {
+                docs: std::collections::BTreeMap::new(),
+            }),
+        );
+        for patch in [
+            serde_json::json!({"realm": {"global": null}}),
+            serde_json::json!({"realm": null}),
+        ] {
+            let refused = store
+                .patch(ConfigDelta(patch.clone()))
+                .await
+                .expect_err("the write would drop the governance other realms compose");
+            assert!(
+                refused.to_string().contains("[realm.global]"),
+                "{patch}: {refused}"
+            );
+        }
+        assert_eq!(tokio::fs::read_to_string(&path).await.unwrap(), user);
+        store
+            .patch(ConfigDelta(serde_json::json!({"max_tokens": 2048})))
+            .await
+            .expect("an unrelated edit of the user document commits");
     }
 
     /// A chain member other than the head and `global` composes only from

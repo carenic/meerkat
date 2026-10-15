@@ -4606,12 +4606,11 @@ fn config_runtime_err_to_api(err: meerkat_core::ConfigRuntimeError) -> ApiError 
         // An ordinary config write is not administration of a section the
         // host administers in the document itself; nothing was written. The
         // refusal keeps its typed discriminator, as on JSON-RPC and MCP.
-        meerkat_core::ConfigRuntimeError::Config(
-            error @ (meerkat_core::ConfigError::GovernanceAdministration
-            | meerkat_core::ConfigError::ConfinementAdministration),
-        ) => {
-            let refusal = match error {
-                meerkat_core::ConfigError::ConfinementAdministration => {
+        meerkat_core::ConfigRuntimeError::Config(error)
+            if error.administered_section().is_some() =>
+        {
+            let refusal = match error.administered_section() {
+                Some(meerkat_core::AdministeredSection::Confinement) => {
                     meerkat_contracts::wire::WireConfigWriteRefusal::ConfinementAdministrationRequired
                 }
                 _ => meerkat_contracts::wire::WireConfigWriteRefusal::GovernanceAdministrationRequired,

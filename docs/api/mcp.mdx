@@ -1182,9 +1182,11 @@ A `set` or `patch` that would administer a section the host administers in the
 document itself is refused with `-32602` (invalid params), and nothing is
 written. The error's `data.type` is `governance_administration_required`
 (change, remove or restate `[governance]`) or
-`confinement_administration_required` (add, change or remove `[confinement]`,
-or change the realm's parent edge so that it composes a different
-`[confinement]`).
+`confinement_administration_required` (add, change or remove `[confinement]`).
+A write that changes realm sections (a parent edge, or the user document's
+`[realm.global]`) so that a realm would compose a different section is
+refused with the same types, and its message names the change and the
+realm.
 
 ### meerkat_capabilities
 

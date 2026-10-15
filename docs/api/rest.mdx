@@ -1097,13 +1097,15 @@ A `PUT` or `PATCH` that would administer a section the host administers in the
 document itself returns `400` with code `CONFIG_WRITE_REFUSED`, and nothing is
 written. `details.type` names the section: `governance_administration_required`
 (change, remove or restate `[governance]`) or
-`confinement_administration_required` (add, change or remove `[confinement]`,
-or change the realm's parent edge so that it composes a different
-`[confinement]`).
+`confinement_administration_required` (add, change or remove `[confinement]`).
+A write that changes realm sections (a parent edge, or the user document's
+`[realm.global]`) so that a realm would compose a different section is
+refused with the same types, and its message names the change and the realm,
+for example `removing [realm.global] would change the [governance] section a realm whose own document states no parent and no [realm.global] composes`.
 
 ```json
 {
-  "error": "the confinement section is administered by the host in the config documents; a config write cannot add, change or remove it, or change the realm parent edge it is composed through",
+  "error": "the confinement section is administered by the host in the config documents; a config write cannot add, change or remove it",
   "code": "CONFIG_WRITE_REFUSED",
   "details": { "type": "confinement_administration_required" }
 }

@@ -987,12 +987,9 @@ fn map_config_runtime_error(err: ConfigRuntimeError) -> ToolCallError {
         ),
         // An ordinary write is not administration of a section the realm's
         // trusted host administers; nothing was written.
-        ConfigRuntimeError::Config(
-            refused @ (meerkat_core::ConfigError::GovernanceAdministration
-            | meerkat_core::ConfigError::ConfinementAdministration),
-        ) => {
-            let refusal = match refused {
-                meerkat_core::ConfigError::ConfinementAdministration => {
+        ConfigRuntimeError::Config(refused) if refused.administered_section().is_some() => {
+            let refusal = match refused.administered_section() {
+                Some(meerkat_core::AdministeredSection::Confinement) => {
                     WireConfigWriteRefusal::ConfinementAdministrationRequired
                 }
                 _ => WireConfigWriteRefusal::GovernanceAdministrationRequired,
@@ -8507,6 +8504,66 @@ requirement = { baseline = "command_runtime_v1", read = { kind = "paths", paths 
         .expect("a patch that keeps the edge commits");
         let committed = std::fs::read_to_string(&team_doc).expect("team");
         assert!(committed.contains("parent = \"org\""), "{committed}");
+    }
+
+    /// Served as the global realm, the MCP config tool writes the user
+    /// document, whose `[realm.global]` section puts the user document's
+    /// `[governance]` on the chain of every realm that states no parent of
+    /// its own. A patch that removes that section is refused with the
+    /// governance discriminator, naming the section, and writes nothing; an
+    /// unrelated edit commits.
+    #[tokio::test]
+    async fn test_user_document_writes_cannot_drop_the_governance_other_realms_compose() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let realms = temp.path().join("realms");
+        let user_root = temp.path().join("user");
+        std::fs::create_dir_all(user_root.join(".rkat")).expect("user root");
+        let user_doc = user_root.join(".rkat").join("config.toml");
+        let user_text = "[realm.global]\n\n[[governance.review.rules]]\ntarget = { kind = \"mcp_server\", server = \"mail\" }\ntier = \"r2\"\n";
+        std::fs::write(&user_doc, user_text).expect("user document");
+        let mut bootstrap = RuntimeBootstrap::default();
+        bootstrap.realm.selection = RealmSelection::Explicit {
+            realm_id: "global".into(),
+        };
+        bootstrap.realm.state_root = Some(realms);
+        bootstrap.context.user_config_root = Some(user_root);
+        let state = MeerkatMcpState::new_with_bootstrap_options_and_llm(
+            bootstrap,
+            false,
+            Some(Arc::new(TestClient::for_provider(Provider::Anthropic))),
+            None,
+        )
+        .await
+        .expect("the global realm serves");
+
+        let refused = Box::pin(handle_tools_call(
+            &state,
+            "meerkat_config",
+            &json!({"action": "patch", "patch": {"realm": {"global": null}}}),
+        ))
+        .await
+        .expect_err("the patch would drop the governance other realms compose");
+        assert_eq!(refused.code, -32602);
+        assert_eq!(
+            refused.data,
+            Some(json!({"type": "governance_administration_required"})),
+            "{}",
+            refused.message
+        );
+        assert!(
+            refused.message.contains("[realm.global]"),
+            "{}",
+            refused.message
+        );
+        assert_eq!(std::fs::read_to_string(&user_doc).expect("user"), user_text);
+
+        Box::pin(handle_tools_call(
+            &state,
+            "meerkat_config",
+            &json!({"action": "patch", "patch": {"max_tokens": 2048}}),
+        ))
+        .await
+        .expect("an unrelated edit commits");
     }
 
     /// A start whose confined processes could change the realm state is

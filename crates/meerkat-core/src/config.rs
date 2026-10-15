@@ -3005,6 +3005,26 @@ pub enum ConfigScope {
 #[serde(transparent)]
 pub struct ConfigDelta(pub serde_json::Value);
 
+/// A config section the host administers in the documents themselves: an
+/// ordinary config write cannot change it, nor change what a realm composes
+/// of it ([`ConfigError::administered_section`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdministeredSection {
+    /// `[confinement]`.
+    Confinement,
+    /// `[governance]`.
+    Governance,
+}
+
+impl std::fmt::Display for AdministeredSection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Confinement => "confinement",
+            Self::Governance => "governance",
+        })
+    }
+}
+
 /// Configuration errors
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -3053,15 +3073,34 @@ pub enum ConfigError {
     GovernanceAdministration,
 
     /// A write would add, change or remove the document's `[confinement]`
-    /// section ([`crate::ConfinementConfig`]), or change the realm's parent
-    /// edge so that the realm composes a different `[confinement]` from its
-    /// ancestors. Ordinary config write permission is not confinement
-    /// administration: the host administers the section in the documents
-    /// themselves. Nothing is written.
+    /// section ([`crate::ConfinementConfig`]). Ordinary config write
+    /// permission is not confinement administration: the host administers
+    /// the section in the documents themselves. Nothing is written.
     #[error(
-        "the confinement section is administered by the host in the config documents; a config write cannot add, change or remove it, or change the realm parent edge it is composed through"
+        "the confinement section is administered by the host in the config documents; a config write cannot add, change or remove it"
     )]
     ConfinementAdministration,
+
+    /// A write would change the realm sections a document states (a realm's
+    /// parent edge, or the `[realm.global]` section that puts the user
+    /// document on the chain of every realm whose own documents state none)
+    /// so that a realm composes a different `[confinement]` or
+    /// `[governance]` from the documents on its chain, adding or dropping a
+    /// requirement alike. Ordinary config write permission is not their
+    /// administration: the host administers them in the documents
+    /// themselves. Nothing is written.
+    #[error(
+        "{change} would change the [{administered}] section {composer} composes; the host administers it in the config documents, so a config write cannot change it"
+    )]
+    CompositionAdministration {
+        /// The section the realm would compose differently.
+        administered: AdministeredSection,
+        /// The realm sections the write changes, for example `removing
+        /// [realm.global]`.
+        change: String,
+        /// The realm that would compose it differently.
+        composer: String,
+    },
 
     /// A less trusted config document states confinement for a launch kind
     /// differently from the more trusted document that decided it.
@@ -3073,6 +3112,22 @@ pub enum ConfigError {
 }
 
 impl ConfigError {
+    /// The administered section a refused write would change, when this
+    /// error is such a refusal ([`Self::ConfinementAdministration`],
+    /// [`Self::GovernanceAdministration`],
+    /// [`Self::CompositionAdministration`]): surfaces report it as
+    /// `confinement_administration_required` or
+    /// `governance_administration_required`.
+    #[must_use]
+    pub fn administered_section(&self) -> Option<AdministeredSection> {
+        match self {
+            Self::ConfinementAdministration => Some(AdministeredSection::Confinement),
+            Self::GovernanceAdministration => Some(AdministeredSection::Governance),
+            Self::CompositionAdministration { administered, .. } => Some(*administered),
+            _ => None,
+        }
+    }
+
     /// A rule refused the document as it is persisted, not a caller's
     /// candidate. The stored state is at fault, so a validation refusal here
     /// becomes an internal error; surfaces keep `Validation` for the caller's

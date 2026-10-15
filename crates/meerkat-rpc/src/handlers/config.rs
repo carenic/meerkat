@@ -144,11 +144,11 @@ fn runtime_error_to_response(id: Option<RpcId>, err: ConfigRuntimeError) -> RpcR
             format!("Generation conflict: expected {expected}, current {current}"),
         ),
         // An ordinary write is not administration of a section the host
-        // administers in the document; nothing was written.
-        ConfigRuntimeError::Config(
-            refused @ (meerkat_core::ConfigError::GovernanceAdministration
-            | meerkat_core::ConfigError::ConfinementAdministration),
-        ) => administration_response(id, &refused),
+        // administers in the documents, nor of what a realm composes of it;
+        // nothing was written.
+        ConfigRuntimeError::Config(refused) if refused.administered_section().is_some() => {
+            administration_response(id, &refused)
+        }
         // The store refused the caller's candidate config: its own new or
         // changed realm MCP server holds an environment reference, or the
         // written config is invalid (for example after a concurrent edit
@@ -167,10 +167,11 @@ fn runtime_error_to_response(id: Option<RpcId>, err: ConfigRuntimeError) -> RpcR
 }
 
 /// The typed refusal of a config write that would change, remove or restate
-/// a host-administered section: the realm's governance or its confinement.
+/// a host-administered section (the realm's governance or its confinement),
+/// or change what a realm composes of one.
 fn administration_response(id: Option<RpcId>, refused: &meerkat_core::ConfigError) -> RpcResponse {
-    let refusal = match refused {
-        meerkat_core::ConfigError::ConfinementAdministration => {
+    let refusal = match refused.administered_section() {
+        Some(meerkat_core::AdministeredSection::Confinement) => {
             WireConfigWriteRefusal::ConfinementAdministrationRequired
         }
         _ => WireConfigWriteRefusal::GovernanceAdministrationRequired,
@@ -191,8 +192,7 @@ fn administration_response(id: Option<RpcId>, refused: &meerkat_core::ConfigErro
 /// governance refusal stays typed, anything else is internal.
 fn store_write_error_response(id: Option<RpcId>, err: meerkat_core::ConfigError) -> RpcResponse {
     match err {
-        refused @ (meerkat_core::ConfigError::GovernanceAdministration
-        | meerkat_core::ConfigError::ConfinementAdministration) => {
+        refused if refused.administered_section().is_some() => {
             administration_response(id, &refused)
         }
         other => RpcResponse::error(id, error::INTERNAL_ERROR, other.to_string()),

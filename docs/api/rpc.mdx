@@ -2881,8 +2881,11 @@ written. The error's `data.type` names the section:
 
 | `data.type` | The write would |
 |-------------|-----------------|
-| `governance_administration_required` | Change, remove or restate `[governance]` |
-| `confinement_administration_required` | Add, change or remove `[confinement]`, or change the realm's parent edge so that it composes a different `[confinement]` |
+| `governance_administration_required` | Change, remove or restate `[governance]`, or change realm sections (a parent edge, the user document's `[realm.global]`) so that a realm composes a different `[governance]` |
+| `confinement_administration_required` | Add, change or remove `[confinement]`, or change realm sections so that a realm composes a different `[confinement]` |
+
+A refusal for changed realm sections names the change and the realm in its
+message, for example `removing [realm.global] would change the [governance] section a realm whose own document states no parent and no [realm.global] composes`.
 
 See [governance settings](/concepts/configuration#governance-settings) and
 [OS process confinement](/concepts/configuration#os-process-confinement).
