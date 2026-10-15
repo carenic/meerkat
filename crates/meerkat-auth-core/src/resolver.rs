@@ -88,9 +88,30 @@ pub async fn resolve_simple_secret(
             use crate::auth_store::{CommandCredentialRunner, CommandCredentialSpec};
             // A credential command runs as the host, outside its OS process
             // confinement: one a confined process could change never runs.
+            // Without a working directory of its own it runs from the user's
+            // home directory, never from the host's working directory (which
+            // a confined process may be able to change). A configured working
+            // directory is judged with everything under it; the home
+            // directory as the directory itself and the files in it, since
+            // the user's projects, and the write grants on them, may lie
+            // under it.
             let guard = env.host_launch_guard();
+            let (cwd, cwd_subtree) = match cwd {
+                Some(cwd) => (Some(cwd.clone()), true),
+                None => match dirs::home_dir() {
+                    Some(home) => (Some(home), false),
+                    None => (None, true),
+                },
+            };
             if let Some(guard) = guard
-                && credential_command_is_changeable(program, cwd.as_deref(), cmd_env, env, guard)
+                && credential_command_is_changeable(
+                    program,
+                    cwd.as_deref(),
+                    cwd_subtree,
+                    cmd_env,
+                    env,
+                    guard,
+                )
             {
                 return Err(ProviderAuthError::HostLaunchRefused {
                     exemption: meerkat_core::HostLaunchExemption::CredentialHelper,
@@ -101,7 +122,7 @@ pub async fn resolve_simple_secret(
             let spec = CommandCredentialSpec {
                 program: program.clone(),
                 args: args.clone(),
-                cwd: cwd.clone(),
+                cwd,
                 env: cmd_env
                     .iter()
                     .map(|(k, v)| (k.clone(), v.clone()))
@@ -141,9 +162,9 @@ pub async fn resolve_simple_secret(
 }
 
 /// Whether a confined process could change what a credential command runs
-/// as the host: its working directory (with everything under it; the host's
-/// own when none is given, which refuses the command when it cannot be
-/// read), any file its program could resolve to through its
+/// as the host: its working directory (`cwd_subtree`: with everything under
+/// it; the host's own when none is given, which refuses the command when it
+/// cannot be read), any file its program could resolve to through its
 /// cleaned `PATH` ([`meerkat_core::confinement::program_routes`],
 /// [`meerkat_core::confinement::trusted_search_path`]), or the interpreter a
 /// script's `#!` line names by path. A program only its configured `PATH`
@@ -153,6 +174,7 @@ pub async fn resolve_simple_secret(
 fn credential_command_is_changeable(
     program: &std::path::Path,
     cwd: Option<&std::path::Path>,
+    cwd_subtree: bool,
     command_env: &std::collections::BTreeMap<String, String>,
     env: &ResolverEnvironment,
     guard: &meerkat_llm_core::provider_runtime::HostLaunchGuard,
@@ -164,7 +186,7 @@ fn credential_command_is_changeable(
     else {
         return true;
     };
-    if guard(&working_directory, true) {
+    if guard(&working_directory, cwd_subtree) {
         return true;
     }
     let configured = command_env

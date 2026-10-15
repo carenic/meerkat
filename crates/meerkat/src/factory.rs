@@ -5372,6 +5372,15 @@ impl AgentFactory {
                         .map_err(FactoryError::ClientBuild)?;
                     return Ok(LlmClientForIdentity { client, selection });
                 }
+                // A credential command the host refused ends resolution with
+                // the refusal: no later candidate (an ancestor's binding,
+                // the global realm's, the environment's default) silently
+                // stands in for the operator's command.
+                Err(
+                    error @ meerkat_llm_core::provider_runtime::ProviderAuthError::HostLaunchRefused {
+                        ..
+                    },
+                ) => return Err(FactoryError::ProviderAuth(error)),
                 Err(error) => {
                     first_resolution_error.get_or_insert(error);
                     if explicit_auth_binding {
@@ -9943,6 +9952,18 @@ impl AgentFactory {
                                         resolved_model,
                                     ));
                                     break;
+                                }
+                                // A refused credential command ends
+                                // resolution with the refusal; no later
+                                // candidate silently stands in for it.
+                                Err(
+                                    err @ meerkat_llm_core::provider_runtime::ProviderAuthError::HostLaunchRefused {
+                                        ..
+                                    },
+                                ) => {
+                                    return Err(BuildAgentError::LlmClient(
+                                        FactoryError::ProviderAuth(err),
+                                    ));
                                 }
                                 Err(err) => {
                                     first_resolution_error.get_or_insert(err);

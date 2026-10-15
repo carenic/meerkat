@@ -70,9 +70,13 @@ them.
   `mcp_stdio`, a stdio skill source runs confined (its program by absolute
   path, only its configured environment, from the kind's working
   directory), and under a host that confines every launch kind, a
-  credential command or Git skill repository a confined process could
-  change is refused (a credential command without `cwd` runs in, and is
-  judged by, the host's working directory). See Changed and Fixed.
+  credential command or Git skill cache a confined process could change is
+  refused. See Changed and Fixed.
+- Behaviour-only (not measured by the gate): a credential command without
+  `cwd` runs from the user's home directory on every host, not from the
+  host's working directory, and a credential command the host refuses ends
+  its binding's resolution with `HostLaunchRefused` instead of falling back
+  to the next credential (see Fixed).
 
 ### Deprecated
 
@@ -274,6 +278,14 @@ them.
   environment, `node_modules/.bin`, a relative entry), a confined process
   could plant a program there, such as `xdg-open`, that the host then ran
   unconfined.
+- A credential command without `cwd` runs from the user's home directory,
+  judged as that directory and the files in it, instead of from the host's
+  working directory, which a host that confines every launch kind refused
+  whenever a confined process could write it (as for `rkat` run from its
+  workspace). A credential command the host refuses ends its binding's
+  resolution with `HostLaunchRefused`. Before, a session moved on to the
+  next credential (an ancestor realm's binding, the global realm's, the
+  environment's default such as `OPENAI_API_KEY`) without saying so.
 
 ## [0.9.1] - 2026-10-15
 

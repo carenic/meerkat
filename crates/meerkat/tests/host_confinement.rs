@@ -949,3 +949,142 @@ async fn a_credential_command_never_runs_an_interpreter_planted_on_its_path() {
         "the planted interpreter never ran: {result:?}"
     );
 }
+
+/// A credential command without a working directory of its own runs, under
+/// a confining host, from the user's home directory rather than the host's
+/// working directory (which a confined process may be able to change), so
+/// it is neither refused nor exposed by default.
+#[cfg(all(unix, feature = "openai"))]
+#[tokio::test]
+async fn a_credential_command_without_a_working_directory_runs_from_a_protected_one() {
+    use std::collections::BTreeMap;
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let base = temp.path().canonicalize().unwrap();
+    let helper_dir = base.join("helper");
+    std::fs::create_dir_all(&helper_dir).unwrap();
+    let ran_in = base.join("helper-ran-in");
+    let helper = helper_dir.join("helper.sh");
+    std::fs::write(
+        &helper,
+        format!(
+            "#!/bin/sh\npwd -P > '{}'\nprintf sk-from-helper\n",
+            ran_in.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    // A confined process can write the host's working directory.
+    let host = writing_host(&std::env::current_dir().unwrap().canonicalize().unwrap());
+
+    preflight_command(&base, &host, helper, Vec::new(), None, BTreeMap::new())
+        .await
+        .expect("the command runs from a directory no confined process can change");
+    let home = std::path::PathBuf::from(std::env::var_os("HOME").expect("HOME is set"))
+        .canonicalize()
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&ran_in).unwrap().trim(),
+        home.display().to_string()
+    );
+}
+
+/// A credential command the host refuses ends the binding's resolution with
+/// that refusal: no other credential (another realm's binding, the global
+/// realm's, or the process environment's) silently stands in for it.
+#[cfg(all(unix, feature = "openai"))]
+#[tokio::test]
+async fn a_refused_credential_command_is_not_replaced_by_another_credential() {
+    use meerkat_core::{
+        AuthProfileConfig, BackendProfileConfig, CredentialSourceSpec, ProviderBindingConfig,
+        RealmConfigSection, SessionLlmIdentity,
+    };
+    use std::collections::BTreeMap;
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let base = temp.path().canonicalize().unwrap();
+    let writable = base.join("writable");
+    std::fs::create_dir_all(&writable).unwrap();
+    let helper = writable.join("helper.sh");
+    std::fs::write(&helper, "#!/bin/sh\nprintf sk-from-helper\n").unwrap();
+    std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let section = |source: CredentialSourceSpec| {
+        let mut section = RealmConfigSection::default();
+        section.backend.insert(
+            "openai_api".to_string(),
+            BackendProfileConfig {
+                provider: "openai".to_string(),
+                backend_kind: "openai_api".to_string(),
+                base_url: None,
+                options: serde_json::Value::Null,
+                server: None,
+            },
+        );
+        section.auth.insert(
+            "token".to_string(),
+            AuthProfileConfig {
+                provider: "openai".to_string(),
+                auth_method: "api_key".to_string(),
+                source,
+                constraints: Default::default(),
+                metadata_defaults: Default::default(),
+            },
+        );
+        section.binding.insert(
+            "openai".to_string(),
+            ProviderBindingConfig {
+                backend_profile: "openai_api".to_string(),
+                auth_profile: "token".to_string(),
+                credential_account: None,
+                default_model: None,
+                policy: Default::default(),
+                provider_default: true,
+            },
+        );
+        section
+    };
+    let realm = meerkat_core::mob_realm_id("helper").unwrap();
+    let mut config = Config::default();
+    config.realm.insert(
+        realm.as_str().to_string(),
+        section(CredentialSourceSpec::Command {
+            program: helper,
+            args: Vec::new(),
+            cwd: Some(base.clone()),
+            env: BTreeMap::new(),
+            timeout_ms: 5_000,
+            refresh_interval_ms: None,
+        }),
+    );
+    config.realm.insert(
+        "global".to_string(),
+        section(CredentialSourceSpec::InlineSecret {
+            secret: "sk-global-stand-in".into(),
+        }),
+    );
+    let identity = SessionLlmIdentity {
+        model: "gpt-5.4".to_string(),
+        provider: Provider::OpenAI,
+        self_hosted_server_id: None,
+        provider_params: None,
+        auth_binding: None,
+    };
+    let refused = AgentFactory::new(base.join("sessions"))
+        .with_host_confinement(&writing_host(&writable))
+        .preflight_llm_identity(
+            &config,
+            &identity,
+            &BTreeMap::new(),
+            Some(&realm),
+            Some(meerkat_runtime::MeerkatMachine::ephemeral().generated_auth_lease_handle()),
+        )
+        .await
+        .expect_err("the refused command is not replaced by the global realm's credential");
+    assert!(
+        refused.to_string().contains("confined process"),
+        "{refused}"
+    );
+}

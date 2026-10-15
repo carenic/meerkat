@@ -44,9 +44,12 @@ pub enum ProviderAuthError {
     },
     /// The host refused to run a program of its own outside its OS process
     /// confinement ([`meerkat_core::HostLaunchExemption`]): a confined
-    /// process could change the program or its working directory. The
-    /// program did not run.
-    #[error("{exemption} refused: {refusal}")]
+    /// process could change the program, the interpreter it names or its
+    /// working directory. The program did not run, and no other credential
+    /// stands in for it.
+    #[error(
+        "{exemption} refused: a confined process could change its program, its interpreter or its working directory ({refusal})"
+    )]
     HostLaunchRefused {
         exemption: meerkat_core::HostLaunchExemption,
         refusal: meerkat_core::confinement::ConfinementRefusal,

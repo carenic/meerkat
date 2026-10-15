@@ -265,10 +265,11 @@ except these, which it runs as itself (`meerkat_core::HostLaunchExemption`):
   process could change the skill cache.
 - Credential command (auth profile `source = { kind = "command" }`,
   `HostLaunchExemption::credential_command`): produces the host's provider
-  credentials; it is refused before it runs
-  (`ProviderAuthError::HostLaunchRefused`) when a confined process could
-  change its program, the interpreter its `#!` line names by path, or its
-  working directory (the host's own when it names none).
+  credentials; without `cwd` it runs from the user's home directory; it is
+  refused before it runs (`ProviderAuthError::HostLaunchRefused`) when a
+  confined process could change its program, the interpreter its `#!` line
+  names by path, or its working directory, and the refusal ends the
+  binding's resolution (no other credential stands in for it).
 - Browser opener (`HostLaunchExemption::browser_opener`: `/usr/bin/open`,
   `xdg-open`, the system `rundll32.exe`; OAuth logins and the CLI's HTML
   artifact): must reach the user's desktop session; the URL is one argument.
