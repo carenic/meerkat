@@ -52,6 +52,10 @@ them.
   `[realm.global]` section) is also refused with
   `governance_administration_required` when the realm would compose a
   different `[governance]` (see Fixed).
+- Behaviour-only (not measured by the gate): a realm whose ancestor's own
+  config document is missing no longer composes (a missing parent), and
+  `rkat realm delete` and `rkat realm prune` keep a realm another realm's
+  document names as its parent, `--force` included (see Fixed).
 
 ### Deprecated
 
@@ -117,10 +121,18 @@ them.
   refusal message now also names the parent edge.
 - A realm's own config document decides its own parent edge. A section
   another document states for the realm (an ordinary write to an ancestor
-  realm's document could add one) applies only when the realm's own
-  document states none. Before, such a section in a document that sorted
-  after the realm's own replaced its edge during composition and cut the
-  realm from that ancestor and its `[confinement]`.
+  realm's document could add one) never replaces it. Before, such a section
+  in a document that sorted after the realm's own replaced its edge during
+  composition and cut the realm from that ancestor and its `[confinement]`.
+- An ancestor realm whose own config document is missing no longer
+  composes as if it required nothing. Every chain member other than the
+  head and `global` is configured by its own document alone, so a chain
+  through a missing ancestor fails as a missing parent, and `rkat realm
+  delete` and `rkat realm prune` keep a realm that another realm's document
+  names as its parent, naming the child. Before, a section an ordinary
+  write placed in another document (`{"realm":{"org":{}}}`) kept a deleted
+  ancestor on the chain, and the realm started without the `[confinement]`
+  of that ancestor and of every realm above it.
 - An ordinary config write can no longer cut a realm from the ancestors
   whose `[governance]` it composes. A write that changes the realm sections
   of its own document (the parent edge, or a `[realm.global]` section that

@@ -703,6 +703,12 @@ hosts' stores do (`FileConfigStore::with_realm_chain`,
 in-memory store, keep the document's own `[confinement]` and `[governance]`
 sections but not the realm sections that compose an ancestor's.
 
+A realm composes only from the documents on its chain, each from its own:
+an ancestor whose own document is missing fails the composition (a missing
+parent) instead of composing as if it required nothing, and `rkat realm
+delete` and `rkat realm prune` keep a realm another realm's document names
+as its parent.
+
 ### Operator flags
 
 Each stock binary accepts `--confinement <trusted-host|workspace>`, with

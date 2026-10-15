@@ -1671,6 +1671,41 @@ mod tests {
         assert_eq!(tokio::fs::read_to_string(&path).await.unwrap(), HEAD);
     }
 
+    /// A chain member other than the head and `global` composes only from
+    /// its own document: a section another document states for it neither
+    /// stands in for the missing document nor gives it a parent edge. A
+    /// realm whose ancestor's own document is gone does not compose, rather
+    /// than composing as if that ancestor and the realms above it required
+    /// nothing.
+    #[tokio::test]
+    async fn a_missing_ancestor_document_does_not_compose_as_requiring_nothing() {
+        use crate::connection::RealmId;
+
+        // team -> org -> corp, where org requires confinement; org's own
+        // document is gone. team's own document and the user document state
+        // an empty section for org, which an ordinary write can add.
+        let team = confinement_document("[realm.team]\nparent = \"org\"\n\n[realm.org]\n");
+        let corp =
+            confinement_document("[realm.corp]\n\n[confinement.shell]\nmode = \"workspace\"\n");
+        let global = confinement_document("[realm.org]\n");
+        let docs = std::collections::BTreeMap::from([
+            ("team".to_string(), team.clone()),
+            ("corp".to_string(), corp),
+            ("global".to_string(), global),
+        ]);
+        let reader = EffectiveConfigReader::new(Arc::new(MapSource { docs }));
+        let team_id = RealmId::parse("team").unwrap();
+        for composed in [
+            reader.effective_config(&team_id).await,
+            reader.effective_config_over_head(&team_id, team).await,
+        ] {
+            assert!(
+                matches!(composed, Err(ConfigError::RealmChain(_))),
+                "{composed:?}"
+            );
+        }
+    }
+
     /// A realm document as 0.9.0 wrote it, with no `[confinement]`, loads,
     /// composes and is written back without one: every launch stays the
     /// trusted host, exactly as before.

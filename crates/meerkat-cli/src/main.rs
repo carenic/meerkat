@@ -10275,11 +10275,91 @@ fn work_event_kind_label(kind: meerkat::WorkGraphEventKind) -> &'static str {
     }
 }
 
+/// A realm another realm's own document names as its parent is kept: the
+/// child composes its `[confinement]` and `[governance]` through that edge,
+/// so removing the parent would cut the child from them.
+#[derive(Debug)]
+struct RealmIsParent {
+    realm: String,
+    children: Vec<String>,
+}
+
+impl std::fmt::Display for RealmIsParent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let children: Vec<String> = self
+            .children
+            .iter()
+            .map(|child| format!("'{child}'"))
+            .collect();
+        write!(
+            f,
+            "realm '{}' is the parent of {}: removing it would cut them from the [confinement] \
+             and [governance] they compose through it; give them another parent in their own \
+             documents first",
+            self.realm,
+            children.join(", ")
+        )
+    }
+}
+
+impl std::error::Error for RealmIsParent {}
+
+/// The realms in `state_root` whose own document names `realm_id` as its
+/// parent. A document that cannot be read could name it, so it refuses the
+/// question instead of answering none.
+async fn realms_naming_parent(
+    state_root: &std::path::Path,
+    realm_id: &str,
+) -> anyhow::Result<Vec<String>> {
+    let manifests = meerkat_store::list_realm_manifests_in(state_root)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to list realms: {e}"))?;
+    let mut children = Vec::new();
+    for entry in manifests {
+        let child = entry.manifest.realm.as_str();
+        if child == realm_id {
+            continue;
+        }
+        let path = meerkat_store::realm_paths_in(state_root, child).config_path;
+        let content = match tokio::fs::read_to_string(&path).await {
+            Ok(content) => content,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => anyhow::bail!(
+                "cannot read realm '{child}''s config document {}, which may name '{realm_id}' as its parent: {error}",
+                path.display()
+            ),
+        };
+        let document: toml::Table = content.parse().map_err(|error| {
+            anyhow::anyhow!(
+                "realm '{child}''s config document {} is not TOML, so it may name '{realm_id}' as its parent: {error}",
+                path.display()
+            )
+        })?;
+        let parent = document
+            .get("realm")
+            .and_then(|realms| realms.get(child))
+            .and_then(|section| section.get("parent"))
+            .and_then(toml::Value::as_str);
+        if parent == Some(realm_id) {
+            children.push(child.to_owned());
+        }
+    }
+    Ok(children)
+}
+
 async fn delete_realm(
     state_root: &std::path::Path,
     realm_id: &str,
     force: bool,
 ) -> anyhow::Result<()> {
+    let children = realms_naming_parent(state_root, realm_id).await?;
+    if !children.is_empty() {
+        return Err(RealmIsParent {
+            realm: realm_id.to_owned(),
+            children,
+        }
+        .into());
+    }
     let lease_status = meerkat_store::inspect_realm_leases_in(state_root, realm_id, true)
         .await
         .map_err(|e| anyhow::anyhow!("Failed to inspect realm leases: {e}"))?;
@@ -10334,12 +10414,16 @@ async fn prune_realms(
 ) -> anyhow::Result<()> {
     let outcome = prune_realms_inner(state_root, isolated_only, older_than_hours, force).await?;
     println!(
-        "Prune summary: removed={}, skipped_active={}, skipped_legacy={}, leftovers={}",
+        "Prune summary: removed={}, skipped_active={}, skipped_legacy={}, kept_parents={}, leftovers={}",
         outcome.removed,
         outcome.skipped_active,
         outcome.skipped_legacy,
+        outcome.kept_parents.len(),
         outcome.leftovers.len()
     );
+    for kept in &outcome.kept_parents {
+        println!("note: {kept}");
+    }
     if outcome.skipped_legacy > 0 {
         println!(
             "note: {} legacy/unknown realm(s) were kept. Use --force to prune them.",
@@ -10363,6 +10447,8 @@ struct PruneOutcome {
     removed: usize,
     skipped_active: usize,
     skipped_legacy: usize,
+    /// Realms kept because another realm names them as its parent.
+    kept_parents: Vec<RealmIsParent>,
     leftovers: Vec<String>,
 }
 
@@ -10408,6 +10494,15 @@ async fn prune_realms_inner(
                 .map_err(|e| anyhow::anyhow!("Failed to inspect realm leases: {e}"))?;
         if lease_status.blocks_destructive_prune() && !force {
             outcome.skipped_active += 1;
+            continue;
+        }
+
+        let children = realms_naming_parent(state_root, manifest.realm.as_str()).await?;
+        if !children.is_empty() {
+            outcome.kept_parents.push(RealmIsParent {
+                realm: manifest.realm.as_str().to_owned(),
+                children,
+            });
             continue;
         }
 
@@ -34717,6 +34812,52 @@ supports_reasoning = true
         )
         .await
         .expect("a patch that keeps the edge commits");
+    }
+
+    /// A realm that another realm's own document names as its parent is
+    /// neither deleted nor pruned: the child would otherwise stop composing
+    /// the parent's `[confinement]` and `[governance]`. The refusal names
+    /// the child, and the parent's directory survives.
+    #[tokio::test]
+    async fn test_realm_delete_and_prune_keep_a_realm_another_names_as_parent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state_root = dir.path().to_path_buf();
+        for (realm, origin) in [
+            ("parent", meerkat_store::RealmOrigin::Generated),
+            ("child", meerkat_store::RealmOrigin::Explicit),
+        ] {
+            meerkat_store::ensure_realm_manifest_in(
+                &state_root,
+                realm,
+                Some(meerkat_store::RealmBackend::Sqlite),
+                Some(origin),
+            )
+            .await
+            .expect("create manifest");
+        }
+        write_policy_parent_and_child_realm_docs(&state_root, "").await;
+        let parent_root = meerkat_store::realm_paths_in(&state_root, "parent").root;
+
+        for force in [false, true] {
+            let refused = delete_realm(&state_root, "parent", force)
+                .await
+                .expect_err("a realm another names as its parent is not deleted");
+            assert!(format!("{refused:#}").contains("'child'"), "{refused:#}");
+            assert!(parent_root.exists(), "the parent realm survives");
+        }
+
+        let outcome = prune_realms_inner(&state_root, true, 0, false)
+            .await
+            .expect("prune outcome");
+        assert_eq!(outcome.removed, 0, "{outcome:?}");
+        assert!(parent_root.exists(), "the parent realm is not pruned");
+
+        delete_realm(&state_root, "child", false)
+            .await
+            .expect("a realm nothing names as its parent is deleted");
+        delete_realm(&state_root, "parent", false)
+            .await
+            .expect("the parent of no remaining realm is deleted");
     }
 
     /// `config set` refuses a wrapped config in every input form: a

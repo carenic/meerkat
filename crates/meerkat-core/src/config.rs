@@ -3484,29 +3484,45 @@ pub(crate) fn check_composed_confinement(
     )
 }
 
-/// The chain [`compose_effective_config`] folds for `head`: the chain
-/// authority over the union of every fetched document's realm sections, so it
-/// sees each member's parent edge regardless of which document carried it.
-/// A realm's own document decides its own section: a section another
-/// document states for the realm applies only when the realm's own document
-/// states none, so no other document replaces the parent edge the realm's
-/// own document names (the edge discovery followed). Outer-key only:
-/// sub-maps are never merged across realms.
+/// The chain [`compose_effective_config`] folds for `head`, resolved by the
+/// chain authority over each member's own document. A realm with its own
+/// document is configured by that document alone: its own section decides
+/// its parent edge, and it has none when the section is absent. A section
+/// another document states for a realm never stands in for it, so a chain
+/// through an ancestor whose own document is missing does not resolve (a
+/// missing parent) instead of composing as if that ancestor, and every
+/// realm above it, required nothing. Only the head, which may have no
+/// document, takes a section another document states for it when its own
+/// states none, and any document's `[realm.global]` section configures the
+/// reserved `global` root. Outer-key only: sub-maps are never merged across
+/// realms.
 fn composition_chain(
     docs: &std::collections::BTreeMap<crate::connection::RealmId, Config>,
     head: &crate::connection::RealmId,
 ) -> Result<crate::connection::RealmChain, crate::connection::RealmChainError> {
+    let global = crate::connection::RealmId::global();
     let mut topology = Config::default();
     for doc in docs.values() {
         for (realm_id, section) in &doc.realm {
-            topology.realm.insert(realm_id.clone(), section.clone());
+            if realm_id == head.as_str() || realm_id == global.as_str() {
+                topology.realm.insert(realm_id.clone(), section.clone());
+            }
         }
     }
     for (owner, doc) in docs {
-        if let Some(section) = doc.realm.get(owner.as_str()) {
-            topology
-                .realm
-                .insert(owner.as_str().to_owned(), section.clone());
+        match doc.realm.get(owner.as_str()) {
+            Some(section) => {
+                topology
+                    .realm
+                    .insert(owner.as_str().to_owned(), section.clone());
+            }
+            None if owner != head && !owner.is_global() => {
+                topology.realm.insert(
+                    owner.as_str().to_owned(),
+                    crate::connection::RealmConfigSection::default(),
+                );
+            }
+            None => {}
         }
     }
     crate::connection::RealmChain::resolve(&topology, head)
