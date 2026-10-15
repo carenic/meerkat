@@ -54,6 +54,9 @@ them.
   `SendAmbiguous { envelope_id, message, retry_safe, required_action }`
   (code `send_ambiguous`), for a `comms/send` whose delivery outcome is
   unknown. Exhaustive matches over `CommsSendErrorData` need an arm for it.
+  It sits before `CommsSendErrorData::SendFailed` and
+  `CommsSendErrorData::InvalidCommand`, whose implicit discriminants move
+  from 4 to 5 and from 5 to 6.
   `required_action` is the new `CommsSendRequiredAction` enum (`Reconcile`),
   and the new `CommsSendErrorData::ambiguous_delivery` and
   `CommsSendErrorData::peer_input_rejected` constructors build the shared
