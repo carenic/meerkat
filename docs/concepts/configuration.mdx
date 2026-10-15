@@ -672,8 +672,10 @@ administration from out of its confined processes' reach:
   is discovered, registered or stored for it. The model sees a refused
   server under its name when that is a plain server name, else under a
   `refused-mcp-server-<n>` placeholder (never the name of another server of
-  the session), and a refused definition never fails the rest of the
-  session's setup.
+  the session), and a refused definition does not fail the rest of the
+  session's setup. An untrusted `mcp.toml` that does not parse, or that
+  states an invalid access policy, still fails the setup, as a trusted one
+  does.
 - Links: an input or a skills directory is judged with the symbolic links in
   it. A start whose realm state or credential store links to a path a
   confined process could change (a target that does not exist yet
@@ -742,7 +744,7 @@ constructor per program):
 
 | Launch | Why it runs as the host |
 |---|---|
-| `git` for a Git skill repository | It fetches with the host's own Git credentials and network. A repository is not loaded when a confined process could change the skill cache. |
+| `git` for a Git skill repository | It fetches with the host's own Git credentials and network. A repository is not loaded when a confined process could change the skill cache, and a skill that a link leads out of the checkout to is not read. |
 | A credential command (an auth profile's `source = { kind = "command" }`) | It produces the host's own provider credentials, which no confined process may read. Without a `cwd` it runs from the user's home directory, never from the host's working directory. It is refused before it runs when a confined process could change its program, the interpreter its `#!` line names by path, or its working directory (the home directory itself, and the files in it, when it names none). A refused command ends the binding's resolution with the refusal: no other credential (another realm's binding, the global realm's, the environment's) stands in for it. |
 | The browser opener (`/usr/bin/open` on macOS, `xdg-open` on Linux, the system `rundll32.exe` on Windows) | It shows an OAuth authorization page or an HTML artifact in the user's desktop session, which a confined process cannot reach. The URL is one argument. |
 | `stty`, by absolute path (`/bin/stty`, else `/usr/bin/stty`) | Host terminal control: `rkat` hides a client secret typed at its own terminal. |

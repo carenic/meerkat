@@ -104,6 +104,11 @@ them.
   profile (canonically `AgentFactory::mcp_stdio_launch_profile`) or
   `McpStdioLaunchProfile::trusted_host()` for no OS confinement. Their
   behaviour is unchanged, and `McpRouter::default()` stays the trusted host.
+- `meerkat::resolve_configured_mcp_target` and
+  `meerkat::resolve_configured_mcp_target_in_realm`, which trust every
+  `mcp.toml`, one a confined process can write included. Use
+  `meerkat::resolve_configured_mcp_target_in_realm_trusting` with the host's
+  `HostConfinement::untrusted_source`. Their behaviour is unchanged.
 
 ### Added
 
@@ -247,10 +252,10 @@ them.
   run it unconfined with the host's credentials. The processes a host runs
   as itself are now a typed, tested list (`HostLaunchExemption`).
 - A symbolic link no longer carries a confined process past a trusted input:
-  a skill linked out of a trusted skills directory (or out of a Git
-  checkout) to a path a confined process could change is not loaded, and a
-  start whose realm state or credential store links to such a path is
-  refused.
+  a skill linked out of a trusted skills directory to a path a confined
+  process could change is not loaded, a skill linked out of a Git checkout
+  is not loaded wherever the link leads, and a start whose realm state or
+  credential store links to such a path is refused.
 - The `rkat` mob deploy RPC host's config store addresses the realm's
   document as the realm config source maps it, so the reserved `global`
   realm's is the user document it composes, not a file under the state

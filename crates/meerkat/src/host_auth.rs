@@ -335,11 +335,20 @@ impl HostMcpTargetRefusal {
 /// configured URL, the server must use OAuth login, and a requested
 /// `oauth_account` must equal the configured one. The identity is built from
 /// the configuration, never from the request.
+///
+/// Every `mcp.toml` is trusted here, so a definition a confined process
+/// planted resolves: a host that confines its agents' launches resolves
+/// through [`resolve_configured_mcp_target_in_realm_trusting`].
+#[deprecated(
+    since = "0.9.2",
+    note = "trusts every mcp.toml, including one a confined process can write; use `resolve_configured_mcp_target_in_realm_trusting` with the host's `HostConfinement::untrusted_source`"
+)]
 pub async fn resolve_configured_mcp_target(
     target: &meerkat_contracts::WireMcpAuthTarget,
     context_root: Option<&std::path::Path>,
     user_config_root: Option<&std::path::Path>,
 ) -> Result<McpServerIdentity, HostAuthError> {
+    #[allow(deprecated)]
     resolve_configured_mcp_target_in_realm(target, &[], context_root, user_config_root).await
 }
 
@@ -349,6 +358,13 @@ pub async fn resolve_configured_mcp_target(
 /// so a server installed in the realm's config resolves like one in an
 /// `mcp.toml` file. `realm_servers` is the realm's composed
 /// `Config::tools.mcp_servers`.
+///
+/// Every `mcp.toml` is trusted here, as in
+/// [`resolve_configured_mcp_target`].
+#[deprecated(
+    since = "0.9.2",
+    note = "trusts every mcp.toml, including one a confined process can write; use `resolve_configured_mcp_target_in_realm_trusting` with the host's `HostConfinement::untrusted_source`"
+)]
 pub async fn resolve_configured_mcp_target_in_realm(
     target: &meerkat_contracts::WireMcpAuthTarget,
     realm_servers: &[meerkat_core::McpServerConfig],
@@ -1701,6 +1717,7 @@ fn validate_resolved_oauth_target(
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
     use meerkat_core::{

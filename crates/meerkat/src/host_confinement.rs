@@ -578,6 +578,12 @@ impl HostConfinement {
     /// exist yet included), when the host claims the guarantee. The host
     /// follows such a link when it reads the subtree, so a link out of a
     /// protected input into a write grant hands the input to that kind.
+    ///
+    /// Cost: a guarded host start reads every directory of each subtree
+    /// input (the realm state root among them) once, visiting each
+    /// directory once, so the walk grows with the number of directories the
+    /// realm state holds (one per session or job store, for example). A
+    /// trusted host does not walk.
     fn link_writer_under(&self, directory: &Path) -> Option<ConfinementLaunchKind> {
         if self.authority() != HostAuthority::Guarded {
             return None;

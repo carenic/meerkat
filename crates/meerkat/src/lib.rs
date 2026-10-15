@@ -411,7 +411,9 @@ pub use factory::{
 pub use factory::{
     McpAdapterComposeRefusal, McpAdapterComposer, McpAdapterCustody, McpAdapterCustodyClosed,
 };
+// The untrusted MCP target resolvers stay exported, deprecated.
 #[cfg(not(target_arch = "wasm32"))]
+#[allow(deprecated)]
 pub use host_auth::{
     HostAuthDevicePoll, HostAuthDeviceStart, HostAuthError, HostAuthLoginComplete,
     HostAuthLoginStart, HostAuthService, HostAuthStatus, HostAuthTarget, HostMcpAuthPhase,

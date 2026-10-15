@@ -33,6 +33,19 @@ pub use protocol::{
     TrustedHostStdioSkillRunner,
 };
 
+/// Whether `entry` under the directory `root` resolves, through a link, to a
+/// path outside `root`. An entry that does not resolve is not read either
+/// way.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn leads_out_of(root: &std::path::Path, entry: &std::path::Path) -> bool {
+    let Ok(target) = entry.canonicalize() else {
+        return false;
+    };
+    !root
+        .canonicalize()
+        .is_ok_and(|root| target.starts_with(root))
+}
+
 /// Whether `entry` under the source directory `root` resolves, through a
 /// link, to a path outside `root` that `untrusted` names (`subtree`: judged
 /// with everything under it). A skill a link leads to there could be

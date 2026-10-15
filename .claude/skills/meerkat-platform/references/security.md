@@ -158,7 +158,9 @@ requirement = { baseline = "command_runtime_v1", read = { kind = "paths", paths 
   are refused before they are expanded, authorized, connected or spawned;
   the model sees each as that server's failed setup with
   `untrusted_configuration_source`, under its name when that is a plain
-  server name, else `refused-mcp-server-<n>`; an MCP auth request naming one
+  server name, else `refused-mcp-server-<n>` (an untrusted `mcp.toml` that
+  does not parse, or states an invalid access policy, still fails the
+  setup); an MCP auth request naming one
   is refused as `mcp_server_not_configured`), a project `.rkat/config.toml`
   (its hooks are refused at every invocation), and a skills directory (the
   project `.rkat/skills`, a filesystem repository or the Git skill cache: its
@@ -267,7 +269,8 @@ except these, which it runs as itself (`meerkat_core::HostLaunchExemption`):
 
 - Git skill source (`HostLaunchExemption::git`): fetches with the host's
   Git credentials and network; a repository is not loaded when a confined
-  process could change the skill cache.
+  process could change the skill cache, and a skill linked out of the
+  checkout is not read.
 - Credential command (auth profile `source = { kind = "command" }`,
   `HostLaunchExemption::credential_command`): produces the host's provider
   credentials; without `cwd` it runs from the user's home directory; it is

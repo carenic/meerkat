@@ -114,7 +114,8 @@ impl SkillHostBoundary {
 /// Git repositories are fetched into, and the project skills directory
 /// (`<context>/.rkat/skills`). `git`, and every program it starts by name,
 /// runs from a `PATH` without the directories `host` does not trust. A
-/// skill linked out of a trusted directory is judged where the link leads. Stdio skill sources launch through the host's
+/// skill linked out of a trusted directory is judged where the link leads;
+/// one linked out of a Git checkout is not read. Stdio skill sources launch through the host's
 /// runner. Each refusal is logged; the embedded skills and every other
 /// source still load.
 pub async fn resolve_repositories_with_roots_trusting(

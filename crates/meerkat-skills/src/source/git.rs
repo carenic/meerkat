@@ -223,18 +223,15 @@ impl GitSkillSource {
         let mut documents = std::collections::BTreeMap::new();
         let mut quarantined = Vec::new();
         for skill_dir in discover_skill_directories(&root) {
-            if let Some(untrusted) = &self.untrusted
-                && (super::leads_out_to_untrusted(&self.checkout_dir, &skill_dir, true, untrusted)
-                    || super::leads_out_to_untrusted(
-                        &self.checkout_dir,
-                        &skill_dir.join("SKILL.md"),
-                        false,
-                        untrusted,
-                    ))
+            // Repository content never reaches into the host's filesystem: a
+            // skill whose directory or SKILL.md a link leads out of the
+            // checkout to is not read, wherever the link leads.
+            if super::leads_out_of(&self.checkout_dir, &skill_dir)
+                || super::leads_out_of(&self.checkout_dir, &skill_dir.join("SKILL.md"))
             {
                 tracing::warn!(
                     dir = %skill_dir.display(),
-                    "skipping Git skill: it links to a path a confined process can change"
+                    "skipping Git skill: it links out of the checkout"
                 );
                 continue;
             }
@@ -534,6 +531,51 @@ fn is_sensitive_query_key(key: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A skill a Git checkout links to outside the checkout is never read,
+    /// wherever the link leads: repository content cannot reach into the
+    /// host's filesystem.
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn a_skill_linked_out_of_the_checkout_is_not_read() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().canonicalize().unwrap();
+        let outside = base.join("outside").join("linked-skill");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(
+            outside.join("SKILL.md"),
+            "---\nname: linked-skill\ndescription: Outside the checkout\n---\n\n# Linked",
+        )
+        .unwrap();
+        let source = GitSkillSource::new(GitSkillConfig {
+            repo_url: "https://example.invalid/skills.git".into(),
+            git_ref: GitRef::Branch("main".into()),
+            cache_dir: base.join("cache"),
+            skills_root: None,
+            refresh_interval: Duration::from_secs(60),
+            auth: None,
+            depth: None,
+            source_uuid: SourceUuid::builtin(),
+            health_thresholds: SourceHealthThresholds::default(),
+        });
+        let inside = source.checkout_dir.join("kept-skill");
+        std::fs::create_dir_all(&inside).unwrap();
+        std::fs::write(
+            inside.join("SKILL.md"),
+            "---\nname: kept-skill\ndescription: Inside the checkout\n---\n\n# Kept",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&outside, source.checkout_dir.join("linked-skill")).unwrap();
+
+        let cache = source.scan_checkout().unwrap();
+        let names: Vec<&str> = cache
+            .descriptors
+            .iter()
+            .map(|descriptor| descriptor.key.skill_name.as_str())
+            .collect();
+        assert_eq!(names, vec!["kept-skill"]);
+    }
 
     #[test]
     fn redact_url_hides_userinfo_and_sensitive_query_values() {
