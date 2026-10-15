@@ -363,7 +363,9 @@ mod tests {
     /// Fields that `ModelProfile` must expose, mirrored by `WireModelProfile`
     /// in `meerkat-contracts::wire::models`. Adding a field here is a
     /// wire-contract change that needs parallel updates in `meerkat-contracts`
-    /// and a schema regeneration.
+    /// and a schema regeneration. The operational defaults
+    /// (`call_timeout_secs`, `stream_inactivity_timeout_secs`) and `provider`
+    /// are the exceptions: `WireModelProfile` does not carry them.
     const EXPECTED_MODEL_PROFILE_FIELDS: &[&str] = &[
         "provider",
         "release_stage",
@@ -381,6 +383,7 @@ mod tests {
         "image_generation",
         "params_schema",
         "call_timeout_secs",
+        "stream_inactivity_timeout_secs",
         "beta_headers",
     ];
 
