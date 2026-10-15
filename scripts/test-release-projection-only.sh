@@ -23,7 +23,7 @@ members = ["crate"]
 version = "1.2.3"
 
 [workspace.dependencies]
-fixture = { version = "1.2.3", path = "crate" }
+fixture = { version = "=1.2.3", path = "crate" }
 EOF
 cat > "$TEST_ROOT/Cargo.lock" <<'EOF'
 [[package]]
@@ -114,6 +114,19 @@ printf '## [1.2.4]\n' > "$TEST_ROOT/CHANGELOG.md"
 git -C "$TEST_ROOT" add .
 git -C "$TEST_ROOT" commit -qm semantic-manifest
 assert_rejected semantic-manifest "$(git -C "$TEST_ROOT" rev-parse HEAD)"
+
+# Internal requirements publish exact (`=X.Y.Z`); a bump that also drops the
+# `=` changes what every published crate requires, so it is no projection.
+git -C "$TEST_ROOT" checkout -q -B dropped-exact-requirement "$projection"
+sed -i.bak 's/version = "=1\.2\.4", path/version = "1.2.4", path/' "$TEST_ROOT/Cargo.toml"
+rm -f "$TEST_ROOT/Cargo.toml.bak"
+grep -Fq 'fixture = { version = "1.2.4", path = "crate" }' "$TEST_ROOT/Cargo.toml" || {
+  echo "dropped-exact-requirement fixture did not drop the exact operator" >&2
+  exit 1
+}
+git -C "$TEST_ROOT" add Cargo.toml
+git -C "$TEST_ROOT" commit -qm dropped-exact-requirement
+assert_rejected dropped-exact-requirement "$(git -C "$TEST_ROOT" rev-parse HEAD)"
 
 git -C "$TEST_ROOT" checkout -q -B equal-version-external "$base"
 printf '\nexternal = "1.2.3"\n' >> "$TEST_ROOT/Cargo.toml"

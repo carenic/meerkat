@@ -48,6 +48,21 @@ them.
   `clippy -D warnings`. The requirement is now `0.2.4` (the first release
   with the new name) and Cargo.lock moves sse-stream from 0.2.3 to 0.2.6,
   whose rewritten line parser the MCP SSE tests now run against.
+- Release crates require their sibling crates exactly. `[workspace.dependencies]`
+  pinned every internal crate as `version = "0.9.1"`, which Cargo reads as
+  `^0.9.1`, so a published crate (meerkat-runtime 0.9.0, for example)
+  accepted any later 0.9.x of its siblings, and a consumer that pinned one
+  meerkat crate `=0.9.0` could still resolve 0.9.1 of others; 0.x patch
+  releases may break API. Every internal entry is now `=X.Y.Z`, which
+  cargo-release keeps exact when it bumps the workspace.
+  `scripts/check_rust_release_packaging.py` (`make check-rust-release-config`,
+  run in PR CI) fails when a release crate would publish a non-exact
+  requirement on a workspace crate (a path-only dev-dependency, which
+  `cargo package` strips, is exempt), `scripts/check-rust-release-packaging.sh`
+  checks the same in every packaged archive
+  (`scripts/check_packaged_internal_requirements.py`),
+  `scripts/verify-version-parity.sh` requires the `=`, and the
+  release-projection classifier treats `=X.Y.Z` as the version projection.
 
 ### Fixed
 

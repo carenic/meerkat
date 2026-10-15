@@ -656,7 +656,7 @@ Six files must agree on the same version:
 | `sdks/web/package.json` | `version` |
 | `artifacts/schemas/version.json` | `contract_version` |
 
-Additionally, all internal crate dependencies in `Cargo.toml` (47 path deps) must match the workspace version.
+Additionally, all internal crate dependencies in `Cargo.toml` (47 path deps) must require the workspace version exactly (`version = "=X.Y.Z"`; cargo-release keeps the `=` when it bumps). 0.x patch releases may break API, so every requirement a release crate publishes on a workspace crate is exact; `make check-rust-release-config` checks the manifests and `make check-rust-release-packaging` the packaged archives.
 
 **`make verify-version-parity`** runs in CI and fails on any drift. After changing versions or wire types:
 
