@@ -494,9 +494,19 @@ impl AdmittedDestroy {
         // drains its database observer. Running it only now, and containing
         // a panic in it, keeps a failing hook from holding the id managed.
         run_after_destroy(after_destroy.as_ref(), &mob_id);
-        MobMcpState::settle_retired_destroy(&mobs, &mob_id, &retired).await
+        MobMcpState::settle_retired_destroy(&mobs, &mob_id, &retired, after_destroy.as_ref()).await
     }
 }
+
+/// How many times a destroy's storage cleanup retries an observer drain
+/// that other owner handles refused, within one cleanup attempt.
+#[cfg(not(target_arch = "wasm32"))]
+const OBSERVER_DRAIN_RETRIES: usize = 10;
+
+/// The wait before each retried observer drain: with
+/// [`OBSERVER_DRAIN_RETRIES`], a holder gets about a second to let go.
+#[cfg(not(target_arch = "wasm32"))]
+const OBSERVER_DRAIN_RETRY_DELAY: Duration = Duration::from_millis(100);
 
 /// Run the host's after-destroy hook for `mob_id`, if one is bound. A panic
 /// in the hook is caught and logged, and the destroy goes on as if the hook
@@ -1527,22 +1537,24 @@ impl MobMcpState {
         mob_id: &MobId,
         retired: &RetiredMob,
     ) -> Result<meerkat_mob::MobDestroyReport, MobMcpDestroyError> {
+        let after_destroy = self.after_destroy.get();
         if retired.cleanup_owed() {
-            run_after_destroy(self.after_destroy.get(), mob_id);
+            run_after_destroy(after_destroy, mob_id);
         }
-        Self::settle_retired_destroy(&self.mobs, mob_id, retired).await
+        Self::settle_retired_destroy(&self.mobs, mob_id, retired, after_destroy).await
     }
 
     /// Settle what the destroy recorded as `retired` still owes its storage
     /// and answer with its canonical report: the report itself once nothing
     /// is owed, otherwise `Incomplete` with a copy that names what is still
-    /// outstanding.
+    /// outstanding. `after_destroy` is run again before each retried drain.
     async fn settle_retired_destroy(
         mobs: &RwLock<BTreeMap<MobId, ManagedMob>>,
         mob_id: &MobId,
         retired: &RetiredMob,
+        after_destroy: Option<&MobAfterDestroy>,
     ) -> Result<meerkat_mob::MobDestroyReport, MobMcpDestroyError> {
-        match Self::settle_owed_storage_cleanup(mobs, mob_id, retired).await {
+        match Self::settle_owed_storage_cleanup(mobs, mob_id, retired, after_destroy).await {
             Ok(()) => Ok(retired.report.clone()),
             Err(outstanding) => Err(MobMcpDestroyError::Incomplete {
                 report: retired.report_with_outstanding_cleanup(&outstanding),
@@ -1558,6 +1570,13 @@ impl MobMcpState {
     /// what is still outstanding; the record keeps everything a later
     /// attempt needs.
     ///
+    /// A drain refused because other owner handles still observe the
+    /// database is retried [`OBSERVER_DRAIN_RETRIES`] times,
+    /// [`OBSERVER_DRAIN_RETRY_DELAY`] apart, each after `after_destroy` ran
+    /// again: a holder that outlives the hook only briefly, such as an
+    /// observer that cloned the handle just before the destroy, then lets go
+    /// within the attempt.
+    ///
     /// This settles the observer and the files only. A read already entered
     /// through a handle that was then dropped, an opener that attaches after
     /// the drain, and other processes stay outside it, so it never states
@@ -1567,6 +1586,7 @@ impl MobMcpState {
         mobs: &RwLock<BTreeMap<MobId, ManagedMob>>,
         mob_id: &MobId,
         retired: &RetiredMob,
+        after_destroy: Option<&MobAfterDestroy>,
     ) -> Result<(), String> {
         let Some(storage) = retired.storage.as_ref() else {
             return Ok(());
@@ -1595,13 +1615,29 @@ impl MobMcpState {
         // (an earlier attempt removed it), there is no database at the path
         // to observe, and only leftover sidecars remain.
         if Self::destroyed_database_at(&storage.path, cleanup.before).await? {
-            let path = storage.path.clone();
-            let drained = tokio::task::spawn_blocking(move || {
-                meerkat_mob::SqliteMobStores::drain_observers(&path)
-            })
-            .await
-            .map_err(|error| format!("the observer drain did not return: {error}"))?;
-            Self::observer_drain_settled(drained)?;
+            let mut retries_left = OBSERVER_DRAIN_RETRIES;
+            loop {
+                let path = storage.path.clone();
+                let drained = tokio::task::spawn_blocking(move || {
+                    meerkat_mob::SqliteMobStores::drain_observers(&path)
+                })
+                .await
+                .map_err(|error| format!("the observer drain did not return: {error}"))?;
+                // A refused drain drained nothing, so it can be retried.
+                if retries_left > 0
+                    && matches!(
+                        drained,
+                        Err(meerkat_mob::SqliteMobObserverDrainRefused::OtherOwners { .. })
+                    )
+                {
+                    retries_left -= 1;
+                    run_after_destroy(after_destroy, mob_id);
+                    tokio::time::sleep(OBSERVER_DRAIN_RETRY_DELAY).await;
+                    continue;
+                }
+                Self::observer_drain_settled(drained)?;
+                break;
+            }
         }
         Self::remove_destroyed_storage_files(&storage.path, cleanup.before).await?;
         *owed = None;
@@ -1637,6 +1673,7 @@ impl MobMcpState {
         _mobs: &RwLock<BTreeMap<MobId, ManagedMob>>,
         _mob_id: &MobId,
         _retired: &RetiredMob,
+        _after_destroy: Option<&MobAfterDestroy>,
     ) -> Result<(), String> {
         // A destroyed mob owns no storage files on wasm32.
         Ok(())
@@ -3977,11 +4014,17 @@ impl MobMcpState {
         // gate; the raw-handle snapshot must not be a graded sibling).
         self.require_console_owner(ControlScope::List)?;
         self.ensure_restored().await?;
+        // A destroyed mob (its phase flips when the destroy is admitted) is
+        // not handed out: a clone taken now would keep observing the
+        // database its destroy's storage cleanup drains.
         Ok(self
             .mobs
             .read()
             .await
             .iter()
+            .filter(|(_, managed)| {
+                managed.handle.status_observation_snapshot() != MobState::Destroyed
+            })
             .map(|(id, managed)| (id.clone(), managed.handle.clone()))
             .collect())
     }
@@ -16319,7 +16362,8 @@ mod tests {
     }
 
     /// A host that still holds the mob when the after-destroy hook first
-    /// runs keeps the storage cleanup outstanding. The same caller's retry
+    /// runs, and through every retried drain, keeps the storage cleanup
+    /// outstanding. The same caller's retry
     /// runs the hook again before its own cleanup attempt, and once the host
     /// releases there, the retry removes the mob's files.
     #[tokio::test]
@@ -16363,7 +16407,11 @@ mod tests {
             }),
             "{report:?}"
         );
-        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1 + OBSERVER_DRAIN_RETRIES,
+            "the hook ran before the cleanup and again before each retried drain"
+        );
         assert!(
             tokio::fs::metadata(&storage_path).await.is_ok(),
             "the held database is kept"
@@ -16377,7 +16425,7 @@ mod tests {
         assert!(report.errors.is_empty(), "{report:?}");
         assert_eq!(
             calls.load(std::sync::atomic::Ordering::SeqCst),
-            2,
+            2 + OBSERVER_DRAIN_RETRIES,
             "the retry ran the hook again before its cleanup"
         );
         assert!(existing_storage_files(&storage_path).is_empty());
@@ -16438,6 +16486,103 @@ mod tests {
             .mob_create_definition(explicit_definition("panicking-release-destroy"))
             .await
             .expect("the destroyed mob's id is free again at once");
+    }
+
+    /// A holder that still observes the destroyed mob's database when the
+    /// cleanup first drains it, and lets go shortly after, does not leave the
+    /// cleanup outstanding: the refused drain is retried a bounded number of
+    /// times, each after the host's release hook ran again.
+    #[tokio::test]
+    async fn a_short_lived_holder_does_not_leave_the_destroy_cleanup_outstanding() {
+        let svc = Arc::new(MockSessionSvc::new());
+        let root = tempfile::tempdir().expect("tempdir");
+        let state = persistent_destroy_state(&svc, root.path());
+        let bound = bind_activated_mobs(&state);
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (releaser, counted) = (Arc::clone(&bound), Arc::clone(&calls));
+        let hook: MobAfterDestroy = Arc::new(move |mob_id: &MobId| {
+            if counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst) > 0 {
+                return;
+            }
+            // The first call hands the binding to a short-lived holder, as
+            // an observer that cloned it just before the destroy would be.
+            let held = releaser
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(mob_id);
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                drop(held);
+            });
+        });
+        state
+            .set_after_destroy(hook)
+            .expect("bind the destroy hook");
+        let mob_id = state
+            .mob_create_definition(explicit_definition("short-lived-holder-destroy"))
+            .await
+            .expect("create explicit mob");
+        let storage_path = destroy_test_storage_path(root.path(), &mob_id);
+
+        let report = state
+            .mob_destroy(&mob_id)
+            .await
+            .expect("the retried drain settles once the holder let go");
+        assert!(report.errors.is_empty(), "{report:?}");
+        assert!(
+            calls.load(std::sync::atomic::Ordering::SeqCst) >= 2,
+            "the hook ran again before a retried drain"
+        );
+        assert!(existing_storage_files(&storage_path).is_empty());
+    }
+
+    /// A mob whose phase is `Destroyed` is not handed out by
+    /// `mob_handles_snapshot` (nor listed by `mob_list`) while its managed
+    /// entry remains, as after a destroy through the mob's own handle: a
+    /// snapshot taken then would hold the destroyed mob's database observer.
+    #[tokio::test]
+    async fn mob_handles_snapshot_skips_a_destroyed_mob() {
+        let svc = Arc::new(MockSessionSvc::new());
+        let root = tempfile::tempdir().expect("tempdir");
+        let state = persistent_destroy_state(&svc, root.path());
+        let kept = state
+            .mob_create_definition(explicit_definition("snapshot-kept"))
+            .await
+            .expect("create the kept mob");
+        let destroyed = state
+            .mob_create_definition(explicit_definition("snapshot-destroyed"))
+            .await
+            .expect("create the destroyed mob");
+        let handle = state
+            .handle_for(&destroyed)
+            .await
+            .expect("the destroyed mob's handle");
+        handle
+            .destroy()
+            .await
+            .expect("destroy through the mob's own handle");
+        assert_eq!(
+            handle.status_observation_snapshot(),
+            meerkat_mob::MobState::Destroyed
+        );
+        drop(handle);
+
+        let snapshot: Vec<MobId> = state
+            .mob_handles_snapshot()
+            .await
+            .expect("owner snapshot")
+            .into_iter()
+            .map(|(mob_id, _)| mob_id)
+            .collect();
+        assert_eq!(snapshot, vec![kept.clone()]);
+        let listed: Vec<MobId> = state
+            .mob_list()
+            .await
+            .expect("owner list")
+            .into_iter()
+            .map(|(mob_id, _)| mob_id)
+            .collect();
+        assert_eq!(listed, vec![kept]);
     }
 
     /// An agent's destroy is continued only by the exact caller it was

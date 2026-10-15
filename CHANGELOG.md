@@ -58,6 +58,15 @@ them.
   observer drain refused: 3 owner handle(s) still observe this mob
   database"), and the destroyed mob's database, file watch and threads stayed
   while its id could not be reused.
+- `meerkat-mob-mcp`: a destroy's storage cleanup no longer stays outstanding
+  because something held the destroyed mob's handle a moment longer than the
+  release hook ran. An observer drain that other owner handles refuse is
+  retried ten times, 100 ms apart, each after the after-destroy hook ran
+  again. Owner cleanups that destroy without retrying later, such as an
+  archived owner session's mobs or an implicit mob recreated for a new
+  model, answered `Incomplete` in that case. `MobMcpState::mob_handles_snapshot`
+  and `mob_list` also skip a mob whose phase is `Destroyed`, so a snapshot
+  taken while a destroy runs holds none of it.
 
 ## [0.9.1] - 2026-10-15
 

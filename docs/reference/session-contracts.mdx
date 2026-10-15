@@ -534,7 +534,10 @@ cleanup. A host drops the read handle it kept there: a handle still held keeps
 that cleanup outstanding, and the destroy answers `Incomplete`. Another mob
 may be managed under the same id by then, so the host releases only what
 observes the destroyed mob. The hook must not block; a panic in it is caught
-and logged, and the destroy goes on.
+and logged, and the destroy goes on. An observer drain that other owner
+handles refuse is retried for about a second, the hook running again before
+each try, so a holder that lets go shortly after the hook does not leave the
+cleanup outstanding.
 
 ## Compaction contract
 
