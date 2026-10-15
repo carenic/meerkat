@@ -1417,7 +1417,7 @@ fn is_wrapped_schema(obj: &Map<String, Value>) -> bool {
 
 /// Unique identifier for a session (UUID v7 for time-ordering)
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct SessionId(#[cfg_attr(feature = "schema", schemars(with = "String"))] pub Uuid);
 
 impl SessionId {

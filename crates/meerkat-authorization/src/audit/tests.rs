@@ -127,7 +127,7 @@ fn unavailable_clock_never_records_a_false_policy_refusal() {
     assert!(!matches!(
         events[0].observation,
         AuditObservation::Prepared { .. }
-            | AuditObservation::Entry
+            | AuditObservation::Entry { .. }
             | AuditObservation::Outcome { .. }
     ));
     assert_eq!(
@@ -825,7 +825,9 @@ async fn a_delegate_observation_names_its_parent_operation() {
     let prepared = meerkat_core::LlmRequestAuthorization::for_tool_delegate(attribution)
         .prepare(helper)
         .expect("the delegate is prepared");
-    prepared.observe_entry().expect("entry staged");
+    prepared
+        .observe_entry(meerkat_core::OperationEntryBoundary::ModelRequest)
+        .expect("entry staged");
     let delegate = prepared.binding().facts().operation_id.clone();
     let records = sink.0.lock().expect("observations").clone();
     let expected = AuditDelegateAttribution {
@@ -843,7 +845,9 @@ async fn a_delegate_observation_names_its_parent_operation() {
     ));
     assert!(matches!(
         helper_records[1].observation,
-        AuditObservation::Entry
+        AuditObservation::Entry {
+            boundary: Some(meerkat_core::OperationEntryBoundary::ModelRequest)
+        }
     ));
     for record in &helper_records {
         assert_eq!(record.delegate_attribution.as_ref(), Some(&expected));

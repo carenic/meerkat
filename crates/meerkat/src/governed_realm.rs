@@ -818,3 +818,6 @@ mod read_custody_tests;
 
 #[cfg(test)]
 mod review_load_tests;
+
+#[cfg(all(test, feature = "memory-store-session"))]
+mod memory_grant_tests;

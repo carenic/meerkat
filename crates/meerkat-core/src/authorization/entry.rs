@@ -197,13 +197,18 @@ impl PreparedOperationCheck {
         crate::approval::review::OperationReviewRefusal::for_unreviewed_entry(self.review_tier())
     }
 
-    /// Stage entry after the final current check and immediately before the
-    /// actual body/send. A staging failure is an infrastructure error.
-    /// This does not replace currentness or establish one-use execution.
-    pub fn observe_entry(&self) -> Result<(), OperationObservationError> {
+    /// Stage entry at `boundary` after the final current check and
+    /// immediately before the actual body/send. A staging failure is an
+    /// infrastructure error. This does not replace currentness or establish
+    /// one-use execution; several boundaries can observe one operation's
+    /// entry, each naming itself.
+    pub fn observe_entry(
+        &self,
+        boundary: super::OperationEntryBoundary,
+    ) -> Result<(), OperationObservationError> {
         self.0
             .decision
-            .observe(&self.0.binding, OperationObservation::Entry)
+            .observe(&self.0.binding, OperationObservation::Entry(boundary))
     }
 
     pub(crate) fn observe_review_attempt_started(

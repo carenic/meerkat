@@ -25,7 +25,7 @@ fn observed_fixture_attempt(
 ) -> Result<(), OperationAuthorizationError> {
     let prepared = PreparedOperationCheck::prepare(context, bound)?;
     let current = prepared.current()?;
-    current.observe_entry()?;
+    current.observe_entry(meerkat_core::OperationEntryBoundary::ModelRequest)?;
     // The recording transport fixture returns a real local error. This is not
     // a model response or a claim that any external provider was contacted.
     bodies.fetch_add(1, Ordering::SeqCst);
@@ -92,7 +92,7 @@ fn assert_complete_attempt(
     ));
     assert!(matches!(
         rows[1].observation.observation,
-        AuditObservation::Entry
+        AuditObservation::Entry { .. }
     ));
     assert!(matches!(
         rows[2].observation.observation,

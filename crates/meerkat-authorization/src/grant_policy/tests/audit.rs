@@ -38,7 +38,9 @@ fn real_compiler_records_grant_observation_refusal_entry_and_deferred_return_wit
     let binding = source(SourceAuthorizationUse::Read, "public");
     let check =
         PreparedOperationCheck::prepare(context.clone(), binding).expect("real grant checks");
-    check.observe_entry().expect("entry staged");
+    check
+        .observe_entry(meerkat_core::OperationEntryBoundary::ToolEffect)
+        .expect("entry staged");
     let native = meerkat_core::ops::AsyncOpRef::detached(meerkat_core::OperationId::new());
     let returned = Ok(meerkat_core::ops::ToolDispatchOutcome::new(
         meerkat_core::ToolResult::new("call".into(), "accepted".into(), false),
@@ -60,7 +62,13 @@ fn real_compiler_records_grant_observation_refusal_entry_and_deferred_return_wit
         vec![fixture.association().candidate().authority_basis.clone()]
     );
     assert!(policy.controller_lineages.is_empty());
-    assert!(matches!(events[1].observation, AuditObservation::Entry));
+    // The record names the boundary that staged the entry.
+    assert!(matches!(
+        events[1].observation,
+        AuditObservation::Entry {
+            boundary: Some(meerkat_core::OperationEntryBoundary::ToolEffect)
+        }
+    ));
     let AuditObservation::Outcome {
         outcome:
             OperationObservedOutcome::ToolDispatchReturned {
@@ -96,7 +104,10 @@ fn warm_checks_do_not_append_and_known_entry_failure_keeps_physical_result_separ
     }
     assert_eq!(sink.events.lock().expect("events").len(), 1);
     sink.fail.store(true, Ordering::SeqCst);
-    assert_eq!(check.observe_entry(), Err(OperationObservationError));
+    assert_eq!(
+        check.observe_entry(meerkat_core::OperationEntryBoundary::ToolEffect),
+        Err(OperationObservationError)
+    );
     let physical: Result<meerkat_core::ops::ToolDispatchOutcome, meerkat_core::ToolError> =
         Ok(meerkat_core::ops::ToolDispatchOutcome::sync_result(
             meerkat_core::ToolResult::new("call".into(), "actual result".into(), false),
@@ -144,7 +155,7 @@ fn final_deadline_denial_is_observed_and_failed_observation_is_infrastructure() 
         ));
         assert!(!events.iter().any(|event| matches!(
             event.observation,
-            AuditObservation::Entry | AuditObservation::Outcome { .. }
+            AuditObservation::Entry { .. } | AuditObservation::Outcome { .. }
         )));
     }
     sink.fail.store(true, Ordering::SeqCst);

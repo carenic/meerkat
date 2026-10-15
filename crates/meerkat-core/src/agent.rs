@@ -1459,6 +1459,47 @@ impl ToolDispatchContext {
             })
     }
 
+    /// For governed work, require that this dispatch was authorized for
+    /// exactly the typed operation `target` its owner is about to perform
+    /// for `call`: the binding-owned call (matched by identity) under a plan
+    /// whose single owner-produced target equals `target`. An owner whose
+    /// effect is selected by a typed target calls this immediately before
+    /// the effect, so work authorized for another target, or for none (a
+    /// wrapper that resolved its own target-less plan, which a base lineage
+    /// would cover), never runs. `target` is computed only for governed
+    /// work; a dispatch without a prepared authorization is unaffected.
+    ///
+    /// # Errors
+    /// Governed work authorized for another call, another target or none
+    /// refuses as malformed facts; an error from `target` is returned as is.
+    pub fn require_authorized_operation_target(
+        &self,
+        call: ToolCallView<'_>,
+        target: impl FnOnce() -> Result<crate::ToolOperationTarget, crate::ToolError>,
+    ) -> Result<(), crate::ToolError> {
+        let Some(prepared) = self.prepared_authorization() else {
+            return Ok(());
+        };
+        let target = target()?;
+        let (bound_call, bound_plan) = prepared
+            .tool_dispatch_parts()
+            .ok_or_else(governed_malformed)?;
+        let mut bound_targets = bound_plan
+            .owner_witnesses()
+            .iter()
+            .filter_map(crate::ToolExecutionOwnerWitness::operation_target);
+        let authorized = std::ptr::eq(call.id, bound_call.id)
+            && std::ptr::eq(call.name, bound_call.name)
+            && std::ptr::eq(call.args, bound_call.args)
+            && bound_targets.next() == Some(&target)
+            && bound_targets.next().is_none();
+        if authorized {
+            Ok(())
+        } else {
+            Err(governed_malformed())
+        }
+    }
+
     /// The governed operation this dispatch prepared, for a trusted native
     /// owner that checks it again later (see [`GovernedDispatchOperation`]).
     /// `call` must be this dispatch's actual borrowed call: it is matched by
@@ -1565,8 +1606,10 @@ impl ToolDispatchContext {
     ///
     /// Call exactly once, after argument and preparation work and any waits,
     /// immediately before the body or handoff, with the context the leaf was
-    /// handed. It runs [`Self::observe_tool_entry`] (staging, the final
-    /// authorization check and the review check point), then spends a
+    /// handed. It runs [`Self::observe_tool_entry_at`] at the effect boundary
+    /// ([`crate::authorization::OperationEntryBoundary::ToolEffect`]:
+    /// staging, the final authorization check and the review check point),
+    /// then spends a
     /// retained review allow once for the exact entering decision. Nothing
     /// external runs between that spend and the caller's effect; the review
     /// `Used` projection is delivered after dispatch returns. A second call
@@ -1593,7 +1636,11 @@ impl ToolDispatchContext {
         plan: Option<&crate::ResolvedToolExecutionPlan>,
     ) -> Result<(Option<Self>, crate::approval::review::ReviewedEntryCustody), crate::ToolError>
     {
-        let entering = self.observe_tool_entry(call, plan)?;
+        let entering = self.observe_tool_entry_at(
+            call,
+            plan,
+            crate::authorization::OperationEntryBoundary::ToolEffect,
+        )?;
         let current = entering.as_ref().unwrap_or(self);
         let custody = match (self.review_entry.as_ref(), current.prepared_authorization()) {
             (Some(entry), Some(check)) => entry.consume_held(check)?,
@@ -1675,15 +1722,36 @@ impl ToolDispatchContext {
     /// synchronous staging work. Adapters call this after their own awaits.
     /// Several adapter boundaries may observe the same operation ID; these
     /// observations do not count physical effects or authorize another call.
+    /// The entry names the dispatch staging boundary
+    /// ([`crate::authorization::OperationEntryBoundary::ToolDispatch`]); a
+    /// staging point with an identity of its own uses
+    /// [`Self::observe_tool_entry_at`].
     pub fn observe_tool_entry(
         &self,
         call: ToolCallView<'_>,
         plan: Option<&crate::ResolvedToolExecutionPlan>,
     ) -> Result<Option<Self>, crate::ToolError> {
+        self.observe_tool_entry_at(
+            call,
+            plan,
+            crate::authorization::OperationEntryBoundary::ToolDispatch,
+        )
+    }
+
+    /// [`Self::observe_tool_entry`] at the named `boundary`, so the entries
+    /// that several boundaries record for one operation stay distinguishable.
+    pub fn observe_tool_entry_at(
+        &self,
+        call: ToolCallView<'_>,
+        plan: Option<&crate::ResolvedToolExecutionPlan>,
+        boundary: crate::authorization::OperationEntryBoundary,
+    ) -> Result<Option<Self>, crate::ToolError> {
         let first = self.check_tool_authorization(call, plan)?;
         let current = first.as_ref().unwrap_or(self);
         if let Some(prepared) = current.prepared_authorization() {
-            prepared.observe_entry().map_err(crate::ToolError::from)?;
+            prepared
+                .observe_entry(boundary)
+                .map_err(crate::ToolError::from)?;
         }
         let final_context = current.check_tool_authorization(call, plan)?;
         let entering = final_context.or(first);

@@ -36,8 +36,8 @@ pub use audit::{
     MANDATORY_HOOK_ID_BYTES, MANDATORY_HOOK_PROVIDER_NATIVE_NAME_BYTES,
     MANDATORY_HOOK_PROVIDER_NATIVE_TOOLS, MandatoryHookCause, MandatoryHookProviderTool,
     MandatoryHookWithheldEffect, MandatoryHookWithholding, MandatoryHookWithholdingRecord,
-    OperationObservation, OperationObservationError, OperationObservationPhase,
-    OperationObservedOutcome,
+    OperationEntryBoundary, OperationObservation, OperationObservationError,
+    OperationObservationPhase, OperationObservedOutcome,
 };
 
 /// Why an input or session operation cannot obtain current runtime authority.

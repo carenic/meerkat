@@ -192,11 +192,12 @@ pub use authorization::{
     AuthorizationOperation, MandatoryHookCause, MandatoryHookProviderTool,
     MandatoryHookWithheldEffect, MandatoryHookWithholding, MandatoryHookWithholdingRecord,
     ModelAuthorizationFacts, ModelAuthorizationUse, OperationAuthorizationError,
-    OperationAuthorizationFacts, OperationRefusalKind, OperationRefused, OperationReviewTier,
-    OwnerQualifiedTarget, PreparedAuthorizationBinding, PreparedOperationAuthorization,
-    PublicationAuthorizationFacts, PublicationMode, PublicationRecipient, SourceAuthorizationFacts,
-    SourceAuthorizationTarget, SourceAuthorizationUse, ToolAuthorizationFacts,
-    ToolAuthorizationTarget, WorkAuthorization, WorkAuthorizationContext,
+    OperationAuthorizationFacts, OperationEntryBoundary, OperationRefusalKind, OperationRefused,
+    OperationReviewTier, OwnerQualifiedTarget, PreparedAuthorizationBinding,
+    PreparedOperationAuthorization, PublicationAuthorizationFacts, PublicationMode,
+    PublicationRecipient, SourceAuthorizationFacts, SourceAuthorizationTarget,
+    SourceAuthorizationUse, ToolAuthorizationFacts, ToolAuthorizationTarget, WorkAuthorization,
+    WorkAuthorizationContext,
 };
 pub use blob::{
     BlobAddressAttestation, BlobId, BlobPayload, BlobRef, BlobStore, BlobStoreError,
@@ -398,8 +399,9 @@ pub use memory::{
     CompactionStageReceipt, CompactionStageReconcileReceipt, EmbeddingModel, HnswParams,
     MemoryEnumerationPage, MemoryEnumerationRequest, MemoryIndexBatch, MemoryIndexReceipt,
     MemoryIndexRequest, MemoryIndexScope, MemoryMetadata, MemoryOwner, MemoryRankingPolicy,
-    MemoryRecord, MemoryResult, MemoryScopeDropReceipt, MemorySearchScope, MemorySource,
-    MemoryStore, MemoryStoreError, MessageRange, SESSION_COMPACTION_PROJECTION_INTENTS_KEY,
+    MemoryRecord, MemoryResult, MemoryScopeDropReceipt, MemoryScopeRef, MemorySearchScope,
+    MemorySource, MemoryStore, MemoryStoreError, MessageRange,
+    SESSION_COMPACTION_PROJECTION_INTENTS_KEY,
 };
 pub use model_defaults::ModelOperationalDefaultsResolver;
 pub use model_profile::catalog::ModelReleaseStage;
@@ -587,8 +589,9 @@ pub use tool_application::{
 pub use tool_bundle::RegisteredToolBundleDispatcher;
 pub use tool_catalog::{
     ToolCallability, ToolCatalogCapabilities, ToolCatalogDeferredEligibility, ToolCatalogEntry,
-    ToolCatalogLoadRejectedReason, ToolCatalogLoadResolution, ToolCatalogMode, ToolPlaneClass,
-    ToolUnavailableReason, deferred_session_entry_count, deferred_session_schema_volume,
+    ToolCatalogLoadRejectedReason, ToolCatalogLoadResolution, ToolCatalogMode, ToolCatalogView,
+    ToolCatalogViewEntry, ToolCatalogVisibility, ToolPlaneClass, ToolUnavailableReason,
+    deferred_session_entry_count, deferred_session_schema_volume,
     select_catalog_mode_from_snapshot,
 };
 pub use tool_consequence_policy::{
@@ -606,12 +609,13 @@ pub use tool_consequence_policy::{
 pub use tool_execution::{
     BuiltinToolOperation, CatalogOperation, CoreDispatchDeadline, DeadlineChainError,
     DeadlineChainExtensionError, DetachedToolExecutionPolicy, EphemeralToolBindingFingerprint,
-    IdempotencyScope, ResolvedExecutionKind, ResolvedToolExecutionPlan, RestartClass,
-    RunnerIdentity, StreamingToolExecutionPolicy, ToolCredentialContextRef, ToolDeadlineChain,
-    ToolDeadlineContributor, ToolDeadlineOwner, ToolDeadlineSource, ToolExecutionApplicability,
-    ToolExecutionContract, ToolExecutionContractError, ToolExecutionDeclarationError,
-    ToolExecutionMode, ToolExecutionOwnerWitness, ToolExecutionResolutionContext,
-    ToolExecutionResolutionError, ToolOperationTarget, ToolOutputPolicy, ToolProgressPolicy,
+    IdempotencyScope, MemoryOperation, PeerSendKind, ResolvedExecutionKind,
+    ResolvedToolExecutionPlan, RestartClass, RunnerIdentity, StreamingToolExecutionPolicy,
+    ToolCredentialContextRef, ToolDeadlineChain, ToolDeadlineContributor, ToolDeadlineOwner,
+    ToolDeadlineSource, ToolExecutionApplicability, ToolExecutionContract,
+    ToolExecutionContractError, ToolExecutionDeclarationError, ToolExecutionMode,
+    ToolExecutionOwnerWitness, ToolExecutionResolutionContext, ToolExecutionResolutionError,
+    ToolOperationTarget, ToolOutputPolicy, ToolProgressPolicy,
     ephemeral_tool_catalog_binding_fingerprint,
 };
 pub use tool_execution_policy::{

@@ -300,7 +300,9 @@ impl PreparedOperationAuthorization for AuditedPrepared {
                     attempt_ref: attempt_ref.to_string(),
                 }
             }
-            OperationObservation::Entry => AuditObservation::Entry,
+            OperationObservation::Entry(boundary) => AuditObservation::Entry {
+                boundary: Some(boundary),
+            },
             OperationObservation::AuthorizationUnavailable => {
                 AuditObservation::AuthorizationUnavailable {
                     target: Arc::clone(&self.target),

@@ -317,7 +317,9 @@ impl LlmClient for RecordModel {
             .expect("controller authorization")
             .current()
             .expect("final controller entry check");
-        check.observe_entry().expect("transport entry");
+        check
+            .observe_entry(meerkat_core::OperationEntryBoundary::ModelRequest)
+            .expect("transport entry");
         check
             .observe_outcome(OperationObservedOutcome::HttpResponse { status: 200 })
             .expect("fixture response");

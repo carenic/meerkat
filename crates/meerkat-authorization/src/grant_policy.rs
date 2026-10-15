@@ -39,11 +39,13 @@ pub fn single_tool_operation_target(
 /// The typed target an operation's grant lineage is selected by: the single
 /// MCP server a dispatched tool operates on, the exact checked route to that
 /// server it was reached through, the exact registered tool bundle operation
-/// it runs, the builtin operation it is, the hosted-search helper route and
-/// capability of a builtin web_search call's delegate, or `None` for an
-/// operation with no typed target or a tool catalog control, which uses the
-/// basis's base lineage. Raw operation meaning is untouched; this only says
-/// which selected lineage applies.
+/// it runs, the one peer a comms delivery reaches, the session's own peer
+/// directory, the exact memory scope a memory operation reaches, the builtin
+/// operation it is, the hosted-search helper route and capability of a
+/// builtin web_search call's delegate, or `None` for an operation with no
+/// typed target or a tool catalog control, which uses the basis's base
+/// lineage. Raw operation meaning is untouched; this only says which
+/// selected lineage applies.
 ///
 /// It reads the whole binding, not only its facts: a delegate's model
 /// operation selects the lineage of its own route and capability, while an
@@ -99,6 +101,20 @@ pub fn operation_grant_target(
                 server: server.clone(),
             }))
         }
+        // A comms delivery uses only the lineage selected for exactly the
+        // peer it reaches, whatever kind of delivery it is: never another
+        // peer's, the peer directory's or the base.
+        Some(ToolOperationTarget::PeerSend { peer, .. }) => {
+            Ok(Some(GrantTarget::Peer { peer: *peer }))
+        }
+        // A read of the session's own peer directory uses only its own
+        // lineage, which covers no delivery.
+        Some(ToolOperationTarget::PeerDirectoryRead) => Ok(Some(GrantTarget::PeerDirectory)),
+        // A memory operation uses only the lineage selected for exactly the
+        // scope it reaches: never another scope's or the base.
+        Some(ToolOperationTarget::MemoryOperation { scope, .. }) => Ok(Some(GrantTarget::Memory {
+            scope: scope.clone(),
+        })),
         // A builtin operation (the builtin web_search call) is its own
         // target: it uses only the lineage selected for exactly that
         // operation, never the base, the catalog or the controller lineage.

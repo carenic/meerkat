@@ -54,6 +54,12 @@
 //!   the builtin web_search operation (its owner-produced
 //!   [`ToolOperationTarget::BuiltinOperation`] target), and provider-hosted
 //!   tool targets;
+//! - comms deliveries, the trusted-peer directory read and memory
+//!   operations. Their plans carry typed targets (`PeerSend`,
+//!   `PeerDirectoryRead`, `MemoryOperation`), but stock issues no grant for
+//!   those targets, so under a per-target selection the grant owner denies
+//!   them before this owner is asked; an older single worker grant reaches
+//!   this owner, which leaves them unmapped;
 //! - blobs, runtime inputs, transcript ranges and external sources;
 //! - publications;
 //! - hosted capabilities, alternate models and live model channels,
@@ -1957,6 +1963,64 @@ mod tests {
             )
             .expect_err("another requester");
         assert!(is_denied_verdict(&error));
+    }
+
+    /// Under a single grant lineage every operation resolves the work's one
+    /// lineage, so the stock owner is what keeps peer and memory tool
+    /// operations out of a stock realm: their owner-produced targets (each
+    /// comms delivery kind, the peer directory, and the read of the work's
+    /// own session memory through `memory_search`) have no stock mapping
+    /// and are unavailable, never a stock tuple and never a verdict.
+    #[test]
+    fn peer_and_memory_tool_targets_are_unmapped_under_a_single_grant_lineage() {
+        let session = SessionId::new();
+        let policy = policy();
+        let own = association(&session, |_| {});
+        assert!(matches!(
+            own.candidate().authority_basis,
+            WorkAuthorityBasis::GrantLineage { .. }
+        ));
+        let peer = meerkat_core::comms::PeerId::new();
+        let delivery = |kind| ToolOperationTarget::PeerSend { peer, kind };
+        for (name, target) in [
+            (
+                "send_message",
+                delivery(meerkat_core::PeerSendKind::Message),
+            ),
+            (
+                "reply_to_peer",
+                delivery(meerkat_core::PeerSendKind::Message),
+            ),
+            (
+                "send_request",
+                delivery(meerkat_core::PeerSendKind::Request),
+            ),
+            (
+                "send_response",
+                delivery(meerkat_core::PeerSendKind::Response),
+            ),
+            ("peers", ToolOperationTarget::PeerDirectoryRead),
+            (
+                "memory_search",
+                ToolOperationTarget::MemoryOperation {
+                    scope: MemorySearchScope::for_session(session.clone()).scope_ref(),
+                    operation: meerkat_core::MemoryOperation::Read,
+                },
+            ),
+        ] {
+            assert_eq!(
+                policy
+                    .authorize_operation(
+                        &own,
+                        &tool_binding(&session, name, Some(target)),
+                        LocalPolicyPurpose::Operation,
+                        5,
+                    )
+                    .expect_err(name),
+                OperationAuthorizationError::Unavailable,
+                "{name} has no stock mapping"
+            );
+        }
     }
 
     /// The stock mandate is the checked invocation itself, named by this

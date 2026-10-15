@@ -741,7 +741,9 @@ impl LlmClient for ProviderFixture {
                     .prepare(model_facts())
                     .expect("actual generated-grant preparation");
                 let current = prepared.current().expect("current before Entry");
-                current.observe_entry().expect("actual native Entry append");
+                current
+                    .observe_entry(meerkat_core::OperationEntryBoundary::ModelRequest)
+                    .expect("actual native Entry append");
                 let current = current
                     .current()
                     .expect("current after Entry before scripted transport");
@@ -1175,7 +1177,7 @@ fn assert_audit(fixture: &Fixture, audit: &[StoredAuthorizationAuditObservation]
             audit
                 .iter()
                 .filter(|r| &r.observation.operation_id == operation
-                    && matches!(r.observation.observation, AuditObservation::Entry))
+                    && matches!(r.observation.observation, AuditObservation::Entry { .. }))
                 .count(),
             1
         );
@@ -1227,7 +1229,7 @@ fn assert_audit(fixture: &Fixture, audit: &[StoredAuthorizationAuditObservation]
                 == refusal.observation.operation_id
                 && matches!(
                     r.observation.observation,
-                    AuditObservation::Entry | AuditObservation::Outcome { .. }
+                    AuditObservation::Entry { .. } | AuditObservation::Outcome { .. }
                 )));
         } else {
             // Entry precedes the awaited recheck. Its refusal returns a typed

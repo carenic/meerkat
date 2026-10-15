@@ -840,7 +840,7 @@ async fn exercise_search(controller_server: &Server, helper_server: &Server, cas
                 )));
                 assert!(has(|observation| matches!(
                     observation,
-                    AuditObservation::Entry
+                    AuditObservation::Entry { .. }
                 )));
                 assert!(has(|observation| matches!(
                     observation,
@@ -879,7 +879,7 @@ async fn exercise_search(controller_server: &Server, helper_server: &Server, cas
                 assert!(!has(|observation| matches!(
                     observation,
                     AuditObservation::Prepared { .. }
-                        | AuditObservation::Entry
+                        | AuditObservation::Entry { .. }
                         | AuditObservation::Outcome { .. }
                 )));
             }
@@ -919,7 +919,7 @@ async fn exercise_search(controller_server: &Server, helper_server: &Server, cas
                 )));
                 assert!(!has(|observation| matches!(
                     observation,
-                    AuditObservation::Entry | AuditObservation::Outcome { .. }
+                    AuditObservation::Entry { .. } | AuditObservation::Outcome { .. }
                 )));
             }
             Case::OwnerUnavailable => {
@@ -937,7 +937,7 @@ async fn exercise_search(controller_server: &Server, helper_server: &Server, cas
                 assert!(!has(|observation| matches!(
                     observation,
                     AuditObservation::Prepared { .. }
-                        | AuditObservation::Entry
+                        | AuditObservation::Entry { .. }
                         | AuditObservation::Outcome { .. }
                 )));
             }
@@ -965,7 +965,7 @@ async fn exercise_search(controller_server: &Server, helper_server: &Server, cas
                 assert!(
                     !has(|observation| matches!(
                         observation,
-                        AuditObservation::Entry
+                        AuditObservation::Entry { .. }
                             | AuditObservation::Outcome { .. }
                             | AuditObservation::Refused { .. }
                     )),
@@ -979,7 +979,10 @@ async fn exercise_search(controller_server: &Server, helper_server: &Server, cas
             audit
                 .iter()
                 .any(|record| record.observation.operation_id == parent
-                    && matches!(record.observation.observation, AuditObservation::Entry))
+                    && matches!(
+                        record.observation.observation,
+                        AuditObservation::Entry { .. }
+                    ))
         );
     }
 

@@ -80,6 +80,69 @@ them.
   builtin registration after resolving it, or when another owner (such as
   an external tool) now holds the name: a plan that carries the composite's
   builtin witness runs only on that builtin.
+- Behaviour-only (not measured by the gate): comms and `memory_search`
+  operations carry typed operation targets (see Added). Under a targeted
+  grant basis (`WorkAuthorityBasis::TargetedGrantLineages`) each resolves
+  only the lineage selected for its own target and is denied without one;
+  the base lineage no longer covers them. A stock realm issues no peer,
+  peer-directory or memory grant, so its per-target selections now deny
+  these operations at the grant owner, where the stock policy used to
+  report them unmapped (`operation_authorization_unavailable`).
+- Behaviour-only (not measured by the gate): a comms tool call whose
+  addressee cannot be determined (arguments that do not parse as the tool's
+  input, or a `reply_to_peer` that selects no single delivery of the turn)
+  now fails at execution-plan resolution with `invalid_arguments` and the
+  handler's own reason, where it failed at dispatch with `execution_failed`.
+- Behaviour-only (not measured by the gate): under governed work the comms
+  tools and `memory_search` run only when the dispatch's prepared
+  authorization names exactly the typed target they are about to reach (the
+  peer a delivery reaches, the peer directory, or the read of the memory
+  scope searched). A wrapper that forwards their `dispatch_with_context` but
+  resolves its own plan without that target (which a base lineage would
+  cover), or with another one, is now refused with `authorization_refused`
+  (malformed facts) before any delivery or memory read. Forward
+  `resolve_execution_plan` and `dispatch_resolved_with_context` to the
+  owning dispatcher instead. Ungoverned dispatch is unchanged.
+- Behaviour-only (not measured by the gate): the comms dispatchers
+  (`CommsToolSurface`, `CommsToolDispatcher`, `DynCommsToolDispatcher`) and
+  `MemorySearchDispatcher` own their execution plans: their
+  `dispatch_resolved_with_context` refuses, as unavailable
+  (`ExecutionOwnerChanged`), a plan they did not resolve themselves for
+  exactly the call's current target and binding. A wrapper that forwards
+  `dispatch_resolved_with_context` to them but resolves its own plan (does
+  not forward `resolve_execution_plan`) no longer runs these tools; forward
+  both.
+- Behaviour-only (not measured by the gate): a host `OperationPolicyOwner`
+  now reads an owner-produced target for the comms tools and
+  `memory_search`: `single_tool_operation_target` returns
+  `Some(PeerSend { .. })`, `Some(PeerDirectoryRead)` or
+  `Some(MemoryOperation { .. })` where it returned `None`. An owner that
+  mapped these tools in its target-less arm (for example by tool name) no
+  longer reaches that arm for them; map the new targets instead.
+- Persisted format (not measured by the gate): a work association whose
+  targeted selection names a `peer`, `peer_directory` or `memory` target
+  cannot be read by a binary without this change (such as 0.9.1), and
+  neither can a `prepared` authorization audit record of any operation of
+  such work, which embeds the work's whole authority basis
+  (`AuditPolicyRead::operation_authorities`). Such a binary fails to decode
+  the record with an unknown-variant error naming the target kind; it never
+  reads it as another target. Associations and audit records that name none
+  of them are unchanged.
+- Audit entries name their boundary (see Added). `meerkat-core`:
+  `OperationObservation::Entry` is now `Entry(OperationEntryBoundary)`
+  instead of a unit variant, so a match needs `Entry(_)` or a boundary, and
+  `PreparedOperationCheck::observe_entry` takes the observing boundary,
+  `observe_entry(boundary: OperationEntryBoundary)`; a custom model
+  transport (for example an `LlmClient::stream_prepared` fixture) passes
+  `OperationEntryBoundary::ModelRequest`.
+  `meerkat-authorization-contracts`: `AuditObservation::Entry` is now the
+  struct variant `Entry { boundary: Option<OperationEntryBoundary> }`
+  instead of a unit variant, so a match needs `Entry { .. }`. Persisted
+  audit records (not measured by the gate): a new entry record adds the
+  boundary (`{"kind": "entry", "boundary": "tool_effect"}`); a record
+  written before decodes with `boundary: None` and re-encodes unchanged,
+  and a reader built before this change ignores the field and still decodes
+  the record as an entry. `SafeAuditObservation::EntryAttempt` is unchanged.
 
 ### Added
 
@@ -149,6 +212,76 @@ them.
   feedback and the search never runs: R2 is `reviewer_missing` without a
   reviewer and `unsupported_entry` with one; R3 is `human_consent_required`
   without a human consent route and `unsupported_entry` with one.
+- Typed catalog mode and visibility query. `meerkat_core::ToolCatalogView`
+  (with `ToolCatalogViewEntry` and `ToolCatalogVisibility`: `Visible`,
+  `Deferred` or `Hidden`) reports how a live session's next model request
+  projects its tool catalog: the catalog mode it takes (deferred only when
+  the exact catalog selects it and a catalog control plane exists or may be
+  composed), sources still connecting, whether a staged visibility change
+  waits for the next boundary, and for each catalog entry its deferral
+  eligibility (with its typed source owner), callability and visibility to
+  the model. It is read without changing anything, by the rules each
+  model-call boundary applies; the boundary now computes its control and
+  deferred names through the same projection. `Agent::tool_catalog_view`,
+  `SessionAgent::tool_catalog_view` (defaulted to `None`),
+  `EphemeralSessionService::tool_catalog_view`,
+  `PersistentSessionService::tool_catalog_view` and
+  `MobSessionService::tool_catalog_view` (defaulted to `Ok(None)`) expose it
+  beside the existing tool-scope snapshot queries. Like those siblings it
+  is not exposed over JSON-RPC or REST. A host that attaches a
+  deferred-eligible operation can ask whether the session defers it instead
+  of inferring that from the operation's source kind.
+- Typed boundary identity on authorization audit entries. Several
+  boundaries can record the entry of one operation (each staging point on a
+  tool call's dispatch chain, then its effect), and each now names itself
+  with the new `meerkat_core::OperationEntryBoundary`: `ToolDispatch` (the
+  root dispatch or an adapter staging the call), `ToolExecutionPolicy` (the
+  call-level execution policy gate), `ToolEffect` (the owning leaf's entry
+  immediately before its effect or transport handoff), `McpResourceRead`,
+  `McpAttachment`, `ModelRequest`, `ContextAppend` and `ReviewContextRead`.
+  The new `ToolDispatchContext::observe_tool_entry_at` stages a tool entry
+  at a named boundary; `observe_tool_entry` keeps its signature and names
+  `ToolDispatch`.
+- Typed grant targets for peer (comms) and memory operations.
+  `meerkat-core`: `ToolOperationTarget` gains `PeerSend { peer, kind }` (one
+  delivery to exactly one peer, by its canonical `PeerId`),
+  `PeerDirectoryRead` (a read of the session's own trusted-peer directory)
+  and `MemoryOperation { scope, operation }`, with the new `PeerSendKind`
+  (`Message`, `Request`, `Response`), `MemoryOperation` (`Read`, `Write`,
+  `Delete`, `Propose`) and `MemoryScopeRef` (`Session { session_id }`,
+  `Host { owner, scope }`, with `is_named()`), and
+  `MemorySearchScope::scope_ref()`. `SessionId` implements `PartialOrd` and
+  `Ord`. The default plans of the comms tools carry these targets:
+  `CommsToolSurface` (meerkat-tools) and `CommsToolDispatcher` and
+  `DynCommsToolDispatcher` (meerkat-comms), through the new
+  `meerkat_comms::CommsExecutionAuthority` and
+  `meerkat_comms::comms_tool_operation_target`, attach the peer each
+  delivery reaches (the `peer_id` of `send_message`, `send_request` and
+  `send_response`; for `reply_to_peer`, the sender of the turn's peer
+  message it selects) and the peer directory for `peers`.
+  `MemorySearchDispatcher` attaches a `Read` of the session memory it
+  searches. Each owner revalidates its own target at dispatch, so a plan
+  resolved for one peer never delivers to another, and under governed work
+  each runs only when the prepared authorization names exactly that target,
+  through the new `ToolDispatchContext::require_authorized_operation_target`
+  (for any owner whose effect a typed target selects) and
+  `CommsExecutionAuthority::require_authorized_target`.
+  `meerkat-authorization-contracts`: `GrantTarget` gains `Peer { peer }`,
+  `PeerDirectory` and `Memory { scope }`, and `meerkat-authorization`'s
+  `operation_grant_target` selects them on the normal targeted grant path:
+  one lineage per peer, per memory scope and for the peer directory, never a
+  wildcard and never the base. An embedding host maps the typed facts to its
+  own actions and selects one grant per target. The peer targets cover only
+  the five comms tools (`send_message`, `reply_to_peer`, `send_request` and
+  `send_response` select `Peer`, and `peers` selects `PeerDirectory`).
+  Other tools that reach agents, such as `delegate`, `council`,
+  `mob_spawn_member` and a mob member's calls up to its mob's operator,
+  carry no peer target and stay on the work's base lineage, which a `Peer`
+  lineage neither widens nor narrows. A `send_response` delivery's
+  addressee is the caller's assertion: the runtime checks that its request
+  id names a request this session received and can still answer, but
+  records no requester, so its `Peer` target names the peer the response is
+  delivered to, not a verified requester.
 
 ### Changed
 

@@ -12886,6 +12886,17 @@ impl meerkat_mob::MobSessionService for RunMobSessionService {
         .await
     }
 
+    async fn tool_catalog_view(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Option<meerkat_core::ToolCatalogView>, meerkat_core::service::SessionError> {
+        <EphemeralSessionService<FactoryAgentBuilder> as meerkat_mob::MobSessionService>::tool_catalog_view(
+            &self.inner,
+            session_id,
+        )
+        .await
+    }
+
     async fn external_tool_surface_snapshot(
         &self,
         session_id: &SessionId,
