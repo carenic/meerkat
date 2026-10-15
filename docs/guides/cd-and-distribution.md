@@ -243,7 +243,12 @@ embedding a separate runtime implementation.
 2. Prefer waiting for both exact-main CI and **Release semver readiness** on
    that prepared tree before cargo-release publishes the tag. Ordinary CI and
    semver readiness produce separate artifacts; one cannot substitute for the
-   other.
+   other. Land the version bump as its own commit on a `main` commit whose CI
+   succeeded: when the release commit differs from its first parent only by
+   the hook's version projection, CI runs the release checks (version parity,
+   lock consistency, schema and SDK freshness, release packaging and
+   configuration, docs and the Bazel graph) and reuses the parent's test
+   evidence instead of rebuilding every crate at the new version.
 3. The tag path verifies the exact-tree CI attestation instead of recomputing
    the broad CI graph. After `require_ci_green`, `release_semver_gate` looks
    up `meerkat-semver-attestation-main-<tree_sha>` and requires unexpired
@@ -273,7 +278,13 @@ SHA, CI workflow run and attempt, branch, and event to backend
 `github-hosted-cargo`, its aggregate `validation_result`, the selected lane
 `plan`, and every lane's `component_results`. The release gate downloads it
 from the successful exact-main workflow run and verifies every required field
-before tag-triggered publication starts. The consumer also accepts the
+before tag-triggered publication starts. A release-projection run (plan mode
+`release-projection`) also records `reused_test_evidence`: the first-parent
+commit and tree and the CI run and attempt whose tests it reused. The release
+gate then checks that the release commit is still a projection of that
+parent, and that the recorded attempt is a successful push run of `ci.yml` on
+`main` at exactly that parent whose own attestation verifies and is not
+itself a reuse. The consumer also accepts the
 supported legacy schema-1 Cargo, schema-2 BuildBuddy, and schema-3
 BuildBuddy-plus-dense-Mob attestations; the current producer does not emit
 those formats.

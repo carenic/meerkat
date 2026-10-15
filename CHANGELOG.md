@@ -42,6 +42,22 @@ them.
   whole-workspace tests 16 slow periods (960 s) instead of 8, so a cold row
   (as after a release version bump, when no compiled unit can be reused)
   completes on a hosted 4-vCPU runner.
+- CI plans a release commit whose diff from its first parent is only the
+  release hook's version projection as mode `release-projection` when that
+  parent has a successful exact-main CI run: format + governance (version
+  parity, lock consistency, release packaging and configuration, docs), the
+  generation ratchets (schema and SDK freshness) and the Bazel graph check
+  run, and the test lanes reuse the parent's run instead of rebuilding every
+  crate at the new version. The `CI gate` re-verifies that run and records it
+  in the exact-tree attestation (`reused_test_evidence`), and
+  `require_ci_green` verifies it again before a tag publishes. Any other
+  diff, or a parent without that evidence, keeps the ordinary plan.
+- The release-projection classifier shared by the pre-push hook and CI
+  (`scripts/release-projection-only.mjs`) recognizes the real v0.9.1 bump:
+  stamped documents may keep past and upcoming version mentions verbatim
+  while only old-version tokens become the new version, the standalone
+  example locks the release hook refreshes are projection surfaces, and a
+  CHANGELOG over 1 MiB no longer makes classification fail.
 
 ## [0.9.1] - 2026-10-15
 
