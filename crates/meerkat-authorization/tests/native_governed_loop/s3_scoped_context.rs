@@ -170,11 +170,13 @@ async fn scoped_destination_carries_a_native_turn_and_refuses_other_destinations
     // Native readiness still uses the actual machine's generated owner and the
     // exact credential identity pinned by the real adapter.
     let credential_owner = machine.generated_auth_lease_handle();
-    meerkat_core::publish_token_lifecycle_acquired_for_identity(
+    meerkat_core::publish_token_lifecycle_acquired_for_identity_within(
         &credential_owner,
         pin.selection().credential(),
         &meerkat_core::auth::PersistedTokens::api_key("synthetic-native-loop-credential"),
+        tokio::time::Instant::now() + CREDENTIAL_PUBLICATION_WAIT,
     )
+    .await
     .expect("actual generated fixture credential before native admission");
     assert_eq!(
         credential_owner
@@ -415,11 +417,13 @@ async fn a_retired_destination_keeps_the_known_result_and_the_executor() {
     // Native readiness still uses the actual machine's generated owner and the
     // exact credential identity pinned by the real adapter.
     let credential_owner = machine.generated_auth_lease_handle();
-    meerkat_core::publish_token_lifecycle_acquired_for_identity(
+    meerkat_core::publish_token_lifecycle_acquired_for_identity_within(
         &credential_owner,
         pin.selection().credential(),
         &meerkat_core::auth::PersistedTokens::api_key("synthetic-native-loop-credential"),
+        tokio::time::Instant::now() + CREDENTIAL_PUBLICATION_WAIT,
     )
+    .await
     .expect("actual generated fixture credential before native admission");
     assert_eq!(
         credential_owner

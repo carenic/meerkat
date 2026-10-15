@@ -67,6 +67,12 @@ const MODEL: &str = "claude-sonnet-4-5";
 const ENDPOINT: &str = "https://native-loop.invalid/messages";
 const DENIED_CALL: &str = "attempt-delete";
 const PERMITTED_CALL: &str = "attempt-read";
+/// Deadline for publishing a fixture controller credential. Publication only
+/// tries the machine's controller custody (the session map, each session's
+/// mutation gate and driver lock) and answers the typed Busy refusal while
+/// session work holds one of them. Core's bounded publication retries exactly
+/// that refusal until this deadline.
+const CREDENTIAL_PUBLICATION_WAIT: Duration = Duration::from_secs(30);
 
 // Keep ordinary-case observations through panic and timeout cancellation.
 // Explicit roots preserve the existing no-overwrite artifact behavior.
@@ -669,11 +675,13 @@ async fn generated_grant_denial_reaches_controller_and_permitted_tool_finishes_s
     // Native readiness still uses the actual machine's generated owner and the
     // exact credential identity pinned by the real adapter.
     let credential_owner = machine.generated_auth_lease_handle();
-    meerkat_core::publish_token_lifecycle_acquired_for_identity(
+    meerkat_core::publish_token_lifecycle_acquired_for_identity_within(
         &credential_owner,
         pin.selection().credential(),
         &meerkat_core::auth::PersistedTokens::api_key("synthetic-native-loop-credential"),
+        tokio::time::Instant::now() + CREDENTIAL_PUBLICATION_WAIT,
     )
+    .await
     .expect("actual generated fixture credential before native admission");
     assert_eq!(
         credential_owner
