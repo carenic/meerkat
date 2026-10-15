@@ -314,7 +314,9 @@ pub struct ModelCapabilities {
     /// loop aborts the call as stalled. `None` keeps the global window
     /// (`[retry] stream_inactivity_timeout`, 300 s by default). Rows set it
     /// where the provider documents responses that can stay silent for
-    /// minutes.
+    /// minutes. A set window must be at least
+    /// [`crate::MIN_MODEL_STREAM_INACTIVITY_TIMEOUT`]; config load does not
+    /// check catalog rows, so the catalog's owner does.
     pub stream_inactivity_timeout_secs: Option<u64>,
 }
 

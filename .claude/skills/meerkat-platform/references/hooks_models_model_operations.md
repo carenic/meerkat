@@ -272,8 +272,10 @@ multiplier = 2.0
   own (`gemini-4-argon` 900s, `gpt-5.5-pro` 7200s; self-hosted models:
   `[self_hosted.models.<id>] stream_inactivity_timeout_secs`, at least 60),
   else 300s. It is resolved for each call, so a model switch or fallback uses
-  the new model's window. The compaction summary call has none of these
-  guards.
+  the new model's window. An explicit window must be above zero (`"0s"` is
+  refused; `"disabled"` turns the watchdog off), and one under 60s can abort
+  and retry a stream whose answer already arrived. The compaction summary
+  call has none of these guards.
 - Tools: `[tools] default_timeout = "10m"`; per tool `[tools.tool_timeouts]
   shell = { secs = 120, nanos = 0 }` (not humantime). A timed-out tool returns
     a `timeout` error result and the run goes on. Since 0.9.1 a call that hits

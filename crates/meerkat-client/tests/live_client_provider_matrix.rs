@@ -4,6 +4,11 @@
 //! Live integration tests for LLM clients.
 //!
 //! Verifies stream normalization and error handling for all providers.
+//!
+//! No CI lane runs these tests: each live test is ignored and needs the
+//! provider's API key. Run them by hand:
+//! `cargo test -p meerkat-client --features integration-real-tests --test
+//! live_client_provider_matrix -- --ignored`.
 
 use axum::{Router, http::StatusCode, routing::post};
 use futures::StreamExt;
@@ -204,7 +209,7 @@ fn image_capabilities() -> ImageGenerationTargetCapabilities {
 }
 
 #[tokio::test]
-#[ignore = "lane:e2e-live"]
+#[ignore = "live provider matrix: needs provider API keys; run by hand with --ignored"]
 async fn e2e_anthropic_stream() -> Result<(), Box<dyn std::error::Error>> {
     let Some(api_key) = anthropic_api_key() else {
         eprintln!("Skipping: missing ANTHROPIC_API_KEY (or RKAT_ANTHROPIC_API_KEY)");
@@ -237,7 +242,7 @@ async fn e2e_anthropic_stream() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[tokio::test]
-#[ignore = "lane:e2e-smoke"]
+#[ignore = "live provider matrix: needs provider API keys; run by hand with --ignored"]
 async fn e2e_smoke_provider_web_search_all_three() -> Result<(), Box<dyn std::error::Error>> {
     let mut ran = 0usize;
     let prompt = "Use the web search tool for this answer. Search for the current title of https://example.com and answer in one short sentence with the source URL.";
@@ -326,7 +331,7 @@ async fn e2e_smoke_provider_web_search_all_three() -> Result<(), Box<dyn std::er
 }
 
 #[tokio::test]
-#[ignore = "lane:e2e-smoke"]
+#[ignore = "live provider matrix: needs provider API keys; run by hand with --ignored"]
 async fn e2e_smoke_openai_live_image_generation() -> Result<(), Box<dyn std::error::Error>> {
     let Some(api_key) = openai_api_key() else {
         eprintln!("Skipping OpenAI image smoke: missing OPENAI_API_KEY (or RKAT_OPENAI_API_KEY)");
@@ -437,7 +442,7 @@ async fn e2e_smoke_openai_live_image_generation() -> Result<(), Box<dyn std::err
 }
 
 #[tokio::test]
-#[ignore = "lane:e2e-smoke"]
+#[ignore = "live provider matrix: needs provider API keys; run by hand with --ignored"]
 async fn e2e_smoke_gemini_live_image_generation() -> Result<(), Box<dyn std::error::Error>> {
     let Some(api_key) = gemini_api_key() else {
         eprintln!(
@@ -488,7 +493,7 @@ async fn e2e_smoke_gemini_live_image_generation() -> Result<(), Box<dyn std::err
 }
 
 #[tokio::test]
-#[ignore = "lane:e2e-live"]
+#[ignore = "live provider matrix: needs provider API keys; run by hand with --ignored"]
 async fn e2e_anthropic_tool_use() -> Result<(), Box<dyn std::error::Error>> {
     let Some(api_key) = anthropic_api_key() else {
         eprintln!("Skipping: missing ANTHROPIC_API_KEY (or RKAT_ANTHROPIC_API_KEY)");
@@ -763,7 +768,7 @@ async fn test_anthropic_stream_end_without_done_yields_incomplete()
 }
 
 #[tokio::test]
-#[ignore = "lane:e2e-live"]
+#[ignore = "live provider matrix: needs provider API keys; run by hand with --ignored"]
 async fn e2e_openai_stream() -> Result<(), Box<dyn std::error::Error>> {
     let Some(api_key) = openai_api_key() else {
         eprintln!("Skipping: missing OPENAI_API_KEY (or RKAT_OPENAI_API_KEY)");
@@ -796,7 +801,7 @@ async fn e2e_openai_stream() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[tokio::test]
-#[ignore = "lane:e2e-live"]
+#[ignore = "live provider matrix: needs provider API keys; run by hand with --ignored"]
 async fn e2e_openai_tool_use() -> Result<(), Box<dyn std::error::Error>> {
     let Some(api_key) = openai_api_key() else {
         eprintln!("Skipping: missing OPENAI_API_KEY (or RKAT_OPENAI_API_KEY)");
@@ -844,7 +849,7 @@ async fn e2e_openai_tool_use() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[tokio::test]
-#[ignore = "lane:e2e-live"]
+#[ignore = "live provider matrix: needs provider API keys; run by hand with --ignored"]
 async fn e2e_gemini_stream() -> Result<(), Box<dyn std::error::Error>> {
     let Some(api_key) = gemini_api_key() else {
         eprintln!("Skipping: missing GOOGLE_API_KEY (or GEMINI_API_KEY/RKAT_GEMINI_API_KEY)");
@@ -877,7 +882,7 @@ async fn e2e_gemini_stream() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[tokio::test]
-#[ignore = "lane:e2e-live"]
+#[ignore = "live provider matrix: needs provider API keys; run by hand with --ignored"]
 async fn e2e_gemini_tool_use() -> Result<(), Box<dyn std::error::Error>> {
     let Some(api_key) = gemini_api_key() else {
         eprintln!("Skipping: missing GOOGLE_API_KEY (or GEMINI_API_KEY/RKAT_GEMINI_API_KEY)");
@@ -967,7 +972,8 @@ async fn test_openai_auth_error() -> Result<(), Box<dyn std::error::Error>> {
 // =============================================================================
 //
 // These tests verify structured output works with real API calls.
-// Run with: ANTHROPIC_API_KEY=... cargo test -p meerkat-client structured_output -- --ignored
+// Run with: ANTHROPIC_API_KEY=... cargo test -p meerkat-client --features
+// integration-real-tests --test live_client_provider_matrix structured_output -- --ignored
 
 fn person_schema() -> Value {
     serde_json::json!({
@@ -1060,7 +1066,7 @@ async fn collect_stream_text(
 }
 
 #[tokio::test]
-#[ignore = "lane:e2e-live"]
+#[ignore = "live provider matrix: needs provider API keys; run by hand with --ignored"]
 async fn e2e_anthropic_structured_output() -> Result<(), Box<dyn std::error::Error>> {
     let Some(api_key) = anthropic_api_key() else {
         eprintln!("Skipping: missing ANTHROPIC_API_KEY (or RKAT_ANTHROPIC_API_KEY)");
@@ -1095,7 +1101,7 @@ async fn e2e_anthropic_structured_output() -> Result<(), Box<dyn std::error::Err
 }
 
 #[tokio::test]
-#[ignore = "lane:e2e-live"]
+#[ignore = "live provider matrix: needs provider API keys; run by hand with --ignored"]
 async fn e2e_openai_structured_output() -> Result<(), Box<dyn std::error::Error>> {
     let Some(api_key) = openai_api_key() else {
         eprintln!("Skipping: missing OPENAI_API_KEY (or RKAT_OPENAI_API_KEY)");
@@ -1128,7 +1134,7 @@ async fn e2e_openai_structured_output() -> Result<(), Box<dyn std::error::Error>
 }
 
 #[tokio::test]
-#[ignore = "lane:e2e-live"]
+#[ignore = "live provider matrix: needs provider API keys; run by hand with --ignored"]
 async fn e2e_gemini_structured_output() -> Result<(), Box<dyn std::error::Error>> {
     let Some(api_key) = gemini_api_key() else {
         eprintln!("Skipping: missing GOOGLE_API_KEY (or GEMINI_API_KEY/RKAT_GEMINI_API_KEY)");
@@ -1161,7 +1167,7 @@ async fn e2e_gemini_structured_output() -> Result<(), Box<dyn std::error::Error>
 }
 
 #[tokio::test]
-#[ignore = "lane:e2e-live"]
+#[ignore = "live provider matrix: needs provider API keys; run by hand with --ignored"]
 async fn e2e_openai_structured_output_strict_nested_schema()
 -> Result<(), Box<dyn std::error::Error>> {
     let Some(api_key) = openai_api_key() else {
@@ -1203,7 +1209,7 @@ async fn e2e_openai_structured_output_strict_nested_schema()
 }
 
 #[tokio::test]
-#[ignore = "lane:e2e-live"]
+#[ignore = "live provider matrix: needs provider API keys; run by hand with --ignored"]
 async fn e2e_anthropic_structured_output_strict_nested_schema()
 -> Result<(), Box<dyn std::error::Error>> {
     let Some(api_key) = anthropic_api_key() else {
@@ -1247,7 +1253,7 @@ async fn e2e_anthropic_structured_output_strict_nested_schema()
 }
 
 #[tokio::test]
-#[ignore = "lane:e2e-live"]
+#[ignore = "live provider matrix: needs provider API keys; run by hand with --ignored"]
 async fn e2e_gemini_structured_output_rich_schema_keywords()
 -> Result<(), Box<dyn std::error::Error>> {
     let Some(api_key) = gemini_api_key() else {

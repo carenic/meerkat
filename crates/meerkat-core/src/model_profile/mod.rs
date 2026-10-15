@@ -136,6 +136,13 @@ pub fn project_to_profile(caps: &ModelCapabilities) -> ModelProfile {
 /// Injected provider-model catalog. meerkat-core defines the shape and
 /// mechanics; the data lives outside core (`meerkat-models` provides the
 /// canonical instance). Core must never embed provider data.
+///
+/// Core trusts the rows it is given. In particular, config load checks the
+/// [`crate::MIN_MODEL_STREAM_INACTIVITY_TIMEOUT`] floor (60 s) only for the
+/// self-hosted models a config declares, never for a row's
+/// [`ModelCapabilities::stream_inactivity_timeout_secs`]: `meerkat-models`
+/// tests its canonical rows against it, and an embedder that injects its own
+/// catalog owns that check for its rows.
 #[derive(Debug, Clone, Copy)]
 pub struct ModelCatalog {
     /// Curated catalog entries (projection of the capability rows).

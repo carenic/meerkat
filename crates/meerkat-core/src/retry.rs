@@ -146,6 +146,14 @@ pub const DEFAULT_STREAM_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(300)
 /// final event. A window not well beyond that wait would race the adapter's
 /// ordinary end of stream against a retryable stall of an answer the caller
 /// already has; twice the 30 s wait leaves the margin.
+///
+/// Config load checks this floor only for the self-hosted models a config
+/// declares. Catalog rows are not checked at load (`meerkat-models` tests its
+/// canonical catalog against this floor), so an embedder that injects its own
+/// [`crate::ModelCatalog`] or [`crate::ModelOperationalDefaultsResolver`] owns
+/// the check for the windows it serves. An explicit `[retry]
+/// stream_inactivity_timeout` is not floored, only a zero one is refused, so
+/// a shorter explicit window carries the same race.
 pub const MIN_MODEL_STREAM_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(60);
 
 fn default_stream_inactivity_timeout() -> Option<Duration> {

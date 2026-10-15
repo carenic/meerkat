@@ -296,12 +296,19 @@ event re-arms the window, so long-but-alive responses are unaffected. Set
 omitted value inherits from the model profile: a model whose provider
 documents responses that can stay silent for minutes has its own catalog
 window (`gemini-4-argon`: 900 s, `gpt-5.5-pro`: 7200 s), a self-hosted model
-can declare one with `stream_inactivity_timeout_secs`, and every other model
-uses the built-in 300 s. The window is resolved for each LLM call, so a model
-change or fallback uses the new model's window. The watchdog covers all
-built-in provider clients; a custom `AgentLlmClient` that does not report
-stream liveness fails open (no watchdog; only the hard call timeout
-applies).
+can declare one with `stream_inactivity_timeout_secs` (at least 60 seconds;
+config validation refuses a shorter one), and every other model uses the
+built-in 300 s. The window is resolved for each LLM call, so a model change or
+fallback uses the new model's window. The watchdog covers all built-in
+provider clients; a custom `AgentLlmClient` that does not report stream
+liveness fails open (no watchdog; only the hard call timeout applies).
+
+An explicit `stream_inactivity_timeout` must be greater than zero: config
+validation refuses `"0s"`, which would stall every call; use `"disabled"` to
+turn the watchdog off. Keep an explicit window at 60 seconds or more. The
+OpenAI-compatible client waits up to 30 seconds after the model's final event
+for its usage trailer, and the watchdog keeps running through that wait, so a
+shorter window can abort and retry a stream whose answer already arrived.
 
 Unknown provider failures also enter the machine-authorized bounded retry path.
 Explicit terminal classes such as invalid requests, authentication failures,

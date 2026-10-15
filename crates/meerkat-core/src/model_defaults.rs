@@ -29,6 +29,13 @@ pub trait ModelOperationalDefaultsResolver: Send + Sync {
     /// given model/provider, or `None` when the model declares none (the
     /// agent then uses its retry policy's window).
     ///
+    /// The agent uses a returned window as given. Config load checks the
+    /// [`crate::MIN_MODEL_STREAM_INACTIVITY_TIMEOUT`] floor (60 s) only for
+    /// the self-hosted models a config declares, so a resolver that serves
+    /// other windows, from an injected catalog for example, owns that check:
+    /// a shorter window can abort and retry a stream whose answer already
+    /// arrived.
+    ///
     /// Defaults to `None`, so a resolver that predates per-model windows
     /// keeps the retry policy's window for every model.
     fn stream_inactivity_timeout_for(&self, _provider: Provider, _model: &str) -> Option<Duration> {

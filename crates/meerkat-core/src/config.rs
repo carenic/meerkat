@@ -1081,6 +1081,20 @@ impl Config {
                 "limits.max_turn_duration must be greater than 0 when set".to_string(),
             ));
         }
+        // A zero stream-inactivity window would stall every model call before
+        // its first event. `"disabled"` is the way to turn the watchdog off.
+        // A short nonzero window still loads (configs that set one load
+        // today); see `RetryConfig::stream_inactivity_timeout_override`.
+        if matches!(
+            self.retry.stream_inactivity_timeout_override,
+            CallTimeoutOverride::Value(window) if window.is_zero()
+        ) {
+            return Err(ConfigError::Validation(
+                "retry.stream_inactivity_timeout must be greater than 0 when set; use \"disabled\" \
+                 to turn the stream-inactivity watchdog off"
+                    .to_string(),
+            ));
+        }
         if self.compaction.auto_compact_threshold == 0 {
             return Err(ConfigError::Validation(
                 "compaction.auto_compact_threshold must be greater than 0".to_string(),
@@ -2588,7 +2602,11 @@ pub struct RetryConfig {
     /// - `Disabled` (`stream_inactivity_timeout = "disabled"`): no watchdog,
     ///   whatever the model declares
     /// - `Value(duration)` (`stream_inactivity_timeout = "120s"`): explicit
-    ///   window for every model
+    ///   window for every model. [`Config::validate`] refuses a zero window;
+    ///   a nonzero one is used as given. A window under
+    ///   [`crate::MIN_MODEL_STREAM_INACTIVITY_TIMEOUT`] can abort and retry a
+    ///   stream whose answer already arrived: the watchdog keeps running while
+    ///   a provider adapter waits for a trailer after the model's final event
     #[serde(
         default,
         rename = "stream_inactivity_timeout",
@@ -5585,6 +5603,45 @@ stream_inactivity_timeout = "disabled"
             config.retry.stream_inactivity_timeout_override,
             CallTimeoutOverride::Disabled
         );
+    }
+
+    /// A zero stream-inactivity window would stall every model call at once,
+    /// so config validation refuses it. `"disabled"` turns the watchdog off,
+    /// and a short window (even one under the per-model minimum) still loads.
+    #[test]
+    fn test_validate_rejects_zero_stream_inactivity_timeout() {
+        for zero in ["0s", "0ms"] {
+            let config: Config = toml::from_str(&format!(
+                "[retry]\nstream_inactivity_timeout = \"{zero}\"\n"
+            ))
+            .expect("a zero duration parses");
+            assert_eq!(
+                config.retry.stream_inactivity_timeout_override,
+                CallTimeoutOverride::Value(Duration::ZERO)
+            );
+            let err = config
+                .validate(*crate::model_profile::test_catalog::TEST_CATALOG)
+                .expect_err("a zero stream_inactivity_timeout should be invalid");
+            assert!(
+                matches!(
+                    &err,
+                    ConfigError::Validation(message)
+                        if message.contains("retry.stream_inactivity_timeout")
+                ),
+                "unexpected validation error: {err}"
+            );
+        }
+        for accepted in ["1s", "30s", "disabled"] {
+            let config: Config = toml::from_str(&format!(
+                "[retry]\nstream_inactivity_timeout = \"{accepted}\"\n"
+            ))
+            .expect("the window parses");
+            let result = config.validate(*crate::model_profile::test_catalog::TEST_CATALOG);
+            assert!(
+                result.is_ok(),
+                "stream_inactivity_timeout = {accepted:?} must still load: {result:?}"
+            );
+        }
     }
 
     #[test]

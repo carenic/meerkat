@@ -146,8 +146,8 @@ user/project MCP convention files are managed separately as described below.
 Streaming retries have an inactivity watchdog: 300 seconds by default, or the
 model's own window where it declares one (see
 [retry and stream watchdog settings](/concepts/configuration#retry-and-stream-watchdog-settings)).
-Override it for every model with a humantime value, or disable only this
-watchdog explicitly:
+Override it for every model with a humantime value above zero (keep it at 60
+seconds or more), or disable only this watchdog explicitly:
 
 ```toml
 [retry]

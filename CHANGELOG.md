@@ -144,6 +144,13 @@ them.
   `supports_mid_conversation_system_messages`. An identity that names no
   binding, or the synthetic env-var default (an API-key backend), keeps the
   row as before.
+- `[retry] stream_inactivity_timeout = "0s"` was accepted and stalled every
+  model call before its first event. `Config::validate` now refuses a zero
+  window with `ConfigError::Validation`; `"disabled"` turns the watchdog off.
+  A nonzero window still loads as before. The docs now say that an explicit
+  window under 60 s can abort and retry a stream whose answer already
+  arrived, since the watchdog keeps running while a provider adapter waits
+  for a trailer after the model's final event.
 
 ## [0.9.1] - 2026-10-15
 
