@@ -1114,7 +1114,9 @@ jobs:
     # Selected by the row count alone.
     if: ${{ needs.changes.result == 'success' && needs.changes.outputs.closure_test_count != '0' }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 40
+    # A cold row (no reusable units, as after a release version bump) builds
+    # for about 22 min and then runs the nested-Cargo canaries one at a time.
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.changes.outputs.closure_test_matrix) }}
