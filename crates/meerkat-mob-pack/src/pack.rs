@@ -1289,8 +1289,8 @@ max_aggregate_tool_calls = 100\n";
 
     /// How the `ToolConfig::deny` doc comment ends in 0.9.1, as schemars
     /// renders it into the LayerDecision schema's `deny` description (doc
-    /// lines joined with "\n"). 0.9.1 and earlier hosts compare a pack's
-    /// bundled schema with their own including this text.
+    /// lines joined with "\n"). 0.9.1 hosts compare a pack's bundled schema
+    /// with their own including this text.
     const DENY_DOC_0_9_1_TAIL: &str = "server's `tool_names`. Denied tools stay listed and the execution gate\n\
 refuses every call by name.";
 
@@ -1358,15 +1358,102 @@ execution gate still refuses every call by name.";
         schema
     }
 
+    /// The canonical LayerDecision schema of 0.9.1: what its pack builder
+    /// bundled into every adaptive pack, and what its hosts require a bundled
+    /// schema to equal exactly, documentation text included (JSON equality;
+    /// the fixture escapes non-ASCII text, so only its bytes differ from the
+    /// builder's). Captured while every source the schema derives from was
+    /// still identical to v0.9.1. It is a released artifact: never regenerate
+    /// it from the current code.
+    const LAYER_DECISION_SCHEMA_V0_9_1: &str =
+        include_str!("../tests/fixtures/layer_decision_schema_v0_9_1.json");
+
+    fn layer_decision_schema_v0_9_1() -> serde_json::Value {
+        serde_json::from_str(LAYER_DECISION_SCHEMA_V0_9_1).expect("the 0.9.1 schema fixture parses")
+    }
+
+    /// The JSON pointer of the first place where `left` and `right` differ.
+    fn first_json_difference(
+        left: &serde_json::Value,
+        right: &serde_json::Value,
+        pointer: &str,
+    ) -> Option<String> {
+        use serde_json::Value;
+        match (left, right) {
+            (Value::Object(left), Value::Object(right)) => {
+                let child =
+                    |key: &str| format!("{pointer}/{}", key.replace('~', "~0").replace('/', "~1"));
+                for (key, value) in left {
+                    let Some(other) = right.get(key) else {
+                        return Some(child(key));
+                    };
+                    if let Some(found) = first_json_difference(value, other, &child(key)) {
+                        return Some(found);
+                    }
+                }
+                right
+                    .keys()
+                    .find(|key| !left.contains_key(*key))
+                    .map(|key| child(key))
+            }
+            (Value::Array(left), Value::Array(right)) => {
+                for (index, (value, other)) in left.iter().zip(right).enumerate() {
+                    if let Some(found) =
+                        first_json_difference(value, other, &format!("{pointer}/{index}"))
+                    {
+                        return Some(found);
+                    }
+                }
+                (left.len() != right.len()).then(|| pointer.to_owned())
+            }
+            _ => (left != right).then(|| pointer.to_owned()),
+        }
+    }
+
     #[test]
-    fn test_this_host_still_renders_the_0_9_1_deny_doc_text() {
-        // 0.9.1 and earlier hosts compare a pack's bundled schema with their
-        // own, doc text included. A pack this host builds loads there only
-        // while it renders the 0.9.1 wording, so the rewording waits until
-        // hosts that ignore schema doc text (0.9.2 and later) replace them.
-        let mut canonical = canonical_layer_decision_schema().unwrap();
+    fn test_this_host_renders_the_whole_0_9_1_layer_decision_schema() {
+        // 0.9.1 hosts compare a pack's bundled schema with their own, doc
+        // text included, so a pack this host builds loads on them only while
+        // the whole canonical schema is the 0.9.1 one. A reworded doc comment
+        // on any type the schema reaches (the `ToolConfig::deny` rewording
+        // among them) waits until hosts that ignore schema doc text (0.9.2
+        // and later) replace them; a structural change is a new schema for
+        // every host.
+        let golden = layer_decision_schema_v0_9_1();
+        let canonical = canonical_layer_decision_schema().unwrap();
+        if let Some(pointer) = first_json_difference(&canonical, &golden, "") {
+            panic!(
+                "the canonical LayerDecision schema differs from the 0.9.1 schema at `{pointer}` \
+                 (now {:?}, 0.9.1 {:?}), so 0.9.1 hosts would refuse every adaptive pack this \
+                 host builds as a stale schema",
+                canonical.pointer(&pointer),
+                golden.pointer(&pointer),
+            );
+        }
+        assert_eq!(canonical, golden);
+        let bundled: serde_json::Value =
+            serde_json::from_slice(&canonical_layer_decision_schema_bytes().unwrap()).unwrap();
+        assert_eq!(bundled, golden, "the builder bundles the 0.9.1 schema");
+    }
+
+    #[test]
+    fn test_a_pack_carrying_the_0_9_1_schema_validates() {
+        // The schema a 0.9.1 builder bundled loads on this host.
+        let mut files = adaptive_pack_files();
+        files.insert(
+            LAYER_DECISION_SCHEMA_PATH.to_string(),
+            LAYER_DECISION_SCHEMA_V0_9_1.as_bytes().to_vec(),
+        );
+        validate_extracted_pack_files(&files).unwrap();
+    }
+
+    #[test]
+    fn test_the_0_9_1_deny_doc_tail_is_the_released_text() {
+        // The tolerant-match tests below reword the released deny text; keep
+        // their constant bound to the 0.9.1 schema itself.
+        let mut golden = layer_decision_schema_v0_9_1();
         let mut descriptions = Vec::new();
-        let edited = edit_deny_property_schemas(&mut canonical, &mut |deny| {
+        let edited = edit_deny_property_schemas(&mut golden, &mut |deny| {
             descriptions.push(
                 deny.get("description")
                     .and_then(serde_json::Value::as_str)
@@ -1375,15 +1462,49 @@ execution gate still refuses every call by name.";
         });
         assert!(
             edited >= 1,
-            "the LayerDecision schema must carry ToolConfig::deny"
+            "the 0.9.1 LayerDecision schema carries ToolConfig::deny"
         );
         for description in descriptions {
             let description = description.expect("ToolConfig::deny carries its doc text");
             assert!(
                 description.ends_with(DENY_DOC_0_9_1_TAIL),
-                "keep the 0.9.1 deny wording until 0.9.1 hosts are gone: {description:?}"
+                "DENY_DOC_0_9_1_TAIL is not the released deny text: {description:?}"
             );
         }
+    }
+
+    #[test]
+    fn test_first_json_difference_names_the_differing_pointer() {
+        let base = serde_json::json!({ "a/b": [1, { "c": true }], "d~": "x" });
+        assert_eq!(first_json_difference(&base, &base, ""), None);
+        let mut changed = base.clone();
+        changed["a/b"][1]["c"] = serde_json::json!(false);
+        assert_eq!(
+            first_json_difference(&changed, &base, "").as_deref(),
+            Some("/a~1b/1/c")
+        );
+        let mut added = base.clone();
+        added["d~"] = serde_json::json!("y");
+        added["e"] = serde_json::json!(1);
+        assert_eq!(
+            first_json_difference(&added, &base, "").as_deref(),
+            Some("/d~0")
+        );
+        let mut removed = base.clone();
+        removed.as_object_mut().unwrap().remove("d~");
+        assert_eq!(
+            first_json_difference(&removed, &base, "").as_deref(),
+            Some("/d~0")
+        );
+        let mut longer = base.clone();
+        longer["a/b"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!(2));
+        assert_eq!(
+            first_json_difference(&longer, &base, "").as_deref(),
+            Some("/a~1b")
+        );
     }
 
     #[test]

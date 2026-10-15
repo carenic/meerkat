@@ -54,6 +54,7 @@ rust_library(
     rustc_flags = WORKSPACE_LINT_RUSTC_FLAGS,
     compile_data = [
         "Cargo.toml",
+        "tests/fixtures/layer_decision_schema_v0_9_1.json",
     ],
     srcs = glob(["src/**/*.rs"]),
     visibility = ["//visibility:public"],
@@ -84,6 +85,7 @@ rust_library(
     rustc_flags = WORKSPACE_LINT_RUSTC_FLAGS,
     compile_data = [
         "Cargo.toml",
+        "tests/fixtures/layer_decision_schema_v0_9_1.json",
     ],
     srcs = glob(["src/**/*.rs"]),
     visibility = [
@@ -124,6 +126,7 @@ rust_test(
     rustc_flags = WORKSPACE_LINT_RUSTC_FLAGS,
     compile_data = [
         "Cargo.toml",
+        "tests/fixtures/layer_decision_schema_v0_9_1.json",
     ],
     srcs = glob(["src/**/*.rs"]),
     visibility = ["//visibility:public"],
@@ -137,6 +140,10 @@ rust_test(
     ],
     size = "medium",
     data = [
+        "//:test_fixtures",
+        "//tests/fixtures/machine-dsl-tests:package_runfiles",
+        "//tests/fixtures/mcp-test-server:package_runfiles",
+        "//tests/fixtures/surface-build-fixtures:package_runfiles",
         ":package_runfiles",
     ],
     env = {

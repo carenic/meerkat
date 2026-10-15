@@ -183,15 +183,17 @@ them.
 - Adaptive mobpack validation no longer counts doc-only schema text as a
   schema change. It compares the bundled `adaptive/layer-decision.schema.json`
   with the runtime's canonical LayerDecision schema after removing the
-  documentation keywords (`title`, `description`) from both, so a reworded
-  Rust doc comment, which reaches that schema as description text, no longer
-  makes packs built by another release fail with `StaleAdaptiveSchema`; a
-  structural difference still does. Property names and instance data
-  (`const`, `enum`, `default`, `examples`) are never stripped. This release
-  keeps the 0.9.1 text of the `ToolConfig::deny` doc comment, so packs it
-  builds still validate on 0.9.1 and earlier hosts, which compare that text
-  exactly; rewording it (since #1807 every build removes denied tools from
-  the member's visible tool list) waits for a later release.
+  documentation keywords (`title`, `description`) from both, so on 0.9.2 and
+  later hosts a reworded Rust doc comment, which reaches that schema as
+  description text, no longer makes packs built by another release fail with
+  `StaleAdaptiveSchema`; a structural difference still does. Property names
+  and instance data (`const`, `enum`, `default`, `examples`) are never
+  stripped. 0.9.1 hosts still compare the whole schema exactly, doc text
+  included, so this release's canonical schema is exactly the 0.9.1 one (a
+  meerkat-mob-pack test pins it, whole, against the 0.9.1 schema) and packs
+  it builds validate on 0.9.1 hosts. Rewording the `ToolConfig::deny` doc
+  comment (since #1807 every build removes denied tools from the member's
+  visible tool list) waits for a later release.
 - The meerkat-mob test `durable_cursor_resumes_across_pump_restart` restarts
   the controlling mob only once the member's durable event cursor covers
   every row the first turn consumed. The pump writes that cursor after it
