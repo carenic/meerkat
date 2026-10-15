@@ -268,7 +268,8 @@
                   "mobkit/guides/console",
                   "mobkit/guides/flow-editor",
                   "mobkit/guides/authentication",
-                  "mobkit/guides/deployment"
+                  "mobkit/guides/deployment",
+                  "mobkit/guides/upgrading-from-mobkit"
                 ]
               }
             ]
