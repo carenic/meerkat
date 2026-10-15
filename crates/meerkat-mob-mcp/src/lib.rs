@@ -849,6 +849,7 @@ pub struct MobCreateRequest {
     /// agent's session for its `mob_create` and its implicit delegation
     /// mob, a session of its own for a temporary council. `None` only for a
     /// mob a host creates directly ([`MobMcpState::mob_create_definition`],
+    /// [`MobMcpState::mob_create_definition_with_member_external_tools`],
     /// [`MobMcpState::mob_create_from_mobpack`]).
     pub owner_bridge_session_id: Option<SessionId>,
     /// Whether this is the owner session's implicit delegation mob, created
@@ -2420,7 +2421,9 @@ impl MobMcpState {
     /// proceed or `Err(reason)` to refuse it. Every create path asks it: an
     /// agent's `mob_create`, the implicit delegation mob, a temporary
     /// council, a host's definition or mobpack create. Restoring a persisted
-    /// mob creates nothing and never asks it.
+    /// mob creates nothing and never asks it, and neither does a handle a
+    /// host registers itself ([`Self::mob_insert_handle`],
+    /// [`Self::try_mob_insert_handle`]).
     ///
     /// The hook fails closed: a refusal, a panic while calling it and a
     /// panic in the future it returns all refuse the create, with an error

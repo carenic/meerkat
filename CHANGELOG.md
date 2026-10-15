@@ -47,7 +47,9 @@ them.
   the id derived from the session. The hook fails closed: a refusal or a
   panic refuses the create with an error `MobMcpState::is_create_refusal`
   recognizes, carrying the reason in its message and structured data (`kind`
-  `MOB_CREATE_REFUSED_KIND`). Restoring a persisted mob never asks it.
+  `MOB_CREATE_REFUSED_KIND`). Restoring a persisted mob never asks it, and
+  neither does a handle a host registers itself with `mob_insert_handle` or
+  `try_mob_insert_handle`.
 
 ### Changed
 
