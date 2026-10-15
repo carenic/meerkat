@@ -5807,16 +5807,18 @@ impl SessionRuntime {
         })?;
         // Project the effective realm config's `[shell]` vocabulary into the
         // monitor job manager, same seam as the factory-composed shell tool.
+        // Monitors are shell launches, so they also run inside the host's
+        // shell confinement, as the factory-composed shell tool does.
         let effective_config = self.effective_config().await?;
+        let mut shell_config = meerkat_tools::builtin::shell::ShellConfig::from_defaults(
+            &effective_config.shell,
+            project_root,
+        );
+        shell_config.confinement = self.factory.shell_confinement().clone();
         let manager = Arc::new(
-            meerkat_tools::builtin::shell::JobManager::new(
-                meerkat_tools::builtin::shell::ShellConfig::from_defaults(
-                    &effective_config.shell,
-                    project_root,
-                ),
-            )
-            .bind_canonical_async_ops(session_id.clone(), ops_registry)
-            .with_durable_job_runtime(durable),
+            meerkat_tools::builtin::shell::JobManager::new(shell_config)
+                .bind_canonical_async_ops(session_id.clone(), ops_registry)
+                .with_durable_job_runtime(durable),
         );
         let mut managers = self.monitor_job_managers.lock().await;
         Ok(Arc::clone(

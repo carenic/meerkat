@@ -678,6 +678,11 @@ them.
   confinement still had those stdio servers launched unconfined. `rkat-mcp`
   sessions (fresh, resumed without a router, and scheduled) take one profile
   from the server's state.
+- JSON-RPC monitors (`monitors/start`, and monitors recovered after a
+  restart) now run inside the host's shell confinement
+  (`AgentFactory::with_shell_confinement`), like the shell tool. Their job
+  manager was built with the trusted-host profile, so a host that required
+  shell confinement still ran them unconfined.
 
 ### Known issues
 
@@ -687,6 +692,12 @@ them.
   `--max-total-tokens`, `--max-duration`, `--max-tool-calls`) nor the pack's
   deploy defaults (`[budget]`, `[models]`, `max_tokens`, `[compaction]`)
   apply to those members.
+- An ordinary config write can change or remove a realm's
+  `[realm.<id>].parent` edge. From the next start that realm no longer
+  composes the `[confinement]` of its former ancestors (governance
+  inheritance follows the same edge). A requirement in the user document or
+  set with the `--confinement` flags is not affected; put confinement that
+  must hold there.
 
 ## [0.9.0] - 2026-10-13
 
