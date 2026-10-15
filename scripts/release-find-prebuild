@@ -1,0 +1,142 @@
+#!/usr/bin/env bash
+# Find the pre-tag prebuild of a release commit.
+#
+# Usage: release-find-prebuild <release-commit-sha>
+#
+# Prints the id of the newest release.yml run that prebuilt the release
+# artifacts of exactly <release-commit-sha>, or nothing when there is none:
+#   - a workflow_dispatch run of .github/workflows/release.yml on main in this
+#     repository (GITHUB_REPOSITORY) whose head is that commit;
+#   - whose "Release prebuild gate" job succeeded (only a
+#     prebuild_release_artifacts dispatch has that job, and it passes only when
+#     every binary lane and the Web SDK package succeeded);
+#   - whose release artifacts are all still downloadable: the Windows archive,
+#     at least one Linux/macOS archive artifact, no expired meerkat-* artifact,
+#     and rkat-web-package.
+# A matching run that is still in progress is waited for, polling every
+# MEERKAT_PREBUILD_POLL_SECONDS (default 60), until it completes or
+# MEERKAT_PREBUILD_WAIT_SECONDS (default 6000) have passed since it started: a
+# prebuild already under way finishes no later than a fresh build would.
+#
+# The id is only a pointer. The publishing jobs verify every archive and the
+# Web SDK package against their build attestations before anything is
+# published. "No prebuild" exits 0 with empty output; an API failure exits
+# non-zero.
+
+set -euo pipefail
+shopt -s inherit_errexit
+
+PREBUILD_GATE_JOB="Release prebuild gate"
+WINDOWS_ARTIFACT="meerkat-x86_64-pc-windows-msvc-windows-latest"
+WEB_SDK_ARTIFACT="rkat-web-package"
+
+usage() {
+  sed -n '2,/^$/s/^# \{0,1\}//p' "$0" >&2
+  exit 2
+}
+
+[[ "$#" -eq 1 ]] || usage
+release_sha="$1"
+[[ "${release_sha}" =~ ^[0-9a-f]{40}$ ]] || {
+  echo "release-find-prebuild: expected a full commit sha, got ${release_sha}" >&2
+  exit 2
+}
+repository="${GITHUB_REPOSITORY:?GITHUB_REPOSITORY must name the repository}"
+poll_seconds="${MEERKAT_PREBUILD_POLL_SECONDS:-60}"
+wait_seconds="${MEERKAT_PREBUILD_WAIT_SECONDS:-6000}"
+[[ "${poll_seconds}" =~ ^[0-9]+$ && "${wait_seconds}" =~ ^[0-9]+$ ]] || {
+  echo "release-find-prebuild: poll and wait seconds must be integers" >&2
+  exit 2
+}
+
+log() {
+  printf '%s\n' "$*" >&2
+}
+
+# id<TAB>status<TAB>started-epoch for every candidate run, newest first.
+candidate_runs() {
+  local listing
+  listing="$(gh api \
+    "repos/${repository}/actions/workflows/release.yml/runs?event=workflow_dispatch&branch=main&head_sha=${release_sha}&per_page=100" \
+    --jq '.workflow_runs[] | [.id, .status, .path, .event, .head_branch, .head_sha, .repository.full_name, (.run_started_at // .created_at)] | @tsv')" ||
+    { log "cannot list release.yml runs of ${release_sha}"; return 1; }
+  local id status path event branch sha repo started
+  while IFS=$'\t' read -r id status path event branch sha repo started; do
+    [[ -n "${id}" ]] || continue
+    # The query parameters filter server-side; check every field again.
+    if [[ "${path}" != ".github/workflows/release.yml" || "${event}" != "workflow_dispatch" ||
+          "${branch}" != "main" || "${sha}" != "${release_sha}" || "${repo}" != "${repository}" ]]; then
+      continue
+    fi
+    printf '%s\t%s\t%s\n' "${id}" "${status}" "$(date -u -d "${started}" +%s)"
+  done <<<"${listing}" | sort -t $'\t' -k1,1nr
+}
+
+prebuild_gate_succeeded() {
+  local run_id="$1" conclusion
+  conclusion="$(gh api --paginate "repos/${repository}/actions/runs/${run_id}/jobs?per_page=100" \
+    --jq ".jobs[] | select(.name == \"${PREBUILD_GATE_JOB}\") | .conclusion")" ||
+    { log "cannot list the jobs of run ${run_id}"; exit 1; }
+  [[ "${conclusion}" == "success" ]]
+}
+
+artifacts_downloadable() {
+  local run_id="$1" listing name expired unix=0 windows=0 web=0
+  listing="$(gh api --paginate "repos/${repository}/actions/runs/${run_id}/artifacts?per_page=100" \
+    --jq '.artifacts[] | [.name, (.expired | tostring)] | @tsv')" ||
+    { log "cannot list the artifacts of run ${run_id}"; exit 1; }
+  while IFS=$'\t' read -r name expired; do
+    [[ -n "${name}" ]] || continue
+    case "${name}" in
+      "${WEB_SDK_ARTIFACT}")
+        [[ "${expired}" == "false" ]] && web=1
+        ;;
+      "${WINDOWS_ARTIFACT}")
+        [[ "${expired}" == "false" ]] && windows=1
+        ;;
+      meerkat-*)
+        if [[ "${expired}" != "false" ]]; then
+          log "run ${run_id}: artifact ${name} has expired"
+          return 1
+        fi
+        unix=$((unix + 1))
+        ;;
+    esac
+  done <<<"${listing}"
+  if [[ "${unix}" -eq 0 || "${windows}" -eq 0 || "${web}" -eq 0 ]]; then
+    log "run ${run_id}: release artifacts incomplete (Linux/macOS: ${unix}, Windows: ${windows}, Web SDK: ${web})"
+    return 1
+  fi
+}
+
+while true; do
+  runs="$(candidate_runs)"
+  pending=0
+  while IFS=$'\t' read -r run_id status started; do
+    [[ -n "${run_id}" ]] || continue
+    if [[ "${status}" != "completed" ]]; then
+      if (($(date -u +%s) - started < wait_seconds)); then
+        log "run ${run_id} for ${release_sha} is ${status}; waiting for it"
+        pending=1
+      else
+        log "run ${run_id} for ${release_sha} is still ${status} ${wait_seconds}s after it started; not waiting longer"
+      fi
+      continue
+    fi
+    if ! prebuild_gate_succeeded "${run_id}"; then
+      log "run ${run_id}: no successful ${PREBUILD_GATE_JOB} job (not a complete prebuild)"
+      continue
+    fi
+    if ! artifacts_downloadable "${run_id}"; then
+      continue
+    fi
+    log "run ${run_id} prebuilt the release artifacts of ${release_sha}"
+    printf '%s\n' "${run_id}"
+    exit 0
+  done <<<"${runs}"
+  if [[ "${pending}" -eq 0 ]]; then
+    log "no complete prebuild of ${release_sha}"
+    exit 0
+  fi
+  sleep "${poll_seconds}"
+done

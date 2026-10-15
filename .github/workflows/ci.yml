@@ -405,6 +405,9 @@ jobs:
       - name: Release doctor workflow assertions still bind
         run: scripts/test-release-doctor-workflow-contract.sh
 
+      - name: Release prebuild lookup selects only complete exact-commit prebuilds
+        run: scripts/test-release-find-prebuild.sh
+
       # The tombstone scans (retired public names, session-control routes,
       # the deprecated backend) are ripgrep text scans. The hosted image
       # does not ship ripgrep, and each scan refuses to run without it

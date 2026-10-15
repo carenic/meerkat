@@ -623,6 +623,23 @@ for gate in (False, True):
         else:
             ok(f"release dispatch ({scenario.describe()}) validates with {selected}")
 
+# A pre-tag prebuild dispatch builds artifacts and validates nothing: no
+# validation lane, no validation gate, on either backend and graph state.
+for gate in (False, True):
+    for actor, backend in (("someone", "github-hosted"), ("lukacf", "buildbuddy")):
+        scenario = Scenario("workflow_dispatch", gate, actor=actor, inputs={
+            "prebuild_release_artifacts": True,
+        }, release_backend=backend, outputs={
+            "require_ci_green": {"prebuild_tag": "v0.0.0"},
+            "release_prebuild": {},
+        })
+        route, results = release_route(scenario)
+        ran_jobs = [job for job, result in route.items() if result != "skipped"]
+        if ran_jobs:
+            fail(f"release prebuild dispatch {scenario.describe()} runs validation jobs {ran_jobs}")
+        else:
+            ok(f"release prebuild dispatch ({scenario.describe()}) runs no release validation")
+
 for job, lines in release_jobs.items():
     text = "\n".join(lines)
     if "build_binaries_buildbuddy" == job and GATE_VAR in text:

@@ -14,9 +14,10 @@ push, a package-recovery dispatch, an explicit historical-evidence dispatch).
 Reflowing a condition across lines, collapsing it onto one line, or rewriting
 an expression into an equivalent one all pass; gating a step off tag pushes,
 re-enabling the long measurement on tags, relaxing the 30 minute publication
-SLO, making the SDK packages wait on it, or re-running Cargo validation on a
-tag whose exact-tree CI attestation already covers it all fail and name the
-defect.
+SLO, making the SDK packages wait on it, re-running Cargo validation on a
+tag whose exact-tree CI attestation already covers it, or letting a pre-tag
+prebuild publish anything or a tag publish a prebuild's artifacts without the
+attested-archive verification all fail and name the defect.
 
 Only the Python standard library is used, so the doctor and its contract test
 run wherever `python3` does.
@@ -259,6 +260,7 @@ class EventContext:
     step_outputs: dict[str, str] = field(default_factory=dict)
     actor: str = "release-bot"
     sha: str = "0" * 40
+    run_id: str = "1"
     # Repository variables; an unset variable reads as empty, as on GitHub.
     variables: dict[str, str] = field(default_factory=dict)
     # job -> result, for upstream jobs whose result differs from needs_result.
@@ -278,6 +280,11 @@ class EventContext:
             return self.actor
         if path == "github.sha":
             return self.sha
+        if path == "github.run_id":
+            return self.run_id
+        if path == "github.token":
+            # Never a real credential: scripts run here only against stubs.
+            return "contract-check-token"
         if path.startswith("github.event.inputs."):
             # Unset dispatch inputs and push events both read as empty.
             return self.inputs.get(path[len("github.event.inputs.") :], "")
@@ -970,13 +977,26 @@ def _attested_tag(schema: str, **kwargs: object) -> EventContext:
     )
 
 
+def _runner_env(context: EventContext) -> dict[str, str]:
+    """The default environment a runner gives every step of `context`."""
+    return {
+        "PATH": os.environ.get("PATH", ""),
+        "GITHUB_SHA": context.sha,
+        "GITHUB_REF": context.ref,
+        "GITHUB_REF_NAME": github_ref_name(context.ref),
+        "GITHUB_EVENT_NAME": context.event_name,
+        "GITHUB_REPOSITORY": "example/meerkat",
+        "GITHUB_RUN_ID": context.run_id,
+    }
+
+
 def _run_gate_script(step: Step, context: EventContext) -> tuple[int, str]:
-    """Run the validation gate's shell step as the runner would."""
+    """Run a gate job's shell step as the runner would."""
     env = {key: render_strict(value, context) for key, value in step.env.items()}
     script = render_strict(step.run, context)
     result = subprocess.run(
         ["bash", "-c", script],
-        env={"PATH": os.environ.get("PATH", ""), **env},
+        env={**_runner_env(context), **env},
         capture_output=True,
         text=True,
         check=False,
@@ -1140,6 +1160,285 @@ def check_tag_validation(text: str) -> list[str]:
     return violations
 
 
+PREBUILD_INPUT = "prebuild_release_artifacts"
+PREBUILD_LOOKUP_JOB = "release_prebuild"
+PREBUILD_GATE_JOB = "release_prebuild_gate"
+PREBUILD_LOOKUP_SCRIPT = "scripts/release-find-prebuild"
+PROVENANCE_VERIFIER = "scripts/verify-release-asset-provenance"
+BINARY_BUILD_JOBS = ("build_binaries", "build_binaries_buildbuddy", "build_binaries_windows_cross")
+WEB_SDK_BUILD_JOB = "build_web_sdk_package"
+WEB_SDK_PUBLISH_JOB = "publish_web_sdk"
+ASSET_PUBLISH_JOB = "publish_github_release"
+# A job whose block contains one of these writes to a public surface.
+PUBLISHING_MARKERS = (
+    "softprops/action-gh-release",
+    "gh release upload",
+    "update-homebrew",
+    "release-publish-rust-crates.sh",
+    "twine upload",
+    "npm publish",
+    "release-publish-web-sdk-package.sh",
+)
+PREBUILD_RUN = "424242"
+
+
+def _job_names(text: str) -> list[str]:
+    lines = text.splitlines()
+    try:
+        start = lines.index("jobs:")
+    except ValueError as error:
+        raise ContractError("the workflow has no top-level `jobs:`") from error
+    return [
+        match.group(1)
+        for line in lines[start + 1 :]
+        if (match := JOB_HEADER.match(line))
+    ]
+
+
+def _job_runs(text: str, job: str, context: EventContext) -> bool:
+    condition = parse_mapping(job_block(text, job), 4).get("if")
+    return condition is None or truthy(evaluate(condition, context))
+
+
+def _running_steps(text: str, job: str, context: EventContext) -> list[tuple[int, Step]]:
+    return [
+        (index, step)
+        for index, step in enumerate(job_steps(job_block(text, job)))
+        if step_runs(step, context)
+    ]
+
+
+def _checkout_ref(text: str, job: str, context: EventContext) -> str | None:
+    for step in job_steps(job_block(text, job)):
+        if CHECKOUT_ACTION in step.fields.get("uses", "") and "ref" in step.nested("with"):
+            return render_strict(step.nested("with")["ref"], context)
+    return None
+
+
+def _verifier_invocations(step: Step, context: EventContext) -> list[list[str]]:
+    """Run the step with a stub verifier and return the argv of each call."""
+    env = {key: render_strict(value, context) for key, value in step.env.items()}
+    script = render_strict(step.run, context)
+    with tempfile.TemporaryDirectory(prefix="release-prebuild-") as scratch:
+        record = Path(scratch, "calls")
+        stub = Path(scratch, PROVENANCE_VERIFIER)
+        stub.parent.mkdir(parents=True)
+        stub.write_text(
+            "#!/usr/bin/env bash\n"
+            f"printf '%s\\x1f' \"$@\" >> '{record}'\n"
+            f"printf '\\n' >> '{record}'\n",
+            encoding="utf-8",
+        )
+        stub.chmod(0o755)
+        subprocess.run(
+            ["bash", "-c", script],
+            cwd=scratch,
+            env={**_runner_env(context), **env},
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if not record.exists():
+            return []
+        return [
+            [arg for arg in line.split("\x1f") if arg]
+            for line in record.read_text(encoding="utf-8").splitlines()
+        ]
+
+
+def check_prebuild(text: str) -> list[str]:
+    """A pre-tag prebuild publishes nothing; a tag reuses it only verified.
+
+    A `prebuild_release_artifacts` dispatch on main builds every release
+    binary and the Web SDK package of the exact dispatched commit, runs no
+    release validation or semver measurement, and publishes nothing. A tag
+    push looks the prebuild of its own commit up (`release_prebuild`); when
+    one is found it builds nothing, publishes that run's archives only after
+    `verify-release-asset-provenance --source-run` (the assets_run_id trust
+    path) and the Web SDK package only after its attestation is verified;
+    when none is found it builds as before.
+    """
+    violations: list[str] = []
+    names = _job_names(text)
+    for job in (PREBUILD_LOOKUP_JOB, PREBUILD_GATE_JOB, *BINARY_BUILD_JOBS, WEB_SDK_BUILD_JOB):
+        if job not in names:
+            return [f"job `{job}` is not defined in the workflow"]
+
+    prebuild_outputs = {
+        f"{PREBUILD_LOOKUP_JOB}.run_id": "",
+        f"{CI_GREEN_JOB}.{ATTESTATION_SCHEMA_OUTPUT}": "",
+        f"{CI_GREEN_JOB}.prebuild_tag": "v0.0.0",
+    }
+    prebuild = EventContext(
+        label="a prebuild dispatch on main",
+        event_name="workflow_dispatch",
+        ref="refs/heads/main",
+        sha="1" * 40,
+        inputs={PREBUILD_INPUT: "true", "release_backend": "github-hosted"},
+        job_outputs=prebuild_outputs,
+    )
+
+    # 1. A prebuild publishes nothing, whatever its upstream jobs report.
+    for job in names:
+        block = "\n".join(job_block(text, job))
+        if any(marker in block for marker in PUBLISHING_MARKERS) and _job_runs(text, job, prebuild):
+            violations.append(f"job `{job}` publishes on {prebuild.label}")
+
+    # 2. It runs no release validation or semver measurement, does not wait
+    #    for CI, and verifies its request.
+    for job in ("release_validate_cargo", "release_validate_buildbuddy", "release_validate_gate", SEMVER_GATE_JOB):
+        if job in names and _job_runs(text, job, prebuild):
+            violations.append(f"job `{job}` runs on {prebuild.label}, which validates nothing")
+    ci_steps = job_steps(job_block(text, CI_GREEN_JOB))
+    for step in ci_steps:
+        if step.fields.get("id") == "ci_run" and step_runs(step, prebuild):
+            violations.append(f"step `{step.name}` waits for exact-main CI on {prebuild.label}")
+    requests = [step for step in ci_steps if step.fields.get("id") == "prebuild_request"]
+    if len(requests) != 1 or not step_runs(requests[0], prebuild) or "tag" not in requests[0].written_outputs():
+        violations.append(
+            f"job `{CI_GREEN_JOB}` must verify the request with one step `id: prebuild_request` "
+            f"that runs on {prebuild.label} and writes its `tag`"
+        )
+    elif "refs/heads/main" not in requests[0].run:
+        violations.append(f"step `{requests[0].name}` does not refuse a prebuild off refs/heads/main")
+
+    # 3. It builds every artifact from exactly the dispatched commit.
+    realistic = EventContext(
+        **{
+            **prebuild.__dict__,
+            "job_results": {
+                "release_validate_gate": "skipped",
+                SEMVER_GATE_JOB: "skipped",
+                PREBUILD_LOOKUP_JOB: "skipped",
+            },
+        }
+    )
+    for job in ("build_binaries", "build_binaries_windows_cross", WEB_SDK_BUILD_JOB, "build_binaries_gate", PREBUILD_GATE_JOB):
+        if not _job_runs(text, job, realistic):
+            violations.append(f"job `{job}` is skipped on {prebuild.label}")
+    for job in (*BINARY_BUILD_JOBS, WEB_SDK_BUILD_JOB):
+        ref = _checkout_ref(text, job, prebuild)
+        if ref != prebuild.sha:
+            violations.append(
+                f"job `{job}` checks out `{ref}` on {prebuild.label}, not the dispatched commit "
+                "(github.sha): a moving main would be built instead"
+            )
+
+    # 4. The prebuild gate passes only on every artifact, and the lookup
+    #    requires exactly that job.
+    gate_steps = [step for step in job_steps(job_block(text, PREBUILD_GATE_JOB)) if step.run]
+    gate_name = parse_mapping(job_block(text, PREBUILD_GATE_JOB), 4).get("name", "")
+    if len(gate_steps) != 1:
+        violations.append(f"job `{PREBUILD_GATE_JOB}` must have exactly one run step")
+    else:
+        for failed in ("build_binaries_gate", WEB_SDK_BUILD_JOB):
+            context = EventContext(**{**realistic.__dict__, "job_results": {failed: "failure"}})
+            status, _ = _run_gate_script(gate_steps[0], context)
+            if status == 0:
+                violations.append(f"job `{PREBUILD_GATE_JOB}` passes although `{failed}` failed")
+        status, output = _run_gate_script(gate_steps[0], realistic)
+        if status != 0:
+            violations.append(f"job `{PREBUILD_GATE_JOB}` refuses a complete prebuild: {output.strip()}")
+    lookup_script = Path(__file__).resolve().with_name(Path(PREBUILD_LOOKUP_SCRIPT).name)
+    try:
+        lookup_text = lookup_script.read_text(encoding="utf-8")
+    except OSError:
+        lookup_text = ""
+    if f'PREBUILD_GATE_JOB="{gate_name}"' not in lookup_text:
+        violations.append(
+            f"{PREBUILD_LOOKUP_SCRIPT} does not require the `{gate_name}` job that marks a complete prebuild"
+        )
+
+    # 5. A tag looks its own commit's prebuild up; dispatches never do.
+    if not _job_runs(text, PREBUILD_LOOKUP_JOB, TAG_PUSH):
+        violations.append(f"job `{PREBUILD_LOOKUP_JOB}` does not run on {TAG_PUSH.label}")
+    for context in (PACKAGE_RECOVERY, prebuild):
+        if _job_runs(text, PREBUILD_LOOKUP_JOB, context):
+            violations.append(f"job `{PREBUILD_LOOKUP_JOB}` runs on {context.label}")
+    if not any(PREBUILD_LOOKUP_SCRIPT in step.run for step in job_steps(job_block(text, PREBUILD_LOOKUP_JOB))):
+        violations.append(f"job `{PREBUILD_LOOKUP_JOB}` does not run `{PREBUILD_LOOKUP_SCRIPT}`")
+
+    # 6. A tag whose commit was prebuilt builds nothing and publishes the
+    #    prebuild's artifacts only through the attested-archive verification.
+    def tag_push(run_id: str) -> EventContext:
+        return EventContext(
+            label=f"a tag push {'with a prebuild found' if run_id else 'without a prebuild'}",
+            event_name="push",
+            job_outputs={
+                f"{PREBUILD_LOOKUP_JOB}.run_id": run_id,
+                f"{CI_GREEN_JOB}.{ATTESTATION_SCHEMA_OUTPUT}": "4",
+                f"{CI_GREEN_JOB}.prebuild_tag": "",
+            },
+        )
+
+    reused, fresh = tag_push(PREBUILD_RUN), tag_push("")
+    for job in (*BINARY_BUILD_JOBS, WEB_SDK_BUILD_JOB):
+        if _job_runs(text, job, reused):
+            violations.append(f"job `{job}` builds on {reused.label}")
+    for job in ("build_binaries_windows_cross", WEB_SDK_BUILD_JOB):
+        if not _job_runs(text, job, fresh):
+            violations.append(f"job `{job}` is skipped on {fresh.label}")
+
+    for job in (ASSET_PUBLISH_JOB, WEB_SDK_PUBLISH_JOB):
+        if not _job_runs(text, job, reused):
+            violations.append(f"job `{job}` does not run on {reused.label}")
+            continue
+        steps = _running_steps(text, job, reused)
+        downloads = [
+            step for _, step in steps if "actions/download-artifact" in step.fields.get("uses", "")
+        ]
+        if not downloads:
+            violations.append(f"job `{job}` downloads nothing on {reused.label}")
+        for step in downloads:
+            run_id = render_strict(step.nested("with").get("run-id", ""), reused)
+            if run_id != PREBUILD_RUN:
+                violations.append(
+                    f"step `{step.name}` downloads from run `{run_id or 'this run'}` on "
+                    f"{reused.label}, not the prebuild run"
+                )
+
+    verify_steps = [
+        step for _, step in _running_steps(text, ASSET_PUBLISH_JOB, reused) if PROVENANCE_VERIFIER in step.run
+    ]
+    if len(verify_steps) != 1:
+        violations.append(
+            f"job `{ASSET_PUBLISH_JOB}` must run `{PROVENANCE_VERIFIER}` in exactly one step on {reused.label}"
+        )
+    else:
+        calls = _verifier_invocations(verify_steps[0], reused)
+        if len(calls) != 1 or calls[0][:2] != ["--source-run", PREBUILD_RUN] or "--stamps" not in calls[0]:
+            violations.append(
+                f"step `{verify_steps[0].name}` verifies {reused.label} with {calls}; expected "
+                f"`{PROVENANCE_VERIFIER} --source-run {PREBUILD_RUN} --stamps ...`, the "
+                "assets_run_id trust path"
+            )
+        fresh_calls = _verifier_invocations(verify_steps[0], fresh)
+        if len(fresh_calls) != 1 or "--source-run" in fresh_calls[0]:
+            violations.append(
+                f"step `{verify_steps[0].name}` verifies {fresh.label} with {fresh_calls}; "
+                "expected the exact-tag verification"
+            )
+
+    web_steps = _running_steps(text, WEB_SDK_PUBLISH_JOB, reused)
+    verify_index = next(
+        (
+            index
+            for index, step in web_steps
+            if "gh attestation verify" in step.run and "--source-ref refs/heads/main" in step.run
+        ),
+        None,
+    )
+    publish_index = next(
+        (index for index, step in web_steps if "release-publish-web-sdk-package.sh" in step.run),
+        None,
+    )
+    if verify_index is None or publish_index is None or verify_index > publish_index:
+        violations.append(
+            f"job `{WEB_SDK_PUBLISH_JOB}` must verify the prebuilt package's attestation "
+            f"(`gh attestation verify ... --source-ref refs/heads/main`) before publishing on {reused.label}"
+        )
+    return violations
+
 def _readiness_push(needed: str, baseline: str) -> EventContext:
     return EventContext(
         label=f"a main push with needed={needed!r} and notes baseline {baseline!r}",
@@ -1209,6 +1508,7 @@ CHECKS: dict[str, Callable[[str], list[str]]] = {
     "registry-slo": check_registry_slo,
     "dispatch-binding": check_dispatch_binding,
     "tag-validation": check_tag_validation,
+    "prebuild": check_prebuild,
 }
 
 # Checks of release-semver-readiness.yml; run them by name with

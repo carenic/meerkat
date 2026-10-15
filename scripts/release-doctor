@@ -211,7 +211,7 @@ if awk '
     in_job && /--version/ { version = 1 }
     END { exit (native && version) ? 0 : 1 }
   ' "${release_workflow}" &&
-  grep -Fq 'needs: [build_binaries, build_binaries_buildbuddy, build_binaries_windows_cross, verify_windows_binaries]' "${release_workflow}" &&
+  grep -Eq '^    needs: \[build_binaries, build_binaries_buildbuddy, build_binaries_windows_cross, verify_windows_binaries(, [a-z_]+)*\]$' "${release_workflow}" &&
   grep -Fq '[[ "${windows_cross_result}" == "success" && "${windows_verify_result}" == "success" ]] || exit 1' "${release_workflow}" &&
   ! grep -Eq 'runs-on: *"?windows-latest"?.*target' "${release_workflow}" &&
   ! grep -Fq '"runs-on":"windows-latest","target":"x86_64-pc-windows-msvc"' "${release_workflow}" &&
@@ -279,6 +279,12 @@ if dispatch_contract="$(workflow_contract dispatch-binding)"; then
   pass "Publishing dispatches are bound to their version's tag"
 else
   bad "A publishing dispatch without release_tag could publish a branch tip as the tagged version (${dispatch_contract//$'\n'/; })"
+fi
+
+if prebuild_contract="$(workflow_contract prebuild)"; then
+  pass "Pre-tag prebuilds publish nothing, and a tag publishes its own commit's prebuild only through the attested-archive verification"
+else
+  bad "A pre-tag prebuild must publish nothing, and a tag may publish its commit's prebuild only through the attested-archive verification (${prebuild_contract//$'\n'/; })"
 fi
 
 if tag_validation_contract="$(workflow_contract tag-validation)"; then

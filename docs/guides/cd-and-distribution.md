@@ -246,7 +246,10 @@ embedding a separate runtime implementation.
 2. Prefer waiting for both exact-main CI and **Release semver readiness** on
    that prepared tree before cargo-release publishes the tag. Ordinary CI and
    semver readiness produce separate artifacts; one cannot substitute for the
-   other.
+   other. Dispatch the [pre-tag prebuild](#pre-tag-prebuild)
+   (`make release-prebuild VERSION=vX.Y.Z`) as soon as the release commit is
+   on `main`, so the binaries and the Web SDK package build while CI and
+   readiness run, and wait for it too.
 3. The tag path verifies the exact-tree CI attestation instead of recomputing
    the broad CI graph: with the self-hosted graph off, a verified schema-4
    attestation passes `release_validate_gate` without `release_validate_cargo`,
@@ -255,7 +258,8 @@ embedding a separate runtime implementation.
    up `meerkat-semver-attestation-main-<tree_sha>` and requires unexpired
    evidence for that tree and version from a successful readiness `main` push.
 4. In parallel, verify registry credentials, consume declared-break evidence,
-   build platform binaries, and build the Web SDK package artifact.
+   and either find the complete prebuild of the tag commit or build the
+   platform binaries and the Web SDK package artifact.
 5. Publish the macOS/Linux assets early when available, then complete the
    GitHub release with every platform archive, `checksums.sha256`, and
    `index.json`.
@@ -264,6 +268,35 @@ embedding a separate runtime implementation.
    runners. Their publish jobs build and smoke-test the package artifacts before
    upload.
 8. Publish the prebuilt Web SDK artifact on a GitHub-hosted runner.
+
+### Pre-tag prebuild
+
+`make release-prebuild VERSION=vX.Y.Z` dispatches `release.yml` on `main` with
+`prebuild_release_artifacts=true`. The run refuses any other ref, any
+publishing or recovery input, and a version whose tag already exists. It
+does not wait for CI: it builds every release binary (BuildBuddy or the
+GitHub-hosted lane for Linux/macOS, cargo-xwin for Windows, verified on a
+Windows runner) and the Web SDK package from exactly the dispatched commit,
+stamps each archive with that commit, attests and uploads everything, and
+publishes nothing. Its `Release prebuild gate` job passes only when every
+binary lane and the Web SDK package succeeded.
+
+The tag run looks the prebuild up after `require_ci_green`
+(`release_prebuild`, `scripts/release-find-prebuild`): a `release.yml`
+dispatch on `main` at exactly the tag commit, in this repository, whose
+`Release prebuild gate` passed and whose artifacts have not expired; one
+still running is waited for, because it finishes no later than a fresh build
+would. When it finds one, the tag run skips every build job,
+`publish_github_release` verifies that run's archives exactly like an
+`--assets-run-id` recovery (`verify-release-asset-provenance --source-run`:
+every archive and its stamp attested by `release.yml` at that commit on
+`refs/heads/main`, the stamp naming the tag commit, the run's
+`Release binary build gate` green) and checks that every binary embeds the
+release version, and `publish_web_sdk` verifies the package's attestation
+and version before publishing. Without a complete prebuild the tag builds
+everything as before. The prebuild never relaxes a publication gate: exact-main
+CI, semver evidence and registry credentials are still required by the tag
+run itself.
 
 The default `./scripts/repo-cargo release patch --execute` flow combines
 bump, commit, tag, and push; that command summary alone does not establish

@@ -31,6 +31,8 @@ DISPATCH_PASS="PASS Publishing dispatches are bound to their version's tag"
 DISPATCH_FAIL="FAIL A publishing dispatch without release_tag could publish a branch tip as the tagged version"
 TAG_VALIDATION_PASS="PASS Tag releases validate on the verified schema-4 exact-tree CI attestation instead of re-running Cargo validation"
 TAG_VALIDATION_FAIL="FAIL Tag releases must validate on the verified schema-4 exact-tree CI attestation"
+PREBUILD_PASS="PASS Pre-tag prebuilds publish nothing, and a tag publishes its own commit's prebuild only through the attested-archive verification"
+PREBUILD_FAIL="FAIL A pre-tag prebuild must publish nothing, and a tag may publish its commit's prebuild only through the attested-archive verification"
 
 fail() {
   echo "release doctor workflow contract violated: $1" >&2
@@ -364,6 +366,54 @@ elif name == "tag-validation-reflowed":
         "vars.MEERKAT_GCP_BUILDBUDDY_ENABLED != 'true' && "
         "github.event_name != 'workflow_dispatch') ||\n",
     )
+elif name == "prebuild-publishes":
+    # A prebuild dispatch reaches the GitHub release publisher.
+    replace_once(
+        "  publish_github_release:\n    name: Publish GitHub release assets\n    if: >-\n",
+        "  publish_github_release:\n    name: Publish GitHub release assets\n    if: >-\n"
+        "      github.event.inputs.prebuild_release_artifacts == 'true' ||\n",
+    )
+elif name == "prebuild-moving-checkout":
+    # The Web SDK prebuild checks out main's moving tip, not the dispatched commit.
+    job = text.index("  build_web_sdk_package:\n")
+    needle = (
+        "          ref: ${{ github.event_name == 'workflow_dispatch' && "
+        "github.event.inputs.prebuild_release_artifacts == 'true' && github.sha || "
+    )
+    at = text.index(needle, job)
+    text = text[:at] + "          ref: ${{ " + text[at + len(needle):]
+elif name == "prebuild-builds-anyway":
+    # A tag whose commit was prebuilt rebuilds every binary anyway.
+    needle = "      needs.release_prebuild.outputs.run_id == '' &&\n"
+    if text.count(needle) != 3:
+        raise SystemExit(f"fixture `{name}` expects three binary build guards, found {text.count(needle)}")
+    text = text.replace(needle, "")
+elif name == "prebuild-reuse-unverified":
+    # The publisher takes the prebuild's archives through the exact-tag
+    # verification, which a main-attested archive cannot pass honestly, and
+    # drops the --source-run binding.
+    pattern = re.compile(
+        r'          if \[\[ -n "\$\{PREBUILD_RUN_ID\}" \]\]; then\n'
+        r"            # The tag commit's pre-tag prebuild(?:.*\n)*?          elif "
+    )
+    text, count = pattern.subn("          if ", text)
+    if count != 1:
+        raise SystemExit(f"fixture `{name}` expects one prebuild verification branch, found {count}")
+elif name == "prebuild-web-unverified":
+    match = re.search(
+        r"      - name: Verify the prebuilt Web SDK package\n" + STEP_BODY, text
+    )
+    if match is None:
+        raise SystemExit(f"fixture `{name}` expects the Web SDK verification step")
+    text = text[: match.start()] + text[match.end() :]
+elif name == "prebuild-gate-renamed":
+    replace_once("    name: Release prebuild gate\n", "    name: Prebuild complete\n")
+elif name == "prebuild-lookup-if-reflowed":
+    # Equivalent: the lookup's condition folded, its operands reordered.
+    replace_once(
+        "    if: ${{ startsWith(github.ref, 'refs/tags/v') && github.event_name != 'workflow_dispatch' }}\n",
+        "    if: >-\n      github.event_name != 'workflow_dispatch' &&\n      startsWith(github.ref, 'refs/tags/v')\n",
+    )
 elif name == "both-defects":
     replace_once(
         MEASUREMENT_STEP_IF,
@@ -436,6 +486,8 @@ mutate dispatch-ref-name-expression "${TEST_ROOT}/dispatch-ref-name-expression.y
 expect_pass dispatch-ref-name-expression "${TEST_ROOT}/dispatch-ref-name-expression.yml" dispatch-binding
 mutate tag-validation-reflowed "${TEST_ROOT}/tag-validation-reflowed.yml"
 expect_pass tag-validation-reflowed "${TEST_ROOT}/tag-validation-reflowed.yml" tag-validation
+mutate prebuild-lookup-if-reflowed "${TEST_ROOT}/prebuild-lookup-if-reflowed.yml"
+expect_pass prebuild-lookup-if-reflowed "${TEST_ROOT}/prebuild-lookup-if-reflowed.yml" prebuild
 
 # 3. Dropping the behaviour fails and names the defect.
 mutate evidence-step-removed "${TEST_ROOT}/evidence-step-removed.yml"
@@ -507,6 +559,25 @@ mutate tag-validation-schema-unwritten "${TEST_ROOT}/tag-validation-schema-unwri
 expect_fail_named tag-validation-schema-unwritten "${TEST_ROOT}/tag-validation-schema-unwritten.yml" \
   "does not write \`schema\` to \$GITHUB_OUTPUT" tag-validation
 
+mutate prebuild-publishes "${TEST_ROOT}/prebuild-publishes.yml"
+expect_fail_named prebuild-publishes "${TEST_ROOT}/prebuild-publishes.yml" \
+  "job \`publish_github_release\` publishes on a prebuild dispatch on main" prebuild
+mutate prebuild-moving-checkout "${TEST_ROOT}/prebuild-moving-checkout.yml"
+expect_fail_named prebuild-moving-checkout "${TEST_ROOT}/prebuild-moving-checkout.yml" \
+  "job \`build_web_sdk_package\` checks out \`refs/heads/main\` on a prebuild dispatch on main" prebuild
+mutate prebuild-builds-anyway "${TEST_ROOT}/prebuild-builds-anyway.yml"
+expect_fail_named prebuild-builds-anyway "${TEST_ROOT}/prebuild-builds-anyway.yml" \
+  "job \`build_binaries_windows_cross\` builds on a tag push with a prebuild found" prebuild
+mutate prebuild-reuse-unverified "${TEST_ROOT}/prebuild-reuse-unverified.yml"
+expect_fail_named prebuild-reuse-unverified "${TEST_ROOT}/prebuild-reuse-unverified.yml" \
+  "expected \`scripts/verify-release-asset-provenance --source-run 424242 --stamps ...\`" prebuild
+mutate prebuild-web-unverified "${TEST_ROOT}/prebuild-web-unverified.yml"
+expect_fail_named prebuild-web-unverified "${TEST_ROOT}/prebuild-web-unverified.yml" \
+  "must verify the prebuilt package's attestation" prebuild
+mutate prebuild-gate-renamed "${TEST_ROOT}/prebuild-gate-renamed.yml"
+expect_fail_named prebuild-gate-renamed "${TEST_ROOT}/prebuild-gate-renamed.yml" \
+  "does not require the \`Prebuild complete\` job" prebuild
+
 mutate readback-step-removed "${TEST_ROOT}/readback-step-removed.yml"
 expect_fail_named readback-step-removed "${TEST_ROOT}/readback-step-removed.yml" \
   "no step that reads every crate back" registry-slo
@@ -526,7 +597,7 @@ run_doctor() {
 }
 
 run_doctor "$WORKFLOW" "${TEST_ROOT}/doctor-committed.log"
-for line in "$SEMVER_PASS" "$SLO_PASS" "$DISPATCH_PASS" "$TAG_VALIDATION_PASS"; do
+for line in "$SEMVER_PASS" "$SLO_PASS" "$DISPATCH_PASS" "$TAG_VALIDATION_PASS" "$PREBUILD_PASS"; do
   if ! grep -Fxq "$line" "${TEST_ROOT}/doctor-committed.log"; then
     fail "doctor does not report \`${line}\` for the committed workflow" \
       "$(cat "${TEST_ROOT}/doctor-committed.log")"
@@ -554,6 +625,13 @@ run_doctor "${TEST_ROOT}/doctor-tag-validation.yml" "${TEST_ROOT}/doctor-tag-val
 if ! grep -Fq "$TAG_VALIDATION_FAIL" "${TEST_ROOT}/doctor-tag-validation.log"; then
   fail "doctor does not report \`${TAG_VALIDATION_FAIL}\` for a workflow that re-runs Cargo validation on attested tags" \
     "$(cat "${TEST_ROOT}/doctor-tag-validation.log")"
+fi
+
+mutate prebuild-publishes "${TEST_ROOT}/doctor-prebuild.yml"
+run_doctor "${TEST_ROOT}/doctor-prebuild.yml" "${TEST_ROOT}/doctor-prebuild.log"
+if ! grep -Fq "$PREBUILD_FAIL" "${TEST_ROOT}/doctor-prebuild.log"; then
+  fail "doctor does not report \`${PREBUILD_FAIL}\` for a workflow whose prebuild publishes" \
+    "$(cat "${TEST_ROOT}/doctor-prebuild.log")"
 fi
 
 echo "release doctor workflow contract holds"

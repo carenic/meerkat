@@ -27,7 +27,7 @@ YELLOW := \033[0;33m
 RED := \033[0;31m
 NC := \033[0m
 
-.PHONY: all install-build-deps build test test-unit test-mob-dense-topology test-mcp-confinement-positive test-int e2e-fast e2e-build e2e-system e2e-live e2e-copilot-live e2e-smoke e2e-auth test-int-real test-e2e test-all test-minimal test-feature-matrix-lib test-feature-matrix-surface test-feature-matrix test-surface-modularity test-sdk-python test-sdk-typescript test-sdk-web test-sdk-suites wasm-check lint lint-feature-matrix fmt fmt-check audit rust-lane-doctor agent-gate cargo-agent-gate buildbuddy-install buildbuddy-generate buildbuddy-lock-update buildbuddy-generate-check buildbuddy-doctor buildbuddy-build buildbuddy-check buildbuddy-clippy buildbuddy-lint buildbuddy-test buildbuddy-test-all buildbuddy-test-unit buildbuddy-test-int buildbuddy-e2e-fast buildbuddy-e2e-system buildbuddy-e2e-live buildbuddy-e2e-smoke buildbuddy-e2e-smoke-turbo-s buildbuddy-e2e-auth buildbuddy-agent-gate buildbuddy-ci-dispatch buildbuddy-fast buildbuddy-benchmark buildbuddy-ci buildbuddy-ci-warm buildbuddy-ci-full buildbuddy-ci-full-warm ci ci-smoke release-doctor release-preflight release-preflight-smoke release-workflow release-assets release-packages release-web-sdk publish-dry-run publish-dry-run-python publish-dry-run-typescript publish-dry-run-web release-dry-run release-dry-run-smoke clean doc docs-check docs-only-contract-gate docs-sync-mobkit release install-hooks coverage check help legacy-surface-gate legacy-surface-inventory session-control-gate deprecated-backend-gate deprecated-backend-inventory sync-meerkat-dogma-skill-docs verify-version-parity verify-schema-freshness verify-sdk-codegen-freshness verify-sdk-event-inventory verify-rpc-surface-alignment verify-rest-surface-alignment verify-sdk-wrapper-freshness verify-machine-poster-coverage verify-fixture-mint-generator check-rust-release-config check-crate-license-files check-rust-release-packaging check-rust-release-packaging-contract verify-lock-consistency verify-bazel-locks verify-bazel-locks-strict verify-bazel-module-lock-inputs verify-bazel-release-features release-test-code-guards-selftest check-published-facade-link bump-sdk-versions smoke-sdk-python-artifact smoke-sdk-typescript-artifact xtask-build machine-codegen machine-verify machine-verify-deep-compositions machine-verify-full machine-check-drift machine-authority-docs-gate mobpack-docs-contract-gate runtime-authority-bypass storage-ambient-gate seam-inventory rmat-audit audit-generated-headers semver-breaks protocol-codegen protocol-check-drift semver-breaks-selftest path-classifier-selftest stack-budget-release turbo-s-oracle-gate
+.PHONY: all install-build-deps build test test-unit test-mob-dense-topology test-mcp-confinement-positive test-int e2e-fast e2e-build e2e-system e2e-live e2e-copilot-live e2e-smoke e2e-auth test-int-real test-e2e test-all test-minimal test-feature-matrix-lib test-feature-matrix-surface test-feature-matrix test-surface-modularity test-sdk-python test-sdk-typescript test-sdk-web test-sdk-suites wasm-check lint lint-feature-matrix fmt fmt-check audit rust-lane-doctor agent-gate cargo-agent-gate buildbuddy-install buildbuddy-generate buildbuddy-lock-update buildbuddy-generate-check buildbuddy-doctor buildbuddy-build buildbuddy-check buildbuddy-clippy buildbuddy-lint buildbuddy-test buildbuddy-test-all buildbuddy-test-unit buildbuddy-test-int buildbuddy-e2e-fast buildbuddy-e2e-system buildbuddy-e2e-live buildbuddy-e2e-smoke buildbuddy-e2e-smoke-turbo-s buildbuddy-e2e-auth buildbuddy-agent-gate buildbuddy-ci-dispatch buildbuddy-fast buildbuddy-benchmark buildbuddy-ci buildbuddy-ci-warm buildbuddy-ci-full buildbuddy-ci-full-warm ci ci-smoke release-doctor release-preflight release-preflight-smoke release-workflow release-assets release-packages release-web-sdk release-prebuild publish-dry-run publish-dry-run-python publish-dry-run-typescript publish-dry-run-web release-dry-run release-dry-run-smoke clean doc docs-check docs-only-contract-gate docs-sync-mobkit release install-hooks coverage check help legacy-surface-gate legacy-surface-inventory session-control-gate deprecated-backend-gate deprecated-backend-inventory sync-meerkat-dogma-skill-docs verify-version-parity verify-schema-freshness verify-sdk-codegen-freshness verify-sdk-event-inventory verify-rpc-surface-alignment verify-rest-surface-alignment verify-sdk-wrapper-freshness verify-machine-poster-coverage verify-fixture-mint-generator check-rust-release-config check-crate-license-files check-rust-release-packaging check-rust-release-packaging-contract verify-lock-consistency verify-bazel-locks verify-bazel-locks-strict verify-bazel-module-lock-inputs verify-bazel-release-features release-test-code-guards-selftest check-published-facade-link bump-sdk-versions smoke-sdk-python-artifact smoke-sdk-typescript-artifact xtask-build machine-codegen machine-verify machine-verify-deep-compositions machine-verify-full machine-check-drift machine-authority-docs-gate mobpack-docs-contract-gate runtime-authority-bypass storage-ambient-gate seam-inventory rmat-audit audit-generated-headers semver-breaks protocol-codegen protocol-check-drift semver-breaks-selftest path-classifier-selftest stack-budget-release turbo-s-oracle-gate
 
 # Default target
 all: ci
@@ -830,6 +830,7 @@ release-doctor:
 	@echo "$(GREEN)Checking release environment...$(NC)"
 	@scripts/test-release-npm-publish-preflight.sh
 	@scripts/test-release-doctor-workflow-contract.sh
+	@scripts/test-release-find-prebuild.sh
 	@scripts/test-gcp-buildbuddy-workflow-gate.sh
 	@scripts/release-doctor
 
@@ -924,6 +925,13 @@ release-packages:
 release-web-sdk:
 	@echo "$(GREEN)Dispatching Web SDK release recovery workflow...$(NC)"
 	@scripts/release-workflow-dispatch --mode web-sdk
+
+# Pre-tag prebuild of the release commit already on main (VERSION=vX.Y.Z):
+# builds and attests every release artifact, publishes nothing; the tag run of
+# that exact commit then publishes them instead of rebuilding.
+release-prebuild:
+	@echo "$(GREEN)Dispatching release prebuild workflow...$(NC)"
+	@scripts/release-workflow-dispatch --mode prebuild
 
 # Dry-run publish for Python SDK (build + twine check only)
 publish-dry-run-python:
@@ -1109,6 +1117,7 @@ help:
 	@echo "  $(GREEN)release-assets$(NC)        - Dispatch binary asset release/recovery workflow"
 	@echo "  $(GREEN)release-packages$(NC)      - Dispatch registry package release/recovery workflow"
 	@echo "  $(GREEN)release-web-sdk$(NC)       - Dispatch Web SDK package recovery workflow"
+	@echo "  $(GREEN)release-prebuild$(NC)      - Dispatch the pre-tag prebuild of the release commit on main"
 	@echo "  $(GREEN)publish-dry-run$(NC)       - Dry-run cargo publish for all crates"
 	@echo "  $(GREEN)publish-dry-run-python$(NC) - Dry-run Python SDK publish check (build + twine check)"
 	@echo "  $(GREEN)publish-dry-run-typescript$(NC)- Dry-run TypeScript SDK publish check (npm publish --dry-run)"

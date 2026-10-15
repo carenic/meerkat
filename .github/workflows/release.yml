@@ -56,6 +56,11 @@ on:
         required: false
         default: ""
         type: string
+      prebuild_release_artifacts:
+        description: "Pre-tag prebuild, dispatched on main: build, attest and upload every release binary and the Web SDK package of the dispatched commit, publishing nothing; the tag run of exactly that commit publishes them instead of rebuilding"
+        required: false
+        default: false
+        type: boolean
       release_backend:
         description: "Release backend for validation and binary builds"
         required: false
@@ -94,6 +99,8 @@ jobs:
       # exact-tree CI produced a schema-4 attestation validates on it alone
       # (release_validate_cargo is skipped, release_validate_gate accepts it).
       ci_attestation_schema: ${{ steps.ci_attestation.outputs.schema }}
+      # The tag (v<workspace version>) a pre-tag prebuild builds for.
+      prebuild_tag: ${{ steps.prebuild_request.outputs.tag }}
     steps:
       - name: Checkout release ref
         uses: actions/checkout@v6
@@ -112,6 +119,71 @@ jobs:
           echo "Release tree: ${release_tree}"
           echo "sha=${release_sha}" >> "${GITHUB_OUTPUT}"
           echo "tree=${release_tree}" >> "${GITHUB_OUTPUT}"
+
+      # A pre-tag prebuild (prebuild_release_artifacts) builds the release
+      # artifacts of the dispatched main commit before its tag exists and
+      # publishes nothing, so it neither binds a tag nor waits for CI: the
+      # tag run that may later publish its artifacts requires exact-main CI
+      # itself, and reuses them only for exactly its own commit (see
+      # release_prebuild). It runs on main only, because only main's
+      # attestations are trusted by the tag run, and takes no publishing or
+      # recovery input.
+      - name: Verify release prebuild request
+        id: prebuild_request
+        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.prebuild_release_artifacts == 'true' }}
+        shell: bash
+        env:
+          RELEASE_TAG_INPUT: ${{ github.event.inputs.release_tag }}
+          PUBLISH_RELEASE_PACKAGES: ${{ github.event.inputs.publish_release_packages }}
+          REGISTRY_DRY_RUN: ${{ github.event.inputs.registry_dry_run }}
+          ALPHA_CRATES_ONLY: ${{ github.event.inputs.alpha_crates_only }}
+          PUBLISH_WEB_SDK_ONLY: ${{ github.event.inputs.publish_web_sdk_only }}
+          WEB_SDK_ARTIFACT_RUN_ID: ${{ github.event.inputs.web_sdk_artifact_run_id }}
+          ASSETS_RUN_ID: ${{ github.event.inputs.assets_run_id }}
+          PUBLISH_RELEASE_ASSETS_ONLY: ${{ github.event.inputs.publish_release_assets_only }}
+          SEMVER_EVIDENCE_RUN_ID: ${{ github.event.inputs.semver_evidence_run_id }}
+          SEMVER_EVIDENCE_JOB_ID: ${{ github.event.inputs.semver_evidence_job_id }}
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF}" != "refs/heads/main" ]]; then
+            echo "A release prebuild runs on refs/heads/main only, got ${GITHUB_REF}: a tag run trusts only archives attested on main." >&2
+            exit 1
+          fi
+          conflicting=()
+          [[ -z "${RELEASE_TAG_INPUT}" ]] || conflicting+=(release_tag)
+          [[ "${PUBLISH_RELEASE_PACKAGES}" != "true" ]] || conflicting+=(publish_release_packages)
+          [[ "${REGISTRY_DRY_RUN}" != "true" ]] || conflicting+=(registry_dry_run)
+          [[ "${ALPHA_CRATES_ONLY}" != "true" ]] || conflicting+=(alpha_crates_only)
+          [[ "${PUBLISH_WEB_SDK_ONLY}" != "true" ]] || conflicting+=(publish_web_sdk_only)
+          [[ -z "${WEB_SDK_ARTIFACT_RUN_ID}" ]] || conflicting+=(web_sdk_artifact_run_id)
+          [[ -z "${ASSETS_RUN_ID}" ]] || conflicting+=(assets_run_id)
+          [[ "${PUBLISH_RELEASE_ASSETS_ONLY}" != "true" ]] || conflicting+=(publish_release_assets_only)
+          [[ -z "${SEMVER_EVIDENCE_RUN_ID}" ]] || conflicting+=(semver_evidence_run_id)
+          [[ -z "${SEMVER_EVIDENCE_JOB_ID}" ]] || conflicting+=(semver_evidence_job_id)
+          if [[ "${#conflicting[@]}" -gt 0 ]]; then
+            echo "A release prebuild publishes nothing and takes no publishing or recovery input; unset: ${conflicting[*]}" >&2
+            exit 1
+          fi
+          version="$(git show "${GITHUB_SHA}:Cargo.toml" | awk '
+            /^\[workspace.package\]/ { in_workspace_package = 1; next }
+            /^\[/ { in_workspace_package = 0 }
+            in_workspace_package && $1 == "version" {
+              gsub(/"/, "", $3)
+              print $3
+              exit
+            }
+          ')"
+          if [[ -z "${version}" ]]; then
+            echo "Cannot read workspace.package.version at ${GITHUB_SHA}" >&2
+            exit 1
+          fi
+          tag="v${version}"
+          if git rev-parse -q --verify "refs/tags/${tag}" >/dev/null; then
+            echo "${tag} already exists; its tag run builds or reuses its own artifacts (asset recovery: make release-assets)." >&2
+            exit 1
+          fi
+          echo "tag=${tag}" >> "${GITHUB_OUTPUT}"
+          echo "Prebuilding the ${tag} release artifacts of ${GITHUB_SHA}; nothing is published."
 
       # Every publishing run is bound to a TAG from an explicit allowlist:
       # v<version> for every mode, and alpha/v<version> only for the
@@ -180,6 +252,7 @@ jobs:
 
       - name: Require successful exact-main CI
         id: ci_run
+        if: ${{ !(github.event_name == 'workflow_dispatch' && github.event.inputs.prebuild_release_artifacts == 'true') }}
         uses: actions/github-script@v7
         env:
           RELEASE_SHA: ${{ steps.release_ref.outputs.sha }}
@@ -340,6 +413,7 @@ jobs:
       (github.event_name == 'workflow_dispatch' &&
        github.event.inputs.publish_web_sdk_only != 'true' &&
        github.event.inputs.publish_release_assets_only != 'true' &&
+       github.event.inputs.prebuild_release_artifacts != 'true' &&
        !(github.actor == 'lukacf' &&
          github.event.inputs.release_backend == 'buildbuddy'))
     runs-on: ubuntu-24.04
@@ -418,6 +492,7 @@ jobs:
       github.event_name == 'workflow_dispatch' &&
       github.event.inputs.publish_web_sdk_only != 'true' &&
       github.event.inputs.publish_release_assets_only != 'true' &&
+      github.event.inputs.prebuild_release_artifacts != 'true' &&
       github.actor == 'lukacf' &&
       github.event.inputs.release_backend == 'buildbuddy'
     runs-on: ${{ fromJSON(vars.MEERKAT_CI_RUNNER || '"ubuntu-24.04"') }}
@@ -473,7 +548,8 @@ jobs:
       always() &&
       (github.event_name != 'workflow_dispatch' ||
        (github.event.inputs.publish_web_sdk_only != 'true' &&
-        github.event.inputs.publish_release_assets_only != 'true'))
+        github.event.inputs.publish_release_assets_only != 'true' &&
+        github.event.inputs.prebuild_release_artifacts != 'true'))
     needs: [require_ci_green, release_validate_cargo, release_validate_buildbuddy, release_validate_buildbuddy_full]
     runs-on: ${{ fromJSON(vars.MEERKAT_CI_RUNNER || '"ubuntu-24.04"') }}
     steps:
@@ -576,7 +652,8 @@ jobs:
     needs: [require_ci_green]
     if: >-
       github.event.inputs.publish_web_sdk_only != 'true' &&
-      github.event.inputs.publish_release_assets_only != 'true'
+      github.event.inputs.publish_release_assets_only != 'true' &&
+      github.event.inputs.prebuild_release_artifacts != 'true'
     runs-on: ubuntu-24.04
     # The measurement belongs before the tag. Tag-triggered releases consume
     # exact-tree evidence from Release semver readiness. Manual recovery may
@@ -740,9 +817,58 @@ jobs:
             --release-sha "${release_sha}" \
             --changelog .semver-recovery-policy/CHANGELOG.md
 
+  # A tag run publishes the artifacts of a successful pre-tag prebuild of
+  # exactly its commit instead of rebuilding them: a release.yml run
+  # dispatched on main at the tag commit with prebuild_release_artifacts,
+  # whose Release prebuild gate succeeded and whose artifacts have not
+  # expired (scripts/release-find-prebuild; a prebuild still running is
+  # waited for). Its run id is the only thing reused: publish_github_release
+  # verifies every archive exactly as for an assets_run_id recovery (each one
+  # and its source stamp attested by release.yml at that commit on
+  # refs/heads/main, the run's binary build gate green, every binary
+  # embedding the release version), and publish_web_sdk verifies the package
+  # attestation and version. No prebuild: the tag builds as before.
+  release_prebuild:
+    name: Find exact-commit release prebuild
+    needs: [require_ci_green]
+    if: ${{ startsWith(github.ref, 'refs/tags/v') && github.event_name != 'workflow_dispatch' }}
+    runs-on: ubuntu-24.04
+    # Bounded by the lookup's own wait for a running prebuild.
+    timeout-minutes: 130
+    outputs:
+      run_id: ${{ steps.lookup.outputs.run_id }}
+    steps:
+      - name: Checkout release tooling
+        uses: actions/checkout@v6
+        with:
+          sparse-checkout: |
+            scripts/release-find-prebuild
+          sparse-checkout-cone-mode: false
+
+      - name: Find a successful prebuild of the tag commit
+        id: lookup
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          release_sha="$(git rev-parse HEAD)"
+          # A failed lookup is not a reason to stop the release: it only means
+          # this run builds everything, as without a prebuild.
+          if ! run_id="$(scripts/release-find-prebuild "${release_sha}")"; then
+            echo "::warning::The prebuild lookup failed; this run builds every release artifact."
+            run_id=""
+          fi
+          if [[ -n "${run_id}" ]]; then
+            echo "Publishing the prebuilt artifacts of release run ${run_id} (${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${run_id}); no binary or Web SDK build in this run."
+          else
+            echo "No complete prebuild of ${release_sha}; this run builds every release artifact."
+          fi
+          echo "run_id=${run_id}" >> "${GITHUB_OUTPUT}"
+
   build_binaries:
     name: Build and package surface binaries with GitHub-hosted runners (${{ matrix.surface.bin }}, ${{ matrix.platform.target }})
-    needs: [require_ci_green, release_validate_gate]
+    needs: [require_ci_green, release_validate_gate, release_prebuild]
     # Linux/macOS fallback lane only. Under the owner BuildBuddy split those
     # four targets come from build_binaries_buildbuddy, and Windows is always
     # cross-compiled by build_binaries_windows_cross, so this job is skipped.
@@ -752,11 +878,14 @@ jobs:
       needs.require_ci_green.result == 'success' &&
       (needs.release_validate_gate.result == 'success' ||
        (github.event_name == 'workflow_dispatch' &&
-        github.event.inputs.publish_release_assets_only == 'true' &&
+        (github.event.inputs.publish_release_assets_only == 'true' ||
+         github.event.inputs.prebuild_release_artifacts == 'true') &&
         needs.release_validate_gate.result == 'skipped')) &&
       (startsWith(github.ref, 'refs/tags/v') ||
        (github.event_name == 'workflow_dispatch' &&
-        github.event.inputs.publish_release_assets_only == 'true')) &&
+        (github.event.inputs.publish_release_assets_only == 'true' ||
+         github.event.inputs.prebuild_release_artifacts == 'true'))) &&
+      needs.release_prebuild.outputs.run_id == '' &&
       (github.event_name != 'workflow_dispatch' || github.event.inputs.assets_run_id == '')
     runs-on: ${{ matrix.platform.runs-on }}
     # Linux GNU binaries must keep the same glibc floor as the BuildBuddy lane
@@ -809,7 +938,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
         with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag != '' && github.event.inputs.release_tag || github.ref }}
+          ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.prebuild_release_artifacts == 'true' && github.sha || github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag != '' && github.event.inputs.release_tag || github.ref }}
 
       # actions/checkout marks the workspace safe in the host user's Git
       # config. Linux release builds run inside the Bullseye container as a
@@ -941,7 +1070,7 @@ jobs:
         shell: bash
         env:
           TARGET: ${{ matrix.platform.target }}
-          VERSION: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag || github.ref_name }}
+          VERSION: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.prebuild_release_artifacts == 'true' && needs.require_ci_green.outputs.prebuild_tag || github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag || github.ref_name }}
           ARCHIVE_EXT: ${{ matrix.platform.archive_ext }}
         run: |
           set -euo pipefail
@@ -977,22 +1106,32 @@ jobs:
       # its attestations name main's commit, not the tag. Each archive
       # therefore carries a stamp of the tree it was built from, written only
       # after checking that the checkout is the tag's commit, and attested
-      # with it (see scripts/verify-release-asset-provenance --stamps).
+      # with it (see scripts/verify-release-asset-provenance --stamps). A
+      # pre-tag prebuild runs before the tag exists: its stamp names the
+      # dispatched main commit, which a tag run accepts only as its own.
       - name: Stamp archives with the checked-out release commit
         id: source_commit
         shell: bash
         env:
-          RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag || github.ref_name }}
+          RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.prebuild_release_artifacts == 'true' && needs.require_ci_green.outputs.prebuild_tag || github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag || github.ref_name }}
+          PREBUILD: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.prebuild_release_artifacts == 'true' }}
         run: |
           set -euo pipefail
           tree="$(git rev-parse HEAD)"
-          if ! tag_commit="$(git rev-parse --verify --quiet "refs/tags/${RELEASE_TAG}^{commit}")"; then
-            git fetch --no-tags --depth=1 origin "+refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}"
-            tag_commit="$(git rev-parse --verify "refs/tags/${RELEASE_TAG}^{commit}")"
-          fi
-          if [[ "${tree}" != "${tag_commit}" ]]; then
-            echo "checked-out tree ${tree} is not the ${RELEASE_TAG} commit ${tag_commit}" >&2
-            exit 1
+          if [[ "${PREBUILD}" == "true" ]]; then
+            if [[ "${tree}" != "${GITHUB_SHA}" ]]; then
+              echo "checked-out tree ${tree} is not the dispatched prebuild commit ${GITHUB_SHA}" >&2
+              exit 1
+            fi
+          else
+            if ! tag_commit="$(git rev-parse --verify --quiet "refs/tags/${RELEASE_TAG}^{commit}")"; then
+              git fetch --no-tags --depth=1 origin "+refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}"
+              tag_commit="$(git rev-parse --verify "refs/tags/${RELEASE_TAG}^{commit}")"
+            fi
+            if [[ "${tree}" != "${tag_commit}" ]]; then
+              echo "checked-out tree ${tree} is not the ${RELEASE_TAG} commit ${tag_commit}" >&2
+              exit 1
+            fi
           fi
           echo "source_commit=${tree}" >> "${GITHUB_OUTPUT}"
           stamped=0
@@ -1021,17 +1160,20 @@ jobs:
 
   build_binaries_windows_cross:
     name: Cross-compile and package Windows surface binaries on Linux
-    needs: [require_ci_green, release_validate_gate]
+    needs: [require_ci_green, release_validate_gate, release_prebuild]
     if: >-
       always() &&
       needs.require_ci_green.result == 'success' &&
       (needs.release_validate_gate.result == 'success' ||
        (github.event_name == 'workflow_dispatch' &&
-        github.event.inputs.publish_release_assets_only == 'true' &&
+        (github.event.inputs.publish_release_assets_only == 'true' ||
+         github.event.inputs.prebuild_release_artifacts == 'true') &&
         needs.release_validate_gate.result == 'skipped')) &&
       (startsWith(github.ref, 'refs/tags/v') ||
        (github.event_name == 'workflow_dispatch' &&
-        github.event.inputs.publish_release_assets_only == 'true')) &&
+        (github.event.inputs.publish_release_assets_only == 'true' ||
+         github.event.inputs.prebuild_release_artifacts == 'true'))) &&
+      needs.release_prebuild.outputs.run_id == '' &&
       (github.event_name != 'workflow_dispatch' || github.event.inputs.assets_run_id == '')
     # Windows binaries are cross-compiled from Linux with cargo-xwin (clang-cl,
     # lld-link, the Windows SDK). The native windows-latest build ran 190 to
@@ -1048,7 +1190,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
         with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag != '' && github.event.inputs.release_tag || github.ref }}
+          ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.prebuild_release_artifacts == 'true' && github.sha || github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag != '' && github.event.inputs.release_tag || github.ref }}
 
       # The published source is always the release tag, but a recovery
       # dispatch runs this workflow definition from main, and a tag cut
@@ -1073,7 +1215,7 @@ jobs:
         id: version
         shell: bash
         env:
-          VERSION: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag || github.ref_name }}
+          VERSION: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.prebuild_release_artifacts == 'true' && needs.require_ci_green.outputs.prebuild_tag || github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag || github.ref_name }}
         run: |
           set -euo pipefail
           VERSION="${VERSION#v}"
@@ -1089,22 +1231,32 @@ jobs:
       # its attestations name main's commit, not the tag. Each archive
       # therefore carries a stamp of the tree it was built from, written only
       # after checking that the checkout is the tag's commit, and attested
-      # with it (see scripts/verify-release-asset-provenance --stamps).
+      # with it (see scripts/verify-release-asset-provenance --stamps). A
+      # pre-tag prebuild runs before the tag exists: its stamp names the
+      # dispatched main commit, which a tag run accepts only as its own.
       - name: Stamp archives with the checked-out release commit
         id: source_commit
         shell: bash
         env:
-          RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag || github.ref_name }}
+          RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.prebuild_release_artifacts == 'true' && needs.require_ci_green.outputs.prebuild_tag || github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag || github.ref_name }}
+          PREBUILD: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.prebuild_release_artifacts == 'true' }}
         run: |
           set -euo pipefail
           tree="$(git rev-parse HEAD)"
-          if ! tag_commit="$(git rev-parse --verify --quiet "refs/tags/${RELEASE_TAG}^{commit}")"; then
-            git fetch --no-tags --depth=1 origin "+refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}"
-            tag_commit="$(git rev-parse --verify "refs/tags/${RELEASE_TAG}^{commit}")"
-          fi
-          if [[ "${tree}" != "${tag_commit}" ]]; then
-            echo "checked-out tree ${tree} is not the ${RELEASE_TAG} commit ${tag_commit}" >&2
-            exit 1
+          if [[ "${PREBUILD}" == "true" ]]; then
+            if [[ "${tree}" != "${GITHUB_SHA}" ]]; then
+              echo "checked-out tree ${tree} is not the dispatched prebuild commit ${GITHUB_SHA}" >&2
+              exit 1
+            fi
+          else
+            if ! tag_commit="$(git rev-parse --verify --quiet "refs/tags/${RELEASE_TAG}^{commit}")"; then
+              git fetch --no-tags --depth=1 origin "+refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}"
+              tag_commit="$(git rev-parse --verify "refs/tags/${RELEASE_TAG}^{commit}")"
+            fi
+            if [[ "${tree}" != "${tag_commit}" ]]; then
+              echo "checked-out tree ${tree} is not the ${RELEASE_TAG} commit ${tag_commit}" >&2
+              exit 1
+            fi
           fi
           echo "source_commit=${tree}" >> "${GITHUB_OUTPUT}"
           stamped=0
@@ -1172,17 +1324,20 @@ jobs:
 
   build_binaries_buildbuddy:
     name: Build and package surface binaries via BuildBuddy
-    needs: [require_ci_green, release_validate_gate]
+    needs: [require_ci_green, release_validate_gate, release_prebuild]
     if: >-
       always() &&
       needs.require_ci_green.result == 'success' &&
       (needs.release_validate_gate.result == 'success' ||
        (github.event_name == 'workflow_dispatch' &&
-        github.event.inputs.publish_release_assets_only == 'true' &&
+        (github.event.inputs.publish_release_assets_only == 'true' ||
+         github.event.inputs.prebuild_release_artifacts == 'true') &&
         needs.release_validate_gate.result == 'skipped')) &&
       (startsWith(github.ref, 'refs/tags/v') ||
        (github.event_name == 'workflow_dispatch' &&
-        github.event.inputs.publish_release_assets_only == 'true')) &&
+        (github.event.inputs.publish_release_assets_only == 'true' ||
+         github.event.inputs.prebuild_release_artifacts == 'true'))) &&
+      needs.release_prebuild.outputs.run_id == '' &&
       (github.actor == 'lukacf' &&
        ((github.event_name == 'workflow_dispatch' &&
          github.event.inputs.release_backend == 'buildbuddy') ||
@@ -1214,7 +1369,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
         with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag != '' && github.event.inputs.release_tag || github.ref }}
+          ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.prebuild_release_artifacts == 'true' && github.sha || github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag != '' && github.event.inputs.release_tag || github.ref }}
 
       - uses: ./.github/actions/setup-buildbuddy-ci
         with:
@@ -1278,7 +1433,7 @@ jobs:
         shell: bash
         env:
           TARGET: ${{ matrix.target }}
-          VERSION: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag || github.ref_name }}
+          VERSION: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.prebuild_release_artifacts == 'true' && needs.require_ci_green.outputs.prebuild_tag || github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag || github.ref_name }}
           ARCHIVE_EXT: ${{ matrix.archive_ext }}
           BB_OUTPUT_BASE: ${{ runner.temp }}/bb-release-${{ matrix.target }}
         run: |
@@ -1353,22 +1508,32 @@ jobs:
       # its attestations name main's commit, not the tag. Each archive
       # therefore carries a stamp of the tree it was built from, written only
       # after checking that the checkout is the tag's commit, and attested
-      # with it (see scripts/verify-release-asset-provenance --stamps).
+      # with it (see scripts/verify-release-asset-provenance --stamps). A
+      # pre-tag prebuild runs before the tag exists: its stamp names the
+      # dispatched main commit, which a tag run accepts only as its own.
       - name: Stamp archives with the checked-out release commit
         id: source_commit
         shell: bash
         env:
-          RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag || github.ref_name }}
+          RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.prebuild_release_artifacts == 'true' && needs.require_ci_green.outputs.prebuild_tag || github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag || github.ref_name }}
+          PREBUILD: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.prebuild_release_artifacts == 'true' }}
         run: |
           set -euo pipefail
           tree="$(git rev-parse HEAD)"
-          if ! tag_commit="$(git rev-parse --verify --quiet "refs/tags/${RELEASE_TAG}^{commit}")"; then
-            git fetch --no-tags --depth=1 origin "+refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}"
-            tag_commit="$(git rev-parse --verify "refs/tags/${RELEASE_TAG}^{commit}")"
-          fi
-          if [[ "${tree}" != "${tag_commit}" ]]; then
-            echo "checked-out tree ${tree} is not the ${RELEASE_TAG} commit ${tag_commit}" >&2
-            exit 1
+          if [[ "${PREBUILD}" == "true" ]]; then
+            if [[ "${tree}" != "${GITHUB_SHA}" ]]; then
+              echo "checked-out tree ${tree} is not the dispatched prebuild commit ${GITHUB_SHA}" >&2
+              exit 1
+            fi
+          else
+            if ! tag_commit="$(git rev-parse --verify --quiet "refs/tags/${RELEASE_TAG}^{commit}")"; then
+              git fetch --no-tags --depth=1 origin "+refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}"
+              tag_commit="$(git rev-parse --verify "refs/tags/${RELEASE_TAG}^{commit}")"
+            fi
+            if [[ "${tree}" != "${tag_commit}" ]]; then
+              echo "checked-out tree ${tree} is not the ${RELEASE_TAG} commit ${tag_commit}" >&2
+              exit 1
+            fi
           fi
           echo "source_commit=${tree}" >> "${GITHUB_OUTPUT}"
           stamped=0
@@ -1515,20 +1680,23 @@ jobs:
 
   build_web_sdk_package:
     name: Build Web SDK package
-    needs: [require_ci_green, release_validate_gate]
+    needs: [require_ci_green, release_validate_gate, release_prebuild]
     if: >-
       always() &&
       needs.require_ci_green.result == 'success' &&
       (needs.release_validate_gate.result == 'success' ||
        (github.event_name == 'workflow_dispatch' &&
-        github.event.inputs.publish_web_sdk_only == 'true' &&
+        (github.event.inputs.publish_web_sdk_only == 'true' ||
+         github.event.inputs.prebuild_release_artifacts == 'true') &&
         needs.release_validate_gate.result == 'skipped')) &&
       (github.event_name != 'workflow_dispatch' ||
        github.event.inputs.web_sdk_artifact_run_id == '') &&
       (startsWith(github.ref, 'refs/tags/v') ||
        (github.event_name == 'workflow_dispatch' &&
-        github.event.inputs.publish_release_packages == 'true' &&
-        github.event.inputs.alpha_crates_only != 'true'))
+        ((github.event.inputs.publish_release_packages == 'true' &&
+          github.event.inputs.alpha_crates_only != 'true') ||
+         github.event.inputs.prebuild_release_artifacts == 'true'))) &&
+      needs.release_prebuild.outputs.run_id == ''
     runs-on: ${{ fromJSON(vars.MEERKAT_CI_RUNNER || '"ubuntu-24.04"') }}
     timeout-minutes: 180
     steps:
@@ -1537,7 +1705,7 @@ jobs:
         with:
           # Recovery dispatches run the workflow definition from main, but the
           # package must always be built from the explicitly selected release.
-          ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag != '' && github.event.inputs.release_tag || github.ref }}
+          ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.prebuild_release_artifacts == 'true' && github.sha || github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag != '' && github.event.inputs.release_tag || github.ref }}
 
       - uses: ./.github/actions/setup-rust-ci
 
@@ -1577,7 +1745,7 @@ jobs:
       # script refuses a packed wasm below 8 MiB and runs one turn from it.
       - name: Build and pack Web SDK
         env:
-          VERSION: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag || github.ref_name }}
+          VERSION: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.prebuild_release_artifacts == 'true' && needs.require_ci_green.outputs.prebuild_tag || github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag || github.ref_name }}
           CARGO_INCREMENTAL: "0"
           # Serialize memory-heavy wasm32 compilations. Local capped
           # comparisons OOM-killed at jobs 4 and 2; with jobs 1, the Cargo
@@ -1586,6 +1754,13 @@ jobs:
           CARGO_BUILD_JOBS: "1"
         run: scripts/release-build-web-sdk-package.sh "${GITHUB_WORKSPACE}/web-sdk-package"
 
+      # A tag run that reuses a prebuild's package verifies this attestation
+      # (release.yml at the tag commit on refs/heads/main) before publishing.
+      - name: Attest Web SDK package provenance
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: web-sdk-package/rkat-web-*.tgz
+
       - name: Upload Web SDK package
         uses: actions/upload-artifact@v4
         with:
@@ -1593,22 +1768,63 @@ jobs:
           path: web-sdk-package/rkat-web-*.tgz
           if-no-files-found: error
 
+  # The marker release_prebuild requires of a prebuild run: every binary lane
+  # (the binary build gate, Windows verified on Windows) and the Web SDK
+  # package succeeded for the dispatched commit.
+  release_prebuild_gate:
+    name: Release prebuild gate
+    needs: [require_ci_green, build_binaries_gate, build_web_sdk_package]
+    if: >-
+      always() &&
+      github.event_name == 'workflow_dispatch' &&
+      github.event.inputs.prebuild_release_artifacts == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Require every prebuilt release artifact
+        shell: bash
+        env:
+          PREBUILD_TAG: ${{ needs.require_ci_green.outputs.prebuild_tag }}
+        run: |
+          set -euo pipefail
+          request="${{ needs.require_ci_green.result }}"
+          binaries="${{ needs.build_binaries_gate.result }}"
+          web_sdk="${{ needs.build_web_sdk_package.result }}"
+          echo "Prebuild request: ${request}"
+          echo "Release binary build gate: ${binaries}"
+          echo "Web SDK package: ${web_sdk}"
+          [[ "${request}" == "success" && "${binaries}" == "success" && "${web_sdk}" == "success" && -n "${PREBUILD_TAG}" ]]
+          echo "Prebuilt every ${PREBUILD_TAG} release artifact of ${GITHUB_SHA}; the ${PREBUILD_TAG} tag run of exactly this commit publishes them instead of rebuilding."
+
   build_binaries_gate:
     name: Release binary build gate
     if: >-
       always() &&
       (startsWith(github.ref, 'refs/tags/v') ||
        (github.event_name == 'workflow_dispatch' &&
-        github.event.inputs.publish_release_assets_only == 'true'))
-    needs: [build_binaries, build_binaries_buildbuddy, build_binaries_windows_cross, verify_windows_binaries]
+        (github.event.inputs.publish_release_assets_only == 'true' ||
+         github.event.inputs.prebuild_release_artifacts == 'true')))
+    needs: [build_binaries, build_binaries_buildbuddy, build_binaries_windows_cross, verify_windows_binaries, release_prebuild]
     runs-on: ${{ fromJSON(vars.MEERKAT_CI_RUNNER || '"ubuntu-24.04"') }}
     steps:
       - name: Check selected release binary backend
         shell: bash
         env:
           ASSETS_RUN_ID: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.assets_run_id || '' }}
+          PREBUILD_RUN_ID: ${{ needs.release_prebuild.outputs.run_id }}
         run: |
           set -euo pipefail
+          # A tag whose commit was prebuilt: nothing is built here; the
+          # publisher verifies the prebuild run's archives and that its own
+          # build gate passed (see publish_github_release).
+          if [[ -n "${PREBUILD_RUN_ID}" ]]; then
+            for result in "${{ needs.build_binaries.result }}" "${{ needs.build_binaries_buildbuddy.result }}" \
+                          "${{ needs.build_binaries_windows_cross.result }}" "${{ needs.verify_windows_binaries.result }}"; do
+              [[ "${result}" == "skipped" ]] || { echo "release_prebuild found run ${PREBUILD_RUN_ID}, but a build job ran (${result})" >&2; exit 1; }
+            done
+            echo "Publishing the prebuilt archives of release run ${PREBUILD_RUN_ID}; no build in this run."
+            exit 0
+          fi
           # Asset recovery from an earlier run: nothing is built here; the
           # publisher verifies that run's archives and that its own build
           # gate passed (see publish_github_release).
@@ -1671,6 +1887,7 @@ jobs:
         release_semver_gate,
         build_binaries_gate,
         publish_unix_release_and_homebrew,
+        release_prebuild,
       ]
     runs-on: ubuntu-24.04
     steps:
@@ -1682,10 +1899,22 @@ jobs:
           fetch-depth: 0
 
       - name: Download all artifacts
-        if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.assets_run_id == '' }}
+        if: ${{ (github.event_name != 'workflow_dispatch' || github.event.inputs.assets_run_id == '') && needs.release_prebuild.outputs.run_id == '' }}
         uses: actions/download-artifact@v4
         with:
           path: release-artifacts
+
+      # A tag whose commit was prebuilt: the prebuild run's archives, stamps
+      # and attestations; verify-release-asset-provenance --source-run binds
+      # them to that run before anything is published.
+      - name: Download the archives of the exact-commit prebuild
+        if: ${{ needs.release_prebuild.outputs.run_id != '' }}
+        uses: actions/download-artifact@v4
+        with:
+          path: release-artifacts
+          pattern: meerkat-*
+          run-id: ${{ needs.release_prebuild.outputs.run_id }}
+          github-token: ${{ github.token }}
 
       # Asset recovery from an earlier run (assets_run_id): its archives,
       # stamps and attestations; verify-release-asset-provenance --source-run
@@ -1753,24 +1982,37 @@ jobs:
       # runs main's workflow against the tag, so its attestations name the
       # run's commit: then each archive must be attested by release.yml at
       # that commit on refs/heads/main, and carry an attested stamp proving
-      # its build job checked out the tag commit. With assets_run_id the
-      # archives come from that earlier run: --source-run binds them to its
-      # commit, requires its build gate to have passed, and accepts an
-      # unstamped run only if nothing outside .github/ and CHANGELOG.md
-      # changed between the tag and that commit.
+      # its build job checked out the tag commit. With assets_run_id, or on a
+      # tag whose commit was prebuilt (release_prebuild), the archives come
+      # from that earlier run: --source-run binds them to its commit,
+      # requires its build gate to have passed, and accepts an unstamped run
+      # only if nothing outside .github/ and CHANGELOG.md changed between the
+      # tag and that commit.
       - name: Verify exact-tag release build provenance
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag || github.ref_name }}
           RECOVERY_FROM_MAIN: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.publish_release_assets_only == 'true' && github.ref == 'refs/heads/main' }}
           ASSETS_RUN_ID: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.assets_run_id || '' }}
+          PREBUILD_RUN_ID: ${{ needs.release_prebuild.outputs.run_id }}
         run: |
           set -euo pipefail
           if [[ -n "${ASSETS_RUN_ID}" && "${RECOVERY_FROM_MAIN}" != "true" ]]; then
             echo "assets_run_id requires publish_release_assets_only dispatched on main" >&2
             exit 1
           fi
-          if [[ -n "${ASSETS_RUN_ID}" ]]; then
+          if [[ -n "${PREBUILD_RUN_ID}" ]]; then
+            # The tag commit's pre-tag prebuild, verified exactly like an
+            # assets_run_id recovery: release.yml dispatched on main at a
+            # commit in this tag's history with a green binary build gate,
+            # every archive and its stamp attested by release.yml at that
+            # commit on refs/heads/main, and every stamp naming this tag's
+            # commit (release_prebuild only selects a run at exactly it).
+            scripts/verify-release-asset-provenance \
+              --source-run "${PREBUILD_RUN_ID}" \
+              --stamps release-artifacts \
+              prepared-release-artifacts "${RELEASE_TAG}"
+          elif [[ -n "${ASSETS_RUN_ID}" ]]; then
             scripts/verify-release-asset-provenance \
               --source-run "${ASSETS_RUN_ID}" \
               --stamps release-artifacts \
@@ -2111,13 +2353,14 @@ jobs:
       needs.require_ci_green.result == 'success' &&
       needs.registry_credentials_preflight.result == 'success' &&
       (needs.build_web_sdk_package.result == 'success' ||
+       needs.release_prebuild.outputs.run_id != '' ||
        (github.event_name == 'workflow_dispatch' &&
         github.event.inputs.web_sdk_artifact_run_id != '')) &&
       (startsWith(github.ref, 'refs/tags/v') ||
        (github.event_name == 'workflow_dispatch' &&
         github.event.inputs.publish_release_packages == 'true' &&
         github.event.inputs.alpha_crates_only != 'true'))
-    needs: [require_ci_green, build_web_sdk_package, registry_credentials_preflight]
+    needs: [require_ci_green, build_web_sdk_package, registry_credentials_preflight, release_prebuild]
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
@@ -2140,12 +2383,45 @@ jobs:
           path: web-sdk-package
           run-id: >-
             ${{
+              needs.release_prebuild.outputs.run_id != '' &&
+              needs.release_prebuild.outputs.run_id ||
               github.event_name == 'workflow_dispatch' &&
               github.event.inputs.web_sdk_artifact_run_id != '' &&
               github.event.inputs.web_sdk_artifact_run_id ||
               github.run_id
             }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      # A package from the tag commit's pre-tag prebuild must be attested by
+      # release.yml at exactly this commit on refs/heads/main (the prebuild
+      # ran there) and pack this release's version.
+      - name: Verify the prebuilt Web SDK package
+        if: ${{ needs.release_prebuild.outputs.run_id != '' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          packages=(web-sdk-package/rkat-web-*.tgz)
+          if [[ "${#packages[@]}" -ne 1 ]]; then
+            echo "expected exactly one prebuilt @rkat/web package, found ${#packages[@]}" >&2
+            exit 1
+          fi
+          release_sha="$(git rev-parse HEAD)"
+          gh attestation verify "${packages[0]}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --source-digest "${release_sha}" \
+            --source-ref refs/heads/main \
+            --signer-workflow "github.com/${GITHUB_REPOSITORY}/.github/workflows/release.yml" \
+            >/dev/null
+          expected="$(node -p "require('./sdks/web/package.json').version")"
+          packed="$(tar -xzOf "${packages[0]}" package/package.json | node -e 'let s = ""; process.stdin.on("data", (d) => (s += d)).on("end", () => console.log(JSON.parse(s).version))')"
+          if [[ "${packed}" != "${expected}" ]]; then
+            echo "prebuilt @rkat/web packs ${packed}, this release is ${expected}" >&2
+            exit 1
+          fi
+          echo "Verified prebuilt @rkat/web ${packed}: attested by release.yml at ${release_sha} on refs/heads/main"
 
       - name: Publish Web SDK
         env:
