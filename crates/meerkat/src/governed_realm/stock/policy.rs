@@ -1891,6 +1891,64 @@ mod tests {
         assert!(is_denied_verdict(&error));
     }
 
+    /// Under a single grant lineage every operation resolves the work's one
+    /// lineage, so the stock owner is what keeps peer and memory tool
+    /// operations out of a stock realm: their owner-produced targets (each
+    /// comms delivery kind, the peer directory, and the read of the work's
+    /// own session memory through `memory_search`) have no stock mapping
+    /// and are unavailable, never a stock tuple and never a verdict.
+    #[test]
+    fn peer_and_memory_tool_targets_are_unmapped_under_a_single_grant_lineage() {
+        let session = SessionId::new();
+        let policy = policy();
+        let own = association(&session, |_| {});
+        assert!(matches!(
+            own.candidate().authority_basis,
+            WorkAuthorityBasis::GrantLineage { .. }
+        ));
+        let peer = meerkat_core::comms::PeerId::new();
+        let delivery = |kind| ToolOperationTarget::PeerSend { peer, kind };
+        for (name, target) in [
+            (
+                "send_message",
+                delivery(meerkat_core::PeerSendKind::Message),
+            ),
+            (
+                "reply_to_peer",
+                delivery(meerkat_core::PeerSendKind::Message),
+            ),
+            (
+                "send_request",
+                delivery(meerkat_core::PeerSendKind::Request),
+            ),
+            (
+                "send_response",
+                delivery(meerkat_core::PeerSendKind::Response),
+            ),
+            ("peers", ToolOperationTarget::PeerDirectoryRead),
+            (
+                "memory_search",
+                ToolOperationTarget::MemoryOperation {
+                    scope: MemorySearchScope::for_session(session.clone()).scope_ref(),
+                    operation: meerkat_core::MemoryOperation::Read,
+                },
+            ),
+        ] {
+            assert_eq!(
+                policy
+                    .authorize_operation(
+                        &own,
+                        &tool_binding(&session, name, Some(target)),
+                        LocalPolicyPurpose::Operation,
+                        5,
+                    )
+                    .expect_err(name),
+                OperationAuthorizationError::Unavailable,
+                "{name} has no stock mapping"
+            );
+        }
+    }
+
     /// The stock mandate is the checked invocation itself, named by this
     /// policy's own principals and never by a lineage reference, whatever
     /// the operation; work the stock rule does not admit is refused as at
