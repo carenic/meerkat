@@ -72,6 +72,23 @@ them.
   signal that they started; the archive post-commit hook signals with
   `notify_one`. The waits that follow a release are bounded at 5 s, so a lost
   release fails with a message instead of hanging the run.
+- BuildBuddy (Bazel) release builds of the shipped binaries no longer compile
+  tokio's `test-util` feature, the one test-only feature 0.9.1 left in them.
+  crate_universe resolves one feature set per external crate across every
+  dependency kind (26 workspace members dev-depend on tokio with
+  `test-util`), and a crate annotation can add a feature but not remove one.
+  A second rules_rust patch,
+  `tools/third-party/patches/rules_rust-release-stripped-crate-features.patch`,
+  moves each feature that `scripts/non-shipping-features.json` lists under
+  the new `external_crate_features` key out of the crate's rendered static
+  `crate_features` and into a select on `//tools/bazel:release_build`: the
+  test lanes keep it, `--define=meerkat_release_build=1` drops it. Editing
+  that key changes `MODULE.bazel.lock`. `scripts/check-bazel-release-features.py`
+  now also fails when a listed feature stays enabled in a release build of
+  any repository MODULE.bazel.lock renders for the crate (or when a listed
+  crate has none), and `scripts/check-release-binary-markers` no longer
+  allows tokio's test-util marker in a packaged binary. Cargo-built release
+  binaries never compiled it.
 
 ## [0.9.1] - 2026-10-15
 

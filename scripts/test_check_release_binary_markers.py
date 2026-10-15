@@ -3,8 +3,8 @@
 
 The artifact guard must refuse a binary carrying any of its test-only markers,
 name the marker, accept a clean binary, and fail closed on unreadable input.
-Exactly one marker is allowed (tokio's test-util until 0.9.2): alone it passes
-with a notice, and it never masks any other marker.
+No marker is allowed: tokio's test-util marker, the one exception until 0.9.2,
+now fails a binary like every other marker.
 Every workspace marker must still be a string that only gated test code
 compiles in: it must occur in its declared source under a `#[cfg(...)]` that
 names its gate. No marker may appear in the docs or in the help corpus the
@@ -25,8 +25,8 @@ GUARD = ROOT / "scripts" / "check-release-binary-markers"
 # The guard and this test name the markers; their gated sources compile them.
 NAMING_FILES = {"scripts/check-release-binary-markers", "scripts/test_check_release_binary_markers.py"}
 GATE_WINDOW = 60
-# The one documented exception; widening it must change this test too.
-ALLOWED = "time is not frozen"
+# tokio's test-util marker: allowed until 0.9.2, refused like any other since.
+TOKIO_TEST_UTIL = "time is not frozen"
 
 
 def markers() -> list[tuple[str, str, str]]:
@@ -36,10 +36,6 @@ def markers() -> list[tuple[str, str, str]]:
         marker, source, gate = line.split("|")
         entries.append((marker, source, gate))
     return entries
-
-
-def allowed_marker() -> str:
-    return subprocess.run([str(GUARD), "--allowed"], capture_output=True, text=True, check=True).stdout.strip()
 
 
 def tracked_files() -> list[str]:
@@ -82,10 +78,8 @@ class ReleaseBinaryMarkerTests(unittest.TestCase):
             self.assertGreaterEqual(len(marker), 16, f"{marker!r} is too short to be unique")
             self.assertTrue(source and gate, marker)
 
-    def test_each_marker_but_the_allowed_one_fails_the_binary_carrying_it(self) -> None:
+    def test_each_marker_fails_the_binary_carrying_it(self) -> None:
         for marker, source, _ in markers():
-            if marker == ALLOWED:
-                continue
             with self.subTest(marker=marker):
                 path = self.binary("rkat", marker.encode())
                 result = self.guard(str(path))
@@ -93,32 +87,23 @@ class ReleaseBinaryMarkerTests(unittest.TestCase):
                 self.assertIn(f'carries test-only code: "{marker}"', result.stderr)
                 self.assertIn(source, result.stderr)
 
-    def test_the_allowlist_is_exactly_the_tokio_marker(self) -> None:
-        self.assertEqual(allowed_marker(), ALLOWED)
-        self.assertIn(ALLOWED, [marker for marker, _, _ in markers()])
-
-    def test_the_allowed_marker_alone_passes_with_a_notice(self) -> None:
-        path = self.binary("rkat-mcp", ALLOWED.encode())
+    def test_tokio_test_util_marker_is_no_longer_allowed(self) -> None:
+        # The Bazel release builds drop tokio's test-util (a select on
+        # //tools/bazel:release_build), so its marker fails a binary alone and
+        # the guard has no allowlist left to consult.
+        self.assertIn(TOKIO_TEST_UTIL, [marker for marker, _, _ in markers()])
+        path = self.binary("rkat-mcp", TOKIO_TEST_UTIL.encode())
         result = self.guard(str(path))
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn(f'carries the allowed marker "{ALLOWED}"', result.stdout)
-        self.assertIn("beyond the allowed one", result.stdout)
-
-    def test_the_allowed_marker_never_masks_another(self) -> None:
-        for marker, _, _ in markers():
-            if marker == ALLOWED:
-                continue
-            with self.subTest(marker=marker):
-                path = self.binary("rkat", ALLOWED.encode() + b"\0" + marker.encode())
-                result = self.guard(str(path))
-                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-                self.assertIn(f'carries test-only code: "{marker}"', result.stderr)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn(f'carries test-only code: "{TOKIO_TEST_UTIL}"', result.stderr)
+        self.assertNotIn("allowed", result.stdout + result.stderr)
+        self.assertEqual(self.guard("--allowed").returncode, 2)
 
     def test_clean_binaries_pass_and_only_the_dirty_one_is_named(self) -> None:
         clean = self.binary("rkat-rpc")
         result = self.guard(str(clean))
         self.assertEqual(result.returncode, 0, result.stderr)
-        marker = next(marker for marker, _, _ in markers() if marker != ALLOWED)
+        marker = next(marker for marker, _, _ in markers() if marker != TOKIO_TEST_UTIL)
         dirty = self.binary("rkat-rest", b"\0" + marker.encode() + b"\0")
         result = self.guard(str(clean), str(dirty))
         self.assertEqual(result.returncode, 1)

@@ -125,6 +125,8 @@ for target in "${targets[@]}"; do
     fi
   done
   notes=""
+  # Only a checkout older than 0.9.2 has an allowed marker (tokio's test-util);
+  # its own guard reports it.
   if grep -q "carries the allowed marker" "${guard_log}"; then
     notes="; allowed marker present"
   fi

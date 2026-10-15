@@ -1,1 +1,4 @@
-exports_files(["rules_rust-portable-path-deps.patch"])
+exports_files([
+    "rules_rust-portable-path-deps.patch",
+    "rules_rust-release-stripped-crate-features.patch",
+])

@@ -1300,8 +1300,7 @@ jobs:
             if [[ "${TARGET}" == *-unknown-linux-gnu ]]; then
               ./scripts/check-linux-release-binary-portability.sh "${stage_dir}/${payload_name}"
             fi
-            # No release binary may carry compiled-in test code (the guard
-            # names its one documented exception, tokio's test-util).
+            # No release binary may carry compiled-in test code.
             .release-tooling/scripts/check-release-binary-markers "${stage_dir}/${payload_name}"
             archive_path="${PWD}/dist/${artifact_name}"
 

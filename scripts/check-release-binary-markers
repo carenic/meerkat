@@ -14,9 +14,10 @@
 #
 # Usage: check-release-binary-markers <binary>...
 #        check-release-binary-markers --list       (marker|source|gate, one per line)
-#        check-release-binary-markers --allowed    (the allowed marker)
-# Exit 0 = no marker but the allowed one, 1 = a binary carries test-only code,
-# 2 = usage or read error.
+# Exit 0 = no marker, 1 = a binary carries test-only code, 2 = usage or read
+# error. No marker is allowed: tokio's test-util marker was until 0.9.2, when
+# the Bazel release builds stopped compiling that feature (see
+# scripts/non-shipping-features.json, external_crate_features).
 
 set -euo pipefail
 
@@ -33,30 +34,13 @@ MARKERS=(
   "OAuth endpoints redirected to the local test fixture|crates/meerkat-auth-core/src/oauth_flow.rs|debug_assertions"
 )
 
-# The one allowed marker, until 0.9.2. tokio's test-util feature reaches the
-# Bazel (BuildBuddy) release binaries because crate_universe resolves one
-# feature set per external crate across every workspace dependency kind, dev
-# included (26 members dev-depend on tokio with test-util), and a crate
-# annotation can add features but never remove one. Its time-control APIs
-# (tokio::time::pause, advance, resume) are not used by production code;
-# runtime bookkeeping remains. The 0.9.2 fix overrides tokio's crate target
-# with one that drops test-util under //tools/bazel:release_build; delete this
-# entry with it.
-# Cargo release builds never contain it.
-ALLOWED_MARKER="time is not frozen"
-
 if [[ $# -eq 0 ]]; then
-  echo "usage: check-release-binary-markers <binary>... | --list | --allowed" >&2
+  echo "usage: check-release-binary-markers <binary>... | --list" >&2
   exit 2
 fi
 
 if [[ "$1" == "--list" ]]; then
   printf '%s\n' "${MARKERS[@]}"
-  exit 0
-fi
-
-if [[ "$1" == "--allowed" ]]; then
-  printf '%s\n' "${ALLOWED_MARKER}"
   exit 0
 fi
 
@@ -80,25 +64,17 @@ for binary in "$@"; do
     exit 2
   fi
   failed=0
-  allowed=0
   if [[ "${rc}" -eq 0 ]]; then
     for entry in "${MARKERS[@]}"; do
       marker="${entry%%|*}"
       rest="${entry#*|}"
       grep -qxF -- "${marker}" <<<"${found}" || continue
-      if [[ "${marker}" == "${ALLOWED_MARKER}" ]]; then
-        echo "notice: ${binary} carries the allowed marker \"${marker}\" (${rest%%|*}, ${rest#*|}; time-control APIs are not used by production code; runtime bookkeeping remains; removed in 0.9.2)"
-        allowed=1
-        continue
-      fi
       failed=1
       echo "error: ${binary} carries test-only code: \"${marker}\" (${rest%%|*}, ${rest#*|})" >&2
     done
   fi
   if [[ "${failed}" -eq 1 ]]; then
     status=1
-  elif [[ "${allowed}" -eq 1 ]]; then
-    echo "no test-only markers in ${binary} beyond the allowed one"
   else
     echo "no test-only markers in ${binary}"
   fi
