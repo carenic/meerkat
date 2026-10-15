@@ -218,6 +218,7 @@ of this full catalog.
 | `mob/snapshot` | Mob | `MobIdParams` | `MobSnapshotResult` | Point-in-time aggregate of mob status plus member list (mob feature) |
 | `mob/destroy` | Mob | `MobIdParams` | `MobDestroyResult` | Destroy a mob and surface the structured MobDestroyReport (mob feature) |
 | `mob/rotate_supervisor` | Mob | `MobIdParams` | `MobRotateSupervisorResult` | Rotate the supervisor bridge for all members of a mob (mob feature) |
+| `mob/claim_callback_route` | Mob | `MobIdParams` | `MobClaimCallbackRouteResult` | Bind a mob's member callback route to this connection (mob feature) |
 | `mob/submit_work` | Mob | `MobSubmitWorkParams` | `MobSubmitWorkResult` | Submit a unit of work to a mob member through the work lane (mob feature) |
 | `mob/conclude_objective` | Mob | `MobConcludeObjectiveParams` | `MobConcludeObjectiveResult` | Explicitly conclude a durable kickoff objective (mob feature) |
 | `mob/cancel_work` | Mob | `MobCancelWorkParams` | `MobCancelWorkResult` | Cancel a previously submitted unit of work (mob feature) |
@@ -489,6 +490,25 @@ result, or the turn cannot finish its callback. This foreground RPC exchange
 is neither MCP's `pending_tool_calls`/`meerkat_resume` continuation nor the
 separate detached-job callback extensions. `tool/execute` is not a
 client-callable catalog method.
+
+### Mob members
+
+A mob's members call the callback tools of the connection that holds the
+mob's callback route. `mob/create` gives the route to the creating
+connection. A mob restored after a restart, or one whose connection closed,
+has no route: a member's callback call fails `tool_unavailable` ("no
+connected client holds the callback route that serves it") until a
+connection claims the route:
+
+```json
+{"jsonrpc":"2.0","id":13,"method":"mob/claim_callback_route","params":{"mob_id":"team"}}
+```
+
+The claim is admitted like `mob/create` and returns `{"mob_id":"team"}`. It
+reaches the mob's live members and the ones it spawns later, which then call
+the tools this connection registered. While the connection that holds the
+route is open, another connection's claim is refused with `-32002`; the
+holder's own repeated claim succeeds.
 
 ## Session methods
 

@@ -140,6 +140,27 @@ fn rpc_mob_external_tools_provider_from_parts(
     })
 }
 
+/// The member external tools of one RPC mob: its callback route slot's
+/// tools, composed with the configured MCP tools.
+#[cfg(feature = "mob")]
+fn rpc_mob_slot_external_tools_provider(
+    runtime: &Arc<SessionRuntime>,
+    slot: Arc<crate::callback_dispatcher::MobCallbackRouteSlot>,
+    configured_mcp_tools: Option<Arc<dyn AgentToolDispatcher>>,
+) -> meerkat_mob::ExternalToolsProvider {
+    let runtime = Arc::downgrade(runtime);
+    let callback_tools_provider: Arc<
+        dyn Fn() -> Option<Arc<dyn AgentToolDispatcher>> + Send + Sync,
+    > = Arc::new(move || {
+        Some(Arc::new(
+            runtime
+                .upgrade()?
+                .callback_tool_dispatcher_for_mob_slot(&slot, vec![]),
+        ) as Arc<dyn AgentToolDispatcher>)
+    });
+    rpc_mob_external_tools_provider_from_parts(callback_tools_provider, configured_mcp_tools)
+}
+
 /// Compose the canonical RPC mob state before serving a transport.
 ///
 /// Shipping binaries use this seam to install process-scoped capabilities
@@ -179,8 +200,32 @@ pub fn compose_rpc_mob_state(
                 .map(|dispatcher| Arc::new(dispatcher) as Arc<dyn AgentToolDispatcher>)
         }
     });
-    let tools_provider =
-        rpc_mob_external_tools_provider_from_parts(callback_tools_provider, configured_mcp_tools);
+    let tools_provider = rpc_mob_external_tools_provider_from_parts(
+        callback_tools_provider,
+        configured_mcp_tools.clone(),
+    );
+    // Every mob built without its creator's route (a restored mob, or one
+    // created other than by `mob/create`) gets a route slot of its own, which
+    // `mob/claim_callback_route` binds to a connection. On a connection-owned
+    // server it starts unclaimed. A single-client host that installed the
+    // process-default route holds it with that route, so its restored mobs
+    // keep reaching its callbacks as before.
+    let member_external_tools_factory: meerkat_mob_mcp::MemberExternalToolsFactory = Arc::new({
+        let runtime = Arc::downgrade(runtime);
+        move |mob_id: &meerkat_mob::MobId| {
+            let runtime = runtime.upgrade()?;
+            let slot = Arc::new(match runtime.default_callback_route() {
+                Some(route) => crate::callback_dispatcher::MobCallbackRouteSlot::claimed_by(route),
+                None => crate::callback_dispatcher::MobCallbackRouteSlot::unclaimed(),
+            });
+            runtime.index_mob_callback_route_slot(mob_id.clone(), &slot);
+            Some(rpc_mob_slot_external_tools_provider(
+                &runtime,
+                slot,
+                configured_mcp_tools.clone(),
+            ))
+        }
+    });
     let mut state = meerkat_mob_mcp::MobMcpState::new_with_runtime_adapter(
         runtime.session_service(),
         Some(runtime.runtime_adapter()),
@@ -203,6 +248,7 @@ pub fn compose_rpc_mob_state(
     )
     .with_default_llm_client_provider(Some(llm_provider))
     .with_external_tools_provider(Some(tools_provider))
+    .with_member_external_tools_factory(member_external_tools_factory)
     // A top-level session that convenes a detached council is revived
     // through this runtime when its idle executor was retired meanwhile.
     .with_detached_owner_host(Arc::new(crate::detached_owner::RpcDetachedOwnerHost::new(
@@ -2030,31 +2076,34 @@ impl MethodRouter {
             .or_else(|| self.runtime.default_callback_route())
     }
 
-    /// `mob/create`: the new mob's members build their callback tools from
-    /// this connection's route. The route is given to that mob alone when it
-    /// is built, so a mob later created under the same id, or restored, never
-    /// reaches this connection's callbacks.
+    /// `mob/create`: the new mob's members call the callback tools of this
+    /// connection's route, through a route slot this connection holds for
+    /// that mob alone. A mob later created under the same id, or restored,
+    /// gets a slot of its own and never reaches this connection's callbacks
+    /// unless the connection claims it (`mob/claim_callback_route`).
     #[cfg(feature = "mob")]
     async fn handle_mob_create(
         &self,
         id: Option<crate::protocol::RpcId>,
         params: Option<&serde_json::value::RawValue>,
     ) -> RpcResponse {
-        let member_external_tools = self.callback_route.clone().map(|route| {
-            let runtime = Arc::downgrade(&self.runtime);
-            Arc::new(move || {
-                let runtime = runtime.upgrade()?;
-                Some(
-                    Arc::new(runtime.callback_tool_dispatcher_for_route(&route, vec![]))
-                        as Arc<dyn AgentToolDispatcher>,
-                )
-            }) as meerkat_mob::ExternalToolsProvider
+        let slot = self.callback_route().map(|route| {
+            Arc::new(crate::callback_dispatcher::MobCallbackRouteSlot::claimed_by(route))
+        });
+        let member_external_tools = slot.as_ref().map(|slot| {
+            rpc_mob_slot_external_tools_provider(&self.runtime, Arc::clone(slot), None)
         });
         handlers::mob::handle_create_with_member_external_tools(
             id,
             params,
             &self.mob_state,
             member_external_tools,
+            |mob_id| {
+                if let Some(slot) = &slot {
+                    self.runtime
+                        .index_mob_callback_route_slot(mob_id.clone(), slot);
+                }
+            },
         )
         .await
     }
@@ -2776,6 +2825,19 @@ impl MethodRouter {
             "mob/rotate_supervisor" => {
                 routed_arm(|| handlers::mob::handle_rotate_supervisor(id, params, &self.mob_state))
                     .await
+            }
+            #[cfg(feature = "mob")]
+            "mob/claim_callback_route" => {
+                routed_arm(|| {
+                    handlers::mob::handle_claim_callback_route(
+                        id,
+                        params,
+                        &self.mob_state,
+                        &self.runtime,
+                        self.callback_route(),
+                    )
+                })
+                .await
             }
             #[cfg(feature = "mob")]
             "mob/submit_work" => {
@@ -5911,7 +5973,21 @@ mod tests {
         );
         assert_eq!(result["capabilities"]["features"]["event_replay"], false);
 
-        let text = serde_json::to_string(result).expect("result serializes");
+        // The callable method names are the catalog's own (a name such as
+        // `mob/claim_callback_route` is no topology claim); the rest of the
+        // projection names no topology authority.
+        assert!(
+            result["endpoints"]["rpc_methods"].is_array(),
+            "the projection lists the callable methods: {result}"
+        );
+        let mut projection = result.clone();
+        if let Some(endpoints) = projection
+            .get_mut("endpoints")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            endpoints.remove("rpc_methods");
+        }
+        let text = serde_json::to_string(&projection).expect("result serializes");
         for forbidden in ["topology", "registry", "lease", "claim", "project"] {
             assert!(
                 !text.contains(forbidden),

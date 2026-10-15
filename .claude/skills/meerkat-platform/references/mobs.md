@@ -474,9 +474,13 @@ surface contracts.
 ```
 
 A mob's members reach the callback tools registered on the JSON-RPC
-connection whose `mob/create` created that mob. A mob restored after a
-restart, or created any other way, has no callback route; re-create it to
-bind a live connection.
+connection that holds the mob's callback route: the connection whose
+`mob/create` created it, or the one that claimed it with
+`mob/claim_callback_route {mob_id}`. A mob restored after a restart, created
+any other way, or whose connection closed, has no route: its members'
+callbacks fail `tool_unavailable` until a connection claims it. The claim
+reaches live and later members alike; while the holding connection is open,
+another connection's claim is refused with `-32002`.
 
 ### REST
 

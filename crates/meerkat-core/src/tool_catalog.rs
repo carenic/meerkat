@@ -136,6 +136,10 @@ pub enum ToolUnavailableReason {
     /// execution-plan resolution.
     ExecutionOwnerChanged,
     TemporarilyUnavailable,
+    /// The tool is served over a mob's callback route, and no connected
+    /// client holds that route: no connection claimed it in this process,
+    /// or the connection that held it closed.
+    CallbackRouteUnclaimed,
 }
 
 impl std::fmt::Display for ToolUnavailableReason {
@@ -156,6 +160,9 @@ impl std::fmt::Display for ToolUnavailableReason {
             }
             ToolUnavailableReason::TemporarilyUnavailable => {
                 f.write_str("tool is temporarily unavailable")
+            }
+            ToolUnavailableReason::CallbackRouteUnclaimed => {
+                f.write_str("no connected client holds the callback route that serves it")
             }
         }
     }

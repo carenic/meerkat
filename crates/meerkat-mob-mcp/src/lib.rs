@@ -620,6 +620,11 @@ fn destroy_report_summary(report: &meerkat_mob::MobDestroyReport) -> String {
 
 type DefaultLlmClientProvider = Arc<dyn Fn() -> Option<Arc<dyn LlmClient>> + Send + Sync + 'static>;
 
+/// Builds the default external tools of one mob's members from the mob's id
+/// (see [`MobMcpState::with_member_external_tools_factory`]).
+pub type MemberExternalToolsFactory =
+    Arc<dyn Fn(&MobId) -> Option<meerkat_mob::ExternalToolsProvider> + Send + Sync>;
+
 #[doc(hidden)]
 #[derive(Default)]
 pub struct InMemoryArchiveFailureControl {
@@ -802,6 +807,8 @@ pub struct MobMcpState {
     default_llm_client: Option<Arc<dyn LlmClient>>,
     default_llm_client_provider: Option<DefaultLlmClientProvider>,
     external_tools_provider: Option<meerkat_mob::ExternalToolsProvider>,
+    /// Per-mob member external tools (see [`MemberExternalToolsFactory`]).
+    member_external_tools_factory: Option<MemberExternalToolsFactory>,
     /// Host selection of member destinations, inherited by every child mob.
     member_runtime_registration_hook: Option<Arc<dyn meerkat_mob::MemberRuntimeRegistrationHook>>,
     before_activation: std::sync::OnceLock<meerkat_mob::MobBeforeActivation>,
@@ -1005,6 +1012,7 @@ impl MobMcpState {
             default_llm_client: None,
             default_llm_client_provider: None,
             external_tools_provider: None,
+            member_external_tools_factory: None,
             member_runtime_registration_hook: None,
             before_activation: std::sync::OnceLock::new(),
             child_tool_bundles: ChildToolBundles::default(),
@@ -2228,6 +2236,36 @@ impl MobMcpState {
         self
     }
 
+    /// Build each mob's member external tools from its id, for every mob
+    /// this state builds without caller-supplied member tools: a restored
+    /// mob, and one created other than through
+    /// [`Self::mob_create_definition_with_member_external_tools`]. A surface
+    /// that binds member tools per mob (an RPC connection's callback route,
+    /// which a later [`Self::mob_claim_member_external_tools`] rebinds)
+    /// supplies it. Without it, those mobs get
+    /// [`Self::with_external_tools_provider`]'s state-wide tools.
+    pub fn with_member_external_tools_factory(
+        mut self,
+        factory: MemberExternalToolsFactory,
+    ) -> Self {
+        self.member_external_tools_factory = Some(factory);
+        self
+    }
+
+    /// The member external tools of the mob `mob_id` builds: the caller's
+    /// own, else the per-mob factory's.
+    fn member_external_tools_for(
+        &self,
+        mob_id: &MobId,
+        supplied: Option<meerkat_mob::ExternalToolsProvider>,
+    ) -> Option<meerkat_mob::ExternalToolsProvider> {
+        supplied.or_else(|| {
+            self.member_external_tools_factory
+                .as_ref()
+                .and_then(|factory| factory(mob_id))
+        })
+    }
+
     /// Inherit the host's member destination selection into every child mob
     /// this state creates or restores, so no child member registers without
     /// its destination installed.
@@ -2971,8 +3009,16 @@ impl MobMcpState {
         path: &Path,
     ) -> Result<MobId, MobError> {
         let scope = child_tool_policy::ChildMobScope::default();
+        let member_external_tools = match storage.created_definition().await? {
+            Some(definition) => self.member_external_tools_for(&definition.id, None),
+            None => None,
+        };
         let handle = self
-            .configure_builder(MobBuilder::for_resume(storage), scope.clone(), None)
+            .configure_builder(
+                MobBuilder::for_resume(storage),
+                scope.clone(),
+                member_external_tools,
+            )
             .before_activation(self.restore_scope_hook(scope))
             .resume()
             .await?;
@@ -3212,8 +3258,13 @@ impl MobMcpState {
         }
         let scope = child_tool_policy::ChildMobScope::default();
         let (custody, custody_watch) = meerkat_mob::runtime::start_admitted_destroy_custody();
+        let member_external_tools = self.member_external_tools_for(&mob_id, None);
         let resumed = self
-            .configure_builder(MobBuilder::for_resume(storage), scope.clone(), None)
+            .configure_builder(
+                MobBuilder::for_resume(storage),
+                scope.clone(),
+                member_external_tools,
+            )
             .before_activation(self.restore_scope_hook(scope))
             .admit_destroy_before_start(
                 CommandAuthority::principal(self.console_principal.clone()),
@@ -3501,6 +3552,36 @@ impl MobMcpState {
             .await
     }
 
+    /// Claim the member external tools of an existing mob for a caller (an
+    /// RPC connection claiming a mob's callback route).
+    ///
+    /// Admitted like a create: the console owner only (`SendCommand`), and
+    /// held by this state's admission while it runs, so a stood-down state
+    /// admits no claim. A restored mob is restored first, so the claim
+    /// reaches the tools its restored members were built with. `claim` is
+    /// the caller's own binding of what it claims; it runs once the mob is
+    /// found, and its answer is returned unchanged.
+    pub async fn mob_claim_member_external_tools<T, F>(
+        &self,
+        mob_id: &MobId,
+        claim: F,
+    ) -> Result<T, MobError>
+    where
+        F: FnOnce() -> T + Send,
+        T: Send,
+    {
+        self.require_console_owner(ControlScope::SendCommand)?;
+        let _admission = self.admit("mob callback route claim")?;
+        self.ensure_restored().await?;
+        if !self.mobs.read().await.contains_key(mob_id) {
+            return Err(self
+                .held_child_mob_error(mob_id)
+                .await
+                .unwrap_or_else(|| MobError::MobNotFound(mob_id.clone())));
+        }
+        Ok(claim())
+    }
+
     pub async fn mob_create_from_mobpack(
         &self,
         definition: MobDefinition,
@@ -3557,11 +3638,12 @@ impl MobMcpState {
             return Err(Self::owed_destroy_cleanup_error(&mob_id));
         }
         let (storage, storage_path) = self.storage_for_new_mob(&mob_id).await?;
+        let member_external_tools = self.member_external_tools_for(&mob_id, None);
         let handle = self
             .configure_builder(
                 MobBuilder::new(definition, storage),
                 child_tool_policy::ChildMobScope::default(),
-                None,
+                member_external_tools,
             )
             .create()
             .await?;
@@ -3713,6 +3795,7 @@ impl MobMcpState {
                 .supply(&mut definition)?;
         }
         let scope = child_tool_policy::ChildMobScope::new(child);
+        let member_external_tools = self.member_external_tools_for(&mob_id, member_external_tools);
         let mut builder = self.configure_builder(
             MobBuilder::new(definition.clone(), storage),
             scope,

@@ -43,6 +43,35 @@ them.
   `builtin_config.shell_timeout_secs`). Struct-literal constructors must add
   it; `None` keeps the previous behaviour. `SessionBuildState` skips it when
   unset, so stored sessions keep their bytes.
+- `meerkat-core`: `ToolUnavailableReason` gains `CallbackRouteUnclaimed` (see
+  Added: `mob/claim_callback_route`). The enum is not `#[non_exhaustive]`;
+  exhaustive matches must add the variant.
+
+### Added
+
+- `meerkat-rpc`: `mob/claim_callback_route {mob_id}` binds a mob's member
+  callback route to the calling connection (#1459). A mob restored after a
+  restart had no callback route: its members were rebuilt before any
+  connection could offer one, so their callback tools were absent until the
+  mob was re-created. Every member of an RPC mob now calls its callback
+  tools through a per-mob route slot. `mob/create` still gives it to the
+  creating connection; a restored mob's slot starts empty, and the claim
+  fills it for the mob's live members and later ones alike. The claim is
+  admitted like `mob/create`, and refused with `-32002` while the connection
+  that holds the route is open. When that connection closes, or before any
+  claim, a member's callback fails `tool_unavailable` with the
+  `CallbackRouteUnclaimed` reason ("no connected client holds the callback
+  route that serves it") instead of reaching a closed route. The Python
+  (`mob_claim_callback_route`) and TypeScript (`mobClaimCallbackRoute`)
+  clients wrap it, and `meerkat-contracts` adds
+  `MobClaimCallbackRouteResult`. For hosts: `meerkat-mob-mcp` adds
+  `MemberExternalToolsFactory`, `MobMcpState::with_member_external_tools_factory`
+  (member external tools built per mob, restored mobs included) and
+  `MobMcpState::mob_claim_member_external_tools`; `meerkat-rpc` adds
+  `MobCallbackRouteSlot`, `MobCallbackRouteClaimRefused`,
+  `CallbackToolDispatcher::from_mob_slot` (and `_with_job_runtime`),
+  `CallbackRoute::same_connection` and
+  `SessionRuntime::callback_tool_dispatcher_for_mob_slot`.
 
 ### Changed
 

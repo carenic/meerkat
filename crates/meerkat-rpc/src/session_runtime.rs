@@ -504,6 +504,13 @@ pub(crate) use meerkat::session_runtime::staged_promotion::{
 };
 
 #[cfg(feature = "mob")]
+type RpcMobCallbackRouteSlots = Arc<
+    StdMutex<
+        HashMap<meerkat_mob::MobId, Vec<Weak<crate::callback_dispatcher::MobCallbackRouteSlot>>>,
+    >,
+>;
+
+#[cfg(feature = "mob")]
 type RpcMobActorWitnesses = Arc<StdRwLock<HashMap<SessionId, meerkat::LiveSessionActorWitness>>>;
 
 #[cfg(feature = "mob")]
@@ -2529,6 +2536,12 @@ pub struct SessionRuntime {
     mob_state: Arc<StdRwLock<Option<Arc<meerkat_mob_mcp::MobMcpState>>>>,
     #[cfg(feature = "mob")]
     mob_actor_witnesses: RpcMobActorWitnesses,
+    /// The callback route slots of the mobs the runtime's mob state built
+    /// (see [`crate::callback_dispatcher::MobCallbackRouteSlot`]), newest
+    /// last under each mob id. The mob's member tools hold its slot; this
+    /// index only finds it for a claim.
+    #[cfg(feature = "mob")]
+    mob_callback_route_slots: RpcMobCallbackRouteSlots,
     #[cfg(feature = "mcp")]
     mcp_sessions: Arc<RwLock<std::collections::HashMap<SessionId, SessionMcpState>>>,
     /// The governed host's MCP attachment identity-key custody. Only the
@@ -3517,6 +3530,8 @@ impl SessionRuntime {
             mob_state: Arc::new(StdRwLock::new(None)),
             #[cfg(feature = "mob")]
             mob_actor_witnesses: Arc::new(StdRwLock::new(HashMap::new())),
+            #[cfg(feature = "mob")]
+            mob_callback_route_slots: Arc::new(StdMutex::new(HashMap::new())),
             #[cfg(feature = "mcp")]
             mcp_sessions: Arc::new(RwLock::new(std::collections::HashMap::new())),
             #[cfg(feature = "mcp")]
@@ -3688,6 +3703,8 @@ impl SessionRuntime {
             mob_state: Arc::new(StdRwLock::new(None)),
             #[cfg(feature = "mob")]
             mob_actor_witnesses: Arc::new(StdRwLock::new(HashMap::new())),
+            #[cfg(feature = "mob")]
+            mob_callback_route_slots: Arc::new(StdMutex::new(HashMap::new())),
             #[cfg(feature = "mcp")]
             mcp_sessions: Arc::new(RwLock::new(std::collections::HashMap::new())),
             #[cfg(feature = "mcp")]
@@ -7028,6 +7045,68 @@ impl SessionRuntime {
                 crate::callback_dispatcher::CallbackToolDispatcher::from_route(route, inline_tools)
             }
         }
+    }
+
+    /// Build a dispatcher for a mob's members on the mob's claimable
+    /// callback route slot: it follows every later claim of the slot.
+    #[cfg(feature = "mob")]
+    pub fn callback_tool_dispatcher_for_mob_slot(
+        &self,
+        slot: &Arc<crate::callback_dispatcher::MobCallbackRouteSlot>,
+        inline_tools: Vec<meerkat_core::ToolDef>,
+    ) -> crate::callback_dispatcher::CallbackToolDispatcher {
+        match self.realm_id() {
+            Some(realm_id) => {
+                crate::callback_dispatcher::CallbackToolDispatcher::from_mob_slot_with_job_runtime(
+                    Arc::clone(slot),
+                    inline_tools,
+                    realm_id.to_string(),
+                    self.job_store.clone(),
+                    self.blob_store(),
+                )
+            }
+            None => crate::callback_dispatcher::CallbackToolDispatcher::from_mob_slot(
+                Arc::clone(slot),
+                inline_tools,
+            ),
+        }
+    }
+
+    /// Index `slot` as the newest callback route slot of the mob `mob_id`.
+    ///
+    /// Slots nothing holds any more leave the index. An earlier slot under
+    /// the same id stays until it dies: a mob re-created under the id of one
+    /// still shutting down, or a create that loses a race to a duplicate,
+    /// leaves a slot that dies with what built it, and the lookup skips it.
+    #[cfg(feature = "mob")]
+    pub(crate) fn index_mob_callback_route_slot(
+        &self,
+        mob_id: meerkat_mob::MobId,
+        slot: &Arc<crate::callback_dispatcher::MobCallbackRouteSlot>,
+    ) {
+        let mut slots = self
+            .mob_callback_route_slots
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        slots.retain(|_, indexed| {
+            indexed.retain(|slot| slot.strong_count() > 0);
+            !indexed.is_empty()
+        });
+        slots.entry(mob_id).or_default().push(Arc::downgrade(slot));
+    }
+
+    /// The newest callback route slot of the mob `mob_id` that its members
+    /// still hold.
+    #[cfg(feature = "mob")]
+    pub(crate) fn mob_callback_route_slot(
+        &self,
+        mob_id: &meerkat_mob::MobId,
+    ) -> Option<Arc<crate::callback_dispatcher::MobCallbackRouteSlot>> {
+        self.mob_callback_route_slots
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(mob_id)
+            .and_then(|indexed| indexed.iter().rev().find_map(Weak::upgrade))
     }
 
     /// Bind `session_id` to the callback route it was created on.

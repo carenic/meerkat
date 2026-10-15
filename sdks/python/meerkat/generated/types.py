@@ -2989,6 +2989,13 @@ class MobRotateSupervisorResult:
 
 
 @dataclass
+class MobClaimCallbackRouteResult:
+    """Response payload for `mob/claim_callback_route`: the calling connection
+now holds the mob's member callback route."""
+    mob_id: str
+
+
+@dataclass
 class MobSubmitWorkParams:
     """Request payload for `mob/submit_work`.
 

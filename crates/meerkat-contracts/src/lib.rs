@@ -238,6 +238,7 @@ pub use wire::{
     MobCancelAllWorkResult,
     MobCancelWorkParams,
     MobCancelWorkResult,
+    MobClaimCallbackRouteResult,
     MobConcludeObjectiveParams,
     MobConcludeObjectiveResult,
     MobCreateParams,
