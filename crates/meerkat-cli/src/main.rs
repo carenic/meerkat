@@ -5661,6 +5661,30 @@ pub(crate) fn with_cli_confinement(
     Ok(factory.with_host_confinement(&confinement))
 }
 
+/// The project root a CLI factory in `scope` works in: the context root,
+/// else the project found from the working directory.
+fn cli_project_root(scope: &RuntimeScope) -> PathBuf {
+    scope.context_root.clone().unwrap_or_else(|| {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        find_project_root(&cwd).unwrap_or(cwd)
+    })
+}
+
+/// The OS process confinement a run in `scope` installs
+/// ([`with_cli_confinement`]): `config`'s composed `[confinement]`, with the
+/// `--confinement*` flags [`load_config`] applied, over the project root.
+/// For a command that judges the host's own inputs without building a
+/// factory.
+fn cli_host_confinement(
+    config: &Config,
+    scope: &RuntimeScope,
+) -> anyhow::Result<meerkat::HostConfinement> {
+    Ok(meerkat::HostConfinement::resolve(
+        &config.confinement,
+        Some(&cli_project_root(scope)),
+    )?)
+}
+
 /// Report this host's confinement once per process on stderr, the CLI's
 /// channel for its startup report: each launch kind's requested and
 /// effective confinement and what keeps the host's own inputs from its
@@ -18453,21 +18477,51 @@ async fn load_mcp_login_servers(
     cli_scope: &RuntimeScope,
 ) -> anyhow::Result<Vec<meerkat_core::McpServerWithSource>> {
     use meerkat_core::McpServerSource;
+    // A login addresses only servers the host installed: an `mcp.toml` a
+    // confined process can write configures none, so a planted entry cannot
+    // point a login at a server of its choosing.
+    let (config, _) = load_config(cli_scope).await?;
+    let host = cli_host_confinement(&config, cli_scope)?;
+    let untrusted = |path: &Path| host.untrusted_source(path);
+    let not_configured = || {
+        anyhow::anyhow!(
+            "MCP server '{name}' is not configured: {}",
+            meerkat_core::confinement::ConfinementRefusal::UntrustedConfigurationSource
+        )
+    };
     let realm_servers = cli_realm_mcp_servers(selection, cli_scope).await?;
     let servers = match selection {
-        Some(McpServerSource::File(scope)) => McpConfig::load_scope_from_roots(
-            scope,
-            cli_scope.context_root.as_deref(),
-            cli_scope.user_config_root.as_deref(),
-        )
-        .await?
-        .servers
-        .into_iter()
-        .map(|server| meerkat_core::McpServerWithSource {
-            server,
-            source: McpServerSource::File(scope),
-        })
-        .collect::<Vec<_>>(),
+        Some(McpServerSource::File(scope)) => {
+            let file = match scope {
+                McpScope::Project => cli_scope
+                    .context_root
+                    .as_deref()
+                    .map(meerkat_core::mcp_config::project_mcp_path_in),
+                McpScope::User => cli_scope
+                    .user_config_root
+                    .as_deref()
+                    .map(meerkat_core::mcp_config::user_mcp_path_in),
+            };
+            let servers = McpConfig::load_scope_from_roots(
+                scope,
+                cli_scope.context_root.as_deref(),
+                cli_scope.user_config_root.as_deref(),
+            )
+            .await?
+            .servers;
+            if file.as_deref().is_some_and(untrusted)
+                && servers.iter().any(|server| server.name == name)
+            {
+                return Err(not_configured());
+            }
+            servers
+                .into_iter()
+                .map(|server| meerkat_core::McpServerWithSource {
+                    server,
+                    source: McpServerSource::File(scope),
+                })
+                .collect::<Vec<_>>()
+        }
         // The realm's own servers, refused as a whole like any realm MCP
         // set (an environment reference in any entry, selected or not)
         // before one is selected.
@@ -18476,12 +18530,21 @@ async fn load_mcp_login_servers(
         }
         // The realm's MCP set, as a session in this realm sees it.
         None => {
-            McpConfig::effective_servers_from_roots(
+            let servers = McpConfig::effective_servers_from_roots_trusting(
                 &realm_servers,
                 cli_scope.context_root.as_deref(),
                 cli_scope.user_config_root.as_deref(),
+                &untrusted,
             )
-            .await?
+            .await?;
+            if servers
+                .refused
+                .iter()
+                .any(|refused| refused.server.name == name)
+            {
+                return Err(not_configured());
+            }
+            servers.admitted
         }
     };
     Ok(servers
@@ -34858,6 +34921,71 @@ supports_reasoning = true
         delete_realm(&state_root, "parent", false)
             .await
             .expect("the parent of no remaining realm is deleted");
+    }
+
+    /// `rkat mcp login` addresses only servers the host installed: a server
+    /// that only an `mcp.toml` a confined process can write defines is
+    /// refused before any discovery, client registration or credential
+    /// storage, so a planted entry cannot point a login at a server of its
+    /// choosing. The same file outside every write grant is used.
+    #[cfg(feature = "mcp")]
+    #[tokio::test]
+    async fn test_mcp_login_refuses_a_server_only_an_untrusted_mcp_toml_defines() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let base = temp.path().canonicalize().expect("canonical temp");
+        let project = base.join("project");
+        let state = base.join("state");
+        for dir in [project.join(".rkat"), state.join(".rkat")] {
+            tokio::fs::create_dir_all(&dir).await.expect("create dir");
+        }
+        tokio::fs::write(
+            project.join(".rkat").join("mcp.toml"),
+            "[[servers]]\nname = \"planted\"\nurl = \"https://planted.example/mcp\"\n",
+        )
+        .await
+        .expect("write project mcp.toml");
+        let mut scope = test_scope(state.clone(), "login-untrusted");
+        scope.context_root = Some(project.clone());
+        let user_document = |write: &Path| {
+            format!(
+                "[confinement.all]\nmode = \"custom\"\nworking_directory = \"{dir}\"\nrequirement = {{ baseline = \"command_runtime_v1\", read = {{ kind = \"paths\", paths = [{{ kind = \"subtree\", path = \"{dir}\" }}] }}, write = {{ kind = \"paths\", paths = [{{ kind = \"subtree\", path = \"{dir}\" }}] }}, deny_read = [], deny_write = [], network = {{ kind = \"denied\" }}, unix_connect = [], require_descendant_termination = false }}\n",
+                dir = write.display()
+            )
+        };
+
+        tokio::fs::write(
+            state.join(".rkat").join("config.toml"),
+            user_document(&project),
+        )
+        .await
+        .expect("write user document");
+        for selection in [
+            None,
+            Some(meerkat_core::McpServerSource::File(McpScope::Project)),
+        ] {
+            let refused = load_mcp_login_servers("planted", selection, &scope)
+                .await
+                .expect_err("a server only an untrusted mcp.toml defines is refused");
+            assert!(
+                format!("{refused:#}").contains("confined process"),
+                "{selection:?}: {refused:#}"
+            );
+        }
+
+        let elsewhere = base.join("elsewhere");
+        tokio::fs::create_dir_all(&elsewhere)
+            .await
+            .expect("create elsewhere");
+        tokio::fs::write(
+            state.join(".rkat").join("config.toml"),
+            user_document(&elsewhere),
+        )
+        .await
+        .expect("write user document");
+        let servers = load_mcp_login_servers("planted", None, &scope)
+            .await
+            .expect("a trusted mcp.toml configures the server");
+        assert_eq!(servers.len(), 1);
     }
 
     /// `config set` refuses a wrapped config in every input form: a

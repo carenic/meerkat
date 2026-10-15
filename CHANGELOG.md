@@ -47,6 +47,12 @@ them.
   have a new `refused_mcp_servers` field (`Vec<McpServerRefusal>`); a struct
   literal must add it (or use `..Default::default()` or
   `AgentBuildConfig::new`).
+- `meerkat::HostMcpTargetRefusal` has a new variant `Refused { server_name,
+  refusal }` (an MCP auth target only an untrusted `mcp.toml` defines; see
+  Fixed); an exhaustive match must handle it.
+- `meerkat_rest::AppState` has a new public field `host_confinement`
+  (`meerkat::HostConfinement`); a struct literal must add it
+  (`HostConfinement::trusted_host()` keeps the previous behaviour).
 - Behaviour-only (not measured by the gate): a config write that changes the
   realm sections of a realm's own document (its parent edge, or a
   `[realm.global]` section) is also refused with
@@ -93,6 +99,8 @@ them.
   `HostConfinement::untrusted_directory` judges a convention directory as a
   whole; `meerkat_skills::resolve_repositories_with_roots_trusting` resolves
   skill repositories without the directories a predicate does not trust.
+- `meerkat::resolve_configured_mcp_target_in_realm_trusting` resolves an MCP
+  auth target without the `mcp.toml` files a predicate does not trust.
 - `SdkConfigStore::with_realm_document` builds a realm document store that
   keeps the realm's composed `[confinement]` and `[governance]`
   (`FileConfigStore::with_realm_chain`).
@@ -145,6 +153,14 @@ them.
   REST, the MCP config tool, `rkat config`, and the governed stock
   finalization store). In 0.9.1 such a write dropped the ancestors' review
   rules from the next start.
+- An MCP auth request (`auth/login/*`, `auth/status/get`, `auth/logout`
+  over JSON-RPC, the REST login, completion and cancel routes, and `rkat mcp
+  login`) on a host whose confined processes can write an `mcp.toml` no
+  longer addresses a server only that file defines: it is refused as not
+  configured (`mcp_server_not_configured`) before anything is discovered,
+  registered or stored for it. Before, a confined process could plant a
+  definition and point a login at a server of its choosing, which then held
+  the user's authorization.
 - `rkat-rpc`, `rkat-rest` and `rkat-mcp` read their working directory at
   startup only for a relative `--confinement-read` or `--confinement-write`
   path. They read it on every start, so a server whose working directory had

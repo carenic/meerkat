@@ -662,7 +662,11 @@ administration from out of its confined processes' reach:
   expanded, authorized, connected or spawned, each of its hooks keeps its
   place and is refused at every invocation, so a mandatory guardrail
   withholds what it gates, and its skills are not loaded. A definition that
-  a trusted source states identically is used from that source.
+  a trusted source states identically is used from that source. An MCP auth
+  request (login, completion, cancel, status or logout over JSON-RPC or
+  REST, and `rkat mcp login`) that names a server only such a file defines
+  is refused as not configured (`mcp_server_not_configured`) before anything
+  is discovered, registered or stored for it.
 
 Each launch kind is judged on its own grants and protections: one kind's
 protection does not cover another kind that writes the same place. On macOS

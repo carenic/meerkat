@@ -304,6 +304,15 @@ pub enum HostMcpTargetRefusal {
     /// set does not resolve.
     #[error(transparent)]
     InvalidAccessPolicy(meerkat_core::McpServerAccessError),
+    /// The server is defined only in an `mcp.toml` a confined process can
+    /// write, so it is not a server the host installed: nothing is
+    /// discovered, registered or stored for it
+    /// ([`resolve_configured_mcp_target_in_realm_trusting`]).
+    #[error("MCP server '{server_name}' is not configured: {refusal}")]
+    Refused {
+        server_name: String,
+        refusal: meerkat_core::confinement::ConfinementRefusal,
+    },
 }
 
 impl HostMcpTargetRefusal {
@@ -346,28 +355,68 @@ pub async fn resolve_configured_mcp_target_in_realm(
     context_root: Option<&std::path::Path>,
     user_config_root: Option<&std::path::Path>,
 ) -> Result<McpServerIdentity, HostAuthError> {
+    resolve_configured_mcp_target_in_realm_trusting(
+        target,
+        realm_servers,
+        context_root,
+        user_config_root,
+        &|_| false,
+    )
+    .await
+}
+
+/// [`resolve_configured_mcp_target_in_realm`] for a host whose confined
+/// processes may write an `mcp.toml` file: `untrusted` names each file they
+/// can write ([`crate::HostConfinement::untrusted_source`]), as for the
+/// host's sessions
+/// ([`McpConfig::effective_servers_from_roots_trusting`](meerkat_core::McpConfig::effective_servers_from_roots_trusting)).
+/// A server only such a file defines is not one the host installed: it is
+/// refused ([`HostMcpTargetRefusal::Refused`]) before anything is
+/// discovered, registered or stored for it, so a definition a confined
+/// process planted cannot point a login at a server of its choosing. A
+/// definition a trusted source states identically resolves from that
+/// source.
+pub async fn resolve_configured_mcp_target_in_realm_trusting(
+    target: &meerkat_contracts::WireMcpAuthTarget,
+    realm_servers: &[meerkat_core::McpServerConfig],
+    context_root: Option<&std::path::Path>,
+    user_config_root: Option<&std::path::Path>,
+    untrusted: &(dyn Fn(&std::path::Path) -> bool + Send + Sync),
+) -> Result<McpServerIdentity, HostAuthError> {
     use meerkat_core::mcp_config::{
         EffectiveMcpServersError, McpConfig, McpTransportConfig, McpTransportKind,
     };
     let server_name = || target.server_name.clone();
-    let servers =
-        McpConfig::effective_servers_from_roots(realm_servers, context_root, user_config_root)
-            .await
-            .map_err(|error| match error {
-                EffectiveMcpServersError::Config(error) => {
-                    HostMcpTargetRefusal::ConfigUnavailable(error)
-                }
-                EffectiveMcpServersError::Conflict(conflict) => {
-                    HostMcpTargetRefusal::DefinitionConflict(conflict)
-                }
-                EffectiveMcpServersError::RealmEnvReference(reference) => {
-                    HostMcpTargetRefusal::RealmServerEnvReference(reference)
-                }
-                EffectiveMcpServersError::Access(error) => {
-                    HostMcpTargetRefusal::InvalidAccessPolicy(error)
-                }
-            })?;
+    let servers = McpConfig::effective_servers_from_roots_trusting(
+        realm_servers,
+        context_root,
+        user_config_root,
+        untrusted,
+    )
+    .await
+    .map_err(|error| match error {
+        EffectiveMcpServersError::Config(error) => HostMcpTargetRefusal::ConfigUnavailable(error),
+        EffectiveMcpServersError::Conflict(conflict) => {
+            HostMcpTargetRefusal::DefinitionConflict(conflict)
+        }
+        EffectiveMcpServersError::RealmEnvReference(reference) => {
+            HostMcpTargetRefusal::RealmServerEnvReference(reference)
+        }
+        EffectiveMcpServersError::Access(error) => HostMcpTargetRefusal::InvalidAccessPolicy(error),
+    })?;
+    if servers
+        .refused
+        .iter()
+        .any(|refused| refused.server.name == target.server_name)
+    {
+        return Err(HostMcpTargetRefusal::Refused {
+            server_name: server_name(),
+            refusal: meerkat_core::confinement::ConfinementRefusal::UntrustedConfigurationSource,
+        }
+        .into());
+    }
     let server = servers
+        .admitted
         .into_iter()
         .map(|configured| configured.server)
         .find(|server| server.name == target.server_name)
@@ -637,7 +686,8 @@ impl HostAuthError {
             Self::BrowserFlowUnsupported(_) | Self::DeviceFlowUnsupported(_) => R::FlowUnsupported,
             Self::McpOAuth(error) => mcp_oauth_reason(error),
             Self::McpTarget(refusal) => match refusal {
-                HostMcpTargetRefusal::UnknownServer { .. } => R::McpServerNotConfigured,
+                HostMcpTargetRefusal::UnknownServer { .. }
+                | HostMcpTargetRefusal::Refused { .. } => R::McpServerNotConfigured,
                 HostMcpTargetRefusal::UrlMismatch { .. }
                 | HostMcpTargetRefusal::NotOAuthCapable { .. } => R::McpServerMismatch,
                 HostMcpTargetRefusal::AccountMismatch { .. } => R::AccountMismatch,

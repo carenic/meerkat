@@ -134,6 +134,7 @@ async fn integration_real_live_continue_hangs() {
         ),
         auth_lease: runtime_adapter.generated_auth_lease_handle(),
         provider_registry,
+        host_confinement: meerkat::HostConfinement::trusted_host(),
     };
 
     let app = router(state);

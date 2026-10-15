@@ -536,3 +536,81 @@ fn rkat_rpc_config_writes_cannot_drop_inherited_governance() {
     assert!(committed.contains("parent = \"org\""), "{committed}");
     assert!(committed.contains("max_tokens = 2048"), "{committed}");
 }
+
+/// An MCP auth request addresses only servers the host installed: on a
+/// server whose confined processes can write the project `mcp.toml`, a
+/// server only that file defines is refused as not configured, naming the
+/// refusal, so a planted entry cannot point a login at a server of its
+/// choosing.
+#[test]
+fn rkat_rpc_mcp_auth_refuses_a_server_only_an_untrusted_mcp_toml_defines() {
+    let binary = rkat_rpc_binary();
+    let temp = TempDir::new().expect("temp dir");
+    let base = temp.path().canonicalize().expect("canonical temp");
+    let project = base.join("project");
+    let home = base.join("home");
+    let state = base.join("state");
+    let user_root = base.join("user");
+    for dir in [
+        project.join(".rkat"),
+        home.join(".config"),
+        state.clone(),
+        user_root.join(".rkat"),
+    ] {
+        std::fs::create_dir_all(&dir).expect("directory should initialize");
+    }
+    std::fs::write(
+        project.join(".rkat").join("mcp.toml"),
+        "[[servers]]\nname = \"planted\"\nurl = \"https://planted.example/mcp\"\n",
+    )
+    .expect("project mcp.toml should be written");
+    std::fs::write(
+        user_root.join(".rkat").join("config.toml"),
+        format!(
+            "[confinement.all]\nmode = \"custom\"\nworking_directory = \"{dir}\"\nrequirement = {{ baseline = \"command_runtime_v1\", read = {{ kind = \"paths\", paths = [{{ kind = \"subtree\", path = \"{dir}\" }}] }}, write = {{ kind = \"paths\", paths = [{{ kind = \"subtree\", path = \"{dir}\" }}] }}, deny_read = [], deny_write = [], network = {{ kind = \"denied\" }}, unix_connect = [], require_descendant_termination = false }}\n",
+            dir = project.display()
+        ),
+    )
+    .expect("user document should be written");
+
+    let mut command = Command::new(&binary);
+    command
+        .current_dir(&base)
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .args(scope_args("rpc-untrusted-mcp", &state, &user_root))
+        .args([
+            "--context-root",
+            project.to_str().expect("utf-8 project root"),
+        ]);
+    let (run, responses) = run_rpc_command(
+        command,
+        &[(
+            "auth/status/get",
+            serde_json::json!({
+                "mcp": {
+                    "server_name": "planted",
+                    "server_url": "https://planted.example/mcp",
+                }
+            }),
+        )],
+    );
+    assert!(
+        run.answered,
+        "the server serves; exit={:?} stderr:\n{}",
+        run.status, run.stderr
+    );
+    let error = &responses[&2]["error"];
+    assert_eq!(
+        error["data"]["reason"], "mcp_server_not_configured",
+        "{}",
+        responses[&2]
+    );
+    assert!(
+        error["message"]
+            .as_str()
+            .is_some_and(|text| text.contains("confined process")),
+        "{}",
+        responses[&2]
+    );
+}

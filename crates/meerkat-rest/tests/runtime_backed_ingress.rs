@@ -190,6 +190,7 @@ async fn runtime_backed_external_events_stay_queued_without_waking_idle_sessions
         ),
         auth_lease: runtime_adapter.generated_auth_lease_handle(),
         provider_registry,
+        host_confinement: meerkat::HostConfinement::trusted_host(),
         #[cfg(feature = "mob")]
         mob_state,
         #[cfg(feature = "mcp")]

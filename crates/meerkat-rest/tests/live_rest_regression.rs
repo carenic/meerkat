@@ -152,6 +152,7 @@ fn build_app_state(client: Arc<dyn LlmClient>) -> (AppState, axum::Router) {
         ),
         auth_lease: runtime_adapter.generated_auth_lease_handle(),
         provider_registry,
+        host_confinement: meerkat::HostConfinement::trusted_host(),
     };
 
     let app = router(state.clone());

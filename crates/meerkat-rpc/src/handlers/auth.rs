@@ -1554,7 +1554,8 @@ pub async fn handle_auth_profile_delete(
 
 /// Resolve a requested MCP target against this runtime's configured MCP
 /// servers: the realm's own (from its composed config) and the `mcp.toml`
-/// scopes. A client-supplied name or URL is never an authority.
+/// scopes the host trusts. A client-supplied name or URL is never an
+/// authority, and neither is an `mcp.toml` a confined process can write.
 async fn configured_mcp_target(
     id: &Option<RpcId>,
     runtime: &SessionRuntime,
@@ -1565,11 +1566,13 @@ async fn configured_mcp_target(
         .await
         .map_err(|error| RpcResponse::error(id.clone(), error.code, error.message))?;
     let (context_root, user_root) = runtime.skill_identity_roots();
-    meerkat::resolve_configured_mcp_target_in_realm(
+    let host_confinement = runtime.host_confinement();
+    meerkat::resolve_configured_mcp_target_in_realm_trusting(
         mcp,
         &realm_config.tools.mcp_servers,
         context_root.as_deref(),
         user_root.as_deref(),
+        &|path| host_confinement.is_some_and(|host| host.untrusted_source(path)),
     )
     .await
     .map_err(|error_value| host_auth_error_response(id.clone(), error_value))
