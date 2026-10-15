@@ -132,7 +132,9 @@ or test(=downstream_public_cargo_facade_agentbuilder_links_without_repo_cfg)
 or (binary(compile_fail_tests) and test(=compile_fail))
 or test(=live_workspace_rmat_audit_is_strictly_clean)
 '''
-slow-timeout = { period = "60s", terminate-after = 8 }
+# Sixteen periods: on a cold hosted 4-vCPU runner (a release version bump
+# leaves no reusable units) the nested Cargo builds took 441 s to over 480 s.
+slow-timeout = { period = "60s", terminate-after = 16 }
 
 [profile.fast]
 # Cargo's default fast lane: unit + integration-fast, with dedicated e2e lane
