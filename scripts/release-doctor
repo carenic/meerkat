@@ -320,9 +320,9 @@ else
 fi
 
 if tag_validation_contract="$(workflow_contract tag-validation)"; then
-  pass "Tag releases validate on the verified schema-4 exact-tree CI attestation instead of re-running Cargo validation"
+  pass "Tag releases skip Cargo validation only on an exact-tree CI attestation that proves its lanes ran"
 else
-  bad "Tag releases must validate on the verified schema-4 exact-tree CI attestation, keeping Cargo validation for legacy attestations and manual dispatches (${tag_validation_contract//$'\n'/; })"
+  bad "Tag releases may skip Cargo validation only on an exact-tree CI attestation that proves its lanes ran, keeping Cargo validation for every other attestation and manual dispatches (${tag_validation_contract//$'\n'/; })"
 fi
 
 registry_job="$(workflow_job publish_registries)"
