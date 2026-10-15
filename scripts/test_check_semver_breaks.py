@@ -374,6 +374,10 @@ Failed in:
                 "Struct PeersTool in crates/meerkat-tools/src/builtin/comms/tools.rs:115",
                 ("PeersTool",),
             ),
+            "function_marked_deprecated": (
+                "function meerkat::mcp::standalone_router in crates/meerkat/src/mcp.rs:41",
+                ("standalone_router",),
+            ),
         }
         for lint_id, (item, expected) in cases.items():
             with self.subTest(lint_id=lint_id):
@@ -652,6 +656,58 @@ Failed in:
         )
         self.assertEqual(len(one_missing), 1)
         self.assertIn("missing: `PeersTool`", one_missing[0])
+
+    FUNCTION_DEPRECATED_REPORT = """\
+    Checking meerkat v0.9.1 -> v0.9.1 (assume patch change)
+--- failure function_marked_deprecated: function #[deprecated] added ---
+
+Description:
+A function is now #[deprecated]. Downstream crates will get a compiler warning when using this function.
+        ref: https://doc.rust-lang.org/reference/attributes/diagnostics.html#the-deprecated-attribute
+       impl: https://github.com/obi1kenobi/cargo-semver-checks/tree/v0.50.0/src/lints/function_marked_deprecated.ron
+
+Failed in:
+  function meerkat::mcp::standalone_router in crates/meerkat/src/mcp.rs:41
+  function meerkat::resolve_configured_mcp_target in crates/meerkat/src/host_auth.rs:346
+  function meerkat::resolve_configured_mcp_target_in_realm in crates/meerkat/src/host_auth.rs:368
+
+     Summary semver requires new minor version: 0 major and 1 minor checks failed
+    Finished [   0.791s] meerkat
+"""
+
+    def test_deprecated_functions_are_read_in_full(self) -> None:
+        # The 0.9.2 integration report: three facade functions newly #[deprecated].
+        parsed = gate.parse_report(self.FUNCTION_DEPRECATED_REPORT)
+        self.assertEqual(
+            [(f.lint_id, f.symbols, f.structural) for f in parsed.findings],
+            [
+                ("function_marked_deprecated", ("standalone_router",), True),
+                ("function_marked_deprecated", ("resolve_configured_mcp_target",), True),
+                ("function_marked_deprecated", ("resolve_configured_mcp_target_in_realm",), True),
+            ],
+        )
+        self.assertEqual(gate.check_recognized(parsed), [])
+
+    def test_deprecated_functions_need_their_exact_names(self) -> None:
+        parsed = gate.parse_report(self.FUNCTION_DEPRECATED_REPORT)
+        declared = (
+            "`meerkat::mcp::standalone_router`. Use "
+            "`meerkat::mcp::standalone_router_with_stdio_profile`.\n"
+            "- `meerkat::resolve_configured_mcp_target` and "
+            "`meerkat::resolve_configured_mcp_target_in_realm`. Use "
+            "`meerkat::resolve_configured_mcp_target_in_realm_trusting`."
+        )
+        self.assertEqual(gate.check_named(parsed, self.section(declared, "Deprecated")), [])
+        # Only the longer replacement names: they never cover the deprecated ones.
+        replacements_only = (
+            "Use `meerkat::mcp::standalone_router_with_stdio_profile` and "
+            "`meerkat::resolve_configured_mcp_target_in_realm_trusting`."
+        )
+        errors = gate.check_named(parsed, self.section(replacements_only, "Deprecated"))
+        self.assertEqual(len(errors), 3)
+        self.assertTrue(any("missing: `standalone_router`" in error for error in errors))
+        self.assertTrue(any("missing: `resolve_configured_mcp_target`" in error for error in errors))
+        self.assertTrue(any("missing: `resolve_configured_mcp_target_in_realm`" in error for error in errors))
 
     def test_deprecated_method_cannot_be_declared_by_owner_alone(self) -> None:
         parsed = gate.parse_report(self.DEPRECATED_REPORT)

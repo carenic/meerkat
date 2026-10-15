@@ -220,9 +220,11 @@ them.
   `ScheduleService::attach_identity_target_probe` and the scheduling guide
   say so. Behaviour is unchanged; 0.8.51 already worked this way.
 - The release semver gate (`make semver-breaks`) reads cargo-semver-checks'
-  `type_marked_deprecated` findings, a struct, enum, union or trait newly
-  marked `#[deprecated]` (reported as `Struct PeersTool in <file>:<line>`).
-  `scripts/check_semver_breaks.py` had no reader for that shape, so such a
+  `type_marked_deprecated` and `function_marked_deprecated` findings: a
+  struct, enum, union or trait newly marked `#[deprecated]` (reported as
+  `Struct PeersTool in <file>:<line>`) and a newly deprecated function
+  (`function meerkat::mcp::standalone_router in <file>:<line>`).
+  `scripts/check_semver_breaks.py` had no reader for those shapes, so such a
   deprecation failed the gate as unreadable even when `### Deprecated` named
   it.
 
