@@ -130,6 +130,10 @@ them.
   (`scripts/check_packaged_internal_requirements.py`),
   `scripts/verify-version-parity.sh` requires the `=`, and the
   release-projection classifier treats `=X.Y.Z` as the version projection.
+  `scripts/test-release-projection-only.sh` bumps this repository's own
+  Cargo.toml, Cargo.lock and CHANGELOG.md to the next patch release and
+  requires the classifier to accept that bump, and to refuse it with one `=`
+  dropped.
 
 ### Fixed
 
