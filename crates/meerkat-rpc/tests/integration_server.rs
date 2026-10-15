@@ -2466,6 +2466,11 @@ mod tcp_callback_ownership {
             json!(meerkat_rpc::error::SESSION_BUSY),
             "a claim of a route its open owner holds is refused: {refused}"
         );
+        assert_eq!(
+            refused["error"]["data"],
+            json!({"mob_id": "held_mob", "reason": "held_by_open_connection"}),
+            "the refusal carries its typed data: {refused}"
+        );
         let held = a
             .request(7, "mob/claim_callback_route", json!({"mob_id":"held_mob"}))
             .await;

@@ -2576,9 +2576,16 @@ pub struct SessionRuntime {
     unsettled_requests: Arc<std::sync::atomic::AtomicUsize>,
     /// The process-default callback route: the pre-created stdio/embedded
     /// channel from [`Self::init_callback_channel`] (or the deprecated
-    /// [`Self::set_callback_channel`]). Connection-owned routes (one per TCP
-    /// connection) are never written here: a connection's callbacks must
-    /// never be borrowed by another connection.
+    /// [`Self::set_callback_channel`]). Connection-owned routes (one per
+    /// connection) are never written here: a connection's callbacks are never
+    /// borrowed by another connection while it is open. The one hand-over is
+    /// a mob's callback route slot
+    /// ([`crate::callback_dispatcher::MobCallbackRouteSlot`]): once the
+    /// connection holding it closes, the first connection to claim it
+    /// (`mob/claim_callback_route`) takes over the mob's member callbacks,
+    /// including the pending detached callback jobs the closed connection's
+    /// tools started, when it registers tools of the same name and runner:
+    /// it then reconciles and cancels those jobs.
     default_callback_route: StdRwLock<Option<crate::callback_dispatcher::CallbackRoute>>,
     /// The callback route each session was created on. Recovery and live
     /// orchestration rebuild a session's callback tools from its own route;
@@ -7072,12 +7079,13 @@ impl SessionRuntime {
         }
     }
 
-    /// Index `slot` as the newest callback route slot of the mob `mob_id`.
+    /// Index `slot` as the newest callback route slot of the mob `mob_id`,
+    /// once that mob is in the mob state's managed set (a build whose mob
+    /// never gets there is never indexed).
     ///
     /// Slots nothing holds any more leave the index. An earlier slot under
-    /// the same id stays until it dies: a mob re-created under the id of one
-    /// still shutting down, or a create that loses a race to a duplicate,
-    /// leaves a slot that dies with what built it, and the lookup skips it.
+    /// the same id stays until it dies (a mob re-created under the id of one
+    /// still shutting down), and the lookup skips it.
     #[cfg(feature = "mob")]
     pub(crate) fn index_mob_callback_route_slot(
         &self,

@@ -209,21 +209,33 @@ pub fn compose_rpc_mob_state(
     // `mob/claim_callback_route` binds to a connection. On a connection-owned
     // server it starts unclaimed. A single-client host that installed the
     // process-default route holds it with that route, so its restored mobs
-    // keep reaching its callbacks as before.
+    // keep reaching its callbacks as before. The slot is indexed for claims
+    // only once its mob is managed, so a build whose mob never gets there (a
+    // create that lost to a duplicate) never shadows the live mob's slot.
     let member_external_tools_factory: meerkat_mob_mcp::MemberExternalToolsFactory = Arc::new({
         let runtime = Arc::downgrade(runtime);
-        move |mob_id: &meerkat_mob::MobId| {
-            let runtime = runtime.upgrade()?;
-            let slot = Arc::new(match runtime.default_callback_route() {
+        move |_mob_id: &meerkat_mob::MobId| {
+            let live = runtime.upgrade()?;
+            let slot = Arc::new(match live.default_callback_route() {
                 Some(route) => crate::callback_dispatcher::MobCallbackRouteSlot::claimed_by(route),
                 None => crate::callback_dispatcher::MobCallbackRouteSlot::unclaimed(),
             });
-            runtime.index_mob_callback_route_slot(mob_id.clone(), &slot);
-            Some(rpc_mob_slot_external_tools_provider(
-                &runtime,
-                slot,
+            let provider = rpc_mob_slot_external_tools_provider(
+                &live,
+                Arc::clone(&slot),
                 configured_mcp_tools.clone(),
-            ))
+            );
+            let index_on = Arc::downgrade(&live);
+            let on_managed: meerkat_mob_mcp::MemberExternalToolsOnManaged =
+                Box::new(move |mob_id: &meerkat_mob::MobId| {
+                    if let Some(runtime) = index_on.upgrade() {
+                        runtime.index_mob_callback_route_slot(mob_id.clone(), &slot);
+                    }
+                });
+            Some(meerkat_mob_mcp::MemberExternalTools {
+                provider,
+                on_managed: Some(on_managed),
+            })
         }
     });
     let mut state = meerkat_mob_mcp::MobMcpState::new_with_runtime_adapter(
@@ -5973,20 +5985,19 @@ mod tests {
         );
         assert_eq!(result["capabilities"]["features"]["event_replay"], false);
 
-        // The callable method names are the catalog's own (a name such as
-        // `mob/claim_callback_route` is no topology claim); the rest of the
-        // projection names no topology authority.
-        assert!(
-            result["endpoints"]["rpc_methods"].is_array(),
-            "the projection lists the callable methods: {result}"
-        );
+        // `mob/claim_callback_route` is a method name, not a topology claim:
+        // it is the one catalog name allowed past the token scan.
         let mut projection = result.clone();
-        if let Some(endpoints) = projection
-            .get_mut("endpoints")
-            .and_then(serde_json::Value::as_object_mut)
-        {
-            endpoints.remove("rpc_methods");
-        }
+        let methods = projection["endpoints"]["rpc_methods"]
+            .as_array_mut()
+            .expect("the projection lists the callable methods");
+        let listed = methods.len();
+        methods.retain(|method| method != "mob/claim_callback_route");
+        assert_eq!(
+            methods.len() + 1,
+            listed,
+            "the claim method is listed once: {result}"
+        );
         let text = serde_json::to_string(&projection).expect("result serializes");
         for forbidden in ["topology", "registry", "lease", "claim", "project"] {
             assert!(

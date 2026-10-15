@@ -2095,6 +2095,15 @@ pub async fn handle_rotate_supervisor(
 // mob/claim_callback_route
 // ---------------------------------------------------------------------------
 
+/// `data` of a `mob/claim_callback_route` refused (`-32002`) because
+/// another open connection holds the route.
+#[derive(Debug, serde::Serialize)]
+struct MobCallbackRouteClaimRefusedData {
+    mob_id: String,
+    /// Why the claim was refused: `held_by_open_connection`.
+    reason: &'static str,
+}
+
 /// Handle `mob/claim_callback_route`: bind the mob's member callback route
 /// to the calling connection's `route`, so the mob's live and future
 /// members call the callback tools that connection registered.
@@ -2139,11 +2148,21 @@ pub(crate) async fn handle_claim_callback_route(
                 mob_id: mob_id.to_string(),
             },
         ),
-        Ok(Some(Err(refused))) => RpcResponse::error(
-            id,
-            error::SESSION_BUSY,
-            format!("mob '{mob_id}': {refused}"),
-        ),
+        Ok(Some(Err(refused))) => {
+            let message = format!("mob '{mob_id}': {refused}");
+            let reason = match refused {
+                crate::callback_dispatcher::MobCallbackRouteClaimRefused::HeldByOpenConnection => {
+                    "held_by_open_connection"
+                }
+            };
+            match serde_json::to_value(MobCallbackRouteClaimRefusedData {
+                mob_id: mob_id.to_string(),
+                reason,
+            }) {
+                Ok(data) => RpcResponse::error_with_data(id, error::SESSION_BUSY, message, data),
+                Err(_) => RpcResponse::error(id, error::SESSION_BUSY, message),
+            }
+        }
         Ok(None) => RpcResponse::error(
             id,
             error::INVALID_REQUEST,
