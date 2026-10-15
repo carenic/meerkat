@@ -840,7 +840,9 @@ pub enum ReasoningMode {
 /// (see the agent's per-attempt lowering). It never becomes durable session
 /// identity, and an explicit reasoning setting on the same input wins.
 ///
-/// `Minimal` is refused: no catalog row validates it for this preference.
+/// `Minimal` is refused: the runtime carries a preference as one level of its
+/// portable ladder, which has no `minimal` (some Gemini rows accept it, but
+/// only as an explicit `thinking_level`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RequestReasoningPreference {
     /// Request this effort level.

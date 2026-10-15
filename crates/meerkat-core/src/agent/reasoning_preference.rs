@@ -8,10 +8,11 @@
 
 use crate::Provider;
 use crate::lifecycle::run_primitive::{
-    AnthropicEffort, AnthropicThinkingConfig, ProviderParamsOverride, ProviderTag, ReasoningEffort,
-    ReasoningLoweringBaseline, ReasoningLoweringOutcome, ReasoningMode, ReasoningNotAppliedReason,
+    AnthropicEffort, AnthropicThinkingConfig, GeminiThinkingLevel, ProviderParamsOverride,
+    ProviderTag, ReasoningEffort, ReasoningLoweringBaseline, ReasoningLoweringOutcome,
+    ReasoningMode, ReasoningNotAppliedReason,
 };
-use crate::model_profile::capabilities::{EffortLevel, ModelCapabilities};
+use crate::model_profile::capabilities::{EffortLevel, ModelCapabilities, ThinkingSupport};
 
 /// Lower `level` onto `params`, the request copy for `provider`, against the
 /// selected model's catalog row (`None` for a model without one).
@@ -91,10 +92,50 @@ fn apply(
             tag.effort = Some(effort);
             Ok(())
         }
-        // Gemini rows list their accepted thinking levels in `effort_levels`
-        // for the params schema, but a preference is not lowered onto
-        // `thinking_level` yet, so no level is validated for Gemini here.
-        Provider::Gemini => Err(ReasoningNotAppliedReason::UnknownSupportedLevels),
+        Provider::Gemini => {
+            // Gemini thinking-level rows list the `thinkingConfig.thinkingLevel`
+            // values they accept in `effort_levels`; a row that lists none
+            // gives no level to validate the preference against.
+            match capabilities.thinking {
+                ThinkingSupport::GeminiThinkingLevel if capabilities.effort_levels.is_empty() => {
+                    return Err(ReasoningNotAppliedReason::UnknownSupportedLevels);
+                }
+                ThinkingSupport::GeminiThinkingLevel => {}
+                _ => return Err(ReasoningNotAppliedReason::UnsupportedLevel),
+            }
+            if !capabilities.effort_levels.contains(&level) {
+                return Err(ReasoningNotAppliedReason::UnsupportedLevel);
+            }
+            let thinking_level =
+                gemini_thinking_level(level).ok_or(ReasoningNotAppliedReason::UnsupportedLevel)?;
+            // A thinking budget, generic or Gemini's own, is what the baseline
+            // sends; a level would replace it on the wire.
+            if params
+                .as_ref()
+                .is_some_and(|params| params.thinking_budget_tokens.is_some())
+            {
+                return Err(ReasoningNotAppliedReason::BudgetConflict);
+            }
+            if let Some(ProviderTag::Gemini(tag)) = params
+                .as_ref()
+                .and_then(|params| params.provider_tag.as_ref())
+                && (tag.thinking_budget.is_some()
+                    || tag
+                        .thinking
+                        .as_ref()
+                        .is_some_and(|thinking| thinking.thinking_budget.is_some()))
+            {
+                return Err(ReasoningNotAppliedReason::BudgetConflict);
+            }
+            let tag = gemini_tag(params).ok_or(ReasoningNotAppliedReason::NoCatalogFact)?;
+            // Write the level the request sends: the nested config's level
+            // wins over the flat field on the wire.
+            match tag.thinking.as_mut() {
+                Some(thinking) => thinking.thinking_level = Some(thinking_level),
+                None => tag.thinking_level = Some(thinking_level),
+            }
+            Ok(())
+        }
         Provider::SelfHosted | Provider::Other => Err(ReasoningNotAppliedReason::NoCatalogFact),
     }
 }
@@ -129,6 +170,21 @@ fn anthropic_tag(
     }
 }
 
+/// The Gemini tag of the request copy, created when absent. `None` when the
+/// copy carries another provider's tag.
+fn gemini_tag(
+    params: &mut Option<ProviderParamsOverride>,
+) -> Option<&mut crate::lifecycle::run_primitive::GeminiProviderTag> {
+    let params = params.get_or_insert_with(ProviderParamsOverride::default);
+    let tag = params
+        .provider_tag
+        .get_or_insert_with(|| ProviderTag::Gemini(Default::default()));
+    match tag {
+        ProviderTag::Gemini(tag) => Some(tag),
+        ProviderTag::Anthropic(_) | ProviderTag::OpenAi(_) | ProviderTag::Unknown { .. } => None,
+    }
+}
+
 fn openai_effort(level: EffortLevel) -> Option<ReasoningEffort> {
     Some(match level {
         EffortLevel::None => ReasoningEffort::None,
@@ -149,6 +205,16 @@ fn anthropic_effort(level: EffortLevel) -> Option<AnthropicEffort> {
         EffortLevel::Xhigh => AnthropicEffort::XHigh,
         EffortLevel::Max => AnthropicEffort::Max,
         EffortLevel::None | EffortLevel::Minimal => return None,
+    })
+}
+
+fn gemini_thinking_level(level: EffortLevel) -> Option<GeminiThinkingLevel> {
+    Some(match level {
+        EffortLevel::Minimal => GeminiThinkingLevel::Minimal,
+        EffortLevel::Low => GeminiThinkingLevel::Low,
+        EffortLevel::Medium => GeminiThinkingLevel::Medium,
+        EffortLevel::High => GeminiThinkingLevel::High,
+        EffortLevel::None | EffortLevel::Xhigh | EffortLevel::Max => return None,
     })
 }
 
@@ -429,5 +495,167 @@ mod tests {
             ReasoningLoweringBaseline::Explicit(EffortLevel::High),
             "nested wins over flat"
         );
+    }
+
+    const GEMINI_LEVELS: &[EffortLevel] =
+        &[EffortLevel::Low, EffortLevel::Medium, EffortLevel::High];
+
+    fn gemini_tag(params: Option<ProviderParamsOverride>) -> GeminiProviderTag {
+        match params.and_then(|params| params.provider_tag) {
+            Some(ProviderTag::Gemini(tag)) => tag,
+            other => panic!("expected a gemini tag, got {other:?}"),
+        }
+    }
+
+    /// A Gemini thinking-level row lowers an accepted preference onto the
+    /// level field the request actually sends: the nested `thinking` config
+    /// when the baseline has one (it wins over the flat field on the wire),
+    /// else the flat field, creating the tag when the baseline has none.
+    #[test]
+    fn gemini_applies_a_catalog_level_to_the_thinking_level_it_sends() {
+        let caps = caps(Provider::Gemini, false, GEMINI_LEVELS);
+
+        let mut flat = Some(ProviderParamsOverride {
+            temperature: Some(0.2),
+            provider_tag: Some(ProviderTag::Gemini(GeminiProviderTag {
+                thinking_level: Some(GeminiThinkingLevel::High),
+                top_k: Some(20),
+                ..Default::default()
+            })),
+            ..Default::default()
+        });
+        let (baseline, outcome) =
+            lower_reasoning_preference(Some(&caps), Provider::Gemini, EffortLevel::Low, &mut flat);
+        assert_eq!(
+            baseline,
+            ReasoningLoweringBaseline::Explicit(EffortLevel::High)
+        );
+        assert_eq!(outcome, ReasoningLoweringOutcome::Applied(EffortLevel::Low));
+        assert_eq!(flat.as_ref().and_then(|p| p.temperature), Some(0.2));
+        let tag = gemini_tag(flat);
+        assert_eq!(tag.thinking_level, Some(GeminiThinkingLevel::Low));
+        assert_eq!(tag.top_k, Some(20), "unrelated knobs stay");
+
+        let mut nested = Some(ProviderParamsOverride {
+            provider_tag: Some(ProviderTag::Gemini(GeminiProviderTag {
+                thinking: Some(GeminiThinkingConfig {
+                    include_thoughts: Some(true),
+                    thinking_level: Some(GeminiThinkingLevel::High),
+                    thinking_budget: None,
+                }),
+                ..Default::default()
+            })),
+            ..Default::default()
+        });
+        let (_, outcome) = lower_reasoning_preference(
+            Some(&caps),
+            Provider::Gemini,
+            EffortLevel::Medium,
+            &mut nested,
+        );
+        assert_eq!(
+            outcome,
+            ReasoningLoweringOutcome::Applied(EffortLevel::Medium)
+        );
+        let thinking = gemini_tag(nested).thinking.expect("nested thinking config");
+        assert_eq!(thinking.thinking_level, Some(GeminiThinkingLevel::Medium));
+        assert_eq!(thinking.include_thoughts, Some(true));
+
+        let mut absent = None;
+        let (baseline, outcome) = lower_reasoning_preference(
+            Some(&caps),
+            Provider::Gemini,
+            EffortLevel::High,
+            &mut absent,
+        );
+        assert_eq!(baseline, ReasoningLoweringBaseline::ProviderDefault);
+        assert_eq!(
+            outcome,
+            ReasoningLoweringOutcome::Applied(EffortLevel::High)
+        );
+        assert_eq!(
+            gemini_tag(absent).thinking_level,
+            Some(GeminiThinkingLevel::High)
+        );
+    }
+
+    /// A level outside the row, a row that records no levels, and a baseline
+    /// thinking budget (which a level would replace on the wire) leave the
+    /// Gemini baseline byte-identical.
+    #[test]
+    fn gemini_not_applied_leaves_the_baseline_byte_identical() {
+        let unrecorded = caps(Provider::Gemini, false, &[]);
+        let levels = caps(Provider::Gemini, false, GEMINI_LEVELS);
+        let budget_tag = |thinking_budget: Option<u32>, nested_budget: Option<u32>| {
+            Some(ProviderParamsOverride {
+                provider_tag: Some(ProviderTag::Gemini(GeminiProviderTag {
+                    thinking_budget,
+                    thinking: nested_budget.map(|budget| GeminiThinkingConfig {
+                        include_thoughts: None,
+                        thinking_level: None,
+                        thinking_budget: Some(budget),
+                    }),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            })
+        };
+        let cases: Vec<(
+            &ModelCapabilities,
+            EffortLevel,
+            Option<ProviderParamsOverride>,
+            ReasoningNotAppliedReason,
+        )> = vec![
+            (
+                &levels,
+                EffortLevel::Xhigh,
+                None,
+                ReasoningNotAppliedReason::UnsupportedLevel,
+            ),
+            (
+                &levels,
+                EffortLevel::None,
+                None,
+                ReasoningNotAppliedReason::UnsupportedLevel,
+            ),
+            (
+                &unrecorded,
+                EffortLevel::Low,
+                None,
+                ReasoningNotAppliedReason::UnknownSupportedLevels,
+            ),
+            (
+                &levels,
+                EffortLevel::Low,
+                budget_tag(Some(4096), None),
+                ReasoningNotAppliedReason::BudgetConflict,
+            ),
+            (
+                &levels,
+                EffortLevel::Low,
+                budget_tag(None, Some(4096)),
+                ReasoningNotAppliedReason::BudgetConflict,
+            ),
+            (
+                &levels,
+                EffortLevel::Low,
+                Some(ProviderParamsOverride {
+                    thinking_budget_tokens: Some(4096),
+                    ..Default::default()
+                }),
+                ReasoningNotAppliedReason::BudgetConflict,
+            ),
+        ];
+        for (caps, level, params, reason) in cases {
+            let mut copy = params.clone();
+            let (_, outcome) =
+                lower_reasoning_preference(Some(caps), Provider::Gemini, level, &mut copy);
+            assert_eq!(
+                outcome,
+                ReasoningLoweringOutcome::NotApplied(reason),
+                "{level:?}"
+            );
+            assert_eq!(copy, params, "{reason:?}: the baseline is untouched");
+        }
     }
 }

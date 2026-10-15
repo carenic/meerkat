@@ -49,6 +49,17 @@ them.
   defaults. It sent retired ids such as `claude-3-haiku-20240307`, so its live
   tests failed. A test that needs no provider keys now fails when the matrix
   names a model outside Core's catalog.
+- A turn's reasoning-effort preference (set on a live channel's delegated
+  member turns) is now lowered onto Gemini requests too, as it already was
+  for OpenAI and Anthropic. When the selected model's catalog row lists the
+  level among its accepted thinking levels, the request sends it as
+  `thinking_level` (in the nested `thinking` config when the request has
+  one), and `request_reasoning_lowered` reports `applied`. A level the row does
+  not list is `unsupported_level`, a request that already sets a thinking
+  budget (the generic `thinking_budget_tokens` or Gemini's own) is
+  `budget_conflict`, and a row without recorded levels stays
+  `unknown_supported_levels`; each leaves the request unchanged. Every Gemini
+  model used to report `unknown_supported_levels`.
 
 ### Fixed
 
