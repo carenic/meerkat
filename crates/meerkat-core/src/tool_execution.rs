@@ -632,7 +632,9 @@ pub enum CatalogOperation {
     Load,
 }
 
-/// The kind of delivery a comms operation makes to its one peer.
+/// The kind of delivery a comms operation makes to its one peer. It is
+/// descriptive, not an authority boundary: grant lineage selection ignores
+/// it, so a host maps `Response` to the same action as `Message`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum PeerSendKind {

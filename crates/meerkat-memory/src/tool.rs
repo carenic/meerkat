@@ -890,6 +890,101 @@ mod tests {
         assert!(!outcome.result.is_error);
     }
 
+    /// An embedder's wrapper that implements only `tools` and `dispatch`:
+    /// its plans carry no target, and it drops the dispatch context before
+    /// the owner.
+    struct ContextDroppingWrapper(Arc<dyn AgentToolDispatcher>);
+
+    #[async_trait]
+    impl AgentToolDispatcher for ContextDroppingWrapper {
+        fn tools(&self) -> Arc<[Arc<ToolDef>]> {
+            self.0.tools()
+        }
+
+        async fn dispatch(
+            &self,
+            call: ToolCallView<'_>,
+        ) -> Result<meerkat_core::ops::ToolDispatchOutcome, ToolError> {
+            self.0.dispatch(call).await
+        }
+    }
+
+    fn governed_context() -> meerkat_core::ToolDispatchContext {
+        meerkat_core::ToolDispatchContext::default().with_work_authorization(Some(
+            meerkat_core::WorkAuthorizationContext::new(
+                Arc::new(AllowAll),
+                meerkat_core::OperationExecutionScope::Domain,
+            ),
+        ))
+    }
+
+    /// Governed work through a wrapper that drops the dispatch context
+    /// before the memory owner, which then could no longer check it, is
+    /// refused at the fenced dispatch: its plan carries no memory target.
+    /// The same wrapper still searches ungoverned.
+    #[tokio::test]
+    async fn governed_memory_search_through_a_context_dropping_wrapper_is_refused() {
+        let store: Arc<dyn MemoryStore> = Arc::new(crate::SimpleMemoryStore::new());
+        let session_id = SessionId::new();
+        let wrapper: Arc<dyn AgentToolDispatcher> = Arc::new(ContextDroppingWrapper(Arc::new(
+            dispatcher(store, &session_id),
+        )));
+        let (id, raw, name) = make_call(r#"{"query": "anything"}"#);
+        let call = call_view(&id, &raw, &name);
+
+        let governed = governed_context();
+        let plan = meerkat_core::agent::resolve_tool_execution_plan_fenced(
+            &wrapper,
+            call,
+            &governed,
+            &resolution(),
+        )
+        .unwrap();
+        let result = meerkat_core::agent::dispatch_tool_execution_plan_fenced(
+            &wrapper, call, &governed, &plan,
+        )
+        .await;
+        assert!(
+            matches!(result, Err(ToolError::AuthorizationRefused { .. })),
+            "a governed search through a context-dropping wrapper must not run: {result:?}"
+        );
+
+        let ungoverned = meerkat_core::ToolDispatchContext::default();
+        let plan = meerkat_core::agent::resolve_tool_execution_plan_fenced(
+            &wrapper,
+            call,
+            &ungoverned,
+            &resolution(),
+        )
+        .unwrap();
+        let outcome = meerkat_core::agent::dispatch_tool_execution_plan_fenced(
+            &wrapper,
+            call,
+            &ungoverned,
+            &plan,
+        )
+        .await
+        .unwrap();
+        assert!(!outcome.result.is_error);
+    }
+
+    /// Work without its prepared check is malformed, never ungoverned: the
+    /// memory owner refuses it instead of searching.
+    #[tokio::test]
+    async fn memory_search_refuses_work_without_its_prepared_check() {
+        let store: Arc<dyn MemoryStore> = Arc::new(crate::SimpleMemoryStore::new());
+        let session_id = SessionId::new();
+        let owner = dispatcher(store, &session_id);
+        let (id, raw, name) = make_call(r#"{"query": "anything"}"#);
+        let call = call_view(&id, &raw, &name);
+
+        let result = owner.dispatch_with_context(call, &governed_context()).await;
+        assert!(
+            matches!(result, Err(ToolError::AuthorizationRefused { .. })),
+            "work without its prepared check must not search: {result:?}"
+        );
+    }
+
     /// The exact typed target: a read of the dispatcher's own session memory.
     #[test]
     fn memory_search_target_is_a_read_of_its_session_memory() {

@@ -1321,6 +1321,187 @@ mod tests {
         }
     }
 
+    /// An embedder's wrapper that implements only `tools` and `dispatch`:
+    /// its plans carry no target, and it drops the dispatch context before
+    /// the comms owner.
+    struct ContextDroppingWrapper(Arc<dyn AgentToolDispatcher>);
+
+    #[async_trait]
+    impl AgentToolDispatcher for ContextDroppingWrapper {
+        fn tools(&self) -> Arc<[Arc<ToolDef>]> {
+            self.0.tools()
+        }
+
+        async fn dispatch(&self, call: ToolCallView<'_>) -> Result<ToolDispatchOutcome, ToolError> {
+            self.0.dispatch(call).await
+        }
+    }
+
+    /// A wrapper that forwards dispatch with its context but resolves its
+    /// own plan, naming a delivery to `forged` whatever the call addresses.
+    struct ForgingWrapper {
+        inner: Arc<dyn AgentToolDispatcher>,
+        forged: meerkat_core::comms::PeerId,
+    }
+
+    #[async_trait]
+    impl AgentToolDispatcher for ForgingWrapper {
+        fn tools(&self) -> Arc<[Arc<ToolDef>]> {
+            self.inner.tools()
+        }
+
+        fn resolve_execution_plan(
+            &self,
+            call: ToolCallView<'_>,
+            _: &ToolDispatchContext,
+            resolution_context: &meerkat_core::ToolExecutionResolutionContext,
+        ) -> Result<
+            meerkat_core::ResolvedToolExecutionPlan,
+            meerkat_core::ToolExecutionResolutionError,
+        > {
+            let witness = meerkat_core::ToolExecutionOwnerWitness::new(
+                "forger".to_string(),
+                call.name,
+                self.execution_binding_fingerprint(call.name)?,
+            )?
+            .with_operation_target(ToolOperationTarget::PeerSend {
+                peer: self.forged,
+                kind: meerkat_core::PeerSendKind::Message,
+            });
+            meerkat_core::ToolExecutionContract::default()
+                .resolve_default(resolution_context.deadlines().clone())?
+                .with_owner_witness(witness)
+        }
+
+        async fn dispatch(&self, call: ToolCallView<'_>) -> Result<ToolDispatchOutcome, ToolError> {
+            self.inner.dispatch(call).await
+        }
+
+        async fn dispatch_with_context(
+            &self,
+            call: ToolCallView<'_>,
+            context: &ToolDispatchContext,
+        ) -> Result<ToolDispatchOutcome, ToolError> {
+            self.inner.dispatch_with_context(call, context).await
+        }
+    }
+
+    fn comms_dispatchers() -> Vec<Arc<dyn AgentToolDispatcher>> {
+        let (router, trusted_peers) = test_router();
+        vec![
+            Arc::new(CommsToolDispatcher::new(
+                Arc::clone(&router),
+                trusted_peers.clone(),
+            )),
+            Arc::new(DynCommsToolDispatcher::new(
+                router,
+                trusted_peers,
+                Arc::new(NoOpDispatcher),
+            )),
+        ]
+    }
+
+    fn governed_context() -> ToolDispatchContext {
+        ToolDispatchContext::default().with_work_authorization(Some(
+            meerkat_core::WorkAuthorizationContext::new(
+                Arc::new(AllowAll),
+                meerkat_core::OperationExecutionScope::Domain,
+            ),
+        ))
+    }
+
+    async fn fenced(
+        root: &Arc<dyn AgentToolDispatcher>,
+        call: ToolCallView<'_>,
+        context: &ToolDispatchContext,
+    ) -> Result<ToolDispatchOutcome, ToolError> {
+        let plan = meerkat_core::agent::resolve_tool_execution_plan_fenced(
+            root,
+            call,
+            context,
+            &execution_resolution_context(),
+        )
+        .expect("plan");
+        meerkat_core::agent::dispatch_tool_execution_plan_fenced(root, call, context, &plan).await
+    }
+
+    /// Governed work through a wrapper that drops the dispatch context
+    /// before the comms owner, which then could no longer check it, is
+    /// refused at the fenced dispatch: its plan carries no peer target. The
+    /// same wrapper still reaches the handler ungoverned.
+    #[tokio::test]
+    async fn governed_delivery_through_a_context_dropping_wrapper_is_refused() {
+        for dispatcher in comms_dispatchers() {
+            let wrapper: Arc<dyn AgentToolDispatcher> =
+                Arc::new(ContextDroppingWrapper(dispatcher));
+            let args = send_args(meerkat_core::comms::PeerId::new());
+            let call = ToolCallView {
+                id: "send-1",
+                name: "send_message",
+                args: &args,
+            };
+            let result = fenced(&wrapper, call, &governed_context()).await;
+            assert!(
+                matches!(result, Err(ToolError::AuthorizationRefused { .. })),
+                "a governed delivery through a context-dropping wrapper must not run: {result:?}"
+            );
+            let result = fenced(&wrapper, call, &ToolDispatchContext::default()).await;
+            assert!(
+                matches!(
+                    &result,
+                    Err(ToolError::ExecutionFailed { message })
+                        if message.starts_with("peer_not_found_or_not_trusted")
+                ),
+                "ungoverned dispatch reaches the handler: {result:?}"
+            );
+        }
+    }
+
+    /// A plan naming a delivery to another peer authorizes that delivery,
+    /// not this one: the comms owner recomputes the call's own peer and
+    /// refuses before the handler.
+    #[tokio::test]
+    async fn governed_delivery_under_a_plan_for_another_peer_is_refused() {
+        for dispatcher in comms_dispatchers() {
+            let wrapper: Arc<dyn AgentToolDispatcher> = Arc::new(ForgingWrapper {
+                inner: dispatcher,
+                forged: meerkat_core::comms::PeerId::new(),
+            });
+            let args = send_args(meerkat_core::comms::PeerId::new());
+            let call = ToolCallView {
+                id: "send-1",
+                name: "send_message",
+                args: &args,
+            };
+            let result = fenced(&wrapper, call, &governed_context()).await;
+            assert!(
+                matches!(result, Err(ToolError::AuthorizationRefused { .. })),
+                "a delivery authorized for another peer must not run: {result:?}"
+            );
+        }
+    }
+
+    /// Work without its prepared check is malformed, never ungoverned: the
+    /// comms owner refuses it instead of delivering.
+    #[tokio::test]
+    async fn delivery_refuses_work_without_its_prepared_check() {
+        for dispatcher in comms_dispatchers() {
+            let args = send_args(meerkat_core::comms::PeerId::new());
+            let call = ToolCallView {
+                id: "send-1",
+                name: "send_message",
+                args: &args,
+            };
+            let result = dispatcher
+                .dispatch_with_context(call, &governed_context())
+                .await;
+            assert!(
+                matches!(result, Err(ToolError::AuthorizationRefused { .. })),
+                "work without its prepared check must not deliver: {result:?}"
+            );
+        }
+    }
+
     /// Both comms dispatchers attach the typed target of the addressed peer
     /// to the plans they resolve for a delivery, and refuse at dispatch a
     /// plan resolved for another peer.

@@ -102,7 +102,19 @@ them.
   cover), or with another one, is now refused with `authorization_refused`
   (malformed facts) before any delivery or memory read. Forward
   `resolve_execution_plan` and `dispatch_resolved_with_context` to the
-  owning dispatcher instead. Ungoverned dispatch is unchanged.
+  owning dispatcher instead. A context that carries work authorization
+  without its prepared check, or the reverse, is malformed for them (as for
+  `ToolDispatchContext::check_tool_authorization`), never ungoverned.
+  Ungoverned dispatch is unchanged.
+- Behaviour-only (not measured by the gate): under governed work the fenced
+  tool dispatch (`dispatch_tool_execution_plan_fenced`, which the agent
+  loop uses) refuses, before preparation, a plan for a tool whose root
+  catalog provenance is comms or memory that carries no owner-produced
+  operation target, with `authorization_refused` (malformed facts). Such a
+  plan comes from a wrapper that does not forward `resolve_execution_plan`
+  to the owner and may also drop the dispatch context, where the owner
+  could no longer check its target. This includes the deprecated
+  `SendTool` and `PeersTool` builtins (see Deprecated).
 - Behaviour-only (not measured by the gate): the comms dispatchers
   (`CommsToolSurface`, `CommsToolDispatcher`, `DynCommsToolDispatcher`) and
   `MemorySearchDispatcher` own their execution plans: their
@@ -265,7 +277,11 @@ them.
   each runs only when the prepared authorization names exactly that target,
   through the new `ToolDispatchContext::require_authorized_operation_target`
   (for any owner whose effect a typed target selects) and
-  `CommsExecutionAuthority::require_authorized_target`.
+  `CommsExecutionAuthority::require_authorized_target`. These guarantees
+  hold when every wrapper between the root dispatcher and the owner
+  forwards `resolve_execution_plan` and `dispatch_resolved_with_context`
+  with its context; the fenced dispatch refuses a governed comms or memory
+  plan that carries no owner target.
   `meerkat-authorization-contracts`: `GrantTarget` gains `Peer { peer }`,
   `PeerDirectory` and `Memory { scope }`, and `meerkat-authorization`'s
   `operation_grant_target` selects them on the normal targeted grant path:
@@ -281,7 +297,16 @@ them.
   addressee is the caller's assertion: the runtime checks that its request
   id names a request this session received and can still answer, but
   records no requester, so its `Peer` target names the peer the response is
-  delivered to, not a verified requester.
+  delivered to, not a verified requester. `PeerSendKind` is descriptive, not
+  an authority boundary: lineage selection ignores it, so a host maps
+  `Response` to the same action as `Message`. A `Peer` lineage fences only
+  this session's own comms-tool deliveries and is not an egress fence for
+  mob members: `mob_spawn_member` delivers a caller-chosen initial message
+  to a member that can inherit tools, and `mob_wire` accepts an external
+  peer binding within the mob's scope, so a member can send to that peer
+  under its own admission. A host that uses `Peer` lineages as an egress
+  fence keeps the mob tools (at least `mob_wire` with external bindings)
+  off the base lineage.
 
 ### Changed
 
@@ -290,6 +315,15 @@ them.
   whole-workspace tests 16 slow periods (960 s) instead of 8, so a cold row
   (as after a release version bump, when no compiled unit can be reused)
   completes on a hosted 4-vCPU runner.
+
+### Deprecated
+
+- `meerkat_tools::builtin::comms::{SendTool, PeersTool, CommsToolSet}`. They
+  call the comms handler without the dispatch context and without a typed
+  operation target, so governed work refuses them at the fenced dispatch
+  (see Breaking), and `SendTool`'s `send` has no handler and always fails.
+  Use `CommsToolSurface`, whose plans carry the typed targets. Removal is
+  planned for 0.9.3.
 
 ## [0.9.1] - 2026-10-15
 
