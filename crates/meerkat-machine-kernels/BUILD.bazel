@@ -64,9 +64,12 @@ rust_library(
     aliases = aliases(package_name = "crates/meerkat-machine-kernels"),
     crate_name = "meerkat_machine_kernels",
     crate_root = "src/lib.rs",
-    crate_features = [
-        "test-oracle",
-    ],
+    crate_features = select({
+        "//tools/bazel:release_build": [],
+        "//conditions:default": [
+            "test-oracle",
+        ],
+    }),
     edition = "2024",
     rustc_flags = WORKSPACE_LINT_RUSTC_FLAGS,
     compile_data = [
@@ -75,7 +78,7 @@ rust_library(
     srcs = glob(["src/**/*.rs"]),
     visibility = ["//visibility:public"],
     rustc_env = {
-        "CARGO_PKG_VERSION": "0.9.0",
+        "CARGO_PKG_VERSION": "0.9.1",
         "CARGO_MANIFEST_DIR": "./crates/meerkat-machine-kernels",
     },
     proc_macro_deps = all_crate_deps(
@@ -97,9 +100,12 @@ rust_library(
     aliases = aliases(package_name = "crates/meerkat-machine-kernels"),
     crate_name = "meerkat_machine_kernels",
     crate_root = "src/lib.rs",
-    crate_features = [
-        "test-oracle",
-    ],
+    crate_features = select({
+        "//tools/bazel:release_build": [],
+        "//conditions:default": [
+            "test-oracle",
+        ],
+    }),
     edition = "2024",
     rustc_flags = WORKSPACE_LINT_RUSTC_FLAGS,
     compile_data = [
@@ -110,7 +116,7 @@ rust_library(
         "//crates/meerkat:__pkg__",
     ],
     rustc_env = {
-        "CARGO_PKG_VERSION": "0.9.0",
+        "CARGO_PKG_VERSION": "0.9.1",
         "CARGO_MANIFEST_DIR": "./crates/meerkat-machine-kernels",
     },
     proc_macro_deps = all_crate_deps(
@@ -149,7 +155,7 @@ rust_test(
     srcs = glob(["src/**/*.rs"]),
     visibility = ["//visibility:public"],
     rustc_env = {
-        "CARGO_PKG_VERSION": "0.9.0",
+        "CARGO_PKG_VERSION": "0.9.1",
         "CARGO_MANIFEST_DIR": "./crates/meerkat-machine-kernels",
     },
     tags = [
@@ -204,7 +210,7 @@ rust_test(
     ],
     visibility = ["//visibility:public"],
     rustc_env = {
-        "CARGO_PKG_VERSION": "0.9.0",
+        "CARGO_PKG_VERSION": "0.9.1",
         "CARGO_BIN_NAME": "content_shape_wire_contract",
         "CARGO_MANIFEST_DIR": "./crates/meerkat-machine-kernels",
     },
@@ -258,7 +264,7 @@ rust_test(
     ],
     visibility = ["//visibility:public"],
     rustc_env = {
-        "CARGO_PKG_VERSION": "0.9.0",
+        "CARGO_PKG_VERSION": "0.9.1",
         "CARGO_BIN_NAME": "kernel_typed_round_trip",
         "CARGO_MANIFEST_DIR": "./crates/meerkat-machine-kernels",
     },
@@ -312,7 +318,7 @@ rust_test(
     ],
     visibility = ["//visibility:public"],
     rustc_env = {
-        "CARGO_PKG_VERSION": "0.9.0",
+        "CARGO_PKG_VERSION": "0.9.1",
         "CARGO_BIN_NAME": "live_token_debug_redaction",
         "CARGO_MANIFEST_DIR": "./crates/meerkat-machine-kernels",
     },

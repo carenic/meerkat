@@ -35,15 +35,28 @@ rkat [--realm <id>] [--isolated] [--instance <id>] \
   [--state-root <path>] \
   [--context-root <path>] \
   [--user-config-root <path>] \
+  [--as-agent <agent>] \
   [--default-model <model>] \
+  [--confinement <trusted-host|workspace>] \
+  [--confinement-network <denied|unrestricted>] \
+  [--confinement-read <path>]... [--confinement-write <path>]... \
   <command>
 ```
+
+The `--confinement` flags select the OS process confinement of the shell,
+command hooks and MCP stdio servers this invocation launches, replacing the
+`[confinement]` config section for every launch kind; see
+[OS process confinement](/cli/configuration#os-process-confinement).
 
 `--default-model <model>` persists the default agent model into the
 scope-resolved config (project/user/realm resolution included) and exits when
 given without a command — `rkat --default-model claude-fable-5` is the
 one-liner for switching what every future run talks to. The model is
 validated against the catalog and configured custom models.
+
+In a governed realm (see [realm](#realm)), `--as-agent <agent>` acts as
+that agent: its executor and the grants the operator selected for it. The
+default agent is `rkat-agent`.
 
 By default, CLI commands use the current directory as the invocation context
 and derive a stable workspace realm id from that path. For project-local state,
@@ -299,6 +312,12 @@ tail -f app.log | rkat run --resume --stdin lines "watch for new incidents"
 - `~N` for the Nth older session (`~1` is one before the most recent)
 
 Omitting the value means `last`, so `rkat run --resume "keep going"` and `rkat run --resume last "keep going"` are equivalent.
+When `--resume` is followed by the run's only positional argument, that
+argument is the prompt and the session is `last`. A lone argument that names a
+session (a UUID, `<realm>:<uuid>`, a hexadecimal handle of 8 to 36 characters,
+`last`, `~`, or `~N`) is read as the session instead, and the prompt is still
+required. Option values, such as `gpt-5.5` in `-m gpt-5.5`, are not
+positional arguments.
 
 The CLI displays short handles as the final eight UUID characters. Ambiguous
 prefix/tail matches fail instead of selecting a session. A qualified locator
@@ -320,6 +339,7 @@ rkat run --resume -m gemma-4-31b "Continue with the local model"
 rkat session list [--limit <N>] [--offset <N>] [--label <KEY=VALUE>]
 rkat session show <SESSION_ID>
 rkat session export-atif <SESSION_ID> [--output <FILE>]
+rkat session repair-wholeblob <SESSION_ID> [--apply [--accept-shorter]] [--runtime-store <FILE>] [--json]
 rkat session delete <SESSION_ID>
 rkat session interrupt <SESSION_ID>
 ```
@@ -331,6 +351,10 @@ projection. A slow live subscriber can receive a typed stream-truncation
 marker without dropping projector input, but projection is asynchronous
 best-effort derived state and export does not first drain it to the latest
 committed session boundary.
+
+`session repair-wholeblob` diagnoses, and with `--apply` repairs, a WholeBlob
+session whose every send reports `reload_required`; see
+[Storage operations](/guides/storage-operations#repair-a-wholeblob-session-wedged-on-its-audited-endpoint).
 
 Meerkat supports ordinary durable-state opens from 0.8.10 onward. For an older
 SQLite realm, stop every process that can access it and run the explicit
@@ -367,12 +391,28 @@ rkat realm show <REALM_ID>
 rkat realm create <REALM_ID> [--backend <sqlite|jsonl|memory>]
 rkat realm delete <REALM_ID> [--force]
 rkat realm prune [--isolated-only] [--older-than-hours <HOURS>] [--force]
+rkat realm govern <REALM_ID>
+rkat realm grant <REALM_ID> [--agent <AGENT>] (--mcp <SERVER>=<OP>[,<OP>...] | --catalog) [--expires-in-secs <SECS>]
+rkat realm grant <REALM_ID> [--agent <AGENT>] --controller --route <ROUTE_KEY>...
+rkat realm revoke-grant <REALM_ID> [--agent <AGENT>] (--mcp <SERVER> | --catalog | --controller | --worker)
 ```
 
 `realm current` prints the realm selected by the CLI scope. `realm list` and
 `realm show` inspect manifests in the active state root. `realm prune` defaults
 to a 24-hour age threshold. `--force` bypasses active-lease safety checks, so
 use it only after confirming that no process still owns the target realm.
+
+`realm govern` makes an existing realm governed, durably, with the local user
+as operator; every later `rkat` process opens it governed, and no flag selects
+that posture. `realm grant` then issues a named agent (default `rkat-agent`)
+one grant per target: an installed MCP server and its raw operations
+(`--mcp <server>=<op>[,<op>...]`, or `<server>=*` for all of them), the tool
+catalog (`--catalog`), or the agent's controller (`--controller` with one or
+more `--route <key>`; a controller grant has no expiry). A new grant
+supersedes only its target's previous one.
+`realm revoke-grant` revokes the grant selected for one target and exits
+successfully only when it is revoked. Use the global `--as-agent` to run as a
+granted agent.
 
 ## config
 
@@ -406,7 +446,17 @@ rkat auth test <BINDING_ID>            # dry-run resolve the binding
 rkat auth refresh <PROFILE_ID>         # force-refresh OAuth tokens
 rkat auth logout [<REALM>:]<BINDING_ID> # clear persisted credentials; bare means global
 rkat auth profile-delete <PROFILE_ID> -y
+rkat auth connector-client set <ID> --issuer <ISSUER> --client <CLIENT_ID> [--client-secret [--secret-stdin]] [--authorize-param <NAME=VALUE>...] [--no-resource-indicator] [--protocol <ID>] [--redirect-uri <URI>...]
+rkat auth connector-client rotate-secret <ID>   # new client secret from stdin
+rkat auth connector-client list
+rkat auth connector-client remove <ID>
 ```
+
+`<PROVIDER>` is `anthropic`, `openai`, `gemini`, or `copilot` (GitHub
+Copilot device login, interactive only). `connector-client` manages the
+realm's [connector OAuth](/guides/auth#connector-oauth) clients: writes go to
+the realm's own config, and client secrets go to the credential store, read
+from stdin and never from the command line.
 
 Interactive OAuth/device `rkat auth login` writes nonsecret backend, auth
 profile, and binding declarations into the reserved **`global`** config doc
@@ -575,8 +625,8 @@ confused with `rkat realm prune`, which deletes whole realm directories.
 the project and user `mcp.toml` files.
 
 ```bash
-rkat mcp add <NAME> [--transport stdio|http|sse] [--scope project|user|local|realm] [--expected-generation <N>] [-H KEY:VALUE...] [-e KEY=VALUE...] [--url <URL> | <URL> | -- <CMD...>]
-rkat mcp login <NAME> [--scope project|user|local|realm]
+rkat mcp add <NAME> [--transport stdio|http|sse] [--scope project|user|local|realm] [--expected-generation <N>] [-H KEY:VALUE...] [-e KEY=VALUE...] [--oauth-account <ACCOUNT_ID>] [--allow-operation <OPERATION>...] [--url <URL> | <URL> | -- <CMD...>]
+rkat mcp login <NAME> [--scope project|user|local|realm] [--allow-headless]
 rkat mcp remove <NAME> [--scope project|user|local|realm] [--expected-generation <N>]
 rkat mcp list [--scope project|user|local|realm] [--json]
 rkat mcp get <NAME> [--scope project|user|local|realm] [--json]
@@ -590,6 +640,10 @@ that generation (`rkat config get --with-generation`). A server that a realm
 only inherits is removed in the realm that configures it. Realm servers are
 literal: `--scope realm` refuses a `${VAR}` reference in the command, args,
 `-e` values, URL or `-H` values; put env-derived values in `mcp.toml`.
+`--allow-operation <OPERATION>` (repeatable) allows only the named raw MCP
+operations on the server; every other operation is refused and not offered.
+`--oauth-account` sets the OAuth account a streamable HTTP server's login
+must prove.
 
 Examples:
 
@@ -612,7 +666,10 @@ for the default strategy), or `oauth_account_selection = "discover"` (bind
 the account verified at the first login) or `"unverified"` (an explicit
 opt-in for servers that cannot prove an account; no account is verified).
 Set these in `mcp.toml`; `rkat mcp get` shows them.
-Use `rkat mcp login <NAME>` to open the browser flow ahead of time, or
+Use `rkat mcp login <NAME>` to open the browser flow ahead of time
+(`--allow-headless` permits it without an interactive terminal and prints the
+authorize URL to stderr if no browser opens, so avoid it where output is
+captured or logged), or
 `rkat run "..." --mcp-auth interactive` to allow a TTY run to authenticate
 when an HTTP MCP server first requires it. The CLI owns the loopback callback
 and your browser; agents never see the authorize URL or callback data. The
@@ -689,10 +746,11 @@ Multi-host notes:
   `live/webrtc/answer` supports WebRTC only when the caller can address the
   owning session directly. Controller `session/*` methods do not proxy a
   placed member's host-local session in multi-host v1.
-- Mob verbs exit with typed codes for the four multi-host error classes:
-  scope denied `45`, host unavailable `46`, stale cursor `47`, stale fence
-  `48`, each with a one-line `detail: {...}` JSON rendering on stderr.
-  Everything else keeps the generic exit `1`.
+- Mob verbs exit with typed codes: scope denied `45`, host unavailable
+  `46`, stale cursor `47`, stale fence `48`, and stale delivery scope `56`
+  (the member's session rotated under a still-current fence; capture the
+  delivery scope again), each with a one-line `detail: {...}` JSON rendering
+  on stderr. Everything else keeps the generic exit `1`.
 - Durable member role migration is not a CLI spawn option. The one-shot
   `resume_from_role` declaration is restricted to trusted in-process
   `SpawnMemberSpec` construction and the private member-host materialization
@@ -765,6 +823,9 @@ rkat workgraph attention-list [--namespace <NS>] [--status <STATUS>] [--json]
 rkat workgraph attention-pause <BINDING_ID> --expected-revision <N> [--namespace <NS>] [--json]
 rkat workgraph attention-resume <BINDING_ID> --expected-revision <N> [--namespace <NS>] [--json]
 ```
+
+The CLI's WorkGraph grant covers one namespace, `default`, in the selected
+realm: other `--namespace` values and `--all-namespaces` are refused.
 
 Agents mutate WorkGraph through `workgraph_*` tools. The CLI exposes only the
 narrow trusted goal/attention controls above; attention continuation injection

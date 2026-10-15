@@ -8,6 +8,7 @@
 )]
 
 mod cli_parse;
+mod exit_status;
 #[cfg(feature = "mcp")]
 mod mcp;
 #[cfg(all(
@@ -17,6 +18,7 @@ mod mcp;
     feature = "rpc-surface"
 ))]
 mod mob_host;
+mod resume_args;
 mod shutdown_signal;
 #[cfg(feature = "comms")]
 mod stdin_events;
@@ -44,7 +46,6 @@ use meerkat_contracts::{SessionLocator, SessionLocatorError, format_session_ref}
 use meerkat_core::AgentToolDispatcher;
 #[cfg(feature = "comms")]
 use meerkat_core::CommsRuntimeMode;
-#[cfg(feature = "mob")]
 use meerkat_core::config::CliOverrides;
 use meerkat_core::service::{
     CreateSessionRequest, DeferredPromptPolicy, SessionBuildOptions, SessionQuery, SessionService,
@@ -96,19 +97,19 @@ use std::time::Duration;
 use tokio::process::Command as TokioCommand;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-/// Exit codes as per DESIGN.md §12
+/// Exit codes as per DESIGN.md §12. A failed command with a typed error
+/// exits with its public code's `cli_exit_code()` (see [`exit_status`]).
 const EXIT_SUCCESS: u8 = 0;
 const EXIT_ERROR: u8 = 1;
-const EXIT_BUDGET_EXHAUSTED: u8 = 2;
 /// Usage errors mirror clap's argument-error exit code.
 const EXIT_USAGE: u8 = 2;
 
 const CLI_ABOUT: &str = "Run agent tasks and manage local Meerkat surfaces from the terminal";
 
-const ROOT_AFTER_HELP: &str = "Command groups:\n  Runtime:      run, help\n  Realm config: init, config, realm\n  Utility:      session, blob, models, capabilities, doctor, storage\n\nAdditional commands appear when their supporting capabilities are compiled in.\n\nRealm defaults:\n  - context root: current directory, unless --context-root is supplied\n  - state root: <project-root>/.rkat/realms, where project root is the nearest ancestor containing .rkat (or the context root when none exists), unless --state-root is supplied\n  - realm id: workspace-derived ws-... unless --realm or --isolated is supplied\n\nExamples:\n  rkat \"summarize this repository\"\n  rkat help \"How do I add an mcp server?\"\n  cat story.txt | rkat \"summarize the story\"\n  git diff | rkat run \"review these changes\"\n  tail -f app.log | rkat run --stdin lines \"watch for incidents\"\n  rkat run -t workspace \"fix the failing test\"\n\nUse `<binary> <command> -h` for the basic view and `<binary> <command> --help` for all options.";
-const HELP_AFTER_HELP: &str = "Examples:\n  rkat help \"How do I add an mcp server and schedule to remove it in 30 minutes\"\n  rkat help \"Use gemini with my vertex auth, load ~/codex/skills\" --prompt \"Write a match-3 game in Erlang\"";
+const ROOT_AFTER_HELP: &str = "Command groups:\n  Runtime:      run, help\n  Realm config: init, config, realm, auth\n  Utility:      session, blob, workgraph, models, capabilities, doctor, storage\n  Integrations: mcp, mob, skill (when compiled in)\n\nRealm defaults:\n  - context root: current directory, unless --context-root is supplied\n  - state root: <project-root>/.rkat/realms, where project root is the nearest ancestor containing .rkat (or the context root when none exists), unless --state-root is supplied\n  - realm id: workspace-derived ws-... unless --realm or --isolated is supplied\n\nExamples:\n  rkat \"summarize this repository\"\n  rkat help \"How do I add an mcp server?\"\n  cat story.txt | rkat \"summarize the story\"\n  git diff | rkat run \"review these changes\"\n  tail -f app.log | rkat run --stdin lines \"watch for incidents\"\n  rkat run -t workspace \"fix the failing test\"\n\nUse `rkat <command> -h` for the basic view and `rkat <command> --help` for all options. `rkat help <QUESTION>` answers usage questions with a model.";
+const HELP_AFTER_HELP: &str = "Examples:\n  rkat help \"How do I add an mcp server and schedule to remove it in 30 minutes\"\n  rkat help \"Use gemini with my vertex auth, load ~/codex/skills\" --prompt \"Write a match-3 game in Erlang\"\n\nFor the command reference, run `rkat --help` or `rkat <command> --help`.";
 
-const RUN_AFTER_HELP: &str = "Examples:\n  rkat run \"summarize this repository\"\n  cat story.txt | rkat run \"summarize the story\"\n  git diff | rkat run --json \"review these changes\"\n  rkat run --html \"make a visual explainer\"\n  rkat run --browser \"create an implementation plan\"\n  rkat run --resume \"keep going\"\n  rkat run --resume ~2 \"pick this thread back up\"\n  tail -f app.log | rkat run --stdin lines \"watch for incidents\"\n  rkat run -t workspace \"fix the failing test\"\n\nDefaults:\n  - realm state under <project-root>/.rkat/realms, using the nearest ancestor containing .rkat or the context root when none exists; use --verbose to print the active realm root\n  - `--tools safe`\n  - provider-native web search on for supporting models; use `--no-web-search` to disable\n  - stream on in a TTY, off in pipes/scripts\n  - piped stdin is read as blob context unless `--stdin lines` is set";
+const RUN_AFTER_HELP: &str = "Examples:\n  rkat run \"summarize this repository\"\n  cat story.txt | rkat run \"summarize the story\"\n  git diff | rkat run --json \"review these changes\"\n  rkat run --html \"make a visual explainer\"\n  rkat run --browser \"create an implementation plan\"\n  rkat run --resume last \"keep going\"\n  rkat run --resume ~2 \"pick this thread back up\"\n  tail -f app.log | rkat run --stdin lines \"watch for incidents\"\n  rkat run -t workspace \"fix the failing test\"\n\nDefaults:\n  - realm state under <project-root>/.rkat/realms, using the nearest ancestor containing .rkat or the context root when none exists; use --verbose to print the active realm root\n  - `--tools safe`\n  - provider-native web search on for supporting models; use `--no-web-search` to disable\n  - stream on in a TTY, off in pipes/scripts\n  - piped stdin is read as blob context unless `--stdin lines` is set";
 
 const DEFAULT_TRACE_FILTER: &str = "off";
 const VERBOSE_TRACE_FILTER: &str = "info";
@@ -284,9 +285,9 @@ impl CliOutputPipeline {
 fn accumulate_anyhow_error(slot: &mut Option<anyhow::Error>, err: anyhow::Error) {
     match slot.take() {
         Some(existing) => {
-            *slot = Some(anyhow::anyhow!(
-                "{existing}; additionally failed during shutdown: {err}"
-            ));
+            // The first failure keeps its typed owner (and so its exit code).
+            let message = format!("{existing}; additionally failed during shutdown: {err}");
+            *slot = Some(existing.context(message));
         }
         None => {
             *slot = Some(err);
@@ -362,8 +363,12 @@ fn completion_outcome_to_cli_runtime_turn_result(
                 pending_tool_calls,
             }))
         }
+        // Typed as the shared completion projection types it, so a
+        // cancelled turn exits with the request-cancelled code.
         meerkat_runtime::completion::CompletionOutcome::Cancelled => {
-            Err(anyhow::anyhow!("request cancelled"))
+            Err(exit_status::typed_failure(AgentError::Cancelled, |_| {
+                "request cancelled".to_string()
+            }))
         }
         meerkat_runtime::completion::CompletionOutcome::Abandoned { reason, .. } => {
             Err(anyhow::anyhow!("turn abandoned: {reason}"))
@@ -629,9 +634,12 @@ where
         (Ok(result), Ok(())) => Ok(result),
         (Ok(_), Err(shutdown_err)) => Err(shutdown_err),
         (Err(turn_err), Ok(())) => Err(turn_err),
-        (Err(turn_err), Err(shutdown_err)) => Err(anyhow::anyhow!(
-            "{turn_err}; additionally failed during CLI shutdown: {shutdown_err}"
-        )),
+        (Err(turn_err), Err(shutdown_err)) => {
+            // The turn failure keeps its typed owner (and so its exit code).
+            let message =
+                format!("{turn_err}; additionally failed during CLI shutdown: {shutdown_err}");
+            Err(turn_err.context(message))
+        }
     }
 }
 
@@ -849,12 +857,17 @@ fn is_root_flag_with_value(arg: &str) -> bool {
     matches!(
         arg,
         "-r" | "--realm"
+            | "--as-agent"
             | "--instance"
             | "--realm-backend"
             | "--state-root"
             | "--context-root"
             | "--user-config-root"
             | "--default-model"
+            | "--confinement"
+            | "--confinement-network"
+            | "--confinement-read"
+            | "--confinement-write"
     )
 }
 
@@ -877,7 +890,8 @@ fn is_root_flag_with_attached_value(arg: &str) -> bool {
 }
 
 /// Inject `run` as the default subcommand when the first positional argument
-/// is not a known command, while preserving top-level help/version handling.
+/// is not a known command, while preserving top-level help/version handling,
+/// and give `run --resume` its documented `[SESSION] PROMPT` shape.
 fn normalize_cli_args(
     args: impl IntoIterator<Item = std::ffi::OsString>,
 ) -> Vec<std::ffi::OsString> {
@@ -905,7 +919,7 @@ fn normalize_cli_args(
         "continue",
         "c",
     ];
-    let args: Vec<std::ffi::OsString> = args.into_iter().collect();
+    let mut args: Vec<std::ffi::OsString> = args.into_iter().collect();
     let mut i = 1; // skip binary name
     while i < args.len() {
         let arg_str = args[i].to_str().unwrap_or("");
@@ -921,12 +935,17 @@ fn normalize_cli_args(
                 break;
             }
         } else {
+            if arg_str == "run" {
+                imply_run_resume_last(&mut args, i);
+                return args;
+            }
             if SUBCOMMANDS.contains(&arg_str) {
                 return args;
             }
             let mut patched = args[..i].to_vec();
             patched.push("run".into());
             patched.extend_from_slice(&args[i..]);
+            imply_run_resume_last(&mut patched, i);
             return patched;
         }
     }
@@ -935,34 +954,28 @@ fn normalize_cli_args(
         let mut patched = args[..i].to_vec();
         patched.push("run".into());
         patched.extend_from_slice(&args[i..]);
-        if let Some(resume_index) = patched
-            .iter()
-            .position(|arg| arg.to_str() == Some("--resume"))
-        {
-            let remaining_positionals = patched
-                .iter()
-                .skip(resume_index + 1)
-                .filter(|arg| !arg.to_string_lossy().starts_with('-'))
-                .count();
-            let next_value = patched
-                .get(resume_index + 1)
-                .and_then(|arg| arg.to_str())
-                .filter(|arg| !arg.starts_with('-'));
-            let should_insert_last = match (next_value, remaining_positionals) {
-                (None, _) => true,
-                (Some(_), 0) => true,
-                (Some(value), 1) => !looks_like_resume_target(value),
-                (Some(_), _) => false,
-            };
-            if should_insert_last {
-                patched.insert(resume_index + 1, "last".into());
-            }
-        }
-
+        imply_run_resume_last(&mut patched, i);
         return patched;
     }
 
     args
+}
+
+/// The documented `run --resume [SESSION] PROMPT` shape for the `run` at
+/// `run_index`, explicit or implied (see [`resume_args::imply_resume_last`]).
+fn imply_run_resume_last(args: &mut Vec<std::ffi::OsString>, run_index: usize) {
+    if !args
+        .iter()
+        .skip(run_index + 1)
+        .any(|arg| arg.to_str() == Some("--resume"))
+    {
+        return;
+    }
+    let mut command = <Cli as clap::CommandFactory>::command();
+    command.build();
+    if let Some(run) = command.find_subcommand("run") {
+        resume_args::imply_resume_last(args, run_index, run, looks_like_resume_target);
+    }
 }
 
 /// Read piped stdin content and prepend it to the prompt as context.
@@ -1424,8 +1437,91 @@ struct Cli {
     )]
     default_model: Option<String>,
 
+    /// OS process confinement for the shell, command hooks and MCP stdio
+    /// servers this process launches. `workspace` confines each launch to
+    /// the context root; `trusted-host` runs them unconfined. Replaces the
+    /// config's `[confinement]` for this process.
+    #[arg(
+        long,
+        global = true,
+        value_enum,
+        value_name = "MODE",
+        hide_short_help = true,
+        help_heading = "Confinement options"
+    )]
+    confinement: Option<ConfinementModeArg>,
+    /// IP network access of workspace-confined launches (default: denied).
+    #[arg(
+        long,
+        global = true,
+        value_enum,
+        value_name = "ACCESS",
+        requires = "confinement",
+        hide_short_help = true,
+        help_heading = "Confinement options"
+    )]
+    confinement_network: Option<ConfinementNetworkArg>,
+    /// An extra read-only directory for workspace-confined launches.
+    /// Repeatable.
+    #[arg(
+        long,
+        global = true,
+        value_name = "PATH",
+        requires = "confinement",
+        hide_short_help = true,
+        help_heading = "Confinement options"
+    )]
+    confinement_read: Vec<PathBuf>,
+    /// An extra writable directory for workspace-confined launches.
+    /// Repeatable.
+    #[arg(
+        long,
+        global = true,
+        value_name = "PATH",
+        requires = "confinement",
+        hide_short_help = true,
+        help_heading = "Confinement options"
+    )]
+    confinement_write: Vec<PathBuf>,
+
     #[command(subcommand)]
     command: Option<Commands>,
+}
+
+/// `--confinement`: how this process confines the processes it launches.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum ConfinementModeArg {
+    /// Launch as the trusted host, with no OS confinement.
+    TrustedHost,
+    /// Confine each launch to the context root and the extra directories.
+    Workspace,
+}
+
+impl From<ConfinementModeArg> for meerkat_core::ConfinementFlagMode {
+    fn from(value: ConfinementModeArg) -> Self {
+        match value {
+            ConfinementModeArg::TrustedHost => Self::TrustedHost,
+            ConfinementModeArg::Workspace => Self::Workspace,
+        }
+    }
+}
+
+/// `--confinement-network`: IP access of workspace-confined launches.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum ConfinementNetworkArg {
+    /// No IP sockets.
+    Denied,
+    /// IP sockets over the host's own network.
+    Unrestricted,
+}
+
+impl From<ConfinementNetworkArg> for meerkat_core::WorkspaceNetwork {
+    fn from(value: ConfinementNetworkArg) -> Self {
+        match value {
+            ConfinementNetworkArg::Denied => Self::Denied,
+            ConfinementNetworkArg::Unrestricted => Self::Unrestricted,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -1720,7 +1816,7 @@ enum Commands {
         #[arg(long, short = 'm', help_heading = "Common options")]
         model: Option<String>,
 
-        /// LLM provider (anthropic, openai, gemini). Inferred from the model registry when omitted.
+        /// LLM provider. Inferred from the model registry when omitted.
         #[arg(
             long,
             short = 'p',
@@ -2026,14 +2122,17 @@ enum Commands {
         )]
         line_format: LineFormat,
 
-        /// Typed auth binding reference `realm:binding[:profile]`.
+        /// Auth binding for this run, as `realm:binding[:profile]`.
         ///
-        /// Parsed at the CLI boundary by
-        /// `cli_parse::parse_auth_binding_user_input`; a typed
-        /// [`meerkat_core::AuthBindingRef`] is threaded through
-        /// `SessionBuildOptions.auth_binding`. Opaque-string
-        /// ferry through the runtime is prohibited by the
-        /// wave-b deletion of `AuthBindingRef::parse` / `Display`.
+        /// Uses that binding's backend and credential (and the named auth
+        /// profile, when given) instead of the default credential
+        /// resolution. `rkat auth bindings` lists the configured bindings.
+        // Parsed at the CLI boundary by
+        // `cli_parse::parse_auth_binding_user_input`; a typed
+        // `meerkat_core::AuthBindingRef` is threaded through
+        // `SessionBuildOptions.auth_binding`. Opaque-string ferry through
+        // the runtime is prohibited by the wave-b deletion of
+        // `AuthBindingRef::parse` / `Display`.
         #[arg(
             long = "auth-binding",
             value_name = "REALM:BINDING[:PROFILE]",
@@ -2042,13 +2141,18 @@ enum Commands {
         auth_binding: Option<String>,
     },
 
-    #[command(after_help = HELP_AFTER_HELP)]
+    #[command(after_help = HELP_AFTER_HELP, arg_required_else_help = true)]
     /// Ask how to use Meerkat
+    ///
+    /// A model answers the question from the embedded Meerkat platform and
+    /// CLI reference, so it needs a configured provider, like `rkat run`.
+    /// For the command reference, use `rkat --help`.
     Help {
         /// The Meerkat usage question to answer
         question: String,
 
-        /// Inert prompt payload for future execution-oriented help
+        /// A task you intend to run later. Help explains it, or plans it
+        /// with --plan-execution, and treats it as input only
         #[arg(
             long,
             value_name = "PROMPT",
@@ -2057,7 +2161,8 @@ enum Commands {
         )]
         prompt: Option<String>,
 
-        /// Plan future execution without executing anything
+        /// Ask for a plan with the exact commands or API calls to run later,
+        /// instead of an explanation
         #[arg(
             long = "plan-execution",
             hide_short_help = true,
@@ -2213,14 +2318,15 @@ enum Commands {
         command: StorageCommands,
     },
 
-    /// Auth profile management — list, inspect, test, log in, log out,
-    /// delete, and check status of realm-scoped auth profiles.
-    /// `login` runs the interactive OAuth flow by default, or writes an
-    /// inline api_key when `--non-interactive --secret <S>` is passed.
-    /// Env-var auth (`RKAT_*` provider keys, ANTHROPIC_API_KEY,
-    /// OPENAI_API_KEY, AZURE_OPENAI_API_KEY + AZURE_OPENAI_ENDPOINT,
-    /// GEMINI_API_KEY / GOOGLE_API_KEY) continues to work as a fallback for
-    /// callers that haven't migrated.
+    /// Sign in to providers and manage realm-scoped auth profiles
+    ///
+    /// List, inspect, test, refresh, log in, log out, and delete realm-scoped
+    /// auth profiles and bindings. `login` runs the provider's interactive
+    /// OAuth or device flow by default; `--non-interactive` stores an API key
+    /// from `--secret` or stdin instead. Provider API keys in environment
+    /// variables (`RKAT_*` provider keys, ANTHROPIC_API_KEY, OPENAI_API_KEY,
+    /// AZURE_OPENAI_API_KEY + AZURE_OPENAI_ENDPOINT, GEMINI_API_KEY /
+    /// GOOGLE_API_KEY) work without any auth profile.
     Auth {
         #[command(subcommand)]
         command: AuthCommands,
@@ -2375,9 +2481,11 @@ enum AuthCommands {
         profile_id: String,
     },
 
-    /// Delete an auth profile's persisted credentials from the TokenStore.
-    /// The realm config entry itself is declarative — this removes the
-    /// secret/token material bound to the profile's owning `<realm>:<binding_id>`.
+    /// Delete an auth profile's stored credentials
+    ///
+    /// Removes the secret or token material stored for the binding that owns
+    /// the profile (`<realm>:<binding_id>`). The profile's declaration in the
+    /// realm config is left unchanged.
     ProfileDelete {
         /// Auth profile id.
         profile_id: String,
@@ -2397,42 +2505,49 @@ enum AuthCommands {
         binding_id: String,
     },
 
-    /// Print auth profile status — reports realm config shape and the
-    /// observed AuthMachine lease lifecycle state.
+    /// Show an auth profile's realm config and credential lease state.
     Status {
         /// Auth profile id.
         profile_id: String,
     },
 
-    /// Sign in to a provider and persist the resolved credential into the
-    /// TokenStore. Interactive (OAuth) when `--secret` is omitted; scripted
-    /// (inline api key) with `--non-interactive --secret`.
+    /// Sign in to a provider and store the credential
+    ///
+    /// By default this runs the provider's interactive OAuth or device flow
+    /// and records the sign-in in the reserved `global` realm, which every
+    /// workspace realm inherits. `--non-interactive` instead stores an API key
+    /// from `--secret` (or one line of stdin) under
+    /// `global:default_<provider>`, for CI and scripted provisioning; it
+    /// writes no binding config, so a matching binding must already exist.
     Login {
-        /// Provider — `anthropic` / `openai` / `gemini` (positional or
-        /// selected interactively when absent).
+        /// Provider. Interactive login accepts `anthropic` (or `claude`,
+        /// `claude.ai`), `openai` (or `chatgpt`), `gemini` (or `google`,
+        /// `code_assist`) and `copilot` (or `github_copilot`, GitHub
+        /// Copilot). --non-interactive accepts `anthropic`, `openai` or
+        /// `gemini`. Prompted for when omitted; required with
+        /// --non-interactive.
         provider: Option<String>,
 
-        /// Target backend kind (e.g. `anthropic_api`, `openai_api`,
-        /// `chatgpt_backend`, `google_genai`). Defaults to the
-        /// provider's primary backend.
+        /// With --non-interactive: the backend kind recorded with the stored
+        /// key (e.g. `anthropic_api`, `openai_api`, `google_genai`). Defaults
+        /// to the provider's default backend. Interactive login ignores it.
         #[arg(long)]
         backend: Option<String>,
 
-        /// Auth method (e.g. `api_key`, `azure_api_key`,
-        /// `managed_chatgpt_oauth`, `claude_ai_oauth`, `google_oauth`).
-        /// Defaults to the primary interactive flow for the provider.
+        /// With --non-interactive: the auth method of the stored secret, such
+        /// as `api_key` (default), `azure_api_key`, or `static_bearer`. OAuth
+        /// methods need interactive login, which ignores this flag.
         #[arg(long)]
         method: Option<String>,
 
-        /// Skip interactive prompts — resolve the secret from
-        /// `--secret` (or stdin if not given) and write directly to
-        /// TokenStore. Intended for CI / scripted provisioning.
+        /// Store an API key without a browser or prompts. The secret comes
+        /// from --secret, or from one line of stdin. Intended for CI and
+        /// scripted provisioning.
         #[arg(long, requires = "provider")]
         non_interactive: bool,
 
-        /// Inline secret for `--non-interactive` flows. For
-        /// interactive flows the secret is captured via OAuth and
-        /// this flag is ignored.
+        /// The secret to store with --non-interactive. Omit it to read the
+        /// secret from stdin, which keeps it out of the process list.
         #[arg(long, requires = "non_interactive")]
         secret: Option<String>,
     },
@@ -2459,9 +2574,11 @@ enum AuthCommands {
         profile_id: String,
     },
 
-    /// Manage the realm's connector OAuth clients (used for connector login
-    /// and refresh). Writes go to the realm's own config; client secrets go
-    /// to the credential store, never to the config.
+    /// Manage the realm's connector OAuth clients
+    ///
+    /// Connector clients are used for connector login and refresh. Writes go
+    /// to the realm's own config; client secrets go to the credential store,
+    /// never to the config.
     ConnectorClient {
         #[command(subcommand)]
         command: ConnectorClientCommands,
@@ -2472,9 +2589,10 @@ enum AuthCommands {
 /// hosts use for connector login and refresh.
 #[derive(Subcommand)]
 enum ConnectorClientCommands {
-    /// Create or replace a connector client in the realm's own config. A
-    /// client secret is read from stdin (piped, or typed without echo), never
-    /// from the command line.
+    /// Create or replace a connector client in the realm's own config.
+    ///
+    /// A client secret is read from stdin (piped, or typed without echo),
+    /// never from the command line.
     Set {
         /// Profile id a connector login names.
         id: String,
@@ -2504,8 +2622,10 @@ enum ConnectorClientCommands {
         #[arg(long = "redirect-uri")]
         registered_redirect_uris: Vec<String>,
     },
-    /// Replace a client's stored secret, read from stdin. The next code
-    /// exchange or refresh uses it; existing sign-ins stay valid.
+    /// Replace a client's stored secret, read from stdin.
+    ///
+    /// The next code exchange or refresh uses it; existing sign-ins stay
+    /// valid.
     RotateSecret {
         /// Profile id.
         id: String,
@@ -2682,6 +2802,7 @@ async fn handle_connector_client_command(
 enum ConfigCommands {
     /// Print the current config
     Get {
+        /// Output format
         #[arg(long, default_value = "toml")]
         format: ConfigFormat,
         /// Include the monotonic config generation in the output envelope/header
@@ -2760,8 +2881,10 @@ enum StreamView {
 enum SessionCommands {
     /// List sessions
     List {
+        /// Maximum number of sessions to list
         #[arg(long, default_value = "20")]
         limit: usize,
+        /// Number of sessions to skip before listing
         #[arg(long)]
         offset: Option<usize>,
         /// Filter by label (key=value, repeatable). Only sessions matching ALL labels are shown.
@@ -2774,10 +2897,13 @@ enum SessionCommands {
         /// Session ID
         id: String,
     },
-    /// Diagnose, and with --apply repair, a WholeBlob session whose committed
-    /// document is refused because its live rows no longer preserve the
-    /// graph-proved audited endpoint (every send reports reload_required).
-    /// The repair keeps every message and re-anchors the audit graph.
+    /// Diagnose, and with --apply repair, a WholeBlob session stuck on reload_required
+    ///
+    /// Diagnoses, and with --apply repairs, a WholeBlob session whose
+    /// committed document is refused because its live rows no longer
+    /// preserve the graph-proved audited endpoint (every send reports
+    /// reload_required). The repair keeps every message and re-anchors the
+    /// audit graph.
     RepairWholeblob {
         /// Session ID
         id: String,
@@ -2858,16 +2984,20 @@ enum RealmCommands {
         #[arg(long, value_enum)]
         backend: Option<RealmBackendArg>,
     },
-    /// Govern an existing realm: select governed posture durably and
-    /// provision its grant owner with the local user as operator. Every later
-    /// rkat process opens the realm governed; it is never selected by a flag.
+    /// Make an existing realm governed, with the local user as operator.
+    ///
+    /// Selects governed posture durably and provisions the realm's grant
+    /// owner with the local user as operator. Every later rkat process opens
+    /// the realm governed; it is never selected by a flag.
     #[cfg(feature = "local-authorization")]
     Govern {
         /// Realm ID
         realm_id: String,
     },
-    /// Issue one grant of a governed realm to a named agent, as the local
-    /// operator, and select it for one target: an installed MCP server
+    /// Issue an agent of a governed realm the grant for one target.
+    ///
+    /// Issues one grant of a governed realm to a named agent, as the local
+    /// operator, and selects it for one target: an installed MCP server
     /// (`--mcp`), the tool catalog (`--catalog`) or the agent's controller
     /// (`--controller`). Each target has its own grant and lifetime; a new
     /// grant supersedes only its target's previous one, which is recorded
@@ -2906,8 +3036,10 @@ enum RealmCommands {
         #[arg(long)]
         expires_in_secs: Option<u64>,
     },
-    /// Revoke an agent's grant selected for one target now, as the local
-    /// operator, and unselect it once revoked: `--mcp <server>`,
+    /// Revoke an agent's grant for one target of a governed realm.
+    ///
+    /// Revokes the agent's grant selected for one target now, as the local
+    /// operator, and unselects it once revoked: `--mcp <server>`,
     /// `--catalog`, `--controller`, or `--worker` (an older selection's single
     /// worker grant). Exits successfully only when it is revoked; otherwise
     /// it reports what the attempt did.
@@ -3054,67 +3186,103 @@ impl From<WorkAttentionStatusArg> for meerkat::WorkAttentionStatus {
 enum WorkGraphCommands {
     /// List WorkGraph items
     List {
+        /// WorkGraph namespace. Defaults to `default`, the only namespace the
+        /// CLI is granted
         #[arg(long)]
         namespace: Option<String>,
+        /// Read every namespace. Refused: the CLI's WorkGraph grant covers one
+        /// namespace
         #[arg(long)]
         all_namespaces: bool,
+        /// Only items in this status (repeatable). Completed, cancelled, and
+        /// failed items also need --include-terminal
         #[arg(long = "status", value_enum)]
         statuses: Vec<WorkGraphStatusArg>,
+        /// Only items with this label (repeatable; all must match)
         #[arg(long = "label")]
         labels: Vec<String>,
+        /// Include completed, cancelled, and failed items
         #[arg(long)]
         include_terminal: bool,
+        /// Maximum number of items (default 100, at most 1000)
         #[arg(long)]
         limit: Option<usize>,
+        /// Output as JSON
         #[arg(long)]
         json: bool,
     },
     /// Show one WorkGraph item
     Show {
+        /// WorkGraph item ID
         id: String,
+        /// WorkGraph namespace. Defaults to `default`, the only namespace the
+        /// CLI is granted
         #[arg(long)]
         namespace: Option<String>,
+        /// Output as JSON
         #[arg(long)]
         json: bool,
     },
     /// List ready WorkGraph items
     Ready {
+        /// WorkGraph namespace. Defaults to `default`, the only namespace the
+        /// CLI is granted
         #[arg(long)]
         namespace: Option<String>,
+        /// Only items with this label (repeatable; all must match)
         #[arg(long = "label")]
         labels: Vec<String>,
+        /// Maximum number of items (default 100, at most 1000)
         #[arg(long)]
         limit: Option<usize>,
+        /// Output as JSON
         #[arg(long)]
         json: bool,
     },
     /// Show a graph snapshot
     Snapshot {
+        /// WorkGraph namespace. Defaults to `default`, the only namespace the
+        /// CLI is granted
         #[arg(long)]
         namespace: Option<String>,
+        /// Read every namespace. Refused: the CLI's WorkGraph grant covers one
+        /// namespace
         #[arg(long)]
         all_namespaces: bool,
+        /// Only items in this status (repeatable). Completed, cancelled, and
+        /// failed items also need --include-terminal
         #[arg(long = "status", value_enum)]
         statuses: Vec<WorkGraphStatusArg>,
+        /// Only items with this label (repeatable; all must match)
         #[arg(long = "label")]
         labels: Vec<String>,
+        /// Include completed, cancelled, and failed items
         #[arg(long)]
         include_terminal: bool,
+        /// Maximum number of items (default 100, at most 1000)
         #[arg(long)]
         limit: Option<usize>,
+        /// Output as JSON
         #[arg(long)]
         json: bool,
     },
     /// List WorkGraph events
     Events {
+        /// WorkGraph namespace. Defaults to `default`, the only namespace the
+        /// CLI is granted
         #[arg(long)]
         namespace: Option<String>,
+        /// Read every namespace. Refused: the CLI's WorkGraph grant covers one
+        /// namespace
         #[arg(long)]
         all_namespaces: bool,
+        /// Only events after this sequence number
         #[arg(long)]
         after_seq: Option<i64>,
+        /// Maximum number of events (default 100, at most 1000)
         #[arg(long)]
         limit: Option<usize>,
+        /// Output as JSON
         #[arg(long)]
         json: bool,
     },
@@ -3124,81 +3292,125 @@ enum WorkGraphCommands {
         session_id: String,
         /// Goal title
         title: String,
+        /// WorkGraph namespace. Defaults to `default`, the only namespace the
+        /// CLI is granted
         #[arg(long)]
         namespace: Option<String>,
+        /// Goal description
         #[arg(long, allow_hyphen_values = true)]
         description: Option<String>,
+        /// Attention mode of the session binding
         #[arg(long, value_enum, default_value = "pursue")]
         mode: WorkAttentionModeArg,
+        /// Who may close the goal: the bound session itself (self-attest), or
+        /// only with host confirmation evidence (host-confirmed)
         #[arg(long, value_enum, default_value = "self-attest")]
         completion_policy: WorkCompletionPolicyArg,
+        /// Output as JSON
         #[arg(long)]
         json: bool,
     },
     /// Show a goal item and its attention binding
     GoalStatus {
+        /// Attention binding ID of the goal
         binding_id: String,
+        /// WorkGraph namespace. Defaults to `default`, the only namespace the
+        /// CLI is granted
         #[arg(long)]
         namespace: Option<String>,
+        /// Output as JSON
         #[arg(long)]
         json: bool,
     },
     /// Attach confirmation evidence to a goal
     GoalConfirm {
+        /// Attention binding ID of the goal
         binding_id: String,
+        /// WorkGraph namespace. Defaults to `default`, the only namespace the
+        /// CLI is granted
         #[arg(long)]
         namespace: Option<String>,
+        /// The goal item's current revision (see goal-status); the write is
+        /// refused if it changed
         #[arg(long)]
         expected_revision: u64,
+        /// Evidence kind, for example `notification`
         #[arg(long)]
         kind: String,
+        /// ID of the evidence artifact (WorkGraph stores the reference only)
         #[arg(long)]
         id: String,
+        /// Short evidence label
         #[arg(long)]
         label: Option<String>,
+        /// Evidence summary
         #[arg(long)]
         summary: Option<String>,
+        /// Output as JSON
         #[arg(long)]
         json: bool,
     },
     /// Request policy-gated goal closure
     GoalClose {
+        /// Attention binding ID of the goal
         binding_id: String,
+        /// WorkGraph namespace. Defaults to `default`, the only namespace the
+        /// CLI is granted
         #[arg(long)]
         namespace: Option<String>,
+        /// The goal item's current revision (see goal-status); the close is
+        /// refused if it changed
         #[arg(long)]
         expected_revision: u64,
+        /// Terminal status to close the goal with
         #[arg(long = "status", value_enum, default_value = "completed")]
         status: WorkGraphTerminalStatusArg,
+        /// Output as JSON
         #[arg(long)]
         json: bool,
     },
     /// List attention bindings
     AttentionList {
+        /// WorkGraph namespace. Defaults to `default`, the only namespace the
+        /// CLI is granted
         #[arg(long)]
         namespace: Option<String>,
+        /// Only bindings in this status
         #[arg(long = "status", value_enum)]
         status: Option<WorkAttentionStatusArg>,
+        /// Output as JSON
         #[arg(long)]
         json: bool,
     },
     /// Pause an attention binding
     AttentionPause {
+        /// Attention binding ID
         binding_id: String,
+        /// WorkGraph namespace. Defaults to `default`, the only namespace the
+        /// CLI is granted
         #[arg(long)]
         namespace: Option<String>,
+        /// The binding's current revision (`machine_state.revision` in
+        /// attention-list --json); the pause is refused if it changed
         #[arg(long)]
         expected_revision: u64,
+        /// Output as JSON
         #[arg(long)]
         json: bool,
     },
     /// Resume an attention binding
     AttentionResume {
+        /// Attention binding ID
         binding_id: String,
+        /// WorkGraph namespace. Defaults to `default`, the only namespace the
+        /// CLI is granted
         #[arg(long)]
         namespace: Option<String>,
+        /// The binding's current revision (`machine_state.revision` in
+        /// attention-list --json); the resume is refused if it changed
         #[arg(long)]
         expected_revision: u64,
+        /// Output as JSON
         #[arg(long)]
         json: bool,
     },
@@ -3370,7 +3582,9 @@ enum McpCommands {
 enum MobCommands {
     /// Pack a mob directory into a .mobpack archive.
     Pack {
+        /// Mob directory to pack
         dir: PathBuf,
+        /// Path of the .mobpack archive to write
         #[arg(short = 'o', long)]
         output: PathBuf,
         /// Path to an Ed25519 signing key (hex-encoded).
@@ -3383,16 +3597,28 @@ enum MobCommands {
         signer_id: Option<String>,
     },
     /// Inspect a .mobpack archive.
-    Inspect { pack: PathBuf },
+    Inspect {
+        /// Path to a .mobpack archive
+        pack: PathBuf,
+    },
     /// Validate a .mobpack archive.
     Validate {
+        /// Path to a .mobpack archive
         pack: PathBuf,
+        /// Signature trust policy (default: RKAT_TRUST_POLICY, then the
+        /// realm's trust.policy, then strict)
+        ///
+        /// strict rejects unsigned packs and unknown signers; permissive
+        /// allows them with a warning. Invalid signatures are always rejected.
         #[arg(long, value_enum)]
         trust_policy: Option<TrustPolicyArg>,
     },
     /// Deploy a .mobpack archive with a prompt.
     Deploy {
+        /// Path to a .mobpack archive
         pack: PathBuf,
+        /// Prompt for the mob's orchestrator member (not delivered when the
+        /// pack defines no orchestrator)
         prompt: String,
         /// Override model at deploy time.
         #[arg(long, short = 'm')]
@@ -3406,13 +3632,21 @@ enum MobCommands {
         /// Override maximum tool calls at deploy time.
         #[arg(long)]
         max_tool_calls: Option<usize>,
+        /// Signature trust policy (default: RKAT_TRUST_POLICY, then the
+        /// realm's trust.policy, then strict)
+        ///
+        /// strict rejects unsigned packs and unknown signers; permissive
+        /// allows them with a warning. Invalid signatures are always rejected.
         #[arg(long, value_enum)]
         trust_policy: Option<TrustPolicyArg>,
+        /// Deploy surface: `cli` runs the mob in this process; `rpc` also
+        /// serves it as JSON-RPC on stdin/stdout
         #[arg(long, value_enum, default_value = "cli")]
         surface: DeploySurfaceArg,
     },
     /// Invoke a mobpack or installed mob as a typed callable run.
     Run {
+        /// Path to a .mobpack archive, or the ID of an installed mob
         target: String,
         /// Flow id to invoke. Defaults to `main`, or the only declared flow.
         #[arg(long = "flow")]
@@ -3429,14 +3663,23 @@ enum MobCommands {
         /// Output a machine-readable result envelope.
         #[arg(long)]
         json: bool,
+        /// Signature trust policy for a .mobpack TARGET (default:
+        /// RKAT_TRUST_POLICY, then the realm's trust.policy, then strict)
+        ///
+        /// strict rejects unsigned packs and unknown signers; permissive
+        /// allows them with a warning. Invalid signatures are always rejected.
+        /// An installed mob ID ignores it.
         #[arg(long, value_enum)]
         trust_policy: Option<TrustPolicyArg>,
     },
-    /// Start a flow run and print the run_id.
+    /// Run a flow on an installed mob, wait for it to finish, and print the run_id.
     RunFlow {
+        /// Installed mob ID
         mob_id: String,
+        /// Flow ID to run
         #[arg(long = "flow")]
         flow: String,
+        /// Flow parameters as a JSON object
         #[arg(long = "params")]
         params: Option<String>,
         /// Stream flow member outputs while the run is executing
@@ -3447,9 +3690,15 @@ enum MobCommands {
         no_stream: bool,
     },
     /// Show JSON status for a flow run.
-    FlowStatus { mob_id: String, run_id: String },
+    FlowStatus {
+        /// Mob ID
+        mob_id: String,
+        /// Run ID
+        run_id: String,
+    },
     /// List run resources for an installed mob.
     Runs {
+        /// Installed mob ID
         mob_id: String,
         /// Filter to one flow id.
         #[arg(long = "flow")]
@@ -3460,7 +3709,9 @@ enum MobCommands {
     },
     /// Show status for one run resource.
     Status {
+        /// Mob ID
         mob_id: String,
+        /// Run ID
         run_id: String,
         /// Output only the typed status projection.
         #[arg(long)]
@@ -3468,6 +3719,7 @@ enum MobCommands {
     },
     /// Read mob event history for run diagnostics.
     Logs {
+        /// Mob ID
         mob_id: String,
         /// First cursor to read after.
         #[arg(long, default_value_t = 0)]
@@ -3481,7 +3733,9 @@ enum MobCommands {
     },
     /// Wait for a detached run and print its typed result envelope.
     Attach {
+        /// Mob ID
         mob_id: String,
+        /// Run ID of the detached run
         run_id: String,
         /// Output a machine-readable result envelope.
         #[arg(long)]
@@ -3493,8 +3747,8 @@ enum MobCommands {
         mob_id: String,
         /// Task prompt for the helper
         prompt: String,
-        /// Agent identity for the helper. Required: the surface does not
-        /// allocate member identity (#115).
+        /// Agent identity for the helper. Required: the CLI does not
+        /// generate member identities.
         #[arg(long)]
         agent_identity: String,
         /// Profile to use
@@ -3524,8 +3778,8 @@ enum MobCommands {
         source_member: String,
         /// Task prompt for the forked helper
         prompt: String,
-        /// Agent identity for the helper. Required: the surface does not
-        /// allocate member identity (#115).
+        /// Agent identity for the helper. Required: the CLI does not
+        /// generate member identities.
         #[arg(long)]
         agent_identity: String,
         /// Profile to use
@@ -3584,9 +3838,8 @@ enum MobCommands {
         /// Absolute expiry (UNIX epoch milliseconds); stored verbatim
         #[arg(long, conflicts_with = "expires_in")]
         expires_at_ms: Option<u64>,
-        /// Relative expiry sugar (e.g. "30m", "2h"); the CLI reads the
-        /// clock ONCE and sends the absolute timestamp — expiry is data by
-        /// the time it reaches the machine
+        /// Relative expiry (e.g. "30m", "2h"), converted once to an
+        /// absolute timestamp when the command runs
         #[arg(long, conflicts_with = "expires_at_ms")]
         expires_in: Option<String>,
     },
@@ -3601,8 +3854,10 @@ enum MobCommands {
         #[arg(long = "scope")]
         scopes: Vec<String>,
     },
-    /// List raw control-scope grant records (expired rows appear verbatim
-    /// with their expires_at_ms; the enforcement seam evaluates expiry).
+    /// List a mob's stored control-scope grant records.
+    ///
+    /// Expired grants are still listed, with their expires_at_ms; expiry is
+    /// checked when a grant is used.
     Grants {
         /// Mob ID
         mob_id: String,
@@ -3634,8 +3889,7 @@ enum MobCommands {
         #[arg(long)]
         json: bool,
     },
-    /// Bind a member-host daemon to a mob using its binding descriptor
-    /// (multi-host mobs §7.2 step 2).
+    /// Bind a member-host daemon to a mob using its binding descriptor.
     BindHost {
         /// Mob ID
         mob_id: String,
@@ -3678,7 +3932,7 @@ enum MobCommands {
         /// Mob ID
         mob_id: String,
     },
-    /// Member live-channel console verbs (§16.9).
+    /// Open, inspect, control, and close member live channels.
     Live {
         #[command(subcommand)]
         command: MobLiveCommands,
@@ -3692,8 +3946,8 @@ enum MobCommands {
     ///
     /// Binds the host acceptor, writes the host binding descriptor (0600),
     /// and serves supervisor bind/rebind ceremonies until interrupted.
-    /// Realm selection is workspace-derived by default; `--isolated` is a
-    /// typed startup rejection for the daemon.
+    /// Realm selection is workspace-derived by default; the daemon refuses
+    /// to start with `--isolated`.
     #[cfg(all(feature = "comms", feature = "schedule", feature = "rpc-surface"))]
     Host {
         /// Host acceptor TCP bind address (default: 127.0.0.1:0).
@@ -3749,10 +4003,12 @@ enum MobCommands {
 #[cfg(feature = "mob")]
 #[derive(Subcommand)]
 enum MobLiveCommands {
-    /// Open a live realtime channel on a member. Prints the wire
-    /// LiveOpenResult JSON (URL + single-use token) to stdout VERBATIM —
-    /// stdout is the delivery channel, not a log; stderr stays token-free
-    /// (DEC-P6B-C7/C8).
+    /// Open a live realtime channel on a member.
+    ///
+    /// Prints the LiveOpenResult JSON (live URL and single-use token) to
+    /// stdout, unmodified: stdout is the delivery channel, not a log, and
+    /// stderr stays token-free. The returned WebSocket is the input plane;
+    /// there is no `live send` verb.
     Open {
         /// Mob ID
         mob_id: String,
@@ -3761,11 +4017,13 @@ enum MobLiveCommands {
         /// Turning mode (omitted = the owning host's provider-managed default)
         #[arg(long, value_enum)]
         turning_mode: Option<CliRealtimeTurningMode>,
-        /// Requested live transport
+        /// Requested live transport. Member live channels support only
+        /// websocket; webrtc is refused (use the session-scoped JSON-RPC
+        /// live/open for WebRTC)
         #[arg(long, value_enum)]
         transport: Option<CliLiveOpenTransport>,
     },
-    /// Close one NAMED live channel (close-what-you-name, DEC-P6B-C9).
+    /// Close one live channel, named by its id.
     Close {
         /// Mob ID
         mob_id: String,
@@ -3774,8 +4032,10 @@ enum MobLiveCommands {
         /// Channel id to close
         channel_id: String,
     },
-    /// Read live channel status. Omit --channel-id for the reply-loss
-    /// discovery read of the member's active channel (ADJ-P6B-2).
+    /// Read live channel status.
+    ///
+    /// Without --channel-id, reads the member's active channel, so the id of
+    /// an open whose reply was lost can be found and closed.
     Status {
         /// Mob ID
         mob_id: String,
@@ -3793,7 +4053,7 @@ enum MobLiveCommands {
         agent_identity: String,
         /// Channel id to control
         channel_id: String,
-        /// Control verb (closed DL10 vocabulary)
+        /// Control verb
         #[arg(value_enum)]
         verb: CliMobLiveControlVerb,
         /// Truncate only: provider item id
@@ -3863,7 +4123,9 @@ enum CliMobLiveControlVerb {
 enum MobWebCommands {
     /// Build a browser-deployable WASM bundle from a .mobpack archive.
     Build {
+        /// Path to a .mobpack archive
         pack: PathBuf,
+        /// Output directory for the bundle
         #[arg(short = 'o', long)]
         output: PathBuf,
         /// Prebuilt meerkat-web-runtime artifacts: either the wasm-pack `--target web` output
@@ -3871,6 +4133,11 @@ enum MobWebCommands {
         /// `<name>.js` glue is copied alongside). Required: the CLI does not compile wasm32 itself.
         #[arg(long)]
         wasm: PathBuf,
+        /// Signature trust policy (default: RKAT_TRUST_POLICY, then the
+        /// realm's trust.policy, then strict)
+        ///
+        /// strict rejects unsigned packs and unknown signers; permissive
+        /// allows them with a warning. Invalid signatures are always rejected.
         #[arg(long, value_enum)]
         trust_policy: Option<TrustPolicyArg>,
     },
@@ -3983,10 +4250,7 @@ async fn cli_main() -> anyhow::Result<ExitCode> {
         }
         return Ok(match handle_storage_command(command, &cli).await {
             Ok(()) => ExitCode::from(EXIT_SUCCESS),
-            Err(e) => {
-                eprintln!("Error: {e}");
-                ExitCode::from(EXIT_ERROR)
-            }
+            Err(e) => exit_status::report_failure(&e),
         });
     }
 
@@ -3999,8 +4263,7 @@ async fn cli_main() -> anyhow::Result<ExitCode> {
     if let Some(model) = cli.default_model.as_deref()
         && let Err(e) = handle_set_default_model(model, &cli_scope).await
     {
-        eprintln!("Error: {e}");
-        return Ok(ExitCode::from(EXIT_ERROR));
+        return Ok(exit_status::report_failure(&e));
     }
     let Some(command) = cli.command else {
         if cli.default_model.is_some() {
@@ -4134,6 +4397,7 @@ async fn cli_main() -> anyhow::Result<ExitCode> {
                 stdin,
                 line_format,
                 auth_binding,
+                None,
                 &cli_scope,
             ))
             .await
@@ -4248,34 +4512,11 @@ async fn cli_main() -> anyhow::Result<ExitCode> {
         }
     };
 
-    // Map result to exit code
+    // Map result to exit code: a typed failure exits with its public code's
+    // `cli_exit_code()` (§17.4 mob codes included), anything else with 1.
     Ok(match result {
         Ok(()) => ExitCode::from(EXIT_SUCCESS),
-        Err(e) => {
-            // Check if it's a budget exhaustion error
-            if let Some(agent_err) = e.downcast_ref::<AgentError>()
-                && agent_err.is_graceful()
-            {
-                // Budget exhausted - this is a graceful termination
-                eprintln!("Budget exhausted: {agent_err}");
-                return Ok(ExitCode::from(EXIT_BUDGET_EXHAUSTED));
-            }
-            // §17.4 typed exit path (mob verb family only): the four
-            // console codes exit 45-48 with one typed `detail:` line
-            // rendered from the typed fields, never a display string.
-            #[cfg(feature = "mob")]
-            if let Some(code) = mob_exit_code(&e) {
-                eprintln!("Error: {e}");
-                if let Some(detail) = mob_wire_detail(&e)
-                    && let Ok(json) = detail.detail_value()
-                {
-                    eprintln!("detail: {json}");
-                }
-                return Ok(ExitCode::from(code));
-            }
-            eprintln!("Error: {e}");
-            ExitCode::from(EXIT_ERROR)
-        }
+        Err(e) => exit_status::report_failure(&e),
     })
 }
 
@@ -4311,11 +4552,15 @@ async fn handle_help_command(
         max_tokens,
     };
     let help_prompt = meerkat::help::render_help_prompt(&request)?;
+    // Like every help entry point, the CLI builds its session from the one
+    // shared help session: the embedded skills whole in the system prompt and
+    // the read-only reference tools as the session's only tools.
+    let help = cli_help_session()?;
 
     handle_run_command(
         help_prompt,
         None,
-        Some(meerkat::help::help_system_prompt().to_string()),
+        Some(help.system_prompt),
         model,
         provider,
         max_tokens,
@@ -4330,12 +4575,12 @@ async fn handle_help_command(
         html_template_file,
         stream,
         no_stream,
-        false,
+        true,
         false,
         Vec::new(),
         None,
         None,
-        meerkat::help::platform_preload_skill_names(),
+        Vec::new(),
         Vec::new(),
         Vec::new(),
         Vec::new(),
@@ -4354,15 +4599,48 @@ async fn handle_help_command(
         None,
         None,
         None,
-        false,
+        true,
         None,
         Vec::new(),
         StdinMode::Off,
         LineFormat::Text,
         None,
+        Some((help.tools, help.tool_access_policy)),
         scope,
     )
     .await
+}
+
+/// The session `rkat help` runs: the embedded skills whole in the system
+/// prompt, the read-only reference tools as its only tools, and the launch
+/// tool access policy that admits only them.
+#[cfg_attr(not(feature = "skills"), allow(dead_code))]
+struct CliHelpSession {
+    system_prompt: String,
+    tools: Arc<dyn AgentToolDispatcher>,
+    tool_access_policy: meerkat_core::ops::ToolAccessPolicy,
+}
+
+#[cfg(feature = "skills")]
+fn cli_help_session() -> anyhow::Result<CliHelpSession> {
+    let help = meerkat::help::help_session();
+    Ok(CliHelpSession {
+        system_prompt: help.system_prompt,
+        tools: help.tools,
+        tool_access_policy: help.tool_access_policy,
+    })
+}
+
+/// Model help answers from the embedded skills and reads their references
+/// through the help session's resource tools. A build without the `skills`
+/// feature has neither, so `rkat help` is refused here, before any session or
+/// tool is composed, instead of running as an ordinary run.
+#[cfg(not(feature = "skills"))]
+fn cli_help_session() -> anyhow::Result<CliHelpSession> {
+    anyhow::bail!(
+        "rkat help needs the `skills` feature, which this rkat was built without: \
+         help answers from the embedded skills and their reference documents"
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4415,6 +4693,10 @@ async fn handle_run_command(
     stdin: StdinMode,
     line_format: LineFormat,
     auth_binding: Option<AuthBindingRef>,
+    help_tools: Option<(
+        Arc<dyn AgentToolDispatcher>,
+        meerkat_core::ops::ToolAccessPolicy,
+    )>,
     scope: &RuntimeScope,
 ) -> anyhow::Result<()> {
     // One-time, idempotent: carry any pre-`global` (`dev`) login credentials
@@ -4618,6 +4900,7 @@ async fn handle_run_command(
                 manifest,
                 persistence,
                 &storage_scope,
+                help_tools,
                 scope,
             )
             .await
@@ -4957,16 +5240,45 @@ impl CommsOverrides {
             || self.pairing_password.is_some()
             || self.peer_meta.is_some()
     }
+
+    /// Apply the `--comms-*` overrides to the loaded comms config. An
+    /// explicit `--comms-advertise-tcp` replaces the configured
+    /// `advertise_address`; without one the configured address stands.
+    #[cfg(feature = "comms")]
+    fn apply_to(&self, config: &mut Config) {
+        if let Some(addr) = &self.listen_tcp {
+            config.comms.mode = CommsRuntimeMode::Tcp;
+            config.comms.address = Some(addr.clone());
+        }
+        if let Some(advertise_address) = &self.advertise_address {
+            config.comms.advertise_address = Some(advertise_address.clone());
+        }
+        // A runtime-only secret: realm config never carries it (serde
+        // skips it), so the CLI flags are its only source.
+        config.comms.pairing_password = self.pairing_password.clone();
+    }
 }
 
+/// `--comms-advertise-tcp HOST:PORT` (or `tcp://HOST:PORT`) as the `tcp://`
+/// route the comms runtime advertises to signed peers. HOST is a DNS name,
+/// an IPv4 address or a bracketed IPv6 address. A name is not resolved here:
+/// the comms transport resolves it when a peer connects.
 fn resolve_comms_advertise_tcp(advertise_tcp: Option<String>) -> anyhow::Result<Option<String>> {
-    let Some(advertise_tcp) = advertise_tcp else {
+    let Some(raw) = advertise_tcp else {
         return Ok(None);
     };
-    let addr: std::net::SocketAddr = advertise_tcp
-        .parse()
-        .map_err(|err| anyhow::anyhow!("invalid --comms-advertise-tcp address: {err}"))?;
-    Ok(Some(format!("tcp://{addr}")))
+    let route = raw.strip_prefix("tcp://").unwrap_or(&raw);
+    let address = match route.parse::<std::net::SocketAddr>() {
+        Ok(socket) => format!("tcp://{socket}"),
+        Err(_) => format!("tcp://{route}"),
+    };
+    #[cfg(feature = "comms")]
+    meerkat_comms::validate_advertised_tcp_address(&address).map_err(|reason| {
+        anyhow::anyhow!(
+            "invalid --comms-advertise-tcp address '{raw}': {reason}; expected HOST:PORT with a DNS name, an IPv4 address or a bracketed IPv6 address, and a nonzero port"
+        )
+    })?;
+    Ok(Some(address))
 }
 
 fn resolve_comms_pairing_password(
@@ -5066,6 +5378,9 @@ struct RuntimeScope {
     origin_hint: RealmOrigin,
     context_root: Option<PathBuf>,
     user_config_root: Option<PathBuf>,
+    /// The process's `--confinement*` selection, applied over the composed
+    /// `[confinement]` by every config load (`None`: the config decides).
+    confinement: Option<meerkat_core::LaunchConfinement>,
     /// The governed-realm agent this process acts as (`--as-agent`).
     #[cfg(feature = "local-authorization")]
     stock_agent: Option<String>,
@@ -5166,6 +5481,15 @@ fn resolve_runtime_scope_with_realm(
         );
     }
     let user_config_root = cli.user_config_root.clone().or_else(dirs::home_dir);
+    // Relative confinement paths resolve against the working directory, as
+    // any other path argument does.
+    let confinement = meerkat_core::ConfinementFlags {
+        mode: cli.confinement.map(Into::into),
+        network: cli.confinement_network.map(Into::into),
+        read: cli.confinement_read.clone(),
+        write: cli.confinement_write.clone(),
+    }
+    .selection(&std::env::current_dir().unwrap_or_else(|_| context_root.clone()))?;
     #[cfg(any(
         all(feature = "anthropic", feature = "openai", feature = "gemini"),
         feature = "mcp"
@@ -5187,6 +5511,7 @@ fn resolve_runtime_scope_with_realm(
         origin_hint,
         context_root: Some(context_root),
         user_config_root,
+        confinement,
         #[cfg(feature = "local-authorization")]
         stock_agent: cli.as_agent.clone(),
         auth_lease,
@@ -5293,6 +5618,57 @@ async fn load_config(scope: &RuntimeScope) -> anyhow::Result<(Config, PathBuf)> 
     let (config, root, warnings) = load_config_with_warnings(scope).await?;
     report_config_load_warnings(scope, &warnings);
     Ok((config, root))
+}
+
+/// Install this process's OS process confinement on a CLI factory: the
+/// composed `[confinement]`, with the `--confinement*` flags already applied
+/// by [`load_config`], lowered over `workspace_root`, the factory's project
+/// root. A selection that cannot be lowered refuses the command, and so does
+/// one whose confined processes could change the realm state or the user
+/// config document; a launch the platform cannot confine is refused at that
+/// launch, never run unconfined.
+pub(crate) fn with_cli_confinement(
+    factory: AgentFactory,
+    config: &Config,
+    scope: &RuntimeScope,
+    workspace_root: &Path,
+) -> anyhow::Result<AgentFactory> {
+    let confinement = meerkat::HostConfinement::resolve(&config.confinement, Some(workspace_root))?;
+    let user_document = cli_global_config_path(scope);
+    let inputs =
+        meerkat::HostConfinement::host_inputs(&scope.locator.state_root, Some(&user_document));
+    confinement.admit_host_inputs(&inputs)?;
+    report_cli_confinement(
+        &confinement,
+        &inputs,
+        &meerkat::HostConfinement::convention_sources(
+            Some(scope.context_root.as_deref().unwrap_or(workspace_root)),
+            scope.user_config_root.as_deref(),
+        ),
+    );
+    Ok(factory.with_host_confinement(&confinement))
+}
+
+/// Warn once per process, on stderr, for what the operator should act on in
+/// this host's confinement report: a confined launch kind the platform
+/// cannot enforce (each such launch is refused), a guarantee the host does
+/// not claim, and each untrusted convention source.
+fn report_cli_confinement(
+    confinement: &meerkat::HostConfinement,
+    inputs: &[(meerkat::HostInput, PathBuf)],
+    convention_sources: &[PathBuf],
+) {
+    static REPORTED: std::sync::Once = std::sync::Once::new();
+    if confinement.is_trusted_host() {
+        return;
+    }
+    REPORTED.call_once(|| {
+        for notice in confinement.startup_report(inputs, convention_sources) {
+            if notice.warning {
+                eprintln!("warning: {}", notice.text);
+            }
+        }
+    });
 }
 
 /// Operator-facing line for a typed config warning, naming the document to
@@ -5456,6 +5832,10 @@ async fn load_config_with_warnings(
     config
         .apply_env_overrides()
         .map_err(|e| anyhow::anyhow!("Failed to apply env overrides: {e}"))?;
+    config.apply_cli_overrides(CliOverrides {
+        confinement: scope.confinement.clone(),
+        ..CliOverrides::default()
+    });
     config
         .validate(meerkat_models::canonical())
         .map_err(|e| anyhow::anyhow!("Invalid runtime config: {e}"))?;
@@ -6548,9 +6928,21 @@ impl LoginProvider {
         }
     }
 
+    /// Default model written into a freshly synthesized OAuth binding.
+    ///
+    /// Routes follow the catalog default for their provider, except the
+    /// Google login: it is the Code Assist route, which keeps its own
+    /// [`GOOGLE_CODE_ASSIST_SAMPLE_MODEL`] because the catalog's Gemini
+    /// default is chosen for the API-key route and is not verified on Code
+    /// Assist (notably its free tier).
     fn sample_model(self) -> &'static str {
-        meerkat_models::default_model(self.provider())
-            .expect("login provider must have a catalog default model")
+        match self {
+            Self::Google => GOOGLE_CODE_ASSIST_SAMPLE_MODEL,
+            Self::Anthropic | Self::OpenAi | Self::Copilot => {
+                meerkat_models::default_model(self.provider())
+                    .expect("login provider must have a catalog default model")
+            }
+        }
     }
 
     /// FROZEN historical snapshot of prior built-in OAuth binding sample
@@ -6559,8 +6951,9 @@ impl LoginProvider {
     /// This is intentionally NOT a mirror of the live model catalog. It exists
     /// only to detect a stale `default_model` that an *older* CLI build wrote
     /// into a synthesized OAuth binding and heal it by redirecting to the
-    /// catalog-derived current default (`sample_model` →
-    /// `catalog::default_model`; see `ensure_cli_interactive_oauth_config`).
+    /// current route default (`sample_model`: `catalog::default_model`, or
+    /// the Code Assist route default for Google; see
+    /// `ensure_cli_interactive_oauth_config`).
     /// Because it must match what prior builds persisted, it deliberately
     /// retains retired model IDs (e.g. `claude-opus-4-6`) that no longer exist
     /// in the catalog, so it cannot — and must not — be catalog-bound. Append a
@@ -6581,6 +6974,30 @@ impl LoginProvider {
         }
     }
 }
+
+/// Default model of a synthesized Google OAuth (Code Assist) binding.
+///
+/// Route-specific on purpose: the catalog's Gemini default serves the API-key
+/// route and may not be available through Code Assist, notably on its free
+/// tier, so a Google login keeps a model that route is known to serve. Must
+/// stay a catalog Gemini model (pinned by a test).
+#[cfg(all(feature = "anthropic", feature = "openai", feature = "gemini"))]
+const GOOGLE_CODE_ASSIST_SAMPLE_MODEL: &str = "gemini-3.8-flash";
+
+/// Default model of the synthesized Copilot Gemini route binding
+/// (`copilot_gemini`).
+///
+/// Route-specific for the same reason as [`GOOGLE_CODE_ASSIST_SAMPLE_MODEL`]:
+/// Copilot serves an account-specific model list matched by exact id, and the
+/// catalog's Gemini default is chosen for the API-key route and is not
+/// verified there. Must stay a catalog Gemini model (pinned by a test).
+#[cfg(all(
+    feature = "anthropic",
+    feature = "openai",
+    feature = "gemini",
+    feature = "copilot"
+))]
+const COPILOT_GEMINI_SAMPLE_MODEL: &str = "gemini-3.8-flash";
 
 #[cfg(all(feature = "anthropic", feature = "openai", feature = "gemini"))]
 const ALL_LOGIN_PROVIDERS: &[LoginProvider] = &[
@@ -6909,7 +7326,13 @@ fn ensure_cli_interactive_oauth_config(
         {
             let route_id = route.binding_id();
             let route_provider = route.provider();
-            let default_model = meerkat_models::default_model(route_provider);
+            let default_model = match route {
+                meerkat_copilot::CopilotProviderRoute::Gemini => Some(COPILOT_GEMINI_SAMPLE_MODEL),
+                meerkat_copilot::CopilotProviderRoute::OpenAi
+                | meerkat_copilot::CopilotProviderRoute::Anthropic => {
+                    meerkat_models::default_model(route_provider)
+                }
+            };
             if !section.backend.contains_key(route_id) {
                 section.backend.insert(
                     route_id.to_string(),
@@ -8040,13 +8463,13 @@ async fn interactive_login(
         eprintln!();
         print_warn(&format!("{env_var} is set in your environment."));
         print_hint(&format!(
-            "The env-var auth path will continue to handle `{cli_cmd} run` without"
+            "After this login, `{cli_cmd} run` without `--auth-binding` tries this provider's"
         ));
         print_hint(&format!(
-            "`--auth-binding`. OAuth tokens are used when you invoke `{cli_cmd}` with"
+            "stored bindings, this login included, before {env_var}."
         ));
         print_hint(&format!(
-            "`--auth-binding global:{}`.",
+            "`--auth-binding global:{}` selects this login explicitly.",
             provider.binding_id(),
         ));
     }
@@ -10320,13 +10743,15 @@ fn runtime_accept_failure(
     error: meerkat_runtime::RuntimeDriverError,
     route_hint: &StockRouteHint,
 ) -> anyhow::Error {
-    match (route_hint, &error) {
-        (Some(hint), meerkat_runtime::RuntimeDriverError::InputRefused { .. }) => anyhow::anyhow!(
+    let message = match (route_hint, &error) {
+        (Some(hint), meerkat_runtime::RuntimeDriverError::InputRefused { .. }) => format!(
             "runtime accept failed: {error}\nInformation only: if this refusal is due to the \
              controller route, {hint}"
         ),
-        _ => anyhow::anyhow!("runtime accept failed: {error}"),
-    }
+        _ => format!("runtime accept failed: {error}"),
+    };
+    // Kept typed: a refused or not-ready input exits with its public code.
+    exit_status::typed_failure(error, |_| message)
 }
 
 /// Admit a governed prompt's original after the runtime accepted its input.
@@ -10568,6 +10993,19 @@ impl meerkat_mcp::McpAuthResolver for CliMcpHostAuthResolver {
                 },
             })?;
         self.authority.require_stored_bearer_token(target).await
+    }
+
+    /// The native authority's realm, as the RPC and REST resolvers report
+    /// it: the connection scopes its target to it, so the identity it
+    /// reports (sign-out, awaiting-authorization) is the realm's own.
+    fn credential_realm(&self) -> Option<meerkat_core::connection::RealmId> {
+        meerkat_mcp::McpAuthResolver::credential_realm(&self.authority)
+    }
+
+    /// The native authority's bound egress profile: under a required
+    /// profile a connection uses only a resolver bound to that same one.
+    fn http_egress(&self) -> Option<meerkat_mcp::HttpEgressProfile> {
+        meerkat_mcp::McpAuthResolver::http_egress(&self.authority)
     }
 
     fn selected_account(
@@ -10854,22 +11292,33 @@ async fn create_mcp_tools(
     wait_for_mcp: bool,
     mcp_auth: CliMcpAuthMode,
     external_surface_handle: Option<Arc<dyn meerkat_core::ExternalToolSurfaceHandle>>,
+    stdio_profile: CliMcpStdioProfile,
 ) -> anyhow::Result<Option<McpRouterAdapter>> {
     use meerkat_core::mcp_config::{McpConfig, McpScope, McpServerSource};
     use meerkat_mcp::{McpConnection, McpRouter};
 
     // The realm's MCP set, with each server's source for security warnings.
-    let servers_with_scope = McpConfig::effective_servers_from_roots(
+    // An `mcp.toml` a confined process could write is never expanded: each
+    // of its servers is refused before it is authorized or launched.
+    let CliMcpStdioProfile {
+        profile: stdio_profile,
+        host_confinement,
+    } = stdio_profile;
+    let effective = McpConfig::effective_servers_from_roots_trusting(
         realm_servers,
         scope.context_root.as_deref(),
         scope.user_config_root.as_deref(),
+        &|path| host_confinement.untrusted_source(path),
     )
     .await
     .map_err(|e| anyhow::anyhow!("MCP config error: {e}"))?;
+    let servers_with_scope = effective.admitted;
+    let refused_servers = effective.refused;
 
-    if servers_with_scope.is_empty() {
+    if servers_with_scope.is_empty() && refused_servers.is_empty() {
         return Ok(None);
     }
+    report_refused_mcp_servers(&refused_servers);
 
     // Warn about project-scoped servers (potential security concern)
     let project_servers: Vec<_> = servers_with_scope
@@ -10913,12 +11362,23 @@ async fn create_mcp_tools(
     let Some(external_surface_handle) = external_surface_handle else {
         anyhow::bail!("MCP config requires generated external-tool surface authority");
     };
-    let mut router = McpRouter::new_with_surface_handle(external_surface_handle)
-        .with_mcp_auth(mcp_auth.into(), mcp_auth_resolver);
+    let mut router = McpRouter::new_with_surface_handle_and_stdio_profile(
+        external_surface_handle,
+        stdio_profile,
+    )
+    .with_mcp_auth(mcp_auth.into(), mcp_auth_resolver);
     for s in &servers_with_scope {
         tracing::info!("Staging MCP server: {}", s.server.name);
         router
             .stage_add(s.server.clone())
+            .map_err(|e| anyhow::anyhow!("MCP config: {e}"))?;
+    }
+    for refused in &refused_servers {
+        router
+            .stage_add_refused(
+                refused.server.clone(),
+                meerkat_core::confinement::ConfinementRefusal::UntrustedConfigurationSource,
+            )
             .map_err(|e| anyhow::anyhow!("MCP config: {e}"))?;
     }
 
@@ -10973,6 +11433,19 @@ async fn create_mcp_tools(
     Ok(Some(adapter))
 }
 
+/// Tell the operator, on stderr, which `mcp.toml` servers are refused: their
+/// file is writable by a confined process. The model sees each refusal as a
+/// failed server.
+#[cfg(feature = "mcp")]
+fn report_refused_mcp_servers(refused: &[meerkat_core::mcp_config::RefusedMcpServer]) {
+    for server in refused {
+        eprintln!(
+            "warning: MCP server '{}' from the {} mcp.toml is refused: a confined process can write that file",
+            server.server.name, server.scope
+        );
+    }
+}
+
 fn resolve_keep_alive(requested: bool) -> anyhow::Result<bool> {
     let support = if cfg!(feature = "comms") {
         meerkat::surface::KeepAliveSupport::Available
@@ -11005,6 +11478,7 @@ async fn load_mcp_external_tools(
     wait_for_mcp: bool,
     mcp_auth: CliMcpAuthMode,
     external_surface_handle: Option<Arc<dyn meerkat_core::ExternalToolSurfaceHandle>>,
+    stdio_profile: CliMcpStdioProfile,
 ) -> anyhow::Result<(
     Option<Arc<dyn AgentToolDispatcher>>,
     Option<Arc<McpRouterAdapter>>,
@@ -11017,6 +11491,7 @@ async fn load_mcp_external_tools(
             wait_for_mcp,
             mcp_auth,
             external_surface_handle,
+            stdio_profile,
         )
         .await
         {
@@ -11038,12 +11513,39 @@ async fn load_mcp_external_tools(
         let _ = wait_for_mcp;
         let _ = mcp_auth;
         let _ = external_surface_handle;
+        let _ = stdio_profile;
         Ok((None, None))
     }
 }
 
 #[cfg(not(feature = "mcp"))]
 type McpRouterAdapter = ();
+
+/// The local MCP launch boundary of a CLI factory and the host confinement
+/// that decides which `mcp.toml` files it trusts, for the routers the CLI
+/// builds itself (the `rkat run` loader).
+#[cfg(feature = "mcp")]
+#[derive(Clone)]
+struct CliMcpStdioProfile {
+    profile: meerkat::McpStdioLaunchProfile,
+    host_confinement: meerkat::HostConfinement,
+}
+#[cfg(not(feature = "mcp"))]
+type CliMcpStdioProfile = ();
+
+/// The factory's own local MCP launch boundary
+/// ([`AgentFactory::mcp_stdio_launch_profile`]) and host confinement, never
+/// rebuilt per call.
+#[cfg(feature = "mcp")]
+fn cli_mcp_stdio_profile(factory: &AgentFactory) -> CliMcpStdioProfile {
+    CliMcpStdioProfile {
+        profile: factory.mcp_stdio_launch_profile().clone(),
+        host_confinement: factory.host_confinement().cloned().unwrap_or_default(),
+    }
+}
+
+#[cfg(not(feature = "mcp"))]
+fn cli_mcp_stdio_profile(_factory: &AgentFactory) -> CliMcpStdioProfile {}
 
 /// Whether `persistence` opened a governed realm: its machine has the
 /// governed host installed, with or without available stock owners. Without
@@ -11064,26 +11566,34 @@ async fn governed_configured_mcp_servers(
     persistence: &PersistenceBundle,
     scope: &RuntimeScope,
     realm_servers: &[meerkat_core::McpServerConfig],
+    host_confinement: Option<&meerkat::HostConfinement>,
 ) -> anyhow::Result<Option<Vec<meerkat_core::McpServerConfig>>> {
     if !persistence_is_governed(persistence) {
         return Ok(None);
     }
     #[cfg(feature = "mcp")]
     {
-        let servers = meerkat_core::mcp_config::McpConfig::effective_servers_from_roots(
+        // An `mcp.toml` a confined process could write configures nothing.
+        let servers = meerkat_core::mcp_config::McpConfig::effective_servers_from_roots_trusting(
             realm_servers,
             scope.context_root.as_deref(),
             scope.user_config_root.as_deref(),
+            &|path| host_confinement.is_some_and(|host| host.untrusted_source(path)),
         )
         .await
         .map_err(|e| anyhow::anyhow!("MCP config error: {e}"))?;
+        report_refused_mcp_servers(&servers.refused);
         Ok(Some(
-            servers.into_iter().map(|entry| entry.server).collect(),
+            servers
+                .admitted
+                .into_iter()
+                .map(|entry| entry.server)
+                .collect(),
         ))
     }
     #[cfg(not(feature = "mcp"))]
     {
-        let _ = (scope, realm_servers);
+        let _ = (scope, realm_servers, host_confinement);
         Ok(Some(Vec::new()))
     }
 }
@@ -12979,7 +13489,9 @@ async fn build_deploy_mob_session_service(
 fn session_err_to_anyhow(e: meerkat_core::service::SessionError) -> anyhow::Error {
     match e {
         meerkat_core::service::SessionError::Agent(agent_err) => anyhow::Error::from(agent_err),
-        other => anyhow::anyhow!("Session service error: {other}"),
+        other => {
+            exit_status::typed_failure(other, |other| format!("Session service error: {other}"))
+        }
     }
 }
 
@@ -13025,7 +13537,9 @@ async fn resolve_flexible_session_id(
                     labels: None,
                 })
                 .await
-                .map_err(|e| anyhow::anyhow!("Failed to list sessions: {e}"))?;
+                .map_err(|e| {
+                    exit_status::typed_failure(e, |e| format!("Failed to list sessions: {e}"))
+                })?;
             return sessions
                 .get(offset)
                 .map(|s| s.session_id.clone())
@@ -13073,7 +13587,9 @@ async fn resolve_flexible_session_id(
                 labels: None,
             })
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to list sessions: {e}"))?;
+            .map_err(|e| {
+                exit_status::typed_failure(e, |e| format!("Failed to list sessions: {e}"))
+            })?;
 
         let matches = find_session_matches_in_summaries(input, &sessions);
 
@@ -13173,6 +13689,38 @@ fn build_turn_tool_overlay(
     })
 }
 
+/// Tool families a run composes from its flags and the realm configuration.
+/// A help run composes none of them: its help tools are its only tools.
+#[cfg(feature = "session-store")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RunToolFamilies {
+    workgraph: bool,
+    mob: bool,
+    schedule: bool,
+    /// The realm's configured MCP servers.
+    realm_mcp: bool,
+}
+
+#[cfg(feature = "session-store")]
+impl RunToolFamilies {
+    fn resolve(help_run: bool, enable_workgraph: bool, enable_mob: bool, config: &Config) -> Self {
+        if help_run {
+            return Self {
+                workgraph: false,
+                mob: false,
+                schedule: false,
+                realm_mcp: false,
+            };
+        }
+        Self {
+            workgraph: enable_workgraph || config.tools.workgraph_enabled,
+            mob: cfg!(feature = "mob") && (enable_mob || config.tools.mob_enabled),
+            schedule: config.tools.schedule_enabled,
+            realm_mcp: true,
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_agent(
     prompt: &str,
@@ -13216,6 +13764,10 @@ async fn run_agent(
     manifest: meerkat_store::RealmManifest,
     persistence: PersistenceBundle,
     storage_scope: &RuntimeScope,
+    help_tools: Option<(
+        Arc<dyn AgentToolDispatcher>,
+        meerkat_core::ops::ToolAccessPolicy,
+    )>,
     scope: &RuntimeScope,
 ) -> anyhow::Result<()> {
     #[cfg(not(feature = "session-store"))]
@@ -13262,6 +13814,7 @@ async fn run_agent(
             manifest,
             persistence,
             storage_scope,
+            help_tools,
             scope,
         );
         anyhow::bail!("rkat built without session-store support");
@@ -13269,8 +13822,10 @@ async fn run_agent(
     #[cfg(feature = "session-store")]
     {
         let keep_alive = resolve_keep_alive(keep_alive)?;
-        let effective_workgraph = enable_workgraph || config.tools.workgraph_enabled;
-        let effective_mob = cfg!(feature = "mob") && (enable_mob || config.tools.mob_enabled);
+        let help_run = help_tools.is_some();
+        let families = RunToolFamilies::resolve(help_run, enable_workgraph, enable_mob, config);
+        let effective_workgraph = families.workgraph;
+        let effective_mob = families.mob;
         let turn_tool_overlay = build_turn_tool_overlay(allow_tools, block_tools);
         // Wave-c C-12: the canonical runtime identity for a skill is
         // `SkillKey { source_uuid, skill_name }` (C-1 / C-4 upstream retype).
@@ -13326,23 +13881,36 @@ async fn run_agent(
                 )
                 .root,
             )
-            .project_root(project_root)
+            .project_root(project_root.clone())
             .builtins(enable_builtins)
             .shell(enable_shell)
             .workgraph(effective_workgraph)
-            .schedule(config.tools.schedule_enabled);
+            .schedule(families.schedule);
         if let Some(context_root) = scope.context_root.clone() {
             factory = factory.context_root(context_root);
         }
         if let Some(user_root) = scope.user_config_root.clone() {
             factory = factory.user_config_root(user_root);
         }
+        let factory = with_cli_confinement(factory, config, scope, &project_root)?;
 
         #[cfg(feature = "comms")]
         let factory = factory.comms(!comms_overrides.disabled);
-        let governed_mcp =
-            governed_configured_mcp_servers(&persistence, scope, &config.tools.mcp_servers).await?;
+        let governed_mcp = if families.realm_mcp {
+            governed_configured_mcp_servers(
+                &persistence,
+                scope,
+                &config.tools.mcp_servers,
+                factory.host_confinement(),
+            )
+            .await?
+        } else {
+            None
+        };
         let factory = with_governed_mcp_auth(factory, scope, governed_mcp.as_deref(), mcp_auth)?;
+        // The loader's router launches stdio servers inside the factory's
+        // own launch boundary.
+        let mcp_stdio_profile = cli_mcp_stdio_profile(&factory);
 
         let context_root = scope
             .context_root
@@ -13356,19 +13924,11 @@ async fn run_agent(
         );
         tracing::info!("Using provider: {:?}, model: {}", provider, model);
 
-        // Apply --comms-listen-tcp override to the config
+        // Apply the --comms-* overrides to the config
         #[allow(unused_mut)]
         let mut config = config.clone();
         #[cfg(feature = "comms")]
-        if let Some(ref addr) = comms_overrides.listen_tcp {
-            config.comms.mode = CommsRuntimeMode::Tcp;
-            config.comms.address = Some(addr.clone());
-        }
-        #[cfg(feature = "comms")]
-        {
-            config.comms.advertise_address = comms_overrides.advertise_address.clone();
-            config.comms.pairing_password = comms_overrides.pairing_password.clone();
-        }
+        comms_overrides.apply_to(&mut config);
 
         // Build the parent session service on the runtime-backed persistent
         // surface. CLI one-shots must leave the runtime snapshot as durable
@@ -13448,7 +14008,7 @@ async fn run_agent(
 
         // Load optional MCP tools immediately before external tool composition so
         // later early-return windows cannot skip adapter shutdown.
-        let (mcp_external_tools, mcp_adapter) = if governed_mcp.is_some() {
+        let (mcp_external_tools, mcp_adapter) = if governed_mcp.is_some() || !families.realm_mcp {
             (None, None)
         } else {
             load_mcp_external_tools(
@@ -13457,12 +14017,16 @@ async fn run_agent(
                 wait_for_mcp,
                 mcp_auth,
                 Some(Arc::clone(bindings.external_tool_surface())),
+                mcp_stdio_profile,
             )
             .await?
         };
         // Mob tools now flow through mob_tools (factory pattern), not external_tools.
-        // Only MCP tools remain as external_tools.
-        let external_tools = mcp_external_tools;
+        // Only MCP tools (or a help run's help tools) remain as external_tools.
+        // A help run's launch policy admits only its help tools, and the
+        // session persists it.
+        let (help_tools, help_tool_access_policy) = help_tools.unzip();
+        let external_tools = help_tools.or(mcp_external_tools);
         #[cfg(feature = "mob")]
         let mob_tools_factory: Option<Arc<dyn meerkat_core::service::MobToolsFactory>> =
             run_mob_tools.as_ref().map(|ctx| {
@@ -13489,7 +14053,7 @@ async fn run_agent(
 
         let mut build = SessionBuildOptions {
             model_fallback: None,
-            tool_access_policy: None,
+            tool_access_policy: help_tool_access_policy,
             declared_tool_restriction: None,
             tool_dispatch_admission: None,
             application_tool_policy: meerkat_core::ApplicationToolPolicyBinding::Unmanaged,
@@ -13524,12 +14088,20 @@ async fn run_agent(
             override_builtins: meerkat_core::ToolCategoryOverride::from_effective(enable_builtins),
             override_shell: meerkat_core::ToolCategoryOverride::from_effective(enable_shell),
             override_memory: meerkat_core::ToolCategoryOverride::from_effective(enable_memory),
-            override_schedule: meerkat_core::ToolCategoryOverride::Inherit,
+            override_schedule: if help_run {
+                meerkat_core::ToolCategoryOverride::Disable
+            } else {
+                meerkat_core::ToolCategoryOverride::Inherit
+            },
             override_workgraph: meerkat_core::ToolCategoryOverride::from_effective(
                 effective_workgraph,
             ),
             override_mob: meerkat_core::ToolCategoryOverride::Inherit,
-            override_image_generation: meerkat_core::ToolCategoryOverride::Inherit,
+            override_image_generation: if help_run {
+                meerkat_core::ToolCategoryOverride::Disable
+            } else {
+                meerkat_core::ToolCategoryOverride::Inherit
+            },
             override_web_search: if no_web_search {
                 meerkat_core::ToolCategoryOverride::Disable
             } else {
@@ -13556,7 +14128,12 @@ async fn run_agent(
             } else {
                 Some(instructions)
             },
-            initial_metadata_entries: std::collections::BTreeMap::new(),
+            // The help marker makes every rebuild of a help session from
+            // storage refuse it.
+            initial_metadata_entries: help_run
+                .then(meerkat::help::help_session_metadata_entry)
+                .into_iter()
+                .collect(),
             initial_tool_filter: None,
             initial_tool_visibility_state: None,
             shell_env: None,
@@ -13661,7 +14238,9 @@ async fn run_agent(
                 .register_session_with_executor(session_id.clone(), executor)
                 .await
                 .map_err(|error| {
-                    anyhow::anyhow!("runtime executor registration failed: {error}")
+                    exit_status::typed_failure(error, |error| {
+                        format!("runtime executor registration failed: {error}")
+                    })
                 })?;
 
             #[cfg(feature = "comms")]
@@ -13721,7 +14300,9 @@ async fn run_agent(
                     .update_peer_ingress_context(&session_id, keep_alive, comms_rt)
                     .await
                     .map_err(|err| {
-                        anyhow::anyhow!("failed to update peer ingress context: {err}")
+                        exit_status::typed_failure(err, |err| {
+                            format!("failed to update peer ingress context: {err}")
+                        })
                     })?;
             }
 
@@ -14009,15 +14590,7 @@ async fn resume_session_with_llm_override(
         let (config, runtime_preload_skills) = resolve_runtime_skills(config, skills).await?;
         let mut config = config;
         #[cfg(feature = "comms")]
-        if let Some(ref addr) = comms_overrides.listen_tcp {
-            config.comms.mode = CommsRuntimeMode::Tcp;
-            config.comms.address = Some(addr.clone());
-        }
-        #[cfg(feature = "comms")]
-        {
-            config.comms.advertise_address = comms_overrides.advertise_address.clone();
-            config.comms.pairing_password = comms_overrides.pairing_password.clone();
-        }
+        comms_overrides.apply_to(&mut config);
         let has_max_duration = max_duration.is_some();
         let has_max_tool_calls = max_tool_calls.is_some();
         let duration = max_duration.map(|s| parse_duration(&s)).transpose()?;
@@ -14054,7 +14627,10 @@ async fn resume_session_with_llm_override(
             .load(&session_id)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to load session: {e}"))?
-            .ok_or_else(|| anyhow::anyhow!("Session not found: {session_id}"))?;
+            .ok_or_else(|| exit_status::session_not_found(&session_id))?;
+        // A help session continues only on the live session its help entry
+        // point built: refuse the rebuild before anything is composed.
+        meerkat::help::HelpSessionNotResumable::check(&session).map_err(anyhow::Error::new)?;
         let message_count = session.messages().len();
         let stored_metadata = session
             .session_metadata()
@@ -14121,7 +14697,7 @@ async fn resume_session_with_llm_override(
                 )
                 .root,
             )
-            .project_root(project_root)
+            .project_root(project_root.clone())
             .builtins(tooling.builtins.resolve(config.tools.builtins_enabled))
             .shell(tooling.shell.resolve(config.tools.shell_enabled))
             .workgraph(tooling.workgraph.resolve(config.tools.workgraph_enabled))
@@ -14133,6 +14709,7 @@ async fn resume_session_with_llm_override(
         if let Some(user_root) = scope.user_config_root.clone() {
             factory = factory.user_config_root(user_root);
         }
+        let factory = with_cli_confinement(factory, &config, scope, &project_root)?;
 
         #[cfg(feature = "comms")]
         let factory = factory.comms(
@@ -14141,9 +14718,17 @@ async fn resume_session_with_llm_override(
                     || keep_alive
                     || comms_overrides.requires_runtime()),
         );
-        let governed_mcp =
-            governed_configured_mcp_servers(&persistence, scope, &config.tools.mcp_servers).await?;
+        let governed_mcp = governed_configured_mcp_servers(
+            &persistence,
+            scope,
+            &config.tools.mcp_servers,
+            factory.host_confinement(),
+        )
+        .await?;
         let factory = with_governed_mcp_auth(factory, scope, governed_mcp.as_deref(), mcp_auth)?;
+        // The loader's router launches stdio servers inside the factory's
+        // own launch boundary.
+        let mcp_stdio_profile = cli_mcp_stdio_profile(&factory);
 
         log_stage("build_cli_persistent_service");
         // Build persistent session service for resume — durable runtime
@@ -14224,6 +14809,7 @@ async fn resume_session_with_llm_override(
                 wait_for_mcp,
                 mcp_auth,
                 Some(Arc::clone(resume_bindings.external_tool_surface())),
+                mcp_stdio_profile,
             )
             .await?
         };
@@ -14415,7 +15001,9 @@ async fn resume_session_with_llm_override(
                 .register_session_with_executor(session_id.clone(), executor)
                 .await
                 .map_err(|error| {
-                    anyhow::anyhow!("runtime executor registration failed: {error}")
+                    exit_status::typed_failure(error, |error| {
+                        format!("runtime executor registration failed: {error}")
+                    })
                 })?;
 
             #[cfg(feature = "comms")]
@@ -14486,7 +15074,9 @@ async fn resume_session_with_llm_override(
                     .update_peer_ingress_context(&session_id, keep_alive, comms_rt)
                     .await
                     .map_err(|err| {
-                        anyhow::anyhow!("failed to update peer ingress context: {err}")
+                        exit_status::typed_failure(err, |err| {
+                            format!("failed to update peer ingress context: {err}")
+                        })
                     })?;
             }
 
@@ -14645,7 +15235,7 @@ async fn get_or_create_cli_persistent_surface_from_bundle(
             meerkat_store::realm_paths_in(&scope.locator.state_root, scope.locator.realm.as_str())
                 .root,
         )
-        .project_root(project_root)
+        .project_root(project_root.clone())
         .builtins(config.tools.builtins_enabled)
         .shell(config.tools.shell_enabled)
         .workgraph(config.tools.workgraph_enabled)
@@ -14656,6 +15246,7 @@ async fn get_or_create_cli_persistent_surface_from_bundle(
     if let Some(user_root) = scope.user_config_root.clone() {
         factory = factory.user_config_root(user_root);
     }
+    let factory = with_cli_confinement(factory, &config, scope, &project_root)?;
 
     let schedule_service = ScheduleService::new(persistence.schedule_store());
     let default_schedule_tools = Some(Arc::new(ScheduleToolDispatcher::new(
@@ -16435,10 +17026,9 @@ async fn list_sessions(
             },
         };
 
-        let sessions = service
-            .list(query)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to list sessions: {e}"))?;
+        let sessions = service.list(query).await.map_err(|e| {
+            exit_status::typed_failure(e, |e| format!("Failed to list sessions: {e}"))
+        })?;
 
         if sessions.is_empty() {
             println!("No sessions found.");
@@ -16741,8 +17331,8 @@ async fn show_session(id: &str, scope: &RuntimeScope) -> anyhow::Result<()> {
         let session = service
             .load_authoritative_session(&session_id)
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to load session: {e}"))?
-            .ok_or_else(|| anyhow::anyhow!("Session not found: {session_id}"))?;
+            .map_err(|e| exit_status::typed_failure(e, |e| format!("Failed to load session: {e}")))?
+            .ok_or_else(|| exit_status::session_not_found(&session_id))?;
 
         // Print session header
         println!("Session: {session_id}");
@@ -16869,7 +17459,9 @@ async fn delete_session(id: &str, scope: &RuntimeScope) -> anyhow::Result<()> {
                     &session_id,
                 )
                 .await
-                .map_err(|e| anyhow::anyhow!("Failed to delete session: {e}"))?;
+                .map_err(|e| {
+                    exit_status::typed_failure(e, |e| format!("Failed to delete session: {e}"))
+                })?;
             } else {
                 service
                     .archive_with_machine_protocol(
@@ -16879,7 +17471,9 @@ async fn delete_session(id: &str, scope: &RuntimeScope) -> anyhow::Result<()> {
                         ),
                     )
                     .await
-                    .map_err(|e| anyhow::anyhow!("Failed to delete session: {e}"))?;
+                    .map_err(|e| {
+                        exit_status::typed_failure(e, |e| format!("Failed to delete session: {e}"))
+                    })?;
             }
         }
         #[cfg(not(feature = "mob"))]
@@ -16893,7 +17487,9 @@ async fn delete_session(id: &str, scope: &RuntimeScope) -> anyhow::Result<()> {
                     ),
                 )
                 .await
-                .map_err(|e| anyhow::anyhow!("Failed to delete session: {e}"))?;
+                .map_err(|e| {
+                    exit_status::typed_failure(e, |e| format!("Failed to delete session: {e}"))
+                })?;
         }
 
         println!("Deleted session: {session_id}");
@@ -16918,10 +17514,9 @@ async fn interrupt_session(id: &str, scope: &RuntimeScope) -> anyhow::Result<()>
 
         let (config, _) = load_config(scope).await?;
         let (service, runtime_adapter) = build_cli_persistent_service(scope, config).await?;
-        service
-            .read(&session_id)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to interrupt session: {e}"))?;
+        service.read(&session_id).await.map_err(|e| {
+            exit_status::typed_failure(e, |e| format!("Failed to interrupt session: {e}"))
+        })?;
 
         let (result, conflict_state) = match runtime_adapter
             .hard_cancel_current_run(&session_id, "CLI session interrupt")
@@ -16968,7 +17563,11 @@ async fn interrupt_session(id: &str, scope: &RuntimeScope) -> anyhow::Result<()>
                 ),
                 Some(state),
             ),
-            Err(e) => return Err(anyhow::anyhow!("Failed to interrupt session: {e}")),
+            Err(e) => {
+                return Err(exit_status::typed_failure(e, |e| {
+                    format!("Failed to interrupt session: {e}")
+                }));
+            }
         };
 
         match result.map_err(|e| anyhow::anyhow!("Failed to classify interrupt result: {e}"))? {
@@ -16990,12 +17589,26 @@ async fn interrupt_session(id: &str, scope: &RuntimeScope) -> anyhow::Result<()>
                 );
                 Ok(())
             }
-            meerkat_runtime::UserInterruptPublicResult::NotFound => Err(anyhow::anyhow!(
-                "Failed to interrupt session: session not found"
-            )),
-            meerkat_runtime::UserInterruptPublicResult::SessionBusy => Err(anyhow::anyhow!(
-                "Failed to interrupt session: session is still being materialized"
-            )),
+            // Typed as JSON-RPC types them: session not found, session busy.
+            meerkat_runtime::UserInterruptPublicResult::NotFound => {
+                Err(exit_status::typed_failure(
+                    meerkat_core::SessionError::NotFound {
+                        id: session_id.clone(),
+                    },
+                    |_| "Failed to interrupt session: session not found".to_string(),
+                ))
+            }
+            meerkat_runtime::UserInterruptPublicResult::SessionBusy => {
+                Err(exit_status::typed_failure(
+                    meerkat_core::SessionError::Busy {
+                        id: session_id.clone(),
+                    },
+                    |_| {
+                        "Failed to interrupt session: session is still being materialized"
+                            .to_string()
+                    },
+                ))
+            }
             meerkat_runtime::UserInterruptPublicResult::Conflict => {
                 let message = match conflict_state {
                     Some(state) => {
@@ -17954,35 +18567,6 @@ where
     anyhow::Error::new(err)
 }
 
-/// The four-code console projection carried by a mob verb failure, when the
-/// error chain bottoms out in a mob-family error (§17.4).
-#[cfg(feature = "mob")]
-fn mob_wire_detail(e: &anyhow::Error) -> Option<meerkat_contracts::wire::WireMobErrorDetail> {
-    e.downcast_ref::<meerkat_mob::MobError>()
-        .and_then(meerkat_mob::MobError::wire_detail)
-        .or_else(|| {
-            e.downcast_ref::<meerkat_mob::MobRespawnError>()
-                .and_then(meerkat_mob::MobRespawnError::wire_detail)
-        })
-        .or_else(|| {
-            e.downcast_ref::<meerkat_mob_mcp::MobMcpDestroyError>()
-                .and_then(meerkat_mob_mcp::MobMcpDestroyError::wire_detail)
-        })
-}
-
-/// §17.4 typed exit path (DEC-P7B-11, ADJ-P7-7): exit codes 45-48 for the
-/// mob verb family ONLY — scoping is by construction, since only mob
-/// handler arms put mob-family errors into the chain via [`mob_anyhow`].
-/// Unmapped mob errors keep `EXIT_ERROR`. The pre-existing
-/// `EXIT_BUDGET_EXHAUSTED=2` vs `cli_exit_code(BudgetExhausted)=21`
-/// inconsistency is recorded and deliberately NOT changed (plan-pinned).
-#[cfg(feature = "mob")]
-fn mob_exit_code(e: &anyhow::Error) -> Option<u8> {
-    let detail = mob_wire_detail(e)?;
-    // 45..=48 always fit; try_from is the no-panic guard.
-    u8::try_from(detail.code().cli_exit_code()).ok()
-}
-
 /// Human host-roster row (grants-verb rendering precedent): the wire enum
 /// owns the snake_case phase spelling — rendered via serde, never a
 /// CLI-local vocabulary copy.
@@ -18169,76 +18753,6 @@ async fn handle_mob_live_command(
 mod mob_typed_exit_tests {
     use super::*;
 
-    /// T-B11: `mob_exit_code` maps exactly the four console codes —
-    /// ScopeDenied→45, HostUnavailable→46, StaleCursor→47, StaleFence→48 —
-    /// and nothing else; the typed `detail:` line renders
-    /// `{required, presented}` from the typed fields.
-    #[test]
-    fn mob_exit_code_maps_four_codes_only() {
-        let denied = mob_anyhow(meerkat_mob::MobError::ScopeDenied(
-            meerkat_mob::ScopeDenial {
-                required: meerkat_mob::machines::mob_machine::ControlScope::AdminHost,
-                presented: std::collections::BTreeSet::from([
-                    meerkat_mob::machines::mob_machine::ControlScope::List,
-                ]),
-            },
-        ));
-        assert_eq!(mob_exit_code(&denied), Some(45));
-
-        let timed_out = mob_anyhow(meerkat_mob::MobError::BridgeRequestTimedOut {
-            request_envelope_id: "env".to_string(),
-            timeout_ms: 30_000,
-        });
-        assert_eq!(mob_exit_code(&timed_out), Some(46));
-
-        let stale_cursor = mob_anyhow(meerkat_mob::MobError::StaleEventCursor {
-            after_cursor: 9,
-            latest_cursor: 4,
-        });
-        assert_eq!(mob_exit_code(&stale_cursor), Some(47));
-
-        let stale_fence = mob_anyhow(meerkat_mob::MobError::StaleFenceToken {
-            runtime_id: meerkat_mob::AgentRuntimeId::initial(meerkat_mob::AgentIdentity::from(
-                "worker",
-            )),
-            expected: meerkat_mob::FenceToken::new(2),
-            actual: meerkat_mob::FenceToken::new(1),
-        });
-        assert_eq!(mob_exit_code(&stale_fence), Some(48));
-
-        // Unmapped mob errors keep EXIT_ERROR (None here ⇒ 1 at the mapper).
-        let not_found = mob_anyhow(meerkat_mob::MobError::MobNotFound(
-            meerkat_mob::MobId::from("missing"),
-        ));
-        assert_eq!(mob_exit_code(&not_found), None);
-
-        // PeerOffline ≠ HostUnavailable — pinned non-mapping (§17.4).
-        let peer_offline = mob_anyhow(meerkat_mob::MobError::CommsError(
-            meerkat_core::comms::SendError::PeerOffline,
-        ));
-        assert_eq!(mob_exit_code(&peer_offline), None);
-
-        // Non-mob chains (incl. the budget path's AgentError) never route
-        // through the mob exit path.
-        assert_eq!(mob_exit_code(&anyhow::anyhow!("boom")), None);
-
-        // The respawn wrapper delegates.
-        let respawn = mob_anyhow(meerkat_mob::MobRespawnError::Mob(
-            meerkat_mob::MobError::BridgeRequestTimedOut {
-                request_envelope_id: "env-2".to_string(),
-                timeout_ms: 15_000,
-            },
-        ));
-        assert_eq!(mob_exit_code(&respawn), Some(46));
-
-        // The `detail:` line renders the typed pair, not a display string.
-        let detail = mob_wire_detail(&denied).expect("scope denial detail");
-        assert_eq!(
-            detail.detail_value().expect("detail serializes"),
-            serde_json::json!({ "required": "admin_host", "presented": ["list"] })
-        );
-    }
-
     #[derive(Clone)]
     struct CaptureWriter(Arc<Mutex<Vec<u8>>>);
 
@@ -18376,7 +18890,7 @@ async fn run_pack_flow_foreground(
     let run_id = state
         .mob_run_flow(mob_id, flow_id, params)
         .await
-        .map_err(|err| anyhow::anyhow!("mob run failed: {err}"))?;
+        .map_err(|err| exit_status::typed_failure(err, |err| format!("mob run failed: {err}")))?;
     match select_pack_flow_terminal_or_shutdown(
         wait_for_terminal_flow_run(state, mob_id.as_str(), &run_id),
         shutdown_signal::wait_for_shutdown_signal(),
@@ -19020,6 +19534,7 @@ async fn handle_mob_command(command: MobCommands, scope: &RuntimeScope) -> anyho
             max_duration: parsed_max_duration,
             max_tool_calls: *max_tool_calls,
             override_config: None,
+            confinement: scope.confinement.clone(),
         };
         println!(
             "{}",
@@ -20229,7 +20744,7 @@ async fn execute_mob_run_pack(
             source_identity,
         )
         .await
-        .map_err(|err| anyhow::anyhow!("mob run failed: {err}"))?;
+        .map_err(|err| exit_status::typed_failure(err, |err| format!("mob run failed: {err}")))?;
 
     if invocation.detach {
         let Some(flow_id) = flow_id else {
@@ -20240,7 +20755,9 @@ async fn execute_mob_run_pack(
         let run_id = state
             .mob_run_flow(&mob_id, flow_id.clone(), params)
             .await
-            .map_err(|err| anyhow::anyhow!("mob run failed: {err}"))?;
+            .map_err(|err| {
+                exit_status::typed_failure(err, |err| format!("mob run failed: {err}"))
+            })?;
         let rendered = if invocation.json {
             serde_json::to_string_pretty(&serde_json::json!({
                 "mob_id": mob_id.to_string(),
@@ -20298,7 +20815,9 @@ async fn execute_mob_run_pack(
                 &objective,
             )
             .await
-            .map_err(|err| anyhow::anyhow!("mob run failed: {err}"))?;
+            .map_err(|err| {
+                exit_status::typed_failure(err, |err| format!("mob run failed: {err}"))
+            })?;
             if invocation.json {
                 serde_json::to_string_pretty(&serde_json::json!({
                     "mob_id": archive.definition.id.to_string(),
@@ -20687,20 +21206,26 @@ fn apply_pack_deploy_policy(
     {
         config.models.gemini = model.as_str().to_string();
     }
+    // The pack's `[budget]` fills the enforced `[limits]` dimensions that
+    // `Config::budget_limits` gives every member built from this config. The
+    // legacy `[budget]` table is not enforced, so it neither receives these
+    // values nor blocks them. Precedence per dimension: a
+    // `rkat mob deploy --max-*` flag (applied by `load_deploy_runtime_config`)
+    // > the operator's realm `[limits]` chain > the pack default.
     if let Some(max_tokens) = policy.budget.max_tokens
-        && config.budget.max_tokens.is_none()
+        && config.limits.budget.is_none()
     {
-        config.budget.max_tokens = Some(max_tokens);
+        config.limits.budget = Some(max_tokens);
     }
     if let Some(secs) = policy.budget.max_duration_secs
-        && config.budget.max_duration.is_none()
+        && config.limits.max_duration.is_none()
     {
-        config.budget.max_duration = Some(std::time::Duration::from_secs(secs));
+        config.limits.max_duration = Some(std::time::Duration::from_secs(secs));
     }
     if let Some(calls) = policy.budget.max_tool_calls
-        && config.budget.max_tool_calls.is_none()
+        && config.limits.max_tool_calls.is_none()
     {
-        config.budget.max_tool_calls = Some(calls);
+        config.limits.max_tool_calls = Some(calls);
     }
     if let Some(threshold) = policy.compaction.auto_compact_threshold
         && config.compaction.auto_compact_threshold == baseline.compaction.auto_compact_threshold
@@ -20881,7 +21406,7 @@ where
     let mut factory = AgentFactory::new(realm_store_path(&manifest, scope))
         .session_store(session_store.clone())
         .runtime_root(paths.root.clone())
-        .project_root(project_root)
+        .project_root(project_root.clone())
         .builtins(config.tools.builtins_enabled)
         .shell(config.tools.shell_enabled)
         .workgraph(config.tools.workgraph_enabled)
@@ -20892,7 +21417,9 @@ where
     if let Some(user_root) = scope.user_config_root.clone() {
         factory = factory.user_config_root(user_root);
     }
+    let factory = with_cli_confinement(factory, &config, scope, &project_root)?;
 
+    let mcp_stdio_profile = cli_mcp_stdio_profile(&factory);
     let skill_runtime = factory.build_skill_runtime(&config).await?;
     let config_runtime = Arc::new(meerkat_core::ConfigRuntime::new(
         Arc::clone(&config_store),
@@ -20960,8 +21487,15 @@ where
     if let Some(warning) = mobpack_rpc_realm_mcp_warning(&config.tools.mcp_servers) {
         eprintln!("warning: {warning}");
     }
-    let (mcp_external_tools, _mcp_adapter_guard) =
-        load_mcp_external_tools(scope, &[], false, CliMcpAuthMode::Stored, None).await?;
+    let (mcp_external_tools, _mcp_adapter_guard) = load_mcp_external_tools(
+        scope,
+        &[],
+        false,
+        CliMcpAuthMode::Stored,
+        None,
+        mcp_stdio_profile,
+    )
+    .await?;
 
     let external_tools_provider: Option<meerkat_mob::ExternalToolsProvider> = Some(Arc::new({
         let runtime = runtime.clone();
@@ -21568,6 +22102,7 @@ mod tests {
             // test's own state root so `load_config` composition never reads the
             // developer's real `~/.rkat/config.toml`.
             user_config_root: Some(state_root),
+            confinement: None,
             #[cfg(feature = "local-authorization")]
             stock_agent: None,
             auth_lease,
@@ -21702,7 +22237,7 @@ mod tests {
             std::collections::HashMap::new(),
         )];
         assert!(
-            governed_configured_mcp_servers(&ordinary, &scope, &servers)
+            governed_configured_mcp_servers(&ordinary, &scope, &servers, None)
                 .await
                 .expect("ordinary route")
                 .is_none()
@@ -21722,7 +22257,7 @@ mod tests {
         .expect("governed without owners");
         assert!(governed.stock_governance().is_none());
         assert!(persistence_is_governed(&governed));
-        let routed = governed_configured_mcp_servers(&governed, &scope, &servers)
+        let routed = governed_configured_mcp_servers(&governed, &scope, &servers, None)
             .await
             .expect("governed route")
             .expect("the governed route, never the ordinary preload");
@@ -22570,6 +23105,46 @@ mod tests {
 
     #[cfg(all(feature = "anthropic", feature = "openai", feature = "gemini"))]
     #[test]
+    fn test_cli_google_oauth_config_keeps_the_code_assist_route_default() {
+        assert_eq!(
+            meerkat_models::infer_provider(GOOGLE_CODE_ASSIST_SAMPLE_MODEL),
+            Some(meerkat_core::Provider::Gemini),
+            "the Code Assist login default must stay a catalog Gemini model"
+        );
+
+        let mut config = Config::default();
+        assert!(ensure_cli_interactive_oauth_config(LoginProvider::Google, &mut config).unwrap());
+        let default_model = |config: &Config| {
+            config
+                .realm
+                .get("global")
+                .and_then(|realm| realm.binding.get("google_oauth"))
+                .and_then(|binding| binding.default_model.clone())
+        };
+        assert_eq!(
+            default_model(&config).as_deref(),
+            Some(GOOGLE_CODE_ASSIST_SAMPLE_MODEL),
+            "a new Google login binds the Code Assist route default, not the \
+             API-key catalog default"
+        );
+
+        // A binding an older build synthesized with its sample model heals to
+        // the same route default.
+        config
+            .realm
+            .get_mut("global")
+            .and_then(|realm| realm.binding.get_mut("google_oauth"))
+            .expect("google oauth binding")
+            .default_model = Some("gemini-3.1-flash-lite".to_string());
+        assert!(ensure_cli_interactive_oauth_config(LoginProvider::Google, &mut config).unwrap());
+        assert_eq!(
+            default_model(&config).as_deref(),
+            Some(GOOGLE_CODE_ASSIST_SAMPLE_MODEL)
+        );
+    }
+
+    #[cfg(all(feature = "anthropic", feature = "openai", feature = "gemini"))]
+    #[test]
     fn test_cli_copilot_routes_share_one_credential_account() {
         let mut config = Config::default();
         assert!(ensure_cli_interactive_oauth_config(LoginProvider::Copilot, &mut config).unwrap());
@@ -22590,6 +23165,41 @@ mod tests {
         assert!(
             !ensure_cli_interactive_oauth_config(LoginProvider::Copilot, &mut config).unwrap(),
             "complete Copilot config should be idempotent"
+        );
+    }
+
+    #[cfg(all(
+        feature = "anthropic",
+        feature = "openai",
+        feature = "gemini",
+        feature = "copilot"
+    ))]
+    #[test]
+    fn test_cli_copilot_gemini_route_keeps_its_route_default() {
+        assert_eq!(
+            meerkat_models::infer_provider(COPILOT_GEMINI_SAMPLE_MODEL),
+            Some(meerkat_core::Provider::Gemini),
+            "the Copilot Gemini route default must stay a catalog Gemini model"
+        );
+
+        let mut config = Config::default();
+        assert!(ensure_cli_interactive_oauth_config(LoginProvider::Copilot, &mut config).unwrap());
+        let realm = config.realm.get("global").expect("global realm");
+        let default_model = |binding_id: &str| {
+            realm
+                .binding
+                .get(binding_id)
+                .and_then(|binding| binding.default_model.as_deref())
+        };
+        assert_eq!(
+            default_model("copilot_gemini"),
+            Some(COPILOT_GEMINI_SAMPLE_MODEL),
+            "the Copilot Gemini route binds its route default, not the API-key catalog default"
+        );
+        assert_eq!(
+            default_model("copilot_anthropic"),
+            meerkat_models::default_model(meerkat_core::Provider::Anthropic),
+            "the other Copilot routes keep following the catalog default"
         );
     }
 
@@ -25630,6 +26240,7 @@ default_model = "gemma"
             stdin,
             line_format,
             auth_binding,
+            None,
             &scope,
         )
         .await
@@ -26741,6 +27352,45 @@ default_model = "gemma"
         assert_eq!(default_trace_filter(&cli), DEFAULT_TRACE_FILTER);
     }
 
+    /// The `--confinement*` flags are root flags with a value: before an
+    /// explicit subcommand the arguments are left intact, and before a bare
+    /// prompt `run` is injected after them.
+    #[test]
+    fn test_normalize_cli_args_keeps_confinement_flags_ahead_of_the_subcommand() {
+        let explicit = [
+            "rkat",
+            "--confinement",
+            "workspace",
+            "--confinement-network",
+            "unrestricted",
+            "--confinement-read",
+            "/opt/tool",
+            "--confinement-write",
+            "/tmp/build",
+            "run",
+            "hello",
+        ];
+        let normalized = normalize_cli_args(explicit.map(Into::into));
+        assert_eq!(
+            normalized,
+            explicit.map(std::ffi::OsString::from).to_vec(),
+            "an explicit subcommand after the flags is left intact"
+        );
+        let cli = Cli::try_parse_from(normalized).expect("the explicit run parses");
+        assert_eq!(cli.confinement, Some(ConfinementModeArg::Workspace));
+
+        let prompt =
+            normalize_cli_args(["rkat", "--confinement", "trusted-host", "hello"].map(Into::into));
+        assert_eq!(
+            prompt,
+            ["rkat", "--confinement", "trusted-host", "run", "hello"]
+                .map(std::ffi::OsString::from)
+                .to_vec()
+        );
+        let cli = Cli::try_parse_from(prompt).expect("the prompt shortcut parses");
+        assert_eq!(cli.confinement, Some(ConfinementModeArg::TrustedHost));
+    }
+
     #[test]
     fn test_normalize_cli_args() {
         let args = normalize_cli_args(["rkat", "-h"].map(Into::into));
@@ -26930,6 +27580,146 @@ default_model = "gemma"
                 .map(std::ffi::OsString::from)
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[tokio::test]
+    async fn test_run_preloading_the_platform_skill_keeps_the_configured_injection_limit() {
+        // Only the help entry points carry the help skills whole (through
+        // `meerkat::help::help_session`); a normal run that preloads them
+        // keeps the configured per-skill limit for every skill it injects.
+        let default_limit = Config::default().skills.max_injection_bytes;
+        let (config, preload) = resolve_runtime_skills(
+            Config::default(),
+            meerkat::help::platform_preload_skill_names(),
+        )
+        .await
+        .expect("builtin help skills resolve");
+        assert_eq!(preload, meerkat::help::platform_preload_skill_names());
+        assert_eq!(config.skills.max_injection_bytes, default_limit);
+
+        let mut configured = Config::default();
+        configured.skills.max_injection_bytes = 48 * 1024;
+        let (config, _) =
+            resolve_runtime_skills(configured, meerkat::help::platform_preload_skill_names())
+                .await
+                .expect("builtin help skills resolve");
+        assert_eq!(config.skills.max_injection_bytes, 48 * 1024);
+    }
+
+    #[cfg(feature = "session-store")]
+    #[test]
+    fn test_help_run_composes_none_of_the_realm_tool_families() {
+        let mut config = Config::default();
+        config.tools.workgraph_enabled = true;
+        config.tools.mob_enabled = true;
+        config.tools.schedule_enabled = true;
+
+        // `rkat help` passes its help tools: nothing the realm configures,
+        // and none of its MCP servers, joins them.
+        assert_eq!(
+            RunToolFamilies::resolve(true, true, true, &config),
+            RunToolFamilies {
+                workgraph: false,
+                mob: false,
+                schedule: false,
+                realm_mcp: false,
+            }
+        );
+        // A normal run is unchanged: it composes what its flags and the
+        // realm configure, and loads the realm's MCP servers.
+        assert_eq!(
+            RunToolFamilies::resolve(false, false, false, &config),
+            RunToolFamilies {
+                workgraph: true,
+                mob: cfg!(feature = "mob"),
+                schedule: true,
+                realm_mcp: true,
+            }
+        );
+        let defaults = Config::default();
+        assert_eq!(
+            RunToolFamilies::resolve(false, true, false, &defaults),
+            RunToolFamilies {
+                workgraph: true,
+                mob: cfg!(feature = "mob") && defaults.tools.mob_enabled,
+                schedule: defaults.tools.schedule_enabled,
+                realm_mcp: true,
+            }
+        );
+    }
+
+    #[test]
+    fn test_normalize_cli_args_as_agent_before_the_command() {
+        // `--as-agent` is a root option with a value: in front of a command
+        // name it must not turn that command into the prompt.
+        let cases: [(&[&str], &[&str]); 4] = [
+            (
+                &["rkat", "--as-agent", "agent-a", "realm", "list"],
+                &["rkat", "--as-agent", "agent-a", "realm", "list"],
+            ),
+            (
+                &["rkat", "--as-agent=agent-a", "realm", "list"],
+                &["rkat", "--as-agent=agent-a", "realm", "list"],
+            ),
+            (
+                &[
+                    "rkat",
+                    "--realm",
+                    "team",
+                    "--as-agent",
+                    "agent-a",
+                    "run",
+                    "hi",
+                ],
+                &[
+                    "rkat",
+                    "--realm",
+                    "team",
+                    "--as-agent",
+                    "agent-a",
+                    "run",
+                    "hi",
+                ],
+            ),
+            (
+                &["rkat", "--as-agent", "agent-a", "hi"],
+                &["rkat", "--as-agent", "agent-a", "run", "hi"],
+            ),
+        ];
+        for (argv, expected) in cases {
+            let args = normalize_cli_args(argv.iter().copied().map(Into::into));
+            assert_eq!(
+                args,
+                expected
+                    .iter()
+                    .copied()
+                    .map(std::ffi::OsString::from)
+                    .collect::<Vec<_>>(),
+                "{argv:?}"
+            );
+        }
+
+        #[cfg(feature = "local-authorization")]
+        {
+            let cli = Cli::try_parse_from(normalize_cli_args(
+                [
+                    "rkat",
+                    "--realm",
+                    "team",
+                    "--as-agent",
+                    "agent-a",
+                    "run",
+                    "hi",
+                ]
+                .map(Into::into),
+            ))
+            .expect("root-position --as-agent parses");
+            assert_eq!(cli.as_agent.as_deref(), Some("agent-a"));
+            match cli.command.expect("test invocation parses a subcommand") {
+                Commands::Run { prompt, .. } => assert_eq!(prompt, "hi"),
+                _ => unreachable!("expected run command"),
+            }
+        }
     }
 
     #[test]
@@ -28241,6 +29031,174 @@ url = "https://user.example/mcp"
         handle.await.expect("preflight server finishes");
     }
 
+    /// The `rkat run` loader launches the realm's stdio servers inside the
+    /// factory's own MCP stdio launch profile. Under a required profile the
+    /// backend refuses (`require_descendant_termination` is unsupported on
+    /// every backend): the server is refused typed and never starts.
+    #[cfg(all(feature = "mcp", unix))]
+    #[tokio::test]
+    async fn test_cli_mcp_loader_launches_inside_the_factory_stdio_launch_profile() {
+        use meerkat_core::confinement::{
+            ConfinementRefusal, ConfinementSpec, FilesystemAccess, IpNetworkAccess, PathAccess,
+            PlatformBaseline,
+        };
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let marker = root.join("loader-launch-marker");
+        let scope = test_scope(root.join("realms"), "loader-realm");
+        let requirement = ConfinementSpec {
+            baseline: PlatformBaseline::CommandRuntimeV1,
+            read: FilesystemAccess::Paths(vec![PathAccess::Subtree(root.clone())]),
+            write: FilesystemAccess::Paths(vec![PathAccess::Subtree(root.clone())]),
+            deny_read: vec![],
+            deny_write: vec![],
+            network: IpNetworkAccess::Denied,
+            unix_connect: vec![],
+            require_descendant_termination: true,
+        }
+        .try_into()
+        .unwrap();
+        let factory = AgentFactory::new(root.join("sessions")).with_mcp_stdio_launch_profile(
+            meerkat::McpStdioLaunchProfile::required(requirement, root.clone()),
+        );
+        let server = meerkat_core::McpServerConfig::stdio(
+            "confined-realm-server",
+            "/bin/sh",
+            vec!["-c".into(), "printf entered > \"$MARKER\"".into()],
+            HashMap::from([("MARKER".into(), marker.display().to_string())]),
+        );
+
+        let adapter = create_mcp_tools(
+            &scope,
+            &[server],
+            false,
+            CliMcpAuthMode::Stored,
+            Some(Arc::new(
+                meerkat_runtime::handles::RuntimeExternalToolSurfaceHandle::ephemeral(),
+            )),
+            cli_mcp_stdio_profile(&factory),
+        )
+        .await
+        .expect("the loader stages the realm server")
+        .expect("one configured server");
+        let deltas = adapter
+            .wait_until_ready(std::time::Duration::from_secs(15))
+            .await
+            .unwrap();
+
+        assert!(
+            deltas.iter().any(|delta| {
+                delta.target == "confined-realm-server"
+                    && delta.phase == meerkat_core::ExternalToolDeltaPhase::Failed
+                    && delta.confinement_refusal == Some(ConfinementRefusal::UnsupportedRequirement)
+            }),
+            "the loader's launch is refused by the factory's boundary: {deltas:?}"
+        );
+        assert!(
+            !marker.exists(),
+            "a refused server never starts its process"
+        );
+        adapter.shutdown().await;
+    }
+
+    /// A project `mcp.toml` that a confined process can write is not trusted:
+    /// each of its servers is refused with the typed untrusted-source
+    /// refusal before anything in it is expanded (an unset variable would
+    /// otherwise fail the load), authorized, connected (no arrival) or
+    /// spawned (no marker), and the model sees each refusal.
+    #[cfg(all(feature = "mcp", unix))]
+    #[tokio::test]
+    async fn test_cli_mcp_loader_refuses_an_untrusted_project_mcp_toml() {
+        use meerkat_core::confinement::{
+            ConfinementRefusal, ConfinementSpec, FilesystemAccess, IpNetworkAccess, PathAccess,
+            PlatformBaseline,
+        };
+
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().canonicalize().unwrap();
+        let project = base.join("project");
+        std::fs::create_dir_all(project.join(".rkat")).unwrap();
+        let marker = base.join("untrusted-entered");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        std::fs::write(
+            project.join(".rkat").join("mcp.toml"),
+            format!(
+                "[[servers]]\nname = \"untrusted-remote\"\nurl = \"http://{}/mcp\"\nheaders = {{ Authorization = \"Bearer ${{CONFINEMENT_TEST_UNSET_SECRET}}\" }}\n\n[[servers]]\nname = \"untrusted-local\"\ncommand = \"/bin/sh\"\nargs = [\"-c\", \"printf entered > {}\"]\n",
+                listener.local_addr().unwrap(),
+                marker.display()
+            ),
+        )
+        .unwrap();
+        let mut scope = test_scope(base.join("realms"), "untrusted-project");
+        scope.context_root = Some(project.clone());
+        let requirement = ConfinementSpec {
+            baseline: PlatformBaseline::CommandRuntimeV1,
+            read: FilesystemAccess::Paths(vec![PathAccess::Subtree(project.clone())]),
+            write: FilesystemAccess::Paths(vec![PathAccess::Subtree(project.clone())]),
+            deny_read: vec![],
+            deny_write: vec![],
+            network: IpNetworkAccess::Denied,
+            unix_connect: vec![],
+            require_descendant_termination: false,
+        }
+        .try_into()
+        .unwrap();
+        let config = Config {
+            confinement: meerkat_core::ConfinementConfig::for_all(
+                meerkat_core::LaunchConfinement::Custom(meerkat_core::CustomConfinement {
+                    working_directory: project.clone(),
+                    requirement,
+                }),
+            ),
+            ..Config::default()
+        };
+        let factory = with_cli_confinement(
+            AgentFactory::new(base.join("sessions")),
+            &config,
+            &scope,
+            &project,
+        )
+        .expect("the realm state is outside every grant");
+
+        let adapter = create_mcp_tools(
+            &scope,
+            &[],
+            false,
+            CliMcpAuthMode::Stored,
+            Some(Arc::new(
+                meerkat_runtime::handles::RuntimeExternalToolSurfaceHandle::ephemeral(),
+            )),
+            cli_mcp_stdio_profile(&factory),
+        )
+        .await
+        .expect("an untrusted file is refused, not an error")
+        .expect("its servers are staged as refusals");
+        let deltas = adapter
+            .wait_until_ready(std::time::Duration::from_secs(15))
+            .await
+            .unwrap();
+
+        for name in ["untrusted-remote", "untrusted-local"] {
+            assert!(
+                deltas.iter().any(|delta| {
+                    delta.target == name
+                        && delta.phase == meerkat_core::ExternalToolDeltaPhase::Failed
+                        && delta.confinement_refusal
+                            == Some(ConfinementRefusal::UntrustedConfigurationSource)
+                }),
+                "{name} is refused as untrusted: {deltas:?}"
+            );
+        }
+        assert!(
+            matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+            "no connection arrived"
+        );
+        assert!(!marker.exists(), "no server was spawned");
+        adapter.shutdown().await;
+    }
+
     #[cfg(feature = "mcp")]
     #[test]
     fn test_cli_mcp_interactive_wait_budget_includes_browser_login_timeout() {
@@ -28276,6 +29234,10 @@ url = "https://user.example/mcp"
         assert!(top.contains("rkat help \"How do I add an mcp server?\""));
         assert!(top.contains("tail -f app.log | rkat run --stdin lines"));
         assert!(top.contains("help"));
+        assert!(top.contains("Realm config: init, config, realm, auth"));
+        assert!(top.contains("Utility:      session, blob, workgraph,"));
+        assert!(top.contains("Integrations: mcp, mob, skill"));
+        assert!(top.contains("Use `rkat <command> -h`"));
 
         let run = render_help(Cli::command().find_subcommand("run").unwrap().clone());
         assert!(run.contains("--tools <TOOLS>"));
@@ -28287,6 +29249,18 @@ url = "https://user.example/mcp"
         assert!(help.contains("--prompt <PROMPT>"));
         assert!(help.contains("--plan-execution"));
         assert!(help.contains("How do I add an mcp server"));
+        assert!(help.contains("For the command reference, run `rkat --help`"));
+
+        let login = render_help(
+            Cli::command()
+                .find_subcommand("auth")
+                .unwrap()
+                .find_subcommand("login")
+                .unwrap()
+                .clone(),
+        );
+        assert!(login.contains("`copilot`"), "{login}");
+        assert!(login.contains("Interactive login ignores it"), "{login}");
 
         #[cfg(feature = "mob")]
         {
@@ -28305,6 +29279,331 @@ url = "https://user.example/mcp"
             assert!(mob.contains("respawn"));
             assert!(mob.contains("wait-kickoff"));
         }
+    }
+
+    #[test]
+    fn test_help_tree_carries_no_internal_references() {
+        use clap::CommandFactory;
+
+        fn collect_long_help(
+            command: &clap::Command,
+            path: &str,
+            pages: &mut Vec<(String, String)>,
+        ) {
+            let mut out = Vec::new();
+            command
+                .clone()
+                .write_long_help(&mut out)
+                .expect("help should render");
+            pages.push((
+                path.to_string(),
+                String::from_utf8(out).expect("utf-8 help"),
+            ));
+            for sub in command.get_subcommands() {
+                collect_long_help(sub, &format!("{path} {}", sub.get_name()), pages);
+            }
+        }
+
+        let mut pages = Vec::new();
+        collect_long_help(&Cli::command(), "rkat", &mut pages);
+        assert!(pages.len() > 20, "the help walk must reach nested commands");
+        for (path, page) in &pages {
+            for marker in [
+                "\u{a7}",
+                "DEC-",
+                "ADJ-",
+                "DL10",
+                "wave-b",
+                "cli_parse::",
+                "SessionBuildOptions",
+                "enforcement seam",
+                "<binary>",
+            ] {
+                assert!(
+                    !page.contains(marker),
+                    "`{path} --help` leaks internal reference {marker:?}:\n{page}"
+                );
+            }
+            assert!(
+                !page
+                    .match_indices("(#")
+                    .any(|(at, _)| page[at + 2..].starts_with(|c: char| c.is_ascii_digit())),
+                "`{path} --help` cites an issue number:\n{page}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_bare_help_command_prints_its_usage() {
+        let error = match Cli::try_parse_from(["rkat", "help"]) {
+            Err(error) => error,
+            Ok(_) => panic!("bare `rkat help` has no question to answer"),
+        };
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+        );
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("rkat help [OPTIONS] <QUESTION>"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("run `rkat --help`"), "{rendered}");
+    }
+
+    /// A requirement no platform backend enforces (descendant termination),
+    /// so a factory that installs it refuses every confined launch on any OS.
+    const UNENFORCEABLE_CONFINEMENT: &str = r#"[confinement.all]
+mode = "custom"
+working_directory = "/"
+requirement = { baseline = "command_runtime_v1", read = { kind = "paths", paths = [] }, write = { kind = "paths", paths = [] }, deny_read = [], deny_write = [], network = { kind = "denied" }, unix_connect = [], require_descendant_termination = true }
+"#;
+
+    /// The `--confinement*` flags are global, so they parse before or after
+    /// the subcommand; a workspace option without `--confinement` is a usage
+    /// error rather than an ignored flag.
+    #[test]
+    fn test_confinement_flags_parse_globally_and_need_a_mode() {
+        let cli = Cli::try_parse_from([
+            "rkat",
+            "--confinement",
+            "workspace",
+            "--confinement-network",
+            "unrestricted",
+            "--confinement-write",
+            "/tmp/build",
+            "--confinement-read",
+            "/opt/tool",
+            "run",
+            "hello",
+        ])
+        .expect("confinement flags parse");
+        assert_eq!(cli.confinement, Some(ConfinementModeArg::Workspace));
+        assert_eq!(
+            cli.confinement_network,
+            Some(ConfinementNetworkArg::Unrestricted)
+        );
+        assert_eq!(cli.confinement_write, vec![PathBuf::from("/tmp/build")]);
+        assert_eq!(cli.confinement_read, vec![PathBuf::from("/opt/tool")]);
+
+        let after = Cli::try_parse_from(["rkat", "run", "--confinement", "trusted-host", "hello"])
+            .expect("the global flag also follows the subcommand");
+        assert_eq!(after.confinement, Some(ConfinementModeArg::TrustedHost));
+
+        for orphan in [
+            ["rkat", "--confinement-network", "denied", "run", "hello"],
+            ["rkat", "--confinement-read", "/opt/tool", "run", "hello"],
+            ["rkat", "--confinement-write", "/tmp/build", "run", "hello"],
+        ] {
+            assert!(
+                Cli::try_parse_from(orphan).is_err(),
+                "{orphan:?} needs --confinement"
+            );
+        }
+    }
+
+    /// The scope carries the flags' selection, with relative paths resolved
+    /// against the working directory; trusted-host refuses workspace options.
+    #[test]
+    fn test_runtime_scope_resolves_the_confinement_selection() {
+        let temp = tempfile::tempdir().unwrap();
+        let state_root = temp.path().join("realms");
+        let state_root = state_root.to_str().unwrap();
+        let cli = Cli::try_parse_from([
+            "rkat",
+            "--state-root",
+            state_root,
+            "--confinement",
+            "workspace",
+            "--confinement-write",
+            "target",
+            "run",
+            "hello",
+        ])
+        .unwrap();
+        let scope = resolve_runtime_scope(&cli).unwrap();
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(
+            scope.confinement,
+            Some(meerkat_core::LaunchConfinement::Workspace(
+                meerkat_core::WorkspaceConfinement {
+                    network: meerkat_core::WorkspaceNetwork::Denied,
+                    read: Vec::new(),
+                    write: vec![cwd.join("target")],
+                }
+            ))
+        );
+
+        let unset =
+            Cli::try_parse_from(["rkat", "--state-root", state_root, "run", "hello"]).unwrap();
+        assert_eq!(resolve_runtime_scope(&unset).unwrap().confinement, None);
+
+        let contradictory = Cli::try_parse_from([
+            "rkat",
+            "--state-root",
+            state_root,
+            "--confinement",
+            "trusted-host",
+            "--confinement-write",
+            "/tmp/build",
+            "run",
+            "hello",
+        ])
+        .unwrap();
+        assert!(resolve_runtime_scope(&contradictory).is_err());
+    }
+
+    /// `rkat` installs the composed `[confinement]` on its factory and on the
+    /// MCP loader's launch boundary; a `--confinement` flag replaces the
+    /// realm's documents for the process.
+    #[tokio::test]
+    async fn test_cli_confinement_documents_and_flags_reach_the_factory() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut scope = test_scope(temp.path().join("realms"), "confined-realm");
+        let document =
+            meerkat_store::realm_paths_in(&scope.locator.state_root, scope.locator.realm.as_str())
+                .config_path;
+        std::fs::create_dir_all(document.parent().unwrap()).unwrap();
+        std::fs::write(&document, UNENFORCEABLE_CONFINEMENT).unwrap();
+
+        let (config, _) = load_config(&scope).await.expect("load config");
+        let factory = with_cli_confinement(
+            AgentFactory::new(temp.path().join("sessions")),
+            &config,
+            &scope,
+            temp.path(),
+        )
+        .expect("install confinement");
+        assert!(matches!(
+            factory.shell_confinement(),
+            meerkat_tools::builtin::shell::ShellConfinement::Required { .. }
+        ));
+        #[cfg(feature = "mcp")]
+        assert_eq!(
+            cli_mcp_stdio_profile(&factory).profile.capabilities().err(),
+            Some(meerkat_core::confinement::ConfinementRefusal::UnsupportedRequirement)
+        );
+
+        scope.confinement = Some(meerkat_core::LaunchConfinement::TrustedHost);
+        let (config, _) = load_config(&scope).await.expect("load config");
+        assert_eq!(
+            config.confinement,
+            meerkat_core::ConfinementConfig::for_all(meerkat_core::LaunchConfinement::TrustedHost)
+        );
+        let factory = with_cli_confinement(
+            AgentFactory::new(temp.path().join("sessions")),
+            &config,
+            &scope,
+            temp.path(),
+        )
+        .expect("install confinement");
+        assert_eq!(
+            factory.shell_confinement(),
+            &meerkat_tools::builtin::shell::ShellConfinement::TrustedHost
+        );
+        #[cfg(feature = "mcp")]
+        assert!(matches!(
+            cli_mcp_stdio_profile(&factory).profile.capabilities(),
+            Ok(None)
+        ));
+    }
+
+    /// A confined command whose processes could change the realm state is
+    /// refused before it starts, naming the input and its remedy; state
+    /// outside every write grant starts.
+    #[test]
+    fn test_cli_confinement_refuses_a_writable_realm_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().canonicalize().unwrap();
+        let workspace = base.join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let writable_state = test_scope(workspace.join(".rkat").join("realms"), "confined-state");
+        std::fs::create_dir_all(&writable_state.locator.state_root).unwrap();
+        let config = Config {
+            confinement: meerkat_core::ConfinementConfig::for_all(
+                meerkat_core::LaunchConfinement::Custom(meerkat_core::CustomConfinement {
+                    working_directory: workspace.clone(),
+                    requirement: meerkat_core::confinement::ConfinementSpec {
+                        baseline: meerkat_core::confinement::PlatformBaseline::CommandRuntimeV1,
+                        read: meerkat_core::confinement::FilesystemAccess::Paths(vec![
+                            meerkat_core::confinement::PathAccess::Subtree(workspace.clone()),
+                        ]),
+                        write: meerkat_core::confinement::FilesystemAccess::Paths(vec![
+                            meerkat_core::confinement::PathAccess::Subtree(workspace.clone()),
+                        ]),
+                        deny_read: vec![],
+                        deny_write: vec![],
+                        network: meerkat_core::confinement::IpNetworkAccess::Denied,
+                        unix_connect: vec![],
+                        require_descendant_termination: false,
+                    }
+                    .try_into()
+                    .unwrap(),
+                }),
+            ),
+            ..Config::default()
+        };
+        let refused = with_cli_confinement(
+            AgentFactory::new(base.join("sessions")),
+            &config,
+            &writable_state,
+            &workspace,
+        )
+        .expect_err("a confined process could change the realm state");
+        assert!(
+            refused.to_string().contains("the realm state")
+                && refused.to_string().contains("--state-root"),
+            "{refused}"
+        );
+
+        let outside = test_scope(base.join("state"), "confined-state");
+        std::fs::create_dir_all(&outside.locator.state_root).unwrap();
+        assert!(
+            with_cli_confinement(
+                AgentFactory::new(base.join("sessions")),
+                &config,
+                &outside,
+                &workspace,
+            )
+            .is_ok()
+        );
+    }
+
+    /// The workspace preset confines every launch kind to the factory's
+    /// project root.
+    #[test]
+    fn test_cli_workspace_confinement_grants_the_project_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().canonicalize().unwrap();
+        let root = base.join("workspace");
+        std::fs::create_dir_all(&root).unwrap();
+        let scope = test_scope(base.join("realms"), "workspace-root");
+        let config = Config {
+            confinement: meerkat_core::ConfinementConfig::for_all(
+                meerkat_core::LaunchConfinement::Workspace(
+                    meerkat_core::WorkspaceConfinement::default(),
+                ),
+            ),
+            ..Config::default()
+        };
+        let factory = with_cli_confinement(
+            AgentFactory::new(base.join("sessions")),
+            &config,
+            &scope,
+            &root,
+        )
+        .expect("install confinement");
+        let meerkat_tools::builtin::shell::ShellConfinement::Required { requirement } =
+            factory.shell_confinement()
+        else {
+            unreachable!("workspace confinement installs a shell requirement");
+        };
+        assert_eq!(
+            requirement.specification().write,
+            meerkat_core::confinement::FilesystemAccess::Paths(vec![
+                meerkat_core::confinement::PathAccess::Subtree(root)
+            ])
+        );
     }
 
     #[cfg(feature = "mob")]
@@ -28947,6 +30246,77 @@ capabilities = ["core", "skills", "hooks", "adaptive_flow"]
         assert_eq!(
             config.models.anthropic, operator_anthropic,
             "untouched field stays at its resolved default"
+        );
+    }
+
+    #[cfg(feature = "mob")]
+    #[test]
+    fn test_pack_deploy_policy_budget_reaches_effective_budget_limits() {
+        // A pack's `[budget]` must reach the limits every deployed member is
+        // built with (`Config::budget_limits`), not the legacy `[budget]`
+        // table that nothing enforces.
+        let mut config = Config::default();
+        let policy = meerkat_mob_pack::deploy_policy::MobpackDeployPolicy::parse(Some(
+            b"[budget]\nmax_tokens = 200000\nmax_duration_secs = 900\nmax_tool_calls = 50\n",
+        ))
+        .expect("valid policy");
+
+        apply_pack_deploy_policy(
+            &mut config,
+            &empty_deploy_manifest(),
+            &policy,
+            DeploySurfaceArg::Cli,
+        )
+        .expect("ungated budget knobs apply");
+
+        assert_eq!(
+            config.budget_limits(),
+            BudgetLimits {
+                max_tokens: Some(200_000),
+                max_duration: Some(Duration::from_secs(900)),
+                max_turn_duration: None,
+                max_tool_calls: Some(50),
+            }
+        );
+    }
+
+    #[cfg(feature = "mob")]
+    #[test]
+    fn test_pack_deploy_policy_budget_never_overrides_explicit_limits() {
+        // The operator's realm `[limits]` pins the token budget and a deploy
+        // flag pins the tool-call cap, so the pack only fills the duration
+        // both left unset. The legacy realm `[budget]` value is not enforced:
+        // it neither applies nor blocks the pack default.
+        let mut config = Config::default();
+        config
+            .merge_toml_str("[limits]\nbudget = 1000\n\n[budget]\nmax_duration = \"30m\"\n")
+            .expect("realm config merge");
+        config.apply_cli_overrides(CliOverrides {
+            max_tool_calls: Some(7),
+            ..CliOverrides::default()
+        });
+        let policy = meerkat_mob_pack::deploy_policy::MobpackDeployPolicy::parse(Some(
+            b"[budget]\nmax_tokens = 200000\nmax_duration_secs = 900\nmax_tool_calls = 50\n",
+        ))
+        .expect("valid policy");
+
+        apply_pack_deploy_policy(
+            &mut config,
+            &empty_deploy_manifest(),
+            &policy,
+            DeploySurfaceArg::Cli,
+        )
+        .expect("ungated budget knobs apply");
+
+        assert_eq!(
+            config.budget_limits(),
+            BudgetLimits {
+                max_tokens: Some(1000),
+                max_duration: Some(Duration::from_secs(900)),
+                max_turn_duration: None,
+                max_tool_calls: Some(7),
+            },
+            "realm [limits] and the deploy flag win; the pack fills only the unset duration"
         );
     }
 
@@ -29833,6 +31203,7 @@ capabilities = ["rpc"]
                     max_duration: None,
                     max_tool_calls: None,
                     override_config: None,
+                    confinement: None,
                 },
                 #[cfg(feature = "rpc-surface")]
                 rpc_io: None,
@@ -29852,6 +31223,77 @@ capabilities = ["rpc"]
             "operator realm [tools] config is untouched by the pack (mob_enabled=false), the pack's \
              allow-listed max_tokens default fills (4321), and the CLI model override still wins at \
              the deploy boundary"
+        );
+    }
+
+    /// The deploy budget reaches the limits the deployed members are built
+    /// with: a `--max-*` flag wins over the operator's realm `[limits]`, which
+    /// wins over the pack's `[budget]` default.
+    #[cfg(feature = "mob")]
+    #[tokio::test]
+    async fn test_mob_deploy_budget_flags_and_pack_budget_reach_member_limits() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut scope = test_scope_with_context(temp.path().to_path_buf());
+        scope.user_config_root = Some(temp.path().to_path_buf());
+        let config_path =
+            meerkat_store::realm_paths_in(&scope.locator.state_root, scope.locator.realm.as_str())
+                .config_path;
+        std::fs::create_dir_all(config_path.parent().expect("config parent"))
+            .expect("mkdir config");
+        std::fs::write(&config_path, "[limits]\nbudget = 1000\n").expect("write config");
+
+        let mob_dir = create_mobpack_fixture_dir(temp.path());
+        std::fs::create_dir_all(mob_dir.join("config")).expect("config dir");
+        std::fs::write(
+            mob_dir.join("config").join("defaults.toml"),
+            "[budget]\nmax_tokens = 200000\nmax_duration_secs = 900\nmax_tool_calls = 50\n",
+        )
+        .expect("write pack defaults");
+        let pack_out = temp.path().join("budget-proof.mobpack");
+        execute_mob_pack(&mob_dir, &pack_out, None)
+            .await
+            .expect("pack succeeds");
+
+        let observed = Arc::new(Mutex::new(None::<BudgetLimits>));
+        let observer: Arc<dyn Fn(&Config) + Send + Sync> = Arc::new({
+            let observed = Arc::clone(&observed);
+            move |config: &Config| {
+                *observed.lock().expect("lock observed") = Some(config.budget_limits());
+            }
+        });
+        let output = Box::pin(execute_mob_deploy_internal(
+            &scope,
+            &pack_out,
+            "hello",
+            DeployInvocation {
+                cli_trust_policy: Some(TrustPolicyArg::Permissive),
+                surface: DeploySurfaceArg::Cli,
+                cli_overrides: CliOverrides {
+                    max_tool_calls: Some(7),
+                    ..CliOverrides::default()
+                },
+                #[cfg(feature = "rpc-surface")]
+                rpc_io: None,
+                config_observer: Some(observer),
+            },
+        ))
+        .await
+        .expect("deploy succeeds");
+
+        assert!(
+            output.contains("deployed\tmob="),
+            "unexpected output: {output}"
+        );
+        assert_eq!(
+            *observed.lock().expect("lock observed"),
+            Some(BudgetLimits {
+                max_tokens: Some(1000),
+                max_duration: Some(Duration::from_secs(900)),
+                max_turn_duration: None,
+                max_tool_calls: Some(7),
+            }),
+            "the --max-tool-calls flag wins, the realm [limits] budget wins over the pack, and \
+             the pack fills the duration both left unset"
         );
     }
 
@@ -33178,6 +34620,7 @@ supports_reasoning = true
             origin_hint: RealmOrigin::Explicit,
             context_root: Some(root),
             user_config_root: None,
+            confinement: None,
             #[cfg(feature = "local-authorization")]
             stock_agent: None,
             auth_lease,
@@ -33547,6 +34990,81 @@ mod docs_cli_examples {
         lines
     }
 
+    /// The `rkat` examples of every command's after-help text, a piped
+    /// example reduced to its `rkat` stage.
+    fn after_help_examples() -> Vec<String> {
+        fn walk(command: &clap::Command, examples: &mut Vec<String>) {
+            if let Some(text) = command.get_after_help() {
+                for line in text.to_string().lines() {
+                    let line = line.trim();
+                    let stage = line
+                        .rsplit_once(" | ")
+                        .map_or(line, |(_, last)| last.trim());
+                    if stage.starts_with("rkat ") {
+                        examples.push(stage.to_string());
+                    }
+                }
+            }
+            for subcommand in command.get_subcommands() {
+                walk(subcommand, examples);
+            }
+        }
+        let mut examples = Vec::new();
+        walk(
+            &<super::Cli as clap::CommandFactory>::command(),
+            &mut examples,
+        );
+        examples
+    }
+
+    #[test]
+    fn after_help_examples_parse_against_clap() {
+        let mut checked = 0usize;
+        let mut failures = Vec::new();
+        for example in after_help_examples() {
+            // Placeholders such as `<PKG_DIR>` are shapes, not invocations.
+            if example.contains('<') {
+                continue;
+            }
+            let Some(tokens) = split_tokens(&example) else {
+                failures.push(format!("`{example}`: unbalanced quotes"));
+                continue;
+            };
+            match validate_example(&tokens, CliFeature::compiled) {
+                ExampleValidation::Accepted => checked += 1,
+                ExampleValidation::UnsupportedFeature => {}
+                ExampleValidation::Rejected(err) => {
+                    checked += 1;
+                    failures.push(format!("`{example}`: {err}"));
+                }
+            }
+        }
+        assert!(checked > 0, "no after-help examples were checked");
+        assert!(
+            failures.is_empty(),
+            "after-help examples the CLI rejects:\n{}",
+            failures.join("\n")
+        );
+    }
+
+    #[test]
+    fn resume_examples_that_name_their_session_parse() {
+        // Help and docs examples name the session before the prompt.
+        for line in [
+            r#"rkat run --resume last "keep going""#,
+            r#"rkat run --resume '~2' "pick this thread back up""#,
+        ] {
+            let tokens = split_tokens(line).expect("tokens");
+            assert!(
+                matches!(
+                    validate_example(&tokens, CliFeature::compiled),
+                    ExampleValidation::Accepted
+                ),
+                "{line}"
+            );
+        }
+    }
+
     #[test]
     fn fenced_rkat_doc_examples_parse_against_clap() {
         let docs_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -33817,5 +35335,153 @@ mod no_cli_alias_tables {
         );
         assert!(parse_cli_principal_id("").is_err());
         assert!(parse_cli_principal_id("ok-principal").is_ok());
+    }
+}
+
+#[cfg(all(test, feature = "comms"))]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod comms_override_tests {
+    use super::*;
+
+    /// `--comms-advertise-tcp` accepts a DNS name, as the comms docs show,
+    /// and passes it on unresolved: the transport resolves it when a peer
+    /// dials. IP literals keep their canonical form.
+    #[test]
+    fn comms_advertise_tcp_accepts_unresolved_dns_names() {
+        for (raw, advertised) in [
+            ("target.example.com:4200", "tcp://target.example.com:4200"),
+            (
+                "tcp://reviewer.example.com:4200",
+                "tcp://reviewer.example.com:4200",
+            ),
+            (
+                "unresolvable.invalid:4200",
+                "tcp://unresolvable.invalid:4200",
+            ),
+            ("203.0.113.10:4200", "tcp://203.0.113.10:4200"),
+            ("[2001:db8::1]:4200", "tcp://[2001:db8::1]:4200"),
+        ] {
+            assert_eq!(
+                resolve_comms_advertise_tcp(Some(raw.to_string())).unwrap(),
+                Some(advertised.to_string()),
+                "{raw}"
+            );
+        }
+        assert_eq!(resolve_comms_advertise_tcp(None).unwrap(), None);
+    }
+
+    /// A route peers cannot dial is refused with a clear error: no port, a
+    /// zero port, a wildcard host, an unbracketed IPv6 host, no host.
+    #[test]
+    fn comms_advertise_tcp_refuses_undialable_routes() {
+        for raw in [
+            "target.example.com",
+            "target.example.com:0",
+            "0.0.0.0:4200",
+            "[::]:4200",
+            "2001:db8::1:4200",
+            ":4200",
+        ] {
+            let error = resolve_comms_advertise_tcp(Some(raw.to_string()))
+                .expect_err(raw)
+                .to_string();
+            assert!(
+                error.starts_with(&format!("invalid --comms-advertise-tcp address '{raw}'")),
+                "{raw}: {error}"
+            );
+        }
+    }
+
+    /// An explicit `--comms-advertise-tcp` wins over the configured
+    /// `comms.advertise_address`; without the flag the configured address
+    /// stands, also when `--comms-listen-tcp` switches the listener.
+    #[test]
+    fn comms_overrides_keep_the_configured_advertise_address() {
+        const CONFIGURED: &str = "tcp://configured.example.com:4200";
+        let configured = || {
+            let mut config = Config::default();
+            config.comms.advertise_address = Some(CONFIGURED.to_string());
+            config
+        };
+
+        let mut config = configured();
+        CommsOverrides::default().apply_to(&mut config);
+        assert_eq!(config.comms.advertise_address.as_deref(), Some(CONFIGURED));
+
+        let mut config = configured();
+        CommsOverrides {
+            listen_tcp: Some("0.0.0.0:4200".to_string()),
+            ..CommsOverrides::default()
+        }
+        .apply_to(&mut config);
+        assert_eq!(config.comms.mode, CommsRuntimeMode::Tcp);
+        assert_eq!(config.comms.address.as_deref(), Some("0.0.0.0:4200"));
+        assert_eq!(config.comms.advertise_address.as_deref(), Some(CONFIGURED));
+
+        let mut config = configured();
+        CommsOverrides {
+            advertise_address: Some("tcp://explicit.example.com:4300".to_string()),
+            ..CommsOverrides::default()
+        }
+        .apply_to(&mut config);
+        assert_eq!(
+            config.comms.advertise_address.as_deref(),
+            Some("tcp://explicit.example.com:4300")
+        );
+    }
+}
+
+#[cfg(all(test, feature = "mcp"))]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod cli_mcp_host_auth_resolver_tests {
+    use super::*;
+
+    /// The CLI host resolver reports its native authority's credential realm
+    /// and bound egress profile, as the RPC and REST resolvers (the
+    /// authority itself) do.
+    #[tokio::test]
+    async fn cli_resolver_forwards_credential_realm_and_http_egress() {
+        let runtime = meerkat_runtime::MeerkatMachine::ephemeral();
+        let realm = meerkat_core::connection::RealmId::parse("team-alpha").unwrap();
+        let service = meerkat::HostAuthService::new(
+            meerkat_providers::auth_store::ProviderAuthPersistence::new(
+                Arc::new(meerkat_providers::auth_store::EphemeralTokenStore::new()),
+                Arc::new(meerkat_providers::auth_store::InMemoryCoordinator::new()),
+            ),
+            runtime.provider_auth_runtime_authority(),
+        )
+        .with_mcp_realm(realm.clone());
+        let profile =
+            meerkat_mcp::HttpEgressProfile::required(meerkat_mcp::HttpEgressPolicy::new());
+        let authority = service
+            .mcp_oauth_authority()
+            .unwrap()
+            .stored_only()
+            .with_http_egress(&profile);
+
+        // Positive control: the authority, as RPC and REST install it.
+        assert_eq!(
+            meerkat_mcp::McpAuthResolver::credential_realm(&authority),
+            Some(realm.clone())
+        );
+        assert!(
+            meerkat_mcp::McpAuthResolver::http_egress(&authority)
+                .is_some_and(|bound| bound.same_profile(&profile))
+        );
+
+        let resolver = CliMcpHostAuthResolver {
+            service,
+            authority,
+            mode: CliMcpAuthMode::Stored,
+        };
+        assert_eq!(
+            meerkat_mcp::McpAuthResolver::credential_realm(&resolver),
+            Some(realm)
+        );
+        assert!(
+            meerkat_mcp::McpAuthResolver::http_egress(&resolver)
+                .is_some_and(|bound| bound.same_profile(&profile)),
+            "the CLI resolver must report the authority's bound egress profile"
+        );
     }
 }

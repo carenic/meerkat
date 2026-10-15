@@ -5,8 +5,8 @@
 # marker in the tree corresponds to a codegen-emit path and every
 # codegen-emit path carries the marker. Non-zero exit blocks the push.
 #
-# This is the companion guard to `pre-push-machines.sh` and
-# `pre-push-clippy.sh`: machines/verify catches schema drift,
+# This is the companion guard to `pre-push-machines.sh` and the
+# required CI Clippy lanes: machines/verify catches schema drift,
 # clippy catches lint regressions, this catches "hand-editing a
 # generated file" and "adding a codegen pass without marking its
 # output."

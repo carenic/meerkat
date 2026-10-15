@@ -32568,6 +32568,35 @@ async fn test_resume_fails_when_orchestrator_resume_notification_fails() {
     );
 }
 
+/// Wait until `session_id`'s runtime holds no active input, so every bounded
+/// attempt the runtime owes an input it already admitted has run.
+#[cfg(feature = "runtime-adapter")]
+async fn wait_for_session_runtime_inputs_settled(
+    runtime: &meerkat_runtime::MeerkatMachine,
+    session_id: &SessionId,
+) {
+    use meerkat_runtime::service_ext::SessionServiceRuntimeExt as _;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while !runtime
+        .list_active_inputs(session_id)
+        .await
+        .is_ok_and(|active| active.is_empty())
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the session runtime never settled its active inputs"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+#[cfg(not(feature = "runtime-adapter"))]
+async fn wait_for_session_runtime_inputs_settled(
+    _runtime: &meerkat_runtime::MeerkatMachine,
+    _session_id: &SessionId,
+) {
+}
+
 /// A cold resume of a RUNNING mob hands its TurnDriven orchestrator's resume
 /// notification to the actor's lifecycle owner instead of awaiting the turn.
 /// The reconstruction returns while that notification is still held; when it
@@ -32576,7 +32605,7 @@ async fn test_resume_fails_when_orchestrator_resume_notification_fails() {
 #[tokio::test]
 async fn test_cold_resume_of_a_running_mob_reports_a_late_orchestrator_notification_failure() {
     let service = Arc::new(MockSessionService::new());
-    let _ = service.enable_runtime_adapter();
+    let runtime = service.enable_runtime_adapter();
     let mut def = sample_definition();
     for profile in def.profiles.values_mut().filter_map(|b| b.as_inline_mut()) {
         profile.runtime_mode = crate::MobRuntimeMode::TurnDriven;
@@ -32675,9 +32704,12 @@ async fn test_cold_resume_of_a_running_mob_reports_a_late_orchestrator_notificat
         "the recorded reason is the delivery failure: {}",
         failure.2
     );
-    // Every turn call since the restart is that one resume notification
-    // (the runtime's own attempts at its single input), and no call follows
-    // the recorded outcome.
+    // The recorded failure reports the notification's first failed attempt;
+    // the runtime's remaining bounded attempts at that same input may follow
+    // it. Count only once the orchestrator's runtime holds no active input:
+    // every turn call since the restart is then that one resume notification
+    // (the runtime's own attempts at its single input), and no call follows.
+    wait_for_session_runtime_inputs_settled(&runtime, &orchestrator_session).await;
     let calls_at_failure = service.non_host_start_turn_calls.load(Ordering::Acquire);
     let prompts = service.recorded_start_turn_prompts().await;
     let since_restart = &prompts[prompts_before..];
@@ -32694,7 +32726,7 @@ async fn test_cold_resume_of_a_running_mob_reports_a_late_orchestrator_notificat
     assert_eq!(
         service.non_host_start_turn_calls.load(Ordering::Acquire),
         calls_at_failure,
-        "no further turn call after the failure is recorded"
+        "no further turn call once the notification input has settled"
     );
     assert_eq!(
         resumed.status().await.expect("status"),

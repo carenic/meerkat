@@ -174,7 +174,7 @@ Current catalog defaults:
 |----------|---------|
 | Anthropic | `claude-opus-5-5` |
 | OpenAI | `gpt-6-astra` |
-| Gemini | `gemini-3.8-flash` |
+| Gemini | `gemini-4-argon` (paid Gemini API tiers; select `gemini-3.8-flash` on the free tier) |
 
 Runtime model fallback is bounded and capability-aware. An accepted fallback
 re-resolves credentials and makes the new model/provider identity sticky for
@@ -443,7 +443,7 @@ Meerkat is pre-1.0 and patch releases can contain declared public API breaks.
 Exactly pin the Meerkat crate family and bump deliberately:
 
 ```toml
-meerkat = { version = "=0.9.0", features = ["sqlite-store", "session-store"] }
+meerkat = { version = "=0.9.1", features = ["sqlite-store", "session-store"] }
 ```
 
 ## License

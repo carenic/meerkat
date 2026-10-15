@@ -4,12 +4,28 @@ use std::collections::HashSet;
 
 use indexmap::IndexMap;
 use meerkat_core::skills::{
-    SkillDescriptor, SkillDocument, SkillError, SkillExtensionKey, SkillFilter, SkillKey,
-    SkillSource, SourceHealthSnapshot, SourceHealthThresholds, SourceUuid, apply_filter,
-    classify_source_health,
+    SkillArtifact, SkillArtifactContent, SkillDescriptor, SkillDocument, SkillError,
+    SkillExtensionKey, SkillFilter, SkillKey, SkillSource, SourceHealthSnapshot,
+    SourceHealthThresholds, SourceUuid, apply_filter, classify_source_health,
 };
 
 use crate::registration::{RegistrationId, SkillRegistration, collect_registered_skills};
+
+/// Media type of the reference documents an embedded skill serves.
+const REFERENCE_ARTIFACT_MIME_TYPE: &str = "text/markdown";
+
+/// The registration's reference documents, in registration order: the
+/// extensions whose key is a `references/*.md` path. An embedded skill serves
+/// each one as an artifact at that path; every other extension stays author
+/// metadata.
+fn reference_artifacts(
+    reg: &SkillRegistration,
+) -> impl Iterator<Item = (&'static str, &'static str)> {
+    reg.extensions
+        .iter()
+        .copied()
+        .filter(|(path, _)| path.starts_with("references/") && path.ends_with(".md"))
+}
 
 /// Convert a static `SkillRegistration` to a `SkillDescriptor`.
 ///
@@ -72,11 +88,11 @@ struct EmbeddedScan<'a> {
     total_count: u32,
 }
 
-impl EmbeddedScan<'_> {
+impl<'a> EmbeddedScan<'a> {
     /// Resolve one registration from the same collision-aware projection used
     /// by list and health. An ambiguous key is a load error, never a
     /// link-order-dependent `NotFound` or silently selected owner.
-    fn load(&self, key: &SkillKey) -> Result<SkillDocument, SkillError> {
+    fn registration(&self, key: &SkillKey) -> Result<&'a SkillRegistration, SkillError> {
         if self.ambiguous_keys.contains(key) {
             return Err(SkillError::Load(
                 format!(
@@ -88,9 +104,40 @@ impl EmbeddedScan<'_> {
         self.registrations
             .get(key)
             .copied()
-            .map(registration_to_document)
-            .transpose()?
             .ok_or_else(|| SkillError::NotFound { key: key.clone() })
+    }
+
+    fn load(&self, key: &SkillKey) -> Result<SkillDocument, SkillError> {
+        registration_to_document(self.registration(key)?)
+    }
+
+    fn list_artifacts(&self, key: &SkillKey) -> Result<Vec<SkillArtifact>, SkillError> {
+        Ok(reference_artifacts(self.registration(key)?)
+            .map(|(path, content)| SkillArtifact {
+                path: path.to_string(),
+                mime_type: REFERENCE_ARTIFACT_MIME_TYPE.to_string(),
+                byte_length: content.len(),
+            })
+            .collect())
+    }
+
+    fn read_artifact(
+        &self,
+        key: &SkillKey,
+        artifact_path: &str,
+    ) -> Result<SkillArtifactContent, SkillError> {
+        reference_artifacts(self.registration(key)?)
+            .find(|(path, _)| *path == artifact_path)
+            .map(|(path, content)| SkillArtifactContent {
+                path: path.to_string(),
+                mime_type: REFERENCE_ARTIFACT_MIME_TYPE.to_string(),
+                content: content.to_string(),
+            })
+            .ok_or_else(|| {
+                SkillError::Load(
+                    format!("embedded skill {key} has no artifact '{artifact_path}'").into(),
+                )
+            })
     }
 }
 
@@ -172,6 +219,9 @@ fn scan_registration_iter<'a>(
 }
 
 /// Skill source that reads from `inventory`-registered skills.
+///
+/// A registration's `references/*.md` extensions are served as its
+/// artifacts, so the skill resource tools can list and read them.
 pub struct EmbeddedSkillSource;
 
 impl EmbeddedSkillSource {
@@ -215,6 +265,24 @@ impl SkillSource for EmbeddedSkillSource {
             return Err(SkillError::NotFound { key: key.clone() });
         }
         scan_registrations().load(key)
+    }
+
+    async fn list_artifacts(&self, key: &SkillKey) -> Result<Vec<SkillArtifact>, SkillError> {
+        if key.source_uuid != SourceUuid::builtin() {
+            return Err(SkillError::NotFound { key: key.clone() });
+        }
+        scan_registrations().list_artifacts(key)
+    }
+
+    async fn read_artifact(
+        &self,
+        key: &SkillKey,
+        artifact_path: &str,
+    ) -> Result<SkillArtifactContent, SkillError> {
+        if key.source_uuid != SourceUuid::builtin() {
+            return Err(SkillError::NotFound { key: key.clone() });
+        }
+        scan_registrations().read_artifact(key, artifact_path)
     }
 }
 
@@ -443,5 +511,82 @@ mod tests {
         assert_eq!(scan.invalid_count, 3);
         assert!(scan.descriptors.is_empty());
         assert!(scan.registrations.is_empty());
+    }
+
+    #[test]
+    fn reference_extensions_are_served_as_artifacts() {
+        let reg = SkillRegistration {
+            id: "task-workflow",
+            name: "Task Workflow",
+            description: "",
+            scope: SkillScope::Builtin,
+            requires_capabilities: &[],
+            body: "Body",
+            extensions: &[
+                ("references/guide.md", "# Guide"),
+                ("vendor.policy", "strict"),
+                ("references/data.json", "{}"),
+            ],
+        };
+        let key =
+            SkillKey::builtin(meerkat_core::skills::SkillName::parse("task-workflow").unwrap());
+        let scan = scan_registration_iter([&reg]);
+
+        assert_eq!(
+            scan.list_artifacts(&key).unwrap(),
+            vec![SkillArtifact {
+                path: "references/guide.md".to_string(),
+                mime_type: "text/markdown".to_string(),
+                byte_length: "# Guide".len(),
+            }]
+        );
+        assert_eq!(
+            scan.read_artifact(&key, "references/guide.md").unwrap(),
+            SkillArtifactContent {
+                path: "references/guide.md".to_string(),
+                mime_type: "text/markdown".to_string(),
+                content: "# Guide".to_string(),
+            }
+        );
+        // Other extensions stay author metadata, never artifacts.
+        for path in [
+            "vendor.policy",
+            "references/data.json",
+            "references/missing.md",
+        ] {
+            assert!(
+                matches!(scan.read_artifact(&key, path), Err(SkillError::Load(_))),
+                "{path} must not be readable as an artifact"
+            );
+        }
+
+        let unknown =
+            SkillKey::builtin(meerkat_core::skills::SkillName::parse("other-skill").unwrap());
+        assert!(matches!(
+            scan.list_artifacts(&unknown),
+            Err(SkillError::NotFound { .. })
+        ));
+        assert!(matches!(
+            scan.read_artifact(&unknown, "references/guide.md"),
+            Err(SkillError::NotFound { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn artifacts_of_a_non_builtin_key_are_not_found() {
+        let key = SkillKey {
+            source_uuid: SourceUuid::parse("018f4a3e-7b2c-7d10-9e45-1f2a3b4c5d6e").unwrap(),
+            skill_name: meerkat_core::skills::SkillName::parse("meerkat-platform").unwrap(),
+        };
+        let source = EmbeddedSkillSource::new();
+
+        assert!(matches!(
+            source.list_artifacts(&key).await,
+            Err(SkillError::NotFound { .. })
+        ));
+        assert!(matches!(
+            source.read_artifact(&key, "references/mobs.md").await,
+            Err(SkillError::NotFound { .. })
+        ));
     }
 }

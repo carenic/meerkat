@@ -153,6 +153,12 @@ const ENDPOINT: &str = "https://native-loop.invalid/messages";
 const DENIED_CALL: &str = "attempt-delete";
 const READ_CALLS: [&str; 4] = ["read-0", "read-1", "read-2", "read-3"];
 const FILE_BYTES: &[u8] = b"native-cost-record-7\n";
+/// Deadline for publishing a fixture controller credential, outside timing.
+/// Publication only tries the machine's controller custody (the session map,
+/// each session's mutation gate and driver lock) and answers the typed Busy
+/// refusal while session work holds one of them. Core's bounded publication
+/// retries exactly that refusal until this deadline.
+const CREDENTIAL_PUBLICATION_WAIT: Duration = Duration::from_secs(30);
 
 fn id(value: &str) -> EvidenceId {
     EvidenceId::new(value).expect("bounded fixture identifier")
@@ -1032,11 +1038,13 @@ impl Fixture {
         // timing. This scripted transport has no vault or external account.
         // Use the exact actor-pinned identity, never a caller-selected allow flag.
         let credential_owner = machine.generated_auth_lease_handle();
-        meerkat_core::publish_token_lifecycle_acquired_for_identity(
+        meerkat_core::publish_token_lifecycle_acquired_for_identity_within(
             &credential_owner,
             pin.selection().credential(),
             &meerkat_core::auth::PersistedTokens::api_key("synthetic-native-cost-credential"),
+            tokio::time::Instant::now() + CREDENTIAL_PUBLICATION_WAIT,
         )
+        .await
         .expect("actual fixture credential before native admission");
         assert_eq!(
             credential_owner

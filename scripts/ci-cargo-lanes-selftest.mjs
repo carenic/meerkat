@@ -5,8 +5,22 @@
 // BuildBuddy mode violated: a build-relevant change always yields lanes.
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
-import { dirname, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
+import {
+  CI_ROW_STEPS,
+  HOOK_SCRIPT,
+  bindRowSteps,
+  checkHookCoverage,
+  hookModel,
+  featureClosure,
+  parseFilter,
+  profileFilter,
+  workspaceFeatures,
+} from "./ci-hook-coverage.mjs";
+import { readMetadata, workspacePackages } from "./rust-test-selector.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const classifier = resolve(here, "ci-cargo-lanes.mjs");
@@ -87,6 +101,84 @@ function assertLanes(plan, label) {
     `${label}: main unit shards and archived lanes cover every workspace package`,
   );
   assertArchivedLanes(plan, label);
+  assertHookParity(plan, label);
+}
+
+const HOOK_STACK = 32 * 1024 * 1024;
+const OTHER_E2E_LANES = ["e2e_auth_lane", "e2e_build_lane", "e2e_system_lane", "e2e_live_lane", "e2e_smoke_lane", "e2e_models_lane"];
+
+// The closure-tests rows: the pre-push hook's cargo-test coverage for the
+// test scope (the reverse-dependency closure plus the readers of changed
+// non-Rust inputs), each row naming exactly the binaries it runs. The lib row
+// exists only on a named runner; without one the plan leaves the hook's
+// kind(lib) lane to the hook.
+function assertHookParity(plan, label) {
+  assert.deepEqual(
+    plan.test_scope,
+    [...new Set([...plan.closure, ...plan.reader_packages])].sort(),
+    `${label}: the test scope is the closure plus the non-Rust readers`,
+  );
+  assert.deepEqual(plan.hook_coverage.missing, [], `${label}: every hook binary in scope has a row`);
+  assert.deepEqual(plan.hook_coverage.errors, [], `${label}: every row builds`);
+  const libRows = plan.closure_test_rows.filter((row) => row.lane === "lib");
+  if (plan.lib_row_runner === null) {
+    assert.deepEqual(libRows, [], `${label}: no lib row without a runner for it`);
+    assert.deepEqual(plan.hook_retained_lanes, ["workspace unit lane"], `${label}: the hook keeps its kind(lib) lane`);
+  } else {
+    assert.deepEqual(plan.hook_retained_lanes, [], `${label}: a plan with a lib row leaves no lane to the hook`);
+    assert.equal(plan.hook_coverage.hook_retained, 0, `${label}: and no binary`);
+    for (const row of libRows) assert.equal(row.runner, plan.lib_row_runner, `${label}: the lib row runs on its runner`);
+  }
+  for (const row of plan.closure_test_rows.filter((candidate) => candidate.lane !== "lib")) {
+    assert.equal(row.runner, undefined, `${label}: ${row.name} runs on its job's runner`);
+  }
+  const names = plan.closure_test_rows.map((row) => row.name);
+  assert.equal(new Set(names).size, names.length, `${label}: closure test row names are unique`);
+  const runs = [];
+  for (const row of plan.closure_test_rows) {
+    assert.ok(row.binaries.length > 0, `${label}: ${row.name} names its binaries`);
+    assert.ok(["ci-unit", "ci-integration"].includes(row.profile), `${label}: ${row.name} profile ${row.profile}`);
+    assert.ok(["warn", "fail"].includes(row.no_tests), `${label}: ${row.name} no-tests policy`);
+    assert.equal(row.rust_min_stack, HOOK_STACK, `${label}: ${row.name} runs on the hook's stack`);
+    for (const feature of row.package_flags.match(/--features (\S+)/)?.[1]?.split(",") ?? []) {
+      assert.match(feature, /^[A-Za-z0-9_-]+\/[A-Za-z0-9_-]+$/, `${label}: ${row.name} names each feature's package`);
+    }
+    // Every row but HeadCanonical selects the whole workspace, so Cargo
+    // resolves features exactly as the hook's workspace build does.
+    if (row.lane !== "headcanonical") {
+      assert.equal(row.package_flags, "--workspace", `${label}: ${row.name} selects the whole workspace`);
+    }
+    if (row.lane === "lib") {
+      assert.equal(row.test_flags, "--lib", `${label}: ${row.name} runs lib tests`);
+      // --workspace --lib also builds proc-macro crates' tests, which the
+      // hook's kind(lib) lane does not run and the row does not name.
+      assert.match(row.filter, /^kind\(lib\)( & \(.+\))?$/, `${label}: ${row.name} runs only kind(lib) binaries`);
+      assert.deepEqual(row.binaries, row.packages, `${label}: ${row.name} lists one lib binary per package`);
+    } else {
+      // Every named target is one of the row's binaries, and the reverse (a
+      // name shared by several members names all of their binaries).
+      const named = [...new Set([...row.test_flags.matchAll(/--test (\S+)/g)].map((match) => match[1]))].sort();
+      assert.deepEqual(named, [...new Set(row.binaries.map((binary) => binary.split("::")[1]))].sort(), `${label}: ${row.name} names exactly its binaries`);
+      for (const binary of row.binaries) {
+        assert.ok(row.packages.includes(binary.split("::")[0]), `${label}: ${row.name} selects the package of ${binary}`);
+      }
+    }
+    if (row.lane !== "headcanonical") runs.push(...row.binaries);
+  }
+  assert.equal(new Set(runs).size, runs.length, `${label}: each hook binary runs in one row (HeadCanonical's own build aside)`);
+  for (const lane of OTHER_E2E_LANES) {
+    assert.ok(!runs.includes(`meerkat-integration-tests::${lane}`), `${label}: ${lane} is outside the hook's fast selection`);
+  }
+  assert.equal(
+    plan.closure_test_rows.some((row) => row.lane === "headcanonical"),
+    plan.test_scope.includes("meerkat-mob"),
+    `${label}: HeadCanonical runs exactly when meerkat-mob is in scope`,
+  );
+  assert.equal(
+    plan.closure_test_rows.some((row) => row.lane === "e2e-fast"),
+    plan.test_scope.includes("meerkat-integration-tests"),
+    `${label}: e2e-fast runs exactly when meerkat-integration-tests is in scope`,
+  );
 }
 
 // Every archive build is executed by exactly its partitions, 1..n of n, and
@@ -295,7 +387,28 @@ function assertArchivedLanes(plan, label) {
   assertLanes(plan, "Cargo.lock");
   assert.ok(plan.packages.length >= 45, `workspace mode lists every member (${plan.packages.length})`);
   assert.deepEqual(plan.closure, plan.packages);
-  assert.ok(plan.shards.length <= 8 && plan.shards.length >= 2, `bounded shard count (${plan.shards.length})`);
+  // The heads of the long check chains each get a fixed Clippy shard of
+  // their own (CLIPPY_HEAD_SHARDS), so the pole is one head and their
+  // dependencies' feature sets repeat between runs; the rest pack into five
+  // more shards.
+  const heads = [
+    ["rkat"],
+    ["meerkat-rpc"],
+    ["meerkat-mob"],
+    ["meerkat"],
+    ["meerkat-mob-adaptive", "meerkat-mob-mcp", "meerkat-mob-pack"],
+    ["meerkat-mcp-server", "meerkat-rest", "meerkat-web-runtime"],
+    ["meerkat-integration-tests", "surface-build-fixtures"],
+  ];
+  for (const group of heads) {
+    assert.ok(
+      plan.shards.some((shard) => JSON.stringify(shard.packages) === JSON.stringify(group)),
+      `the workspace plan lints ${group.join(" ")} in a shard of its own`,
+    );
+  }
+  assert.equal(plan.shards.length, heads.length + 5, `head shards plus five packed (${plan.shards.length})`);
+  // Feature checks keep the weight-packed shards (--workspace-shards).
+  assert.ok(new Set(plan.feature_check_jobs.map((job) => job.name.replace(/ (bazel set|matrix)$/, ""))).size <= 8);
   // Cost-balanced, not count-balanced: no shard carries more than a quarter
   // of the estimated workspace cost, so the heaviest crates spread out.
   const total = plan.shards.reduce((sum, shard) => sum + shard.estimated_cost, 0);
@@ -317,6 +430,10 @@ for (const path of [
   "scripts/repo-cargo",
   "scripts/cargo-agent-gate",
   "scripts/ci-cargo-lanes.mjs",
+  "scripts/ci-hook-coverage.mjs",
+  "scripts/ci-verify-row-binaries.mjs",
+  "scripts/ci-non-rust-readers.mjs",
+  "scripts/ci-clippy-sccache-wrapper",
   ".github/workflows/ci.yml",
   ".github/actions/setup-rust-ci/action.yml",
 ]) {
@@ -879,6 +996,18 @@ for (const path of [
     rows(mob).some((row) => /^-p meerkat-mob --no-default-features --features \S+ --lib$/.test(row) && !row.includes("test-support")),
     "the production library set without test-support is checked",
   );
+  // A production target selects its release feature set (no test-only
+  // feature) under //tools/bazel:release_build; both branches are checked.
+  const core = planFor(["crates/meerkat-core/src/lib.rs"]);
+  const coreRows = rows(core).filter((row) => row.startsWith("-p meerkat-core ") && row.endsWith(" --lib"));
+  assert.ok(
+    coreRows.some((row) => !row.includes("test-support")),
+    "the release-configuration feature set of meerkat-core is checked",
+  );
+  assert.ok(
+    coreRows.some((row) => row.includes("test-support")),
+    "the default-configuration feature set of meerkat-core is checked",
+  );
   // A bin-only package gets no --lib; weak dependency features stay out.
   const cli = planFor(["crates/meerkat-cli/src/main.rs"]);
   assert.match(rows(cli)[0], /^-p rkat --no-default-features --features \S+ --bins --tests$/);
@@ -886,12 +1015,18 @@ for (const path of [
   for (const row of rows(cli)) {
     assert.match(row, /^-p rkat /, `${row} belongs to the changed package`);
   }
-  // A workspace plan checks every package, shard by shard, and runs every
-  // Make feature-matrix check row with the shard that holds its package.
+  // A workspace plan checks every package, shard by shard (the weight-packed
+  // shards, not the Clippy head split), and runs every Make feature-matrix
+  // check row with the shard that holds its package.
   const workspace = planFor(["Cargo.toml"]);
-  assert.ok(workspace.feature_check_jobs.length <= 2 * workspace.shards.length);
+  assert.deepEqual(
+    workspace.feature_check_shards.flatMap((shard) => shard.packages).sort(),
+    workspace.packages,
+    "feature-check shards partition the workspace",
+  );
+  assert.ok(workspace.feature_check_jobs.length <= 2 * workspace.feature_check_shards.length);
   for (const job of workspace.feature_check_jobs) {
-    const shard = workspace.shards.find(
+    const shard = workspace.feature_check_shards.find(
       (candidate) => job.name === `${candidate.name} bazel set` || job.name === `${candidate.name} matrix`,
     );
     assert.ok(shard, `feature-check job ${job.name} follows a clippy shard`);
@@ -929,11 +1064,417 @@ for (const path of [
 
 // A change to the lane definitions runs the lanes they define.
 {
-  for (const path of [".github/workflows/ci.yml", "scripts/ci-cargo-lanes.mjs", "scripts/ci-cargo-lanes-selftest.mjs"]) {
+  for (const path of [
+    ".github/workflows/ci.yml",
+    "scripts/ci-cargo-lanes.mjs",
+    "scripts/ci-cargo-lanes-selftest.mjs",
+    "scripts/ci-hook-coverage.mjs",
+    "scripts/ci-verify-row-binaries.mjs",
+    "scripts/ci-non-rust-readers.mjs",
+  ]) {
     const plan = planFor([path]);
     assert.equal(plan.bazel_graph, true, `${path} selects the Bazel graph check`);
     assert.equal(plan.examples_browser, true, `${path} selects the example suites`);
     assert.equal(plan.example_web, true, `${path} selects the example web suites`);
+  }
+}
+
+// Hook parity: workspace-unified features. meerkat-mcp's form_elicitation
+// and lifecycle_contract require test-support, which only the workspace's
+// feature unification enables (a package-scoped build has none), so their
+// row must carry it. The mob chain's lib tests run before the merge, never
+// only on main: in the hook's kind(lib) lane without a lib-row runner, in the
+// pull request's lib row with one.
+{
+  const plan = planFor(["crates/meerkat-mcp/src/lib.rs"]);
+  assertLanes(plan, "mcp touch");
+  const row = plan.closure_test_rows.find((candidate) => candidate.binaries.includes("meerkat-mcp::form_elicitation"));
+  assert.ok(row, "a row runs meerkat-mcp's form_elicitation");
+  assert.ok(row.binaries.includes("meerkat-mcp::lifecycle_contract"), "and lifecycle_contract");
+  assert.equal(row.package_flags, "--workspace", "under the workspace's resolution, which enables test-support");
+  assert.equal(
+    checkHookCoverage(plan).map["meerkat-mob::lib::meerkat_mob"],
+    "hook: workspace unit lane",
+    "without a lib-row runner, the hook runs meerkat-mob's lib tests",
+  );
+  const withRunner = planFor(["crates/meerkat-mcp/src/lib.rs"], ["--lib-row-runner", "ubuntu-24.04"]);
+  assertLanes(withRunner, "mcp touch, lib-row runner");
+  assert.ok(
+    withRunner.closure_test_rows.some((candidate) => candidate.lane === "lib" && candidate.packages.includes("meerkat-mob")),
+    "with one, meerkat-mob's lib tests run in the pull request",
+  );
+}
+
+// The hook's named lanes keep the hook's own flags.
+{
+  const plan = planFor(["crates/meerkat-mob/src/lib.rs"]);
+  assertLanes(plan, "mob touch");
+  const pick = (lane) => {
+    const row = plan.closure_test_rows.find((candidate) => candidate.lane === lane);
+    assert.ok(row, `the mob plan has a ${lane} row`);
+    return { packages: row.package_flags, tests: row.test_flags, profile: row.profile, filter: row.filter, no_tests: row.no_tests };
+  };
+  assert.deepEqual(pick("headcanonical"), {
+    packages: "-p meerkat-mob --features meerkat-mob/test-support",
+    tests: "--test cold_restart_mob_resume",
+    profile: "ci-integration",
+    filter: "binary(cold_restart_mob_resume)",
+    no_tests: "fail",
+  });
+  assert.deepEqual(pick("e2e-fast"), {
+    packages: "--workspace",
+    tests: "--test e2e_fast_lane",
+    profile: "ci-unit",
+    filter: "binary(e2e_fast_lane)",
+    no_tests: "fail",
+  });
+}
+
+// Readers of non-Rust inputs: a docs-only change has no Cargo lanes but runs
+// the tests that read docs/ (and the whole-checkout audits), with the
+// workspace feature set, as the hook did on every push.
+{
+  const plan = planFor(["docs/index.mdx"]);
+  assert.equal(plan.rust_changed, false);
+  assert.deepEqual(plan.closure, []);
+  for (const name of ["rkat", "meerkat-machine-schema", "xtask"]) {
+    assert.ok(plan.reader_packages.includes(name), `docs/index.mdx selects its reader ${name}`);
+  }
+  assertHookParity(plan, "docs reader");
+  assert.ok(plan.closure_test_rows.length > 0, "a docs change runs its readers' rows");
+  const github = run(["--format", "github", "--", "docs/index.mdx"]);
+  assert.equal(github.status, 0, github.stderr);
+  const lines = Object.fromEntries(github.stdout.trim().split("\n").map((line) => [line.slice(0, line.indexOf("=")), line.slice(line.indexOf("=") + 1)]));
+  assert.equal(lines.closure_test_count, String(plan.closure_test_rows.length));
+  assert.equal(JSON.parse(lines.closure_test_matrix).include.length, plan.closure_test_rows.length);
+  assert.equal(lines.hook_retained_lanes, "workspace unit lane", "the plan log names the lane it leaves to the hook");
+  assert.equal(lines.hook_retained_count, String(plan.hook_coverage.hook_retained));
+}
+
+// The coverage checker on mutated plans: each mutation is a way a row change
+// could narrow what CI runs, and each must be reported. The plan has the lib
+// row (a runner named for it), so the lib mutations have a row to change.
+{
+  const plan = planFor(["crates/meerkat-mcp/src/lib.rs"], ["--lib-row-runner", "ubuntu-24.04"]);
+  const baseline = checkHookCoverage(plan);
+  assert.deepEqual([baseline.missing, baseline.errors], [[], []], "the planned rows cover the hook");
+  const mutate = (change) => {
+    const copy = JSON.parse(JSON.stringify(plan));
+    change(copy);
+    return checkHookCoverage(copy);
+  };
+  const mcpRow = (copy) => copy.closure_test_rows.find((row) => row.binaries.includes("meerkat-mcp::form_elicitation"));
+  // A dropped row leaves its binaries uncovered.
+  const dropped = mutate((copy) => {
+    copy.closure_test_rows = copy.closure_test_rows.filter((row) => row !== mcpRow(copy));
+  });
+  assert.ok(dropped.missing.includes("meerkat-mcp::test::form_elicitation"), "a dropped row is a gap");
+  // A package-scoped row is not the hook's build: Cargo refuses the
+  // required-features targets, and nothing in the row counts.
+  const scoped = mutate((copy) => {
+    mcpRow(copy).package_flags = "-p meerkat-mcp";
+  });
+  assert.ok(scoped.errors.some((error) => error.includes("form_elicitation requires test-support")), "Cargo would refuse the row");
+  assert.ok(scoped.missing.includes("meerkat-mcp::test::account_selection"), "the scoped set does not cover the hook");
+  // A package-scoped lib row is a gap even with the workspace's own
+  // features: its dependencies are not the hook's.
+  const libScoped = mutate((copy) => {
+    const row = copy.closure_test_rows.find((candidate) => candidate.lane === "lib");
+    row.package_flags = "-p meerkat-mob --features meerkat-mob/runtime-adapter,meerkat-mob/schema,meerkat-mob/test-support";
+    delete row.filter;
+  });
+  assert.ok(libScoped.missing.includes("meerkat-mob::lib::meerkat_mob"), "meerkat-mob's lib under its scoped set is a gap");
+  // HeadCanonical under the workspace set is not the hook's HeadCanonical.
+  const headCanonical = mutate((copy) => {
+    const row = copy.closure_test_rows.find((candidate) => candidate.lane === "headcanonical");
+    row.package_flags = "-p meerkat-mob --features meerkat-mob/test-support,meerkat-mob/schema";
+  });
+  assert.ok(headCanonical.missing.includes("HeadCanonical::meerkat-mob::cold_restart_mob_resume"), "HeadCanonical keeps the hook's flags");
+  // A profile whose default-filter drops a binary does not run it.
+  const filtered = mutate((copy) => {
+    copy.closure_test_rows.find((candidate) => candidate.lane === "e2e-fast").profile = "ci-integration";
+  });
+  assert.ok(filtered.missing.includes("meerkat-integration-tests::test::e2e_fast_lane"), "ci-integration drops e2e_fast_lane");
+  // A row's binary list is what its job checks nextest against: it must be
+  // exactly what the row runs.
+  const overlisted = mutate((copy) => {
+    copy.closure_test_rows.find((row) => row.lane === "lib").binaries.push("meerkat-machine-derive");
+  });
+  assert.ok(overlisted.errors.some((error) => error.includes("lists binaries it does not run (meerkat-machine-derive)")), "a row cannot list a binary it does not run");
+  const underlisted = mutate((copy) => {
+    const row = copy.closure_test_rows.find((candidate) => candidate.lane === "lib");
+    delete row.filter;
+  });
+  assert.ok(underlisted.errors.some((error) => error.includes("runs binaries it does not list")), "a row cannot run binaries it does not list");
+  // A narrower scope than the closure is caught by the selftest's own
+  // test-scope assertion (the checker trusts plan.test_scope).
+  assert.throws(() => assertHookParity({ ...plan, test_scope: plan.packages }, "narrowed scope"));
+  // Every row-executing step is bound: with no workflow, each one is missing.
+  const unbound = checkHookCoverage(plan, { workflowText: "" });
+  assert.equal(unbound.errors.length, CI_ROW_STEPS.length, "every row-executing step is bound");
+}
+
+// What a plan may leave to the hook: the lib binaries of a lane the hook
+// runs, nothing else; and a row runs where its bound job runs.
+{
+  const plan = planFor(["crates/meerkat-mcp/src/lib.rs"]);
+  const baseline = checkHookCoverage(plan);
+  assert.deepEqual([baseline.missing, baseline.errors], [[], []], "the rows and the hook's kind(lib) lane cover the hook");
+  assert.ok(baseline.hook_retained > 0, "the plan leaves lib binaries to the hook");
+  const mutate = (change) => {
+    const copy = JSON.parse(JSON.stringify(plan));
+    change(copy);
+    return checkHookCoverage(copy);
+  };
+  const unretained = mutate((copy) => {
+    copy.hook_retained_lanes = [];
+  });
+  assert.ok(unretained.missing.includes("meerkat-mcp::lib::meerkat_mcp"), "a lib binary that neither runs is a gap");
+  // A retained lane exempts lib binaries only: leaving the integration lane to
+  // the hook exempts none of its tests, and the lib binaries lose their lane.
+  const integrationKept = mutate((copy) => {
+    copy.hook_retained_lanes = ["workspace integration lane"];
+    copy.closure_test_rows = copy.closure_test_rows.filter((row) => !row.binaries.includes("meerkat-mcp::form_elicitation"));
+  });
+  assert.ok(integrationKept.missing.includes("meerkat-mcp::test::form_elicitation"), "the integration lane's tests still need rows");
+  assert.ok(integrationKept.missing.includes("meerkat-mcp::lib::meerkat_mcp"), "and the lib binaries their own lane");
+  const unknownLane = mutate((copy) => {
+    copy.hook_retained_lanes = ["workspace lib lane"];
+  });
+  assert.ok(
+    unknownLane.errors.some((error) => error.includes("leaves \"workspace lib lane\" to the hook, which has no such workspace lane")),
+    "a lane the hook does not have is refused",
+  );
+  assert.ok(unknownLane.missing.includes("meerkat-mcp::lib::meerkat_mcp"), "and exempts nothing");
+  const elsewhere = mutate((copy) => {
+    copy.closure_test_rows[0].runner = "r1-c3d-30";
+  });
+  assert.ok(
+    elsewhere.errors.some((error) => error.includes("names runner r1-c3d-30, but job closure-tests runs on ubuntu-24.04")),
+    "a row cannot name a runner its job does not run on",
+  );
+  // The planner fails the same way for a lib-row runner no bound job runs on,
+  // and refuses an empty label.
+  const r1 = run(["--format", "json", "--lib-row-runner", "r1-c3d-30", "--", "crates/meerkat-mcp/src/lib.rs"]);
+  assert.equal(r1.status, 1, "a lib row on an unbound runner fails the plan");
+  assert.match(r1.stderr, /row lib names runner r1-c3d-30, but job closure-tests runs on ubuntu-24\.04/);
+  const empty = run(["--format", "json", "--lib-row-runner", "", "--", "crates/meerkat-mcp/src/lib.rs"]);
+  assert.equal(empty.status, 1, "an empty lib-row runner is an error");
+  assert.match(empty.stderr, /--lib-row-runner requires a runner label/);
+}
+
+// The bound steps: what a closure-tests row lists is what it runs, and no
+// other nextest command, selection or missing binary check can hide in the
+// steps the coverage model reads. Each mutation edits the real ci.yml text.
+{
+  const workflow = readFileSync(resolve(root, ".github/workflows/ci.yml"), "utf8");
+  assert.deepEqual(bindRowSteps(workflow), [], "the real workflow binds");
+  const mutated = (from, to) => {
+    assert.equal(workflow.split(from).length, 2, `mutation anchor is unique: ${from}`);
+    return bindRowSteps(workflow.replace(from, to));
+  };
+  const run = '          ./scripts/repo-cargo nextest run "${selection[@]}" --no-tests="${NO_TESTS}" --no-fail-fast --status-level slow --final-status-level slow\n';
+  const runOnly = mutated(run, run.replace('"${selection[@]}"', `"\${selection[@]}" -E 'none()'`));
+  assert.ok(runOnly.some((error) => error.includes("job closure-tests: the step runs")), "a run-only selection change is refused");
+  const ownSelection = mutated(run, run.replace('"${selection[@]}"', '${PACKAGES} "${test_flags[@]}" --profile "${PROFILE}"'));
+  assert.ok(ownSelection.some((error) => error.includes("job closure-tests: the step runs")), "a run that does not use the listed selection is refused");
+  const narrowed = mutated(
+    '          selection=(${PACKAGES} "${test_flags[@]}" --profile "${PROFILE}" "${filter_args[@]}")\n',
+    '          selection=(${PACKAGES} "${test_flags[@]}" --profile "${PROFILE}" "${filter_args[@]}")\n          [[ "${NO_TESTS}" == warn ]] && filter_args=(-E "none()")\n',
+  );
+  assert.ok(narrowed.some((error) => error.includes("job closure-tests: the step runs")), "a later selection change is refused");
+  const unchecked = mutated('          node scripts/ci-verify-row-binaries.mjs "${RUNNER_TEMP}/closure-test-list.json" ${BINARIES}\n', "");
+  assert.ok(unchecked.some((error) => error.includes("job closure-tests: the step runs")), "a step without the binary check is refused");
+  // An input reassigned before it is read leaves every pinned line intact:
+  // the line that reassigns it names it, and is refused.
+  const selectionLine = '          selection=(${PACKAGES} "${test_flags[@]}" --profile "${PROFILE}" "${filter_args[@]}")\n';
+  const repackaged = mutated(selectionLine, `          PACKAGES='-p meerkat-integration-tests'\n${selectionLine}`);
+  assert.ok(repackaged.some((error) => error.includes("job closure-tests: the step runs")), "a PACKAGES reassignment is refused");
+  const reprofiled = mutated(selectionLine, `          export PROFILE=ci-pr\n${selectionLine}`);
+  assert.ok(reprofiled.some((error) => error.includes("job closure-tests: the step runs")), "a PROFILE export is refused");
+  const listLine = '          ./scripts/repo-cargo nextest list "${selection[@]}" --message-format json >"${RUNNER_TEMP}/closure-test-list.json"\n';
+  const reread = mutated(listLine, `          read -r NO_TESTS <<<"warn"\n${listLine}`);
+  assert.ok(reread.some((error) => error.includes("job closure-tests: the step runs")), "a NO_TESTS read is refused");
+  // The test-thread stack: its MIN_STACK mapping and the line that exports it
+  // are pinned, and no later line can override RUST_MIN_STACK.
+  const mapping = "          NO_TESTS: ${{ matrix.no_tests }}\n          MIN_STACK: ${{ matrix.rust_min_stack }}\n";
+  const remapped = mutated(mapping, "          NO_TESTS: ${{ matrix.no_tests }}\n          MIN_STACK: 1048576\n");
+  assert.ok(remapped.some((error) => error.includes("step env MIN_STACK")), "an altered MIN_STACK mapping is refused");
+  const stackExport = '          # The hook ran every lane on a 32 MiB test-thread stack.\n          if [[ -n "${MIN_STACK}" ]]; then export RUST_MIN_STACK="${MIN_STACK}"; fi\n';
+  const reexported = mutated(stackExport, stackExport.replace('RUST_MIN_STACK="${MIN_STACK}"', "RUST_MIN_STACK=1048576"));
+  assert.ok(reexported.some((error) => error.includes("job closure-tests: the step runs")), "an altered RUST_MIN_STACK export is refused");
+  const unexported = mutated(stackExport, "");
+  assert.ok(unexported.some((error) => error.includes("job closure-tests: the step runs")), "a removed RUST_MIN_STACK export is refused");
+  const overridden = mutated(listLine, `          export RUST_MIN_STACK=1048576\n${listLine}`);
+  assert.ok(overridden.some((error) => error.includes("job closure-tests: the step runs")), "a later RUST_MIN_STACK override is refused");
+  const moved = mutated("      - name: Closure tests (the row's targets, workspace feature set)\n", "      - name: Closure tests (moved)\n");
+  assert.ok(moved.some((error) => error.includes("job closure-tests: step")), "the rows' step is bound by name");
+  const wrongMatrix = mutated(
+    "      matrix: ${{ fromJSON(needs.changes.outputs.closure_test_matrix) }}\n",
+    "      matrix: ${{ fromJSON(needs.changes.outputs.integration_matrix) }}\n",
+  );
+  assert.ok(wrongMatrix.some((error) => error.includes("its matrix is not")), "the closure-tests job runs the closure matrix");
+  const otherRunner = mutated(
+    "    if: ${{ needs.changes.result == 'success' && needs.changes.outputs.closure_test_count != '0' }}\n    runs-on: ubuntu-24.04\n",
+    "    if: ${{ needs.changes.result == 'success' && needs.changes.outputs.closure_test_count != '0' }}\n    runs-on: ubuntu-22.04\n",
+  );
+  assert.ok(otherRunner.some((error) => error.includes("job closure-tests: it does not run on ubuntu-24.04")), "the job's runner is bound");
+  const rewired = mutated(
+    "          TESTS: ${{ matrix.tests }}\n          PROFILE: ${{ matrix.profile }}\n",
+    "          TESTS: ${{ matrix.packages }}\n          PROFILE: ${{ matrix.profile }}\n",
+  );
+  assert.ok(rewired.some((error) => error.includes("step env TESTS")), "the step reads each selection input from its own matrix field");
+  const envSelection = mutated(
+    "          BINARIES: ${{ matrix.binaries }}\n",
+    "          BINARIES: ${{ matrix.binaries }}\n          NEXTEST_RUN_IGNORED: only\n",
+  );
+  assert.ok(envSelection.some((error) => error.includes("sets a NEXTEST_ variable")), "a NEXTEST_ variable in a bound job is refused");
+}
+
+// The hook's selection is read from the hook script, not copied: a changed
+// hook filter changes what CI must cover, and a shape the model cannot read
+// fails closed.
+{
+  const hookText = readFileSync(resolve(root, HOOK_SCRIPT), "utf8");
+  const hook = hookModel(hookText);
+  assert.equal(hook.buildFilter, "kind(lib) or kind(test)");
+  assert.deepEqual(hook.headCanonical, { package: "meerkat-mob", test: "cold_restart_mob_resume", features: ["test-support"], profile: "fast" });
+  assert.equal(hook.e2eFast.binary, "e2e_fast_lane");
+  assert.deepEqual(
+    hook.lanes.map((lane) => [lane.label, lane.profile, lane.filter]),
+    [
+      ["workspace unit lane", "default", "kind(lib)"],
+      ["workspace integration lane", "fast", "kind(test)"],
+      ["e2e-fast lane", "default", "binary(e2e_fast_lane)"],
+    ],
+  );
+  const plan = planFor(["Cargo.lock"]);
+  assert.deepEqual(checkHookCoverage(plan, { hookText }).missing, []);
+  const mutatedHook = (from, to) => {
+    assert.equal(hookText.split(from).length, 2, `hook mutation anchor is unique: ${from}`);
+    return hookText.replace(from, to);
+  };
+  // Widening only a lane's filter changes nothing (the build inventory lists
+  // lib and test binaries); widening both makes bin tests hook coverage.
+  const laneOnly = checkHookCoverage(plan, {
+    hookText: mutatedHook("    -E 'kind(lib)' --no-tests=fail --no-fail-fast \\\n", "    -E 'kind(lib) or kind(bin)' --no-tests=fail --no-fail-fast \\\n"),
+  });
+  assert.deepEqual(laneOnly.missing, [], "a lane cannot run binaries the hook's build does not list");
+  const widened = checkHookCoverage(plan, {
+    hookText: mutatedHook("    -E 'kind(lib)' --no-tests=fail --no-fail-fast \\\n", "    -E 'kind(lib) or kind(bin)' --no-tests=fail --no-fail-fast \\\n")
+      .replace("-E 'kind(lib) or kind(test)' >", "-E 'kind(lib) or kind(test) or kind(bin)' >"),
+  });
+  assert.ok(widened.missing.some((key) => key.includes("::bin::")), "a hook that also builds and runs bin tests needs rows for them");
+  const otherLane = checkHookCoverage(plan, {
+    hookText: mutatedHook("    -E 'binary(e2e_fast_lane)' --no-tests=fail --no-fail-fast \\\n", "    -E 'binary(e2e_system_lane)' --no-tests=fail --no-fail-fast \\\n"),
+  });
+  assert.ok(otherLane.missing.includes("meerkat-integration-tests::test::e2e_system_lane"), "a different e2e lane in the hook needs its row");
+  assert.throws(
+    () => checkHookCoverage(plan, { hookText: mutatedHook("    -E 'kind(lib)' --no-tests=fail --no-fail-fast \\\n", "    -E 'kind(lib) and not test(=slow)' --no-tests=fail --no-fail-fast \\\n") }),
+    /cannot be decided per binary/,
+    "a hook filter the model cannot decide per binary fails closed",
+  );
+  assert.throws(
+    () => hookModel(mutatedHook("    -E 'kind(lib)' --no-tests=fail --no-fail-fast \\\n", "    -E 'kind(lib)' --no-tests=fail --no-fail-fast --run-ignored all \\\n")),
+    /shape the coverage model does not read/,
+    "a hook lane with an extra selection flag fails closed",
+  );
+}
+
+// The matrix the closure-tests job runs is the plan's rows, field by field.
+{
+  const plan = planFor(["crates/meerkat-mob/src/lib.rs"]);
+  const github = run(["--format", "github", "--", "crates/meerkat-mob/src/lib.rs"]);
+  assert.equal(github.status, 0, github.stderr);
+  const lines = Object.fromEntries(github.stdout.trim().split("\n").map((line) => [line.slice(0, line.indexOf("=")), line.slice(line.indexOf("=") + 1)]));
+  assert.deepEqual(
+    JSON.parse(lines.closure_test_matrix).include,
+    plan.closure_test_rows.map((row) => ({
+      name: row.name,
+      packages: row.package_flags,
+      tests: row.test_flags,
+      profile: row.profile,
+      filter: row.filter ?? "",
+      binaries: row.binaries.join(" "),
+      no_tests: row.no_tests,
+      rust_min_stack: String(row.rust_min_stack),
+    })),
+  );
+}
+
+// The filter subset and the profiles: ci-integration selects exactly fast's
+// binaries; ci-pr and ci-unit select every binary (nextest's `inherits`
+// does not carry a default-filter); a test() predicate cannot be decided per
+// binary and is refused rather than guessed.
+{
+  const nextest = readFileSync(resolve(root, ".config/nextest.toml"), "utf8");
+  assert.equal(profileFilter(nextest, "ci-integration"), profileFilter(nextest, "fast"));
+  assert.equal(profileFilter(nextest, "ci-pr"), "all()");
+  assert.equal(profileFilter(nextest, "ci-unit"), "all()");
+  const fast = parseFilter(profileFilter(nextest, "fast"));
+  assert.equal(fast({ kind: "test", binary: "e2e_fast_lane", package: "meerkat-integration-tests" }), false);
+  assert.equal(fast({ kind: "test", binary: "phase1_wiring", package: "meerkat-integration-tests" }), true);
+  const both = parseFilter("kind(test) & (binary(=a) | package(b))");
+  assert.equal(both({ kind: "test", binary: "a", package: "x" }), true);
+  assert.equal(both({ kind: "lib", binary: "a", package: "x" }), false);
+  assert.equal(both({ kind: "test", binary: "c", package: "b" }), true);
+  assert.throws(() => parseFilter("test(=foo)"), /cannot be decided per binary/);
+  assert.throws(() => parseFilter("binary(~e2e)"), /unsupported name matcher/);
+  assert.throws(() => profileFilter(nextest, "no-such-profile"));
+}
+
+// featureClosure infers the features of a package-scoped build (HeadCanonical's
+// own command, any package-scoped row the checker reads). That inference must
+// never claim a feature Cargo does not enable in a package-scoped build.
+{
+  const metadata = readMetadata();
+  const packages = workspacePackages(metadata);
+  const unified = workspaceFeatures(metadata, packages);
+  for (const pkg of packages) {
+    const defaults = Object.hasOwn(pkg.features ?? {}, "default") ? ["default"] : [];
+    const inferred = featureClosure(pkg, new Set(defaults));
+    const tree = spawnSync(
+      join(root, "scripts/repo-cargo"),
+      ["tree", "-p", pkg.name, "--depth", "0", "-e", "normal,build,dev", "--prefix", "none", "-f", "{p}|{f}"],
+      { cwd: root, encoding: "utf8" },
+    );
+    assert.equal(tree.status, 0, `cargo tree -p ${pkg.name}: ${tree.stderr}`);
+    const first = tree.stdout.split("\n")[0];
+    const actual = new Set(first.slice(first.indexOf("|") + 1).split(",").filter(Boolean));
+    for (const feature of inferred) {
+      assert.ok(actual.has(feature), `${pkg.name}: inferred default feature ${feature} is enabled by Cargo`);
+      assert.ok(unified.get(pkg.name).has(feature), `${pkg.name}: ${feature} is in the workspace set`);
+    }
+  }
+}
+
+// The job's runtime check: nextest must list exactly the planned binaries,
+// and no test of theirs may be filtered out by a profile.
+{
+  const verifier = resolve(here, "ci-verify-row-binaries.mjs");
+  const scratch = mkdtempSync(join(tmpdir(), "ci-verify-row-binaries-"));
+  const verify = (suites, expected) => {
+    const listPath = join(scratch, "list.json");
+    writeFileSync(listPath, JSON.stringify({ "rust-suites": suites }));
+    return spawnSync("node", [verifier, listPath, ...expected], { encoding: "utf8" });
+  };
+  const suite = (testcases, status = "listed") => ({ status, testcases });
+  const match = { "filter-match": { status: "matches" } };
+  const ignored = { "filter-match": { status: "mismatch", reason: "ignored" } };
+  const defaultFiltered = { "filter-match": { status: "mismatch", reason: "default-filter" } };
+  try {
+    assert.equal(verify({ "p::a": suite({ t1: match, t2: ignored }), p: suite({ t3: match }) }, ["p::a", "p"]).status, 0);
+    assert.equal(verify({ "p::a": suite({ t1: match }) }, ["p::a", "p::b"]).status, 1, "a missing binary fails");
+    assert.equal(verify({ "p::a": suite({ t1: match }), "q::a": suite({ t1: match }) }, ["p::a"]).status, 1, "an extra binary fails");
+    assert.equal(
+      verify({ "p::a": suite({ t1: match }), q: suite({ t1: { "filter-match": { status: "mismatch", reason: "expression" } } }), r: suite({}, "skipped") }, ["p::a"]).status,
+      0,
+      "a listed binary none of whose tests are selected (another member's lib under --workspace) passes",
+    );
+    assert.equal(verify({ "p::a": suite({ t1: defaultFiltered }) }, ["p::a"]).status, 1, "a profile-filtered test fails");
+    assert.equal(verify({ "p::a": suite({}, "skipped") }, ["p::a"]).status, 1, "a skipped binary fails");
+  } finally {
+    rmSync(scratch, { recursive: true, force: true });
   }
 }
 

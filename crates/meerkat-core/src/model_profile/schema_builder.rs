@@ -277,7 +277,10 @@ fn build_openai_schema(caps: &ModelCapabilities) -> Value {
 //
 // Current hand-written shape:
 // - thinking: object { thinking_level, thinking_budget }
-// - thinking_level: string enum                       (Gemini 3 authoritative knob)
+// - thinking_level: string enum                       (Gemini 3 authoritative knob;
+//                                                      the row's `effort_levels`, or
+//                                                      every Gemini level when the
+//                                                      row records none)
 // - thinking_budget: integer                          (legacy flat alternative)
 // - top_k: integer
 // - top_p: number
@@ -289,7 +292,7 @@ fn build_gemini_schema(caps: &ModelCapabilities) -> Value {
     if caps.thinking != ThinkingSupport::None {
         let thinking_props = match caps.thinking {
             ThinkingSupport::GeminiThinkingLevel => json!({
-                "thinking_level": gemini_thinking_level_schema(),
+                "thinking_level": gemini_thinking_level_schema(caps.effort_levels),
                 "thinking_budget": { "type": "integer", "minimum": 0 }
             }),
             _ => json!({
@@ -306,7 +309,10 @@ fn build_gemini_schema(caps: &ModelCapabilities) -> Value {
             }),
         );
         if caps.thinking == ThinkingSupport::GeminiThinkingLevel {
-            props.insert("thinking_level".into(), gemini_thinking_level_schema());
+            props.insert(
+                "thinking_level".into(),
+                gemini_thinking_level_schema(caps.effort_levels),
+            );
         }
         if caps.supports_thinking_budget_legacy {
             props.insert(
@@ -352,12 +358,24 @@ fn integer_nonneg_schema() -> Value {
     json!({ "type": "integer", "minimum": 0 })
 }
 
-fn gemini_thinking_level_schema() -> Value {
-    json!({
-        "description": "Gemini 3 reasoning level.",
-        "type": "string",
-        "enum": ["minimal", "low", "medium", "high"]
-    })
+/// Every Gemini `thinkingConfig.thinkingLevel` value, in wire order.
+const GEMINI_THINKING_LEVELS: &[EffortLevel] = &[
+    EffortLevel::Minimal,
+    EffortLevel::Low,
+    EffortLevel::Medium,
+    EffortLevel::High,
+];
+
+/// The `thinking_level` enum a Gemini row advertises: the levels the row
+/// records in `effort_levels` (a model may refuse some, e.g. `minimal`), or
+/// every Gemini level when the row records none.
+fn gemini_thinking_level_schema(levels: &[EffortLevel]) -> Value {
+    let levels = if levels.is_empty() {
+        GEMINI_THINKING_LEVELS
+    } else {
+        levels
+    };
+    effort_enum_schema("Gemini 3 reasoning level.", levels)
 }
 
 /// Project a typed [`EffortLevel`] set into a JSON Schema string-enum.
@@ -485,6 +503,34 @@ mod tests {
             .map(str::to_string)
             .collect();
         assert_eq!(values, expected);
+    }
+
+    #[test]
+    fn gemini_thinking_level_enum_follows_recorded_levels() {
+        let base = TEST_CATALOG
+            .capabilities_for(crate::Provider::Gemini, "test-gemini-video")
+            .expect("test gemini row");
+        let caps = ModelCapabilities {
+            effort_levels: &[EffortLevel::Low, EffortLevel::Medium, EffortLevel::High],
+            ..*base
+        };
+        let schema = build_params_schema(&caps);
+        let expected = json!(["low", "medium", "high"]);
+        assert_eq!(
+            schema["properties"]["thinking_level"]["enum"], expected,
+            "a row that records its levels advertises exactly those"
+        );
+        assert_eq!(
+            schema["properties"]["thinking"]["properties"]["thinking_level"]["enum"], expected,
+            "the nested thinking object follows the same levels"
+        );
+
+        // A row that records no levels keeps advertising every Gemini level.
+        let unrecorded = build_params_schema(base);
+        assert_eq!(
+            unrecorded["properties"]["thinking_level"]["enum"],
+            json!(["minimal", "low", "medium", "high"])
+        );
     }
 
     #[test]

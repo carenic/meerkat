@@ -6,7 +6,7 @@ icon: "python"
 
 The Python SDK (`meerkat-sdk`) is a runtime-backed client over `rkat-rpc`.
 
-- **Contract version:** `0.9.0`
+- **Contract version:** `0.9.1`
 - **Python:** `>=3.10`
 - **Runtime dependencies:** `websockets>=12,<16`, plus `typing_extensions>=4.1` on Python 3.10
 
@@ -89,8 +89,15 @@ asyncio.run(main())
 - `injected_context`, `transient_turn_context`
 - `skill_refs`, `turn_tool_overlay`
 - `additional_instructions`
-- `keep_alive`, `model`, `provider`, `self_hosted_server_id`, `max_tokens`, `system_prompt`
-- `output_schema`, `structured_output_retries`, `provider_params`
+- `keep_alive`, `model`, `provider`, `self_hosted_server_id`, `system_prompt`
+- `provider_params`
+- `auth_binding`: a binding ref (or `{"action": "set", "value": ref}`) switches
+  the session's credential binding from this turn on, `{"action": "clear"}`
+  drops it, and omitting it keeps the current one
+
+They also accept `max_tokens`, `output_schema` and `structured_output_retries`,
+but the server refuses these on a turn with `INVALID_PARAMS`: they are build
+settings. Pass them to `create_session(...)` or `create_deferred_session(...)`.
 
 Immediate session creation also accepts `injected_context`,
 `transient_turn_context`, `auth_binding`, the schedule/WorkGraph/web-search

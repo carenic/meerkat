@@ -86,9 +86,11 @@ not make a `config get` then `config set` round trip safe in a child realm:
 in, and `config set` writes all of it back as the child's own values. Use
 `config patch` for partial edits.
 
-This shared configuration path does not install native permission owners or
-select OS confinement. Native governance requires explicit trusted-host
-composition; shell confinement is a separate host setting. See
+This shared configuration path does not install native permission owners.
+Native governance requires explicit trusted-host composition. The stock hosts
+select OS process confinement from the `[confinement]` section and their
+`--confinement` flags (see [OS process confinement](#os-process-confinement));
+a Rust embedding installs it on its own factory. See
 [authorization integration](/guides/authorization-integration) for the supported
 profiles and [native governed embedding](/rust/native-authorization) for setup.
 
@@ -134,6 +136,7 @@ Meerkat uses three update models:
   - filesystem-backed docs additionally use raw TOML presence for `tools`, `retry`, and `skills` overrides, so explicitly setting a supported field to its default can override a parent; this is not a universal rule for all scalar fields or non-filesystem sources
   - `model_fallback`: a nondefault table replaces the inherited table as a whole; an empty/default-valued table inherits, while `enabled = false` explicitly replaces and disables
   - `governance`: a present section, even an empty one, replaces the inherited one as a whole; a document without it inherits it
+  - `confinement`: per launch kind, a requirement only holds or is added; a less trusted document cannot replace or remove it (see [composition](#composition))
   - the binding/backend/auth maps are **not** merged across realms: each realm's binding resolves its `backend_profile` / `auth_profile` only within its own section (the owning realm)
 3. Runtime patch APIs (`config/patch`, `PATCH /config`) use **RFC 7396 JSON merge-patch** semantics.
 
@@ -312,6 +315,7 @@ separate owner:
 ```toml
 [limits]
 budget = 200000              # max tokens, agent lifetime
+max_tool_calls = 500         # max tool calls, agent lifetime
 max_duration = "4h"          # wall-clock ceiling for the AGENT'S LIFETIME
 max_turn_duration = "30m"    # aggregate wall-clock ceiling for ONE TURN
 ```
@@ -337,6 +341,20 @@ deployment declares a ceiling. The bound is enforced at segment boundaries, so
 it never tears down a tool call that is already running; the effective ceiling
 is `max_turn_duration` plus the longest segment already in flight (at most one
 per-tool-call timeout, since calls in a batch run their clocks together).
+
+Before a limit stops a run, the agent warns once: when tokens, tool calls, or
+a time horizon reach `[agent] budget_warning_threshold` of their limit (`0.8`
+by default), it emits a `budget_warning` event whose `percent` is the fraction
+used. The per-turn horizon warns again each turn. The value takes effect when
+it is greater than 0 and at most 1; `1.0` keeps only the `budget_warning`
+emitted when a limit is reached. A config with a value outside that range
+still loads, with a warning, and keeps the inherited threshold (the default if
+no parent realm sets one).
+
+```toml
+[agent]
+budget_warning_threshold = 0.8
+```
 
 `limits.max_sessions` controls active-session admission; persisted history
 does not consume the limit. RPC, REST, and MCP snapshot this value when their
@@ -544,6 +562,127 @@ config document. An ordinary config write (`config/set`, `config/patch`,
 remove or restate the section, including a full replace that omits it, and
 is refused with `governance_administration_required`. The section stays
 readable through the ordinary config reads.
+
+## OS process confinement
+
+`[confinement]` selects the OS process confinement a stock host (`rkat`,
+`rkat-rpc`, `rkat-rest` and `rkat-mcp`) applies to the processes its agents
+launch: shell tool calls, background jobs and monitors (`shell`), command
+hooks (`command_hooks`) and local MCP stdio servers (`mcp_stdio`). Without
+the section, every launch runs as the trusted host, as before.
+
+```toml
+# Every launch kind: the workspace preset.
+[confinement.all]
+mode = "workspace"
+network = "denied"           # the default; or "unrestricted"
+read = ["/opt/toolchain"]    # extra read-only subtrees
+write = ["/tmp/build"]       # extra writable subtrees
+
+# A kind's own table replaces `all` for that kind in this document.
+[confinement.mcp_stdio]
+mode = "custom"
+working_directory = "/srv/mcp"
+requirement = { baseline = "command_runtime_v1", read = { kind = "paths", paths = [{ kind = "subtree", path = "/srv/mcp" }] }, write = { kind = "paths", paths = [] }, deny_read = [], deny_write = [], network = { kind = "denied" }, unix_connect = [], require_descendant_termination = false }
+```
+
+- `trusted_host`: no OS confinement, the default.
+- `workspace`: the launched process reads and writes the host's workspace
+  root and the `write` subtrees, reads the `read` subtrees, gets the
+  `command_runtime_v1` platform baseline, and opens IP sockets only with
+  `network = "unrestricted"`. The workspace root is the CLI's project root
+  and a server's `--context-root`; a server started without `--context-root`
+  refuses to start with this mode instead of confining nothing. Command hooks
+  and MCP stdio servers start in the workspace root; the shell keeps its own
+  working directory.
+- `custom`: an explicit requirement in the confinement wire shape (see
+  [native governed embedding](/rust/native-authorization)), and the absolute
+  working directory of the command hooks and MCP stdio servers it confines.
+
+Every path is absolute, without `.` or `..` components. Unknown keys, modes
+and fields are refused, not ignored.
+
+A launch the platform's backend cannot confine as required is refused at that
+launch with typed `confinement_refused` feedback; it never runs unconfined,
+and the rest of the run continues. At startup a host reports each launch
+kind's requested and effective confinement (the backend that enforces it, or
+that every launch of the kind is refused), what keeps the host's own inputs
+from its confined processes, and each convention source it does not trust.
+macOS uses Seatbelt. Linux uses namespaces and seccomp: it needs unprivileged
+user namespaces, and it refuses deny lists, Unix socket grants, nested grants,
+and granted paths that do not exist or pass through a symbolic link. Other
+platforms refuse every confined launch. A confined process finds its program,
+libraries and data only inside its granted subtrees and the platform
+baseline; grant anything else it needs with `read`. A confined command hook
+or MCP stdio server names its program by absolute path and receives only its
+configured environment, never the host's; a relative program name or a loader
+variable such as `LD_PRELOAD` refuses that launch.
+
+### Composition
+
+A requirement only ever holds or is added across the documents a realm
+composes, from the most trusted: the user document (`~/.rkat/config.toml`,
+which applies even when no document declares `[realm.global]`), then the
+realm chain from its root to the head. A document's statement for a launch
+kind is its own kind table, else its own `all`.
+
+- The most trusted document that requires confinement for a kind decides it.
+- A less trusted document may restate that requirement exactly or state
+  nothing for the kind. Any other statement, `trusted_host` included, refuses
+  the composition with an error naming both realms.
+- A less trusted document can still add confinement for a kind that no more
+  trusted document confines.
+
+### The host's own inputs
+
+A host that confines every launch kind keeps the inputs it reads its own
+administration from out of its confined processes' reach:
+
+- The realm state (every realm config document and the head realm's stores
+  under the state root) and the user config document. A start in which a
+  confined process could change one, by writing it, creating it where it is
+  missing, or replacing a directory on the way to it, is refused, naming the
+  input and the launch kind. Keep the state root and the user config root
+  outside every write grant (`--state-root`, `--user-config-root`).
+- The convention sources: the project and user `mcp.toml` files and the
+  hooks of the project `.rkat/config.toml`. A source a confined process can
+  write is not trusted. Each of its MCP servers is refused with
+  `untrusted_configuration_source` before it is expanded, authorized,
+  connected or spawned, and each of its hooks keeps its place and is refused
+  at every invocation, so a mandatory guardrail withholds what it gates. A
+  definition that a trusted source states identically is used from that
+  source.
+
+Each launch kind is judged on its own grants and protections: one kind's
+protection does not cover another kind that writes the same place. On macOS
+the `workspace` preset protects `<root>/.rkat` (the CLI's default realm state
+and the project's convention files). The Linux backend has no deny lists, so
+there the host's realm state must live outside the workspace.
+
+A host that runs any launch kind as the trusted host claims none of this: its
+startup report says that a process the agent drives can still change the
+host's own inputs. `--confinement trusted-host` turns confinement off for the
+whole process, with no such guarantee.
+
+### Administration
+
+Like [governance](#governance-settings), the section is administered by the
+host in the document itself. An ordinary config write (`config/set`,
+`config/patch`, `PUT`/`PATCH /config`, the MCP config tool or the CLI) cannot
+add, change or remove it, including a full replace that omits it, and is
+refused with `confinement_administration_required`. Restating it unchanged is
+allowed. The section stays readable through the ordinary config reads.
+
+### Operator flags
+
+Each stock binary accepts `--confinement <trusted-host|workspace>`, with
+`--confinement-network <denied|unrestricted>` and the repeatable
+`--confinement-read <path>` and `--confinement-write <path>` for the workspace
+preset. The flags replace the composed section for every launch kind of that
+process, after composition: `--confinement trusted-host` is the operator's
+explicit opt-out. They are never persisted, and no session, turn or API
+parameter can carry them. Relative flag paths resolve against the working
+directory.
 
 ## See also
 

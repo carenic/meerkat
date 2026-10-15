@@ -47,11 +47,17 @@ rust_library(
     aliases = aliases(package_name = "crates/meerkat-live"),
     crate_name = "meerkat_live",
     crate_root = "src/lib.rs",
-    crate_features = [
-        "__meerkat-generated-authority-bridge",
-        "test-support",
-        "webrtc",
-    ],
+    crate_features = select({
+        "//tools/bazel:release_build": [
+            "__meerkat-generated-authority-bridge",
+            "webrtc",
+        ],
+        "//conditions:default": [
+            "__meerkat-generated-authority-bridge",
+            "test-support",
+            "webrtc",
+        ],
+    }),
     edition = "2024",
     rustc_flags = [
         "--cfg=meerkat_internal_generated_authority_bridge",
@@ -62,7 +68,7 @@ rust_library(
     srcs = glob(["src/**/*.rs"]),
     visibility = ["//visibility:public"],
     rustc_env = {
-        "CARGO_PKG_VERSION": "0.9.0",
+        "CARGO_PKG_VERSION": "0.9.1",
         "CARGO_MANIFEST_DIR": "./crates/meerkat-live",
         "MEERKAT_GENERATED_AUTHORITY_BRIDGE_SYMBOL_SUFFIX": "bazel_private_generated_authority_bridge",
     },
@@ -89,11 +95,17 @@ rust_library(
     aliases = aliases(package_name = "crates/meerkat-live"),
     crate_name = "meerkat_live",
     crate_root = "src/lib.rs",
-    crate_features = [
-        "__meerkat-generated-authority-bridge",
-        "test-support",
-        "webrtc",
-    ],
+    crate_features = select({
+        "//tools/bazel:release_build": [
+            "__meerkat-generated-authority-bridge",
+            "webrtc",
+        ],
+        "//conditions:default": [
+            "__meerkat-generated-authority-bridge",
+            "test-support",
+            "webrtc",
+        ],
+    }),
     edition = "2024",
     rustc_flags = [
         "--cfg=meerkat_internal_generated_authority_bridge",
@@ -106,7 +118,7 @@ rust_library(
         "//crates/meerkat:__pkg__",
     ],
     rustc_env = {
-        "CARGO_PKG_VERSION": "0.9.0",
+        "CARGO_PKG_VERSION": "0.9.1",
         "CARGO_MANIFEST_DIR": "./crates/meerkat-live",
         "MEERKAT_GENERATED_AUTHORITY_BRIDGE_SYMBOL_SUFFIX": "bazel_private_generated_authority_bridge",
     },
@@ -154,7 +166,7 @@ rust_test(
     srcs = glob(["src/**/*.rs"]),
     visibility = ["//visibility:public"],
     rustc_env = {
-        "CARGO_PKG_VERSION": "0.9.0",
+        "CARGO_PKG_VERSION": "0.9.1",
         "CARGO_MANIFEST_DIR": "./crates/meerkat-live",
         "MEERKAT_GENERATED_AUTHORITY_BRIDGE_SYMBOL_SUFFIX": "bazel_private_generated_authority_bridge",
     },

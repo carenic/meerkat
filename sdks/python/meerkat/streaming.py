@@ -14,7 +14,11 @@ from typing import TYPE_CHECKING, Any, AsyncIterator, Callable
 
 from .consent import CONSENT_NOTICE_NOTIFICATION
 from .event_envelope import parse_agent_event_envelope
-from .errors import MeerkatError, meerkat_error_from_jsonrpc_code
+from .errors import (
+    COMMS_SEND_ERROR_CODES,
+    MeerkatError,
+    meerkat_error_from_jsonrpc_code,
+)
 from .events import Event, TextDelta
 
 if TYPE_CHECKING:
@@ -273,10 +277,14 @@ class _StdoutDispatcher:
                             # payload that happened to also carry "reason"
                             # (e.g. `mob_member_reload_required`). The whole
                             # dict survives as `details` unless the server
-                            # explicitly nests one under "details".
-                            nested_details = nested_details.get(
-                                "details", nested_details
-                            )
+                            # explicitly nests one under "details". A typed
+                            # `comms/send` failure is such a bare payload: its
+                            # own optional `details` field (a transport
+                            # error's text) is part of it, not an envelope.
+                            if nested_code not in COMMS_SEND_ERROR_CODES:
+                                nested_details = nested_details.get(
+                                    "details", nested_details
+                                )
                         future.set_exception(
                             meerkat_error_from_jsonrpc_code(
                                 err.get("code", "UNKNOWN"),

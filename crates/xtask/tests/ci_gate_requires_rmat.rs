@@ -67,6 +67,7 @@ fn ci_runs_fail_closed_cargo_lanes_on_hosted_runners() {
             "changes",
             "clippy",
             "closure-check",
+            "closure-tests",
             "example-web",
             "feature-check",
             "fmt-governance",
@@ -215,6 +216,7 @@ fn ci_runs_fail_closed_cargo_lanes_on_hosted_runners() {
         "clippy",
         "unit",
         "integration",
+        "closure-tests",
         "governed-jsonl",
         "main-unit",
         "main-unit-archive-build",
@@ -241,11 +243,17 @@ fn ci_runs_fail_closed_cargo_lanes_on_hosted_runners() {
         "require_ran \"Example web suites\"",
         "require_ran \"WASM timer ownership\"",
         "require_ran \"Integration tests\"",
+        "require_ran \"Closure tests\"",
         "require_ran \"Governed JSONL\"",
         // Every tests/*.rs binary of an integration suite, unless the suite
         // names its targets (the gpt-live replay suite runs one).
         "test_flags=(--test '*')",
         "\"${test_flags[@]}\" --profile ci-pr",
+        // The pre-push hook's cargo-test coverage for the test scope: every
+        // row lists exactly its planned binaries before it runs them.
+        "closure_test_matrix",
+        "node scripts/ci-verify-row-binaries.mjs",
+        "\"${test_flags[@]}\" --profile \"${PROFILE}\" \"${filter_args[@]}\"",
         "a build-relevant change produced no lanes",
         "neither a unit lane nor a deferred package list",
         "unit tests deferred to the push-to-main run",
@@ -510,9 +518,14 @@ fn nightly_holds_a_bounded_number_of_hosted_slots() {
         if name == ROOT {
             assert!(job.get("needs").is_none(), "{ROOT} runs first");
             // A graph-only dispatch (the pre-tag check) runs exactly this job.
-            assert!(
-                job.get("if").is_none(),
-                "{ROOT} runs on every nightly run, graph-only dispatches included"
+            // Only the self-hosted graph's default-off repository gate skips
+            // it on other runs (the chains below still run); a graph-only
+            // dispatch always calls it, so a disabled graph fails there
+            // instead of finishing green with nothing run.
+            assert_eq!(
+                job.get("if").and_then(serde_yaml::Value::as_str),
+                Some("${{ vars.MEERKAT_GCP_BUILDBUDDY_ENABLED == 'true' || inputs.graph_only }}"),
+                "{ROOT} runs on every nightly run while the self-hosted graph is enabled and on every graph-only dispatch"
             );
             continue;
         }
@@ -607,6 +620,42 @@ fn buildbuddy_workflow_is_called_only_by_nightly_and_release() {
     assert!(
         release.contains(".schema_version == 4") && release.contains("github-hosted-cargo"),
         "require_ci_green must accept the Cargo PR CI attestation"
+    );
+    // The self-hosted graph is default off behind one repository variable:
+    // every job in buildbuddy.yml that starts, syncs or scales GCP carries it,
+    // and a tag validates with Cargo whenever it is off
+    // (scripts/test-gcp-buildbuddy-workflow-gate.sh plans both routes).
+    const GATE_ON: &str = "vars.MEERKAT_GCP_BUILDBUDDY_ENABLED == 'true'";
+    const GATE_OFF: &str = "vars.MEERKAT_GCP_BUILDBUDDY_ENABLED != 'true'";
+    let job_if = |workflow: &serde_yaml::Value, job: &str| -> String {
+        workflow
+            .get("jobs")
+            .and_then(|jobs| jobs.get(job))
+            .and_then(|job| job.get("if"))
+            .and_then(serde_yaml::Value::as_str)
+            .unwrap_or_default()
+            .to_owned()
+    };
+    for job in [
+        "control-plane-up",
+        "executors-up",
+        "executors-down",
+        "control-plane-down",
+    ] {
+        let condition = job_if(&doc, job);
+        assert!(
+            condition.contains(GATE_ON) && !condition.contains("||"),
+            "buildbuddy.yml job {job} must run only while the self-hosted graph is enabled; if: {condition:?}"
+        );
+    }
+    let release_doc = read_workflow(&release_yml);
+    assert!(
+        job_if(&release_doc, "release_validate_buildbuddy_full").contains(GATE_ON),
+        "the tag runs the full BuildBuddy graph only while the self-hosted graph is enabled"
+    );
+    assert!(
+        job_if(&release_doc, "release_validate_cargo").contains(GATE_OFF),
+        "the tag validates with Cargo while the self-hosted graph is disabled"
     );
 }
 

@@ -70,6 +70,18 @@ impl OpenAiBackendKind {
         matches!(self, Self::OpenAiApi)
     }
 
+    /// Whether this backend's wire carries an ordered System message after
+    /// the leading system prefix. The ChatGPT backend's Responses wire has one
+    /// top-level `instructions` string: it carries a single leading System
+    /// row and refuses any later one. The other backends carry System rows in
+    /// place. A catalog row's `supports_mid_conversation_system_messages`
+    /// holds through a backend only when this holds too. The one owner of
+    /// that decision: the OpenAI client refuses such a row on this wire, and
+    /// session capability resolution reads it from here.
+    pub fn admits_mid_conversation_system_messages(self) -> bool {
+        !matches!(self, Self::ChatGptBackend)
+    }
+
     pub fn default_base_url(self) -> &'static str {
         match self {
             Self::OpenAiApi => "https://api.openai.com",
@@ -91,6 +103,18 @@ mod tests {
             assert_eq!(
                 kind.admits_prompt_cache_fields(),
                 *kind == OpenAiBackendKind::OpenAiApi,
+                "{}",
+                kind.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn only_the_chatgpt_backend_refuses_mid_conversation_system_messages() {
+        for kind in OpenAiBackendKind::ALL {
+            assert_eq!(
+                kind.admits_mid_conversation_system_messages(),
+                *kind != OpenAiBackendKind::ChatGptBackend,
                 "{}",
                 kind.as_str()
             );

@@ -2813,7 +2813,8 @@
           "invalid_launch",
           "unsupported_requirement",
           "backend_unavailable",
-          "preparation_failed"
+          "preparation_failed",
+          "untrusted_configuration_source"
         ],
         "type": "string"
       },
@@ -27573,7 +27574,8 @@
           "invalid_launch",
           "unsupported_requirement",
           "backend_unavailable",
-          "preparation_failed"
+          "preparation_failed",
+          "untrusted_configuration_source"
         ],
         "type": "string"
       },
@@ -32482,7 +32484,8 @@
           "invalid_launch",
           "unsupported_requirement",
           "backend_unavailable",
-          "preparation_failed"
+          "preparation_failed",
+          "untrusted_configuration_source"
         ],
         "type": "string"
       },
@@ -42503,7 +42506,8 @@
           "invalid_launch",
           "unsupported_requirement",
           "backend_unavailable",
-          "preparation_failed"
+          "preparation_failed",
+          "untrusted_configuration_source"
         ],
         "type": "string"
       },
@@ -60361,7 +60365,8 @@
           "invalid_launch",
           "unsupported_requirement",
           "backend_unavailable",
-          "preparation_failed"
+          "preparation_failed",
+          "untrusted_configuration_source"
         ],
         "type": "string"
       },
@@ -80864,7 +80869,8 @@
           "invalid_launch",
           "unsupported_requirement",
           "backend_unavailable",
-          "preparation_failed"
+          "preparation_failed",
+          "untrusted_configuration_source"
         ],
         "type": "string"
       },
@@ -88028,6 +88034,16 @@
           "transport_error"
         ],
         "type": "string"
+      },
+      "CommsSendRequiredAction": {
+        "description": "The caller's next safe move after an ambiguous `comms/send`.",
+        "oneOf": [
+          {
+            "const": "reconcile",
+            "description": "Reconcile against durable work truth by envelope id before any new\nattempt.",
+            "type": "string"
+          }
+        ]
       }
     },
     "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -88128,6 +88144,36 @@
           "peer",
           "envelope_id",
           "message"
+        ],
+        "type": "object"
+      },
+      {
+        "description": "The delivery outcome is unknown: the envelope may already be\ndelivered, so this is not a failed send. Reconcile against durable\nwork truth by `envelope_id` before any new attempt; a retry can\nduplicate the delivery.",
+        "properties": {
+          "code": {
+            "const": "send_ambiguous",
+            "type": "string"
+          },
+          "envelope_id": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "required_action": {
+            "$ref": "#/$defs/CommsSendRequiredAction"
+          },
+          "retry_safe": {
+            "description": "Always `false`: a blind retry can duplicate the delivery.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "code",
+          "envelope_id",
+          "message",
+          "retry_safe",
+          "required_action"
         ],
         "type": "object"
       },
@@ -88690,6 +88736,10 @@
           "budget": true,
           "comms": true,
           "compaction": true,
+          "confinement": {
+            "$ref": "#/$defs/ConfinementConfig",
+            "description": "Readable through the ordinary config surfaces; an ordinary write\ncannot add, change or remove it (the host administers OS process\nconfinement in the document itself)."
+          },
           "governance": {
             "anyOf": [
               {
@@ -88740,6 +88790,144 @@
           "tools": true
         },
         "type": "object"
+      },
+      "ConfinementConfig": {
+        "additionalProperties": false,
+        "description": "`[confinement]`: the OS process confinement a host applies to the\nprocesses its agents launch.\n\n`all` covers every launch kind, including kinds a later release adds. A\nkind's own table replaces `all` for that kind within the same document.\nAn empty table states nothing, so the document inherits.",
+        "properties": {
+          "all": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/LaunchConfinement"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "command_hooks": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/LaunchConfinement"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "mcp_stdio": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/LaunchConfinement"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "shell": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/LaunchConfinement"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "ExecutionConfinement": {
+        "additionalProperties": false,
+        "description": "Validated immutable requirements. Final host-path and backend validation\nbelongs to the adapter at preparation, not this platform-neutral contract.",
+        "properties": {
+          "baseline": {
+            "$ref": "#/$defs/PlatformBaseline"
+          },
+          "deny_read": {
+            "description": "Exclusions take precedence over all grants, including the baseline.",
+            "items": {
+              "$ref": "#/$defs/PathAccess"
+            },
+            "type": "array"
+          },
+          "deny_write": {
+            "items": {
+              "$ref": "#/$defs/PathAccess"
+            },
+            "type": "array"
+          },
+          "network": {
+            "$ref": "#/$defs/IpNetworkAccess"
+          },
+          "read": {
+            "$ref": "#/$defs/FilesystemAccess"
+          },
+          "require_descendant_termination": {
+            "description": "Some backends cannot prove termination of descendants that leave their\nprocess group. Such a backend must refuse when this is required.",
+            "type": "boolean"
+          },
+          "unix_connect": {
+            "description": "Exact local socket paths or explicitly granted socket directories.",
+            "items": {
+              "$ref": "#/$defs/PathAccess"
+            },
+            "type": "array"
+          },
+          "write": {
+            "$ref": "#/$defs/FilesystemAccess"
+          }
+        },
+        "required": [
+          "baseline",
+          "read",
+          "write",
+          "deny_read",
+          "deny_write",
+          "network",
+          "unix_connect",
+          "require_descendant_termination"
+        ],
+        "type": "object"
+      },
+      "FilesystemAccess": {
+        "description": "An empty path list grants no access of this class.",
+        "oneOf": [
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "unrestricted",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "paths",
+                "type": "string"
+              },
+              "paths": {
+                "items": {
+                  "$ref": "#/$defs/PathAccess"
+                },
+                "type": "array"
+              }
+            },
+            "required": [
+              "kind",
+              "paths"
+            ],
+            "type": "object"
+          }
+        ]
       },
       "GeminiThinkingConfig": {
         "additionalProperties": false,
@@ -88795,6 +88983,129 @@
           }
         },
         "type": "object"
+      },
+      "IpNetworkAccess": {
+        "description": "IP access is independent of Unix sockets and platform service IPC.\nEndpoints are resolved by the trusted host, never from child proxy settings.",
+        "oneOf": [
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "denied",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "unrestricted",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "endpoints": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "kind": {
+                "const": "connect",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "endpoints"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "LaunchConfinement": {
+        "description": "One launch kind's confinement.",
+        "oneOf": [
+          {
+            "additionalProperties": false,
+            "properties": {
+              "mode": {
+                "const": "trusted_host",
+                "type": "string"
+              }
+            },
+            "required": [
+              "mode"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "description": "The workspace preset: the launched process reads and writes the host's\nworkspace root and the `write` subtrees, reads the `read` subtrees, has\nthe platform baseline (`command_runtime_v1`), and opens IP sockets only\nwhen `network` allows it. It gets no deny lists, Unix socket grants or\ndescendant-termination requirement; use [`CustomConfinement`] for those.",
+            "properties": {
+              "mode": {
+                "const": "workspace",
+                "type": "string"
+              },
+              "network": {
+                "$ref": "#/$defs/WorkspaceNetwork",
+                "default": "denied"
+              },
+              "read": {
+                "default": [],
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "write": {
+                "default": [],
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              }
+            },
+            "required": [
+              "mode"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "description": "An explicit requirement in the [`crate::confinement::ConfinementSpec`]\nwire shape, and the absolute working directory of the command hooks and\nMCP stdio servers it confines. The shell keeps its own working directory.",
+            "properties": {
+              "mode": {
+                "const": "custom",
+                "type": "string"
+              },
+              "requirement": {
+                "$ref": "#/$defs/ExecutionConfinement"
+              },
+              "working_directory": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "mode",
+              "working_directory",
+              "requirement"
+            ],
+            "type": "object"
+          }
+        ]
       },
       "MeerkatSchema": {
         "description": "A Meerkat-native JSON schema."
@@ -89036,6 +89347,55 @@
           "schema"
         ],
         "type": "object"
+      },
+      "PathAccess": {
+        "description": "A literal file or directory, or a directory and its descendants.",
+        "oneOf": [
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "literal",
+                "type": "string"
+              },
+              "path": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "path"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "subtree",
+                "type": "string"
+              },
+              "path": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "path"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "PlatformBaseline": {
+        "description": "Explicit compatibility privileges, enumerated by each backend's policy.\nThere is no ambient home-directory, scratch, network, or credential grant.",
+        "oneOf": [
+          {
+            "const": "command_runtime_v1",
+            "description": "Executable loaders, system libraries, CPU/OS queries and null/random\ndevices. User data and optional service IPC require explicit grants.",
+            "type": "string"
+          }
+        ]
       },
       "ProfileId": {
         "description": "Opaque slug identifying an auth profile override on a connection.",
@@ -89834,6 +90194,21 @@
           "key"
         ],
         "type": "object"
+      },
+      "WorkspaceNetwork": {
+        "description": "IP network access of a workspace-confined launch. Exact connect\nendpoints are not offered: neither platform backend enforces them.",
+        "oneOf": [
+          {
+            "const": "denied",
+            "description": "No IP sockets (the default).",
+            "type": "string"
+          },
+          {
+            "const": "unrestricted",
+            "description": "IP sockets over the host's own network.",
+            "type": "string"
+          }
+        ]
       }
     },
     "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -93341,7 +93716,8 @@
           "invalid_launch",
           "unsupported_requirement",
           "backend_unavailable",
-          "preparation_failed"
+          "preparation_failed",
+          "untrusted_configuration_source"
         ],
         "type": "string"
       },
@@ -118698,7 +119074,8 @@
           "invalid_launch",
           "unsupported_requirement",
           "backend_unavailable",
-          "preparation_failed"
+          "preparation_failed",
+          "untrusted_configuration_source"
         ],
         "type": "string"
       },
@@ -144598,7 +144975,8 @@
           "invalid_launch",
           "unsupported_requirement",
           "backend_unavailable",
-          "preparation_failed"
+          "preparation_failed",
+          "untrusted_configuration_source"
         ],
         "type": "string"
       },
@@ -154400,7 +154778,8 @@
           "invalid_launch",
           "unsupported_requirement",
           "backend_unavailable",
-          "preparation_failed"
+          "preparation_failed",
+          "untrusted_configuration_source"
         ],
         "type": "string"
       },
@@ -159887,7 +160266,8 @@
           "invalid_launch",
           "unsupported_requirement",
           "backend_unavailable",
-          "preparation_failed"
+          "preparation_failed",
+          "untrusted_configuration_source"
         ],
         "type": "string"
       },
@@ -169000,7 +169380,8 @@
           "invalid_launch",
           "unsupported_requirement",
           "backend_unavailable",
-          "preparation_failed"
+          "preparation_failed",
+          "untrusted_configuration_source"
         ],
         "type": "string"
       },
@@ -176967,7 +177348,8 @@
           "invalid_launch",
           "unsupported_requirement",
           "backend_unavailable",
-          "preparation_failed"
+          "preparation_failed",
+          "untrusted_configuration_source"
         ],
         "type": "string"
       },
@@ -179854,7 +180236,8 @@
           "invalid_launch",
           "unsupported_requirement",
           "backend_unavailable",
-          "preparation_failed"
+          "preparation_failed",
+          "untrusted_configuration_source"
         ],
         "type": "string"
       },
@@ -183201,7 +183584,8 @@
           "invalid_launch",
           "unsupported_requirement",
           "backend_unavailable",
-          "preparation_failed"
+          "preparation_failed",
+          "untrusted_configuration_source"
         ],
         "type": "string"
       },

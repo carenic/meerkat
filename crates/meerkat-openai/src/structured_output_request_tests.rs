@@ -556,7 +556,10 @@ fn chat_completions_main_and_extraction_requests() {
 
 #[test]
 fn chat_completions_with_explicit_cache_keeps_the_section_before_the_breakpoint() {
-    let client = compatible_client();
+    // Breakpoints are authored only through a backend that has admitted the
+    // prompt-cache fields; no compatible route's backend has today.
+    let client = compatible_client()
+        .with_openai_backend(meerkat_core::provider_matrix::OpenAiBackendKind::OpenAiApi);
     let schema = review_schema();
     let body = client
         .build_chat_completions_body(&main_request(

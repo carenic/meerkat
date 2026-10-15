@@ -54,6 +54,23 @@ If `--realm` is omitted, the server creates a new isolated opaque realm (`realm-
 `--realm-backend` is a creation hint only; after first open, `realm_manifest.json`
 is authoritative.
 
+OS process confinement flags (see
+[OS process confinement](/concepts/configuration#os-process-confinement)):
+
+```bash
+rkat-rest [--confinement <trusted-host|workspace>] \
+  [--confinement-network <denied|unrestricted>] \
+  [--confinement-read <path>]... [--confinement-write <path>]...
+```
+
+They replace the realm's composed `[confinement]` for every launch kind of
+this process. The workspace preset confines each launch to `--context-root`;
+without `--context-root` the server refuses to start with it. A start in which
+a confined process could change the server's realm state or user config
+document is refused (see [the host's own inputs](/concepts/configuration#the-hosts-own-inputs)).
+At startup the server logs each launch kind's requested and effective
+confinement and warns for each required kind its platform cannot confine.
+
 <Warning>
 The REST server has no general inbound HTTP authentication layer. The `auth/*`
 routes manage outbound provider credentials; they do not authenticate callers
@@ -987,7 +1004,7 @@ Return the curated model catalog with provider profiles, capability metadata, an
 
 ```json Response (abbreviated)
 {
-  "contract_version": {"major": 0, "minor": 9, "patch": 0},
+  "contract_version": {"major": 0, "minor": 9, "patch": 1},
   "providers": [
     {
       "provider": "anthropic",
@@ -1021,7 +1038,7 @@ Returns runtime capabilities with status resolved against config.
 
 ```json Response (abbreviated)
 {
-  "contract_version": {"major": 0, "minor": 9, "patch": 0},
+  "contract_version": {"major": 0, "minor": 9, "patch": 1},
   "capabilities": [
     {
       "id": "sessions",
@@ -1075,6 +1092,20 @@ Accepted request forms:
   - `{ "patch": <JSON>, "expected_generation": <u64|null> }`
 
 If `expected_generation` is stale, the server returns `400` with a generation-conflict message.
+
+A `PUT` or `PATCH` that would administer a section the host administers in the
+document itself returns `400` with code `CONFIG_WRITE_REFUSED`, and nothing is
+written. `details.type` names the section: `governance_administration_required`
+(change, remove or restate `[governance]`) or
+`confinement_administration_required` (add, change or remove `[confinement]`).
+
+```json
+{
+  "error": "the confinement section is administered by the host in the config document; a config write cannot add, change or remove it",
+  "code": "CONFIG_WRITE_REFUSED",
+  "details": { "type": "confinement_administration_required" }
+}
+```
 
 ### GET /auth/profiles
 
@@ -1483,6 +1514,16 @@ the recipient's agent turn; a queued send does not prove receiver admission.
 This is distinct from the webhook routes' `202`/`{"queued":true}` admission
 response.
 
+#### Send errors
+
+A failed send returns HTTP `500` whose `code` and `details.code` name the
+failure with the JSON-RPC vocabulary: `peer_not_found_or_not_trusted`,
+`peer_unreachable`, `peer_admission_dropped`, `peer_input_rejected`,
+`send_ambiguous` or `send_failed`. `send_ambiguous` means the envelope may
+already be delivered: its `details` carry the `envelope_id`,
+`retry_safe: false` and `required_action: "reconcile"`. Reconcile by that
+envelope before any new attempt; a retry can duplicate it.
+
 <Note>
 Unlike the two webhook ingress routes (which optionally check
 `X-Webhook-Secret` against `RKAT_WEBHOOK_SECRET`), `/comms/send` has **no
@@ -1555,6 +1596,7 @@ envelope:
 | HTTP Status | Code | When |
 |-------------|------|------|
 | 400 | `BAD_REQUEST` | Invalid parameters, session ID mismatch, keep_alive without comms |
+| 400 | `CONFIG_WRITE_REFUSED` | A config write would administer `[governance]` or `[confinement]`; `details.type` names the section |
 | 401 | `UNAUTHORIZED` | Missing or invalid webhook secret |
 | 404 | `NOT_FOUND` | Resource not found |
 | 409 | `CONFLICT` | Operation conflicts with current state |

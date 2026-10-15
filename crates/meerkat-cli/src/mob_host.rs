@@ -796,7 +796,7 @@ pub(crate) async fn run_mob_host(args: MobHostArgs, scope: &RuntimeScope) -> any
     let mut factory = AgentFactory::new(store_path)
         .session_store(session_store)
         .runtime_root(realm_root.clone())
-        .project_root(project_root)
+        .project_root(project_root.clone())
         .builtins(true)
         .shell(true)
         .schedule(config.tools.schedule_enabled)
@@ -807,6 +807,7 @@ pub(crate) async fn run_mob_host(args: MobHostArgs, scope: &RuntimeScope) -> any
     if let Some(user_root) = scope.user_config_root.clone() {
         factory = factory.user_config_root(user_root);
     }
+    let factory = crate::with_cli_confinement(factory, &config, &scope, &project_root)?;
 
     // Tier-1 probe material resolves BEFORE the factory moves into the
     // service builder (fail closed on a faulted credential backend).

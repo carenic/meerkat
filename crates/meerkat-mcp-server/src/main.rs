@@ -46,6 +46,59 @@ struct Args {
     /// Expose resolved filesystem paths in config tool responses.
     #[arg(long, default_value_t = false)]
     expose_paths: bool,
+    /// OS process confinement for the shell, command hooks and MCP stdio
+    /// servers this server launches. `workspace` confines each launch to
+    /// --context-root; `trusted-host` runs them unconfined. Replaces the
+    /// config's `[confinement]` for this process.
+    #[arg(long, value_enum, value_name = "MODE")]
+    confinement: Option<ConfinementModeArg>,
+    /// IP network access of workspace-confined launches (default: denied).
+    #[arg(long, value_enum, value_name = "ACCESS", requires = "confinement")]
+    confinement_network: Option<ConfinementNetworkArg>,
+    /// An extra read-only directory for workspace-confined launches.
+    /// Repeatable.
+    #[arg(long, value_name = "PATH", requires = "confinement")]
+    confinement_read: Vec<PathBuf>,
+    /// An extra writable directory for workspace-confined launches.
+    /// Repeatable.
+    #[arg(long, value_name = "PATH", requires = "confinement")]
+    confinement_write: Vec<PathBuf>,
+}
+
+/// `--confinement`: how this server confines the processes it launches.
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum ConfinementModeArg {
+    /// Launch as the trusted host, with no OS confinement.
+    TrustedHost,
+    /// Confine each launch to --context-root and the extra directories.
+    Workspace,
+}
+
+impl From<ConfinementModeArg> for meerkat_core::ConfinementFlagMode {
+    fn from(value: ConfinementModeArg) -> Self {
+        match value {
+            ConfinementModeArg::TrustedHost => Self::TrustedHost,
+            ConfinementModeArg::Workspace => Self::Workspace,
+        }
+    }
+}
+
+/// `--confinement-network`: IP access of workspace-confined launches.
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum ConfinementNetworkArg {
+    /// No IP sockets.
+    Denied,
+    /// IP sockets over the host's own network.
+    Unrestricted,
+}
+
+impl From<ConfinementNetworkArg> for meerkat_core::WorkspaceNetwork {
+    fn from(value: ConfinementNetworkArg) -> Self {
+        match value {
+            ConfinementNetworkArg::Denied => Self::Denied,
+            ConfinementNetworkArg::Unrestricted => Self::Unrestricted,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -139,13 +192,21 @@ fn main() -> ExitCode {
 
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
+    // Relative confinement paths resolve against the working directory.
+    let confinement = meerkat_core::ConfinementFlags {
+        mode: args.confinement.map(Into::into),
+        network: args.confinement_network.map(Into::into),
+        read: args.confinement_read,
+        write: args.confinement_write,
+    }
+    .selection(&std::env::current_dir()?)?;
     let selection =
         RealmConfig::selection_from_inputs(args.realm, args.isolated, RealmSelection::Isolated)?;
     let backend_hint = args
         .realm_backend
         .map(Into::into)
         .map(|b: RealmBackend| b.as_str().to_string());
-    let state = meerkat_mcp_server::MeerkatMcpState::new_with_bootstrap_and_options(
+    let state = meerkat_mcp_server::MeerkatMcpState::new_with_bootstrap_options_and_confinement(
         RuntimeBootstrap {
             realm: RealmConfig {
                 selection,
@@ -159,6 +220,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             },
         },
         args.expose_paths,
+        confinement,
     )
     .await?;
     let state = Arc::new(state);

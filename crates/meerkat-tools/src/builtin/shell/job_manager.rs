@@ -2957,6 +2957,9 @@ fn confinement_spawn_failure_code(error: &std::io::Error) -> Option<&'static str
         ConfinementRefusal::UnsupportedRequirement => "confinement_refused_unsupported_requirement",
         ConfinementRefusal::BackendUnavailable => "confinement_refused_backend_unavailable",
         ConfinementRefusal::PreparationFailed => "confinement_refused_preparation_failed",
+        ConfinementRefusal::UntrustedConfigurationSource => {
+            "confinement_refused_untrusted_configuration_source"
+        }
     })
 }
 
@@ -3936,6 +3939,10 @@ mod durable_tests {
             (
                 ConfinementRefusal::PreparationFailed,
                 "confinement_refused_preparation_failed",
+            ),
+            (
+                ConfinementRefusal::UntrustedConfigurationSource,
+                "confinement_refused_untrusted_configuration_source",
             ),
         ] {
             assert_eq!(

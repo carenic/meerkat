@@ -9,7 +9,7 @@ use meerkat_core::ops::{
 use meerkat_core::{LiveBridgeEffectKind, LiveBridgeEffectOutcome};
 use serde_json::json;
 
-const CAUSES: [(ConfinementRefusal, &str); 5] = [
+const CAUSES: [(ConfinementRefusal, &str); 6] = [
     (
         ConfinementRefusal::InvalidRequirement,
         "invalid_requirement",
@@ -24,6 +24,10 @@ const CAUSES: [(ConfinementRefusal, &str); 5] = [
         "backend_unavailable",
     ),
     (ConfinementRefusal::PreparationFailed, "preparation_failed"),
+    (
+        ConfinementRefusal::UntrustedConfigurationSource,
+        "untrusted_configuration_source",
+    ),
 ];
 
 #[test]
@@ -112,7 +116,7 @@ fn confinement_refusal_wire_rejects_missing_or_invented_causes() {
 
 #[cfg(feature = "schema")]
 #[test]
-fn confinement_refusal_schema_preserves_the_five_exact_wire_causes() {
+fn confinement_refusal_schema_preserves_the_exact_wire_causes() {
     let schema = serde_json::to_value(schemars::schema_for!(ConfinementRefusal)).unwrap();
     assert_eq!(schema["type"], "string");
     assert_eq!(

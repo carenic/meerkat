@@ -665,7 +665,22 @@ export interface TurnOptions {
   readonly outputSchema?: Record<string, unknown>;
   readonly structuredOutputRetries?: number;
   readonly providerParams?: Record<string, unknown>;
+  /**
+   * Switch the session's credential binding from this turn on; omit it to
+   * keep the current one. See {@link TurnAuthBindingOverride}.
+   */
+  readonly authBinding?: TurnAuthBindingOverride;
 }
+
+/**
+ * Per-turn auth-binding override, the `turn/start` wire's Set/Clear
+ * tri-state: a binding ref (or `{ action: "set", value }`) switches the
+ * session to that binding, `{ action: "clear" }` drops the session's binding.
+ */
+export type TurnAuthBindingOverride =
+  | WireAuthBindingRef
+  | { readonly action: "set"; readonly value: WireAuthBindingRef }
+  | { readonly action: "clear" };
 
 export type EventSourceIdentity =
   | { readonly type: "session"; readonly sessionId: string }
@@ -869,7 +884,7 @@ export interface MobTurnStartOptions {
    * (or an untagged binding ref, which the server admits as Set),
    * `{ action: "clear" }`, or omit the option to inherit.
    */
-  readonly authBinding?: Record<string, unknown>;
+  readonly authBinding?: TurnAuthBindingOverride;
 }
 
 export interface MobEventsOptions {
@@ -913,14 +928,8 @@ export interface Capability {
 // longer owns a camelCase projection of it.
 export type { ConfigEnvelope, ConfigWriteResult } from "./generated/types.js";
 
-export type CommsSendReceipt = Generated.CommsSendResult & {
-  readonly requestId?: string;
-  readonly interactionId?: string;
-  readonly inputId?: string;
-  readonly envelopeId?: string;
-  readonly streamReserved?: boolean;
-  readonly inReplyTo?: string;
-};
+/** The `comms/send` receipt exactly as the server returns it (snake_case). */
+export type CommsSendReceipt = Generated.CommsSendResult;
 
 // ---------------------------------------------------------------------------
 // comms/send typed command surface.
@@ -956,16 +965,7 @@ export interface CommsPeerMessageCommand {
 export interface CommsPeerLifecycleCommand {
   kind: "peer_lifecycle";
   to: string;
-  lifecycle_kind:
-    | "mob.peer_added"
-    | "mob.peer_retired"
-    | "mob.peer_unwired"
-    | "mob.kickoff_pending"
-    | "mob.kickoff_starting"
-    | "mob.kickoff_started"
-    | "mob.kickoff_callback_pending"
-    | "mob.kickoff_failed"
-    | "mob.kickoff_cancelled";
+  lifecycle_kind: Generated.CommsSendParamsPeerLifecycle["lifecycle_kind"];
   params: Generated.CommsPeerLifecycleParams;
 }
 

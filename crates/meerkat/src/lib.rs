@@ -356,6 +356,12 @@ pub use meerkat_workgraph::{
 #[cfg(not(target_arch = "wasm32"))]
 mod command_hook_confinement;
 #[cfg(not(target_arch = "wasm32"))]
+mod host_confinement;
+#[cfg(not(target_arch = "wasm32"))]
+pub use host_confinement::{
+    HostAuthority, HostConfinement, HostConfinementError, HostConfinementNotice, HostInput,
+};
+#[cfg(not(target_arch = "wasm32"))]
 mod connector_clients;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod controller_route;

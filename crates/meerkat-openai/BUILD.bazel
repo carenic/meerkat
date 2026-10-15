@@ -63,13 +63,21 @@ rust_library(
     aliases = aliases(package_name = "crates/meerkat-openai"),
     crate_name = "meerkat_openai",
     crate_root = "src/lib.rs",
-    crate_features = [
-        "copilot",
-        "live",
-        "oauth",
-        "realtime",
-        "test-realtime-fixtures",
-    ],
+    crate_features = select({
+        "//tools/bazel:release_build": [
+            "copilot",
+            "live",
+            "oauth",
+            "realtime",
+        ],
+        "//conditions:default": [
+            "copilot",
+            "live",
+            "oauth",
+            "realtime",
+            "test-realtime-fixtures",
+        ],
+    }),
     edition = "2024",
     rustc_flags = WORKSPACE_LINT_RUSTC_FLAGS,
     compile_data = [
@@ -78,7 +86,7 @@ rust_library(
     srcs = glob(["src/**/*.rs"]),
     visibility = ["//visibility:public"],
     rustc_env = {
-        "CARGO_PKG_VERSION": "0.9.0",
+        "CARGO_PKG_VERSION": "0.9.1",
         "CARGO_MANIFEST_DIR": "./crates/meerkat-openai",
     },
     proc_macro_deps = all_crate_deps(
@@ -103,13 +111,21 @@ rust_library(
     aliases = aliases(package_name = "crates/meerkat-openai"),
     crate_name = "meerkat_openai",
     crate_root = "src/lib.rs",
-    crate_features = [
-        "copilot",
-        "live",
-        "oauth",
-        "realtime",
-        "test-realtime-fixtures",
-    ],
+    crate_features = select({
+        "//tools/bazel:release_build": [
+            "copilot",
+            "live",
+            "oauth",
+            "realtime",
+        ],
+        "//conditions:default": [
+            "copilot",
+            "live",
+            "oauth",
+            "realtime",
+            "test-realtime-fixtures",
+        ],
+    }),
     edition = "2024",
     rustc_flags = WORKSPACE_LINT_RUSTC_FLAGS,
     compile_data = [
@@ -120,7 +136,7 @@ rust_library(
         "//crates/meerkat:__pkg__",
     ],
     rustc_env = {
-        "CARGO_PKG_VERSION": "0.9.0",
+        "CARGO_PKG_VERSION": "0.9.1",
         "CARGO_MANIFEST_DIR": "./crates/meerkat-openai",
     },
     proc_macro_deps = all_crate_deps(
@@ -166,7 +182,7 @@ rust_test(
     srcs = glob(["src/**/*.rs"]),
     visibility = ["//visibility:public"],
     rustc_env = {
-        "CARGO_PKG_VERSION": "0.9.0",
+        "CARGO_PKG_VERSION": "0.9.1",
         "CARGO_MANIFEST_DIR": "./crates/meerkat-openai",
     },
     tags = [
@@ -234,7 +250,7 @@ rust_test(
     ],
     visibility = ["//visibility:public"],
     rustc_env = {
-        "CARGO_PKG_VERSION": "0.9.0",
+        "CARGO_PKG_VERSION": "0.9.1",
         "CARGO_BIN_NAME": "mock_realtime_ws_selftest",
         "CARGO_MANIFEST_DIR": "./crates/meerkat-openai",
     },
@@ -299,7 +315,7 @@ rust_test(
     ],
     visibility = ["//visibility:public"],
     rustc_env = {
-        "CARGO_PKG_VERSION": "0.9.0",
+        "CARGO_PKG_VERSION": "0.9.1",
         "CARGO_BIN_NAME": "oauth_resolve",
         "CARGO_MANIFEST_DIR": "./crates/meerkat-openai",
     },

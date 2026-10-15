@@ -3990,6 +3990,99 @@ mod tests {
         assert_eq!(status(13).await["phase"], "authorization_required");
     }
 
+    /// `auth/logout` with an MCP target retires the login attempt pending for
+    /// that server, not only its stored credential: the attempt is gone from
+    /// `auth/status/get` and its reference no longer cancels anything.
+    /// Logout reports `cleared: true` even when no credential was stored.
+    #[tokio::test]
+    async fn mcp_logout_over_rpc_retires_the_pending_login_attempt() {
+        use meerkat::test_fixtures::mcp_oauth::{McpOAuthFixture, SUBJECT};
+
+        let fixture = McpOAuthFixture::spawn().await.unwrap();
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(project.path().join(".rkat")).unwrap();
+        std::fs::write(
+            project.path().join(".rkat/mcp.toml"),
+            format!(
+                "[[servers]]\nname = \"logout-attempt\"\nurl = \"{}\"\noauth_account = \"{SUBJECT}\"\n",
+                fixture.mcp_url()
+            ),
+        )
+        .unwrap();
+        let runtime = test_runtime();
+        runtime.set_skill_identity_roots(Some(project.path().to_path_buf()), None);
+        let mcp = serde_json::json!({
+            "server_name": "logout-attempt",
+            "server_url": fixture.mcp_url(),
+            "oauth_account": SUBJECT,
+        });
+        let status = |id: i64| {
+            let mcp = mcp.clone();
+            let runtime = &runtime;
+            async move {
+                rpc_result(
+                    handle_auth_status_get(
+                        Some(RpcId::Num(id)),
+                        Some(raw_params(serde_json::json!({ "mcp": mcp })).as_ref()),
+                        runtime,
+                    )
+                    .await,
+                )
+            }
+        };
+
+        rpc_result(
+            handle_auth_login_start(
+                Some(RpcId::Num(1)),
+                Some(
+                    raw_params(serde_json::json!({
+                        "mcp": mcp,
+                        "redirect_uri": "http://127.0.0.1:1/mcp/oauth/callback",
+                    }))
+                    .as_ref(),
+                ),
+                &runtime,
+            )
+            .await,
+        );
+        let pending = status(2).await;
+        let attempt_ref = pending["attempt"]["ref"]
+            .as_str()
+            .expect("a pending attempt is reported")
+            .to_owned();
+
+        let logged_out = rpc_result(
+            handle_auth_logout(
+                Some(RpcId::Num(3)),
+                Some(raw_params(serde_json::json!({ "mcp": mcp })).as_ref()),
+                &runtime,
+            )
+            .await,
+        );
+        assert_eq!(
+            logged_out,
+            serde_json::json!({ "mcp": mcp, "cleared": true }),
+            "logout reports cleared even with no stored credential"
+        );
+        let after = status(4).await;
+        assert!(
+            after.get("attempt").is_none(),
+            "logout retires the pending attempt: {after}"
+        );
+        let cancel = handle_auth_login_cancel(
+            Some(RpcId::Num(5)),
+            Some(
+                raw_params(serde_json::json!({ "mcp": mcp, "attempt_ref": attempt_ref })).as_ref(),
+            ),
+            &runtime,
+        )
+        .await;
+        assert!(
+            cancel.error.is_some(),
+            "a retired attempt's reference cancels nothing"
+        );
+    }
+
     /// A realm-only MCP server (in the realm's composed `tools.mcp_servers`,
     /// absent from every `mcp.toml`) resolves to the same identity for login
     /// start, cancel by attempt reference and logout, and a stored-config
@@ -4232,20 +4325,31 @@ mod tests {
         let result: serde_json::Value =
             serde_json::from_str(resp.result.as_ref().expect("result").get()).unwrap();
         let state = result["state"].as_str().expect("state");
-        assert!(matches!(
-            unrelated_runtime.oauth_flow_authority().consume(
+        // A state another runtime admitted is an attempt this runtime does
+        // not hold: attempt_missing, never an authority fault.
+        let foreign = unrelated_runtime
+            .oauth_flow_authority()
+            .consume(
                 state,
                 &credential_identity(&openai_auth_binding()),
                 meerkat_providers::oauth_flow::OAuthBrowserFlowCompletion::from(
-                    meerkat_providers::oauth_flow::OAuthProviderIdentity::OpenAiChatGpt
+                    meerkat_providers::oauth_flow::OAuthProviderIdentity::OpenAiChatGpt,
                 ),
                 redirect_uri,
-            ),
-            Err(OAuthFlowError::LifecycleRejected {
-                operation: "verify_oauth_browser_flow",
-                ..
-            })
-        ));
+            )
+            .expect_err("an unrelated runtime holds no attempt with this state");
+        assert_eq!(foreign, OAuthFlowError::Missing);
+        let refusal = host_auth_error_response(
+            Some(RpcId::Num(2)),
+            meerkat::HostAuthError::OAuthFlow(foreign),
+        )
+        .error
+        .expect("error response");
+        assert_eq!(refusal.code, error::INVALID_PARAMS);
+        assert_eq!(
+            refusal.data.as_ref().and_then(|data| data.get("reason")),
+            Some(&serde_json::json!("attempt_missing"))
+        );
         let flow = runtime
             .oauth_flow_authority()
             .consume(
@@ -6065,7 +6169,7 @@ mod tests {
                 .message
                 .contains("oauth state terminal consume failed")
         );
-        assert!(error.message.contains("verify_oauth_browser_flow"));
+        assert!(error.message.contains("oauth state is missing or expired"));
         assert!(store.load(&key).await.unwrap().is_none());
         let snapshot = auth_lease.snapshot(&LeaseKey::from_auth_binding(&auth_binding));
         assert_eq!(snapshot.phase, None);

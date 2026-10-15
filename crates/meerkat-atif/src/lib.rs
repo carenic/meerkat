@@ -188,6 +188,9 @@ struct PendingTurn {
     reasoning: String,
     tool_calls: Vec<ToolCall>,
     observations: Vec<ObservationResult>,
+    /// Calls whose timeout is recorded in `observations` and whose
+    /// completion has not arrived yet.
+    timed_out_calls: std::collections::BTreeSet<String>,
 }
 
 impl PendingTurn {
@@ -199,6 +202,7 @@ impl PendingTurn {
             reasoning: String::new(),
             tool_calls: Vec::new(),
             observations: Vec::new(),
+            timed_out_calls: std::collections::BTreeSet::new(),
         }
     }
 
@@ -380,30 +384,49 @@ impl TrajectoryBuilder {
                 content,
                 is_error,
                 ..
-            } => pending
-                .get_or_insert_with(|| PendingTurn::new(envelope.timestamp_ms))
-                .observations
-                .push(ObservationResult {
-                    source_call_id: Some(id.clone()),
-                    content: Some(atif_blocks(content)),
-                    extra: (*is_error)
-                        .then(|| Map::from_iter([(String::from("is_error"), Value::Bool(true))])),
-                    subagent_trajectory_ref: None,
-                }),
-            AgentEvent::ToolExecutionTimedOut { id, timeout_ms, .. } => pending
-                .get_or_insert_with(|| PendingTurn::new(envelope.timestamp_ms))
-                .observations
-                .push(ObservationResult {
+            } => {
+                let turn = pending.get_or_insert_with(|| PendingTurn::new(envelope.timestamp_ms));
+                let content = Some(atif_blocks(content));
+                let error = (*is_error).then(|| (String::from("is_error"), Value::Bool(true)));
+                // The loop announces a timeout before the timed-out call's
+                // completion; the completion fills in that observation, so
+                // the call keeps exactly one.
+                let timed_out = if turn.timed_out_calls.remove(id) {
+                    turn.observations
+                        .iter_mut()
+                        .rev()
+                        .find(|observation| observation.source_call_id.as_ref() == Some(id))
+                } else {
+                    None
+                };
+                match timed_out {
+                    Some(observation) => {
+                        observation.content = content;
+                        observation.extra.get_or_insert_with(Map::new).extend(error);
+                    }
+                    None => turn.observations.push(ObservationResult {
+                        source_call_id: Some(id.clone()),
+                        content,
+                        extra: error.map(|entry| Map::from_iter([entry])),
+                        subagent_trajectory_ref: None,
+                    }),
+                }
+            }
+            AgentEvent::ToolExecutionTimedOut { id, timeout_ms, .. } => {
+                let turn = pending.get_or_insert_with(|| PendingTurn::new(envelope.timestamp_ms));
+                turn.timed_out_calls.insert(id.clone());
+                turn.observations.push(ObservationResult {
                     source_call_id: Some(id.clone()),
                     content: Some(AtifContent::Text(format!(
                         "tool execution timed out after {timeout_ms}ms"
                     ))),
-                    extra: Some(Map::from_iter([(
-                        String::from("timed_out"),
-                        Value::Bool(true),
-                    )])),
+                    extra: Some(Map::from_iter([
+                        (String::from("timed_out"), Value::Bool(true)),
+                        (String::from("timeout_ms"), Value::from(*timeout_ms)),
+                    ])),
                     subagent_trajectory_ref: None,
-                }),
+                });
+            }
             AgentEvent::ServerToolContent {
                 id, content, kind, ..
             } => pending
@@ -1640,6 +1663,111 @@ mod tests {
             .iter()
             .filter(|step| step.source == StepSource::Agent)
             .collect()
+    }
+
+    /// The loop announces a tool call's timeout before the call's completion.
+    /// The step keeps one observation for the call: the completion's content,
+    /// marked with the timeout and its bound. A log that ends before the
+    /// completion still records the timeout.
+    #[test]
+    fn a_timed_out_tool_call_exports_one_observation_carrying_the_timeout() {
+        let id = SessionId::new();
+        let timed_out_call = vec![
+            run_started(&id, "run the slow tool"),
+            AgentEvent::TurnStarted {
+                turn_number: 0,
+                assistant_message_id: None,
+            },
+            AgentEvent::ToolCallRequested {
+                id: "call-1".into(),
+                name: "slow_tool".into(),
+                args: meerkat_core::event::ToolCallArguments::from_value(serde_json::json!({}))
+                    .unwrap(),
+            },
+            AgentEvent::ToolExecutionTimedOut {
+                id: "call-1".into(),
+                name: "slow_tool".into(),
+                timeout_ms: 20,
+            },
+        ];
+        let mut events = timed_out_call.clone();
+        events.extend([
+            AgentEvent::ToolExecutionCompleted {
+                id: "call-1".into(),
+                name: "slow_tool".into(),
+                content: ContentBlock::text_vec("tool slow_tool timed out after 20ms".into()),
+                is_error: true,
+                duration_ms: 20,
+            },
+            AgentEvent::TurnCompleted {
+                stop_reason: meerkat_core::StopReason::ToolUse,
+                usage: Some(openai_usage(10, 1, 0, 0)),
+                assistant_message_id: None,
+            },
+            AgentEvent::TurnStarted {
+                turn_number: 1,
+                assistant_message_id: None,
+            },
+            AgentEvent::TextComplete {
+                content: "it timed out".into(),
+                assistant_message_id: None,
+            },
+            AgentEvent::TurnCompleted {
+                stop_reason: meerkat_core::StopReason::EndTurn,
+                usage: Some(openai_usage(20, 2, 0, 0)),
+                assistant_message_id: None,
+            },
+            run_completed(&id, "it timed out", false),
+        ]);
+        let trajectory = trajectory_from_events(&envelopes(&id, events), test_agent()).unwrap();
+        let observation = agent_steps(&trajectory)[0]
+            .observation
+            .as_ref()
+            .expect("the tool turn has an observation");
+        assert_eq!(
+            observation.results,
+            vec![ObservationResult {
+                source_call_id: Some("call-1".into()),
+                content: Some(AtifContent::Text(
+                    "tool slow_tool timed out after 20ms".into()
+                )),
+                extra: Some(Map::from_iter([
+                    (String::from("is_error"), Value::Bool(true)),
+                    (String::from("timed_out"), Value::Bool(true)),
+                    (String::from("timeout_ms"), Value::from(20_u64)),
+                ])),
+                subagent_trajectory_ref: None,
+            }]
+        );
+
+        let mut cut = timed_out_call;
+        cut.push(AgentEvent::RunFailed {
+            identity: Default::default(),
+            session_id: id.clone(),
+            error_report: meerkat_core::AgentErrorReport::from_agent_error(
+                &meerkat_core::AgentError::InternalError("host stopped".into()),
+            ),
+            terminal_cause_kind: None,
+        });
+        let trajectory = trajectory_from_events(&envelopes(&id, cut), test_agent()).unwrap();
+        let observation = agent_steps(&trajectory)[0]
+            .observation
+            .as_ref()
+            .expect("the flushed tool turn has an observation");
+        assert_eq!(
+            observation.results,
+            vec![ObservationResult {
+                source_call_id: Some("call-1".into()),
+                content: Some(AtifContent::Text(
+                    "tool execution timed out after 20ms".into()
+                )),
+                extra: Some(Map::from_iter([
+                    (String::from("timed_out"), Value::Bool(true)),
+                    (String::from("timeout_ms"), Value::from(20_u64)),
+                ])),
+                subagent_trajectory_ref: None,
+            }]
+        );
     }
 
     /// A compaction boundary sends the loop back to rebuild its request

@@ -50,7 +50,7 @@ Turn / drain / admission:
 - `comms_drain: Arc<dyn CommsDrainHandle>` — drain lifecycle transitions
 - `session_admission: Arc<dyn SessionAdmissionHandle>` — session turn admission
 - `session_claim_handle: Arc<dyn SessionClaimHandle>` — session-claim ownership/release transitions
-- `session_context: Arc<dyn SessionContextHandle>` — system-context append transitions
+- `session_context: Arc<dyn SessionContextHandle>` - session-context advancement (`AdvanceSessionContext` watermark) transitions
 
 Tool surface:
 
@@ -82,6 +82,19 @@ Compaction:
 
 - `compaction_commit_coordinator` - exact transcript-plus-memory handoff for
   the session/runtime epoch
+
+Host slots and observation:
+
+- `post_commit_hooks` - mechanical observe-only dispatcher shared with the
+  runtime owner
+- `interrupted_tool_evidence` - hand-off of interrupted-run evidence from
+  agent construction to runtime materialization
+- `configured_mcp_attachment` - present only when the runtime has an installed
+  native work host: that host's authority for each configured MCP server,
+  asked before discovery, spawn, or first use (`None` keeps ungoverned
+  behavior)
+- `tool_surface_gate`, `mcp_observation` - registration slots for a trusted
+  host's tool-surface gate and the factory-installed MCP adapter observation
 
 When you add a new handle field, `prepare_bindings()` and the factory's
 `SessionOwned` validation must be updated so the surface receives the correct
@@ -147,7 +160,10 @@ per-session fence and converges idempotently when a competing process wins.
 
 ## Policy engine
 
-`DefaultPolicyTable` resolves `PolicyDecision` per input kind × runtime state:
+Admission policy is decided by the generated `MeerkatMachine`
+`ResolveAdmissionPlan` transition. `DefaultPolicyTable`
+(`crates/meerkat-runtime/src/policy_table.rs`) is a compatibility facade that
+projects that verdict as a `PolicyDecision` per input kind × runtime state:
 
 - 9 input kinds: prompt, peer_message, peer_request, peer_response_progress, peer_response_terminal, flow_step, external_event, continuation, operation
 - 2 states: idle, running
@@ -212,11 +228,11 @@ decide what is a barrier or when the barrier is satisfied.
 
 ## OpsLifecycleRegistry
 
-Trait in `crates/meerkat-core/src/ops_lifecycle.rs`. Concrete impl `RuntimeOpsLifecycleRegistry` in `crates/meerkat-runtime/src/ops_lifecycle.rs` is a thin projection/command surface over MeerkatMachine's ops state (`op_statuses`, `op_terminal_outcomes`, `op_peer_ready`, `op_progress_count`, `wait_active`, `wait_operation_ids`). DSL is the sole authority; the registry exposes:
+Trait in `crates/meerkat-core/src/ops_lifecycle.rs`. Concrete impl `RuntimeOpsLifecycleRegistry` in `crates/meerkat-runtime/src/ops_lifecycle.rs` is a thin projection/command surface over MeerkatMachine's ops state (`op_statuses`, `op_terminal_outcomes`, `op_peer_ready`, `op_progress_counts`, `wait_active`, `wait_operation_ids`). DSL is the sole authority; the registry exposes:
 
 - Typed commands: `register_operation`, `provisioning_succeeded`/`failed`, `peer_ready`, `report_progress`, `complete_operation`, `fail_operation`, `abort_provisioning`, `cancel_operation`, `request_retire`, `mark_retired`, `terminate_owner`. Each routes to a DSL transition.
 - Typed read surface: `snapshot(id)`, `list_operations()`, `register_watcher(id)`.
-- `wait_all` + `collect_completed` + `drain_completed` for barrier coordination.
+- `wait_all` + `collect_completed` for barrier coordination, plus completion-feed cursor reads (`completion_feed`, `completion_cursor`, `advance_completion_cursor`).
 - Bounded completed-operation retention (FIFO eviction; default 256).
 - Multi-listener completion observation, peer info in snapshots, wall-clock timestamps (`created_at_ms`, `completed_at_ms`, `elapsed_ms` from SystemTime anchor), per-parent concurrency enforcement (`max_concurrent`).
 - Completion-feed wake signals for keep-alive runtimes.
@@ -299,7 +315,7 @@ Store seam: `SessionStore` lives in `meerkat-core`; `meerkat-store` is the defau
 Persistent realm opening is backend-owned in the `meerkat` facade through `PersistenceBundle`.
 
 - Surfaces open a realm bundle, not a raw session store plus ad hoc runtime companion.
-- The bundle carries the paired `SessionStore`, optional `RuntimeStore`, matching `MeerkatMachine`, and when enabled the blob/task companions for that realm.
+- The bundle carries the paired `SessionStore`, the `RuntimeStore` with its one `RuntimeDeliveryInbox` (under `session-store`), the matching `MeerkatMachine`, and the realm's schedule, WorkGraph, job, blob, and artifact stores, plus the optional event store/projector, the persistence's `ApprovalService` issuer, and (stock-governed realms) the `StockGovernance` composition.
 - SQLite is the default persistent realm backend when compiled; jsonl is the file-backed alternative. Mob persistence is SQLite/WAL-backed.
 - `meerkat-tools::builtin::SqliteTaskStore` persists session-scoped tasks in the shared SQLite realm when `session-store` is enabled.
 - `meerkat-mob::MobStorage::persistent()` uses `SqliteMobStores` (WAL, per-operation connections). `MobStorage::custom()` is the extension seam for user-provided mob stores.
@@ -334,7 +350,7 @@ entrypoints that bypass `scripts/repo-cargo`.
 - `crates/meerkat-runtime/src/meerkat_machine/dispatch_*.rs` — dispatch paths per input family
 - `crates/meerkat-runtime/src/driver/ephemeral.rs`, `driver/persistent.rs` — per-session drivers
 - `crates/meerkat-runtime/src/ops_lifecycle.rs` — `RuntimeOpsLifecycleRegistry`
-- `crates/meerkat-runtime/src/policy_table.rs` — `DefaultPolicyTable`
+- `crates/meerkat-runtime/src/policy_table.rs` - `DefaultPolicyTable` (compatibility projection of generated admission)
 - `crates/meerkat-runtime/src/runtime_loop.rs` — completion-feed wake injection and runtime loop
 - `crates/meerkat-runtime/src/recovery.rs` — store-bound durable-tail preparation, classification, authorization, and realization (`recover_durable_tail(store, session_id)`)
 - `crates/meerkat-runtime/src/store/mod.rs` — `RuntimeStore` contract (fenced records, boundary receipts)

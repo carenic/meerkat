@@ -488,6 +488,23 @@ rkat-mcp [--realm <id>] [--isolated] [--instance <id>] \
 
 If `--realm` is omitted, the server creates a new isolated realm by default.
 `--realm-backend` is a creation hint only; after the first open, the manifest-pinned backend is authoritative.
+
+OS process confinement flags (see
+[OS process confinement](/concepts/configuration#os-process-confinement)):
+
+```bash
+rkat-mcp [--confinement <trusted-host|workspace>] \
+  [--confinement-network <denied|unrestricted>] \
+  [--confinement-read <path>]... [--confinement-write <path>]...
+```
+
+They replace the realm's composed `[confinement]` for every launch kind of
+this process. The workspace preset confines each launch to `--context-root`;
+without `--context-root` the server refuses to start with it. A start in which
+a confined process could change the server's realm state or user config
+document is refused (see [the host's own inputs](/concepts/configuration#the-hosts-own-inputs)).
+At startup the server logs each launch kind's requested and effective
+confinement and warns for each required kind its platform cannot confine.
 The bundled binary is stdio-only. If an embedding host publishes these tools
 over HTTP, that host owns transport authentication, authorization, and
 encryption; provider auth bindings configure outbound model credentials and do
@@ -775,8 +792,7 @@ Start a new Meerkat agent session with the given prompt.
   ],
   "enable_builtins": false,
   "builtin_config": {
-    "enable_shell": false,
-    "shell_timeout_secs": 30
+    "enable_shell": false
   },
   "keep_alive": null,
   "comms_name": null,
@@ -869,8 +885,9 @@ extraction calls.
   Shell-tools override. Omit / `null` to use the default on run or inherit the persisted session value on resume.
 </ParamField>
 
-<ParamField body="builtin_config.shell_timeout_secs" type="u64 | null" default="30">
-  Default shell command timeout.
+<ParamField body="builtin_config.shell_timeout_secs" type="u64 | null" default="null">
+  Accepted and ignored in 0.9.1. Set the shell's default command timeout with
+  `[shell] timeout_secs` in the realm config.
 </ParamField>
 
 <ParamField body="keep_alive" type="bool | null" default="null">
@@ -1049,6 +1066,15 @@ even when several pending calls invoke the same tool.
   Run-scoped hook overrides.
 </ParamField>
 
+<ParamField body="turn_tool_overlay" type="object | null" default="null">
+  Per-turn tool overlay, the same shape `turn/start` takes: `allowed_tools`,
+  `blocked_tools`, and `tool_choice_plan` (entry `k` is the tool choice of the
+  turn's `k`-th provider call, for example `[{"mode": "required"}]`). It
+  applies to this turn only, on a live session and on a resume that rebuilds
+  the session's agent. Keys it does not know are ignored and logged by the
+  server.
+</ParamField>
+
 ### Response format
 
 Both `meerkat_run` and `meerkat_resume` return MCP-standard tool results.
@@ -1152,6 +1178,12 @@ close outcome (`swapped`, `skipped`, `swap_failed`, `refreshed`, `closed`,
 channels. Use the JSON-RPC `config/set` / `config/patch` methods when you need
 the typed live-propagation report.
 
+A `set` or `patch` that would administer a section the host administers in the
+document itself is refused with `-32602` (invalid params), and nothing is
+written. The error's `data.type` is `governance_administration_required`
+(change, remove or restate `[governance]`) or
+`confinement_administration_required` (add, change or remove `[confinement]`).
+
 ### meerkat_capabilities
 
 Returns the runtime capability set with status resolved against config.
@@ -1163,7 +1195,7 @@ Returns the runtime capability set with status resolved against config.
 
 ```json Response
 {
-  "contract_version": {"major": 0, "minor": 9, "patch": 0},
+  "contract_version": {"major": 0, "minor": 9, "patch": 1},
   "capabilities": [
     {
       "id": "sessions",
@@ -1230,7 +1262,7 @@ Return the curated model catalog with provider profiles, capability metadata, an
 
 ```json Response
 {
-  "contract_version": {"major": 0, "minor": 9, "patch": 0},
+  "contract_version": {"major": 0, "minor": 9, "patch": 1},
   "providers": [
     {
       "provider": "anthropic",

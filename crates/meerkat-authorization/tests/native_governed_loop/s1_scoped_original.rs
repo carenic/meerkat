@@ -320,11 +320,13 @@ async fn an_authenticated_scoped_original_carries_a_native_turn() {
         .await
         .expect("actual immutable selected LlmClientAdapter");
     let credential_owner = machine.generated_auth_lease_handle();
-    meerkat_core::publish_token_lifecycle_acquired_for_identity(
+    meerkat_core::publish_token_lifecycle_acquired_for_identity_within(
         &credential_owner,
         pin.selection().credential(),
         &meerkat_core::auth::PersistedTokens::api_key("synthetic-native-loop-credential"),
+        tokio::time::Instant::now() + CREDENTIAL_PUBLICATION_WAIT,
     )
+    .await
     .expect("actual generated fixture credential before native admission");
     let runtime = LogicalRuntimeId::for_session(&session_id);
     let registration = machine
@@ -641,11 +643,13 @@ async fn a_governed_dispatch_builds_its_helper_fence_from_its_own_operation() {
         .await
         .expect("actual immutable selected LlmClientAdapter");
     let credential_owner = machine.generated_auth_lease_handle();
-    meerkat_core::publish_token_lifecycle_acquired_for_identity(
+    meerkat_core::publish_token_lifecycle_acquired_for_identity_within(
         &credential_owner,
         pin.selection().credential(),
         &meerkat_core::auth::PersistedTokens::api_key("synthetic-native-loop-credential"),
+        tokio::time::Instant::now() + CREDENTIAL_PUBLICATION_WAIT,
     )
+    .await
     .expect("actual generated fixture credential before native admission");
     let runtime = LogicalRuntimeId::for_session(&session_id);
     let registration = machine

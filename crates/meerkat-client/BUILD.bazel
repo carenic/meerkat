@@ -49,16 +49,27 @@ rust_library(
     aliases = aliases(package_name = "crates/meerkat-client"),
     crate_name = "meerkat_client",
     crate_root = "src/lib.rs",
-    crate_features = [
-        "anthropic",
-        "gemini",
-        "integration-real-tests",
-        "native-keyring",
-        "oauth",
-        "openai",
-        "openai-realtime",
-        "refresh-file-lock",
-    ],
+    crate_features = select({
+        "//tools/bazel:release_build": [
+            "anthropic",
+            "gemini",
+            "native-keyring",
+            "oauth",
+            "openai",
+            "openai-realtime",
+            "refresh-file-lock",
+        ],
+        "//conditions:default": [
+            "anthropic",
+            "gemini",
+            "integration-real-tests",
+            "native-keyring",
+            "oauth",
+            "openai",
+            "openai-realtime",
+            "refresh-file-lock",
+        ],
+    }),
     edition = "2024",
     rustc_flags = WORKSPACE_LINT_RUSTC_FLAGS,
     compile_data = [
@@ -67,7 +78,7 @@ rust_library(
     srcs = glob(["src/**/*.rs"]),
     visibility = ["//visibility:public"],
     rustc_env = {
-        "CARGO_PKG_VERSION": "0.9.0",
+        "CARGO_PKG_VERSION": "0.9.1",
         "CARGO_MANIFEST_DIR": "./crates/meerkat-client",
     },
     proc_macro_deps = all_crate_deps(
@@ -91,16 +102,27 @@ rust_library(
     aliases = aliases(package_name = "crates/meerkat-client"),
     crate_name = "meerkat_client",
     crate_root = "src/lib.rs",
-    crate_features = [
-        "anthropic",
-        "gemini",
-        "integration-real-tests",
-        "native-keyring",
-        "oauth",
-        "openai",
-        "openai-realtime",
-        "refresh-file-lock",
-    ],
+    crate_features = select({
+        "//tools/bazel:release_build": [
+            "anthropic",
+            "gemini",
+            "native-keyring",
+            "oauth",
+            "openai",
+            "openai-realtime",
+            "refresh-file-lock",
+        ],
+        "//conditions:default": [
+            "anthropic",
+            "gemini",
+            "integration-real-tests",
+            "native-keyring",
+            "oauth",
+            "openai",
+            "openai-realtime",
+            "refresh-file-lock",
+        ],
+    }),
     edition = "2024",
     rustc_flags = WORKSPACE_LINT_RUSTC_FLAGS,
     compile_data = [
@@ -111,7 +133,7 @@ rust_library(
         "//crates/meerkat:__pkg__",
     ],
     rustc_env = {
-        "CARGO_PKG_VERSION": "0.9.0",
+        "CARGO_PKG_VERSION": "0.9.1",
         "CARGO_MANIFEST_DIR": "./crates/meerkat-client",
     },
     proc_macro_deps = all_crate_deps(
@@ -159,7 +181,7 @@ rust_test(
     srcs = glob(["src/**/*.rs"]),
     visibility = ["//visibility:public"],
     rustc_env = {
-        "CARGO_PKG_VERSION": "0.9.0",
+        "CARGO_PKG_VERSION": "0.9.1",
         "CARGO_MANIFEST_DIR": "./crates/meerkat-client",
     },
     tags = [
@@ -224,7 +246,7 @@ rust_test(
     ],
     visibility = ["//visibility:public"],
     rustc_env = {
-        "CARGO_PKG_VERSION": "0.9.0",
+        "CARGO_PKG_VERSION": "0.9.1",
         "CARGO_BIN_NAME": "live_client_provider_matrix",
         "CARGO_MANIFEST_DIR": "./crates/meerkat-client",
     },
@@ -289,7 +311,7 @@ rust_test(
     ],
     visibility = ["//visibility:public"],
     rustc_env = {
-        "CARGO_PKG_VERSION": "0.9.0",
+        "CARGO_PKG_VERSION": "0.9.1",
         "CARGO_BIN_NAME": "rct_contracts",
         "CARGO_MANIFEST_DIR": "./crates/meerkat-client",
     },
@@ -355,7 +377,7 @@ rust_test(
     ],
     visibility = ["//visibility:public"],
     rustc_env = {
-        "CARGO_PKG_VERSION": "0.9.0",
+        "CARGO_PKG_VERSION": "0.9.1",
         "CARGO_BIN_NAME": "system_client_proxy",
         "CARGO_MANIFEST_DIR": "./crates/meerkat-client",
     },

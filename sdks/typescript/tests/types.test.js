@@ -1213,7 +1213,8 @@ describe("Typed Events", () => {
 
   it("preserves optional typed MCP setup refusals without deriving them from prose", () => {
     for (const refusal of [undefined, null, "invalid_requirement", "invalid_launch",
-      "unsupported_requirement", "backend_unavailable", "preparation_failed"]) {
+      "unsupported_requirement", "backend_unavailable", "preparation_failed",
+      "untrusted_configuration_source"]) {
       const status = { kind: "external_tool_delta", phase: "failed",
         detail: "required execution confinement is unsupported by this backend",
         ...(refusal !== undefined ? { confinement_refusal: refusal } : {}) };
@@ -6308,7 +6309,7 @@ describe("turn tool-choice plan", () => {
 it("hook launch refusal raw events retain every cause and exact call ID", () => {
   for (const refusal of [
     "invalid_requirement", "invalid_launch", "unsupported_requirement",
-    "backend_unavailable", "preparation_failed",
+    "backend_unavailable", "preparation_failed", "untrusted_configuration_source",
   ]) {
     const raw = {
       type: "hook_launch_refused", hook_id: "hook-1",
@@ -6335,7 +6336,8 @@ it("hook failed preserves all canonical reason variants", () => {
     { reason_code: "timeout", timeout_ms: 10 },
     { reason_code: "config_invalid", message: "invalid config" },
     { reason_code: "observe_only_violation" },
-    ...["invalid_requirement", "invalid_launch", "unsupported_requirement", "backend_unavailable", "preparation_failed"]
+    ...["invalid_requirement", "invalid_launch", "unsupported_requirement", "backend_unavailable", "preparation_failed",
+      "untrusted_configuration_source"]
       .map(refusal => ({ reason_code: "confinement_refused", refusal })),
   ];
   for (const reason of reasons) {
@@ -6417,6 +6419,7 @@ it("hook failed displays each known confinement cause exactly", () => {
     unsupported_requirement: "required execution confinement is unsupported by this backend",
     backend_unavailable: "required execution confinement backend is unavailable",
     preparation_failed: "confined process preparation failed",
+    untrusted_configuration_source: "launch configuration comes from a source a confined process can write",
   };
   for (const [refusal, message] of Object.entries(messages)) {
     const reason = { reason_code: "confinement_refused", refusal };

@@ -24,7 +24,9 @@ fallback. Eligible manual dispatches select release validation and packaging
 under the [BuildBuddy rules below](#buildbuddy). Both release backends still
 require exact-main GitHub Actions CI (the Cargo-only pull-request lanes),
 and the tag path additionally runs the full BuildBuddy graph as its
-validation gate. Windows binaries are cross-compiled
+validation gate while the self-hosted graph is enabled
+(`MEERKAT_GCP_BUILDBUDDY_ENABLED` is `true`); otherwise the tag validates
+with the Cargo validation job. Windows binaries are cross-compiled
 and packaged on hosted Ubuntu, then verified on Windows; credentialed registry
 publishing stays GitHub-hosted.
 
@@ -343,7 +345,8 @@ Windows packaging and every credentialed registry publish still run on
 GitHub-hosted runners, and the exact-main GitHub Actions CI requirement remains
 in force. This release
 backend selection is separate from per-push CI, which is Cargo-only on
-GitHub-hosted runners; the full BuildBuddy graph runs nightly and on the tag.
+GitHub-hosted runners; the full BuildBuddy graph runs nightly and on the tag
+while `MEERKAT_GCP_BUILDBUDDY_ENABLED` is `true`.
 
 For local Make commands, `MEERKAT_BUILDBUDDY=1` selects the optional BuildBuddy
 developer backend:

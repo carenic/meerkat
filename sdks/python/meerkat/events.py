@@ -1219,6 +1219,7 @@ _CONFINEMENT_REFUSAL_MESSAGES = {
     "unsupported_requirement": "required execution confinement is unsupported by this backend",
     "backend_unavailable": "required execution confinement backend is unavailable",
     "preparation_failed": "confined process preparation failed",
+    "untrusted_configuration_source": "launch configuration comes from a source a confined process can write",
 }
 
 

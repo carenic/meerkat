@@ -426,14 +426,15 @@ interface SessionOptions {
 ```
 
 `createDeferredSession(...)` reuses `SessionOptions`, but the server rejects
-`transientTurnContext` when no immediate turn exists. The current TypeScript
-`DeferredTurnOptions` also does not expose `transientTurnContext`,
-`injectedContext`, or `selfHostedServerId`: set injected context on deferred
-creation, and use `startTurn(...)` or `stream(...)` only with `skillRefs`,
-`turnToolOverlay`, `additionalInstructions`, `keepAlive`, `model`, `provider`,
-`maxTokens`, `systemPrompt`, `outputSchema`, `structuredOutputRetries`, and
-`providerParams`. Transient first-turn context and a self-hosted server route
-are not expressible through the current deferred TypeScript wrapper.
+`transientTurnContext` when no immediate turn exists: pass it to the first
+turn instead. `startTurn(...)` and `stream(...)` take `injectedContext`,
+`transientTurnContext`, `skillRefs`, `turnToolOverlay`,
+`additionalInstructions`, `keepAlive`, `model`, `provider`,
+`selfHostedServerId`, `systemPrompt`, `providerParams`, and `authBinding`.
+The turn options also carry `maxTokens`, `outputSchema`, and
+`structuredOutputRetries`, but the server refuses them on a turn with
+`INVALID_PARAMS`: they are build settings, so set them on `createSession(...)`
+or `createDeferredSession(...)`.
 
 ---
 
@@ -493,11 +494,12 @@ async turn(
     outputSchema?: Record<string, unknown>;
     structuredOutputRetries?: number;
     providerParams?: Record<string, unknown>;
+    authBinding?: TurnAuthBindingOverride;
   },
 ): Promise<RunResult>
 ```
 
-Sends another turn to the session and returns the `RunResult`. Also updates the session's last-result shortcuts.
+Sends another turn to the session and returns the `RunResult`. Also updates the session's last-result shortcuts. `maxTokens`, `outputSchema`, and `structuredOutputRetries` are build settings: the server refuses them on a turn with `INVALID_PARAMS`, so set them when you create the session.
 
 ```typescript
 const result = await session.turn("Now explain the second point in more detail");
@@ -524,6 +526,7 @@ stream(
     outputSchema?: Record<string, unknown>;
     structuredOutputRetries?: number;
     providerParams?: Record<string, unknown>;
+    authBinding?: TurnAuthBindingOverride;
   },
 ): EventStream
 ```

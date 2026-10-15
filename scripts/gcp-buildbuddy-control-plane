@@ -1,74 +1,554 @@
 #!/usr/bin/env bash
 set -euo pipefail
+# Bash >= 4.4 (see scripts/lib/require-bash.sh).
+. "$(dirname "${BASH_SOURCE[0]}")/lib/require-bash.sh"
 
 usage() {
   cat <<'EOF'
-usage: gcp-buildbuddy-control-plane <status|ensure|start|stop|endpoint|logs>
+usage: gcp-buildbuddy-control-plane <command>
 
-Manages the always-on GCP BuildBuddy control plane/cache used by CI. The control
-plane stays warm; executor VMs are burst separately by
-scripts/gcp-buildbuddy-executor-pool.
+Manages the GCP BuildBuddy control plane/cache used by the GCP BuildBuddy CI
+lane (.github/workflows/buildbuddy.yml, default off behind the repository
+variable MEERKAT_GCP_BUILDBUDDY_ENABLED). The workflow starts it for a run and
+stops it afterwards; executor VMs are burst separately by
+scripts/gcp-buildbuddy-executor-pool. The data disk keeps the cache between
+runs.
+
+Security baseline (each point is checked by `ensure`/`verify` and by
+scripts/test-gcp-buildbuddy-hardening.sh):
+  - TLS only: gRPCS on 1986 and HTTPS on 8081, served with a certificate from
+    a per-boot CA whose certificate the VM reports as a guest attribute.
+  - Private ingress: IAP TCP forwarding (35.235.240.0/20) on 22/1986/8081,
+    the executor service account on 1986, everything else denied by an
+    explicit rule. No firewall rule may admit 0.0.0.0/0 to the VM.
+  - No anonymous use: every client presents an org API key; executors need
+    an executor key (require_executor_authorization) and serve only their
+    org (user-owned executors). Self auth is the UI login, so the UI must
+    stay reachable only through IAP.
+  - Deterministic config: the startup script installs the rendered config
+    byte for byte and reports its sha256; `verify` compares it with this
+    script's rendering, and `ensure` refuses a VM whose startup script differs.
+
+Commands:
+  ensure | start        Check, then create or start the control plane. Refuses,
+                        changing nothing, when an enabled firewall rule lets
+                        anything but IAP or the executors reach the VM ahead of
+                        the deny rule, an open rule is aimed at it, a managed
+                        rule is disabled or differs from its rendering, the
+                        legacy rule exists, or the existing VM (tags included)
+                        or data disk was not made from this rendering. Never
+                        re-enables or edits an existing firewall rule.
+  verify [--wait SECS]  Check the VM's startup script and the config hash and
+                        readiness it reports for this boot.
+  endpoint [plain|shell|github-output]
+                        Executor (internal IP) and IAP-tunnel endpoints; with
+                        github-output also the per-boot CA (tls_ca_b64).
+  tunnel                Open an IAP tunnel from 127.0.0.1 to the gRPCS port,
+                        write the CA from BUILDBUDDY_TLS_CA_B64 to a file and
+                        export BUILDBUDDY_TLS_CERTIFICATE (CI submitters).
+  stop | status | logs
+  render-config | config-sha256 | render-startup-script
 
 Environment:
   MEERKAT_GCP_PROJECT_ID                         GCP project
-  MEERKAT_GCP_REGION                             GCP region
   MEERKAT_GCP_ZONE                               GCP zone
   MEERKAT_GCP_BUILDBUDDY_CONTROL_INSTANCE        VM name (default: meerkat-bb-control)
-  MEERKAT_GCP_BUILDBUDDY_CONTROL_ADDRESS         Static address name
-  MEERKAT_GCP_BUILDBUDDY_CONTROL_DISK            Persistent data/cache disk name
+  MEERKAT_GCP_BUILDBUDDY_CONTROL_DISK            Data/cache disk name
   MEERKAT_GCP_BUILDBUDDY_CONTROL_MACHINE_TYPE    VM machine type
   MEERKAT_GCP_BUILDBUDDY_CONTROL_BOOT_DISK_GB    Boot disk size
   MEERKAT_GCP_BUILDBUDDY_CONTROL_DATA_DISK_GB    Data/cache disk size
-  MEERKAT_GCP_BUILDBUDDY_CONTROL_IMAGE           BuildBuddy app image
+  MEERKAT_GCP_BUILDBUDDY_CONTROL_IMAGE           BuildBuddy app image, pinned by
+                                                 digest (required to render)
+  MEERKAT_GCP_BUILDBUDDY_SERVICE_ACCOUNT         Executor service account allowed in
   MEERKAT_BUILDBUDDY_EXECUTOR_POOL               Default executor pool
   MEERKAT_BUILDBUDDY_CONTROL_CACHE_BYTES         BuildBuddy disk cache limit
+  MEERKAT_GCP_BUILDBUDDY_TUNNEL_PORT             Local IAP tunnel port (default: 1986)
+  MEERKAT_GCP_BUILDBUDDY_WAIT_ON_DOWN            0 stops asynchronously
   MEERKAT_GCP_BUILDBUDDY_MANAGE_IAM              Create/bind IAM (default: 0)
 EOF
 }
 
 project="${MEERKAT_GCP_PROJECT_ID:-${GCP_PROJECT_ID:-king-dnn-training-dev}}"
-region="${MEERKAT_GCP_REGION:-europe-west1}"
 zone="${MEERKAT_GCP_ZONE:-europe-west1-b}"
 instance="${MEERKAT_GCP_BUILDBUDDY_CONTROL_INSTANCE:-meerkat-bb-control}"
-address_name="${MEERKAT_GCP_BUILDBUDDY_CONTROL_ADDRESS:-${instance}-ip}"
 disk_name="${MEERKAT_GCP_BUILDBUDDY_CONTROL_DISK:-${instance}-data}"
 service_account_name="${MEERKAT_GCP_BUILDBUDDY_CONTROL_SERVICE_ACCOUNT_NAME:-meerkat-bb-control}"
 service_account="${MEERKAT_GCP_BUILDBUDDY_CONTROL_SERVICE_ACCOUNT:-${service_account_name}@${project}.iam.gserviceaccount.com}"
+executor_service_account="${MEERKAT_GCP_BUILDBUDDY_SERVICE_ACCOUNT:-${MEERKAT_GCP_BUILDBUDDY_SERVICE_ACCOUNT_NAME:-meerkat-bb-executor}@${project}.iam.gserviceaccount.com}"
 machine_type="${MEERKAT_GCP_BUILDBUDDY_CONTROL_MACHINE_TYPE:-c3d-standard-8}"
 boot_disk_gb="${MEERKAT_GCP_BUILDBUDDY_CONTROL_BOOT_DISK_GB:-50}"
 data_disk_gb="${MEERKAT_GCP_BUILDBUDDY_CONTROL_DATA_DISK_GB:-1000}"
-image="${MEERKAT_GCP_BUILDBUDDY_CONTROL_IMAGE:-gcr.io/flame-public/buildbuddy-app-enterprise:latest}"
+image="${MEERKAT_GCP_BUILDBUDDY_CONTROL_IMAGE:-}"
+intended_image="buildbuddy.bbcr.io/public/buildbuddy-app-enterprise:enterprise-v2.265.0"
 pool="${MEERKAT_BUILDBUDDY_EXECUTOR_POOL:-meerkat-ci}"
 cache_bytes="${MEERKAT_BUILDBUDDY_CONTROL_CACHE_BYTES:-800000000000}"
 manage_iam="${MEERKAT_GCP_BUILDBUDDY_MANAGE_IAM:-0}"
-tags="meerkat-bb-control"
-labels="purpose=buildbuddy-control,repo=meerkat"
+network="default"
+grpcs_port=1986
+https_port=8081
+tunnel_port="${MEERKAT_GCP_BUILDBUDDY_TUNNEL_PORT:-${grpcs_port}}"
+# Google's documented source range for IAP TCP forwarding.
+iap_source_range="35.235.240.0/20"
+iap_rules="tcp:22,tcp:${grpcs_port},tcp:${https_port}"
+executor_rules="tcp:${grpcs_port}"
+deny_rule="meerkat-bb-control-deny-ingress"
+iap_rule="meerkat-bb-control-allow-iap"
+executor_rule="meerkat-bb-control-allow-executors"
+allow_priority=900
+deny_priority=1000
+# The pre-hardening rule and network tag. Never reused, edited or re-enabled.
+legacy_firewall_rule="meerkat-bb-control-grpc-http"
+legacy_tag="meerkat-bb-control"
+baseline="hardened-v1"
+labels="purpose=buildbuddy-control,repo=meerkat,bb-baseline=${baseline}"
+startup_script_file=""
+trap 'if [[ -n "${startup_script_file}" ]]; then rm -f "${startup_script_file}"; fi' EXIT
+
+py_helpers="$(
+  cat <<'PY'
+import base64
+import datetime
+import hashlib
+import ipaddress
+import json
+import sys
+
+
+def read_json():
+    raw = sys.stdin.read()
+    return json.loads(raw) if raw.strip() else None
+
+
+def digest(text):
+    return hashlib.sha256(text.rstrip("\n").encode()).hexdigest()
+
+
+def show(value):
+    return ",".join(sorted(":".join(v) if isinstance(v, tuple) else str(v) for v in value)) if isinstance(value, set) else str(value)
+
+
+def spec_perms(spec):
+    return {(proto.lower(), port) for proto, _, port in (item.partition(":") for item in spec.split(","))}
+
+
+def rule_perms(rule):
+    perms = set()
+    for entry in rule.get("allowed") or rule.get("denied") or []:
+        for port in entry.get("ports") or [""]:
+            perms.add((str(entry.get("IPProtocol", "")).lower(), str(port)))
+    return perms
+
+
+def rule_action(rule):
+    return "DENY" if rule.get("denied") else "ALLOW"
+
+
+def last_segment(path):
+    return str(path or "").rstrip("/").rsplit("/", 1)[-1]
+
+
+def cmd_sha256(_):
+    print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest())
+
+
+def cmd_digest(_):
+    print(digest(sys.stdin.read()))
+
+
+def cmd_audit_firewall(args):
+    (network, control_sa, executor_sa, iap_range, allow_priority, deny_priority, legacy_rule,
+     legacy_tag, deny_rule, iap_rule, iap_rules, executor_rule, executor_rules) = args
+    allow_priority, deny_priority = int(allow_priority), int(deny_priority)
+    rules = read_json() or []
+    by_name = {rule.get("name"): rule for rule in rules}
+    common = {"network": network, "direction": "INGRESS", "sourceTags": set(),
+              "targetServiceAccounts": {control_sa}, "targetTags": set()}
+    managed = {
+        deny_rule: dict(common, action="DENY", priority=deny_priority, perms=spec_perms("all"),
+                        sourceRanges={"0.0.0.0/0"}, sourceServiceAccounts=set()),
+        iap_rule: dict(common, action="ALLOW", priority=allow_priority, perms=spec_perms(iap_rules),
+                       sourceRanges={iap_range}, sourceServiceAccounts=set()),
+        executor_rule: dict(common, action="ALLOW", priority=allow_priority,
+                            perms=spec_perms(executor_rules), sourceRanges=set(),
+                            sourceServiceAccounts={executor_sa}),
+    }
+    refusals = []
+    for name, want in managed.items():
+        rule = by_name.get(name)
+        if rule is None:
+            print(f"MISSING\t{name}")
+            continue
+        have = {
+            "network": last_segment(rule.get("network")),
+            "direction": rule.get("direction", "INGRESS"),
+            "action": rule_action(rule),
+            "priority": int(rule.get("priority", 1000)),
+            "perms": rule_perms(rule),
+            "sourceRanges": set(rule.get("sourceRanges") or []),
+            "sourceServiceAccounts": set(rule.get("sourceServiceAccounts") or []),
+            "sourceTags": set(rule.get("sourceTags") or []),
+            "targetServiceAccounts": set(rule.get("targetServiceAccounts") or []),
+            "targetTags": set(rule.get("targetTags") or []),
+        }
+        problems = ["is disabled (a disabled rule is never re-enabled)"] if rule.get("disabled") else []
+        problems += [f"{key} is {show(have[key])!r}, rendered {show(want[key])!r}"
+                     for key in want if have[key] != want[key]]
+        if problems:
+            refusals.append(f"managed firewall rule {name} " + "; ".join(problems))
+        else:
+            print(f"OK\t{name}")
+    if legacy_rule in by_name:
+        rule = by_name[legacy_rule]
+        refusals.append(f"legacy firewall rule {legacy_rule} exists (disabled={bool(rule.get('disabled'))}, "
+                        f"sources={show(set(rule.get('sourceRanges') or []))}); it is never reused or re-enabled")
+    # Every other ALLOW rule that can reach the VM must stay within the two
+    # intended allows: sources inside the IAP range on IAP ports, or the
+    # executor service account on the executor port. A rule reaches the VM
+    # when it targets every instance or the control-plane service account
+    # (the VM carries no network tags; ensure refuses a tagged VM) and is not
+    # shadowed by the deny rule: it is shadowed only at a priority number at
+    # or above the deny's (equal priorities go to the deny) and with IPv4
+    # sources alone (the deny covers 0.0.0.0/0).
+    iap_network = ipaddress.ip_network(iap_range)
+    iap_perms = spec_perms(iap_rules)
+    executor_perms = spec_perms(executor_rules)
+
+    def within(perms, allowed):
+        for proto, port in perms:
+            low, _, high = port.partition("-")
+            if not low or (high and high != low) or (proto, low) not in allowed:
+                return False
+        return bool(perms)
+
+    def inside_iap(sources):
+        try:
+            networks = [ipaddress.ip_network(s, strict=False) for s in sources]
+        except ValueError:
+            return False
+        return bool(networks) and all(n.version == 4 and n.subnet_of(iap_network) for n in networks)
+
+    for rule in rules:
+        name = rule.get("name")
+        if name in managed or name == legacy_rule:
+            continue
+        if (last_segment(rule.get("network")) != network or rule.get("direction", "INGRESS") != "INGRESS"
+                or rule_action(rule) != "ALLOW"):
+            continue
+        tags = set(rule.get("targetTags") or [])
+        accounts = set(rule.get("targetServiceAccounts") or [])
+        sources = [str(s) for s in rule.get("sourceRanges") or []]
+        source_accounts = set(rule.get("sourceServiceAccounts") or [])
+        source_tags = set(rule.get("sourceTags") or [])
+        priority = int(rule.get("priority", 1000))
+        disabled = bool(rule.get("disabled"))
+        open_sources = sorted(s for s in sources if s.endswith("/0"))
+        if open_sources and (legacy_tag in tags or control_sa in accounts):
+            refusals.append(f"firewall rule {name} admits {', '.join(open_sources)} to the control plane "
+                            f"(disabled={disabled})")
+            continue
+        if disabled or not ((not tags and not accounts) or control_sa in accounts):
+            continue
+        if priority >= deny_priority and not any(":" in s for s in sources):
+            continue
+        perms = rule_perms(rule)
+        if inside_iap(sources) and not source_accounts and not source_tags and within(perms, iap_perms):
+            continue
+        if (not sources and source_accounts and source_accounts <= {executor_sa} and not source_tags
+                and within(perms, executor_perms)):
+            continue
+        reach = ", ".join(sources + sorted(source_accounts) + sorted("tag:" + t for t in source_tags)) or "any source"
+        refusals.append(f"firewall rule {name} lets {reach} reach the control plane on {show(perms)} at "
+                        f"priority {priority}, ahead of {deny_rule} ({deny_priority}) and outside the IAP "
+                        f"and executor allows")
+    for refusal in refusals:
+        print(f"REFUSE\t{refusal}")
+
+
+def cmd_instance(_):
+    instance = read_json() or {}
+    items = {i.get("key"): i.get("value", "") for i in (instance.get("metadata") or {}).get("items") or []}
+    nic = (instance.get("networkInterfaces") or [{}])[0]
+    accounts = [a.get("email", "") for a in instance.get("serviceAccounts") or []]
+    started = ""
+    try:
+        stamp = instance.get("lastStartTimestamp") or instance["creationTimestamp"]
+        started = str(int(datetime.datetime.fromisoformat(stamp).timestamp()))
+    except (KeyError, TypeError, ValueError):
+        pass
+    print("status=" + str(instance.get("status", "")))
+    print("network_ip=" + str(nic.get("networkIP", "")))
+    print("service_account=" + (accounts[0] if accounts else ""))
+    print("guest_attributes=" + str(items.get("enable-guest-attributes", "")))
+    print("startup_script_digest=" + (digest(items["startup-script"]) if "startup-script" in items else ""))
+    print("last_start_epoch=" + started)
+    print("tags=" + ",".join((instance.get("tags") or {}).get("items") or []))
+
+
+def cmd_label(args):
+    print(((read_json() or {}).get("labels") or {}).get(args[0], ""))
+
+
+def cmd_guest(_):
+    found = []
+
+    def walk(node):
+        if isinstance(node, list):
+            for item in node:
+                walk(item)
+        elif isinstance(node, dict):
+            if "key" in node and "value" in node:
+                found.append(node)
+            walk((node.get("queryValue") or {}).get("items") or [])
+
+    walk(read_json())
+    for item in found:
+        if item.get("namespace", "meerkat") == "meerkat":
+            print(f"{item['key']}={item['value']}")
+
+
+def cmd_private_ipv4(args):
+    try:
+        address = ipaddress.IPv4Address(args[0])
+    except ValueError:
+        sys.exit(1)
+    private = ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")
+    sys.exit(0 if any(address in ipaddress.IPv4Network(net) for net in private) else 1)
+
+
+def cmd_ca_pem(args):
+    try:
+        pem = base64.b64decode(args[0], validate=True).decode()
+    except ValueError:
+        sys.exit("error: the control-plane CA is not valid base64")
+    if not (pem.startswith("-----BEGIN CERTIFICATE-----") and pem.rstrip().endswith("-----END CERTIFICATE-----")):
+        sys.exit("error: the control-plane CA is not a PEM certificate")
+    sys.stdout.write(pem if pem.endswith("\n") else pem + "\n")
+
+
+COMMANDS = {
+    "sha256": cmd_sha256, "digest": cmd_digest, "audit-firewall": cmd_audit_firewall,
+    "instance": cmd_instance, "label": cmd_label, "guest": cmd_guest,
+    "private-ipv4": cmd_private_ipv4, "ca-pem": cmd_ca_pem,
+}
+COMMANDS[sys.argv[1]](sys.argv[2:])
+PY
+)"
+
+py() {
+  python3 -c "${py_helpers}" "$@"
+}
+
+die() {
+  echo "error: $*" >&2
+  exit 1
+}
 
 require_gcloud() {
-  if ! command -v gcloud >/dev/null 2>&1; then
-    echo "error: gcloud is required" >&2
-    exit 1
+  command -v gcloud >/dev/null 2>&1 || die "gcloud is required"
+}
+
+require_python() {
+  command -v python3 >/dev/null 2>&1 || die "python3 is required"
+}
+
+validate_inputs() {
+  [[ "${pool}" =~ ^[A-Za-z0-9._-]+$ ]] || die "invalid executor pool name '${pool}'"
+  [[ "${cache_bytes}" =~ ^[0-9]+$ ]] || die "invalid cache size '${cache_bytes}'"
+  [[ "${tunnel_port}" =~ ^[0-9]+$ ]] || die "invalid tunnel port '${tunnel_port}'"
+}
+
+require_pinned_image() {
+  if ! [[ "${image}" =~ ^[A-Za-z0-9._/:-]+@sha256:[0-9a-f]{64}$ ]]; then
+    die "MEERKAT_GCP_BUILDBUDDY_CONTROL_IMAGE must pin the BuildBuddy app image by digest (<repository>[:tag]@sha256:<64 hex>); got '${image}'. Resolve the digest of ${intended_image} and set it."
   fi
 }
 
-instance_exists() {
-  gcloud compute instances describe "${instance}" --project "${project}" --zone "${zone}" >/dev/null 2>&1
+summary_field() {
+  sed -n "s/^$1=//p" <<<"$2" | head -n 1
 }
 
-disk_exists() {
-  gcloud compute disks describe "${disk_name}" --project "${project}" --zone "${zone}" >/dev/null 2>&1
+render_config() {
+  cat <<EOF
+# Rendered by scripts/gcp-buildbuddy-control-plane. The VM's startup script
+# installs this file byte for byte and refuses to start BuildBuddy when its
+# sha256 differs; CI compares the hash the VM reports with this rendering.
+app:
+  build_buddy_url: "https://localhost:${https_port}"
+  events_api_url: "grpcs://localhost:${grpcs_port}"
+  cache_api_url: "grpcs://localhost:${grpcs_port}"
+
+database:
+  data_source: "sqlite3:///data/buildbuddy/buildbuddy.db"
+
+storage:
+  ttl_seconds: 2592000
+  chunk_file_size_bytes: 3000000
+  disk:
+    root_directory: /data/buildbuddy/blobstore
+
+cache:
+  max_size_bytes: ${cache_bytes}
+  disk:
+    root_directory: /data/buildbuddy/cache
+
+# Every client authenticates with an org API key. BuildBuddy enforces that
+# only while an auth provider is configured, so self auth is enabled as the
+# UI login; the UI is reachable only through IAP. The JWT signing key is
+# generated per boot and expanded from the environment.
+auth:
+  enable_anonymous_usage: false
+  enable_self_auth: true
+  jwt_key: "\${BB_AUTH_JWT_KEY}"
+
+ssl:
+  enable_ssl: true
+  cert_file: /tls/server.crt
+  key_file: /tls/server.key
+
+# Executors register with an executor key of the org and serve only that
+# org's work; CI selects them with use-self-hosted-executors.
+remote_execution:
+  enable_remote_exec: true
+  enable_user_owned_executors: true
+  enable_executor_key_creation: true
+  require_executor_authorization: true
+  default_pool_name: "${pool}"
+  redis_target: "127.0.0.1:6379"
+
+disable_telemetry: true
+EOF
 }
 
-address_exists() {
-  gcloud compute addresses describe "${address_name}" --project "${project}" --region "${region}" >/dev/null 2>&1
+config_sha256() {
+  render_config | py sha256
 }
 
-firewall_exists() {
-  gcloud compute firewall-rules describe meerkat-bb-control-grpc-http --project "${project}" >/dev/null 2>&1
+render_startup_script() {
+  local config config_sha
+  config="$(render_config)"
+  config_sha="$(printf '%s\n' "${config}" | py sha256)"
+  cat <<EOF
+#!/usr/bin/env bash
+# Rendered by scripts/gcp-buildbuddy-control-plane; runs on every boot.
+set -euo pipefail
+
+IMAGE="${image}"
+CONFIG_SHA256="${config_sha}"
+HTTPS_PORT="${https_port}"
+EOF
+  cat <<'EOF'
+
+exec > >(tee -a /var/log/meerkat-buildbuddy-control-startup.log | logger -t meerkat-bb-control-startup -s 2>/dev/console) 2>&1
+
+metadata() {
+  curl -fsS -H "Metadata-Flavor: Google" "http://metadata.google.internal/computeMetadata/v1/$1"
+}
+
+# CI reads this boot's state from these guest attributes.
+report() {
+  curl -fsS -X PUT --data "$2" -H "Metadata-Flavor: Google" \
+    "http://metadata.google.internal/computeMetadata/v1/instance/guest-attributes/meerkat/$1" >/dev/null
+}
+
+fail() {
+  echo "error: $1" >&2
+  report ready "$2" || true
+  exit 1
+}
+
+report boot-started "$(date -u +%s)"
+report ready starting
+
+if ! command -v docker >/dev/null 2>&1 || ! command -v redis-server >/dev/null 2>&1 ||
+  ! command -v openssl >/dev/null 2>&1; then
+  apt-get update -y
+  DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates curl docker.io openssl redis-server
+fi
+systemctl enable --now docker
+systemctl enable --now redis-server
+
+mkdir -p /data/buildbuddy
+if ! findmnt /data/buildbuddy >/dev/null 2>&1; then
+  device="/dev/disk/by-id/google-bb-data"
+  [[ -e "${device}" ]] || fail "data disk ${device} is missing" unhealthy
+  if ! blkid "${device}" >/dev/null 2>&1; then
+    mkfs.ext4 -F "${device}"
+  fi
+  if ! grep -q '/data/buildbuddy' /etc/fstab; then
+    echo "${device} /data/buildbuddy ext4 defaults,nofail 0 2" >>/etc/fstab
+  fi
+  mount /data/buildbuddy
+fi
+mkdir -p /data/buildbuddy/blobstore /data/buildbuddy/cache /etc/buildbuddy
+
+cat >/etc/buildbuddy/config.yaml <<'BUILDBUDDY_CONFIG'
+EOF
+  printf '%s\n' "${config}"
+  cat <<'EOF'
+BUILDBUDDY_CONFIG
+installed_sha256="$(sha256sum /etc/buildbuddy/config.yaml | cut -d' ' -f1)"
+if [[ "${installed_sha256}" != "${CONFIG_SHA256}" ]]; then
+  fail "installed config sha256 ${installed_sha256} differs from the rendered ${CONFIG_SHA256}" config-mismatch
+fi
+
+# Per-boot TLS: a CA signs one server certificate for localhost and
+# 127.0.0.1 (IAP tunnels) and this VM's internal IP (executors), then its key
+# is destroyed. CI and the executors trust only that CA certificate.
+internal_ip="$(metadata instance/network-interfaces/0/ip)"
+state=/run/meerkat-bb-control
+tls="${state}/tls"
+rm -rf "${state}"
+install -d -m 0700 "${state}" "${tls}"
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 30 \
+  -subj "/CN=meerkat-bb-control per-boot CA" \
+  -addext "basicConstraints=critical,CA:TRUE,pathlen:0" \
+  -addext "keyUsage=critical,keyCertSign,cRLSign" \
+  -keyout "${tls}/ca.key" -out "${tls}/ca.crt" 2>/dev/null
+openssl req -new -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
+  -subj "/CN=meerkat-bb-control" -keyout "${tls}/server.key" -out "${tls}/server.csr" 2>/dev/null
+printf '%s\n' "basicConstraints=critical,CA:FALSE" "keyUsage=critical,digitalSignature" \
+  "extendedKeyUsage=serverAuth" "subjectAltName=DNS:localhost,IP:127.0.0.1,IP:${internal_ip}" \
+  >"${tls}/server.ext"
+openssl x509 -req -in "${tls}/server.csr" -CA "${tls}/ca.crt" -CAkey "${tls}/ca.key" -CAcreateserial \
+  -days 30 -sha256 -extfile "${tls}/server.ext" -out "${tls}/server.crt" 2>/dev/null
+rm -f "${tls}/ca.key" "${tls}/ca.srl" "${tls}/server.csr" "${tls}/server.ext"
+cat /etc/ssl/certs/ca-certificates.crt "${tls}/ca.crt" >"${tls}/ca-bundle.pem"
+
+# Per-boot JWT signing key; the config's auth.jwt_key expands it.
+jwt_key="$(head -c 48 /dev/urandom | base64 -w0)"
+[[ "${#jwt_key}" -eq 64 ]] || fail "could not generate the JWT signing key" unhealthy
+(umask 077 && printf 'BB_AUTH_JWT_KEY=%s\nSSL_CERT_FILE=/tls/ca-bundle.pem\n' "${jwt_key}" >"${state}/env")
+unset jwt_key
+
+docker pull "${IMAGE}"
+docker rm -f buildbuddy-control >/dev/null 2>&1 || true
+docker run -d \
+  --name buildbuddy-control \
+  --restart unless-stopped \
+  --network host \
+  --env-file "${state}/env" \
+  -v /etc/buildbuddy/config.yaml:/config.yaml:ro \
+  -v "${tls}:/tls:ro" \
+  -v /data/buildbuddy:/data/buildbuddy \
+  "${IMAGE}" \
+  --config_file=/config.yaml \
+  --server_type=buildbuddy-server
+
+for _ in {1..60}; do
+  if curl -fsS -o /dev/null --cacert "${tls}/ca.crt" "https://127.0.0.1:${HTTPS_PORT}/readyz"; then
+    report tls-ca "$(base64 -w0 "${tls}/ca.crt")"
+    report config-sha256 "${installed_sha256}"
+    report ready ok
+    exit 0
+  fi
+  sleep 5
+done
+docker logs --tail 100 buildbuddy-control || true
+fail "BuildBuddy did not become ready on https://127.0.0.1:${HTTPS_PORT}" unhealthy
+EOF
 }
 
 ensure_service_account() {
-  require_gcloud
   if ! gcloud iam service-accounts describe "${service_account}" --project "${project}" >/dev/null 2>&1; then
     if [[ "${manage_iam}" != "1" && "${manage_iam}" != "true" ]]; then
       echo "error: control-plane service account ${service_account} is missing" >&2
@@ -97,110 +577,141 @@ ensure_service_account() {
   done
 }
 
-write_startup_script() {
-  local path="$1"
-  cat >"${path}" <<EOF
-#!/usr/bin/env bash
-set -euo pipefail
+instance_json() {
+  gcloud compute instances describe "${instance}" --project "${project}" --zone "${zone}" --format=json 2>/dev/null
+}
 
-exec > >(tee -a /var/log/meerkat-buildbuddy-control-startup.log | logger -t meerkat-bb-control-startup -s 2>/dev/console) 2>&1
+create_firewall_rule() {
+  case "$1" in
+    "${deny_rule}")
+      gcloud compute firewall-rules create "${deny_rule}" \
+        --project "${project}" \
+        --network "${network}" \
+        --direction INGRESS \
+        --priority "${deny_priority}" \
+        --action DENY \
+        --rules all \
+        --source-ranges 0.0.0.0/0 \
+        --target-service-accounts "${service_account}" \
+        --description "Meerkat BuildBuddy control plane: deny every ingress the narrower rules do not allow" \
+        --quiet
+      ;;
+    "${iap_rule}")
+      gcloud compute firewall-rules create "${iap_rule}" \
+        --project "${project}" \
+        --network "${network}" \
+        --direction INGRESS \
+        --priority "${allow_priority}" \
+        --action ALLOW \
+        --rules "${iap_rules}" \
+        --source-ranges "${iap_source_range}" \
+        --target-service-accounts "${service_account}" \
+        --description "Meerkat BuildBuddy control plane: IAP TCP forwarding (SSH, gRPCS, HTTPS)" \
+        --quiet
+      ;;
+    "${executor_rule}")
+      gcloud compute firewall-rules create "${executor_rule}" \
+        --project "${project}" \
+        --network "${network}" \
+        --direction INGRESS \
+        --priority "${allow_priority}" \
+        --action ALLOW \
+        --rules "${executor_rules}" \
+        --source-service-accounts "${executor_service_account}" \
+        --target-service-accounts "${service_account}" \
+        --description "Meerkat BuildBuddy control plane: gRPCS from the executor pool" \
+        --quiet
+      ;;
+    *)
+      die "unknown managed firewall rule $1"
+      ;;
+  esac
+}
 
-IMAGE="${image}"
-POOL="${pool}"
-CACHE_BYTES="${cache_bytes}"
+wait_while_stopping() {
+  local current="$1"
+  local _
+  for _ in $(seq 1 36); do
+    [[ "${current}" == "STOPPING" ]] || break
+    sleep 5
+    current="$(gcloud compute instances describe "${instance}" --project "${project}" --zone "${zone}" --format='value(status)')"
+  done
+  printf '%s\n' "${current}"
+}
 
-apt-get update -y
-DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates curl docker.io python3 redis-server
-systemctl enable --now docker
-systemctl enable --now redis-server
+ensure_instance() {
+  require_gcloud
+  require_python
+  validate_inputs
+  require_pinned_image
 
-mkdir -p /data/buildbuddy
-if ! findmnt /data/buildbuddy >/dev/null 2>&1; then
-  device="/dev/disk/by-id/google-bb-data"
-  if [[ -e "\${device}" ]]; then
-    if ! blkid "\${device}" >/dev/null 2>&1; then
-      mkfs.ext4 -F "\${device}"
+  local rendered_digest
+  startup_script_file="$(mktemp)"
+  render_startup_script >"${startup_script_file}"
+  rendered_digest="$(py digest <"${startup_script_file}")"
+
+  # Read everything first and refuse before anything changes.
+  local refusals=() missing=() audit kind detail
+  audit="$(gcloud compute firewall-rules list --project "${project}" --format=json |
+    py audit-firewall "${network}" "${service_account}" "${executor_service_account}" \
+      "${iap_source_range}" "${allow_priority}" "${deny_priority}" "${legacy_firewall_rule}" \
+      "${legacy_tag}" "${deny_rule}" "${iap_rule}" "${iap_rules}" "${executor_rule}" "${executor_rules}")"
+  while IFS=$'\t' read -r kind detail; do
+    case "${kind}" in
+      REFUSE) refusals+=("${detail}") ;;
+      MISSING) missing+=("${detail}") ;;
+    esac
+  done <<<"${audit}"
+
+  local current_json="" summary="" status=""
+  if current_json="$(instance_json)"; then
+    summary="$(py instance <<<"${current_json}")"
+    status="$(summary_field status "${summary}")"
+    local have_digest have_account
+    have_digest="$(summary_field startup_script_digest "${summary}")"
+    have_account="$(summary_field service_account "${summary}")"
+    if [[ "${have_digest}" != "${rendered_digest}" ]]; then
+      refusals+=("instance ${instance} runs a startup script (digest ${have_digest:-none}) other than the rendered one (${rendered_digest}); it is never started or updated in place")
     fi
-    mkdir -p /data/buildbuddy
-    if ! grep -q '/data/buildbuddy' /etc/fstab; then
-      echo "\${device} /data/buildbuddy ext4 defaults,nofail 0 2" >> /etc/fstab
+    if [[ "${have_account}" != "${service_account}" ]]; then
+      refusals+=("instance ${instance} runs as ${have_account:-no service account}, not ${service_account}")
     fi
-    mount /data/buildbuddy
+    if [[ "$(summary_field guest_attributes "${summary}")" != "TRUE" ]]; then
+      refusals+=("instance ${instance} does not enable guest attributes, so its config hash cannot be verified")
+    fi
+    if [[ -n "$(summary_field tags "${summary}")" ]]; then
+      refusals+=("instance ${instance} carries network tags ($(summary_field tags "${summary}")), so tag-targeted firewall rules could reach it")
+    fi
   fi
-fi
 
-mkdir -p /data/buildbuddy/blobstore /data/buildbuddy/cache /etc/buildbuddy
-chmod -R a+rwX /data/buildbuddy
-
-metadata() {
-  curl -fsS -H "Metadata-Flavor: Google" "http://metadata.google.internal/computeMetadata/v1/\$1"
-}
-
-external_ip="\$(metadata 'instance/network-interfaces/0/access-configs/0/external-ip' || true)"
-internal_ip="\$(metadata 'instance/network-interfaces/0/ip')"
-host="\${external_ip:-\${internal_ip}}"
-http_url="http://\${host}:8080"
-grpc_url="grpc://\${host}:1985"
-
-cat >/etc/buildbuddy/config.yaml <<CONFIG
-app:
-  build_buddy_url: "\${http_url}"
-  events_api_url: "\${grpc_url}"
-  cache_api_url: "\${grpc_url}"
-
-database:
-  data_source: "sqlite3:///data/buildbuddy/buildbuddy.db"
-
-storage:
-  ttl_seconds: 2592000
-  chunk_file_size_bytes: 3000000
-  disk:
-    root_directory: /data/buildbuddy/blobstore
-
-cache:
-  max_size_bytes: \${CACHE_BYTES}
-  disk:
-    root_directory: /data/buildbuddy/cache
-
-auth:
-  enable_anonymous_usage: true
-
-remote_execution:
-  enable_remote_exec: true
-  enable_user_owned_executors: true
-  require_executor_authorization: false
-  default_pool_name: "\${POOL}"
-  redis_target: "127.0.0.1:6379"
-
-disable_telemetry: true
-CONFIG
-
-docker pull "\${IMAGE}"
-docker rm -f buildbuddy-control >/dev/null 2>&1 || true
-docker run -d \
-  --name buildbuddy-control \
-  --restart unless-stopped \
-  --network host \
-  -v /etc/buildbuddy/config.yaml:/config.yaml:ro \
-  -v /data/buildbuddy:/data/buildbuddy \
-  "\${IMAGE}" \
-  --config_file=/config.yaml \
-  --server_type=buildbuddy-server
-EOF
-}
-
-ensure_address() {
-  if ! address_exists; then
-    gcloud compute addresses create "${address_name}" \
-      --project "${project}" \
-      --region "${region}" \
-      --network-tier PREMIUM \
-      --quiet
+  local disk_present=0 disk_json disk_baseline
+  if disk_json="$(gcloud compute disks describe "${disk_name}" --project "${project}" --zone "${zone}" --format=json 2>/dev/null)"; then
+    disk_present=1
+    disk_baseline="$(py label bb-baseline <<<"${disk_json}")"
+    if [[ "${disk_baseline}" != "${baseline}" ]]; then
+      refusals+=("data disk ${disk_name} lacks label bb-baseline=${baseline} (has '${disk_baseline}'): it predates this baseline and may hold untrusted cache or database state; it is never attached")
+    fi
   fi
-}
 
-ensure_disk() {
-  if ! disk_exists; then
+  if [[ "${#refusals[@]}" -gt 0 ]]; then
+    echo "error: refusing to ensure the BuildBuddy control plane; nothing was changed:" >&2
+    printf '  - %s\n' "${refusals[@]}" >&2
+    echo "Record what is listed for review, then delete it (or choose new names) and rerun; see the rebuild runbook." >&2
+    exit 1
+  fi
+
+  ensure_service_account
+  # Converge: the deny rule first, then the narrow allows.
+  local rule name
+  for rule in "${deny_rule}" "${iap_rule}" "${executor_rule}"; do
+    for name in "${missing[@]}"; do
+      if [[ "${name}" == "${rule}" ]]; then
+        create_firewall_rule "${rule}"
+      fi
+    done
+  done
+
+  if [[ "${disk_present}" -eq 0 ]]; then
     gcloud compute disks create "${disk_name}" \
       --project "${project}" \
       --zone "${zone}" \
@@ -209,104 +720,188 @@ ensure_disk() {
       --labels "${labels}" \
       --quiet
   fi
-}
 
-ensure_firewall() {
-  if ! firewall_exists; then
-    gcloud compute firewall-rules create meerkat-bb-control-grpc-http \
+  if [[ -z "${summary}" ]]; then
+    # No --address: the ephemeral external IP serves egress only; the deny
+    # rule above blocks every ingress the IAP and executor rules do not allow.
+    gcloud compute instances create "${instance}" \
       --project "${project}" \
-      --network default \
-      --allow tcp:8080,tcp:1985 \
-      --source-ranges 0.0.0.0/0 \
-      --target-tags "${tags}" \
-      --description "Allow GitHub submitters and GCP executors to reach Meerkat BuildBuddy control plane" \
+      --zone "${zone}" \
+      --machine-type "${machine_type}" \
+      --network "${network}" \
+      --boot-disk-size "${boot_disk_gb}GB" \
+      --boot-disk-type pd-ssd \
+      --image-family debian-12 \
+      --image-project debian-cloud \
+      --maintenance-policy MIGRATE \
+      --provisioning-model STANDARD \
+      --service-account "${service_account}" \
+      --scopes cloud-platform \
+      --labels "${labels}" \
+      --disk "name=${disk_name},device-name=bb-data,mode=rw,boot=no,auto-delete=no" \
+      --metadata enable-guest-attributes=TRUE \
+      --metadata-from-file startup-script="${startup_script_file}" \
       --quiet
-  fi
-}
-
-ensure_instance() {
-  require_gcloud
-  ensure_service_account
-  ensure_address
-  ensure_disk
-  ensure_firewall
-
-  if instance_exists; then
-    local status
-    status="$(gcloud compute instances describe "${instance}" --project "${project}" --zone "${zone}" --format='value(status)')"
-    if [[ "${status}" == "TERMINATED" ]]; then
-      gcloud compute instances start "${instance}" --project "${project}" --zone "${zone}" --quiet
-    fi
     return
   fi
 
-  startup_script="$(mktemp)"
-  trap 'rm -f "${startup_script}"' EXIT
-  write_startup_script "${startup_script}"
-  gcloud compute instances create "${instance}" \
-    --project "${project}" \
-    --zone "${zone}" \
-    --machine-type "${machine_type}" \
-    --boot-disk-size "${boot_disk_gb}GB" \
-    --boot-disk-type pd-ssd \
-    --image-family debian-12 \
-    --image-project debian-cloud \
-    --maintenance-policy MIGRATE \
-    --provisioning-model STANDARD \
-    --service-account "${service_account}" \
-    --scopes cloud-platform \
-    --address "${address_name}" \
-    --tags "${tags}" \
-    --labels "${labels}" \
-    --disk "name=${disk_name},device-name=bb-data,mode=rw,boot=no,auto-delete=no" \
-    --metadata-from-file startup-script="${startup_script}" \
-    --quiet
+  status="$(wait_while_stopping "${status}")"
+  case "${status}" in
+    TERMINATED)
+      gcloud compute instances start "${instance}" --project "${project}" --zone "${zone}" --quiet
+      ;;
+    RUNNING | PROVISIONING | STAGING) ;;
+    *)
+      die "instance ${instance} is ${status}; start it manually or delete it"
+      ;;
+  esac
+}
+
+verify() {
+  require_gcloud
+  require_python
+  validate_inputs
+  require_pinned_image
+  local wait_seconds=0
+  if [[ "${1:-}" == "--wait" ]]; then
+    wait_seconds="${2:-}"
+    [[ "${wait_seconds}" =~ ^[0-9]+$ ]] || die "verify --wait needs a number of seconds"
+  fi
+
+  local expected_config expected_digest current_json summary
+  expected_config="$(config_sha256)"
+  expected_digest="$(render_startup_script | py digest)"
+  current_json="$(instance_json)" || die "control-plane instance ${instance} is missing"
+  summary="$(py instance <<<"${current_json}")"
+  if [[ "$(summary_field startup_script_digest "${summary}")" != "${expected_digest}" ]]; then
+    die "instance ${instance} runs a startup script other than the rendered one (${expected_digest}); run ensure for the details"
+  fi
+  local last_start
+  last_start="$(summary_field last_start_epoch "${summary}")"
+  [[ "${last_start}" =~ ^[0-9]+$ ]] || die "instance ${instance} reports no start time, so this boot's report cannot be told from an earlier one"
+
+  local deadline attributes ready installed booted ca
+  deadline=$(($(date +%s) + wait_seconds))
+  while true; do
+    attributes="$(gcloud compute instances get-guest-attributes "${instance}" \
+      --project "${project}" \
+      --zone "${zone}" \
+      --query-path=meerkat/ \
+      --format=json 2>/dev/null | py guest || true)"
+    ready="$(summary_field ready "${attributes}")"
+    installed="$(summary_field config-sha256 "${attributes}")"
+    booted="$(summary_field boot-started "${attributes}")"
+    ca="$(summary_field tls-ca "${attributes}")"
+    # Only a well-formed report written after this boot started counts; a
+    # missing, malformed or earlier one is not this boot's.
+    if ! [[ "${booted}" =~ ^[0-9]+$ ]] || ((booted < last_start || booted > $(date +%s) + 300)); then
+      ready="not-this-boot"
+    fi
+    case "${ready}" in
+      ok)
+        if [[ "${installed}" != "${expected_config}" ]]; then
+          die "instance ${instance} reports config sha256 '${installed}', rendered ${expected_config}"
+        fi
+        [[ -n "${ca}" ]] || die "instance ${instance} reports no TLS CA"
+        echo "verified ${instance}: startup script ${expected_digest}, config sha256 ${installed}, TLS CA reported"
+        return 0
+        ;;
+      config-mismatch | unhealthy)
+        logs >&2 || true
+        die "instance ${instance} reports ready=${ready}"
+        ;;
+    esac
+    if (($(date +%s) >= deadline)); then
+      logs >&2 || true
+      die "instance ${instance} did not report ready with config sha256 ${expected_config} (ready='${ready}', reported '${installed}')"
+    fi
+    sleep 10
+  done
 }
 
 endpoint() {
   require_gcloud
-  if ! instance_exists; then
-    echo "error: control-plane instance ${instance} is missing" >&2
-    exit 1
-  fi
-  local ip
-  ip="$(gcloud compute instances describe "${instance}" \
-    --project "${project}" \
-    --zone "${zone}" \
-    --format='value(networkInterfaces[0].accessConfigs[0].natIP)')"
-  if [[ -z "${ip}" ]]; then
-    ip="$(gcloud compute instances describe "${instance}" \
-      --project "${project}" \
-      --zone "${zone}" \
-      --format='value(networkInterfaces[0].networkIP)')"
-  fi
-  case "${1:-plain}" in
+  require_python
+  local mode="${1:-plain}" current_json summary ip
+  current_json="$(instance_json)" || die "control-plane instance ${instance} is missing"
+  summary="$(py instance <<<"${current_json}")"
+  ip="$(summary_field network_ip "${summary}")"
+  py private-ipv4 "${ip}" || die "control-plane internal IP '${ip}' is not a private IPv4 address"
+  local executor_url="grpcs://${ip}:${grpcs_port}"
+  local tunnel_url="grpcs://127.0.0.1:${tunnel_port}"
+  local http_url="https://localhost:${https_port}"
+  case "${mode}" in
     github-output)
+      local attributes ca
+      attributes="$(gcloud compute instances get-guest-attributes "${instance}" \
+        --project "${project}" \
+        --zone "${zone}" \
+        --query-path=meerkat/ \
+        --format=json | py guest)"
+      ca="$(summary_field tls-ca "${attributes}")"
+      py ca-pem "${ca}" >/dev/null
       {
-        echo "grpc_url=grpc://${ip}:1985"
-        echo "http_url=http://${ip}:8080"
+        echo "executor_grpc_url=${executor_url}"
+        echo "grpc_url=${tunnel_url}"
+        echo "http_url=${http_url}"
+        echo "tls_ca_b64=${ca}"
       } >>"${GITHUB_OUTPUT}"
       ;;
     shell)
-      echo "BUILDBUDDY_GRPC_URL=grpc://${ip}:1985"
-      echo "BUILDBUDDY_HTTP_URL=http://${ip}:8080"
+      echo "BUILDBUDDY_EXECUTOR_GRPC_URL=${executor_url}"
+      echo "BUILDBUDDY_GRPC_URL=${tunnel_url}"
+      echo "BUILDBUDDY_HTTP_URL=${http_url}"
       ;;
     *)
-      echo "grpc://{ip}:1985" | sed "s/{ip}/${ip}/"
-      echo "http://{ip}:8080" | sed "s/{ip}/${ip}/"
+      echo "${executor_url}"
+      echo "${tunnel_url}"
+      echo "${http_url}"
       ;;
   esac
+}
+
+tunnel() {
+  require_gcloud
+  require_python
+  validate_inputs
+  [[ -n "${BUILDBUDDY_TLS_CA_B64:-}" ]] || die "BUILDBUDDY_TLS_CA_B64 (the control-plane-up output tls_ca_b64) is required"
+  local dir="${RUNNER_TEMP:-${TMPDIR:-/tmp}}"
+  local ca_file="${dir}/meerkat-bb-control-ca.pem"
+  local log="${dir}/meerkat-bb-control-tunnel.log"
+  py ca-pem "${BUILDBUDDY_TLS_CA_B64}" >"${ca_file}"
+  nohup gcloud compute start-iap-tunnel "${instance}" "${grpcs_port}" \
+    --local-host-port="127.0.0.1:${tunnel_port}" \
+    --zone "${zone}" \
+    --project "${project}" >"${log}" 2>&1 &
+  local pid=$!
+  local _
+  for _ in $(seq 1 60); do
+    if ! kill -0 "${pid}" 2>/dev/null; then
+      cat "${log}" >&2
+      die "the IAP tunnel to ${instance}:${grpcs_port} exited"
+    fi
+    if (exec 3<>"/dev/tcp/127.0.0.1/${tunnel_port}") 2>/dev/null; then
+      if [[ -n "${GITHUB_ENV:-}" ]]; then
+        echo "BUILDBUDDY_TLS_CERTIFICATE=${ca_file}" >>"${GITHUB_ENV}"
+      fi
+      echo "IAP tunnel to ${instance}:${grpcs_port} listens on 127.0.0.1:${tunnel_port} (pid ${pid}); CA in ${ca_file}"
+      return 0
+    fi
+    sleep 1
+  done
+  cat "${log}" >&2
+  kill "${pid}" 2>/dev/null || true
+  die "timed out waiting for the IAP tunnel to ${instance}:${grpcs_port}"
 }
 
 status() {
   require_gcloud
   echo "project=${project} zone=${zone} instance=${instance} disk=${disk_name}"
-  if instance_exists; then
+  if gcloud compute instances describe "${instance}" --project "${project}" --zone "${zone}" >/dev/null 2>&1; then
     gcloud compute instances describe "${instance}" \
       --project "${project}" \
       --zone "${zone}" \
-      --format='table(name,status,machineType.basename(),networkInterfaces[0].networkIP,networkInterfaces[0].accessConfigs[0].natIP)'
-    endpoint shell
+      --format='table(name,status,machineType.basename(),networkInterfaces[0].networkIP)'
   else
     echo "instance ${instance}: absent"
   fi
@@ -314,11 +909,21 @@ status() {
 
 logs() {
   require_gcloud
-  gcloud compute ssh "${instance}" \
+  gcloud compute instances get-serial-port-output "${instance}" \
     --project "${project}" \
-    --zone "${zone}" \
-    --command='sudo systemctl --no-pager --full status google-startup-scripts.service || true; sudo docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Image}}" || true; sudo docker logs --tail 160 buildbuddy-control || true' \
-    --quiet
+    --zone "${zone}" | tail -n 200
+}
+
+stop() {
+  require_gcloud
+  if gcloud compute instances describe "${instance}" --project "${project}" --zone "${zone}" >/dev/null 2>&1; then
+    local args=(compute instances stop "${instance}" --project "${project}" --zone "${zone}" --quiet)
+    case "${MEERKAT_GCP_BUILDBUDDY_WAIT_ON_DOWN:-1}" in
+      0 | false | False | FALSE | no | No | NO) args+=(--async) ;;
+    esac
+    gcloud "${args[@]}"
+  fi
+  status
 }
 
 command="${1:-status}"
@@ -326,25 +931,43 @@ case "${command}" in
   status)
     status
     ;;
-  ensure|start)
+  ensure | start)
     ensure_instance
     status
     ;;
+  verify)
+    shift || true
+    verify "$@"
+    ;;
   stop)
-    require_gcloud
-    if instance_exists; then
-      gcloud compute instances stop "${instance}" --project "${project}" --zone "${zone}" --quiet
-    fi
-    status
+    stop
     ;;
   endpoint)
     shift || true
     endpoint "${1:-plain}"
     ;;
+  tunnel)
+    tunnel
+    ;;
   logs)
     logs
     ;;
-  -h|--help|help)
+  render-config)
+    validate_inputs
+    render_config
+    ;;
+  config-sha256)
+    require_python
+    validate_inputs
+    config_sha256
+    ;;
+  render-startup-script)
+    require_python
+    validate_inputs
+    require_pinned_image
+    render_startup_script
+    ;;
+  -h | --help | help)
     usage
     ;;
   *)

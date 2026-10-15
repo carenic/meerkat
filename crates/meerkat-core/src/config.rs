@@ -67,6 +67,13 @@ pub struct Config {
     /// back as present.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub governance: Option<crate::GovernanceConfig>,
+    /// OS process confinement of the processes launched for agents
+    /// (`[confinement]`). The host administers it in the document itself,
+    /// and across the documents a composition folds a requirement only holds
+    /// or is added ([`crate::ConfinementConfig::fold_less_trusted`]). Skipped
+    /// when it states nothing, so a document without it keeps its bytes.
+    #[serde(default, skip_serializing_if = "crate::ConfinementConfig::is_empty")]
+    pub confinement: crate::ConfinementConfig,
     /// Realm-scoped connection sets (backend profiles, auth profiles,
     /// bindings). TOML keys use the singular `[realm.<id>.*]` namespace
     /// even though the Rust field is plural-adjacent — `#[serde(rename)]`
@@ -104,6 +111,7 @@ impl Default for Config {
             model_fallback: ModelFallbackConfig::default(),
             presentation: PresentationConfig::default(),
             governance: None,
+            confinement: crate::ConfinementConfig::default(),
             realm: BTreeMap::new(),
         }
     }
@@ -151,6 +159,7 @@ impl Config {
         self.model_fallback
             .normalize_persisted()
             .into_iter()
+            .chain(self.agent.normalize_persisted())
             .collect()
     }
 }
@@ -319,6 +328,7 @@ impl Config {
         self.merge_self_hosted_from_toml_presence(&parsed, &self_hosted_layer);
         self.merge_provider_tools_from_toml_presence(&parsed, &provider_tools_layer);
         self.merge_skills_from_toml_presence(&parsed, &skills_layer);
+        self.merge_agent_from_toml_presence(&parsed);
         Ok(warnings)
     }
 
@@ -351,6 +361,9 @@ impl Config {
         }
         if other.agent.extraction_prompt.is_some() {
             self.agent.extraction_prompt = other.agent.extraction_prompt;
+        }
+        if other.agent.budget_warning_threshold != AgentConfig::default().budget_warning_threshold {
+            self.agent.budget_warning_threshold = other.agent.budget_warning_threshold;
         }
 
         // Storage config
@@ -465,6 +478,9 @@ impl Config {
         if other.limits.max_turn_duration.is_some() {
             self.limits.max_turn_duration = other.limits.max_turn_duration;
         }
+        if other.limits.max_tool_calls.is_some() {
+            self.limits.max_tool_calls = other.limits.max_tool_calls;
+        }
         if other.rest != RestServerConfig::default() {
             self.rest = other.rest;
         }
@@ -489,6 +505,9 @@ impl Config {
         if other.governance.is_some() {
             self.governance = other.governance;
         }
+        // `other` is the less trusted layer: it can add confinement, never
+        // weaken or replace a requirement this layer already holds.
+        self.confinement.fold_less_trusted(&other.confinement);
 
         // Skills: scalar toggles and health policy are child-wins when
         // non-default. Identity-governance records are an append-only overlay:
@@ -612,6 +631,22 @@ impl Config {
         }
         if other.workgraph_enabled != defaults.workgraph_enabled {
             self.tools.workgraph_enabled = other.workgraph_enabled;
+        }
+    }
+
+    /// `[agent] budget_warning_threshold` by presence: an explicit value wins
+    /// even when it equals the template default, which the value merge
+    /// cannot tell from an omitted key. A value outside its range loaded as
+    /// the default with a warning and is ignored, so the inherited threshold
+    /// stays.
+    fn merge_agent_from_toml_presence(&mut self, parsed: &toml::Value) {
+        if let Some(threshold) = parsed
+            .get("agent")
+            .and_then(|agent| agent.get("budget_warning_threshold"))
+            .and_then(|threshold| threshold.clone().try_into::<f32>().ok())
+            .filter(|threshold| AgentConfig::budget_warning_threshold_applies(*threshold))
+        {
+            self.agent.budget_warning_threshold = threshold;
         }
     }
 
@@ -881,7 +916,10 @@ impl Config {
 
     /// Apply CLI argument overrides.
     ///
-    /// - Explicit CLI flags override scalar runtime knobs.
+    /// - Explicit CLI flags override scalar runtime knobs. The budget flags
+    ///   override the enforced `[limits]` dimensions read by
+    ///   [`Config::budget_limits`], never the legacy `[budget]` table, which
+    ///   no runtime enforces.
     /// - `override_config` applies RFC 7396 JSON merge-patch semantics.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn apply_cli_overrides(&mut self, cli: CliOverrides) {
@@ -889,13 +927,13 @@ impl Config {
             self.agent.model = model;
         }
         if let Some(tokens) = cli.max_tokens {
-            self.budget.max_tokens = Some(tokens);
+            self.limits.budget = Some(tokens);
         }
         if let Some(duration) = cli.max_duration {
-            self.budget.max_duration = Some(duration);
+            self.limits.max_duration = Some(duration);
         }
         if let Some(calls) = cli.max_tool_calls {
-            self.budget.max_tool_calls = Some(calls);
+            self.limits.max_tool_calls = Some(calls);
         }
         // Apply JSON merge patch override if present
         if let Some(delta) = cli.override_config {
@@ -904,6 +942,11 @@ impl Config {
             if let Ok(updated) = serde_json::from_value(value) {
                 *self = updated;
             }
+        }
+        // The operator's `--confinement*` flags replace every document's
+        // `[confinement]` for every launch kind of this process.
+        if let Some(selection) = cli.confinement {
+            self.confinement = crate::ConfinementConfig::for_all(selection);
         }
     }
 }
@@ -1081,11 +1124,17 @@ impl Config {
 #[derive(Debug, Clone, Default)]
 pub struct CliOverrides {
     pub model: Option<String>,
+    /// Agent-lifetime token budget; overrides `limits.budget`.
     pub max_tokens: Option<u64>,
+    /// Agent-lifetime wall-clock ceiling; overrides `limits.max_duration`.
     pub max_duration: Option<Duration>,
+    /// Agent-lifetime tool-call ceiling; overrides `limits.max_tool_calls`.
     pub max_tool_calls: Option<usize>,
     /// Arbitrary configuration overrides via JSON merge patch
     pub override_config: Option<ConfigDelta>,
+    /// The operator's process confinement selection (`--confinement*`
+    /// flags); replaces `[confinement]` for every launch kind.
+    pub confinement: Option<crate::LaunchConfinement>,
 }
 
 /// Canonical default for the structured-output validation retry budget.
@@ -1132,7 +1181,11 @@ pub struct AgentConfig {
     pub max_tokens_per_turn: Option<u32>,
     /// Temperature for sampling
     pub temperature: Option<f32>,
-    /// Warning threshold for budget (0.0-1.0)
+    /// Fraction of each budget limit (tokens, tool calls, time) at which the
+    /// agent emits one early `BudgetWarning`, before the limit is reached.
+    /// Takes effect in `(0, 1]`; `1.0` keeps only the warning at the limit.
+    /// A persisted value outside that range loads as the default, with
+    /// [`ConfigWarning::OutOfRangeBudgetWarningThreshold`].
     pub budget_warning_threshold: f32,
     /// Maximum turns before forced stop
     pub max_turns: Option<u32>,
@@ -1167,6 +1220,11 @@ pub struct AgentConfig {
     pub provider_native_tools: crate::ProviderNativeToolPolicy,
     /// Output schema for structured output extraction.
     ///
+    /// A per-build setting: the factory takes it from the build's
+    /// `output_schema`, never from a realm config, so `[agent] output_schema`
+    /// in a realm document applies to no session and loads with
+    /// [`ConfigWarning::UnappliedAgentOutputSchema`].
+    ///
     /// When set, every request shows the model the schema, and a final reply
     /// that already validates becomes the structured output. Otherwise the
     /// agent performs an extraction turn after completing the agentic work,
@@ -1182,7 +1240,8 @@ pub struct AgentConfig {
     ///
     /// When `output_schema` is set, this prompt is sent as a user message
     /// after the agentic loop to elicit schema-valid JSON. Defaults to a
-    /// built-in prompt if `None`.
+    /// built-in prompt if `None`. A realm's `[agent] extraction_prompt` sets
+    /// it for every agent the factory builds from that config.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub extraction_prompt: Option<String>,
 }
@@ -1229,6 +1288,22 @@ impl AgentConfig {
             })
             .filter(|value| *value > 0)
             .unwrap_or(DEFAULT_MAX_TOKENS_PER_TURN)
+    }
+
+    /// Whether a `budget_warning_threshold` takes effect: one in `(0, 1]`.
+    fn budget_warning_threshold_applies(threshold: f32) -> bool {
+        threshold > 0.0 && threshold <= 1.0
+    }
+
+    /// Load normalization for `[agent]`: a `budget_warning_threshold` outside
+    /// `(0, 1]` loads as the default. Releases through 0.9.0 never read the
+    /// key, so documents they wrote may hold any value.
+    fn normalize_persisted(&mut self) -> Option<ConfigWarning> {
+        if Self::budget_warning_threshold_applies(self.budget_warning_threshold) {
+            return None;
+        }
+        self.budget_warning_threshold = Self::default().budget_warning_threshold;
+        Some(ConfigWarning::OutOfRangeBudgetWarningThreshold)
     }
 }
 
@@ -1823,6 +1898,14 @@ pub struct LimitsConfig {
         skip_serializing_if = "Option::is_none"
     )]
     pub max_turn_duration: Option<Duration>,
+    /// Agent-lifetime tool-call ceiling, the configuration twin of
+    /// [`BudgetLimits::max_tool_calls`]. Counted from agent construction like
+    /// `budget`, not per turn.
+    ///
+    /// Skipped when unset so an existing realm config document keeps its
+    /// exact bytes rather than gaining a null key on the next rewrite.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tool_calls: Option<usize>,
 }
 
 impl LimitsConfig {
@@ -1831,7 +1914,7 @@ impl LimitsConfig {
             max_tokens: self.budget,
             max_duration: self.max_duration,
             max_turn_duration: self.max_turn_duration,
-            max_tool_calls: None,
+            max_tool_calls: self.max_tool_calls,
         }
     }
 }
@@ -2969,6 +3052,20 @@ pub enum ConfigError {
     )]
     GovernanceAdministration,
 
+    /// A write would add, change or remove the document's `[confinement]`
+    /// section ([`crate::ConfinementConfig`]). Ordinary config write
+    /// permission is not confinement administration: the host administers
+    /// the section in the document itself. Nothing is written.
+    #[error(
+        "the confinement section is administered by the host in the config document; a config write cannot add, change or remove it"
+    )]
+    ConfinementAdministration,
+
+    /// A less trusted config document states confinement for a launch kind
+    /// differently from the more trusted document that decided it.
+    #[error(transparent)]
+    ConfinementLayerConflict(#[from] crate::ConfinementLayerConflict),
+
     #[error("realm inheritance chain error: {0}")]
     RealmChain(#[from] crate::connection::RealmChainError),
 }
@@ -3006,6 +3103,15 @@ pub enum ConfigWarning {
     /// settings the table is no fallback policy and inherits the parent
     /// realm's explicit policy, off if there is none.
     LegacyModelFallbackCatalogChain,
+    /// `[agent] output_schema` in a realm document. A schema is a per-build
+    /// setting, so the realm value applies to no session; the document still
+    /// loads.
+    UnappliedAgentOutputSchema,
+    /// `[agent] budget_warning_threshold` outside `(0, 1]`. Releases through
+    /// 0.9.0 never read the key, so the document still loads: the value is
+    /// ignored and the threshold is inherited from the parent realm, or the
+    /// default if there is none.
+    OutOfRangeBudgetWarningThreshold,
 }
 
 impl std::fmt::Display for ConfigWarning {
@@ -3027,6 +3133,20 @@ impl std::fmt::Display for ConfigWarning {
                  if there is none). To silence this warning, delete the key (or the whole \
                  [model_fallback] table), or add a reviewed [[model_fallback.chain]] target \
                  to enable fallback here",
+            ),
+            Self::UnappliedAgentOutputSchema => f.write_str(
+                "[agent] output_schema in a realm config applies to no session: structured \
+                 output is requested per run (rkat run --schema, output_schema on session \
+                 create or turn start, or AgentBuildConfig.output_schema). To silence this \
+                 warning, delete the key",
+            ),
+            Self::OutOfRangeBudgetWarningThreshold => write!(
+                f,
+                "[agent] budget_warning_threshold must be greater than 0 and at most 1; the \
+                 value is ignored, so the threshold is inherited from the parent realm, or \
+                 is the default {} if there is none. To silence this warning, set a value \
+                 in that range or delete the key",
+                AgentConfig::default().budget_warning_threshold
             ),
         }
     }
@@ -3160,6 +3280,9 @@ impl PersistedConfigDocument {
             mut removed_key_warnings,
         } = self;
         removed_key_warnings.extend(config.normalize_persisted());
+        if config.agent.output_schema.is_some() {
+            removed_key_warnings.push(ConfigWarning::UnappliedAgentOutputSchema);
+        }
         (config, removed_key_warnings)
     }
 
@@ -3279,6 +3402,7 @@ pub(crate) fn compose_effective_config_with_chain(
                 effective.merge_provider_tools_from_toml_presence(raw, &doc.provider_tools);
                 effective.merge_self_hosted_from_toml_presence(raw, &doc.self_hosted);
                 effective.merge_skills_from_toml_presence(raw, &doc.skills);
+                effective.merge_agent_from_toml_presence(raw);
             } else {
                 // No raw TOML for this doc (e.g. a non-filesystem source): fall
                 // back to a whole-section child-wins swap so self_hosted /
@@ -3292,6 +3416,13 @@ pub(crate) fn compose_effective_config_with_chain(
             }
         }
     }
+    // Confinement folds over its own layer order, from the most trusted
+    // document: the user document first even when it is not on the chain.
+    let mut confinement = crate::ConfinementConfig::default();
+    for (_, layer) in confinement_layers(docs, &chain) {
+        confinement.fold_less_trusted(layer);
+    }
+    effective.confinement = confinement;
     // NOTE (Finding D, non-blocking per adversarial review): `effective.realm`
     // is the outer-key union of every folded doc's sections (via Config::merge),
     // so a doc that hand-places a foreign `[realm.X]` (X != its owning realm)
@@ -3303,6 +3434,43 @@ pub(crate) fn compose_effective_config_with_chain(
     // `[realm.b]`, ... is how the CLI and surfaces resolve a `--realm`/section
     // that is not itself a chain member). Tracked, not gated.
     Ok((effective, chain))
+}
+
+/// The documents whose `[confinement]` a composition for `chain` folds, from
+/// the most trusted: the reserved `global` document (the home-rooted user
+/// document), whether or not a `[realm.global]` section puts it on the
+/// chain, then the chain's other realms from the root to the head.
+pub(crate) fn confinement_layers<'a>(
+    docs: &'a std::collections::BTreeMap<crate::connection::RealmId, Config>,
+    chain: &crate::connection::RealmChain,
+) -> Vec<(&'a crate::connection::RealmId, &'a crate::ConfinementConfig)> {
+    let mut layers = Vec::new();
+    if let Some((realm, doc)) = docs.get_key_value(&crate::connection::RealmId::global()) {
+        layers.push((realm, &doc.confinement));
+    }
+    for member in chain.realms().iter().rev() {
+        if member.is_global() {
+            continue;
+        }
+        if let Some((realm, doc)) = docs.get_key_value(member) {
+            layers.push((realm, &doc.confinement));
+        }
+    }
+    layers
+}
+
+/// Refuse a composition in which a less trusted document weakens or
+/// replaces a confinement requirement ([`crate::check_confinement_layers`]).
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn check_composed_confinement(
+    docs: &std::collections::BTreeMap<crate::connection::RealmId, Config>,
+    chain: &crate::connection::RealmChain,
+) -> Result<(), crate::ConfinementLayerConflict> {
+    crate::check_confinement_layers(
+        confinement_layers(docs, chain)
+            .into_iter()
+            .map(|(realm, layer)| (realm.as_str(), layer)),
+    )
 }
 
 /// The chain [`compose_effective_config`] folds for `head`: the chain
@@ -3585,6 +3753,27 @@ max_sessions = 7
     }
 
     #[test]
+    fn test_limits_max_tool_calls_reaches_budget_limits() {
+        let mut config = Config::default();
+        config
+            .merge_toml_str(
+                r"
+[limits]
+max_tool_calls = 12
+",
+            )
+            .expect("merge max_tool_calls");
+        assert_eq!(config.budget_limits().max_tool_calls, Some(12));
+
+        // An explicit CLI override wins over the configured value.
+        config.apply_cli_overrides(CliOverrides {
+            max_tool_calls: Some(3),
+            ..Default::default()
+        });
+        assert_eq!(config.budget_limits().max_tool_calls, Some(3));
+    }
+
+    #[test]
     fn test_config_layering() {
         // 1. Test defaults
         let config = Config::default();
@@ -3627,9 +3816,43 @@ max_sessions = 7
             max_tokens: Some(50000),
             ..Default::default()
         });
-        // CLI should win over defaults
+        // CLI should win over defaults. The token budget lands in the
+        // enforced `[limits]` table, not the legacy `[budget]` table.
         assert_eq!(config.agent.model, "cli-model");
-        assert_eq!(config.budget.max_tokens, Some(50000));
+        assert_eq!(config.budget_limits().max_tokens, Some(50000));
+        assert_eq!(config.budget.max_tokens, None);
+    }
+
+    /// The operator's `--confinement*` selection replaces the composed
+    /// `[confinement]` for every launch kind; without it the configuration
+    /// decides.
+    #[test]
+    fn cli_confinement_override_replaces_the_composed_section() {
+        let composed = crate::ConfinementConfig {
+            shell: Some(crate::LaunchConfinement::Workspace(
+                crate::WorkspaceConfinement::default(),
+            )),
+            ..crate::ConfinementConfig::default()
+        };
+        let mut config = Config {
+            confinement: composed.clone(),
+            ..Config::default()
+        };
+        config.apply_cli_overrides(CliOverrides::default());
+        assert_eq!(
+            config.confinement, composed,
+            "without a flag the documents decide"
+        );
+
+        config.apply_cli_overrides(CliOverrides {
+            confinement: Some(crate::LaunchConfinement::TrustedHost),
+            ..CliOverrides::default()
+        });
+        assert_eq!(
+            config.confinement,
+            crate::ConfinementConfig::for_all(crate::LaunchConfinement::TrustedHost),
+            "the flag replaces every launch kind's statement"
+        );
     }
 
     #[test]
@@ -3704,6 +3927,147 @@ model = "custom-model"
             "extraction_prompt must survive merge when absent in later layer"
         );
         assert_eq!(base.agent.model, "custom-model");
+    }
+
+    #[test]
+    fn test_merge_budget_warning_threshold_survives_layering() {
+        let mut base = Config::default();
+        base.merge_toml_str("[agent]\nbudget_warning_threshold = 0.5\n")
+            .expect("merge toml");
+        assert_eq!(base.agent.budget_warning_threshold, 0.5);
+
+        base.merge_toml_str("[agent]\nmodel = \"custom-model\"\n")
+            .expect("merge toml2");
+        assert_eq!(
+            base.agent.budget_warning_threshold, 0.5,
+            "budget_warning_threshold must survive merge when absent in later layer"
+        );
+
+        // An explicit child value wins even when it equals the template
+        // default; an omitted or out-of-range one keeps the parent's. Realm
+        // composition follows the same rule.
+        for (child_agent, expected) in [
+            ("budget_warning_threshold = 0.8\n", 0.8),
+            ("model = \"custom-model\"\n", 1.0),
+            ("budget_warning_threshold = 7.0\n", 1.0),
+        ] {
+            let mut layered = Config::default();
+            layered
+                .merge_toml_str("[agent]\nbudget_warning_threshold = 1.0\n")
+                .expect("merge the parent layer");
+            layered
+                .merge_toml_str(&format!("[agent]\n{child_agent}"))
+                .expect("merge the child layer");
+            assert_eq!(
+                layered.agent.budget_warning_threshold, expected,
+                "merged {child_agent}"
+            );
+
+            let parent_id =
+                crate::connection::RealmId::parse("parent").expect("valid parent realm");
+            let child_id = crate::connection::RealmId::parse("child").expect("valid child realm");
+            let mut parent = Config::default();
+            parent.agent.budget_warning_threshold = 1.0;
+            parent.realm.insert(
+                parent_id.to_string(),
+                crate::connection::RealmConfigSection::default(),
+            );
+            // Every child document loads with the default threshold: an
+            // explicit 0.8, an omitted key, and an out-of-range value alike.
+            let mut child = Config::default();
+            child.realm.insert(
+                child_id.to_string(),
+                crate::connection::RealmConfigSection {
+                    parent: Some(parent_id.clone()),
+                    ..Default::default()
+                },
+            );
+            let docs =
+                std::collections::BTreeMap::from([(parent_id, parent), (child_id.clone(), child)]);
+            let raw_docs = std::collections::BTreeMap::from([(
+                child_id.clone(),
+                toml::from_str(&format!("[agent]\n{child_agent}")).expect("raw child config"),
+            )]);
+            let effective = compose_effective_config(&docs, &raw_docs, &child_id)
+                .expect("realm composition should succeed");
+            assert_eq!(
+                effective.agent.budget_warning_threshold, expected,
+                "composed {child_agent}"
+            );
+        }
+    }
+
+    /// Releases through 0.9.0 never read `[agent] budget_warning_threshold`,
+    /// so a document they wrote may hold any value. It still loads and
+    /// validates: an out-of-range value warns and falls back to the default,
+    /// and a layer that holds one keeps the threshold it inherits.
+    #[test]
+    fn test_out_of_range_budget_warning_threshold_loads_as_the_default_with_a_warning() {
+        let default = AgentConfig::default().budget_warning_threshold;
+        assert_eq!(default, 0.8, "the template default");
+        for threshold in ["0.0", "-0.5", "1.5", "nan", "inf"] {
+            let (config, warnings) = Config::from_persisted_toml(&format!(
+                "[agent]\nbudget_warning_threshold = {threshold}\n"
+            ))
+            .expect("a document with any threshold loads");
+            assert_eq!(
+                config.agent.budget_warning_threshold, default,
+                "{threshold} falls back to the default"
+            );
+            assert_eq!(
+                warnings,
+                vec![ConfigWarning::OutOfRangeBudgetWarningThreshold],
+                "{threshold}"
+            );
+            config
+                .validate(*crate::model_profile::test_catalog::TEST_CATALOG)
+                .expect("the loaded document validates");
+        }
+        for (text, threshold) in [("0.5", 0.5), ("1.0", 1.0)] {
+            let (config, warnings) = Config::from_persisted_toml(&format!(
+                "[agent]\nbudget_warning_threshold = {text}\n"
+            ))
+            .expect("an in-range threshold loads");
+            assert_eq!(config.agent.budget_warning_threshold, threshold, "{text}");
+            assert!(warnings.is_empty(), "{text}: {warnings:?}");
+        }
+
+        let mut layered = Config::default();
+        layered
+            .merge_toml_str("[agent]\nbudget_warning_threshold = 0.5\n")
+            .expect("merge the parent layer");
+        let warnings = layered
+            .merge_toml_str_with_warnings("[agent]\nbudget_warning_threshold = 7.0\n")
+            .expect("merge the out-of-range layer");
+        assert_eq!(
+            warnings,
+            vec![ConfigWarning::OutOfRangeBudgetWarningThreshold]
+        );
+        assert_eq!(
+            layered.agent.budget_warning_threshold, 0.5,
+            "an ignored value keeps the inherited threshold"
+        );
+
+        // A config that bypassed the load boundary is not refused either.
+        let mut config = Config::default();
+        config.agent.budget_warning_threshold = 1.5;
+        config
+            .validate(*crate::model_profile::test_catalog::TEST_CATALOG)
+            .expect("an out-of-range threshold never fails validation");
+    }
+
+    #[test]
+    fn test_realm_agent_output_schema_loads_with_an_unapplied_warning() {
+        let (config, warnings) =
+            Config::from_persisted_toml("[agent.output_schema]\ntype = \"object\"\n")
+                .expect("a realm output_schema still loads");
+        assert!(config.agent.output_schema.is_some());
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.to_string().contains("[agent] output_schema")),
+            "a realm output_schema must warn that it applies to no session: {warnings:?}"
+        );
     }
 
     #[test]

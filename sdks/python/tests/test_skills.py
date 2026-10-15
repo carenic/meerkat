@@ -69,6 +69,7 @@ class _MockClient:
         output_schema=None,
         structured_output_retries=None,
         provider_params=None,
+        auth_binding=None,
     ):
         self._calls.append({
             "session_id": session_id,
@@ -86,6 +87,7 @@ class _MockClient:
             "output_schema": output_schema,
             "structured_output_retries": structured_output_retries,
             "provider_params": provider_params,
+            "auth_binding": auth_binding,
         })
         return RunResult(
             session_id=session_id,

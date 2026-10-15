@@ -348,11 +348,12 @@ mod image_generation_substrate {
         };
         assert_eq!(blocks.len(), 1, "live smoke should commit one image block");
 
-        let ContentBlock::Text { text } = &outcome.result.content[0] else {
-            panic!("tool result should be JSON text");
-        };
+        // JSON object tool outputs are carried as a structured block.
+        let data = outcome.result.content[0]
+            .structured_data()
+            .expect("tool result should be a structured JSON block");
         let result: meerkat_core::image_generation::ImageGenerationToolResult =
-            serde_json::from_str(text).expect("tool result should decode");
+            serde_json::from_str(data.get()).expect("tool result should decode");
         assert!(
             matches!(result.terminal, ImageOperationTerminalClass::Generated),
             "image substrate terminal should be Generated, got {:?}",

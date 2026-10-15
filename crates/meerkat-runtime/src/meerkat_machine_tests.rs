@@ -1763,13 +1763,7 @@ fn persistent_oauth_authority_cache_rebinds_reopened_sqlite_store_after_drop() {
             redirect_uri,
         )
         .expect_err("consumed browser payload must not rehydrate after reopened-store consume");
-    assert!(matches!(
-        err,
-        meerkat_auth_core::oauth_flow::OAuthFlowError::LifecycleRejected {
-            operation: "verify_oauth_browser_flow",
-            ..
-        }
-    ));
+    assert_eq!(err, meerkat_auth_core::oauth_flow::OAuthFlowError::Missing);
 }
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-store"))]
@@ -1833,13 +1827,7 @@ fn persistent_oauth_authority_cache_rebinds_overlapping_reopened_sqlite_store() 
             redirect_uri,
         )
         .expect_err("consumed browser payload must not rehydrate after overlapping-store consume");
-    assert!(matches!(
-        err,
-        meerkat_auth_core::oauth_flow::OAuthFlowError::LifecycleRejected {
-            operation: "verify_oauth_browser_flow",
-            ..
-        }
-    ));
+    assert_eq!(err, meerkat_auth_core::oauth_flow::OAuthFlowError::Missing);
 }
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-store"))]
@@ -1901,13 +1889,10 @@ fn persistent_oauth_release_prunes_durable_payload_snapshot_for_sqlite_store() {
             redirect_uri,
         )
         .expect_err("released browser payload must not rehydrate from durable snapshot");
-    assert!(matches!(
+    assert_eq!(
         browser_err,
-        meerkat_auth_core::oauth_flow::OAuthFlowError::LifecycleRejected {
-            operation: "verify_oauth_browser_flow",
-            ..
-        }
-    ));
+        meerkat_auth_core::oauth_flow::OAuthFlowError::Missing
+    );
 
     let device_err = restarted
         .oauth_flow_authority()
@@ -2000,12 +1985,7 @@ fn oauth_lifecycle_shares_auth_machine_release_authority() {
             ),
             redirect_uri,
         ),
-        Err(
-            meerkat_auth_core::oauth_flow::OAuthFlowError::LifecycleRejected {
-                operation: "verify_oauth_browser_flow",
-                ..
-            }
-        )
+        Err(meerkat_auth_core::oauth_flow::OAuthFlowError::Missing)
     ));
 }
 
@@ -2047,12 +2027,7 @@ fn oauth_lifecycle_release_stays_paired_after_runtime_auth_handle_install() {
             ),
             redirect_uri,
         ),
-        Err(
-            meerkat_auth_core::oauth_flow::OAuthFlowError::LifecycleRejected {
-                operation: "verify_oauth_browser_flow",
-                ..
-            }
-        )
+        Err(meerkat_auth_core::oauth_flow::OAuthFlowError::Missing)
     ));
 }
 

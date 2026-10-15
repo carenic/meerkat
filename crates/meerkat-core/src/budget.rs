@@ -6,7 +6,7 @@ use crate::error::AgentError;
 use crate::time_compat::{DeadlineInstant, Duration};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// Resource limits for an agent run
 ///
@@ -138,6 +138,40 @@ fn saturating_usize(value: u64) -> usize {
     value.min(usize::MAX as u64) as usize
 }
 
+/// A budget dimension's usage at the check where it first reached the
+/// warning threshold of its limit (see [`Budget::take_threshold_crossings`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct BudgetThresholdCrossing {
+    pub(crate) dimension: BudgetDimension,
+    /// Usage in the dimension's unit: tokens, tool calls, or whole seconds.
+    pub(crate) used: u64,
+    /// The limit in the same unit.
+    pub(crate) limit: u64,
+    /// `used / limit`, measured before whole-second rounding.
+    pub(crate) fraction: f32,
+}
+
+/// Report a dimension at `fraction` of its limit when it has reached
+/// `threshold` but not the limit itself, once per `latch`.
+fn latch_threshold_crossing(
+    latch: &AtomicBool,
+    dimension: BudgetDimension,
+    used: u64,
+    limit: u64,
+    fraction: f32,
+    threshold: f32,
+) -> Option<BudgetThresholdCrossing> {
+    if !(threshold..1.0).contains(&fraction) || latch.swap(true, Ordering::Relaxed) {
+        return None;
+    }
+    Some(BudgetThresholdCrossing {
+        dimension,
+        used,
+        limit,
+        fraction,
+    })
+}
+
 impl BudgetLimits {
     /// Create unlimited budget
     pub fn unlimited() -> Self {
@@ -183,12 +217,19 @@ pub struct Budget {
     start_time: DeadlineInstant,
     /// Per-turn horizon epoch. Re-armed by [`Budget::begin_turn`] at run entry.
     turn_start: DeadlineInstant,
+    /// Threshold-warning latch of the per-turn horizon, re-armed with it.
+    turn_time_warned: AtomicBool,
 }
 
 #[derive(Debug)]
 struct BudgetAccounting {
     tokens_used: AtomicU64,
     tool_calls_made: AtomicU64,
+    /// Threshold-warning latches of the agent-lifetime dimensions, shared
+    /// with [`Budget::fork_shared_accounting`] like the counters they watch.
+    tokens_warned: AtomicBool,
+    tool_calls_warned: AtomicBool,
+    lifetime_time_warned: AtomicBool,
 }
 
 impl Budget {
@@ -200,9 +241,13 @@ impl Budget {
             accounting: Arc::new(BudgetAccounting {
                 tokens_used: AtomicU64::new(0),
                 tool_calls_made: AtomicU64::new(0),
+                tokens_warned: AtomicBool::new(false),
+                tool_calls_warned: AtomicBool::new(false),
+                lifetime_time_warned: AtomicBool::new(false),
             }),
             start_time: now,
             turn_start: now,
+            turn_time_warned: AtomicBool::new(false),
         }
     }
 
@@ -216,6 +261,7 @@ impl Budget {
     /// whoever chose when to resume, not to the loop.
     pub fn begin_turn(&mut self) {
         self.turn_start = DeadlineInstant::now();
+        *self.turn_time_warned.get_mut() = false;
     }
 
     /// Create an unlimited budget
@@ -327,6 +373,71 @@ impl Budget {
         }
 
         BudgetObservation::WithinLimit
+    }
+
+    /// The dimensions whose usage reached `threshold` of their limit since
+    /// the last call, each reported once: an agent-lifetime dimension once
+    /// per budget, the per-turn time horizon once per turn (it re-arms at
+    /// [`Budget::begin_turn`]).
+    ///
+    /// A dimension already at or past its limit is not reported here; that
+    /// fact belongs to [`Budget::observe`]. A `threshold` outside `(0, 1)`
+    /// reports nothing, so `1.0` keeps only the warning at the limit.
+    pub(crate) fn take_threshold_crossings(&self, threshold: f32) -> Vec<BudgetThresholdCrossing> {
+        let mut crossings = Vec::new();
+        let enabled = threshold > 0.0 && threshold < 1.0;
+        if !enabled {
+            return crossings;
+        }
+        if let Some(limit) = self.limits.max_tokens {
+            let used = self.accounting.tokens_used.load(Ordering::Relaxed);
+            crossings.extend(latch_threshold_crossing(
+                &self.accounting.tokens_warned,
+                BudgetDimension::Tokens,
+                used,
+                limit,
+                (used as f64 / limit as f64) as f32,
+                threshold,
+            ));
+        }
+        if let Some(limit) = self.limits.max_tool_calls {
+            let used = self.accounting.tool_calls_made.load(Ordering::Relaxed);
+            let limit = limit as u64;
+            crossings.extend(latch_threshold_crossing(
+                &self.accounting.tool_calls_warned,
+                BudgetDimension::ToolCalls,
+                used,
+                limit,
+                (used as f64 / limit as f64) as f32,
+                threshold,
+            ));
+        }
+        for (horizon, epoch, latch) in [
+            (
+                self.limits.max_duration,
+                self.start_time,
+                &self.accounting.lifetime_time_warned,
+            ),
+            (
+                self.limits.max_turn_duration,
+                self.turn_start,
+                &self.turn_time_warned,
+            ),
+        ] {
+            let Some(limit) = horizon else {
+                continue;
+            };
+            let elapsed = epoch.elapsed();
+            crossings.extend(latch_threshold_crossing(
+                latch,
+                BudgetDimension::Time,
+                elapsed.as_secs(),
+                limit.as_secs(),
+                (elapsed.as_secs_f64() / limit.as_secs_f64()) as f32,
+                threshold,
+            ));
+        }
+        crossings
     }
 
     /// Check if budget is exhausted (returns bool)
@@ -448,12 +559,14 @@ impl Budget {
             accounting: Arc::clone(&self.accounting),
             start_time: self.start_time,
             turn_start: DeadlineInstant::now(),
+            turn_time_warned: AtomicBool::new(false),
         }
     }
 }
 
 impl Clone for Budget {
     fn clone(&self) -> Self {
+        let latch = |flag: &AtomicBool| AtomicBool::new(flag.load(Ordering::Relaxed));
         Self {
             limits: self.limits.clone(),
             accounting: Arc::new(BudgetAccounting {
@@ -461,9 +574,13 @@ impl Clone for Budget {
                 tool_calls_made: AtomicU64::new(
                     self.accounting.tool_calls_made.load(Ordering::Relaxed),
                 ),
+                tokens_warned: latch(&self.accounting.tokens_warned),
+                tool_calls_warned: latch(&self.accounting.tool_calls_warned),
+                lifetime_time_warned: latch(&self.accounting.lifetime_time_warned),
             }),
             start_time: self.start_time,
             turn_start: self.turn_start,
+            turn_time_warned: latch(&self.turn_time_warned),
         }
     }
 }
@@ -627,6 +744,59 @@ mod tests {
                 limit: 5,
             })
         );
+    }
+
+    /// A dimension reports its threshold crossing once, never after reaching
+    /// its limit, and the per-turn time horizon re-arms with every turn.
+    #[test]
+    fn threshold_crossings_report_once_per_dimension_and_turn() {
+        let mut budget = Budget::new(
+            BudgetLimits::default()
+                .with_max_tokens(100)
+                .with_max_tool_calls(4)
+                .with_max_turn_duration(Duration::from_secs(10)),
+        );
+        let usage = |crossings: Vec<BudgetThresholdCrossing>| {
+            crossings
+                .into_iter()
+                .filter(|crossing| crossing.dimension != BudgetDimension::Time)
+                .map(|crossing| (crossing.dimension, crossing.used, crossing.limit))
+                .collect::<Vec<_>>()
+        };
+
+        budget.record_tokens(79);
+        budget.record_calls(2);
+        assert_eq!(usage(budget.take_threshold_crossings(0.8)), Vec::new());
+
+        // Tokens reach exactly 80%; tool calls jump straight to the limit,
+        // which is the exceeded fact `observe` reports, not a warning.
+        budget.record_tokens(1);
+        budget.record_calls(2);
+        assert_eq!(
+            usage(budget.take_threshold_crossings(0.8)),
+            vec![(BudgetDimension::Tokens, 80, 100)]
+        );
+        assert_eq!(usage(budget.take_threshold_crossings(0.8)), Vec::new());
+
+        // A threshold outside (0, 1) disables the early warning.
+        let disabled = Budget::new(BudgetLimits::default().with_max_tokens(100));
+        disabled.record_tokens(99);
+        assert_eq!(disabled.take_threshold_crossings(1.0), Vec::new());
+        assert_eq!(disabled.take_threshold_crossings(0.0), Vec::new());
+
+        let time_crossings = |budget: &Budget| {
+            budget
+                .take_threshold_crossings(0.001)
+                .into_iter()
+                .filter(|crossing| crossing.dimension == BudgetDimension::Time)
+                .count()
+        };
+        std::thread::sleep(Duration::from_millis(20));
+        assert_eq!(time_crossings(&budget), 1);
+        assert_eq!(time_crossings(&budget), 0);
+        budget.begin_turn();
+        std::thread::sleep(Duration::from_millis(20));
+        assert_eq!(time_crossings(&budget), 1, "the turn horizon re-arms");
     }
 
     /// The per-turn horizon is exhausted by wall-clock alone and reports the

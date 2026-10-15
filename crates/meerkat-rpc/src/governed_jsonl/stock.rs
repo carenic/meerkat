@@ -349,5 +349,6 @@ pub fn stock_governed_jsonl_setup_with_connector_authority(
         connector_authority,
         operation_review: None,
         consent: None,
+        host_confinement: meerkat::HostConfinement::trusted_host(),
     })
 }

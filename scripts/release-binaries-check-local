@@ -1,0 +1,134 @@
+#!/usr/bin/env bash
+# release-binaries-check-local: build the four release binaries of a checkout
+# exactly as the release workflow's BuildBuddy lane does, then run the release
+# packaging guards on every one of them, publishing nothing.
+#
+# For each release target (Linux x86_64 and arm64, macOS arm64 and x86_64) it
+# runs the checkout's own launcher case, scripts/buildbuddy-bazel-poc
+# release-build-* (which passes --define=meerkat_release_build=1), in
+# parallel and with its own output base. Then it checks the four binaries of
+# each target with the Linux portability check (Linux targets) and the
+# checkout's scripts/check-release-binary-markers, and prints one verdict per
+# target. Nothing is published: the remote build writes BuildBuddy cache
+# entries and an invocation record, and downloads only the four binaries per
+# target; no archive, attestation, release or registry upload.
+#
+# Requires the pinned bb CLI (make buildbuddy-install) and BUILDBUDDY_API_KEY.
+# The macOS targets need the owner's self-hosted macOS executors online.
+#
+# Usage: release-binaries-check-local <checkout> [work-dir]
+#   <checkout>  a checkout of the candidate commit; it is not modified
+#   [work-dir]  output bases and logs (default: a new directory under TMPDIR)
+# Environment: RELEASE_CHECK_JOBS (default 64), RELEASE_CHECK_TARGETS (space
+# separated release-build case suffixes, default all four).
+# Exit 0 = every target built and passed, 1 = a target failed, 2 = usage.
+
+set -euo pipefail
+
+usage() {
+  echo "usage: release-binaries-check-local <checkout> [work-dir]" >&2
+  exit 2
+}
+
+[[ $# -ge 1 && $# -le 2 ]] || usage
+checkout="$(cd "$1" 2>/dev/null && pwd)" || usage
+for required in scripts/buildbuddy-bazel-poc scripts/check-release-binary-markers \
+  scripts/check-linux-release-binary-portability.sh; do
+  if [[ ! -x "${checkout}/${required}" ]]; then
+    echo "release-binaries-check-local: ${checkout} has no executable ${required}" >&2
+    exit 2
+  fi
+done
+if [[ -z "${BUILDBUDDY_API_KEY:-}" ]]; then
+  echo "release-binaries-check-local: BUILDBUDDY_API_KEY is not set" >&2
+  exit 2
+fi
+if [[ $# -eq 2 ]]; then
+  work="$2"
+  mkdir -p "${work}"
+else
+  work="$(mktemp -d "${TMPDIR:-/tmp}/release-binaries-check.XXXXXX")"
+fi
+work="$(cd "${work}" && pwd)"
+jobs="${RELEASE_CHECK_JOBS:-64}"
+read -r -a targets <<<"${RELEASE_CHECK_TARGETS:-linux-x86 linux-arm64 macos-arm64 macos-x86}"
+commit="$(git -C "${checkout}" rev-parse HEAD 2>/dev/null || echo unknown)"
+
+# Release binary -> Bazel output path, as release.yml packages them.
+binaries=(rkat rkat-rpc rkat-rest rkat-mcp)
+bazel_path() {
+  case "$1" in
+    rkat) echo "crates/meerkat-cli/rkat" ;;
+    rkat-rpc) echo "crates/meerkat-rpc/rkat_rpc_bin" ;;
+    rkat-rest) echo "crates/meerkat-rest/rkat_rest_bin" ;;
+    rkat-mcp) echo "crates/meerkat-mcp-server/rkat_mcp_bin" ;;
+  esac
+}
+
+echo "Release binaries check of ${checkout} at ${commit}; logs and outputs in ${work}"
+pids=()
+for target in "${targets[@]}"; do
+  mkdir -p "${work}/${target}"
+  (
+    cd "${checkout}"
+    set +e
+    BUILDBUDDY_BAZEL_COMMAND="release-build-${target}" \
+      BUILDBUDDY_OUTPUT_BASE="${work}/${target}/output-base" \
+      BUILDBUDDY_OUTPUT_LANE="release-check-${target}" \
+      MEERKAT_BUILDBUDDY_OUTPUT_ROOT="${work}" \
+      scripts/buildbuddy-bazel-poc --jobs="${jobs}" >"${work}/${target}/build.log" 2>&1
+    echo "$?" >"${work}/${target}/build.rc"
+  ) &
+  pids+=("$!")
+  echo "started release-build-${target} (log ${work}/${target}/build.log)"
+done
+for pid in "${pids[@]}"; do
+  wait "${pid}" || true
+done
+
+status=0
+for target in "${targets[@]}"; do
+  rc="$(cat "${work}/${target}/build.rc" 2>/dev/null || echo missing)"
+  # 38: the build completed but its event-stream upload failed; the outputs
+  # are still checked, as the release workflow does.
+  if [[ "${rc}" != "0" && "${rc}" != "38" ]]; then
+    echo "VERDICT release-build-${target}: FAIL (launcher exit ${rc}; see ${work}/${target}/build.log)"
+    status=1
+    continue
+  fi
+  found=()
+  missing=()
+  for bin in "${binaries[@]}"; do
+    src="$(find "${work}/${target}/output-base/execroot/_main/bazel-out" \
+      -path "*/$(bazel_path "${bin}")" -type f 2>/dev/null | head -1)"
+    if [[ -n "${src}" ]]; then
+      found+=("${src}")
+    else
+      missing+=("${bin}")
+    fi
+  done
+  if [[ "${#missing[@]}" -gt 0 ]]; then
+    echo "VERDICT release-build-${target}: FAIL (missing ${missing[*]})"
+    status=1
+    continue
+  fi
+  verdict="PASS"
+  guard_log="${work}/${target}/guards.log"
+  : >"${guard_log}"
+  for src in "${found[@]}"; do
+    if [[ "${target}" == linux-* ]] &&
+      ! "${checkout}/scripts/check-linux-release-binary-portability.sh" "${src}" >>"${guard_log}" 2>&1; then
+      verdict="FAIL"
+    fi
+    if ! "${checkout}/scripts/check-release-binary-markers" "${src}" >>"${guard_log}" 2>&1; then
+      verdict="FAIL"
+    fi
+  done
+  notes=""
+  if grep -q "carries the allowed marker" "${guard_log}"; then
+    notes="; allowed marker present"
+  fi
+  echo "VERDICT release-build-${target}: ${verdict} (launcher exit ${rc}, ${#found[@]} binaries${notes}; see ${guard_log})"
+  [[ "${verdict}" == "PASS" ]] || status=1
+done
+exit "${status}"

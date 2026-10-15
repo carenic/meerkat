@@ -35,6 +35,342 @@ them.
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-10-15
+
+### Breaking
+
+- `meerkat-core`: `LimitsConfig` gains `max_tool_calls: Option<usize>`, the
+  configuration twin of `BudgetLimits::max_tool_calls` (see Fixed).
+  Struct-literal constructors must add the field (`None` keeps the previous
+  unlimited behaviour). It is skipped when unset, so existing realm config
+  documents keep their bytes.
+- Behaviour-only (not measured by the gate): `Config::apply_cli_overrides`
+  writes the `CliOverrides` budget fields to the enforced `[limits]`
+  dimensions: `max_tokens` to `limits.budget`, `max_duration` to
+  `limits.max_duration` and `max_tool_calls` to `limits.max_tool_calls`.
+  They used to land in the legacy `[budget]` table (`Config::budget`), which
+  no runtime reads, and that table no longer receives them.
+- `meerkat-contracts`: `CommsSendErrorData` has a new variant,
+  `SendAmbiguous { envelope_id, message, retry_safe, required_action }`
+  (code `send_ambiguous`), for a `comms/send` whose delivery outcome is
+  unknown. Exhaustive matches over `CommsSendErrorData` need an arm for it.
+  It sits before `CommsSendErrorData::SendFailed` and
+  `CommsSendErrorData::InvalidCommand`, whose implicit discriminants move
+  from 4 to 5 and from 5 to 6.
+  `required_action` is the new `CommsSendRequiredAction` enum (`Reconcile`),
+  and the new `CommsSendErrorData::ambiguous_delivery` and
+  `CommsSendErrorData::peer_input_rejected` constructors build the shared
+  payloads. Rust clients that deserialize CommsSendErrorData with
+  meerkat-contracts 0.9.0 must upgrade to 0.9.1 to decode send_ambiguous; the
+  Python and TS SDKs pass unknown error data through.
+- Behaviour-only (not measured by the gate): `rkat` now exits with the
+  documented `ErrorCode` CLI code of a typed failure instead of `1`. For
+  example, session not found exits 10, session busy 11, a durable resume hold
+  12, an interrupted turn 14, a provider failure 20, a refused governed prompt
+  50, an unready one 51, an unavailable session runtime 52, and a mob member
+  that needs a reload 49. A typed budget error now exits 21
+  (`BUDGET_EXHAUSTED`) instead of 2, so code 2 now means only a usage error
+  or `INVALID_PARAMS`. These codes are unchanged: a run that stops at its
+  token or tool-call budget exits 0, a turn that reaches its time budget or
+  turn limit exits 1, and a failure the CLI detects itself exits 1.
+- `meerkat_mcp_server::TurnToolOverlayInput` has a new `tool_choice_plan`
+  field and implements `Default`; a struct literal needs the new field or
+  `..Default::default()`.
+- Behaviour-only (not measured by the gate): `RuntimeOAuthFlowHandle`
+  (`OAuthFlowAuthority::verify` and `consume`) returns
+  `OAuthFlowError::Missing` for a browser attempt its AuthMachine no longer
+  holds, where it returned `LifecycleRejected`; a fault while applying to a
+  held attempt is still `LifecycleRejected`.
+- Behaviour-only (not measured by the gate): JSON-RPC `turn/start` and
+  `mob/turn_start` return the code of a failed turn's typed cause (`-32010`,
+  `-32011` or `-32012`) instead of `-32603` (see Changed). Clients that
+  matched `-32603` for those failures must also accept the new codes.
+- Behaviour-only (not measured by the gate): JSON-RPC `comms/send` and the
+  MCP `meerkat_comms_send` tool fail an ambiguous peer delivery with
+  `send_ambiguous` instead of `send_failed`, and the MCP tool fails a durably
+  rejected envelope with `peer_input_rejected` instead of `send_failed` (see
+  Fixed). Reconcile an ambiguous send by its `envelope_id` before any new
+  attempt.
+- Python and TypeScript SDKs (not measured by the gate): a failed
+  `comms/send` carries the typed error object in the error's `details`
+  instead of the transport error text, so code that read `details` as a
+  string must read the object. TypeScript: `CommsSendReceipt` no longer
+  declares the camelCase fields (`requestId`, `interactionId`, `inputId`,
+  `envelopeId`, `streamReserved`, `inReplyTo`); read the snake_case fields
+  after narrowing on `kind`. `MobTurnStartOptions.authBinding` is typed as
+  `TurnAuthBindingOverride` (a binding ref, `{ action: "set", value }` or
+  `{ action: "clear" }`) instead of an untyped object (see Fixed).
+- `meerkat_rest::AppState` has a new `mcp_stdio_launch_profile` field (with
+  the `mcp` feature): the launch boundary its sessions' live MCP routers
+  retain. A struct literal must add it; pass the factory's
+  `mcp_stdio_launch_profile()`, or `McpStdioLaunchProfile::trusted_host()`
+  for the previous behavior.
+- `meerkat_core::confinement::ConfinementRefusal` has a new variant,
+  `UntrustedConfigurationSource` (`untrusted_configuration_source` on the
+  wire). An exhaustive match needs an arm for it. A 0.9.0 client can receive
+  the value where typed confinement refusals already appear (an MCP server's
+  failed setup notice, a `confinement_refused` tool error, a hook launch
+  refusal), only from a host that confines every launch kind and finds a
+  convention source its confined processes can write. A 0.9.0 Python or
+  TypeScript SDK client rejects an MCP setup status or tool-config event
+  that carries it (`INVALID_RESPONSE`, or an event parse error for an
+  unknown `confinement_refusal`); the 0.9.1 SDKs accept it, and their
+  `ConfinementRefusal` literal unions (Python, TypeScript, Web) gain the
+  value.
+- `meerkat_core::Config` and `meerkat_core::config::CliOverrides` have a new
+  `confinement` field; a struct literal must add it (or use
+  `..Default::default()`).
+- `meerkat_core::ConfigError` has new `ConfinementAdministration` and
+  `ConfinementLayerConflict` variants, and
+  `meerkat_contracts::wire::WireConfigWriteRefusal` a new
+  `ConfinementAdministrationRequired` variant; exhaustive matches need arms.
+- `meerkat_rpc::governed_jsonl::GovernedJsonlSetup` has a new
+  `host_confinement` field; pass `meerkat::HostConfinement::trusted_host()`
+  for the previous behavior.
+
+### Security
+
+- rustls updated to 0.23.46 (RUSTSEC-2026-0346, RUSTSEC-2026-0347,
+  RUSTSEC-2026-0348, RUSTSEC-2026-0349).
+- 0.9.0 is not exposed to these advisories: its `rkat`, `rkat-rpc`,
+  `rkat-rest` and `rkat-mcp` binaries use rustls only as a TLS client with the
+  `ring` provider and rustls's built-in session cache, without the `brotli`
+  feature, Encrypted Client Hello or post-quantum key exchange, and the Web
+  SDK does not contain rustls. The update removes these advisories from `cargo
+  deny` and `cargo audit` reports; applications that build on the Meerkat
+  crates get the fix with `cargo update -p rustls`.
+
+### Added
+
+- Release packaging and publishing reject tracked test-only binary markers,
+  except the documented Tokio test-util allowance. The release-graph check
+  rejects listed workspace non-shipping features. Publishing also checks the
+  named TestClient and OAuth fixture hooks in the archive's provenance-bound
+  source tree, including reused or recovered archives.
+- `AgentBuilder::budget_warning_threshold` and `AgentBuilder::extraction_prompt`
+  set the early budget-warning fraction and the structured-output extraction
+  prompt of a directly built agent.
+- `ToolTimeoutPolicy::from_shell_defaults` derives the tool timeout policy
+  from a loaded config's `[shell]` section.
+- `meerkat_contracts::error::session_transport_error_code` and
+  `agent_transport_error_code` return the `ErrorCode` that JSON-RPC session
+  methods and the `rkat` exit status report for a `SessionError` or
+  `AgentError`.
+- `meerkat_comms::validate_advertised_tcp_address` checks an advertised
+  signed-comms TCP route. It does not resolve DNS names.
+- The embedded help corpus gains 16 reference documents for the
+  meerkat-platform skill, reviewed against 0.9.0: security (OS sandboxing,
+  shell and tool policy, credential and secret storage, MCP boundaries,
+  audit, security errors), governed realms and approvals, MCP servers,
+  built-in tools, skills, hooks, model calls (output caps, budgets,
+  compaction, structured output, retries, fallback), turn control and
+  events, providers and models, credentials and `rkat auth`, sessions,
+  storage and config, API changes with the error-code table, live channels,
+  comms, and mob changes since 0.8.40. `rkat help`, JSON-RPC `help/ask`,
+  REST `POST /help` and the MCP `meerkat_help` tool read them on demand
+  through `skill_read_resource`, and the skill's "Where to find details"
+  index names each one.
+- Gemini 4 Argon (`gemini-4-argon`, GA 2026-10-13) is in the model catalog:
+  1M-token context window shared by input, thinking and output, 64K
+  synchronous output, thinking levels `low`/`medium`/`high` (default
+  `medium`; thinking cannot be turned off), no sampling parameters, no
+  explicit context caching, and a 900-second default call timeout following
+  Google's guidance for long thinking. Meerkat sends no sampling fields,
+  thinking level or cached content unless the caller sets them, and the
+  default output budget resolves to 65,536 tokens.
+- Claude Haiku 5.5 (`claude-haiku-5-5`, released 2026-10-07) is in the model
+  catalog: 1M context, 128K output (300K with the Batch API beta), adaptive
+  thinking on by default, `low` to `max` effort (default `medium`), no
+  sampling parameters or thinking budget, forced tool choice, compaction,
+  structured outputs and mid-conversation system messages.
+- The stable Gemini text models `gemini-3.6-flash`, `gemini-3.5-flash-lite`
+  and `gemini-3.1-flash-lite` are in the model catalog.
+- Gemini Nano Banana 2.1 (`gemini-nano-banana-2.1`) is a catalog image
+  generation model.
+- `OpenAiClient::with_copilot_backend_wire` and
+  `OpenAiCompatibleClient::with_openai_backend` declare the backend a
+  hand-built client speaks to, so it applies that backend's admissions (the
+  built-in GitHub Copilot routes now use them).
+- Python and TypeScript SDKs: session turns take a per-turn `auth_binding`
+  (Python `Session.turn`, `Session.stream` and `DeferredSession.start_turn`;
+  TypeScript `authBinding` in the turn, stream and deferred-start options), as
+  RPC `turn/start` does. A binding ref or `{"action": "set", "value": ref}`
+  switches the session's binding from that turn on, `{"action": "clear"}`
+  drops it, and omitting it keeps the current binding. New types:
+  `TurnAuthBindingOverride` in both SDKs, plus `AuthBindingOverrideSet` and
+  `AuthBindingOverrideClear` in Python.
+- Python and TypeScript SDKs: `comms_send_error(error)` (Python) and
+  `commsSendError(error)` (TypeScript) return the typed `CommsSendErrorData`
+  of a failed `comms/send`, tagged on `code`, and `COMMS_SEND_ERROR_CODES`
+  lists the codes. Both SDKs export `CommsSendErrorData`, its per-code
+  variants, `CommsPeerUnreachableReason`, `AdmissionDropReason` and
+  `CommsSendRequiredAction`.
+- `AgentFactory::mcp_stdio_launch_profile` returns the factory's MCP stdio
+  launch profile. `meerkat::mcp::standalone_router_with_stdio_profile` and
+  `McpRouter::new_with_stdio_profile` build a standalone or an unbound router
+  that retains a given profile.
+- OS process confinement in the stock binaries, through configuration and
+  flags. The `[confinement]` config section selects the confinement of each
+  launch kind the host's agents use: `all`, or `shell` (foreground calls,
+  background jobs and monitors), `command_hooks` and `mcp_stdio`, each
+  `trusted_host` (the default), `workspace` (the workspace root plus listed
+  read and write subtrees, the platform baseline, and IP sockets only with
+  `network = "unrestricted"`) or `custom` (an explicit requirement and
+  working directory). `rkat`, `rkat-rpc`, `rkat-rest` and `rkat-mcp` accept
+  `--confinement <trusted-host|workspace>`, `--confinement-network`,
+  `--confinement-read` and `--confinement-write`, which replace the section
+  for every launch kind of that process. A launch the platform cannot
+  confine as required is refused with typed feedback and never runs
+  unconfined. A config without the section behaves exactly as before.
+- Across the documents a realm composes (the user document, then the realm
+  chain from its root), a confinement requirement only holds or is added: a
+  less trusted document that states a required launch kind differently is
+  refused with `ConfigError::ConfinementLayerConflict`.
+- Ordinary config writes cannot add, change or remove `[confinement]`; they
+  are refused with `confinement_administration_required`
+  (`WireConfigWriteRefusal::ConfinementAdministrationRequired`) on JSON-RPC,
+  REST and MCP, and nothing is written.
+- A host that confines every launch kind keeps its own inputs from its
+  confined processes. A start in which a confined process could change the
+  realm state or the user config document (by writing it, creating it, or
+  replacing a directory on the way to it) is refused, naming the input, the
+  launch kind and the remedy (`--state-root`, `--user-config-root`). An
+  `mcp.toml` or project `.rkat/config.toml` that a confined process can
+  write is not trusted: its MCP servers are refused before they are
+  expanded, authorized, connected or spawned, and its hooks keep their
+  place and are refused at every invocation, all with the typed reason
+  `untrusted_configuration_source`. A host that runs any launch kind as the
+  trusted host reports that it gives no such guarantee. On macOS the
+  `workspace` preset protects `<root>/.rkat`; on Linux the host's realm
+  state must live outside the workspace. Known limitation: on a governed
+  realm, `rkat`'s configured MCP route leaves an untrusted file's servers
+  out with a warning on stderr instead of reporting each refusal to the
+  model.
+- Each host reports at startup the requested and effective confinement of
+  every launch kind, the inputs it keeps from confined processes, and each
+  convention source it does not trust.
+- Rust API: `meerkat::HostConfinement` (with `HostAuthority`, `HostInput`,
+  `HostConfinementNotice` and `HostConfinementError`) resolves a selection
+  once; `AgentFactory::with_host_confinement` installs it,
+  `AgentFactory::host_confinement` and `AgentFactory::shell_confinement`
+  read it back. `meerkat_core` exports the section's vocabulary
+  (`ConfinementConfig`, `ConfinementLaunchKind`, `LaunchConfinement`,
+  `WorkspaceConfinement`, `WorkspaceNetwork`, `CustomConfinement`,
+  `ConfinementFlags`, `ConfinementLayerConflict`), and
+  `McpConfig::effective_servers_from_roots_trusting` and
+  `McpConfig::load_with_scopes_from_roots_trusting` load MCP servers
+  without trusting a file a confined process can write.
+  `McpRouter::stage_add_refused` stages a typed refused add and
+  `DefaultHookEngine::with_refused_entries` refuses hook entries at every
+  invocation. The config contract schema describes the section's closed
+  shapes.
+
+### Changed
+
+- `RKAT_TEST_CLIENT` is now honoured only in debug builds. Release binaries
+  ignore it.
+- `MEERKAT_TEST_OAUTH_ENDPOINT_OVERRIDE` and `MEERKAT_TEST_OAUTH_BASE_URL` are
+  now honoured only in debug builds. Release binaries always use the
+  providers' own OAuth endpoints.
+- CI: the self-hosted GCP BuildBuddy validation graph runs only when the
+  repository variable `MEERKAT_GCP_BUILDBUDDY_ENABLED` is `true`. While it is
+  off, nightly runs skip the graph, a `graph_only` nightly dispatch fails
+  instead of reporting success, and release tags validate through the Cargo
+  release validation job. The hosted BuildBuddy binary build is unaffected.
+- CI: the self-hosted BuildBuddy provisioning scripts now require client
+  authentication and executor authorization, serve only over TLS behind IAP
+  (no public ingress), pin the server, executor and action images by digest,
+  give executors access only to their own secrets, use a dedicated API key
+  secret (`MEERKAT_GCP_BUILDBUDDY_API_KEY`) separate from the hosted
+  BuildBuddy key, refuse to proceed when existing cloud resources differ from
+  what the scripts render, and stop the control plane after each run. The
+  Bazel wrapper refuses to send an API key to a non-TLS endpoint.
+- The pre-push hook no longer runs Clippy. Clippy is a required CI check: the
+  CI planner gives every package the hook used to lint a Clippy lane with the
+  same flags (`--no-deps --all-targets --all-features -- -D warnings`), and
+  the CI gate requires those lanes on every Rust change. The hook keeps the
+  agent gate's changed-path ratchets (formal/governance targets, generated
+  contract freshness, Web SDK tests, wasm check) as the
+  `changed-path-ratchets` hook (`scripts/pre-push-ratchets.sh`,
+  `cargo-agent-gate --ratchets-only`). This removes about 16 minutes from a
+  Rust push.
+- A hooked push now prints each hook's wall time and the deterministic gate's
+  lane times after the gate, and appends them to
+  `.git/meerkat-hook-cache/timings.tsv`.
+- CI's change classification checks out depth 2 instead of the full history.
+  The full fetch took 41-63 s, once 242 s, on the path of every lane.
+- CI now runs the pre-push hook's integration, `e2e-fast` and HeadCanonical
+  coverage as required `Closure tests` rows for the change's test scope: the
+  reverse-dependency closure of the changed packages (every member on a global
+  change) plus the packages whose tests read a changed non-Rust input (docs,
+  specs, SDK files, fixtures outside a crate, whole-checkout audits;
+  `scripts/ci-non-rust-readers.json`, kept complete by a fail-closed guard).
+  The rows select the whole workspace and name only their targets, so they
+  compile exactly the units of the hook's workspace build: every `tests/*.rs`
+  target the hook built, `e2e-fast`, and HeadCanonical with the hook's own
+  command. The hook keeps running the lib tests: a `--workspace --lib` row is
+  planned only for a runner that can build it in time (`--lib-row-runner`; a
+  hosted 4-vCPU runner needs about 64 minutes). Tests behind features only
+  workspace unification enables (for example meerkat-mcp's `test-support`
+  targets) now run in CI. A row lists and runs one shared selection and checks
+  that nextest selects exactly its planned binaries before it runs; the plan
+  fails if an independent check, which reads the hook's lanes from
+  `scripts/pre-push-unit.sh` and every line of the executing step that names a
+  row input, finds a hook binary in scope that neither a row nor the hook's
+  own lib lane runs.
+- CI planning now treats both sides of a rename and type-only changes as
+  changed paths, so a file moved between crates or renamed out of Rust still
+  selects its old crate's lanes.
+- CI's Clippy lanes now cache the crates they do not lint
+  (`scripts/ci-clippy-sccache-wrapper`), so a lane no longer re-checks the
+  whole workspace chain below its packages, and a whole-workspace plan gives
+  the chain heads (rkat, rpc, mob, the facade and their groups) Clippy shards
+  of their own.
+- The default Gemini model is now `gemini-4-argon` (was `gemini-3.8-flash`).
+  `gemini-4-argon` is served only on paid Gemini API tiers; it is not on the
+  Gemini free tier. To keep the previous default, set the model explicitly:
+  `--model gemini-3.8-flash` for one run, or `[models] gemini =
+  "gemini-3.8-flash"` in config for every Gemini session that does not name
+  a model (an auth binding's `default_model` works the same way). Changing
+  the catalog default does not rewrite existing auth bindings, configured
+  models, or the model a session recorded: sessions created before the
+  upgrade resume on their recorded model. The one exception is the CLI's
+  narrow built-in OAuth repair, which rewrites a reserved `global` OAuth
+  binding's `default_model` only while it still holds a frozen legacy sample
+  value (for `google_oauth`, `gemini-3.1-flash-lite` is repaired to
+  `gemini-3.8-flash`). The global default stays `gpt-6-astra`.
+- `rkat auth login google` (the Google OAuth / Code Assist route) does not
+  follow the new Gemini default: a new `google_oauth` binding starts on
+  `gemini-3.8-flash`, because `gemini-4-argon` is not verified on Code
+  Assist, notably on its free tier. The `copilot_gemini` route binding that
+  `rkat auth login copilot` creates also starts on `gemini-3.8-flash`,
+  because Copilot serves an account-specific model list. The API-key route
+  default is `gemini-4-argon`.
+- Browser sessions (`@rkat/web`) with a Gemini key use the new Gemini
+  default too; with a free-tier key, pass `gemini-3.8-flash` as the model.
+- The fallback `web_search` tool, which runs only when web search is enabled
+  explicitly and the session model has no native search, uses its provider's
+  catalog default model; for Gemini that is now `gemini-4-argon`, which has
+  native search itself.
+- The Gemini image generation default is now `gemini-nano-banana-2.1` (was
+  `gemini-3.1-flash-image-preview`, whose shutdown Google has announced).
+  `gemini-3.1-flash-image-preview` stays selectable by model.
+- A JSON-RPC `turn/start` or `mob/turn_start` whose turn fails returns the
+  code of its typed cause (`-32010` for `llm_failure` and `retry_exhausted`,
+  `-32011` for `budget_exhausted` and `time_budget_exceeded`, `-32012` for
+  `hook_denied`) instead of `-32603`, and keeps the typed turn error in
+  `error.data.error`. Other causes stay `-32603`.
+- REST `PUT`/`PATCH /config` refuses a write that would change, remove or
+  restate `[governance]` with HTTP 400, code `CONFIG_WRITE_REFUSED` and
+  `details.type = "governance_administration_required"`, instead of a 500
+  `CONFIGURATION_ERROR`.
+
+### Deprecated
+
+- `[agent] output_schema` in a realm config applies to no session: structured
+  output is requested per run. Such a config still loads, now with the typed
+  warning `ConfigWarning::UnappliedAgentOutputSchema`.
+
 ### Fixed
 
 - Python and TypeScript SDK `comms/send` now accept the `delivery` outcome the
@@ -45,6 +381,323 @@ them.
   imported `NotRequired` and `Required` from `typing`, which has them only from
   3.11; on 3.10 they now come from `typing_extensions>=4.1`, a new dependency
   there only.
+- Release binaries no longer include workspace test-only features; tokio's
+  test-util feature remains in BuildBuddy-built binaries (its time-control
+  APIs are not used by production code; runtime bookkeeping remains) and will
+  be removed in 0.9.2.
+- `budget_warning` now fires before a budget runs out: once when tokens, tool
+  calls or a time limit reach `[agent] budget_warning_threshold` of their
+  limit (0.8 by default), with `percent` set to the fraction used. The
+  per-turn time limit warns again each turn. Before, `budget_warning` fired
+  only when a limit was already reached.
+- A realm's `[agent] budget_warning_threshold` and `[agent] extraction_prompt`
+  now apply to the agents built from it; both were parsed and then ignored.
+  A threshold outside (0, 1] still loads, with the typed warning
+  `ConfigWarning::OutOfRangeBudgetWarningThreshold`, and the config keeps the
+  inherited threshold (0.8 by default).
+- `tool_execution_timed_out` is now emitted when a tool call hits its per-call
+  timeout (or its inactivity timeout), carrying the bound in `timeout_ms`,
+  before the call's `tool_execution_completed`. It was documented but never
+  emitted. ATIF exports record such a call as one observation: the call's
+  result, marked `timed_out` with `timeout_ms`.
+- The shell tool's default command timeout now honours `[shell] timeout_secs`,
+  read through `ToolTimeoutPolicy`. The key was parsed and then ignored, so
+  every command without its own `timeout_secs` used 30 seconds. A value of 0
+  keeps the 30-second default.
+- A hooked push no longer fails, or loses its failing hook's exit status, when
+  the optional timing log or the gate log cannot be written: the transcript is
+  always relayed in full.
+- `rkat run --resume "keep going"` now resumes the most recent session with
+  that prompt, as documented. Before, the prompt was read as the session and
+  the run failed for a missing prompt. A lone word that names a session (an
+  id, a handle, `last`, or `~N`) is still read as the session. Option values
+  no longer count as the prompt, so `rkat --resume "keep going" -m <model>`
+  also works.
+- `rkat` exit codes now match `ErrorCode::cli_exit_code()` on every command
+  path. Mob errors use their own code, not only codes 45-48. For example,
+  `MEMBER_RELOAD_REQUIRED` exits 49 instead of 1.
+- The CLI's MCP credential resolver now reports its realm and its bound HTTP
+  egress profile, like the RPC and REST resolvers do. A realm-scoped MCP
+  sign-out now reaches the CLI's connections, and a required egress profile
+  no longer refuses the CLI's own credential owner.
+- `--comms-advertise-tcp` accepts a DNS name such as
+  `host.example.com:4200`, as the comms docs show, and advertises it
+  unresolved. The transport resolves the name when a peer connects. A
+  wildcard host, a zero or missing port, or an unbracketed IPv6 host is
+  refused with a clear error.
+- `rkat run` and `rkat run --resume` no longer erase a configured
+  `comms.advertise_address` when `--comms-advertise-tcp` is not given. An
+  explicit flag still wins.
+- `rkat help` answers from a corrected corpus. About a hundred statements
+  in the platform skill, its API, mob and migration references and the CLI
+  reference were wrong or stale for 0.9.0 and are fixed, among them: the CLI
+  realm root (an existing user-global realm is used where it lies), hook
+  inheritance (a child cannot override an inherited hook id), the
+  `tool_access_policy` and profile `tools.deny` visibility rules since
+  0.8.52, read-only builds disabling provider-native tools, durable resume
+  hold codes and when recovery runs, `rkat mob host --advertise-tcp`
+  needing `tcp://`, `rkat mob live` serving local members too, the default
+  model and env-key fast path, CLI `rkat auth logout` on inherited bindings,
+  and the RPC error codes' extra cases.
+- `rkat` help now matches 0.9 behaviour. `rkat auth login` lists the
+  `copilot` provider and the provider aliases it accepts, says that
+  `--backend` and `--method` apply only with `--non-interactive` and that
+  `--secret` requires it, and no longer says that the environment key keeps
+  handling `rkat run` (a stored login is tried before it). `rkat run
+  --auth-binding` no longer prints internal implementation notes, and the
+  `rkat mob` live, host and helper verbs no longer cite internal design
+  references. `rkat mob live open --transport` states that member channels
+  accept only websocket. The WorkGraph, mob, session and config arguments
+  that had no help are described, including that the CLI's WorkGraph grant
+  covers only the `default` namespace, so `--all-namespaces` is refused. The
+  root command list keeps one-line summaries and names every command group,
+  `rkat help` without a question prints its usage instead of a bare
+  missing-argument error, and the `rkat run --help` resume example names its
+  session (`rkat run --resume last "keep going"`).
+- `rkat help` knows about OS sandboxing. Before, the help corpus did not
+  mention it, so `rkat help` answered that Meerkat has no OS-level
+  sandboxing. The platform skill now summarizes execution confinement (the
+  host-installed `Required` profiles for shell tools, command hooks and
+  stdio MCP servers, the macOS Seatbelt and Linux namespace and seccomp
+  backends, refusal instead of fallback, and the trusted-host default of the
+  stock binaries), and its security reference has the details. The 0.9
+  migration notes are embedded with the skill as well.
+- `rkat help`, JSON-RPC `help/ask`, REST `POST /help` and the MCP
+  `meerkat_help` tool see the whole embedded platform skill and CLI
+  reference, and can read the platform skill's references. The help
+  surfaces preloaded both skills, and a preload is cut at
+  `skills.max_injection_bytes` (32 KiB by default), so a help session saw
+  about the first third of the platform skill and none of its reference
+  documents. Every help surface now builds its session from
+  `meerkat::help::help_session()`: both skills whole in the system prompt,
+  and exactly two read-only tools, `skill_list_resources` and
+  `skill_read_resource`, which read the references (an embedded skill now
+  serves its `references/*.md` documents as artifacts). Help sessions no
+  longer start the realm's MCP servers or attach callback tools, and get no
+  other tool family. Normal sessions keep the configured
+  `skills.max_injection_bytes`, including a `rkat run` that preloads
+  meerkat-platform.
+- `--as-agent` works before the command name, like the other root options.
+  `rkat --as-agent <AGENT> realm list` was rewritten into a prompt-first run
+  whose prompt was the command name.
+- A saved help session cannot be resumed after a restart; ask the question
+  again. A help session's reference tools exist only in the live session its
+  help entry point built, so `rkat help`, JSON-RPC `help/ask`, REST
+  `POST /help` and the MCP `meerkat_help` tool now mark their session as a
+  help session. While that live session runs, the help session takes further
+  turns with its help tools (the MCP `meerkat_resume` tool now continues it
+  there instead of rebuilding it). Once it has ended, for example after a
+  restart, `rkat run --resume`, JSON-RPC `turn/start`, REST
+  `POST /sessions/{id}/messages` and `meerkat_resume` refuse it with
+  `SESSION_NOT_RUNNING` (kind `help_session_not_resumable`) before any model
+  call. Before, a resume rebuilt a saved help session with that surface's
+  ordinary tools: the connection's callback tools and a live MCP router. Help
+  sessions also run with a launch tool access policy that admits only
+  `skill_list_resources` and `skill_read_resource`, and with provider-native
+  tools off. Help sessions saved by 0.9.0 or earlier carry no help mark and
+  still resume as ordinary sessions.
+- The mob guide now documents a profile's `tools.deny`: denied tools are
+  hidden from the member's tool catalog (the tool list sent to the model) on
+  every build, and a call to a denied tool is still refused with an
+  `access_denied` tool error. The `DeclaredToolRestriction::deny` and
+  `AgentBuildConfig::tool_access_policy` docs said denied tools stay listed,
+  which has not been true since 0.8.52 (#1807).
+- Correction to the 0.8.51 notes: mob flow steps cannot set a turn's
+  `tool_choice_plan`. A flow step has no tool choice plan (RPC `mob/create`
+  rejects the key and a TOML definition ignores it), so flow-step turns,
+  including those sent to remote members over the supervisor bridge, use
+  `Auto`. Set a plan through `turn_tool_overlay` on RPC `turn/start` or
+  `mob/turn_start`, or on a REST session continue.
+- The `xtask bridge-classifier` gate's docs and finding message no longer
+  name the removed `classify_response_terminality`; they point at the
+  machine-classified `response_terminality`.
+- Live e2e scenarios: REST scenario 25 shuts its first host down before the
+  reloaded host resumes the session, and the S101 history check counts each
+  heard response against its own committed text instead of requiring
+  alternating rows.
+- The `ci-nextest-archive-contract` pre-push hook no longer needs ripgrep,
+  which macOS does not ship. Without it, the hook failed with "doctor
+  workflow check raw Cargo archive consumer: expected fail, got pass" after
+  five Python tracebacks, and its source scans passed without checking
+  anything. `scripts/rust-lane-doctor` now runs its workflow `cargo` scan in
+  Python, and the hook's source scans use `git grep`. A user ripgrep config
+  (`RIPGREP_CONFIG_PATH`, for example with `--heading`) no longer changes the
+  hook's result.
+- The `ci-nextest-archive-contract` hook no longer prints Python tracebacks on
+  every run. It now checks that each archive family builds the
+  mcp-test-server fixture before archiving when a selected package needs it.
+- `scripts/mcp-test-server-fixture --if-needed` now fails when `cargo
+  metadata` or its package check fails. It used to treat any failure as "no
+  package needs the fixture" and skip the build, so tests that spawn the
+  fixture failed later without the cause.
+- `scripts/require-python 3.10` now tries `python3.10`. A PATH with an older
+  `python3` first (such as Apple's 3.9) and only `python3.10` qualifying was
+  refused.
+- The `ci-nextest-archive-contract` hook no longer fails when the `python3.10`
+  on PATH cannot run Python 3.10, such as a pyenv or asdf shim with no 3.10
+  selected. It skips the extra 3.10 run and prints a note.
+- The `ci-nextest-archive-contract` hook's rust-lane-doctor probes now run only
+  the doctor's workflow entrypoint check, not its later `env bash` version
+  check. A check that crashes no longer counts as a detection.
+- MCP App views now load on routers that carry the stock connector
+  call-context provider. Every runtime-backed factory with provider-auth
+  persistence (the Meta `rpc_gateway`'s member factories among them) attaches
+  `ConnectorMcpCallContextProvider` to each MCP router it builds. That
+  provider inherited the refusing `McpCallContextProvider::prepare_resource`
+  default, so every MCP App resource read was refused as temporarily
+  unavailable before reaching the server: the read of the declared view at
+  tool-call time, and a later read through `SessionService::tool_application`
+  (the Console's `read-resource` route). The provider now selects a read's
+  destination the same way it selects a tool call's: by complete
+  configuration equality for a fixed installation list, by the read's own
+  staged configuration for the live provider, and never by server name.
+  - A read of a server without a connector binding goes out unchanged, as on
+    a router without the provider.
+  - A read of a connector-bound server, or of a server that only shares a
+    trusted installation's name, is refused as denied before anything is
+    sent. An invalid binding serves no read.
+  - A resource read never carries the connector credential and never
+    consults the credential owner, because a binding declares credentials per
+    tool operation only.
+  - A governed read (one whose dispatch context carries work authorization)
+    still needs a host provider that supplies the resource's native
+    authority. Under the stock provider it stays refused as unavailable.
+- `McpRouter` no longer sends a resource read to a connector-bound server
+  unprepared. With no call-context provider, or with a provider that
+  prepares nothing for that server (for example a fixed installation list
+  that does not name it), the read is refused as unavailable before
+  transport, as that server's tool calls already were. This includes the
+  read of the declared view at tool-call time.
+- `rkat mob deploy` budget limits now limit the deployed members.
+  `--max-total-tokens`, `--max-duration`, `--max-tool-calls` and a mobpack's
+  `[budget]` deploy default were recorded in the legacy `[budget]` config
+  table, which nothing enforces, so the members ran without them. They now
+  set each member's agent-lifetime `[limits]` (`budget`, `max_duration` and
+  `max_tool_calls`) on the default `cli` deploy surface and for
+  `rkat mob run <pack>`. A deploy flag wins over the operator's realm
+  `[limits]`, and the realm wins over the pack's default. The new
+  `[limits] max_tool_calls` key also caps tool calls for any agent built
+  from a realm config that sets it.
+- Gemini model profiles advertise only the thinking levels the model
+  accepts: `params_schema` no longer offers `thinking_level: "minimal"` for
+  `gemini-4-argon`, `gemini-3.8-flash`, `gemini-3.7-flash` and
+  `gemini-3.1-pro-preview`, which answer it with HTTP 400. An explicit
+  `minimal` is still sent to the provider as before.
+- An OAuth browser callback whose state the auth machine no longer holds (a
+  wrong, already-used, released or pruned-expired state, or one admitted by
+  another runtime) is refused as `attempt_missing` (JSON-RPC `-32602`, REST
+  `400`) instead of an internal error (`-32603`, HTTP `500`, reported as "auth
+  infrastructure failure" since 0.8.52). The error class regressed in 0.8.9;
+  the login was always refused and nothing was stored. An attempt that expires
+  in the short window after the callback's state check can still report the
+  internal error.
+- OpenAI prompt-cache fields (`prompt_cache_enabled`, `prompt_cache_key`,
+  `prompt_cache_retention`, `prompt_cache_options` and the input breakpoints
+  they author) no longer reach backends that have not admitted them on the
+  remaining routes: self-hosted OpenAI-compatible servers (Chat Completions
+  and Responses) and the GitHub Copilot `/responses` and `/chat/completions`
+  routes, whether the fields came from model defaults or explicit
+  `provider_params`. A disabled cache (`prompt_cache_enabled: false`) now
+  sends nothing there instead of `prompt_cache_options: {"mode":"explicit"}`.
+  The public OpenAI API is unchanged.
+- A session served by the ChatGPT backend now resolves
+  `supports_mid_conversation_system_messages` as false (session capabilities,
+  `WireResolvedModelCapabilities.mid_conversation_system_messages`): that
+  backend accepts only one leading System message. An instruction activation
+  on such a session is refused with `UnsupportedCurrentLowering` before
+  anything is appended, instead of being applied and then refused by the
+  provider on every later turn. A model change or binding clear that would put
+  a session with recorded activations on that backend is refused the same way
+  before anything changes: a cleared binding is planned with the binding the
+  session's client resolution selects. The model catalog's per-model value is
+  unchanged, and stored sessions and realms load as before.
+- `AnthropicClient::with_base_url` no longer keeps the HTTP client built for
+  the previous base URL when the client for the new URL cannot be built; a
+  request without an authorization check then fails with the build error, as
+  with the other providers, and a request with one builds its checked client
+  for the new URL.
+- JSON-RPC `turn/start` and `mob/turn_start` refuse `max_tokens`,
+  `output_schema` and `structured_output_retries` while they parse their
+  params, with `-32602` naming the setting and where to set it, before any
+  session work. These build settings were always refused on a turn, but only
+  after the session had been touched, and the message wrongly suggested a
+  deferred session; set them on `session/create` (a deferred create included).
+  An explicit `null` is still accepted.
+- MCP `meerkat_resume` forwards `turn_tool_overlay.tool_choice_plan` like the
+  other surfaces, and keeps the whole turn tool overlay when the resume
+  rebuilds the session's agent (a cold session or a build override), where it
+  was dropped. Unknown overlay keys are still accepted, ignored and logged.
+- A JSON-RPC `mob/create` whose caller is cancelled or disconnected
+  mid-creation still registers its mob: the RPC host now runs each mob create
+  and resume as its mob state's own task, as the CLI, REST and MCP hosts do,
+  instead of leaving a started mob and its durable store outside the managed
+  set. Restored RPC hosts also schedule the temporary-council and fork_off
+  recovery passes.
+- The Python, TypeScript and Web SDK MCP logout helpers (`auth_mcp_logout`,
+  `authMcpLogout`, `mcpLogout`) document what `auth/logout` does: it retires
+  the server's pending login attempt, removes its stored credential and stops
+  offering the server to the runtime's sessions until a later login.
+- The docs no longer say that a `turn/start` on a session with a running turn
+  fails with `SESSION_BUSY`: the turn is queued behind the running one and
+  returns its own result, as an ordinary REST continue and MCP
+  `meerkat_resume` do. The error tables say when `-32002` is returned.
+- JSON-RPC `comms/send` and the MCP `meerkat_comms_send` tool reported an
+  ambiguous peer delivery (the envelope may already have been delivered) as
+  `send_failed`, which invites a retry that can duplicate it. They now fail
+  with `send_ambiguous` and the same payload as REST: the `envelope_id`,
+  `retry_safe: false` and `required_action: "reconcile"`. Reconcile by that
+  envelope before any new attempt.
+- The MCP `meerkat_comms_send` tool reported a durably rejected envelope as
+  `send_failed`. It now fails with `peer_input_rejected` and the
+  `envelope_id`, as REST and JSON-RPC do.
+- Python and TypeScript SDKs: a `comms/send` that failed with a transport
+  error kept only the transport error text as the error's `details` and lost
+  its `code`, `peer` and `reason`. The whole typed error data now survives.
+- Python and TypeScript SDKs: the `delivery` outcome of peer `comms/send`
+  receipts is now typed. `durably_resolved` carries a typed `outcome`
+  (`accepted`, `deduplicated` or `rejected`) instead of an untyped map, and
+  both SDKs export `PeerDeliveryOutcome` and `PeerIngressTerminalOutcomeKind`.
+- TypeScript SDK: `CommsSendReceipt`, the result of `session.send()`,
+  declared camelCase fields (`requestId`, `interactionId`, `inputId`,
+  `envelopeId`, `streamReserved`, `inReplyTo`) that were never set. It is now
+  exactly the snake_case receipt the server returns; read fields such as
+  `request_id` after narrowing on `kind`.
+- Python and TypeScript SDKs: typed peer lifecycle sends accept the
+  `mob.dismiss` lifecycle kind.
+- TypeScript SDK: a deferred session's `startTurn(...)` and `stream(...)`
+  options now accept `injectedContext`, `transientTurnContext` and
+  `selfHostedServerId`, like any other turn.
+- TypeScript SDK: `MobTurnStartOptions.authBinding` is typed as
+  `TurnAuthBindingOverride` (a binding ref, `{ action: "set", value }` or
+  `{ action: "clear" }`) instead of an untyped object.
+- Live and configured MCP stdio servers now launch inside the host's MCP
+  stdio launch profile (`AgentFactory::with_mcp_stdio_launch_profile`) on
+  every route. JSON-RPC `mcp/add` (on a created, promoted or cold-recovered
+  session), REST live MCP and the `rkat run` loader each built their own
+  router with the trusted-host profile, so a Rust host that required
+  confinement still had those stdio servers launched unconfined. `rkat-mcp`
+  sessions (fresh, resumed without a router, and scheduled) take one profile
+  from the server's state.
+- JSON-RPC monitors (`monitors/start`, and monitors recovered after a
+  restart) now run inside the host's shell confinement
+  (`AgentFactory::with_shell_confinement`), like the shell tool. Their job
+  manager was built with the trusted-host profile, so a host that required
+  shell confinement still ran them unconfined.
+
+### Known issues
+
+- `rkat mob deploy --surface rpc` builds the deployed members from the
+  realm's config store (the realm document and its parent chain), not from
+  the deploy config, so neither the deploy flags (`--model`,
+  `--max-total-tokens`, `--max-duration`, `--max-tool-calls`) nor the pack's
+  deploy defaults (`[budget]`, `[models]`, `max_tokens`, `[compaction]`)
+  apply to those members.
+- An ordinary config write can change or remove a realm's
+  `[realm.<id>].parent` edge. From the next start that realm no longer
+  composes the `[confinement]` of its former ancestors (governance
+  inheritance follows the same edge). A requirement in the user document or
+  set with the `--confinement` flags is not affected; put confinement that
+  must hold there.
 
 ## [0.9.0] - 2026-10-13
 
@@ -2455,7 +3108,7 @@ them.
   names no binding is likewise switched to with the binding and credential its
   client resolved.
 
-- `rkat run` and `rkat resume` work in a governed realm: the CLI's runtime
+- `rkat run` and `rkat run --resume` work in a governed realm: the CLI's runtime
   executor declares and forwards the native work context of each governed
   turn, as the shared runtime-backed executor does, instead of every
   governed prompt being refused as "governed executor support is
@@ -2463,7 +3116,7 @@ them.
 
 - The CLI launches a realm-defined MCP stdio server with the service secrets
   its realm stored for the server's declared `secret_env` slots. It refused
-  every declared slot before: the MCP loader of `rkat run` and `rkat resume`
+  every declared slot before: the MCP loader of `rkat run` and `rkat run --resume`
   on an ordinary realm held no service-secret custody, and the servers
   launched through the CLI's runtime-backed composition (such as a governed
   realm's configured servers) were refused as ownerless, because that
@@ -2481,7 +3134,7 @@ them.
   reviewed operation on such a server. A source that states no account
   still states none through the custody.
 
-- The MCP credential source of `rkat run` and `rkat resume` states the
+- The MCP credential source of `rkat run` and `rkat run --resume` states the
   account the native MCP OAuth owner selected for a server
   (`oauth_account`). It stated none, so in a governed realm the stock policy
   refused each reviewed operation on such a server.
@@ -24847,7 +25500,8 @@ tag, so its comparison link uses v0.3.0 as the exact ancestry base.
 
 Initial development release.
 
-[Unreleased]: https://github.com/lukacf/meerkat/compare/v0.9.0...HEAD
+[Unreleased]: https://github.com/lukacf/meerkat/compare/v0.9.1...HEAD
+[0.9.1]: https://github.com/lukacf/meerkat/compare/v0.9.0...v0.9.1
 [0.9.0]: https://github.com/lukacf/meerkat/compare/v0.8.52...v0.9.0
 [0.8.52]: https://github.com/lukacf/meerkat/compare/v0.8.51...v0.8.52
 [0.8.51]: https://github.com/lukacf/meerkat/compare/v0.8.50...v0.8.51

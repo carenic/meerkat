@@ -278,7 +278,16 @@ COMMS_SESSION_STREAM_RPC_CONTRACT_ALIAS_TYPES = [
     "ContentBlock",
     "ContentInput",
     "CommsSendParams",
+    # The typed `delivery` on every peer `comms/send` receipt; emitted before
+    # `CommsSendResult` so the receipt variants reference it by name.
+    "PeerIngressTerminalOutcomeKind",
+    "PeerDeliveryOutcome",
     "CommsSendResult",
+    # Typed `error.data` of a failed `comms/send`, tagged on `code`.
+    "CommsPeerUnreachableReason",
+    "AdmissionDropReason",
+    "CommsSendRequiredAction",
+    "CommsSendErrorData",
     "CommsChecksumTokenResultIntent",
     "CommsPeerRequestIntent",
     "CommsPeerRequestParams",
@@ -3673,6 +3682,7 @@ def generate_python_types(schemas: dict, output_dir: Path, *, has_comms: bool = 
                 "BridgeRejectionCause",
                 "BridgeOutboundTaintTarget",
                 "WireFlowTurnOutcome",
+                "PeerDeliveryOutcome",
             }
             else None
         )
@@ -4586,6 +4596,7 @@ def generate_typescript_types(schemas: dict, output_dir: Path, *, has_comms: boo
                 "MemberBuildRejection",
                 "BridgeRejectionCause",
                 "WireFlowTurnOutcome",
+                "PeerDeliveryOutcome",
             }
             else None
         )

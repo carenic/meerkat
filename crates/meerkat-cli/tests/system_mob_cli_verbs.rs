@@ -443,7 +443,7 @@ async fn integration_real_mob_cli_verbs_over_tcp() {
     // host-availability claim). The honest console outcome is therefore the
     // UNMAPPED mob-family exit (1) with the raw typed message, NOT 46.
     // Exit 46 (HostUnavailable ← bridge reply deadline / typed Unavailable
-    // rejection) is pinned at unit level (mob_exit_code) and via the MCP
+    // rejection) is pinned at unit level (exit_status mob tests) and via the MCP
     // dispatch rows per FLAG-WB-5's recorded disposition: a delivered-but-
     // unanswered bridge request is not deterministically manufacturable in
     // this lane without fault injection.

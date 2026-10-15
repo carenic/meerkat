@@ -368,6 +368,122 @@ impl CommandHookProcessCustody for LegacyCustody {
     }
 }
 
+/// A custody whose closed launch counts every entry it is asked for.
+struct CountingCustody {
+    spawn_calls: AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl CommandHookProcessCustody for CountingCustody {
+    async fn spawn(
+        &self,
+        _hook_id: &HookId,
+        _run_id: Option<&meerkat_core::RunId>,
+        _command: &CommandRuntimeConfig,
+    ) -> Result<ProcessChild, HookFailureReason> {
+        self.spawn_calls.fetch_add(1, Ordering::SeqCst);
+        Err(HookFailureReason::ConfinementRefused {
+            refusal: ConfinementRefusal::UnsupportedRequirement,
+        })
+    }
+
+    async fn prepare(
+        &self,
+        _hook_id: &HookId,
+        _run_id: Option<&meerkat_core::RunId>,
+        _program: &OsStr,
+        _args: &[OsString],
+    ) -> Result<(Box<dyn CommandHookCustodySpawn>, Command), CommandHookCustodyError> {
+        Err(CommandHookCustodyError {
+            reason: "legacy mutable-command preparation was reached".to_owned(),
+        })
+    }
+}
+
+/// An entry the host refuses (its definition comes from a source a
+/// confined process can write) fails every invocation with its typed launch
+/// refusal before its runtime is reached: a mandatory guardrail keeps its
+/// slot and refuses what it gates, an observer reports its refusal, no
+/// command is launched and no HTTP request is sent.
+#[tokio::test]
+async fn refused_entries_never_reach_their_runtime() -> Result<(), Box<dyn std::error::Error>> {
+    let custody = Arc::new(CountingCustody {
+        spawn_calls: AtomicUsize::new(0),
+    });
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+    listener.set_nonblocking(true)?;
+    let url = format!("http://{}/hook", listener.local_addr()?);
+    let guard = HookId::new("project-guard");
+    let observer = HookId::new("project-observer");
+    let engine = DefaultHookEngine::new(HooksConfig {
+        entries: vec![
+            HookEntryConfig {
+                id: observer.clone(),
+                point: HookPoint::PreToolExecution,
+                priority: -1,
+                capability: HookCapability::Observe,
+                runtime: HookAdapterConfig::http(url, "POST", HashMap::new()),
+                ..Default::default()
+            },
+            HookEntryConfig {
+                id: guard.clone(),
+                point: HookPoint::PreToolExecution,
+                capability: HookCapability::Guardrail,
+                runtime: HookAdapterConfig::command("sh", Vec::new(), HashMap::new()),
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    })
+    .with_command_process_custody(custody.clone())
+    .with_refused_entries([
+        (
+            guard.clone(),
+            ConfinementRefusal::UntrustedConfigurationSource,
+        ),
+        (
+            observer.clone(),
+            ConfinementRefusal::UntrustedConfigurationSource,
+        ),
+    ]);
+
+    let refused = engine
+        .execute(
+            HookInvocation::new(HookPoint::PreToolExecution, SessionId::new()),
+            None,
+        )
+        .await;
+    let Err(HookEngineError::WithReport { report, error }) = refused else {
+        return Err(format!("the guardrail is refused after the observer: {refused:?}").into());
+    };
+    assert_eq!(report.launch_refusals.len(), 1);
+    assert_eq!(report.launch_refusals[0].hook_id, observer);
+    assert_eq!(
+        report.launch_refusals[0].refusal,
+        ConfinementRefusal::UntrustedConfigurationSource
+    );
+    assert!(report.started.is_empty(), "no refused entry entered");
+    assert!(matches!(
+        *error,
+        HookEngineError::LaunchRefused {
+            hook_id: ref actual,
+            reason: HookFailureReason::ConfinementRefused {
+                refusal: ConfinementRefusal::UntrustedConfigurationSource,
+            },
+        } if *actual == guard
+    ));
+    assert_eq!(
+        custody.spawn_calls.load(Ordering::SeqCst),
+        0,
+        "no command was launched"
+    );
+    assert!(
+        matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+        "no HTTP request was sent"
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn legacy_custody_without_closed_launch_support_refuses_before_prepare() {
     let custody = Arc::new(LegacyCustody {

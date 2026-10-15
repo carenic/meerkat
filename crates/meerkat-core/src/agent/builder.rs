@@ -379,6 +379,21 @@ impl AgentBuilder {
         self
     }
 
+    /// Set the prompt of the structured-output extraction turn, replacing the
+    /// built-in one.
+    pub fn extraction_prompt(mut self, prompt: impl Into<String>) -> Self {
+        self.config.extraction_prompt = Some(prompt.into());
+        self
+    }
+
+    /// Set the fraction of each budget limit at which the agent emits one
+    /// early `BudgetWarning` before the limit is reached. A value outside
+    /// `(0, 1)` keeps only the warning at the limit itself.
+    pub fn budget_warning_threshold(mut self, threshold: f32) -> Self {
+        self.config.budget_warning_threshold = threshold;
+        self
+    }
+
     /// Set the memory store for indexing compaction discards.
     pub fn memory_store(mut self, store: Arc<dyn crate::memory::MemoryStore>) -> Self {
         self.memory_store = Some(store);

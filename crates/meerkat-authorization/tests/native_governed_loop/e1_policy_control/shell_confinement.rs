@@ -208,7 +208,6 @@ async fn exercise_required_shell(server: &Server) {
     // Select the executable directly instead of macOS /bin/sh's mutable
     // /private/var/select/sh selector, which is outside the read grant.
     config.shell.program = "/bin/bash".into();
-    config.shell.timeout_secs = 5;
     config.shell.security_mode = meerkat_core::SecurityMode::Unrestricted;
     // This fixture grants shell operations, not provider-hosted search.
     config.provider_tools.anthropic.web_search = false;

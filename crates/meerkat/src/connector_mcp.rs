@@ -22,13 +22,27 @@
 //! governed invocation context decides whether the actual operation may run,
 //! a call without one is refused, and a server's access ceiling still
 //! refuses an operation the binding lists but the ceiling does not admit.
+//!
+//! A resource read (an MCP App's `ui://` view, read when its tool is called
+//! and again when a viewer asks for it) never carries the connector
+//! credential: a binding declares what each tool operation needs and nothing
+//! for a read. The provider selects a read's destination exactly as a call's
+//! and leaves the read of a server that is no trusted installation
+//! unchanged, as a router without this provider sends it. It refuses the read
+//! of a connector-bound server, or of one that only shares a trusted
+//! installation's name, before anything is sent (and the router itself
+//! refuses a bound server's read that no provider prepares, as it refuses
+//! its calls). It knows no native authority for a resource, so a governed
+//! read stays refused.
 
 use std::collections::BTreeMap;
 
 use async_trait::async_trait;
 use meerkat_core::types::ToolCallView;
 use meerkat_core::{McpServerConfig, ToolDispatchContext};
-use meerkat_mcp::{McpCallContext, McpCallContextError, McpCallContextProvider, McpCallTarget};
+use meerkat_mcp::{
+    McpCallContext, McpCallContextError, McpCallContextProvider, McpCallTarget, McpResourceTarget,
+};
 use meerkat_providers::connector_login::{ConnectorCallExpectation, ConnectorOAuthAuthority};
 
 /// The protected `_meta` key a connector-bound call's credential travels in.
@@ -251,6 +265,44 @@ impl McpCallContextProvider for ConnectorMcpCallContextProvider {
         }
     }
 
+    /// A read carries no connector credential: a binding declares what each
+    /// tool operation needs, never what a read needs, so no operation's
+    /// credential, scopes or approval stand in for one. The read's
+    /// destination is selected as [`Self::prepare`] selects a call's
+    /// (complete configuration equality for a fixed list, the read's own
+    /// staged configuration for the live provider), never by name alone. A
+    /// server that is no trusted installation is read with its payload
+    /// unchanged; a connector-bound one, or one that only shares a trusted
+    /// installation's name, is refused (`Denied`) before anything is sent;
+    /// and a binding that is not valid serves no read (`Unavailable`).
+    async fn prepare_resource(
+        &self,
+        target: McpResourceTarget<'_>,
+        _context: &ToolDispatchContext,
+    ) -> Result<Option<McpCallContext>, McpCallContextError> {
+        let bound = match &self.installations {
+            Installations::Fixed(installations) => {
+                select_installation(installations, target.config)?.is_some()
+            }
+            Installations::Live => live_installation(target.config)?.is_some(),
+        };
+        if bound {
+            tracing::debug!("MCP resource read refused for a connector-bound server");
+            return Err(McpCallContextError::Denied);
+        }
+        Ok(None)
+    }
+
+    /// None: this provider knows no native authority that owns an MCP
+    /// resource (neither a server name nor a connector slot is one), so a
+    /// governed read is refused before anything is prepared or sent.
+    fn resource_authorization_target(
+        &self,
+        _target: McpResourceTarget<'_>,
+    ) -> Option<meerkat_core::authorization::OwnerQualifiedTarget> {
+        None
+    }
+
     async fn prepare(
         &self,
         target: McpCallTarget<'_>,
@@ -328,16 +380,26 @@ fn live_binding(
     config: &McpServerConfig,
     raw_operation: &str,
 ) -> Result<Option<ConnectorOperationBinding>, McpCallContextError> {
-    match ConnectorMcpInstallation::from_config(config) {
-        None => Ok(None),
-        Some(Err(_)) => Err(McpCallContextError::Unavailable),
-        Some(Ok(installation)) => installation
-            .operations
-            .get(raw_operation)
-            .cloned()
-            .map(Some)
-            .ok_or(McpCallContextError::Denied),
-    }
+    let Some(installation) = live_installation(config)? else {
+        return Ok(None);
+    };
+    installation
+        .operations
+        .get(raw_operation)
+        .cloned()
+        .map(Some)
+        .ok_or(McpCallContextError::Denied)
+}
+
+/// The trusted installation `config` itself declares: `None` for a server
+/// without a connector binding. A binding that is not valid serves nothing
+/// (`Unavailable`).
+fn live_installation(
+    config: &McpServerConfig,
+) -> Result<Option<ConnectorMcpInstallation>, McpCallContextError> {
+    ConnectorMcpInstallation::from_config(config)
+        .transpose()
+        .map_err(|_| McpCallContextError::Unavailable)
 }
 
 /// The binding a call to `config`'s `raw_operation` needs: `None` for a
@@ -349,16 +411,7 @@ fn select_binding<'a>(
     config: &McpServerConfig,
     raw_operation: &str,
 ) -> Result<Option<&'a ConnectorOperationBinding>, McpCallContextError> {
-    let Some(installation) = installations
-        .iter()
-        .find(|installation| &installation.config == config)
-    else {
-        if installations
-            .iter()
-            .any(|installation| installation.config.name == config.name)
-        {
-            return Err(McpCallContextError::Denied);
-        }
+    let Some(installation) = select_installation(installations, config)? else {
         return Ok(None);
     };
     installation
@@ -367,6 +420,31 @@ fn select_binding<'a>(
         .map(Some)
         .ok_or(McpCallContextError::Denied)
 }
+
+/// The trusted installation `config` is, by complete configuration equality:
+/// `None` for a server that is no trusted installation. A server that only
+/// shares an installation's name is refused rather than treated as unbound.
+fn select_installation<'a>(
+    installations: &'a [ConnectorMcpInstallation],
+    config: &McpServerConfig,
+) -> Result<Option<&'a ConnectorMcpInstallation>, McpCallContextError> {
+    if let Some(installation) = installations
+        .iter()
+        .find(|installation| &installation.config == config)
+    {
+        return Ok(Some(installation));
+    }
+    if installations
+        .iter()
+        .any(|installation| installation.config.name == config.name)
+    {
+        return Err(McpCallContextError::Denied);
+    }
+    Ok(None)
+}
+
+#[cfg(test)]
+mod apps_tests;
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]

@@ -54,9 +54,11 @@ ownership boundaries intact:
 - Extraction fallback must merge the target request policy with the current
   extraction overrides: reapply structured output for the new provider and keep
   provider-native web search disabled.
-- Tool visibility projections must use the active model's
-  `active_capability_base_filter()` on every call and visible-tool snapshot, so
-  later sticky fallback turns and control-plane reads agree.
+- Tool visibility projections read the active capability base filter from
+  `ToolScope` visibility state and the registry-minted active profile
+  (`ModelProfileWitness`) on every call and visible-tool snapshot, never a
+  client-local projection (the client-side `active_capability_base_filter`
+  was removed), so later sticky fallback turns and control-plane reads agree.
 - Selection and precommit use `ModelFallbackRequest` over actual materialized
   messages/tools/params/output schema. Use canonical context forecast/pressure
   owners, never bytes-as-tokens or only the last ContextExceeded error.
@@ -73,8 +75,9 @@ ownership boundaries intact:
   `SkillContext { skill_key, text }`
 - `ContentInput` (meerkat-core): `Text(String)` or `Blocks(Vec<ContentBlock>)`
 - `ToolOutput` (meerkat-tools): `Json(Value)`,
-  `JsonWithEffects { value, session_effects }`, or
-  `Blocks(Vec<ContentBlock>)`
+  `JsonWithEffects { value, session_effects }`,
+  `Blocks(Vec<ContentBlock>)`, or `JsonRenderedAsText { value, text }` (typed
+  JSON for Rust callers, compact text for the model and transcript)
 - `AssistantBlock::Image` (meerkat-core): canonical generated assistant image output; stores `image_id`, `blob_ref`, dimensions, revised prompt disposition, and provider metadata.
 
 ## Assistant Image Generation

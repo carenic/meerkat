@@ -122,10 +122,10 @@ fi
     MEERKAT_RELEASE_PROJECTION_CALL_LOG="$CALL_LOG" \
     PRE_COMMIT_FROM_REF="$base" \
     PRE_COMMIT_TO_REF="$head" \
-    "$REPO_ROOT/scripts/pre-push-clippy.sh"
+    "$REPO_ROOT/scripts/pre-push-ratchets.sh"
 )
 if [[ "$(cat "$CALL_LOG")" != "verify-version-parity" ]]; then
-  echo "release projection clippy seam did not run only version parity" >&2
+  echo "release projection ratchets seam did not run only version parity" >&2
   cat "$CALL_LOG" >&2
   exit 1
 fi
@@ -167,10 +167,10 @@ semantic_head="$(git -C "$TEST_ROOT" rev-parse HEAD)"
     MEERKAT_RELEASE_PROJECTION_CALL_LOG="$CALL_LOG" \
     PRE_COMMIT_FROM_REF="$base" \
     PRE_COMMIT_TO_REF="$semantic_head" \
-    "$REPO_ROOT/scripts/pre-push-clippy.sh"
+    "$REPO_ROOT/scripts/pre-push-ratchets.sh"
 )
-if [[ "$(cat "$CALL_LOG")" != "agent-gate --committed --clippy-only --machine-drift-by-hook" ]]; then
-  echo "semantic change bypassed the ordinary clippy gate" >&2
+if [[ "$(cat "$CALL_LOG")" != "agent-gate --committed --ratchets-only --machine-drift-by-hook" ]]; then
+  echo "semantic change bypassed the ordinary ratchets gate" >&2
   cat "$CALL_LOG" >&2
   exit 1
 fi
@@ -227,7 +227,7 @@ assert_range_gate() {
       ROOT="$TEST_ROOT" \
         RELEASE_PROJECTION_ONLY="$REPO_ROOT/scripts/release-projection-only.mjs" \
         AGENT_GATE="$TEST_ROOT/scripts/cargo-agent-gate" \
-        "$REPO_ROOT/scripts/pre-push-clippy.sh" --dry-run "$@"
+        "$REPO_ROOT/scripts/pre-push-ratchets.sh" --dry-run "$@"
     elif [[ "$mode" == env-override ]]; then
       CARGO_AGENT_BASE="$range_base" ./scripts/cargo-agent-gate --committed --clippy-only --dry-run "$@"
     elif [[ "$mode" == diff-error ]]; then
@@ -238,6 +238,20 @@ assert_range_gate() {
   )" || status=$?
   local passed=0
   case "$expected" in
+    ratchets-quiet)
+      # The hook lints nothing: a runtime-only range runs no ratchet, no
+      # Clippy and no tests.
+      if [[ "$status" -eq 0 ]] && printf '%s' "$output" | grep -Fq 'ratchets only' \
+        && ! printf '%s' "$output" | grep -Eq 'clippy|test-sdk-web|wasm-check|fast --no-run|nextest run'; then
+        passed=1
+      fi
+      ;;
+    ratchets-web)
+      if [[ "$status" -eq 0 ]] && printf '%s' "$output" | grep -Fq 'DRY-RUN make test-sdk-web' \
+        && ! printf '%s' "$output" | grep -Eq 'clippy|fast --no-run|nextest run'; then
+        passed=1
+      fi
+      ;;
     runtime-only)
       if [[ "$status" -eq 0 ]] && printf '%s' "$output" | grep -Fq -- 'clippy -p meerkat-runtime' \
         && ! printf '%s' "$output" | grep -Eq 'test-sdk-web|wasm-check|fast --no-run|nextest run'; then
@@ -275,7 +289,9 @@ assert_range_gate() {
     range_failures=$((range_failures + 1))
   fi
 }
-assert_range_gate exact-push-parent runtime-only "$range_parent" "$range_head" hook
+assert_range_gate exact-push-parent ratchets-quiet "$range_parent" "$range_head" hook
+assert_range_gate exact-push-range-with-web ratchets-web "$range_base" "$range_head" hook
+assert_range_gate exact-push-parent-gate runtime-only "$range_parent" "$range_head" direct
 assert_range_gate zero-oid-new-branch whole-tree 0000000000000000000000000000000000000000 "$range_head" direct
 assert_range_gate empty-tree-new-branch whole-tree "$empty_tree" "$range_head" direct
 assert_range_gate explicit-base-override full-history "$range_parent" "$range_head" direct --base "$range_base"
@@ -314,6 +330,99 @@ git -C "$TEST_ROOT" commit -qm rust-file-became-symlink
 type_head="$(git -C "$TEST_ROOT" rev-parse HEAD)"
 assert_range_gate rust-file-type-change runtime-only "$range_head" "$type_head" direct
 git -C "$TEST_ROOT" checkout -q --detach "$range_head"
+
+# The same actual commits feed CI planning: the planner's own path collection
+# (run in the fixture repository) must name every path a change touches, both
+# sides of a rename and type-only changes included, and the real workspace
+# plan for those paths must give the touched crates Clippy lanes. The hook no
+# longer runs Clippy, so a path the planner drops is unlinted code. The plan
+# must also hold the touched crates in its test scope and cover the hook's
+# cargo-test binaries for that scope: the independent checker
+# (scripts/ci-hook-coverage.mjs) re-reads the emitted plan and must report no
+# gap. The planner resolves the repository from its working directory, so it
+# runs from this checkout against the fixture's commits.
+ci_plan_failures=0
+assert_ci_plan() {
+  local label="$1" from="$2" to="$3" expected_paths="$4" expected_packages="$5"
+  local collected
+  collected="$(cd "$TEST_ROOT" && node "$REPO_ROOT/scripts/ci-cargo-lanes.mjs" --changed-paths-only --base "$from" --head "$to")" || {
+    printf 'FAIL ci plan: %s: path collection failed\n' "$label" >&2
+    ci_plan_failures=$((ci_plan_failures + 1))
+    return
+  }
+  if ! python3 - "$collected" "$expected_paths" "$expected_packages" "$REPO_ROOT" <<'PY'
+import json
+import subprocess
+import sys
+
+collected, expected_paths, expected_packages, repo_root = sys.argv[1:]
+paths = json.loads(collected)["changed_paths"]
+missing = [path for path in expected_paths.split(",") if path not in paths]
+if missing:
+    sys.exit(f"collection {paths} misses {missing}")
+planned = subprocess.run(
+    ["node", "scripts/ci-cargo-lanes.mjs", "--format", "json", "--", *paths],
+    cwd=repo_root, check=True, capture_output=True, text=True,
+).stdout
+plan = json.loads(planned)
+linted = {name for shard in plan["shards"] for name in shard["packages"]}
+unlinted = [name for name in expected_packages.split(",") if name not in linted and plan["mode"] != "workspace"]
+if not plan["rust_changed"] or unlinted:
+    sys.exit(f"plan for {paths}: rust_changed={plan['rust_changed']}, Clippy lanes {sorted(linted)} miss {unlinted}")
+untested = [name for name in expected_packages.split(",") if name not in plan.get("test_scope", [])]
+if untested:
+    sys.exit(f"plan for {paths}: test scope misses {untested}")
+checked = subprocess.run(
+    ["node", "scripts/ci-hook-coverage.mjs", "--plan", "-"],
+    cwd=repo_root, input=planned, capture_output=True, text=True,
+)
+if checked.returncode != 0:
+    sys.exit(f"plan for {paths}: hook coverage check failed: {checked.stdout}{checked.stderr}")
+report = json.loads(checked.stdout)
+if report["hook_binaries"] == 0 or report["missing"] or report["errors"]:
+    sys.exit(f"plan for {paths}: hook coverage {report}")
+PY
+  then
+    printf 'FAIL ci plan: %s\n' "$label" >&2
+    ci_plan_failures=$((ci_plan_failures + 1))
+  else
+    printf 'PASS ci plan: %s\n' "$label"
+  fi
+}
+git -C "$TEST_ROOT" checkout -q --detach "$range_head"
+git -C "$TEST_ROOT" rm -q crates/meerkat-runtime/src/lib.rs
+git -C "$TEST_ROOT" commit -qm ci-deleted-runtime-source
+assert_ci_plan deleted-runtime-source "$range_head" "$(git -C "$TEST_ROOT" rev-parse HEAD)" \
+  crates/meerkat-runtime/src/lib.rs meerkat-runtime
+git -C "$TEST_ROOT" checkout -q --detach "$range_head"
+git -C "$TEST_ROOT" mv crates/meerkat-runtime/src/lib.rs crates/meerkat-runtime/src/notes.txt
+git -C "$TEST_ROOT" commit -qm ci-rust-renamed-to-text
+assert_ci_plan rust-renamed-to-text "$range_head" "$(git -C "$TEST_ROOT" rev-parse HEAD)" \
+  crates/meerkat-runtime/src/lib.rs,crates/meerkat-runtime/src/notes.txt meerkat-runtime
+git -C "$TEST_ROOT" checkout -q --detach "$range_head"
+mkdir -p "$TEST_ROOT/docs"
+git -C "$TEST_ROOT" mv crates/meerkat-runtime/src/lib.rs docs/retired-test.md
+git -C "$TEST_ROOT" commit -qm ci-rust-renamed-into-docs
+assert_ci_plan rust-renamed-into-docs "$range_head" "$(git -C "$TEST_ROOT" rev-parse HEAD)" \
+  crates/meerkat-runtime/src/lib.rs,docs/retired-test.md meerkat-runtime
+git -C "$TEST_ROOT" checkout -q --detach "$range_head"
+mkdir -p "$TEST_ROOT/crates/meerkat-core/src"
+git -C "$TEST_ROOT" mv crates/meerkat-runtime/src/lib.rs crates/meerkat-core/src/moved_from_runtime.rs
+git -C "$TEST_ROOT" commit -qm ci-test-moved-between-crates
+assert_ci_plan test-moved-between-crates "$range_head" "$(git -C "$TEST_ROOT" rev-parse HEAD)" \
+  crates/meerkat-runtime/src/lib.rs,crates/meerkat-core/src/moved_from_runtime.rs meerkat-runtime,meerkat-core
+git -C "$TEST_ROOT" checkout -q --detach "$range_head"
+rm "$TEST_ROOT/crates/meerkat-runtime/src/lib.rs"
+ln -s ../../../README.md "$TEST_ROOT/crates/meerkat-runtime/src/lib.rs"
+git -C "$TEST_ROOT" add .
+git -C "$TEST_ROOT" commit -qm ci-rust-file-became-symlink
+assert_ci_plan rust-file-type-change "$range_head" "$(git -C "$TEST_ROOT" rev-parse HEAD)" \
+  crates/meerkat-runtime/src/lib.rs meerkat-runtime
+git -C "$TEST_ROOT" checkout -q --detach "$range_head"
+if [[ "$ci_plan_failures" -ne 0 ]]; then
+  echo "$ci_plan_failures CI planning contract failures" >&2
+  exit 1
+fi
 REAL_GIT="$(command -v git)"
 cat > "$HARNESS_ROOT/git" <<'EOF_GIT'
 #!/usr/bin/env bash

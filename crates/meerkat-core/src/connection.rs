@@ -614,6 +614,21 @@ pub struct BackendProfile {
     pub server: Option<String>,
 }
 
+impl BackendProfile {
+    /// Whether requests through this backend can carry an ordered System
+    /// message after the leading system prefix, as the provider matrix
+    /// declares it ([`OpenAiBackendKind::admits_mid_conversation_system_messages`]).
+    /// A backend of another provider, or a backend kind this version does not
+    /// know, leaves the model's own capability standing.
+    pub fn admits_mid_conversation_system_messages(&self) -> bool {
+        match self.provider {
+            Provider::OpenAI => OpenAiBackendKind::parse(&self.backend_kind)
+                .is_none_or(OpenAiBackendKind::admits_mid_conversation_system_messages),
+            _ => true,
+        }
+    }
+}
+
 /// Auth profile: how credentials are obtained, refreshed, constrained.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
@@ -2448,6 +2463,34 @@ impl ProviderBindingConfig {
 mod tests {
     use super::*;
     use std::str::FromStr;
+
+    #[test]
+    fn only_a_chatgpt_backend_profile_refuses_mid_conversation_system_messages() {
+        let backend = |provider, backend_kind: &str| BackendProfile {
+            id: "backend".to_string(),
+            provider,
+            backend_kind: backend_kind.to_string(),
+            base_url: None,
+            options: serde_json::Value::Null,
+            server: None,
+        };
+        assert!(
+            !backend(Provider::OpenAI, "chatgpt_backend").admits_mid_conversation_system_messages()
+        );
+        for (provider, backend_kind) in [
+            (Provider::OpenAI, "openai_api"),
+            (Provider::OpenAI, "azure_openai"),
+            (Provider::OpenAI, "copilot"),
+            (Provider::OpenAI, "a_backend_this_version_does_not_know"),
+            (Provider::Anthropic, "anthropic_api"),
+            (Provider::Gemini, "google_genai"),
+        ] {
+            assert!(
+                backend(provider, backend_kind).admits_mid_conversation_system_messages(),
+                "{backend_kind}"
+            );
+        }
+    }
 
     #[test]
     fn credential_source_spec_debug_redacts_inline_secret_and_command_values() {

@@ -129,18 +129,17 @@ repos:
         pass_filenames: false
         stages: [pre-push]
 
-  # On push: clippy on changed crates only (falls back to workspace for root manifest changes)
+  # On push: the agent gate's changed-path ratchets (formal/governance
+  # targets, generated contract freshness, Web SDK tests, wasm check). No
+  # Clippy: the required CI Clippy lanes lint every package this hook used to,
+  # with the same flags, before merge (scripts/test-pre-push-ratchets.sh).
   - repo: local
     hooks:
-      - id: cargo-clippy
-        name: cargo clippy (changed crates)
-        entry: scripts/pre-push-clippy.sh
+      - id: changed-path-ratchets
+        name: governance, contract, Web SDK and wasm ratchets (changed paths)
+        entry: scripts/pre-push-ratchets.sh
         language: script
-        types: [rust]
         pass_filenames: false
-        # Cargo.lock has no Rust file type, but lock-only pushes must still
-        # compile the resolved dependency graph before prior-graph source-test
-        # evidence is reused. CI re-tests the current lock graph.
         always_run: true
         stages: [pre-push]
 
@@ -150,7 +149,7 @@ repos:
       # The only local machine/protocol drift check: machine-codegen and
       # protocol-codegen under the clean-tree contract, for the exact pushed
       # refs and the machine-authority classifier CI uses. The pre-push
-      # dispatcher refuses SKIP=machine-codegen-drift; the clippy hook's
+      # dispatcher refuses SKIP=machine-codegen-drift; the ratchets hook's
       # governance gate leaves drift to this hook (--machine-drift-by-hook).
       - id: machine-codegen-drift
         name: machine + protocol codegen drift (changed files)
@@ -271,9 +270,33 @@ repos:
         always_run: true
         stages: [pre-push]
 
+      - id: release-test-code-guards-contract
+        name: release guards reject test-only features and test-code markers
+        entry: scripts/test-release-test-code-guards.sh
+        language: script
+        pass_filenames: false
+        always_run: true
+        stages: [pre-push]
+
       - id: release-doctor-workflow-contract
         name: release doctor workflow assertions survive rewording and reject removal
         entry: scripts/test-release-doctor-workflow-contract.sh
+        language: script
+        pass_filenames: false
+        always_run: true
+        stages: [pre-push]
+
+      - id: gcp-buildbuddy-workflow-gate-contract
+        name: self-hosted GCP graph stays default-off and tags validate with Cargo while it is off
+        entry: scripts/test-gcp-buildbuddy-workflow-gate.sh
+        language: script
+        pass_filenames: false
+        always_run: true
+        stages: [pre-push]
+
+      - id: gcp-buildbuddy-hardening-contract
+        name: BuildBuddy keys travel only over TLS and the self-hosted path keeps its own key
+        entry: scripts/test-gcp-buildbuddy-hardening.sh
         language: script
         pass_filenames: false
         always_run: true

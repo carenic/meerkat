@@ -49,8 +49,10 @@ source_test_fingerprint() {
   local revision="${1:-HEAD}"
   local tree_record tree_path
   # Root dependency locks are validated by the preceding Cargo and Bazel lock
-  # gates, while CI remains authoritative for advisories. The always-run
-  # changed-crate Clippy gate also compiles their resolved workspace graph.
+  # gates, while CI remains authoritative for advisories. CI's required
+  # Clippy lanes compile their resolved workspace graph before merge:
+  # Cargo.lock is a global path for the CI planner, so a lock change runs
+  # Clippy over every package with --all-targets --all-features.
   # Excluding only these two generated lock artifacts lets that narrow
   # dependency evidence reuse source-test results; every other tracked byte
   # remains fail-closed because tests may read fixtures or configuration with
@@ -179,27 +181,45 @@ run_with_timeout() {
   wait "$cmd_pid"
 }
 
+# The pre-push dispatcher names a file in MEERKAT_PRE_PUSH_LANE_TIMINGS and
+# reports each lane's wall time from it after the gate. Recording never
+# decides the gate.
+record_lane_time() {
+  [[ -n "${MEERKAT_PRE_PUSH_LANE_TIMINGS:-}" ]] || return 0
+  printf '%s\t%s\t%s\n' "$1" "$2" "$3" >>"$MEERKAT_PRE_PUSH_LANE_TIMINGS" 2>/dev/null || true
+}
+
 retry_lane() {
   local label="$1"
   local timeout_secs="$2"
   shift 2
   local lane_cmd=("$@")
   local status
+  local lane_started="$SECONDS"
 
   echo "Running ${label}..."
   if run_with_timeout "$timeout_secs" "${lane_cmd[@]}"; then
+    record_lane_time "$label" "$((SECONDS - lane_started))" passed
     return 0
   else
     status=$?
   fi
 
   if [[ "$status" -ne 124 ]]; then
+    record_lane_time "$label" "$((SECONDS - lane_started))" "failed-${status}"
     return "$status"
   fi
 
   echo "${label} timed out; retrying once with a clean process tree..." >&2
   sleep 1
-  run_with_timeout "$timeout_secs" "${lane_cmd[@]}"
+  if run_with_timeout "$timeout_secs" "${lane_cmd[@]}"; then
+    record_lane_time "$label" "$((SECONDS - lane_started))" passed-after-retry
+    return 0
+  else
+    status=$?
+  fi
+  record_lane_time "$label" "$((SECONDS - lane_started))" "failed-${status}"
+  return "$status"
 }
 
 NEXTEST_REUSE_DIR=""
@@ -224,7 +244,7 @@ PID_FILE="${LOCK_DIR}/pid"
 
 if [[ "${MEERKAT_SKIP_PRE_PUSH_UNIT_CACHE:-0}" != "1" && -f "$stamp_path" ]]; then
   echo "reusing deterministic source-test evidence for fingerprint ${source_fingerprint}."
-  echo "Current root lock graph was compiled by pre-push Clippy but is not re-tested locally; CI is authoritative."
+  echo "Current root lock graph is compiled by the required CI Clippy lanes and is not re-tested locally; CI is authoritative."
   exit 0
 fi
 
@@ -294,7 +314,7 @@ acquire_lock
 # process waited. Reuse its evidence instead of rebuilding the same graph.
 if [[ "${MEERKAT_SKIP_PRE_PUSH_UNIT_CACHE:-0}" != "1" && -f "$stamp_path" ]]; then
   echo "reusing deterministic source-test evidence for fingerprint ${source_fingerprint}."
-  echo "Current root lock graph was compiled by pre-push Clippy but is not re-tested locally; CI is authoritative."
+  echo "Current root lock graph is compiled by the required CI Clippy lanes and is not re-tested locally; CI is authoritative."
   exit 0
 fi
 

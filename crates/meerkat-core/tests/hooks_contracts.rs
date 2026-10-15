@@ -351,6 +351,7 @@ fn hook_launch_refusal_preserves_domain_cause_without_claiming_entry() {
         ConfinementRefusal::UnsupportedRequirement,
         ConfinementRefusal::BackendUnavailable,
         ConfinementRefusal::PreparationFailed,
+        ConfinementRefusal::UntrustedConfigurationSource,
     ]
     .into_iter()
     .map(|refusal| HookFailureReason::ConfinementRefused { refusal })
@@ -404,6 +405,7 @@ fn hook_launch_refused_event_retains_typed_identity_cause_and_call()
         ConfinementRefusal::UnsupportedRequirement,
         ConfinementRefusal::BackendUnavailable,
         ConfinementRefusal::PreparationFailed,
+        ConfinementRefusal::UntrustedConfigurationSource,
     ]
     .into_iter()
     .map(|refusal| HookFailureReason::ConfinementRefused { refusal })

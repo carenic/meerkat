@@ -9,7 +9,9 @@
 
 use meerkat_core::Provider;
 use meerkat_core::model_profile::capabilities::{EffortLevel, ThinkingSupport};
-use meerkat_core::model_profile::catalog::{ImageGenerationModelRoute, ModelTier};
+use meerkat_core::model_profile::catalog::{
+    ImageGenerationModelRoute, ImageGenerationSizeParameter, ModelTier,
+};
 use meerkat_models::capabilities::{all_capabilities, capabilities_for};
 use meerkat_models::catalog::{
     allowed_models, canonical, catalog, catalog_providers, default_image_generation_model,
@@ -21,7 +23,7 @@ use meerkat_models::profile::{inline_video_support_for, profile_for};
 use std::collections::HashSet;
 
 const IMAGE_DEFAULT_OPENAI: &str = "gpt-image-2";
-const IMAGE_DEFAULT_GEMINI: &str = "gemini-3.1-flash-image-preview";
+const IMAGE_DEFAULT_GEMINI: &str = "gemini-nano-banana-2.1";
 
 fn provider_from_catalog(provider: &str) -> Provider {
     Provider::parse_strict(provider)
@@ -198,12 +200,29 @@ fn claude_fable_51_is_recommended_without_changing_default_ladder() {
 }
 
 #[test]
-fn gemini_38_owns_the_default_and_recommendation_ladder() {
+fn gemini_4_argon_owns_the_gemini_default() {
+    assert_eq!(default_model(Provider::Gemini), Some("gemini-4-argon"));
+    let entry = entry_for(Provider::Gemini, "gemini-4-argon")
+        .expect("gemini-4-argon must be in the catalog");
+    assert_eq!(entry.provider, "gemini");
+    assert_eq!(entry.display_name, "Gemini 4 Argon");
+    assert_eq!(entry.tier, ModelTier::Recommended);
+    let defaults = provider_defaults()
+        .iter()
+        .find(|defaults| defaults.provider == "gemini")
+        .expect("gemini provider defaults");
+    assert_eq!(defaults.default_model_id, "gemini-4-argon");
+    // The platform-wide default stays OpenAI-owned.
+    assert_eq!(global_default_model(), "gpt-6-astra");
+}
+
+#[test]
+fn gemini_38_stays_recommended_without_owning_the_default() {
     let recommended = entry_for(Provider::Gemini, "gemini-3.8-flash")
         .expect("gemini-3.8-flash must be in the catalog");
     assert_eq!(recommended.display_name, "Gemini 3.8 Flash");
     assert_eq!(recommended.tier, ModelTier::Recommended);
-    assert_eq!(default_model(Provider::Gemini), Some("gemini-3.8-flash"));
+    assert_ne!(default_model(Provider::Gemini), Some("gemini-3.8-flash"));
 
     for supported_id in ["gemini-3.7-flash", "gemini-3.5-flash"] {
         let supported = entry_for(Provider::Gemini, supported_id)
@@ -311,6 +330,72 @@ fn claude_sonnet_5_5_capability_row_matches_the_official_model_page() {
             EffortLevel::Max,
         ]
     );
+}
+
+#[test]
+fn claude_haiku_5_5_is_cataloged_without_changing_the_anthropic_default() {
+    let entry = entry_for(Provider::Anthropic, "claude-haiku-5-5")
+        .expect("claude-haiku-5-5 must be in catalog");
+    assert_eq!(entry.provider, "anthropic");
+    assert_eq!(entry.display_name, "Claude Haiku 5.5");
+    assert_eq!(entry.tier, ModelTier::Recommended);
+    assert_eq!(entry.context_window, Some(1_000_000));
+    assert_eq!(entry.max_output_tokens, Some(128_000));
+    assert!(
+        allowed_models(Provider::Anthropic).any(|id| id == "claude-haiku-5-5"),
+        "claude-haiku-5-5 must be in the Anthropic allowlist"
+    );
+    assert_eq!(
+        infer_provider("claude-haiku-5-5"),
+        Some(Provider::Anthropic)
+    );
+    assert_eq!(default_model(Provider::Anthropic), Some("claude-opus-5-5"));
+}
+
+#[test]
+fn claude_haiku_5_5_capability_row_matches_the_official_model_page() {
+    let caps = capabilities_for(Provider::Anthropic, "claude-haiku-5-5")
+        .expect("claude-haiku-5-5 must be in the Anthropic catalog");
+    assert_eq!(caps.provider, Provider::Anthropic);
+    assert_eq!(caps.model_family, "claude-haiku-5");
+    assert_eq!(caps.context_window, Some(1_000_000));
+    assert_eq!(caps.max_output_tokens, Some(128_000));
+    assert_eq!(
+        caps.max_output_tokens_beta.map(|beta| beta.value),
+        Some(300_000),
+        "Haiku 5.5 is listed for the output-300k batch beta"
+    );
+    assert_eq!(caps.thinking, ThinkingSupport::AnthropicAdaptiveOnly);
+    assert!(
+        !caps.supports_temperature && !caps.supports_top_p && !caps.supports_top_k,
+        "non-default sampling parameters return 400 on Haiku 5.5"
+    );
+    assert!(
+        !caps.supports_thinking_budget_legacy,
+        "budget_tokens returns 400 on Haiku 5.5"
+    );
+    assert!(caps.vision);
+    assert!(!caps.inline_video);
+    assert!(caps.supports_mid_conversation_system_messages);
+    assert!(caps.supports_inference_geo);
+    assert!(caps.supports_compaction);
+    assert!(caps.supports_structured_output);
+    assert!(caps.supports_web_search);
+    assert!(
+        caps.supports_forced_tool_choice,
+        "Haiku 5.5 accepts a forced tool_choice (the call then skips thinking)"
+    );
+    assert_eq!(
+        caps.effort_levels,
+        &[
+            EffortLevel::Low,
+            EffortLevel::Medium,
+            EffortLevel::High,
+            EffortLevel::Xhigh,
+            EffortLevel::Max,
+        ]
+    );
+    assert_eq!(caps.call_timeout_secs, Some(120));
 }
 
 #[test]
@@ -644,6 +729,32 @@ fn image_generation_defaults_are_catalog_owned_and_typed() {
 }
 
 #[test]
+fn gemini_nano_banana_21_owns_the_gemini_image_default() {
+    let default = default_image_generation_model(Provider::Gemini)
+        .expect("Gemini must have an image-generation default");
+    assert_eq!(default.model_id, "gemini-nano-banana-2.1");
+    assert_eq!(default.display_name, "Gemini Nano Banana 2.1");
+    assert_eq!(default.tier, ModelTier::Recommended);
+    assert!(matches!(
+        default.route,
+        ImageGenerationModelRoute::GeminiNativeModel {
+            image_size_parameter: ImageGenerationSizeParameter::Supported,
+        }
+    ));
+
+    // The previous default stays resolvable on the same route.
+    let previous = image_generation_model(Provider::Gemini, "gemini-3.1-flash-image-preview")
+        .expect("the previous Gemini image default must stay cataloged");
+    assert_eq!(previous.tier, ModelTier::Supported);
+    assert!(matches!(
+        previous.route,
+        ImageGenerationModelRoute::GeminiNativeModel {
+            image_size_parameter: ImageGenerationSizeParameter::Supported,
+        }
+    ));
+}
+
+#[test]
 fn image_generation_lookup_fails_closed_for_unknown_or_mismatched_models() {
     assert!(image_generation_model(Provider::Gemini, "gemini-unknown-image-preview").is_none());
     assert!(image_generation_model(Provider::OpenAI, "gpt-image-unknown").is_none());
@@ -878,6 +989,101 @@ fn gemini_38_and_37_capability_rows_match_the_current_flash_contract() {
         assert!(caps.supports_structured_output);
         assert!(caps.supports_web_search);
     }
+}
+
+#[test]
+fn gemini_36_flash_35_flash_lite_and_31_flash_lite_rows_match_their_model_pages() {
+    // (id, display name, sampling parameters accepted, legacy thinking_budget)
+    for (id, display_name, sampling, thinking_budget_legacy) in [
+        ("gemini-3.6-flash", "Gemini 3.6 Flash", false, false),
+        (
+            "gemini-3.5-flash-lite",
+            "Gemini 3.5 Flash Lite",
+            false,
+            false,
+        ),
+        ("gemini-3.1-flash-lite", "Gemini 3.1 Flash Lite", true, true),
+    ] {
+        let entry = entry_for(Provider::Gemini, id)
+            .unwrap_or_else(|| panic!("{id} must be in the Gemini catalog"));
+        assert_eq!(entry.display_name, display_name);
+        assert_eq!(entry.tier, ModelTier::Supported, "{id}");
+        assert_eq!(infer_provider(id), Some(Provider::Gemini), "{id}");
+        assert!(
+            allowed_models(Provider::Gemini).any(|allowed| allowed == id),
+            "{id} must be in the Gemini allowlist"
+        );
+
+        let caps = capabilities_for(Provider::Gemini, id)
+            .unwrap_or_else(|| panic!("{id} must have a capability row"));
+        assert_eq!(caps.model_family, "gemini-3", "{id}");
+        assert_eq!(caps.context_window, Some(1_048_576), "{id}");
+        assert_eq!(caps.max_output_tokens, Some(65_536), "{id}");
+        assert_eq!(caps.thinking, ThinkingSupport::GeminiThinkingLevel, "{id}");
+        assert_eq!(caps.supports_temperature, sampling, "{id}");
+        assert_eq!(caps.supports_top_p, sampling, "{id}");
+        assert_eq!(caps.supports_top_k, sampling, "{id}");
+        assert_eq!(
+            caps.supports_thinking_budget_legacy, thinking_budget_legacy,
+            "{id}"
+        );
+        assert!(
+            caps.vision && caps.image_tool_results && caps.inline_video,
+            "{id}"
+        );
+        assert!(!caps.realtime && !caps.image_generation, "{id}");
+        assert!(caps.supports_structured_output, "{id}");
+        assert!(caps.supports_web_search, "{id}");
+        assert_eq!(caps.call_timeout_secs, Some(120), "{id}");
+    }
+}
+
+#[test]
+fn gemini_4_argon_capability_row_matches_the_official_model_page() {
+    let caps = capabilities_for(Provider::Gemini, "gemini-4-argon")
+        .expect("gemini-4-argon must be in the Gemini catalog");
+    assert_eq!(caps.provider, Provider::Gemini);
+    assert_eq!(caps.display_name, "Gemini 4 Argon");
+    assert_eq!(caps.tier, ModelTier::Recommended);
+    assert_eq!(caps.model_family, "gemini-4");
+    assert_eq!(
+        caps.context_window,
+        Some(1_048_576),
+        "input, thinking and output share one 1,048,576-token window"
+    );
+    assert_eq!(caps.max_input_tokens, None);
+    assert_eq!(
+        caps.max_output_tokens,
+        Some(65_536),
+        "synchronous output cap; longer output needs Interactions background mode"
+    );
+    assert_eq!(caps.thinking, ThinkingSupport::GeminiThinkingLevel);
+    assert!(
+        !caps.supports_temperature && !caps.supports_top_p && !caps.supports_top_k,
+        "Gemini 4 Argon ignores sampling parameters"
+    );
+    assert!(
+        !caps.supports_thinking_budget_legacy,
+        "Gemini 4 Argon documents thinking_level only"
+    );
+    assert!(caps.vision);
+    assert!(caps.image_tool_results);
+    assert!(caps.inline_video);
+    assert!(!caps.realtime, "the Live API does not serve Gemini 4 Argon");
+    assert!(!caps.image_generation);
+    assert!(caps.supports_structured_output);
+    assert!(caps.supports_web_search);
+    assert!(caps.supports_forced_tool_choice);
+    assert_eq!(
+        caps.call_timeout_secs,
+        Some(900),
+        "Google asks for client timeouts of at least 15 minutes"
+    );
+    assert_eq!(infer_provider("gemini-4-argon"), Some(Provider::Gemini));
+    assert!(
+        allowed_models(Provider::Gemini).any(|id| id == "gemini-4-argon"),
+        "gemini-4-argon must be in the Gemini allowlist"
+    );
 }
 
 #[test]
@@ -1148,6 +1354,23 @@ fn image_generation_is_model_owned_not_provider_derived() {
     let claude = profile_for(Provider::Anthropic, "claude-opus-4-8")
         .expect("claude-opus-4-8 must have a profile");
     assert!(!claude.image_generation);
+}
+
+/// The fallback `web_search` executor runs on its provider's catalog default
+/// model and fails closed when that row lacks web search, so every provider
+/// default must keep it.
+#[test]
+fn every_provider_default_model_supports_web_search() {
+    for &provider in catalog_providers() {
+        let model = default_model(provider)
+            .unwrap_or_else(|| panic!("{provider:?} must have a default model"));
+        let profile = profile_for(provider, model)
+            .unwrap_or_else(|| panic!("{provider:?} default '{model}' must have a profile"));
+        assert!(
+            profile.supports_web_search,
+            "{provider:?} default '{model}' must support web search"
+        );
+    }
 }
 
 #[test]
@@ -1422,6 +1645,53 @@ mod schema {
             .map(str::to_string)
             .collect();
         assert_eq!(values, expected);
+    }
+
+    /// Live probe 2026-10-14: `thinkingConfig.thinkingLevel: "minimal"`
+    /// answers 400 "Thinking level MINIMAL is not supported for this model"
+    /// on these models and 200 on every other Gemini row, so only the others
+    /// may advertise `minimal`.
+    #[test]
+    fn gemini_rows_advertise_only_the_thinking_levels_the_model_accepts() {
+        const REFUSES_MINIMAL: &[&str] = &[
+            "gemini-4-argon",
+            "gemini-3.8-flash",
+            "gemini-3.7-flash",
+            "gemini-3.1-pro-preview",
+        ];
+        let gemini_rows: Vec<_> = all_capabilities()
+            .filter(|caps| caps.provider == Provider::Gemini)
+            .collect();
+        assert!(!gemini_rows.is_empty());
+        for caps in gemini_rows {
+            assert!(
+                caps.effort_levels.iter().all(|level| matches!(
+                    level,
+                    EffortLevel::Minimal
+                        | EffortLevel::Low
+                        | EffortLevel::Medium
+                        | EffortLevel::High
+                )),
+                "{} may only record Gemini thinking levels",
+                caps.id
+            );
+            let expected = if REFUSES_MINIMAL.contains(&caps.id) {
+                serde_json::json!(["low", "medium", "high"])
+            } else {
+                serde_json::json!(["minimal", "low", "medium", "high"])
+            };
+            let schema = build_params_schema(caps);
+            assert_eq!(
+                schema["properties"]["thinking_level"]["enum"], expected,
+                "{} thinking_level",
+                caps.id
+            );
+            assert_eq!(
+                schema["properties"]["thinking"]["properties"]["thinking_level"]["enum"], expected,
+                "{} thinking.thinking_level",
+                caps.id
+            );
+        }
     }
 
     #[test]

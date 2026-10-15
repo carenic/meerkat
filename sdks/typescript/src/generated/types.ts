@@ -1,9 +1,9 @@
 // Generated wire types for Meerkat SDK
-// Contract version: 0.9.0
+// Contract version: 0.9.1
 
 import { MeerkatError } from "./errors.js";
 
-export const CONTRACT_VERSION = "0.9.0";
+export const CONTRACT_VERSION = "0.9.1";
 
 export type Value = unknown;
 
@@ -3482,7 +3482,7 @@ export type ToolConfigChangeOperation = "add" | "remove" | "reload";
 
 export type ExternalToolDeltaPhase = "pending" | "applied" | "draining" | "forced" | "failed";
 
-export type ConfinementRefusal = "invalid_requirement" | "invalid_launch" | "unsupported_requirement" | "backend_unavailable" | "preparation_failed";
+export type ConfinementRefusal = "invalid_requirement" | "invalid_launch" | "unsupported_requirement" | "backend_unavailable" | "preparation_failed" | "untrusted_configuration_source";
 
 export type McpAttachmentRestoreWireOutcome = "suppressed" | "retired" | "rebound" | "account_changed" | "denied" | "unavailable" | "not_current" | "review_required" | "mismatch" | "stage_failed" | "renewal_required";
 
@@ -5350,6 +5350,18 @@ export interface CommsSendParamsPeerResponse {
 
 export type CommsSendParams = CommsSendParamsInput | CommsSendParamsPeerMessage | CommsSendParamsPeerLifecycle | CommsSendParamsPeerRequest | CommsSendParamsPeerResponse;
 
+export type PeerIngressTerminalOutcomeKind = "accepted" | "deduplicated" | "rejected";
+
+export interface PeerDeliveryOutcomeDurablyResolvedPayload {
+  outcome: PeerIngressTerminalOutcomeKind;
+}
+
+export interface PeerDeliveryOutcomeDurablyResolved {
+  durably_resolved: PeerDeliveryOutcomeDurablyResolvedPayload;
+}
+
+export type PeerDeliveryOutcome = PeerDeliveryOutcomeDurablyResolved | "acked" | "volatile_handed_off" | "queued";
+
 export interface CommsSendResultInputAccepted {
   interaction_id: string;
   kind: "input_accepted";
@@ -5357,19 +5369,19 @@ export interface CommsSendResultInputAccepted {
 }
 
 export interface CommsSendResultPeerMessageSent {
-  delivery: { durably_resolved: Record<string, unknown> } | "acked" | "volatile_handed_off" | "queued";
+  delivery: PeerDeliveryOutcome;
   envelope_id: string;
   kind: "peer_message_sent";
 }
 
 export interface CommsSendResultPeerLifecycleSent {
-  delivery: { durably_resolved: Record<string, unknown> } | "acked" | "volatile_handed_off" | "queued";
+  delivery: PeerDeliveryOutcome;
   envelope_id: string;
   kind: "peer_lifecycle_sent";
 }
 
 export interface CommsSendResultPeerRequestSent {
-  delivery: { durably_resolved: Record<string, unknown> } | "acked" | "volatile_handed_off" | "queued";
+  delivery: PeerDeliveryOutcome;
   envelope_id: string;
   interaction_id: string;
   kind: "peer_request_sent";
@@ -5378,13 +5390,67 @@ export interface CommsSendResultPeerRequestSent {
 }
 
 export interface CommsSendResultPeerResponseSent {
-  delivery: { durably_resolved: Record<string, unknown> } | "acked" | "volatile_handed_off" | "queued";
+  delivery: PeerDeliveryOutcome;
   envelope_id: string;
   in_reply_to: string;
   kind: "peer_response_sent";
 }
 
 export type CommsSendResult = CommsSendResultInputAccepted | CommsSendResultPeerMessageSent | CommsSendResultPeerLifecycleSent | CommsSendResultPeerRequestSent | CommsSendResultPeerResponseSent;
+
+export type CommsPeerUnreachableReason = "offline_or_no_ack" | "transport_error";
+
+export type AdmissionDropReason = "untrusted_sender" | "classification_rejected" | "session_closed" | "inbox_full";
+
+export type CommsSendRequiredAction = "reconcile";
+
+export interface CommsSendErrorDataPeerNotFoundOrNotTrusted {
+  code: "peer_not_found_or_not_trusted";
+  message: string;
+  peer: string;
+}
+
+export interface CommsSendErrorDataPeerUnreachable {
+  code: "peer_unreachable";
+  details?: string | null;
+  message: string;
+  peer: string;
+  reason: CommsPeerUnreachableReason;
+}
+
+export interface CommsSendErrorDataPeerAdmissionDropped {
+  code: "peer_admission_dropped";
+  message: string;
+  peer: string;
+  reason: AdmissionDropReason;
+}
+
+export interface CommsSendErrorDataPeerInputRejected {
+  code: "peer_input_rejected";
+  envelope_id: string;
+  message: string;
+  peer: string;
+}
+
+export interface CommsSendErrorDataSendAmbiguous {
+  code: "send_ambiguous";
+  envelope_id: string;
+  message: string;
+  required_action: CommsSendRequiredAction;
+  retry_safe: boolean;
+}
+
+export interface CommsSendErrorDataSendFailed {
+  code: "send_failed";
+  message: string;
+}
+
+export interface CommsSendErrorDataInvalidCommand {
+  code: "invalid_command";
+  message: string;
+}
+
+export type CommsSendErrorData = CommsSendErrorDataPeerNotFoundOrNotTrusted | CommsSendErrorDataPeerUnreachable | CommsSendErrorDataPeerAdmissionDropped | CommsSendErrorDataPeerInputRejected | CommsSendErrorDataSendAmbiguous | CommsSendErrorDataSendFailed | CommsSendErrorDataInvalidCommand;
 
 export type CommsChecksumTokenResultIntent = "checksum_token";
 

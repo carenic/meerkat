@@ -479,11 +479,13 @@ async fn governed_record_run(passes: bool) -> (Arc<CredentialProvider>, Vec<Stri
         .pin_controller_client_for_actor(&actor)
         .await
         .expect("selected client");
-    meerkat_core::publish_token_lifecycle_acquired_for_identity(
+    meerkat_core::publish_token_lifecycle_acquired_for_identity_within(
         &machine.generated_auth_lease_handle(),
         pin.selection().credential(),
         &meerkat_core::auth::PersistedTokens::api_key("synthetic-native-loop-credential"),
+        tokio::time::Instant::now() + CREDENTIAL_PUBLICATION_WAIT,
     )
+    .await
     .expect("fixture controller credential");
     let runtime = LogicalRuntimeId::for_session(&session_id);
     let mut prompt = PromptInput::new("Try delete, then read if the operation is refused", None);

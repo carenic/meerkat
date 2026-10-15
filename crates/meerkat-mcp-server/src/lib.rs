@@ -897,7 +897,8 @@ pub struct BuiltinConfigInput {
     /// Enable shell tools. Omit to inherit/default.
     #[serde(default)]
     pub enable_shell: Option<bool>,
-    /// Default timeout for shell commands in seconds (default: 30)
+    /// Accepted and ignored in 0.9.1. Set the shell's default command timeout
+    /// with `[shell] timeout_secs` in the realm config.
     #[serde(default)]
     pub shell_timeout_secs: Option<u64>,
 }
@@ -984,18 +985,27 @@ fn map_config_runtime_error(err: ConfigRuntimeError) -> ToolCallError {
                 "current_generation": current
             })),
         ),
-        // An ordinary write is not governance administration; nothing was
-        // written.
+        // An ordinary write is not administration of a section the realm's
+        // trusted host administers; nothing was written.
         ConfigRuntimeError::Config(
-            refused @ meerkat_core::ConfigError::GovernanceAdministration,
-        ) => match serde_json::to_value(WireConfigWriteRefusal::GovernanceAdministrationRequired) {
-            Ok(data) => ToolCallError::new(-32602, refused.to_string(), Some(data)),
-            Err(serialize_error) => ToolCallError::new(
-                -32603,
-                format!("failed to serialize config refusal data: {serialize_error}"),
-                None,
-            ),
-        },
+            refused @ (meerkat_core::ConfigError::GovernanceAdministration
+            | meerkat_core::ConfigError::ConfinementAdministration),
+        ) => {
+            let refusal = match refused {
+                meerkat_core::ConfigError::ConfinementAdministration => {
+                    WireConfigWriteRefusal::ConfinementAdministrationRequired
+                }
+                _ => WireConfigWriteRefusal::GovernanceAdministrationRequired,
+            };
+            match serde_json::to_value(refusal) {
+                Ok(data) => ToolCallError::new(-32602, refused.to_string(), Some(data)),
+                Err(serialize_error) => ToolCallError::new(
+                    -32603,
+                    format!("failed to serialize config refusal data: {serialize_error}"),
+                    None,
+                ),
+            }
+        }
         // The store refused the caller's candidate config (a new or changed
         // realm MCP server with an environment reference, or an invalid
         // written config); document and store failures stay internal.
@@ -1027,6 +1037,27 @@ fn mcp_realm_config_source(
         global_doc,
         meerkat_models::canonical(),
     ))
+}
+
+/// The one local MCP launch boundary of this server's routers, built once at
+/// construction from the host's resolved confinement: its `mcp_stdio`
+/// requirement, or the trusted host.
+fn host_mcp_stdio_launch_profile(
+    confinement: &meerkat::HostConfinement,
+) -> meerkat_mcp::McpStdioLaunchProfile {
+    let kind = meerkat_core::ConfinementLaunchKind::McpStdio;
+    match (
+        confinement.requirement(kind),
+        confinement.working_directory(kind),
+    ) {
+        (Some(requirement), Some(working_directory)) => {
+            meerkat_mcp::McpStdioLaunchProfile::required(
+                requirement.clone(),
+                working_directory.to_path_buf(),
+            )
+        }
+        _ => meerkat_mcp::McpStdioLaunchProfile::trusted_host(),
+    }
 }
 
 /// Load the effective config for `realm_id`, failing closed on every
@@ -1213,6 +1244,11 @@ pub struct MeerkatMcpState {
     /// model / self-hosted alias resolves like the agent build path.
     realm_config_source: Arc<dyn meerkat_core::RealmConfigSource>,
     skill_runtime: Option<Arc<meerkat_core::skills::SkillRuntime>>,
+    /// The host's local MCP launch boundary, owned here once for the life of
+    /// the state: every router this server builds (fresh creation, a resume
+    /// whose router is missing, schedule seeding) retains it. This server's
+    /// agent factory builds no MCP router of its own.
+    mcp_stdio_launch_profile: meerkat_mcp::McpStdioLaunchProfile,
     #[cfg(feature = "mob")]
     mob_state: Arc<meerkat_mob_mcp::MobMcpState>,
     sidecars: runtime_ingress::SharedMcpSidecars,
@@ -1324,7 +1360,19 @@ impl MeerkatMcpState {
         bootstrap: RuntimeBootstrap,
         expose_paths: bool,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        Self::new_with_bootstrap_options_and_llm(bootstrap, expose_paths, None).await
+        Self::new_with_bootstrap_options_and_confinement(bootstrap, expose_paths, None).await
+    }
+
+    /// [`Self::new_with_bootstrap_and_options`] with the operator's
+    /// `--confinement*` selection, which replaces the realm's composed
+    /// `[confinement]` for every launch kind of this process (`None`: the
+    /// configuration decides).
+    pub async fn new_with_bootstrap_options_and_confinement(
+        bootstrap: RuntimeBootstrap,
+        expose_paths: bool,
+        confinement: Option<meerkat_core::LaunchConfinement>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::new_with_bootstrap_options_and_llm(bootstrap, expose_paths, None, confinement).await
     }
 
     #[doc(hidden)]
@@ -1336,6 +1384,7 @@ impl MeerkatMcpState {
             bootstrap,
             expose_paths,
             Some(Arc::new(TestClient::for_provider(Provider::Anthropic))),
+            None,
         )
         .await
     }
@@ -1344,6 +1393,7 @@ impl MeerkatMcpState {
         bootstrap: RuntimeBootstrap,
         expose_paths: bool,
         default_llm_client: Option<Arc<dyn meerkat::LlmClient>>,
+        confinement: Option<meerkat_core::LaunchConfinement>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         // Realm-id-first dual-root resolution through the storage layout
         // (the single path authority; the layout's realm-root candidates arm
@@ -1406,7 +1456,7 @@ impl MeerkatMcpState {
             .global_config_path()
             .unwrap_or_else(|| realms_root.join("__no_global__").join("config.toml"));
         let fs_realm_config_source = mcp_realm_config_source(&realms_root, global_doc);
-        let config = load_config_async(
+        let mut config = load_config_async(
             &realm_id,
             &realms_root,
             backend_hint,
@@ -1415,6 +1465,11 @@ impl MeerkatMcpState {
             &fs_realm_config_source,
         )
         .await?;
+        // The operator's flags replace the documents' `[confinement]`.
+        config.apply_cli_overrides(meerkat_core::config::CliOverrides {
+            confinement,
+            ..meerkat_core::config::CliOverrides::default()
+        });
         // #1813: a realm that declares multi-process hosting refuses to start
         // when its stores cannot provide it.
         persistence.require_hosting_mode(config.storage.hosting_mode())?;
@@ -1454,6 +1509,29 @@ impl MeerkatMcpState {
         )
         .await?;
 
+        // The host's OS process confinement over --context-root: the
+        // workspace preset never grants the realm's own directory. This
+        // server's routers keep the one MCP stdio profile it lowers to.
+        let host_confinement = meerkat::HostConfinement::resolve(
+            &config.confinement,
+            conventions_context_root.as_deref(),
+        )?;
+        // A start whose confined processes could change the realm state or
+        // the user config document is refused before it serves.
+        let host_inputs = meerkat::HostConfinement::host_inputs(
+            &realms_root,
+            layout.global_config_path().as_deref(),
+        );
+        host_confinement.admit_host_inputs(&host_inputs)?;
+        host_confinement.log_startup(
+            &host_inputs,
+            &meerkat::HostConfinement::convention_sources(
+                conventions_context_root.as_deref(),
+                bootstrap.context.user_config_root.as_deref(),
+            ),
+        );
+        let mcp_stdio_launch_profile = host_mcp_stdio_launch_profile(&host_confinement);
+
         // Create factory with max-permissive flags; per-request overrides
         // in SessionBuildOptions control what tools are actually enabled.
         let mut factory = AgentFactory::new(store_path)
@@ -1463,7 +1541,8 @@ impl MeerkatMcpState {
             .builtins(true)
             .shell(true)
             .workgraph(true)
-            .schedule(true);
+            .schedule(true)
+            .with_host_confinement(&host_confinement);
         if let Some(context_root) = conventions_context_root {
             factory = factory.context_root(context_root);
         }
@@ -1560,6 +1639,7 @@ impl MeerkatMcpState {
             config_runtime,
             realm_config_source,
             skill_runtime,
+            mcp_stdio_launch_profile,
             #[cfg(feature = "mob")]
             mob_state,
             sidecars: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
@@ -1745,6 +1825,7 @@ impl MeerkatMcpState {
             config_runtime,
             realm_config_source,
             skill_runtime: None,
+            mcp_stdio_launch_profile: meerkat_mcp::McpStdioLaunchProfile::trusted_host(),
             #[cfg(feature = "mob")]
             mob_state: meerkat_mob_mcp::MobMcpState::new_in_memory(),
             sidecars: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
@@ -2172,17 +2253,61 @@ impl From<BudgetLimitsInput> for meerkat_core::BudgetLimits {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+/// Per-turn tool overlay of `meerkat_resume`: the public overlay the other
+/// surfaces take ([`meerkat_core::service::PublicTurnToolOverlay`]), with the
+/// MCP inputs' tolerance of keys they do not know. An unknown key is ignored
+/// and logged, never forwarded, so a tool call cannot supply host-only
+/// dispatch context.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct TurnToolOverlayInput {
     #[serde(default)]
     pub allowed_tools: Option<Vec<String>>,
     #[serde(default)]
     pub blocked_tools: Option<Vec<String>>,
+    /// Tool choice for this turn's provider calls, in order: entry `k`
+    /// applies to the turn's `k`-th call, and every call after the plan is
+    /// exhausted is `auto`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_choice_plan: Vec<meerkat_core::lifecycle::run_primitive::ToolChoice>,
+}
+
+impl<'de> Deserialize<'de> for TurnToolOverlayInput {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        /// Take `key` out of `object`; absent and `null` are the default.
+        fn take<T, E>(object: &mut serde_json::Map<String, Value>, key: &str) -> Result<T, E>
+        where
+            T: serde::de::DeserializeOwned + Default,
+            E: serde::de::Error,
+        {
+            match object.remove(key) {
+                None | Some(Value::Null) => Ok(T::default()),
+                Some(value) => serde_json::from_value(value)
+                    .map_err(|error| E::custom(format!("turn_tool_overlay.{key}: {error}"))),
+            }
+        }
+
+        let mut object = serde_json::Map::<String, Value>::deserialize(deserializer)?;
+        let overlay = Self {
+            allowed_tools: take(&mut object, "allowed_tools")?,
+            blocked_tools: take(&mut object, "blocked_tools")?,
+            tool_choice_plan: take(&mut object, "tool_choice_plan")?,
+        };
+        if !object.is_empty() {
+            tracing::warn!(
+                ignored_keys = ?object.keys().collect::<Vec<_>>(),
+                "meerkat_resume ignored unknown turn_tool_overlay keys"
+            );
+        }
+        Ok(overlay)
+    }
 }
 
 impl From<TurnToolOverlayInput> for meerkat_core::service::TurnToolOverlay {
     fn from(value: TurnToolOverlayInput) -> Self {
-        Self {
+        meerkat_core::service::PublicTurnToolOverlay {
             allowed_tools: value.allowed_tools.map(|names| {
                 names
                     .into_iter()
@@ -2195,8 +2320,9 @@ impl From<TurnToolOverlayInput> for meerkat_core::service::TurnToolOverlay {
                     .map(meerkat_core::ToolName::from)
                     .collect()
             }),
-            ..Default::default()
+            tool_choice_plan: value.tool_choice_plan,
         }
+        .into()
     }
 }
 
@@ -2353,6 +2479,17 @@ fn format_agent_result_tool(
         }
         result => format_agent_result(result, session_id).map_err(ToolCallError::internal),
     }
+}
+
+/// The typed tool error of a refused help-session rebuild.
+fn help_session_not_resumable_tool_error(
+    refusal: &meerkat::help::HelpSessionNotResumable,
+) -> ToolCallError {
+    ToolCallError::new(
+        refusal.error_code().jsonrpc_code(),
+        refusal.to_string(),
+        Some(refusal.data()),
+    )
 }
 
 fn build_callback_dispatcher(tools: &[McpToolDef]) -> Option<Arc<dyn AgentToolDispatcher>> {
@@ -4026,6 +4163,20 @@ fn normalize_mcp_comms_send_error(
                 })),
             )
         }
+        meerkat_core::comms::SendError::DurableAdmissionRejected { envelope_id } => {
+            typed_mcp_comms_send_error(&meerkat_contracts::CommsSendErrorData::peer_input_rejected(
+                peer_name.unwrap_or("<unknown>"),
+                *envelope_id,
+            ))
+        }
+        // Not a failed send: the envelope may already be delivered, and a
+        // caller told "failed" retries, which can duplicate the delivery.
+        meerkat_core::comms::SendError::AmbiguousDelivery {
+            envelope_id,
+            detail,
+        } => typed_mcp_comms_send_error(
+            &meerkat_contracts::CommsSendErrorData::ambiguous_delivery(*envelope_id, detail),
+        ),
         other => ToolCallError::new(
             -32603,
             other.to_string(),
@@ -4033,6 +4184,23 @@ fn normalize_mcp_comms_send_error(
                 "code": "send_failed",
                 "message": other.to_string(),
             })),
+        ),
+    }
+}
+
+/// A tool error carrying the typed `comms/send` error data RPC and REST share.
+#[cfg(feature = "comms")]
+fn typed_mcp_comms_send_error(data: &meerkat_contracts::CommsSendErrorData) -> ToolCallError {
+    match serde_json::to_value(data) {
+        Ok(value) => ToolCallError::new(
+            -32603,
+            format!("{}: {}", data.code(), data.message()),
+            Some(value),
+        ),
+        Err(error) => ToolCallError::new(
+            -32603,
+            format!("failed to serialize comms error data: {error}"),
+            None,
         ),
     }
 }
@@ -4063,10 +4231,14 @@ async fn handle_meerkat_help(
     let prompt = meerkat::help::render_help_prompt(&input)
         .map_err(|err| ToolCallError::invalid_params(err.to_string()))?;
     let provider = help_provider_to_mcp_provider(input.provider.clone())?;
+    // Like every help entry point, meerkat_help builds its session from the
+    // one shared help session: the embedded skills whole in the system prompt
+    // and the read-only reference tools as the session's only tools.
+    let help = meerkat::help::help_session();
     let run_input = MeerkatRunInput {
         prompt,
         transient_turn_context: None,
-        system_prompt: Some(meerkat::help::help_system_prompt().to_string()),
+        system_prompt: Some(help.system_prompt),
         model: input
             .model
             .map(meerkat_core::lifecycle::run_primitive::ModelId::new),
@@ -4093,7 +4265,7 @@ async fn handle_meerkat_help(
         enable_web_search: Some(false),
         provider_params: None,
         budget_limits: None,
-        preload_skills: Some(meerkat::help::platform_preload_skills()),
+        preload_skills: None,
         skill_refs: None,
         skill_references: None,
         labels: None,
@@ -4103,11 +4275,12 @@ async fn handle_meerkat_help(
         auth_binding: None,
     };
 
-    Box::pin(handle_meerkat_run(
+    Box::pin(handle_meerkat_run_with_help_tools(
         state,
         run_input,
         notifier,
         request_context,
+        Some((help.tools, help.tool_access_policy)),
     ))
     .await
 }
@@ -4117,6 +4290,30 @@ async fn handle_meerkat_run(
     input: MeerkatRunInput,
     notifier: Option<EventNotifier>,
     request_context: Option<RequestContext>,
+) -> Result<Value, ToolCallError> {
+    Box::pin(handle_meerkat_run_with_help_tools(
+        state,
+        input,
+        notifier,
+        request_context,
+        None,
+    ))
+    .await
+}
+
+/// `help_tools` are a help session's only tools, with the launch tool access
+/// policy that admits only them: the tools take the place of the client's
+/// callback tools and of the session's live MCP router, and the session
+/// persists the policy, so a later resume keeps it.
+async fn handle_meerkat_run_with_help_tools(
+    state: &MeerkatMcpState,
+    input: MeerkatRunInput,
+    notifier: Option<EventNotifier>,
+    request_context: Option<RequestContext>,
+    help_tools: Option<(
+        Arc<dyn AgentToolDispatcher>,
+        meerkat_core::ops::ToolAccessPolicy,
+    )>,
 ) -> Result<Value, ToolCallError> {
     validate_public_peer_meta(input.peer_meta.as_ref()).map_err(ToolCallError::invalid_params)?;
     let ingress = state.runtime_ingress_context();
@@ -4216,8 +4413,10 @@ async fn handle_meerkat_run(
     let instance_id = state.instance_id.clone();
     let backend = meerkat_core::RecoveryBackendKind::parse(&state.backend);
     let callback_tools_for_plan = callback_tools.clone();
+    let help_tools_for_plan = help_tools;
     let event_tx_for_plan = event_tx.clone();
     let request_context_for_plan = request_context.clone();
+    let stdio_profile_for_plan = state.mcp_stdio_launch_profile.clone();
     let materialization = materialize_mcp_actor_transaction(
         &state.service,
         &state.runtime_adapter,
@@ -4232,16 +4431,33 @@ async fn handle_meerkat_run(
             {
                 return Err(request_cancelled_tool_error());
             }
-            let adapter = Arc::new(meerkat_mcp::McpRouterAdapter::new(
-                McpRouter::new_with_surface_handle(Arc::clone(bindings.external_tool_surface())),
-            ));
-            let mcp_tools: Arc<dyn AgentToolDispatcher> = adapter.clone();
-            let external_tools =
-                compose_external_tool_dispatchers(callback_tools_for_plan.clone(), Some(mcp_tools))
-                    .map_err(ToolCallError::internal)?;
+            // A help session's only tools are its help tools: it gets no live
+            // MCP router, so no MCP server or catalog control tool joins them.
+            // Every other session's router launches local stdio servers inside
+            // the host's own launch boundary.
+            let adapter = help_tools_for_plan.is_none().then(|| {
+                Arc::new(meerkat_mcp::McpRouterAdapter::new(
+                    McpRouter::new_with_surface_handle_and_stdio_profile(
+                        Arc::clone(bindings.external_tool_surface()),
+                        stdio_profile_for_plan,
+                    ),
+                ))
+            });
+            let external_tools = match help_tools_for_plan.as_ref() {
+                Some((help_tools, _)) => Some(Arc::clone(help_tools)),
+                None => compose_external_tool_dispatchers(
+                    callback_tools_for_plan.clone(),
+                    adapter
+                        .clone()
+                        .map(|adapter| adapter as Arc<dyn AgentToolDispatcher>),
+                )
+                .map_err(ToolCallError::internal)?,
+            };
             let mut build = SessionBuildOptions {
                 model_fallback: None,
-                tool_access_policy: None,
+                tool_access_policy: help_tools_for_plan
+                    .as_ref()
+                    .map(|(_, tool_access_policy)| tool_access_policy.clone()),
                 declared_tool_restriction: None,
                 tool_dispatch_admission: None,
                 application_tool_policy: meerkat_core::ApplicationToolPolicyBinding::Unmanaged,
@@ -4306,7 +4522,13 @@ async fn handle_meerkat_run(
                 app_context: input.app_context.clone(),
                 fork_source: None,
                 additional_instructions: input.additional_instructions.clone(),
-                initial_metadata_entries: std::collections::BTreeMap::new(),
+                // The help marker makes every rebuild of a help session from
+                // storage refuse it.
+                initial_metadata_entries: help_tools_for_plan
+                    .as_ref()
+                    .map(|_| meerkat::help::help_session_metadata_entry())
+                    .into_iter()
+                    .collect(),
                 initial_tool_filter: None,
                 initial_tool_visibility_state: None,
                 shell_env: input.shell_env.clone(),
@@ -4368,7 +4590,7 @@ async fn handle_meerkat_run(
                 callback_config: runtime_ingress::McpCallbackConfig::Replace(
                     callback_tools_for_plan,
                 ),
-                router_to_publish: Some(Arc::clone(&adapter)),
+                router_to_publish: adapter,
             })
         },
     )
@@ -4487,6 +4709,16 @@ async fn handle_meerkat_resume(
             format!("Session not found: {}", input.session_id),
             None,
         ));
+    }
+
+    // A help session continues only on the live session its help entry
+    // point built, where its help tools are: any rebuild from storage is
+    // refused before a turn is admitted or a tool is composed.
+    let help_session = meerkat::help::HelpSessionNotResumable::check(&session).err();
+    if let Some(refusal) = help_session.as_ref()
+        && mcp_resume_requires_rebuild(&input)
+    {
+        return Err(help_session_not_resumable_tool_error(refusal));
     }
 
     // Admit callback results through the session service's exact durable
@@ -4620,11 +4852,18 @@ async fn handle_meerkat_resume(
     // Decide from one exact B-owned actor/config/attachment snapshot. Any
     // rebuild re-snapshots logical config after its own prepared transaction
     // acquires B, so no pre-boundary router can enter the replacement actor.
+    // A live help session has no router by design and takes its turn on the
+    // live session; any other help session would need a rebuild.
     let needs_rebuild = live_actor_lease.is_none()
-        || existing_adapter.is_none()
+        || (existing_adapter.is_none() && help_session.is_none())
         || !exact_live_attachment
         || mcp_resume_requires_rebuild(&input);
     drop(live_actor_lease);
+    if let Some(refusal) = help_session.as_ref()
+        && needs_rebuild
+    {
+        return Err(help_session_not_resumable_tool_error(refusal));
+    }
     let create_requires_materialization = needs_rebuild;
     let mut resume_admission = if create_requires_materialization {
         Some(
@@ -4798,10 +5037,12 @@ async fn handle_meerkat_resume(
         let prompt_for_plan = prompt.clone();
         let system_prompt_for_plan = input.system_prompt.clone();
         let transient_turn_context_for_plan = input.transient_turn_context.clone();
+        let turn_tool_overlay_for_plan = input.turn_tool_overlay.clone();
         let event_tx_for_plan = event_tx.clone();
         let skill_references_for_plan = skill_references.clone();
         let requested_callback_tools_for_plan = requested_callback_tools.clone();
         let request_context_for_plan = request_context.clone();
+        let stdio_profile_for_plan = state.mcp_stdio_launch_profile.clone();
         materialize_mcp_actor_transaction(
             &state.service,
             &state.runtime_adapter,
@@ -4821,11 +5062,14 @@ async fn handle_meerkat_resume(
                 } else {
                     exact_config.callback_tools.clone()
                 };
+                // A missing router is rebuilt inside the host's launch
+                // boundary, as the fresh path builds it.
                 let adapter = exact_config.router.clone().unwrap_or_else(|| {
                     Arc::new(meerkat_mcp::McpRouterAdapter::new(
-                        McpRouter::new_with_surface_handle(Arc::clone(
-                            resume_bindings.external_tool_surface(),
-                        )),
+                        McpRouter::new_with_surface_handle_and_stdio_profile(
+                            Arc::clone(resume_bindings.external_tool_surface()),
+                            stdio_profile_for_plan,
+                        ),
                     ))
                 });
                 let mcp_tools: Arc<dyn AgentToolDispatcher> = adapter.clone();
@@ -4855,6 +5099,14 @@ async fn handle_meerkat_resume(
                         .initial_turn_metadata
                         .get_or_insert_with(Default::default)
                         .transient_turn_context = Some(context);
+                }
+                // The rebuilt agent's first turn is this resume's turn: it
+                // carries the per-turn overlay as the live path does.
+                if let Some(overlay) = turn_tool_overlay_for_plan {
+                    build
+                        .initial_turn_metadata
+                        .get_or_insert_with(Default::default)
+                        .turn_tool_overlay = Some(overlay.into());
                 }
                 let request = CreateSessionRequest {
                     injected_context: Vec::new(),
@@ -4978,6 +5230,11 @@ async fn handle_meerkat_resume(
         match turn_result {
             Ok(run_result) => Ok(run_result),
             Err((SessionError::NotFound { .. }, recovered_admission)) => {
+                // The live session ended under the turn: a help session is
+                // not rebuilt.
+                if let Some(refusal) = help_session.as_ref() {
+                    return Err(help_session_not_resumable_tool_error(refusal));
+                }
                 let admission = match recovered_admission.or_else(|| resume_admission.take()) {
                     Some(admission) => admission,
                     None => state
@@ -5060,7 +5317,7 @@ async fn handle_meerkat_resume(
             || runtime_materialization_committed
             || (!runtime_was_materialized && sidecar_existed));
     if should_configure_runtime_ingress && !runtime_materialization_committed {
-        let router = if existing_adapter.is_some() {
+        let router = if existing_adapter.is_some() || help_session.is_some() {
             None
         } else {
             let Some(mcp_adapter) = mcp_adapter.take() else {
@@ -5619,6 +5876,541 @@ mod tests {
         }
     }
 
+    /// Answers `ok` and records the tool names each request offers.
+    struct ToolNameRecordingLlmClient {
+        tool_names: Arc<std::sync::Mutex<Vec<Vec<String>>>>,
+    }
+
+    #[async_trait]
+    impl LlmClient for ToolNameRecordingLlmClient {
+        fn project_replay_messages(
+            &self,
+            messages: &[meerkat_core::Message],
+        ) -> Result<Vec<meerkat_core::Message>, meerkat_client::LlmError> {
+            Ok(messages.to_vec())
+        }
+
+        fn stream<'a>(
+            &'a self,
+            request: &'a LlmRequest,
+        ) -> Pin<Box<dyn futures::Stream<Item = Result<LlmEvent, LlmError>> + Send + 'a>> {
+            self.tool_names
+                .lock()
+                .expect("recorded tool names lock")
+                .push(
+                    request
+                        .tools
+                        .iter()
+                        .map(|tool| tool.name.to_string())
+                        .collect(),
+                );
+            Box::pin(stream::iter(vec![
+                Ok(LlmEvent::TextDelta {
+                    delta: "ok".to_string(),
+                    meta: None,
+                }),
+                Ok(LlmEvent::UsageUpdate {
+                    usage: meerkat_core::TurnUsage::host_declared(
+                        provider_for_successful_mcp_test_model(&request.model),
+                        &request.model,
+                        meerkat_core::Usage::default(),
+                    ),
+                }),
+                Ok(LlmEvent::Done {
+                    outcome: LlmDoneOutcome::Success {
+                        stop_reason: meerkat_core::StopReason::EndTurn,
+                    },
+                }),
+            ]))
+        }
+
+        fn provider(&self) -> meerkat_core::Provider {
+            meerkat_core::Provider::Anthropic
+        }
+
+        async fn health_check(&self) -> Result<(), LlmError> {
+            Ok(())
+        }
+    }
+
+    /// `meerkat_help` runs with exactly the two read-only reference tools and
+    /// no live MCP router; an ordinary `meerkat_run` is unchanged and keeps
+    /// its router.
+    #[tokio::test]
+    async fn test_meerkat_help_runs_with_only_the_help_tools_and_no_live_mcp() {
+        let tool_names = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let store: Arc<dyn SessionStore> = Arc::new(meerkat::MemoryStore::new());
+        let runtime_store: Arc<dyn meerkat_runtime::RuntimeStore> =
+            Arc::new(meerkat_runtime::InMemoryRuntimeStore::new());
+        let state = MeerkatMcpState::new_with_store_options_and_llm(
+            store,
+            runtime_store,
+            None,
+            Some(Arc::new(ToolNameRecordingLlmClient {
+                tool_names: Arc::clone(&tool_names),
+            })),
+        )
+        .await;
+        let session_id_of = |value: Value| {
+            let payload = unwrap_payload(value);
+            meerkat::SessionId::parse(payload["session_id"].as_str().expect("session id"))
+                .expect("session id parses")
+        };
+
+        let help = Box::pin(handle_meerkat_help(
+            &state,
+            meerkat_contracts::HelpRequest {
+                question: "How do I add an MCP server?".to_string(),
+                prompt: None,
+                execution_mode: meerkat_contracts::HelpExecutionMode::ExplainOnly,
+                model: Some("claude-sonnet-4-5".to_string()),
+                provider: Some("anthropic".to_string()),
+                max_tokens: None,
+            },
+            None,
+            None,
+        ))
+        .await
+        .expect("meerkat_help succeeds");
+        let help_session = session_id_of(help);
+        let mut tools = tool_names.lock().expect("recorded tool names lock")[0].clone();
+        tools.sort();
+        assert_eq!(tools, ["skill_list_resources", "skill_read_resource"]);
+        let ingress = state.runtime_ingress_context();
+        assert!(ingress.logical_router(&help_session).await.is_none());
+
+        let run_input: MeerkatRunInput = serde_json::from_value(json!({
+            "prompt": "hello",
+            "model": "claude-sonnet-4-5",
+            "provider": "anthropic",
+        }))
+        .expect("run input");
+        let run = Box::pin(handle_meerkat_run(&state, run_input, None, None))
+            .await
+            .expect("meerkat_run succeeds");
+        let session = session_id_of(run);
+        assert!(ingress.logical_router(&session).await.is_some());
+    }
+
+    /// Records the tool names each model request offers. An armed tool call
+    /// is asked for by the next request only; every other request answers
+    /// `ok`.
+    #[derive(Default)]
+    struct ToolCallScriptLlmClient {
+        tool_names: std::sync::Mutex<Vec<Vec<String>>>,
+        armed_call: std::sync::Mutex<Option<(String, Value)>>,
+    }
+
+    impl ToolCallScriptLlmClient {
+        fn arm_call(&self, name: &str, args: Value) {
+            *self.armed_call.lock().expect("armed call lock") = Some((name.to_string(), args));
+        }
+
+        fn requests(&self) -> Vec<std::collections::BTreeSet<String>> {
+            self.tool_names
+                .lock()
+                .expect("recorded tool names lock")
+                .iter()
+                .map(|names| names.iter().cloned().collect())
+                .collect()
+        }
+    }
+
+    #[async_trait]
+    impl LlmClient for ToolCallScriptLlmClient {
+        fn project_replay_messages(
+            &self,
+            messages: &[meerkat_core::Message],
+        ) -> Result<Vec<meerkat_core::Message>, meerkat_client::LlmError> {
+            Ok(messages.to_vec())
+        }
+
+        fn stream<'a>(
+            &'a self,
+            request: &'a LlmRequest,
+        ) -> Pin<Box<dyn futures::Stream<Item = Result<LlmEvent, LlmError>> + Send + 'a>> {
+            self.tool_names
+                .lock()
+                .expect("recorded tool names lock")
+                .push(
+                    request
+                        .tools
+                        .iter()
+                        .map(|tool| tool.name.to_string())
+                        .collect(),
+                );
+            let usage = LlmEvent::UsageUpdate {
+                usage: meerkat_core::TurnUsage::host_declared(
+                    provider_for_successful_mcp_test_model(&request.model),
+                    &request.model,
+                    meerkat_core::Usage::default(),
+                ),
+            };
+            let armed = self.armed_call.lock().expect("armed call lock").take();
+            let events = match armed {
+                Some((name, args)) => vec![
+                    Ok(LlmEvent::ToolCallComplete {
+                        id: format!("call_{name}"),
+                        name,
+                        args,
+                        meta: None,
+                    }),
+                    Ok(usage),
+                    Ok(LlmEvent::Done {
+                        outcome: LlmDoneOutcome::Success {
+                            stop_reason: meerkat_core::StopReason::ToolUse,
+                        },
+                    }),
+                ],
+                None => vec![
+                    Ok(LlmEvent::TextDelta {
+                        delta: "ok".to_string(),
+                        meta: None,
+                    }),
+                    Ok(usage),
+                    Ok(LlmEvent::Done {
+                        outcome: LlmDoneOutcome::Success {
+                            stop_reason: meerkat_core::StopReason::EndTurn,
+                        },
+                    }),
+                ],
+            };
+            Box::pin(stream::iter(events))
+        }
+
+        fn provider(&self) -> meerkat_core::Provider {
+            meerkat_core::Provider::Anthropic
+        }
+
+        async fn health_check(&self) -> Result<(), LlmError> {
+            Ok(())
+        }
+    }
+
+    /// The launch policy of a help session: only the two help tools.
+    fn help_launch_policy() -> meerkat_core::ops::ToolAccessPolicy {
+        meerkat_core::ops::ToolAccessPolicy::AllowList(
+            ["skill_list_resources", "skill_read_resource"]
+                .into_iter()
+                .collect(),
+        )
+    }
+
+    /// The tool names of the catalog control plane.
+    fn catalog_control_plane() -> std::collections::BTreeSet<String> {
+        ["tool_catalog_search", "tool_catalog_load"]
+            .into_iter()
+            .map(String::from)
+            .collect()
+    }
+
+    /// Asserts that the call `tool_use_id` was refused as `access_denied`.
+    fn assert_refused_as_access_denied(session: &Session, tool_use_id: &str) {
+        let result = session
+            .messages()
+            .iter()
+            .rev()
+            .find_map(|message| match message {
+                meerkat_core::types::Message::ToolResults { results, .. } => results
+                    .iter()
+                    .find(|result| result.tool_use_id == tool_use_id)
+                    .cloned(),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no tool result for {tool_use_id}"));
+        assert!(result.is_error, "{tool_use_id} must fail: {result:?}");
+        let payload: Value =
+            serde_json::from_str(&result.text_content()).expect("typed tool error payload");
+        assert_eq!(
+            payload["error"], "access_denied",
+            "{tool_use_id} must be refused by the session's policy: {payload}"
+        );
+    }
+
+    fn session_id_of(value: Value) -> meerkat::SessionId {
+        let payload = unwrap_payload(value);
+        meerkat::SessionId::parse(payload["session_id"].as_str().expect("session id"))
+            .expect("session id parses")
+    }
+
+    async fn load_saved_session(
+        state: &MeerkatMcpState,
+        session_id: &meerkat::SessionId,
+    ) -> Session {
+        state
+            .service
+            .load_authoritative_session(session_id)
+            .await
+            .expect("load the saved session")
+            .expect("the session is saved")
+    }
+
+    fn help_tool_names() -> std::collections::BTreeSet<String> {
+        ["skill_list_resources", "skill_read_resource"]
+            .into_iter()
+            .map(String::from)
+            .collect()
+    }
+
+    /// A server over `store` and `runtime_store` whose model is `llm`.
+    async fn mcp_server_over(
+        store: &Arc<dyn SessionStore>,
+        runtime_store: &Arc<dyn meerkat_runtime::RuntimeStore>,
+        llm: &Arc<ToolCallScriptLlmClient>,
+    ) -> MeerkatMcpState {
+        MeerkatMcpState::new_with_store_options_and_llm(
+            Arc::clone(store),
+            Arc::clone(runtime_store),
+            None,
+            Some(Arc::clone(llm) as Arc<dyn meerkat::LlmClient>),
+        )
+        .await
+    }
+
+    /// A help session asked through `meerkat_help` and an ordinary session
+    /// run through `meerkat_run` on `state`.
+    async fn help_and_ordinary_sessions(
+        state: &MeerkatMcpState,
+    ) -> (meerkat::SessionId, meerkat::SessionId) {
+        let help_session = session_id_of(
+            Box::pin(handle_meerkat_help(
+                state,
+                meerkat_contracts::HelpRequest {
+                    question: "How do I add an MCP server?".to_string(),
+                    prompt: None,
+                    execution_mode: meerkat_contracts::HelpExecutionMode::ExplainOnly,
+                    model: Some("claude-sonnet-4-5".to_string()),
+                    provider: Some("anthropic".to_string()),
+                    max_tokens: None,
+                },
+                None,
+                None,
+            ))
+            .await
+            .expect("meerkat_help succeeds"),
+        );
+        // A restarted test server opens a fresh realm, and a WorkGraph
+        // namespace grant is bound to its realm, so the ordinary session
+        // leaves WorkGraph off to stay resumable there.
+        let run_input: MeerkatRunInput = serde_json::from_value(json!({
+            "prompt": "hello",
+            "model": "claude-sonnet-4-5",
+            "provider": "anthropic",
+            "enable_workgraph": false,
+        }))
+        .expect("run input");
+        let ordinary = session_id_of(
+            Box::pin(handle_meerkat_run(state, run_input, None, None))
+                .await
+                .expect("meerkat_run succeeds"),
+        );
+        (help_session, ordinary)
+    }
+
+    async fn resume_session(
+        state: &MeerkatMcpState,
+        session_id: &meerkat::SessionId,
+        tools: Vec<McpToolDef>,
+    ) -> Result<Value, ToolCallError> {
+        Box::pin(handle_meerkat_resume(
+            state,
+            bounded_resume_input(session_id.to_string(), tools),
+            None,
+            None,
+        ))
+        .await
+    }
+
+    /// Resume `session_id` with the client's callback `tools` and no other
+    /// override. Like the other cold-resume tests, accept the one post-turn
+    /// failure this harness can raise, the peer-ingress refresh.
+    async fn resume_with_client_tools(
+        state: &MeerkatMcpState,
+        session_id: &meerkat::SessionId,
+        tools: Vec<McpToolDef>,
+    ) -> Option<Value> {
+        match resume_session(state, session_id, tools).await {
+            Ok(payload) => Some(unwrap_payload(payload)),
+            Err(error)
+                if error
+                    .message
+                    .contains("failed to update peer ingress context") =>
+            {
+                None
+            }
+            Err(error) => panic!("meerkat_resume of {session_id} failed: {error:?}"),
+        }
+    }
+
+    fn callback_tool(name: &str) -> McpToolDef {
+        McpToolDef {
+            name: name.to_string(),
+            description: "A tool the MCP client serves".to_string(),
+            input_schema: meerkat_tools::empty_object_schema(),
+            handler: Some("callback".to_string()),
+        }
+    }
+
+    /// Asserts that `meerkat_resume` refused to rebuild `help_session` from
+    /// storage with the typed help-session refusal, before any model call and
+    /// without publishing an MCP router for it.
+    async fn assert_help_rebuild_refused(
+        state: &MeerkatMcpState,
+        help_session: &meerkat::SessionId,
+        llm: &ToolCallScriptLlmClient,
+        result: Result<Value, ToolCallError>,
+    ) {
+        let refusal = result.expect_err("a help session is not rebuilt from storage");
+        assert_eq!(
+            refusal.code,
+            meerkat_contracts::ErrorCode::SessionNotRunning.jsonrpc_code(),
+            "{refusal:?}"
+        );
+        assert_eq!(
+            refusal.data.as_ref().map(|data| data["kind"].clone()),
+            Some(json!("help_session_not_resumable")),
+            "{refusal:?}"
+        );
+        assert!(llm.requests().is_empty(), "no model call");
+        assert!(
+            state
+                .runtime_ingress_context()
+                .logical_router(help_session)
+                .await
+                .is_none(),
+            "no MCP router was published for the help session"
+        );
+    }
+
+    /// A help session continues only on the live session `meerkat_help`
+    /// built: while that runs, `meerkat_resume` takes the turn there with the
+    /// help tools. On a restarted server, `meerkat_resume` with no override
+    /// refuses to rebuild it from storage with a typed error before any model
+    /// call, and publishes no MCP router.
+    #[tokio::test]
+    async fn test_a_saved_help_session_runs_warm_and_is_refused_cold() {
+        let store: Arc<dyn SessionStore> = Arc::new(meerkat::MemoryStore::new());
+        let runtime_store: Arc<dyn meerkat_runtime::RuntimeStore> =
+            Arc::new(meerkat_runtime::InMemoryRuntimeStore::new());
+        let warm_llm = Arc::new(ToolCallScriptLlmClient::default());
+        let state = mcp_server_over(&store, &runtime_store, &warm_llm).await;
+        let (help_session, _ordinary) = help_and_ordinary_sessions(&state).await;
+        let saved = load_saved_session(&state, &help_session).await;
+
+        resume_with_client_tools(&state, &help_session, vec![]).await;
+        assert_eq!(
+            warm_llm.requests().last(),
+            Some(&help_tool_names()),
+            "a live help session keeps its help tools"
+        );
+        assert_eq!(
+            saved.metadata().get("meerkat.help_session"),
+            Some(&json!(true)),
+            "meerkat_help marks its session as a help session"
+        );
+
+        // Reconstruct the server against the same stores to model a restart.
+        drop(state);
+        let llm = Arc::new(ToolCallScriptLlmClient::default());
+        let state = mcp_server_over(&store, &runtime_store, &llm).await;
+        let result = resume_session(&state, &help_session, vec![]).await;
+        assert_help_rebuild_refused(&state, &help_session, &llm, result).await;
+    }
+
+    /// A client resuming a saved help session on a restarted server with its
+    /// callback tools, one of them named like a help tool, is refused before
+    /// any model call: no call is handed back to the client and no MCP router
+    /// is published. An ordinary session resumed the same way offers the
+    /// callback tools.
+    #[tokio::test]
+    async fn test_a_saved_help_session_resumed_cold_refuses_client_callback_tools() {
+        let store: Arc<dyn SessionStore> = Arc::new(meerkat::MemoryStore::new());
+        let runtime_store: Arc<dyn meerkat_runtime::RuntimeStore> =
+            Arc::new(meerkat_runtime::InMemoryRuntimeStore::new());
+        let first_llm = Arc::new(ToolCallScriptLlmClient::default());
+        let state = mcp_server_over(&store, &runtime_store, &first_llm).await;
+        let (help_session, ordinary) = help_and_ordinary_sessions(&state).await;
+        drop(state);
+        let llm = Arc::new(ToolCallScriptLlmClient::default());
+        let state = mcp_server_over(&store, &runtime_store, &llm).await;
+        let client_tools = || {
+            vec![
+                callback_tool("client_callback"),
+                callback_tool("skill_read_resource"),
+            ]
+        };
+
+        let result = resume_session(&state, &help_session, client_tools()).await;
+        assert_help_rebuild_refused(&state, &help_session, &llm, result).await;
+
+        // Control: an ordinary session resumed the same way offers them.
+        resume_with_client_tools(&state, &ordinary, client_tools()).await;
+        let offered = llm.requests().last().cloned().unwrap_or_default();
+        assert!(
+            offered.contains("client_callback") && offered.contains("skill_read_resource"),
+            "an ordinary resumed session offers the client's callback tools: {offered:?}"
+        );
+    }
+
+    /// The help launch policy is the second line: a saved help session that
+    /// carries no help marker, as one saved before the marker existed does,
+    /// is rebuilt by `meerkat_resume` under the policy `meerkat_help`
+    /// persisted. The model is offered only the catalog control plane of the
+    /// rebuilt router, and a call to it is refused and loads nothing.
+    #[tokio::test]
+    async fn test_a_saved_help_session_without_its_marker_keeps_its_launch_policy() {
+        let store: Arc<dyn SessionStore> = Arc::new(meerkat::MemoryStore::new());
+        let runtime_store: Arc<dyn meerkat_runtime::RuntimeStore> =
+            Arc::new(meerkat_runtime::InMemoryRuntimeStore::new());
+        let first_llm = Arc::new(ToolCallScriptLlmClient::default());
+        let state = mcp_server_over(&store, &runtime_store, &first_llm).await;
+        let (help_session, _ordinary) = help_and_ordinary_sessions(&state).await;
+        let mut unmarked = load_saved_session(&state, &help_session).await;
+        let first_turn_tooling = unmarked
+            .session_metadata()
+            .expect("help session metadata")
+            .tooling;
+        unmarked.remove_metadata("meerkat.help_session");
+        drop(state);
+        seed_runtime_authority_session(&runtime_store, &unmarked).await;
+        let llm = Arc::new(ToolCallScriptLlmClient::default());
+        let state = mcp_server_over(&store, &runtime_store, &llm).await;
+
+        llm.arm_call(
+            "tool_catalog_load",
+            json!({"names": ["skill_read_resource"]}),
+        );
+        resume_with_client_tools(&state, &help_session, vec![]).await;
+        let requests = llm.requests();
+        let [.., offered, after_load] = requests.as_slice() else {
+            panic!("the resumed turn asks the model twice: {requests:?}");
+        };
+        assert_eq!(
+            offered,
+            &catalog_control_plane(),
+            "the restored policy offers no composed tool but the control plane"
+        );
+        assert_eq!(
+            first_turn_tooling.spawn_tool_access_policy,
+            Some(meerkat_core::ops::SpawnToolAccessPolicy::Restricted {
+                policy: help_launch_policy()
+            }),
+            "meerkat_help persists the launch policy that admits only the help tools"
+        );
+        let resumed = load_saved_session(&state, &help_session).await;
+        assert_eq!(
+            resumed
+                .session_metadata()
+                .expect("help session metadata")
+                .tooling
+                .tool_access_policy,
+            Some(help_launch_policy()),
+            "the rebuild restores the help session's launch policy"
+        );
+        assert_refused_as_access_denied(&resumed, "call_tool_catalog_load");
+        assert_eq!(after_load, offered, "the refused load attaches no tool");
+    }
+
     struct OwnershipCheckingLlmClient {
         old_executor_stopped: Arc<AtomicBool>,
         turn_started: Arc<AtomicBool>,
@@ -5719,6 +6511,15 @@ mod tests {
     }
 
     async fn state_with_persisted_session() -> (MeerkatMcpState, String) {
+        state_with_persisted_session_and_llm(Arc::new(TestClient::for_provider(
+            Provider::Anthropic,
+        )))
+        .await
+    }
+
+    async fn state_with_persisted_session_and_llm(
+        llm_client: Arc<dyn LlmClient>,
+    ) -> (MeerkatMcpState, String) {
         let store: Arc<dyn SessionStore> = Arc::new(meerkat::MemoryStore::new());
         let runtime_store: Arc<dyn meerkat_runtime::RuntimeStore> =
             Arc::new(meerkat_runtime::InMemoryRuntimeStore::new());
@@ -5726,7 +6527,7 @@ mod tests {
             Arc::clone(&store),
             Arc::clone(&runtime_store),
             None,
-            Some(Arc::new(TestClient::for_provider(Provider::Anthropic))),
+            Some(llm_client),
         )
         .await;
         let mut session = Session::new();
@@ -5759,6 +6560,193 @@ mod tests {
         store.save(&session).await.expect("persisted session");
         seed_runtime_authority_session(&runtime_store, &session).await;
         (state, session_id)
+    }
+
+    /// A launch boundary over `root` that no platform backend enforces
+    /// (`require_descendant_termination` is unsupported on every backend),
+    /// so every stdio launch under it is refused before its program runs.
+    #[cfg(unix)]
+    fn unenforceable_stdio_profile(root: &std::path::Path) -> meerkat_mcp::McpStdioLaunchProfile {
+        use meerkat_core::confinement::{
+            ConfinementSpec, FilesystemAccess, IpNetworkAccess, PathAccess, PlatformBaseline,
+        };
+        let requirement = ConfinementSpec {
+            baseline: PlatformBaseline::CommandRuntimeV1,
+            read: FilesystemAccess::Paths(vec![PathAccess::Subtree(root.to_path_buf())]),
+            write: FilesystemAccess::Paths(vec![PathAccess::Subtree(root.to_path_buf())]),
+            deny_read: vec![],
+            deny_write: vec![],
+            network: IpNetworkAccess::Denied,
+            unix_connect: vec![],
+            require_descendant_termination: true,
+        }
+        .try_into()
+        .expect("structurally valid requirement");
+        meerkat_mcp::McpStdioLaunchProfile::required(requirement, root.to_path_buf())
+    }
+
+    /// Stage a stdio server on `router` and assert the launch boundary
+    /// refused it, typed, without starting its process.
+    #[cfg(unix)]
+    async fn assert_router_refuses_stdio_launch(
+        router: &meerkat_mcp::McpRouterAdapter,
+        root: &std::path::Path,
+    ) {
+        let marker = root.join("launch-marker");
+        router
+            .stage_add(meerkat_core::McpServerConfig::stdio(
+                "confined-server",
+                "/bin/sh",
+                vec!["-c".into(), "printf entered > \"$MARKER\"".into()],
+                HashMap::from([("MARKER".into(), marker.display().to_string())]),
+            ))
+            .await
+            .expect("stage the server");
+        router.apply_staged().await.expect("apply the staged add");
+        let deltas = router
+            .wait_until_ready(std::time::Duration::from_secs(15))
+            .await
+            .expect("the add settles");
+        assert!(
+            deltas.iter().any(|delta| {
+                delta.target == "confined-server"
+                    && delta.phase == meerkat_core::ExternalToolDeltaPhase::Failed
+                    && delta.confinement_refusal
+                        == Some(
+                            meerkat_core::confinement::ConfinementRefusal::UnsupportedRequirement,
+                        )
+            }),
+            "the launch is refused by the state's boundary: {deltas:?}"
+        );
+        assert!(!marker.exists(), "a refused server never starts");
+    }
+
+    /// A fresh `meerkat_run` builds its session's router inside the state's
+    /// MCP stdio launch profile.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fresh_run_router_launches_inside_the_state_stdio_launch_profile() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let mut state = MeerkatMcpState::new_with_store_options_and_llm(
+            Arc::new(meerkat::MemoryStore::new()),
+            Arc::new(meerkat_runtime::InMemoryRuntimeStore::new()),
+            None,
+            Some(Arc::new(TestClient::for_provider(Provider::Anthropic))),
+        )
+        .await;
+        state.mcp_stdio_launch_profile = unenforceable_stdio_profile(&root);
+        let input: MeerkatRunInput = serde_json::from_value(json!({
+            "prompt": "Hello",
+            "model": "claude-opus-4-8",
+            "provider": "anthropic"
+        }))
+        .expect("run input");
+        let result = Box::pin(handle_meerkat_run(&state, input, None, None))
+            .await
+            .expect("the fresh run completes");
+        let session_id = meerkat::SessionId::parse(
+            unwrap_payload(result)["session_id"]
+                .as_str()
+                .expect("run result names its session"),
+        )
+        .expect("valid session id");
+        let router = state
+            .runtime_ingress_context()
+            .logical_router(&session_id)
+            .await
+            .expect("the fresh session publishes its router");
+        assert_router_refuses_stdio_launch(&router, &root).await;
+    }
+
+    /// A resume whose session has no live router rebuilds it inside the
+    /// state's MCP stdio launch profile, as the fresh path builds it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn resume_without_a_router_rebuilds_it_inside_the_state_stdio_launch_profile() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let (mut state, session_id) = state_with_persisted_session().await;
+        state.mcp_stdio_launch_profile = unenforceable_stdio_profile(&root);
+        let parsed = meerkat::SessionId::parse(&session_id).expect("valid session id");
+        assert!(
+            state
+                .runtime_ingress_context()
+                .logical_router(&parsed)
+                .await
+                .is_none(),
+            "the cold session has no router before its resume"
+        );
+        let result = Box::pin(handle_meerkat_resume(
+            &state,
+            bounded_resume_input(session_id, vec![]),
+            None,
+            None,
+        ))
+        .await;
+        assert!(
+            result.is_ok()
+                || result.as_ref().is_err_and(|error| {
+                    error
+                        .message
+                        .contains("failed to update peer ingress context")
+                }),
+            "the resume reaches its post-completion boundary: {result:?}"
+        );
+        let router = state
+            .runtime_ingress_context()
+            .logical_router(&parsed)
+            .await
+            .expect("the resume publishes the rebuilt router");
+        assert_router_refuses_stdio_launch(&router, &root).await;
+    }
+
+    /// Schedule seeding builds its router inside the state's MCP stdio
+    /// launch profile, so a realm's configured server is refused too.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn schedule_seeding_launches_inside_the_state_stdio_launch_profile() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let marker = root.join("seeded-launch-marker");
+        let mut state =
+            MeerkatMcpState::new_with_store(Arc::new(meerkat::MemoryStore::new())).await;
+        state.mcp_stdio_launch_profile = unenforceable_stdio_profile(&root);
+        let server = meerkat_core::McpServerConfig::stdio(
+            "confined-seeded",
+            "/bin/sh",
+            vec!["-c".into(), "printf entered > \"$MARKER\"".into()],
+            HashMap::from([("MARKER".into(), marker.display().to_string())]),
+        );
+        state
+            .config_runtime
+            .patch(
+                meerkat_core::ConfigDelta(json!({"tools": {"mcp_servers": [server]}})),
+                None,
+            )
+            .await
+            .expect("the realm configures its server");
+        let adapter = schedule_host::seed_realm_mcp_adapter_for_test(
+            &state,
+            Arc::new(meerkat_runtime::handles::RuntimeExternalToolSurfaceHandle::ephemeral()),
+        )
+        .await
+        .expect("schedule seeding stages the realm's server");
+        let deltas = adapter
+            .wait_until_ready(std::time::Duration::from_secs(15))
+            .await
+            .expect("the seeded add settles");
+        assert!(
+            deltas.iter().any(|delta| {
+                delta.target == "confined-seeded"
+                    && delta.confinement_refusal
+                        == Some(
+                            meerkat_core::confinement::ConfinementRefusal::UnsupportedRequirement,
+                        )
+            }),
+            "the seeded launch is refused by the state's boundary: {deltas:?}"
+        );
+        assert!(!marker.exists(), "a refused seeded server never starts");
     }
 
     async fn materialize_test_mcp_fixture<F>(
@@ -6118,6 +7106,355 @@ mod tests {
                 .count(),
             1,
             "live admission must append the explicit System exactly once"
+        );
+    }
+
+    /// Records the tool choice of every provider call.
+    struct ToolChoiceRecordingLlmClient {
+        provider: meerkat_core::Provider,
+        tool_choices: Arc<std::sync::Mutex<Vec<meerkat_core::ToolChoice>>>,
+    }
+
+    #[async_trait]
+    impl LlmClient for ToolChoiceRecordingLlmClient {
+        fn project_replay_messages(
+            &self,
+            messages: &[meerkat_core::Message],
+        ) -> Result<Vec<meerkat_core::Message>, meerkat_client::LlmError> {
+            Ok(messages.to_vec())
+        }
+
+        fn stream<'a>(
+            &'a self,
+            request: &'a LlmRequest,
+        ) -> Pin<Box<dyn futures::Stream<Item = Result<LlmEvent, LlmError>> + Send + 'a>> {
+            self.tool_choices
+                .lock()
+                .expect("tool choice log lock poisoned")
+                .push(request.tool_choice.clone());
+            Box::pin(stream::iter(vec![
+                Ok(LlmEvent::TextDelta {
+                    delta: "ok".to_string(),
+                    meta: None,
+                }),
+                Ok(LlmEvent::UsageUpdate {
+                    usage: meerkat_core::TurnUsage::host_declared(
+                        provider_for_successful_mcp_test_model(&request.model),
+                        &request.model,
+                        meerkat_core::Usage::default(),
+                    ),
+                }),
+                Ok(LlmEvent::Done {
+                    outcome: LlmDoneOutcome::Success {
+                        stop_reason: meerkat_core::StopReason::EndTurn,
+                    },
+                }),
+            ]))
+        }
+
+        fn provider(&self) -> meerkat_core::Provider {
+            self.provider
+        }
+
+        async fn health_check(&self) -> Result<(), LlmError> {
+            Ok(())
+        }
+    }
+
+    /// A state with one live session whose agent runs on `llm_client`.
+    async fn state_with_live_session(
+        llm_client: Arc<dyn LlmClient>,
+    ) -> (MeerkatMcpState, meerkat::SessionId) {
+        let store: Arc<dyn SessionStore> = Arc::new(meerkat::MemoryStore::new());
+        let state = MeerkatMcpState::new_with_store_options_and_llm(
+            store,
+            Arc::new(meerkat_runtime::InMemoryRuntimeStore::new()),
+            None,
+            Some(Arc::new(TestClient::default())),
+        )
+        .await;
+        let session = Session::new();
+        let session_id = session.id().clone();
+        materialize_test_mcp_fixture(
+            &state,
+            &session_id,
+            McpActorMaterializationMode::Fresh,
+            move |bindings| {
+                let router = Arc::new(meerkat_mcp::McpRouterAdapter::new(
+                    McpRouter::new_with_surface_handle(Arc::clone(
+                        bindings.external_tool_surface(),
+                    )),
+                ));
+                let router_tools: Arc<dyn AgentToolDispatcher> = router.clone();
+                let mut request = mock_deferred_materialization_request(session, bindings, None);
+                let build = request.build.get_or_insert_with(Default::default);
+                build.external_tools = Some(router_tools);
+                build.llm_client_override =
+                    Some(meerkat::encode_llm_client_override_for_service(llm_client));
+                (request, router)
+            },
+        )
+        .await;
+        (state, session_id)
+    }
+
+    /// `meerkat_resume` takes the same per-turn overlay as the other
+    /// surfaces: its `tool_choice_plan` reaches the turn's provider call on a
+    /// live session instead of being dropped.
+    #[tokio::test]
+    async fn live_resume_forwards_the_turn_tool_choice_plan() {
+        let tool_choices = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (state, session_id) = state_with_live_session(Arc::new(ToolChoiceRecordingLlmClient {
+            provider: Provider::Other,
+            tool_choices: Arc::clone(&tool_choices),
+        }))
+        .await;
+        let attachment_before = state
+            .runtime_adapter
+            .current_executor_attachment_witness(&session_id)
+            .await
+            .expect("live fixture has an exact attachment");
+
+        handle_tools_call(
+            &state,
+            "meerkat_resume",
+            &json!({
+                "session_id": session_id.to_string(),
+                "prompt": "Answer without calling a tool",
+                "turn_tool_overlay": { "tool_choice_plan": [{ "mode": "none" }] }
+            }),
+        )
+        .await
+        .expect("live resume with a tool choice plan should run");
+
+        assert_eq!(
+            state
+                .runtime_adapter
+                .current_executor_attachment_witness(&session_id)
+                .await,
+            Some(attachment_before),
+            "the overlay rides the live turn without an actor rebuild"
+        );
+        assert_eq!(
+            tool_choices
+                .lock()
+                .expect("tool choice log lock poisoned")
+                .first(),
+            Some(&meerkat_core::ToolChoice::None),
+            "the plan's first entry is the first provider call's tool choice"
+        );
+    }
+
+    /// A resume that rebuilds the session's agent (here a cold session) keeps
+    /// the per-turn overlay: its `tool_choice_plan` reaches the turn's first
+    /// provider call.
+    #[tokio::test]
+    async fn cold_resume_forwards_the_turn_tool_overlay() {
+        let tool_choices = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (state, session_id) =
+            state_with_persisted_session_and_llm(Arc::new(ToolChoiceRecordingLlmClient {
+                provider: Provider::Anthropic,
+                tool_choices: Arc::clone(&tool_choices),
+            }))
+            .await;
+
+        let result = timeout(
+            NO_DEADLOCK_BOUND,
+            Box::pin(handle_tools_call(
+                &state,
+                "meerkat_resume",
+                &json!({
+                    "session_id": session_id,
+                    "prompt": "Answer without calling a tool",
+                    "turn_tool_overlay": { "tool_choice_plan": [{ "mode": "none" }] }
+                }),
+            )),
+        )
+        .await
+        .expect("cold resume with an overlay must not deadlock");
+        assert!(
+            result.is_ok()
+                || result.as_ref().is_err_and(|error| {
+                    error
+                        .message
+                        .contains("failed to update peer ingress context")
+                }),
+            "cold resume must reach its post-completion boundary: {result:?}"
+        );
+        assert_eq!(
+            tool_choices
+                .lock()
+                .expect("tool choice log lock poisoned")
+                .first(),
+            Some(&meerkat_core::ToolChoice::None),
+            "the rebuilt turn keeps the overlay's tool choice plan"
+        );
+    }
+
+    /// Unknown overlay keys stay tolerated, as on every other MCP input that
+    /// 0.9.0 clients may send: they are ignored (and logged), never
+    /// forwarded, and the known keys still apply.
+    #[test]
+    fn turn_tool_overlay_input_ignores_unknown_keys_and_keeps_known_ones() {
+        let input: MeerkatResumeInput = serde_json::from_value(json!({
+            "session_id": "unused",
+            "prompt": "x",
+            "turn_tool_overlay": {
+                "allowed_tools": ["shell"],
+                "tool_choice_plan": [{ "mode": "required" }],
+                "dispatch_context": { "trusted": true },
+                "allowed_tool": ["typo"]
+            }
+        }))
+        .expect("unknown overlay keys are tolerated");
+        let overlay = meerkat_core::service::TurnToolOverlay::from(
+            input.turn_tool_overlay.expect("overlay parsed"),
+        );
+        assert_eq!(
+            overlay.allowed_tools,
+            Some(vec![meerkat_core::ToolName::from("shell")])
+        );
+        assert_eq!(
+            overlay.tool_choice_plan,
+            vec![meerkat_core::ToolChoice::Required]
+        );
+        assert!(
+            overlay.dispatch_context.is_empty(),
+            "host-only dispatch context is never taken from a tool call"
+        );
+    }
+
+    /// Holds every provider call until the test releases it.
+    struct GatedLlmClient {
+        calls: Arc<tokio::sync::watch::Sender<usize>>,
+        release: Arc<tokio::sync::Semaphore>,
+    }
+
+    #[async_trait]
+    impl LlmClient for GatedLlmClient {
+        fn project_replay_messages(
+            &self,
+            messages: &[meerkat_core::Message],
+        ) -> Result<Vec<meerkat_core::Message>, meerkat_client::LlmError> {
+            Ok(messages.to_vec())
+        }
+
+        fn stream<'a>(
+            &'a self,
+            request: &'a LlmRequest,
+        ) -> Pin<Box<dyn futures::Stream<Item = Result<LlmEvent, LlmError>> + Send + 'a>> {
+            self.calls.send_modify(|calls| *calls += 1);
+            let release = Arc::clone(&self.release);
+            let usage = meerkat_core::TurnUsage::host_declared(
+                provider_for_successful_mcp_test_model(&request.model),
+                &request.model,
+                meerkat_core::Usage::default(),
+            );
+            Box::pin(stream::unfold(0u8, move |step| {
+                let release = Arc::clone(&release);
+                let usage = usage.clone();
+                async move {
+                    match step {
+                        0 => {
+                            release
+                                .acquire()
+                                .await
+                                .expect("release semaphore stays open")
+                                .forget();
+                            Some((
+                                Ok(LlmEvent::TextDelta {
+                                    delta: "ok".to_string(),
+                                    meta: None,
+                                }),
+                                1,
+                            ))
+                        }
+                        1 => Some((Ok(LlmEvent::UsageUpdate { usage }), 2)),
+                        2 => Some((
+                            Ok(LlmEvent::Done {
+                                outcome: LlmDoneOutcome::Success {
+                                    stop_reason: meerkat_core::StopReason::EndTurn,
+                                },
+                            }),
+                            3,
+                        )),
+                        _ => None,
+                    }
+                }
+            }))
+        }
+
+        fn provider(&self) -> meerkat_core::Provider {
+            meerkat_core::Provider::Other
+        }
+
+        async fn health_check(&self) -> Result<(), LlmError> {
+            Ok(())
+        }
+    }
+
+    /// A `meerkat_resume` that arrives while another turn on the same live
+    /// session is running waits behind it and then runs; it is not refused
+    /// as busy.
+    #[tokio::test]
+    async fn resume_while_a_turn_runs_waits_instead_of_busy() {
+        // Bounds a failure only; the passing path never waits for it.
+        const FAILURE_BOUND: Duration = Duration::from_secs(30);
+        let calls = Arc::new(tokio::sync::watch::channel(0usize).0);
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let (state, session_id) = state_with_live_session(Arc::new(GatedLlmClient {
+            calls: Arc::clone(&calls),
+            release: Arc::clone(&release),
+        }))
+        .await;
+        let state = Arc::new(state);
+        let resume = |prompt: &'static str| {
+            let state = Arc::clone(&state);
+            let session_id = session_id.to_string();
+            tokio::spawn(async move {
+                Box::pin(handle_tools_call(
+                    &state,
+                    "meerkat_resume",
+                    &json!({ "session_id": session_id, "prompt": prompt }),
+                ))
+                .await
+            })
+        };
+        let mut seen = calls.subscribe();
+
+        let first = resume("first running turn");
+        timeout(FAILURE_BOUND, seen.wait_for(|calls| *calls >= 1))
+            .await
+            .expect("the first resume reaches the provider")
+            .expect("call counter stays open");
+        let mut second = resume("second resume");
+        assert!(
+            timeout(Duration::from_millis(300), &mut second)
+                .await
+                .is_err(),
+            "a resume on a running session waits behind the running turn \
+             instead of answering at once"
+        );
+
+        release.add_permits(1);
+        let first = timeout(FAILURE_BOUND, first)
+            .await
+            .expect("the first resume finishes once released")
+            .expect("first resume task");
+        assert!(first.is_ok(), "first resume: {:?}", first.err());
+        timeout(FAILURE_BOUND, seen.wait_for(|calls| *calls >= 2))
+            .await
+            .expect("the waiting resume runs its turn after the first one")
+            .expect("call counter stays open");
+        release.add_permits(1);
+        let second = timeout(FAILURE_BOUND, second)
+            .await
+            .expect("the waiting resume finishes once released")
+            .expect("second resume task");
+        assert!(
+            second.is_ok(),
+            "the waiting resume returns its own result: {:?}",
+            second.err()
         );
     }
 
@@ -6952,6 +8289,174 @@ mod tests {
         .expect_err("unknown config action string must be rejected before dispatch");
         assert_eq!(err.code, -32602);
         assert!(err.message.contains("unknown variant") || err.message.contains("expected one of"));
+    }
+
+    /// The committed config generation, read through the `meerkat_config` tool.
+    async fn config_generation(state: &MeerkatMcpState) -> u64 {
+        let payload = Box::pin(handle_tools_call(
+            state,
+            "meerkat_config",
+            &json!({"action": "get"}),
+        ))
+        .await
+        .expect("config get");
+        let text = payload["content"][0]["text"]
+            .as_str()
+            .expect("config payload text");
+        serde_json::from_str::<Value>(text).expect("config payload json")["generation"]
+            .as_u64()
+            .expect("config generation")
+    }
+
+    /// A `meerkat_config` write can administer neither the host's
+    /// `[confinement]` nor its governance: invalid params carrying each
+    /// section's own typed refusal, and nothing is written.
+    #[tokio::test]
+    async fn test_config_writes_cannot_administer_host_sections() {
+        let store: Arc<dyn SessionStore> = Arc::new(meerkat::MemoryStore::new());
+        let state = MeerkatMcpState::new_with_store(store).await;
+        let generation = config_generation(&state).await;
+        for (patch, discriminator) in [
+            (
+                json!({"confinement": {"all": {"mode": "workspace"}}}),
+                "confinement_administration_required",
+            ),
+            (
+                json!({"governance": {}}),
+                "governance_administration_required",
+            ),
+        ] {
+            let refused = Box::pin(handle_tools_call(
+                &state,
+                "meerkat_config",
+                &json!({"action": "patch", "patch": patch}),
+            ))
+            .await
+            .expect_err("a config write cannot administer a host section");
+            assert_eq!(refused.code, -32602, "{patch}");
+            assert_eq!(
+                refused.data,
+                Some(json!({"type": discriminator})),
+                "{patch}"
+            );
+        }
+        assert_eq!(
+            config_generation(&state).await,
+            generation,
+            "a refused write commits nothing"
+        );
+    }
+
+    /// A requirement no platform backend enforces (descendant termination),
+    /// so a server that installs it refuses every confined launch on any OS.
+    const UNENFORCEABLE_CONFINEMENT: &str = r#"[confinement.all]
+mode = "custom"
+working_directory = "/"
+requirement = { baseline = "command_runtime_v1", read = { kind = "paths", paths = [] }, write = { kind = "paths", paths = [] }, deny_read = [], deny_write = [], network = { kind = "denied" }, unix_connect = [], require_descendant_termination = true }
+"#;
+
+    /// A start whose confined processes could change the realm state is
+    /// refused before the server serves, naming the input and its remedy.
+    #[tokio::test]
+    async fn test_startup_refuses_confinement_that_could_change_the_realm_state() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let base = temp.path().canonicalize().expect("canonical temp");
+        let state = base.join("realms");
+        std::fs::create_dir_all(&state).expect("state root");
+        let user_root = base.join("user");
+        std::fs::create_dir_all(user_root.join(".rkat")).expect("user root");
+        std::fs::write(user_root.join(".rkat").join("config.toml"), format!(
+            "[confinement.all]\nmode = \"custom\"\nworking_directory = \"{state}\"\nrequirement = {{ baseline = \"command_runtime_v1\", read = {{ kind = \"paths\", paths = [{{ kind = \"subtree\", path = \"{state}\" }}] }}, write = {{ kind = \"paths\", paths = [{{ kind = \"subtree\", path = \"{state}\" }}] }}, deny_read = [], deny_write = [], network = {{ kind = \"denied\" }}, unix_connect = [], require_descendant_termination = false }}\n",
+            state = state.display()
+        ))
+        .expect("user document");
+        let mut bootstrap = RuntimeBootstrap::default();
+        bootstrap.realm.selection = RealmSelection::Explicit {
+            realm_id: "state-writer".into(),
+        };
+        bootstrap.realm.state_root = Some(state);
+        bootstrap.context.context_root = Some(base.clone());
+        bootstrap.context.user_config_root = Some(user_root);
+        let refused = MeerkatMcpState::new_with_bootstrap_options_and_llm(
+            bootstrap,
+            false,
+            Some(Arc::new(TestClient::for_provider(Provider::Anthropic))),
+            None,
+        )
+        .await
+        .err()
+        .expect("a confined process could change the realm state");
+        let message = refused.to_string();
+        assert!(
+            message.contains("the realm state") && message.contains("--state-root"),
+            "{message}"
+        );
+    }
+
+    /// The server's one MCP stdio launch profile comes from the composed
+    /// `[confinement]`: a requirement in the user document applies without a
+    /// `[realm.global]` section, the operator's flag replaces the documents,
+    /// and the workspace preset without --context-root refuses startup
+    /// instead of confining nothing.
+    #[tokio::test]
+    async fn test_startup_takes_the_stdio_profile_from_documents_and_flags() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let user_root = temp.path().join("user");
+        std::fs::create_dir_all(user_root.join(".rkat")).expect("user root");
+        std::fs::write(
+            user_root.join(".rkat").join("config.toml"),
+            UNENFORCEABLE_CONFINEMENT,
+        )
+        .expect("user document");
+        let bootstrap = |realm_id: &str, context_root: Option<PathBuf>| {
+            let mut bootstrap = RuntimeBootstrap::default();
+            bootstrap.realm.selection = RealmSelection::Explicit {
+                realm_id: realm_id.into(),
+            };
+            bootstrap.realm.state_root = Some(temp.path().join("realms"));
+            bootstrap.context.context_root = context_root;
+            bootstrap.context.user_config_root = Some(user_root.clone());
+            bootstrap
+        };
+        let start = |bootstrap, confinement| {
+            MeerkatMcpState::new_with_bootstrap_options_and_llm(
+                bootstrap,
+                false,
+                Some(Arc::new(TestClient::for_provider(Provider::Anthropic))),
+                confinement,
+            )
+        };
+
+        let configured = start(bootstrap("confined", Some(temp.path().to_path_buf())), None)
+            .await
+            .expect("configured server");
+        assert_eq!(
+            configured.mcp_stdio_launch_profile.capabilities().err(),
+            Some(meerkat_core::confinement::ConfinementRefusal::UnsupportedRequirement),
+            "the user document's requirement reaches the server's launch boundary"
+        );
+
+        let flagged = start(
+            bootstrap("flagged", Some(temp.path().to_path_buf())),
+            Some(meerkat_core::LaunchConfinement::TrustedHost),
+        )
+        .await
+        .expect("flagged server");
+        assert!(
+            matches!(flagged.mcp_stdio_launch_profile.capabilities(), Ok(None)),
+            "the operator's flag replaces the documents"
+        );
+
+        let refused = start(
+            bootstrap("unrooted", None),
+            Some(meerkat_core::LaunchConfinement::Workspace(
+                meerkat_core::WorkspaceConfinement::default(),
+            )),
+        )
+        .await
+        .err()
+        .expect("workspace confinement without --context-root refuses startup");
+        assert!(refused.to_string().contains("--context-root"), "{refused}");
     }
 
     #[cfg(feature = "mob")]
@@ -7853,6 +9358,71 @@ mod tests {
         assert_eq!(
             data.get("reason").and_then(Value::as_str),
             Some("classification_rejected")
+        );
+    }
+
+    // An ambiguous delivery may already have landed: it must reach the caller
+    // as `send_ambiguous` with its envelope id and the same reconcile fields
+    // RPC and REST carry, never as `send_failed`, which invites a retry.
+    #[cfg(feature = "comms")]
+    #[test]
+    fn test_normalize_mcp_comms_send_error_names_ambiguous_delivery() {
+        let envelope_id = uuid::Uuid::new_v4();
+        let err = normalize_mcp_comms_send_error(
+            Some("peer-a"),
+            &meerkat_core::comms::SendError::AmbiguousDelivery {
+                envelope_id,
+                detail: "ack timed out".to_string(),
+            },
+        );
+        assert_eq!(err.code, -32603);
+        assert!(
+            err.message.starts_with("send_ambiguous:"),
+            "{}",
+            err.message
+        );
+        let data = err.data.expect("structured error data");
+        assert_eq!(
+            data.get("code").and_then(Value::as_str),
+            Some("send_ambiguous")
+        );
+        assert_eq!(
+            data.get("envelope_id").and_then(Value::as_str),
+            Some(envelope_id.to_string().as_str())
+        );
+        assert_eq!(data.get("retry_safe").and_then(Value::as_bool), Some(false));
+        assert_eq!(
+            data.get("required_action").and_then(Value::as_str),
+            Some("reconcile")
+        );
+    }
+
+    // A durably rejected envelope is a terminal, unambiguous rejection: the
+    // caller gets `peer_input_rejected` with the envelope id, as on RPC and
+    // REST, not a plain `send_failed`.
+    #[cfg(feature = "comms")]
+    #[test]
+    fn test_normalize_mcp_comms_send_error_names_durable_rejection() {
+        let envelope_id = uuid::Uuid::new_v4();
+        let err = normalize_mcp_comms_send_error(
+            Some("peer-a"),
+            &meerkat_core::comms::SendError::DurableAdmissionRejected { envelope_id },
+        );
+        assert_eq!(err.code, -32603);
+        assert!(
+            err.message.starts_with("peer_input_rejected:"),
+            "{}",
+            err.message
+        );
+        let data = err.data.expect("structured error data");
+        assert_eq!(
+            data.get("code").and_then(Value::as_str),
+            Some("peer_input_rejected")
+        );
+        assert_eq!(data.get("peer").and_then(Value::as_str), Some("peer-a"));
+        assert_eq!(
+            data.get("envelope_id").and_then(Value::as_str),
+            Some(envelope_id.to_string().as_str())
         );
     }
 
