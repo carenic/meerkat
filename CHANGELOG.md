@@ -76,6 +76,25 @@ them.
   `OAuthFlowError::Missing` for a browser attempt its AuthMachine no longer
   holds, where it returned `LifecycleRejected`; a fault while applying to a
   held attempt is still `LifecycleRejected`.
+- Behaviour-only (not measured by the gate): JSON-RPC `turn/start` and
+  `mob/turn_start` return the code of a failed turn's typed cause (`-32010`,
+  `-32011` or `-32012`) instead of `-32603` (see Changed). Clients that
+  matched `-32603` for those failures must also accept the new codes.
+- Behaviour-only (not measured by the gate): JSON-RPC `comms/send` and the
+  MCP `meerkat_comms_send` tool fail an ambiguous peer delivery with
+  `send_ambiguous` instead of `send_failed`, and the MCP tool fails a durably
+  rejected envelope with `peer_input_rejected` instead of `send_failed` (see
+  Fixed). Reconcile an ambiguous send by its `envelope_id` before any new
+  attempt.
+- Python and TypeScript SDKs (not measured by the gate): a failed
+  `comms/send` carries the typed error object in the error's `details`
+  instead of the transport error text, so code that read `details` as a
+  string must read the object. TypeScript: `CommsSendReceipt` no longer
+  declares the camelCase fields (`requestId`, `interactionId`, `inputId`,
+  `envelopeId`, `streamReserved`, `inReplyTo`); read the snake_case fields
+  after narrowing on `kind`. `MobTurnStartOptions.authBinding` is typed as
+  `TurnAuthBindingOverride` (a binding ref, `{ action: "set", value }` or
+  `{ action: "clear" }`) instead of an untyped object (see Fixed).
 
 ### Security
 
@@ -91,12 +110,11 @@ them.
 
 ### Added
 
-- Release packaging now refuses any binary that carries compiled-in test code,
-  and a release-graph check fails when a test-only feature can reach a
-  released binary.
-- Release publishing now refuses archives built from a source tree whose test
-  hooks still reach release builds, including reused or recovered archives of
-  an older build.
+- Release packaging and publishing reject tracked test-only binary markers,
+  except the documented Tokio test-util allowance. The release-graph check
+  rejects listed workspace non-shipping features. Publishing also checks the
+  named TestClient and OAuth fixture hooks in the archive's provenance-bound
+  source tree, including reused or recovered archives.
 - `AgentBuilder::budget_warning_threshold` and `AgentBuilder::extraction_prompt`
   set the early budget-warning fraction and the structured-output extraction
   prompt of a directly built agent.
