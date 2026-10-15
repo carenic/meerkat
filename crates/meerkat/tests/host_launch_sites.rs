@@ -283,25 +283,87 @@ fn gates_test_only(attribute: &str) -> bool {
 
 /// The index after the item that starts at or after `start`: past any
 /// further attributes, through its matching closing brace, or its `;` when
-/// it has no body.
+/// it has no body. A match arm, field, variant or argument (anything that
+/// does not start with an item or statement keyword) also ends at its `,`,
+/// and any item ends where the construct enclosing it closes, so the code
+/// after it is scanned.
 fn item_end(bytes: &[u8], start: usize) -> usize {
+    let separated = !starts_with_item_keyword(bytes, start);
     let mut index = start;
     let mut depth = 0usize;
     while index < bytes.len() {
         match bytes[index] {
-            b'{' => depth += 1,
-            b'}' => {
-                depth = depth.saturating_sub(1);
+            b'{' | b'(' | b'[' => depth += 1,
+            closing @ (b'}' | b')' | b']') => {
                 if depth == 0 {
+                    return index;
+                }
+                depth -= 1;
+                if depth == 0 && closing == b'}' {
                     return index + 1;
                 }
             }
             b';' if depth == 0 => return index + 1,
+            b',' if depth == 0 && separated => return index + 1,
             _ => {}
         }
         index += 1;
     }
     bytes.len()
+}
+
+/// Whether the code at `start`, past whitespace and attributes, starts with
+/// an item or statement keyword (whose `,` at the top level, as in generic
+/// parameters, does not end it).
+fn starts_with_item_keyword(bytes: &[u8], start: usize) -> bool {
+    const KEYWORDS: &[&str] = &[
+        "async",
+        "const",
+        "enum",
+        "extern",
+        "fn",
+        "impl",
+        "let",
+        "macro_rules",
+        "mod",
+        "pub",
+        "static",
+        "struct",
+        "trait",
+        "type",
+        "union",
+        "unsafe",
+        "use",
+    ];
+    let mut index = start;
+    loop {
+        while bytes.get(index).is_some_and(u8::is_ascii_whitespace) {
+            index += 1;
+        }
+        if bytes.get(index) != Some(&b'#') {
+            break;
+        }
+        let mut depth = 0usize;
+        while let Some(&byte) = bytes.get(index) {
+            index += 1;
+            match byte {
+                b'[' => depth += 1,
+                b']' => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let word_end = bytes[index.min(bytes.len())..]
+        .iter()
+        .position(|byte| !(byte.is_ascii_alphanumeric() || *byte == b'_'))
+        .map_or(bytes.len(), |offset| index + offset);
+    let word = std::str::from_utf8(&bytes[index.min(bytes.len())..word_end]).unwrap_or("");
+    KEYWORDS.contains(&word)
 }
 
 /// `source` with every comment and string or character literal replaced by
@@ -561,4 +623,29 @@ fn lifetime<'a>(value: &'a str) -> &'a str { value }
     assert!(!is_shipped_source("crates/xtask/src/main.rs"));
     assert!(!is_shipped_source("crates/meerkat/build.rs"));
     assert!(!is_shipped_source("tests/integration/src/harness_only.rs"));
+}
+
+/// A test-only item ends where the item does: a test-only match arm, field
+/// or argument ends at its comma, and the shipped code after it is scanned.
+#[test]
+fn the_scanner_keeps_code_after_a_test_only_arm_or_field() {
+    let source = r#"
+fn arms(x: u8) {
+    match x {
+        #[cfg(test)]
+        0 => helper(),
+        _ => {
+            let _ = std::process::Command::new("after-a-test-only-arm");
+        }
+    }
+}
+struct Fields {
+    #[cfg(test)]
+    probe: u8,
+    kept: u8,
+}
+fn after_fields() { let _ = std::process::Command::new("after-a-test-only-field"); }
+"#;
+    let found = launches(&shipped_code(source));
+    assert_eq!(found.get("Command::new("), Some(&2), "{found:?}");
 }

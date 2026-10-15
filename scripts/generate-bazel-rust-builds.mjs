@@ -1136,7 +1136,10 @@ function workspaceDataLabels(target, source = targetScanSource(target)) {
     labels.add("//tests/fixtures/mcp-test-server:package_runfiles");
     labels.add("//tests/fixtures/surface-build-fixtures:package_runfiles");
   }
-  if (target.name === "protocol_codegen_drift") {
+  // A test that scans the workspace's Rust sources (the process launch site
+  // inventory) reads every package's sources: the root glob cannot see
+  // inside a Bazel package.
+  if (target.name === "protocol_codegen_drift" || source.includes("walk_rust_sources(&root)")) {
     for (const label of packageRunfileLabels) labels.add(label);
   }
   if (source.includes("scan_for_manual_input_schema_literals")) {

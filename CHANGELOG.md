@@ -183,6 +183,10 @@ them.
   `rkat-rest` binary, and the real-binary confinement tests of `rkat-rpc`
   and `rkat-rest` fail, rather than pass without having run, when their
   binary is missing.
+- The source test that classifies every process launch in shipped code
+  scans every workspace crate under Bazel too (its generated target carries
+  every package's sources), and it scans the code after a test-only match
+  arm, field or argument, which it skipped.
 - CI's `Closure tests` rows have 60 minutes instead of 40, and the
   `ci-integration` profile gives its four slow nested-Cargo and
   whole-workspace tests 16 slow periods (960 s) instead of 8, so a cold row
