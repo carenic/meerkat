@@ -22,8 +22,23 @@ name = "fixture"
 version = "1.2.3"
 EOF
 printf 'module before\n' > "$TEST_ROOT/MODULE.bazel.lock"
-printf '## [Unreleased]\n' > "$TEST_ROOT/CHANGELOG.md"
+# The projection is the real stampers' output, as the classifier requires.
+mkdir -p "$TEST_ROOT/scripts" "$TEST_ROOT/.claude/skills/meerkat-platform"
+cp "$REPO_ROOT/scripts/stamp-docs-contract-version.sh" "$REPO_ROOT/scripts/stamp-changelog-release.py" "$TEST_ROOT/scripts/"
+cat > "$TEST_ROOT/CHANGELOG.md" <<'EOF'
+## [Unreleased]
+
+- Projection fixture.
+
+## [1.2.3] - 2026-08-01
+
+- Previous fixture release.
+
+[Unreleased]: https://github.com/example/meerkat/compare/v1.2.3...HEAD
+[1.2.3]: https://github.com/example/meerkat/compare/v1.2.2...v1.2.3
+EOF
 printf 'meerkat = "1.2.3"\n' > "$TEST_ROOT/README.md"
+printf 'cargo install rkat --version "=1.2.3"\n' > "$TEST_ROOT/.claude/skills/meerkat-platform/SKILL.md"
 git -C "$TEST_ROOT" add .
 git -C "$TEST_ROOT" commit -qm base
 base="$(git -C "$TEST_ROOT" rev-parse HEAD)"
@@ -48,10 +63,11 @@ printf 'source_fingerprint=%s\n' "$base_fingerprint" \
   > "$cache_root/v10-cargo-source-${base_fingerprint}.ok"
 
 sed -i.bak 's/1\.2\.3/1.2.4/g' \
-  "$TEST_ROOT/Cargo.toml" "$TEST_ROOT/Cargo.lock" "$TEST_ROOT/README.md"
+  "$TEST_ROOT/Cargo.toml" "$TEST_ROOT/Cargo.lock"
 rm -f "$TEST_ROOT"/*.bak
 printf 'module after\n' > "$TEST_ROOT/MODULE.bazel.lock"
-printf '## [1.2.4]\n\n- Projection fixture.\n' > "$TEST_ROOT/CHANGELOG.md"
+bash "$TEST_ROOT/scripts/stamp-docs-contract-version.sh" 1.2.4 >/dev/null
+MEERKAT_RELEASE_DATE=2026-08-28 python3 "$TEST_ROOT/scripts/stamp-changelog-release.py" "$TEST_ROOT/CHANGELOG.md" 1.2.4 >/dev/null
 git -C "$TEST_ROOT" add .
 git -C "$TEST_ROOT" commit -qm projection
 head="$(git -C "$TEST_ROOT" rev-parse HEAD)"

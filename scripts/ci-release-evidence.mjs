@@ -2,37 +2,46 @@
 // Exact-main CI evidence for a release-projection commit.
 //
 // A commit whose diff from its first parent is only the release projection
-// (scripts/release-projection-only.mjs: the version bump scripts/release-hook.sh
-// writes) changes no test input the parent's CI did not already run against,
-// apart from the version strings the release checks still verify. CI then
-// reuses the parent's test evidence instead of rebuilding the workspace cold:
-// the version bump changes every crate's metadata, so nothing is cached.
-// The evidence must be a completed, successful run of the CI workflow
+// (scripts/release-projection-only.mjs: the forward patch bump
+// scripts/release-hook.sh writes) changes no test input the parent's CI did
+// not already run against, apart from the version strings the release
+// checks verify and the files whose readers the plan still runs. CI then
+// reuses the parent's test evidence instead of rebuilding the workspace
+// cold: the version bump changes every crate's metadata, so nothing is
+// cached.
+//
+// The evidence must be a COMPLETED, successful run of the CI workflow
 // (ci.yml) for a push to main at exactly the parent commit, whose schema-4
-// exact-tree attestation names the parent's commit and tree and executed its
-// own tests (it is not itself a reuse).
+// exact-tree attestation names the parent's commit and tree, planned the
+// whole workspace (plan mode `workspace`) and records every lane as
+// `success`. A narrower parent run is not evidence: a `none` or `packages`
+// plan tests only its own diff, and an earlier main commit whose run was
+// cancelled would otherwise ship untested behind it. A run that is still in
+// progress is never evidence either; `find` can wait for it to finish.
 //
 // usage:
 //   ci-release-evidence.mjs find   --repository OWNER/REPO --base REV --head REV
+//                                  [--wait-seconds S]
 //   ci-release-evidence.mjs verify --repository OWNER/REPO --base REV --head REV
-//                                  --run-id ID [--run-attempt N]
-//                                  [--wait-seconds S] [--github-output FILE]
+//                                  --run-id ID --run-attempt N
+//                                  [--github-output FILE]
 //
 // Both modes first require that head's first parent is base and that
-// base..head is a release projection.
+// base..head is a release projection. The CI workflows run the copies of this
+// script and of the classifier from the parent commit's tree, so a commit
+// cannot certify itself with edited scripts.
 //
-// find (the change classification): prints `<base sha>:<run id>:<attempt>` for
-//   a completed, successful exact-main run whose attestation verifies, or
-//   `<base sha>:<run id>:pending` while that run is still in progress (the CI
-//   gate then waits for it and verifies it). Exit 1 when there is no usable
-//   evidence, including any lookup failure: the caller then plans the full
-//   workspace, never less.
-// verify (the CI gate and the release workflow's require_ci_green): waits up
-//   to --wait-seconds for the run to complete, then requires it (the named
-//   --run-attempt when given) to be a successful exact-main run of base with
-//   a verified attestation. Prints the evidence and, with --github-output,
-//   records run_id, run_attempt, commit, tree, run_url, attestation_artifact,
-//   from_version and to_version. Exit 1 on any failure.
+// find (the change classification): prints `<base sha>:<run id>:<attempt>`
+//   for a completed, successful exact-main run of base whose attestation
+//   verifies. While such a run is still queued or running it waits, up to
+//   --wait-seconds (default 0), for it to finish. Exit 1 when there is no
+//   usable evidence, including any lookup failure: the caller then plans the
+//   full workspace, never less.
+// verify (the CI gate and the release workflow's require_ci_green): requires
+//   the named run attempt to be a completed, successful exact-main run of
+//   base with a verified attestation. Prints the evidence and, with
+//   --github-output, records run_id, run_attempt, commit, tree, run_url,
+//   attestation_artifact, from_version and to_version. Exit 1 on any failure.
 //
 // The GitHub CLI is `gh` (MEERKAT_CI_EVIDENCE_GH overrides it for the
 // self-test's fake); MEERKAT_CI_EVIDENCE_POLL_SECONDS sets the wait poll
@@ -50,6 +59,26 @@ export const CI_WORKFLOW_NAME = "CI";
 export const ATTESTATION_BACKEND = "github-hosted-cargo";
 export const RELEASE_PROJECTION_MODE = "release-projection";
 export const REUSE_CLASSIFIER = "release-projection-only";
+// Every lane of the CI attestation's component_results, all of which a
+// workspace-mode main push runs.
+export const WORKSPACE_LANES = [
+  "changes",
+  "fmt_governance",
+  "ratchets",
+  "clippy",
+  "unit",
+  "integration",
+  "closure_tests",
+  "governed_jsonl",
+  "mcp_confinement_positive",
+  "main_unit",
+  "closure_check",
+  "wasm_check",
+  "sdk_host",
+  "example_web",
+  "wasm_timers",
+  "bazel_graph",
+];
 const PENDING_STATUSES = new Set(["queued", "in_progress", "waiting", "requested", "pending"]);
 
 export class EvidenceError extends Error {}
@@ -80,8 +109,8 @@ export function runProblems(run, commit) {
 
 // Problems with a schema-4 attestation as the exact-tree evidence of
 // `commit`/`tree` from run `runId` attempt `runAttempt`; empty when it
-// qualifies. Reused evidence is never evidence again: one release
-// projection reuses one executed run.
+// qualifies. Only a whole-workspace run whose every lane succeeded is
+// evidence, and reused evidence is never evidence again.
 export function attestationProblems(attestation, { repository, commit, tree, runId, runAttempt }) {
   const problems = [];
   const expect = (field, actual, wanted) => {
@@ -98,21 +127,17 @@ export function attestationProblems(attestation, { repository, commit, tree, run
   expect("ref", attestation?.ref, "refs/heads/main");
   expect("validation_backend", attestation?.validation_backend, ATTESTATION_BACKEND);
   expect("validation_result", attestation?.validation_result, "success");
+  expect("plan.mode", attestation?.plan?.mode, "workspace");
   const components = attestation?.component_results;
   if (!components || typeof components !== "object" || Array.isArray(components)) {
     problems.push("component_results is missing");
   } else {
-    for (const required of ["changes", "fmt_governance", "ratchets"]) {
-      expect(`component_results.${required}`, components[required], "success");
-    }
+    for (const lane of WORKSPACE_LANES) expect(`component_results.${lane}`, components[lane], "success");
     for (const [lane, result] of Object.entries(components)) {
-      if (result !== "success" && result !== "skipped") problems.push(`component_results.${lane} is ${JSON.stringify(result)}`);
+      if (!WORKSPACE_LANES.includes(lane) && result !== "success") {
+        problems.push(`component_results.${lane} is ${JSON.stringify(result)}, not "success"`);
+      }
     }
-  }
-  if (typeof attestation?.plan?.mode !== "string" || attestation.plan.mode === "") {
-    problems.push("plan.mode is missing");
-  } else if (attestation.plan.mode === RELEASE_PROJECTION_MODE) {
-    problems.push("its plan reused another run's test evidence (mode release-projection)");
   }
   if (attestation && Object.hasOwn(attestation, "reused_test_evidence")) {
     problems.push("it records reused_test_evidence");
@@ -121,10 +146,10 @@ export function attestationProblems(attestation, { repository, commit, tree, run
 }
 
 // The evidence argument the classification hands the planner:
-// `<base sha>:<run id>:<attempt | pending>`.
+// `<base sha>:<run id>:<attempt>`.
 export function parseEvidenceArgument(value) {
-  const match = /^([0-9a-f]{40}):([1-9][0-9]*):([1-9][0-9]*|pending)$/.exec(value ?? "");
-  if (!match) throw new EvidenceError(`release evidence ${JSON.stringify(value)} is not <commit>:<run id>:<attempt|pending>`);
+  const match = /^([0-9a-f]{40}):([1-9][0-9]*):([1-9][0-9]*)$/.exec(value ?? "");
+  if (!match) throw new EvidenceError(`release evidence ${JSON.stringify(value)} is not <commit>:<run id>:<attempt>`);
   return { commit: match[1], runId: match[2], runAttempt: match[3] };
 }
 
@@ -221,91 +246,86 @@ function verifyAttestation({ repository, baseSha, baseTree, runId, runAttempt })
   return artifact;
 }
 
-function find({ repository, base, head }) {
+const sleep = (seconds) => new Promise((done) => setTimeout(done, Math.max(1, seconds) * 1000));
+
+async function find({ repository, base, head, waitSeconds }) {
   const projection = releaseProjectionBase({ base, head });
-  const listing = ghJson(
-    `repos/${repository}/actions/workflows/ci.yml/runs?branch=main&event=push&head_sha=${projection.baseSha}&per_page=100`,
-  );
-  const runs = (listing?.workflow_runs ?? []).filter(
-    (run) =>
-      run.head_sha === projection.baseSha &&
-      run.head_branch === "main" &&
-      run.event === "push" &&
-      run.path === CI_WORKFLOW_PATH,
-  );
-  const rejected = [];
-  // Newest first: a later run of the same commit supersedes an older one.
-  for (const run of [...runs].sort((a, b) => b.id - a.id)) {
-    if (run.status === "completed" && run.conclusion === "success") {
+  const pollSeconds = Number.parseInt(process.env.MEERKAT_CI_EVIDENCE_POLL_SECONDS || "30", 10);
+  const deadline = Date.now() + waitSeconds * 1000;
+  for (;;) {
+    const listing = ghJson(
+      `repos/${repository}/actions/workflows/ci.yml/runs?branch=main&event=push&head_sha=${projection.baseSha}&per_page=100`,
+    );
+    // Newest first: a later run of the same commit supersedes an older one.
+    const runs = (listing?.workflow_runs ?? [])
+      .filter(
+        (run) =>
+          run.head_sha === projection.baseSha &&
+          run.head_branch === "main" &&
+          run.event === "push" &&
+          run.path === CI_WORKFLOW_PATH,
+      )
+      .sort((a, b) => b.id - a.id);
+    const rejected = [];
+    for (const run of runs) {
+      if (run.status !== "completed" || run.conclusion !== "success") continue;
       const problems = runProblems(run, projection.baseSha);
       if (problems.length > 0) {
         rejected.push(`run ${run.id}: ${problems.join("; ")}`);
         continue;
       }
       try {
-        verifyAttestation({
+        const artifact = verifyAttestation({
           repository,
           baseSha: projection.baseSha,
           baseTree: projection.baseTree,
           runId: run.id,
           runAttempt: run.run_attempt,
         });
+        return { ...projection, runId: String(run.id), runAttempt: String(run.run_attempt), url: run.html_url ?? "", artifact };
       } catch (error) {
+        if (!(error instanceof EvidenceError)) throw error;
         rejected.push(`run ${run.id}: ${error.message}`);
-        continue;
       }
-      return { ...projection, runId: run.id, runAttempt: String(run.run_attempt), url: run.html_url };
     }
-  }
-  const pending = [...runs].sort((a, b) => b.id - a.id).find((run) => PENDING_STATUSES.has(run.status));
-  if (pending) return { ...projection, runId: pending.id, runAttempt: "pending", url: pending.html_url };
-  const outcomes = runs.map((run) => `run ${run.id} attempt ${run.run_attempt}: ${run.status}/${run.conclusion ?? "none"}`);
-  throw new EvidenceError(
-    `no successful exact-main CI run of ${projection.baseSha} to reuse` +
-      `${outcomes.length > 0 ? ` (${outcomes.join(", ")})` : " (no run)"}` +
-      `${rejected.length > 0 ? `; rejected: ${rejected.join(" | ")}` : ""}`,
-  );
-}
-
-async function verify({ repository, base, head, runId, runAttempt, waitSeconds }) {
-  const projection = releaseProjectionBase({ base, head });
-  if (!/^[1-9][0-9]*$/.test(runId ?? "")) throw new EvidenceError(`--run-id ${JSON.stringify(runId)} is not a run id`);
-  if (runAttempt !== "" && !/^[1-9][0-9]*$/.test(runAttempt)) {
-    throw new EvidenceError(`--run-attempt ${JSON.stringify(runAttempt)} is not an attempt number`);
-  }
-  const pollSeconds = Number.parseInt(process.env.MEERKAT_CI_EVIDENCE_POLL_SECONDS || "30", 10);
-  const deadline = Date.now() + waitSeconds * 1000;
-  const path = runAttempt
-    ? `repos/${repository}/actions/runs/${runId}/attempts/${runAttempt}`
-    : `repos/${repository}/actions/runs/${runId}`;
-  let run = ghJson(path);
-  while (run?.status !== "completed" && Date.now() < deadline) {
-    process.stderr.write(`waiting for CI run ${runId} of ${projection.baseSha} (${run?.status ?? "unknown"})\n`);
-    await new Promise((done) => setTimeout(done, Math.max(1, pollSeconds) * 1000));
-    run = ghJson(path);
-  }
-  const problems = runProblems(run, projection.baseSha);
-  if (String(run?.id) !== String(runId)) problems.push(`run id is ${JSON.stringify(run?.id)}, not ${runId}`);
-  if (runAttempt && String(run?.run_attempt) !== runAttempt) {
-    problems.push(`attempt is ${JSON.stringify(run?.run_attempt)}, not ${runAttempt}`);
-  }
-  if (problems.length > 0) {
-    const rerun = run?.status === "completed" && run?.conclusion !== "success" && run?.head_sha === projection.baseSha
-      ? ` A cancelled (superseded) or failed run can be re-run with \`gh run rerun ${runId} --repo ${repository}\`; then re-run this job.`
-      : "";
+    const pending = runs.find((run) => PENDING_STATUSES.has(run.status));
+    if (pending && Date.now() < deadline) {
+      process.stderr.write(
+        `waiting for CI run ${pending.id} of ${projection.baseSha} (${pending.status}); reuse needs it completed\n`,
+      );
+      await sleep(pollSeconds);
+      continue;
+    }
+    const outcomes = runs.map((run) => `run ${run.id} attempt ${run.run_attempt}: ${run.status}/${run.conclusion ?? "none"}`);
     throw new EvidenceError(
-      `CI run ${runId} is not successful exact-main evidence for ${projection.baseSha}: ${problems.join("; ")}.${rerun}`,
+      `no completed, successful workspace-mode exact-main CI run of ${projection.baseSha} to reuse` +
+        `${outcomes.length > 0 ? ` (${outcomes.join(", ")})` : " (no run)"}` +
+        `${rejected.length > 0 ? `; rejected: ${rejected.join(" | ")}` : ""}`,
     );
   }
-  const attempt = String(run.run_attempt);
+}
+
+function verify({ repository, base, head, runId, runAttempt }) {
+  const projection = releaseProjectionBase({ base, head });
+  if (!/^[1-9][0-9]*$/.test(runId ?? "")) throw new EvidenceError(`--run-id ${JSON.stringify(runId)} is not a run id`);
+  if (!/^[1-9][0-9]*$/.test(runAttempt ?? "")) {
+    throw new EvidenceError(`--run-attempt ${JSON.stringify(runAttempt)} is not an attempt number`);
+  }
+  const run = ghJson(`repos/${repository}/actions/runs/${runId}/attempts/${runAttempt}`);
+  const problems = runProblems(run, projection.baseSha);
+  if (String(run?.id) !== String(runId)) problems.push(`run id is ${JSON.stringify(run?.id)}, not ${runId}`);
+  if (String(run?.run_attempt) !== runAttempt) problems.push(`attempt is ${JSON.stringify(run?.run_attempt)}, not ${runAttempt}`);
+  if (problems.length > 0) {
+    throw new EvidenceError(`CI run ${runId} attempt ${runAttempt} is not successful exact-main evidence for ${projection.baseSha}: ${problems.join("; ")}`);
+  }
   const artifact = verifyAttestation({
     repository,
     baseSha: projection.baseSha,
     baseTree: projection.baseTree,
     runId,
-    runAttempt: attempt,
+    runAttempt,
   });
-  return { ...projection, runId: String(runId), runAttempt: attempt, url: run.html_url ?? "", artifact };
+  return { ...projection, runId: String(runId), runAttempt, url: run.html_url ?? "", artifact };
 }
 
 function parseArgs(argv) {
@@ -335,7 +355,7 @@ function parseArgs(argv) {
     }
   }
   if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(args.repository)) throw new EvidenceError("--repository OWNER/REPO is required");
-  if (mode === "verify" && !args.runId) throw new EvidenceError("verify needs --run-id");
+  if (mode === "verify" && (!args.runId || !args.runAttempt)) throw new EvidenceError("verify needs --run-id and --run-attempt");
   return args;
 }
 
@@ -349,15 +369,15 @@ async function main(argv) {
   }
   try {
     if (args.mode === "find") {
-      const found = find(args);
+      const found = await find(args);
       process.stderr.write(
         `release projection ${found.fromVersion} -> ${found.toVersion}: reusing CI run ${found.runId} ` +
-          `(attempt ${found.runAttempt}) of ${found.baseSha} ${found.url ?? ""}\n`,
+          `(attempt ${found.runAttempt}) of ${found.baseSha} ${found.url}\n`,
       );
       process.stdout.write(`${found.baseSha}:${found.runId}:${found.runAttempt}\n`);
       return 0;
     }
-    const verified = await verify(args);
+    const verified = verify(args);
     process.stdout.write(
       `verified release-projection evidence: ${verified.fromVersion} -> ${verified.toVersion}, CI run ${verified.runId} ` +
         `attempt ${verified.runAttempt} of ${verified.baseSha} (tree ${verified.baseTree}) ${verified.url}\n`,

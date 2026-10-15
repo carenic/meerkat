@@ -311,20 +311,31 @@ jobs:
           echo "Verified exact-tree CI attestation for ${RELEASE_SHA} (${RELEASE_TREE})"
 
       # A release commit whose diff from its first parent is only the
-      # version projection (scripts/release-projection-only.mjs) gets a CI
-      # plan that reuses the parent's exact-main test evidence instead of
+      # forward patch projection (scripts/release-projection-only.mjs) gets a
+      # CI plan that reuses the parent's exact-main test evidence instead of
       # rebuilding the workspace cold; its schema-4 attestation says so
       # (plan mode release-projection, reused_test_evidence). Such an
-      # attestation is accepted only when the evidence holds now: the
-      # release commit is still a projection of its first parent, and the
-      # recorded run and attempt are a successful push run of ci.yml on main
-      # at exactly that parent, whose own attestation names the parent's
-      # commit and tree and is not itself a reuse.
+      # attestation is accepted only when the evidence holds now, judged by
+      # the PARENT's copies of the classifier and the evidence script (a
+      # commit cannot certify itself with edited scripts; for an honest
+      # projection they are byte-identical): the release commit is still a
+      # projection of its first parent, and the recorded attempt is a
+      # completed, successful push run of ci.yml on main at exactly that
+      # parent, whose own attestation names the parent's commit and tree,
+      # planned the whole workspace with every lane successful and is not
+      # itself a reuse.
       - name: Setup Node for reused CI evidence
         if: ${{ github.event_name != 'workflow_dispatch' }}
         uses: actions/setup-node@v6
         with:
           node-version: "22"
+
+      # The classifier runs the parent's docs and changelog stampers.
+      - name: Setup Python for reused CI evidence
+        if: ${{ github.event_name != 'workflow_dispatch' }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
 
       - name: Verify reused release-projection CI evidence
         if: ${{ github.event_name != 'workflow_dispatch' }}
@@ -360,7 +371,11 @@ jobs:
             echo "The reused CI evidence does not name ${RELEASE_SHA}'s first parent ${parent} (${parent_tree})." >&2
             exit 1
           }
-          node scripts/ci-release-evidence.mjs verify --repository "${GITHUB_REPOSITORY}" \
+          tools="${RUNNER_TEMP}/release-evidence-tools/scripts"
+          mkdir -p "${tools}"
+          git show "${parent}:scripts/ci-release-evidence.mjs" > "${tools}/ci-release-evidence.mjs"
+          git show "${parent}:scripts/release-projection-only.mjs" > "${tools}/release-projection-only.mjs"
+          node "${tools}/ci-release-evidence.mjs" verify --repository "${GITHUB_REPOSITORY}" \
             --base "${parent}" --head "${RELEASE_SHA}" \
             --run-id "$(jq -r .reused_test_evidence.workflow_run_id "${attestation}")" \
             --run-attempt "$(jq -r .reused_test_evidence.workflow_run_attempt "${attestation}")"

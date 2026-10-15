@@ -6,9 +6,12 @@
 // through a fake `gh`), and the CI gate's own shell (read from ci.yml).
 //
 // The real v0.9.1 bump (a954c519, whose first parent is 1a4d3419) must
-// classify as a projection and plan only the release checks; the same bump
-// plus one source edit must not, and the planner must refuse evidence for it.
-// Missing commits are fetched from origin (CI checks out depth 2).
+// classify as a projection and plan only the release checks and the readers
+// of its changed files; the same bump plus one source edit must not, and the
+// planner must refuse evidence for it. Only a completed, workspace-mode,
+// all-success parent run is evidence, and `CI-Plan: workspace` gives a
+// release's parent such a run. Missing commits are fetched from origin (CI
+// checks out depth 2).
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { chmodSync, existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
@@ -16,11 +19,13 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
+  WORKSPACE_LANES,
   attestationProblems,
   parseEvidenceArgument,
   runProblems,
 } from "./ci-release-evidence.mjs";
-import { classifyReleaseProjection, isVersionTokenSubstitution } from "./release-projection-only.mjs";
+import { loadNonRustReaders, readerPackagesFor } from "./ci-non-rust-readers.mjs";
+import { classifyReleaseProjection, isForwardPatchBump } from "./release-projection-only.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const root = resolve(here, "..");
@@ -64,7 +69,7 @@ const withScratch = { ...process.env, GIT_ALTERNATE_OBJECT_DIRECTORIES: join(sto
 
 // A commit whose tree is `fromTree` with `edits` (path -> new text) and whose
 // only parent is `parent`.
-function synthesize({ fromTree, parent, edits, message }) {
+function synthesize({ fromTree, parent, parents = [parent], edits, message }) {
   const index = join(scratch, `index-${Math.random().toString(16).slice(2)}`);
   const env = { ...process.env, GIT_INDEX_FILE: index };
   git(["read-tree", fromTree], { cwd: store, env });
@@ -73,7 +78,7 @@ function synthesize({ fromTree, parent, edits, message }) {
     git(["update-index", "--cacheinfo", `100644,${blob},${path}`], { cwd: store, env });
   }
   const tree = git(["write-tree"], { cwd: store, env });
-  return git(["commit-tree", tree, "-p", parent, "-m", message], { cwd: store });
+  return git(["commit-tree", tree, ...parents.flatMap((one) => ["-p", one]), "-m", message], { cwd: store });
 }
 
 function plan(args, env = withScratch) {
@@ -86,17 +91,12 @@ function plan(args, env = withScratch) {
 }
 
 try {
-  // --- The version-token alignment the stamped documents use. ---
-  assert.ok(isVersionTokenSubstitution("a 0.9.0 b", "a 0.9.1 b", "0.9.0", "0.9.1"));
-  assert.ok(isVersionTokenSubstitution("since 0.9.0; =0.9.0", "since 0.9.0; =0.9.1", "0.9.0", "0.9.1"), "a historical mention stays");
-  assert.ok(isVersionTokenSubstitution("in 0.9.1 =0.9.0", "in 0.9.1 =0.9.1", "0.9.0", "0.9.1"), "an upcoming mention stays");
-  assert.ok(isVersionTokenSubstitution("=0.9.1 x", "=0.9.10 x", "0.9.1", "0.9.10"), "one version may prefix the other");
-  assert.ok(!isVersionTokenSubstitution("a 0.9.0 b", "a 0.9.2 b", "0.9.0", "0.9.1"), "another version is not the projection");
-  assert.ok(!isVersionTokenSubstitution("v10.9.0", "v10.9.1", "0.9.0", "0.9.1"), "a longer number is not a token");
-  assert.ok(!isVersionTokenSubstitution("0.9.0.1", "0.9.1.1", "0.9.0", "0.9.1"), "a dotted continuation is not a token");
-  assert.ok(!isVersionTokenSubstitution("0.9.0-rc.1", "0.9.1-rc.1", "0.9.0", "0.9.1"), "a prerelease is another version");
-  assert.ok(!isVersionTokenSubstitution("a 0.9.0 b", "a 0.9.1 c", "0.9.0", "0.9.1"), "a prose edit is not the projection");
-  assert.ok(!isVersionTokenSubstitution("a 0.9.0", "a 0.9.1 ", "0.9.0", "0.9.1"), "a trailing byte is not the projection");
+  // --- Only a forward patch release is a projection. ---
+  assert.ok(isForwardPatchBump("0.9.0", "0.9.1"));
+  assert.ok(isForwardPatchBump("0.9.9", "0.9.10"));
+  for (const [from, to] of [["0.9.1", "0.10.0"], ["0.9.1", "1.0.0"], ["0.9.1", "0.9.3"], ["0.9.1", "0.9.0"], ["0.9.1", "0.9.2-rc.1"], ["0.9.1-rc.1", "0.9.2"], ["0.9.01", "0.9.2"]]) {
+    assert.ok(!isForwardPatchBump(from, to), `${from} -> ${to} is not a forward patch release`);
+  }
 
   // --- The real v0.9.1 bump against a bump plus one source edit. ---
   const real = classifyReleaseProjection({ base: BUMP_PARENT, head: BUMP, cwd: root });
@@ -135,11 +135,22 @@ try {
   assert.equal(projectionPlan.rust_changed, false);
   for (const field of [
     "packages", "closure", "shards", "unit_shards", "unit_feature_shards", "main_unit_shards",
-    "main_feature_unit_shards", "main_archive_builds", "main_archive_runs", "integration_suites",
-    "feature_check_jobs", "test_scope", "closure_test_rows", "reader_packages",
+    "main_feature_unit_shards", "main_archive_builds", "main_archive_runs", "feature_check_jobs",
   ]) {
     assert.deepEqual(projectionPlan[field], [], `a release projection plans no ${field}`);
   }
+  // The readers of the changed files still run, exactly as any plan runs
+  // them: their hook-parity rows and the integration suites the paths select.
+  const changedPaths = git(["diff", "--name-only", "--no-renames", BUMP_PARENT, BUMP]).split("\n");
+  const readers = readerPackagesFor(changedPaths, loadNonRustReaders());
+  assert.ok(readers.includes("xtask"), "the CHANGELOG's retired-token reader (xtask) is in scope");
+  assert.deepEqual(projectionPlan.reader_packages, readers, "the projection keeps every reader of its changed files");
+  assert.deepEqual(projectionPlan.test_scope, readers, "the test scope is the readers alone");
+  assert.ok(projectionPlan.closure_test_rows.length > 0, "the readers' hook-parity rows are planned");
+  const rowBinaries = projectionPlan.closure_test_rows.flatMap((row) => row.binaries);
+  assert.ok(rowBinaries.includes("xtask::buildbuddy_static_lanes"), "the retired-surface-tokens test that reads CHANGELOG.md runs");
+  assert.deepEqual(projectionPlan.integration_suites.map((suite) => suite.name), ["xtask"], "the sdks/ paths select the xtask suite");
+  assert.deepEqual(projectionPlan.hook_coverage.missing, [], "the readers' hook binaries are all covered");
   assert.deepEqual(
     Object.fromEntries(["generated_contract", "bazel_graph", "machine_authority", "machine_posters", "wasm", "sdk_host", "examples_browser", "example_web"].map((key) => [key, projectionPlan[key]])),
     { generated_contract: true, bazel_graph: true, machine_authority: false, machine_posters: false, wasm: false, sdk_host: false, examples_browser: false, example_web: false },
@@ -157,7 +168,7 @@ try {
       attestation_artifact: `meerkat-ci-attestation-${BUMP_PARENT}-1`,
     },
   });
-  const github = spawnSync("node", [planner, "--format", "github", "--base", BUMP_PARENT, "--head", BUMP, "--reuse-release-evidence", `${BUMP_PARENT}:${RUN_ID}:pending`], {
+  const github = spawnSync("node", [planner, "--format", "github", "--base", BUMP_PARENT, "--head", BUMP, "--reuse-release-evidence", `${BUMP_PARENT}:${RUN_ID}:2`], {
     cwd: root,
     encoding: "utf8",
   });
@@ -168,9 +179,9 @@ try {
     "release_projection=true",
     `release_evidence_commit=${BUMP_PARENT}`,
     `release_evidence_run_id=${RUN_ID}`,
-    "release_evidence_run_attempt=pending",
-    "closure_test_count=0",
-    "integration_count=0",
+    "release_evidence_run_attempt=2",
+    `closure_test_count=${projectionPlan.closure_test_rows.length}`,
+    "integration_count=1",
     "generated_contract=true",
     "bazel_graph=true",
     "example_web=false",
@@ -190,7 +201,8 @@ try {
     ["evidence for another commit", ["--base", BUMP_PARENT, "--head", BUMP, "--reuse-release-evidence", `${BUMP}:${RUN_ID}:1`], /release evidence names/],
     ["a base that is not the first parent", ["--base", git(["rev-parse", `${BUMP}^{commit}`]), "--head", BUMP, "--reuse-release-evidence", `${BUMP}:${RUN_ID}:1`], /is not the first parent/],
     ["an explicit path list", ["--reuse-release-evidence", evidence, "--", "Cargo.toml"], /needs a --base\/--head diff/],
-    ["malformed evidence", ["--base", BUMP_PARENT, "--head", BUMP, "--reuse-release-evidence", `${BUMP_PARENT}:latest:1`], /is not <commit>:<run id>:<attempt\|pending>/],
+    ["malformed evidence", ["--base", BUMP_PARENT, "--head", BUMP, "--reuse-release-evidence", `${BUMP_PARENT}:latest:1`], /is not <commit>:<run id>:<attempt>/],
+    ["evidence of a run still in progress", ["--base", BUMP_PARENT, "--head", BUMP, "--reuse-release-evidence", `${BUMP_PARENT}:${RUN_ID}:pending`], /is not <commit>:<run id>:<attempt>/],
   ];
   for (const [label, args, pattern] of refused) {
     const result = plan(args);
@@ -202,6 +214,42 @@ try {
   const editedPlan = JSON.parse(editedFull.stdout);
   assert.equal(editedPlan.mode, "workspace", "the bump plus one source edit gets the full plan");
   assert.ok(editedPlan.changed_paths.includes(sourcePath));
+
+  // --- CI-Plan: workspace gives a release's parent workspace-mode evidence. ---
+  const docsPath = "docs/guides/cd-and-distribution.md";
+  const docsOnly = (message) => synthesize({
+    fromTree: `${BUMP_PARENT}^{tree}`,
+    parent: BUMP_PARENT,
+    edits: { [docsPath]: `${git(["show", `${BUMP_PARENT}:${docsPath}`])}\nA docs-only edit.\n` },
+    message,
+  });
+  const planOf = (head, extra = []) => {
+    const result = plan(["--base", BUMP_PARENT, "--head", head, ...extra]);
+    assert.equal(result.status, 0, result.stderr);
+    return JSON.parse(result.stdout);
+  };
+  assert.equal(planOf(docsOnly("docs: an ordinary edit")).mode, "none", "a docs-only commit plans no Rust lanes");
+  const requested = planOf(docsOnly("docs: release preparation\n\nCI-Plan: workspace\n"));
+  assert.equal(requested.mode, "workspace", "CI-Plan: workspace plans the whole workspace");
+  assert.match(requested.reason, /requests a workspace plan \(CI-Plan: workspace\)/);
+  assert.equal(planOf(docsOnly("docs: mention CI-Plan: workspace in prose")).mode, "none", "the trailer counts only on its own line");
+  const branchHead = docsOnly("release: last commit of the release branch\n\nCI-Plan: workspace\n");
+  const releaseMerge = synthesize({
+    fromTree: `${branchHead}^{tree}`,
+    parents: [BUMP_PARENT, branchHead],
+    edits: {},
+    message: "Merge pull request #1 from example/rel/0.9.1",
+  });
+  assert.equal(planOf(releaseMerge).mode, "workspace", "a merge of a branch whose head carries the trailer is planned as the workspace");
+  const requestedBump = synthesize({
+    fromTree: `${BUMP}^{tree}`,
+    parent: BUMP_PARENT,
+    edits: {},
+    message: "chore: release v0.9.1\n\nCI-Plan: workspace\n",
+  });
+  const noReuse = planOf(requestedBump, ["--reuse-release-evidence", evidence]);
+  assert.equal(noReuse.mode, "workspace", "an explicit workspace request outranks reuse");
+  assert.equal(noReuse.release_projection, null);
 
   // --- Evidence records. ---
   const goodAttestation = {
@@ -217,7 +265,7 @@ try {
     validation_backend: "github-hosted-cargo",
     validation_result: "success",
     plan: { mode: "workspace", package_count: 53 },
-    component_results: { changes: "success", fmt_governance: "success", ratchets: "success", clippy: "success", sdk_host: "skipped" },
+    component_results: Object.fromEntries(WORKSPACE_LANES.map((lane) => [lane, "success"])),
   };
   const expected = { repository: REPOSITORY, commit: BUMP_PARENT, tree: BUMP_PARENT_TREE, runId: RUN_ID, runAttempt: 1 };
   assert.deepEqual(attestationProblems(goodAttestation, expected), []);
@@ -230,6 +278,18 @@ try {
     ["schema 3", { schema_version: 3 }],
     ["a failed lane", { component_results: { ...goodAttestation.component_results, clippy: "failure" } }],
     ["chained reuse", { plan: { mode: "release-projection" } }],
+    // A docs-only main push after a Rust change whose own run was cancelled:
+    // its plan tested only its own diff, so the earlier change is untested.
+    ["a mode-none run with every Rust lane skipped", {
+      plan: { mode: "none" },
+      component_results: {
+        ...goodAttestation.component_results,
+        ...Object.fromEntries(["clippy", "unit", "integration", "governed_jsonl", "mcp_confinement_positive", "main_unit", "closure_check", "wasm_check", "sdk_host"].map((lane) => [lane, "skipped"])),
+      },
+    }],
+    ["a packages-mode run", { plan: { mode: "packages" } }],
+    ["a workspace run with one lane skipped", { component_results: { ...goodAttestation.component_results, sdk_host: "skipped" } }],
+    ["a workspace run without a lane", { component_results: Object.fromEntries(WORKSPACE_LANES.filter((lane) => lane !== "closure_tests").map((lane) => [lane, "success"])) }],
     ["recorded reuse", { reused_test_evidence: { workflow_run_id: "1" } }],
   ]) {
     assert.ok(attestationProblems({ ...goodAttestation, ...change }, expected).length > 0, `an attestation from ${label} is not evidence`);
@@ -257,7 +317,8 @@ try {
   ]) {
     assert.ok(runProblems({ ...goodRun, ...change }, BUMP_PARENT).length > 0, `${label} is not evidence`);
   }
-  assert.deepEqual(parseEvidenceArgument(`${BUMP_PARENT}:12:pending`), { commit: BUMP_PARENT, runId: "12", runAttempt: "pending" });
+  assert.deepEqual(parseEvidenceArgument(`${BUMP_PARENT}:12:3`), { commit: BUMP_PARENT, runId: "12", runAttempt: "3" });
+  assert.throws(() => parseEvidenceArgument(`${BUMP_PARENT}:12:pending`), /is not <commit>/);
   assert.throws(() => parseEvidenceArgument(`${BUMP_PARENT}:12`), /is not <commit>/);
 
   // --- The finder and verifier through a fake gh. ---
@@ -313,9 +374,16 @@ if (args[0] === "api") {
   assert.equal(result.status, 0, `find accepts a verified successful parent run: ${result.stderr}`);
   assert.equal(result.stdout.trim(), `${BUMP_PARENT}:${RUN_ID}:1`);
 
-  result = evidenceRun("find", bumpArgs, { ...okFixture, api: { [listPath]: { workflow_runs: [{ ...goodRun, status: "in_progress", conclusion: null }] } } });
-  assert.equal(result.status, 0, `find hands a running parent run to the gate: ${result.stderr}`);
-  assert.equal(result.stdout.trim(), `${BUMP_PARENT}:${RUN_ID}:pending`);
+  const running = { ...goodRun, status: "in_progress", conclusion: null };
+  result = evidenceRun("find", bumpArgs, { ...okFixture, api: { [listPath]: { workflow_runs: [running] } } });
+  assert.equal(result.status, 1, "a running parent run is not evidence");
+  assert.equal(result.stdout, "", "a running parent run prints no evidence");
+  result = evidenceRun("find", [...bumpArgs, "--wait-seconds", "30"], { ...okFixture, api: { [listPath]: [{ workflow_runs: [running] }, { workflow_runs: [goodRun] }] } });
+  assert.equal(result.status, 0, `find waits for the parent run to complete: ${result.stderr}`);
+  assert.equal(result.stdout.trim(), `${BUMP_PARENT}:${RUN_ID}:1`);
+  assert.match(result.stderr, /waiting for CI run/);
+  result = evidenceRun("find", [...bumpArgs, "--wait-seconds", "30"], { ...okFixture, api: { [listPath]: [{ workflow_runs: [running] }, { workflow_runs: [{ ...goodRun, conclusion: "cancelled" }] }] } });
+  assert.equal(result.status, 1, "a parent run that ends cancelled leaves the ordinary plan");
 
   for (const [label, fixture] of [
     ["no run", { api: { [listPath]: { workflow_runs: [] } }, artifacts: {} }],
@@ -323,6 +391,7 @@ if (args[0] === "api") {
     ["a cancelled run", { ...okFixture, api: { [listPath]: { workflow_runs: [{ ...goodRun, conclusion: "cancelled" }] } } }],
     ["a missing attestation", { ...okFixture, artifacts: {} }],
     ["a reused attestation", { ...okFixture, artifacts: { [artifactKey]: { ...goodAttestation, plan: { mode: "release-projection" } } } }],
+    ["a mode-none attestation", { ...okFixture, artifacts: { [artifactKey]: { ...goodAttestation, plan: { mode: "none" } } } }],
     ["an attestation of another tree", { ...okFixture, artifacts: { [artifactKey]: { ...goodAttestation, tree_sha: "1".repeat(40) } } }],
     ["a lookup failure", { api: {}, artifacts: {} }],
   ]) {
@@ -336,34 +405,35 @@ if (args[0] === "api") {
   assert.match(result.stderr, /is not a release projection/);
   assert.ok(!existsSync(join(scratch, "gh-calls.log")), "a non-projection never reaches the API");
 
-  // verify waits for a running parent run, then checks it and its attestation.
+  // verify checks the named attempt and its attestation.
+  const attemptPath = `${runPath}/attempts/1`;
   const outputFile = join(scratch, "github-output");
   writeFileSync(outputFile, "");
-  result = evidenceRun("verify", [...bumpArgs, "--run-id", String(RUN_ID), "--wait-seconds", "30", "--github-output", outputFile], {
+  result = evidenceRun("verify", [...bumpArgs, "--run-id", String(RUN_ID), "--run-attempt", "1", "--github-output", outputFile], {
     ...okFixture,
-    api: { [runPath]: [{ ...goodRun, status: "in_progress", conclusion: null }, goodRun] },
+    api: { [attemptPath]: goodRun },
   });
-  assert.equal(result.status, 0, `verify accepts the parent run once it succeeds: ${result.stderr}`);
-  assert.match(result.stderr, /waiting for CI run/);
+  assert.equal(result.status, 0, `verify accepts the completed parent attempt: ${result.stderr}`);
   const outputs = Object.fromEntries(readFileSync(outputFile, "utf8").trim().split("\n").map((line) => line.split(/=(.*)/s).slice(0, 2)));
   assert.deepEqual(
     { run_id: outputs.run_id, run_attempt: outputs.run_attempt, commit: outputs.commit, tree: outputs.tree, attestation_artifact: outputs.attestation_artifact, from_version: outputs.from_version, to_version: outputs.to_version },
     { run_id: String(RUN_ID), run_attempt: "1", commit: BUMP_PARENT, tree: BUMP_PARENT_TREE, attestation_artifact: `meerkat-ci-attestation-${BUMP_PARENT}-1`, from_version: "0.9.0", to_version: "0.9.1" },
   );
-  const attemptPath = `${runPath}/attempts/1`;
-  result = evidenceRun("verify", [...bumpArgs, "--run-id", String(RUN_ID), "--run-attempt", "1"], { ...okFixture, api: { [attemptPath]: goodRun } });
-  assert.equal(result.status, 0, `verify accepts a named successful attempt: ${result.stderr}`);
+  const attemptArgs = ["--run-id", String(RUN_ID), "--run-attempt", "1"];
   for (const [label, args, fixture] of [
-    ["a run that ends cancelled", ["--run-id", String(RUN_ID), "--wait-seconds", "30"], { ...okFixture, api: { [runPath]: [{ ...goodRun, status: "in_progress", conclusion: null }, { ...goodRun, conclusion: "cancelled" }] } }],
-    ["a run still running at the deadline", ["--run-id", String(RUN_ID), "--wait-seconds", "0"], { ...okFixture, api: { [runPath]: { ...goodRun, status: "in_progress", conclusion: null } } }],
-    ["another commit's run", ["--run-id", String(RUN_ID)], { ...okFixture, api: { [runPath]: { ...goodRun, head_sha: BUMP } } }],
-    ["a named attempt that failed", ["--run-id", String(RUN_ID), "--run-attempt", "1"], { ...okFixture, api: { [attemptPath]: { ...goodRun, conclusion: "failure" } } }],
-    ["an attestation of another tree", ["--run-id", String(RUN_ID)], { ...okFixture, artifacts: { [artifactKey]: { ...goodAttestation, tree_sha: "1".repeat(40) } } }],
+    ["a cancelled attempt", attemptArgs, { ...okFixture, api: { [attemptPath]: { ...goodRun, conclusion: "cancelled" } } }],
+    ["an attempt still running", attemptArgs, { ...okFixture, api: { [attemptPath]: running } }],
+    ["another commit's run", attemptArgs, { ...okFixture, api: { [attemptPath]: { ...goodRun, head_sha: BUMP } } }],
+    ["a named attempt that failed", attemptArgs, { ...okFixture, api: { [attemptPath]: { ...goodRun, conclusion: "failure" } } }],
+    ["another attempt's record", attemptArgs, { ...okFixture, api: { [attemptPath]: { ...goodRun, run_attempt: 2 } } }],
+    ["an attestation of another tree", attemptArgs, { ...okFixture, api: { [attemptPath]: goodRun }, artifacts: { [artifactKey]: { ...goodAttestation, tree_sha: "1".repeat(40) } } }],
+    ["a mode-none attestation", attemptArgs, { ...okFixture, api: { [attemptPath]: goodRun }, artifacts: { [artifactKey]: { ...goodAttestation, plan: { mode: "none" } } } }],
+    ["no attempt", ["--run-id", String(RUN_ID)], { ...okFixture, api: { [attemptPath]: goodRun } }],
   ]) {
     result = evidenceRun("verify", [...bumpArgs, ...args], fixture);
-    assert.equal(result.status, 1, `verify: ${label} fails closed (stderr ${result.stderr})`);
+    assert.notEqual(result.status, 0, `verify: ${label} fails closed (stderr ${result.stderr})`);
   }
-  result = evidenceRun("verify", ["--base", BUMP_PARENT, "--head", sourceEdit, "--run-id", String(RUN_ID)], okFixture);
+  result = evidenceRun("verify", ["--base", BUMP_PARENT, "--head", sourceEdit, ...attemptArgs], { ...okFixture, api: { [attemptPath]: goodRun } });
   assert.equal(result.status, 1, "verify refuses the bump plus one source edit");
 
   // --- The CI gate's own shell, read from ci.yml. ---
@@ -383,16 +453,23 @@ if (args[0] === "api") {
     MODE: "release-projection", REASON: "release projection", SHARD_COUNT: "0", UNIT_SHARD_COUNT: "0",
     UNIT_DEFERRED: "", UNIT_DEFERRED_COUNT: "0", PACKAGE_COUNT: "0", CLOSURE_COUNT: "0",
     GENERATED_CONTRACT: "true", RELEASE_PROJECTION: "true",
-    RELEASE_EVIDENCE_COMMIT: BUMP_PARENT, RELEASE_EVIDENCE_RUN_ID: String(RUN_ID),
+    RELEASE_EVIDENCE_COMMIT: BUMP_PARENT, RELEASE_EVIDENCE_RUN_ID: String(RUN_ID), RELEASE_EVIDENCE_RUN_ATTEMPT: "1",
   };
   const gate = (change) => spawnSync("bash", ["-c", gateCheck], { env: { ...process.env, ...gateEnv, ...change }, encoding: "utf8" });
   assert.equal(gate({}).status, 0, `the gate accepts a release-projection main push: ${gate({}).stdout}`);
   assert.equal(gate({ IS_MAIN_PUSH: "false" }).status, 0, "and a release-projection pull request");
+  assert.equal(
+    gate({ CLOSURE_TEST_COUNT: "13", CLOSURE_TESTS_RESULT: "success", INTEGRATION_COUNT: "1", INTEGRATION_RESULT: "success" }).status,
+    0,
+    "a release projection whose reader rows ran",
+  );
   for (const [label, change] of [
     ["a failed ratchet", { RATCHETS_RESULT: "failure" }],
     ["a failed Bazel graph check", { BAZEL_GRAPH_RESULT: "failure" }],
     ["a projection plan with Rust lanes", { RUST_CHANGED: "true" }],
-    ["a projection plan with closure-test rows", { CLOSURE_TEST_COUNT: "2" }],
+    ["a projection plan whose reader rows did not run", { CLOSURE_TEST_COUNT: "2" }],
+    ["a projection plan whose integration suite failed", { INTEGRATION_COUNT: "1", INTEGRATION_RESULT: "failure" }],
+    ["a projection plan without a completed attempt", { RELEASE_EVIDENCE_RUN_ATTEMPT: "pending" }],
     ["a projection plan without the ratchets", { GENERATED_CONTRACT: "false" }],
     ["a projection plan without evidence", { RELEASE_EVIDENCE_RUN_ID: "" }],
     ["the projection mode without its flag", { RELEASE_PROJECTION: "false" }],
@@ -402,14 +479,21 @@ if (args[0] === "api") {
   }
   // The gate verifies the evidence after the lanes and records it.
   const verifyStep = extractStepRun(workflow, "Verify reused release-projection evidence");
-  assert.match(verifyStep, /node scripts\/ci-release-evidence\.mjs verify /);
-  assert.match(verifyStep, /--head HEAD --run-id "\$\{RELEASE_EVIDENCE_RUN_ID\}"/);
+  assert.match(verifyStep, /git show "\$\{parent\}:scripts\/ci-release-evidence\.mjs"/, "the gate runs the parent's evidence script");
+  assert.match(verifyStep, /git show "\$\{parent\}:scripts\/release-projection-only\.mjs"/, "and the parent's classifier");
+  assert.match(verifyStep, /node "\$\{tools\}\/ci-release-evidence\.mjs" verify /);
+  assert.match(verifyStep, /--run-attempt "\$\{RELEASE_EVIDENCE_RUN_ATTEMPT\}"/);
+  assert.doesNotMatch(verifyStep, /--wait-seconds/, "the gate never waits: the plan reused a completed run");
   const attestationStep = extractStepRun(workflow, "Build exact-tree CI attestation");
   assert.match(attestationStep, /reused_test_evidence: \$reused/);
-  assert.match(workflow, /node scripts\/ci-release-evidence\.mjs find \\\n\s+--repository "\$\{GITHUB_REPOSITORY\}" --base "\$\{classification_base\}" --head HEAD/);
+  assert.match(workflow, /git show "\$\{classification_base\}:scripts\/ci-release-evidence\.mjs"/, "the classification runs the parent's finder");
+  assert.match(workflow, /node "\$\{evidence_tools\}\/ci-release-evidence\.mjs" find --repository "\$\{GITHUB_REPOSITORY\}"/);
+  assert.match(workflow, /EVIDENCE_WAIT_SECONDS: \$\{\{ github\.event_name == 'push' && '2400' \|\| '0' \}\}/, "only a push waits for its parent's run");
   const release = readFileSync(resolve(root, ".github/workflows/release.yml"), "utf8");
   assert.match(release, /\.reused_test_evidence\.base_commit_sha == \$parent/, "require_ci_green binds the evidence to the release commit's first parent");
-  assert.match(release, /node scripts\/ci-release-evidence\.mjs verify --repository "\$\{GITHUB_REPOSITORY\}"/, "require_ci_green re-verifies the reused run");
+  assert.match(release, /git show "\$\{parent\}:scripts\/ci-release-evidence\.mjs"/, "require_ci_green runs the parent's evidence script");
+  assert.match(release, /git show "\$\{parent\}:scripts\/release-projection-only\.mjs"/, "and the parent's classifier");
+  assert.match(release, /node "\$\{tools\}\/ci-release-evidence\.mjs" verify --repository "\$\{GITHUB_REPOSITORY\}"/, "require_ci_green re-verifies the reused run");
 } finally {
   rmSync(scratch, { recursive: true, force: true });
 }

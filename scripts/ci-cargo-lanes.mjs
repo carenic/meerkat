@@ -20,7 +20,7 @@
 //   ci-cargo-lanes.mjs [--base <rev> --head <rev>] [--max-shards N]
 //                      [--workspace-shards N] [--closure-test-rows N]
 //                      [--lib-row-runner LABEL]
-//                      [--reuse-release-evidence <commit>:<run id>:<attempt|pending>]
+//                      [--reuse-release-evidence <commit>:<run id>:<attempt>]
 //                      [--format json|github] [--] [changed-path ...]
 //   ci-cargo-lanes.mjs --paths-from-stdin [...]
 //
@@ -104,26 +104,35 @@
 // Release projections. A cargo-release version bump changes every crate's
 // version, so the whole workspace is planned and every compile misses the
 // cache: v0.9.1's main run took about 60 minutes plus a re-run. When the
-// commit's diff from its first parent is only the projection
+// commit's diff from its first parent is only the forward patch projection
 // scripts/release-hook.sh writes (scripts/release-projection-only.mjs, the
-// pre-push hook's own fail-closed classifier) and the parent has successful
-// exact-main CI evidence (scripts/ci-release-evidence.mjs finds it; the
-// change classification passes it as --reuse-release-evidence), the plan is
-// mode "release-projection": no Cargo test, Clippy, check, wasm, SDK-suite or
-// example lane, because the parent's run executed them on the same test
-// inputs. What a projection can break still runs: format + governance
-// (version parity, Cargo.lock and example lock consistency, MODULE.bazel.lock
-// recorded inputs, release packaging and configuration, docs-check, the
-// semver self-test, these classifier self-tests), the generation ratchets
-// forced on (schema, SDK codegen and wrapper freshness: the schema emitter
-// compiles meerkat-contracts at the new version) and the Bazel graph check
-// (BUILD files and the module lock changed). No workspace compile check is
-// planned: the bump changes no Rust source and no dependency selection,
-// only version strings (CARGO_PKG_VERSION, ContractVersion::CURRENT), which
-// version parity proves agree. The CI gate re-verifies the evidence before
-// it passes and records it in the exact-tree attestation, and the release
-// workflow's require_ci_green verifies it again. Without evidence, or for
-// any other diff, the plan is the ordinary one.
+// pre-push hook's own fail-closed classifier) and the parent has a completed,
+// successful, workspace-mode exact-main CI run (scripts/ci-release-evidence.mjs
+// finds it from the parent's own copy; the change classification passes it as
+// --reuse-release-evidence), the plan is mode "release-projection": no
+// Clippy, unit, check, feature, wasm, SDK-suite or example lane, because the
+// parent's run executed them over the whole workspace. What a projection can
+// break still runs: format + governance (version parity, Cargo.lock and
+// example lock consistency, MODULE.bazel.lock recorded inputs, release
+// packaging and configuration, docs-check, the semver self-test, these
+// classifier self-tests), the generation ratchets forced on (schema, SDK
+// codegen and wrapper freshness: the schema emitter compiles meerkat-contracts
+// at the new version), the Bazel graph check (BUILD files and the module lock
+// changed), and the readers of the changed files: the hook-parity rows of
+// every package scripts/ci-non-rust-readers.json names for them and the
+// integration suites their paths select, exactly as an ordinary plan would
+// run them. No workspace compile check is planned: the bump changes no Rust
+// source and no dependency selection, only version strings
+// (CARGO_PKG_VERSION, ContractVersion::CURRENT), which version parity proves
+// agree. The CI gate re-verifies the evidence before it passes and records it
+// in the exact-tree attestation, and the release workflow's require_ci_green
+// verifies it again. Without evidence, or for any other diff, the plan is the
+// ordinary one.
+//
+// A commit whose message (or whose merged branch head's message) carries the
+// trailer `CI-Plan: workspace` is planned as the whole workspace, whatever it
+// changed: the explicit way to give a release's parent the workspace-mode
+// evidence a release projection reuses. It only ever adds lanes.
 
 import { execFileSync, spawnSync } from "node:child_process";
 import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
@@ -632,7 +641,7 @@ function parseArgs(argv) {
       break;
     } else if (arg === "--help" || arg === "-h") {
       process.stdout.write(
-        "usage: ci-cargo-lanes.mjs [--base <rev> --head <rev>] [--max-shards N] [--workspace-shards N] [--closure-test-rows N] [--lib-row-runner LABEL] [--reuse-release-evidence <commit>:<run id>:<attempt|pending>] [--format json|github] [--paths-from-stdin] [--changed-paths-only] [--] [changed-path ...]\n",
+        "usage: ci-cargo-lanes.mjs [--base <rev> --head <rev>] [--max-shards N] [--workspace-shards N] [--closure-test-rows N] [--lib-row-runner LABEL] [--reuse-release-evidence <commit>:<run id>:<attempt>] [--format json|github] [--paths-from-stdin] [--changed-paths-only] [--] [changed-path ...]\n",
       );
       process.exit(0);
     } else if (arg.startsWith("-")) {
@@ -1152,6 +1161,10 @@ function plan(args) {
   let workspaceReason = "";
   const seeds = new Set();
 
+  const requestedBy = !args.explicitPaths && args.base && changed !== null ? workspacePlanRequested(args.head) : null;
+  if (requestedBy) {
+    workspaceReason = `commit ${requestedBy} requests a workspace plan (CI-Plan: workspace)`;
+  }
   if (releaseProjection) {
     // Every changed path is a version projection (checked above): nothing
     // selects a package, and nothing is global.
@@ -1470,8 +1483,9 @@ function plan(args) {
       if (!known) throw new Error(`integration suite ${suite.package} names unknown test target ${test}`);
     }
   }
-  // A release projection reuses the parent's integration results too.
-  const changedPaths = releaseProjection ? [] : changed ?? [];
+  // A release projection keeps the suites its changed paths select (their
+  // tests read those files); the trigger-selected ones need a Rust change.
+  const changedPaths = changed ?? [];
   result.integration_suites = INTEGRATION_SUITES.filter(
     (suite) =>
       (result.rust_changed && suite.triggers.some((name) => result.packages.includes(name))) ||
@@ -1490,9 +1504,9 @@ function plan(args) {
   // them against the hook's own selection; a gap fails the plan.
   const nextestText = readFileSync(resolve(root, ".config/nextest.toml"), "utf8");
   const hookText = readFileSync(resolve(root, HOOK_SCRIPT), "utf8");
-  // The readers of a projection's changed files ran on the parent's tree;
-  // the version strings they could see are proven by version parity.
-  result.reader_packages = changed === null || releaseProjection ? [] : readerPackagesFor(changed, loadNonRustReaders());
+  // A release projection keeps the readers of its changed files, as any
+  // plan does: their tests ran on the parent's bytes, not these.
+  result.reader_packages = changed === null ? [] : readerPackagesFor(changed, loadNonRustReaders());
   for (const name of result.reader_packages) {
     if (!byName.has(name)) throw new Error(`the non-Rust reader inventory names unknown package ${name}`);
   }
@@ -1531,6 +1545,21 @@ function plan(args) {
   return result;
 }
 
+// `CI-Plan: workspace` in the head commit's message or in the message of a
+// merged branch head (a parent after the first), as git trailers are
+// written: alone on its line.
+export const WORKSPACE_PLAN_TRAILER = /^CI-Plan:[ \t]*workspace[ \t]*$/im;
+function workspacePlanRequested(head) {
+  const parents = spawnSync("git", ["rev-list", "--parents", "-n", "1", head], { cwd: root, encoding: "utf8" });
+  if (parents.status !== 0) return null;
+  const [commit, , ...merged] = parents.stdout.trim().split(/\s+/);
+  for (const revision of [commit, ...merged]) {
+    const message = spawnSync("git", ["log", "-1", "--format=%B", revision], { cwd: root, encoding: "utf8" });
+    if (message.status === 0 && WORKSPACE_PLAN_TRAILER.test(message.stdout)) return revision;
+  }
+  return null;
+}
+
 // The release-projection plan's evidence (see the header): only with
 // --reuse-release-evidence, only for a --base/--head diff whose head's first
 // parent is the base and whose diff is a release projection, and only for
@@ -1543,6 +1572,8 @@ function releaseProjectionPlan(args, changed, pathReason) {
   }
   if (changed === null) throw new Error(`--reuse-release-evidence needs the diff, but ${pathReason}`);
   const evidence = parseEvidenceArgument(args.releaseEvidence);
+  // An explicit workspace request outranks reuse.
+  if (workspacePlanRequested(args.head)) return null;
   const projection = releaseProjectionBase({ base: args.base, head: args.head, cwd: root });
   if (projection.baseSha !== evidence.commit) {
     throw new Error(`release evidence names ${evidence.commit}, but the diff base is ${projection.baseSha}`);
@@ -1556,9 +1587,7 @@ function releaseProjectionPlan(args, changed, pathReason) {
     evidence: {
       workflow_run_id: evidence.runId,
       workflow_run_attempt: evidence.runAttempt,
-      attestation_artifact: evidence.runAttempt === "pending"
-        ? null
-        : attestationArtifactName(projection.baseSha, evidence.runAttempt),
+      attestation_artifact: attestationArtifactName(projection.baseSha, evidence.runAttempt),
     },
   };
 }
