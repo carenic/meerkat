@@ -3461,6 +3461,7 @@ pub(crate) fn confinement_layers<'a>(
 
 /// Refuse a composition in which a less trusted document weakens or
 /// replaces a confinement requirement ([`crate::check_confinement_layers`]).
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn check_composed_confinement(
     docs: &std::collections::BTreeMap<crate::connection::RealmId, Config>,
     chain: &crate::connection::RealmChain,

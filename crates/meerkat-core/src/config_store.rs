@@ -192,9 +192,7 @@ impl EffectiveConfigReader {
             raw_docs,
             warnings,
         } = self.chain_docs(head).await?;
-        Ok(compose_reporting_chain_warnings(
-            &docs, &raw_docs, head, warnings,
-        )?)
+        compose_reporting_chain_warnings(&docs, &raw_docs, head, warnings)
     }
 
     /// The realm whose OWN document defines the MCP server `name` in
@@ -322,9 +320,7 @@ impl EffectiveConfigReader {
             raw_docs,
             warnings,
         } = self.chain_docs_over_head(head, head_config).await?;
-        Ok(compose_reporting_chain_warnings(
-            &docs, &raw_docs, head, warnings,
-        )?)
+        compose_reporting_chain_warnings(&docs, &raw_docs, head, warnings)
     }
 
     /// [`Self::mcp_server_owner`] with the HEAD realm's own document
@@ -1120,8 +1116,10 @@ mod tests {
                 .await
                 .map(|_| ()),
         );
-        let mut added = Config::default();
-        added.confinement = workspace_confinement();
+        let added = Config {
+            confinement: workspace_confinement(),
+            ..Config::default()
+        };
         refused(store.set(added).await);
 
         let stated = "[confinement.all]\nmode = \"workspace\"\n";

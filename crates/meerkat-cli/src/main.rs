@@ -46,7 +46,6 @@ use meerkat_contracts::{SessionLocator, SessionLocatorError, format_session_ref}
 use meerkat_core::AgentToolDispatcher;
 #[cfg(feature = "comms")]
 use meerkat_core::CommsRuntimeMode;
-#[cfg(feature = "mob")]
 use meerkat_core::config::CliOverrides;
 use meerkat_core::service::{
     CreateSessionRequest, DeferredPromptPolicy, SessionBuildOptions, SessionQuery, SessionService,
@@ -13893,7 +13892,7 @@ async fn run_agent(
         if let Some(user_root) = scope.user_config_root.clone() {
             factory = factory.user_config_root(user_root);
         }
-        let factory = with_cli_confinement(factory, &config, scope, &project_root)?;
+        let factory = with_cli_confinement(factory, config, scope, &project_root)?;
 
         #[cfg(feature = "comms")]
         let factory = factory.comms(!comms_overrides.disabled);
@@ -15247,7 +15246,7 @@ async fn get_or_create_cli_persistent_surface_from_bundle(
     if let Some(user_root) = scope.user_config_root.clone() {
         factory = factory.user_config_root(user_root);
     }
-    let factory = with_cli_confinement(factory, &config, &scope, &project_root)?;
+    let factory = with_cli_confinement(factory, &config, scope, &project_root)?;
 
     let schedule_service = ScheduleService::new(persistence.schedule_store());
     let default_schedule_tools = Some(Arc::new(ScheduleToolDispatcher::new(
@@ -21418,7 +21417,7 @@ where
     if let Some(user_root) = scope.user_config_root.clone() {
         factory = factory.user_config_root(user_root);
     }
-    let factory = with_cli_confinement(factory, &config, &scope, &project_root)?;
+    let factory = with_cli_confinement(factory, &config, scope, &project_root)?;
 
     let mcp_stdio_profile = cli_mcp_stdio_profile(&factory);
     let skill_runtime = factory.build_skill_runtime(&config).await?;
@@ -29550,8 +29549,7 @@ requirement = { baseline = "command_runtime_v1", read = { kind = "paths", paths 
             &writable_state,
             &workspace,
         )
-        .err()
-        .expect("a confined process could change the realm state");
+        .expect_err("a confined process could change the realm state");
         assert!(
             refused.to_string().contains("the realm state")
                 && refused.to_string().contains("--state-root"),
@@ -29603,7 +29601,7 @@ requirement = { baseline = "command_runtime_v1", read = { kind = "paths", paths 
         assert_eq!(
             requirement.specification().write,
             meerkat_core::confinement::FilesystemAccess::Paths(vec![
-                meerkat_core::confinement::PathAccess::Subtree(root.clone())
+                meerkat_core::confinement::PathAccess::Subtree(root)
             ])
         );
     }
