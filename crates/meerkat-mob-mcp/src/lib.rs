@@ -16877,9 +16877,10 @@ mod tests {
             let state = persistent_destroy_state(&svc, root.path());
             let hook: MobBeforeCreate = Arc::new(move |request: MobCreateRequest| {
                 let id = request.mob_id.to_string();
-                if !in_future && !id.is_empty() {
-                    panic!("the host's admission of {id} failed");
-                }
+                assert!(
+                    in_future || id.is_empty(),
+                    "the host's admission of {id} failed"
+                );
                 Box::pin(async move {
                     if id.is_empty() {
                         Ok(())
