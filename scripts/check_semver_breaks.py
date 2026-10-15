@@ -320,6 +320,12 @@ def _symbols_trait_method_missing(text: str) -> tuple[str, ...] | None:
     return _path_symbols(match.group(2)) + (match.group(1),)
 
 
+def _symbols_type_marked_deprecated(text: str) -> tuple[str, ...] | None:
+    # Struct PeersTool
+    match = re.fullmatch(r"(?:Struct|Enum|Union|Trait)\s+([A-Za-z0-9_:]+)", text)
+    return _path_symbols(match.group(1)) if match else None
+
+
 STRUCTURAL_EXTRACTORS = {
     "auto_trait_impl_removed": _symbols_auto_trait_impl_removed,
     "constructible_struct_adds_field": _symbols_constructible_struct_adds_field,
@@ -372,6 +378,10 @@ STRUCTURAL_EXTRACTORS = {
     # "method <path>::<method> in <file>:<line>" (v0.50.0 template; first
     # seen on the 0.8.51 report for SessionRuntime::set_callback_channel).
     "type_method_marked_deprecated": _symbols_type_method,
+    # "{{owner_type}} {{name}} in <file>:<line>" (v0.50.0 template; first seen
+    # on the 0.9.2 integration report for meerkat-tools' `Struct PeersTool`).
+    # Names only the type.
+    "type_marked_deprecated": _symbols_type_marked_deprecated,
 }
 
 

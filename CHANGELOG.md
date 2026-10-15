@@ -219,6 +219,12 @@ them.
   `set_default_schedule_tools`, `FactoryAgentBuilder::default_schedule_tools`,
   `ScheduleService::attach_identity_target_probe` and the scheduling guide
   say so. Behaviour is unchanged; 0.8.51 already worked this way.
+- The release semver gate (`make semver-breaks`) reads cargo-semver-checks'
+  `type_marked_deprecated` findings, a struct, enum, union or trait newly
+  marked `#[deprecated]` (reported as `Struct PeersTool in <file>:<line>`).
+  `scripts/check_semver_breaks.py` had no reader for that shape, so such a
+  deprecation failed the gate as unreadable even when `### Deprecated` named
+  it.
 
 ## [0.9.1] - 2026-10-15
 
