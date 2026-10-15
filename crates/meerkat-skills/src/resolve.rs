@@ -47,6 +47,26 @@ pub async fn resolve_repositories_with_roots(
     user_root: Option<&Path>,
     cache_root: Option<&Path>,
 ) -> Result<Option<CompositeSkillSource>, SkillError> {
+    resolve_repositories_with_roots_trusting(config, context_root, user_root, cache_root, &|_| {
+        false
+    })
+    .await
+}
+
+/// [`resolve_repositories_with_roots`], refusing each skills directory
+/// `untrusted` names: a filesystem repository's directory, the local cache
+/// Git repositories are fetched into, and the project skills directory
+/// (`<context>/.rkat/skills`). A host that confines its launches names each
+/// directory one of its confined processes could change, so skills planted
+/// there never reach a session. Each refused directory is logged; the
+/// embedded skills and every other source still load.
+pub async fn resolve_repositories_with_roots_trusting(
+    config: &SkillsConfig,
+    context_root: Option<&Path>,
+    user_root: Option<&Path>,
+    cache_root: Option<&Path>,
+    untrusted: &(dyn Fn(&Path) -> bool + Send + Sync),
+) -> Result<Option<CompositeSkillSource>, SkillError> {
     if !config.enabled {
         return Ok(None);
     }
@@ -56,7 +76,7 @@ pub async fn resolve_repositories_with_roots(
 
     #[cfg(target_arch = "wasm32")]
     {
-        let _ = (context_root, user_root, cache_root);
+        let _ = (context_root, user_root, cache_root, untrusted);
         if let Some(repo) = config.repositories.first() {
             let error = match &repo.transport {
                 SkillRepoTransport::Filesystem { .. } => unavailable_on_wasm("filesystem"),
@@ -95,6 +115,10 @@ pub async fn resolve_repositories_with_roots(
                     } else {
                         path.into()
                     };
+                    if untrusted(&full_path) {
+                        refuse_untrusted_skills_directory(&full_path);
+                        continue;
+                    }
                     sources.push(NamedSource::new(
                         source_identity,
                         SourceNode::Filesystem(FilesystemSkillSource::new_with_identity(
@@ -191,6 +215,10 @@ pub async fn resolve_repositories_with_roots(
                         .or(user_root)
                         .unwrap_or_else(|| Path::new("."))
                         .join(".rkat/skill-cache/git");
+                    if untrusted(&cache_base) {
+                        refuse_untrusted_skills_directory(&cache_base);
+                        continue;
+                    }
                     let git_ref = match ref_type {
                         GitRefType::Branch => GitRef::Branch(git_ref.clone()),
                         GitRefType::Tag => GitRef::Tag(git_ref.clone()),
@@ -222,7 +250,9 @@ pub async fn resolve_repositories_with_roots(
 
         if let Some(root) = context_root {
             let default_project_skills = root.join(".rkat/skills");
-            if default_project_skills.is_dir() {
+            if default_project_skills.is_dir() && untrusted(&default_project_skills) {
+                refuse_untrusted_skills_directory(&default_project_skills);
+            } else if default_project_skills.is_dir() {
                 let project_identity =
                     active_source_identity(&registry, &records, &SourceUuid::project_local())?;
                 sources.push(NamedSource::new(
@@ -241,6 +271,16 @@ pub async fn resolve_repositories_with_roots(
             sources, registry,
         )))
     }
+}
+
+/// Log a skills directory the host does not trust, whose skills are not
+/// loaded.
+#[cfg(not(target_arch = "wasm32"))]
+fn refuse_untrusted_skills_directory(directory: &Path) {
+    tracing::warn!(
+        directory = %directory.display(),
+        "skills directory not trusted: a confined process can write it, so its skills are not loaded"
+    );
 }
 
 fn active_source_identity(

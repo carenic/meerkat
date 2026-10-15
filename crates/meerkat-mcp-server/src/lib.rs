@@ -1519,11 +1519,18 @@ impl MeerkatMcpState {
             &config.confinement,
             conventions_context_root.as_deref(),
         )?;
-        // A start whose confined processes could change the realm state or
-        // the user config document is refused before it serves.
-        let host_inputs = meerkat::HostConfinement::host_inputs(
+        // A start whose confined processes could change the realm state, the
+        // user config document or the credential store is refused before it
+        // serves.
+        let mut host_inputs = meerkat::HostConfinement::host_inputs(
             &realms_root,
             layout.global_config_path().as_deref(),
+        );
+        host_inputs.extend(
+            meerkat::TokenStoreBackend::default_auto()
+                .ok()
+                .as_ref()
+                .and_then(meerkat::HostConfinement::credential_store_input),
         );
         host_confinement.admit_host_inputs(&host_inputs)?;
         host_confinement.log_startup(

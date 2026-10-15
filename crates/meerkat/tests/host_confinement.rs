@@ -533,3 +533,57 @@ async fn a_refused_mcp_stdio_launch_never_runs_unconfined() {
     assert_eq!(result.text, "continued");
     assert!(!marker.exists(), "the refused server never started");
 }
+
+/// A host that confines every launch kind does not trust a skills directory
+/// one of its confined processes could change: the project skills directory
+/// under a write grant is not loaded, so a skill planted there never reaches
+/// a session. The same directory outside every grant is loaded.
+#[cfg(all(unix, feature = "skills"))]
+#[tokio::test]
+async fn skills_a_confined_process_can_write_are_not_loaded() {
+    let temp = tempfile::tempdir().unwrap();
+    let base = temp.path().canonicalize().unwrap();
+    let project = base.join("project");
+    let skill = project.join(".rkat").join("skills").join("planted-skill");
+    std::fs::create_dir_all(&skill).unwrap();
+    std::fs::write(
+        skill.join("SKILL.md"),
+        "---\nname: planted-skill\ndescription: A skill a confined process planted\n---\n\n# Planted",
+    )
+    .unwrap();
+    let skill_names = |host: HostConfinement| {
+        let base = base.clone();
+        let project = project.clone();
+        async move {
+            let factory = AgentFactory::new(base.join("sessions"))
+                .session_store(Arc::new(meerkat_store::MemoryStore::new()))
+                .runtime_root(base.join("runtime"))
+                .project_root(&project)
+                .context_root(project.clone())
+                .with_host_confinement(&host);
+            let runtime = factory
+                .build_skill_runtime(&Config::default())
+                .await
+                .unwrap()
+                .expect("a skill runtime");
+            runtime
+                .list_skills(&meerkat_core::skills::SkillFilter::default())
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|skill| skill.name)
+                .collect::<Vec<_>>()
+        }
+    };
+
+    let untrusted = skill_names(writing_host(&project)).await;
+    assert!(
+        !untrusted.iter().any(|name| name == "planted-skill"),
+        "a skills directory a confined process can write is not loaded: {untrusted:?}"
+    );
+    let trusted = skill_names(writing_host(&base.join("elsewhere"))).await;
+    assert!(
+        trusted.iter().any(|name| name == "planted-skill"),
+        "a skills directory outside every grant is loaded: {trusted:?}"
+    );
+}

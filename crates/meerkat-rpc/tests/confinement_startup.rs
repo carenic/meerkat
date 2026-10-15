@@ -440,3 +440,55 @@ fn rkat_rpc_starts_without_a_working_directory_when_no_flag_needs_it() {
         run.status, run.stderr
     );
 }
+
+/// A start whose confined processes could change the host's credential store
+/// (the tokens and keys its providers, MCP servers and connectors use) is
+/// refused before the server serves, naming the store.
+#[test]
+fn confinement_that_could_change_the_credential_store_refuses_rkat_rpc_startup() {
+    let Some(binary) = rkat_rpc_binary() else {
+        eprintln!(
+            "skipping: rkat-rpc binary not advertised (CARGO_BIN_EXE_rkat-rpc unset or missing)"
+        );
+        return;
+    };
+    let temp = TempDir::new().expect("temp dir");
+    let base = temp.path().canonicalize().expect("canonical temp");
+    // The user's config directory, and with it the default credential store,
+    // lives under the only write grant.
+    let home = base.join("home");
+    let state = base.join("state");
+    let user_root = base.join("user");
+    for dir in [home.join(".config"), state.clone(), user_root.join(".rkat")] {
+        std::fs::create_dir_all(&dir).expect("directory should initialize");
+    }
+    std::fs::write(
+        user_root.join(".rkat").join("config.toml"),
+        format!(
+            "[confinement.all]\nmode = \"custom\"\nworking_directory = \"{home}\"\nrequirement = {{ baseline = \"command_runtime_v1\", read = {{ kind = \"paths\", paths = [{{ kind = \"subtree\", path = \"{home}\" }}] }}, write = {{ kind = \"paths\", paths = [{{ kind = \"subtree\", path = \"{home}\" }}] }}, deny_read = [], deny_write = [], network = {{ kind = \"denied\" }}, unix_connect = [], require_descendant_termination = false }}\n",
+            home = home.display()
+        ),
+    )
+    .expect("user document should be written");
+
+    let mut command = Command::new(&binary);
+    command
+        .current_dir(&base)
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .args(scope_args("rpc-credential-writer", &state, &user_root));
+    let (run, _) = run_rpc_command(command, &[]);
+
+    assert!(
+        !run.answered && !run.status.success(),
+        "rkat-rpc must refuse a start whose confined processes could change its credential \
+         store; exit={:?} stderr:\n{}",
+        run.status,
+        run.stderr
+    );
+    assert!(
+        run.stderr.contains("the credential store"),
+        "the refusal names the input; stderr:\n{}",
+        run.stderr
+    );
+}

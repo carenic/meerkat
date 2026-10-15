@@ -26,7 +26,7 @@ use meerkat_core::skills::{
 use meerkat_core::skills_config::{
     SkillRepoTransport, SkillRepositoryConfig, SkillsConfig, SkillsIdentityConfig,
 };
-use meerkat_skills::resolve_repositories_with_roots;
+use meerkat_skills::{resolve_repositories_with_roots, resolve_repositories_with_roots_trusting};
 use std::fs;
 use std::path::Path;
 #[cfg(feature = "skills-http")]
@@ -381,4 +381,70 @@ async fn git_repository_reports_unavailable_on_wasm() {
         err.to_string().contains("Git") && err.to_string().contains("unavailable on wasm"),
         "wasm Git repos must fail with a typed unavailable transport error, got {err:?}",
     );
+}
+
+/// A host that confines its launches names each skills directory one of its
+/// confined processes could change. The trusting resolver loads no skill from
+/// such a directory, neither a configured filesystem repository nor the
+/// project skills directory, and still loads the directories it trusts.
+#[tokio::test]
+async fn untrusted_skill_directories_are_not_loaded() {
+    let tmp = tempfile::tempdir().unwrap();
+    let trusted = tmp.path().join("trusted-skills");
+    let untrusted = tmp.path().join("untrusted-skills");
+    let project_skills = tmp.path().join(".rkat").join("skills");
+    write_skill(&trusted, "kept");
+    write_skill(&untrusted, "planted");
+    write_skill(&project_skills, "project-planted");
+    let cfg = SkillsConfig {
+        repositories: vec![
+            fs_repo(
+                "trusted",
+                "5c0a8d0e-6f3b-4c55-9a0d-1f6f1a0c7b21",
+                "trusted-skills",
+            ),
+            fs_repo(
+                "untrusted",
+                "0b9e7f6a-2d4c-4b8e-8f1a-3c5d7e9f1a2b",
+                "untrusted-skills",
+            ),
+        ],
+        ..Default::default()
+    };
+
+    let names = |composite: meerkat_skills::CompositeSkillSource| async move {
+        composite
+            .list(&SkillFilter::default())
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|descriptor| descriptor.key.skill_name.as_str().to_owned())
+            .collect::<Vec<_>>()
+    };
+    let refused = names(
+        resolve_repositories_with_roots_trusting(&cfg, Some(tmp.path()), None, None, &|path| {
+            path == untrusted.as_path() || path == project_skills.as_path()
+        })
+        .await
+        .unwrap()
+        .expect("enabled config"),
+    )
+    .await;
+    assert!(refused.contains(&"kept".to_owned()), "{refused:?}");
+    assert!(!refused.contains(&"planted".to_owned()), "{refused:?}");
+    assert!(
+        !refused.contains(&"project-planted".to_owned()),
+        "{refused:?}"
+    );
+
+    let all = names(
+        resolve_repositories_with_roots(&cfg, Some(tmp.path()), None, None)
+            .await
+            .unwrap()
+            .expect("enabled config"),
+    )
+    .await;
+    for name in ["kept", "planted", "project-planted"] {
+        assert!(all.contains(&name.to_owned()), "{name}: {all:?}");
+    }
 }

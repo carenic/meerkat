@@ -639,19 +639,23 @@ A host that confines every launch kind keeps the inputs it reads its own
 administration from out of its confined processes' reach:
 
 - The realm state (every realm config document and the head realm's stores
-  under the state root) and the user config document. A start in which a
-  confined process could change one, by writing it, creating it where it is
-  missing, or replacing a directory on the way to it, is refused, naming the
-  input and the launch kind. Keep the state root and the user config root
-  outside every write grant (`--state-root`, `--user-config-root`).
-- The convention sources: the project and user `mcp.toml` files and the
-  hooks of the project `.rkat/config.toml`. A source a confined process can
-  write is not trusted. Each of its MCP servers is refused with
-  `untrusted_configuration_source` before it is expanded, authorized,
-  connected or spawned, and each of its hooks keeps its place and is refused
-  at every invocation, so a mandatory guardrail withholds what it gates. A
-  definition that a trusted source states identically is used from that
-  source.
+  under the state root), the user config document and the file credential
+  store (the tokens, keys and secrets of the host's providers, MCP servers,
+  connectors and comms identity; by default `meerkat/credentials` under the
+  user's config directory). A start in which a confined process could
+  change one, by writing it, creating it where it is missing, or replacing a
+  directory on the way to it, is refused, naming the input and the launch
+  kind. Keep the state root, the user config root and the user's config
+  directory outside every write grant (`--state-root`, `--user-config-root`).
+- The convention sources: the project and user `mcp.toml` files, the hooks
+  of the project `.rkat/config.toml`, and the skills directories (the
+  project `.rkat/skills`, filesystem skill repositories and the Git skill
+  cache). A source a confined process can write is not trusted. Each of its
+  MCP servers is refused with `untrusted_configuration_source` before it is
+  expanded, authorized, connected or spawned, each of its hooks keeps its
+  place and is refused at every invocation, so a mandatory guardrail
+  withholds what it gates, and its skills are not loaded. A definition that
+  a trusted source states identically is used from that source.
 
 Each launch kind is judged on its own grants and protections: one kind's
 protection does not cover another kind that writes the same place. On macOS

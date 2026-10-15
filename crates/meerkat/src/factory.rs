@@ -4533,6 +4533,16 @@ impl AgentFactory {
         self.host_confinement.as_ref()
     }
 
+    /// Whether the host confinement does not trust the skills directory at
+    /// `path`: a confined process could change it, so its skills are not
+    /// loaded ([`crate::HostConfinement::untrusted_directory`]).
+    #[cfg(all(feature = "skills", not(target_arch = "wasm32")))]
+    fn untrusted_skills_directory(&self, path: &std::path::Path) -> bool {
+        self.host_confinement
+            .as_ref()
+            .is_some_and(|host| host.untrusted_directory(path))
+    }
+
     /// Install a stock host's resolved OS process confinement: each launch
     /// kind it requires gets its requirement through the per-kind builder
     /// (the shell, command hooks with their working directory, local MCP
@@ -4864,11 +4874,12 @@ impl AgentFactory {
                         .clone()
                         .or_else(|| self.project_root.clone())
                         .unwrap_or_else(|| self.store_path.clone());
-                    match meerkat_skills::resolve_repositories_with_roots(
+                    match meerkat_skills::resolve_repositories_with_roots_trusting(
                         &config.skills,
                         conventions_context_root,
                         conventions_user_root,
                         Some(runtime_root.as_path()),
+                        &|path| self.untrusted_skills_directory(path),
                     )
                     .await
                     {
@@ -7355,11 +7366,12 @@ impl AgentFactory {
                     } else {
                         #[cfg(not(target_arch = "wasm32"))]
                         {
-                            match meerkat_skills::resolve_repositories_with_roots(
+                            match meerkat_skills::resolve_repositories_with_roots_trusting(
                                 &config.skills,
                                 _conventions_context_root,
                                 _conventions_user_root,
                                 Some(_realm_scope_root.as_path()),
+                                &|path| self.untrusted_skills_directory(path),
                             )
                             .await
                             {

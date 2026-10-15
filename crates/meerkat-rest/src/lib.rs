@@ -693,6 +693,7 @@ impl AppState {
         // signal to silently run ephemeral: that would launder a real auth
         // backend failure into apparent "no credentials". Propagate the typed
         // TokenStoreError and fail REST startup.
+        let credential_store_input = meerkat::HostConfinement::credential_store_input(&credentials);
         let provider_auth_persistence = credentials.open_with_refresh_authority()?;
         let mut factory = AgentFactory::new(store_path.clone())
             .with_provider_auth_persistence(provider_auth_persistence.clone())
@@ -714,12 +715,14 @@ impl AppState {
             &config.confinement,
             conventions_context_root.as_deref(),
         )?;
-        // A start whose confined processes could change the realm state or
-        // the user config document is refused before it serves.
-        let host_inputs = meerkat::HostConfinement::host_inputs(
+        // A start whose confined processes could change the realm state, the
+        // user config document or the credential store is refused before it
+        // serves.
+        let mut host_inputs = meerkat::HostConfinement::host_inputs(
             &realms_root,
             layout.global_config_path().as_deref(),
         );
+        host_inputs.extend(credential_store_input);
         host_confinement.admit_host_inputs(&host_inputs)?;
         host_confinement.log_startup(
             &host_inputs,

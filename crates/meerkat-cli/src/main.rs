@@ -5641,8 +5641,14 @@ pub(crate) fn with_cli_confinement(
 ) -> anyhow::Result<AgentFactory> {
     let confinement = meerkat::HostConfinement::resolve(&config.confinement, Some(workspace_root))?;
     let user_document = cli_global_config_path(scope);
-    let inputs =
+    let mut inputs =
         meerkat::HostConfinement::host_inputs(&scope.locator.state_root, Some(&user_document));
+    inputs.extend(
+        meerkat_providers::auth_store::TokenStoreBackend::default_auto()
+            .ok()
+            .as_ref()
+            .and_then(meerkat::HostConfinement::credential_store_input),
+    );
     confinement.admit_host_inputs(&inputs)?;
     report_cli_confinement(
         &confinement,

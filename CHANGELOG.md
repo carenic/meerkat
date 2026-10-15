@@ -64,6 +64,11 @@ them.
   build, where the factory stages each one refused
   (`McpRouterAdapter::stage_add_refused`), so the model sees the refusal in
   that server's failed-setup MCP system notice.
+- `HostInput::CredentialStore` and `HostConfinement::credential_store_input`
+  add a host's file credential store to its administration inputs;
+  `HostConfinement::untrusted_directory` judges a convention directory as a
+  whole; `meerkat_skills::resolve_repositories_with_roots_trusting` resolves
+  skill repositories without the directories a predicate does not trust.
 
 ### Changed
 
@@ -110,6 +115,18 @@ them.
   0.9.1 the governed route left those servers out with only a warning on
   stderr (the 0.9.1 known limitation), so the model could not tell why a
   configured server was missing.
+- A host that confines every launch kind keeps its file credential store
+  and its skills directories from its confined processes, as it keeps its
+  realm state and user config document. A start in which a confined process
+  could change the credential store (the tokens, keys and secrets of its
+  providers, MCP servers, connectors and comms identity; by default under
+  the user's config directory, `meerkat/credentials`) is refused, naming it.
+  A skills directory a confined process can write (the project
+  `.rkat/skills`, a filesystem skill repository, the Git skill cache) is not
+  trusted: its skills are not loaded, and the startup report names the
+  project skills directory. In 0.9.1 neither was checked, so a confined
+  process could plant credentials the host then used, or skills whose
+  instructions reached the model.
 
 ## [0.9.1] - 2026-10-15
 
