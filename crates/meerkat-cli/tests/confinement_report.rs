@@ -73,3 +73,59 @@ fn rkat_reports_its_confinement_on_stderr() {
         "the report is printed once; stderr:\n{stderr}"
     );
 }
+
+/// `rkat skill list` loads skills as a run does, under the host's
+/// confinement: a project skills directory a confined process can write is
+/// not trusted, so a skill planted there is not listed.
+#[test]
+fn rkat_skill_list_does_not_load_skills_from_an_untrusted_project() {
+    let temp = tempfile::TempDir::new().unwrap();
+    let base = temp.path().canonicalize().unwrap();
+    let project = base.join("project");
+    let state = base.join("state");
+    let user = base.join("user");
+    let home = base.join("home");
+    let skill = project.join(".rkat").join("skills").join("planted-skill");
+    for dir in [&skill, &state, &user.join(".rkat"), &home] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    std::fs::write(
+        skill.join("SKILL.md"),
+        "---\nname: planted-skill\ndescription: A skill a confined process planted\n---\n\n# Planted",
+    )
+    .unwrap();
+    std::fs::write(
+        user.join(".rkat").join("config.toml"),
+        format!(
+            "[confinement.all]\nmode = \"custom\"\nworking_directory = \"{dir}\"\nrequirement = {{ baseline = \"command_runtime_v1\", read = {{ kind = \"paths\", paths = [{{ kind = \"subtree\", path = \"{dir}\" }}] }}, write = {{ kind = \"paths\", paths = [{{ kind = \"subtree\", path = \"{dir}\" }}] }}, deny_read = [], deny_write = [], network = {{ kind = \"denied\" }}, unix_connect = [], require_descendant_termination = false }}\n",
+            dir = project.display()
+        ),
+    )
+    .unwrap();
+
+    let output = Command::new(rkat_binary())
+        .current_dir(&project)
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env_remove("RUST_LOG")
+        .arg("--context-root")
+        .arg(&project)
+        .arg("--state-root")
+        .arg(&state)
+        .arg("--user-config-root")
+        .arg(&user)
+        .args(["--realm", "skills-untrusted", "skill", "list", "--json"])
+        .output()
+        .expect("run rkat");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "rkat skill list: status={} stderr:\n{stderr}",
+        output.status
+    );
+    assert!(
+        !stdout.contains("planted-skill"),
+        "an untrusted project skills directory is not loaded; stdout:\n{stdout}"
+    );
+}

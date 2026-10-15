@@ -141,6 +141,8 @@ them.
   local MCP stdio server does: its program named by absolute path, only its
   configured environment, from the kind's working directory, and a launch
   the platform cannot confine is refused. It ran as the trusted host.
+- `rkat skill list` and `rkat skill inspect` load skills under the host
+  confinement a run installs, so they show what a run loads.
 - The generated Bazel targets of `meerkat-rest`'s tests get the
   `rkat-rest` binary, and the real-binary confinement tests of `rkat-rpc`
   and `rkat-rest` fail, rather than pass without having run, when their

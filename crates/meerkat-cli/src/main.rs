@@ -18172,6 +18172,10 @@ async fn handle_skills_command(
         SkillsCommands::List { .. } | SkillsCommands::Inspect { .. } => {}
     }
 
+    // The skills a run would load, under the host confinement a run
+    // installs: a skills directory, Git program or cache, or linked skill a
+    // confined process could change is not trusted, and a stdio skill source
+    // launches confined.
     let factory = {
         let mut f = meerkat::AgentFactory::new(realm_root.clone()).runtime_root(realm_root);
         if let Some(ref root) = scope.context_root {
@@ -18180,7 +18184,7 @@ async fn handle_skills_command(
         if let Some(ref root) = scope.user_config_root {
             f = f.user_config_root(root.clone());
         }
-        f
+        with_cli_confinement(f, &config, scope, &cli_project_root(scope))?
     };
 
     let skill_runtime = factory.build_skill_runtime(&config).await?;
