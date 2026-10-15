@@ -37,16 +37,24 @@ them.
 
 ### Changed
 
-- The release workflow's `Build Web SDK package` job starts with the run,
-  beside `Require green CI` and the release validation, instead of after
-  them; `Publish Web SDK package` now itself requires the release validation
-  gate (skipped only on Web-only recovery), as well as green CI, the registry
-  credential preflight and the build. The job's Cargo build runs four jobs
-  instead of one: `scripts/release-web-sdk-rustc-wrapper` compiles the
-  machine catalog crate (12.8 GiB in one rustc) apart from the other
-  memory-heavy wasm32 crates, so the build peaks at 13.0 GiB instead of
-  18.8 GiB at four plain jobs. Locally, on four vCPUs, its Cargo phase took
-  about 11 minutes instead of 24 at one job (33m43s in the v0.9.1 tag run).
+- The release workflow's `Build Web SDK package` job runs beside the release
+  validation and the semver gate once `Require green CI` passes, instead of
+  after them. Its Cargo build runs four jobs instead of one: the release
+  tree's `scripts/release-web-sdk-rustc-wrapper` compiles the machine
+  catalog crate (12.8 GiB in one rustc) apart from the other memory-heavy
+  wasm32 crates, so the build peaked at 13.0 GiB instead of 18.8 GiB at four
+  plain jobs; a tree without a wrapper that matches its crates builds at one
+  job. Locally, on four vCPUs, the Cargo phase took about 11 minutes instead
+  of 24 at one job (33m43s in the v0.9.1 tag run).
+- `Publish Web SDK package` also requires the release validation gate and
+  `Breaks declared and notes stamped` (both skipped only on Web-only
+  recovery). It publishes only a package whose source stamp (commit, package
+  name and version, tarball digest) names its own checkout and the commit
+  `Require green CI` passed; packages built before stamping are refused. A
+  package reused through `web_sdk_artifact_run_id` must come from a
+  release.yml tag-push or dispatch run whose `Require green CI` passed, and
+  `scripts/release-publish-web-sdk-package.sh` refuses a tarball whose name
+  or version differs from the checkout's package or the release tag.
 - `@rkat/web`: the release wasm is optimized with `wasm-opt -O1` instead of
   wasm-pack's default `-O` (binaryen's `-Os`). On the 0.9.1 module the
   download gets smaller (11.06 MB instead of 11.40 MB with gzip -9, 6.93 MB

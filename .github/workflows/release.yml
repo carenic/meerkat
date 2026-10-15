@@ -88,6 +88,9 @@ jobs:
     name: Require green CI
     timeout-minutes: 130
     runs-on: ${{ fromJSON(vars.MEERKAT_CI_RUNNER || '"ubuntu-24.04"') }}
+    outputs:
+      # The release commit; publish_web_sdk binds the package artifact to it.
+      sha: ${{ steps.release_ref.outputs.sha }}
     steps:
       - name: Checkout release ref
         uses: actions/checkout@v6
@@ -1486,14 +1489,17 @@ jobs:
           tap_token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
           checksums_path: published-release-artifacts/checksums.sha256
 
-  # The package build starts with the run, beside Require green CI and the
-  # release validation rather than after them: building publishes nothing,
-  # and publish_web_sdk keeps every gate (green CI, release validation,
-  # registry credentials, this build). The v0.9.1 tag run started this
-  # 51-minute job only after 108 minutes of CI wait and validation.
+  # The package build runs no code from the release tree before Require
+  # green CI has checked the release ref; it then runs beside the release
+  # validation and the semver gate instead of after them. Building
+  # publishes nothing: publish_web_sdk requires green CI, the release
+  # validation, the semver gate, the registry credentials and this build.
   build_web_sdk_package:
     name: Build Web SDK package
+    needs: [require_ci_green]
     if: >-
+      always() &&
+      needs.require_ci_green.result == 'success' &&
       (github.event_name != 'workflow_dispatch' ||
        github.event.inputs.web_sdk_artifact_run_id == '') &&
       (startsWith(github.ref, 'refs/tags/v') ||
@@ -1502,6 +1508,8 @@ jobs:
         github.event.inputs.alpha_crates_only != 'true'))
     runs-on: ${{ fromJSON(vars.MEERKAT_CI_RUNNER || '"ubuntu-24.04"') }}
     timeout-minutes: 180
+    permissions:
+      contents: read
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -1514,6 +1522,10 @@ jobs:
 
       - name: Cache cargo registry
         uses: Swatinem/rust-cache@v2
+        with:
+          # A dispatch runs on main and would save into the default branch's
+          # scope, which every later tag run restores from.
+          save-if: ${{ github.event_name != 'workflow_dispatch' }}
 
       - name: Install Python + Node tooling
         uses: actions/setup-python@v5
@@ -1541,19 +1553,6 @@ jobs:
       - name: Add wasm32 target
         run: rustup target add wasm32-unknown-unknown
 
-      # The heavy-crate rustc wrapper comes from the workflow ref: a Web SDK
-      # recovery of an older tag builds a tree that predates it. Sparse, so
-      # the checkout adds no Cargo or npm package to the build.
-      - name: Checkout Web SDK build tooling
-        uses: actions/checkout@v6
-        with:
-          ref: ${{ github.sha }}
-          path: .release-tooling
-          persist-credentials: false
-          sparse-checkout: |
-            scripts/release-web-sdk-rustc-wrapper
-          sparse-checkout-cone-mode: false
-
       # No RUSTFLAGS here: sdks/web/scripts/build-wasm.mjs owns the wasm
       # flags (the getrandom cfg and the 8 MiB stack). An ambient RUSTFLAGS
       # made Cargo ignore them and shipped a 1 MiB stack from 0.8.30 through
@@ -1563,26 +1562,62 @@ jobs:
         env:
           VERSION: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag || github.ref_name }}
           CARGO_INCREMENTAL: "0"
-          # Four jobs, while scripts/release-web-sdk-rustc-wrapper keeps the
-          # other memory-heavy wasm32 crates off the machine catalog's rustc
-          # (12.8 GiB alone). Plain jobs 4 and 2 were OOM-killed under local
-          # 13-15 GiB limits: pipelining overlapped the catalog with
-          # meerkat_runtime and meerkat_mob, 18.8 GiB at jobs 4. Jobs 1 fit,
-          # but also ran each crate's code generation on one thread: 33m43s
-          # of Cargo in the v0.9.1 tag run, 24m05s locally on four vCPUs,
-          # where jobs 4 with the wrapper took 11m14s and peaked at 13.0 GiB
-          # under a 14 GiB limit. This bounds Cargo concurrency, not
+        run: |
+          set -euo pipefail
+          # Four Cargo jobs, while the release tree's own
+          # scripts/release-web-sdk-rustc-wrapper keeps the other memory-heavy
+          # wasm32 crates off the machine catalog's rustc (12.8 GiB alone).
+          # Plain jobs 4 and 2 were OOM-killed under local 13-15 GiB limits:
+          # pipelining overlapped the catalog with meerkat_runtime and
+          # meerkat_mob, 18.8 GiB at jobs 4. Jobs 1 fit, but also ran each
+          # crate's code generation on one thread: 33m43s of Cargo in the
+          # v0.9.1 tag run, 24m05s locally on four vCPUs, where jobs 4 with
+          # the wrapper took 11m14s and peaked at 13.0 GiB under a 14 GiB
+          # limit. A tree without the wrapper (a recovery of an older tag),
+          # or one whose wrapper names a crate the tree does not have, builds
+          # at one job as before. This bounds Cargo concurrency, not
           # wasm-opt's parallelism.
-          CARGO_BUILD_JOBS: "4"
-          RUSTC_WRAPPER: ${{ github.workspace }}/.release-tooling/scripts/release-web-sdk-rustc-wrapper
-          MEERKAT_WEB_WASM_HEAVY_RUSTC_LOCK: ${{ runner.temp }}/web-sdk-heavy-rustc.lock
-        run: scripts/release-build-web-sdk-package.sh "${GITHUB_WORKSPACE}/web-sdk-package"
+          wrapper="${GITHUB_WORKSPACE}/scripts/release-web-sdk-rustc-wrapper"
+          if [[ -x "${wrapper}" ]] && "${wrapper}" --check-heavy-crates; then
+            export CARGO_BUILD_JOBS=4
+            export RUSTC_WRAPPER="${wrapper}"
+            export MEERKAT_WEB_WASM_HEAVY_RUSTC_LOCK="${RUNNER_TEMP}/web-sdk-heavy-rustc.lock"
+          else
+            echo "::warning title=Web SDK build::no heavy-crate wrapper matching this tree; building at one Cargo job"
+            export CARGO_BUILD_JOBS=1
+          fi
+          echo "Web SDK wasm build: CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS} RUSTC_WRAPPER=${RUSTC_WRAPPER:-none}"
+          scripts/release-build-web-sdk-package.sh "${GITHUB_WORKSPACE}/web-sdk-package"
+
+      # Binds the artifact to its source. publish_web_sdk refuses a package
+      # whose stamp does not name both its own checkout and Require green
+      # CI's commit, or whose tarball differs from the stamped one.
+      - name: Stamp Web SDK package source
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          tarballs=(web-sdk-package/rkat-web-*.tgz)
+          [[ "${#tarballs[@]}" -eq 1 ]] || { echo "expected one rkat-web tarball, found ${#tarballs[@]}" >&2; exit 1; }
+          tarball="${tarballs[0]}"
+          packed="$(tar -xzOf "${tarball}" package/package.json | jq -r '.name + "@" + .version')"
+          expected="$(jq -r '.name + "@" + .version' sdks/web/package.json)"
+          [[ "${packed}" == "${expected}" ]] || { echo "tarball package ${packed} is not ${expected}" >&2; exit 1; }
+          jq -n \
+            --arg commit "$(git rev-parse HEAD)" \
+            --arg package "${packed}" \
+            --arg tarball "$(basename "${tarball}")" \
+            --arg tarball_sha256 "$(sha256sum "${tarball}" | cut -d' ' -f1)" \
+            '{commit: $commit, package: $package, tarball: $tarball, tarball_sha256: $tarball_sha256}' \
+            > web-sdk-package/rkat-web-package.json
+          cat web-sdk-package/rkat-web-package.json
 
       - name: Upload Web SDK package
         uses: actions/upload-artifact@v4
         with:
           name: rkat-web-package
-          path: web-sdk-package/rkat-web-*.tgz
+          path: |
+            web-sdk-package/rkat-web-*.tgz
+            web-sdk-package/rkat-web-package.json
           if-no-files-found: error
 
   build_binaries_gate:
@@ -2106,6 +2141,10 @@ jobs:
        (github.event_name == 'workflow_dispatch' &&
         github.event.inputs.publish_web_sdk_only == 'true' &&
         needs.release_validate_gate.result == 'skipped')) &&
+      (needs.release_semver_gate.result == 'success' ||
+       (github.event_name == 'workflow_dispatch' &&
+        github.event.inputs.publish_web_sdk_only == 'true' &&
+        needs.release_semver_gate.result == 'skipped')) &&
       (needs.build_web_sdk_package.result == 'success' ||
        (github.event_name == 'workflow_dispatch' &&
         github.event.inputs.web_sdk_artifact_run_id != '')) &&
@@ -2113,7 +2152,7 @@ jobs:
        (github.event_name == 'workflow_dispatch' &&
         github.event.inputs.publish_release_packages == 'true' &&
         github.event.inputs.alpha_crates_only != 'true'))
-    needs: [require_ci_green, release_validate_gate, build_web_sdk_package, registry_credentials_preflight]
+    needs: [require_ci_green, release_validate_gate, release_semver_gate, build_web_sdk_package, registry_credentials_preflight]
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
@@ -2129,6 +2168,36 @@ jobs:
         with:
           node-version: "22"
 
+      # A reused package comes from an earlier run of this workflow: it must
+      # be this repository's release.yml, run by a tag push or a dispatch
+      # (never a pull request), and its Require green CI job must have
+      # passed (as scripts/verify-release-asset-provenance --source-run
+      # checks for reused release archives). The stamp check below then
+      # binds its package to this release's commit.
+      - name: Verify Web SDK artifact source run
+        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.web_sdk_artifact_run_id != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_RUN: ${{ github.event.inputs.web_sdk_artifact_run_id }}
+        run: |
+          set -euo pipefail
+          [[ "${SOURCE_RUN}" =~ ^[0-9]+$ ]] || { echo "web_sdk_artifact_run_id must be a run id: ${SOURCE_RUN}" >&2; exit 1; }
+          run_meta="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_RUN}" \
+            --jq '[.path, .event, .repository.full_name] | @tsv')"
+          IFS=$'\t' read -r run_path run_event run_repo <<<"${run_meta}"
+          if [[ "${run_path}" != ".github/workflows/release.yml" || "${run_repo}" != "${GITHUB_REPOSITORY}" ]] ||
+            [[ "${run_event}" != "push" && "${run_event}" != "workflow_dispatch" ]]; then
+            echo "run ${SOURCE_RUN} is not a release.yml push or workflow_dispatch run of ${GITHUB_REPOSITORY} (path=${run_path} event=${run_event} repo=${run_repo})" >&2
+            exit 1
+          fi
+          ci_gate="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_RUN}/jobs?per_page=100" --paginate \
+            --jq '.jobs[] | select(.name == "Require green CI") | .conclusion')"
+          if [[ "${ci_gate}" != "success" ]]; then
+            echo "run ${SOURCE_RUN}: Require green CI did not succeed (${ci_gate:-absent})" >&2
+            exit 1
+          fi
+          echo "source run ${SOURCE_RUN}: release.yml ${run_event} run, Require green CI passed"
+
       - name: Download Web SDK package
         uses: actions/download-artifact@v4
         with:
@@ -2143,10 +2212,50 @@ jobs:
             }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
+      # The package must have been built from this checkout, the commit
+      # Require green CI passed: the build job's stamp names its checkout,
+      # and the tarball must be the stamped one and carry this checkout's
+      # package name and version. An artifact without a stamp (built before
+      # stamping) is refused.
+      - name: Verify Web SDK package source
+        env:
+          RELEASE_SHA: ${{ needs.require_ci_green.outputs.sha }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          head="$(git rev-parse HEAD)"
+          stamp=web-sdk-package/rkat-web-package.json
+          [[ -f "${stamp}" ]] || { echo "the Web SDK artifact carries no source stamp (${stamp})" >&2; exit 1; }
+          tarballs=(web-sdk-package/rkat-web-*.tgz)
+          [[ "${#tarballs[@]}" -eq 1 ]] || { echo "expected one rkat-web tarball, found ${#tarballs[@]}" >&2; exit 1; }
+          tarball="${tarballs[0]}"
+          stamp_commit="$(jq -er .commit "${stamp}")"
+          stamp_package="$(jq -er .package "${stamp}")"
+          stamp_tarball="$(jq -er .tarball "${stamp}")"
+          stamp_sha256="$(jq -er .tarball_sha256 "${stamp}")"
+          [[ "${RELEASE_SHA}" =~ ^[0-9a-f]{40}$ ]] || { echo "Require green CI reported no release commit (${RELEASE_SHA:-empty})" >&2; exit 1; }
+          if [[ "${stamp_commit}" != "${RELEASE_SHA}" || "${RELEASE_SHA}" != "${head}" ]]; then
+            echo "Web SDK package source mismatch: stamp ${stamp_commit}, Require green CI ${RELEASE_SHA}, checkout ${head}" >&2
+            exit 1
+          fi
+          tarball_sha256="$(sha256sum "${tarball}" | cut -d' ' -f1)"
+          if [[ "$(basename "${tarball}")" != "${stamp_tarball}" || "${tarball_sha256}" != "${stamp_sha256}" ]]; then
+            echo "tarball $(basename "${tarball}") (sha256 ${tarball_sha256}) is not the stamped ${stamp_tarball} (${stamp_sha256})" >&2
+            exit 1
+          fi
+          expected="$(jq -r '.name + "@" + .version' sdks/web/package.json)"
+          packed="$(tar -xzOf "${tarball}" package/package.json | jq -r '.name + "@" + .version')"
+          if [[ "${packed}" != "${expected}" || "${stamp_package}" != "${expected}" ]]; then
+            echo "package mismatch: tarball ${packed}, stamp ${stamp_package}, sdks/web/package.json ${expected}" >&2
+            exit 1
+          fi
+          echo "Web SDK package ${expected} built from ${head} (sha256 ${tarball_sha256})"
+
       - name: Publish Web SDK
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
           MEERKAT_REGISTRY_DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.registry_dry_run == 'true' }}
+          VERSION: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag || github.ref_name }}
         run: |
           set -euo pipefail
           scripts/release-publish-web-sdk-package.sh web-sdk-package/rkat-web-*.tgz
