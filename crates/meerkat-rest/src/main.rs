@@ -115,6 +115,13 @@ impl From<RealmBackendArg> for RealmBackend {
     }
 }
 
+/// Filter applied when `RUST_LOG` is unset: the server's own events (its
+/// library's and this binary's, whose target is `rkat_rest`), the HTTP
+/// layer, and the host's confinement startup report
+/// (`meerkat::host_confinement`), which every host prints at startup.
+const DEFAULT_TRACE_FILTER: &str =
+    "meerkat_rest=info,rkat_rest=info,meerkat::host_confinement=info,tower_http=debug";
+
 fn main() -> ExitCode {
     // One documented worker-stack budget for every host binary; the main
     // future runs on a budgeted thread too, not the platform main thread.
@@ -161,7 +168,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "meerkat_rest=info,tower_http=debug".into()),
+                .unwrap_or_else(|_| DEFAULT_TRACE_FILTER.into()),
         )
         .with(tracing_subscriber::fmt::layer())
         .init();

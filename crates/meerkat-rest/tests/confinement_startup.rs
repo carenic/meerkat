@@ -1,9 +1,13 @@
 //! OS process confinement on the rkat-rest surface: what the stock binary
-//! reads at startup to resolve its `--confinement*` flags.
+//! reads at startup to resolve its `--confinement*` flags, and the startup
+//! report of the confinement it installs.
 //!
 //! The observables are the real binary's output. A server started without a
 //! confinement flag that needs the working directory starts even when that
-//! directory was removed.
+//! directory was removed. A requirement in the user document reaches the
+//! server's log under the default filter: each launch kind's requested and
+//! effective confinement and what keeps the host's own inputs from its
+//! confined processes, not only the warnings.
 
 #![cfg(unix)]
 #![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
@@ -14,6 +18,15 @@ use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
+
+/// A requirement no platform backend enforces (descendant termination) and
+/// that grants no write, so every confined launch is refused on any OS and
+/// the host's own inputs stay out of reach.
+const UNENFORCEABLE_CONFINEMENT: &str = r#"[confinement.all]
+mode = "custom"
+working_directory = "/"
+requirement = { baseline = "command_runtime_v1", read = { kind = "paths", paths = [] }, write = { kind = "paths", paths = [] }, deny_read = [], deny_write = [], network = { kind = "denied" }, unix_connect = [], require_descendant_termination = true }
+"#;
 
 /// Last-resort bound for a server that neither listens nor exits: well above
 /// the observed startup latency under a fully parallel crate run.
@@ -201,5 +214,50 @@ fn rkat_rest_starts_without_a_working_directory_when_no_flag_needs_it() {
         !refused.listening,
         "a relative confinement path needs the working directory; output:\n{}",
         refused.output
+    );
+}
+
+/// A requirement in the user document reaches the server's log under its
+/// default filter, as the startup report documents it: each launch kind's
+/// requested and effective confinement, and what keeps the host's own
+/// inputs from its confined processes, besides the warnings.
+#[test]
+fn the_rkat_rest_startup_report_reaches_the_default_log() {
+    let Some(binary) = rkat_rest_binary() else {
+        eprintln!(
+            "skipping: rkat-rest binary not advertised (CARGO_BIN_EXE_rkat-rest unset or missing)"
+        );
+        return;
+    };
+    let temp = TempDir::new().expect("temp dir");
+    let (args, port) = scope_args(temp.path(), "rest-confinement-reported");
+    std::fs::create_dir_all(temp.path().join("user").join(".rkat")).expect("user root");
+    std::fs::write(
+        temp.path().join("user").join(".rkat").join("config.toml"),
+        UNENFORCEABLE_CONFINEMENT,
+    )
+    .expect("user document");
+
+    let mut command = Command::new(&binary);
+    command.current_dir(temp.path()).args(&args);
+    let started = start(command, port);
+    assert!(
+        started.listening,
+        "a confined server still serves; output:\n{}",
+        started.output
+    );
+    for kind in ["shell", "command_hooks", "mcp_stdio"] {
+        assert!(
+            started
+                .output
+                .contains(&format!("{kind} confinement: requested custom")),
+            "{kind}'s requested and effective confinement is reported; output:\n{}",
+            started.output
+        );
+    }
+    assert!(
+        started.output.contains("kept from every confined process"),
+        "the host's protected inputs are reported, not only the warnings; output:\n{}",
+        started.output
     );
 }

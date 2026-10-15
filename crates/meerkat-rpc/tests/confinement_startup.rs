@@ -33,6 +33,8 @@ requirement = { baseline = "command_runtime_v1", read = { kind = "paths", paths 
 /// launch kind this host cannot confine.
 const INSTALLED_REPORT: &str = "confinement: requested custom";
 const UNENFORCEABLE_REPORT: &str = "cannot be enforced on this host";
+/// The report's informational line naming the host's protected inputs.
+const PROTECTED_INPUTS_REPORT: &str = "kept from every confined process: the realm state at";
 
 /// Last-resort bound for a server that neither exits nor answers, as in
 /// `realm_config_ingress.rs`: well above the observed startup latency under
@@ -304,6 +306,11 @@ fn the_user_documents_confinement_reaches_the_rkat_rpc_startup_report() {
         configured.stderr.contains(INSTALLED_REPORT)
             && configured.stderr.contains(UNENFORCEABLE_REPORT),
         "the user document's requirement reaches the startup report; stderr:\n{}",
+        configured.stderr
+    );
+    assert!(
+        configured.stderr.contains(PROTECTED_INPUTS_REPORT),
+        "the report's informational lines reach the default log too; stderr:\n{}",
         configured.stderr
     );
 

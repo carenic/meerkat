@@ -5655,10 +5655,13 @@ pub(crate) fn with_cli_confinement(
     Ok(factory.with_host_confinement(&confinement))
 }
 
-/// Warn once per process, on stderr, for what the operator should act on in
-/// this host's confinement report: a confined launch kind the platform
-/// cannot enforce (each such launch is refused), a guarantee the host does
-/// not claim, and each untrusted convention source.
+/// Report this host's confinement once per process on stderr, the CLI's
+/// channel for its startup report: each launch kind's requested and
+/// effective confinement and what keeps the host's own inputs from its
+/// confined processes, and, as warnings, what the operator should act on (a
+/// confined launch kind the platform cannot enforce, whose every launch is
+/// refused, a guarantee the host does not claim, and each untrusted
+/// convention source).
 fn report_cli_confinement(
     confinement: &meerkat::HostConfinement,
     inputs: &[(meerkat::HostInput, PathBuf)],
@@ -5670,11 +5673,18 @@ fn report_cli_confinement(
     }
     REPORTED.call_once(|| {
         for notice in confinement.startup_report(inputs, convention_sources) {
-            if notice.warning {
-                eprintln!("warning: {}", notice.text);
-            }
+            eprintln!("{}", render_cli_confinement_notice(&notice));
         }
     });
+}
+
+/// One line of the CLI's confinement report: a warning is marked as one.
+fn render_cli_confinement_notice(notice: &meerkat::HostConfinementNotice) -> String {
+    if notice.warning {
+        format!("warning: {}", notice.text)
+    } else {
+        format!("info: {}", notice.text)
+    }
 }
 
 /// Operator-facing line for a typed config warning, naming the document to

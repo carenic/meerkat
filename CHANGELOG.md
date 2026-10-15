@@ -85,6 +85,14 @@ them.
   startup only for a relative `--confinement-read` or `--confinement-write`
   path. They read it on every start, so a server whose working directory had
   been removed failed to start even without a confinement flag.
+- The startup confinement report is visible as documented. `rkat` prints
+  every line of it once on stderr (informational lines as `info:`), where it
+  printed only the warnings, and `rkat-rest`'s default log filter includes
+  it (`meerkat::host_confinement=info`), where it showed none of it, and
+  the binary's own startup lines (`rkat_rest=info`, such as its listening
+  address), which the filter also left out. Each host reports each launch
+  kind's requested and effective confinement and what keeps its own inputs
+  from its confined processes, not only what needs action.
 
 ## [0.9.1] - 2026-10-15
 
