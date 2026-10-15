@@ -20,7 +20,9 @@ use std::sync::Arc;
 /// Its comms owner ([`CommsExecutionAuthority`]) attaches each call's typed
 /// operation target to the plan it resolves (the one peer a delivery
 /// reaches, or the trusted-peer directory) and runs only a plan it resolved
-/// for exactly that target.
+/// for exactly that target. Governed work reaches the handler only when its
+/// prepared authorization carries exactly that target, including through a
+/// wrapper that forwards this dispatcher's dispatch.
 pub struct CommsToolSurface {
     tool_context: ToolContext,
     tool_defs: Arc<[Arc<ToolDef>]>,
@@ -238,6 +240,7 @@ impl AgentToolDispatcher for CommsToolSurface {
 
         let args = ToolCallArguments::from_raw_json(call.args)
             .map_err(|error| ToolError::invalid_arguments(call.name, error.to_string()))?;
+        CommsExecutionAuthority::require_authorized_target(call, args.as_value(), context)?;
         let result =
             handle_tools_call_with_context(&self.tool_context, call.name, args.as_value(), context)
                 .await
@@ -541,6 +544,131 @@ mod tests {
                     if message.starts_with("peer_not_found_or_not_trusted")
             ),
             "the resolved call reaches the comms handler: {result:?}"
+        );
+    }
+
+    /// Bound work that allows every operation at R1, so only the comms
+    /// owner's own checks decide.
+    struct AllowAll;
+    struct Allowed;
+
+    impl meerkat_core::WorkAuthorization for AllowAll {
+        fn prepare(
+            &self,
+            _: &meerkat_core::PreparedAuthorizationBinding,
+        ) -> Result<
+            Arc<dyn meerkat_core::PreparedOperationAuthorization>,
+            meerkat_core::OperationAuthorizationError,
+        > {
+            Ok(Arc::new(Allowed))
+        }
+    }
+
+    impl meerkat_core::PreparedOperationAuthorization for Allowed {
+        fn review_tier(&self) -> meerkat_core::OperationReviewTier {
+            meerkat_core::OperationReviewTier::R1
+        }
+
+        fn check_current(
+            &self,
+            _: &meerkat_core::PreparedAuthorizationBinding,
+        ) -> Result<(), meerkat_core::OperationAuthorizationError> {
+            Ok(())
+        }
+    }
+
+    /// An embedder's wrapper that forwards dispatch but resolves its own
+    /// plan from its catalog, so the plan carries no operation target.
+    struct NaiveWrapper(Arc<dyn AgentToolDispatcher>);
+
+    #[async_trait]
+    impl AgentToolDispatcher for NaiveWrapper {
+        fn tools(&self) -> Arc<[Arc<ToolDef>]> {
+            self.0.tools()
+        }
+
+        async fn dispatch(
+            &self,
+            call: ToolCallView<'_>,
+        ) -> Result<meerkat_core::ops::ToolDispatchOutcome, ToolError> {
+            self.0.dispatch(call).await
+        }
+
+        async fn dispatch_with_context(
+            &self,
+            call: ToolCallView<'_>,
+            context: &ToolDispatchContext,
+        ) -> Result<meerkat_core::ops::ToolDispatchOutcome, ToolError> {
+            self.0.dispatch_with_context(call, context).await
+        }
+    }
+
+    fn governed() -> ToolDispatchContext {
+        ToolDispatchContext::default().with_work_authorization(Some(
+            meerkat_core::WorkAuthorizationContext::new(
+                Arc::new(AllowAll),
+                meerkat_core::OperationExecutionScope::Domain,
+            ),
+        ))
+    }
+
+    /// Governed work delivers only when its authorization covered exactly
+    /// the peer the delivery reaches. Through a wrapper that resolved its
+    /// own target-less plan (which the base lineage would cover), the comms
+    /// owner refuses before any delivery; through its own plan the same
+    /// governed call reaches the handler.
+    #[tokio::test]
+    async fn governed_delivery_requires_its_authorized_peer_target() {
+        let (router, trusted_peers) = make_tool_context();
+        let surface: Arc<dyn AgentToolDispatcher> =
+            Arc::new(CommsToolSurface::new(router, trusted_peers));
+        let naive: Arc<dyn AgentToolDispatcher> = Arc::new(NaiveWrapper(Arc::clone(&surface)));
+        let governed = governed();
+        let args = send_args(meerkat_core::comms::PeerId::new());
+        let call = ToolCallView {
+            id: "send-1",
+            name: "send_message",
+            args: &args,
+        };
+
+        let plan = meerkat_core::agent::resolve_tool_execution_plan_fenced(
+            &naive,
+            call,
+            &governed,
+            &resolution(),
+        )
+        .expect("wrapper plan");
+        assert!(
+            plan_targets(&plan).is_empty(),
+            "the wrapper's plan is target-less"
+        );
+        let result = meerkat_core::agent::dispatch_tool_execution_plan_fenced(
+            &naive, call, &governed, &plan,
+        )
+        .await;
+        assert!(
+            matches!(result, Err(ToolError::AuthorizationRefused { .. })),
+            "a delivery authorized without its peer target must not run: {result:?}"
+        );
+
+        let plan = meerkat_core::agent::resolve_tool_execution_plan_fenced(
+            &surface,
+            call,
+            &governed,
+            &resolution(),
+        )
+        .expect("owner plan");
+        let result = meerkat_core::agent::dispatch_tool_execution_plan_fenced(
+            &surface, call, &governed, &plan,
+        )
+        .await;
+        assert!(
+            matches!(
+                &result,
+                Err(ToolError::ExecutionFailed { message })
+                    if message.starts_with("peer_not_found_or_not_trusted")
+            ),
+            "the owner's own governed plan reaches the handler: {result:?}"
         );
     }
 

@@ -50,6 +50,16 @@ them.
   input, or a `reply_to_peer` that selects no single delivery of the turn)
   now fails at execution-plan resolution with `invalid_arguments` and the
   handler's own reason, where it failed at dispatch with `execution_failed`.
+- Behaviour-only (not measured by the gate): under governed work the comms
+  tools and `memory_search` run only when the dispatch's prepared
+  authorization names exactly the typed target they are about to reach (the
+  peer a delivery reaches, the peer directory, or the read of the memory
+  scope searched). A wrapper that forwards their `dispatch_with_context` but
+  resolves its own plan without that target (which a base lineage would
+  cover), or with another one, is now refused with `authorization_refused`
+  (malformed facts) before any delivery or memory read. Forward
+  `resolve_execution_plan` and `dispatch_resolved_with_context` to the
+  owning dispatcher instead. Ungoverned dispatch is unchanged.
 - Persisted format (not measured by the gate): a work association whose
   targeted selection names a `peer`, `peer_directory` or `memory` target
   cannot be read by a binary without this change. Associations that name
@@ -121,7 +131,11 @@ them.
   message it selects) and the peer directory for `peers`.
   `MemorySearchDispatcher` attaches a `Read` of the session memory it
   searches. Each owner revalidates its own target at dispatch, so a plan
-  resolved for one peer never delivers to another.
+  resolved for one peer never delivers to another, and under governed work
+  each runs only when the prepared authorization names exactly that target,
+  through the new `ToolDispatchContext::require_authorized_operation_target`
+  (for any owner whose effect a typed target selects) and
+  `CommsExecutionAuthority::require_authorized_target`.
   `meerkat-authorization-contracts`: `GrantTarget` gains `Peer { peer }`,
   `PeerDirectory` and `Memory { scope }`, and `meerkat-authorization`'s
   `operation_grant_target` selects them on the normal targeted grant path:

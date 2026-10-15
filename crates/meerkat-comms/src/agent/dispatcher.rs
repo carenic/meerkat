@@ -28,6 +28,9 @@ static NEXT_COMMS_EXECUTION_AUTHORITY_ID: AtomicU64 = AtomicU64::new(1);
 /// the session's trusted-peer directory. A plan dispatches only when this
 /// same owner resolved it for exactly the call's current target and
 /// binding, so a plan resolved for one peer never delivers to another.
+/// Governed work also delivers only when its prepared authorization carries
+/// exactly that target ([`Self::require_authorized_target`]), whichever
+/// dispatcher resolved the plan.
 #[derive(Debug)]
 pub struct CommsExecutionAuthority {
     key: String,
@@ -102,6 +105,30 @@ impl CommsExecutionAuthority {
             witness.owner_key() == call.name
                 && witness.binding_fingerprint() == binding
                 && witness.operation_target() == Some(&target)
+        })
+    }
+
+    /// For governed work, require that the dispatch of `call` was authorized
+    /// for exactly the typed target its handler is about to reach, derived
+    /// from `arguments` and `dispatch_context` as the handler routes by (see
+    /// [`ToolDispatchContext::require_authorized_operation_target`]). Every
+    /// comms leaf calls this immediately before its handler, so a wrapper
+    /// that forwards the leaf's dispatch but resolved its own target-less
+    /// plan (which a base lineage would cover) never delivers. Dispatch
+    /// without a prepared authorization is unaffected.
+    ///
+    /// # Errors
+    /// Governed work authorized for another call, another target or none is
+    /// `AuthorizationRefused`; a governed call that names no single
+    /// addressee is `InvalidArguments`.
+    pub fn require_authorized_target(
+        call: ToolCallView<'_>,
+        arguments: &serde_json::Value,
+        dispatch_context: &ToolDispatchContext,
+    ) -> Result<(), ToolError> {
+        dispatch_context.require_authorized_operation_target(call, || {
+            comms_tool_operation_target(call.name, arguments, dispatch_context)
+                .map_err(|reason| ToolError::invalid_arguments(call.name, reason))
         })
     }
 
@@ -346,6 +373,7 @@ impl<T: AgentToolDispatcher + 'static> AgentToolDispatcher for CommsToolDispatch
             // `Value::String` that would silently reach the comms handler.
             let args = ToolCallArguments::from_raw_json(call.args)
                 .map_err(|err| ToolError::invalid_arguments(call.name, err.to_string()))?;
+            CommsExecutionAuthority::require_authorized_target(call, args.as_value(), context)?;
             let result = handle_tools_call_with_context(
                 &self.tool_context,
                 call.name,
@@ -640,6 +668,7 @@ impl AgentToolDispatcher for DynCommsToolDispatcher {
             // `Value::String` that would silently reach the comms handler.
             let args = ToolCallArguments::from_raw_json(call.args)
                 .map_err(|err| ToolError::invalid_arguments(call.name, err.to_string()))?;
+            CommsExecutionAuthority::require_authorized_target(call, args.as_value(), context)?;
             let result = handle_tools_call_with_context(
                 &self.tool_context,
                 call.name,
@@ -1188,6 +1217,108 @@ mod tests {
             .to_string(),
         )
         .expect("valid args")
+    }
+
+    /// Bound work that allows every operation at R1, so only the comms
+    /// owner's own checks decide.
+    struct AllowAll;
+    struct Allowed;
+
+    impl meerkat_core::WorkAuthorization for AllowAll {
+        fn prepare(
+            &self,
+            _: &meerkat_core::PreparedAuthorizationBinding,
+        ) -> Result<
+            Arc<dyn meerkat_core::PreparedOperationAuthorization>,
+            meerkat_core::OperationAuthorizationError,
+        > {
+            Ok(Arc::new(Allowed))
+        }
+    }
+
+    impl meerkat_core::PreparedOperationAuthorization for Allowed {
+        fn review_tier(&self) -> meerkat_core::OperationReviewTier {
+            meerkat_core::OperationReviewTier::R1
+        }
+
+        fn check_current(
+            &self,
+            _: &meerkat_core::PreparedAuthorizationBinding,
+        ) -> Result<(), meerkat_core::OperationAuthorizationError> {
+            Ok(())
+        }
+    }
+
+    /// An embedder's wrapper that forwards dispatch but resolves its own
+    /// plan from its catalog, so the plan carries no operation target.
+    struct NaiveWrapper(Arc<dyn AgentToolDispatcher>);
+
+    #[async_trait]
+    impl AgentToolDispatcher for NaiveWrapper {
+        fn tools(&self) -> Arc<[Arc<ToolDef>]> {
+            self.0.tools()
+        }
+
+        async fn dispatch(&self, call: ToolCallView<'_>) -> Result<ToolDispatchOutcome, ToolError> {
+            self.0.dispatch(call).await
+        }
+
+        async fn dispatch_with_context(
+            &self,
+            call: ToolCallView<'_>,
+            context: &ToolDispatchContext,
+        ) -> Result<ToolDispatchOutcome, ToolError> {
+            self.0.dispatch_with_context(call, context).await
+        }
+    }
+
+    /// Through a wrapper that resolved its own target-less plan, governed
+    /// work authorized without the delivery's peer target never reaches the
+    /// comms handler of either dispatcher.
+    #[tokio::test]
+    async fn governed_delivery_through_a_target_less_wrapper_is_refused() {
+        let (router, trusted_peers) = test_router();
+        let dispatchers: Vec<Arc<dyn AgentToolDispatcher>> = vec![
+            Arc::new(CommsToolDispatcher::new(
+                Arc::clone(&router),
+                trusted_peers.clone(),
+            )),
+            Arc::new(DynCommsToolDispatcher::new(
+                router,
+                trusted_peers,
+                Arc::new(NoOpDispatcher),
+            )),
+        ];
+        let governed = ToolDispatchContext::default().with_work_authorization(Some(
+            meerkat_core::WorkAuthorizationContext::new(
+                Arc::new(AllowAll),
+                meerkat_core::OperationExecutionScope::Domain,
+            ),
+        ));
+        for dispatcher in dispatchers {
+            let naive: Arc<dyn AgentToolDispatcher> = Arc::new(NaiveWrapper(dispatcher));
+            let args = send_args(meerkat_core::comms::PeerId::new());
+            let call = ToolCallView {
+                id: "send-1",
+                name: "send_message",
+                args: &args,
+            };
+            let plan = meerkat_core::agent::resolve_tool_execution_plan_fenced(
+                &naive,
+                call,
+                &governed,
+                &execution_resolution_context(),
+            )
+            .expect("wrapper plan");
+            let result = meerkat_core::agent::dispatch_tool_execution_plan_fenced(
+                &naive, call, &governed, &plan,
+            )
+            .await;
+            assert!(
+                matches!(result, Err(ToolError::AuthorizationRefused { .. })),
+                "a delivery authorized without its peer target must not run: {result:?}"
+            );
+        }
     }
 
     /// Both comms dispatchers attach the typed target of the addressed peer

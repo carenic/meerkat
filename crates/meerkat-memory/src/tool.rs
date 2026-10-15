@@ -64,7 +64,10 @@ fn input_schema() -> Value {
 /// agent-callable tool. Created by the factory when the `memory-store-session`
 /// feature is enabled. It is the owner of its plans: each carries the typed
 /// [`meerkat_core::ToolOperationTarget::MemoryOperation`] read of the scope
-/// this dispatcher searches, and only a plan it resolved dispatches.
+/// this dispatcher searches, and only a plan it resolved dispatches. Governed
+/// work searches only when its prepared authorization carries exactly that
+/// read, including through a wrapper that forwards this dispatcher's
+/// dispatch.
 pub struct MemorySearchDispatcher {
     store: Arc<dyn MemoryStore>,
     scope: MemorySearchScope,
@@ -204,6 +207,25 @@ impl AgentToolDispatcher for MemorySearchDispatcher {
             ));
         }
         self.dispatch_with_context(call, context).await
+    }
+
+    /// For governed work, the search runs only when the dispatch was
+    /// authorized for exactly the read of the scope this dispatcher searches
+    /// (see [`meerkat_core::ToolDispatchContext::require_authorized_operation_target`]),
+    /// so a wrapper that forwards this dispatch but resolved its own
+    /// target-less plan never reads memory. Ungoverned dispatch is unchanged.
+    async fn dispatch_with_context(
+        &self,
+        call: ToolCallView<'_>,
+        context: &meerkat_core::ToolDispatchContext,
+    ) -> Result<meerkat_core::ops::ToolDispatchOutcome, ToolError> {
+        if call.name != TOOL_NAME {
+            return Err(ToolError::NotFound {
+                name: call.name.into(),
+            });
+        }
+        context.require_authorized_operation_target(call, || Ok(self.operation_target()))?;
+        self.dispatch(call).await
     }
 
     async fn dispatch(
@@ -686,6 +708,186 @@ mod tests {
             targets[0].contains(&session_id.to_string()),
             "the target names the searched session's memory: {targets:?}"
         );
+    }
+
+    /// Bound work that allows every operation at R1, so only the memory
+    /// owner's own checks decide.
+    struct AllowAll;
+    struct Allowed;
+
+    impl meerkat_core::WorkAuthorization for AllowAll {
+        fn prepare(
+            &self,
+            _: &meerkat_core::PreparedAuthorizationBinding,
+        ) -> Result<
+            Arc<dyn meerkat_core::PreparedOperationAuthorization>,
+            meerkat_core::OperationAuthorizationError,
+        > {
+            Ok(Arc::new(Allowed))
+        }
+    }
+
+    impl meerkat_core::PreparedOperationAuthorization for Allowed {
+        fn review_tier(&self) -> meerkat_core::OperationReviewTier {
+            meerkat_core::OperationReviewTier::R1
+        }
+
+        fn check_current(
+            &self,
+            _: &meerkat_core::PreparedAuthorizationBinding,
+        ) -> Result<(), meerkat_core::OperationAuthorizationError> {
+            Ok(())
+        }
+    }
+
+    /// An embedder's wrapper that forwards dispatch but resolves its own
+    /// plan from its catalog, so the plan carries no operation target.
+    struct NaiveWrapper(Arc<dyn AgentToolDispatcher>);
+
+    #[async_trait]
+    impl AgentToolDispatcher for NaiveWrapper {
+        fn tools(&self) -> Arc<[Arc<ToolDef>]> {
+            self.0.tools()
+        }
+
+        async fn dispatch(
+            &self,
+            call: ToolCallView<'_>,
+        ) -> Result<meerkat_core::ops::ToolDispatchOutcome, ToolError> {
+            self.0.dispatch(call).await
+        }
+
+        async fn dispatch_with_context(
+            &self,
+            call: ToolCallView<'_>,
+            context: &meerkat_core::ToolDispatchContext,
+        ) -> Result<meerkat_core::ops::ToolDispatchOutcome, ToolError> {
+            self.0.dispatch_with_context(call, context).await
+        }
+    }
+
+    /// A wrapper that forwards dispatch but resolves its own plan naming the
+    /// read of another session's memory.
+    struct ForgingWrapper(Arc<dyn AgentToolDispatcher>);
+
+    #[async_trait]
+    impl AgentToolDispatcher for ForgingWrapper {
+        fn tools(&self) -> Arc<[Arc<ToolDef>]> {
+            self.0.tools()
+        }
+
+        fn resolve_execution_plan(
+            &self,
+            call: ToolCallView<'_>,
+            _: &meerkat_core::ToolDispatchContext,
+            resolution_context: &meerkat_core::ToolExecutionResolutionContext,
+        ) -> Result<
+            meerkat_core::ResolvedToolExecutionPlan,
+            meerkat_core::ToolExecutionResolutionError,
+        > {
+            let witness = meerkat_core::ToolExecutionOwnerWitness::new(
+                "forger".to_string(),
+                call.name,
+                self.execution_binding_fingerprint(call.name)?,
+            )?
+            .with_operation_target(ToolOperationTarget::MemoryOperation {
+                scope: MemorySearchScope::for_session(SessionId::new()).scope_ref(),
+                operation: MemoryOperation::Read,
+            });
+            meerkat_core::ToolExecutionContract::default()
+                .resolve_default(resolution_context.deadlines().clone())?
+                .with_owner_witness(witness)
+        }
+
+        async fn dispatch(
+            &self,
+            call: ToolCallView<'_>,
+        ) -> Result<meerkat_core::ops::ToolDispatchOutcome, ToolError> {
+            self.0.dispatch(call).await
+        }
+
+        async fn dispatch_with_context(
+            &self,
+            call: ToolCallView<'_>,
+            context: &meerkat_core::ToolDispatchContext,
+        ) -> Result<meerkat_core::ops::ToolDispatchOutcome, ToolError> {
+            self.0.dispatch_with_context(call, context).await
+        }
+    }
+
+    /// Governed work searches only when its authorization covered exactly
+    /// the memory scope the search reads. Through a wrapper that resolved
+    /// its own target-less plan (which the base lineage would cover), or a
+    /// plan naming another scope, the memory owner refuses before reading;
+    /// through its own plan the same governed search runs.
+    #[tokio::test]
+    async fn governed_memory_search_requires_its_authorized_scope_target() {
+        let store: Arc<dyn MemoryStore> = Arc::new(crate::SimpleMemoryStore::new());
+        let session_id = SessionId::new();
+        let owner: Arc<dyn AgentToolDispatcher> = Arc::new(dispatcher(store, &session_id));
+        let naive: Arc<dyn AgentToolDispatcher> = Arc::new(NaiveWrapper(Arc::clone(&owner)));
+        let governed = meerkat_core::ToolDispatchContext::default().with_work_authorization(Some(
+            meerkat_core::WorkAuthorizationContext::new(
+                Arc::new(AllowAll),
+                meerkat_core::OperationExecutionScope::Domain,
+            ),
+        ));
+        let (id, raw, name) = make_call(r#"{"query": "anything"}"#);
+        let call = call_view(&id, &raw, &name);
+
+        let plan = meerkat_core::agent::resolve_tool_execution_plan_fenced(
+            &naive,
+            call,
+            &governed,
+            &resolution(),
+        )
+        .unwrap();
+        assert!(
+            plan.owner_witnesses()
+                .iter()
+                .all(|witness| witness.operation_target().is_none()),
+            "the wrapper's plan is target-less"
+        );
+        let result = meerkat_core::agent::dispatch_tool_execution_plan_fenced(
+            &naive, call, &governed, &plan,
+        )
+        .await;
+        assert!(
+            matches!(result, Err(ToolError::AuthorizationRefused { .. })),
+            "a search authorized without its scope target must not run: {result:?}"
+        );
+
+        // A plan naming another scope's read authorizes that read, not this one.
+        let forging: Arc<dyn AgentToolDispatcher> = Arc::new(ForgingWrapper(Arc::clone(&owner)));
+        let plan = meerkat_core::agent::resolve_tool_execution_plan_fenced(
+            &forging,
+            call,
+            &governed,
+            &resolution(),
+        )
+        .unwrap();
+        let result = meerkat_core::agent::dispatch_tool_execution_plan_fenced(
+            &forging, call, &governed, &plan,
+        )
+        .await;
+        assert!(
+            matches!(result, Err(ToolError::AuthorizationRefused { .. })),
+            "a search authorized for another scope must not run: {result:?}"
+        );
+
+        let plan = meerkat_core::agent::resolve_tool_execution_plan_fenced(
+            &owner,
+            call,
+            &governed,
+            &resolution(),
+        )
+        .unwrap();
+        let outcome = meerkat_core::agent::dispatch_tool_execution_plan_fenced(
+            &owner, call, &governed, &plan,
+        )
+        .await
+        .unwrap();
+        assert!(!outcome.result.is_error);
     }
 
     /// The exact typed target: a read of the dispatcher's own session memory.
