@@ -697,6 +697,9 @@ impl CallbackToolDispatcher {
                 meerkat_core::ToolUnavailableReason::ExecutionModeOwnerUnavailable,
             )
         })?;
+        // The route first: a call no open connection can take writes nothing
+        // durable, so no later holder of the route can run it.
+        let route = self.call_route(call.name)?;
         let (spec, arguments) = detached_callback_job_spec(&runtime.realm_id, call, context, plan)?;
         // The blob contract carries base64-encoded bytes: store the base64 of
         // the exact argument bytes the call carried.
@@ -725,7 +728,6 @@ impl CallbackToolDispatcher {
         };
         let wire_receipt = meerkat::project_job_receipt(receipt.clone());
 
-        let route = self.call_route(call.name)?;
         let callback_tx = route.sender();
         let id_counter = route.id_counter();
         tokio::spawn(async move {
@@ -3397,5 +3399,88 @@ mod tests {
         let (outcome, params) = tokio::join!(call, answer_next_callback(&mut other_rx, "other"));
         assert_eq!(params["tool_use_id"], "tc-reclaimed");
         assert_eq!(outcome.unwrap().result.text_content(), "other");
+    }
+
+    /// A detached call through a mob slot whose holder closed is refused
+    /// before anything durable is written: no stored arguments and no job,
+    /// so no later claim or same-named registration can run a call the
+    /// model was told failed.
+    #[tokio::test]
+    async fn detached_call_on_a_released_mob_slot_writes_no_artifact_and_no_job() {
+        let registry = Arc::new(CallbackToolRegistry::default());
+        registry
+            .replace_or_add_with_contracts(vec![(
+                make_provenanced_tool_def("durable"),
+                detached_execution_contract(),
+            )])
+            .unwrap();
+        let (owner_tx, owner_rx) = mpsc::channel(2);
+        let owner = CallbackRoute::from_parts(owner_tx, Arc::new(AtomicU64::new(0)), registry);
+        let slot = Arc::new(MobCallbackRouteSlot::claimed_by(owner));
+        let job_store = Arc::new(meerkat::MemoryDetachedJobStore::new());
+        let blob_store = Arc::new(meerkat::MemoryBlobStore::new());
+        let dispatcher: Arc<dyn AgentToolDispatcher> =
+            Arc::new(CallbackToolDispatcher::from_mob_slot_with_job_runtime(
+                Arc::clone(&slot),
+                vec![],
+                "realm-a",
+                job_store.clone(),
+                blob_store.clone(),
+            ));
+        // The holder's connection closes; its detached tool stays advertised.
+        drop(owner_rx);
+        let args = RawValue::from_string(r#"{"target":"lan"}"#.to_string()).unwrap();
+        let call = ToolCallView {
+            id: "tc-released-detached",
+            name: "durable",
+            args: &args,
+        };
+        let context = meerkat_core::ToolDispatchContext::default().with_runtime_identity(
+            meerkat_core::SessionId::new(),
+            Some(meerkat_core::interaction::InteractionId(
+                uuid::Uuid::from_u128(0xdead_feed),
+            )),
+        );
+        let resolution_context = meerkat_core::ToolExecutionResolutionContext::new(
+            meerkat_core::ToolDeadlineChain::new(vec![
+                meerkat_core::ToolDeadlineContributor::finite(
+                    meerkat_core::ToolDeadlineOwner::CoreToolDispatch,
+                    std::time::Duration::from_secs(30),
+                ),
+            ])
+            .unwrap(),
+        );
+        let plan = meerkat_core::resolve_tool_execution_plan_fenced(
+            &dispatcher,
+            call,
+            &context,
+            &resolution_context,
+        )
+        .unwrap();
+
+        let outcome =
+            meerkat_core::dispatch_tool_execution_plan_fenced(&dispatcher, call, &context, &plan)
+                .await;
+        assert!(is_unclaimed_route_error(&outcome), "{outcome:?}");
+        assert!(
+            meerkat::DetachedJobStore::list_all(&*job_store, 16)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a refused detached call submits no job"
+        );
+        let arguments = meerkat_core::BlobStore::put_artifact(
+            &meerkat::MemoryBlobStore::new(),
+            CALLBACK_ARGUMENTS_MEDIA_TYPE,
+            &standard_base64(args.get().as_bytes()),
+        )
+        .await
+        .unwrap();
+        assert!(
+            meerkat_core::BlobStore::get(&*blob_store, &arguments.blob_id)
+                .await
+                .is_err(),
+            "a refused detached call stores no arguments"
+        );
     }
 }
