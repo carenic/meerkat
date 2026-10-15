@@ -3,8 +3,10 @@
 
 The artifact guard must refuse a binary carrying any of its test-only markers,
 name the marker, accept a clean binary, and fail closed on unreadable input.
-No marker is allowed: tokio's test-util marker, the one exception until 0.9.2,
-now fails a binary like every other marker.
+One marker, tokio's test-util, passes in the binaries of a release before
+0.9.2 (named by VERSION), whose Bazel release builds compiled that feature;
+with VERSION unset, unparsable, or 0.9.2 and later it fails like every other
+marker, and it never masks another.
 Every workspace marker must still be a string that only gated test code
 compiles in: it must occur in its declared source under a `#[cfg(...)]` that
 names its gate. No marker may appear in the docs or in the help corpus the
@@ -25,8 +27,30 @@ GUARD = ROOT / "scripts" / "check-release-binary-markers"
 # The guard and this test name the markers; their gated sources compile them.
 NAMING_FILES = {"scripts/check-release-binary-markers", "scripts/test_check_release_binary_markers.py"}
 GATE_WINDOW = 60
-# tokio's test-util marker: allowed until 0.9.2, refused like any other since.
+# tokio's test-util marker: allowed only for a release before 0.9.2.
 TOKIO_TEST_UTIL = "time is not frozen"
+# VERSION values that name a release before 0.9.2, and values that do not
+# (0.9.2 and later, a 0.9.2 prerelease, or not a release version at all).
+BEFORE_0_9_2 = ("0.9.1", "v0.9.1", "0.9.1-rc.1", "0.9.0", "0.8.24", "0.1.0")
+NOT_BEFORE_0_9_2 = (
+    "0.9.2",
+    "v0.9.2",
+    "0.9.2-rc.1",
+    "0.9.3",
+    "0.10.0",
+    "1.0.0",
+    "1.0.0-alpha.1",
+    "",
+    "0.9",
+    "0.9.1.1",
+    "00.9.1",
+    "0.09.1",
+    "0.9.1+build.1",
+    "V0.9.1",
+    " 0.9.1",
+    "release-0.9.1",
+    "latest",
+)
 
 
 def markers() -> list[tuple[str, str, str]]:
@@ -67,8 +91,12 @@ class ReleaseBinaryMarkerTests(unittest.TestCase):
         path.write_bytes(os.urandom(4096) + payload + os.urandom(4096))
         return path
 
-    def guard(self, *args: str) -> subprocess.CompletedProcess[str]:
-        return subprocess.run([str(GUARD), *args], capture_output=True, text=True, check=False)
+    def guard(self, *args: str, version: str | None = None) -> subprocess.CompletedProcess[str]:
+        # The caller's environment never decides: VERSION is unset unless given.
+        env = {key: value for key, value in os.environ.items() if key != "VERSION"}
+        if version is not None:
+            env["VERSION"] = version
+        return subprocess.run([str(GUARD), *args], capture_output=True, text=True, check=False, env=env)
 
     def test_marker_list_is_well_formed(self) -> None:
         entries = markers()
@@ -87,17 +115,47 @@ class ReleaseBinaryMarkerTests(unittest.TestCase):
                 self.assertIn(f'carries test-only code: "{marker}"', result.stderr)
                 self.assertIn(source, result.stderr)
 
-    def test_tokio_test_util_marker_is_no_longer_allowed(self) -> None:
-        # The Bazel release builds drop tokio's test-util (a select on
-        # //tools/bazel:release_build), so its marker fails a binary alone and
-        # the guard has no allowlist left to consult.
+    def test_tokio_test_util_marker_fails_without_a_release_before_0_9_2(self) -> None:
+        # Since 0.9.2 the Bazel release builds drop tokio's test-util (a
+        # select on //tools/bazel:release_build): its marker fails a binary
+        # alone unless VERSION names an older release.
         self.assertIn(TOKIO_TEST_UTIL, [marker for marker, _, _ in markers()])
         path = self.binary("rkat-mcp", TOKIO_TEST_UTIL.encode())
-        result = self.guard(str(path))
-        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-        self.assertIn(f'carries test-only code: "{TOKIO_TEST_UTIL}"', result.stderr)
-        self.assertNotIn("allowed", result.stdout + result.stderr)
-        self.assertEqual(self.guard("--allowed").returncode, 2)
+        for version in (None, *NOT_BEFORE_0_9_2):
+            with self.subTest(version=version):
+                result = self.guard(str(path), version=version)
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn(f'carries test-only code: "{TOKIO_TEST_UTIL}"', result.stderr)
+                self.assertIn("only a release before 0.9.2 may carry it", result.stderr)
+                self.assertNotIn("carries the allowed marker", result.stdout + result.stderr)
+
+    def test_tokio_test_util_marker_passes_in_a_release_before_0_9_2(self) -> None:
+        # Asset recovery of an older tag runs the current guard on binaries
+        # whose Bazel release build compiled tokio's test-util.
+        path = self.binary("rkat-mcp", TOKIO_TEST_UTIL.encode())
+        for version in BEFORE_0_9_2:
+            with self.subTest(version=version):
+                result = self.guard(str(path), version=version)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn(f'carries the allowed marker "{TOKIO_TEST_UTIL}"', result.stdout)
+                self.assertIn(f"beyond the one allowed for {version}", result.stdout)
+
+    def test_no_release_allows_any_other_marker(self) -> None:
+        for version in BEFORE_0_9_2:
+            for marker, _, _ in markers():
+                if marker == TOKIO_TEST_UTIL:
+                    continue
+                with self.subTest(version=version, marker=marker):
+                    alone = self.binary("rkat", marker.encode())
+                    result = self.guard(str(alone), version=version)
+                    self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                    self.assertIn(f'carries test-only code: "{marker}"', result.stderr)
+                    # The allowed marker never masks another.
+                    both = self.binary("rkat-rest", TOKIO_TEST_UTIL.encode() + b"\0" + marker.encode())
+                    result = self.guard(str(both), version=version)
+                    self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                    self.assertIn(f'carries test-only code: "{marker}"', result.stderr)
+                    self.assertNotIn(f'carries test-only code: "{TOKIO_TEST_UTIL}"', result.stderr)
 
     def test_clean_binaries_pass_and_only_the_dirty_one_is_named(self) -> None:
         clean = self.binary("rkat-rpc")

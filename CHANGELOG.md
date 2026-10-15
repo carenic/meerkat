@@ -172,9 +172,13 @@ them.
   that key changes `MODULE.bazel.lock`. `scripts/check-bazel-release-features.py`
   now also fails when a listed feature stays enabled in a release build of
   any repository MODULE.bazel.lock renders for the crate (or when a listed
-  crate has none), and `scripts/check-release-binary-markers` no longer
-  allows tokio's test-util marker in a packaged binary. Cargo-built release
-  binaries never compiled it.
+  crate has none), and `scripts/check-release-binary-markers` allows tokio's
+  test-util marker only in the binaries of a release before 0.9.2, named by
+  `VERSION` (the release workflow's packaging and publishing steps pass the
+  release version), so an asset recovery of an older tag, which runs the
+  current guard, still accepts that tag's BuildBuddy binaries. With `VERSION`
+  unset, unparsable, or 0.9.2 and later, the marker fails a binary like every
+  other one. Cargo-built release binaries never compiled it.
 
 - Adaptive mobpack validation no longer counts doc-only schema text as a
   schema change. It compares the bundled `adaptive/layer-decision.schema.json`

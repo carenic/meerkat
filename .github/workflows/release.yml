@@ -1013,7 +1013,9 @@ jobs:
             if [[ "${TARGET}" == *-unknown-linux-gnu ]]; then
               ./scripts/check-linux-release-binary-portability.sh "$src"
             fi
-            # No release binary may carry compiled-in test code.
+            # No release binary may carry compiled-in test code. The guard
+            # reads the release version from VERSION: tokio's test-util
+            # marker passes only in a release before 0.9.2.
             .release-tooling/scripts/check-release-binary-markers "$src"
 
             tar -czf "dist/${artifact_name}" -C "$(dirname "$src")" "$(basename "$src")"
@@ -1374,7 +1376,10 @@ jobs:
             if [[ "${TARGET}" == *-unknown-linux-gnu ]]; then
               ./scripts/check-linux-release-binary-portability.sh "${stage_dir}/${payload_name}"
             fi
-            # No release binary may carry compiled-in test code.
+            # No release binary may carry compiled-in test code. The guard
+            # reads the release version from VERSION: tokio's test-util
+            # marker passes only in a release before 0.9.2, whose Bazel
+            # release builds compiled it (an asset recovery of such a tag).
             .release-tooling/scripts/check-release-binary-markers "${stage_dir}/${payload_name}"
             archive_path="${PWD}/dist/${artifact_name}"
 
@@ -1835,8 +1840,10 @@ jobs:
                 echo "$(basename "${archive}"): $(basename "${binary}") does not embed release version ${version}" >&2
                 exit 1
               }
-              # Nor may it carry compiled-in test code.
-              scripts/check-release-binary-markers "${binary}"
+              # Nor may it carry compiled-in test code. The guard reads the
+              # release version from VERSION: tokio's test-util marker passes
+              # only in a release before 0.9.2.
+              VERSION="${version}" scripts/check-release-binary-markers "${binary}"
             done < <(find "${unpacked}" -type f -print0)
             [[ "${binaries}" -gt 0 ]] || { echo "$(basename "${archive}") is empty" >&2; exit 1; }
             rm -rf "${unpacked}"
