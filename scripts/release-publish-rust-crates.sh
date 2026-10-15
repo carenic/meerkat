@@ -12,10 +12,11 @@
 # MEERKAT_CRATE_INDEX_TIMEOUT seconds per level (default 600).
 #
 # Failure semantics are those of the sequential publisher, per level: an
-# already published version is skipped, a rate limit is retried, and the
-# first crate (in canonical order) that fails stops the publication with its
-# exit status (124 after MEERKAT_CRATE_PUBLISH_TIMEOUT) once the crates of
-# its level already in flight finish; no later level starts.
+# already published version is skipped, a rate limit is retried, and once a
+# crate fails no further crate starts (the level's crates already in flight
+# finish), and the publication stops with the status of the first failed
+# crate in canonical order (124 after MEERKAT_CRATE_PUBLISH_TIMEOUT); no
+# later level starts.
 
 set -euo pipefail
 
@@ -177,6 +178,16 @@ publish_worker() {
   echo "  ${crate}: finished (exit ${rc})"
 }
 
+# True once any crate of the level recorded a non-zero exit status.
+level_failed() {
+  local rc_file
+  for rc_file in "$1"/*.rc; do
+    [[ -f "$rc_file" ]] || continue
+    [[ "$(cat "$rc_file")" == "0" ]] || return 0
+  done
+  return 1
+}
+
 # crates.io sparse index path of a crate name.
 index_path() {
   local name="${1,,}"
@@ -233,14 +244,20 @@ publish_level() {
     names+=("${entry%%:*}")
   done
   echo "Level ${level}: publishing ${names[*]} (at most ${JOBS} at a time)"
+  local launched=()
   for crate in "${names[@]}"; do
     while [[ "$(jobs -rp | wc -l)" -ge "$JOBS" ]]; do
       wait -n || true
     done
+    if level_failed "$dir"; then
+      echo "Level ${level}: a crate failed; ${crate} and the rest of the level are not started" >&2
+      break
+    fi
     publish_worker "$crate" "$dir" &
+    launched+=("$crate")
   done
   wait || true
-  for crate in "${names[@]}"; do
+  for crate in "${launched[@]}"; do
     cat "${dir}/${crate}.log"
     rc="$(cat "${dir}/${crate}.rc" 2>/dev/null || echo 1)"
     if [[ "$rc" -ne 0 && -z "$failed_crate" ]]; then

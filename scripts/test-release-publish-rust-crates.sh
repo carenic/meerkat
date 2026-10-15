@@ -185,23 +185,27 @@ if awk -F '\t' -v level="${dry_level}" '$1 > level { print $2 }' <<<"${LEVELS}" 
 fi
 echo "ok: a dry run checks crates one at a time without waiting for the index and stops at ${dry_crate}"
 
-# 4. A failing crate stops the publication with its status; its level's other
-#    crates finish, and no later level starts.
+# 4. A failing crate stops the publication with its status: once it failed,
+#    no further crate of its level starts (one at a time here, so none of its
+#    siblings), and no later level starts.
 failing_level=3
 failing_crate="$(awk -F '\t' -v level="${failing_level}" '$1 == level { print $2; exit }' <<<"${LEVELS}")"
 prepare failure "${failing_crate}" fail
-publish failure 3
+publish failure 3 MEERKAT_CRATE_PUBLISH_JOBS=1
 check_level_order failure
 later="$(awk -F '\t' -v level="${failing_level}" '$1 > level { print $2 }' <<<"${LEVELS}" | sort)"
 if comm -12 <(started failure) <(printf '%s\n' "${later}") | grep -q .; then
   fail "failure: a crate of a later level started after ${failing_crate} failed"
 fi
-siblings="$(awk -F '\t' -v level="${failing_level}" '$1 == level { print $2 }' <<<"${LEVELS}" | sort)"
-[[ "$(comm -12 <(started failure) <(printf '%s\n' "${siblings}"))" == "${siblings}" ]] ||
-  fail "failure: the other crates of level ${failing_level} did not finish"
+siblings="$(awk -F '\t' -v level="${failing_level}" -v crate="${failing_crate}" '$1 == level && $2 != crate { print $2 }' <<<"${LEVELS}" | sort)"
+if comm -12 <(started failure) <(printf '%s\n' "${siblings}") | grep -q .; then
+  fail "failure: a sibling of ${failing_crate} started after it failed" "$(comm -12 <(started failure) <(printf '%s\n' "${siblings}"))"
+fi
 grep -Fq "Level ${failing_level}: ${failing_crate} failed (exit 3)" "${TEST_ROOT}/failure/out.log" ||
   fail "failure: the failing crate is not named"
-echo "ok: ${failing_crate} failing stops the publication with exit 3 after its level"
+grep -Fq "and the rest of the level are not started" "${TEST_ROOT}/failure/out.log" ||
+  fail "failure: the unstarted rest of the level is not reported"
+echo "ok: ${failing_crate} failing stops the publication with exit 3; no further crate starts"
 
 # 5. A crate that never reaches the index fails its level after the timeout.
 hidden_crate="$(awk -F '\t' 'NR == 1 { print $2 }' <<<"${LEVELS}")"
