@@ -3,10 +3,13 @@
 #
 # Usage: release-find-prebuild <release-commit-sha>
 #
-# Prints the id of the newest release.yml run that prebuilt the release
-# artifacts of exactly <release-commit-sha>, or nothing when there is none:
+# Prints "<run id> <run attempt>" of the newest release.yml run that prebuilt
+# the release artifacts of exactly <release-commit-sha>, or nothing when there
+# is none:
 #   - a workflow_dispatch run of .github/workflows/release.yml on main in this
-#     repository (GITHUB_REPOSITORY) whose head is that commit;
+#     repository (GITHUB_REPOSITORY) whose head is that commit, started and
+#     triggered by the repository owner (or an account listed in
+#     MEERKAT_PREBUILD_ACTORS);
 #   - whose "Release prebuild gate" job succeeded (only a
 #     prebuild_release_artifacts dispatch has that job, and it passes once the
 #     critical Linux and macOS arm64 binaries and the Web SDK package are
@@ -20,10 +23,10 @@
 # MEERKAT_PREBUILD_WAIT_SECONDS (default 6000) have passed since the run
 # started: a prebuild already under way finishes no later than a fresh build.
 #
-# The id is only a pointer. The publishing jobs verify every archive and the
-# Web SDK package against their build attestations before anything is
-# published. "No prebuild" exits 0 with empty output; an API failure exits
-# non-zero.
+# The id is only a pointer, pinned to the attempt examined here: the
+# publishing jobs verify every archive and the Web SDK package against their
+# build attestations, and that attempt's gates, before anything is published.
+# "No prebuild" exits 0 with empty output; an API failure exits non-zero.
 
 set -euo pipefail
 shopt -s inherit_errexit
@@ -55,22 +58,28 @@ log() {
   printf '%s\n' "$*" >&2
 }
 
-# id<TAB>status<TAB>started-epoch for every candidate run, newest first.
+# id<TAB>status<TAB>started-epoch<TAB>attempt for every candidate run, newest
+# first.
 candidate_runs() {
   local listing
   listing="$(gh api \
     "repos/${repository}/actions/workflows/release.yml/runs?event=workflow_dispatch&branch=main&head_sha=${release_sha}&per_page=100" \
-    --jq '.workflow_runs[] | [.id, .status, .path, .event, .head_branch, .head_sha, .repository.full_name, (.run_started_at // .created_at)] | @tsv')" ||
+    --jq '.workflow_runs[] | [.id, .status, .path, .event, .head_branch, .head_sha, .repository.full_name, (.run_started_at // .created_at), .run_attempt, (.actor.login // ""), (.triggering_actor.login // ""), (.repository.owner.login // "")] | @tsv')" ||
     { log "cannot list release.yml runs of ${release_sha}"; return 1; }
-  local id status path event branch sha repo started
-  while IFS=$'\t' read -r id status path event branch sha repo started; do
+  local id status path event branch sha repo started attempt actor trigger owner allowed
+  while IFS=$'\t' read -r id status path event branch sha repo started attempt actor trigger owner; do
     [[ -n "${id}" ]] || continue
     # The query parameters filter server-side; check every field again.
     if [[ "${path}" != ".github/workflows/release.yml" || "${event}" != "workflow_dispatch" ||
           "${branch}" != "main" || "${sha}" != "${release_sha}" || "${repo}" != "${repository}" ]]; then
       continue
     fi
-    printf '%s\t%s\t%s\n' "${id}" "${status}" "$(date -u -d "${started}" +%s)"
+    allowed=" ${MEERKAT_PREBUILD_ACTORS:-${owner}} "
+    if [[ -z "${actor}" || -z "${trigger}" || "${allowed}" != *" ${actor} "* || "${allowed}" != *" ${trigger} "* ]]; then
+      log "run ${id}: started by ${actor:-unknown}, triggered by ${trigger:-unknown}; only${allowed%% }may prebuild a release"
+      continue
+    fi
+    printf '%s\t%s\t%s\t%s\n' "${id}" "${status}" "$(date -u -d "${started}" +%s)" "${attempt}"
   done <<<"${listing}" | sort -t $'\t' -k1,1nr
 }
 
@@ -120,7 +129,7 @@ artifacts_downloadable() {
 while true; do
   runs="$(candidate_runs)"
   pending=0
-  while IFS=$'\t' read -r run_id status started; do
+  while IFS=$'\t' read -r run_id status started attempt; do
     [[ -n "${run_id}" ]] || continue
     gate="$(prebuild_gate_state "${run_id}")"
     if [[ "${gate}" == "pending" || ( "${gate}" == "absent" && "${status}" != "completed" ) ]]; then
@@ -139,8 +148,8 @@ while true; do
     if ! artifacts_downloadable "${run_id}"; then
       continue
     fi
-    log "run ${run_id} prebuilt the critical release artifacts of ${release_sha} (run ${status})"
-    printf '%s\n' "${run_id}"
+    log "run ${run_id} attempt ${attempt} prebuilt the critical release artifacts of ${release_sha} (run ${status})"
+    printf '%s %s\n' "${run_id}" "${attempt}"
     exit 0
   done <<<"${runs}"
   if [[ "${pending}" -eq 0 ]]; then

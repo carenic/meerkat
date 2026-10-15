@@ -1282,6 +1282,7 @@ PUBLISHING_MARKERS = (
     "release-publish-web-sdk-package.sh",
 )
 PREBUILD_RUN = "424242"
+PREBUILD_ATTEMPT = "2"
 
 
 def _job_names(text: str) -> list[str]:
@@ -1368,6 +1369,7 @@ def check_prebuild(text: str) -> list[str]:
 
     prebuild_outputs = {
         f"{PREBUILD_LOOKUP_JOB}.run_id": "",
+        f"{PREBUILD_LOOKUP_JOB}.run_attempt": "",
         f"{CI_GREEN_JOB}.{ATTESTATION_SCHEMA_OUTPUT}": "",
         f"{CI_GREEN_JOB}.{COVERS_OUTPUT}": "",
         f"{CI_GREEN_JOB}.prebuild_tag": "v0.0.0",
@@ -1478,6 +1480,7 @@ def check_prebuild(text: str) -> list[str]:
             step_outputs={"manifest.upload": "true"},
             job_outputs={
                 f"{PREBUILD_LOOKUP_JOB}.run_id": run_id,
+                f"{PREBUILD_LOOKUP_JOB}.run_attempt": PREBUILD_ATTEMPT if run_id else "",
                 f"{CI_GREEN_JOB}.{ATTESTATION_SCHEMA_OUTPUT}": "4",
                 f"{CI_GREEN_JOB}.{COVERS_OUTPUT}": "true",
                 f"{CI_GREEN_JOB}.prebuild_tag": "",
@@ -1535,11 +1538,14 @@ def check_prebuild(text: str) -> list[str]:
             or calls[0][:2] != ["--source-run", PREBUILD_RUN]
             or "--stamps" not in calls[0]
             or "--prebuild" not in calls[0]
+            or "--source-attempt" not in calls[0]
+            or calls[0][calls[0].index("--source-attempt") + 1] != PREBUILD_ATTEMPT
         ):
             violations.append(
                 f"step `{verify_steps[0].name}` verifies {reused.label} with {calls}; expected "
-                f"`{PROVENANCE_VERIFIER} --source-run {PREBUILD_RUN} --prebuild --stamps ...`, the "
-                "assets_run_id trust path for the tag's own prebuild"
+                f"`{PROVENANCE_VERIFIER} --source-run {PREBUILD_RUN} --source-attempt {PREBUILD_ATTEMPT} "
+                "--prebuild --stamps ...`, the assets_run_id trust path for the tag's own prebuild, "
+                "pinned to the attempt the lookup examined"
             )
         else:
             # The critical archives are verified against the prebuild's
@@ -1570,7 +1576,9 @@ def check_prebuild(text: str) -> list[str]:
         (
             index
             for index, step in publisher_steps
-            if "Release binary build gate" in step.run and "PREBUILD_RUN_ID" in step.run
+            if "Release binary build gate" in step.run
+            and "PREBUILD_RUN_ID" in step.run
+            and "PREBUILD_RUN_ATTEMPT" in step.run
         ),
         None,
     )

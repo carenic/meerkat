@@ -863,6 +863,9 @@ jobs:
     timeout-minutes: 130
     outputs:
       run_id: ${{ steps.lookup.outputs.run_id }}
+      # The attempt whose gates the lookup examined; the publishers verify
+      # that attempt and refuse a prebuild re-run after the lookup.
+      run_attempt: ${{ steps.lookup.outputs.run_attempt }}
     steps:
       - name: Checkout release tooling
         uses: actions/checkout@v6
@@ -881,10 +884,17 @@ jobs:
           release_sha="$(git rev-parse HEAD)"
           # A failed lookup is not a reason to stop the release: it only means
           # this run builds everything, as without a prebuild.
-          if ! run_id="$(scripts/release-find-prebuild "${release_sha}")"; then
+          if ! found="$(scripts/release-find-prebuild "${release_sha}")"; then
             echo "::warning::The prebuild lookup failed; this run builds every release artifact."
+            found=""
+          fi
+          read -r run_id run_attempt <<<"${found}" || true
+          if [[ -n "${run_id:-}" && ! "${run_attempt:-}" =~ ^[0-9]+$ ]]; then
+            echo "::warning::The prebuild lookup returned no attempt for run ${run_id}; this run builds every release artifact."
             run_id=""
           fi
+          run_id="${run_id:-}"
+          echo "run_attempt=${run_attempt:-}" >> "${GITHUB_OUTPUT}"
           if [[ -n "${run_id}" ]]; then
             echo "Publishing the prebuilt artifacts of release run ${run_id} (${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${run_id}); no binary or Web SDK build in this run."
           else
@@ -1832,6 +1842,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ github.ref_name }}
           PREBUILD_RUN_ID: ${{ needs.release_prebuild.outputs.run_id }}
+          PREBUILD_RUN_ATTEMPT: ${{ needs.release_prebuild.outputs.run_attempt }}
         run: |
           set -euo pipefail
           if [[ -n "${PREBUILD_RUN_ID}" ]]; then
@@ -1839,6 +1850,7 @@ jobs:
             # critical gate covers the archives verified here.
             scripts/verify-release-asset-provenance \
               --source-run "${PREBUILD_RUN_ID}" \
+              --source-attempt "${PREBUILD_RUN_ATTEMPT}" \
               --source-gate "Release critical binary build gate" \
               --prebuild \
               --stamps release-artifacts \
@@ -2192,11 +2204,12 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           PREBUILD_RUN_ID: ${{ needs.release_prebuild.outputs.run_id }}
+          PREBUILD_RUN_ATTEMPT: ${{ needs.release_prebuild.outputs.run_attempt }}
         run: |
           set -euo pipefail
           deadline=$(( $(date +%s) + 9000 ))
           while true; do
-            state="$(gh api --paginate "repos/${GITHUB_REPOSITORY}/actions/runs/${PREBUILD_RUN_ID}/jobs?per_page=100" \
+            state="$(gh api --paginate "repos/${GITHUB_REPOSITORY}/actions/runs/${PREBUILD_RUN_ID}/attempts/${PREBUILD_RUN_ATTEMPT}/jobs?per_page=100" \
               --jq '.jobs[] | select(.name == "Release binary build gate") | (.conclusion // "pending")')"
             case "${state:-pending}" in
               success)
@@ -2307,6 +2320,7 @@ jobs:
           RECOVERY_FROM_MAIN: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.publish_release_assets_only == 'true' && github.ref == 'refs/heads/main' }}
           ASSETS_RUN_ID: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.assets_run_id || '' }}
           PREBUILD_RUN_ID: ${{ needs.release_prebuild.outputs.run_id }}
+          PREBUILD_RUN_ATTEMPT: ${{ needs.release_prebuild.outputs.run_attempt }}
         run: |
           set -euo pipefail
           if [[ -n "${ASSETS_RUN_ID}" && "${RECOVERY_FROM_MAIN}" != "true" ]]; then
@@ -2322,6 +2336,7 @@ jobs:
             # commit (release_prebuild only selects a run at exactly it).
             scripts/verify-release-asset-provenance \
               --source-run "${PREBUILD_RUN_ID}" \
+              --source-attempt "${PREBUILD_RUN_ATTEMPT}" \
               --prebuild \
               --stamps release-artifacts \
               prepared-release-artifacts "${RELEASE_TAG}"

@@ -305,8 +305,10 @@ Intel macOS and Windows lanes keep running in the same run.
 
 The tag run looks the prebuild up after `require_ci_green`
 (`release_prebuild`, `scripts/release-find-prebuild`): a `release.yml`
-dispatch on `main` at exactly the tag commit, in this repository, whose
-`Release prebuild gate` passed and whose critical artifacts have not expired;
+dispatch on `main` at exactly the tag commit, in this repository, started
+and triggered by the repository owner, whose `Release prebuild gate` passed
+and whose critical artifacts have not expired; the publishers verify the run
+attempt the lookup examined and refuse it if the run was re-run since;
 a gate that has not concluded yet is waited for, because the prebuild
 finishes no later than a fresh build would. When it finds one, the tag run
 skips every build job and publishes that run's artifacts after the same

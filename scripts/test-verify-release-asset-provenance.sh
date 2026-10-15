@@ -45,6 +45,7 @@ echo later >"${TEST_ROOT}/repo/file"
 git_in_repo commit -q -am later
 LATER_SHA="$(git_in_repo rev-parse HEAD)"
 echo "${SHA}" >"${TEST_ROOT}/run_sha"
+echo 1 >"${TEST_ROOT}/run_attempt"
 
 # gh api runs/<id> and runs/<id>/jobs, through real jq; gh attestation verify
 # passes for --source-digest <the run's head> with --source-ref refs/heads/main.
@@ -69,9 +70,9 @@ while [[ "\$#" -gt 0 ]]; do
 done
 case "\${url}" in
   "repos/${REPO}/actions/runs/${RUN_ID}")
-    printf '{"path": ".github/workflows/release.yml", "event": "workflow_dispatch", "head_branch": "main", "head_sha": "%s", "repository": {"full_name": "${REPO}"}}' "\${run_sha}" | jq -r "\${filter}"
+    printf '{"path": ".github/workflows/release.yml", "event": "workflow_dispatch", "head_branch": "main", "head_sha": "%s", "repository": {"full_name": "${REPO}"}, "run_attempt": %s}' "\${run_sha}" "\$(cat "${TEST_ROOT}/run_attempt")" | jq -r "\${filter}"
     ;;
-  "repos/${REPO}/actions/runs/${RUN_ID}/jobs?per_page=100")
+  "repos/${REPO}/actions/runs/${RUN_ID}/jobs?per_page=100"|"repos/${REPO}/actions/runs/${RUN_ID}/attempts/"*"/jobs?per_page=100")
     jq -r "\${filter}" "${TEST_ROOT}/jobs.json"
     ;;
   *) echo "stub gh: unexpected \${url}" >&2; exit 1 ;;
@@ -127,6 +128,12 @@ grep -Fq "is a pre-tag prebuild" "${TEST_ROOT}/prebuild-refused-for-recovery.log
   fail "prebuild-refused-for-recovery: the refusal is not named" "$(cat "${TEST_ROOT}/prebuild-refused-for-recovery.log")"
 verify prebuild-flag-outside-tag-run 1 --prebuild
 CALLER_REF=refs/tags/v0.0.0 verify prebuild-in-its-tag-run 0 --prebuild
+CALLER_REF=refs/tags/v0.0.0 verify prebuild-pinned-attempt 0 --source-attempt 1 --prebuild
+echo 2 >"${TEST_ROOT}/run_attempt"
+CALLER_REF=refs/tags/v0.0.0 verify prebuild-re-run-after-lookup 1 --source-attempt 1 --prebuild
+grep -Fq "not the pinned attempt 1" "${TEST_ROOT}/prebuild-re-run-after-lookup.log" ||
+  fail "prebuild-re-run-after-lookup: the attempt mismatch is not named" "$(cat "${TEST_ROOT}/prebuild-re-run-after-lookup.log")"
+echo 1 >"${TEST_ROOT}/run_attempt"
 gates '"success"' '"success"' '"failure"'
 CALLER_REF=refs/tags/v0.0.0 verify prebuild-gate-failed 1 --prebuild
 gates '"success"' '"success"' '"success"'
@@ -138,7 +145,7 @@ grep -Fq "not the v0.0.0 commit" "${TEST_ROOT}/prebuild-of-another-commit.log" |
 echo "${SHA}" >"${TEST_ROOT}/run_sha"
 gates '"success"' '"success"'
 
-echo "${SHA%?}0" >"${TEST_ROOT}/stamps/rkat-0.0.0-x86_64-unknown-linux-gnu.tar.gz.source-commit"
+echo "${LATER_SHA}" >"${TEST_ROOT}/stamps/rkat-0.0.0-x86_64-unknown-linux-gnu.tar.gz.source-commit"
 verify stamp-names-another-commit 1
 
 echo "release asset provenance contract holds"

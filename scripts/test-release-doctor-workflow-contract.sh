@@ -683,7 +683,7 @@ expect_fail_named prebuild-builds-anyway "${TEST_ROOT}/prebuild-builds-anyway.ym
   "job \`build_binaries_windows_cross\` builds on a tag push with a prebuild found" prebuild
 mutate prebuild-reuse-unverified "${TEST_ROOT}/prebuild-reuse-unverified.yml"
 expect_fail_named prebuild-reuse-unverified "${TEST_ROOT}/prebuild-reuse-unverified.yml" \
-  "expected \`scripts/verify-release-asset-provenance --source-run 424242 --prebuild --stamps ...\`" prebuild
+  "expected \`scripts/verify-release-asset-provenance --source-run 424242 --source-attempt 2 --prebuild --stamps ...\`" prebuild
 mutate prebuild-web-unverified "${TEST_ROOT}/prebuild-web-unverified.yml"
 expect_fail_named prebuild-web-unverified "${TEST_ROOT}/prebuild-web-unverified.yml" \
   "must verify the prebuilt package's attestation" prebuild
