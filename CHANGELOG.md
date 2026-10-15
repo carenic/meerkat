@@ -156,8 +156,9 @@ them.
   executors, the destroy-commit store, the archive-publication fake and the
   six in-memory store test hooks now create the release future before they
   signal that they started; the archive post-commit hook signals with
-  `notify_one`. The waits that follow a release are bounded at 5 s, so a lost
-  release fails with a message instead of hanging the run.
+  `notify_one`. The waits that follow a release are bounded at 5 s (the join
+  of the released receipt-CAS archive task at 10 s), so a lost release fails
+  with a message instead of hanging the run.
 - BuildBuddy (Bazel) release builds of the shipped binaries no longer compile
   tokio's `test-util` feature, the one test-only feature 0.9.1 left in them.
   crate_universe resolves one feature set per external crate across every
@@ -168,8 +169,11 @@ them.
   moves each feature that `scripts/non-shipping-features.json` lists under
   the new `external_crate_features` key out of the crate's rendered static
   `crate_features` and into a select on `//tools/bazel:release_build`: the
-  test lanes keep it, `--define=meerkat_release_build=1` drops it. Editing
-  that key changes `MODULE.bazel.lock`. `scripts/check-bazel-release-features.py`
+  test lanes keep it, `--define=meerkat_release_build=1` drops it. The
+  patched extension reads the whole file, so any edit to
+  `scripts/non-shipping-features.json` (a new test-only feature in its
+  `features` list too) changes `MODULE.bazel.lock`: refresh it with
+  `make buildbuddy-lock-update`. `scripts/check-bazel-release-features.py`
   now also fails when a listed feature stays enabled in a release build of
   any repository MODULE.bazel.lock renders for the crate (or when a listed
   crate has none), and `scripts/check-release-binary-markers` allows tokio's
@@ -179,7 +183,6 @@ them.
   current guard, still accepts that tag's BuildBuddy binaries. With `VERSION`
   unset, unparsable, or 0.9.2 and later, the marker fails a binary like every
   other one. Cargo-built release binaries never compiled it.
-
 - Adaptive mobpack validation no longer counts doc-only schema text as a
   schema change. It compares the bundled `adaptive/layer-decision.schema.json`
   with the runtime's canonical LayerDecision schema after removing the
