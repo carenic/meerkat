@@ -47,6 +47,12 @@ them.
   memory-heavy wasm32 crates, so the build peaks at 13.0 GiB instead of
   18.8 GiB at four plain jobs. Locally, on four vCPUs, its Cargo phase took
   about 11 minutes instead of 24 at one job (33m43s in the v0.9.1 tag run).
+- `@rkat/web`: the release wasm is optimized with `wasm-opt -O1` instead of
+  wasm-pack's default `-O` (binaryen's `-Os`). On the 0.9.1 module the
+  download gets smaller (11.06 MB instead of 11.40 MB with gzip -9, 6.93 MB
+  instead of 7.40 MB with brotli 11) and the unpacked module larger
+  (41.6 MB instead of 36.9 MB), and the pass takes about a minute instead of
+  nine (16 in the v0.9.1 tag run).
 - CI's `Closure tests` rows have 60 minutes instead of 40, and the
   `ci-integration` profile gives its four slow nested-Cargo and
   whole-workspace tests 16 slow periods (960 s) instead of 8, so a cold row
