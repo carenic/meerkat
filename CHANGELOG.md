@@ -66,11 +66,15 @@ them.
 - Behaviour-only (not measured by the gate): under governed work the fenced
   tool dispatch (`dispatch_tool_execution_plan_fenced`, which the agent
   loop uses) refuses, before preparation, a plan for a tool whose root
-  catalog provenance is comms or memory that carries no owner-produced
-  operation target, with `authorization_refused` (malformed facts). Such a
-  plan comes from a wrapper that does not forward `resolve_execution_plan`
-  to the owner and may also drop the dispatch context, where the owner
-  could no longer check its target. This includes the deprecated
+  catalog provenance is comms or memory unless every operation target it
+  carries is of that owner's kind (a peer delivery or the peer directory
+  for comms, a memory operation for memory) and it carries one, with
+  `authorization_refused` (malformed facts). Another owner's target, such
+  as the bundle target a registered Rust bundle attaches to a plan that
+  names none, does not stand in for it. Such a plan comes from a wrapper
+  that does not forward `resolve_execution_plan` to the owner and may also
+  drop the dispatch context, where the owner could no longer check its
+  target. This includes the deprecated
   `SendTool` and `PeersTool` builtins (see Deprecated).
 - Behaviour-only (not measured by the gate): the comms dispatchers
   (`CommsToolSurface`, `CommsToolDispatcher`, `DynCommsToolDispatcher`) and
@@ -172,7 +176,7 @@ them.
   hold when every wrapper between the root dispatcher and the owner
   forwards `resolve_execution_plan` and `dispatch_resolved_with_context`
   with its context; the fenced dispatch refuses a governed comms or memory
-  plan that carries no owner target.
+  plan that carries no target of its owner's kind.
   `meerkat-authorization-contracts`: `GrantTarget` gains `Peer { peer }`,
   `PeerDirectory` and `Memory { scope }`, and `meerkat-authorization`'s
   `operation_grant_target` selects them on the normal targeted grant path:

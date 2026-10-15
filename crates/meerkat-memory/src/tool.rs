@@ -715,6 +715,12 @@ mod tests {
     struct AllowAll;
     struct Allowed;
 
+    /// The governed refusal these owners give: malformed facts.
+    fn is_malformed<T>(result: &Result<T, ToolError>) -> bool {
+        matches!(result, Err(ToolError::AuthorizationRefused { refusal })
+            if refusal.kind() == meerkat_core::authorization::OperationRefusalKind::MalformedFacts)
+    }
+
     impl meerkat_core::WorkAuthorization for AllowAll {
         fn prepare(
             &self,
@@ -853,7 +859,7 @@ mod tests {
         )
         .await;
         assert!(
-            matches!(result, Err(ToolError::AuthorizationRefused { .. })),
+            is_malformed(&result),
             "a search authorized without its scope target must not run: {result:?}"
         );
 
@@ -871,7 +877,7 @@ mod tests {
         )
         .await;
         assert!(
-            matches!(result, Err(ToolError::AuthorizationRefused { .. })),
+            is_malformed(&result),
             "a search authorized for another scope must not run: {result:?}"
         );
 
@@ -945,7 +951,7 @@ mod tests {
         )
         .await;
         assert!(
-            matches!(result, Err(ToolError::AuthorizationRefused { .. })),
+            is_malformed(&result),
             "a governed search through a context-dropping wrapper must not run: {result:?}"
         );
 
@@ -980,7 +986,7 @@ mod tests {
 
         let result = owner.dispatch_with_context(call, &governed_context()).await;
         assert!(
-            matches!(result, Err(ToolError::AuthorizationRefused { .. })),
+            is_malformed(&result),
             "work without its prepared check must not search: {result:?}"
         );
     }
