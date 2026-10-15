@@ -370,6 +370,10 @@ Failed in:
                 "enum TokenStoreError in crates/meerkat-core/src/auth/token_store.rs:607",
                 ("TokenStoreError",),
             ),
+            "type_marked_deprecated": (
+                "Struct PeersTool in crates/meerkat-tools/src/builtin/comms/tools.rs:115",
+                ("PeersTool",),
+            ),
         }
         for lint_id, (item, expected) in cases.items():
             with self.subTest(lint_id=lint_id):
@@ -601,6 +605,53 @@ Failed in:
         self.assertEqual(len(findings), 1)
         self.assertEqual(findings[0].symbols, ("SessionRuntime", "set_callback_channel"))
         self.assertTrue(findings[0].structural)
+
+    TYPE_DEPRECATED_REPORT = """\
+    Checking meerkat-tools v0.9.1 -> v0.9.1 (assume patch change)
+     Checked [   0.022s] 223 checks: 222 pass, 1 fail, 0 warn, 31 skip
+
+--- failure type_marked_deprecated: #[deprecated] added on type ---
+
+Description:
+A type is now #[deprecated]. Downstream crates will get a compiler warning when using this type.
+        ref: https://doc.rust-lang.org/reference/attributes/diagnostics.html#the-deprecated-attribute
+       impl: https://github.com/obi1kenobi/cargo-semver-checks/tree/v0.50.0/src/lints/type_marked_deprecated.ron
+
+Failed in:
+  Struct PeersTool in crates/meerkat-tools/src/builtin/comms/tools.rs:115
+  Struct SendTool in crates/meerkat-tools/src/builtin/comms/tools.rs:72
+  Struct CommsToolSet in crates/meerkat-tools/src/builtin/comms/tool_set.rs:15
+
+     Summary semver requires new minor version: 0 major and 1 minor checks failed
+    Finished [   0.282s] meerkat-tools
+"""
+
+    def test_deprecated_types_are_read_in_full(self) -> None:
+        # The 0.9.2 integration report: three comms types newly #[deprecated].
+        parsed = gate.parse_report(self.TYPE_DEPRECATED_REPORT)
+        self.assertEqual(
+            [(f.lint_id, f.symbols, f.structural) for f in parsed.findings],
+            [
+                ("type_marked_deprecated", ("PeersTool",), True),
+                ("type_marked_deprecated", ("SendTool",), True),
+                ("type_marked_deprecated", ("CommsToolSet",), True),
+            ],
+        )
+        self.assertEqual(gate.check_recognized(parsed), [])
+
+    def test_deprecated_types_are_declared_under_deprecated(self) -> None:
+        parsed = gate.parse_report(self.TYPE_DEPRECATED_REPORT)
+        declared = "`meerkat_tools::builtin::comms::{SendTool, PeersTool, CommsToolSet}`."
+        self.assertEqual(gate.check_named(parsed, self.section(declared, "Deprecated")), [])
+        only_breaking = gate.check_named(parsed, self.section(declared, "Breaking"))
+        self.assertEqual(len(only_breaking), 1)
+        self.assertIn("`### Deprecated`", only_breaking[0])
+        self.assertIn("3 deprecation(s)", only_breaking[0])
+        one_missing = gate.check_named(
+            parsed, self.section("`SendTool` and `CommsToolSet`.", "Deprecated")
+        )
+        self.assertEqual(len(one_missing), 1)
+        self.assertIn("missing: `PeersTool`", one_missing[0])
 
     def test_deprecated_method_cannot_be_declared_by_owner_alone(self) -> None:
         parsed = gate.parse_report(self.DEPRECATED_REPORT)
