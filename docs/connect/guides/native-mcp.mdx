@@ -4,30 +4,7 @@ description: "Connect an installed MCP integration through Meerkat's existing ho
 icon: "plug"
 ---
 
-After Toolkit installs an integration, a Meerkat host can use its ordinary MCP
-configuration to make those tools available in a new session. This does not
-require Toolkit's unfinished native `find_and_install` workflow.
-
-This handoff has been exercised on macOS arm64 with the released Meerkat 0.8.50
-CLI and an actual installed SQLite MCP server. A deterministic local model
-fixture searched and loaded the operation, called it and received its real
-read-only result. That verifies runtime integration; it does not prove agent
-reasoning, account authentication or dynamic acquisition. A separate live trial
-with installed Agno 0.1.1 and real OpenAI `gpt-6.1-sol` completed native catalog
-search, unchanged-schema loading, a public Wikipedia read and the final answer.
-Fresh-process export retained the complete trajectory. The model constructed
-the article link from returned title/content; the connector did not return a
-URL field. This public-read trial does not establish protected authentication
-or dynamic acquisition.
-
-The Agno 0.1.2 successor now preserves source metadata. A further native trial
-installed it through the normal library setup and cited the exact returned
-URL and retrieval timestamp. The timestamp records local retrieval, not an
-article revision or freshness guarantee. The original 0.1.1 trial above retains
-its narrower evidence scope.
-
-The host must separately authorize the process, its resource access and the
-operations the agent may perform. An installation receipt is not that authority.
+After installation, attach the selected MCP integration through Meerkat's host configuration or live-session API. The host selects its account, resource access and agent permissions.
 
 ## Preserve the installed launch
 
@@ -45,7 +22,7 @@ args = ["-I", "-B", "-m", "example_integration"]
 ```
 
 The example paths and module are placeholders. Use the actual installer output.
-Meerkat 0.8.50 does not consume the JSON `mcpServers` wrapper directly. This
+The native configuration uses TOML rather than the JSON `mcpServers` wrapper. This
 handoff supports stdio `command`, `args` and optional `env`; refuse other fields
 until their semantics have a supported mapping. In particular, do not drop a
 `cwd` requirement, and do not pass literal strings containing `${`, which the
@@ -91,7 +68,7 @@ response alone does not establish that a particular integration works.
 
 ## Add tools to a live session
 
-Meerkat 0.8.50 also exposes live MCP mutation through its Python SDK and
+Meerkat exposes live MCP mutation through its Python SDK and
 `rkat-rpc`. Keep the connected client and original session alive while setup
 finishes. Register setup explicitly with `client.mcp_add` for the intended
 session before asking the agent to install anything; the CLI project MCP file
@@ -116,12 +93,9 @@ result = await session.turn(
 )
 ```
 
-The native runtime applies staged operations at a turn boundary. In the
-demonstrated flow, the agent uses catalog search/load before invoking the
+The native runtime applies staged operations at a turn boundary. The agent uses catalog search/load before invoking the
 newly available operation.
-Even a nonexistent executable can receive a `staged` response. Report usable
-tools only after actual discovery and successful invocation establish them.
-`persisted=False` changes the live session and makes no restart promise.
+After the turn boundary, inspect the connection and invoke the selected tool. `persisted=False` applies the configuration to the live session.
 
 Keep the genuine setup server's identity and catalog stable during this
 handoff. The server name contributes to native tool provenance. Replacing
@@ -131,40 +105,7 @@ named tools. Reopening a setup workspace is not equivalent to keeping its
 controller alive. Use the documented recovery path for process loss and
 validate native restoration separately.
 
-This sequence has passed a real-model acceptance on macOS with the published
-Meerkat RPC/SDK 0.8.50 and the ordinary-plugin r2 library. The same session
-inspected and installed a supplied plugin, then recalled its guidance and
-answered correctly with one call to the newly attached connector. Independent
-runtime controls exercised another session's attempted call, an explicit turn
-denial, colliding tool names and a missing executable. The full records are in
-`docs/verification/20261004-plugin-continuation/` in the Toolkit checkout.
-
-The same composition also passes with a fresh agent's outside-catalog choice:
-given a vague Fetch clue, the agent performs public research, acquires and
-inspects the actual package, installs it and uses the attached connector to
-answer the original task. This trial supplies native web research and shell
-tools for the setup work; it does not replace agent investigation with a package
-resolver. Its evidence is in
-`docs/verification/20261004-native-acquisition-gap/`. The successful connector
-call follows actual pending, deferred and loaded observations. The terminal
-answer is verified by fresh session readback because the released ATIF export
-omits it in this trial.
-
-A subsequent two-connector test completes the original Slack-to-email task.
-The same agent chooses and installs both catalog services, then reads Slack
-and submits one correct synthetic email after host attachment. That test uses
-the installed services' public client-factory API with synthetic HTTP transport
-and the exact emitted configurations. It verifies public host embedding, not
-the unwrapped CLI launch or live account authentication. Its complete
-trajectory and committed answer survive fresh readback; see
-`docs/verification/20261004-native-slack-email/`.
-
-The earlier `20261005-release-guide` Linux archive passed the same-session
-Slack/Gmail task using Services 0.1.21 and published RPC/SDK 0.8.50. Fresh
-credential-free runtime readback preserves its history, not connector processes.
-This was a direct Meerkat client trial, not a complete MobKit runtime trial.
-
-The generated Toolkit setup command has a single-use workspace. Preserve its
+The generated Connect setup command has a single-use workspace. Preserve its
 process during this live handoff. For process loss, follow
 [saved-setup recovery](/connect/guides/manage-connections#read-saved-work-after-process-loss)
 instead of restarting that command against the old directory. A recovery
@@ -179,24 +120,6 @@ continuation does not accept those creation-time overrides on each turn.
 The immediate MCP response's `persisted` value concerns configuration
 persistence. Do not infer configuration writes or restart readiness from a
 later lifecycle event's similarly named field.
-
-This is host-mediated live attachment. It does not supply Toolkit's governed
-setup-agent delegation, protected account authentication, requester-bound
-grants or durable continuation after process loss.
-
-## Check model compatibility without weakening validation
-
-Meerkat 0.8.50's OpenAI client explicitly sends `strict: false` for function
-tools. The original Wikipedia schema works in that mode. A controlled request
-that omitted the setting reproduced the reported regex-lookaround rejection.
-Check the runtime actually being executed and its provider request mode before
-changing a connector's schema.
-
-Keep canonical invocation validation. Removing regex constraints recursively
-can make schemas with negation or exclusive branches reject valid inputs.
-Provider-specific treatment belongs with the native provider owner. Acceptance
-for one public tool and model does not establish compatibility for every tool
-or provider.
 
 ## Connect two instances without ambiguous tool names
 

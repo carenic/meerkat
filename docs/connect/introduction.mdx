@@ -1,60 +1,36 @@
 ---
 title: "Meerkat Connect"
-description: "Discover and set up service integrations through the CLI or your application's Console."
+description: "Give agents the integrations they need to get work done."
 icon: "toolbox"
 ---
 
-Tell the agent what you need to do. Connect researches an integration, prepares
-its configuration, and asks you to approve the software and access it needs.
-Toolkit supplies more than 100 adopted OSS identities plus acquisition tools
-for supported Python, Node and MCP packages outside the catalog.
+Meerkat Connect lets agents find, configure and use integrations. Describe the work you need done; the setup agent selects the software, prepares its configuration and brings the required installation and access decisions to you.
 
-<Note>
-Connect 0.9.0 is available for Apple Silicon macOS and Linux x86_64, with
-Meerkat Core and Meta 0.9.0. See [installation](/connect/quickstart) for the CLI archives
-and [availability](/connect/availability) for platform requirements and the scope of
-the Console host components.
-</Note>
+Connect includes more than 100 service integrations and can research Python, Node and MCP packages beyond its library. Use it from the terminal, embed setup in your application's Console, or use its SDKs directly.
 
 <CardGroup cols={2}>
-  <Card title="Install and use Connect" icon="terminal" href="/connect/quickstart">
-    Set up a service with the CLI or your application's integrated Console.
+  <Card title="Install Connect" icon="terminal" href="/connect/quickstart">
+    Set up your first integration and use it from a Meerkat agent.
   </Card>
-  <Card title="Check integration support" icon="box-open" href="/connect/library/adoption">
-    Find the supported platform, operations and account requirements.
+  <Card title="Explore the library" icon="boxes-stacked" href="/connect/library/adoption">
+    Connect communication, development, research, data and business services.
+  </Card>
+  <Card title="Build with Connect" icon="code" href="/connect/guides/host-composition">
+    Embed setup, service operations and connection management in your application.
+  </Card>
+  <Card title="Go beyond the library" icon="compass" href="/connect/concepts/acquisition">
+    Let a setup agent investigate a package for the task at hand.
   </Card>
 </CardGroup>
 
 ## Start with the work
 
-A request such as "Read last week's updates from these channels and summarize
-them" gives the agent a goal without requiring you to choose a package or
-protocol. The catalog speeds up known choices; it does not limit research.
+Ask for an outcome: "Read last week's updates from these Slack channels and draft a summary for the team." The agent works out which integrations and operations the task needs. You review the selected software, account and access before it is used.
 
-The first release supports two service-setup paths:
+In the **CLI**, choose a realm, complete setup, then use the integration through an ordinary `rkat` agent in that realm. In an **integrated Console**, the application presents setup alongside the original conversation and manages the return to that task.
 
-- **Standalone CLI:** choose the realm, review setup and access, then use the
-  installed integration through an ordinary `rkat` agent in that realm.
-- **Integrated Console:** begin in your application's original conversation.
-  Its setup panel collects protected input and reviews, then returns the result
-  to the same task.
+## Control the access
 
-Model-provider sign-in and integration-account sign-in are separate. Keep keys,
-passwords and authorization codes out of chat. Installing software does not by
-itself connect an account or give every agent access.
+An installation, an account connection and an agent's permissions are separate choices. You can use the same service with several accounts, give an agent selected operations, and set an access lifetime. Credentials go through protected terminal or application controls, outside the agent conversation.
 
-## What the first release covers
-
-Service support follows each integration's declared operations, authentication
-profile and platform. More than 100 adopted identities does not mean every
-provider operation or newcomer authentication route is qualified.
-
-Broad frontend, custom-host, remote, HomeCore and device parity remains
-[follow-up work](/connect/roadmap). Existing frontend and SDK components keep their
-explicit host contracts. A frontend needs a persistent application that owns
-identity, audience, routing and delivery; a one-shot CLI session is not that host.
-
-Connect is optional. Core and Meta can use existing tools without it. Connect
-uses their public APIs and introduces no Toolkit dependency into `rkat`.
-The [advanced host recipes](/connect/guides/host-composition) explain application
-composition separately from the [ordinary quickstart](/connect/quickstart).
+Connect builds on Meerkat's runtime and Meta's application framework. Its Python and TypeScript service libraries are also usable independently. See [platforms and installation options](/connect/availability) to choose your starting point.

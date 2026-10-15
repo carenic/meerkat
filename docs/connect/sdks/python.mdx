@@ -1,6 +1,6 @@
 ---
 title: "Python SDK"
-description: "Use reviewed OSS functions and reusable service operations through explicit host composition."
+description: "Call service operations and embed native setup in a Python application."
 icon: "python"
 ---
 
@@ -18,27 +18,20 @@ python3 -m venv .venv-toolkit
   'meerkat-toolkit[slack] @ https://github.com/lukacf/meerkat-connect/releases/download/v0.9.0/meerkat_toolkit-0.9.0-py3-none-any.whl'
 ```
 
-This installs a GitHub release asset, not a package selected from PyPI. For source
-development, use `.venv-toolkit/bin/python -m pip install './sdk/python[slack]'`
-from the checkout root. Keep the wheel's bundled licenses and upstream notices.
+For source development, use `.venv-toolkit/bin/python -m pip install './sdk/python[slack]'` from the checkout root.
 
 | Extra | Purpose |
 | --- | --- |
-| `agno` | Experimental synchronous adapter for explicitly selected real Agno functions |
-| `agno-mcp` | Combined SDK source profile; use the separate reviewed Agno wheel for the adopted library |
 | `home-assistant`, `gmail`, `google-calendar`, `google-drive`, `slack` | Selected HTTPX/AnyIO service operations |
 | `homecore-live` | Existing HomeCore live image transport |
 | `telegram` | Telegram provider normalization dependency |
-| `native-host` | Application composition with `meerkat-meta==0.9.0`; requires the matching SDK and Toolkit gateway |
+| `native-host` | Application composition with `meerkat-meta==0.9.0`; requires the matching SDK and Connect gateway |
 
 Service extras currently require HTTPX `>=0.28.1,<0.29` and AnyIO `>=4.13,<5`. The stdlib-only Gmail formatting and base Telegram wire transport do not require those extras.
 
 ## Native application composition
 
-The optional native classes retain the ordinary `meerkat_meta.runtime.MetaRuntime`
-configuration, callback handling and lifecycle. They require a compatible
-selected Meta SDK artifact and a local Toolkit gateway on POSIX. A version
-constraint alone is not qualification of that artifact.
+The native classes use `meerkat_meta.runtime.MetaRuntime` configuration, callbacks and lifecycle. Supply the matching Meta SDK and a local Connect gateway on POSIX.
 
 | Startup path | Class and module |
 | --- | --- |
@@ -72,14 +65,9 @@ start another attempt after startup has entered.
 Preserve native exceptions and any retained cleanup capability. For
 `GatewayStartupCleanupError`, await its `cleanup.shutdown()`; interrupted native
 startup can retain the same capability as `gateway_cleanup` on the original
-exception. Neither cleanup nor a private acknowledgement proves rollback,
-readiness or completion of the original task.
+exception. Retain the startup outcome separately from the cleanup result.
 
-These APIs compose an application host with the matching Toolkit gateway and
-Meta SDK. The release notes identify the qualified compositions; source/build
-checks do not establish every host, replacement or recovery path.
-See [host composition](/connect/guides/host-composition#native-application-lifecycle) for
-the shared lifecycle, Restore reconnect rules and service/frontend boundaries.
+See [host composition](/connect/guides/host-composition#native-application-lifecycle) for startup, reconnect and lifecycle management.
 
 ## Supply the MCP browser callback
 
@@ -89,14 +77,7 @@ authentication, forwards completion to native auth, and closes its socket work
 on settlement. Native auth retains PKCE, state, account verification, persistence
 and cancellation. Rust embedding hosts use the native loopback helper instead.
 
-The recorded Linux qualification in
-`docs/verification/20261006-mcp-native-login/REPORT.md`
-used published Meerkat 0.8.51 RPC and Python SDK artifacts, a synthetic loopback
-issuer and `TOKIO_WORKER_THREADS=2`. It covers the loopback source recorded there,
-not the later registered-HTTPS additions, and did not repin Toolkit dependencies.
-The host supplies an already connected compatible client and a protected human
-sign-in presenter. No ordinary browser opener, new RPC protocol or credential
-store is supplied. Do not expose the adapter as an agent tool.
+Supply an already connected Meerkat client and a protected sign-in presenter. Keep the callback adapter in host code, outside the agent tool surface.
 
 For cancellable request handlers, retain `McpLoginCustodian(client, target)`
 under the existing host-owned step before awaiting `begin()`. It keeps one
@@ -110,83 +91,6 @@ cleanup. Closing a panel must not call it. A Joined result leaves cancellation
 and presentation with the original custodian. Low-level `begin_mcp_login` and
 explicit `observe_mcp_auth` remain available. This is in-memory transport custody,
 not recovery across process loss. The full contract is in `sdk/python/MCP-AUTH.md`.
-
-Earlier SDK framing and Toolkit-view checks used a scripted peer. The separate
-released-native run exercises wrong configured-account refusal, waiter rejoin,
-Started/Joined ownership, one synthetic PKCE code exchange, status and explicit
-cancel. Its report retains the original startup failure and the later bounded
-success. Real provider login, authenticated requester admission, protected
-presentation, process-loss recovery and the complete acquisition path remain
-unverified. The qualified profile is same-host loopback. Current registered-HTTPS
-callback source still requires compatible native admission and host-owned routing;
-it does not establish a remote/headless production journey.
-
-## Reuse Agno functions
-
-**Current experimental component.** The `agno` extra selects Agno `3.0.11` and jsonschema `4.26.0`. The host supplies a configured toolkit and explicitly classifies the selected operations:
-
-```python
-from agno.tools.hackernews import HackerNewsTools
-from meerkat_toolkit.adapters.agno import AgnoToolkitAdapter
-
-adapter = AgnoToolkitAdapter(
-    HackerNewsTools(timeout=10),
-    functions={"get_top_hackernews_stories": "read"},
-)
-descriptions = adapter.describe()  # Metadata only; no provider call.
-```
-
-After authorization, `adapter.invoke(name, arguments)` validates the JSON arguments and invokes the selected upstream function with Agno's Python argument conversion. It preserves bounded result values and does not interpret returned error strings as business success. Unsupported runtime injection, hooks, approval, cache, async and streaming behavior is refused. The adapter creates no Agno agent and registers no native tools.
-
-The host retains credentials, account isolation, network configuration and toolkit lifetime. This synchronous profile supplies no hard cancellation deadline or automatic retries. An error after a write entered the invocation boundary carries an unknown write outcome. Source and installed-wheel tests exercise actual Hacker News and PubMed bodies against controlled HTTP peers; they do not establish supported host activation or adopted integration counts. The complete component contract is maintained in `sdk/python/AGNO.md`.
-
-## Run a selected Agno MCP profile
-
-The adopted library uses the separate `meerkat-toolkit-agno` wheel, which excludes the extracted HomeCore-derived modules. Install the exact artifact and runtime constraints named in `docs/adoption/AGNO-SUPPORT.md`. The [local consumer guide](/connect/library/local-install) supplies the current installation path; earlier verification directories retain their own artifacts. No public registry publication is claimed.
-
-Use the installed module's `profiles` and `config-help --profile hackernews`
-commands before writing a configuration. The
-[account prerequisites](/connect/library/local-install#select-an-account-through-the-host)
-adds `prerequisites` and `unresolved_details` for all 36 profiles. It distinguishes
-public access, API keys, access tokens, passwords and explicit service
-credentials, including each profile's host and account preparation. The helper
-needs no credential or provider runtime and does not perform authentication.
-
-Save a host-controlled configuration file:
-
-```json
-{
-  "profile": "hackernews",
-  "operations": ["get_top_hackernews_stories"],
-  "config": {"timeout": 10}
-}
-```
-
-Configure the MCP host to launch the installed interpreter with:
-
-```text
--m meerkat_toolkit_agno.agno_mcp serve --config /absolute/path/hackernews.json
-```
-
-Use `check-config --config /absolute/path/hackernews.json` to validate the
-nonsecret configuration before supplying any credential. Help and validation
-leave credential acquisition, account verification and grants with the host.
-
-The accepted wheel supplies thirty-six profiles: Hacker News, PubMed, SearXNG, Tavily, Financial Datasets, OpenWeather, Bitbucket, GitLab, ClickUp, Discord, Shopify, Spotify, Unsplash, Cal.com, Jina Reader, OpenRouteService, Zendesk Help Center, Bright Data, Linkup, Todoist, Zoom, Exa, Firecrawl, Trello, Salesforce, Twilio, Webex, Plivo, arXiv, Reddit, X, YouTube metadata, Oxylabs, Wikipedia, AWS Lambda and PostgreSQL metadata. Its packaged `PROFILE-GUIDE.md` lists exact operation names and host configuration. Consumers supply choices and named credential references without writing provider clients. Authenticated profiles require the appropriate existing credential; acquisition, consent and refresh remain unfinished.
-
-Cal.com, Jina, OpenRouteService and Zendesk use explicit source ports of seven operations, retaining real Agno Toolkit classes and helpers. Their guide discloses timezone and pagination limits, Jina's JSON-to-string formatting, required collection shapes and route-metric checks. Those four ports preceded the Agno21 additions. Agno29 expanded its predecessor graph to 96 exact pins. Agno35 retains 95 of those versions, replaces OAuthlib 4.0.0 with approved 3.3.1 for Tweepy, and adds 13 dependencies for 109 exact pins. Agno36 preserves all 109 and adds Psycopg and Psycopg Binary 3.3.6 for 111 exact pins.
-
-`describe` prints selected schemas without a provider call. Keys are resolved at construction, including `describe`, and missing keys fail without ambient fallback. Public profiles require their documented timeout, instance or operator contact choices. No arbitrary imports or heuristic intent selection are accepted.
-
-Bright Data retains inherited scrape/search operations and wraps successful UTF-8 content under `content`; it sends targets to its fixed provider endpoint. Linkup retains actual SDK request and response models. Todoist retains its real SDK and donor task formatter with explicit client injection. Zoom uses documented constructor/read-body ports and a preselected token, with the first list page only. These profiles perform no refresh or writes.
-
-Reddit and X retain actual SDK models through explicit owned request ports. YouTube exposes public metadata only. Oxylabs validates both parsed and fallback results before the donor formats them. Wikipedia uses an attributable exact-title port with selected language, bounded redirects and consistent page identity. AWS Lambda retains actual botocore signing and parsing and refuses an incomplete function list. The packaged guide and notices document each port and omitted operation.
-
-The accepted standalone wheel passes 220 installed methods in a full consumer and 29 PostgreSQL methods in a second fresh consumer, with all 111 exact dependency versions and 36 CLI profiles verified in both. Actual donor operations, account isolation, bounded results, failures and cleanup run against controlled providers. PostgreSQL uses real isolated SCRAM principals and metadata statements over an explicitly selected local Unix socket; remote TCP/TLS, arbitrary SQL and export are excluded. One active invocation owner and at most one MCP server may use each PostgreSQL profile. These are thirty-six **adopted local library profiles**, with the exact support limits recorded in `docs/adoption/AGNO-SUPPORT.md`. Earlier live and native Hacker News observations remain bound to their respective artifacts.
-
-A historical real public Hacker News read used the Agno21 wheel, SHA-256 `ed31567a1087bc2b2a2fd40f5512259083b7bf3611a20a2b9042354f303eefa7`, and is evidence for that exact artifact only. Agno36 has the controlled-provider and isolated-database acceptance above; it does not inherit the earlier live receipt. Neither receipt establishes authenticated profiles, native attachment or automatic setup. Follow the current [integration quickstart](/connect/quickstart) for the complete Connect 0.9 installation.
-
-Credentialed sessions use normal TLS, explicit account binding, no automatic retry or redirect, and no ambient proxy or account fallback. Calls serialize; cancellation waits for the active synchronous worker and its cleanup to settle. A request timeout does not bound an entire multi-request operation. Selected newer service helpers also bound decoded response bytes before formatting; limits for earlier donors remain as documented in the artifact's guide. The host owns process lifetime, network policy and stderr access. Close a profile only after its serving and worker tasks have joined.
 
 ## Prepare the client once
 

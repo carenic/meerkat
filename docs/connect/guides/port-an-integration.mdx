@@ -11,7 +11,7 @@ Start by identifying what the donor actually contributes: a maintained provider 
     Retain source URL, revision or artifact digest, license, dependency notices and the behavior being reused. Distinguish copied implementation, a dependency and a documentation-based reimplementation. Check distribution rights before packaging private donor code.
   </Step>
   <Step title="Separate operations from framework machinery">
-    Extract explicit provider requests, bounded parsing and receipt handling. Replace donor-specific agent decorators, session creation, credential globals and approval bypasses with narrow host inputs. Meerkat remains the runtime; MobKit remains application composition.
+    Extract explicit provider requests, bounded parsing and receipt handling. Replace donor-specific agent decorators, session creation, credential globals and approval bypasses with narrow host inputs. Meerkat remains the runtime; Meta remains application composition.
   </Step>
   <Step title="Map authority and lifecycle">
     Identify the selected account, resource policy, credential owner, event/delivery semantics, state migration and shutdown behavior. If the donor assumes one global user, define and test the account boundary before advertising multi-account support.
@@ -24,14 +24,12 @@ Start by identifying what the donor actually contributes: a maintained provider 
   </Step>
 </Steps>
 
-## HomeCore as a consumer
+## Reuse in an application
 
-HomeCore's existing implementation supplies concrete requirements and source provenance for metadata-first loading, transport cleanup and durable output. HomeCore adopts shared Toolkit ownership and retires duplicated generic machinery while retaining household policy, grants, recipient selection and domain formatting.
-
-Existing local extractions include Gmail formatting, Telegram transport and durable egress. These bounded adoptions do not establish that HomeCore's complete generic extension host has been replaced.
+Keep application policy, grants, recipient selection and domain formatting in the host. Share the provider operations, transport cleanup and durable output components across applications.
 
 ## Portable metadata
 
-Toolkit parses Agent Plugins and MCPB metadata into inert descriptions. Import success does not prove executable compatibility, sandboxing, credential correctness or full donor-platform compatibility. A component that requires Toolkit host services cannot be exported as a generic MCP entry that silently discards them.
+Connect parses Agent Plugins and MCPB metadata into inert descriptions. Import success does not prove executable compatibility, sandboxing, credential correctness or full donor-platform compatibility. A component that requires Connect host services cannot be exported as a generic MCP entry that silently discards them.
 
 Read [portability](/connect/reference/portability) and [distribution](/connect/availability#distribution) before choosing a delivery format.

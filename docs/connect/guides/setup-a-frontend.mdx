@@ -1,120 +1,53 @@
 ---
 title: "Set up an agent frontend"
-description: "Connect people to an existing agent through a compatible host, with the right participants, routing and reply audience."
+description: "Connect a chat or device interface to an agent through your application."
 icon: "comments"
 ---
 
-A frontend lets people reach an agent through an interface such as Telegram, Slack, a web app or a device. Connect's selected design supports frontend setup from both the standalone `meerkat-connect` CLI and an application's MobKit console.
+A frontend lets people talk to an agent through Slack, Telegram, a web app or a device. The application runs the interface and owns participant identity, conversation routing and reply delivery.
 
-The complete journey is not yet shipped or live-qualified. This guide identifies the current CLI source behavior and the intended console experience. Check [availability](/connect/availability) for current distribution and implementation limits.
+This guide describes the configuration to provide when integrating a frontend with your host. For service operations such as reading Slack history, use [service setup](/connect/guides/request-an-integration).
 
-## Start with the conversation you want
+## Choose the host and conversation
 
-For example:
+Select a persistent application that supports the interface. A realm supplies native configuration and storage; the application supplies the listener, routing and delivery lifecycle.
+
+Describe the interaction you want:
 
 ```text
-Let my family talk to HomeCore through Telegram.
-Use our existing HomeCore host and only the people and groups it admits.
-Send replies into the permitted conversation.
+Let the approved Support group talk to the existing Work Assistant
+in our support channel. Keep each admitted thread separate and send
+replies into that same thread.
 ```
 
-The agent investigates suitable frontend packages and the selected host's capabilities. You can name a package or repository, but you do not need to choose an implementation before describing the result.
+## Configure the interaction
 
-<Tabs>
-  <Tab title="Standalone CLI">
-    In the current `meerkat-connect` source, choose a stored realm or name a new one, then describe your request. Complete model-provider sign-in if prompted; this is separate from the frontend's Telegram or other service credentials.
+| Setting | Choose |
+| --- | --- |
+| Interface | Provider installation, endpoint and account |
+| Participants | People or groups allowed to send, view and control |
+| Target | The existing agent or routing policy |
+| Conversations | How provider channels and threads map to agent context |
+| Replies | Permitted destinations and visible output |
+| Service access | Operations the agent may perform for those participants |
+| Lifetime | Persistent or time-limited exposure |
 
-    The agent can ask the protected terminal controls to select a supported Forge application's Console and sign in, or to select and pair with HomeCore. This keeps the original setup conversation. You do not need to choose a service/frontend mode or provide a HomeCore flag before asking.
-  </Tab>
-  <Tab title="MobKit console">
-    The intended experience keeps your request, questions, review and progress in the application's setup conversation. The application supplies the selected realm, authenticated viewer and permitted host choices, including when you use its console remotely.
+Use the host's protected controls for provider credentials. Sign in to the application separately from connecting the provider account.
 
-    The application must adopt Connect's optional composition. The current private v1 component supports Forge/Reading setup through an authenticated application bridge. HomeCore Console integration, remote protected interactions and the complete browser journey remain unfinished. The newer HomeCore v2 work is separate from that v1 component; see [availability](/connect/availability).
-  </Tab>
-</Tabs>
+## Review and activate
 
-## Choose the host as well as the realm
+Review the exact package, configuration, participants and requested service authority. Apply executable or deployment changes through the application's deployment workflow.
 
-The **realm** selects native configuration and conversation storage. The **application host** runs the frontend, decides who may interact, routes messages and delivers replies. Selecting a realm does not create that host.
+After activation, send a message from an admitted identity. Confirm that it reaches the intended agent and that its reply returns to the permitted conversation. Check an excluded participant as part of the application's access validation.
 
-Use a compatible persistent host that can serve the requested interface. If it needs installation or deployment changes, those belong to its operator and deployment workflow. The CLI does not become a server, and `rkat` needs no Connect command or dependency.
+## Keep the application running
 
-For HomeCore, admitted messages go to the sender's own agent. There is no destination-agent selector. Other hosts may offer a fixed target, an authorized agent choice or a routing agent; setup should show only the choices that host actually supports.
+The application owns the frontend after setup ends. Its process lifecycle is separate from the setup conversation. Use its current status to inspect connection, routing and delivery health.
 
-## Sign in to the host and choose the permitted interaction
+## Pause or remove
 
-For a supported Forge application, select its local Console address and enter its password in the protected terminal controls, never in chat. This creates an in-memory Console session. The application must advertise frontend-management support before the agent can use its controls; sign-in alone authorizes no configuration change. This is separate from HomeCore pairing and from the frontend provider's credentials.
+Review what happens to accepted work and queued replies before pausing or disabling the frontend. The application can drain that work or cancel it according to its policy. Remove a shared daemon or credential only after checking the other integrations that use it.
 
-For HomeCore, the CLI asks for the running host address in a separate terminal prompt. Enter it there. Choose whether to remember the pairing in the OS credential store or keep it only for this process. Neither choice sends the address or pairing credentials to the model.
+## Build the adapter
 
-Follow the host's pairing method. HomeCore can send its owner a Telegram code, or accept a code issued on its protected terminal when that feature is enabled. The latter allows pairing before Telegram is available. Enter the code through the hidden terminal prompt. If its format is wrong, correct it there or enter `/quit`; Connect keeps the input hidden and sends only a valid-format entry to HomeCore. A host rejection does not cause an automatic retry. Model sign-in, HomeCore pairing and the frontend's provider credentials are separate steps.
-
-Once authenticated, the agent reads the host's inventory before proposing changes. Discuss who may send messages, which declared groups or channels are included, how conversations stay separate, and where replies may appear. The current HomeCore path uses its declared provider group IDs; it does not discover new groups or edit sender/group declarations. Those changes need the host operator.
-
-For a new frontend extension, the agent can investigate a repository and ask HomeCore to inspect its exact source tag and prepare a pinned proposal. Source evidence may identify a nested package path. HomeCore returns either channel choices or its supported role selections, including the daemon mode, required facades and number of voice-map entries. The agent preserves those source pins and helps you choose the configuration that fits your request. It cannot invent a role or host binding.
-
-The host owns package eligibility, build, review and deployment. A prepared proposal is not an installation, and applied status does not establish daemon startup, live voice or delivery. Full custom-extension setup, including independent service and frontend roles, remains an end-state requirement. Its live host acceptance is [follow-up work](/connect/roadmap), not a first-release prerequisite.
-
-## Review the exact change
-
-The CLI can prepare a change to an existing channel or a new extension proposal. When HomeCore supplies a review link, the terminal can show it after the agent's turn finishes. Open that exact link yourself; your browser must be paired with HomeCore independently. The page rechecks the draft's current state.
-
-In the same CLI conversation, you can ask, "Show that change's review link again." Connect checks HomeCore's current status and can redisplay the original link for a prepared draft or a submitted request, including later attempts and failures. The host page shows current progress and any available recovery actions; opening it approves none of them. A stale draft can still be inspected. After an uncertain submission in that conversation, continue with status checks for that request.
-
-The new standalone source also supports returning later. Choose the same realm,
-ask "Check my previous HomeCore setup," and select and pair the same host when
-prompted. Connect reads private request locators saved by this version of the CLI
-and asks HomeCore for current status before showing any prior request. You do not
-need to find a receipt or edit a recovery file. Larger histories are read in
-bounded pages.
-
-Ask to see one of those requests' review links and Connect can show its original
-host-supplied link privately after another current status check. The browser still
-needs its own HomeCore pairing. Recorded, applied or failed requests retain their
-actual host status. A prepared draft is inspectable, but does not prove an earlier
-submission failed. No previous approval or submission permission is restored, and
-Connect never resubmits a request to recover progress.
-
-Only nonsecret request references and review paths are saved. Pairing credentials,
-secret-entry links and approval records are not part of this return path. Requests
-from another realm or host, and requests the current host does not admit, are not
-shown. This source path still needs native and live-host qualification; older CLI
-runs without saved locators retain their existing receipt-based status path.
-
-Submitting a proposal asks for a separate terminal approval showing the host and the exact change. Sign-in or pairing alone does not approve it. For HomeCore, a successful submission records an operator review request; HomeCore then owns any build, review and activation work. A Forge application returns its own command outcome; that outcome does not establish activation or message delivery.
-
-If the host supports protected secret entry, use the private entry link and its owner confirmation. Do not put bot tokens or other secrets in the setup conversation. A stored secret is still separate from successful provider authentication.
-
-## Check the result and keep the host running
-
-Ask for the submitted request's status in the setup conversation. The current CLI can read HomeCore's observations, such as building, under review, activating or applied. If submission is uncertain, request status for that same change instead of submitting it again.
-
-Before calling the frontend ready, verify that an admitted person can send a message, the host routes it to the intended agent, and a permitted reply reaches the right conversation. An applied configuration or successful build alone does not establish this. See [readiness](/connect/concepts/readiness) for the distinction.
-
-At the `You:` prompt, `/quit` or end-of-input ends the setup conversation. Ctrl-C requests cancellation and exit; wait for the reported outcome. It does not return to a fresh prompt in the same conversation or undo a completed host change.
-
-After setup exits, the persistent application host keeps the activated frontend running. Exiting the CLI does not revoke HomeCore pairing or undo a submitted change. Starting the CLI again creates a new setup conversation. Ask to check previous HomeCore setup to observe the same retained requests under current host access. This restores no old workflow or approval. Use the host's controls for ongoing operation or removal.
-
-## Manage an existing frontend
-
-Return to `meerkat-connect` in the same realm and ask to manage the frontend.
-Select the same compatible Forge application's Console and sign in through the
-[protected host controls](#sign-in-to-the-host-and-choose-the-permitted-interaction).
-The agent reads the application's current inventory to find its supported actions.
-You can request pause, resume, disable or removal when the application offers them;
-for example, "Pause the Telegram frontend" or "Resume it".
-
-Before approving, review the exact frontend and change, including what happens to
-already accepted work and pending replies. The host's policy determines whether
-that work drains, is cancelled or stops. Check the submitted change's status for
-any remaining work or uncertain outcome instead of repeating the submission.
-A known configuration result does not by itself establish that work has settled.
-
-For example, Reading retains queued messages while paused and lets accepted work
-and replies drain. It offers removal only after the frontend is disabled and its
-component has reported settlement. Those are Reading's prerequisites; another
-application may offer different actions and pending-work policies.
-
-## Packages with more than one role
-
-A package can provide both service operations and a frontend: Slack tools plus a bot, or Reachy operations plus voice interaction. Configure and verify each role independently. Enabling a frontend does not grant its audience every service capability, and usable service tools do not prove the frontend is live. See [connectors and frontends](/connect/concepts/roles) for their separate lifecycles.
+The [frontend authoring guide](/connect/guides/agent-frontends) describes provider verification, principal admission and delivery contracts. The [Python frontend SDK](/connect/sdks/python-frontends) supplies transport and durable egress components.

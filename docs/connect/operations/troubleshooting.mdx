@@ -10,7 +10,7 @@ archive and command failed before changing either.
 
 ## A Connect conversation turn fails
 
-In the current standalone `meerkat-connect` source, a confirmed failed turn can
+In `meerkat-connect`, a confirmed failed turn can
 return to the `You: ` prompt. Enter a new question there to continue the same
 conversation. Connect does not automatically retry the failed request.
 
@@ -50,17 +50,6 @@ credential repair follows from that outcome.
 | Unsupported Python, Node, npm or libc | Use the [declared versions](/connect/library/local-install#choose-a-supported-host). Changing `--target` does not make a runtime compatible. |
 | `output_or_workspace_exists` or an existing client directory | Choose fresh disjoint paths with existing parents. Preserve the earlier attempt. |
 | `overlapping_directories` | Separate release, staging, output, workspace, client and relevant historical/recipe paths. Avoid names differing only by case or Unicode spelling. |
-| Missing Node/npm with Python-only work | Explicitly select `--families agno,services`; the default also selects Activepieces. |
-| Linux refuses Playwright, MCPB, Compose or the hosted-MCP connection checker | The [Linux profile](/connect/library/local-install#enable-additional-routes-deliberately) lacks those executables. Its recipe store/exporter is available separately. |
-
-For the frozen `20261005-release-guide` edition, ordinary direct preparation
-can miss a case/Unicode alias between future paths. If its output then occupies
-the future workspace, preserve it and choose clearly distinct names. Bootstrap
-already refuses those aliases. The `20261005-recipe-paths` edition and later editions also
-refuse them during direct preparation and also protect recipe database
-sidecars under that normalized-path rule. Avoid output or workspace names
-that alias a future `-wal`, `-shm` or `-journal` path. Older frozen archives
-are unchanged.
 
 ## The setup MCP worked once and refuses to restart
 
@@ -103,12 +92,11 @@ Send the relevant host or release maintainer a bounded report containing:
 - The relevant receipt/check result and the smallest useful log excerpt.
 
 Keep tokens, passwords, authorization URLs, callback material, private account
-content and whole saved-request files out of public reports. No public support
-endpoint is assigned yet; use your host's existing support route.
+content and whole saved-request files out of public reports. Use your application's support route or the [Connect issue tracker](https://github.com/lukacf/meerkat-connect/issues).
 
 ## find_and_install returns unavailable
 
-This is the current intentional production boundary. The native work-publication, accepted authority and continuation composition are unfinished. Registering the tool or satisfying its content schema does not enable installation. Use current operation libraries through explicit host composition, or investigate via [read-only discovery](/connect/api/discovery).
+Check that the application enrolled its native setup owner, that the owner is active, and that the invocation carries the required authenticated context. Constructing a dispatcher alone does not bind that owner. See [host composition](/connect/guides/host-composition).
 
 ## A recipe exists but discovery cannot find it
 
@@ -126,11 +114,11 @@ Call `prepare_httpx_client` once at the host construction site before sharing th
 
 The SDK operation and the agent's runtime binding are separate. Observe `identity_resolved_tools` for the actual member and perform a real dispatch through that surface. Check profile selection, package/grant revisions and the current target incarnation.
 
-Some development/released upstream compositions differ in how customizer tools reach restored, repair, helper, raw or flow spawn paths. Do not infer those paths from the initial spawn or an SDK fake test. Select an accepted upstream graph and verify each path you claim to support.
+Check the application's restoration, helper and spawn configuration when a tool is available in one member but missing in another.
 
 ## Startup shows progress but never reports ready
 
-Keep progress separate from terminal readiness. The proposed typed acceptance/progress/settled startup protocol is unreleased and includes no built-in SDK stall timer. Caller cancellation/deadline or transport loss without observed settlement yields `InitOutcomeUnknown`; it does not establish rollback or a failed runtime. Reconcile through the actual startup owner before retrying.
+Inspect the native startup result and the configured startup budgets. A timeout or lost reply calls for reconciliation through the startup owner before another attempt. See [native application lifecycle](/connect/guides/host-composition#native-application-lifecycle).
 
 ## Authentication completed but access is denied
 
@@ -154,7 +142,7 @@ The deadline starts cancellation; retained cleanup is still awaited. Host hooks,
 
 ## A database has the expected version but fails to open
 
-Private and accepted upstream schemas can reuse version numbers with different tables. Preserve the database and exact dependency identity. Use the owner's reviewed migration or a separately owned fresh fixture. Resetting state is not a compatibility fix.
+Preserve the database and exact dependency versions. Use the storage owner's migration procedure and inspect the schema error before changing state.
 
 ## The UI action shows uncertain acknowledgment
 

@@ -4,7 +4,7 @@ description: "Inject durable feature storage with atomic admission, revisions, e
 icon: "database"
 ---
 
-**Current source contract.** `ToolkitStore` stores feature-owned records. It is not a policy owner, credential vault, scheduler or another setup state machine. Hosts authenticate and authorize every namespace; typed adapters validate record schema/version and permitted transitions.
+`ToolkitStore` stores feature-owned records. It is not a policy owner, credential vault, scheduler or another setup state machine. Hosts authenticate and authorize every namespace; typed adapters validate record schema/version and permitted transitions.
 
 ## Required capabilities
 
@@ -43,7 +43,7 @@ Effect acknowledgment does not automatically establish setup readiness. The orig
 
 ## Other stores and schema compatibility
 
-A future cloud backend must pass its actual transaction, concurrent claim, lost-CAS, ambiguous commit and recovery cases. Current SQLite results do not certify BigQuery or another cloud store. An in-memory implementation cannot be labeled durable.
+A custom backend must implement atomic transactions, concurrent claims, compare-and-swap, commit recovery and fencing. Run the store conformance checks against that backend.
 
 A database schema version number alone is not compatibility evidence across development and released graphs. Preserve existing state and establish the actual schema/owner contract before migration; an owned fresh fixture is different from silently resetting a user's store.
 

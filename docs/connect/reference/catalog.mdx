@@ -1,99 +1,44 @@
 ---
 title: "Integration catalogs"
-description: "Adopted local MCP metadata and retained research recipes, with exact evidence and explicit host selection."
+description: "Inspect recipes, select exact versions and read operation metadata."
 icon: "books"
 ---
 
-`bundled_adopted_catalog()` exposes the **101 adopted local MCP profiles** from the [OSS inventory](/connect/library/candidates). It uses ordinary package metadata and can be supplied to `DiscoveryTools::new`. Each entry names its selected operations, configuration document, exact evidence hashes and remaining limits. Its `compatible` assessment concerns the retained installed profile, not a new account's readiness or completed automatic setup.
+Connect exposes library profiles and research recipes through read-only discovery APIs. Agents use these descriptions to choose an integration before installation.
 
-These entries are generated from `docs/adoption/oss-inventory.json`; maintainers do not curate a second service list. A content-derived metadata version changes when the description changes. Upstream source revision, installed artifact identity and catalog metadata revision remain distinct.
+## Catalog APIs
 
-Historical evidence paths refer to the private development repository and are not included in this public source export. Catalog bytes and identities are retained unchanged. Artifact publication and supported scope are stated by the current release notes, separately from those historical references. The agent still chooses the integration, and host-owned setup must realize and verify that concrete choice.
-
-Slack and Gmail each expose two strategies in the same service record: the
-adopted Activepieces read profile and the
-[first-party service component](/connect/library/slack-gmail). Instructions, operation
-hints and assessments identify the relevant strategy and its own evidence.
-Neither the additional strategy nor its operations increase the integration
-count. The agent chooses; failure never selects the other route automatically.
-
-The [local consumer bundle](/connect/library/local-install) includes these same generated
-bytes as `catalog.json`, alongside the exact Agno, Activepieces and services
-installation inputs. Reading that file requires no package installation. Its
-evidence paths still refer to historical private records; neither this public
-source export nor the consumer bundle includes that verification history or the
-official GitHub/Playwright executables.
-
-## Standalone Connect metadata
-
-The ordinary CLI now exposes `bundled_recipe_catalog()` through the shared
-`RecipeInventory` before service-resource preparation. It combines the 101 adopted
-records and 10 discovery records into **111 distinct metadata entries**, preserving
-whole records, digests, origins and roles. List pages and exact record reads need
-no service bundle, host pairing or installation. The retained historical checkpoint
-covers the actual CLI with a synthetic model; its private raw report is not
-included here. It does not add adopted integrations
-or establish account authentication or runtime readiness.
-
-Service connectors and agent frontends remain separate first-class plugin roles
-in both setup UIs, including extensions that declare both. A frontend still needs
-a compatible persistent application host; selecting or configuring a native realm
-does not supply that host. This metadata addition does not change console admission
-or the separately selected runtime bundle.
-
-## Retained research recipes
-
-`bundled_integration_library()` separately registers 14 package versions across 11 publisher/name identities and 17 strategies: six remote service recipes and eleven guidance-only recipes. Exactly one recipe is an agent frontend. All assessments in that older recipe library are experimental.
-
-These are description counts, not adopted integration counts. The product target is [at least 100 distinct adopted OSS service/system integrations](/connect/library/adoption), usable after documented supported-host auth/configuration. This small experimental inventory is an input to that work, not the planned breadth or its completion.
-
-The equal [agent-led acquisition outcome](/connect/concepts/acquisition) must work beyond these descriptions. Agents can investigate something absent here, select an implementation, install and configure it, and continue their original task; current production dispatch cannot yet complete that path.
-
-| Registered package name | Retained versions | Role |
-| --- | --- | --- |
-| `github-readonly` | `0.1.0` | Service |
-| `linear-readonly` | `0.1.0` | Service |
-| `notion-mcp` | `0.1.0` | Service |
-| `atlassian-mcp` | `0.1.0` | Service |
-| `slack-mcp-setup` | `0.1.0`, `0.2.0` | Service |
-| `playwright-mcp-setup` | `0.1.0` | Service |
-| `home-assistant-mcp-setup` | `0.1.0` | Service |
-| `gmail-api-setup` | `0.1.0`, `0.2.0` | Service |
-| `google-calendar-api-setup` | `0.1.0`, `0.2.0` | Service |
-| `telegram-frontend-setup` | `0.1.0` | Frontend |
-| `agno-brave-donor` | `0.1.0` | Service |
-
-The complete identity includes publisher as returned by discovery. Do not construct identity from this display table alone.
-
-## Files versus registration
-
-Recipe files for `google-drive-api-setup/0.1.0` and `slack-mcp-setup/0.3.0` are present in the checkout but not in the current `bundled_integration_library()` registry. Presence on disk is not compiled discovery availability.
-
-The older `bundled_discovery_catalog()` separately retains ten metadata-only research entries. Choose the intended constructor explicitly; do not add its count to the versioned library as if they were distinct supported integrations.
-
-## Recipe contents
-
-An `IntegrationBundle` joins real `plugin.json`, optional `mcp.json` and typed `recipes.json` inputs. Sources retain observed hashes, upstream identity, license scope and review time. Prerequisites can include developer registration, administrator approval, account selection, authentication, artifact preparation and application binding.
-
-A guidance-only recipe can be useful before any executable selection is feasible. It cannot pass as an executable strategy by inventing a schema digest, credential binding or lifecycle receipt. Remote recipes likewise need current account and operation verification.
-
-## Exact selection and support
-
-Agents choose a version and strategy explicitly. A failed strategy never triggers automatic fallback, and a retained older version is not silently upgraded. Use the returned package and library digests to pin the complete investigated description.
-
-| Assessment | Interpretation |
+| API | Contents |
 | --- | --- |
-| `supported` | A scoped maintainer claim requiring its stated evidence |
-| `compatible` | A narrower compatibility claim, not universal readiness |
-| `experimental` | Investigation and development material with unfinished acceptance |
-| `unavailable` | The stated path cannot currently provide its claimed scope |
+| `bundled_adopted_catalog()` | The packaged integration profiles and their operation/configuration metadata |
+| `bundled_recipe_catalog()` | The combined library and discovery records used by the CLI |
+| `bundled_integration_library()` | Versioned recipe bundles with package, server and strategy data |
+| `bundled_discovery_catalog()` | Metadata for integration research |
 
-Assessment metadata never overrides policy, current provider state or runtime readiness. To promote support, record the specific host/service/account profile, artifact or endpoint identity, maintainer, auth route, operations, failure cases and evidence date.
+Use `DiscoveryTools::new` with a public catalog or `DiscoveryTools::from_library` with versioned bundles. The host selects which agents receive the dispatcher.
 
-## Maintenance
+## Read a recipe
 
-Changed instructions, prerequisites, endpoint configuration or source observations require a new package version under this library's identity contract. Retain older versions for explicit migration. Check drift in dependencies, provider tools, newcomer auth and administrator requirements separately. The explicit local `scripts/check-library-update.py` command compares pinned retained artifacts, dependencies and captured schemas; its guide is `docs/adoption/LIBRARY-MAINTENANCE.md`. It reports observations and optional unapplied proposals, without approving compatibility or changing support status.
+List recipes with `list_integration_recipes`, then pass a returned identity and digest to `read_integration_recipe`. Include `library_digest` when the listing supplies it.
 
-The versioned recipe inputs are the literal include list in `crates/toolkit-package/src/library.rs`. Adopted metadata comes from `crates/toolkit-package/catalog/adopted.json`, generated by `scripts/render-adopted-catalog.py`. Its `--check` mode rejects stale output or changed acceptance evidence. The [discovery API](/connect/api/discovery) exposes the catalog selected by the host without installation.
+A package identity contains `publisher`, `name` and `version`. Preserve the complete tuple and returned digests. Several versions or strategies can describe the same service.
 
-Selected operation IDs describe the adopted donor/profile surface. Obtain actual MCP tool names and schemas from `tools/list` after connection; catalog hints do not establish active runtime bindings.
+The combined catalog contains 111 metadata records: 101 library entries and 10 discovery entries. Discovery records provide research starting points. For the service list, see [integration library](/connect/library/adoption).
+
+## Bundle contents
+
+An `IntegrationBundle` joins `plugin.json`, optional `mcp.json` and typed `recipes.json` inputs. It includes source provenance, configuration requirements, account prerequisites, strategies and selected operations.
+
+A strategy may describe a local package, a remote endpoint or setup guidance. The agent makes the concrete selection. Code validates that selection against the package and host contracts before activation.
+
+## Identity and updates
+
+Package metadata, executable artifacts and source revisions have distinct identities. A metadata change produces a new content-derived version. Retain the exact version and digest used for a selection so it can be inspected or migrated later.
+
+Library registration comes from `crates/toolkit-package/src/library.rs`; packaged profile metadata is in `crates/toolkit-package/catalog/adopted.json`. Use the catalog APIs to inspect the registered inventory.
+
+## Runtime tools
+
+After connection, use MCP `tools/list` or Meerkat's tool catalog to inspect the actual operation names and schemas. Apply the selected agent's permissions through the native runtime.
+
+See [discovery API](/connect/api/discovery), [package contracts](/connect/reference/packages) and [native MCP integration](/connect/guides/native-mcp).

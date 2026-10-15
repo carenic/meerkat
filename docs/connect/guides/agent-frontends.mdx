@@ -8,7 +8,7 @@ A frontend transport is only one part of an agent interface. Provider authentici
 
 For choosing and configuring a frontend, follow [Set up an agent frontend](/connect/guides/setup-a-frontend). This page covers authoring the adapter and its host contracts.
 
-**Current source** supplies reusable Python transport and egress pieces. **Designed behavior** requires composing those pieces with accepted native admission and lifecycle contracts before a complete frontend is ready.
+Use the Python transport and egress components with your application's admission, conversation and runtime lifecycle services.
 
 <Steps>
   <Step title="Verify provider facts">
@@ -62,7 +62,7 @@ from arbitrary application status text or HTTP 200. `known` settles the command'
 uncertainty; it does not mean the requested change succeeded, the frontend is
 ready, a native component closed, or a reply was delivered.
 
-Toolkit accepts `known` only for the exact currently entered submission. It
+Connect accepts `known` only for the exact currently entered submission. It
 returns `recovery_only: false` and clears cached inventory, so the next prepare
 requires a fresh inventory read. A new submission still needs its own human
 approval. Submitted IDs, spent calls and approvals remain spent, and recovery
@@ -72,7 +72,7 @@ uncertainty or authorize replay.
 Without the exact header, or when the hook returns a plain dictionary, the reply
 retains only `protocol`, `host` and `observation`. Descriptors, prepare and
 GET/status replies keep their existing shapes. An older owner may ignore the
-offer. Absent, `unknown`, malformed, mismatched or lost outcomes keep Toolkit
+offer. Absent, `unknown`, malformed, mismatched or lost outcomes keep Connect
 conservative; no observation string restores permission to submit again.
 
 ## Proactive delivery

@@ -9,11 +9,10 @@ icon: "slack"
 The [standalone Slack/Gmail MCP component](/connect/library/slack-gmail) now exposes the
 selected reads and exact-byte Gmail send through an ordinary configured MCP
 process. The direct Python example below is an alternative for embedding hosts.
-Provider login and complete agent-led acquisition are still unfinished.
 
 ## Read a bounded interval
 
-**Current source, host-composed example.** The host supplies an already selected, authenticated and prepared HTTPX client. It authorizes both the requested creation window and the older-root discovery window before calling this function.
+The host supplies an already selected, authenticated and prepared HTTPX client. It authorizes both the requested creation window and the older-root discovery window before calling this function.
 
 ```python
 from meerkat_toolkit.connectors.slack import SlackOperations
@@ -37,7 +36,7 @@ The result reports selected message occurrences, history/thread chain outcomes, 
 
 ## Continue a partial read
 
-Current Python/TypeScript source and services component `0.1.5` can resume the
+Python and TypeScript can resume the
 same interval operation. Set `resumable=True` in Python (`resumable: true` over
 MCP), then pass a returned nonnull `continuation` on a later authorized call.
 Keep the same account and query selection; per-call request/message budgets may
@@ -50,16 +49,15 @@ means the bounded checkpoint cannot fit the next page; use a narrower new query
 or the selected raw page operations instead of blindly retrying.
 
 The checkpoint is caller-held query data. It proves no account identity or prior
-read, and cancelled/lost responses can require reading a page again. The
-combined library editions keep their declared earlier component versions.
+read, and cancelled/lost responses can require reading a page again.
 
 ## Produce and send the summary
 
-**Designed complete composition.** The original agent interprets the observations and their gaps, then selects the authorized email account and recipient. The existing business policy approves the exact effect where required. Gmail's current `send_raw` can send exact MIME bytes through a selected client, but it does not choose recipients or enforce that policy.
+The original agent interprets the observations and their gaps, then selects the authorized email account and recipient. The existing business policy approves the exact effect where required. Gmail's current `send_raw` can send exact MIME bytes through a selected client, but it does not choose recipients or enforce that policy.
 
 A provider send receipt means the provider accepted the request. If a send becomes uncertain after entry, preserve that state and use the effect owner's reconciliation path. Do not resend because the caller timed out or because a later search finds no matching message.
 
-The full Slack-to-email acquisition and continuation scenario remains unverified. [Python connector reference](/connect/sdks/python-connectors) documents the available operations.
+[Python connector reference](/connect/sdks/python-connectors) documents the available operations.
 
 ## Publish a frontend separately
 

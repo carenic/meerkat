@@ -1,148 +1,50 @@
 ---
-title: "Authentication and user actions"
-description: "Keep account connection, credential custody and application permission distinct."
+title: "Authentication and credentials"
+description: "Connect accounts through protected controls and grant agents explicit access."
 icon: "key"
 ---
 
-**Designed behavior with current SDK transport contracts.** The SDKs already borrow host-owned authenticated clients. The complete reusable authentication queue and management composition remain unfinished.
+Connect keeps model credentials, integration credentials and agent permissions separate. An account can stay connected after a task-limited grant expires.
 
-An account can stay connected after a task-limited grant ends. A deployment can use a workload identity with no browser ceremony. Neither choice grants every agent future use of that account.
+## Model-provider sign-in
 
-## Model sign-in in the standalone CLI source
+The CLI checks the selected realm's model configuration before opening the setup conversation. Follow its terminal prompts to select a model binding or complete provider sign-in. This credential runs the setup agent; service accounts are configured separately.
 
-Before pairing a frontend host or starting the setup conversation, the current
-`meerkat-connect` source checks the selected realm's configured model credentials.
-A ready default proceeds; deferred credential sources still resolve during native
-session open. When sign-in is needed, or with `--choose-model`, the terminal offers
-existing native targets and identifies their credential owner. Choosing an inherited
-target keeps the conversation in the selected realm and does not change its defaults.
+## Service credentials
 
-Configured browser OAuth targets use native sign-in, with a private URL presented
-in the terminal for the person to open. Authorization URLs, callback codes and
-tokens stay outside the agent conversation. Cancellation can wait for native
-callback cleanup, or for an exchange already in progress to settle.
+Review the integration, account, requested operations and access duration before entering a key or token. The CLI uses hidden terminal prompts. An integrated application uses protected credential fields outside the agent conversation.
 
-Configured GitHub Copilot account targets also support native device-code sign-in.
-The protected terminal shows a verification page and user code for the person to
-use in their own browser. Native auth owns the flow, account identity, expiry and
-credential storage. Stopping setup stops further polls and waits for an already
-started native request to settle. If that request saved credentials, the terminal
-reports that result before stopping. Stopping polling does not revoke authorization.
+The selected credential owner stores values and supplies them to the intended connection. Configuration refers to named credential slots rather than containing the values themselves.
 
-Configured managed API-key targets also offer protected terminal entry. Choose
-the target, review its owner realm, binding, profile and any shared account, then
-confirm before entering the hidden key. Native credential storage owns the save;
-other sessions using that credential owner will use the stored key. Environment
-and other credential sources cannot be replaced through this prompt. Use
-`--choose-model` to request target selection when native readiness is deferred
-until session open.
+For direct SDK use, the application supplies an authenticated HTTPX client or Fetch binding. See [Python](/connect/sdks/python#prepare-the-client-once) and [TypeScript](/connect/sdks/typescript#transport-contract).
 
-Cancellation before saving leaves the credential unchanged. Once saving has
-started, Connect waits for native settlement and reports the settled result
-before stopping setup. Saving a key does not establish provider acceptance.
+## OAuth sign-in
 
-First-target provisioning remains unfinished. Synthetic provider
-checks verify the current source; the device-code checks cover native account
-storage and reaching the next protected HomeCore pairing prompt, then quit before
-Copilot model use. These checks do not establish live account sign-in or availability
-in a distributed CLI. Model sign-in also does not connect Gmail, Slack or another
-integration account; those retain their own credential and access requirements below.
+Complete sign-in through the host's browser handoff. The native authentication owner handles state, PKCE, callback validation and credential persistence. The application presents the account and destination for review and reports the resulting account status.
 
-## The connection card
+For an MCP integration, distinguish the two connections:
 
-A human action should explain the requesting task or agent, selected account or destination, effective operations/resources, access lifetime and any standing authority. The host-owned presenter displays the actual integration and full URL before navigation. Progress distinguishes waiting, checking, complete, expired and no longer needed.
+| Connection | Credential owner |
+| --- | --- |
+| Client to MCP server | The host or MCP client's credential owner |
+| MCP server to a downstream service | The server's credential owner |
 
-```text
-Connect Slack
-Needed for your weekly summary.
-Access: read the selected workspace and conversations.
-Used by: this task until it finishes.
-The account can remain connected afterward.
+Use the credential intended for that connection and audience. Provider registration, requested scopes and administrator installation come from the selected integration's setup requirements.
 
-[Continue in browser] [Stop setup for this task]
-```
+## Read account prerequisites
 
-This is a UX example, not a shipped dialog contract. The [current UI library](/connect/sdks/ui) can render host-supplied cards and controls; it does not own authentication.
+`config-help --profile` returns `prerequisites` as `{kind, instruction}` rows and `unresolved_details`. It describes public access or required API keys, tokens, passwords and service credentials, together with known resource and host requirements.
 
-## Credential custody
+Read this information before configuring the account. The metadata commands can run before credentials are available.
 
-The credential owner handles secrets, refresh, revocation, callback state and permitted credential destinations. Model context, recipe files, logs and normal MCP forms must not contain tokens, passwords, callback codes or PKCE material.
+## Change or remove credentials
 
-Ordinary setup browsing and actual authentication have different visibility requirements. The supported auth flow hands the person to the host-owned browser or system ceremony and keeps auth-page content, cookies, callback data and secrets out of model/tool observations and diagnostics. Pausing screenshots in an instrumented setup page does not by itself provide that handling.
+Return to Connect in the same realm and ask to reconnect, replace a key or disconnect an account. Review the selected service and fields in the protected controls. Credential changes apply to later connections; retire an existing process when it needs to pick up a new value.
 
-For this release, authentication can run on the ordinary host, including a host administered by agents. A separate machine unreachable by agents is not required, and there is no protected-placement approval or reopen wait. This scope correction does not remove human admission, state/PKCE and account checks, credential custody, current permission or recovery. The callback must match the actual browser topology: remote phone or laptop access may need registered HTTPS on the existing host.
+Use the service provider's controls when you need to revoke the credential itself. Agent access is managed separately through grants.
 
-### Declared credentials in the Console (source draft)
+## Cancellation and recovery
 
-The protected credential form is under development and is not yet qualified end
-to end. For an integration with declared credential fields, the draft setup panel
-keeps those fields separate from the agent conversation. Review the connector,
-defining realm, requested task access and proposed configuration/credential saves
-before entering values in that protected form.
+Connect reports saved configuration, credentials and grants separately. After an interrupted action, read its status before repeating it. An entered update can complete while later steps are cancelled.
 
-The existing approval owner records the decision before native owners save the
-configuration and each required credential. Task access and continuation depend
-on successful saves and the retained grant. A forwarded form response proves
-neither persistence nor provider acceptance; saving credentials alone does not
-make the integration ready.
-
-Credential fields are cleared on submission, refresh or navigation. An expired review requires fresh status before continuing. Cancellation or a later failure can
-leave earlier saves in place. If the outcome is uncertain, read current status
-before another attempt rather than assuming rollback or resubmitting. See
-[connection management](/connect/guides/manage-connections#ordinary-cli-and-console-setup)
-for how this fits the selected CLI and Console journeys.
-
-## Two MCP relationships
-
-| Relationship | Credential owner | What completion means |
-| --- | --- | --- |
-| Client authenticates to MCP server | Host/client credential owner | Selected client-server authorization is established |
-| MCP server authenticates downstream | Remote server's credential owner | Its downstream connection reaches the reported state |
-
-URL-mode elicitation can use the same host-owned presentation but must retain its distinct owner. That presenter displays the full URL and domain without prefetch, preview or metadata fetch. The shared management panel receives only an optional canonical HTTP(S) origin and account label; its **Review sign-in** control passes an owner/action reference to the host. The full authorization URL, callback state, codes and tokens stay outside that shared projection. Reviewing a sign-in offer is not consent. Opening a URL or receiving a redirect is not proof of completion. Completion comes from the applicable notification, status observation or explicit verification.
-
-Do not forward an existing SaaS token to an arbitrary discovered MCP server. OAuth registration, developer-console setup and administrator installation are strategy prerequisites that cannot be inferred from a recipe.
-
-## Local profile prerequisites
-
-The [local library's auth-prerequisite edition](/connect/library/local-install)
-makes known setup requirements readable before credentials are available.
-`config-help --profile` takes an exact selected profile ID and returns
-`prerequisites` as `{kind, instruction}` rows plus `unresolved_details`.
-Coverage is 36 Agno profiles, 63 Activepieces profiles and the two alternative
-first-party Slack/Gmail service profiles. These alternatives add no OSS identities.
-
-The output says whether the profile is public or needs an existing API key,
-access token, password or service credential. It also explains known account,
-resource and host constraints. Provider registration, administrator approval and
-exact scopes remain explicit unresolved work where the selected adapter's
-evidence does not establish them. These instructions are not a login ceremony
-or evidence that its prerequisites have been met.
-
-For these local stdio components, the MCP host controls process access and
-injects selected values through named credential references. The provider
-credential authenticates the connector's service requests, not an arbitrary
-remote MCP endpoint. The existing credential owner handles any acquisition,
-protected human action, refresh and account verification. Help reads no secret,
-imports no provider runtime and opens no browser; validation and provider
-operation behavior remain unchanged.
-
-## Recovery and cancellation
-
-Python wire hosts have a [source-contract callback adapter](/connect/sdks/python#supply-the-mcp-browser-callback)
-for Meerkat's existing MCP login methods. It owns only local callback transport
-and delegates credential decisions to native auth. A compatible released client,
-native composition and a supported human presenter still need their own
-acceptance; this component does not make `find_and_install` available.
-
-Its `McpLoginCustodian` lets an existing host step retain one in-flight login
-start across request cancellation. A later admitted request retrieves the same
-result; uncertain starts are never automatically repeated. Explicit host cleanup
-joins a pending start and closes only a transport it owns. Panel disposal does
-not own that cleanup, and process restart still needs native reconciliation.
-
-Queue human steps per authenticated person and group them by task. Changing account, retrying a challenge, stopping setup and cancelling the business task target different owners. Revalidate the person and exact pending action when a control is used.
-
-Person-bound ceremonies, such as identity verification on a device, can require exclusive ownership, a durable attempt budget and domain reconciliation before another attempt. A generic timeout or setup-agent retry must not repeat a sensitive effect.
-
-See [access control](/connect/reference/access-control) for grants and [troubleshooting](/connect/operations/troubleshooting) for pending and uncertain outcomes.
+Application authors can use `McpLoginCustodian` to retain one in-flight login across request-handler cancellation. The host owns its cleanup and reconciles authentication after process restart. See [MCP browser callback](/connect/sdks/python#supply-the-mcp-browser-callback).

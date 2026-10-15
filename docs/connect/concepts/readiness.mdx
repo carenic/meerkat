@@ -1,38 +1,37 @@
 ---
-title: "Readiness and lifecycle"
-description: "Report what each owner has actually acknowledged, at the current selected revision."
+title: "Connection lifecycle"
+description: "Understand installation, account connection and agent access."
 icon: "circle-check"
 ---
 
-Readiness is a current role-specific observation. It is not permanent permission or a replacement for per-operation policy.
+A usable integration combines installed software, a selected account, agent permissions and an active runtime connection. Each has its own lifecycle.
 
-**Designed contract.** The complete native binding, restoration and frontend lifecycle described here remains pending. Existing component APIs and their narrower evidence are listed in [availability](/connect/availability).
+| Layer | What to check |
+| --- | --- |
+| Software | The selected package and dependencies are installed |
+| Account | The connection uses the intended account and credentials |
+| Access | The acting agent has the required operations, resources and lifetime |
+| Runtime | The intended agent can discover and invoke the operation |
+| Frontend | Participants are admitted, messages reach the agent and replies reach the permitted destination |
 
-| Observation | Establishes | Does not establish |
-| --- | --- | --- |
-| Package parsed | Metadata fits the selected profile | Executable safety or installation |
-| Artifact prepared | Selected bytes are present under the preparation contract | Runtime activation |
-| Account authenticated | A selected authentication relationship | Agent permission or full service coverage |
-| Process healthy | A component's health condition | Service binding or frontend audience readiness |
-| Service ready | Required operations/events are verified and bound for the intended principal/consumer | Completion of the user's business task |
-| Frontend ready | Admission, conversation, target and delivery contracts are acknowledged | Unrestricted access to agent history or private services |
+## Configuration changes
 
-## Revision-bound outcomes
+Bindings identify the package, configuration, connection, grant and runtime target. When one changes, reconcile the binding against the new selection. Apply results only to the revision they describe.
 
-Bindings refer to exact package/manifest, connection, grant, target incarnation and effective runtime surface. A late receipt for an old selection cannot activate a replacement. Account change, schema change, revocation or member restoration requires reconciliation with current owners.
-
-Native additions become available at their supported activation boundary. A handshake finishing in the background does not make a tool callable while an agent remains blocked inside its original setup call. The designed workflow yields and resumes the original task through that boundary.
+Live MCP additions take effect at a runtime turn boundary. The agent can then discover and load the selected operations. See [native MCP integration](/connect/guides/native-mcp).
 
 ## Combined requests
 
-Report service and frontend outcomes separately. "Documents connected; Slack frontend awaiting administrator installation" is useful progress. A single green badge would hide the unfinished requirement.
+Track service access and frontend setup separately. For example, a document connection can be ready while a Slack frontend waits for an administrator to install the app.
 
-Removal hides future use and handles in-flight operations under the declared drain/cancel contract. Removing local access cannot undo external effects that already occurred. Forced or degraded cleanup must remain visible.
+## Stop, revoke or disconnect
 
-## Startup observation
+- **Stop setup** ends the setup request.
+- **Revoke access** removes an agent's permission to use selected operations.
+- **Disconnect an account** changes the credential connection.
+- **Pause a frontend** controls new incoming interactions under the host's policy.
+- **Remove an integration** retires its selected binding and handles its shared dependencies.
 
-Current released startup behavior and the proposed typed MobKit startup protocol must not be conflated. The proposed acceptance/progress/settled protocol is **unreleased**. Its design declares readiness only from a settled-ready result; progress is not readiness. It has no built-in SDK stall timer. Caller cancellation, a caller deadline or transport loss leaves `InitOutcomeUnknown` when settlement cannot be observed.
+Let entered operations settle through their owners before replacing processes or connections. Saved configuration and external actions retain their own outcomes after a cancellation.
 
-Tool presence also needs actual runtime evidence. A host customizer registration or an SDK fake test does not prove the tool survives restoration, delivery repair, helper creation or every spawn path. Observe the actual `identity_resolved_tools` surface and dispatch through the intended member before claiming that binding is usable.
-
-See [host composition](/connect/guides/host-composition) and [operations](/connect/operations/runbook) for the required verification points.
+See [connection management](/connect/guides/manage-connections) and [operations](/connect/operations/runbook).

@@ -4,13 +4,9 @@ description: "Render host-owned connection, frontend, package and setup state wi
 icon: "window-maximize"
 ---
 
-**Current local source.** `@rkat/toolkit/ui` supplies framework-free DOM components. It is separate from the Node connectors. Authentication, durable actions and management endpoints remain application work.
+`@rkat/toolkit/ui` provides framework-free DOM components for connection management. Import its browser entrypoint separately from the Node service connectors.
 
-Mounting a component does not enable Connect in stock MobKit Console. The
-integrated setup journey requires an application-owned wrapper, its retained
-native setup session and authenticated protected presenters. The current private
-v1 Forge/Reading component and pending HomeCore v2 work have separate support
-boundaries; see [availability](/connect/availability).
+Your application supplies authenticated state, command handlers and protected sign-in controls. For an integrated setup conversation, keep the view connected to the application's native setup session.
 
 ```ts
 import { mountToolkitView } from "@rkat/toolkit/ui";
@@ -86,6 +82,6 @@ The **Review sign-in** control dispatches only the exact owner/action reference.
 
 Hosts can provide inert service/frontend descriptions, literal text search, categories and a navigation-only manual-setup callback. Literal catalog filtering is a user browsing feature, not agent intent resolution or automatic package choice.
 
-The UI maintains contextual headings and control labels, preserves relevant keyboard focus, and uses host-supplied concise announcements in a polite live region. Status remains visible text without relying on animation, color or popups. These local behaviors do not establish complete screen-reader or end-to-end UX acceptance.
+The UI maintains contextual headings and control labels, preserves relevant keyboard focus, and uses host-supplied concise announcements in a polite live region. Status remains visible text without relying on animation, color or popups.
 
 There is no polling, cookie, local-storage or network owner inside the renderer. Hosts feed authenticated events or bounded reads into `update`. The canonical source contracts are `sdk/typescript/UI.md` and `sdk/typescript/src/ui/model.ts`.

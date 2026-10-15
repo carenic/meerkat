@@ -4,7 +4,7 @@ description: "A separate integration library built around native execution, expl
 icon: "layer-group"
 ---
 
-Toolkit's architecture separates description, selection, realization and actual use. It can grow an integration library without adding mandatory dependencies or policy to raw Meerkat.
+Connect's architecture separates description, selection, realization and actual use. It can grow an integration library without adding mandatory dependencies or policy to raw Meerkat.
 
 ```mermaid
 flowchart TB
@@ -21,8 +21,6 @@ flowchart TB
   APP --> UI["Controlled management projections"]
 ```
 
-The automatic setup path in this diagram is **designed and incomplete**. Current SDK adapters, metadata/discovery, store and UI components have narrower implemented surfaces.
-
 ## Description and selection
 
 `toolkit-package` owns inert package/recipe types, imported metadata and exact manifest validation. `toolkit-mobkit::discovery` presents public evidence for agents. Neither chooses an integration, grants access or contacts a provider while listing descriptions.
@@ -31,9 +29,9 @@ Descriptions can be partial. Agents complete the concrete choice after investiga
 
 ## Application lifecycle
 
-`toolkit-catalog` contains the generated Toolkit acquisition lifecycle schema. Its name refers to the native DSL catalog, not a service marketplace. It records concrete work and typed observations; it does not interpret user intent or become an auth/runtime owner.
+`toolkit-catalog` contains the generated Connect acquisition lifecycle schema. Its name refers to the native DSL catalog, not a service marketplace. It records concrete work and typed observations; it does not interpret user intent or become an auth/runtime owner.
 
-`meerkat-toolkit` contains developing request/setup/binding/continuation composition. Production activation must adopt accepted upstream owners. Historical private request-custody, registration and admission protocols are not alternative public contracts.
+`meerkat-toolkit` composes request, setup, binding and continuation work through the native runtime and application APIs.
 
 `toolkit-store` supplies an injected atomic persistence boundary for feature state and effects. WorkGraph and native runtime semantics remain responsible for their own work. Durable projections do not replace the canonical owners they observe.
 
@@ -41,7 +39,7 @@ Descriptions can be partial. Agents complete the concrete choice after investiga
 
 Python and TypeScript operations are independently consumable. They borrow selected host transports and expose explicit operation results. Frontend transports supply provider facts or one delivery attempt; the host composes admission, conversations and durable output.
 
-The native MCP adapter realizes a selected remote service using the existing session/native execution surface. Native tools use Meerkat's existing bundle owner; MobKit forwards and composes the accepted inputs. Toolkit does not start a second runtime to make integration code convenient.
+The native MCP adapter realizes a selected remote service using the existing session/native execution surface. Native tools use Meerkat's existing bundle owner; Meta forwards and composes the accepted inputs. Connect does not start a second runtime to make integration code convenient.
 
 ## Presentation
 
@@ -49,6 +47,6 @@ The UI is a controlled view over authenticated host projections. It can validate
 
 ## Consumer boundaries
 
-HomeCore retains household decisions. Reachy retains device and live-domain semantics. Organizational hosts retain tenant policy, service mandates and deployment processes. They adopt shared integration components and retire duplicate generic machinery only with explicit equivalence and migration evidence.
+Applications supply their own tenant, device, audience and deployment policies while sharing the integration components.
 
 The [role model](/connect/concepts/roles), [package contracts](/connect/reference/packages) and [continuation model](/connect/reference/continuation) describe the boundaries in more detail.

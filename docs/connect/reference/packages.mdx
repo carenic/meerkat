@@ -4,7 +4,7 @@ description: "Describe integrations inertly, then validate an exact selection be
 icon: "box"
 ---
 
-**Current metadata API.** `toolkit-package` separates a discoverable package description from a concrete activation selection. Neither layer executes integration code or grants authority.
+`toolkit-package` separates a discoverable package description from a concrete activation selection. Neither layer executes integration code or grants authority.
 
 ## Inspect public metadata
 
@@ -18,7 +18,7 @@ toolkit-package-inspect mcpb < manifest.json
 
 Input is limited to 1 MiB; the JSON report to 256 KiB. Exit 0 means parsed metadata, possibly with diagnostics; exit 2 means refusal and exit 1 means output failure. Check diagnostics and accepted-server counts. Invalid MCP siblings are skipped, and arbitrary client configuration formats are not guessed.
 
-Reports omit executable/configuration values and include the exact input digest, roles or configuration field names where available. Names and diagnostic scopes remain untrusted public source text. The tool does not open package files, execute commands or establish readiness. Separate artifact distribution is unfinished; the command is currently part of the `toolkit-package` source crate.
+Reports omit executable/configuration values and include the exact input digest, roles or configuration field names where available. Names and diagnostic scopes remain untrusted public source text. The tool does not open package files, execute commands or establish readiness. Build the command from the `toolkit-package` source crate.
 
 ## Package description
 

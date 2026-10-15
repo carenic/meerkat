@@ -1,58 +1,54 @@
 ---
-title: "OSS integration adoption"
-description: "Build at least 100 distinct usable integrations from verified upstream implementations and repeatable host setup."
+title: "Integration library"
+description: "Connect agents to communication, development, research, data and business services."
 icon: "boxes-stacked"
 ---
 
-**Required product outcome A:** at least 100 distinct adopted OSS service/system integrations usable through supported host setup after documented authentication and configuration. The requirement is a working integration library, with service and frontend roles kept explicit.
+Connect includes more than 100 integrations. The setup agent selects a profile, reads its operations and account requirements, and prepares the configuration for your task.
 
-The library currently has 101 adopted local profiles: 36 Agno, 63 Activepieces and two official MCP integrations. The count threshold is met within their documented operation, platform and preauthenticated setup scopes. Newcomer authentication, native host setup, distribution and maintenance obligations remain incomplete. [Availability](/connect/availability) reports those boundaries; [local installation](/connect/library/local-install) provides the current consumer path.
+## Explore by task
 
-## What counts as adopted
-
-An adopted integration has an identified upstream implementation and a selected reuse route, packaged or composed through Toolkit with a supported host. An ordinary user of that host can follow the documented account/configuration path and use the verified scoped operations without an undocumented integration project.
-
-| Required record | Evidence |
+| Task | Examples |
 | --- | --- |
-| Distinct integration identity | Canonical service/system identity, deduplicated across upstream packages and languages |
-| OSS implementation and reuse route | Source repository/file, exact revision or artifact, applicable license/provenance and actual reused component |
-| Supported host setup | Runtime/dependencies, account registration/authentication, required administrator configuration and host activation |
-| Usable scope | Useful actual operations/resources, preserved upstream behavior where supported, stated omissions, result limits, account and role boundaries |
-| Verification | Reproducible installed artifact, supported host composition and per-integration execution of the actual implementation, plus direct provider evidence where the scope claims it |
-| Maintenance | Named ownership, dependency/provider drift checks and an update or replacement path |
+| Read conversations and manage messages | Slack, Gmail, Discord, Microsoft Teams |
+| Work with repositories and issues | GitHub, GitLab, Bitbucket, Jira, Linear |
+| Find and read information | Hacker News, Wikipedia, arXiv, PubMed, Tavily, Exa |
+| Work with documents and records | Google Drive, Google Sheets, Notion, Airtable |
+| Coordinate work | ClickUp, Trello, Todoist, Zoom, Webex |
+| Connect business systems | Salesforce, HubSpot, Shopify, Zendesk |
+| Query data and infrastructure | PostgreSQL metadata, AWS Lambda |
+| Automate browser interaction | Playwright MCP on macOS |
 
-A provider API being documented is not an adopted OSS implementation. A recipe being parseable is not a usable integration. A ping, no-op or schema-only wrapper cannot supply the useful operation evidence. Evidence must match the claimed host and operation profile; broad provider coverage cannot be inferred from one successful operation.
+These are entry points into the library. Read the selected profile's operation list and configuration before setup.
 
-Library adoption is separate from each user's account activation. The integration can be distributed with a verified setup path before a particular customer connects an account. Tests using protocol peers prove only the operations and contracts they exercise; provider-side, live-account and hardware claims still require their corresponding direct evidence.
+## Choose operations and an account
 
-## Count once, track roles separately
+Tell Connect the service, resources and result you need. For example:
 
-The minimum counts distinct service/system integrations. Several versions, tools, strategies or Python/TypeScript wrappers for the same integration contribute one identity. Upstream candidates from different frameworks are possible reuse alternatives, not automatically separate integrations.
+```text
+Connect our work Slack account so the research agent can read the launch
+channel. Give it read access for this task.
+```
 
-A service connector reads or acts on the external system. An agent frontend admits people and delivers scoped output. One package can supply both, but the additional role does not create another count toward 100. Frontend adoption and conformance remain separately visible requirements.
+The setup review identifies the package, selected operations, account inputs and access duration. Credentials are entered through protected controls. The agent receives access through the host's grant policy.
 
-## Progress from candidate to adopted
+For direct host integration, `config-help --profile` describes a selected profile's configuration fields and prerequisites. `describe` provides its operation schemas. See [library installation](/connect/library/local-install).
 
-| Implementation state | What is established | Counts toward 100? |
-| --- | --- | --- |
-| Candidate | A verified upstream implementation worth evaluating | No |
-| Runnable | The actual implementation runs through the selected adaptation route within a tested profile | No |
-| Adopted | The documented supported-host setup and usable scoped operations satisfy the adoption contract | Yes, once per distinct identity |
+## Connectors and frontends
 
-These are implementation progress states, not a new runtime lifecycle. Source selection, recipe preparation and component tests are supporting evidence for the transitions.
+A service connector gives an agent operations such as reading Slack history. A frontend lets people talk to an agent through Slack or another interface. Configure each role for its intended account, participants and permissions. See [connectors and frontends](/connect/concepts/roles).
 
-The [OSS candidate inventory](/connect/library/candidates) is generated from `docs/adoption/oss-inventory.json`, with its methodology in `docs/adoption/INVENTORY.md`. Candidate totals must never be copied into an adopted count.
-
-## Reuse routes
-
-Maintained OSS MCP components can supply existing service implementations without a code fork. Existing toolkit libraries and community action packages can expose their actual function, schema, authentication and property contracts through a narrow adapter. Selective Python or TypeScript ports are useful where those routes cannot preserve the required behavior. Frontend transport code has separate admission, conversation and delivery obligations. CLI and custom packages retain exact executable, lifecycle and policy contracts.
-
-Prefer the narrow reusable provider/transport logic. Do not import another framework's agent runtime, global credentials or session authority. HomeCore, Reachy and organizational applications consume Toolkit's common layer and retain their own business policies.
-
-## Adoption batches
-
-Choose batches from the verified inventory by shared transport/runtime, setup feasibility, license fit and useful service coverage. Prove one reusable adapter against several deliberately different integrations before multiplying its scope. Reuse shared conformance evidence while retaining each integration's actual operation checks. Record unresolved dependencies rather than inventing readiness.
-
-Track evidence at 10, 30, 60 and at least 100 adopted identities. The intermediate counts organize execution; they do not reduce the required target. Ordinary integrations can advance while a separate device, frontend or deployment prerequisite remains unresolved.
-
-An end-to-end beyond-library installer is the equal [product outcome B](/connect/concepts/acquisition). It can generate an exact reusable local recipe after successful investigation, but public promotion into this maintained library still needs the adoption evidence and owner decision.
+<CardGroup cols={2}>
+  <Card title="Slack and Gmail" icon="envelope" href="/connect/library/slack-gmail">
+    Read conversations and messages, create drafts and send mail.
+  </Card>
+  <Card title="GitHub" icon="github" href="/connect/library/github">
+    Read account information, commits and repository files.
+  </Card>
+  <Card title="Browser automation" icon="globe" href="/connect/library/playwright">
+    Navigate pages and interact with forms through MCP.
+  </Card>
+  <Card title="Find another integration" icon="compass" href="/connect/concepts/acquisition">
+    Research and prepare a package outside the library.
+  </Card>
+</CardGroup>

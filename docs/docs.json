@@ -375,7 +375,7 @@
                 ]
               },
               {
-                "group": "Advanced host setup",
+                "group": "Host integration",
                 "pages": [
                   "connect/library/local-install",
                   "connect/acquisition/local-install",
@@ -393,7 +393,7 @@
                 ]
               },
               {
-                "group": "Examples and advanced host scenarios",
+                "group": "Examples",
                 "pages": [
                   "connect/examples/remembered-tool",
                   "connect/examples/slack-summary",
@@ -425,7 +425,7 @@
                 "pages": [
                   "connect/sdks/typescript",
                   "connect/sdks/typescript-connectors",
-                  "connect/sdks/activepieces",
+                  "connect/sdks/service-profiles",
                   "connect/sdks/ui"
                 ]
               },
@@ -610,6 +610,10 @@
     {
       "source": "/meta/:slug*",
       "destination": "/mobkit/:slug*"
+    },
+    {
+      "source": "/connect/sdks/activepieces",
+      "destination": "/connect/sdks/service-profiles"
     }
   ]
 }

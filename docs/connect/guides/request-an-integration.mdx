@@ -4,7 +4,7 @@ description: "Describe the work you want done, including its audience and constr
 icon: "comment"
 ---
 
-**Selected user workflow.** Connect is intended to begin with your request in the standalone `meerkat-connect` CLI or an application's MobKit console. Complete automatic setup remains unfinished; see [availability](/connect/availability) for current source and distribution limits. This guide explains the information a host or setup agent needs.
+Start in the standalone `meerkat-connect` CLI or an application's integrated Console. Describe the task and let the setup agent identify the integration and account requirements.
 
 Start with the outcome. "Read updates from these two channels and email me a summary" is more useful than "Install a Slack plugin." It preserves the requested time window, resources, recipient and business purpose without assuming an implementation.
 
@@ -33,11 +33,7 @@ Include the account or workspace when you know it, the resources involved, the i
 
 ## Set up a service key in the terminal
 
-The standalone source includes initial setup for supported checked library
-integrations and agent-selected Python/Node stdio packages that declare their
-required secret environment variables. The agent researches these requirements
-before the installation review. These paths still need native and live-provider
-qualification; this is not a distributed CLI availability claim.
+The terminal can set up library integrations and selected Python/Node stdio packages with declared credential fields. The agent identifies those requirements before the installation review.
 
 <Steps>
   <Step title="Choose the realm and describe the task">
@@ -133,9 +129,7 @@ Connect reports revocation, removal from the selection and cleanup separately.
 Only a native `Revoked` result confirms revocation; deferred or uncertain cleanup
 is still reported. Other agents' access and shared credentials remain separate.
 
-The available inventory shows configured operation ceilings, not current grant
-status, granted operations or expiry. Current grant inspection is not yet exposed
-by this CLI path. An uncertain earlier action stays uncertain after any new action;
+The inventory lists each service's configured operations. Review the separate access decision for the target agent. An uncertain earlier action stays uncertain after any new action;
 Connect does not retry it automatically. A successful grant still needs a normal
 new session to check the intended service operation. Frontend roles use their
 host's separate admission and setup flow.
@@ -202,9 +196,6 @@ value can retain it; removing a saved value neither revokes it at the provider
 nor immediately disconnects such a process. New launches that need a removed
 value refuse until it is supplied again. These operations concern service
 credentials; frontend routing and host setup remain separate.
-
-This management flow is implemented in source and still needs native and
-live-provider qualification. It is not a distributed CLI availability claim.
 
 ## Read the setup result
 

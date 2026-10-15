@@ -1,14 +1,13 @@
 ---
 title: "Rust crates"
-description: "Use the inert package and discovery layers, and understand the development status of native composition."
+description: "Inspect packages, validate selections and compose native setup."
 icon: "rust"
 ---
 
 The public source has a root workspace for `toolkit-package` and `toolkit-store`,
 and a `native-candidate` workspace for Connect and its native adapters. It uses
 published Core and Meta 0.9.0 crates plus the exact included Core code generator.
-The selected build toolchain is Rust 1.97.0; the declared Rust 1.94 minimum has
-not been separately qualified for the complete graph. See the repository
+Build with Rust 1.97.0. See the repository
 `BUILDING.md` for resource-bound native build commands.
 
 ## Crate map
@@ -53,11 +52,7 @@ required by [service-secret setup](/connect/guides/host-composition#standalone-s
 The selected HomeCore binding can expose its frontend setup operations; this
 standalone composer does not turn the session into a persistent frontend host.
 
-These APIs compose an application host with the matching Toolkit gateway and
-Meta SDK. The release notes identify the qualified compositions; source/build
-checks do not establish every host, replacement or recovery path. See
-[host composition](/connect/guides/host-composition#native-application-lifecycle) for
-application Restore, fresh preparation, replacement and their separate owners.
+See [host composition](/connect/guides/host-composition#native-application-lifecycle) for application restore, preparation and replacement.
 
 ## Inspect the integration library
 
@@ -109,11 +104,11 @@ An agent or application supplies the concrete `ActivationManifest`. Its `validat
 
 ## Export a selected portable endpoint
 
-`IntegrationBundle::export_portable(&bundle_digest, selection)` validates a concrete `ActivationManifest` through the existing recipe owner and returns `PortablePluginExport`. It exports exactly the selected remote recipe's retained server, with matching portable declarations. Required Toolkit contracts, services, dependencies and package state prevent portable export. It does not invent host capabilities or claim host compatibility.
+`IntegrationBundle::export_portable(&bundle_digest, selection)` validates a concrete `ActivationManifest` through the existing recipe owner and returns `PortablePluginExport`. It exports exactly the selected remote recipe's retained server, with matching portable declarations. Required Connect contracts, services, dependencies and package state prevent portable export. It does not invent host capabilities or claim host compatibility.
 
 `PortablePluginExport::new` also supports plain portable manifests and inert skill files through `with_file`. Optional metadata remains absent rather than null, namespaces remain opaque and placeholders remain literal. Artifact realization is explicitly unsupported. `write_new` writes files into a new host-controlled directory and refuses existing destinations; it is not an atomic or durable install.
 
-The local operator's `export` command requires an existing recipe, its exact identity and bundle digest, an absolute selection-file path and a new destination. Its result retains local decision provenance and hashes the selection and emitted files. A generic client gets the whole endpoint, not a proxy enforcing Toolkit operation lists, grants or resource limits. The client owns its authentication and authorization.
+The local operator's `export` command requires an existing recipe, its exact identity and bundle digest, an absolute selection-file path and a new destination. Its result retains local decision provenance and hashes the selection and emitted files. A generic client gets the whole endpoint, not a proxy enforcing Connect operation lists, grants or resource limits. The client owns its authentication and authorization.
 
 ## Expose discovery
 
@@ -123,10 +118,7 @@ The dispatcher implements Meerkat's tool surface, but the application must compo
 
 ## MCP integrations
 
-Connect supports MCP servers as integrations through the existing native session
-owners. The separate outer-MCP Connect entry point is deferred, and its
-`toolkit-mcp` workspace is not included in this source release. Installation,
-account readiness, agent access and frontend admission retain separate owners.
+Connect supports MCP servers through Meerkat's native session APIs. Use the host's existing credential, grant and runtime owners when attaching a selected integration.
 
 ## Source locations
 

@@ -4,15 +4,12 @@ description: "Run selected Slack reads and Gmail reads or writes without custom 
 icon: "envelope"
 ---
 
-The local `meerkat-toolkit-services` package exposes Toolkit's existing Slack
+The local `meerkat-toolkit-services` package exposes Connect's existing Slack
 and Gmail operations through standard MCP stdio. An MCP host launches a process
 with a selected account and explicit operations. The package constructs and owns
 the provider client, so consumers do not write Python transport glue.
 
-This is an additional first-party operation route for two existing integrations.
-It does not increase the 101 adopted OSS integration count or replace the
-Activepieces profiles' separate adoption evidence. Slack service operations and
-a [Slack agent frontend](/connect/guides/agent-frontends) remain different roles.
+Slack service operations and a [Slack agent frontend](/connect/guides/agent-frontends) serve different purposes: one gives the agent service access; the other lets people talk to it.
 
 Select `get_user` to expose `slack_get_user` when human-readable author or
 mention attribution is useful. It takes an exact `user` ID and optional boolean
@@ -29,9 +26,7 @@ Use the selected services component from the current macOS or Linux
 [library edition](/connect/library/local-install). Its `README.md`, component
 wheel, requirements and constraints provide the ordinary pip installation path
 in a new Python environment. The maintained guide is `sdk/services/README.md`
-in the Toolkit checkout. The package uses the distinct
-`meerkat_toolkit_services` namespace and excludes private MIME-construction,
-frontend and host-control modules.
+in the Connect checkout. The package uses the `meerkat_toolkit_services` namespace.
 
 The current library includes structured Gmail sending, optional mailbox-profile
 reads, resumable Slack intervals, fixed Slack channel limits and fixed Gmail
@@ -47,11 +42,6 @@ The configured MCP tools do not expose these helpers as agent tools.
 The base library excludes the
 optional Google verifier dependencies and `install-google-oauth-offline.txt`;
 using that verifier requires a separately selected `google-oauth` closure.
-Existing standalone installation kits retain their recorded service versions.
-
-The local package has installed protocol and adversarial checks. It is not a
-public PyPI release or a demonstrated provider sign-in flow. Existing account
-authentication, selected token references and access policy belong to the host.
 
 ## Inspect and configure
 
@@ -135,8 +125,7 @@ Tool names use `slack_` and `gmail_` prefixes. Only configured operations are
 listed or callable. Provider scopes still apply independently of the local
 operation selection.
 
-Services 0.1.19 adds `read_message` and `read_text_part` as explicit operation
-selections. `gmail_read_message` takes a `message_id`, reads the full message
+Select `read_message` and `read_text_part` to read message content. `gmail_read_message` takes a `message_id`, reads the full message
 once and returns decoded inline text with MIME part identities. Plain text and
 HTML remain separate; HTML is returned as source, never rendered. Ordered
 outer headers are retained as message data, not verified sender identities.
@@ -201,10 +190,6 @@ Calls are serialized per process. Cancellation joins request cleanup before a
 later call can enter, and closing the profile waits for entered calls before
 closing its client.
 
-## What remains for the complete task
+## Use it in a task
 
-The [Slack-to-email example](/connect/examples/slack-summary) still requires the original
-agent's interpretation, account and recipient authorization, and an actual send.
-This configured package supplies the operations. Agent-led discovery, provider
-authentication, native attachment and original-task continuation remain separate
-unfinished steps in the [acquisition workflow](/connect/concepts/acquisition).
+See the [Slack-to-email example](/connect/examples/slack-summary) for interval reads, summaries and an authorized email send.
