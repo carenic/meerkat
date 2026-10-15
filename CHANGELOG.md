@@ -206,6 +206,19 @@ them.
   a cursor only re-reads events), which the test misread as a resume defect.
   With 300 ms injected before the cursor write, the old test failed 10 of 10
   runs with the CI failure's exact overlap and the new one passed 10 of 10.
+- The schedule embedding docs now state the teardown step a Rust host owns
+  when its process keeps running. A schedule host attaches its session and
+  mob hosts to the `ScheduleService` for as long as any clone of the service
+  lives, and agent schedule tools in a factory builder's
+  `default_schedule_tools` slot hold such a clone while the session service
+  owns that builder, so after teardown the session service and the mob state
+  stay owned (a mob store's `drain_observers` refuses with other owners)
+  until the host clears that slot, and any registry of its own that holds
+  them, once teardown has succeeded. `spawn_schedule_host`, the
+  runtime-backed schedule host spawners, `SharedScheduleTargetAdapter::new`,
+  `set_default_schedule_tools`, `FactoryAgentBuilder::default_schedule_tools`,
+  `ScheduleService::attach_identity_target_probe` and the scheduling guide
+  say so. Behaviour is unchanged; 0.8.51 already worked this way.
 
 ## [0.9.1] - 2026-10-15
 
