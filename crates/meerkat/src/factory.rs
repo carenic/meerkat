@@ -1680,6 +1680,17 @@ impl meerkat_core::ModelOperationalDefaultsResolver for RegistryBackedDefaultsRe
             .and_then(|p| p.call_timeout_secs)
             .map(std::time::Duration::from_secs)
     }
+
+    fn stream_inactivity_timeout_for(
+        &self,
+        provider: Provider,
+        model: &str,
+    ) -> Option<std::time::Duration> {
+        self.registry
+            .profile_for_provider(provider, model)
+            .and_then(|p| p.stream_inactivity_timeout_secs)
+            .map(std::time::Duration::from_secs)
+    }
 }
 
 fn provider_request_defaults_for(
@@ -1821,6 +1832,32 @@ fn validate_anthropic_request_shaping(
     }
     match meerkat_models::capabilities_for(Provider::Anthropic, model)
         .and_then(|capabilities| capabilities.anthropic_provider_tag_rejection(&tag))
+    {
+        Some(rejection) => Err(BuildAgentError::Config(rejection)),
+        None => Ok(()),
+    }
+}
+
+/// Refuse a Gemini thinking level the resolved catalog row rejects (the
+/// API answers 400 for `minimal` on a model that does not accept it) when
+/// the agent is built, instead of failing its first request. Uncatalogued
+/// models keep the pass-through.
+fn validate_gemini_request_shaping(
+    provider: Provider,
+    model: &str,
+    provider_params: Option<&meerkat_core::lifecycle::run_primitive::ProviderParamsOverride>,
+) -> Result<(), BuildAgentError> {
+    use meerkat_core::lifecycle::run_primitive::ProviderTag;
+    if provider != Provider::Gemini {
+        return Ok(());
+    }
+    let Some(ProviderTag::Gemini(tag)) =
+        provider_params.and_then(|params| params.provider_tag.as_ref())
+    else {
+        return Ok(());
+    };
+    match meerkat_models::capabilities_for(Provider::Gemini, model)
+        .and_then(|capabilities| capabilities.gemini_provider_tag_rejection(tag))
     {
         Some(rejection) => Err(BuildAgentError::Config(rejection)),
         None => Ok(()),
@@ -8775,6 +8812,12 @@ impl AgentFactory {
             .with_tools_config(config.tools.clone())
             .provider_native_tool_policy(provider_native_tool_policy)
             .with_call_timeout_override(effective_call_timeout_override)
+            // An explicit `[retry] stream_inactivity_timeout` wins; when it
+            // inherits, the loop uses the current model's own window from the
+            // resolver above, then the policy's built-in window.
+            .with_stream_inactivity_timeout_override(
+                config.retry.stream_inactivity_timeout_override.clone(),
+            )
             // Config-owned budget warning threshold and extraction prompt reach
             // the agent here; without this every factory-built agent ran on the
             // template threshold and the built-in extraction prompt.
@@ -8808,6 +8851,7 @@ impl AgentFactory {
             &model,
             build_config.provider_params.as_ref(),
         )?;
+        validate_gemini_request_shaping(provider, &model, build_config.provider_params.as_ref())?;
         if let Some(params) = build_config.provider_params.clone() {
             builder = builder.provider_params(params);
         }
@@ -9343,7 +9387,7 @@ impl AgentFactory {
             session_id,
         )?;
         let primary_target_profile = registry
-            .profile_witness_for_provider(identity.provider, &identity.model)
+            .profile_witness_for_identity(config, identity)
             .ok_or_else(|| {
                 BuildAgentError::Config(format!(
                     "model fallback cannot bind active model '{}:{}' because it is absent from the effective model registry",
@@ -9359,19 +9403,20 @@ impl AgentFactory {
         }];
         let (identities, mut skipped) =
             self.model_fallback_identities(config, registry, identity)?;
+        let absent_target = |identity: &SessionLlmIdentity| {
+            BuildAgentError::Config(format!(
+                "model fallback target '{}:{}' is absent from the effective model registry",
+                identity.provider.as_str(),
+                identity.model
+            ))
+        };
         for identity in identities {
-            let target_profile = match registry
-                .profile_witness_for_provider(identity.provider, &identity.model)
+            if registry
+                .entry_for_provider(identity.provider, &identity.model)
+                .is_none()
             {
-                Some(profile) => profile,
-                None => {
-                    return Err(BuildAgentError::Config(format!(
-                        "model fallback target '{}:{}' is absent from the effective model registry",
-                        identity.provider.as_str(),
-                        identity.model
-                    )));
-                }
-            };
+                return Err(absent_target(&identity));
+            }
             let built = match self
                 .build_llm_client_with_selection_for_identity_in_realm(
                     config,
@@ -9413,6 +9458,13 @@ impl AgentFactory {
             let mut identity = identity;
             let selected_credential =
                 LlmCredentialSelection::bind_unselected(built.selection, &mut identity);
+            // The target is judged as the binding its client uses serves it
+            // (the one it names, or the one just bound): a backend can narrow
+            // the model row, as the ChatGPT backend does for mid-conversation
+            // System messages. The activation keeps this witness.
+            let target_profile = registry
+                .profile_witness_for_identity(config, &identity)
+                .ok_or_else(|| absent_target(&identity))?;
             let adapter = events
                 .adapter(built.client, identity.model.clone(), identity.provider)?
                 .with_event_tap(event_tap.clone());
@@ -12262,6 +12314,7 @@ mod tests {
             params_schema: serde_json::json!({}),
             beta_headers: Vec::new(),
             call_timeout_secs: None,
+            stream_inactivity_timeout_secs: None,
         };
 
         let enabled = provider_request_defaults_for(
@@ -12504,6 +12557,70 @@ mod tests {
         );
     }
 
+    /// A Gemini thinking level the cataloged model refuses is refused when
+    /// the agent is built, nested or flat; accepted levels, uncatalogued
+    /// models and other providers pass.
+    #[test]
+    fn unsupported_gemini_thinking_level_is_refused_at_build() {
+        use meerkat_core::lifecycle::run_primitive::{
+            GeminiProviderTag, GeminiThinkingConfig, GeminiThinkingLevel, ProviderParamsOverride,
+            ProviderTag,
+        };
+        let params = |level, nested: bool| ProviderParamsOverride {
+            provider_tag: Some(ProviderTag::Gemini(if nested {
+                GeminiProviderTag {
+                    thinking: Some(GeminiThinkingConfig {
+                        include_thoughts: None,
+                        thinking_level: Some(level),
+                        thinking_budget: None,
+                    }),
+                    ..Default::default()
+                }
+            } else {
+                GeminiProviderTag {
+                    thinking_level: Some(level),
+                    ..Default::default()
+                }
+            })),
+            ..Default::default()
+        };
+        for nested in [false, true] {
+            let Err(BuildAgentError::Config(message)) = validate_gemini_request_shaping(
+                Provider::Gemini,
+                "gemini-3.8-flash",
+                Some(&params(GeminiThinkingLevel::Minimal, nested)),
+            ) else {
+                panic!("minimal must be refused at build for gemini-3.8-flash");
+            };
+            assert!(message.contains("'minimal'"), "{message}");
+            assert!(message.contains("low, medium, high"), "{message}");
+            for (model, level) in [
+                ("gemini-3.8-flash", GeminiThinkingLevel::Low),
+                ("gemini-3.5-flash-lite", GeminiThinkingLevel::Minimal),
+                ("gemini-uncatalogued-preview", GeminiThinkingLevel::Minimal),
+            ] {
+                assert!(
+                    validate_gemini_request_shaping(
+                        Provider::Gemini,
+                        model,
+                        Some(&params(level, nested))
+                    )
+                    .is_ok(),
+                    "{model} {level:?}"
+                );
+            }
+        }
+        assert!(
+            validate_gemini_request_shaping(
+                Provider::OpenAI,
+                "gemini-3.8-flash",
+                Some(&params(GeminiThinkingLevel::Minimal, false)),
+            )
+            .is_ok(),
+            "only a Gemini build is judged by the Gemini rows"
+        );
+    }
+
     /// A realm whose OpenAI binding is the private ChatGPT backend.
     fn chatgpt_backend_cache_config() -> (Config, AuthBindingRef) {
         let mut config = Config::default();
@@ -12528,8 +12645,10 @@ mod tests {
 
     /// The ChatGPT backend serves the GPT catalog rows, but its wire carries
     /// no ordered System message after the leading prefix. The session's
-    /// profile says so; the public API, and an identity that names no
-    /// binding, keep the row's capability.
+    /// profile says so; the public API, an identity that names no binding,
+    /// and the synthetic env-var default (an API-key backend) keep the
+    /// row's capability. A named binding the config does not resolve has an
+    /// unknown backend, so it does not keep the capability.
     #[test]
     fn a_chatgpt_backend_identity_resolves_without_mid_conversation_system_messages() {
         let (mut config, chatgpt_binding) = chatgpt_backend_cache_config();
@@ -12566,6 +12685,62 @@ mod tests {
         assert!(
             supports(None),
             "an identity naming no binding keeps the row"
+        );
+        assert!(
+            supports(Some(AuthBindingRef {
+                realm: RealmId::parse("env_default").expect("valid realm"),
+                binding: BindingId::parse("default").expect("valid binding"),
+                profile: None,
+                origin: meerkat_core::BindingOrigin::SyntheticEnvDefault,
+            })),
+            "the env-var default names an API-key backend and keeps the row"
+        );
+        assert!(
+            !supports(Some(configured_auth_binding("missing", "default_openai"))),
+            "a binding in a realm the config lacks has an unknown backend"
+        );
+        assert!(
+            !supports(Some(configured_auth_binding("public", "missing_binding"))),
+            "a binding the realm lacks has an unknown backend"
+        );
+    }
+
+    /// The witness minted for an identity carries the judgment of its own
+    /// binding, and is judged for exactly that identity.
+    #[test]
+    fn an_identity_witness_carries_its_binding_judgment() {
+        let (config, chatgpt_binding) = chatgpt_backend_cache_config();
+        let registry = config
+            .model_registry(meerkat_models::canonical())
+            .expect("model registry");
+        let identity = |auth_binding: Option<AuthBindingRef>| SessionLlmIdentity {
+            model: "gpt-5.6-sol".to_string(),
+            provider: Provider::OpenAI,
+            self_hosted_server_id: None,
+            provider_params: None,
+            auth_binding,
+        };
+        let bound = identity(Some(chatgpt_binding));
+        let witness = registry
+            .profile_witness_for_identity(&config, &bound)
+            .expect("cataloged model");
+        assert!(
+            !witness.profile().supports_mid_conversation_system_messages,
+            "the ChatGPT backend's judgment is carried"
+        );
+        assert!(witness.judged_for_identity(&bound));
+        assert!(
+            !witness.judged_for_identity(&identity(None)),
+            "a witness judged through a binding does not stand for the row"
+        );
+        let row = registry
+            .profile_witness_for_provider(Provider::OpenAI, "gpt-5.6-sol")
+            .expect("cataloged model");
+        assert!(row.profile().supports_mid_conversation_system_messages);
+        assert!(row.judged_for_identity(&identity(None)));
+        assert!(
+            !row.judged_for_identity(&bound),
+            "the row does not stand for a bound identity"
         );
     }
 
@@ -14677,6 +14852,168 @@ mod tests {
         assert!(
             bindings.auth_lease().snapshot(&lease).credential_present,
             "the resolved default's lease is held after the switch"
+        );
+    }
+
+    /// Run one sticky fallback from an Anthropic source onto `gpt-5.5`
+    /// through realm `fallback_test`, whose OpenAI binding is the private
+    /// ChatGPT backend, and return the session's resolved capability surface
+    /// afterwards. `bound` names that binding on both the source and the
+    /// fallback target; otherwise neither names one, and the target is served
+    /// by the binding its client resolution selects (the ChatGPT one).
+    #[cfg(not(target_arch = "wasm32"))]
+    async fn chatgpt_backend_sticky_fallback_capabilities(
+        bound: bool,
+    ) -> meerkat_runtime::SessionLlmCapabilitySurface {
+        use meerkat_runtime::SessionServiceRuntimeExt as _;
+
+        let primary_model = "claude-sonnet-4-5";
+        let backup_model = "gpt-5.5";
+        let backup_binding = configured_auth_binding("fallback_test", "default_openai");
+        let primary_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let backup_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let temp = tempfile::tempdir().unwrap();
+        let mut factory = AgentFactory::new(temp.path().join("sessions"))
+            .without_provider_auth_persistence()
+            .builtins(false);
+        factory.provider_registry = Arc::new(
+            meerkat_llm_core::provider_runtime::ProviderRuntimeRegistry::empty()
+                .with_runtime(Arc::new(ScriptedStickyFallbackProviderRuntime {
+                    provider: Provider::Anthropic,
+                    client: Arc::new(ScriptedStickyFallbackClient {
+                        provider: Provider::Anthropic,
+                        fail_recoverably: true,
+                        calls: Arc::clone(&primary_calls),
+                    }),
+                }))
+                .with_runtime(Arc::new(ScriptedStickyFallbackProviderRuntime {
+                    provider: Provider::OpenAI,
+                    client: Arc::new(ScriptedStickyFallbackClient {
+                        provider: Provider::OpenAI,
+                        fail_recoverably: false,
+                        calls: Arc::clone(&backup_calls),
+                    }),
+                })),
+        );
+
+        let mut config = Config::default();
+        let mut realm = if bound {
+            inline_realm_section(&[
+                ("anthropic", "test-primary-key"),
+                ("openai", "test-backup-key"),
+            ])
+        } else {
+            // Only the fallback's provider has a configured binding: the
+            // source is served by the environment default.
+            inline_realm_section(&[("openai", "test-backup-key")])
+        };
+        realm
+            .backend
+            .get_mut("default_openai")
+            .expect("OpenAI backend")
+            .backend_kind = "chatgpt_backend".to_string();
+        realm
+            .auth
+            .get_mut("default_openai")
+            .expect("OpenAI auth")
+            .auth_method = "managed_chatgpt_oauth".to_string();
+        config.realm.insert("fallback_test".to_string(), realm);
+        config.model_fallback.enabled = Some(true);
+        config.model_fallback.policy.cross_provider = true;
+        config.model_fallback.policy.trigger_after_attempts = 1;
+        config.model_fallback.policy.require_tool_parity = false;
+        config.model_fallback.chain = vec![ModelFallbackTarget {
+            model: backup_model.to_string(),
+            provider: Some(Provider::OpenAI),
+            auth_binding: bound.then(|| backup_binding.clone()),
+        }];
+        config.retry.max_retries = 1;
+        config.retry.initial_delay = std::time::Duration::ZERO;
+        config.retry.max_delay = std::time::Duration::ZERO;
+        config.retry.multiplier = 1.0;
+
+        let runtime = meerkat_runtime::MeerkatMachine::ephemeral();
+        let session = Session::new();
+        let session_id = session.id().clone();
+        let bindings = runtime
+            .prepare_bindings(session_id.clone())
+            .await
+            .expect("ephemeral machine should prepare real session-owned bindings");
+        let mut build = AgentBuildConfig::new(primary_model);
+        build.max_tokens = Some(1024);
+        build.provider = Some(Provider::Anthropic);
+        build.realm_id = Some(RealmId::parse("fallback_test").expect("test realm"));
+        if bound {
+            build.auth_binding = Some(configured_auth_binding(
+                "fallback_test",
+                "default_anthropic",
+            ));
+        }
+        build.resume_session = Some(session);
+        build.runtime_build_mode = RuntimeBuildMode::SessionOwned(bindings);
+        build.override_builtins = ToolCategoryOverride::Disable;
+
+        let mut agent = factory
+            .build_agent(build, &config)
+            .await
+            .expect("real factory should build the fallback chain");
+        agent.set_runtime_execution_kind(Some(
+            meerkat_core::lifecycle::RuntimeExecutionKind::ContentTurn,
+        ));
+        let result = agent
+            .run(meerkat_core::ContentInput::Text(
+                "exercise fallback".to_string(),
+            ))
+            .await
+            .expect("recoverable primary failure should retry successfully on backup");
+        assert_eq!(result.text, "backup success");
+        assert_eq!(backup_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        let active_identity = agent
+            .session()
+            .session_metadata()
+            .expect("fallback should retain canonical session metadata")
+            .llm_identity();
+        assert_eq!(active_identity.model, backup_model);
+        assert_eq!(
+            active_identity.auth_binding,
+            Some(backup_binding),
+            "the fallback is served through the ChatGPT-backend binding"
+        );
+        runtime
+            .resolved_session_llm_capabilities(&session_id)
+            .await
+            .expect("resolved capability read")
+            .expect("the fallback records a resolved capability surface")
+    }
+
+    /// A sticky fallback onto a target that names the ChatGPT-backend binding
+    /// records what that backend serves: its wire carries no ordered System
+    /// message after the leading prefix, whatever the GPT row says. The
+    /// activation keeps the target's own judgment instead of re-minting the
+    /// model row.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    async fn sticky_fallback_onto_a_chatgpt_binding_records_its_backend_capability() {
+        let capabilities = chatgpt_backend_sticky_fallback_capabilities(true).await;
+        assert!(
+            !capabilities.supports_mid_conversation_system_messages,
+            "the ChatGPT backend refuses a later System row; the fallback must not \
+             record the gpt-5.5 row's capability"
+        );
+    }
+
+    /// A fallback target that names no binding is judged through the binding
+    /// its client resolution selects, here the realm's ChatGPT-backend one,
+    /// not by the model row.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    async fn unbound_fallback_target_is_judged_by_the_binding_it_resolves() {
+        let capabilities = chatgpt_backend_sticky_fallback_capabilities(false).await;
+        assert!(
+            !capabilities.supports_mid_conversation_system_messages,
+            "the target resolves the ChatGPT-backend binding; the row's capability \
+             must not stand for it"
         );
     }
 
@@ -17208,6 +17545,7 @@ mod tests {
                 supports_reasoning: true,
                 supports_web_search: false,
                 call_timeout_secs: Some(600),
+                stream_inactivity_timeout_secs: None,
             },
         );
         config
@@ -17327,6 +17665,7 @@ mod tests {
             supports_reasoning: false,
             supports_web_search: false,
             call_timeout_secs: Some(600),
+            stream_inactivity_timeout_secs: None,
         }
     }
 
@@ -20116,6 +20455,7 @@ mod tests {
                 supports_reasoning: true,
                 supports_web_search: false,
                 call_timeout_secs: Some(600),
+                stream_inactivity_timeout_secs: None,
             },
         );
 

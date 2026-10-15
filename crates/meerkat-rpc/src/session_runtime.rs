@@ -23815,6 +23815,7 @@ mod tests {
                 supports_reasoning: true,
                 supports_web_search: false,
                 call_timeout_secs: Some(600),
+                stream_inactivity_timeout_secs: None,
             },
         );
         config

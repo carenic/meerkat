@@ -35,6 +35,27 @@ them.
 
 ## [Unreleased]
 
+### Breaking
+
+- Per-model stream-inactivity windows (see Added) add the public
+  `stream_inactivity_timeout_secs: Option<u64>` field to the following
+  constructible Rust structs; struct literals must set it (`None` keeps the
+  global window):
+  - `meerkat_core::model_profile::capabilities::ModelCapabilities::stream_inactivity_timeout_secs`
+  - `meerkat_core::model_profile::ModelProfile::stream_inactivity_timeout_secs`
+  - `meerkat_core::config::SelfHostedModelConfig::stream_inactivity_timeout_secs`
+
+  `ModelProfile` and `SelfHostedModelConfig` omit the field when it is unset,
+  so existing documents keep their bytes.
+- Behaviour-only (not measured by the gate): a model fallback switch
+  (`AgentLlmFallbackSwitch`) whose `target_profile` witness was not judged
+  for the target identity's own binding
+  (`ModelProfileWitness::judged_for_identity`) is refused with
+  `AgentError::ConfigError`; the activation used to replace it with the
+  model row's profile. A custom `AgentLlmClient` that proposes fallbacks to
+  targets that name a binding must mint their witnesses with
+  `ModelRegistry::profile_witness_for_identity`.
+
 ### Security
 
 - Cargo.lock moves quinn-proto from 0.11.14 to 0.11.19, clearing
@@ -44,6 +65,34 @@ them.
   (`cargo tree --workspace --all-features --target all -i quinn-proto` is
   empty), but lockfile scanners flagged it. Lockfile only; the new version
   also locks the unused rand_pcg 0.10.2.
+
+### Added
+
+- `meerkat_core::model_profile::capabilities::ModelCapabilities::gemini_provider_tag_rejection`
+  says why a Gemini catalog row refuses the thinking level of a
+  `GeminiProviderTag` (see Fixed), and
+  `meerkat_core::lifecycle::run_primitive::GeminiThinkingLevel::as_effort_level`
+  names a Gemini thinking level in the catalog's `EffortLevel` vocabulary.
+- `meerkat_core::ModelRegistry::profile_witness_for_identity` mints a
+  `ModelProfileWitness` for an identity as its binding's backend serves it,
+  and `ModelProfileWitness::judged_for_identity` says whether a witness was
+  judged for exactly that identity, binding included (see Fixed).
+- Per-model stream-inactivity windows. A model's profile can carry its own
+  watchdog window: the catalog sets one where the provider documents
+  responses that can stay silent for minutes (`gemini-4-argon`, 900 s per
+  Google's 15-minute client-timeout guidance; `gpt-5.5-pro`, 7200 s, its call
+  timeout, since its requests can run for minutes without streaming), and a
+  self-hosted model can declare `stream_inactivity_timeout_secs` (for example
+  for a long prefill; config validation refuses a window below 60 s,
+  `meerkat_core::MIN_MODEL_STREAM_INACTIVITY_TIMEOUT`, twice the 30 s
+  post-finish trailer wait of the OpenAI-compatible client, so the watchdog
+  cannot race that wait). The window is resolved for each LLM call like
+  `call_timeout`: an explicit `[retry] stream_inactivity_timeout` (a duration,
+  or `"disabled"`) wins, then the current model's window, then the built-in
+  300 s, so a model change or fallback uses the new model's window. The 300 s
+  window used to apply to every model. Rust embedders get the provided
+  `ModelOperationalDefaultsResolver::stream_inactivity_timeout_for` (default
+  `None`) and `AgentBuilder::with_stream_inactivity_timeout_override`.
 
 ### Changed
 
@@ -197,6 +246,27 @@ them.
   Cargo.toml, Cargo.lock and CHANGELOG.md to the next patch release and
   requires the classifier to accept that bump, and to refuse it with one `=`
   dropped.
+- The live provider matrix (`meerkat-client` test
+  `live_client_provider_matrix`, which needs provider keys and the
+  `integration-real-tests` feature and is run by hand with `--ignored`; no
+  lane runs it) sends current catalog models, the cheapest per provider
+  (`claude-haiku-5-5`, `gpt-6-luna`, `gemini-3.1-flash-lite`), and the
+  catalog's image-generation defaults. It sent retired ids such as
+  `claude-3-haiku-20240307`, so its live tests failed. A new `meerkat-client`
+  test, `provider_matrix_catalog`, needs no keys or features and runs in the
+  ordinary test lanes: it fails when the matrix names a model outside Core's
+  catalog.
+- A turn's reasoning-effort preference (set on a live channel's delegated
+  member turns) is now lowered onto Gemini requests too, as it already was
+  for OpenAI and Anthropic. When the selected model's catalog row lists the
+  level among its accepted thinking levels, the request sends it as
+  `thinking_level` (in the nested `thinking` config when the request has
+  one), and `request_reasoning_lowered` reports `applied`. A level the row does
+  not list is `unsupported_level`, a request that already sets a thinking
+  budget (the generic `thinking_budget_tokens` or Gemini's own) is
+  `budget_conflict`, and a row without recorded levels stays
+  `unknown_supported_levels`; each leaves the request unchanged. Every Gemini
+  model used to report `unknown_supported_levels`.
 
 ### Fixed
 
@@ -329,6 +399,42 @@ them.
   debug test binary, the agent build takes 833,000 bytes
   (`AgentFactory::assemble_agent`'s own 344,112-byte frame is the largest
   left) and the create 589,032. No behaviour change.
+- Google Code Assist (the `rkat auth login google` route) requests for
+  `gemini-3.1-flash-lite` and `gemini-3.1-flash-lite-preview` went out as
+  `gemini-2.5-flash`, which Google has limited to users who had used it before
+  2026-09-18, so they failed for newer accounts. Both now go out as
+  `gemini-3.1-flash-lite`, the GA model the Gemini CLI itself sends to Code
+  Assist. Every Code Assist substitute is a catalog Gemini model that accepts
+  the requested model's thinking levels.
+- An explicit Gemini `thinking_level` (nested or flat) that the selected
+  catalog model does not accept, such as `minimal` on `gemini-4-argon`,
+  `gemini-3.8-flash`, `gemini-3.7-flash` or `gemini-3.1-pro-preview`, was sent
+  and failed with the provider's 400. The Gemini client now refuses it before
+  sending with a typed `LlmError::InvalidRequest` naming the levels the model
+  accepts, and a build whose provider params carry one fails with
+  `BuildAgentError::Config`. Models outside the catalog keep the pass-through.
+- A sticky model fallback onto a target served through the private ChatGPT
+  backend recorded the GPT catalog row's capabilities for the session,
+  including `supports_mid_conversation_system_messages`, which that backend's
+  wire refuses: the factory judged every fallback target by its model row
+  (a target that names no binding before its binding was even selected), and
+  the activation re-minted the target's profile from the row. Instruction
+  activations were then admitted onto a backend that fails every later turn
+  that carries them. Fallback targets are now judged through the binding their
+  client uses, and the activation keeps that judgment. Ordinary System appends
+  stay ungated, as before. `ModelRegistry::profile_for_identity` now also fails
+  closed for a named binding the config does not resolve: its backend is
+  unknown, so the profile no longer keeps the row's
+  `supports_mid_conversation_system_messages`. An identity that names no
+  binding, or the synthetic env-var default (an API-key backend), keeps the
+  row as before.
+- `[retry] stream_inactivity_timeout = "0s"` was accepted and stalled every
+  model call before its first event. `Config::validate` now refuses a zero
+  window with `ConfigError::Validation`; `"disabled"` turns the watchdog off.
+  A nonzero window still loads as before. The docs now say that an explicit
+  window under 60 s can abort and retry a stream whose answer already
+  arrived, since the watchdog keeps running while a provider adapter waits
+  for a trailer after the model's final event.
 
 ## [0.9.1] - 2026-10-15
 

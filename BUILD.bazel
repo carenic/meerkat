@@ -619,6 +619,7 @@ test_suite(
         "//crates/meerkat-cli:storage_migrate_test",
         "//crates/meerkat-cli:wholeblob_repair_cli_test",
         "//crates/meerkat-client:meerkat_client_unit_test",
+        "//crates/meerkat-client:provider_matrix_catalog_test",
         "//crates/meerkat-client:rct_contracts_test",
         "//crates/meerkat-comms:embedded_skill_registration_test",
         "//crates/meerkat-comms:inbox_admission_toctou_test",

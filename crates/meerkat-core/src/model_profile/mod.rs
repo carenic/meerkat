@@ -76,6 +76,12 @@ pub struct ModelProfile {
     /// consumed by the factory/agent-loop resolver trait at call time.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub call_timeout_secs: Option<u64>,
+    /// Model-specific stream-inactivity watchdog window in seconds, or `None`
+    /// for the global window. Resolved at call time like
+    /// [`Self::call_timeout_secs`]: an explicit `[retry]
+    /// stream_inactivity_timeout` (a duration, or `"disabled"`) still wins.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_inactivity_timeout_secs: Option<u64>,
 }
 
 /// Catalog-owned beta header metadata for a model.
@@ -123,12 +129,20 @@ pub fn project_to_profile(caps: &ModelCapabilities) -> ModelProfile {
             .map(ModelBetaHeader::from)
             .collect(),
         call_timeout_secs: caps.call_timeout_secs,
+        stream_inactivity_timeout_secs: caps.stream_inactivity_timeout_secs,
     }
 }
 
 /// Injected provider-model catalog. meerkat-core defines the shape and
 /// mechanics; the data lives outside core (`meerkat-models` provides the
 /// canonical instance). Core must never embed provider data.
+///
+/// Core trusts the rows it is given. In particular, config load checks the
+/// [`crate::MIN_MODEL_STREAM_INACTIVITY_TIMEOUT`] floor (60 s) only for the
+/// self-hosted models a config declares, never for a row's
+/// [`ModelCapabilities::stream_inactivity_timeout_secs`]: `meerkat-models`
+/// tests its canonical rows against it, and an embedder that injects its own
+/// catalog owns that check for its rows.
 #[derive(Debug, Clone, Copy)]
 pub struct ModelCatalog {
     /// Curated catalog entries (projection of the capability rows).
@@ -356,7 +370,9 @@ mod tests {
     /// Fields that `ModelProfile` must expose, mirrored by `WireModelProfile`
     /// in `meerkat-contracts::wire::models`. Adding a field here is a
     /// wire-contract change that needs parallel updates in `meerkat-contracts`
-    /// and a schema regeneration.
+    /// and a schema regeneration. The operational defaults
+    /// (`call_timeout_secs`, `stream_inactivity_timeout_secs`) and `provider`
+    /// are the exceptions: `WireModelProfile` does not carry them.
     const EXPECTED_MODEL_PROFILE_FIELDS: &[&str] = &[
         "provider",
         "release_stage",
@@ -374,6 +390,7 @@ mod tests {
         "image_generation",
         "params_schema",
         "call_timeout_secs",
+        "stream_inactivity_timeout_secs",
         "beta_headers",
     ];
 

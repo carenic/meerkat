@@ -889,7 +889,7 @@ Tool execution has layered deadlines; the narrowest applicable layer wins.
 | Meta provider callback | 120 seconds | Public host-callback work window |
 | Meta Python/TypeScript callback cancellation | 125 seconds | Host cancellation margin, not extra work time |
 | Meta gateway callback wire | 130 seconds | Transport margin, not extra work time |
-| LLM stream inactivity | 300 seconds | Provider-stream watchdog; unrelated to tool callbacks |
+| LLM stream inactivity | 300 seconds, or the model's own window | Provider-stream watchdog (`[retry] stream_inactivity_timeout` sets it for every model); unrelated to tool callbacks |
 
 Changing the normal Meerkat tool timeout cannot extend a narrower shell,
 SDK/builder `ToolDispatcher`, or Meta callback deadline. The foreground shell

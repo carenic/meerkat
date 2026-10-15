@@ -855,6 +855,10 @@ impl Config {
                     if model_table.contains_key("call_timeout_secs") {
                         merged.call_timeout_secs = model_layer.call_timeout_secs;
                     }
+                    if model_table.contains_key("stream_inactivity_timeout_secs") {
+                        merged.stream_inactivity_timeout_secs =
+                            model_layer.stream_inactivity_timeout_secs;
+                    }
                     merged_models.insert(model_id.clone(), merged);
                 }
                 self.self_hosted.models = merged_models;
@@ -1075,6 +1079,20 @@ impl Config {
         if self.limits.max_turn_duration == Some(Duration::ZERO) {
             return Err(ConfigError::Validation(
                 "limits.max_turn_duration must be greater than 0 when set".to_string(),
+            ));
+        }
+        // A zero stream-inactivity window would stall every model call before
+        // its first event. `"disabled"` is the way to turn the watchdog off.
+        // A short nonzero window still loads (configs that set one load
+        // today); see `RetryConfig::stream_inactivity_timeout_override`.
+        if matches!(
+            self.retry.stream_inactivity_timeout_override,
+            CallTimeoutOverride::Value(window) if window.is_zero()
+        ) {
+            return Err(ConfigError::Validation(
+                "retry.stream_inactivity_timeout must be greater than 0 when set; use \"disabled\" \
+                 to turn the stream-inactivity watchdog off"
+                    .to_string(),
             ));
         }
         if self.compaction.auto_compact_threshold == 0 {
@@ -1628,6 +1646,14 @@ pub struct SelfHostedModelConfig {
     pub supports_web_search: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub call_timeout_secs: Option<u64>,
+    /// This model's stream-inactivity watchdog window in seconds: how long
+    /// its stream may stay silent (a long prefill, for example) before the
+    /// call is aborted as stalled. Omitted keeps the global window; an
+    /// explicit `[retry] stream_inactivity_timeout` still wins. Config
+    /// validation refuses a window below
+    /// [`crate::MIN_MODEL_STREAM_INACTIVITY_TIMEOUT`] (60 s).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_inactivity_timeout_secs: Option<u64>,
 }
 
 impl Default for SelfHostedModelConfig {
@@ -1649,6 +1675,7 @@ impl Default for SelfHostedModelConfig {
             supports_reasoning: false,
             supports_web_search: false,
             call_timeout_secs: None,
+            stream_inactivity_timeout_secs: None,
         }
     }
 }
@@ -2566,12 +2593,20 @@ pub struct RetryConfig {
     pub call_timeout_override: CallTimeoutOverride,
     /// Tri-state override for the per-provider-stream inactivity watchdog.
     ///
-    /// - `Inherit` (default / omitted): the built-in default window
-    ///   ([`crate::retry::DEFAULT_STREAM_INACTIVITY_TIMEOUT`], 300s) — the
+    /// - `Inherit` (default / omitted): the current model's own window when
+    ///   its profile declares one (a catalog row, or a self-hosted model's
+    ///   `stream_inactivity_timeout_secs`), else the built-in default window
+    ///   ([`crate::retry::DEFAULT_STREAM_INACTIVITY_TIMEOUT`], 300s). The
     ///   watchdog is ON by default because a silent provider stream otherwise
     ///   hangs the turn forever
-    /// - `Disabled` (`stream_inactivity_timeout = "disabled"`): no watchdog
-    /// - `Value(duration)` (`stream_inactivity_timeout = "120s"`): explicit window
+    /// - `Disabled` (`stream_inactivity_timeout = "disabled"`): no watchdog,
+    ///   whatever the model declares
+    /// - `Value(duration)` (`stream_inactivity_timeout = "120s"`): explicit
+    ///   window for every model. [`Config::validate`] refuses a zero window;
+    ///   a nonzero one is used as given. A window under
+    ///   [`crate::MIN_MODEL_STREAM_INACTIVITY_TIMEOUT`] can abort and retry a
+    ///   stream whose answer already arrived: the watchdog keeps running while
+    ///   a provider adapter waits for a trailer after the model's final event
     #[serde(
         default,
         rename = "stream_inactivity_timeout",
@@ -2604,7 +2639,9 @@ impl From<RetryConfig> for RetryPolicy {
             CallTimeoutOverride::Value(d) => Some(d),
         };
         // Unlike call_timeout, `Inherit` resolves to the built-in ON default
-        // here: there is no lower profile layer for the stall watchdog.
+        // here: a policy has no model to ask. The agent loop consults the
+        // current model's profile window first while the composition seam's
+        // override inherits (`AgentBuilder::with_stream_inactivity_timeout_override`).
         let stream_inactivity_timeout = match config.stream_inactivity_timeout_override {
             CallTimeoutOverride::Inherit => Some(crate::retry::DEFAULT_STREAM_INACTIVITY_TIMEOUT),
             CallTimeoutOverride::Disabled => None,
@@ -4606,6 +4643,69 @@ max_input_tokens = 700
         assert_eq!(witness.max_output_tokens(), Some(100));
     }
 
+    /// A self-hosted model's stream-inactivity window merges by presence and
+    /// reaches its registry profile; an omitted value keeps the global window.
+    #[test]
+    fn test_merge_self_hosted_stream_inactivity_window_is_presence_based() {
+        let mut config = Config::default();
+        config
+            .merge_toml_str(
+                r#"
+[self_hosted]
+default_model = "slow-prefill"
+[self_hosted.servers.local]
+base_url = "http://localhost:11434"
+[self_hosted.models.slow-prefill]
+server = "local"
+remote_model = "slow-prefill"
+stream_inactivity_timeout_secs = 900
+[self_hosted.models.default-window]
+server = "local"
+remote_model = "default-window"
+"#,
+            )
+            .expect("base");
+        config
+            .merge_toml_str(
+                r"
+[self_hosted.models.slow-prefill]
+call_timeout_secs = 1200
+",
+            )
+            .expect("unrelated overlay");
+        assert_eq!(
+            config.self_hosted.models["slow-prefill"].stream_inactivity_timeout_secs,
+            Some(900)
+        );
+        config
+            .merge_toml_str(
+                r"
+[self_hosted.models.slow-prefill]
+stream_inactivity_timeout_secs = 600
+",
+            )
+            .expect("window override");
+        let restored: Config =
+            toml::from_str(&toml::to_string(&config).expect("serialize")).expect("roundtrip");
+        let registry = restored
+            .model_registry(*crate::model_profile::test_catalog::TEST_CATALOG)
+            .expect("registry");
+        let profile = |model| {
+            registry
+                .profile_for_provider(crate::Provider::SelfHosted, model)
+                .expect("self-hosted profile")
+        };
+        assert_eq!(
+            profile("slow-prefill").stream_inactivity_timeout_secs,
+            Some(600)
+        );
+        assert_eq!(profile("slow-prefill").call_timeout_secs, Some(1200));
+        assert_eq!(
+            profile("default-window").stream_inactivity_timeout_secs,
+            None
+        );
+    }
+
     #[test]
     fn custom_model_input_ceiling_roundtrips_and_reaches_registry() {
         let config: Config = toml::from_str(
@@ -5503,6 +5603,45 @@ stream_inactivity_timeout = "disabled"
             config.retry.stream_inactivity_timeout_override,
             CallTimeoutOverride::Disabled
         );
+    }
+
+    /// A zero stream-inactivity window would stall every model call at once,
+    /// so config validation refuses it. `"disabled"` turns the watchdog off,
+    /// and a short window (even one under the per-model minimum) still loads.
+    #[test]
+    fn test_validate_rejects_zero_stream_inactivity_timeout() {
+        for zero in ["0s", "0ms"] {
+            let config: Config = toml::from_str(&format!(
+                "[retry]\nstream_inactivity_timeout = \"{zero}\"\n"
+            ))
+            .expect("a zero duration parses");
+            assert_eq!(
+                config.retry.stream_inactivity_timeout_override,
+                CallTimeoutOverride::Value(Duration::ZERO)
+            );
+            let err = config
+                .validate(*crate::model_profile::test_catalog::TEST_CATALOG)
+                .expect_err("a zero stream_inactivity_timeout should be invalid");
+            assert!(
+                matches!(
+                    &err,
+                    ConfigError::Validation(message)
+                        if message.contains("retry.stream_inactivity_timeout")
+                ),
+                "unexpected validation error: {err}"
+            );
+        }
+        for accepted in ["1s", "30s", "disabled"] {
+            let config: Config = toml::from_str(&format!(
+                "[retry]\nstream_inactivity_timeout = \"{accepted}\"\n"
+            ))
+            .expect("the window parses");
+            let result = config.validate(*crate::model_profile::test_catalog::TEST_CATALOG);
+            assert!(
+                result.is_ok(),
+                "stream_inactivity_timeout = {accepted:?} must still load: {result:?}"
+            );
+        }
     }
 
     #[test]

@@ -50,8 +50,9 @@ pub const CAPABILITIES: &[ModelCapabilities] = &[
     // Long decode beyond 65,536 output tokens needs background execution on
     // the Interactions API, which Meerkat does not use, so max_output_tokens
     // is the synchronous cap. Thinking budgets are not documented for this
-    // model (thinking_level only). call_timeout_secs follows Google's
-    // 15-minute client-timeout guidance. Default Gemini model since 0.9.1
+    // model (thinking_level only). call_timeout_secs and
+    // stream_inactivity_timeout_secs follow Google's 15-minute client-timeout
+    // guidance. Default Gemini model since 0.9.1
     // (paid Gemini API tier only; the Google OAuth login route keeps its own
     // default).
     ModelCapabilities {
@@ -92,6 +93,9 @@ pub const CAPABILITIES: &[ModelCapabilities] = &[
         supports_thinking_budget_legacy: false,
         beta_headers: &[],
         call_timeout_secs: Some(900),
+        // The stream can stay silent while the model thinks: Google's
+        // 15-minute client-timeout guidance bounds the silence like the call.
+        stream_inactivity_timeout_secs: Some(900),
         supports_forced_tool_choice: true,
     },
     // Gemini 3.8 Flash
@@ -142,6 +146,7 @@ pub const CAPABILITIES: &[ModelCapabilities] = &[
         supports_thinking_budget_legacy: false,
         beta_headers: &[],
         call_timeout_secs: Some(120),
+        stream_inactivity_timeout_secs: None,
         supports_forced_tool_choice: true,
     },
     // Gemini 3.7 Flash
@@ -198,6 +203,7 @@ pub const CAPABILITIES: &[ModelCapabilities] = &[
         supports_thinking_budget_legacy: false,
         beta_headers: &[],
         call_timeout_secs: Some(120),
+        stream_inactivity_timeout_secs: None,
         supports_forced_tool_choice: true,
     },
     // Gemini 3.6 Flash
@@ -260,6 +266,7 @@ pub const CAPABILITIES: &[ModelCapabilities] = &[
         supports_thinking_budget_legacy: false,
         beta_headers: &[],
         call_timeout_secs: Some(120),
+        stream_inactivity_timeout_secs: None,
         supports_forced_tool_choice: true,
     },
     // Gemini 3.5 Flash
@@ -319,6 +326,7 @@ pub const CAPABILITIES: &[ModelCapabilities] = &[
         supports_thinking_budget_legacy: true,
         beta_headers: &[],
         call_timeout_secs: Some(120),
+        stream_inactivity_timeout_secs: None,
         supports_forced_tool_choice: true,
     },
     // Gemini 3.5 Flash-Lite
@@ -379,6 +387,7 @@ pub const CAPABILITIES: &[ModelCapabilities] = &[
         supports_thinking_budget_legacy: false,
         beta_headers: &[],
         call_timeout_secs: Some(120),
+        stream_inactivity_timeout_secs: None,
         supports_forced_tool_choice: true,
     },
     // Gemini 3.1 Pro Preview
@@ -430,6 +439,7 @@ pub const CAPABILITIES: &[ModelCapabilities] = &[
         supports_thinking_budget_legacy: true,
         beta_headers: &[],
         call_timeout_secs: Some(600),
+        stream_inactivity_timeout_secs: None,
         supports_forced_tool_choice: true,
     },
     // Gemini 3.1 Flash-Lite
@@ -492,6 +502,7 @@ pub const CAPABILITIES: &[ModelCapabilities] = &[
         supports_thinking_budget_legacy: true,
         beta_headers: &[],
         call_timeout_secs: Some(120),
+        stream_inactivity_timeout_secs: None,
         supports_forced_tool_choice: true,
     },
     // Gemini 3.1 Flash Lite Preview
@@ -541,6 +552,7 @@ pub const CAPABILITIES: &[ModelCapabilities] = &[
         supports_thinking_budget_legacy: true,
         beta_headers: &[],
         call_timeout_secs: Some(120),
+        stream_inactivity_timeout_secs: None,
         supports_forced_tool_choice: true,
     },
 ];

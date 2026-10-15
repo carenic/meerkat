@@ -481,6 +481,7 @@ async fn self_hosted_auth_binding_uses_registered_wasm_external_resolver() {
             supports_reasoning: true,
             supports_web_search: false,
             call_timeout_secs: Some(600),
+            stream_inactivity_timeout_secs: None,
         },
     );
 

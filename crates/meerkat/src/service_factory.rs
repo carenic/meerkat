@@ -2476,6 +2476,7 @@ mod tests {
                 supports_reasoning: false,
                 supports_web_search: false,
                 call_timeout_secs: None,
+                stream_inactivity_timeout_secs: None,
             },
         );
         config

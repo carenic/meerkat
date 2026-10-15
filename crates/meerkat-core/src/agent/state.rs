@@ -428,7 +428,7 @@ impl Drop for EphemeralCompactionRewriteGuard<'_> {
 
 impl MachineAcceptedModelFallbackActivation {
     fn authorize(
-        mut switch: AgentLlmFallbackSwitch,
+        switch: AgentLlmFallbackSwitch,
         recovery_transition: &TurnExecutionTransition,
         retry_schedule: &crate::retry::LlmRetrySchedule,
         effective_registry: Option<&crate::ModelRegistry>,
@@ -460,18 +460,16 @@ impl MachineAcceptedModelFallbackActivation {
                 "model fallback requires a captured effective model registry".to_string(),
             )
         })?;
-        let authoritative = registry
-            .profile_witness_for_provider(
-                switch.new_identity.provider,
-                &switch.new_identity.model,
-            )
-            .ok_or_else(|| {
-                AgentError::ConfigError(format!(
-                    "model fallback target '{}:{}' is absent from the agent's effective model registry",
-                    switch.new_identity.provider.as_str(),
-                    switch.new_identity.model
-                ))
-            })?;
+        if registry
+            .entry_for_provider(switch.new_identity.provider, &switch.new_identity.model)
+            .is_none()
+        {
+            return Err(AgentError::ConfigError(format!(
+                "model fallback target '{}:{}' is absent from the agent's effective model registry",
+                switch.new_identity.provider.as_str(),
+                switch.new_identity.model
+            )));
+        }
         if !switch.target_profile.was_minted_by(registry.authority()) {
             return Err(AgentError::ConfigError(format!(
                 "model fallback profile witness for '{}:{}' was not minted by the agent's effective model registry",
@@ -479,7 +477,25 @@ impl MachineAcceptedModelFallbackActivation {
                 switch.new_identity.model
             )));
         }
-        switch.target_profile = authoritative;
+        // The agent's registry minted this witness for the target as the
+        // target's own binding serves it
+        // (`ModelRegistry::profile_witness_for_identity`): a backend can
+        // narrow the model row, as the ChatGPT backend does for
+        // mid-conversation System messages. The witness is kept, so that
+        // judgment reaches the session; re-minting it from the model row
+        // would restore what the backend refuses. A witness judged through
+        // another binding, or by the row for a target that names one, is
+        // refused.
+        if !switch
+            .target_profile
+            .judged_for_identity(&switch.new_identity)
+        {
+            return Err(AgentError::ConfigError(format!(
+                "model fallback profile witness for '{}:{}' was not judged through the target's own binding",
+                switch.new_identity.provider.as_str(),
+                switch.new_identity.model
+            )));
+        }
         let proof = crate::StickyModelFallbackActivationProof::new(
             switch.previous_identity.clone(),
             switch.new_identity.clone(),
@@ -2248,6 +2264,33 @@ where
         }
     }
 
+    /// Resolve the stream-inactivity watchdog window for an LLM call to
+    /// `provider`/`model`, in the same order as the call timeout:
+    ///   1. Explicit override (Value/Disabled), from `[retry]
+    ///      stream_inactivity_timeout`
+    ///   2. The model's own window, from the injected resolver
+    ///   3. RetryPolicy.stream_inactivity_timeout (the built-in 300 s window
+    ///      unless a direct builder user set another)
+    ///
+    /// `Disabled` suppresses the model's window too. Resolved per call, so a
+    /// hot swap or model fallback uses the new model's window.
+    fn resolve_stream_inactivity_timeout_for(
+        &self,
+        provider: crate::Provider,
+        model: &str,
+    ) -> Option<std::time::Duration> {
+        use crate::config::CallTimeoutOverride;
+        match &self.stream_inactivity_timeout_override {
+            CallTimeoutOverride::Value(d) => Some(*d),
+            CallTimeoutOverride::Disabled => None,
+            CallTimeoutOverride::Inherit => self
+                .model_defaults_resolver
+                .as_ref()
+                .and_then(|r| r.stream_inactivity_timeout_for(provider, model))
+                .or(self.retry_policy.stream_inactivity_timeout),
+        }
+    }
+
     /// Hydrate one fully composed model request while its exact boundary state
     /// is still canonical pending rather than applied. A cancellation or blob
     /// fault here therefore leaves the context eligible for explicit run-exit
@@ -2287,9 +2330,10 @@ where
     /// - retry delay capped by remaining turn budget
     /// - per-call timeout from override/profile, wrapped with remaining turn budget
     /// - typed timeout-origin selection before await
-    /// - stream-inactivity watchdog (`RetryPolicy::stream_inactivity_timeout`)
-    ///   for liveness-reporting clients: a silent provider stream is aborted
-    ///   with the retryable `LlmFailureReason::StreamStalled`
+    /// - stream-inactivity watchdog (override, then the model's own window,
+    ///   then `RetryPolicy::stream_inactivity_timeout`) for liveness-reporting
+    ///   clients: a silent provider stream is aborted with the retryable
+    ///   `LlmFailureReason::StreamStalled`
     async fn select_model_fallback(
         &self,
         failure: &AgentError,
@@ -2398,12 +2442,24 @@ where
             } else {
                 None
             };
-            let effective_call_timeout = match controller.as_ref() {
-                Some(controller) => self.resolve_call_timeout_for(
-                    controller.selection().provider(),
-                    controller.selection().model(),
+            let (effective_call_timeout, effective_stall_window) = match controller.as_ref() {
+                Some(controller) => (
+                    self.resolve_call_timeout_for(
+                        controller.selection().provider(),
+                        controller.selection().model(),
+                    ),
+                    self.resolve_stream_inactivity_timeout_for(
+                        controller.selection().provider(),
+                        controller.selection().model(),
+                    ),
                 ),
-                None => self.resolve_effective_call_timeout(),
+                None => (
+                    self.resolve_effective_call_timeout(),
+                    self.resolve_stream_inactivity_timeout_for(
+                        self.client.provider(),
+                        self.client.model(),
+                    ),
+                ),
             };
             let remaining_turn = self.budget.remaining_duration();
 
@@ -2570,8 +2626,7 @@ where
             // The inactivity watchdog applies only when the client reports
             // stream liveness; clients without a probe keep the pre-watchdog
             // contract (hard timeouts only).
-            let stall_window =
-                stream_activity_count().and(self.retry_policy.stream_inactivity_timeout);
+            let stall_window = stream_activity_count().and(effective_stall_window);
 
             // Await the call under both deadlines. Each observed stream event
             // re-arms the stall window; the hard deadline is fixed at call
@@ -24640,6 +24695,138 @@ mod tests {
         fallback_activation_test_registry_with_input_ceiling(None)
     }
 
+    fn backup_switch_with_witness(
+        target: crate::SessionLlmIdentity,
+        target_profile: crate::ModelProfileWitness,
+    ) -> crate::AgentLlmFallbackSwitch {
+        crate::AgentLlmFallbackSwitch {
+            policy: crate::config::ModelFallbackPolicy::default(),
+            previous_identity: crate::SessionLlmIdentity {
+                model: "primary".to_string(),
+                provider: crate::Provider::OpenAI,
+                self_hosted_server_id: None,
+                provider_params: None,
+                auth_binding: None,
+            },
+            new_identity: target,
+            request_policy: crate::SessionLlmRequestPolicy {
+                model: "backup".to_string(),
+                credential_identity: None,
+                provider_native_tools: crate::ProviderNativeToolPolicy::Inherit,
+                provider_params: None,
+                provider_tool_defaults: None,
+            },
+            target_profile,
+            skipped_targets: Vec::new(),
+        }
+    }
+
+    fn authorize_backup_activation(
+        registry: &crate::ModelRegistry,
+        switch: crate::AgentLlmFallbackSwitch,
+    ) -> Result<super::MachineAcceptedModelFallbackActivation, AgentError> {
+        let recovery = crate::turn_execution_authority::TurnExecutionTransition {
+            prev_phase: crate::turn_execution_authority::TurnPhase::CallingLlm,
+            next_phase: crate::turn_execution_authority::TurnPhase::CallingLlm,
+            effects: Vec::new(),
+        };
+        let retry = crate::retry::LlmRetrySchedule {
+            failure: crate::retry::LlmRetryFailure {
+                provider: "openai".to_string(),
+                kind: crate::retry::LlmRetryFailureKind::RetryableProviderError,
+                retry_after_ms: None,
+                duration_ms: None,
+                message: "overloaded".to_string(),
+            },
+            plan: crate::retry::LlmRetryPlan {
+                attempt: 1,
+                max_retries: 1,
+                computed_delay_ms: 0,
+                selected_delay_ms: 0,
+                retry_after_hint_ms: None,
+                rate_limit_floor_applied: false,
+                budget_capped: false,
+            },
+        };
+        super::MachineAcceptedModelFallbackActivation::authorize(
+            switch,
+            &recovery,
+            &retry,
+            Some(registry),
+        )
+    }
+
+    /// A fallback activation keeps the target's witness when the registry
+    /// judged it through the target's own binding, and refuses one judged by
+    /// the row for a target that names a binding, or through another binding:
+    /// the target is judged as its own binding serves it, never re-minted
+    /// from the model row. A target that names no binding is judged by the
+    /// row.
+    #[test]
+    fn fallback_activation_keeps_the_witness_judged_through_the_target_binding() {
+        let registry = fallback_activation_test_registry();
+        let config = crate::Config::default();
+        let binding = |name: &str| crate::AuthBindingRef {
+            realm: crate::RealmId::parse("fallback").expect("realm"),
+            binding: crate::BindingId::parse(name).expect("binding"),
+            profile: None,
+            origin: crate::BindingOrigin::Configured,
+        };
+        let bound = crate::SessionLlmIdentity {
+            model: "backup".to_string(),
+            provider: crate::Provider::OpenAI,
+            self_hosted_server_id: None,
+            provider_params: None,
+            auth_binding: Some(binding("backup_route")),
+        };
+
+        let judged = registry
+            .profile_witness_for_identity(&config, &bound)
+            .expect("backup witness");
+        let activation = authorize_backup_activation(
+            &registry,
+            backup_switch_with_witness(bound.clone(), judged),
+        )
+        .expect("a witness judged for the target's own binding is kept");
+        assert!(
+            activation
+                .proof
+                .target_profile()
+                .judged_for_identity(&bound)
+        );
+
+        let row = registry
+            .profile_witness_for_provider(crate::Provider::OpenAI, "backup")
+            .expect("backup row witness");
+        let other_binding = crate::SessionLlmIdentity {
+            auth_binding: Some(binding("another_route")),
+            ..bound.clone()
+        };
+        let foreign = registry
+            .profile_witness_for_identity(&config, &other_binding)
+            .expect("backup witness through another binding");
+        for witness in [row.clone(), foreign] {
+            match authorize_backup_activation(
+                &registry,
+                backup_switch_with_witness(bound.clone(), witness),
+            ) {
+                Err(AgentError::ConfigError(message)) => assert!(
+                    message.contains("not judged through the target's own binding"),
+                    "{message}"
+                ),
+                Err(other) => panic!("expected a ConfigError refusal, got {other:?}"),
+                Ok(_) => panic!("a witness not judged for the target's binding must be refused"),
+            }
+        }
+
+        let unbound = crate::SessionLlmIdentity {
+            auth_binding: None,
+            ..bound
+        };
+        authorize_backup_activation(&registry, backup_switch_with_witness(unbound, row))
+            .expect("an unbound target is judged by the model row");
+    }
+
     fn fallback_activation_test_registry_with_input_ceiling(
         max_input_tokens: Option<u32>,
     ) -> Arc<crate::ModelRegistry> {
@@ -26021,6 +26208,110 @@ mod tests {
             .expect("alive stream must not be classified as stalled");
         assert_eq!(result.text, "slow but alive");
         assert_eq!(client.calls(), 1, "no retry for a live stream");
+    }
+
+    /// A model defaults resolver that declares one stream-inactivity window
+    /// for every model.
+    struct StallWindowResolver(Option<Duration>);
+
+    impl crate::ModelOperationalDefaultsResolver for StallWindowResolver {
+        fn call_timeout_for(&self, _provider: crate::Provider, _model: &str) -> Option<Duration> {
+            None
+        }
+
+        fn stream_inactivity_timeout_for(
+            &self,
+            _provider: crate::Provider,
+            _model: &str,
+        ) -> Option<Duration> {
+            self.0
+        }
+    }
+
+    fn stall_window_policy(window: Option<Duration>) -> crate::retry::RetryPolicy {
+        crate::retry::RetryPolicy {
+            max_retries: 1,
+            initial_delay: Duration::from_millis(1),
+            max_delay: Duration::from_millis(1),
+            multiplier: 1.0,
+            call_timeout: None,
+            stream_inactivity_timeout: window,
+        }
+    }
+
+    /// While the override inherits, the current model's own window wins over
+    /// the retry policy's: a model that declares 30 ms has its silent stream
+    /// aborted although the policy's window is an hour.
+    #[tokio::test]
+    async fn model_stream_inactivity_window_wins_over_the_policy_window() {
+        let client = Arc::new(StallThenSucceedClient::new());
+        let mut agent = with_test_turn_state_handle(AgentBuilder::new())
+            .retry_policy(stall_window_policy(Some(Duration::from_secs(3600))))
+            .with_model_defaults_resolver(Arc::new(StallWindowResolver(Some(
+                Duration::from_millis(30),
+            ))))
+            .build_standalone(client.clone(), Arc::new(NoTools), Arc::new(NoopStore))
+            .await;
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(30),
+            agent.run("stall once".to_string().into()),
+        )
+        .await
+        .expect("the model's 30 ms window must abort the silent stream")
+        .expect("the retry after the stall succeeds");
+        assert_eq!(result.text, "ok after stall retry");
+        assert_eq!(client.calls(), 2, "one stall, one retry");
+    }
+
+    /// An explicit override wins over the model's window: 30 ms applies
+    /// although the model declares an hour.
+    #[tokio::test]
+    async fn explicit_stream_inactivity_override_wins_over_the_model_window() {
+        let client = Arc::new(StallThenSucceedClient::new());
+        let mut agent = with_test_turn_state_handle(AgentBuilder::new())
+            .retry_policy(stall_window_policy(Some(Duration::from_secs(3600))))
+            .with_model_defaults_resolver(Arc::new(StallWindowResolver(Some(Duration::from_secs(
+                3600,
+            )))))
+            .with_stream_inactivity_timeout_override(crate::config::CallTimeoutOverride::Value(
+                Duration::from_millis(30),
+            ))
+            .build_standalone(client.clone(), Arc::new(NoTools), Arc::new(NoopStore))
+            .await;
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(30),
+            agent.run("stall once".to_string().into()),
+        )
+        .await
+        .expect("the explicit 30 ms window must abort the silent stream")
+        .expect("the retry after the stall succeeds");
+        assert_eq!(result.text, "ok after stall retry");
+        assert_eq!(client.calls(), 2, "one stall, one retry");
+    }
+
+    /// `Disabled` turns the watchdog off whatever the model declares: a
+    /// response silent for 150 ms completes on its first call although the
+    /// model's window is 30 ms.
+    #[tokio::test]
+    async fn disabled_stream_inactivity_override_turns_off_the_model_window() {
+        let client = Arc::new(SlowButAliveClient::new(Duration::from_millis(150), 1));
+        let mut agent = with_test_turn_state_handle(AgentBuilder::new())
+            .retry_policy(stall_window_policy(Some(Duration::from_millis(30))))
+            .with_model_defaults_resolver(Arc::new(StallWindowResolver(Some(
+                Duration::from_millis(30),
+            ))))
+            .with_stream_inactivity_timeout_override(crate::config::CallTimeoutOverride::Disabled)
+            .build_standalone(client.clone(), Arc::new(NoTools), Arc::new(NoopStore))
+            .await;
+
+        let result = agent
+            .run("slow first token".to_string().into())
+            .await
+            .expect("a disabled watchdog never aborts the call");
+        assert_eq!(result.text, "slow but alive");
+        assert_eq!(client.calls(), 1, "no stall, no retry");
     }
 
     #[tokio::test]

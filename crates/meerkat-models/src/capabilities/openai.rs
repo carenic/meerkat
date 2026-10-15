@@ -193,6 +193,7 @@ pub const CAPABILITIES: &[ModelCapabilities] = &[
         supports_thinking_budget_legacy: false,
         beta_headers: &[],
         call_timeout_secs: Some(600),
+        stream_inactivity_timeout_secs: None,
         supports_forced_tool_choice: true,
     },
     // Source: https://developers.openai.com/api/docs/models/gpt-6-sol
@@ -239,6 +240,7 @@ pub const CAPABILITIES: &[ModelCapabilities] = &[
         supports_thinking_budget_legacy: false,
         beta_headers: &[],
         call_timeout_secs: Some(600),
+        stream_inactivity_timeout_secs: None,
         supports_forced_tool_choice: true,
     },
     // Source: https://developers.openai.com/api/docs/models/gpt-6.1-sol
@@ -288,6 +290,7 @@ pub const CAPABILITIES: &[ModelCapabilities] = &[
         supports_thinking_budget_legacy: false,
         beta_headers: &[],
         call_timeout_secs: Some(600),
+        stream_inactivity_timeout_secs: None,
         supports_forced_tool_choice: true,
     },
     // Source: https://developers.openai.com/api/docs/models/gpt-6-luna
@@ -334,6 +337,7 @@ pub const CAPABILITIES: &[ModelCapabilities] = &[
         supports_thinking_budget_legacy: false,
         beta_headers: &[],
         call_timeout_secs: Some(600),
+        stream_inactivity_timeout_secs: None,
         supports_forced_tool_choice: true,
     },
     // GPT-5.6 Sol / Terra / Luna (plus the official Sol alias)
@@ -391,6 +395,7 @@ pub const CAPABILITIES: &[ModelCapabilities] = &[
         supports_thinking_budget_legacy: false,
         beta_headers: &[],
         call_timeout_secs: Some(600),
+        stream_inactivity_timeout_secs: None,
         supports_forced_tool_choice: true,
     },
     ModelCapabilities {
@@ -431,6 +436,7 @@ pub const CAPABILITIES: &[ModelCapabilities] = &[
         supports_thinking_budget_legacy: false,
         beta_headers: &[],
         call_timeout_secs: Some(600),
+        stream_inactivity_timeout_secs: None,
         supports_forced_tool_choice: true,
     },
     ModelCapabilities {
@@ -471,6 +477,7 @@ pub const CAPABILITIES: &[ModelCapabilities] = &[
         supports_thinking_budget_legacy: false,
         beta_headers: &[],
         call_timeout_secs: Some(600),
+        stream_inactivity_timeout_secs: None,
         supports_forced_tool_choice: true,
     },
     // Official alias: gpt-5.6 routes to gpt-5.6-sol.
@@ -513,6 +520,7 @@ pub const CAPABILITIES: &[ModelCapabilities] = &[
         supports_thinking_budget_legacy: false,
         beta_headers: &[],
         call_timeout_secs: Some(600),
+        stream_inactivity_timeout_secs: None,
         supports_forced_tool_choice: true,
     },
     // GPT-5.5
@@ -557,12 +565,16 @@ pub const CAPABILITIES: &[ModelCapabilities] = &[
         supports_thinking_budget_legacy: false,
         beta_headers: &[],
         call_timeout_secs: Some(600),
+        stream_inactivity_timeout_secs: None,
         supports_forced_tool_choice: true,
     },
     // GPT-5.5 Pro
     //
     // Pro tier of GPT-5.5. The long-running timeout is explicit catalog data,
     // not derived from the `-pro` suffix.
+    // Source: https://developers.openai.com/api/docs/models/gpt-5.5-pro
+    // ("some requests may take several minutes to finish"; streaming is not
+    // listed).
     ModelCapabilities {
         id: "gpt-5.5-pro",
         provider: Provider::OpenAI,
@@ -601,6 +613,10 @@ pub const CAPABILITIES: &[ModelCapabilities] = &[
         supports_thinking_budget_legacy: false,
         beta_headers: &[],
         call_timeout_secs: Some(7200),
+        // "Some requests may take several minutes to finish" and the model
+        // page lists no streaming: the response can stay silent until it
+        // completes, so the window is the row's call timeout.
+        stream_inactivity_timeout_secs: Some(7200),
         supports_forced_tool_choice: true,
     },
     // GPT-5.4
@@ -655,6 +671,7 @@ pub const CAPABILITIES: &[ModelCapabilities] = &[
         supports_thinking_budget_legacy: false,
         beta_headers: &[],
         call_timeout_secs: Some(600),
+        stream_inactivity_timeout_secs: None,
         supports_forced_tool_choice: true,
     },
     // GPT-5.4 mini
@@ -705,6 +722,7 @@ pub const CAPABILITIES: &[ModelCapabilities] = &[
         supports_thinking_budget_legacy: false,
         beta_headers: &[],
         call_timeout_secs: Some(600),
+        stream_inactivity_timeout_secs: None,
         supports_forced_tool_choice: true,
     },
     // GPT-5.3 Codex
@@ -754,6 +772,7 @@ pub const CAPABILITIES: &[ModelCapabilities] = &[
         supports_thinking_budget_legacy: false,
         beta_headers: &[],
         call_timeout_secs: Some(600),
+        stream_inactivity_timeout_secs: None,
         supports_forced_tool_choice: true,
     },
     // GPT Live 1 Codex
@@ -805,6 +824,7 @@ pub const CAPABILITIES: &[ModelCapabilities] = &[
         // close deadlines. This is the catalog-required loose ceiling for any
         // synchronous provider operation around the channel lifecycle.
         call_timeout_secs: Some(600),
+        stream_inactivity_timeout_secs: None,
         supports_forced_tool_choice: true,
     },
     // GPT Live 1
@@ -857,6 +877,7 @@ pub const CAPABILITIES: &[ModelCapabilities] = &[
         // close deadlines. This is the catalog-required loose ceiling for any
         // synchronous provider operation around the channel lifecycle.
         call_timeout_secs: Some(600),
+        stream_inactivity_timeout_secs: None,
         supports_forced_tool_choice: true,
     },
     // gpt-realtime-2
@@ -934,6 +955,7 @@ pub const CAPABILITIES: &[ModelCapabilities] = &[
         // loose ceiling on synchronous fallback paths. Realtime transport
         // owns its own reconnect/heartbeat policy.
         call_timeout_secs: Some(600),
+        stream_inactivity_timeout_secs: None,
         supports_forced_tool_choice: true,
     },
 ];

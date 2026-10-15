@@ -240,6 +240,7 @@ rust_test(
     rustc_flags = WORKSPACE_LINT_RUSTC_FLAGS,
     compile_data = [
         "Cargo.toml",
+        "tests/live_client_provider_matrix.rs",
     ],
     srcs = [
         "tests/live_client_provider_matrix.rs",
@@ -255,6 +256,71 @@ rust_test(
         "live",
         "required-feature",
     ],
+    data = [],
+    env = {
+        "RUST_MIN_STACK": "8388608",
+        "RUST_TEST_THREADS": "1",
+    },
+    proc_macro_deps = all_crate_deps(
+        package_name = "crates/meerkat-client",
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = [
+        "//crates/meerkat-anthropic:meerkat_anthropic",
+        "//crates/meerkat-client:meerkat_client",
+        "//crates/meerkat-core:meerkat_core",
+        "//crates/meerkat-gemini:meerkat_gemini",
+        "//crates/meerkat-llm-core:meerkat_llm_core",
+        "//crates/meerkat-models:meerkat_models",
+        "//crates/meerkat-openai:meerkat_openai",
+    ] + all_crate_deps(
+        package_name = "crates/meerkat-client",
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+rust_test(
+    name = "provider_matrix_catalog_test",
+    aliases = aliases(
+        package_name = "crates/meerkat-client",
+        normal = True,
+        normal_dev = True,
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    crate_name = "provider_matrix_catalog",
+    crate_root = "tests/provider_matrix_catalog.rs",
+    crate_features = [
+        "anthropic",
+        "gemini",
+        "integration-real-tests",
+        "native-keyring",
+        "oauth",
+        "openai",
+        "openai-realtime",
+        "refresh-file-lock",
+    ],
+    edition = "2024",
+    rustc_flags = WORKSPACE_LINT_RUSTC_FLAGS,
+    compile_data = [
+        "Cargo.toml",
+        "tests/live_client_provider_matrix.rs",
+    ],
+    srcs = [
+        "tests/provider_matrix_catalog.rs",
+    ],
+    visibility = ["//visibility:public"],
+    rustc_env = {
+        "CARGO_PKG_VERSION": "0.9.1",
+        "CARGO_BIN_NAME": "provider_matrix_catalog",
+        "CARGO_MANIFEST_DIR": "./crates/meerkat-client",
+    },
+    tags = [
+        "fast",
+    ],
+    size = "medium",
     data = [],
     env = {
         "RUST_MIN_STACK": "8388608",
@@ -305,6 +371,7 @@ rust_test(
     rustc_flags = WORKSPACE_LINT_RUSTC_FLAGS,
     compile_data = [
         "Cargo.toml",
+        "tests/live_client_provider_matrix.rs",
     ],
     srcs = [
         "tests/rct_contracts.rs",
@@ -371,6 +438,7 @@ rust_test(
     rustc_flags = WORKSPACE_LINT_RUSTC_FLAGS,
     compile_data = [
         "Cargo.toml",
+        "tests/live_client_provider_matrix.rs",
     ],
     srcs = [
         "tests/system_client_proxy.rs",
@@ -413,6 +481,7 @@ test_suite(
     name = "fast_tests",
     tests = [
         ":meerkat_client_unit_test",
+        ":provider_matrix_catalog_test",
         ":rct_contracts_test",
     ],
 )
