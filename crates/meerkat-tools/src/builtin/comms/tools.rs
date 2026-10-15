@@ -1,4 +1,11 @@
 //! Comms tool implementations: `send` and `peers`.
+//!
+//! Deprecated: these builtins call the comms handler without the dispatch
+//! context or a typed operation target. [`super::CommsToolSurface`] is the
+//! comms tool surface.
+
+// The deprecated tools' own definitions and implementations.
+#![allow(deprecated)]
 
 use crate::builtin::{BuiltinTool, BuiltinToolError, ToolOutput};
 use crate::schema::empty_object_schema;
@@ -58,6 +65,10 @@ fn get_tool_def(name: &str) -> ToolDef {
 }
 
 /// Unified send tool — dispatches peer_message, peer_request, peer_response via `kind`.
+#[deprecated(
+    since = "0.9.2",
+    note = "use CommsToolSurface: this tool calls the comms handler without the dispatch context or a typed operation target, and `send` has no handler; removal is planned for 0.9.3"
+)]
 pub struct SendTool {
     state: CommsToolState,
 }
@@ -97,6 +108,10 @@ impl BuiltinTool for SendTool {
 }
 
 /// Peers discovery tool.
+#[deprecated(
+    since = "0.9.2",
+    note = "use CommsToolSurface: this tool reads the peer directory without the dispatch context or a typed operation target, so governed work refuses it; removal is planned for 0.9.3"
+)]
 pub struct PeersTool {
     state: CommsToolState,
 }

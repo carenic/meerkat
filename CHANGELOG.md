@@ -198,6 +198,15 @@ them.
   (as after a release version bump, when no compiled unit can be reused)
   completes on a hosted 4-vCPU runner.
 
+### Deprecated
+
+- `meerkat_tools::builtin::comms::{SendTool, PeersTool, CommsToolSet}`. They
+  call the comms handler without the dispatch context and without a typed
+  operation target, so governed work refuses them at the fenced dispatch
+  (see Breaking), and `SendTool`'s `send` has no handler and always fails.
+  Use `CommsToolSurface`, whose plans carry the typed targets. Removal is
+  planned for 0.9.3.
+
 ## [0.9.1] - 2026-10-15
 
 ### Breaking
