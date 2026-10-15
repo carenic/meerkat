@@ -752,6 +752,7 @@ verify-fixture-mint-generator:
 # release binary metadata matches the workspace version.
 check-rust-release-config:
 	@scripts/check-rust-release-config.sh
+	@$(PYTHON) scripts/test_release_crate_levels.py
 
 # Verify every release crate's `cargo package --list` ships LICENSE-MIT and
 # LICENSE-APACHE (cargo never packages the workspace-root license files).
@@ -808,6 +809,7 @@ check-rust-release-packaging:
 
 check-rust-release-packaging-contract:
 	@scripts/test-release-packaging-isolation.sh
+	@scripts/test-release-publish-rust-crates.sh
 
 check-published-facade-link:
 	@scripts/check-published-facade-link.sh

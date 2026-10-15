@@ -262,6 +262,14 @@ else
   bad "Rust crate publish script is missing crates.io rate-limit retry handling"
 fi
 
+if grep -Fq 'scripts/release-rust-crates.sh" --levels' scripts/release-publish-rust-crates.sh &&
+  grep -Fq 'wait_for_index "$level"' scripts/release-publish-rust-crates.sh &&
+  levels_summary="$(scripts/release-rust-crates.sh --levels --format summary 2>&1)"; then
+  pass "Rust crates publish by dependency level ($(wc -l <<<"${levels_summary}" | tr -d ' ') levels), each level visible in the index before the next"
+else
+  bad "Rust crate publishing must walk the dependency levels of scripts/release-rust-crates.sh and wait for each level in the index (${levels_summary:-no level plan})"
+fi
+
 # The semver-gate and SLO assertions evaluate workflow behaviour under concrete
 # events instead of grepping literal lines, so reflowing a condition cannot
 # fail the doctor while removing the behaviour still does (#1091).

@@ -265,8 +265,11 @@ embedding a separate runtime implementation.
    `index.json`.
 6. Update the Homebrew tap from the published assets.
 7. Publish Rust crates plus the Python and TypeScript SDKs on GitHub-hosted
-   runners. Their publish jobs build and smoke-test the package artifacts before
-   upload.
+   runners. The Rust crates publish by dependency level, derived from the
+   canonical order in `scripts/release-rust-crates.sh` and `cargo metadata`:
+   a level's crates upload concurrently and the next level starts once all of
+   them are in the crates.io index. The SDK publish jobs build and smoke-test
+   their package artifacts before upload.
 8. Publish the prebuilt Web SDK artifact on a GitHub-hosted runner.
 
 ### Pre-tag prebuild

@@ -528,7 +528,7 @@ release semver gate; PR and manual artifacts are previews.
 | `publish_github_release` | Tags or manual asset recovery | Downloads artifacts (a prebuild's, verified exactly like an `assets_run_id` recovery), generates `checksums.sha256` + `index.json`, publishes or repairs the GitHub Release |
 | `update_homebrew` | After GitHub release or asset recovery | Updates the Homebrew tap formula |
 | `publish_semver_baseline` | After GitHub release or asset recovery | Generates rustdoc JSON for every publishable library crate on the release tag and attaches `semver-rustdoc-<version>.tar.zst`, the baseline the next release's semver gate compares against |
-| `publish_registries` | Tags or manual `publish_release_packages=true` | Publishes 46 Rust crates → crates.io, Python SDK → PyPI, TypeScript SDK → npm |
+| `publish_registries` | Tags or manual `publish_release_packages=true` | Publishes 46 Rust crates → crates.io by dependency level (concurrently within a level), Python SDK → PyPI, TypeScript SDK → npm |
 | `publish_web_sdk` | Tags or manual package/Web recovery | Publishes `@rkat/web` → npm (a prebuild's package only after verifying its attestation and version) |
 
 **Build matrix:**
@@ -766,6 +766,21 @@ Required GitHub Actions secrets for full release:
 
 The canonical publish order lives in `scripts/release-rust-crates.sh` (46 crates, dependency order):
 `meerkat-sqlite` → `meerkat-machine-derive` → `meerkat-machine-dsl-core` → `meerkat-agent-build-authority` → `meerkat-core` → `meerkat-sandbox` → `meerkat-authorization-contracts` → `meerkat-atif` → `meerkat-store-conformance` → `meerkat-models` → `meerkat-capabilities` → `meerkat-machine-dsl` → `meerkat-machine-schema` → `meerkat-authorization` → `meerkat-machine-kernels` → `meerkat-skills` → `meerkat-schedule` → `meerkat-jobs` → `meerkat-workgraph` → `meerkat-contracts` → `meerkat-store` → `meerkat-llm-core` → `meerkat-live` → `meerkat-auth-core` → `meerkat-memory` → `meerkat-mcp` → `meerkat-hooks` → `meerkat-comms` → `meerkat-runtime` → `meerkat-copilot` → `meerkat-anthropic` → `meerkat-openai` → `meerkat-gemini` → `meerkat-providers` → `meerkat-tools` → `meerkat-session` → `meerkat-client` → `meerkat` → `meerkat-mob` → `meerkat-mob-adaptive` → `meerkat-mob-mcp` → `meerkat-mob-pack` → `meerkat-mcp-server` → `meerkat-rpc` → `meerkat-rest` → `rkat`
+
+Publication walks the dependency levels derived from this order and
+`cargo metadata` (`scripts/release-rust-crates.sh --levels`, computed by
+`scripts/release_crate_levels.py`; `--format summary` prints them): every
+crate of a level publishes concurrently (`MEERKAT_CRATE_PUBLISH_JOBS`,
+default 6 for uploads, 1 for dry runs), and the next level starts only once
+the whole level is visible in the crates.io sparse index. The order stays the
+only hand-written enumeration; `make check-rust-release-config` fails when a
+release crate depends on one listed after it, and
+`scripts/test-release-publish-rust-crates.sh` (part of
+`make check-rust-release-packaging-contract`) proves the level order, the
+bounded overlap, the skip of a published version and the stop at the first
+failure.
+crates.io's own publish rate limit for new versions (a burst, then about one
+per minute) still bounds a full release.
 
 ### Key Rules for AI Agents
 

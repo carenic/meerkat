@@ -12,4 +12,8 @@ done < <("$ROOT/scripts/release-rust-crates.sh")
 
 "$PYTHON" "$ROOT/scripts/check_rust_release_packaging.py" "$ROOT" "${RELEASE_CRATES[@]}"
 
-echo "Rust release config is valid"
+# The publisher walks the dependency levels derived from this order and
+# `cargo metadata`; a level plan that cannot be derived fails here, not at
+# the tag.
+levels="$(PYTHON="$PYTHON" "$ROOT/scripts/release-rust-crates.sh" --levels --format summary)"
+echo "Rust release config is valid ($(wc -l <<<"$levels" | tr -d ' ') publish levels)"
