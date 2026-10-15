@@ -707,6 +707,18 @@ pub struct RefusedMcpServer {
     pub scope: McpScope,
 }
 
+/// A configured MCP server the host refused before anything in it was
+/// expanded, authorized, connected or spawned, with its typed reason. A
+/// session build that carries it reports the refusal to the model as the
+/// server's failed setup, as it reports a launch the platform refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpServerRefusal {
+    /// The definition exactly as written, never expanded.
+    pub server: McpServerConfig,
+    /// Why the host refused it.
+    pub refusal: crate::confinement::ConfinementRefusal,
+}
+
 /// The MCP set of a realm-scoped session when an `mcp.toml` file may be
 /// writable by a confined process: the servers the host runs, and the file
 /// servers it refuses ([`McpConfig::effective_servers_from_roots_trusting`]).

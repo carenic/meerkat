@@ -5644,6 +5644,7 @@ async fn create_session_inner(
         // The session service decides hosting when it creates the actor.
         hosting: meerkat_core::session_hosting::SessionHostingIntent::default(),
         mcp_servers: Vec::new(),
+        refused_mcp_servers: Vec::new(),
         recoverable_tool_defs: None,
         llm_client_override: state
             .llm_client_override
@@ -6904,6 +6905,7 @@ async fn continue_session_inner(
             // The session service decides hosting when it creates the actor.
             hosting: meerkat_core::session_hosting::SessionHostingIntent::default(),
             mcp_servers: Vec::new(),
+            refused_mcp_servers: Vec::new(),
             recoverable_tool_defs: None,
             llm_client_override: state
                 .llm_client_override

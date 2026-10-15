@@ -810,6 +810,12 @@ pub struct AgentBuildConfig {
     /// Declarative MCP server configs materialized by this build into a
     /// session-owned MCP router composed with `external_tools` and builtins.
     pub mcp_servers: Vec<meerkat_core::mcp_config::McpServerConfig>,
+    /// Configured MCP servers the host refused for this build (for example
+    /// an `mcp.toml` a confined process can write), each with its typed
+    /// reason. The build stages each refused in its session-owned router, so
+    /// the model sees the refusal as that server's failed setup in its MCP
+    /// system notice; nothing in it is expanded, connected or spawned.
+    pub refused_mcp_servers: Vec<meerkat_core::mcp_config::McpServerRefusal>,
     /// Serializable tool definitions that can rebuild recoverable
     /// surface-owned dispatchers after persistence or runtime restart.
     pub recoverable_tool_defs: Option<Vec<meerkat_core::ToolDef>>,
@@ -1157,6 +1163,7 @@ impl std::fmt::Debug for AgentBuildConfig {
             .field("additional_instructions", &self.additional_instructions)
             .field("wait_for_mcp", &self.wait_for_mcp)
             .field("mcp_servers", &self.mcp_servers)
+            .field("refused_mcp_servers", &self.refused_mcp_servers)
             .field("runtime_build_mode", &self.runtime_build_mode)
             .field(
                 "initial_tool_visibility_state",
@@ -1250,6 +1257,7 @@ impl AgentBuildConfig {
             additional_instructions: None,
             wait_for_mcp: false,
             mcp_servers: Vec::new(),
+            refused_mcp_servers: Vec::new(),
             shell_env: None,
             checkpointer: None,
             call_timeout_override: meerkat_core::CallTimeoutOverride::default(),
@@ -1341,6 +1349,7 @@ impl AgentBuildConfig {
         self.provider_params = build.provider_params.clone();
         self.external_tools = build.external_tools.clone();
         self.mcp_servers = build.mcp_servers.clone();
+        self.refused_mcp_servers = build.refused_mcp_servers.clone();
         self.recoverable_tool_defs = build.recoverable_tool_defs.clone();
         self.blob_store_override = build.blob_store_override.clone();
         self.llm_client_override = build
@@ -1429,6 +1438,7 @@ impl AgentBuildConfig {
             // The session service decides hosting when it creates the actor.
             hosting: meerkat_core::session_hosting::SessionHostingIntent::default(),
             mcp_servers: self.mcp_servers.clone(),
+            refused_mcp_servers: self.refused_mcp_servers.clone(),
             recoverable_tool_defs: self.recoverable_tool_defs.clone(),
             blob_store_override: self.blob_store_override.clone(),
             llm_client_override: self
@@ -7678,7 +7688,10 @@ impl AgentFactory {
                 if bindings.configured_mcp_attachment().is_some()
         );
         #[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
-        if !build_config.mcp_servers.is_empty() || live_mcp_attachable {
+        if !build_config.mcp_servers.is_empty()
+            || !build_config.refused_mcp_servers.is_empty()
+            || live_mcp_attachable
+        {
             // A registration's surface outlives this construction: its router
             // borrows it and releases only what it staged. A standalone
             // construction's private surface is its router's own.
@@ -7782,6 +7795,20 @@ impl AgentFactory {
                     ))
                 })?;
             }
+            // A server the host refused before setup is staged refused:
+            // applying it reports the typed refusal to the model as that
+            // server's failed setup, and nothing in it connects or spawns.
+            for refused in &build_config.refused_mcp_servers {
+                adapter
+                    .stage_add_refused(refused.server.clone(), refused.refusal)
+                    .await
+                    .map_err(|error| {
+                        BuildAgentError::McpSetup(format!(
+                            "stage refused MCP server '{}': {error}",
+                            refused.server.name
+                        ))
+                    })?;
+            }
             adapter.apply_staged().await.map_err(|error| {
                 BuildAgentError::McpSetup(format!("apply staged MCP servers: {error}"))
             })?;
@@ -7822,7 +7849,7 @@ impl AgentFactory {
             });
         }
         #[cfg(not(all(feature = "mcp", not(target_arch = "wasm32"))))]
-        if !build_config.mcp_servers.is_empty() {
+        if !build_config.mcp_servers.is_empty() || !build_config.refused_mcp_servers.is_empty() {
             // Fail closed: silently dropping requested MCP servers would be
             // a capability downgrade the caller cannot observe.
             return Err(BuildAgentError::McpSetup(

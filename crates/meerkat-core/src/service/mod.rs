@@ -943,6 +943,10 @@ pub struct SessionBuildOptions {
     /// canonical external-tool surface authority (no test-code ephemeral
     /// handle incantation required from embedders).
     pub mcp_servers: Vec<crate::mcp_config::McpServerConfig>,
+    /// Configured MCP servers the host refused for this build, each with its
+    /// typed reason. The factory reports each to the model as that server's
+    /// failed setup, and nothing in it is expanded, connected or spawned.
+    pub refused_mcp_servers: Vec<crate::mcp_config::McpServerRefusal>,
     /// Serializable tool definitions used to reconstruct recoverable
     /// surface-owned dispatchers during session resume/rebuild.
     pub recoverable_tool_defs: Option<Vec<crate::ToolDef>>,
@@ -1878,6 +1882,7 @@ impl Default for SessionBuildOptions {
             external_tools: None,
             hosting: crate::session_hosting::SessionHostingIntent::default(),
             mcp_servers: Vec::new(),
+            refused_mcp_servers: Vec::new(),
             recoverable_tool_defs: None,
             blob_store_override: None,
             llm_client_override: None,

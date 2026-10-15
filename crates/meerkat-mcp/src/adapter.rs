@@ -773,6 +773,27 @@ impl McpRouterAdapter {
         Ok(())
     }
 
+    /// Stage the add of a server the host refused before anything in it was
+    /// expanded, authorized, connected or spawned
+    /// ([`McpRouter::stage_add_refused`]): applying it reports the typed
+    /// `refusal` as that server's failed setup, and nothing connects.
+    pub async fn stage_add_refused(
+        &self,
+        config: McpServerConfig,
+        refusal: meerkat_core::confinement::ConfinementRefusal,
+    ) -> Result<(), String> {
+        self.refuse_if_closing()?;
+        let mut router = self.router.write().await;
+        let router = router
+            .as_mut()
+            .ok_or_else(|| "MCP router has been shut down".to_string())?;
+        router
+            .stage_add_refused(config, refusal)
+            .map_err(|error| error.to_string())?;
+        self.sync_router_projection(router);
+        Ok(())
+    }
+
     /// Stage a governed MCP server add under a prepared attachment control.
     ///
     /// The router installs the exact descriptor and its control together,

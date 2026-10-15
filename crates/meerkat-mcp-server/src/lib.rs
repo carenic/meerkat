@@ -4487,6 +4487,7 @@ async fn handle_meerkat_run_with_help_tools(
                 // The session service decides hosting when it creates the actor.
                 hosting: meerkat_core::session_hosting::SessionHostingIntent::default(),
                 mcp_servers: Vec::new(),
+                refused_mcp_servers: Vec::new(),
                 recoverable_tool_defs: (!input.tools.is_empty())
                     .then(|| recoverable_callback_tool_defs(&input.tools)),
                 llm_client_override: None,
@@ -4953,6 +4954,7 @@ async fn handle_meerkat_resume(
             // The session service decides hosting when it creates the actor.
             hosting: meerkat_core::session_hosting::SessionHostingIntent::default(),
             mcp_servers: Vec::new(),
+            refused_mcp_servers: Vec::new(),
             recoverable_tool_defs: (!input.tools.is_empty())
                 .then(|| recoverable_callback_tool_defs(&input.tools)),
             llm_client_override: None,

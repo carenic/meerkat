@@ -377,8 +377,8 @@ pub use live_execution::{
 pub use mcp_config::{
     EffectiveMcpServersError, McpAccountDeclaration, McpConfig, McpConfigError,
     McpConnectorApproval, McpScope, McpSecretEnvDeclarationError, McpServerAccess,
-    McpServerAccessError, McpServerConfig, McpServerDefinitionConflict, McpServerSource,
-    McpServerWithScope, McpServerWithSource,
+    McpServerAccessError, McpServerConfig, McpServerDefinitionConflict, McpServerRefusal,
+    McpServerSource, McpServerWithScope, McpServerWithSource,
 };
 #[cfg(not(target_arch = "wasm32"))]
 pub use mcp_config::{McpRealmPersistError, McpRealmPersistTarget};

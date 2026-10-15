@@ -11580,17 +11580,29 @@ fn persistence_is_governed(persistence: &PersistenceBundle) -> bool {
         .has_native_work_authorization_host()
 }
 
+/// The configured MCP servers of a governed realm's session build: the
+/// declarative servers the factory connects through the governed host, and
+/// the servers refused before setup, which the session reports to the model.
+#[derive(Debug, Default)]
+struct GovernedMcpServers {
+    servers: Vec<meerkat_core::McpServerConfig>,
+    refused: Vec<meerkat_core::McpServerRefusal>,
+}
+
 /// On a governed realm the CLI does not start configured MCP servers itself:
 /// the effective realm, project and user server set becomes the session
 /// build's declarative servers, connected once by the factory through the
 /// session-owned bindings, where the governed host authorizes each before
-/// discovery or spawn. `None` keeps the ordinary CLI loader.
+/// discovery or spawn. A server refused before setup (from an `mcp.toml` a
+/// confined process could write) goes into the build with its typed
+/// refusal, so the model sees it as that server's failed setup. `None`
+/// keeps the ordinary CLI loader.
 async fn governed_configured_mcp_servers(
     persistence: &PersistenceBundle,
     scope: &RuntimeScope,
     realm_servers: &[meerkat_core::McpServerConfig],
     host_confinement: Option<&meerkat::HostConfinement>,
-) -> anyhow::Result<Option<Vec<meerkat_core::McpServerConfig>>> {
+) -> anyhow::Result<Option<GovernedMcpServers>> {
     if !persistence_is_governed(persistence) {
         return Ok(None);
     }
@@ -11606,18 +11618,27 @@ async fn governed_configured_mcp_servers(
         .await
         .map_err(|e| anyhow::anyhow!("MCP config error: {e}"))?;
         report_refused_mcp_servers(&servers.refused);
-        Ok(Some(
-            servers
+        Ok(Some(GovernedMcpServers {
+            servers: servers
                 .admitted
                 .into_iter()
                 .map(|entry| entry.server)
                 .collect(),
-        ))
+            refused: servers
+                .refused
+                .into_iter()
+                .map(|refused| meerkat_core::McpServerRefusal {
+                    server: refused.server,
+                    refusal:
+                        meerkat_core::confinement::ConfinementRefusal::UntrustedConfigurationSource,
+                })
+                .collect(),
+        }))
     }
     #[cfg(not(feature = "mcp"))]
     {
         let _ = (scope, realm_servers, host_confinement);
-        Ok(Some(Vec::new()))
+        Ok(Some(GovernedMcpServers::default()))
     }
 }
 
@@ -13919,7 +13940,7 @@ async fn run_agent(
 
         #[cfg(feature = "comms")]
         let factory = factory.comms(!comms_overrides.disabled);
-        let governed_mcp = if families.realm_mcp {
+        let governed = if families.realm_mcp {
             governed_configured_mcp_servers(
                 &persistence,
                 scope,
@@ -13929,6 +13950,10 @@ async fn run_agent(
             .await?
         } else {
             None
+        };
+        let (governed_mcp, governed_refused_mcp) = match governed {
+            Some(governed) => (Some(governed.servers), governed.refused),
+            None => (None, Vec::new()),
         };
         let factory = with_governed_mcp_auth(factory, scope, governed_mcp.as_deref(), mcp_auth)?;
         // The loader's router launches stdio servers inside the factory's
@@ -14102,6 +14127,7 @@ async fn run_agent(
             // The session service decides hosting when it creates the actor.
             hosting: meerkat_core::session_hosting::SessionHostingIntent::default(),
             mcp_servers: governed_mcp.clone().unwrap_or_default(),
+            refused_mcp_servers: governed_refused_mcp,
             recoverable_tool_defs: None,
             llm_client_override: None,
             session_comms_runtime_override: None,
@@ -14741,13 +14767,17 @@ async fn resume_session_with_llm_override(
                     || keep_alive
                     || comms_overrides.requires_runtime()),
         );
-        let governed_mcp = governed_configured_mcp_servers(
+        let (governed_mcp, governed_refused_mcp) = match governed_configured_mcp_servers(
             &persistence,
             scope,
             &config.tools.mcp_servers,
             factory.host_confinement(),
         )
-        .await?;
+        .await?
+        {
+            Some(governed) => (Some(governed.servers), governed.refused),
+            None => (None, Vec::new()),
+        };
         let factory = with_governed_mcp_auth(factory, scope, governed_mcp.as_deref(), mcp_auth)?;
         // The loader's router launches stdio servers inside the factory's
         // own launch boundary.
@@ -14943,6 +14973,7 @@ async fn resume_session_with_llm_override(
         if let Some(servers) = governed_mcp {
             build.mcp_servers = servers;
         }
+        build.refused_mcp_servers = governed_refused_mcp;
         build.llm_client_override =
             llm_override.map(meerkat::encode_llm_client_override_for_service);
         build.runtime_build_mode = meerkat_core::RuntimeBuildMode::SessionOwned(resume_bindings);
@@ -22286,7 +22317,91 @@ mod tests {
             .await
             .expect("governed route")
             .expect("the governed route, never the ordinary preload");
-        assert_eq!(routed.len(), 1);
+        assert_eq!(routed.servers.len(), 1);
+        assert!(routed.refused.is_empty());
+    }
+
+    /// On a governed realm an `mcp.toml` a confined process can write
+    /// configures no server: each of its servers goes into the session build
+    /// as a refusal with its typed reason, for the model to see, and none is
+    /// a server the factory would connect.
+    #[cfg(all(feature = "local-authorization", feature = "mcp", unix))]
+    #[tokio::test]
+    async fn a_governed_realm_carries_an_untrusted_mcp_toml_as_refusals() {
+        use meerkat::governed_realm::{
+            RealmGovernance, open_governed_realm_persistence_with_provider,
+        };
+        use meerkat_core::confinement::{
+            ConfinementRefusal, ConfinementSpec, FilesystemAccess, IpNetworkAccess, PathAccess,
+            PlatformBaseline,
+        };
+        let temp = tempfile::tempdir().expect("tempdir");
+        let base = temp.path().canonicalize().expect("canonical temp");
+        let project = base.join("project");
+        std::fs::create_dir_all(project.join(".rkat")).expect("project");
+        std::fs::write(
+            project.join(".rkat").join("mcp.toml"),
+            "[[servers]]\nname = \"untrusted-local\"\ncommand = \"/bin/sh\"\nargs = [\"-c\", \"exit 0\"]\n",
+        )
+        .expect("project mcp.toml");
+        let mut scope = test_scope(base.join("realms"), "ws-untrusted-governed");
+        scope.context_root = Some(project.clone());
+        let (_, ordinary) = create_persistence_bundle(&scope)
+            .await
+            .expect("an ordinary first open materializes the realm");
+        drop(ordinary);
+        let (_, governed) = open_governed_realm_persistence_with_provider(
+            &meerkat::DiskStorageProvider,
+            &base.join("realms"),
+            "ws-untrusted-governed",
+            None,
+            None,
+            None,
+            RealmGovernance::GovernedWithoutOwners,
+        )
+        .await
+        .expect("governed without owners");
+        let requirement = ConfinementSpec {
+            baseline: PlatformBaseline::CommandRuntimeV1,
+            read: FilesystemAccess::Paths(vec![PathAccess::Subtree(project.clone())]),
+            write: FilesystemAccess::Paths(vec![PathAccess::Subtree(project.clone())]),
+            deny_read: vec![],
+            deny_write: vec![],
+            network: IpNetworkAccess::Denied,
+            unix_connect: vec![],
+            require_descendant_termination: false,
+        }
+        .try_into()
+        .expect("requirement");
+        let config = Config {
+            confinement: meerkat_core::ConfinementConfig::for_all(
+                meerkat_core::LaunchConfinement::Custom(meerkat_core::CustomConfinement {
+                    working_directory: project.clone(),
+                    requirement,
+                }),
+            ),
+            ..Config::default()
+        };
+        let factory = with_cli_confinement(
+            AgentFactory::new(base.join("sessions")),
+            &config,
+            &scope,
+            &project,
+        )
+        .expect("the realm state is outside every grant");
+
+        let routed =
+            governed_configured_mcp_servers(&governed, &scope, &[], factory.host_confinement())
+                .await
+                .expect("governed route")
+                .expect("the governed route");
+        assert!(routed.servers.is_empty(), "{:?}", routed.servers);
+        assert_eq!(routed.refused.len(), 1, "{:?}", routed.refused);
+        assert_eq!(routed.refused[0].server.name, "untrusted-local");
+        assert_eq!(
+            routed.refused[0].refusal,
+            ConfinementRefusal::UntrustedConfigurationSource
+        );
     }
 
     /// The governed route forwards `--wait-for-mcp` to the factory, and waits

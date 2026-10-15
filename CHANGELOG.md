@@ -43,6 +43,10 @@ them.
   compose a different `[confinement]`, and a section one config document
   states for another realm no longer replaces that realm's own edge (see
   Fixed). Re-parent such a realm by editing its document as its host.
+- `meerkat_core::service::SessionBuildOptions` and `meerkat::AgentBuildConfig`
+  have a new `refused_mcp_servers` field (`Vec<McpServerRefusal>`); a struct
+  literal must add it (or use `..Default::default()` or
+  `AgentBuildConfig::new`).
 
 ### Added
 
@@ -53,6 +57,13 @@ them.
 - `ConfinementFlags::needs_working_directory` says whether a
   `--confinement*` selection resolves a relative path against the working
   directory.
+- `meerkat_core::McpServerRefusal`: a configured MCP server the host refused
+  before setup, with its typed `ConfinementRefusal`. The new
+  `SessionBuildOptions::refused_mcp_servers` and
+  `AgentBuildConfig::refused_mcp_servers` carry such refusals into a session
+  build, where the factory stages each one refused
+  (`McpRouterAdapter::stage_add_refused`), so the model sees the refusal in
+  that server's failed-setup MCP system notice.
 
 ### Changed
 
@@ -93,6 +104,12 @@ them.
   address), which the filter also left out. Each host reports each launch
   kind's requested and effective confinement and what keeps its own inputs
   from its confined processes, not only what needs action.
+- On a governed realm, `rkat` reports each MCP server it refuses from an
+  `mcp.toml` a confined process can write to the model, as that server's
+  failed setup with the typed `untrusted_configuration_source` refusal. In
+  0.9.1 the governed route left those servers out with only a warning on
+  stderr (the 0.9.1 known limitation), so the model could not tell why a
+  configured server was missing.
 
 ## [0.9.1] - 2026-10-15
 

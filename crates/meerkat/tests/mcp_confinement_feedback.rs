@@ -235,6 +235,88 @@ async fn run_feedback_case(wait_at_build: bool) {
     assert!(!root.join("private-launch-marker").exists());
 }
 
+/// A configured server the host refused before setup (for example from an
+/// `mcp.toml` a confined process can write) reaches the model through the
+/// build's refusal slot: the server's failed setup notice carries the typed
+/// refusal, nothing in the server is spawned, and the run continues with the
+/// permitted sibling.
+#[tokio::test]
+async fn a_refused_configured_server_reaches_the_model_as_its_failed_setup() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let marker = root.join("refused-entered");
+    let server = meerkat_core::McpServerConfig::stdio(
+        "refused-local-server",
+        "/bin/sh",
+        vec![
+            "-c".into(),
+            format!("printf entered > {}", marker.display()),
+        ],
+        HashMap::new(),
+    );
+    let client = Arc::new(RecordingClient::default());
+    let sibling = Arc::new(Sibling::default());
+    let mut build = AgentBuildConfig::new("claude-sonnet-4-5");
+    build.llm_client_override = Some(client.clone());
+    build.wait_for_mcp = true;
+    build.external_tools = Some(sibling.clone());
+    build.refused_mcp_servers = vec![meerkat_core::McpServerRefusal {
+        server,
+        refusal: ConfinementRefusal::UntrustedConfigurationSource,
+    }];
+    let factory =
+        AgentFactory::minimal().session_store(Arc::new(meerkat_store::MemoryStore::new()));
+    let mut agent = tokio::time::timeout(
+        Duration::from_secs(15),
+        factory.build_agent(build, &Config::default()),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let result = tokio::time::timeout(
+        Duration::from_secs(15),
+        agent.run("Use the available sibling".to_string().into()),
+    )
+    .await;
+    assert_eq!(result.unwrap().unwrap().text, "continued");
+    assert_eq!(sibling.0.load(Ordering::SeqCst), 1);
+    let requests = client.0.lock().unwrap();
+    assert_eq!(
+        requests.len(),
+        2,
+        "the refusal neither ends nor retries the run"
+    );
+    for request in requests.iter() {
+        assert_eq!(
+            failure_notices(request),
+            1,
+            "one refused server, one notice"
+        );
+        let notice = request
+            .iter()
+            .find_map(|message| match message {
+                Message::SystemNotice(notice) if notice.kind == SystemNoticeKind::Mcp => {
+                    Some(notice)
+                }
+                _ => None,
+            })
+            .expect("the refused server's failed setup notice");
+        let block = serde_json::to_value(&notice.blocks[0]).unwrap();
+        assert_eq!(
+            block["confinement_refusal"],
+            "untrusted_configuration_source"
+        );
+        assert!(
+            notice
+                .model_projection_text()
+                .contains(&ConfinementRefusal::UntrustedConfigurationSource.to_string())
+        );
+        let serialized = serde_json::to_string(request).unwrap();
+        assert!(!serialized.contains("printf entered"));
+    }
+    assert!(!marker.exists(), "the refused server never ran");
+}
+
 #[tokio::test]
 async fn factory_wait_preserves_refused_mcp_launch_feedback_and_permitted_sibling() {
     run_feedback_case(true).await;
