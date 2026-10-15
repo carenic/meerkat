@@ -37,6 +37,31 @@ them.
 
 ### Changed
 
+- A release tag whose exact-main CI produced a verified schema-4 attestation
+  no longer re-runs "Validate release state with Cargo" (25 minutes on
+  0.9.1) while the self-hosted BuildBuddy graph is off: every check of that
+  job already ran in the attested CI run, and `release_validate_gate` passes
+  on the attestation. A legacy (schema 1-3) attestation and manual
+  dispatches keep Cargo validation; the graph-on route is unchanged.
+- `release.yml` gains a pre-tag prebuild (`make release-prebuild
+  VERSION=vX.Y.Z`, a `prebuild_release_artifacts` dispatch on `main`): it
+  builds, stamps, attests and uploads every release binary and the Web SDK
+  package of the release commit while CI runs, and publishes nothing. The
+  tag run of exactly that commit then skips every build and publishes those
+  artifacts after the same checks as an `--assets-run-id` recovery (each
+  archive and stamp attested by `release.yml` at that commit on
+  `refs/heads/main`, the run's binary build gate green, every binary
+  embedding the release version; the Web SDK package's attestation and
+  version). Without a complete prebuild the tag builds as before.
+- Rust crates publish by dependency level, derived from the canonical order
+  in `scripts/release-rust-crates.sh` and `cargo metadata`
+  (`scripts/release-rust-crates.sh --levels`): a level's crates publish
+  concurrently (`MEERKAT_CRATE_PUBLISH_JOBS`, default 6) and the next level
+  starts once the whole level is in the crates.io index. crates.io's rate
+  limit for new versions still bounds a full release.
+- The semver baseline rustdoc for the next release builds alongside the
+  release instead of after it, and `attach_semver_baseline` attaches it once
+  the GitHub release is published; no job waits for either.
 - CI's `Closure tests` rows have 60 minutes instead of 40, and the
   `ci-integration` profile gives its four slow nested-Cargo and
   whole-workspace tests 16 slow periods (960 s) instead of 8, so a cold row
