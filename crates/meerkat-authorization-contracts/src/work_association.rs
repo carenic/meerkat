@@ -123,7 +123,8 @@ pub enum GrantTarget {
     /// `send_response` addressee is the caller's assertion, not a verified
     /// requester. Holds when every wrapper between the root and the owner
     /// forwards plan resolution and resolved dispatch with its context; a
-    /// governed comms plan without the owner's target is refused.
+    /// governed comms plan without the owner's target is refused. Not an
+    /// egress fence for mob members (see the changelog).
     Peer { peer: meerkat_core::comms::PeerId },
     /// Reads of the session's own trusted-peer directory: the target of the
     /// owner-produced `PeerDirectoryRead`. Its lineage covers no delivery.

@@ -188,7 +188,16 @@ them.
   addressee is the caller's assertion: the runtime checks that its request
   id names a request this session received and can still answer, but
   records no requester, so its `Peer` target names the peer the response is
-  delivered to, not a verified requester.
+  delivered to, not a verified requester. `PeerSendKind` is descriptive, not
+  an authority boundary: lineage selection ignores it, so a host maps
+  `Response` to the same action as `Message`. A `Peer` lineage fences only
+  this session's own comms-tool deliveries and is not an egress fence for
+  mob members: `mob_spawn_member` delivers a caller-chosen initial message
+  to a member that can inherit tools, and `mob_wire` accepts an external
+  peer binding within the mob's scope, so a member can send to that peer
+  under its own admission. A host that uses `Peer` lineages as an egress
+  fence keeps the mob tools (at least `mob_wire` with external bindings)
+  off the base lineage.
 
 ### Changed
 
