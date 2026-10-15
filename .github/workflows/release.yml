@@ -2791,10 +2791,19 @@ jobs:
           RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag || github.ref_name }}
         run: |
           set -euo pipefail
+          asset="semver-rustdoc-${RELEASE_TAG#v}.tar.zst"
+          # Add-only, like every release upload: a baseline already attached
+          # (by the tag run, before an asset recovery of the same tag) stays
+          # as published, and a concurrent upload fails instead of replacing.
+          attached="$(gh release view "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" \
+            --json assets --jq '.assets[].name')"
+          if grep -Fxq -- "${asset}" <<<"${attached}"; then
+            echo "${asset} is already on ${RELEASE_TAG}; leaving it in place"
+            exit 0
+          fi
           gh release upload "${RELEASE_TAG}" \
             --repo "${GITHUB_REPOSITORY}" \
-            --clobber \
-            "semver-baseline/semver-rustdoc-${RELEASE_TAG#v}.tar.zst"
+            "semver-baseline/${asset}"
 
   # Registry publishing runs automatically on tag pushes alongside binary
   # builds. For recovery (e.g. npm was down during the tag-triggered run),

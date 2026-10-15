@@ -1715,6 +1715,11 @@ def check_semver_baseline(text: str) -> list[str]:
         violations.append(f"job `{SEMVER_BASELINE_JOB}` writes to the GitHub release itself")
     if not any("gh release upload" in step.run for step in attach_steps):
         violations.append(f"job `{SEMVER_BASELINE_ATTACH_JOB}` does not attach the baseline")
+    if any(GH_UPLOAD_CLOBBER.search(step.run) for step in attach_steps):
+        violations.append(
+            f"job `{SEMVER_BASELINE_ATTACH_JOB}` attaches with `--clobber`, replacing a baseline "
+            "already on the release"
+        )
     uploaded = {
         step.nested("with").get("name")
         for step in build_steps
@@ -1735,6 +1740,8 @@ def check_semver_baseline(text: str) -> list[str]:
             violations.append(f"job `{job}` does not run on {TAG_PUSH.label}")
     return violations
 
+# A `gh release upload` that replaces an asset of the same name.
+GH_UPLOAD_CLOBBER = re.compile(r"gh release upload(?:[^\n]|\\\n)*--clobber")
 CRITICAL_TARGETS = ("x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu", "aarch64-apple-darwin")
 TRAILING_TARGETS = ("x86_64-apple-darwin", "x86_64-pc-windows-msvc")
 TRAILING_BUILD_JOBS = ("build_binaries_windows_cross", "verify_windows_binaries", "build_binaries_macos_x86_cross")
@@ -1852,6 +1859,11 @@ def check_trailing_platforms(text: str) -> list[str]:
 
     for job in names:
         for step in _steps_of(text, job):
+            if GH_UPLOAD_CLOBBER.search(step.raw_run):
+                violations.append(
+                    f"step `{step.name}` uploads with `gh release upload --clobber`; "
+                    "release uploads are add-only and never replace an asset"
+                )
             if GH_RELEASE_ACTION not in step.fields.get("uses", ""):
                 continue
             files = step.nested("with").get("files", "")

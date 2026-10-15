@@ -297,8 +297,9 @@ embedding a separate runtime implementation.
    release's semver gate compares against (`publish_semver_baseline`, which
    starts with the release) and attach it as
    `semver-rustdoc-<version>.tar.zst` once the GitHub release is published
-   (`attach_semver_baseline`). No job waits for either; if it fails, the next
-   measurement rebuilds the baseline from the tag instead.
+   (`attach_semver_baseline`, add-only: a baseline already attached stays).
+   No job waits for either; if it fails, the next measurement rebuilds the
+   baseline from the tag instead.
 
 ### Pre-tag prebuild
 

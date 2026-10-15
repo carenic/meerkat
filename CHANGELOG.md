@@ -93,7 +93,8 @@ them.
   limit for new versions still bounds a full release.
 - The semver baseline rustdoc for the next release builds alongside the
   release instead of after it, and `attach_semver_baseline` attaches it once
-  the GitHub release is published; no job waits for either.
+  the GitHub release is published, never replacing a baseline already
+  attached; no job waits for either.
 - Intel macOS and Windows release archives trail: the Linux (x86_64,
   aarch64) and macOS arm64 archives publish as soon as their lane passes
   (`publish_critical_release_assets`, add-only), and `publish_github_release`

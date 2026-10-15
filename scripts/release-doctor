@@ -296,7 +296,7 @@ else
 fi
 
 if baseline_contract="$(workflow_contract semver-baseline)"; then
-  pass "Semver baseline rustdoc builds alongside the release and gates nothing; it attaches only to a published release"
+  pass "Semver baseline rustdoc builds alongside the release and gates nothing; it attaches only to a published release, never replacing an attached one"
 else
   bad "The semver baseline rustdoc must stay off every path a user waits on (${baseline_contract//$'\n'/; })"
 fi

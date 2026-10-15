@@ -33,7 +33,7 @@ TAG_VALIDATION_PASS="PASS Tag releases skip Cargo validation only on an exact-tr
 TAG_VALIDATION_FAIL="FAIL Tag releases may skip Cargo validation only on an exact-tree CI attestation that proves its lanes ran"
 PREBUILD_PASS="PASS Pre-tag prebuilds publish nothing, and a tag publishes its own commit's prebuild only through the attested-archive verification"
 PREBUILD_FAIL="FAIL A pre-tag prebuild must publish nothing, and a tag may publish its commit's prebuild only through the attested-archive verification"
-BASELINE_PASS="PASS Semver baseline rustdoc builds alongside the release and gates nothing; it attaches only to a published release"
+BASELINE_PASS="PASS Semver baseline rustdoc builds alongside the release and gates nothing; it attaches only to a published release, never replacing an attached one"
 BASELINE_FAIL="FAIL The semver baseline rustdoc must stay off every path a user waits on"
 TRAILING_PASS="PASS Linux and macOS arm64 assets publish without waiting for the trailing Intel macOS and Windows lanes; no upload replaces a published asset"
 TRAILING_FAIL="FAIL The trailing Intel macOS and Windows lanes must not gate the critical assets, and no upload may replace a published asset"
@@ -541,6 +541,17 @@ elif name == "cache-dispatch-save":
     needle = "          save-if: ${{ github.event_name != 'workflow_dispatch' }}\n"
     at = text.index(needle, job)
     text = text[:at] + text[at + len(needle):]
+elif name == "semver-baseline-clobber":
+    # The pre-review attach replaced a baseline already on the release.
+    replace_once(
+        '          gh release upload "${RELEASE_TAG}" \\\n'
+        '            --repo "${GITHUB_REPOSITORY}" \\\n'
+        '            "semver-baseline/${asset}"\n',
+        '          gh release upload "${RELEASE_TAG}" \\\n'
+        '            --repo "${GITHUB_REPOSITORY}" \\\n'
+        '            --clobber \\\n'
+        '            "semver-baseline/${asset}"\n',
+    )
 elif name == "cache-xwin-dispatch-save":
     # The Windows SDK cache saved by dispatch runs too.
     replace_once(
@@ -822,6 +833,11 @@ expect_fail_named prebuild-gate-renamed "${TEST_ROOT}/prebuild-gate-renamed.yml"
 mutate semver-baseline-gates-homebrew "${TEST_ROOT}/semver-baseline-gates-homebrew.yml"
 expect_fail_named semver-baseline-gates-homebrew "${TEST_ROOT}/semver-baseline-gates-homebrew.yml" \
   "job \`update_homebrew\` waits for the semver baseline rustdoc" semver-baseline
+mutate semver-baseline-clobber "${TEST_ROOT}/semver-baseline-clobber.yml"
+expect_fail_named semver-baseline-clobber "${TEST_ROOT}/semver-baseline-clobber.yml" \
+  "job \`attach_semver_baseline\` attaches with \`--clobber\`" semver-baseline
+expect_fail_named semver-baseline-clobber-add-only "${TEST_ROOT}/semver-baseline-clobber.yml" \
+  "step \`Attach baseline rustdoc to the GitHub release\` uploads with \`gh release upload --clobber\`" trailing-platforms
 mutate semver-baseline-after-release "${TEST_ROOT}/semver-baseline-after-release.yml"
 expect_fail_named semver-baseline-after-release "${TEST_ROOT}/semver-baseline-after-release.yml" \
   "the rustdoc build must run in parallel with publication, not after it" semver-baseline
