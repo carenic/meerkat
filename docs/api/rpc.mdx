@@ -495,10 +495,23 @@ client-callable catalog method.
 
 A mob's members call the callback tools of the connection that holds the
 mob's callback route. `mob/create` gives the route to the creating
-connection. A mob restored after a restart, or one whose connection closed,
-has no route: a member's callback call fails `tool_unavailable` ("no
-connected client holds the callback route that serves it") until a
-connection claims the route:
+connection. Where a restored mob's route starts depends on the server:
+
+- On a connection-owned server, where every connection owns its own route
+  (`rkat-rpc` over stdio or TCP), a mob restored after a restart starts
+  with no route.
+- An embedding host that installed the process-default callback channel
+  (`SessionRuntime::init_callback_channel`, the single-client default
+  route) keeps that channel's contract: a restored mob's route starts held
+  by the default route, and its members reach that host's callbacks without
+  a claim.
+
+A mob with no route, or one whose holding connection closed, fails a
+member's callback call `tool_unavailable` ("no connected client holds the
+callback route that serves it"); the call is never delivered to a closed
+connection. The tool definitions the closed connection registered stay
+advertised to the mob's members until the next claim. A connection claims
+the route with:
 
 ```json
 {"jsonrpc":"2.0","id":13,"method":"mob/claim_callback_route","params":{"mob_id":"team"}}
