@@ -138,7 +138,12 @@ them.
   activations were then admitted onto a backend that fails every later turn
   that carries them. Fallback targets are now judged through the binding their
   client uses, and the activation keeps that judgment. Ordinary System appends
-  stay ungated, as before.
+  stay ungated, as before. `ModelRegistry::profile_for_identity` now also fails
+  closed for a named binding the config does not resolve: its backend is
+  unknown, so the profile no longer keeps the row's
+  `supports_mid_conversation_system_messages`. An identity that names no
+  binding, or the synthetic env-var default (an API-key backend), keeps the
+  row as before.
 
 ## [0.9.1] - 2026-10-15
 

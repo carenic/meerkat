@@ -12612,8 +12612,10 @@ mod tests {
 
     /// The ChatGPT backend serves the GPT catalog rows, but its wire carries
     /// no ordered System message after the leading prefix. The session's
-    /// profile says so; the public API, and an identity that names no
-    /// binding, keep the row's capability.
+    /// profile says so; the public API, an identity that names no binding,
+    /// and the synthetic env-var default (an API-key backend) keep the
+    /// row's capability. A named binding the config does not resolve has an
+    /// unknown backend, so it does not keep the capability.
     #[test]
     fn a_chatgpt_backend_identity_resolves_without_mid_conversation_system_messages() {
         let (mut config, chatgpt_binding) = chatgpt_backend_cache_config();
@@ -12650,6 +12652,23 @@ mod tests {
         assert!(
             supports(None),
             "an identity naming no binding keeps the row"
+        );
+        assert!(
+            supports(Some(AuthBindingRef {
+                realm: RealmId::parse("env_default").expect("valid realm"),
+                binding: BindingId::parse("default").expect("valid binding"),
+                profile: None,
+                origin: meerkat_core::BindingOrigin::SyntheticEnvDefault,
+            })),
+            "the env-var default names an API-key backend and keeps the row"
+        );
+        assert!(
+            !supports(Some(configured_auth_binding("missing", "default_openai"))),
+            "a binding in a realm the config lacks has an unknown backend"
+        );
+        assert!(
+            !supports(Some(configured_auth_binding("public", "missing_binding"))),
+            "a binding the realm lacks has an unknown backend"
         );
     }
 

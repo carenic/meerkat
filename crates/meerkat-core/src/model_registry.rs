@@ -389,8 +389,13 @@ impl ModelRegistry {
     /// model's profile, less what the backend its configured binding names in
     /// `config` cannot carry
     /// ([`crate::BackendProfile::admits_mid_conversation_system_messages`]).
-    /// An identity that names no binding, or one `config` does not resolve,
-    /// keeps the model's profile.
+    ///
+    /// An identity that names no binding keeps the model's profile, and so
+    /// does one naming the synthetic env-var default: that binding is never
+    /// resolved from `config`, and it only ever names a provider's API-key
+    /// backend. A named binding that `config` does not resolve fails closed:
+    /// its backend is unknown, so the profile does not claim
+    /// `supports_mid_conversation_system_messages`.
     pub fn profile_for_identity(
         &self,
         config: &crate::Config,
@@ -399,10 +404,15 @@ impl ModelRegistry {
         let mut profile = self.profile_for_provider(identity.provider, &identity.model)?;
         if profile.supports_mid_conversation_system_messages
             && let Some(auth_binding) = identity.auth_binding.as_ref()
-            && let Ok(target) = crate::resolve_explicit_auth_binding_target(config, auth_binding)
-            && !target.backend.admits_mid_conversation_system_messages()
         {
-            profile.supports_mid_conversation_system_messages = false;
+            let backend_admits =
+                match crate::resolve_explicit_auth_binding_target(config, auth_binding) {
+                    Ok(target) => target.backend.admits_mid_conversation_system_messages(),
+                    Err(_) => auth_binding.is_env_default(),
+                };
+            if !backend_admits {
+                profile.supports_mid_conversation_system_messages = false;
+            }
         }
         Some(profile)
     }
