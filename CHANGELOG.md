@@ -43,6 +43,16 @@ them.
   (as after a release version bump, when no compiled unit can be reused)
   completes on a hosted 4-vCPU runner.
 
+### Fixed
+
+- `scripts/rust-lane-doctor` no longer passes its shell entrypoint scan when
+  the scan did not run. The scan ended in `rg ... || true`, so a missing
+  ripgrep or an unreadable scan root read as "no raw Cargo entrypoint", even
+  with one present. The doctor now reads rg's exit status: 0 (a raw Cargo
+  entrypoint) and any status other than 1 (no match) fail, the latter with the
+  rg exit status and its output. `scripts/test-ci-nextest-archive.sh` probes
+  all four outcomes.
+
 ## [0.9.1] - 2026-10-15
 
 ### Breaking
