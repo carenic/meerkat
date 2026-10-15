@@ -42,6 +42,12 @@ them.
   whole-workspace tests 16 slow periods (960 s) instead of 8, so a cold row
   (as after a release version bump, when no compiled unit can be reused)
   completes on a hosted 4-vCPU runner.
+- meerkat-mcp's protected SSE transport parses event streams with
+  `sse_stream::SseStream::from_bytes_stream`. sse-stream 0.2.4 deprecated the
+  `from_byte_stream` spelling it used, so a lockfile update past 0.2.3 failed
+  `clippy -D warnings`. The requirement is now `0.2.4` (the first release
+  with the new name) and Cargo.lock moves sse-stream from 0.2.3 to 0.2.6,
+  whose rewritten line parser the MCP SSE tests now run against.
 
 ### Fixed
 
