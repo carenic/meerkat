@@ -261,8 +261,9 @@ stream_inactivity_timeout_secs = 600
 ```
 
 `stream_inactivity_timeout_secs` sets this model's stream-inactivity window,
-for example to cover a long prefill before the first token. Omit it to use the
-`[retry]` window.
+for example to cover a long prefill before the first token. It must be at
+least 60 seconds; config validation refuses a shorter window. Omit it to use
+the `[retry]` window.
 
 `vision = true` covers image input. With `api_style = "chat_completions"`,
 `image_tool_results` must remain `false`; that result shape is available only

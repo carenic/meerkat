@@ -1318,6 +1318,11 @@ fn stream_inactivity_windows_follow_documented_long_silent_responses() {
                 "{}: the window must not outlast the call timeout",
                 caps.id
             );
+            assert!(
+                window >= meerkat_core::MIN_MODEL_STREAM_INACTIVITY_TIMEOUT.as_secs(),
+                "{}: the window must not be shorter than the per-model minimum",
+                caps.id
+            );
         }
         assert_eq!(
             profile_for(caps.provider, caps.id)

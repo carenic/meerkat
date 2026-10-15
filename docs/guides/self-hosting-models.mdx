@@ -158,9 +158,12 @@ stream_inactivity_timeout_secs = 600
 `call_timeout_secs` bounds one model call. `stream_inactivity_timeout_secs`
 sets how long this model's stream may stay silent, for example during a long
 prefill before the first token, before Meerkat aborts the call as stalled and
-retries it. Omit it to use the `[retry] stream_inactivity_timeout` window (300
-seconds by default); an explicit `[retry] stream_inactivity_timeout` applies to
-every model, this one included.
+retries it. It must be at least 60 seconds: the client waits up to 30 seconds
+after the model's final event for the usage trailer, and a shorter window
+would race that wait, so config validation refuses it. Omit it to use the
+`[retry] stream_inactivity_timeout` window (300 seconds by default); an
+explicit `[retry] stream_inactivity_timeout` applies to every model, this one
+included.
 
 `vision = true` advertises image input. It is separate from image tool-result
 blocks: the registry forces `image_tool_results = false` for

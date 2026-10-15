@@ -136,6 +136,18 @@ pub struct LlmRetrySchedule {
 /// [`RetryPolicy::with_stream_inactivity_timeout`].
 pub const DEFAULT_STREAM_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// The shortest stream-inactivity window a model may declare for itself
+/// (`stream_inactivity_timeout_secs` on a self-hosted model; config
+/// validation refuses a shorter one, 0 included).
+///
+/// A provider adapter can hold a stream open after the model's final event
+/// to read an accounting trailer (the OpenAI-compatible client that serves
+/// self-hosted models waits up to 30 s), and the watchdog re-arms on that
+/// final event. A window not well beyond that wait would race the adapter's
+/// ordinary end of stream against a retryable stall of an answer the caller
+/// already has; twice the 30 s wait leaves the margin.
+pub const MIN_MODEL_STREAM_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(60);
+
 fn default_stream_inactivity_timeout() -> Option<Duration> {
     Some(DEFAULT_STREAM_INACTIVITY_TIMEOUT)
 }

@@ -73,7 +73,10 @@ them.
   Google's 15-minute client-timeout guidance; `gpt-5.5-pro`, 7200 s, its call
   timeout, since its requests can run for minutes without streaming), and a
   self-hosted model can declare `stream_inactivity_timeout_secs` (for example
-  for a long prefill). The window is resolved for each LLM call like
+  for a long prefill; config validation refuses a window below 60 s,
+  `meerkat_core::MIN_MODEL_STREAM_INACTIVITY_TIMEOUT`, twice the 30 s
+  post-finish trailer wait of the OpenAI-compatible client, so the watchdog
+  cannot race that wait). The window is resolved for each LLM call like
   `call_timeout`: an explicit `[retry] stream_inactivity_timeout` (a duration,
   or `"disabled"`) wins, then the current model's window, then the built-in
   300 s, so a model change or fallback uses the new model's window. The 300 s

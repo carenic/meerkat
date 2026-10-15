@@ -1635,7 +1635,9 @@ pub struct SelfHostedModelConfig {
     /// This model's stream-inactivity watchdog window in seconds: how long
     /// its stream may stay silent (a long prefill, for example) before the
     /// call is aborted as stalled. Omitted keeps the global window; an
-    /// explicit `[retry] stream_inactivity_timeout` still wins.
+    /// explicit `[retry] stream_inactivity_timeout` still wins. Config
+    /// validation refuses a window below
+    /// [`crate::MIN_MODEL_STREAM_INACTIVITY_TIMEOUT`] (60 s).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stream_inactivity_timeout_secs: Option<u64>,
 }

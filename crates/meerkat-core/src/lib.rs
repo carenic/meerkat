@@ -465,7 +465,7 @@ pub use realtime_transcript_sidecar::{
 };
 pub use retry::{
     DEFAULT_STREAM_INACTIVITY_TIMEOUT, LlmRetryFailure, LlmRetryFailureKind, LlmRetryPlan,
-    LlmRetrySchedule, RetryPolicy, select_retry_delay,
+    LlmRetrySchedule, MIN_MODEL_STREAM_INACTIVITY_TIMEOUT, RetryPolicy, select_retry_delay,
 };
 pub use runtime_bootstrap::{
     ContextConfig, DualRootResolution, REALM_MANIFEST_FILE_NAME, RealmConfig, RealmLocator,

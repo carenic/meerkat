@@ -639,6 +639,16 @@ fn append_self_hosted(
                 model.server
             ))
         })?;
+        let min_window = crate::retry::MIN_MODEL_STREAM_INACTIVITY_TIMEOUT.as_secs();
+        if let Some(window) = model.stream_inactivity_timeout_secs
+            && window < min_window
+        {
+            return Err(ConfigError::Validation(format!(
+                "self_hosted.models.{model_id}.stream_inactivity_timeout_secs is {window}; it must \
+                 be at least {min_window}, or the stream-inactivity watchdog races the post-finish \
+                 trailer wait of the model's stream"
+            )));
+        }
         let self_hosted = SelfHostedServerRef {
             server_id: model.server.clone(),
             remote_model: model.remote_model.clone(),
@@ -911,6 +921,54 @@ mod tests {
             !profile.image_tool_results,
             "Chat Completions self-hosted models text-project tool results even when raw config requests image support"
         );
+    }
+
+    /// A self-hosted model's own stream-inactivity window must be at least
+    /// the minimum (0 included), or it races the post-finish trailer wait;
+    /// the minimum itself and longer windows reach the profile.
+    #[test]
+    fn self_hosted_stream_inactivity_window_below_the_minimum_is_refused() {
+        let minimum = crate::retry::MIN_MODEL_STREAM_INACTIVITY_TIMEOUT.as_secs();
+        let with_window = |window| {
+            let mut config = config_with_self_hosted();
+            match config.self_hosted.models.get_mut("gemma-4-31b") {
+                Some(model) => model.stream_inactivity_timeout_secs = Some(window),
+                None => panic!("missing self-hosted model"),
+            }
+            config
+        };
+        for window in [0, 1, minimum - 1] {
+            match ModelRegistry::from_config(&with_window(window), test_catalog()) {
+                Err(ConfigError::Validation(message)) => assert!(
+                    message.contains("stream_inactivity_timeout_secs")
+                        && message.contains(&format!("at least {minimum}")),
+                    "{message}"
+                ),
+                Err(other) => panic!("window {window}: expected a validation error, got {other}"),
+                Ok(_) => panic!("window {window} must be refused"),
+            }
+            match with_window(window).validate(test_catalog()) {
+                Err(ConfigError::Validation(message)) => assert!(
+                    message.contains("stream_inactivity_timeout_secs"),
+                    "{message}"
+                ),
+                other => panic!("window {window}: config validation must refuse it, got {other:?}"),
+            }
+        }
+        for window in [minimum, 900] {
+            if let Err(err) = with_window(window).validate(test_catalog()) {
+                panic!("window {window}: config validation refused it: {err}");
+            }
+            let registry = match ModelRegistry::from_config(&with_window(window), test_catalog()) {
+                Ok(registry) => registry,
+                Err(err) => panic!("window {window}: {err}"),
+            };
+            let profile = match registry.profile_for_provider(Provider::SelfHosted, "gemma-4-31b") {
+                Some(profile) => profile,
+                None => panic!("missing self-hosted profile"),
+            };
+            assert_eq!(profile.stream_inactivity_timeout_secs, Some(window));
+        }
     }
 
     fn insert_second_self_hosted_model(config: &mut Config) {

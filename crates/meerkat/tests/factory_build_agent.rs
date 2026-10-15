@@ -1539,8 +1539,11 @@ impl LlmClient for StallOnceLlmClient {
 /// watchdog: a self-hosted model that declares
 /// `stream_inactivity_timeout_secs` has a silent stream aborted after that
 /// window, not the global 300 s default, and the ordinary retry succeeds.
-#[tokio::test]
+/// The clock is paused, so the window (the per-model minimum) passes in
+/// virtual time.
+#[tokio::test(start_paused = true)]
 async fn a_model_stream_inactivity_window_reaches_the_watchdog() {
+    let window = meerkat_core::MIN_MODEL_STREAM_INACTIVITY_TIMEOUT;
     let temp = tempfile::tempdir().unwrap();
     let factory = temp_factory(&temp);
     let mut config = Config::default();
@@ -1559,7 +1562,7 @@ async fn a_model_stream_inactivity_window_reaches_the_watchdog() {
         "family": "gemma-4",
         "context_window": 256_000,
         "max_output_tokens": 8_192,
-        "stream_inactivity_timeout_secs": 1
+        "stream_inactivity_timeout_secs": window.as_secs()
     }))
     .expect("self-hosted model config");
     config
@@ -1580,16 +1583,24 @@ async fn a_model_stream_inactivity_window_reaches_the_watchdog() {
     };
     let mut agent = factory.build_agent(build_config, &config).await.unwrap();
 
+    let started = tokio::time::Instant::now();
     let result = tokio::time::timeout(
-        std::time::Duration::from_secs(60),
+        // Shorter than the global 300 s default, so only the model's own
+        // window can end the silent stream in time.
+        std::time::Duration::from_secs(280),
         agent.run("Hello".to_string().into()),
     )
     .await
     .expect(
-        "the model's 1 s inactivity window must abort the silent stream long before \
-         the global 300 s default",
+        "the model's inactivity window must abort the silent stream before the global \
+         300 s default",
     )
     .expect("the retry after the stall succeeds");
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed >= window && elapsed < window * 2,
+        "the silent stream must end at the model's {window:?} window, not after {elapsed:?}"
+    );
     assert!(result.text.contains("Hello from mock"), "{}", result.text);
     assert_eq!(calls.load(Ordering::SeqCst), 2, "one stall, one retry");
 }
