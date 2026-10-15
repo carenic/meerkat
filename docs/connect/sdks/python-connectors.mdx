@@ -45,7 +45,7 @@ Optional parameters shown here are keyword arguments. `list_messages_page` accep
 
 The host authorizes the complete MIME bytes and all To/Cc/Bcc recipients. `send_raw` does not add headers, choose a recipient, repair threading or supply idempotency. A Message-ID is not a provider idempotency key.
 
-The separate stdlib-only `.gmail_message` module exposes `decode_message`, `validate_reply_selection`, `reply_linkage` and `compose_message`. It preserves ordered headers and part identity, distinguishes incomplete body data from a complete empty body, and does not render HTML or fetch attachments. This helper carries HomeCore private-source notices.
+The separate stdlib-only `.gmail_message` module exposes `decode_message`, `validate_reply_selection`, `reply_linkage` and `compose_message`. It preserves ordered headers and part identity, distinguishes incomplete body data from a complete empty body, and does not render HTML or fetch attachments.
 
 ## Google Calendar
 

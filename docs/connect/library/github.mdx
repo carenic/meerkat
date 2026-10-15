@@ -1,113 +1,37 @@
 ---
 title: "GitHub MCP"
-description: "Use the official server for selected repository reads with an explicit account and process owner."
+description: "Read account information, repository commits and files through the GitHub integration."
 icon: "github"
 ---
 
-**Adopted local library profile.** Toolkit reuses the official GitHub MCP server unchanged for three useful reads. Separate macOS arm64 and Linux x86_64 binaries use the same revision `85598ba6e1256f7ebf4867b95d63b833c4549264`. This profile assumes an existing selected token. First-time authentication and native agent-led installation remain [unfinished](/connect/availability).
+The GitHub integration exposes selected repository reads through a local MCP server. Use Connect to select the profile and configure access for the repositories your agent needs.
 
-## Select the component
+## Operations
 
-The macOS local consumer bundle at `dist/official-consumers-20261003` supplies the
-unchanged binary, all 78 retained notice files, a generic MCP configuration
-template and ordinary copy/restore instructions. Verify its selected checksums
-before copying. Its README and `delivery.json` identify the two official-server
-routes without increasing the 101-entry library count. The older component
-guide is retained as `github/UPSTREAM-PROFILE.md` inside that bundle.
+| Tool | Use |
+| --- | --- |
+| `get_me` | Read the authenticated account profile |
+| `list_commits` | Read a page of commits from a selected repository |
+| `get_file_contents` | Read a repository path, optionally at a specific commit |
 
-The macOS binary's SHA-256 is:
+## Account setup
 
-```text
-c5d4e70cc7fa1bfc96d810a2700d578fb99b1cab8b014c69b911bc0b3d44451c
-```
+Supply a GitHub token with access to the intended repositories through the host's credential controls. The server receives it as `GITHUB_PERSONAL_ACCESS_TOKEN`. Use a separate process for each account and retire that process when changing accounts.
 
-Keep the upstream, dependency and toolchain notices with copied binaries. The server is self-contained. The optional setup tools and verification client use Python; running the server does not. Another platform or a new build needs its own artifact verification.
+## Direct MCP configuration
 
-## Install through an existing setup agent
-
-The current [local library archives](/connect/library/local-install) offer official
-GitHub setup on macOS arm64 and Linux x86_64. Follow the selected archive's
-README to enable `official-github` with its platform-specific official bundle,
-installer and optional verifier pins. This route remains manually selected;
-the new catalog handoff index covers the adapter libraries and services.
-
-The agent reads the catalog, chooses profile `selected-reads`, selects all three
-operations below and supplies only the variable name
-`GITHUB_PERSONAL_ACCESS_TOKEN`. Metadata preparation, validation, installation
-and file checks never run GitHub or acquire a token. The installer copies the
-binary and all 78 notices, then emits the fixed GitHub.com read-only command.
-The host separately supplies credentials and controls the whole child environment.
-
-An exact install replay observes the same job. A fresh recovery process can
-check the saved original request without retrying installation or restoring
-historical success. Actual ordinary MCP trials exercise both paths and reject
-altered notices and launch configuration. The Linux setup successor separately verifies offline bootstrap, installation,
-exact replay and fresh-process recovery from its archive.
-Native attachment, account authentication and original-task continuation remain
-unfinished. Full evidence is in
-`docs/verification/20261003-official-github-setup/REVIEW.md` and
-`docs/verification/20261003-linux-github-setup/REPORT.md`.
-
-## Linux x86_64 add-on
-
-Use the separate local archive
-`dist/official-github-linux-20261003/official-github-linux-20261003.tar.gz`.
-Its SHA-256 is:
-
-```text
-8dfdcc8bc7e36926e7e75a86a9a8c374eadbbed26d9a8a1b68ef28dc301088e3
-```
-
-This Toolkit crossbuild uses the same pinned official source. It is a static
-linux/amd64 binary with CGO disabled, built with Go 1.26.1. The tested host used
-glibc 2.39; other Linux environments remain untested. No Go installation is
-needed to run it. Its README covers checksum verification, ordinary copy/restore
-and the generic MCP template. Keep all 78 notices with the binary.
-
-Two fresh Linux installations, including a restore, each completed the three
-reads below through the ordinary MCP 2.2 client against fabricated loopback
-accounts, then retired their observed processes. The add-on does not modify the
-older Linux library archive's 99 primary profiles or the overall 101-identity
-count. Playwright's Linux packages installed and listed tools, but the browser
-failed with no usable sandbox; runtime acceptance awaits a compatible host.
-
-This is a local software asset. Live account authentication, native activation,
-original-task continuation and public publication remain unfinished.
-
-## Configure a standard MCP host
-
-Launch the selected binary over stdio with:
+The selected server runs over stdio with:
 
 ```text
 stdio --read-only --gh-host https://github.com --tools get_me,list_commits,get_file_contents
 ```
 
-The account owner supplies a token with the intended repository access. The host passes it to this process as `GITHUB_PERSONAL_ACCESS_TOKEN`, outside model arguments and checked-in configuration. Use one process per selected account. Changing accounts requires retiring the previous process.
+The host selects the executable and child environment. Keep unrelated GitHub, proxy and logging settings out of that environment. Retain the bundled notices alongside the executable.
 
-Provide a controlled child environment. The server reads `GITHUB_*` settings, so unrelated toolset, feature, application, OAuth, logging or proxy variables must not leak into the child. `--read-only` matters because its upstream default is false. Confirm the three observed tools after connecting. A tool list selects operations; GitHub token permissions determine which repositories they can read.
+After connection, inspect the tool list and apply the intended agent grants. For reproducible file reads, use a commit SHA. For commit lists, provide positive integer `page` and `perPage` values and consume returned pages explicitly.
 
-| Tool | Use |
-| --- | --- |
-| `get_me` | Observe the authenticated account profile. |
-| `list_commits` | Read one requested repository page with valid positive integer `page` and `perPage` values. |
-| `get_file_contents` | Read a selected repository path, preferably at a known commit SHA. |
+## Process and output handling
 
-## Retain process ownership
+Set a caller deadline and retain process ownership through cleanup. Apply the host's network and output controls to repository content and provider errors. File reads may involve additional tree or reference requests; resource links are resolved by the consuming host.
 
-Apply a finite caller deadline. MCP cancellation stopped the held fixture request and the same session recovered, but signal handling does not guarantee that every server handler joins internally. Keep ownership until actual process exit and cleanup. The accepted tests observed provider connection EOF and OS reaping; cancelling an awaiter alone is insufficient.
-
-## Understand the supported limits
-
-The unchanged server has a known pagination schema/runtime mismatch: it advertises page ranges without enforcing all of them. It can pass through more rows than requested and has no general response-byte cap. A large-file resource link is presentation behavior, not a memory bound.
-
-Provider errors can reflect credentials. Redirects can access other destinations; host/port credential scoping does not guarantee TLS on every hop. File-reference resolution and tree fallbacks can make additional requests. The host must assess these properties before activating the profile for its workload. They are documented limits, not hidden guarantees supplied by Toolkit.
-
-The original macOS acceptance uses 14 tests through a fresh official MCP client, fabricated accounts and loopback provider responses. It verifies the exact source/build evidence, useful reads, failures, account isolation, recovery and process retirement. It does not establish live account access, OAuth, hosted transport or native Meerkat/MobKit attachment. The full evidence and support disposition are in `docs/verification/20261003-github-mcp/` and `docs/adoption/GITHUB-SUPPORT.md`.
-
-The macOS consumer delivery separately copies and verifies two fresh
-installations, including a restore. Both actual configuration templates launch
-through an ordinary MCP client with explicit fixture substitutions. Each lists
-exactly three tools and performs the three reads against fabricated loopback
-responses; each child process is observed retired. This is distribution and
-local-fixture evidence, not a production account check. Its receipts are in
-`docs/verification/20261003-official-consumers/`.
+See [native MCP integration](/connect/guides/native-mcp) for attachment and [access control](/connect/reference/access-control) for operation and resource permissions.

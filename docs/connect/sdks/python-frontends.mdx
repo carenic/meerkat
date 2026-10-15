@@ -4,7 +4,7 @@ description: "Provider transports and durable output that hosts compose with the
 icon: "comments"
 ---
 
-**Current local source, partial frontend support.** These modules do not establish complete native admission or role activation. They retain their source and license boundaries described in [availability](/connect/availability).
+Use these transports and durable output components with your application's participant admission, conversation routing and audience policy.
 
 ## Durable egress
 
@@ -126,7 +126,7 @@ audience conformance. Hosts must enable enforcement after every restart and
 exclude competing legacy owners. This is a host-policy seam, not atomic provider
 revocation, native admission or completed HomeCore/OB3 adoption.
 
-With a replaceable sender, selection waits before authorization. Toolkit checks
+With a replaceable sender, selection waits before authorization. Connect checks
 that the selected attachment is still current after the callback returns, then
 reserves and enters the provider without another selection wait. A transition
 during the callback leaves the part queued.

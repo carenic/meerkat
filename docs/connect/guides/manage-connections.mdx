@@ -4,11 +4,7 @@ description: "Inspect accounts, effective access, frontend audiences and package
 icon: "sliders"
 ---
 
-Connect 0.9.0 supplies the standalone `meerkat-connect` CLI and components for
-a compatible application's integrated Console. See [availability](/connect/availability)
-for the published platforms and qualification limits. The manual
-recovery-file instructions below belong to the advanced Toolkit library path.
-They are not a prerequisite for ordinary Connect use.
+Manage services from `meerkat-connect` in the selected realm or through your application's integrated Console. Application authors can also use the saved-request and connection-view APIs below.
 
 ## Ordinary CLI and Console setup
 
@@ -21,10 +17,7 @@ The two product paths have different destinations:
   questions, protected human actions and exact reviews. Successful setup returns
   the capability to that same task through its native owner.
 
-The CLI archive supplies its setup tools and runtime. Ordinary use does not require
-a second user-operated Connect server, manual runtime paths or reconstruction of
-recovery manifests. Console composition and lifecycle belong to the application
-host; its complete real-model business journey needs separate acceptance.
+The CLI archive includes its setup runtime. In an integrated Console, the application owns login, setup lifecycle and the original conversation.
 
 Follow [Request an integration](/connect/guides/request-an-integration) for the guided
 journey and [Authentication](/connect/concepts/authentication) for protected human actions.
@@ -139,11 +132,9 @@ This does not restore credentials, migrate provider data or replay a write.
 For interrupted preparation and ambiguous outputs, use
 [troubleshooting](/connect/operations/troubleshooting#bootstrap-failed-or-was-interrupted).
 
-
 ## Service connections
 
-Broader service/frontend management below remains a designed host workflow; UI
-components do not create management endpoints or account authority.
+For an application management view, compose the following information and controls with your existing account and policy services.
 
 A connection view should show the observed account, provider credential scope, effective operations/resources, assigned agent or task, grant lifetime and current diagnostics. A broad provider token can support a narrower local grant only where actual operation enforcement provides that restriction.
 

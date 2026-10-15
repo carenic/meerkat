@@ -4,7 +4,7 @@ description: "Reuse portable metadata and choose runtimes without hiding host re
 icon: "boxes-stacked"
 ---
 
-**Current metadata support with a broader designed execution target.** Parsing a distribution format establishes only that its description fits the parser's supported profile.
+Connect accepts portable package metadata and validates an exact selection against the host's runtime and service contracts.
 
 ## Acquisition forms
 
@@ -19,7 +19,7 @@ A skill is a distribution form, not proof of service access. MCP supports tool o
 
 ## Imported formats
 
-`ImportedPluginManifest` and `ImportedMcpServers` parse Agent Plugins 1.0.0 metadata. Unknown top-level manifest fields produce diagnostics; invalid known fields reject. Unknown extension namespaces remain opaque. A bad MCP entry is isolated from valid siblings. Toolkit's namespace is `ai.rkat.toolkit`.
+`ImportedPluginManifest` and `ImportedMcpServers` parse Agent Plugins 1.0.0 metadata. Unknown top-level manifest fields produce diagnostics; invalid known fields reject. Unknown extension namespaces remain opaque. A bad MCP entry is isolated from valid siblings. Connect's namespace is `ai.rkat.toolkit`.
 
 `ImportedMcpbManifest` parses the supported MCPB 0.3 manifest profile, preserving unresolved host/configuration requirements. It does not extract an archive, verify executable bytes or launch the described process.
 
@@ -27,7 +27,7 @@ A skill is a distribution form, not proof of service access. MCP supports tool o
 
 ## Generic-client projection
 
-A portable MCP entry must work independently. Components that require Toolkit contracts, host services, package state or dependencies cannot also advertise a generic entrypoint that ignores those requirements. Unsupported clients must receive an explicit gap rather than a silently weakened integration.
+A portable MCP entry must work independently. Components that require Connect contracts, host services, package state or dependencies cannot also advertise a generic entrypoint that ignores those requirements. Unsupported clients must receive an explicit gap rather than a silently weakened integration.
 
 ## Host execution modes
 

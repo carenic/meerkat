@@ -1,312 +1,47 @@
 ---
-title: "Install the local library"
-description: "Prepare a supported Mac or Linux host, install a selected integration and return its tools to the original task."
-icon: "box-open"
+title: "Install the integration library"
+description: "Use the bundled library through Connect or integrate its components into your host."
+icon: "download"
 ---
 
-<Note>
-This page retains advanced manual setup instructions from historical library
-editions. The old private prerelease assets and verification records are not
-republished by the public source export. For Connect 0.9.0, start with the
-[quickstart](/connect/quickstart) and the
-[public release list](https://github.com/lukacf/meerkat-connect/releases). Use only
-the asset and manifest selected by those release notes; do not mix the historical
-pins below into a new Connect distribution.
-</Note>
-
-Use the private `20261008-canonical-mcpb` prerelease (historical private asset; not included in this export)
-with an existing MCP-capable host.
-The archive supplies offline packages, setup tools, guides and notices; you
-supply compatible runtimes and the selected accounts. No Toolkit checkout or
-Rust build is required. Sign in with repository access to download the exact
-assets and checksums. Public downloads remain pending.
-
-Both editions include Services **0.1.21**, Agno **0.1.2** and Activepieces
-**0.1.0**. macOS supplies 101 integration identities; Linux supplies 100,
-excluding Playwright. Alternative Slack, Gmail, Calendar and Drive service
-profiles do not increase those counts. The catalog can show a route that this
-host has not enabled.
-
-## Ordinary setup
-
-The self-contained starter is one of six assets on the private prerelease. Download
-`toolkit-setup-20261008-canonical-mcpb.tar.gz` alongside your platform's library,
-then follow the [quickstart verification and extraction](/connect/quickstart) or the
-published download guide (historical private asset; not included in this export).
-The starter needs no Toolkit checkout. Once verified and extracted, use a trusted
-compatible native Python 3.11 outside a virtual environment:
-
-```sh
-python3.11 -I -B /absolute/toolkit-setup/start.py \
-  --archive-dir /absolute/downloads \
-  --destination /absolute/new-toolkit
-```
-
-Keep the archive's supplied filename. The starter uses its own pinned
-distribution selection, detects macOS arm64 or Linux x86_64, verifies the archive,
-extracts it into the new destination and calls the existing offline bootstrap.
-It returns `config/mcp.json` for registration in your existing host. The parent
-of the destination must already exist. Existing destinations are never merged,
-repaired or deleted; after an error, retain any partial output and use a fresh path.
-
-The default enables `agno` and `services`, which need no Node runtime. To also
-enable Activepieces, add your trusted compatible runtime paths to the same command:
-
-```sh
-  --node /absolute/path/to/node --npm-cli /absolute/path/to/npm-cli.js
-```
-
-For agent-led Python package discovery outside the catalog, explicitly add both:
-
-```sh
-  --allow-public-pypi --pip-zipapp /absolute/path/to/trusted-pip.pyz
-```
-
-The pip zipapp is a separately selected host tool. The starter hashes these
-selected runtimes for you; hashes bind your choices and do not establish trust
-or compatibility. Preparation remains offline. The PyPI option authorizes later
-agent-selected acquisition; it does not enable npm, containers, MCPB or hosted recipes.
-Use the [advanced outside-catalog guide](/connect/acquisition/local-install) for those routes.
-
-Continue at [agent selection and installation](#let-the-agent-choose-and-install).
-The starter prepares a setup connection. Signing in, approving the installed
-launch and attaching its tools remain with the existing host. It does not claim
-that the original task has finished.
-
-The following sections retain exact compatibility, archive verification and
-manual bootstrap controls for host integrators. A saved starter keeps its exact
-distribution selection. To adopt an update, obtain the accepted successor starter
-and archive, prepare beside the existing environment, then let the host switch
-its binding after review.
+The [Connect CLI archive](/connect/quickstart) includes the integration library, setup tools and required runtimes. Use that archive for terminal setup.
 
 ## Choose a supported host
 
-| Requirement | macOS arm64 | Linux x86_64 |
-| --- | --- | --- |
-| Library and setup Python | Native CPython 3.11; verified with 3.11.15 | Exact CPython 3.11.16, 64-bit pointers, glibc 2.39 |
-| Python environment support | Working `venv` and `ensurepip` | Working `venv` and `ensurepip` |
-| Activepieces runtime | Node 24.19.0 with host-selected npm CLI; Node 22.19.0 has narrower prior compatibility evidence | Node 22.23.2, npm 10.9.8 |
-| Official Playwright | Node 24.19.0, npm 11.12.1, existing host-pinned Chrome | Unavailable |
-| Native Meerkat host used for acceptance | Released RPC and Python SDK 0.8.50 | Released RPC and Python SDK 0.8.50 |
-
-Python also runs the installer for Node integrations. The Mac installer admits
-CPython 3.11 patch versions, but the recorded consumer used 3.11.15. No minimum
-macOS version or exact Chrome version is qualified by this delivery. Intel Mac,
-Linux arm64, Windows and other Linux libc/runtime combinations need separate
-support evidence. The metadata inspector's glibc 2.34 floor does not widen the
-library installer's glibc 2.39 profile.
-
-The earlier Linux native acceptance used Meerkat directly; it did not exercise
-a complete MobKit-hosted setup workflow. Native dependency selection remains
-separate from this library release. A general MCP host can use the generated
-stdio launch; its lifecycle and configuration mapping remain with that host.
-
-Both current platform archives also carry the canonical Compose planner and
-matched setup/runtime owners. The archived `selected/contracts/COMPOSE.md` and
-`selected/contracts/HOST-PREPARATION.md` describe separate explicit execution
-and successor profiles. A successor may remove a stateful component while
-retaining its original state volume without mounting it. Default removal keeps
-that state; a fresh host may delete only explicitly granted namespaces under
-its exact selected plan and observation. A separately declared same-owner format
-migration uses the owner's pinned migrator and stored receipt through the existing
-successor flow. That bounded path has synthetic SQLite owner evidence on Mac and
-Linux; arbitrary migration, ownership transfer and rollback remain unqualified.
-The browser observes this workflow; successor actions use the existing MCP/host
-controls. The current library refresh preserves these runtime bytes and evidence
-without a new engine run. It adds Linux MCPB installation and updates both
-platforms' canonical metadata inspector. It does not refresh the library resources
-compiled into native `meerkat-connect` distributions.
-
-## Select and verify the archive
-
-The current library-only successor is `20261009-library-support-selection`.
-It corrects catalog support references and route identities while preserving
-the accepted provider packages, dependencies, setup runtime and native
-executables. It adds no live-account or native-journey qualification.
-
-These archives use the manual bootstrap below. The ordinary starter above
-continues to select its exact `20261008-canonical-mcpb` archive pair and
-will not accept these successor filenames. The new private library release
-is library-20261009-library-support-selection (historical private asset; not included in this export).
-
-The current manual-bootstrap repository artifacts are:
-
-- macOS: `dist/toolkit-library-20261009-library-support-selection-macos-arm64/toolkit-library-20261009-library-support-selection-macos-arm64.tar.gz`
-- Linux: `dist/toolkit-library-20261009-library-support-selection-linux-x86_64/toolkit-library-20261009-library-support-selection-linux-x86_64.tar.gz`
-
-Select your platform below. Run each subsequent command only after the previous
-one succeeds. Replace absolute paths with your host's chosen locations.
-
-<Tabs>
-  <Tab title="macOS arm64">
-    ```sh
-    toolkit_edition=toolkit-library-20261009-library-support-selection-macos-arm64
-    toolkit_target=macos-arm64
-    toolkit_archive=/absolute/downloads/$toolkit_edition.tar.gz
-    toolkit_archive_sha256=0b4c6e555c753b5e810b5ad43e87ae7c1ca8d2434cdb5409570fda16624f026c
-    printf '%s  %s\n' "$toolkit_archive_sha256" "$toolkit_archive" | shasum -a 256 -c -
-    ```
-  </Tab>
-  <Tab title="Linux x86_64">
-    ```sh
-    toolkit_edition=toolkit-library-20261009-library-support-selection-linux-x86_64
-    toolkit_target=linux-x86_64
-    toolkit_archive=/absolute/downloads/$toolkit_edition.tar.gz
-    toolkit_archive_sha256=9bdc939d39d8a79e6f6c97a7e7a21e755cc8850f04901125507515b5cb816368
-    printf '%s  %s\n' "$toolkit_archive_sha256" "$toolkit_archive" | sha256sum -c -
-    ```
-  </Tab>
-</Tabs>
-
-Choose two new directories whose parents already exist, then extract:
-
-```sh
-toolkit_extract=/absolute/new/toolkit-files
-toolkit_work=/absolute/new/toolkit-work
-mkdir -m 700 "$toolkit_extract" "$toolkit_work"
-tar -xzf "$toolkit_archive" -C "$toolkit_extract"
-toolkit_release="$toolkit_extract/$toolkit_edition"
-mkdir -m 700 "$toolkit_work/staging"
-```
-
-Keep the archive and extracted tree unchanged and at their selected paths.
-The root `README.md` and `selected/contracts/HOST-PREPARATION.md` are the
-contracts for these exact bytes. Later source changes do not alter a frozen
-archive. Redistribution also needs its source/notices companion; see
-[distribution and support](/connect/availability#distribution).
+Use Apple Silicon macOS 13.5 or later, or Linux x86_64 with glibc 2.39. Keep the complete extracted archive together. See [platforms and installation options](/connect/availability).
 
 ## Prepare the setup host with one command
 
-Select a trusted compatible native Python and calculate its executable hash.
-The checksum binds that selected interpreter; it does not install or approve it.
+Start the installed CLI and select your realm:
 
 ```sh
-toolkit_python=/absolute/path/python3.11
-toolkit_python_sha256="$("$toolkit_python" -I -B -c 'import hashlib,sys; print(hashlib.file_digest(open(sys.argv[1], "rb"), "sha256").hexdigest())' "$toolkit_python")"
-
-"$toolkit_python" -I -B "$toolkit_release/setup/bootstrap_host.py" \
-  --release-archive "$toolkit_archive" --release-sha256 "$toolkit_archive_sha256" \
-  --release-dir "$toolkit_release" --target "$toolkit_target" \
-  --python "$toolkit_python" --python-sha256 "$toolkit_python_sha256" \
-  --client-directory "$toolkit_work/client" \
-  --output "$toolkit_work/config" --workspace "$toolkit_work/session" \
-  --staging-root "$toolkit_work/staging" \
-  --families agno,services --enable-package-inspection
+meerkat-connect --realm work
 ```
 
-This explicit family selection needs no Node runtime. The default also includes
-Activepieces and therefore needs its Node/npm inputs. Bootstrap installs the
-offline MCP client, verifies it and writes `config/mcp.json` plus host receipts.
-It does not start setup, acquire a package, sign in or attach tools.
+Describe the service and task. Connect reads the catalog, selects a profile and prepares the configuration. Review the software and access, then complete any protected credential prompts.
 
-Client, configuration and future workspace paths must be new and disjoint.
-Their parents and staging directory must already exist. Avoid paths that differ
-only in case or Unicode spelling. The future workspace remains absent until
-the generated setup connection starts. See [partial preparation recovery](/connect/operations/troubleshooting#bootstrap-failed-or-was-interrupted)
-before reusing anything after an error.
+After setup finishes, exit Connect and start an ordinary agent in the same realm:
 
-If you already have a verified MCP client, use the same command with
-`setup/prepare_host.py`, omit `--client-directory`, and add the client's absolute
-`--mcp-python` and `--mcp-python-sha256`. That preparer writes host configuration
-without installing a client. Keep the selected native `--python` separate from
-the client's virtual-environment interpreter.
+```sh
+rkat --realm work run --wait-for-mcp --mcp-auth stored "Use the connected service to complete my task."
+```
 
-## Let the agent choose and install
-
-Register `config/mcp.json` through your host's existing MCP interface. Its setup
-command owns one fresh workspace and one process. **Keep that process alive**
-while the original task selects and installs integrations. Restarting the exact
-command against its existing workspace is refused; use the
-[saved-setup recovery path](/connect/guides/manage-connections#read-saved-work-after-process-loss)
-after process loss.
-
-1. The agent reads `setup_catalog`, chooses an exact strategy with
-   `setup_catalog_route`, and prepares the indicated family when needed.
-2. It reads `setup_help` and, where needed, `setup_guide`, selects operations
-   and supplies nonsecret settings. Credential fields contain environment
-   variable names, not tokens or passwords.
-3. `setup_check` validates the selection. `setup_install` performs the selected
-   installation; the agent polls its exact job until settled.
-4. `setup_reconcile` checks retained files and the emitted launch against that
-   request. A matched observation is separate from the historical job outcome.
-5. The host authorizes the process, selected account and operations, supplies
-   credentials, and loads the installation's `ready/mcp.json`.
-6. The original agent discovers the attached tools, performs the requested
-   operation and reports the task result or remaining obstacle.
-
-For Meerkat, use the existing [native MCP handoff](/connect/guides/native-mcp). A host can
-add the approved launch to the same live session with `client.mcp_add` and then
-continue `session.turn`. A staged reply alone is not readiness. Check the
-actual catalog and operation. `persisted=False` provides no restart promise.
-Meerkat's server configuration also needs the documented mapping from the
-emitted JSON wrapper; do not drop fields to make it fit.
-
-The ordinary same-session path has actual Mac and Linux native evidence,
-including synthetic Slack-to-email. It does not establish real account sign-in
-or recipient delivery. Governed setup-agent dispatch, protected authentication
-and durable original-task continuation remain unfinished; see [availability](/connect/availability).
+Use the same working directory and any explicit root settings. See [request an integration](/connect/guides/request-an-integration) for model and realm selection.
 
 ## Select an account through the host
 
-Read the profile's prerequisites before requesting credentials. A field named
-`token_env` may refer to an access token, API key or application password; its
-help defines the meaning. Configuration checks do not verify account access.
+For a directly embedded profile, read its `config-help` output before supplying credentials. It identifies configuration fields, operations and prerequisites. Store secret values with the host's credential owner and supply named references in configuration.
 
-Use a separate configured installation/client for each account. The existing
-host owns secret storage, account verification, refresh and permitted use.
-Do not change the account behind a running service profile. The host-client
-embedding API can borrow an already authenticated client; it does not introduce
-a credential owner or refresh scheduler. See [authentication](/connect/concepts/authentication#local-profile-prerequisites)
-and the [Slack/Gmail guide](/connect/library/slack-gmail).
-
-Native downstream Slack/Google first-account discovery and persistence remain
-unreleased. The known-account OAuth protocol helpers do not provide that flow,
-and authenticating to an MCP server does not authenticate its downstream SaaS
-account. The optional Google verifier dependencies are outside the base library.
+The [Slack and Gmail guide](/connect/library/slack-gmail) includes a complete configuration example and the commands to validate and launch it.
 
 ## Enable additional routes deliberately
 
-| Capability | Host selection |
-| --- | --- |
-| Activepieces | Add `activepieces` to `--families`, plus `--node`, `--node-sha256`, `--npm-cli`, `--npm-cli-sha256` for that platform's library runtime |
-| Official GitHub | Add `official-github`; follow its [fixed read profile](/connect/library/github) |
-| Official Playwright | macOS only: add its family and host profile as described in [Playwright](/connect/library/playwright) |
-| Selected Python/Node packages | Use the archived selected-package contract; Node requires its separate selected-runtime quartet |
-| Public PyPI or npm acquisition | Each needs its own explicit opt-in and pinned acquisition tool; preparation itself remains offline |
-| Public npm search | `--enable-node-search` with selected Node 24.15 or later within major 24 and the complete npm 12.2.0 archive; search does not enable acquisition |
-| Compose | Mac/Linux, with separate explicit archived acquisition and execution profiles; acquisition permission does not authorize execution |
-| MCPB | Mac/Linux: explicit host preparation with `--allow-mcpb --enable-mcpb-inspection` and the selected Node runtime; the starter does not expose these options |
-| Local/hosted recipe retention | Both platforms include the recipe executable; select its database, realm, owner and scope, plus `--allow-remote-recipes` for hosted recipes |
+Application authors can use [native host composition](/connect/guides/host-composition), [Python service operations](/connect/sdks/python) or [TypeScript service operations](/connect/sdks/typescript). For a selected package outside the library, see [package preparation](/connect/acquisition/local-install).
 
-Outside-catalog npm tools use their own Node/npm inputs. Do not replace Linux
-Activepieces' Node 22/npm 10 with that Node 24/npm 12 pair. Read the archived
-contract for the exact selected flags and dependencies.
+The source distribution also includes `sdk/consumer-setup` for custom setup hosts. Its `bootstrap_host.py` prepares an offline client and host configuration; `prepare_host.py` uses an existing client. Follow that component's `HOST-PREPARATION.md` with your selected resource bundle and explicit runtime paths.
 
-Linux lacks the hosted-MCP connection checker. Its recipe store and exporter
-do not establish endpoint connectivity. Shared source files and catalog entries
-do not enable absent executables.
-Linux browser UX is unverified; the accepted Linux setup path uses MCP/CLI.
-The optional local form is a same-machine, single-operator surface, not a remote
-multi-user service. Before the first MCP launch, add `--browser-port 0` to the
-emitted `mcp_adapter.py` command in your host's MCP configuration. That same
-process starts the browser companion and writes its private launcher path to
-stderr. Open `<workspace>/start.html` locally and keep the file private. Closing
-the tab leaves host work running; reopening the launcher returns to the same
-live session. An already running stdio-only process cannot enable the companion
-in place. After process shutdown, use the [explicit recovery flow](/connect/guides/manage-connections#read-saved-work-after-process-loss)
-instead of restarting against the existing workspace.
+## Save and reuse setup
 
-## Save, recover and update
+The CLI saves service configuration and access in the selected realm. Return to the same realm to [manage credentials and agent access](/connect/guides/manage-connections).
 
-Use **Save recovery file** or `setup_recovery_manifest` before closing setup.
-The [connection-management guide](/connect/guides/manage-connections) explains the two
-separate next steps: read an exact old request, or reuse its settings in a new
-setup. A saved file does not include installed software, credentials or a running
-agent. Keep retained workspaces, installed environments and absolute launch
-paths intact.
-
-Install an accepted update beside the existing environment. Review current
-operations and configuration, then let the host switch its binding. Software
-restoration does not restore account grants, undo provider writes or authorize
-replay. For failure codes, partial output and a useful support report, see
-[troubleshooting](/connect/operations/troubleshooting).
+Custom setup hosts can retain exact request references and local recipes. Preserve their selected artifacts and original workspace for [saved-work readback](/connect/guides/manage-connections#read-saved-work-after-process-loss).

@@ -6,9 +6,7 @@ icon: "arrows-left-right"
 
 A **service connector** exposes operations or service events. An **agent frontend** admits external interaction and delivers an allowed response. These are export roles, so a package can contain either or both.
 
-Both the standalone Connect CLI and integrated Console are intended to set up
-both roles. A frontend also needs a compatible persistent application host;
-installing its package into a realm does not create that host.
+A frontend uses a persistent application host for participant identity, conversation routing and delivery. The service connector uses the selected account and operation permissions.
 
 <Tabs>
   <Tab title="Service connector">
@@ -43,8 +41,6 @@ A valid provider signature establishes transport origin. It does not establish t
 Inbound routing, semantic delegation and outbound delivery are distinct jobs. A host may support a fixed agent, an authorized selection or a routing agent. Connect exposes only that host's supported choices. HomeCore routes admitted senders to their own agents and has no destination-agent selector. Semantic specialist selection stays with the agent; exact lookup follows the chosen binding.
 
 ## Independent lifecycles
-
-**Designed contract.** Complete role lifecycle composition remains pending.
 
 Pausing a frontend blocks new admission according to its policy. Removing it does not delete the agent, erase memory or revoke unrelated service connections. Disconnecting shared credentials may degrade both roles and should report that dependency.
 

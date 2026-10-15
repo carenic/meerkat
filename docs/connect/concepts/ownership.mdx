@@ -4,19 +4,19 @@ description: "Keep execution, composition, integration data and application poli
 icon: "diagram-project"
 ---
 
-Toolkit is reusable because it composes existing owners. Each fact has one authority; other components carry references or projections of that fact.
+Connect is reusable because it composes existing owners. Each fact has one authority; other components carry references or projections of that fact.
 
-Meta has no Toolkit dependency, including an optional dependency. Toolkit owns
+Meta has no Connect dependency, including an optional dependency. Connect owns
 the adapters that consume generic native and Meta interfaces. The application
 explicitly opts into those adapters and supplies its existing policy and
-lifecycle owners. Toolkit-specific integration behavior belongs in Toolkit,
+lifecycle owners. Connect-specific integration behavior belongs in Connect,
 while those upstream interfaces remain usable independently.
 
-| Owner | Responsibility | Toolkit's relationship |
+| Owner | Responsibility | Connect's relationship |
 | --- | --- | --- |
 | Meerkat | Agents, sessions, native execution, mob lifecycle and runtime tool surfaces | Use accepted native operations and receipts |
-| MobKit | Application startup, routing, delivery and host composition around Meerkat | Offer optional integration capabilities to selected agents |
-| Toolkit | Packages, recipes, adapters, integration setup records and reusable UI | Describe and validate selections; compose effects through their owners |
+| Meta | Application startup, routing, delivery and host composition around Meerkat | Offer optional integration capabilities to selected agents |
+| Connect | Packages, recipes, adapters, integration setup records and reusable UI | Describe and validate selections; compose effects through their owners |
 | Host application | People, policy, approval, connection selection, domain behavior and deployment decisions | Inject explicit services and enforce actual authority |
 | Credential owner | Tokens, secret handles, refresh, revoke and credential audience | Borrow a selected transport or an opaque handle |
 | Provider or device | External account state and realized effects | Return bounded observations; reconcile uncertain effects |
@@ -43,6 +43,6 @@ Code checks exact identities, manifests, compatibility, policy, account observat
 
 ## Application reuse
 
-HomeCore retains household policy, recipients and domain behavior. Reachy retains physical-safety policy and device semantics. Organizational hosts retain tenant, administrator and audience policy. These hosts can share Toolkit packages and adapters without sharing their private agent runtimes or assuming identical deployment privileges.
+HomeCore retains household policy, recipients and domain behavior. Reachy retains physical-safety policy and device semantics. Organizational hosts retain tenant, administrator and audience policy. These hosts can share Connect packages and adapters without sharing their private agent runtimes or assuming identical deployment privileges.
 
 See [architecture](/connect/reference/architecture) for the crate boundaries and [host composition](/connect/guides/host-composition) for practical integration steps.

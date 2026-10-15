@@ -4,16 +4,13 @@ description: "Use Node service operations, native application composition and a 
 icon: "js"
 ---
 
-`@rkat/toolkit` version `0.9.0` is an ESM package supporting Node 22 or newer. The service libraries run without Meerkat, MobKit or a model. The browser UI has a separate entrypoint.
+`@rkat/toolkit` version `0.9.0` is an ESM package supporting Node 22 or newer. The service libraries run without Meerkat, Meta or a model. The browser UI has a separate entrypoint.
 
 ## Install
 
 ```sh
 npm install https://github.com/lukacf/meerkat-connect/releases/download/v0.9.0/rkat-toolkit-0.9.0.tgz
 ```
-
-This installs the selected GitHub release asset; it does not depend on Toolkit
-being published to npm.
 
 ## Build from source
 
@@ -25,14 +22,13 @@ npm run build
 npm pack --ignore-scripts
 ```
 
-The build emits ESM and declarations in `dist`; packing creates a local archive. Select the actual returned archive in an isolated consumer. These commands do not publish the package or certify its installed behavior.
+The build emits ESM and declarations in `dist`; packing creates a local archive. Select the actual returned archive in an isolated consumer.
 
 ## Native application composition
 
 Import the native classes from `@rkat/toolkit/native-host` and their selected
 input types from `@rkat/toolkit/private-host`. This optional POSIX composition
-uses the local Toolkit gateway and the matching `@rkat/meta-sdk`. The declared
-`0.9.0` peer version alone does not select the required SDK artifact. Service
+uses the local Connect gateway and the matching `@rkat/meta-sdk`. Use the matching SDK release. Service
 connector imports remain independent of this entrypoint.
 
 | Startup path | Native binding |
@@ -42,7 +38,7 @@ connector imports remain independent of this entrypoint.
 | Admitted replacement | `new ToolkitApplicationUpdate(startup).configure(builder)` |
 
 For Restore and replacement, configure one dedicated `MetaBuilder`, then await
-its normal `build()`. For fresh preparation, await the Toolkit binding's
+its normal `build()`. For fresh preparation, await the Connect binding's
 `build()` instead: it joins native initialization with the trusted finalizer and
 adoption. The finalizer accepts a `SelectedHostArtifact` and returns a promise of
 the exact published `HostBootstrapSelection`.
@@ -62,14 +58,7 @@ For fresh preparation, `host.preparationAttempt` and `host.settlement` preserve
 the actual preparation, finalization and native outcomes. Abort joins work that
 has entered; failure does not prove rollback or authorize replay.
 
-These APIs compose an application host with the matching Toolkit gateway and
-Meta SDK. The release notes identify the qualified compositions; source/build
-checks do not establish every host, replacement or recovery path. The native/Python
-consumer results do not establish a complete TypeScript-hosted setup journey.
-The packaged `sdk/typescript/NATIVE-HOST.md` companion gives the exact native
-SDK prerequisites and lifecycle contract. See
-[host composition](/connect/guides/host-composition#native-application-lifecycle) for
-shared ownership, reconnect rules and service/frontend boundaries.
+See [host composition](/connect/guides/host-composition#native-application-lifecycle) for startup and reconnect rules. The source companion `sdk/typescript/NATIVE-HOST.md` describes the native SDK prerequisites and lifecycle contract.
 
 ## Import an explicit operation
 

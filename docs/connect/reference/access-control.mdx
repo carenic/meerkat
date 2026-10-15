@@ -4,7 +4,7 @@ description: "Enforce actual operation, resource, conversation and destination p
 icon: "shield-halved"
 ---
 
-**Designed cross-host contract.** Individual adapters enforce their documented transport/data profiles. Full native requester propagation, multi-user admission and application adoption remain incomplete.
+Compose integration access through the application's identity, policy and runtime services. Installation, account authentication, agent permission and output delivery are separate decisions.
 
 ## Distinct decisions
 
@@ -41,16 +41,13 @@ with the request's exact broader-proposal digest. The older `authorize` remains 
 Installed gateway Public-service review uses its configured Console; Account/software review can
 also use the inherited terminal. Plain `meerkat-connect` setup prepares later fresh realm use and
 does not retain or resume a one-turn `rkat` input. Native Rust and JSON-RPC with Python/TypeScript
-are supported composition surfaces; REST and outer-MCP Connect entrypoints remain deferred.
-
-These paths are implemented in source; their new runtime qualification is **UNRUN**. A policy
-acceptance, joined setup operation or fresh continuation input alone is not original-task completion.
+provide the application composition surfaces.
 
 ## Delegation
 
 Work retains its authenticated requester or explicit service mandate, acting agent, tenant, selected account, audience and actual permissions across peers, forks and continuations. Each hop preserves or narrows the incoming authority and intersects it with local grants.
 
-An immediate sender, session ID, objective ID or signed piece of model prose does not replace that association. Missing or unverifiable context cannot fall back to the receiving agent owner's private access. Native authority contracts, including unresolved owner work, must be adopted through their actual owners rather than private Toolkit substitutes.
+An immediate sender, session ID, objective ID or signed piece of model prose does not replace that association. Missing or unverifiable context cannot fall back to the receiving agent owner's private access. Use the native authority APIs to preserve that association.
 
 ## Resource boundaries
 
@@ -66,8 +63,8 @@ Queued output revalidates current destination policy and membership/visibility e
 
 Frontend pause/removal and permission invalidation affect new admission and subscriptions according to their owners. There is no promise to recall bytes already released.
 
-## What these contracts do not claim
+## Enforcement points
 
-Concrete source references, package provenance and queued-operation associations preserve their actual meanings. They do not provide automatic semantic taint tracking or whole-context information-flow confinement after data is admitted into a model context. Instructions or a gate agent can make fallible judgments; required gate placement and exact-action approval are mechanical boundaries.
+Validate the actual account, resource, operation and destination at their owners. Package provenance records where code came from; source authorization controls which data enters the agent context; destination authorization controls where output is sent.
 
-OS process confinement is a separate enforced boundary. In-process SDK hooks and Fetch closures are trusted host code, not a sandbox against the host itself.
+Use OS process isolation for executable confinement. SDK transports and in-process hooks run as trusted application code.

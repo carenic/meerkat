@@ -1,77 +1,18 @@
 ---
-title: "Playwright MCP"
-description: "Reuse the official browser server with explicit process, output and browser state."
+title: "Browser automation"
+description: "Navigate pages, inspect their structure and interact with forms through MCP."
 icon: "globe"
 ---
 
-**Adopted local library profile.** Toolkit can reuse Microsoft's unchanged Playwright MCP server. A real local-browser fixture verified navigation, form filling, clicking, snapshots, separate browser contexts and reopening with fresh storage. Authenticated websites, human login handoff and native Meerkat/MobKit attachment remain unverified.
+The browser profile gives agents browser operations through Playwright MCP on macOS. The host supplies Chrome, selects its executable and controls the server's working and output directories.
 
-## Install through an existing setup agent
+## Select the profile
 
-The macOS `dist/toolkit-library-20261003-official-playwright-setup` archive exposes
-this profile through the [setup tools](/connect/library/local-install). Follow its
-extracted README to select the official bundle, installer and verifier, enable
-`official-playwright`, and supply Node 24.19.0/npm 11.12.1. The host pins a JSON
-profile containing an existing Chrome executable and its SHA-256, plus an
-existing short process parent. The agent does not choose those filesystem paths.
-
-The agent browses the catalog, prepares metadata, selects `isolated-chrome`, all
-five coverage operations and empty values, then validates and installs. The
-fixed launch is headless and isolated, with 5000 ms action and 10000 ms navigation
-timeouts. The five operations describe tested coverage; all endpoint tools are
-exposed. They are not a permission filter.
-
-Setup uses the original three archives and project lock, with offline npm,
-scripts and browser downloads disabled. It creates separate workspace, output,
-home, temporary and socket directories under a unique child of the process
-parent. Metadata and file checks run no Node, npm, Playwright or Chrome.
-Installation runs Node/npm but does not start the browser server or Chrome.
-
-The returned MCP configuration contains no login state. The host controls the
-whole serving environment, permissions, snapshot-file access and process
-lifetime. Its environment must exclude unrelated Node preload, Playwright
-configuration, secret-file and proxy settings; adding the emitted `env` fields
-does not clear inherited values. Join server/browser processes before cleanup.
-
-Saved-request recovery checks the original package inputs and launch, including
-the host-profile hash. It does not inspect mutable serving contents, restore a
-removed process directory, attest the complete Chrome application bundle or
-establish current browser readiness. Exact replay returns the existing job.
-The accepted trial covers offline installation, deliberate notice/launch
-tampering, separate-process recovery and restore. It was source-author operated,
-with independent review; it is not a fresh-agent reasoning test. The initial
-preflight failure under Chrome execution denial is retained and corrected.
-The final help-only successor accurately marks both official profiles' operation
-lists as fixed. Its separate MCP check verifies that flag, subset rejection and
-full-list acceptance; installation behavior is inherited from the reviewed trial.
-
-This route remains a local setup component. Native attachment, human login and
-original-task continuation are unfinished. Evidence is retained in
-`docs/verification/20261003-official-playwright-setup/REVIEW.md`.
-
-## Install the selected server
-
-The verified package is `@playwright/mcp` version `0.0.83`, with `playwright` and `playwright-core` pinned to `1.64.0-alpha-1790635538000`. Use Node 24 for the tested setup and an explicitly selected Chrome installation. Although the MCP wrapper declares Node >=18, its locked dependencies require Node >=20.
-
-Use the local consumer bundle at `dist/official-consumers-20261003`. Its
-`playwright/` directory supplies the unchanged consumer lock, all three
-lock-pinned npm archives, notices and a generic MCP configuration template.
-Verify the bundle's selected checksums, then follow its README to seed a new
-private npm cache and run ordinary `npm ci --offline --ignore-scripts` in a new
-directory with explicit runtime paths and configuration files. No source
-checkout or verification harness is needed to consume the delivered folder.
-
-This consumer delivery verifies a fresh installation and a separate restore
-under process-scoped network denial, including all installed archive payloads
-and exact package versions. The earlier component proof used `npm install` to
-create the lock; the new consumer proof establishes the documented `npm ci`
-path. A restore recreates software, not a browser account or provider state.
-
-The existing Chrome installation was used directly. Toolkit neither downloaded a browser nor added a browser implementation. Keep the dependency lock and package notices with the installation.
+Use the `isolated-chrome` profile with its selected Node runtime and browser path. The setup profile installs the server and dependencies from its retained package inputs. The browser runs headless with an isolated context.
 
 ## Connect a stdio host
 
-Configure the host to launch its selected Node executable with these arguments, replacing the paths:
+For direct host integration, launch the selected Node executable with:
 
 ```text
 /absolute/path/node_modules/@playwright/mcp/cli.js
@@ -81,35 +22,18 @@ Configure the host to launch its selected Node executable with these arguments, 
 --timeout-action 4000 --timeout-navigation 10000
 ```
 
-Choose the working directory, child environment and output directory explicitly. The host provides MCP stdin/stdout and owns the serving process. On macOS, long temporary paths can exceed the Unix socket limit. The verified workaround supplies `PWTEST_SOCKETS_DIR` pointing to a unique short directory such as one created under `/tmp`. Join process cleanup before removing it.
+Set the working directory and child environment explicitly. On macOS, use a short, unique `PWTEST_SOCKETS_DIR` when temporary paths would exceed Unix socket limits. Retain the server and browser processes until cleanup completes.
 
-This launches a server; it does not install a capability into an existing agent. The complete `find_and_install` path remains [unfinished](/connect/availability).
+## Give the agent page structure
 
-## Expose snapshot files
+Navigation and interaction can return a link to a snapshot file. Read that file through the host's permitted output path and present the snapshot to the agent. Use the current snapshot and tool schema for element references.
 
-At this pin, navigation and clicking return a link to a snapshot file. The agent needs file access to that output, or a host that reads and presents it. A link alone does not provide the page structure.
+The agent can then navigate, fill forms, click controls and inspect the resulting page. Apply operation permissions through the host's MCP policy.
 
-Resolve observed output links against the server working directory and keep access within the host's selected output scope. Use the current snapshot and tool schema for element references; this version uses the `target` argument. Browser closure does not remove retained output files.
+## Browser state
 
-## Choose browser state deliberately
+`--isolated` starts a separate browser context. Website sign-in and any supplied storage state are managed by the host. Keep browser output, account state and network access within the application's selected scope.
 
-`--isolated` without loaded storage starts without a logged-in website account. The fixture verified that its localStorage value stayed separate across simultaneous contexts and disappeared after closing and reopening one browser. It did not test cookie isolation or real identity providers.
+The host owns browser process isolation and network policy. After an action timeout or cancellation, wait for the active work and process cleanup before removing its directories.
 
-Persistent profiles, supplied storage state and existing-browser extension connections expose different website sessions. Those upstream modes need their own host setup and were not exercised here. The headless fixture supplies no user-facing login or browser takeover UX.
-
-Upstream's `--allowed-origins` option is explicitly not a security boundary and does not control redirects. Use the host's existing browser, file and network controls. See the [pinned upstream documentation](https://github.com/microsoft/playwright-mcp/blob/f183dad4a52965583e3cc1d59b88cdc279e2e57d/README.md).
-
-The retained proof lists 25 tools and executes 11 calls against a loopback form. Runtime metadata read afterward records Node 24.19.0 and Chrome 154.0.8037.93. Process cleanup checks were limited to command lines containing the task directory; browser background network traffic was not measured. Exact receipts and the independent review are under `docs/verification/20261002-playwright-mcp/`.
-
-The later recovery proof adds a real tool timeout and successful continuation in the same browser session. Caller cancellation sent a protocol notification, but the active disabled-element click continued until its 4000 ms timeout. Keep ownership until the work settles or the browser and server are closed and joined; a cancelled awaiter does not establish retirement. The bounded support disposition and retained follow-up evidence are in `docs/adoption/PLAYWRIGHT-SUPPORT.md` and `docs/verification/20261002-playwright-mcp-recovery/`.
-
-The consumer-delivery proof reads the actual template and substitutes explicit
-local paths for both installations. Each lists 25 tools and performs six calls
-against an isolated local form, including all five adopted operations. Snapshot
-files are read from the selected output directory, and captured browser/server
-processes are observed retired. Chrome 154.0.8037.93 remains a host prerequisite.
-An additional loopback-only OS browser sandbox failed and is retained as a
-separate unsupported execution attempt; the accepted isolated Chrome profile
-passes. Background browser egress is unmeasured. No real website credentials or
-provider account was used. The receipts are in
-`docs/verification/20261003-official-consumers/`.
+See [native MCP integration](/connect/guides/native-mcp) and [host composition](/connect/guides/host-composition).

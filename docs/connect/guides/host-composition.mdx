@@ -1,28 +1,18 @@
 ---
-title: "Compose Toolkit in a host"
+title: "Compose Connect in a host"
 description: "Add reusable integration components while retaining your existing runtime, policy and lifecycle owners."
 icon: "cubes"
 ---
 
-Toolkit is optional. A host can adopt an operation library or management UI before the complete setup workflow exists. Choose the smallest component that serves the task and declare what the host continues to own.
+Connect is composable. Use individual service operations, setup components or the management UI, and supply the account, policy and lifecycle services your application needs.
 
-The application opts into Toolkit-owned adapters around public Meerkat and Meta
-interfaces. The Meta 0.9 consumer is included; the release notes identify the
-qualified packages and actual application outcomes. Neither Meerkat nor Meta
-gains a Toolkit dependency. The host retains its application, policy and runtime
-composition.
+Connect adapters use public Meerkat and Meta interfaces. The application opts into them; Core and Meta remain independent of Connect.
 
 ## Native application lifecycle
 
 These are application-author APIs. Ordinary users use the standalone
 `meerkat-connect` CLI or their application's integrated Console. They do not
 assemble a gateway, private channel, policy files or recovery records themselves.
-
-<Note>
-These APIs compose an application host with the matching Toolkit gateway and
-Meta SDK. The release notes identify the qualified compositions; source/build
-checks do not establish every host, replacement or recovery path.
-</Note>
 
 Choose the startup path from the application's existing transaction:
 
@@ -68,7 +58,7 @@ Agent frontends additionally require a compatible long-running host that owns
 admission, routing and delivery. These startup adapters preserve those host
 bindings; they do not supply a generic frontend host or make a one-turn realm
 session persistent. The [custom-extension path](#custom-extension-dependencies)
-keeps its host compatibility and verification limits.
+describes package compatibility.
 
 ## Prepare a setup researcher
 
@@ -98,11 +88,6 @@ The host must classify the operations' behavior explicitly; an MCP annotation or
 allowlist alone is not read-only authority. Keep the task's data, audience and
 expiry limits when composing the researcher. Public query text can still disclose
 private knowledge, so target validation is not a semantic privacy guarantee.
-
-The stock native `web_search` composition is deferred: released Core 0.9.0 does
-not supply the required builtin target and nested-model delegation path for this
-prepared helper. The included MCP research tools use the existing MCP authority
-path without widening the controller or catalog grants.
 
 Installing a complete MCP server and granting access to selected operations are
 separate decisions. Public service access selects declared raw MCP operations;
@@ -135,14 +120,10 @@ when needed. Leaving it `null` can remain valid when the session already has the
 required catalog authority or the host exposes the operation eagerly.
 
 See [live-session attachment](/connect/guides/native-mcp#add-tools-to-a-live-session)
-for the supported mapping and example. The demonstrated `persisted=False` path
-supports completing the original task in that live session. A staged response
-alone establishes neither readiness nor restoration after process loss.
+for the supported mapping and example. `persisted=False` attaches the configuration to the live session. Inspect its connection state after the next turn boundary.
 
 For an already installed stdio MCP integration, use the
-[ordinary Meerkat host configuration](/connect/guides/native-mcp). Governed setup-agent
-admission, protected account sign-in and durable original-task continuation
-remain separate native and host dependencies.
+[ordinary Meerkat host configuration](/connect/guides/native-mcp). Use the application's native setup, authentication and continuation owners for those parts of the workflow.
 
 ## Standalone service-secret setup
 
@@ -191,16 +172,7 @@ write landed. Credential changes affect future reads; an already running process
 retains its launch environment. Repair, rotation and account switching need their
 own concrete owner contracts.
 
-This path is standalone only. Installed Console/Profile credential setup still
-needs its host-owned persistence and runtime composition. Agent-led
-[outside-catalog discovery](/connect/acquisition/local-install) uses the same selected
-installation path; protected environment setup applies when that checked local
-Python/Node package supplies the declarations above. Remote authenticated MCP,
-MCPB and custom host credential setup are separate paths. Saved slots do not
-prove provider acceptance, vendor-account identity or service readiness. Native
-controls, fresh-process use and live-provider verification for this new route
-remain unqualified. Success resumes the existing setup conversation; selected
-service use requires a normal new session in that realm.
+The terminal finalizes service-secret setup through native realm configuration and credential storage. It then returns to the setup conversation; use the service in a new ordinary agent session in that realm. An integrated Console supplies its application-owned persistence and runtime composition.
 
 See [the terminal journey](/connect/guides/request-an-integration#set-up-a-service-key-in-the-terminal)
 for the user-facing steps.
@@ -208,12 +180,12 @@ for the user-facing steps.
 ## Advanced host composition
 
 <Warning>
-Use the supported native application APIs above for startup. The advanced host, authority and admission composition below describes required ownership and evidence; it is not a generic bootstrap sequence for a new application.
+Use the native application APIs above for startup. Supply the following application services when composing setup into a custom host.
 </Warning>
 
 <Steps>
   <Step title="Choose a current adoption surface">
-    Python and TypeScript service libraries run without Meerkat or MobKit. Supply an explicitly selected authenticated transport and enforce grants before each operation. For inert discovery, use the package library and read-only discovery dispatcher.
+    Python and TypeScript service libraries run without Meerkat or Meta. Supply an explicitly selected authenticated transport and enforce grants before each operation. For inert discovery, use the package library and read-only discovery dispatcher.
   </Step>
   <Step title="Provide application owners">
     Identify current credential, account, principal, grant, approval, persistence, deployment and delivery owners. Establish who creates and checks their revisions. A metadata capability declaration cannot enforce them.
@@ -222,7 +194,7 @@ Use the supported native application APIs above for startup. The advanced host, 
     Pin package identity, version, strategy, exports, artifact or remote endpoint observation, configuration and dependency closure. Check compatibility before importing code or starting processes.
   </Step>
   <Step title="Compose native tools through the existing owner">
-    Use Meerkat's existing native tool-bundle registration owner and the accepted MobKit composition path for the selected upstream version. Registering a dispatcher does not itself grant every profile access. Avoid private parallel registration or session authorities.
+    Use Meerkat's existing native tool-bundle registration owner and the accepted Meta composition path for the selected upstream version. Registering a dispatcher does not itself grant every profile access. Avoid private parallel registration or session authorities.
   </Step>
   <Step title="Verify the actual execution surface">
     Observe `identity_resolved_tools` for the intended identity and dispatch the selected operation through the real runtime. Exercise the supported restoration and spawn paths before claiming durable availability. Customizer registration alone does not establish these facts.
@@ -234,13 +206,9 @@ Use the supported native application APIs above for startup. The advanced host, 
 
 ## Custom extension dependencies
 
-Toolkit verifies exact retained wheels, selected pure-Python dependencies, installed files and import origins. The private HomeCore adoption candidate calls that verifier while retaining its own release, contract, policy and lifecycle checks. Installed package metadata alone is insufficient evidence of the code that will run.
+Validate an extension's selected files, dependencies and import origins before binding it. The pure-Python dependency profile accepts closed `py3-none-any` packages without extras, native code, namespace-only packages or startup hooks. Extensions with no third-party dependencies can use their compiled release records.
 
-The selected-dependency profile retains required-service refusal, declared optional-media degradation and the existing grant/revocation owners. Its dependency support is limited to closed `py3-none-any` packages without extras, native code, namespace-only packages or startup hooks. A second adapter uses existing compiled release records for extensions with no declared third-party dependencies; unsupported closures fail explicitly.
-
-The actual Reachy extension passes through the compiled-record adapter in service-only, frontend-only, combined and legacy role configurations. Its imported HomeCore API remains a host contract. Its separate daemon's native dependencies are not extension dependencies. Before binding, the candidate host rechecks all loaded extensions using their captured rows and the same verifier; one refusal prevents every binding. A custom verifier must therefore support repeated observation.
-
-These are independently reviewed installed-host candidates with inert facades. Canonical HomeCore migration, native frontend admission, daemon activation and hardware acceptance remain unfinished.
+Recheck the selected files before binding and retain the application's lifecycle, policy and domain checks. See [package contracts](/connect/reference/packages).
 
 ## Own the borrowed transport
 
@@ -248,10 +216,10 @@ Python hosts prepare each HTTPX client once before sharing it. TypeScript hosts 
 
 Keep auth, hooks and transport configuration stable during operations. Preserve the selected method, destination, body and cancellation. Disable hidden request replay, including replay during credential refresh. The host closes its own transport after borrowed work has settled.
 
-## Compose the designed setup feature
+## Compose setup and continuation
 
 Before offering functional acquisition, the host needs authenticated request admission, durable setup work, exact preparation coalescing, human-action handling, permitted activation, role readiness and original-task continuation. Missing any of these is a declared unsupported path.
 
-The original agent's continuation targets its durable task and identity. Resolve the current session through Meerkat/MobKit when resuming; an old session ID or a model-supplied correlation is not authority.
+The original agent's continuation targets its durable task and identity. Resolve the current session through Meerkat/Meta when resuming; an old session ID or a model-supplied correlation is not authority.
 
 See [stores](/connect/reference/stores), [deployment](/connect/reference/deployment), [continuation](/connect/reference/continuation) and [readiness](/connect/concepts/readiness).
