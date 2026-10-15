@@ -93,6 +93,19 @@ them.
   window used to apply to every model. Rust embedders get the provided
   `ModelOperationalDefaultsResolver::stream_inactivity_timeout_for` (default
   `None`) and `AgentBuilder::with_stream_inactivity_timeout_override`.
+- `meerkat-mob-mcp`: `MobMcpState::set_before_create` installs a
+  `MobBeforeCreate` hook that admits or refuses every mob the state creates
+  (an agent's `mob_create`, the implicit delegation mob, a temporary council,
+  a host's definition or mobpack create) before anything of the mob exists.
+  It gets a `MobCreateRequest` built by the create path itself: the mob id,
+  the owner bridge session (`None` only for a host's own create) and whether
+  the mob is that session's implicit delegation mob, which counts only under
+  the id derived from the session. The hook fails closed: a refusal or a
+  panic refuses the create with an error `MobMcpState::is_create_refusal`
+  recognizes, carrying the reason in its message and structured data (`kind`
+  `MOB_CREATE_REFUSED_KIND`). Restoring a persisted mob never asks it, and
+  neither does a handle a host registers itself with `mob_insert_handle` or
+  `try_mob_insert_handle`.
 
 ### Changed
 
@@ -435,6 +448,29 @@ them.
   window under 60 s can abort and retry a stream whose answer already
   arrived, since the watchdog keeps running while a provider adapter waits
   for a trailer after the model's final event.
+- `meerkat-mob-mcp`: a host can now release what it holds of a mob that
+  `MobMcpState` destroys before the destroy's storage cleanup runs. The new
+  `MobMcpState::set_after_destroy` installs a `MobAfterDestroy` hook that gets
+  the mob's id once its native destroy completed and the mob left the managed
+  set, before the storage cleanup that destroy owes, and again before each
+  retry of an outstanding cleanup. A panic in the hook is caught and logged,
+  so it can neither keep the id managed nor skip the cleanup.
+  A host that kept the read handle its `set_before_activation` hook received
+  had no such point: the handle kept the mob's database observer alive, so
+  the destroy answered `Incomplete` ("storage cleanup outstanding: the
+  observer drain refused: 3 owner handle(s) still observe this mob
+  database"), and the destroyed mob's database, file watch and threads stayed
+  while its id could not be reused.
+- `meerkat-mob-mcp`: a destroy's storage cleanup no longer stays outstanding
+  because something held the destroyed mob's handle a moment longer than the
+  release hook ran. An observer drain that other owner handles refuse is
+  retried ten times, 100 ms apart, each after the after-destroy hook ran
+  again. Owner cleanups that destroy without retrying later, such as an
+  archived owner session's mobs or an implicit mob recreated for a new
+  model, answered `Incomplete` in that case. `MobMcpState::mob_handles_snapshot`
+  also skips a mob whose phase is `Destroyed`, so a snapshot taken while a
+  destroy runs holds none of it; `mob_list` still lists such a mob, as
+  `Destroyed`.
 
 ## [0.9.1] - 2026-10-15
 

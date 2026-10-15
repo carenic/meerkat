@@ -406,6 +406,9 @@ struct AdmittedDestroy {
     mobs: Arc<RwLock<BTreeMap<MobId, ManagedMob>>>,
     retired_mobs: Arc<std::sync::Mutex<BTreeMap<MobId, Arc<RetiredMob>>>>,
     mob_set_epoch: tokio::sync::watch::Sender<u64>,
+    /// The host's release hook, run once the native destroy completed and
+    /// the mob left the managed set.
+    after_destroy: Option<MobAfterDestroy>,
 }
 
 impl AdmittedDestroy {
@@ -426,6 +429,7 @@ impl AdmittedDestroy {
             mobs,
             retired_mobs,
             mob_set_epoch,
+            after_destroy,
         } = self;
         let destroy_result = bound.destroy().await;
         // The authority-bound clone retains the SQLite event bus. Release it
@@ -485,7 +489,38 @@ impl AdmittedDestroy {
             mob_set_epoch.send_modify(|epoch| *epoch += 1);
         }
         drop(removed);
-        MobMcpState::settle_retired_destroy(&mobs, &mob_id, &retired).await
+        // Destroyed natively, recorded and no longer managed: the host
+        // releases what it still holds of the mob before the storage cleanup
+        // drains its database observer. Running it only now, and containing
+        // a panic in it, keeps a failing hook from holding the id managed.
+        run_after_destroy(after_destroy.as_ref(), &mob_id);
+        MobMcpState::settle_retired_destroy(&mobs, &mob_id, &retired, after_destroy.as_ref()).await
+    }
+}
+
+/// How many times a destroy's storage cleanup retries an observer drain
+/// that other owner handles refused, within one cleanup attempt.
+#[cfg(not(target_arch = "wasm32"))]
+const OBSERVER_DRAIN_RETRIES: usize = 10;
+
+/// The wait before each retried observer drain: with
+/// [`OBSERVER_DRAIN_RETRIES`], a holder gets about a second to let go.
+#[cfg(not(target_arch = "wasm32"))]
+const OBSERVER_DRAIN_RETRY_DELAY: Duration = Duration::from_millis(100);
+
+/// Run the host's after-destroy hook for `mob_id`, if one is bound. A panic
+/// in the hook is caught and logged, and the destroy goes on as if the hook
+/// had returned: what the host failed to release only keeps the storage
+/// cleanup outstanding, as a held handle does.
+fn run_after_destroy(hook: Option<&MobAfterDestroy>, mob_id: &MobId) {
+    let Some(hook) = hook else {
+        return;
+    };
+    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| hook(mob_id))).is_err() {
+        tracing::error!(
+            mob_id = %mob_id,
+            "the host's after-destroy hook panicked; the destroy continues"
+        );
     }
 }
 
@@ -795,6 +830,69 @@ pub enum DetachedCompletionDelivery {
     Unavailable,
 }
 
+/// Host release hook for the mobs a [`MobMcpState`] destroys: called with a
+/// destroyed mob's id once its native destroy completed and it left the
+/// managed set, before the storage cleanup that destroy owes. See
+/// [`MobMcpState::set_after_destroy`].
+pub type MobAfterDestroy = Arc<dyn Fn(&MobId) + Send + Sync>;
+
+/// What a [`MobBeforeCreate`] hook is told about a mob a [`MobMcpState`] is
+/// about to create. Every field comes from the create path, never from the
+/// caller's input: a model's `mob_create` names the mob's id, nothing else
+/// here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct MobCreateRequest {
+    /// The id the mob would be created under.
+    pub mob_id: MobId,
+    /// The owner bridge session the mob would be created for: the calling
+    /// agent's session for its `mob_create` and its implicit delegation
+    /// mob, a session of its own for a temporary council. `None` only for a
+    /// mob a host creates directly ([`MobMcpState::mob_create_definition`],
+    /// [`MobMcpState::mob_create_definition_with_member_external_tools`],
+    /// [`MobMcpState::mob_create_from_mobpack`]).
+    pub owner_bridge_session_id: Option<SessionId>,
+    /// Whether this is the owner session's implicit delegation mob, created
+    /// by that session's own runtime path
+    /// ([`MobMcpState::ensure_implicit_mob_for_model`]) under the id it
+    /// derives from the session ([`MobDefinition::implicit`]). Never set for
+    /// a mob a caller names, whatever its id.
+    pub implicit_delegation_mob: bool,
+}
+
+/// Host admission hook for the mobs a [`MobMcpState`] creates: `Ok(())` lets
+/// the create proceed, `Err(reason)` refuses it. See
+/// [`MobMcpState::set_before_create`].
+#[cfg(not(target_arch = "wasm32"))]
+pub type MobBeforeCreate = Arc<
+    dyn Fn(
+            MobCreateRequest,
+        )
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>>
+        + Send
+        + Sync,
+>;
+/// Host admission hook for the mobs a [`MobMcpState`] creates: `Ok(())` lets
+/// the create proceed, `Err(reason)` refuses it. See
+/// [`MobMcpState::set_before_create`].
+#[cfg(target_arch = "wasm32")]
+pub type MobBeforeCreate = Arc<
+    dyn Fn(
+            MobCreateRequest,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>>>>
+        + Send
+        + Sync,
+>;
+
+/// The `kind` in the structured data of a host's refusal of a mob create
+/// ([`MobMcpState::set_before_create`], [`MobMcpState::is_create_refusal`]).
+pub const MOB_CREATE_REFUSED_KIND: &str = "mob_create_refused";
+
+/// The reason a create is refused with when the host's create hook panicked:
+/// its answer is unknown, so the create does not proceed.
+const BEFORE_CREATE_PANICKED: &str =
+    "the host's create admission panicked, so the create is refused";
+
 pub struct MobMcpState {
     session_service: Arc<dyn MobSessionService>,
     runtime_adapter: Option<Arc<meerkat_runtime::MeerkatMachine>>,
@@ -805,6 +903,12 @@ pub struct MobMcpState {
     /// Host selection of member destinations, inherited by every child mob.
     member_runtime_registration_hook: Option<Arc<dyn meerkat_mob::MemberRuntimeRegistrationHook>>,
     before_activation: std::sync::OnceLock<meerkat_mob::MobBeforeActivation>,
+    /// Host release hook for the mobs this state destroys; see
+    /// [`MobMcpState::set_after_destroy`].
+    after_destroy: std::sync::OnceLock<MobAfterDestroy>,
+    /// Host admission hook for the mobs this state creates; see
+    /// [`MobMcpState::set_before_create`].
+    before_create: std::sync::OnceLock<MobBeforeCreate>,
     /// Host bundles; only the child-available ones reach child mob builders.
     child_tool_bundles: ChildToolBundles,
     additional_child_tool_bundles: std::sync::OnceLock<ChildToolBundles>,
@@ -1007,6 +1111,8 @@ impl MobMcpState {
             external_tools_provider: None,
             member_runtime_registration_hook: None,
             before_activation: std::sync::OnceLock::new(),
+            after_destroy: std::sync::OnceLock::new(),
+            before_create: std::sync::OnceLock::new(),
             child_tool_bundles: ChildToolBundles::default(),
             additional_child_tool_bundles: std::sync::OnceLock::new(),
             child_mcp_servers: std::sync::RwLock::new(ChildMcpServers::default()),
@@ -1485,25 +1591,31 @@ impl MobMcpState {
     }
 
     /// Continue the destroy recorded as `retired` for its own caller: settle
-    /// the storage cleanup it still owes and answer with its report.
+    /// the storage cleanup it still owes and answer with its report. A retry
+    /// of an outstanding cleanup runs the host's release hook again first.
     pub(crate) async fn continue_retired_destroy(
         &self,
         mob_id: &MobId,
         retired: &RetiredMob,
     ) -> Result<meerkat_mob::MobDestroyReport, MobMcpDestroyError> {
-        Self::settle_retired_destroy(&self.mobs, mob_id, retired).await
+        let after_destroy = self.after_destroy.get();
+        if retired.cleanup_owed() {
+            run_after_destroy(after_destroy, mob_id);
+        }
+        Self::settle_retired_destroy(&self.mobs, mob_id, retired, after_destroy).await
     }
 
     /// Settle what the destroy recorded as `retired` still owes its storage
     /// and answer with its canonical report: the report itself once nothing
     /// is owed, otherwise `Incomplete` with a copy that names what is still
-    /// outstanding.
+    /// outstanding. `after_destroy` is run again before each retried drain.
     async fn settle_retired_destroy(
         mobs: &RwLock<BTreeMap<MobId, ManagedMob>>,
         mob_id: &MobId,
         retired: &RetiredMob,
+        after_destroy: Option<&MobAfterDestroy>,
     ) -> Result<meerkat_mob::MobDestroyReport, MobMcpDestroyError> {
-        match Self::settle_owed_storage_cleanup(mobs, mob_id, retired).await {
+        match Self::settle_owed_storage_cleanup(mobs, mob_id, retired, after_destroy).await {
             Ok(()) => Ok(retired.report.clone()),
             Err(outstanding) => Err(MobMcpDestroyError::Incomplete {
                 report: retired.report_with_outstanding_cleanup(&outstanding),
@@ -1519,6 +1631,13 @@ impl MobMcpState {
     /// what is still outstanding; the record keeps everything a later
     /// attempt needs.
     ///
+    /// A drain refused because other owner handles still observe the
+    /// database is retried [`OBSERVER_DRAIN_RETRIES`] times,
+    /// [`OBSERVER_DRAIN_RETRY_DELAY`] apart, each after `after_destroy` ran
+    /// again: a holder that outlives the hook only briefly, such as an
+    /// observer that cloned the handle just before the destroy, then lets go
+    /// within the attempt.
+    ///
     /// This settles the observer and the files only. A read already entered
     /// through a handle that was then dropped, an opener that attaches after
     /// the drain, and other processes stay outside it, so it never states
@@ -1528,6 +1647,7 @@ impl MobMcpState {
         mobs: &RwLock<BTreeMap<MobId, ManagedMob>>,
         mob_id: &MobId,
         retired: &RetiredMob,
+        after_destroy: Option<&MobAfterDestroy>,
     ) -> Result<(), String> {
         let Some(storage) = retired.storage.as_ref() else {
             return Ok(());
@@ -1556,13 +1676,29 @@ impl MobMcpState {
         // (an earlier attempt removed it), there is no database at the path
         // to observe, and only leftover sidecars remain.
         if Self::destroyed_database_at(&storage.path, cleanup.before).await? {
-            let path = storage.path.clone();
-            let drained = tokio::task::spawn_blocking(move || {
-                meerkat_mob::SqliteMobStores::drain_observers(&path)
-            })
-            .await
-            .map_err(|error| format!("the observer drain did not return: {error}"))?;
-            Self::observer_drain_settled(drained)?;
+            let mut retries_left = OBSERVER_DRAIN_RETRIES;
+            loop {
+                let path = storage.path.clone();
+                let drained = tokio::task::spawn_blocking(move || {
+                    meerkat_mob::SqliteMobStores::drain_observers(&path)
+                })
+                .await
+                .map_err(|error| format!("the observer drain did not return: {error}"))?;
+                // A refused drain drained nothing, so it can be retried.
+                if retries_left > 0
+                    && matches!(
+                        drained,
+                        Err(meerkat_mob::SqliteMobObserverDrainRefused::OtherOwners { .. })
+                    )
+                {
+                    retries_left -= 1;
+                    run_after_destroy(after_destroy, mob_id);
+                    tokio::time::sleep(OBSERVER_DRAIN_RETRY_DELAY).await;
+                    continue;
+                }
+                Self::observer_drain_settled(drained)?;
+                break;
+            }
         }
         Self::remove_destroyed_storage_files(&storage.path, cleanup.before).await?;
         *owed = None;
@@ -1598,6 +1734,7 @@ impl MobMcpState {
         _mobs: &RwLock<BTreeMap<MobId, ManagedMob>>,
         _mob_id: &MobId,
         _retired: &RetiredMob,
+        _after_destroy: Option<&MobAfterDestroy>,
     ) -> Result<(), String> {
         // A destroyed mob owns no storage files on wasm32.
         Ok(())
@@ -2256,6 +2393,100 @@ impl MobMcpState {
         self.before_activation
             .set(callback)
             .map_err(|_| MobError::Internal("before-activation callback already bound".into()))
+    }
+
+    /// Release host services bound to a mob this state destroys. Once a
+    /// destroy completed natively and the mob left the managed set, the hook
+    /// gets the mob's id before the storage cleanup that destroy owes, and
+    /// again before each retry of an outstanding cleanup. A handle of the
+    /// mob the host still holds then, such as the read handle
+    /// [`Self::set_before_activation`] handed it, keeps that cleanup
+    /// outstanding, so the host drops it here.
+    ///
+    /// By the time the hook runs, another mob may be managed under the same
+    /// id: release only what observes the destroyed mob, such as a handle
+    /// whose phase is `Destroyed`. The first call runs on the destroy's own
+    /// task, a retry's on the retrying caller's task; the hook must not
+    /// block. A panic in it is caught and logged, and the destroy goes on.
+    /// Install once before any destroy is admitted.
+    pub fn set_after_destroy(&self, hook: MobAfterDestroy) -> Result<(), MobError> {
+        self.after_destroy
+            .set(hook)
+            .map_err(|_| MobError::Internal("after-destroy hook already bound".into()))
+    }
+
+    /// Admit or refuse each mob this state creates. Before anything of a
+    /// new mob exists (its storage, its actor, its managed entry), the hook
+    /// gets a [`MobCreateRequest`] and answers `Ok(())` to let the create
+    /// proceed or `Err(reason)` to refuse it. Every create path asks it: an
+    /// agent's `mob_create`, the implicit delegation mob, a temporary
+    /// council, a host's definition or mobpack create. Restoring a persisted
+    /// mob creates nothing and never asks it, and neither does a handle a
+    /// host registers itself ([`Self::mob_insert_handle`],
+    /// [`Self::try_mob_insert_handle`]).
+    ///
+    /// The hook fails closed: a refusal, a panic while calling it and a
+    /// panic in the future it returns all refuse the create, with an error
+    /// [`Self::is_create_refusal`] recognizes. The reason is in the error's
+    /// message and, under `reason`, in its structured data (`kind`
+    /// [`MOB_CREATE_REFUSED_KIND`]). Install once before any create is
+    /// admitted.
+    pub fn set_before_create(&self, hook: MobBeforeCreate) -> Result<(), MobError> {
+        self.before_create
+            .set(hook)
+            .map_err(|_| MobError::Internal("before-create hook already bound".into()))
+    }
+
+    /// Whether `error` is a host's refusal of a mob create, through the hook
+    /// [`Self::set_before_create`] installs.
+    pub fn is_create_refusal(error: &MobError) -> bool {
+        matches!(
+            error,
+            MobError::SessionError(meerkat_core::service::SessionError::FailedWithData {
+                data,
+                ..
+            }) if data.get("kind").and_then(serde_json::Value::as_str)
+                == Some(MOB_CREATE_REFUSED_KIND)
+        )
+    }
+
+    /// The error a refused create answers with: the host's reason in its
+    /// message and in its structured data.
+    fn create_refused(mob_id: &MobId, reason: &str) -> MobError {
+        MobError::SessionError(meerkat_core::service::SessionError::FailedWithData {
+            message: format!("mob create refused for mob id '{mob_id}': {reason}"),
+            data: json!({
+                "kind": MOB_CREATE_REFUSED_KIND,
+                "mob_id": mob_id.to_string(),
+                "reason": reason,
+                "retryable": false,
+            }),
+        })
+    }
+
+    /// Ask the host's create hook, if one is bound, whether the mob
+    /// `request` describes may be created. Runs before anything of the mob
+    /// exists; see [`Self::set_before_create`].
+    async fn admit_create(&self, request: MobCreateRequest) -> Result<(), MobError> {
+        let Some(hook) = self.before_create.get() else {
+            return Ok(());
+        };
+        let mob_id = request.mob_id.clone();
+        let panicked = || {
+            tracing::error!(mob_id = %mob_id, "the host's create admission panicked");
+            Err(BEFORE_CREATE_PANICKED.to_string())
+        };
+        let verdict = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| hook(request)))
+        {
+            Ok(answer) => {
+                match futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(answer)).await {
+                    Ok(verdict) => verdict,
+                    Err(_) => panicked(),
+                }
+            }
+            Err(_) => panicked(),
+        };
+        verdict.map_err(|reason| Self::create_refused(&mob_id, &reason))
     }
 
     /// Add provider-opened host bundles before child create/restore is admitted.
@@ -3598,6 +3829,14 @@ impl MobMcpState {
         if self.destroy_cleanup_owed(&mob_id) {
             return Err(Self::owed_destroy_cleanup_error(&mob_id));
         }
+        // The host admits or refuses the create before anything of the mob
+        // exists. A mobpack is the host's own create: no owner session.
+        self.admit_create(MobCreateRequest {
+            mob_id: mob_id.clone(),
+            owner_bridge_session_id: None,
+            implicit_delegation_mob: false,
+        })
+        .await?;
         let (storage, storage_path) = self.storage_for_new_mob(&mob_id).await?;
         let handle = self
             .configure_builder(
@@ -3737,6 +3976,25 @@ impl MobMcpState {
         if self.destroy_cleanup_owed(&mob_id) {
             return Err(Self::owed_destroy_cleanup_error(&mob_id));
         }
+        // The host admits or refuses the create before anything of the mob
+        // exists, told what this path knows: the owner session and whether
+        // this is that session's implicit delegation mob. Only the implicit
+        // path sets the flag, and only under the id it derives from the
+        // owner session does it count.
+        self.admit_create(MobCreateRequest {
+            mob_id: mob_id.clone(),
+            owner_bridge_session_id: owner_bridge_session_authority
+                .as_ref()
+                .map(|(owner_bridge_session_id, _, _)| owner_bridge_session_id.clone()),
+            implicit_delegation_mob: owner_bridge_session_authority.as_ref().is_some_and(
+                |(owner_bridge_session_id, _, implicit_delegation_mob)| {
+                    *implicit_delegation_mob
+                        && MobDefinition::implicit(&owner_bridge_session_id.to_string(), "").id
+                            == mob_id
+                },
+            ),
+        })
+        .await?;
         let (storage, storage_path) = self.storage_for_new_mob(&mob_id).await?;
         let child = owner_bridge_session_authority.as_ref().is_some_and(
             |(_, destroy_on_owner_archive, _)| {
@@ -3960,21 +4218,35 @@ impl MobMcpState {
         // gate; the raw-handle snapshot must not be a graded sibling).
         self.require_console_owner(ControlScope::List)?;
         self.ensure_restored().await?;
+        // A destroyed mob (its phase flips when the destroy is admitted) is
+        // not handed out: a clone taken now would keep observing the
+        // database its destroy's storage cleanup drains.
         Ok(self
             .mobs
             .read()
             .await
             .iter()
+            .filter(|(_, managed)| {
+                managed.handle.status_observation_snapshot() != MobState::Destroyed
+            })
             .map(|(id, managed)| (id.clone(), managed.handle.clone()))
             .collect())
     }
 
     pub async fn mob_list(&self) -> Result<Vec<(MobId, MobState)>, MobError> {
+        // The gate of `mob_handles_snapshot` (cross-mob enumeration is
+        // Owner-only), but every managed mob is listed: a destroyed mob still
+        // managed, such as the retry anchor of a destroy whose native part
+        // is incomplete, shows as `Destroyed`. Only its handle is withheld
+        // from snapshots.
+        self.require_console_owner(ControlScope::List)?;
+        self.ensure_restored().await?;
         Ok(self
-            .mob_handles_snapshot()
-            .await?
-            .into_iter()
-            .map(|(id, handle)| (id, handle.status_observation_snapshot()))
+            .mobs
+            .read()
+            .await
+            .iter()
+            .map(|(id, managed)| (id.clone(), managed.handle.status_observation_snapshot()))
             .collect())
     }
 
@@ -4217,6 +4489,7 @@ impl MobMcpState {
             mobs: Arc::clone(&self.mobs),
             retired_mobs: Arc::clone(&self.retired_mobs),
             mob_set_epoch: self.mob_set_epoch.clone(),
+            after_destroy: self.after_destroy.get().cloned(),
         };
         drop(managed);
         // The destroy is the state's own task, so its caller holds nothing of
@@ -16221,6 +16494,504 @@ mod tests {
             serde_json::to_value(&again).expect("report json"),
             canonical
         );
+    }
+
+    /// A host binding, as an activation hook takes one: every mob that
+    /// activates leaves its read handle in the returned map.
+    fn bind_activated_mobs(
+        state: &MobMcpState,
+    ) -> Arc<std::sync::Mutex<BTreeMap<MobId, meerkat_mob::MobReadHandle>>> {
+        let bound = Arc::new(std::sync::Mutex::new(BTreeMap::new()));
+        let binder = Arc::clone(&bound);
+        let hook: meerkat_mob::MobBeforeActivation = Arc::new(move |handle| {
+            binder
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(handle.mob_id().clone(), handle);
+            Box::pin(async { Ok(()) })
+        });
+        state
+            .set_before_activation(hook)
+            .expect("bind the activation hook");
+        bound
+    }
+
+    /// The after-destroy hook gets the destroyed mob's id once the native
+    /// destroy completed (the host's read handle observes `Destroyed`) and
+    /// before the storage cleanup that destroy owes (the database is still
+    /// there). A host that drops the read handle there leaves nothing
+    /// outstanding: the destroy removes the mob's files.
+    #[tokio::test]
+    async fn an_after_destroy_hook_releases_a_host_binding_before_the_storage_cleanup() {
+        let svc = Arc::new(MockSessionSvc::new());
+        let root = tempfile::tempdir().expect("tempdir");
+        let state = persistent_destroy_state(&svc, root.path());
+        let bound = bind_activated_mobs(&state);
+        let released = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (releaser, seen) = (Arc::clone(&bound), Arc::clone(&released));
+        let storage_root = root.path().to_path_buf();
+        let hook: MobAfterDestroy = Arc::new(move |mob_id: &MobId| {
+            let handle = releaser
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(mob_id)
+                .expect("the host bound the mob it is told was destroyed");
+            seen.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push((
+                    mob_id.clone(),
+                    handle.status_observation_snapshot(),
+                    destroy_test_storage_path(&storage_root, mob_id).exists(),
+                ));
+        });
+        state
+            .set_after_destroy(hook)
+            .expect("bind the destroy hook");
+        assert!(
+            state.set_after_destroy(Arc::new(|_: &MobId| {})).is_err(),
+            "the destroy hook binds once"
+        );
+        let mob_id = state
+            .mob_create_definition(explicit_definition("released-binding-destroy"))
+            .await
+            .expect("create explicit mob");
+        let storage_path = destroy_test_storage_path(root.path(), &mob_id);
+        assert!(
+            bound
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains_key(&mob_id),
+            "the activation hook bound the mob"
+        );
+
+        let report = state
+            .mob_destroy(&mob_id)
+            .await
+            .expect("the released binding leaves no storage cleanup outstanding");
+        assert!(report.errors.is_empty(), "{report:?}");
+        assert_eq!(
+            *released
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            vec![(mob_id.clone(), meerkat_mob::MobState::Destroyed, true)],
+            "the hook ran once, after the native destroy and before the cleanup"
+        );
+        assert!(existing_storage_files(&storage_path).is_empty());
+    }
+
+    /// A host that still holds the mob when the after-destroy hook first
+    /// runs, and through every retried drain, keeps the storage cleanup
+    /// outstanding. The same caller's retry
+    /// runs the hook again before its own cleanup attempt, and once the host
+    /// releases there, the retry removes the mob's files.
+    #[tokio::test]
+    async fn a_destroy_cleanup_retry_runs_the_after_destroy_hook_again() {
+        let svc = Arc::new(MockSessionSvc::new());
+        let root = tempfile::tempdir().expect("tempdir");
+        let state = persistent_destroy_state(&svc, root.path());
+        let bound = bind_activated_mobs(&state);
+        let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (releaser, releasing, counted) =
+            (Arc::clone(&bound), Arc::clone(&release), Arc::clone(&calls));
+        let hook: MobAfterDestroy = Arc::new(move |mob_id: &MobId| {
+            counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if releasing.load(std::sync::atomic::Ordering::SeqCst) {
+                releaser
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(mob_id);
+            }
+        });
+        state
+            .set_after_destroy(hook)
+            .expect("bind the destroy hook");
+        let mob_id = state
+            .mob_create_definition(explicit_definition("held-binding-destroy"))
+            .await
+            .expect("create explicit mob");
+        let storage_path = destroy_test_storage_path(root.path(), &mob_id);
+
+        let incomplete = state
+            .mob_destroy(&mob_id)
+            .await
+            .expect_err("the host's held binding keeps the storage cleanup outstanding");
+        let MobMcpDestroyError::Incomplete { report } = incomplete else {
+            panic!("only the storage cleanup may be outstanding: {incomplete:?}");
+        };
+        assert!(
+            report.errors.iter().any(|error| {
+                error.starts_with("storage cleanup outstanding: ") && error.contains("owner handle")
+            }),
+            "{report:?}"
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1 + OBSERVER_DRAIN_RETRIES,
+            "the hook ran before the cleanup and again before each retried drain"
+        );
+        assert!(
+            tokio::fs::metadata(&storage_path).await.is_ok(),
+            "the held database is kept"
+        );
+
+        release.store(true, std::sync::atomic::Ordering::SeqCst);
+        let report = state
+            .mob_destroy(&mob_id)
+            .await
+            .expect("the retry releases the binding first and completes the cleanup");
+        assert!(report.errors.is_empty(), "{report:?}");
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            2 + OBSERVER_DRAIN_RETRIES,
+            "the retry ran the hook again before its cleanup"
+        );
+        assert!(existing_storage_files(&storage_path).is_empty());
+        assert!(
+            bound
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty()
+        );
+    }
+
+    /// A panicking after-destroy hook is contained. The hook runs once the
+    /// destroyed mob left the managed set, so the panic cannot keep its id
+    /// managed; the destroy goes on with its storage cleanup, and the id can
+    /// be created again at once.
+    #[tokio::test]
+    async fn a_panicking_after_destroy_hook_neither_keeps_the_id_nor_skips_the_cleanup() {
+        let svc = Arc::new(MockSessionSvc::new());
+        let root = tempfile::tempdir().expect("tempdir");
+        let state = persistent_destroy_state(&svc, root.path());
+        let still_managed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (observer, seen) = (Arc::downgrade(&state), Arc::clone(&still_managed));
+        let hook: MobAfterDestroy = Arc::new(move |mob_id: &MobId| {
+            let managed = observer.upgrade().is_some_and(|state| {
+                state
+                    .mobs
+                    .try_read()
+                    .map_or(true, |mobs| mobs.contains_key(mob_id))
+            });
+            seen.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(managed);
+            panic!("the host's release failed");
+        });
+        state
+            .set_after_destroy(hook)
+            .expect("bind the destroy hook");
+        let mob_id = state
+            .mob_create_definition(explicit_definition("panicking-release-destroy"))
+            .await
+            .expect("create explicit mob");
+        let storage_path = destroy_test_storage_path(root.path(), &mob_id);
+
+        let report = state
+            .mob_destroy(&mob_id)
+            .await
+            .expect("a panicking hook does not fail the destroy");
+        assert!(report.errors.is_empty(), "{report:?}");
+        assert_eq!(
+            *still_managed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            vec![false],
+            "the hook ran once, after the destroyed mob left the managed set"
+        );
+        assert!(existing_storage_files(&storage_path).is_empty());
+        state
+            .mob_create_definition(explicit_definition("panicking-release-destroy"))
+            .await
+            .expect("the destroyed mob's id is free again at once");
+    }
+
+    /// A holder that still observes the destroyed mob's database when the
+    /// cleanup first drains it, and lets go shortly after, does not leave the
+    /// cleanup outstanding: the refused drain is retried a bounded number of
+    /// times, each after the host's release hook ran again.
+    #[tokio::test]
+    async fn a_short_lived_holder_does_not_leave_the_destroy_cleanup_outstanding() {
+        let svc = Arc::new(MockSessionSvc::new());
+        let root = tempfile::tempdir().expect("tempdir");
+        let state = persistent_destroy_state(&svc, root.path());
+        let bound = bind_activated_mobs(&state);
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (releaser, counted) = (Arc::clone(&bound), Arc::clone(&calls));
+        let hook: MobAfterDestroy = Arc::new(move |mob_id: &MobId| {
+            if counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst) > 0 {
+                return;
+            }
+            // The first call hands the binding to a short-lived holder, as
+            // an observer that cloned it just before the destroy would be.
+            let held = releaser
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(mob_id);
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                drop(held);
+            });
+        });
+        state
+            .set_after_destroy(hook)
+            .expect("bind the destroy hook");
+        let mob_id = state
+            .mob_create_definition(explicit_definition("short-lived-holder-destroy"))
+            .await
+            .expect("create explicit mob");
+        let storage_path = destroy_test_storage_path(root.path(), &mob_id);
+
+        let report = state
+            .mob_destroy(&mob_id)
+            .await
+            .expect("the retried drain settles once the holder let go");
+        assert!(report.errors.is_empty(), "{report:?}");
+        assert!(
+            calls.load(std::sync::atomic::Ordering::SeqCst) >= 2,
+            "the hook ran again before a retried drain"
+        );
+        assert!(existing_storage_files(&storage_path).is_empty());
+    }
+
+    /// A mob whose phase is `Destroyed` is not handed out by
+    /// `mob_handles_snapshot` while its managed entry remains, as after a
+    /// destroy through the mob's own handle: a snapshot taken then would hold
+    /// the destroyed mob's database observer. `mob_list` still lists it, as
+    /// `Destroyed`.
+    #[tokio::test]
+    async fn mob_handles_snapshot_skips_a_destroyed_mob() {
+        let svc = Arc::new(MockSessionSvc::new());
+        let root = tempfile::tempdir().expect("tempdir");
+        let state = persistent_destroy_state(&svc, root.path());
+        let kept = state
+            .mob_create_definition(explicit_definition("snapshot-kept"))
+            .await
+            .expect("create the kept mob");
+        let destroyed = state
+            .mob_create_definition(explicit_definition("snapshot-destroyed"))
+            .await
+            .expect("create the destroyed mob");
+        let handle = state
+            .handle_for(&destroyed)
+            .await
+            .expect("the destroyed mob's handle");
+        handle
+            .destroy()
+            .await
+            .expect("destroy through the mob's own handle");
+        assert_eq!(
+            handle.status_observation_snapshot(),
+            meerkat_mob::MobState::Destroyed
+        );
+        drop(handle);
+
+        let snapshot: Vec<MobId> = state
+            .mob_handles_snapshot()
+            .await
+            .expect("owner snapshot")
+            .into_iter()
+            .map(|(mob_id, _)| mob_id)
+            .collect();
+        assert_eq!(snapshot, vec![kept.clone()]);
+        let listed: BTreeMap<MobId, meerkat_mob::MobState> = state
+            .mob_list()
+            .await
+            .expect("owner list")
+            .into_iter()
+            .collect();
+        assert_eq!(
+            listed.keys().cloned().collect::<Vec<_>>(),
+            vec![destroyed.clone(), kept]
+        );
+        assert_eq!(listed[&destroyed], meerkat_mob::MobState::Destroyed);
+    }
+
+    /// A host's create hook is asked before anything of a new mob exists, on
+    /// every create path, with what that path itself knows: the owner
+    /// session, and whether the mob is that session's implicit delegation
+    /// mob. A refusal leaves nothing of the mob behind and is recognizable,
+    /// with the host's reason in its message and its structured data.
+    #[tokio::test]
+    async fn a_before_create_hook_answers_before_anything_of_the_mob_exists() {
+        let svc = Arc::new(MockSessionSvc::new());
+        let root = tempfile::tempdir().expect("tempdir");
+        let state = persistent_destroy_state(&svc, root.path());
+        let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorder = Arc::clone(&asked);
+        let hook: MobBeforeCreate = Arc::new(move |request: MobCreateRequest| {
+            let refuse = request.mob_id.as_str().starts_with("refused-");
+            recorder
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(request);
+            Box::pin(async move {
+                if refuse {
+                    Err("the host keeps this id".to_string())
+                } else {
+                    Ok(())
+                }
+            })
+        });
+        state.set_before_create(hook).expect("bind the create hook");
+        assert!(
+            state
+                .set_before_create(Arc::new(|_: MobCreateRequest| Box::pin(async { Ok(()) })))
+                .is_err(),
+            "the create hook binds once"
+        );
+
+        let refused_id = MobId::from("refused-host-create");
+        let refused = state
+            .mob_create_definition(explicit_definition(refused_id.as_str()))
+            .await
+            .expect_err("the hook refuses the create");
+        assert!(MobMcpState::is_create_refusal(&refused), "{refused}");
+        assert!(
+            refused.to_string().contains("the host keeps this id"),
+            "{refused}"
+        );
+        assert_eq!(
+            refused
+                .structured_data()
+                .and_then(|data| data.get("reason").cloned()),
+            Some(json!("the host keeps this id"))
+        );
+        assert!(
+            existing_storage_files(&destroy_test_storage_path(root.path(), &refused_id)).is_empty(),
+            "nothing of the refused mob was stored"
+        );
+        assert!(state.handle_for(&refused_id).await.is_err());
+
+        let owner = SessionId::new();
+        let child = state
+            .mob_create_definition_with_owner_bridge_session(
+                explicit_definition("admitted-child"),
+                owner.clone(),
+                true,
+                false,
+            )
+            .await
+            .expect("the hook admits the child");
+        let (implicit, created) = state
+            .ensure_implicit_mob_for_model(&owner.to_string(), "claude-sonnet-4-5", None)
+            .await
+            .expect("the hook admits the implicit delegation mob");
+        assert!(created);
+        // The implicit flag counts only under the id derived from the owner
+        // session.
+        let flagged = state
+            .mob_create_definition_with_owner_bridge_session(
+                explicit_definition("flagged-not-implicit"),
+                owner.clone(),
+                true,
+                true,
+            )
+            .await
+            .expect("the hook admits the flagged create");
+        assert_eq!(
+            *asked
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            vec![
+                MobCreateRequest {
+                    mob_id: refused_id,
+                    owner_bridge_session_id: None,
+                    implicit_delegation_mob: false,
+                },
+                MobCreateRequest {
+                    mob_id: child,
+                    owner_bridge_session_id: Some(owner.clone()),
+                    implicit_delegation_mob: false,
+                },
+                MobCreateRequest {
+                    mob_id: implicit,
+                    owner_bridge_session_id: Some(owner.clone()),
+                    implicit_delegation_mob: true,
+                },
+                MobCreateRequest {
+                    mob_id: flagged,
+                    owner_bridge_session_id: Some(owner),
+                    implicit_delegation_mob: false,
+                },
+            ]
+        );
+    }
+
+    /// The create hook fails closed: a panic while it is called, or in the
+    /// future it returns, refuses the create, and nothing of the mob exists.
+    #[tokio::test]
+    async fn a_panicking_before_create_hook_refuses_the_create() {
+        for in_future in [false, true] {
+            let svc = Arc::new(MockSessionSvc::new());
+            let root = tempfile::tempdir().expect("tempdir");
+            let state = persistent_destroy_state(&svc, root.path());
+            let hook: MobBeforeCreate = Arc::new(move |request: MobCreateRequest| {
+                let id = request.mob_id.to_string();
+                assert!(
+                    in_future || id.is_empty(),
+                    "the host's admission of {id} failed"
+                );
+                Box::pin(async move {
+                    if id.is_empty() {
+                        Ok(())
+                    } else {
+                        panic!("the host's admission of {id} failed")
+                    }
+                })
+            });
+            state.set_before_create(hook).expect("bind the create hook");
+            let mob_id = MobId::from("panicking-admission");
+            let refused = state
+                .mob_create_definition(explicit_definition(mob_id.as_str()))
+                .await
+                .expect_err("a panicking hook refuses the create");
+            assert!(
+                MobMcpState::is_create_refusal(&refused),
+                "in_future={in_future}: {refused}"
+            );
+            assert!(
+                existing_storage_files(&destroy_test_storage_path(root.path(), &mob_id)).is_empty(),
+                "in_future={in_future}: nothing of the refused mob was stored"
+            );
+            assert!(state.handle_for(&mob_id).await.is_err());
+        }
+    }
+
+    /// Restoring a persisted mob creates nothing, so it never asks the
+    /// create hook: a hook that refuses every create still lets the mob
+    /// come back.
+    #[tokio::test]
+    async fn restoring_a_mob_never_asks_the_before_create_hook() {
+        let svc = Arc::new(MockSessionSvc::new());
+        let root = tempfile::tempdir().expect("tempdir");
+        let state = persistent_destroy_state(&svc, root.path());
+        let mob_id = state
+            .mob_create_definition(explicit_definition("restored-without-admission"))
+            .await
+            .expect("create explicit mob");
+        state
+            .handle_for(&mob_id)
+            .await
+            .expect("predecessor mob handle")
+            .shutdown()
+            .await
+            .expect("retire the predecessor supervisor route");
+
+        let restored = persistent_destroy_state(&svc, root.path());
+        let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = Arc::clone(&asked);
+        restored
+            .set_before_create(Arc::new(move |_: MobCreateRequest| {
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Box::pin(async { Err("this host admits no create".to_string()) })
+            }))
+            .expect("bind the create hook");
+        restored
+            .handle_for(&mob_id)
+            .await
+            .expect("the persisted mob restores");
+        assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     /// An agent's destroy is continued only by the exact caller it was
