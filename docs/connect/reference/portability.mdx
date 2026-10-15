@@ -1,0 +1,46 @@
+---
+title: "Portability and execution modes"
+description: "Reuse portable metadata and choose runtimes without hiding host requirements or importing another framework."
+icon: "boxes-stacked"
+---
+
+**Current metadata support with a broader designed execution target.** Parsing a distribution format establishes only that its description fits the parser's supported profile.
+
+## Acquisition forms
+
+| Form | Useful for | Required checks |
+| --- | --- | --- |
+| Portable MCP or skill pack | Maintained service operations and setup guidance | Protocol, artifact/endpoint, auth, actual operations and host requirements |
+| Native typed adapter | Explicit provider operations or domain contracts | ABI/API compatibility, account binding, policy and lifecycle |
+| CLI pack | Existing command tooling | Exact executable/dependencies, literal argv, bounded output and process ownership |
+| Frontend adapter | External interaction and scoped response | Transport authenticity, admission, conversation, audience and delivery |
+
+A skill is a distribution form, not proof of service access. MCP supports tool operations but does not itself provide a frontend's people, conversation or reply contracts.
+
+## Imported formats
+
+`ImportedPluginManifest` and `ImportedMcpServers` parse Agent Plugins 1.0.0 metadata. Unknown top-level manifest fields produce diagnostics; invalid known fields reject. Unknown extension namespaces remain opaque. A bad MCP entry is isolated from valid siblings. Toolkit's namespace is `ai.rkat.toolkit`.
+
+`ImportedMcpbManifest` parses the supported MCPB 0.3 manifest profile, preserving unresolved host/configuration requirements. It does not extract an archive, verify executable bytes or launch the described process.
+
+`PluginRoot` anchors bounded metadata reads to a capability directory and checks containment and file type. That is a metadata-read boundary, not an execution sandbox or general artifact verifier. Placeholder expansion is literal and single-pass; imported environment/header fields are not a secret store.
+
+## Generic-client projection
+
+A portable MCP entry must work independently. Components that require Toolkit contracts, host services, package state or dependencies cannot also advertise a generic entrypoint that ignores those requirements. Unsupported clients must receive an explicit gap rather than a silently weakened integration.
+
+## Host execution modes
+
+Python and TypeScript integrations can run in a compatible host or supervised workers with isolated dependencies. Native Rust remains useful for host constraints or measured needs. Unselected integrations should remain cold metadata: no import, process or prompt cost merely because a recipe exists.
+
+Pool only across compatible account, credential, policy and transport boundaries. One process per agent is not the default; neither is one global process for incompatible accounts. Persistent workers need explicit concurrency, result limits, cancellation and rate-limit behavior.
+
+Frontend listeners persist independently of a current agent run. Static assets can use an existing authenticated host; they need not imply a dedicated process. Tool-call limits and frontend queue/stream limits are separate.
+
+Browser-only hosts declare unsupported filesystem, local stdio and installer effects. They can delegate those effects to an authorized execution host. Desktop, browser and headless interfaces share role contracts, not identical privileges.
+
+## Existing runtime discovery
+
+After acquisition, authorized operation metadata belongs in Meerkat's exact/deferred tool catalog and search/load controls. Acquiring a missing integration is different from discovering an already available runtime tool. Avoid a mandatory proxy or another tool catalog authority.
+
+Cached recipe data can remain useful during a registry outage. Execution depends on exact installed artifacts and current owner records, and remote health remains a current observation.
