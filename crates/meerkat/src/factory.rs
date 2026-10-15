@@ -7856,19 +7856,17 @@ impl AgentFactory {
             // Its definition comes from a source the host does not trust, so
             // it is staged under a name safe to show the model, distinct from
             // every other server of the session.
-            let mut reported_names: std::collections::BTreeSet<String> = build_config
-                .mcp_servers
-                .iter()
-                .map(|server| server.name.clone())
-                .collect();
-            for (position, refused) in build_config.refused_mcp_servers.iter().enumerate() {
-                let mut name = refused.reported_name(position);
-                let mut suffix = 1usize;
-                while reported_names.contains(&name) {
-                    suffix += 1;
-                    name = format!("refused-mcp-server-{}-{suffix}", position + 1);
-                }
-                reported_names.insert(name.clone());
+            let reported_names = meerkat_core::mcp_config::refused_server_names(
+                build_config
+                    .mcp_servers
+                    .iter()
+                    .map(|server| server.name.as_str()),
+                build_config
+                    .refused_mcp_servers
+                    .iter()
+                    .map(|refused| &refused.server),
+            );
+            for (refused, name) in build_config.refused_mcp_servers.iter().zip(reported_names) {
                 let mut server = refused.server.clone();
                 server.name = name.clone();
                 adapter

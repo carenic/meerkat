@@ -156,7 +156,8 @@ them.
   where its link leads, and `GitSkillSource::with_untrusted_paths` runs
   `git` from a `PATH` without the directories a host does not trust.
 - `McpServerRefusal::reported_name`: the name a session reports a refused
-  server under.
+  server under, and `meerkat_core::mcp_config::refused_server_names`, the
+  distinct names a session stages its refused servers under.
 - `meerkat_core::AdministeredSection` (`Confinement`, `Governance`) and
   `ConfigError::administered_section`, the section a refused config write
   would change.
@@ -315,6 +316,10 @@ them.
   resolution with `HostLaunchRefused`. Before, a session moved on to the
   next credential (an ancestor realm's binding, the global realm's, the
   environment's default such as `OPENAI_API_KEY`) without saying so.
+- `rkat run` and `rkat resume` on an ungoverned realm report an MCP server
+  refused from an untrusted `mcp.toml` to the model under its plain name or
+  a `refused-mcp-server-<n>` placeholder, as sessions on a governed realm
+  do. They reported it under its raw name, which a confined process chose.
 
 ## [0.9.1] - 2026-10-15
 
