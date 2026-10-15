@@ -2699,10 +2699,14 @@ mod tests {
             &self,
             events: &[meerkat_core::event::AgentEvent],
         ) -> Result<Vec<CoreInteractionTerminalPublicationReceipt>, CoreExecutorError> {
+            // Register for the release before the call counter moves: the
+            // tests release the first call with `notify_waiters()` once they
+            // see `calls == 1`, and it reaches only an existing `Notified`.
+            let released = self.release_first.notified();
             let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
             if call == 1 {
                 self.first_entered.notify_one();
-                self.release_first.notified().await;
+                released.await;
                 self.first_returning.notify_one();
             }
             self.batches
@@ -3577,7 +3581,9 @@ mod tests {
                 )
                 .await
         });
-        entered.notified().await;
+        crate::tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())
+            .await
+            .expect("the wedged RuntimeStore read should start");
         let registration_probe = crate::tokio::time::timeout(
             std::time::Duration::from_secs(1),
             restarted.lock_session_registration_transaction(&session_id),
@@ -3800,7 +3806,9 @@ mod tests {
                 )
                 .await
         });
-        entered.notified().await;
+        crate::tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())
+            .await
+            .expect("the publication receipt CAS should start and wedge");
 
         let retry_lease = machine
             .prepare_session_archive_lease(&session_id)
@@ -3836,8 +3844,9 @@ mod tests {
         drop(probe);
 
         release.notify_waiters();
-        first
+        crate::tokio::time::timeout(std::time::Duration::from_secs(10), first)
             .await
+            .expect("receipt-CAS convergence task must finish after its release")
             .expect("receipt-CAS convergence task must join")
             .expect("released receipt CAS must converge");
         assert_eq!(publisher.calls.load(Ordering::SeqCst), 1);

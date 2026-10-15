@@ -61,6 +61,17 @@ them.
 - The Makefile comment on `bridge-no-responsestatus-gate` no longer names the
   removed `classify_response_terminality`; like the gate, it points at the
   machine-classified `response_terminality`.
+- meerkat-runtime tests no longer lose the release of a blocked test fake.
+  `notify_waiters()` wakes only a `Notified` that already exists, and the
+  interrupt-yielding executor rig counted its `apply` before it created its
+  release future, so a test that released the next apply as soon as it saw
+  the count could leave that apply parked (with 200 ms injected at that point,
+  7 of the 9 rig tests failed). The rig, the reentrant and external cleanup
+  executors, the destroy-commit store, the archive-publication fake and the
+  six in-memory store test hooks now create the release future before they
+  signal that they started; the archive post-commit hook signals with
+  `notify_one`. The waits that follow a release are bounded at 5 s, so a lost
+  release fails with a message instead of hanging the run.
 
 ## [0.9.1] - 2026-10-15
 
