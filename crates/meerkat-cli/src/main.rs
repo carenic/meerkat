@@ -21634,11 +21634,15 @@ where
     let session_store = persistence.session_store();
     let paths =
         meerkat_store::realm_paths_in(&scope.locator.state_root, scope.locator.realm.as_str());
-    // The head document composes with the realm's ancestors as a run does,
-    // so a config write cannot cut the realm from their `[confinement]`.
+    // The realm's own document, as the realm config source maps it (the
+    // reserved `global` realm's is the user document), composed with the
+    // realm's ancestors as a run does, so a config write cannot cut the
+    // realm from their `[confinement]` or `[governance]`.
+    let documents = cli_filesystem_realm_config_source(scope);
+    let config_path = documents.config_doc_path(&scope.locator.realm);
     let base_store: Arc<dyn ConfigStore> = Arc::new(
-        FileConfigStore::new(paths.config_path.clone(), meerkat_models::canonical())
-            .with_realm_chain(scope.locator.realm.clone(), cli_realm_config_source(scope)),
+        FileConfigStore::new(config_path.clone(), meerkat_models::canonical())
+            .with_realm_chain(scope.locator.realm.clone(), Arc::new(documents)),
     );
     let tagged = meerkat_core::TaggedConfigStore::new(
         base_store,
@@ -21649,7 +21653,7 @@ where
             resolved_paths: Some(meerkat_core::ConfigResolvedPaths {
                 root: paths.root.display().to_string(),
                 manifest_path: paths.manifest_path.display().to_string(),
-                config_path: paths.config_path.display().to_string(),
+                config_path: config_path.display().to_string(),
                 sessions_sqlite_path: Some(paths.sessions_sqlite_path.display().to_string()),
                 sessions_jsonl_dir: paths.sessions_jsonl_dir.display().to_string(),
             }),

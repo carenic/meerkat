@@ -221,6 +221,10 @@ them.
   checkout) to a path a confined process could change is not loaded, and a
   start whose realm state or credential store links to such a path is
   refused.
+- The `rkat` mob deploy RPC host's config store addresses the realm's
+  document as the realm config source maps it, so the reserved `global`
+  realm's is the user document it composes, not a file under the state
+  root.
 - `rkat-rpc`, `rkat-rest` and `rkat-mcp` read their working directory at
   startup only for a relative `--confinement-read` or `--confinement-write`
   path. They read it on every start, so a server whose working directory had
