@@ -1486,16 +1486,14 @@ jobs:
           tap_token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
           checksums_path: published-release-artifacts/checksums.sha256
 
+  # The package build starts with the run, beside Require green CI and the
+  # release validation rather than after them: building publishes nothing,
+  # and publish_web_sdk keeps every gate (green CI, release validation,
+  # registry credentials, this build). The v0.9.1 tag run started this
+  # 51-minute job only after 108 minutes of CI wait and validation.
   build_web_sdk_package:
     name: Build Web SDK package
-    needs: [require_ci_green, release_validate_gate]
     if: >-
-      always() &&
-      needs.require_ci_green.result == 'success' &&
-      (needs.release_validate_gate.result == 'success' ||
-       (github.event_name == 'workflow_dispatch' &&
-        github.event.inputs.publish_web_sdk_only == 'true' &&
-        needs.release_validate_gate.result == 'skipped')) &&
       (github.event_name != 'workflow_dispatch' ||
        github.event.inputs.web_sdk_artifact_run_id == '') &&
       (startsWith(github.ref, 'refs/tags/v') ||
@@ -1543,6 +1541,19 @@ jobs:
       - name: Add wasm32 target
         run: rustup target add wasm32-unknown-unknown
 
+      # The heavy-crate rustc wrapper comes from the workflow ref: a Web SDK
+      # recovery of an older tag builds a tree that predates it. Sparse, so
+      # the checkout adds no Cargo or npm package to the build.
+      - name: Checkout Web SDK build tooling
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+          path: .release-tooling
+          persist-credentials: false
+          sparse-checkout: |
+            scripts/release-web-sdk-rustc-wrapper
+          sparse-checkout-cone-mode: false
+
       # No RUSTFLAGS here: sdks/web/scripts/build-wasm.mjs owns the wasm
       # flags (the getrandom cfg and the 8 MiB stack). An ambient RUSTFLAGS
       # made Cargo ignore them and shipped a 1 MiB stack from 0.8.30 through
@@ -1552,11 +1563,19 @@ jobs:
         env:
           VERSION: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag || github.ref_name }}
           CARGO_INCREMENTAL: "0"
-          # Serialize memory-heavy wasm32 compilations. Local capped
-          # comparisons OOM-killed at jobs 4 and 2; with jobs 1, the Cargo
-          # phase completed under a 13 GiB limit. This controls Cargo
-          # concurrency, not a total memory cap or wasm-opt's parallelism.
-          CARGO_BUILD_JOBS: "1"
+          # Four jobs, while scripts/release-web-sdk-rustc-wrapper keeps the
+          # other memory-heavy wasm32 crates off the machine catalog's rustc
+          # (12.8 GiB alone). Plain jobs 4 and 2 were OOM-killed under local
+          # 13-15 GiB limits: pipelining overlapped the catalog with
+          # meerkat_runtime and meerkat_mob, 18.8 GiB at jobs 4. Jobs 1 fit,
+          # but also ran each crate's code generation on one thread: 33m43s
+          # of Cargo in the v0.9.1 tag run, 24m05s locally on four vCPUs,
+          # where jobs 4 with the wrapper took 11m14s and peaked at 13.0 GiB
+          # under a 14 GiB limit. This bounds Cargo concurrency, not
+          # wasm-opt's parallelism.
+          CARGO_BUILD_JOBS: "4"
+          RUSTC_WRAPPER: ${{ github.workspace }}/.release-tooling/scripts/release-web-sdk-rustc-wrapper
+          MEERKAT_WEB_WASM_HEAVY_RUSTC_LOCK: ${{ runner.temp }}/web-sdk-heavy-rustc.lock
         run: scripts/release-build-web-sdk-package.sh "${GITHUB_WORKSPACE}/web-sdk-package"
 
       - name: Upload Web SDK package
@@ -2083,6 +2102,10 @@ jobs:
       always() &&
       needs.require_ci_green.result == 'success' &&
       needs.registry_credentials_preflight.result == 'success' &&
+      (needs.release_validate_gate.result == 'success' ||
+       (github.event_name == 'workflow_dispatch' &&
+        github.event.inputs.publish_web_sdk_only == 'true' &&
+        needs.release_validate_gate.result == 'skipped')) &&
       (needs.build_web_sdk_package.result == 'success' ||
        (github.event_name == 'workflow_dispatch' &&
         github.event.inputs.web_sdk_artifact_run_id != '')) &&
@@ -2090,7 +2113,7 @@ jobs:
        (github.event_name == 'workflow_dispatch' &&
         github.event.inputs.publish_release_packages == 'true' &&
         github.event.inputs.alpha_crates_only != 'true'))
-    needs: [require_ci_green, build_web_sdk_package, registry_credentials_preflight]
+    needs: [require_ci_green, release_validate_gate, build_web_sdk_package, registry_credentials_preflight]
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:

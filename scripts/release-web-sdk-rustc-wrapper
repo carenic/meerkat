@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# RUSTC_WRAPPER for the release Web SDK package build (release.yml
+# `build_web_sdk_package`): Cargo runs every crate as
+#   $RUSTC_WRAPPER rustc ARGS
+#
+# A few crates of the wasm32 release graph of meerkat-web-runtime need
+# gigabytes in one rustc. Sampled peak RssAnon per rustc (4-vCPU scope,
+# CARGO_BUILD_JOBS=4, 2026-10-15): meerkat_machine_schema 12.8 GiB,
+# meerkat_runtime 9.0, meerkat_mob 6.0, meerkat_machine_kernels 3.2,
+# meerkat_core 2.5, meerkat_contracts 1.6; every other crate stays under
+# 0.8 GiB. Cargo's pipelining starts a dependent as soon as its dependency's
+# metadata exists, so at four plain jobs the catalog's code generation ran
+# beside meerkat_runtime and meerkat_mob: 18.8 GiB at once, more than a 16 GB
+# hosted runner has. Once the catalog was done, the rest peaked at 11.8 GiB.
+# One job avoided the overlap, but each rustc then also generated its 256
+# codegen units on one thread (33m43s of Cargo in the v0.9.1 tag run).
+#
+# While MEERKAT_WEB_WASM_HEAVY_RUSTC_LOCK names a lock file, the catalog
+# (meerkat_machine_schema) compiles under an exclusive flock(1) and the other
+# heavy crates under a shared one: none of them runs beside the catalog, but
+# they may overlap each other. Every other crate, and each rustc's codegen
+# threads, still use all of CARGO_BUILD_JOBS. Without the variable, or
+# without flock, the wrapper runs rustc unchanged.
+set -euo pipefail
+
+lock="${MEERKAT_WEB_WASM_HEAVY_RUSTC_LOCK:-}"
+if [[ -n "${lock}" ]] && command -v flock >/dev/null 2>&1; then
+  previous=""
+  for arg in "$@"; do
+    if [[ "${previous}" == "--crate-name" ]]; then
+      case "${arg}" in
+        meerkat_machine_schema)
+          exec flock --exclusive "${lock}" "$@"
+          ;;
+        meerkat_runtime | meerkat_mob | meerkat_machine_kernels | meerkat_core | meerkat_contracts)
+          exec flock --shared "${lock}" "$@"
+          ;;
+      esac
+      break
+    fi
+    previous="${arg}"
+  done
+fi
+exec "$@"

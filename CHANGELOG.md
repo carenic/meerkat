@@ -37,6 +37,16 @@ them.
 
 ### Changed
 
+- The release workflow's `Build Web SDK package` job starts with the run,
+  beside `Require green CI` and the release validation, instead of after
+  them; `Publish Web SDK package` now itself requires the release validation
+  gate (skipped only on Web-only recovery), as well as green CI, the registry
+  credential preflight and the build. The job's Cargo build runs four jobs
+  instead of one: `scripts/release-web-sdk-rustc-wrapper` compiles the
+  machine catalog crate (12.8 GiB in one rustc) apart from the other
+  memory-heavy wasm32 crates, so the build peaks at 13.0 GiB instead of
+  18.8 GiB at four plain jobs. Locally, on four vCPUs, its Cargo phase took
+  about 11 minutes instead of 24 at one job (33m43s in the v0.9.1 tag run).
 - CI's `Closure tests` rows have 60 minutes instead of 40, and the
   `ci-integration` profile gives its four slow nested-Cargo and
   whole-workspace tests 16 slow periods (960 s) instead of 8, so a cold row
