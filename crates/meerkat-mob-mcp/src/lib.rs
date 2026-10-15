@@ -836,6 +836,62 @@ pub enum DetachedCompletionDelivery {
 /// [`MobMcpState::set_after_destroy`].
 pub type MobAfterDestroy = Arc<dyn Fn(&MobId) + Send + Sync>;
 
+/// What a [`MobBeforeCreate`] hook is told about a mob a [`MobMcpState`] is
+/// about to create. Every field comes from the create path, never from the
+/// caller's input: a model's `mob_create` names the mob's id, nothing else
+/// here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct MobCreateRequest {
+    /// The id the mob would be created under.
+    pub mob_id: MobId,
+    /// The owner bridge session the mob would be created for: the calling
+    /// agent's session for its `mob_create` and its implicit delegation
+    /// mob, a session of its own for a temporary council. `None` only for a
+    /// mob a host creates directly ([`MobMcpState::mob_create_definition`],
+    /// [`MobMcpState::mob_create_from_mobpack`]).
+    pub owner_bridge_session_id: Option<SessionId>,
+    /// Whether this is the owner session's implicit delegation mob, created
+    /// by that session's own runtime path
+    /// ([`MobMcpState::ensure_implicit_mob_for_model`]) under the id it
+    /// derives from the session ([`MobDefinition::implicit`]). Never set for
+    /// a mob a caller names, whatever its id.
+    pub implicit_delegation_mob: bool,
+}
+
+/// Host admission hook for the mobs a [`MobMcpState`] creates: `Ok(())` lets
+/// the create proceed, `Err(reason)` refuses it. See
+/// [`MobMcpState::set_before_create`].
+#[cfg(not(target_arch = "wasm32"))]
+pub type MobBeforeCreate = Arc<
+    dyn Fn(
+            MobCreateRequest,
+        )
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>>
+        + Send
+        + Sync,
+>;
+/// Host admission hook for the mobs a [`MobMcpState`] creates: `Ok(())` lets
+/// the create proceed, `Err(reason)` refuses it. See
+/// [`MobMcpState::set_before_create`].
+#[cfg(target_arch = "wasm32")]
+pub type MobBeforeCreate = Arc<
+    dyn Fn(
+            MobCreateRequest,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>>>>
+        + Send
+        + Sync,
+>;
+
+/// The `kind` in the structured data of a host's refusal of a mob create
+/// ([`MobMcpState::set_before_create`], [`MobMcpState::is_create_refusal`]).
+pub const MOB_CREATE_REFUSED_KIND: &str = "mob_create_refused";
+
+/// The reason a create is refused with when the host's create hook panicked:
+/// its answer is unknown, so the create does not proceed.
+const BEFORE_CREATE_PANICKED: &str =
+    "the host's create admission panicked, so the create is refused";
+
 pub struct MobMcpState {
     session_service: Arc<dyn MobSessionService>,
     runtime_adapter: Option<Arc<meerkat_runtime::MeerkatMachine>>,
@@ -849,6 +905,9 @@ pub struct MobMcpState {
     /// Host release hook for the mobs this state destroys; see
     /// [`MobMcpState::set_after_destroy`].
     after_destroy: std::sync::OnceLock<MobAfterDestroy>,
+    /// Host admission hook for the mobs this state creates; see
+    /// [`MobMcpState::set_before_create`].
+    before_create: std::sync::OnceLock<MobBeforeCreate>,
     /// Host bundles; only the child-available ones reach child mob builders.
     child_tool_bundles: ChildToolBundles,
     additional_child_tool_bundles: std::sync::OnceLock<ChildToolBundles>,
@@ -1052,6 +1111,7 @@ impl MobMcpState {
             member_runtime_registration_hook: None,
             before_activation: std::sync::OnceLock::new(),
             after_destroy: std::sync::OnceLock::new(),
+            before_create: std::sync::OnceLock::new(),
             child_tool_bundles: ChildToolBundles::default(),
             additional_child_tool_bundles: std::sync::OnceLock::new(),
             child_mcp_servers: std::sync::RwLock::new(ChildMcpServers::default()),
@@ -2354,6 +2414,78 @@ impl MobMcpState {
             .map_err(|_| MobError::Internal("after-destroy hook already bound".into()))
     }
 
+    /// Admit or refuse each mob this state creates. Before anything of a
+    /// new mob exists (its storage, its actor, its managed entry), the hook
+    /// gets a [`MobCreateRequest`] and answers `Ok(())` to let the create
+    /// proceed or `Err(reason)` to refuse it. Every create path asks it: an
+    /// agent's `mob_create`, the implicit delegation mob, a temporary
+    /// council, a host's definition or mobpack create. Restoring a persisted
+    /// mob creates nothing and never asks it.
+    ///
+    /// The hook fails closed: a refusal, a panic while calling it and a
+    /// panic in the future it returns all refuse the create, with an error
+    /// [`Self::is_create_refusal`] recognizes. The reason is in the error's
+    /// message and, under `reason`, in its structured data (`kind`
+    /// [`MOB_CREATE_REFUSED_KIND`]). Install once before any create is
+    /// admitted.
+    pub fn set_before_create(&self, hook: MobBeforeCreate) -> Result<(), MobError> {
+        self.before_create
+            .set(hook)
+            .map_err(|_| MobError::Internal("before-create hook already bound".into()))
+    }
+
+    /// Whether `error` is a host's refusal of a mob create, through the hook
+    /// [`Self::set_before_create`] installs.
+    pub fn is_create_refusal(error: &MobError) -> bool {
+        matches!(
+            error,
+            MobError::SessionError(meerkat_core::service::SessionError::FailedWithData {
+                data,
+                ..
+            }) if data.get("kind").and_then(serde_json::Value::as_str)
+                == Some(MOB_CREATE_REFUSED_KIND)
+        )
+    }
+
+    /// The error a refused create answers with: the host's reason in its
+    /// message and in its structured data.
+    fn create_refused(mob_id: &MobId, reason: &str) -> MobError {
+        MobError::SessionError(meerkat_core::service::SessionError::FailedWithData {
+            message: format!("mob create refused for mob id '{mob_id}': {reason}"),
+            data: json!({
+                "kind": MOB_CREATE_REFUSED_KIND,
+                "mob_id": mob_id.to_string(),
+                "reason": reason,
+                "retryable": false,
+            }),
+        })
+    }
+
+    /// Ask the host's create hook, if one is bound, whether the mob
+    /// `request` describes may be created. Runs before anything of the mob
+    /// exists; see [`Self::set_before_create`].
+    async fn admit_create(&self, request: MobCreateRequest) -> Result<(), MobError> {
+        let Some(hook) = self.before_create.get() else {
+            return Ok(());
+        };
+        let mob_id = request.mob_id.clone();
+        let panicked = || {
+            tracing::error!(mob_id = %mob_id, "the host's create admission panicked");
+            Err(BEFORE_CREATE_PANICKED.to_string())
+        };
+        let verdict = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| hook(request)))
+        {
+            Ok(answer) => {
+                match futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(answer)).await {
+                    Ok(verdict) => verdict,
+                    Err(_) => panicked(),
+                }
+            }
+            Err(_) => panicked(),
+        };
+        verdict.map_err(|reason| Self::create_refused(&mob_id, &reason))
+    }
+
     /// Add provider-opened host bundles before child create/restore is admitted.
     /// This is a one-time bootstrap operation, not a tool-facing mutation.
     pub fn set_additional_child_tool_bundles(
@@ -3652,6 +3784,14 @@ impl MobMcpState {
         if self.destroy_cleanup_owed(&mob_id) {
             return Err(Self::owed_destroy_cleanup_error(&mob_id));
         }
+        // The host admits or refuses the create before anything of the mob
+        // exists. A mobpack is the host's own create: no owner session.
+        self.admit_create(MobCreateRequest {
+            mob_id: mob_id.clone(),
+            owner_bridge_session_id: None,
+            implicit_delegation_mob: false,
+        })
+        .await?;
         let (storage, storage_path) = self.storage_for_new_mob(&mob_id).await?;
         let handle = self
             .configure_builder(
@@ -3791,6 +3931,25 @@ impl MobMcpState {
         if self.destroy_cleanup_owed(&mob_id) {
             return Err(Self::owed_destroy_cleanup_error(&mob_id));
         }
+        // The host admits or refuses the create before anything of the mob
+        // exists, told what this path knows: the owner session and whether
+        // this is that session's implicit delegation mob. Only the implicit
+        // path sets the flag, and only under the id it derives from the
+        // owner session does it count.
+        self.admit_create(MobCreateRequest {
+            mob_id: mob_id.clone(),
+            owner_bridge_session_id: owner_bridge_session_authority
+                .as_ref()
+                .map(|(owner_bridge_session_id, _, _)| owner_bridge_session_id.clone()),
+            implicit_delegation_mob: owner_bridge_session_authority.as_ref().is_some_and(
+                |(owner_bridge_session_id, _, implicit_delegation_mob)| {
+                    *implicit_delegation_mob
+                        && MobDefinition::implicit(&owner_bridge_session_id.to_string(), "").id
+                            == mob_id
+                },
+            ),
+        })
+        .await?;
         let (storage, storage_path) = self.storage_for_new_mob(&mob_id).await?;
         let child = owner_bridge_session_authority.as_ref().is_some_and(
             |(_, destroy_on_owner_archive, _)| {
@@ -16583,6 +16742,192 @@ mod tests {
             .map(|(mob_id, _)| mob_id)
             .collect();
         assert_eq!(listed, vec![kept]);
+    }
+
+    /// A host's create hook is asked before anything of a new mob exists, on
+    /// every create path, with what that path itself knows: the owner
+    /// session, and whether the mob is that session's implicit delegation
+    /// mob. A refusal leaves nothing of the mob behind and is recognizable,
+    /// with the host's reason in its message and its structured data.
+    #[tokio::test]
+    async fn a_before_create_hook_answers_before_anything_of_the_mob_exists() {
+        let svc = Arc::new(MockSessionSvc::new());
+        let root = tempfile::tempdir().expect("tempdir");
+        let state = persistent_destroy_state(&svc, root.path());
+        let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorder = Arc::clone(&asked);
+        let hook: MobBeforeCreate = Arc::new(move |request: MobCreateRequest| {
+            let refuse = request.mob_id.as_str().starts_with("refused-");
+            recorder
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(request);
+            Box::pin(async move {
+                if refuse {
+                    Err("the host keeps this id".to_string())
+                } else {
+                    Ok(())
+                }
+            })
+        });
+        state.set_before_create(hook).expect("bind the create hook");
+        assert!(
+            state
+                .set_before_create(Arc::new(|_: MobCreateRequest| Box::pin(async { Ok(()) })))
+                .is_err(),
+            "the create hook binds once"
+        );
+
+        let refused_id = MobId::from("refused-host-create");
+        let refused = state
+            .mob_create_definition(explicit_definition(refused_id.as_str()))
+            .await
+            .expect_err("the hook refuses the create");
+        assert!(MobMcpState::is_create_refusal(&refused), "{refused}");
+        assert!(
+            refused.to_string().contains("the host keeps this id"),
+            "{refused}"
+        );
+        assert_eq!(
+            refused
+                .structured_data()
+                .and_then(|data| data.get("reason").cloned()),
+            Some(json!("the host keeps this id"))
+        );
+        assert!(
+            existing_storage_files(&destroy_test_storage_path(root.path(), &refused_id)).is_empty(),
+            "nothing of the refused mob was stored"
+        );
+        assert!(state.handle_for(&refused_id).await.is_err());
+
+        let owner = SessionId::new();
+        let child = state
+            .mob_create_definition_with_owner_bridge_session(
+                explicit_definition("admitted-child"),
+                owner.clone(),
+                true,
+                false,
+            )
+            .await
+            .expect("the hook admits the child");
+        let (implicit, created) = state
+            .ensure_implicit_mob_for_model(&owner.to_string(), "claude-sonnet-4-5", None)
+            .await
+            .expect("the hook admits the implicit delegation mob");
+        assert!(created);
+        // The implicit flag counts only under the id derived from the owner
+        // session.
+        let flagged = state
+            .mob_create_definition_with_owner_bridge_session(
+                explicit_definition("flagged-not-implicit"),
+                owner.clone(),
+                true,
+                true,
+            )
+            .await
+            .expect("the hook admits the flagged create");
+        assert_eq!(
+            *asked
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            vec![
+                MobCreateRequest {
+                    mob_id: refused_id,
+                    owner_bridge_session_id: None,
+                    implicit_delegation_mob: false,
+                },
+                MobCreateRequest {
+                    mob_id: child,
+                    owner_bridge_session_id: Some(owner.clone()),
+                    implicit_delegation_mob: false,
+                },
+                MobCreateRequest {
+                    mob_id: implicit,
+                    owner_bridge_session_id: Some(owner.clone()),
+                    implicit_delegation_mob: true,
+                },
+                MobCreateRequest {
+                    mob_id: flagged,
+                    owner_bridge_session_id: Some(owner),
+                    implicit_delegation_mob: false,
+                },
+            ]
+        );
+    }
+
+    /// The create hook fails closed: a panic while it is called, or in the
+    /// future it returns, refuses the create, and nothing of the mob exists.
+    #[tokio::test]
+    async fn a_panicking_before_create_hook_refuses_the_create() {
+        for in_future in [false, true] {
+            let svc = Arc::new(MockSessionSvc::new());
+            let root = tempfile::tempdir().expect("tempdir");
+            let state = persistent_destroy_state(&svc, root.path());
+            let hook: MobBeforeCreate = Arc::new(move |request: MobCreateRequest| {
+                let id = request.mob_id.to_string();
+                if !in_future && !id.is_empty() {
+                    panic!("the host's admission of {id} failed");
+                }
+                Box::pin(async move {
+                    if id.is_empty() {
+                        Ok(())
+                    } else {
+                        panic!("the host's admission of {id} failed")
+                    }
+                })
+            });
+            state.set_before_create(hook).expect("bind the create hook");
+            let mob_id = MobId::from("panicking-admission");
+            let refused = state
+                .mob_create_definition(explicit_definition(mob_id.as_str()))
+                .await
+                .expect_err("a panicking hook refuses the create");
+            assert!(
+                MobMcpState::is_create_refusal(&refused),
+                "in_future={in_future}: {refused}"
+            );
+            assert!(
+                existing_storage_files(&destroy_test_storage_path(root.path(), &mob_id)).is_empty(),
+                "in_future={in_future}: nothing of the refused mob was stored"
+            );
+            assert!(state.handle_for(&mob_id).await.is_err());
+        }
+    }
+
+    /// Restoring a persisted mob creates nothing, so it never asks the
+    /// create hook: a hook that refuses every create still lets the mob
+    /// come back.
+    #[tokio::test]
+    async fn restoring_a_mob_never_asks_the_before_create_hook() {
+        let svc = Arc::new(MockSessionSvc::new());
+        let root = tempfile::tempdir().expect("tempdir");
+        let state = persistent_destroy_state(&svc, root.path());
+        let mob_id = state
+            .mob_create_definition(explicit_definition("restored-without-admission"))
+            .await
+            .expect("create explicit mob");
+        state
+            .handle_for(&mob_id)
+            .await
+            .expect("predecessor mob handle")
+            .shutdown()
+            .await
+            .expect("retire the predecessor supervisor route");
+
+        let restored = persistent_destroy_state(&svc, root.path());
+        let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = Arc::clone(&asked);
+        restored
+            .set_before_create(Arc::new(move |_: MobCreateRequest| {
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Box::pin(async { Err("this host admits no create".to_string()) })
+            }))
+            .expect("bind the create hook");
+        restored
+            .handle_for(&mob_id)
+            .await
+            .expect("the persisted mob restores");
+        assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     /// An agent's destroy is continued only by the exact caller it was

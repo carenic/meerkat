@@ -539,6 +539,16 @@ handles refuse is retried for about a second, the hook running again before
 each try, so a holder that lets go shortly after the hook does not leave the
 cleanup outstanding.
 
+`MobMcpState::set_before_create` is the admission counterpart for the mobs
+that state creates. Before anything of a new mob exists, its `MobBeforeCreate`
+hook gets a `MobCreateRequest` that the create path builds itself: the mob
+id, the owner bridge session (absent only for a host's own create) and
+whether the mob is that session's implicit delegation mob. Every create path
+asks it; restoring a persisted mob creates nothing and does not. The hook
+fails closed: a refusal or a panic refuses the create with an error
+`MobMcpState::is_create_refusal` recognizes, and the reason is in its message
+and structured data.
+
 ## Compaction contract
 
 Compaction is optional. Ordinary recoverable failures preserve uncompacted

@@ -35,6 +35,20 @@ them.
 
 ## [Unreleased]
 
+### Added
+
+- `meerkat-mob-mcp`: `MobMcpState::set_before_create` installs a
+  `MobBeforeCreate` hook that admits or refuses every mob the state creates
+  (an agent's `mob_create`, the implicit delegation mob, a temporary council,
+  a host's definition or mobpack create) before anything of the mob exists.
+  It gets a `MobCreateRequest` built by the create path itself: the mob id,
+  the owner bridge session (`None` only for a host's own create) and whether
+  the mob is that session's implicit delegation mob, which counts only under
+  the id derived from the session. The hook fails closed: a refusal or a
+  panic refuses the create with an error `MobMcpState::is_create_refusal`
+  recognizes, carrying the reason in its message and structured data (`kind`
+  `MOB_CREATE_REFUSED_KIND`). Restoring a persisted mob never asks it.
+
 ### Changed
 
 - CI's `Closure tests` rows have 60 minutes instead of 40, and the
