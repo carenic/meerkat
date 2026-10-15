@@ -39,8 +39,21 @@ const BUMP_PARENT_TREE = "ac72cfd357c09c068e9bc0c23b87371990866e2a";
 const REPOSITORY = "lukacf/meerkat";
 const RUN_ID = 4242;
 
-function git(args, { cwd = root, env = process.env, input } = {}) {
-  const result = spawnSync("git", args, { cwd, env, input, encoding: "utf8", maxBuffer: 256 * 1024 * 1024 });
+// Hosted runners have no git identity, and the synthetic commits below need
+// one: every git call of this test carries a fixed identity and fixed dates,
+// so it also builds the same commits on every run.
+const GIT_IDENTITY = {
+  GIT_AUTHOR_NAME: "ci-selftest",
+  GIT_AUTHOR_EMAIL: "ci-selftest@invalid",
+  GIT_AUTHOR_DATE: "2026-10-15T00:00:00Z",
+  GIT_COMMITTER_NAME: "ci-selftest",
+  GIT_COMMITTER_EMAIL: "ci-selftest@invalid",
+  GIT_COMMITTER_DATE: "2026-10-15T00:00:00Z",
+};
+const baseEnv = { ...process.env, ...GIT_IDENTITY };
+
+function git(args, { cwd = root, env = baseEnv, input } = {}) {
+  const result = spawnSync("git", args, { cwd, env: { ...env, ...GIT_IDENTITY }, input, encoding: "utf8", maxBuffer: 256 * 1024 * 1024 });
   assert.equal(result.status, 0, `git ${args.join(" ")} failed: ${result.stderr}`);
   return result.stdout.trim();
 }
@@ -65,13 +78,13 @@ const store = join(scratch, "store");
 git(["init", "-q", store], { cwd: scratch });
 const commonDir = resolve(root, git(["rev-parse", "--git-common-dir"]));
 writeFileSync(join(store, ".git/objects/info/alternates"), `${join(commonDir, "objects")}\n`);
-const withScratch = { ...process.env, GIT_ALTERNATE_OBJECT_DIRECTORIES: join(store, ".git/objects") };
+const withScratch = { ...baseEnv, GIT_ALTERNATE_OBJECT_DIRECTORIES: join(store, ".git/objects") };
 
 // A commit whose tree is `fromTree` with `edits` (path -> new text) and whose
 // only parent is `parent`.
 function synthesize({ fromTree, parent, parents = [parent], edits, message }) {
   const index = join(scratch, `index-${Math.random().toString(16).slice(2)}`);
-  const env = { ...process.env, GIT_INDEX_FILE: index };
+  const env = { ...baseEnv, GIT_INDEX_FILE: index };
   git(["read-tree", fromTree], { cwd: store, env });
   for (const [path, text] of Object.entries(edits)) {
     const blob = git(["hash-object", "-w", "--stdin"], { cwd: store, input: text });
