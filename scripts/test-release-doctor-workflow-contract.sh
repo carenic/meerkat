@@ -37,6 +37,7 @@ BASELINE_PASS="PASS Semver baseline rustdoc builds alongside the release and gat
 BASELINE_FAIL="FAIL The semver baseline rustdoc must stay off every path a user waits on"
 TRAILING_PASS="PASS Linux and macOS arm64 assets publish without waiting for the trailing Intel macOS and Windows lanes; no upload replaces a published asset"
 TRAILING_FAIL="FAIL The trailing Intel macOS and Windows lanes must not gate the critical assets, and no upload may replace a published asset"
+TOKEN_PASS="PASS Release workflow token is read-only except for the jobs that attest or publish, which never persist it in a checkout; no reusable workflow inherits every secret"
 CACHES_PASS="PASS Release caches in release.yml jobs and the local actions they call are never saved on a dispatch and never cache ~/.cargo/bin; token jobs restore none, and OIDC or attesting jobs restore none that a dispatch-like run of any workflow saves (reusable workflows are not read and never run on a dispatch)"
 CACHES_FAIL="FAIL A release cache can be saved on a dispatch, cache ~/.cargo/bin, or reach a token, OIDC or attesting job"
 
@@ -529,6 +530,17 @@ elif name == "token-write-default":
         "permissions:\n  actions: read\n  checks: read\n  contents: read\n",
         "permissions:\n  actions: read\n  checks: read\n  contents: write\n  id-token: write\n",
     )
+elif name == "token-publisher-persisted":
+    # The pre-review publishers kept the contents: write token in .git/config.
+    job = text.index("  publish_github_release:\n")
+    needle = "          persist-credentials: false\n"
+    at = text.index(needle, job)
+    text = text[:at] + text[at + len(needle):]
+elif name == "secrets-inherit":
+    replace_once(
+        "    secrets:\n      MEERKAT_GCP_BUILDBUDDY_API_KEY: ${{ secrets.MEERKAT_GCP_BUILDBUDDY_API_KEY }}\n",
+        "    secrets: inherit\n",
+    )
 elif name == "cache-registry-restore":
     # The pre-review registry publisher restored a cache with its tokens.
     job = text.index("  publish_registries:\n")
@@ -858,6 +870,12 @@ expect_fail_named trailing-selects-intel "${TEST_ROOT}/trailing-selects-intel.ym
 mutate token-write-default "${TEST_ROOT}/token-write-default.yml"
 expect_fail_named token-write-default "${TEST_ROOT}/token-write-default.yml" \
   "the workflow default grants \`contents: write\` to every job" token-permissions
+mutate token-publisher-persisted "${TEST_ROOT}/token-publisher-persisted.yml"
+expect_fail_named token-publisher-persisted "${TEST_ROOT}/token-publisher-persisted.yml" \
+  "job \`publish_github_release\` step \`Checkout workflow helpers\` persists the workflow token in its checkout" token-permissions
+mutate secrets-inherit "${TEST_ROOT}/secrets-inherit.yml"
+expect_fail_named secrets-inherit "${TEST_ROOT}/secrets-inherit.yml" \
+  "job \`release_validate_buildbuddy_full\` passes every repository secret to a reusable workflow" token-permissions
 
 mutate cache-registry-restore "${TEST_ROOT}/cache-registry-restore.yml"
 expect_fail_named cache-registry-restore "${TEST_ROOT}/cache-registry-restore.yml" \
@@ -905,7 +923,7 @@ run_doctor() {
 }
 
 run_doctor "$WORKFLOW" "${TEST_ROOT}/doctor-committed.log"
-for line in "$SEMVER_PASS" "$SLO_PASS" "$DISPATCH_PASS" "$TAG_VALIDATION_PASS" "$PREBUILD_PASS" "$BASELINE_PASS" "$TRAILING_PASS" "$CACHES_PASS"; do
+for line in "$SEMVER_PASS" "$SLO_PASS" "$DISPATCH_PASS" "$TAG_VALIDATION_PASS" "$PREBUILD_PASS" "$BASELINE_PASS" "$TRAILING_PASS" "$TOKEN_PASS" "$CACHES_PASS"; do
   if ! grep -Fxq "$line" "${TEST_ROOT}/doctor-committed.log"; then
     fail "doctor does not report \`${line}\` for the committed workflow" \
       "$(cat "${TEST_ROOT}/doctor-committed.log")"

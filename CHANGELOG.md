@@ -114,7 +114,9 @@ them.
   `windows-cross-validate.yml` no longer saves the Windows SDK cache from a
   dispatch, so the attesting build jobs restore nothing a dispatch saved. The
   workflow token is read-only by default, with OIDC and attestation writes
-  only on the build jobs and release writes only on the publishers.
+  only on the build jobs and release writes only on the publishers, whose
+  checkouts no longer persist it; the full BuildBuddy graph validation passes
+  `buildbuddy.yml` only its control-plane key instead of every secret.
 - A pre-tag prebuild is reusable as soon as its critical binaries and Web
   SDK package are built: the tag publishes those right away, and its
   trailing publisher waits for the prebuild's Intel macOS and Windows lanes

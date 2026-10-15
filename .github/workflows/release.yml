@@ -74,7 +74,8 @@ on:
 # mint OIDC tokens to attest their archives (id-token, attestations: write),
 # the release publishers write the GitHub release (contents: write), the
 # verifiers read attestations, and the full-graph caller passes id-token on
-# to buildbuddy.yml. Build checkouts do not persist the token.
+# to buildbuddy.yml. No checkout in a job with a write scope persists the
+# token.
 permissions:
   actions: read
   checks: read
@@ -664,7 +665,11 @@ jobs:
     uses: ./.github/workflows/buildbuddy.yml
     with:
       mode: full-fresh
-    secrets: inherit
+    # Only the self-hosted control plane's key: GCP access is the job's OIDC
+    # token (workload identity), and no registry or publish secret reaches
+    # the called workflow.
+    secrets:
+      MEERKAT_GCP_BUILDBUDDY_API_KEY: ${{ secrets.MEERKAT_GCP_BUILDBUDDY_API_KEY }}
 
   release_validate_gate:
     name: Release validation gate
@@ -1935,6 +1940,7 @@ jobs:
         uses: actions/checkout@v6
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Download this run's release archives
         if: ${{ needs.release_prebuild.outputs.run_id == '' }}
@@ -2408,6 +2414,7 @@ jobs:
         uses: actions/checkout@v6
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Download all artifacts
         if: ${{ (github.event_name != 'workflow_dispatch' || github.event.inputs.assets_run_id == '') && needs.release_prebuild.outputs.run_id == '' }}

@@ -1933,7 +1933,9 @@ def check_token_permissions(text: str) -> list[str]:
     The workflow default grants no write scope. Only the build jobs (and the
     full-graph caller, for buildbuddy.yml's OIDC) may mint OIDC tokens, only
     the build jobs may write attestations, and only the release publishers
-    may write repository contents; every build checkout drops the token.
+    may write repository contents. No checkout in a job granted a write
+    scope persists the token, and no reusable workflow receives every secret
+    (`secrets: inherit`).
     """
     violations: list[str] = []
     lines = text.splitlines()
@@ -1942,11 +1944,15 @@ def check_token_permissions(text: str) -> list[str]:
         if level == "write":
             violations.append(f"the workflow default grants `{scope}: write` to every job")
     for job in _job_names(text):
-        scopes = _permission_scopes(job_block(text, job), 4)
+        block = job_block(text, job)
+        scopes = _permission_scopes(block, 4)
         for scope, level in sorted(scopes.items()):
             if level == "write" and job not in WRITE_SCOPES_ALLOWED.get(scope, set()):
                 violations.append(f"job `{job}` is granted `{scope}: write`")
-    for job in (*BINARY_BUILD_JOBS, WEB_SDK_BUILD_JOB):
+        if parse_mapping(block, 4).get("secrets", "").strip() == "inherit":
+            violations.append(f"job `{job}` passes every repository secret to a reusable workflow (`secrets: inherit`)")
+        if "write" not in scopes.values():
+            continue
         for step in _steps_of(text, job):
             inputs = step.nested("with")
             if CHECKOUT_ACTION in step.fields.get("uses", "") and inputs.get("persist-credentials") != "false":
