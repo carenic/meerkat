@@ -271,6 +271,12 @@ embedding a separate runtime implementation.
    them are in the crates.io index. The SDK publish jobs build and smoke-test
    their package artifacts before upload.
 8. Publish the prebuilt Web SDK artifact on a GitHub-hosted runner.
+9. Off the publication path, build the rustdoc JSON baseline the next
+   release's semver gate compares against (`publish_semver_baseline`, which
+   starts with the release) and attach it as
+   `semver-rustdoc-<version>.tar.zst` once the GitHub release is published
+   (`attach_semver_baseline`). No job waits for either; if it fails, the next
+   measurement rebuilds the baseline from the tag instead.
 
 ### Pre-tag prebuild
 

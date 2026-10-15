@@ -17,7 +17,8 @@ re-enabling the long measurement on tags, relaxing the 30 minute publication
 SLO, making the SDK packages wait on it, re-running Cargo validation on a
 tag whose exact-tree CI attestation already covers it, or letting a pre-tag
 prebuild publish anything or a tag publish a prebuild's artifacts without the
-attested-archive verification all fail and name the defect.
+attested-archive verification, or making a job wait for the semver baseline
+rustdoc all fail and name the defect.
 
 Only the Python standard library is used, so the doctor and its contract test
 run wherever `python3` does.
@@ -1439,6 +1440,89 @@ def check_prebuild(text: str) -> list[str]:
         )
     return violations
 
+SEMVER_BASELINE_JOB = "publish_semver_baseline"
+SEMVER_BASELINE_ATTACH_JOB = "attach_semver_baseline"
+
+
+def _job_needs(text: str, job: str) -> list[str]:
+    raw = parse_mapping(job_block(text, job), 4).get("needs", "").strip()
+    if raw.startswith("[") and raw.endswith("]"):
+        raw = raw[1:-1]
+    return [item for item in re.split(r"[\s,]+", raw) if item and item != "-"]
+
+
+def check_semver_baseline(text: str) -> list[str]:
+    """The semver baseline rustdoc is off every path a user waits on.
+
+    Its rustdoc build starts with the release (it waits for nothing that
+    publishes), no job waits for it except the attach job, nothing waits for
+    the attach job, and only the attach job writes to the GitHub release,
+    after the release is published, from the artifact the build uploaded.
+    """
+    violations: list[str] = []
+    names = _job_names(text)
+    for job in (SEMVER_BASELINE_JOB, SEMVER_BASELINE_ATTACH_JOB):
+        if job not in names:
+            return [f"job `{job}` is not defined in the workflow"]
+    needs = {job: _job_needs(text, job) for job in names}
+
+    for job, upstream in needs.items():
+        if job != SEMVER_BASELINE_ATTACH_JOB and SEMVER_BASELINE_JOB in upstream:
+            violations.append(f"job `{job}` waits for the semver baseline rustdoc (`{SEMVER_BASELINE_JOB}`)")
+        if SEMVER_BASELINE_ATTACH_JOB in upstream:
+            violations.append(f"job `{job}` waits for the semver baseline attachment (`{SEMVER_BASELINE_ATTACH_JOB}`)")
+
+    closure: set[str] = set()
+    frontier = list(needs[SEMVER_BASELINE_JOB])
+    while frontier:
+        job = frontier.pop()
+        if job in closure or job not in needs:
+            continue
+        closure.add(job)
+        frontier.extend(needs[job])
+    blocking = sorted(
+        job
+        for job in closure
+        if any(marker in "\n".join(job_block(text, job)) for marker in PUBLISHING_MARKERS)
+        or job.startswith("build_")
+    )
+    if blocking:
+        violations.append(
+            f"job `{SEMVER_BASELINE_JOB}` waits for {', '.join(f'`{job}`' for job in blocking)}; "
+            "the rustdoc build must run in parallel with publication, not after it"
+        )
+
+    if "publish_github_release" not in needs[SEMVER_BASELINE_ATTACH_JOB]:
+        violations.append(
+            f"job `{SEMVER_BASELINE_ATTACH_JOB}` does not wait for `publish_github_release`, "
+            "so it could attach to a release that is not published"
+        )
+    build_steps = job_steps(job_block(text, SEMVER_BASELINE_JOB))
+    attach_steps = job_steps(job_block(text, SEMVER_BASELINE_ATTACH_JOB))
+    if any("gh release upload" in step.run for step in build_steps):
+        violations.append(f"job `{SEMVER_BASELINE_JOB}` writes to the GitHub release itself")
+    if not any("gh release upload" in step.run for step in attach_steps):
+        violations.append(f"job `{SEMVER_BASELINE_ATTACH_JOB}` does not attach the baseline")
+    uploaded = {
+        step.nested("with").get("name")
+        for step in build_steps
+        if "actions/upload-artifact" in step.fields.get("uses", "")
+    }
+    downloaded = {
+        step.nested("with").get("name")
+        for step in attach_steps
+        if "actions/download-artifact" in step.fields.get("uses", "")
+    }
+    if not uploaded or not downloaded or not downloaded <= uploaded:
+        violations.append(
+            f"job `{SEMVER_BASELINE_ATTACH_JOB}` must attach the artifact `{SEMVER_BASELINE_JOB}` "
+            f"uploads (uploads {sorted(filter(None, uploaded))}, downloads {sorted(filter(None, downloaded))})"
+        )
+    for job in (SEMVER_BASELINE_JOB, SEMVER_BASELINE_ATTACH_JOB):
+        if not _job_runs(text, job, TAG_PUSH):
+            violations.append(f"job `{job}` does not run on {TAG_PUSH.label}")
+    return violations
+
 def _readiness_push(needed: str, baseline: str) -> EventContext:
     return EventContext(
         label=f"a main push with needed={needed!r} and notes baseline {baseline!r}",
@@ -1509,6 +1593,7 @@ CHECKS: dict[str, Callable[[str], list[str]]] = {
     "dispatch-binding": check_dispatch_binding,
     "tag-validation": check_tag_validation,
     "prebuild": check_prebuild,
+    "semver-baseline": check_semver_baseline,
 }
 
 # Checks of release-semver-readiness.yml; run them by name with

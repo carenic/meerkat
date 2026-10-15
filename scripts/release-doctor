@@ -295,6 +295,12 @@ else
   bad "A pre-tag prebuild must publish nothing, and a tag may publish its commit's prebuild only through the attested-archive verification (${prebuild_contract//$'\n'/; })"
 fi
 
+if baseline_contract="$(workflow_contract semver-baseline)"; then
+  pass "Semver baseline rustdoc builds alongside the release and gates nothing; it attaches only to a published release"
+else
+  bad "The semver baseline rustdoc must stay off every path a user waits on (${baseline_contract//$'\n'/; })"
+fi
+
 if tag_validation_contract="$(workflow_contract tag-validation)"; then
   pass "Tag releases validate on the verified schema-4 exact-tree CI attestation instead of re-running Cargo validation"
 else

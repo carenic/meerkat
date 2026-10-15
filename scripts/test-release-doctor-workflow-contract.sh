@@ -33,6 +33,8 @@ TAG_VALIDATION_PASS="PASS Tag releases validate on the verified schema-4 exact-t
 TAG_VALIDATION_FAIL="FAIL Tag releases must validate on the verified schema-4 exact-tree CI attestation"
 PREBUILD_PASS="PASS Pre-tag prebuilds publish nothing, and a tag publishes its own commit's prebuild only through the attested-archive verification"
 PREBUILD_FAIL="FAIL A pre-tag prebuild must publish nothing, and a tag may publish its commit's prebuild only through the attested-archive verification"
+BASELINE_PASS="PASS Semver baseline rustdoc builds alongside the release and gates nothing; it attaches only to a published release"
+BASELINE_FAIL="FAIL The semver baseline rustdoc must stay off every path a user waits on"
 
 fail() {
   echo "release doctor workflow contract violated: $1" >&2
@@ -414,6 +416,24 @@ elif name == "prebuild-lookup-if-reflowed":
         "    if: ${{ startsWith(github.ref, 'refs/tags/v') && github.event_name != 'workflow_dispatch' }}\n",
         "    if: >-\n      github.event_name != 'workflow_dispatch' &&\n      startsWith(github.ref, 'refs/tags/v')\n",
     )
+elif name == "semver-baseline-gates-homebrew":
+    # The Homebrew update waits for the 17-minute baseline rustdoc build.
+    job = text.index("  update_homebrew:\n")
+    needle = "    needs: [publish_github_release]\n"
+    at = text.index(needle, job)
+    text = text[:at] + "    needs: [publish_github_release, publish_semver_baseline]\n" + text[at + len(needle):]
+elif name == "semver-baseline-after-release":
+    # The pre-change shape: the rustdoc build starts only after publication.
+    replace_once(
+        "    name: Generate semver baseline rustdoc\n    needs: [require_ci_green]\n",
+        "    name: Generate semver baseline rustdoc\n    needs: [publish_github_release]\n",
+    )
+elif name == "semver-baseline-needs-block-list":
+    # Equivalent: the attach job's needs as a block sequence.
+    replace_once(
+        "    needs: [publish_github_release, publish_semver_baseline]\n",
+        "    needs:\n      - publish_github_release\n      - publish_semver_baseline\n",
+    )
 elif name == "both-defects":
     replace_once(
         MEASUREMENT_STEP_IF,
@@ -488,6 +508,8 @@ mutate tag-validation-reflowed "${TEST_ROOT}/tag-validation-reflowed.yml"
 expect_pass tag-validation-reflowed "${TEST_ROOT}/tag-validation-reflowed.yml" tag-validation
 mutate prebuild-lookup-if-reflowed "${TEST_ROOT}/prebuild-lookup-if-reflowed.yml"
 expect_pass prebuild-lookup-if-reflowed "${TEST_ROOT}/prebuild-lookup-if-reflowed.yml" prebuild
+mutate semver-baseline-needs-block-list "${TEST_ROOT}/semver-baseline-needs-block-list.yml"
+expect_pass semver-baseline-needs-block-list "${TEST_ROOT}/semver-baseline-needs-block-list.yml" semver-baseline
 
 # 3. Dropping the behaviour fails and names the defect.
 mutate evidence-step-removed "${TEST_ROOT}/evidence-step-removed.yml"
@@ -578,6 +600,13 @@ mutate prebuild-gate-renamed "${TEST_ROOT}/prebuild-gate-renamed.yml"
 expect_fail_named prebuild-gate-renamed "${TEST_ROOT}/prebuild-gate-renamed.yml" \
   "does not require the \`Prebuild complete\` job" prebuild
 
+mutate semver-baseline-gates-homebrew "${TEST_ROOT}/semver-baseline-gates-homebrew.yml"
+expect_fail_named semver-baseline-gates-homebrew "${TEST_ROOT}/semver-baseline-gates-homebrew.yml" \
+  "job \`update_homebrew\` waits for the semver baseline rustdoc" semver-baseline
+mutate semver-baseline-after-release "${TEST_ROOT}/semver-baseline-after-release.yml"
+expect_fail_named semver-baseline-after-release "${TEST_ROOT}/semver-baseline-after-release.yml" \
+  "the rustdoc build must run in parallel with publication, not after it" semver-baseline
+
 mutate readback-step-removed "${TEST_ROOT}/readback-step-removed.yml"
 expect_fail_named readback-step-removed "${TEST_ROOT}/readback-step-removed.yml" \
   "no step that reads every crate back" registry-slo
@@ -597,7 +626,7 @@ run_doctor() {
 }
 
 run_doctor "$WORKFLOW" "${TEST_ROOT}/doctor-committed.log"
-for line in "$SEMVER_PASS" "$SLO_PASS" "$DISPATCH_PASS" "$TAG_VALIDATION_PASS" "$PREBUILD_PASS"; do
+for line in "$SEMVER_PASS" "$SLO_PASS" "$DISPATCH_PASS" "$TAG_VALIDATION_PASS" "$PREBUILD_PASS" "$BASELINE_PASS"; do
   if ! grep -Fxq "$line" "${TEST_ROOT}/doctor-committed.log"; then
     fail "doctor does not report \`${line}\` for the committed workflow" \
       "$(cat "${TEST_ROOT}/doctor-committed.log")"
@@ -632,6 +661,13 @@ run_doctor "${TEST_ROOT}/doctor-prebuild.yml" "${TEST_ROOT}/doctor-prebuild.log"
 if ! grep -Fq "$PREBUILD_FAIL" "${TEST_ROOT}/doctor-prebuild.log"; then
   fail "doctor does not report \`${PREBUILD_FAIL}\` for a workflow whose prebuild publishes" \
     "$(cat "${TEST_ROOT}/doctor-prebuild.log")"
+fi
+
+mutate semver-baseline-gates-homebrew "${TEST_ROOT}/doctor-baseline.yml"
+run_doctor "${TEST_ROOT}/doctor-baseline.yml" "${TEST_ROOT}/doctor-baseline.log"
+if ! grep -Fq "$BASELINE_FAIL" "${TEST_ROOT}/doctor-baseline.log"; then
+  fail "doctor does not report \`${BASELINE_FAIL}\` for a workflow that waits for the baseline" \
+    "$(cat "${TEST_ROOT}/doctor-baseline.log")"
 fi
 
 echo "release doctor workflow contract holds"

@@ -527,7 +527,7 @@ release semver gate; PR and manual artifacts are previews.
 | `release_prebuild_gate` | Prebuild dispatches | Passes only when the binary build gate and the Web SDK package succeeded; the marker `release_prebuild` requires of a prebuild run |
 | `publish_github_release` | Tags or manual asset recovery | Downloads artifacts (a prebuild's, verified exactly like an `assets_run_id` recovery), generates `checksums.sha256` + `index.json`, publishes or repairs the GitHub Release |
 | `update_homebrew` | After GitHub release or asset recovery | Updates the Homebrew tap formula |
-| `publish_semver_baseline` | After GitHub release or asset recovery | Generates rustdoc JSON for every publishable library crate on the release tag and attaches `semver-rustdoc-<version>.tar.zst`, the baseline the next release's semver gate compares against |
+| `publish_semver_baseline` / `attach_semver_baseline` | Tags or asset recovery, alongside publication | `publish_semver_baseline` generates rustdoc JSON for every publishable library crate on the release tag as soon as `require_ci_green` passes; `attach_semver_baseline` attaches it as `semver-rustdoc-<version>.tar.zst` once the GitHub release is published. It is the baseline the next release's semver gate compares against; no job waits for either |
 | `publish_registries` | Tags or manual `publish_release_packages=true` | Publishes 46 Rust crates → crates.io by dependency level (concurrently within a level), Python SDK → PyPI, TypeScript SDK → npm |
 | `publish_web_sdk` | Tags or manual package/Web recovery | Publishes `@rkat/web` → npm (a prebuild's package only after verifying its attestation and version) |
 
