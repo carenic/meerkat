@@ -1722,10 +1722,10 @@ jobs:
       - uses: ./.github/actions/setup-buildbuddy-ci
         with:
           profile: native
-          # The archives are attested: no cache entry another run (a
-          # dispatch included) saved may reach them. Costs nothing: this
-          # job's Bazel wrapper uses /tmp/meerkat-bazel-repository-cache, so
-          # the restored directory never reached the build.
+          # The archives are attested: no GitHub Actions cache entry another
+          # run (a dispatch included) saved may reach them. Costs nothing:
+          # this job's Bazel wrapper uses /tmp/meerkat-bazel-repository-cache,
+          # so the restored directory never reached the build.
           repository-cache: "false"
 
       - name: Build release binaries via BuildBuddy

@@ -38,7 +38,7 @@ BASELINE_FAIL="FAIL The semver baseline rustdoc must stay off every path a user 
 TRAILING_PASS="PASS Linux and macOS arm64 assets publish without waiting for the trailing Intel macOS and Windows lanes; no upload replaces a published asset"
 TRAILING_FAIL="FAIL The trailing Intel macOS and Windows lanes must not gate the critical assets, and no upload may replace a published asset"
 TOKEN_PASS="PASS Release workflow token is read-only except for the jobs that attest or publish, which never persist it in a checkout; no reusable workflow inherits every secret"
-CACHES_PASS="PASS Release caches in release.yml jobs and the local actions they call are never saved on a dispatch and never cache ~/.cargo/bin; token jobs restore none, and OIDC or attesting jobs restore none that a dispatch-like run of any workflow saves (reusable workflows are not read and never run on a dispatch)"
+CACHES_PASS="PASS GitHub Actions caches in release.yml jobs and the local actions they call are never saved on a dispatch and never cache ~/.cargo/bin; token jobs restore none, and OIDC or attesting jobs restore none that a dispatch-like run of any workflow saves (reusable workflows are not read and never run on a dispatch)"
 CACHES_FAIL="FAIL A release cache can be saved on a dispatch, cache ~/.cargo/bin, or reach a token, OIDC or attesting job"
 
 fail() {
@@ -634,6 +634,44 @@ elif name == "cache-xwin-validate-dispatch-save":
         "          save-sdk-cache: ${{ github.event_name != 'workflow_dispatch' }}\n",
         '          save-sdk-cache: "true"\n',
     )
+elif name == "cache-dispatch-shared-registry":
+    # An attesting job shares a rust-cache key with a workflow whose trigger
+    # is written with a value (`workflow_dispatch: {}`, as in ci.yml), which
+    # saves that key on a dispatch.
+    release = root / ".github/workflows/release.yml"
+    text = release.read_text()
+    job = text.index("  build_web_sdk_package:\n")
+    needle = "          save-if: ${{ github.event_name != 'workflow_dispatch' }}\n"
+    at = text.index(needle, job)
+    release.write_text(text[:at] + "          shared-key: ci-registry\n" + text[at:])
+    (root / ".github/workflows/registry-dispatch.yml").write_text(
+        "name: Registry cache on dispatch\n"
+        "\n"
+        "on:\n"
+        "  push:\n"
+        "    branches:\n"
+        "      - main\n"
+        "  pull_request:\n"
+        "    types:\n"
+        "      - opened\n"
+        "  workflow_dispatch: {}\n"
+        "\n"
+        "permissions:\n"
+        "  contents: read\n"
+        "\n"
+        "jobs:\n"
+        "  lint:\n"
+        "    runs-on: ubuntu-24.04\n"
+        "    steps:\n"
+        "      - name: Cache cargo registry\n"
+        "        uses: Swatinem/rust-cache@v2\n"
+        "        with:\n"
+        "          shared-key: ci-registry\n"
+        "          cache-targets: \"false\"\n"
+        "\n"
+        "      - name: Lint\n"
+        "        run: make lint\n"
+    )
 elif name == "cache-token-job-action":
     # A cache inside the local action a token job calls.
     replace_once(
@@ -900,6 +938,9 @@ expect_tree_fail_named cache-xwin-save-ungated "${TEST_ROOT}/cache-xwin-save-ung
 mutate_tree cache-xwin-validate-dispatch-save "${TEST_ROOT}/cache-xwin-validate-dispatch-save"
 expect_tree_fail_named cache-xwin-validate-dispatch-save "${TEST_ROOT}/cache-xwin-validate-dispatch-save" \
   "restores \`xwin-sdk-*-cargo-xwin-0.23.1\`, which windows-cross-validate.yml job \`build_windows_cross\` (in \`.github/actions/build-windows-cross\`) saves on a workflow_dispatch run" release-caches
+mutate_tree cache-dispatch-shared-registry "${TEST_ROOT}/cache-dispatch-shared-registry"
+expect_tree_fail_named cache-dispatch-shared-registry "${TEST_ROOT}/cache-dispatch-shared-registry" \
+  "job \`build_web_sdk_package\` restores \`v0-rust-ci-registry\`, which registry-dispatch.yml job \`lint\` saves on a workflow_dispatch run" release-caches
 mutate_tree cache-token-job-action "${TEST_ROOT}/cache-token-job-action"
 expect_tree_fail_named cache-token-job-action "${TEST_ROOT}/cache-token-job-action" \
   "job \`update_homebrew\` (in \`.github/actions/update-homebrew\`) holds a registry or publish token and restores a cache" release-caches

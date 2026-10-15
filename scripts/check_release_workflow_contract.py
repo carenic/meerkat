@@ -1980,17 +1980,15 @@ SETUP_CACHE_ACTIONS = (
     "actions/setup-go",
     "actions/setup-dotnet",
 )
-# Triggers whose runs save into the default branch's cache scope, which every
-# tag run restores, without being a reviewed push to main: a dispatch, an
-# external event, a pull_request_target or workflow_run follow-up, or a
-# workflow call (whose caller's event is unknown here).
-DISPATCH_LIKE_TRIGGERS = (
-    "workflow_dispatch",
-    "repository_dispatch",
-    "pull_request_target",
-    "workflow_run",
-    "workflow_call",
-)
+# The triggers whose saves cannot reach a tag run, or come from reviewed
+# code alone: a push (to main, or to a branch scope tags never read), a pull
+# request or merge-queue run (their own scopes) and a schedule (main's code).
+# Every other trigger is dispatch-like: it saves into the default branch's
+# cache scope, which every tag run restores, on behalf of someone other than
+# a reviewed push to main (a dispatch, repository_dispatch, workflow_call,
+# whose caller's event is unknown here, pull_request_target, workflow_run,
+# issue_comment, issues, ...).
+TRUSTED_SAVE_TRIGGERS = ("push", "pull_request", "schedule", "merge_group")
 # The tree the local actions and the other workflows are read from; the
 # release doctor's fixtures point it at a mutated copy (--repo-root).
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -2391,7 +2389,8 @@ def _workflow_triggers(text: str) -> set[str]:
         for candidate in lines[index + 1 :]:
             if candidate.strip() and not candidate.startswith(" "):
                 break
-            named = re.match(r"^  (?:- )?([A-Za-z_]+):?\s*(?:#.*)?$", candidate)
+            # `workflow_dispatch:`, `workflow_dispatch: {}`, `- push`.
+            named = re.match(r"^  (?:- )?([A-Za-z_]+)\s*(?::.*)?$", candidate)
             if named:
                 triggers.add(named.group(1))
         return triggers
@@ -2423,8 +2422,8 @@ def check_release_caches(text: str) -> list[str]:
     `contents: write`) runs no cache step; and a job that mints OIDC tokens
     or attests artifacts (`id-token` or `attestations: write`) restores only
     caches that no workflow in the repository saves on a dispatch-like run
-    (dispatch, repository_dispatch, pull_request_target, workflow_run, or a
-    workflow call), through the same local action or an overlapping key.
+    (any trigger but push, pull_request, schedule and merge_group), through
+    the same local action or an overlapping key.
     """
     root = REPO_ROOT
     violations: list[str] = []
@@ -2480,9 +2479,7 @@ def check_release_caches(text: str) -> list[str]:
     sources[DEFAULT_WORKFLOW.name] = text
     for workflow, source in sorted(sources.items()):
         triggers = _workflow_triggers(source)
-        for trigger in DISPATCH_LIKE_TRIGGERS:
-            if trigger not in triggers:
-                continue
+        for trigger in sorted(triggers - set(TRUSTED_SAVE_TRIGGERS)):
             frame = OpenFrame(
                 label=f"a {trigger} run",
                 event_name=None if trigger == "workflow_call" else trigger,
