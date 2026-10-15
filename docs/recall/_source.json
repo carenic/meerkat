@@ -1,12 +1,12 @@
 {
   "generated": true,
   "source_repository": "https://github.com/lukacf/meerkat-recall",
-  "source_ref": "codex/recall091-published-docs",
-  "source_commit": "e332456ac5554b10255b531937f7aafb24e3d39b",
+  "source_ref": "codex/recall091-budget-anchor",
+  "source_commit": "db77b364a0332f7a252f5ebd5abc48d78f17ca48",
   "source_version": "0.9.1",
   "source_docs_dirty": false,
   "public_pages": 45,
-  "content_sha256": "8c99fb0e13acece6cd54510844464d9feda2e18d64253f8450170066adaf5fda",
+  "content_sha256": "fb11d69deedb3bd067046bc5d66e6228e7295855621150033c0dad5f610fc204",
   "content_hash_scope": "All mirrored files except _source.json, sorted by relative path; path NUL bytes NUL.",
   "mirror_adjustments": [
     "Local routes namespaced under /recall.",
