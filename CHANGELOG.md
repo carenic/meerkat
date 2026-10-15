@@ -46,6 +46,17 @@ them.
 - `meerkat-core`: `ToolUnavailableReason` gains `CallbackRouteUnclaimed` (see
   Added: `mob/claim_callback_route`). The enum is not `#[non_exhaustive]`;
   exhaustive matches must add the variant.
+- Behaviour-only (not measured by the gate): `meerkat-mob`'s
+  `MobProvisioner::start_turn` for a runtime-backed member resolves at the
+  admitted input's terminal, not at an execution attempt the runtime
+  retries, so a turn whose retry succeeds returns success (see Fixed). A
+  retried input that stops progressing (no run holds it and it gains no
+  attempt for 120 s) ends the call with the failed attempt.
+- Behaviour-only (not measured by the gate): `meerkat-rpc` answers a turn or
+  event its session's runtime refuses to admit with the refusal's typed
+  JSON-RPC code instead of `-32603` (see Fixed), and its not-ready refusal
+  reads "the session runtime is <state> and does not admit this request"
+  instead of "runtime not ready for llm reconfiguration: <state>".
 
 ### Added
 
@@ -60,15 +71,22 @@ them.
   installed the process-default callback channel keeps it held by that
   route), and the claim fills it for the mob's live members and later ones
   alike. The claim is admitted like `mob/create`, and refused with `-32002`
-  while the connection that holds the route is open. When that connection
-  closes, or before any claim, a member's callback fails `tool_unavailable`
-  with the `CallbackRouteUnclaimed` reason ("no connected client holds the
-  callback route that serves it") instead of reaching a closed route. The
+  (`data.reason`: `held_by_open_connection`) while the connection that holds
+  the route is open. When that connection closes, or before any claim, a
+  member's callback fails `tool_unavailable` with the
+  `CallbackRouteUnclaimed` reason ("no connected client holds the callback
+  route that serves it") instead of reaching a closed route, and a detached
+  callback call writes nothing durable. Once the holder has closed, the
+  first claim wins, including the pending detached callback jobs the closed
+  connection's tools started: a claimer that registers tools of the same
+  name and runner reconciles and cancels them. The
   Python (`mob_claim_callback_route`) and TypeScript
   (`mobClaimCallbackRoute`) clients wrap it, and `meerkat-contracts` adds
   `MobClaimCallbackRouteResult`. For hosts: `meerkat-mob-mcp` adds
-  `MemberExternalToolsFactory`, `MobMcpState::with_member_external_tools_factory`
-  (member external tools built per mob, restored mobs included) and
+  `MemberExternalToolsFactory`, `MemberExternalTools` and
+  `MemberExternalToolsOnManaged` (member external tools built per mob,
+  restored mobs included, with a hook that runs once the mob is managed),
+  `MobMcpState::with_member_external_tools_factory` and
   `MobMcpState::mob_claim_member_external_tools`; `meerkat-rpc` adds
   `MobCallbackRouteSlot`, `MobCallbackRouteClaimRefused`,
   `CallbackToolDispatcher::from_mob_slot` (and `_with_job_runtime`),
@@ -91,22 +109,24 @@ them.
   be recorded after the first failed attempt while those retries still ran.
   It is now recorded once, after the input's terminal failure, and not at
   all when a retry delivers the notification. An explicit `MobHandle::resume`
-  and the orchestrator lifecycle notifications report the same final outcome:
-  for a runtime-backed member, `MobProvisioner::start_turn` now resolves at
-  the admitted input's terminal (Behaviour-only: an attempt the runtime
-  retries no longer ends the call, so a turn whose retry succeeds returns
-  success).
+  and the orchestrator lifecycle notifications report the same final outcome
+  (see Breaking: `MobProvisioner::start_turn`). On a governed scoped host, a
+  retried input whose result is withheld from the mob counts as completed.
+  The event is recorded by the in-process lifecycle task waiting for the
+  input, so a crash between the first failed attempt and the input's
+  terminal loses it.
 - `meerkat-rpc`: a turn or event the session's runtime refuses to admit keeps
   the refusal's typed JSON-RPC code. `turn/start` and
   `session/external_event` answered every refusal with `-32603` ("runtime
   accept failed"); they, and `session/peer_response_terminal`, now answer
   `-32602` for an invalid input (an idempotency conflict names the existing
   input in `data.existing_id`), `-32030`/`-32031` for a native refusal or
-  unavailable readiness, `-32001` for a missing runtime, `-32002` for another
-  runtime owner or a teardown in progress, `-32032` for unavailable runtime
-  authority, and `-32600` when the runtime's lifecycle state admits no input
-  (for example a retired runtime; the message names the state and no longer
-  says "llm reconfiguration"). Only a mechanical failure stays `-32603`. RPC
+  unavailable readiness, `-32001` when the runtime driver has no runtime
+  under the session's id, `-32002` for another runtime owner or a teardown
+  in progress, `-32032` for unavailable runtime authority, and `-32600` when
+  the runtime's lifecycle state admits no input (a retired runtime, or the
+  destroyed runtime of a session that is gone; the message names the
+  state). Only a mechanical failure stays `-32603`. RPC
   handlers also stopped dropping an error's typed `data`: every method now
   answers with the data its cause carries (for example the
   unsupported-capability detail of a refused `session/create`), and a failed
