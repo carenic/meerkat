@@ -953,7 +953,11 @@ pub enum MobEventKind {
     /// resume planned; `reason` is the delivery failure. It is final: it is
     /// recorded once the notification's runtime input has failed terminally,
     /// after the runtime's bounded retries, and never for a notification a
-    /// retry delivers.
+    /// retry delivers. A retried input that stops progressing (no run holds
+    /// it and it gains no attempt within a bound) is reported with the failed
+    /// attempt. Only the in-process lifecycle task waiting for the input
+    /// records it, so a crash between the first failed attempt and the
+    /// input's terminal loses the event.
     OrchestratorResumeNotificationFailed {
         member_id: AgentIdentity,
         session_id: SessionId,

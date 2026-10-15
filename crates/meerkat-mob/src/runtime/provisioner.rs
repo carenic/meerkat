@@ -66,6 +66,18 @@ type ArchiveDisposalFuture<'a> = std::pin::Pin<
 #[cfg(feature = "runtime-adapter")]
 const DEFERRED_TURN_EVENT_CHANNEL_CAPACITY: usize = 1024;
 
+/// How long a retried input may go with no run holding it and no new
+/// execution attempt before its turn stops waiting for the input's terminal.
+/// The runtime stages a requeued input again within its bounded attempts; an
+/// input that neither runs nor gains an attempt for this long is parked, and
+/// the turn reports the failed attempt it observed. A run that holds the
+/// input is waited for however long it takes, as the first attempt is.
+#[cfg(all(feature = "runtime-adapter", not(test)))]
+const RETRIED_INPUT_PROGRESS_BOUND: Duration = Duration::from_secs(120);
+
+#[cfg(all(feature = "runtime-adapter", test))]
+const RETRIED_INPUT_PROGRESS_BOUND: Duration = Duration::from_secs(2);
+
 #[cfg(not(test))]
 pub(super) const MEMBER_RETIRE_TOTAL_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -6414,10 +6426,11 @@ impl SessionBackend {
 /// retries it within its bounded attempts. That resolution carries no
 /// committed input terminal, and the failed attempt is not the input's
 /// outcome, since a later attempt may still deliver it. The input's terminal
-/// receipt is the outcome, so the wait continues to it. When no run answered
-/// the input (a terminal without a receipt), or the runtime no longer holds
-/// it or its live registration, the failed attempt stays the last outcome
-/// observed.
+/// receipt is the outcome, so the wait continues to it while the runtime
+/// still works the input (see [`RETRIED_INPUT_PROGRESS_BOUND`]). When no run
+/// answered the input (a terminal without a receipt), when the runtime no
+/// longer holds it or its live registration, or when it is parked, the
+/// failed attempt stays the last outcome observed.
 #[cfg(feature = "runtime-adapter")]
 async fn wait_for_runtime_input_terminal(
     adapter: &MeerkatMachine,
@@ -6428,21 +6441,119 @@ async fn wait_for_runtime_input_terminal(
     meerkat_runtime::completion::CompletionOutcome,
     meerkat_runtime::completion::CompletionWaitError,
 > {
-    use meerkat_runtime::terminal_status::{InputTerminalReceiptRead, InputTerminalReceiptWait};
+    use meerkat_runtime::terminal_status::{
+        InputTerminalReceiptRead, InputTerminalReceiptWait, InteractionSelector,
+    };
     let (attempt, input_terminal) = handle.try_wait_with_terminal_outcome().await?.into_parts();
     if input_terminal.is_some() {
         return Ok(attempt);
     }
-    match adapter
-        .wait_input_terminal_receipt(session_id, input_id)
-        .await
+    let read_input = || {
+        adapter.input_terminal_receipt(session_id, InteractionSelector::InputId(input_id.clone()))
+    };
+    // The attempts the input had when the failed one resolved.
+    let mut progress = RetriedInputProgress::default();
+    if let Ok(Some(read)) = read_input().await
+        && let InputTerminalReceiptRead::Pending {
+            phase,
+            attempt_count,
+            ..
+        } = read.report
     {
-        Ok(Some(InputTerminalReceiptWait::Resolved(read))) => match read.report {
-            InputTerminalReceiptRead::Finalized(receipt) => Ok(receipt.into_outcome()),
-            _ => Ok(attempt),
-        },
-        Ok(_) => Ok(attempt),
-        Err(error) => Err(
+        progress.still_worked(phase, attempt_count);
+    }
+    loop {
+        match tokio::time::timeout(
+            RETRIED_INPUT_PROGRESS_BOUND,
+            adapter.wait_input_terminal_receipt(session_id, input_id),
+        )
+        .await
+        {
+            Ok(Ok(Some(InputTerminalReceiptWait::Resolved(read)))) => {
+                return Ok(match read.report {
+                    InputTerminalReceiptRead::Finalized(receipt) => receipt.into_outcome(),
+                    _ => attempt,
+                });
+            }
+            Ok(Ok(_)) => return Ok(attempt),
+            Ok(Err(error)) => return retried_input_read_failure(input_id, error),
+            Err(_elapsed) => match read_input().await {
+                Ok(Some(read)) => match read.report {
+                    InputTerminalReceiptRead::Pending {
+                        phase,
+                        attempt_count,
+                        ..
+                    } => {
+                        if !progress.still_worked(phase, attempt_count) {
+                            tracing::warn!(
+                                session_id = %session_id,
+                                input_id = %input_id,
+                                phase = ?phase,
+                                attempt_count,
+                                "retried input made no progress within its bound; reporting its failed attempt"
+                            );
+                            return Ok(attempt);
+                        }
+                    }
+                    InputTerminalReceiptRead::Finalized(receipt) => {
+                        return Ok(receipt.into_outcome());
+                    }
+                    _ => return Ok(attempt),
+                },
+                Ok(None) => return Ok(attempt),
+                Err(error) => return retried_input_read_failure(input_id, error),
+            },
+        }
+    }
+}
+
+/// A retried input's execution progress between two reads of a bounded
+/// terminal wait (see [`RETRIED_INPUT_PROGRESS_BOUND`]).
+#[cfg(feature = "runtime-adapter")]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct RetriedInputProgress {
+    attempt_count: Option<u32>,
+}
+
+#[cfg(feature = "runtime-adapter")]
+impl RetriedInputProgress {
+    /// Record a pending read of the input, and say whether the runtime is
+    /// still working it: a run holds it now, or it gained an execution
+    /// attempt since the last read.
+    fn still_worked(
+        &mut self,
+        phase: meerkat_runtime::InputLifecycleState,
+        attempt_count: u32,
+    ) -> bool {
+        use meerkat_runtime::InputLifecycleState as Phase;
+        let gained_attempt = self.attempt_count.is_some_and(|seen| attempt_count > seen);
+        self.attempt_count = Some(attempt_count);
+        gained_attempt
+            || matches!(
+                phase,
+                Phase::Staged | Phase::Applied | Phase::AppliedPendingConsumption
+            )
+    }
+}
+
+/// A retried input's terminal could not be read. On a governed scoped host
+/// the runtime withholds a result this reader may not receive (its scoped
+/// destination is no longer the session's current binding); only a
+/// result-carrying terminal is withheld, so the turn completed, without its
+/// payload.
+#[cfg(feature = "runtime-adapter")]
+fn retried_input_read_failure(
+    input_id: &InputId,
+    error: meerkat_runtime::RuntimeDriverError,
+) -> Result<
+    meerkat_runtime::completion::CompletionOutcome,
+    meerkat_runtime::completion::CompletionWaitError,
+> {
+    match error {
+        meerkat_runtime::RuntimeDriverError::ScopedResultWithheld { .. } => {
+            Ok(meerkat_runtime::completion::CompletionOutcome::CompletedWithoutResult)
+        }
+        error => Err(
             meerkat_runtime::completion::CompletionWaitError::AuthorityUnavailable(format!(
                 "the terminal receipt of retried input '{input_id}' is unavailable: {error}"
             )),
@@ -9280,6 +9391,55 @@ pub(super) async fn prepare_prepared_runtime_session_state(
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::session_turn_error_to_mob_error;
+
+    /// A retried input is still worked while a run holds it, however long
+    /// that run takes, or while it gains attempts; requeued with no new
+    /// attempt since the last read, it is parked.
+    #[cfg(feature = "runtime-adapter")]
+    #[test]
+    fn a_retried_input_is_parked_only_when_it_neither_runs_nor_gains_attempts() {
+        use meerkat_runtime::InputLifecycleState as Phase;
+        let mut progress = super::RetriedInputProgress::default();
+        // The read taken when the first attempt failed sets the baseline.
+        progress.still_worked(Phase::Queued, 1);
+        assert!(progress.still_worked(Phase::Staged, 2), "a run holds it");
+        assert!(
+            progress.still_worked(Phase::Applied, 2),
+            "the run continues"
+        );
+        assert!(
+            progress.still_worked(Phase::Queued, 3),
+            "requeued after another attempt"
+        );
+        assert!(
+            !progress.still_worked(Phase::Queued, 3),
+            "requeued with no attempt since the last read"
+        );
+    }
+
+    /// A withheld scoped result is a completion without its payload; any
+    /// other read failure is the authority being unavailable.
+    #[cfg(feature = "runtime-adapter")]
+    #[test]
+    fn a_withheld_retried_result_completes_without_its_payload() {
+        let input_id = meerkat_core::lifecycle::InputId::new();
+        assert!(matches!(
+            super::retried_input_read_failure(
+                &input_id,
+                meerkat_runtime::RuntimeDriverError::ScopedResultWithheld {
+                    input_id: input_id.clone(),
+                },
+            ),
+            Ok(meerkat_runtime::completion::CompletionOutcome::CompletedWithoutResult)
+        ));
+        assert!(matches!(
+            super::retried_input_read_failure(
+                &input_id,
+                meerkat_runtime::RuntimeDriverError::Internal("store fault".to_string()),
+            ),
+            Err(meerkat_runtime::completion::CompletionWaitError::AuthorityUnavailable(_))
+        ));
+    }
     #[cfg(feature = "runtime-adapter")]
     use super::{
         DeferredTurnEventOutcome, MemberSessionDisposalArc, MultiBackendProvisioner,
