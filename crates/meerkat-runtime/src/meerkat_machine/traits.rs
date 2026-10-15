@@ -236,7 +236,7 @@ impl SessionServiceRuntimeExt for MeerkatMachine {
         session_id: &SessionId,
         idempotency_key: &str,
     ) -> Result<Option<StoredInputState>, RuntimeDriverError> {
-        match self
+        let result = self
             .execute_meerkat_machine_command(
                 None,
                 MeerkatMachineCommand::DurableInputStateByIdempotencyKey {
@@ -244,18 +244,11 @@ impl SessionServiceRuntimeExt for MeerkatMachine {
                     idempotency_key: idempotency_key.to_string(),
                 },
             )
-            .await
-            .map_err(MeerkatMachine::driver_error_from_command_error)?
-        {
-            // A public row read releases its result payload only to a reader
-            // the input's scoped destination permits; lifecycle facts stay.
-            MeerkatMachineCommandResult::InputState(state) => {
-                Ok(self.release_public_row(session_id, state).await)
-            }
-            other => Err(RuntimeDriverError::Internal(format!(
-                "unexpected MeerkatMachineCommandResult for SessionServiceRuntimeExt::durable_input_state_by_idempotency_key: {other:?}"
-            ))),
-        }
+            .await;
+        crate::stack_relief::box_in_own_frame(|| {
+            self.durable_input_state_command_result(session_id, result)
+        })
+        .await
     }
 
     async fn interaction_terminal_status(
@@ -990,6 +983,29 @@ impl MeerkatMachine {
             MeerkatMachineCommandError::Control(err) => {
                 Self::driver_error_from_control_plane_error(err)
             }
+        }
+    }
+
+    /// The handling of a `DurableInputStateByIdempotencyKey` command's
+    /// result, built in its own frame by the trait method that awaits the
+    /// command: at opt-level 0 every move of the result and of its input row
+    /// through `?`, the match and the row release reserved a slot of the
+    /// row's full size in that poll frame, which sits beneath the whole
+    /// command dispatch.
+    async fn durable_input_state_command_result(
+        &self,
+        session_id: &SessionId,
+        result: Result<MeerkatMachineCommandResult, MeerkatMachineCommandError>,
+    ) -> Result<Option<StoredInputState>, RuntimeDriverError> {
+        match result.map_err(Self::driver_error_from_command_error)? {
+            // A public row read releases its result payload only to a reader
+            // the input's scoped destination permits; lifecycle facts stay.
+            MeerkatMachineCommandResult::InputState(state) => {
+                Ok(self.release_public_row(session_id, state).await)
+            }
+            other => Err(RuntimeDriverError::Internal(format!(
+                "unexpected MeerkatMachineCommandResult for SessionServiceRuntimeExt::durable_input_state_by_idempotency_key: {other:?}"
+            ))),
         }
     }
 

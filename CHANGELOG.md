@@ -43,6 +43,25 @@ them.
   (as after a release version bump, when no compiled unit can be reused)
   completes on a hosted 4-vCPU runner.
 
+### Fixed
+
+- A restarted host's fork_off re-link no longer overflows a 2 MiB worker
+  stack in a debug build. Inserting a restored mob's handle spawns the
+  re-link pass, whose first step reads the forker's durable input index for
+  each job's completion through the runtime's machine command dispatch. At
+  opt-level 0 every branch of a function reserves its own stack slots, so
+  the poll frames on that read's path took 2,088,192 bytes: the session and
+  machine command dispatchers took 968,080 and 350,784 bytes, and the
+  re-link's settlement and per-child join frames 632,576. An embedding
+  host's worker overflowed its guard page there. The pass's later receipt
+  wait and outcome delivery reached 2,113,536 and 2,837,920 bytes. Each
+  dispatcher arm and each large re-link future is now built in its own frame
+  (`stack_relief::box_in_own_frame`), and the durable idempotency-key read
+  handles its command result in its own frame; bodies are unchanged.
+  Measured on the debug test binary, the three paths now take 191,680,
+  886,000 and 264,496 bytes. A child-process regression test runs the
+  restart re-link on 2 MiB workers. No behaviour change.
+
 ## [0.9.1] - 2026-10-15
 
 ### Breaking

@@ -4318,3 +4318,182 @@ async fn children_sharing_a_job_id_are_each_retried_as_their_own_job() {
     assert_eq!(completion_records(&fixture, &c_owner, &job_id).await, 1);
     fixture.teardown().await;
 }
+
+/// The worker stack size, in bytes, of the child process that
+/// [`restart_relink_fits_a_2_mib_worker_stack`] starts. Its fixture does
+/// nothing without it; a diagnosis can run the fixture with a smaller size to
+/// measure the re-link's headroom.
+const RELINK_WORKER_STACK_ENV: &str = "MEERKAT_TEST_FORK_RELINK_WORKER_STACK_BYTES";
+/// The child-process fixture of [`restart_relink_fits_a_2_mib_worker_stack`].
+const RELINK_STACK_CHILD_TEST: &str = "restart_relink_on_a_sized_worker_stack_child";
+/// The worker stack an embedding host gives its tokio runtime (also Tokio's
+/// default).
+const HOST_WORKER_STACK: usize = 2 * 1024 * 1024;
+/// The stack of the child's driver thread, which builds the fixture and waits
+/// for the re-link: the debug test-thread budget `.cargo/config.toml` sets.
+/// The re-link itself runs on a worker.
+const RELINK_STACK_DRIVER_STACK: usize = 8 * 1024 * 1024;
+/// How long the parent waits for the child test process before killing it.
+const RELINK_STACK_CHILD_DEADLINE: Duration = Duration::from_secs(300);
+
+/// A restarted host re-links a fork child on a 2 MiB tokio worker, in a debug
+/// build. Inserting the restored mob's handle spawns the re-link pass as a
+/// task. The pass first reads the forker's durable input index for the job's
+/// completion through the runtime's machine command dispatch, then settles
+/// the child and delivers its outcome. At opt-level 0 every branch of a
+/// function reserves its own stack slots, so the dispatch matches and the
+/// re-link's per-child futures had poll frames that together needed more
+/// than 2 MiB: an embedding host's worker overflowed its guard page on
+/// restart. A stack overflow aborts the whole process, so the scenario runs
+/// in a child process, and this test asserts that the child exits
+/// successfully.
+#[test]
+fn restart_relink_fits_a_2_mib_worker_stack() {
+    let output_dir = tempfile::tempdir().expect("child output dir");
+    let output_path = output_dir.path().join("child-output.txt");
+    let stdout = std::fs::File::create(&output_path).expect("child output file");
+    let stderr = stdout.try_clone().expect("child output file");
+    let mut child = std::process::Command::new(std::env::current_exe().expect("test binary"))
+        .args([
+            "--exact",
+            RELINK_STACK_CHILD_TEST,
+            "--ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(RELINK_WORKER_STACK_ENV, HOST_WORKER_STACK.to_string())
+        .stdin(std::process::Stdio::null())
+        .stdout(stdout)
+        .stderr(stderr)
+        .spawn()
+        .expect("start the child test process");
+    let started = std::time::Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("poll the child test process") {
+            break status;
+        }
+        if started.elapsed() > RELINK_STACK_CHILD_DEADLINE {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!(
+                "the child test process did not finish within {RELINK_STACK_CHILD_DEADLINE:?}\n{}",
+                child_output_tail(&output_path)
+            );
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    let output = std::fs::read_to_string(&output_path).unwrap_or_default();
+    assert!(
+        status.success() && output.contains("test result: ok. 1 passed"),
+        "the restart re-link must fit a {HOST_WORKER_STACK}-byte worker stack; the child test \
+         process exited with {status}\n{}",
+        child_output_tail(&output_path)
+    );
+}
+
+/// The last lines of the child test process's output, where a stack overflow
+/// names its thread.
+fn child_output_tail(path: &std::path::Path) -> String {
+    let output = std::fs::read_to_string(path).unwrap_or_default();
+    let lines = output.lines().collect::<Vec<_>>();
+    lines[lines.len().saturating_sub(200)..].join("\n")
+}
+
+/// The child process of [`restart_relink_fits_a_2_mib_worker_stack`]: the
+/// restart scenario on a runtime whose workers have the stack size
+/// [`RELINK_WORKER_STACK_ENV`] gives. Does nothing without it.
+#[test]
+#[ignore = "child-process fixture of restart_relink_fits_a_2_mib_worker_stack"]
+fn restart_relink_on_a_sized_worker_stack_child() {
+    let Some(worker_stack) = std::env::var_os(RELINK_WORKER_STACK_ENV) else {
+        return;
+    };
+    let worker_stack = worker_stack
+        .to_str()
+        .and_then(|bytes| bytes.parse::<usize>().ok())
+        .expect("the worker stack size in bytes");
+    let driver = std::thread::Builder::new()
+        .name("relink-stack-driver".into())
+        .stack_size(RELINK_STACK_DRIVER_STACK)
+        .spawn(move || {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .thread_name("relink-worker")
+                .thread_stack_size(worker_stack)
+                .enable_all()
+                .build()
+                .expect("runtime with sized workers");
+            runtime.block_on(async {
+                tokio::time::timeout(
+                    Duration::from_secs(180),
+                    Box::pin(restart_relink_on_a_worker_scenario()),
+                )
+                .await
+                .expect("the restarted host delivers the child's outcome in time");
+            });
+            runtime.shutdown_timeout(Duration::from_secs(10));
+        })
+        .expect("start the driver thread");
+    if let Err(panic) = driver.join() {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+/// A child finished its job, but its custodian died with the old process.
+/// The restarted host inserts the surviving mob's handle, which spawns the
+/// re-link pass on one of the runtime's workers, and the pass delivers the
+/// child's outcome once.
+async fn restart_relink_on_a_worker_scenario() {
+    let fixture =
+        CouncilFixture::new_runtime_backed(|_| ScriptedTurn::Text(CHILD_REPLY.to_string()));
+    fixture.seed_source_mob(&["forker"]).await;
+    let owner = forker_session(&fixture).await;
+    let handle = fixture
+        .state
+        .handle_for(&fixture.source_mob_id())
+        .await
+        .unwrap();
+    let job_id = "job-relinked-on-a-2-mib-worker".to_string();
+    let (_fork, run) = handle
+        .fork_member_then_run_detached(
+            &AgentIdentity::from("forker"),
+            child_spec("relink-stack-child"),
+            None,
+            "fork_off_result",
+            16 * 1024,
+            meerkat_core::DurableForkSourceAdmission::Quiescent,
+            None,
+            Some(ForkJobBinding {
+                job_id: job_id.clone(),
+                owner_session_id: owner.clone(),
+                retained_work: None,
+            }),
+        )
+        .await
+        .expect("fork");
+    // No custodian: the outcome is observed here and never delivered, as if
+    // the process had died right after the child finished.
+    assert!(matches!(
+        run.outcome().await,
+        Some(ForkChildRunOutcome::Completed(_))
+    ));
+    assert_eq!(completion_records(&fixture, &owner, &job_id).await, 0);
+
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    let runtime = fixture.runtime_adapter.clone().expect("runtime-backed");
+    let restarted = Arc::new(
+        meerkat_mob_mcp::MobMcpState::new_with_runtime_adapter(
+            fixture.service.clone(),
+            Some(runtime),
+            meerkat_mob::MobControlPrincipal::Owner,
+        )
+        .expect("construct runtime authority"),
+    );
+    fixture.bind_continuations(&restarted);
+    restarted
+        .try_mob_insert_handle(fixture.source_mob_id(), handle.clone())
+        .await
+        .expect("insert the restored mob");
+    await_completion_record(&fixture, &owner, &job_id).await;
+    assert_eq!(completion_records(&fixture, &owner, &job_id).await, 1);
+    fixture.teardown().await;
+}
