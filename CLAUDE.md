@@ -366,13 +366,17 @@ GitHub-hosted runners and sized to a 25-minute lane execution budget:
   `release-projection`: `fmt-governance` (version parity, lock consistency,
   release packaging/config, docs-check, the semver self-test), the
   generation ratchets (schema/SDK freshness), the Bazel graph check and the
-  readers of the changed files (their `closure-tests` rows and path-selected
-  integration suites) run, and the Clippy, unit, check, feature, wasm, SDK
-  and example lanes reuse the parent's run. Without such evidence, or for any
+  readers of the changed files (their `closure-tests` rows, path-selected
+  integration suites, and a `--lib --bins` unit row per reader package plus
+  `meerkat-contracts`) run, and the Clippy, other unit, check, feature, wasm,
+  SDK and example lanes reuse the parent's run. The finder takes the newest
+  run of the parent only, and refuses reuse when any test, snapshot, fixture,
+  SDK or Rust code line outside the projection pins the old or new version
+  (`scripts/release-version-pins.mjs`). Without such evidence, or for any
   other byte change, the plan is the ordinary one. A commit whose message, or
   whose merged branch head's message, carries the trailer `CI-Plan: workspace`
-  is planned as the whole workspace: the explicit way to give a release's
-  parent that evidence.
+  is planned as the whole workspace (without looking for evidence): the
+  explicit way to give a release's parent that evidence.
 - `fmt-governance` (always): fmt, docs-check, semver self-test, version
   parity, lock consistency, `make ci-lanes-selftest`,
   `make path-classifier-selftest`, and the ripgrep tombstone scans
@@ -479,8 +483,9 @@ GitHub-hosted runners and sized to a 25-minute lane execution budget:
   pushes. For a `release-projection` plan it re-verifies the reused parent
   attempt with the parent's copies of the scripts (`ci-release-evidence.mjs
   verify`: a completed, successful push run of `ci.yml` on `main` at exactly
-  HEAD's first parent whose attestation names that commit and tree, planned
-  the whole workspace with every lane `success` and is not itself a reuse)
+  HEAD's first parent, still the run's latest attempt, whose attestation
+  names that commit and tree, planned the whole workspace with every lane
+  `success` and is not itself a reuse)
   and records the run and attempt in the attestation (`plan.mode:
   release-projection`, `reused_test_evidence`). It runs under
   `!cancelled()` so superseded runs surface as cancelled.

@@ -75,7 +75,7 @@ function synthesize({ fromTree, parent, parents = [parent], edits, message }) {
   git(["read-tree", fromTree], { cwd: store, env });
   for (const [path, text] of Object.entries(edits)) {
     const blob = git(["hash-object", "-w", "--stdin"], { cwd: store, input: text });
-    git(["update-index", "--cacheinfo", `100644,${blob},${path}`], { cwd: store, env });
+    git(["update-index", "--add", "--cacheinfo", `100644,${blob},${path}`], { cwd: store, env });
   }
   const tree = git(["write-tree"], { cwd: store, env });
   return git(["commit-tree", tree, ...parents.flatMap((one) => ["-p", one]), "-m", message], { cwd: store });
@@ -134,7 +134,7 @@ try {
   assert.equal(projectionPlan.mode, "release-projection");
   assert.equal(projectionPlan.rust_changed, false);
   for (const field of [
-    "packages", "closure", "shards", "unit_shards", "unit_feature_shards", "main_unit_shards",
+    "packages", "closure", "shards", "unit_feature_shards", "main_unit_shards",
     "main_feature_unit_shards", "main_archive_builds", "main_archive_runs", "feature_check_jobs",
   ]) {
     assert.deepEqual(projectionPlan[field], [], `a release projection plans no ${field}`);
@@ -151,6 +151,15 @@ try {
   assert.ok(rowBinaries.includes("xtask::buildbuddy_static_lanes"), "the retired-surface-tokens test that reads CHANGELOG.md runs");
   assert.deepEqual(projectionPlan.integration_suites.map((suite) => suite.name), ["xtask"], "the sdks/ paths select the xtask suite");
   assert.deepEqual(projectionPlan.hook_coverage.missing, [], "the readers' hook binaries are all covered");
+  // Their lib and bin unit tests too (the hook reuses the parent's evidence
+  // for a projection, so nothing else runs them), and meerkat-contracts'.
+  assert.deepEqual(projectionPlan.unit_packages, [...new Set([...readers, "meerkat-contracts"])].sort());
+  assert.deepEqual(
+    projectionPlan.unit_shards.flatMap((shard) => shard.packages).sort(),
+    projectionPlan.unit_packages,
+    "every reader package and meerkat-contracts has a unit row",
+  );
+  assert.ok(projectionPlan.unit_packages.includes("rkat"), "rkat's unit row runs its bin's fenced docs example test");
   assert.deepEqual(
     Object.fromEntries(["generated_contract", "bazel_graph", "machine_authority", "machine_posters", "wasm", "sdk_host", "examples_browser", "example_web"].map((key) => [key, projectionPlan[key]])),
     { generated_contract: true, bazel_graph: true, machine_authority: false, machine_posters: false, wasm: false, sdk_host: false, examples_browser: false, example_web: false },
@@ -181,6 +190,7 @@ try {
     `release_evidence_run_id=${RUN_ID}`,
     "release_evidence_run_attempt=2",
     `closure_test_count=${projectionPlan.closure_test_rows.length}`,
+    `unit_shard_count=${projectionPlan.unit_shards.length}`,
     "integration_count=1",
     "generated_contract=true",
     "bazel_graph=true",
@@ -241,6 +251,9 @@ try {
     message: "Merge pull request #1 from example/rel/0.9.1",
   });
   assert.equal(planOf(releaseMerge).mode, "workspace", "a merge of a branch whose head carries the trailer is planned as the workspace");
+  const probe = (head) => spawnSync("node", [planner, "--workspace-plan-requested", "--head", head], { cwd: root, env: withScratch, encoding: "utf8" }).status;
+  assert.equal(probe(releaseMerge), 0, "the classification's probe sees the trailer on a merged branch head");
+  assert.equal(probe(BUMP), 1, "and nothing on a commit without it");
   const requestedBump = synthesize({
     fromTree: `${BUMP}^{tree}`,
     parent: BUMP_PARENT,
@@ -368,7 +381,9 @@ if (args[0] === "api") {
     });
   };
   const bumpArgs = ["--base", BUMP_PARENT, "--head", BUMP];
-  const okFixture = { api: { [listPath]: { workflow_runs: [goodRun] }, [runPath]: goodRun }, artifacts: { [artifactKey]: goodAttestation } };
+  const attemptPath = `${runPath}/attempts/1`;
+  const okFixture = { api: { [listPath]: { workflow_runs: [goodRun] }, [runPath]: goodRun, [attemptPath]: goodRun }, artifacts: { [artifactKey]: goodAttestation } };
+  const withApi = (api, artifacts = okFixture.artifacts) => ({ api: { ...okFixture.api, ...api }, artifacts });
 
   let result = evidenceRun("find", bumpArgs, okFixture);
   assert.equal(result.status, 0, `find accepts a verified successful parent run: ${result.stderr}`);
@@ -399,19 +414,64 @@ if (args[0] === "api") {
     assert.equal(result.status, 1, `find: ${label} is no evidence (stdout ${result.stdout}, stderr ${result.stderr})`);
     assert.equal(result.stdout, "", `find: ${label} prints no evidence`);
   }
+  // The newest run decides: a newer cancelled or failed run is not passed
+  // over for an older success.
+  const newer = { ...goodRun, id: RUN_ID + 1 };
+  for (const conclusion of ["cancelled", "failure"]) {
+    result = evidenceRun("find", bumpArgs, withApi({ [listPath]: { workflow_runs: [goodRun, { ...newer, conclusion }] } }));
+    assert.equal(result.status, 1, `find: a newer ${conclusion} run withdraws an older success`);
+  }
+  result = evidenceRun("find", bumpArgs, withApi(
+    { [listPath]: { workflow_runs: [{ ...goodRun, conclusion: "failure" }, newer] } },
+    { [artifactKey]: goodAttestation, [`${RUN_ID + 1}/meerkat-ci-attestation-${BUMP_PARENT}-1`]: { ...goodAttestation, workflow_run_id: String(RUN_ID + 1) } },
+  ));
+  assert.equal(result.stdout.trim(), `${BUMP_PARENT}:${RUN_ID + 1}:1`, `find takes the newest successful run: ${result.stderr}`);
+
+  // A test, snapshot, fixture, SDK or Rust code line that pins the old or
+  // new version (unchanged by the bump, so it ran on the parent with the old
+  // version compiled in) sends the bump to the ordinary plan.
+  const pinPath = "crates/meerkat-core/tests/release_version_pin.rs";
+  const pinned = `#[test]\nfn pinned() { assert_eq!(env!("CARGO_PKG_VERSION"), "0.9.0"); }\n`;
+  const pinnedParent = synthesize({ fromTree: `${BUMP_PARENT}^{tree}`, parent: BUMP_PARENT, edits: { [pinPath]: pinned }, message: "test: pin the version" });
+  const pinnedBump = synthesize({ fromTree: `${BUMP}^{tree}`, parent: pinnedParent, edits: { [pinPath]: pinned }, message: "chore: release v0.9.1" });
+  assert.equal(
+    spawnSync(resolve(here, "release-projection-only.mjs"), ["--base", pinnedParent, "--head", pinnedBump], { cwd: root, env: withScratch }).status,
+    0,
+    "the pinned bump is still a projection",
+  );
+  const pinnedListPath = `repos/${REPOSITORY}/actions/workflows/ci.yml/runs?branch=main&event=push&head_sha=${pinnedParent}&per_page=100`;
+  // Everything but the pin is reusable evidence, so the pin alone refuses it.
+  const pinnedFixture = withApi(
+    { [pinnedListPath]: { workflow_runs: [{ ...goodRun, head_sha: pinnedParent }] } },
+    {
+      [`${RUN_ID}/meerkat-ci-attestation-${pinnedParent}-1`]: {
+        ...goodAttestation,
+        commit_sha: pinnedParent,
+        tree_sha: git(["rev-parse", `${pinnedParent}^{tree}`], { env: withScratch }),
+      },
+    },
+  );
+  result = evidenceRun("find", ["--base", pinnedParent, "--head", pinnedBump], pinnedFixture);
+  assert.equal(result.status, 1, "find refuses reuse when a test pins the version");
+  assert.match(result.stderr, /pin 0\.9\.0 or 0\.9\.1 \(first: crates\/meerkat-core\/tests\/release_version_pin\.rs:2\)/);
+  const pinnedPlan = plan(["--base", pinnedParent, "--head", pinnedBump, "--reuse-release-evidence", `${pinnedParent}:${RUN_ID}:1`]);
+  assert.notEqual(pinnedPlan.status, 0, "the planner refuses evidence for a pinned bump");
+  const pinsCli = spawnSync(resolve(here, "release-version-pins.mjs"), ["--from", "0.9.0", "--to", "0.9.1", "--revision", pinnedBump], { cwd: root, env: withScratch, encoding: "utf8" });
+  assert.equal(pinsCli.status, 1, "the pin ratchet reports the pinned test");
+  assert.equal(spawnSync(resolve(here, "release-version-pins.mjs"), ["--from", "0.9.0", "--to", "0.9.1", "--revision", BUMP], { cwd: root }).status, 0, "the real v0.9.1 bump pins nothing");
+
   rmSync(join(scratch, "gh-calls.log"), { force: true });
   result = evidenceRun("find", ["--base", BUMP_PARENT, "--head", sourceEdit], okFixture);
   assert.equal(result.status, 1, "find refuses the bump plus one source edit");
   assert.match(result.stderr, /is not a release projection/);
   assert.ok(!existsSync(join(scratch, "gh-calls.log")), "a non-projection never reaches the API");
 
-  // verify checks the named attempt and its attestation.
-  const attemptPath = `${runPath}/attempts/1`;
+  // verify checks the named attempt, the run's latest attempt and the attestation.
   const outputFile = join(scratch, "github-output");
   writeFileSync(outputFile, "");
   result = evidenceRun("verify", [...bumpArgs, "--run-id", String(RUN_ID), "--run-attempt", "1", "--github-output", outputFile], {
     ...okFixture,
-    api: { [attemptPath]: goodRun },
+    api: { ...okFixture.api },
   });
   assert.equal(result.status, 0, `verify accepts the completed parent attempt: ${result.stderr}`);
   const outputs = Object.fromEntries(readFileSync(outputFile, "utf8").trim().split("\n").map((line) => line.split(/=(.*)/s).slice(0, 2)));
@@ -421,19 +481,22 @@ if (args[0] === "api") {
   );
   const attemptArgs = ["--run-id", String(RUN_ID), "--run-attempt", "1"];
   for (const [label, args, fixture] of [
-    ["a cancelled attempt", attemptArgs, { ...okFixture, api: { [attemptPath]: { ...goodRun, conclusion: "cancelled" } } }],
-    ["an attempt still running", attemptArgs, { ...okFixture, api: { [attemptPath]: running } }],
-    ["another commit's run", attemptArgs, { ...okFixture, api: { [attemptPath]: { ...goodRun, head_sha: BUMP } } }],
-    ["a named attempt that failed", attemptArgs, { ...okFixture, api: { [attemptPath]: { ...goodRun, conclusion: "failure" } } }],
-    ["another attempt's record", attemptArgs, { ...okFixture, api: { [attemptPath]: { ...goodRun, run_attempt: 2 } } }],
-    ["an attestation of another tree", attemptArgs, { ...okFixture, api: { [attemptPath]: goodRun }, artifacts: { [artifactKey]: { ...goodAttestation, tree_sha: "1".repeat(40) } } }],
-    ["a mode-none attestation", attemptArgs, { ...okFixture, api: { [attemptPath]: goodRun }, artifacts: { [artifactKey]: { ...goodAttestation, plan: { mode: "none" } } } }],
-    ["no attempt", ["--run-id", String(RUN_ID)], { ...okFixture, api: { [attemptPath]: goodRun } }],
+    ["a cancelled attempt", attemptArgs, withApi({ [attemptPath]: { ...goodRun, conclusion: "cancelled" } })],
+    ["an attempt still running", attemptArgs, withApi({ [attemptPath]: running })],
+    ["another commit's run", attemptArgs, withApi({ [attemptPath]: { ...goodRun, head_sha: BUMP } })],
+    ["a named attempt that failed", attemptArgs, withApi({ [attemptPath]: { ...goodRun, conclusion: "failure" } })],
+    ["another attempt's record", attemptArgs, withApi({ [attemptPath]: { ...goodRun, run_attempt: 2 } })],
+    ["a later re-run that failed", attemptArgs, withApi({ [runPath]: { ...goodRun, run_attempt: 2, conclusion: "failure" } })],
+    ["a later re-run still running", attemptArgs, withApi({ [runPath]: { ...running, run_attempt: 2 } })],
+    ["a later successful re-run (another attempt)", attemptArgs, withApi({ [runPath]: { ...goodRun, run_attempt: 2 } })],
+    ["an attestation of another tree", attemptArgs, withApi({}, { [artifactKey]: { ...goodAttestation, tree_sha: "1".repeat(40) } })],
+    ["a mode-none attestation", attemptArgs, withApi({}, { [artifactKey]: { ...goodAttestation, plan: { mode: "none" } } })],
+    ["no attempt", ["--run-id", String(RUN_ID)], okFixture],
   ]) {
     result = evidenceRun("verify", [...bumpArgs, ...args], fixture);
     assert.notEqual(result.status, 0, `verify: ${label} fails closed (stderr ${result.stderr})`);
   }
-  result = evidenceRun("verify", ["--base", BUMP_PARENT, "--head", sourceEdit, ...attemptArgs], { ...okFixture, api: { [attemptPath]: goodRun } });
+  result = evidenceRun("verify", ["--base", BUMP_PARENT, "--head", sourceEdit, ...attemptArgs], okFixture);
   assert.equal(result.status, 1, "verify refuses the bump plus one source edit");
 
   // --- The CI gate's own shell, read from ci.yml. ---
@@ -442,7 +505,7 @@ if (args[0] === "api") {
   const gateEnv = {
     CHANGES_RESULT: "success", FMT_GOVERNANCE_RESULT: "success", RATCHETS_RESULT: "success",
     TLC_AUDITS_RESULT: "skipped", MACHINE_AUTHORITY: "false", CLIPPY_RESULT: "skipped",
-    UNIT_RESULT: "skipped", INTEGRATION_RESULT: "skipped", GOVERNED_JSONL_RESULT: "skipped",
+    UNIT_RESULT: "success", INTEGRATION_RESULT: "skipped", GOVERNED_JSONL_RESULT: "skipped",
     MCP_CONFINEMENT_POSITIVE_RESULT: "skipped", INTEGRATION_COUNT: "0", CLOSURE_TESTS_RESULT: "skipped",
     CLOSURE_TEST_COUNT: "0", TEST_SCOPE_COUNT: "0", HOOK_BINARY_COUNT: "0", HOOK_RETAINED_COUNT: "0",
     MAIN_UNIT_PACKED_RESULT: "skipped", MAIN_UNIT_ARCHIVE_BUILD_RESULT: "skipped", MAIN_UNIT_ARCHIVE_RUN_RESULT: "skipped",
@@ -450,7 +513,7 @@ if (args[0] === "api") {
     WASM: "false", WASM_CHECK_RESULT: "skipped", SDK_HOST_RESULT: "skipped", EXAMPLE_WEB_RESULT: "skipped",
     WASM_TIMERS_RESULT: "skipped", BAZEL_GRAPH_RESULT: "success", RUST_CHANGED: "false", IS_MAIN_PUSH: "true",
     SDK_HOST: "false", BAZEL_GRAPH: "true", EXAMPLES_BROWSER: "false", EXAMPLE_WEB: "false",
-    MODE: "release-projection", REASON: "release projection", SHARD_COUNT: "0", UNIT_SHARD_COUNT: "0",
+    MODE: "release-projection", REASON: "release projection", SHARD_COUNT: "0", UNIT_SHARD_COUNT: "6",
     UNIT_DEFERRED: "", UNIT_DEFERRED_COUNT: "0", PACKAGE_COUNT: "0", CLOSURE_COUNT: "0",
     GENERATED_CONTRACT: "true", RELEASE_PROJECTION: "true",
     RELEASE_EVIDENCE_COMMIT: BUMP_PARENT, RELEASE_EVIDENCE_RUN_ID: String(RUN_ID), RELEASE_EVIDENCE_RUN_ATTEMPT: "1",
@@ -473,26 +536,32 @@ if (args[0] === "api") {
     ["a projection plan without the ratchets", { GENERATED_CONTRACT: "false" }],
     ["a projection plan without evidence", { RELEASE_EVIDENCE_RUN_ID: "" }],
     ["the projection mode without its flag", { RELEASE_PROJECTION: "false" }],
-    ["an ordinary main push without the example web suites", { RELEASE_PROJECTION: "false", MODE: "none", RELEASE_EVIDENCE_COMMIT: "", RELEASE_EVIDENCE_RUN_ID: "" }],
+    ["an ordinary main push without the example web suites", { RELEASE_PROJECTION: "false", MODE: "none", RELEASE_EVIDENCE_COMMIT: "", RELEASE_EVIDENCE_RUN_ID: "", UNIT_SHARD_COUNT: "0", UNIT_RESULT: "skipped" }],
+    ["a projection whose unit rows did not run", { UNIT_RESULT: "skipped" }],
+    ["a projection whose unit rows failed", { UNIT_RESULT: "failure" }],
+    ["a projection plan without unit rows", { UNIT_SHARD_COUNT: "0", UNIT_RESULT: "skipped" }],
   ]) {
     assert.equal(gate(change).status, 1, `the gate refuses ${label}`);
   }
   // The gate verifies the evidence after the lanes and records it.
   const verifyStep = extractStepRun(workflow, "Verify reused release-projection evidence");
-  assert.match(verifyStep, /git show "\$\{parent\}:scripts\/ci-release-evidence\.mjs"/, "the gate runs the parent's evidence script");
-  assert.match(verifyStep, /git show "\$\{parent\}:scripts\/release-projection-only\.mjs"/, "and the parent's classifier");
+  assert.match(verifyStep, /git show "\$\{parent\}:scripts\/\$\{script\}"/, "the gate runs the parent's scripts");
   assert.match(verifyStep, /node "\$\{tools\}\/ci-release-evidence\.mjs" verify /);
   assert.match(verifyStep, /--run-attempt "\$\{RELEASE_EVIDENCE_RUN_ATTEMPT\}"/);
   assert.doesNotMatch(verifyStep, /--wait-seconds/, "the gate never waits: the plan reused a completed run");
   const attestationStep = extractStepRun(workflow, "Build exact-tree CI attestation");
   assert.match(attestationStep, /reused_test_evidence: \$reused/);
   assert.match(workflow, /git show "\$\{classification_base\}:scripts\/ci-release-evidence\.mjs"/, "the classification runs the parent's finder");
+  assert.match(workflow, /git show "\$\{classification_base\}:scripts\/release-version-pins\.mjs"/, "with the parent's pin ratchet");
+  assert.match(workflow, /&& ! node scripts\/ci-cargo-lanes\.mjs --workspace-plan-requested --head HEAD \\\n/, "CI-Plan: workspace skips the finder and its wait");
+  assert.match(workflow, /for script in ci-release-evidence\.mjs release-projection-only\.mjs release-version-pins\.mjs; do/, "the gate runs the parent's three scripts");
+  assert.equal((workflow.match(/python-version: "3\.14"/g) ?? []).length >= 2, true, "the classification and the gate pin Python 3.14");
+  assert.match(workflow, /needs\.changes\.outputs\.release_projection == 'true'\) && needs\.changes\.outputs\.unit_shard_count != '0'/, "the unit job runs a projection's rows");
   assert.match(workflow, /node "\$\{evidence_tools\}\/ci-release-evidence\.mjs" find --repository "\$\{GITHUB_REPOSITORY\}"/);
   assert.match(workflow, /EVIDENCE_WAIT_SECONDS: \$\{\{ github\.event_name == 'push' && '2400' \|\| '0' \}\}/, "only a push waits for its parent's run");
   const release = readFileSync(resolve(root, ".github/workflows/release.yml"), "utf8");
   assert.match(release, /\.reused_test_evidence\.base_commit_sha == \$parent/, "require_ci_green binds the evidence to the release commit's first parent");
-  assert.match(release, /git show "\$\{parent\}:scripts\/ci-release-evidence\.mjs"/, "require_ci_green runs the parent's evidence script");
-  assert.match(release, /git show "\$\{parent\}:scripts\/release-projection-only\.mjs"/, "and the parent's classifier");
+  assert.match(release, /for script in ci-release-evidence\.mjs release-projection-only\.mjs release-version-pins\.mjs; do/, "require_ci_green runs the parent's three scripts");
   assert.match(release, /node "\$\{tools\}\/ci-release-evidence\.mjs" verify --repository "\$\{GITHUB_REPOSITORY\}"/, "require_ci_green re-verifies the reused run");
 } finally {
   rmSync(scratch, { recursive: true, force: true });

@@ -189,7 +189,7 @@ function normalizeProjection(path, text, version, parts) {
   return normalized;
 }
 
-function isProjectedPath(path) {
+export function isProjectedPath(path) {
   return (
     path === "Cargo.toml" ||
     isCargoLockPath(path) ||

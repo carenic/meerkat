@@ -437,6 +437,7 @@ for (const path of [
   "scripts/ci-release-evidence.mjs",
   "scripts/ci-release-projection-selftest.mjs",
   "scripts/release-projection-only.mjs",
+  "scripts/release-version-pins.mjs",
   "scripts/ci-clippy-sccache-wrapper",
   ".github/workflows/ci.yml",
   ".github/actions/setup-rust-ci/action.yml",

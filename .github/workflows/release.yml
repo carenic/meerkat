@@ -373,8 +373,9 @@ jobs:
           }
           tools="${RUNNER_TEMP}/release-evidence-tools/scripts"
           mkdir -p "${tools}"
-          git show "${parent}:scripts/ci-release-evidence.mjs" > "${tools}/ci-release-evidence.mjs"
-          git show "${parent}:scripts/release-projection-only.mjs" > "${tools}/release-projection-only.mjs"
+          for script in ci-release-evidence.mjs release-projection-only.mjs release-version-pins.mjs; do
+            git show "${parent}:scripts/${script}" > "${tools}/${script}"
+          done
           node "${tools}/ci-release-evidence.mjs" verify --repository "${GITHUB_REPOSITORY}" \
             --base "${parent}" --head "${RELEASE_SHA}" \
             --run-id "$(jq -r .reused_test_evidence.workflow_run_id "${attestation}")" \

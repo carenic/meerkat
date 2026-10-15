@@ -68,8 +68,11 @@ name: CI
 # of that parent (scripts/ci-release-evidence.mjs, run from the parent's own
 # tree), is planned as mode release-projection: format + governance, the
 # generation ratchets, the Bazel graph check and the readers of the changed
-# files run, and the other lanes reuse the parent's run, which the gate
-# verifies again and records in the attestation. Without that evidence the
+# files (their closure rows, integration suites and lib/bin unit rows, plus
+# meerkat-contracts' unit row) run, and the other lanes reuse the parent's
+# run, which the gate verifies again and records in the attestation. A test,
+# snapshot, fixture, SDK or Rust code line that pins the old or new version
+# (scripts/release-version-pins.mjs) refuses reuse. Without that evidence the
 # commit gets the ordinary plan. A commit carrying the trailer
 # `CI-Plan: workspace` (or merging a branch whose head carries it) is planned
 # as the whole workspace, the explicit way to give a release's parent that
@@ -308,6 +311,19 @@ jobs:
       - name: Setup Rust
         uses: ./.github/actions/setup-rust-ci
 
+      # The release-projection classifier runs the docs and changelog
+      # stampers (Python) and the evidence scripts (Node) under the same
+      # versions as the CI gate and the release workflow.
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+
       - name: Classify changed paths
         id: plan
         shell: bash
@@ -339,12 +355,16 @@ jobs:
           # parent (waiting for a running one up to EVIDENCE_WAIT_SECONDS);
           # otherwise, or on any lookup failure, the plan stays the ordinary
           # one.
+          # A commit carrying `CI-Plan: workspace` gets the whole workspace
+          # anyway, so it neither looks for evidence nor waits for it.
           plan_args=()
           evidence_tools="${RUNNER_TEMP}/release-evidence-tools/scripts"
           mkdir -p "${evidence_tools}"
           if [[ -n "${classification_base}" ]] \
+            && ! node scripts/ci-cargo-lanes.mjs --workspace-plan-requested --head HEAD \
             && git show "${classification_base}:scripts/ci-release-evidence.mjs" > "${evidence_tools}/ci-release-evidence.mjs" 2>/dev/null \
             && git show "${classification_base}:scripts/release-projection-only.mjs" > "${evidence_tools}/release-projection-only.mjs" 2>/dev/null \
+            && git show "${classification_base}:scripts/release-version-pins.mjs" > "${evidence_tools}/release-version-pins.mjs" 2>/dev/null \
             && evidence="$(node "${evidence_tools}/ci-release-evidence.mjs" find --repository "${GITHUB_REPOSITORY}" \
                 --base "${classification_base}" --head HEAD --wait-seconds "${EVIDENCE_WAIT_SECONDS}")"; then
             plan_args=(--reuse-release-evidence "${evidence}")
@@ -739,7 +759,8 @@ jobs:
   unit:
     name: Unit tests (${{ matrix.name }})
     needs: changes
-    if: ${{ needs.changes.outputs.rust_changed == 'true' && needs.changes.outputs.unit_shard_count != '0' }}
+    # A release projection runs its readers' and meerkat-contracts' rows.
+    if: ${{ (needs.changes.outputs.rust_changed == 'true' || needs.changes.outputs.release_projection == 'true') && needs.changes.outputs.unit_shard_count != '0' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 40
     strategy:
@@ -2161,6 +2182,13 @@ jobs:
               echo "::error::the release-projection plan names no completed CI run to reuse (commit='${RELEASE_EVIDENCE_COMMIT}' run='${RELEASE_EVIDENCE_RUN_ID}' attempt='${RELEASE_EVIDENCE_RUN_ATTEMPT}')."
               failed=1
             fi
+            # The readers' and meerkat-contracts' lib and bin unit rows.
+            if [[ "${UNIT_SHARD_COUNT}" =~ ^[0-9]+$ ]] && (( UNIT_SHARD_COUNT > 0 )); then
+              require_ran "Unit tests" "${UNIT_RESULT}"
+            else
+              echo "::error::a release-projection plan must run its readers' unit rows (unit_shard_count='${UNIT_SHARD_COUNT}')."
+              failed=1
+            fi
           elif [[ "${MODE}" == "release-projection" ]]; then
             echo "::error::mode release-projection without the release_projection flag."
             failed=1
@@ -2295,6 +2323,18 @@ jobs:
         with:
           fetch-depth: 2
 
+      - name: Setup Python for the release projection
+        if: ${{ needs.changes.outputs.release_projection == 'true' }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - name: Setup Node for the release projection
+        if: ${{ needs.changes.outputs.release_projection == 'true' }}
+        uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+
       - name: Verify reused release-projection evidence
         if: ${{ needs.changes.outputs.release_projection == 'true' }}
         id: release_evidence
@@ -2313,8 +2353,9 @@ jobs:
           fi
           tools="${RUNNER_TEMP}/release-evidence-tools/scripts"
           mkdir -p "${tools}"
-          git show "${parent}:scripts/ci-release-evidence.mjs" > "${tools}/ci-release-evidence.mjs"
-          git show "${parent}:scripts/release-projection-only.mjs" > "${tools}/release-projection-only.mjs"
+          for script in ci-release-evidence.mjs release-projection-only.mjs release-version-pins.mjs; do
+            git show "${parent}:scripts/${script}" > "${tools}/${script}"
+          done
           node "${tools}/ci-release-evidence.mjs" verify --repository "${GITHUB_REPOSITORY}" \
             --base "${parent}" --head HEAD --run-id "${RELEASE_EVIDENCE_RUN_ID}" \
             --run-attempt "${RELEASE_EVIDENCE_RUN_ATTEMPT}" --github-output "${GITHUB_OUTPUT}"

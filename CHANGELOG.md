@@ -48,9 +48,13 @@ them.
   whole workspace with every lane successful: format + governance (version
   parity, lock consistency, release packaging and configuration, docs), the
   generation ratchets (schema and SDK freshness), the Bazel graph check and
-  the tests that read the changed files run, and the other lanes reuse the
-  parent's run instead of rebuilding every crate at the new version. A main
-  push waits up to 40 minutes for a running parent run. The `CI gate`
+  the tests that read the changed files (their integration rows and the
+  lib and bin unit tests of each reader package and of meerkat-contracts)
+  run, and the other lanes reuse the parent's run instead of rebuilding
+  every crate at the new version. A main push waits up to 40 minutes for a
+  running parent run; only the newest run of the parent counts, and a test,
+  snapshot, fixture, SDK or Rust code line that pins the old or new version
+  refuses reuse. The `CI gate`
   re-verifies the run with the parent's copies of the scripts and records it
   in the exact-tree attestation (`reused_test_evidence`), and
   `require_ci_green` verifies it again the same way before a tag publishes.
