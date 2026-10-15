@@ -1032,11 +1032,19 @@ impl Fixture {
             .await
             .expect("actual immutable selected controller client");
         assert!(pin.selection() == &selection());
-        meerkat_core::publish_token_lifecycle_acquired_for_identity(
+        // Publication only tries the machine's controller custody (the session
+        // map, each session's mutation gate and driver lock) and answers the
+        // typed Busy refusal instead of waiting. The spawn returns before the
+        // member's comms drain has started, and that startup takes the
+        // member's mutation gate and then the session map. Core's bounded
+        // publication retries exactly that refusal until the deadline.
+        meerkat_core::publish_token_lifecycle_acquired_for_identity_within(
             &machine.generated_auth_lease_handle(),
             pin.selection().credential(),
             &meerkat_core::auth::PersistedTokens::api_key("synthetic-governed-mob-credential"),
+            tokio::time::Instant::now() + WAIT,
         )
+        .await
         .expect("actual generated fixture credential before native admission");
         let runtime = LogicalRuntimeId::for_session(&session_id);
         let mut target = association(

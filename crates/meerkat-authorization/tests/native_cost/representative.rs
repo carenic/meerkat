@@ -494,11 +494,13 @@ impl RepresentativeFixture {
             .unwrap();
         assert_eq!(pin.selection(), &selection());
         let owner = machine.generated_auth_lease_handle();
-        meerkat_core::publish_token_lifecycle_acquired_for_identity(
+        meerkat_core::publish_token_lifecycle_acquired_for_identity_within(
             &owner,
             pin.selection().credential(),
             &meerkat_core::auth::PersistedTokens::api_key("synthetic-native-cost-credential"),
+            tokio::time::Instant::now() + CREDENTIAL_PUBLICATION_WAIT,
         )
+        .await
         .unwrap();
         assert_eq!(
             owner
