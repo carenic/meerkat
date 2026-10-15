@@ -1670,8 +1670,12 @@ impl SessionAgentBuilder for FactoryAgentBuilder {
             .build
             .as_ref()
             .and_then(|build| build.external_tools.clone());
-        self.build_agent_with_external_tools(req, external_tools, event_tx)
-            .await
+        // Built in its own frame: at opt-level 0 the awaited build reserved
+        // twice its size in this poll frame, beneath the session's create.
+        meerkat_runtime::stack_relief::box_in_own_frame(|| {
+            self.build_agent_with_external_tools(req, external_tools, event_tx)
+        })
+        .await
     }
 
     async fn build_agent_taking_tools(
@@ -1683,8 +1687,11 @@ impl SessionAgentBuilder for FactoryAgentBuilder {
             .build
             .as_mut()
             .and_then(|build| build.external_tools.take());
-        self.build_agent_with_external_tools(req, external_tools, event_tx)
-            .await
+        // Built in its own frame, as in `build_agent`.
+        meerkat_runtime::stack_relief::box_in_own_frame(|| {
+            self.build_agent_with_external_tools(req, external_tools, event_tx)
+        })
+        .await
     }
 }
 
@@ -1824,7 +1831,10 @@ impl FactoryAgentBuilder {
             build_config.image_generation_executor_override = Some(executor);
         }
 
-        let config = self.resolve_config().await?;
+        // Built in its own frame, like the build below: at opt-level 0 each
+        // awaited future reserved twice its size in this poll frame.
+        let config =
+            meerkat_runtime::stack_relief::box_in_own_frame(|| self.resolve_config()).await?;
 
         // Capture the session_context handle before build_agent consumes the
         // RuntimeBuildMode. Needed so the session task can fire
@@ -1875,16 +1885,32 @@ impl FactoryAgentBuilder {
         // tool-dispatch poll (mob spawn/delegate). Build on a fresh task so
         // child-agent construction never stacks onto the caller's poll
         // chain (2 MiB production worker-stack budget).
+        //
+        // The relieved build and both constructions inside it are built in
+        // their own frames: at opt-level 0 each awaited future reserved
+        // twice its size in the poll frame awaiting it.
         let factory = self.factory.clone();
-        let agent = meerkat_runtime::stack_relief::relieve_caller_stack(move || async move {
-            match surface_gate {
-                Some(gate) => {
-                    factory
-                        .build_agent_through_surface_gate(build_config, &config, gate.as_ref())
+        let agent = meerkat_runtime::stack_relief::box_in_own_frame(move || {
+            meerkat_runtime::stack_relief::relieve_caller_stack(move || async move {
+                match surface_gate {
+                    Some(gate) => {
+                        meerkat_runtime::stack_relief::box_in_own_frame(|| {
+                            factory.build_agent_through_surface_gate(
+                                build_config,
+                                &config,
+                                gate.as_ref(),
+                            )
+                        })
                         .await
+                    }
+                    None => {
+                        meerkat_runtime::stack_relief::box_in_own_frame(|| {
+                            factory.build_agent(build_config, &config)
+                        })
+                        .await
+                    }
                 }
-                None => factory.build_agent(build_config, &config).await,
-            }
+            })
         })
         .await
         .map_err(|error| {

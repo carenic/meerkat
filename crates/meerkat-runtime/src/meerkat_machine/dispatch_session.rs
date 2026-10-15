@@ -3189,86 +3189,101 @@ impl MeerkatMachine {
         &self,
         command: MeerkatMachineCommand,
     ) -> Result<MeerkatMachineCommandResult, RuntimeDriverError> {
-        match command {
+        // Every arm builds its body as an `async move` block inside its own
+        // monomorphized frame, and there is ONE await site. At opt-level 0
+        // the inline arms reserved all their locals in this one poll frame
+        // (968,080 bytes in a debug build), beneath every session command: a
+        // restarted host's durable idempotency-key read through it overflowed
+        // a 2 MiB worker stack.
+        let arm: crate::stack_relief::OwnFrameFuture<
+            '_,
+            Result<MeerkatMachineCommandResult, RuntimeDriverError>,
+        > = match command {
             MeerkatMachineCommand::RegisterSession { session_id } => {
-                let sid = session_id.clone();
-                // A generated Draining image reconstructed from the durable
-                // unregister retry record is CONCLUDED here, not bypassed.
-                // Through 0.8.23 this arm returned `Unit` on that witness -
-                // reporting success for a registration the authority had not
-                // admitted - and left the entry Draining, so every later
-                // registration (binding preparation included) was guard-rejected
-                // for the life of the durable record. Settling reuses the same
-                // teardown `ensure_runtime_executor_attachment` joins.
-                let registration = self
-                    .register_session_settling_cold_recovered_drain(&sid, None)
-                    .await?;
-                debug_assert!(
+                crate::stack_relief::box_in_own_frame(|| async move {
+                    let sid = session_id.clone();
+                    // A generated Draining image reconstructed from the durable
+                    // unregister retry record is CONCLUDED here, not bypassed.
+                    // Through 0.8.23 this arm returned `Unit` on that witness -
+                    // reporting success for a registration the authority had not
+                    // admitted - and left the entry Draining, so every later
+                    // registration (binding preparation included) was guard-rejected
+                    // for the life of the durable record. Settling reuses the same
+                    // teardown `ensure_runtime_executor_attachment` joins.
+                    let registration = self
+                        .register_session_settling_cold_recovered_drain(&sid, None)
+                        .await?;
+                    debug_assert!(
                     registration
                         != super::session_management::RegisterSessionInnerOutcome::InsertedColdRecoveredDraining,
                     "settled registration must not remain in a cold-recovered drain window"
                 );
-                let _registration_gate_guard = self.lock_registration_gate(&sid).await?;
-                // The entry that `register_session_inner` just published owns
-                // the runtime epoch this registration restates.
-                let entry_epoch_id = {
-                    let sessions = self.sessions.read().await;
-                    sessions
-                        .get(&sid)
-                        .map(|entry| entry.epoch_id.clone())
-                        .ok_or(RuntimeDriverError::NotReady {
-                            state: RuntimeState::Destroyed,
-                        })?
-                };
-                // Stage-first: the generated machine owns the legality verdict.
-                // RegisterSession is not declared from Destroyed (it is a
-                // resurrection input the DestroyedShapeInvariant forbids), so a
-                // resident OR cold-recovered Destroyed binding is rejected by
-                // the machine and classified as the terminal `Destroyed` truth
-                // — never silently skipped, never preflighted in the shell. A
-                // same-binding, same-epoch re-registration is the machine-owned
-                // `RegisterSessionIdempotent` no-op; a same-binding registration
-                // naming a different entry epoch is the machine-owned refusal
-                // verdict handled below.
-                let staged = match self
-                    .stage_session_dsl_transition(
-                        &sid,
-                        crate::meerkat_machine::dsl::MeerkatMachineInput::RegisterSession {
-                            session_id: crate::meerkat_machine::dsl::SessionId::from_domain(&sid),
-                            runtime_epoch_id: Some(
-                                crate::meerkat_machine::dsl::RuntimeEpochId::from_domain(
-                                    &entry_epoch_id,
+                    let _registration_gate_guard = self.lock_registration_gate(&sid).await?;
+                    // The entry that `register_session_inner` just published owns
+                    // the runtime epoch this registration restates.
+                    let entry_epoch_id = {
+                        let sessions = self.sessions.read().await;
+                        sessions
+                            .get(&sid)
+                            .map(|entry| entry.epoch_id.clone())
+                            .ok_or(RuntimeDriverError::NotReady {
+                                state: RuntimeState::Destroyed,
+                            })?
+                    };
+                    // Stage-first: the generated machine owns the legality verdict.
+                    // RegisterSession is not declared from Destroyed (it is a
+                    // resurrection input the DestroyedShapeInvariant forbids), so a
+                    // resident OR cold-recovered Destroyed binding is rejected by
+                    // the machine and classified as the terminal `Destroyed` truth
+                    // — never silently skipped, never preflighted in the shell. A
+                    // same-binding, same-epoch re-registration is the machine-owned
+                    // `RegisterSessionIdempotent` no-op; a same-binding registration
+                    // naming a different entry epoch is the machine-owned refusal
+                    // verdict handled below.
+                    let staged = match self
+                        .stage_session_dsl_transition(
+                            &sid,
+                            crate::meerkat_machine::dsl::MeerkatMachineInput::RegisterSession {
+                                session_id: crate::meerkat_machine::dsl::SessionId::from_domain(
+                                    &sid,
                                 ),
-                            ),
-                            initial_run_start_holds: self.registration_run_start_holds(&sid),
-                        },
-                        "RegisterSession",
-                    )
-                    .await
-                {
-                    Ok(staged) => staged,
-                    Err(reason) => {
-                        return Err(self.classify_session_dsl_rejection(&sid, reason).await);
+                                runtime_epoch_id: Some(
+                                    crate::meerkat_machine::dsl::RuntimeEpochId::from_domain(
+                                        &entry_epoch_id,
+                                    ),
+                                ),
+                                initial_run_start_holds: self.registration_run_start_holds(&sid),
+                            },
+                            "RegisterSession",
+                        )
+                        .await
+                    {
+                        Ok(staged) => staged,
+                        Err(reason) => {
+                            return Err(self.classify_session_dsl_rejection(&sid, reason).await);
+                        }
+                    };
+                    if let Some(refusal) = staged.effects.session_registration_refusal() {
+                        return Err(refusal.into_runtime_driver_error(&sid));
                     }
-                };
-                if let Some(refusal) = staged.effects.session_registration_refusal() {
-                    return Err(refusal.into_runtime_driver_error(&sid));
-                }
-                Ok(MeerkatMachineCommandResult::Unit)
+                    Ok(MeerkatMachineCommandResult::Unit)
+                })
             }
             MeerkatMachineCommand::UnregisterSession { session_id } => {
-                if !self.sessions.read().await.contains_key(&session_id) {
-                    return Err(RuntimeDriverError::NotReady {
-                        state: RuntimeState::Destroyed,
-                    });
-                }
-                self.unregister_session_inner(&session_id).await?;
-                Ok(MeerkatMachineCommandResult::Unit)
+                crate::stack_relief::box_in_own_frame(|| async move {
+                    if !self.sessions.read().await.contains_key(&session_id) {
+                        return Err(RuntimeDriverError::NotReady {
+                            state: RuntimeState::Destroyed,
+                        });
+                    }
+                    self.unregister_session_inner(&session_id).await?;
+                    Ok(MeerkatMachineCommandResult::Unit)
+                })
             }
             MeerkatMachineCommand::SetSilentIntents {
                 session_id,
                 intents,
-            } => {
+            } => crate::stack_relief::box_in_own_frame(|| async move {
                 let _gate_guard = self
                     .lock_current_durability_ready_session_mutation_gate(&session_id)
                     .await?;
@@ -3294,33 +3309,37 @@ impl MeerkatMachine {
                         .await);
                 }
                 Ok(MeerkatMachineCommandResult::Unit)
-            }
+            }),
             MeerkatMachineCommand::CancelAfterBoundary { session_id } => {
-                // Stage-first: `cancel_after_boundary_inner` stages the
-                // CancelAfterBoundary DSL input; the machine rejects it on a
-                // Destroyed binding and the inner classification surfaces the
-                // terminal `Destroyed` truth.
-                self.cancel_after_boundary_inner(&session_id).await?;
-                Ok(MeerkatMachineCommandResult::Unit)
+                crate::stack_relief::box_in_own_frame(|| async move {
+                    // Stage-first: `cancel_after_boundary_inner` stages the
+                    // CancelAfterBoundary DSL input; the machine rejects it on a
+                    // Destroyed binding and the inner classification surfaces the
+                    // terminal `Destroyed` truth.
+                    self.cancel_after_boundary_inner(&session_id).await?;
+                    Ok(MeerkatMachineCommandResult::Unit)
+                })
             }
             MeerkatMachineCommand::StopRuntimeExecutor { session_id, reason } => {
-                // Stage-first: `stop_runtime_executor_inner` stages the
-                // StopRuntimeExecutor DSL input; the machine rejects it on a
-                // Destroyed binding and the inner classification surfaces the
-                // terminal `Destroyed` truth. The independently-owned
-                // unregister saga acquires and retains the live/lifecycle
-                // disposal lease. A caller-owned lease here would deadlock the
-                // stop result against that saga once the exact runtime-loop
-                // cleanup publishes generated Draining authority.
-                self.stop_runtime_executor_inner(&session_id, reason)
-                    .await?;
-                Ok(MeerkatMachineCommandResult::Unit)
+                crate::stack_relief::box_in_own_frame(|| async move {
+                    // Stage-first: `stop_runtime_executor_inner` stages the
+                    // StopRuntimeExecutor DSL input; the machine rejects it on a
+                    // Destroyed binding and the inner classification surfaces the
+                    // terminal `Destroyed` truth. The independently-owned
+                    // unregister saga acquires and retains the live/lifecycle
+                    // disposal lease. A caller-owned lease here would deadlock the
+                    // stop result against that saga once the exact runtime-loop
+                    // cleanup publishes generated Draining authority.
+                    self.stop_runtime_executor_inner(&session_id, reason)
+                        .await?;
+                    Ok(MeerkatMachineCommandResult::Unit)
+                })
             }
             MeerkatMachineCommand::StopRuntimeExecutorUntilTerminal {
                 session_id,
                 epoch_id,
                 reason,
-            } => {
+            } => crate::stack_relief::box_in_own_frame(|| async move {
                 // Same stage-first shape as StopRuntimeExecutor; only the
                 // caller's wait policy differs, and the exact epoch keeps a
                 // same-SessionId replacement out of this stop's authority.
@@ -3328,15 +3347,18 @@ impl MeerkatMachine {
                     .stop_runtime_executor_until_terminal_inner(&session_id, &epoch_id, reason)
                     .await?;
                 Ok(MeerkatMachineCommandResult::Bool(stopped))
-            }
+            }),
             MeerkatMachineCommand::ContainsSession { session_id } => {
-                Ok(MeerkatMachineCommandResult::Bool(
-                    self.sessions.read().await.contains_key(&session_id),
-                ))
+                crate::stack_relief::box_in_own_frame(|| async move {
+                    Ok(MeerkatMachineCommandResult::Bool(
+                        self.sessions.read().await.contains_key(&session_id),
+                    ))
+                })
             }
             MeerkatMachineCommand::SessionHasExecutor { session_id } => {
-                let sessions = self.sessions.read().await;
-                Ok(MeerkatMachineCommandResult::Bool(
+                crate::stack_relief::box_in_own_frame(|| async move {
+                    let sessions = self.sessions.read().await;
+                    Ok(MeerkatMachineCommandResult::Bool(
                     sessions
                         .get(&session_id)
                         .map(
@@ -3344,45 +3366,52 @@ impl MeerkatMachine {
                         )
                         .unwrap_or(false),
                 ))
+                })
             }
             MeerkatMachineCommand::SessionHasComms { session_id } => {
-                let engaged = self
-                    .drain_authority_state(&session_id)
-                    .await
-                    .is_some_and(|state| {
-                        state.peer_owner_kind
-                            != crate::meerkat_machine::dsl::PeerIngressOwnerKind::Unattached
-                    });
-                Ok(MeerkatMachineCommandResult::Bool(engaged))
+                crate::stack_relief::box_in_own_frame(|| async move {
+                    let engaged =
+                        self.drain_authority_state(&session_id)
+                            .await
+                            .is_some_and(|state| {
+                                state.peer_owner_kind
+                                    != crate::meerkat_machine::dsl::PeerIngressOwnerKind::Unattached
+                            });
+                    Ok(MeerkatMachineCommandResult::Bool(engaged))
+                })
             }
             MeerkatMachineCommand::OpsLifecycleRegistry { session_id } => {
-                let sessions = self.sessions.read().await;
-                Ok(MeerkatMachineCommandResult::OpsLifecycleRegistry(
-                    sessions
-                        .get(&session_id)
-                        .map(|e| Arc::clone(&e.ops_lifecycle)),
-                ))
+                crate::stack_relief::box_in_own_frame(|| async move {
+                    let sessions = self.sessions.read().await;
+                    Ok(MeerkatMachineCommandResult::OpsLifecycleRegistry(
+                        sessions
+                            .get(&session_id)
+                            .map(|e| Arc::clone(&e.ops_lifecycle)),
+                    ))
+                })
             }
             MeerkatMachineCommand::PrepareBindings { session_id } => {
-                Box::pin(self.prepare_session_runtime_bindings(
-                    session_id,
-                    SessionBindingPreparation::AuthoritativeRuntimeBinding,
-                ))
-                .await
+                crate::stack_relief::box_in_own_frame(|| {
+                    self.prepare_session_runtime_bindings(
+                        session_id,
+                        SessionBindingPreparation::AuthoritativeRuntimeBinding,
+                    )
+                })
             }
             MeerkatMachineCommand::PrepareLocalSessionBindings { session_id } => {
-                Box::pin(self.prepare_session_runtime_bindings(
-                    session_id,
-                    SessionBindingPreparation::LocalSessionResources(
-                        LocalSessionMaterializationMode::Ordinary,
-                    ),
-                ))
-                .await
+                crate::stack_relief::box_in_own_frame(|| {
+                    self.prepare_session_runtime_bindings(
+                        session_id,
+                        SessionBindingPreparation::LocalSessionResources(
+                            LocalSessionMaterializationMode::Ordinary,
+                        ),
+                    )
+                })
             }
             MeerkatMachineCommand::InputState {
                 session_id,
                 input_id,
-            } => {
+            } => crate::stack_relief::box_in_own_frame(|| async move {
                 let driver = {
                     let sessions = self.sessions.read().await;
                     sessions.get(&session_id).map(|entry| entry.driver.clone())
@@ -3408,11 +3437,11 @@ impl MeerkatMachine {
                             .await?,
                     )),
                 }
-            }
+            }),
             MeerkatMachineCommand::InputStateByIdempotencyKey {
                 session_id,
                 idempotency_key,
-            } => {
+            } => crate::stack_relief::box_in_own_frame(|| async move {
                 let driver = {
                     let sessions = self.sessions.read().await;
                     sessions.get(&session_id).map(|entry| entry.driver.clone())
@@ -3449,7 +3478,7 @@ impl MeerkatMachine {
                         .await?,
                     )),
                 }
-            }
+            }),
             // Durable-only key resolution. The live admission map is
             // deliberately not consulted: a caller classifying an expired
             // submit bound must not be told "durably queued" on the strength
@@ -3459,17 +3488,19 @@ impl MeerkatMachine {
             MeerkatMachineCommand::DurableInputStateByIdempotencyKey {
                 session_id,
                 idempotency_key,
-            } => Ok(MeerkatMachineCommandResult::InputState(
-                self.durable_input_witness_by_idempotency_key_if_present(
-                    &session_id,
-                    &idempotency_key,
-                )
-                .await?,
-            )),
+            } => crate::stack_relief::box_in_own_frame(|| async move {
+                Ok(MeerkatMachineCommandResult::InputState(
+                    self.durable_input_witness_by_idempotency_key_if_present(
+                        &session_id,
+                        &idempotency_key,
+                    )
+                    .await?,
+                ))
+            }),
             MeerkatMachineCommand::InteractionTerminalStatus {
                 session_id,
                 selector,
-            } => {
+            } => crate::stack_relief::box_in_own_frame(|| async move {
                 let driver = {
                     let sessions = self.sessions.read().await;
                     sessions.get(&session_id).map(|entry| entry.driver.clone())
@@ -3537,28 +3568,33 @@ impl MeerkatMachine {
                 Ok(MeerkatMachineCommandResult::InteractionTerminalStatus(
                     sourced,
                 ))
-            }
+            }),
             MeerkatMachineCommand::RunTerminalStatus { session_id, run_id } => {
-                let (source, witnesses) = self.session_input_witnesses(&session_id).await?;
-                Ok(MeerkatMachineCommandResult::RunTerminalStatus(Sourced {
-                    source,
-                    report: terminal_status::evaluate_run(&run_id, &witnesses),
-                }))
+                crate::stack_relief::box_in_own_frame(|| async move {
+                    let (source, witnesses) = self.session_input_witnesses(&session_id).await?;
+                    Ok(MeerkatMachineCommandResult::RunTerminalStatus(Sourced {
+                        source,
+                        report: terminal_status::evaluate_run(&run_id, &witnesses),
+                    }))
+                })
             }
             MeerkatMachineCommand::ListActiveInputs { session_id } => {
-                let driver = {
-                    let sessions = self.sessions.read().await;
-                    let entry = sessions
-                        .get(&session_id)
-                        .ok_or(RuntimeDriverError::NotReady {
-                            state: RuntimeState::Destroyed,
-                        })?;
-                    entry.driver.clone()
-                };
-                let driver = driver.lock().await;
-                Ok(MeerkatMachineCommandResult::ActiveInputs(
-                    driver.as_driver().active_input_ids(),
-                ))
+                crate::stack_relief::box_in_own_frame(|| async move {
+                    let driver = {
+                        let sessions = self.sessions.read().await;
+                        let entry =
+                            sessions
+                                .get(&session_id)
+                                .ok_or(RuntimeDriverError::NotReady {
+                                    state: RuntimeState::Destroyed,
+                                })?;
+                        entry.driver.clone()
+                    };
+                    let driver = driver.lock().await;
+                    Ok(MeerkatMachineCommandResult::ActiveInputs(
+                        driver.as_driver().active_input_ids(),
+                    ))
+                })
             }
             MeerkatMachineCommand::ReconfigureSessionLlmIdentity {
                 session_id,
@@ -3577,7 +3613,7 @@ impl MeerkatMachine {
                 next_capability_base_filter,
                 next_active_visibility_revision,
                 tool_visibility_delta,
-            } => {
+            } => crate::stack_relief::box_in_own_frame(|| async move {
                 let _gate_guard = self
                     .lock_current_durability_ready_session_mutation_gate(&session_id)
                     .await?;
@@ -3670,12 +3706,12 @@ impl MeerkatMachine {
                     }
                 };
                 Ok(MeerkatMachineCommandResult::LlmReconfigured(report))
-            }
+            }),
             MeerkatMachineCommand::StagePersistentFilter {
                 session_id,
                 filter,
                 witnesses,
-            } => {
+            } => crate::stack_relief::box_in_own_frame(|| async move {
                 if !self.sessions.read().await.contains_key(&session_id) {
                     return Err(RuntimeDriverError::NotReady {
                         state: RuntimeState::Destroyed,
@@ -3719,11 +3755,11 @@ impl MeerkatMachine {
                     }
                 };
                 Ok(MeerkatMachineCommandResult::VisibilityRevision(revision))
-            }
+            }),
             MeerkatMachineCommand::RequestDeferredTools {
                 session_id,
                 authorities,
-            } => {
+            } => crate::stack_relief::box_in_own_frame(|| async move {
                 if !self.sessions.read().await.contains_key(&session_id) {
                     return Err(RuntimeDriverError::NotReady {
                         state: RuntimeState::Destroyed,
@@ -3762,11 +3798,11 @@ impl MeerkatMachine {
                     }
                 };
                 Ok(MeerkatMachineCommandResult::VisibilityRevision(revision))
-            }
+            }),
             MeerkatMachineCommand::PublishCommittedVisibleSet {
                 session_id,
                 visibility_state,
-            } => {
+            } => crate::stack_relief::box_in_own_frame(|| async move {
                 // Guard: session must exist — publishing to an unknown session
                 // has no target.
                 let sessions = self.sessions.read().await;
@@ -3856,9 +3892,10 @@ impl MeerkatMachine {
                 Ok(MeerkatMachineCommandResult::VisibilityPublished(
                     *visibility_state,
                 ))
-            }
+            }),
             _ => unreachable!("non-session command routed to session handler"),
-        }
+        };
+        arm.await
     }
 
     /// Arc-requiring session dispatch: handles commands that spawn runtime-owned
