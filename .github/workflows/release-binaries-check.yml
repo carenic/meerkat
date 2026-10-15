@@ -1,10 +1,12 @@
 name: Release binaries check
 
 # Builds the four release binaries on the dispatched ref exactly as the
-# release workflow's BuildBuddy lane does (scripts/buildbuddy-bazel-poc
-# release-build-*, which pass --define=meerkat_release_build=1) and runs the
-# release packaging guards on every one of them: the Linux portability check
-# and scripts/check-release-binary-markers. It publishes nothing: a read-only
+# release workflow does: the Linux and macOS arm64 targets through its
+# BuildBuddy lane (scripts/buildbuddy-bazel-poc release-build-*, which pass
+# --define=meerkat_release_build=1), Intel macOS through its cross-build on
+# Apple silicon, and runs the release packaging guards on every one of them:
+# the Linux portability check, scripts/check-release-binary-markers and, for
+# Intel macOS, scripts/check-macos-x86-release-binary. It publishes nothing: a read-only
 # token, no archive, no attestation, no upload, no release, no registry.
 # Dispatch it on a release candidate commit before tagging, so that the tag
 # cannot fail at packaging:
@@ -35,8 +37,6 @@ jobs:
             target: aarch64-unknown-linux-gnu
           - bb_command: release-build-macos-arm64
             target: aarch64-apple-darwin
-          - bb_command: release-build-macos-x86
-            target: x86_64-apple-darwin
 
     steps:
       - name: Checkout
@@ -91,3 +91,58 @@ jobs:
             scripts/check-release-binary-markers "${src}"
           done
           echo "All four ${TARGET} release binaries pass the release packaging guards"
+
+  # Intel macOS is cross-compiled on Apple silicon in the release
+  # (build_binaries_macos_x86_cross), not on BuildBuddy: check it the same
+  # way, one job per surface package.
+  macos-x86-cross:
+    name: Cross-compile and check Intel macOS release binaries (${{ matrix.surface.bin }})
+    runs-on: macos-15
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        surface:
+          - package: rkat
+            bin: rkat
+          - package: meerkat-rpc
+            bin: rkat-rpc
+          - package: meerkat-rest
+            bin: rkat-rest
+          - package: meerkat-mcp-server
+            bin: rkat-mcp
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - uses: ./.github/actions/setup-rust-ci
+
+      - name: Add the Intel macOS target
+        run: rustup target add x86_64-apple-darwin
+
+      - name: Cache cargo registry
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: release-x86_64-apple-darwin-cross
+
+      - name: Cross-compile the surface binary
+        shell: bash
+        env:
+          CARGO_TARGET_DIR: target
+        run: ./scripts/repo-cargo build --locked -p "${{ matrix.surface.package }}" --release --target x86_64-apple-darwin
+
+      - name: Check the release binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          src="target/x86_64-apple-darwin/release/${{ matrix.surface.bin }}"
+          codesign --force --sign - "${src}"
+          version="$(awk '
+            /^\[workspace.package\]/ { in_workspace_package = 1; next }
+            /^\[/ { in_workspace_package = 0 }
+            in_workspace_package && $1 == "version" { gsub(/"/, "", $3); print $3; exit }
+          ' Cargo.toml)"
+          scripts/check-release-binary-markers "${src}"
+          scripts/check-macos-x86-release-binary "${src}" "${version}"

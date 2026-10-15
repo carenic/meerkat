@@ -294,6 +294,14 @@ repos:
         always_run: true
         stages: [pre-push]
 
+      - id: macos-x86-release-binary-check-contract
+        name: Intel macOS release binary check refuses each defect
+        entry: scripts/test-check-macos-x86-release-binary.sh
+        language: script
+        pass_filenames: false
+        always_run: true
+        stages: [pre-push]
+
       - id: release-asset-provenance-contract
         name: release asset provenance accepts an earlier run only through its build gate
         entry: scripts/test-verify-release-asset-provenance.sh

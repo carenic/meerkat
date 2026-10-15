@@ -1452,6 +1452,7 @@ jobs:
           persist-credentials: false
           sparse-checkout: |
             scripts/check-release-binary-markers
+            scripts/check-macos-x86-release-binary
           sparse-checkout-cone-mode: false
 
       - name: Package artifacts
@@ -1471,14 +1472,14 @@ jobs:
             echo "Missing expected binary at $src" >&2
             exit 1
           fi
-          if [[ "$(lipo -archs "$src")" != "x86_64" ]]; then
-            echo "${bin} is not an x86_64 binary: $(lipo -archs "$src")" >&2
-            exit 1
-          fi
           if ! grep -aF -- "$VERSION" "$src" >/dev/null; then
             echo "Binary ${bin} for ${TARGET} does not embed release version ${VERSION}" >&2
             exit 1
           fi
+          # Nothing else in the release runs this binary: x86_64 only, run it
+          # under Rosetta for its version, system libraries only, and a
+          # minimum macOS version every supported Intel Mac meets.
+          .release-tooling/scripts/check-macos-x86-release-binary "$src" "$VERSION"
           # No release binary may carry compiled-in test code.
           .release-tooling/scripts/check-release-binary-markers "$src"
           tar -czf "dist/${artifact_name}" -C "$(dirname "$src")" "$(basename "$src")"

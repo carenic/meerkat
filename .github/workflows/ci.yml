@@ -411,6 +411,9 @@ jobs:
       - name: Release asset provenance accepts an earlier run only through its build gate
         run: scripts/test-verify-release-asset-provenance.sh
 
+      - name: Intel macOS release binary check refuses each defect
+        run: scripts/test-check-macos-x86-release-binary.sh
+
       # Stubbed cargo and a file:// index: levels in order, bounded overlap,
       # skip of a published version, and stop at the first failing crate.
       - name: Level-parallel crate publisher keeps its order and failure semantics
