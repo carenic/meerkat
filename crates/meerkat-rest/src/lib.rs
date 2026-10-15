@@ -5688,6 +5688,7 @@ async fn create_session_inner(
         initial_tool_filter: None,
         initial_tool_visibility_state: None,
         shell_env: req.shell_env,
+        shell_timeout_secs: None,
         resume_override_mask,
         call_timeout_override: Default::default(),
         blob_store_override: None,
@@ -6941,6 +6942,7 @@ async fn continue_session_inner(
             initial_tool_filter: None,
             initial_tool_visibility_state: None,
             shell_env: None,
+            shell_timeout_secs: None,
             resume_override_mask: ResumeOverrideMask {
                 model: req.model.is_some(),
                 provider: llm_binding.provider_overridden,

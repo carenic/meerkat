@@ -35,6 +35,15 @@ them.
 
 ## [Unreleased]
 
+### Breaking
+
+- `meerkat-core`: `SessionBuildOptions` and `SessionBuildState` gain
+  `shell_timeout_secs: Option<NonZeroU64>`, and `meerkat`'s
+  `AgentBuildConfig` gains the same field (see Fixed: MCP
+  `builtin_config.shell_timeout_secs`). Struct-literal constructors must add
+  it; `None` keeps the previous behaviour. `SessionBuildState` skips it when
+  unset, so stored sessions keep their bytes.
+
 ### Changed
 
 - CI's `Closure tests` rows have 60 minutes instead of 40, and the
@@ -71,6 +80,13 @@ them.
   answers with the data its cause carries (for example the
   unsupported-capability detail of a refused `session/create`), and a failed
   runtime executor registration in `session/create` keeps its typed code.
+- `meerkat-mcp-server`: `meerkat_run` and `meerkat_resume` honour
+  `builtin_config.shell_timeout_secs`, which 0.9.1 accepted and ignored. It
+  sets the default command timeout of the session's shell tool (the
+  session's own `[shell] timeout_secs`; a shell call's own `timeout_secs`
+  still wins). The session records it, so a `meerkat_resume` that rebuilds
+  the session keeps it unless the resume sets its own. Omitted, `null` or
+  `0` keep the realm's configured value.
 
 ## [0.9.1] - 2026-10-15
 

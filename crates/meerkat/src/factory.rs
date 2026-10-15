@@ -956,6 +956,10 @@ pub struct AgentBuildConfig {
     pub wait_for_mcp: bool,
     /// Per-agent environment variables injected into shell tool subprocesses.
     pub shell_env: Option<std::collections::HashMap<String, String>>,
+    /// The session's own shell command timeout, in seconds: its
+    /// `[shell] timeout_secs` for this build (see
+    /// `meerkat_core::service::SessionBuildOptions::shell_timeout_secs`).
+    pub shell_timeout_secs: Option<std::num::NonZeroU64>,
     /// Optional session checkpointer for host-mode persistence.
     pub checkpointer: Option<Arc<dyn meerkat_core::SessionCheckpointer>>,
     /// Explicit call-timeout override at the build seam.
@@ -1251,6 +1255,7 @@ impl AgentBuildConfig {
             wait_for_mcp: false,
             mcp_servers: Vec::new(),
             shell_env: None,
+            shell_timeout_secs: None,
             checkpointer: None,
             call_timeout_override: meerkat_core::CallTimeoutOverride::default(),
             resume_override_mask: meerkat_core::service::ResumeOverrideMask::default(),
@@ -1392,6 +1397,7 @@ impl AgentBuildConfig {
         self.application_tool_policy = build.application_tool_policy.clone();
         self.tool_consequence_policy_registry = build.tool_consequence_policy_registry.clone();
         self.shell_env = build.shell_env.clone();
+        self.shell_timeout_secs = build.shell_timeout_secs;
         self.checkpointer = build.checkpointer.clone();
         self.call_timeout_override = build.call_timeout_override.clone();
         self.resume_override_mask = build.resume_override_mask;
@@ -1475,6 +1481,7 @@ impl AgentBuildConfig {
             application_tool_policy: self.application_tool_policy.clone(),
             tool_consequence_policy_registry: self.tool_consequence_policy_registry.clone(),
             shell_env: self.shell_env.clone(),
+            shell_timeout_secs: self.shell_timeout_secs,
             checkpointer: self.checkpointer.clone(),
             call_timeout_override: self.call_timeout_override.clone(),
             resume_override_mask: self.resume_override_mask,
@@ -6633,13 +6640,21 @@ impl AgentFactory {
         }
         self.validate_runtime_profile(&build_config, config)?;
         let mut effective_config;
-        let config = if let Some(fallback) = &build_config.model_fallback {
-            effective_config = config.clone();
-            effective_config.model_fallback = fallback.clone();
-            &effective_config
-        } else {
-            config
-        };
+        let config =
+            if build_config.model_fallback.is_some() || build_config.shell_timeout_secs.is_some() {
+                effective_config = config.clone();
+                if let Some(fallback) = &build_config.model_fallback {
+                    effective_config.model_fallback = fallback.clone();
+                }
+                // The session's own shell timeout is its `[shell] timeout_secs`:
+                // the shell tool reads it through its one timeout policy.
+                if let Some(timeout_secs) = build_config.shell_timeout_secs {
+                    effective_config.shell.timeout_secs = timeout_secs.get();
+                }
+                &effective_config
+            } else {
+                config
+            };
         config
             .model_fallback
             .validate()
@@ -8577,6 +8592,7 @@ impl AgentFactory {
             app_context: build_config.app_context.clone(),
             additional_instructions: build_config.additional_instructions.clone(),
             shell_env: build_config.shell_env.clone(),
+            shell_timeout_secs: build_config.shell_timeout_secs,
             mob_tool_authority_context: build_config.mob_tool_authority_context.clone(),
             call_timeout_override: build_config.call_timeout_override.clone(),
             mcp_attachment_intents: recorded_mcp_attachment_intents,
