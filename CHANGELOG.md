@@ -75,7 +75,8 @@ them.
   refuses web_search as Denied (no lineage is selected for it) instead of
   Unavailable; a legacy single stock grant still leaves it Unavailable. A
   web_search plan is refused at dispatch as `ExecutionOwnerChanged` when it
-  reaches another composite dispatcher, when the same composite replaced a
+  reaches another composite dispatcher that registered web_search as its
+  own builtin, when the same composite replaced a
   builtin registration after resolving it, or when another owner (such as
   an external tool) now holds the name: a plan that carries the composite's
   builtin witness runs only on that builtin.
@@ -88,7 +89,8 @@ them.
   BuiltinToolOperation::WebSearch }` for the web_search builtin it
   registered (the tool declares it through `BuiltinTool::builtin_operation`;
   tools without a declaration keep their plans) and revalidates it at
-  dispatch against its exact registration: another composite, another owner
+  dispatch against its exact registration: another composite that
+  registered web_search as its own builtin, another owner
   key, a plan resolved before the composite replaced its web_search
   executor (even with an identical schema), or a plan whose name another
   owner now holds is `ExecutionOwnerChanged`, and no executor runs. This
@@ -118,13 +120,19 @@ them.
   selector, with their current ceilings and the earliest expiry. Choosing
   a target erases no restriction: hosts issue the target lineages and every
   contributor's ceiling with the original time, operation (including
-  read-only) and private-data restrictions, and a typed public-search
-  target or read-only declaration does not mean private information cannot
-  leave. The
+  read-only, which is an action set: `ExecutionRestrictions` has no
+  read-only flag), resource-domain and private-data restrictions, and a
+  typed public-search target or read-only declaration does not mean private
+  information cannot leave. The
   attribution grants, inherits and exempts nothing: it keys the selection
   and the protected audit record (`AuditDelegateAttribution {
   parent_operation_id, role }`), which also records the helper's own
-  decision and refusal before its provider send. Behaviour contract:
+  decision and authorization refusal before its provider send. A helper
+  rated R2 or R3 settles at its model entry as `unsupported_entry` or
+  `human_consent_required` whether or not a reviewer exists, and nothing
+  is sent; the model sees it as `operation_authorization_unavailable`
+  feedback, and no audit row records that review refusal (a limit of every
+  model request). Behaviour contract:
   revoking the call's own lineage refuses later calls but does not cancel
   an invocation that already entered, which may still make its authorized
   helper request (the helper passes its own work, contributor, route,

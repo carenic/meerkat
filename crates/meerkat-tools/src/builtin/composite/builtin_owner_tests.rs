@@ -847,3 +847,46 @@ async fn a_plan_of_a_replaced_registration_never_runs_on_its_replacement() {
         (0, 1)
     );
 }
+
+/// Registering skill tools changes which owners the composite's names can
+/// resolve to, so it advances the registration generation like every
+/// builtin registration change: a web_search plan resolved before it is an
+/// owner change and its executor never runs; a plan resolved after it runs.
+#[cfg(feature = "skills")]
+#[tokio::test]
+async fn registering_skill_tools_advances_the_registration_generation() {
+    let searches = Arc::new(AtomicUsize::new(0));
+    let mut composite = web_search_composite(&searches);
+    let args =
+        serde_json::value::RawValue::from_string(json!({"query": "fixed query"}).to_string())
+            .expect("raw arguments");
+    let call = ToolCallView {
+        id: "search-call",
+        name: "web_search",
+        args: &args,
+    };
+    let context = ToolDispatchContext::default();
+    let resolution = meerkat_core::ToolExecutionResolutionContext::new(deadlines());
+    let before = composite
+        .resolve_execution_plan(call, &context, &resolution)
+        .expect("the plan before the skill registration");
+
+    composite.register_skill_tools(super::tests::stub_skill_tool_set());
+    let result = composite
+        .dispatch_resolved_with_context(call, &context, &before)
+        .await;
+    assert!(
+        owner_changed(&result),
+        "a plan resolved before the skill registration: {result:?}"
+    );
+    assert_eq!(searches.load(Ordering::SeqCst), 0, "no executor ran");
+
+    let after = composite
+        .resolve_execution_plan(call, &context, &resolution)
+        .expect("the plan after the skill registration");
+    composite
+        .dispatch_resolved_with_context(call, &context, &after)
+        .await
+        .expect("a plan resolved after it runs");
+    assert_eq!(searches.load(Ordering::SeqCst), 1);
+}

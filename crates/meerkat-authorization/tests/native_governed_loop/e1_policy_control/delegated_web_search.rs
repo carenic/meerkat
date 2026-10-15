@@ -36,6 +36,12 @@ enum Case {
     /// while its client authorizes the request and before the physical send:
     /// the send's own current check refuses it and nothing is sent.
     DelegateRevokedAfterPrepare,
+    /// The owner rates the helper's inference R2 while a reviewer is
+    /// installed. A model request carries no operation review, so it settles
+    /// at its model entry as `unsupported_entry` and reaches the model as
+    /// authorization-unavailable feedback: nothing is sent and the reviewer
+    /// is never asked.
+    HelperReviewRequired,
     /// A host tool merely named web_search: no typed target, no delegate.
     HostToolNamedWebSearch,
 }
@@ -101,6 +107,7 @@ struct SearchOwner {
     controller: HttpRecordOwner,
     helper_route: String,
     helper_unavailable: bool,
+    helper_review_tier: meerkat_core::authorization::OperationReviewTier,
     helper_seen: AtomicUsize,
     calls: Mutex<Vec<(String, Option<ToolOperationTarget>)>>,
 }
@@ -173,11 +180,33 @@ impl OperationPolicyOwner for SearchOwner {
                     values(search_domain(), &["search-infer", "hosted-web-search"]),
                     now_ms,
                 )
+                .map(|allowance| LocalPolicyAllowance {
+                    review_tier: self.helper_review_tier,
+                    ..allowance
+                })
             }
             _ => self
                 .controller
                 .authorize_operation(association, binding, purpose, now_ms),
         }
+    }
+}
+
+/// An installed reviewer that counts every review it is asked for.
+#[derive(Default)]
+struct CountingReviewer(AtomicUsize);
+
+#[async_trait]
+impl meerkat_core::approval::review::OperationReviewer for CountingReviewer {
+    async fn review(
+        &self,
+        _candidate: &meerkat_core::approval::review::ReviewCandidate<'_>,
+    ) -> Result<
+        meerkat_core::approval::review::ReviewVerdict,
+        meerkat_core::approval::review::ReviewerFailure,
+    > {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Ok(meerkat_core::approval::review::ReviewVerdict::Allow)
     }
 }
 
@@ -530,6 +559,11 @@ async fn exercise_search(controller_server: &Server, helper_server: &Server, cas
         },
         helper_route: helper_route.clone(),
         helper_unavailable: case == Case::OwnerUnavailable,
+        helper_review_tier: if case == Case::HelperReviewRequired {
+            meerkat_core::authorization::OperationReviewTier::R2
+        } else {
+            meerkat_core::authorization::OperationReviewTier::R1
+        },
         helper_seen: AtomicUsize::new(0),
         calls: Mutex::new(Vec::new()),
     });
@@ -628,7 +662,19 @@ async fn exercise_search(controller_server: &Server, helper_server: &Server, cas
     }
 
     let sessions = Arc::new(RecordingStore::default());
-    let mut builder = FactoryAgentBuilder::new(AgentFactory::minimal(), Config::default());
+    let reviewer = Arc::new(CountingReviewer::default());
+    let factory = if case == Case::HelperReviewRequired {
+        AgentFactory::minimal().with_operation_review(Arc::new(
+            meerkat_core::approval::review::BoundOperationReview::new(
+                reviewer.clone(),
+                meerkat_core::ApprovalService::new(),
+                Duration::from_secs(5),
+            ),
+        ))
+    } else {
+        AgentFactory::minimal()
+    };
+    let mut builder = FactoryAgentBuilder::new(factory, Config::default());
     builder.default_llm_client = Some(client);
     builder.default_tool_dispatcher = Some(Arc::new(composite));
     builder.default_session_store = Some(sessions.clone());
@@ -895,6 +941,37 @@ async fn exercise_search(controller_server: &Server, helper_server: &Server, cas
                         | AuditObservation::Outcome { .. }
                 )));
             }
+            Case::HelperReviewRequired => {
+                // The model entry settles R2 as unsupported_entry; the
+                // executor seam carries it to the tool as authorization
+                // unavailable (the review settlement stays in the provider
+                // error's details).
+                assert_refusal_feedback(
+                    &bodies[1],
+                    SEARCH_CALL,
+                    ToolError::OperationAuthorizationUnavailable,
+                );
+                assert_eq!(helper_sends, 0, "nothing is sent at R2");
+                assert_eq!(
+                    reviewer.0.load(Ordering::SeqCst),
+                    0,
+                    "a model request never asks the installed reviewer"
+                );
+                assert_eq!(owner.helper_seen.load(Ordering::SeqCst), 1);
+                assert!(has(|observation| matches!(
+                    observation,
+                    AuditObservation::Prepared { .. }
+                )));
+                assert!(
+                    !has(|observation| matches!(
+                        observation,
+                        AuditObservation::Entry
+                            | AuditObservation::Outcome { .. }
+                            | AuditObservation::Refused { .. }
+                    )),
+                    "the review refusal at the model entry writes no audit row"
+                );
+            }
             Case::HostToolNamedWebSearch => unreachable!(),
         }
         // The call itself entered and returned its own result.
@@ -997,6 +1074,11 @@ async fn delegate_revocation_before_helper_entry_prevents_its_send() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn delegate_revocation_after_its_preparation_prevents_its_send() {
     run_case(Case::DelegateRevokedAfterPrepare).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_helper_rated_r2_settles_at_its_model_entry_without_a_send_or_review() {
+    run_case(Case::HelperReviewRequired).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

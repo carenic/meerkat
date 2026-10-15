@@ -138,7 +138,8 @@ pub struct CompositeDispatcher {
     /// Generation of this composite's builtin registrations, advanced by
     /// every registration change, including a replacement with identical
     /// name, schema and contract. A builtin operation's plan runs only on
-    /// the exact registration that resolved it.
+    /// the exact registration that resolved it. Invariant: any change to
+    /// which owner wins a tool name must advance this generation.
     builtin_registration_epoch: u64,
 }
 
@@ -468,6 +469,9 @@ impl CompositeDispatcher {
             }
         }
         self.skill_tools = Some(tool_set);
+        // The allowed set and the skill owners changed: no builtin plan
+        // resolved before runs after it.
+        self.builtin_registration_epoch += 1;
     }
 
     /// A dispatcher that serves only the read-only skill resource tools,
@@ -3698,7 +3702,7 @@ mod tests {
     }
 
     #[cfg(feature = "skills")]
-    fn stub_skill_tool_set() -> SkillToolSet {
+    pub(super) fn stub_skill_tool_set() -> SkillToolSet {
         let runtime = Arc::new(meerkat_core::skills::SkillRuntime::new(Arc::new(
             StubSkillEngine,
         )));

@@ -662,14 +662,35 @@ async fn revoking_the_call_lineage_keeps_an_entered_invocations_helper() {
 /// the decision time and whether the operation is allowed under it.
 type Bound = (&'static str, ExecutionRestrictions, u64, bool);
 
-/// `within` and one variant per restriction dimension that excludes the
-/// operation: time (decided after the lifetime ends), private data (another
-/// processor, another audience) and operation (a read-only action set that
-/// lacks the operation's actions).
+/// `within` and one variant per restriction dimension: time (decided after
+/// the lifetime ends), resource domain, private data (another processor,
+/// another audience) and operation (a read-only action set that lacks the
+/// operation's actions; read-only is an action set, as
+/// `ExecutionRestrictions` has no read-only flag) each exclude the
+/// operation. Delegation depth bounds only re-delegation, so a lineage that
+/// can delegate no further still allows it.
 fn bounds(within: ExecutionRestrictions) -> Vec<Bound> {
     vec![
         ("within every bound", within.clone(), 100, true),
         ("after its lifetime", within.clone(), 200, false),
+        (
+            "another resource domain",
+            ExecutionRestrictions {
+                resource_domains: ExactRestriction::exact([domain("elsewhere")]),
+                ..within.clone()
+            },
+            100,
+            false,
+        ),
+        (
+            "no further delegation",
+            ExecutionRestrictions {
+                delegation_depth: DelegationDepth::remaining(0),
+                ..within.clone()
+            },
+            100,
+            true,
+        ),
         (
             "another processor",
             ExecutionRestrictions {
@@ -705,9 +726,9 @@ fn bounds(within: ExecutionRestrictions) -> Vec<Bound> {
 }
 
 /// Choosing a target never erases a restriction (ruling Q5): the call's and
-/// the delegate's selected lineages carry their own time, operation and
-/// private-data bounds, and each bound refuses its operation although the
-/// broad base would allow it. An allowed delegate expires with the earliest
+/// the delegate's selected lineages carry their own time, resource-domain,
+/// operation and private-data bounds, and each bound refuses its operation
+/// although the broad base would allow it. An allowed delegate expires with the earliest
 /// of its own lineage's lifetime, the operation owner's allowance and the
 /// admitted work.
 #[tokio::test]
@@ -728,8 +749,9 @@ async fn a_selected_lineage_keeps_its_time_operation_and_data_restrictions() {
             )
             .expect("issued grant")
     };
-    let within = |actions: &[&str]| ExecutionRestrictions {
+    let within = |actions: &[&str], domains: &[&str]| ExecutionRestrictions {
         actions: ExactRestriction::exact(actions.iter().map(|name| action(name))),
+        resource_domains: ExactRestriction::exact(domains.iter().map(|name| domain(name))),
         processors: ExactRestriction::exact([ProcessorRef::Principal {
             principal: who("executor"),
         }]),
@@ -745,8 +767,9 @@ async fn a_selected_lineage_keeps_its_time_operation_and_data_restrictions() {
     };
     let at = |now_ms: u64| fixture.clock.0.store(now_ms, Ordering::SeqCst);
 
-    for (index, (label, call_bounds, now_ms, allowed)) in
-        bounds(within(&["web_search"])).into_iter().enumerate()
+    for (index, (label, call_bounds, now_ms, allowed)) in bounds(within(&["web_search"], &["web"]))
+        .into_iter()
+        .enumerate()
     {
         at(100);
         let association = work_with(
@@ -780,7 +803,7 @@ async fn a_selected_lineage_keeps_its_time_operation_and_data_restrictions() {
     }
 
     for (index, (label, delegate_bounds, now_ms, allowed)) in
-        bounds(within(&["infer", "web_search"]))
+        bounds(within(&["infer", "web_search"], &["search-models", "web"]))
             .into_iter()
             .enumerate()
     {

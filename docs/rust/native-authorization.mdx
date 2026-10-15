@@ -320,17 +320,27 @@ intersecting ceiling, and every contributing original must select the same
 keys with its own current ceiling. A single `GrantLineage` basis covers both
 like any other operation. Choosing a target does not erase a restriction:
 issue those lineages, and every contributor's ceiling, with the original
-time, operation (including read-only), processor and audience
-(private-data) restrictions, because the base no longer bounds them. A
+time, operation (including read-only), resource domain, processor and
+audience (private-data) restrictions, because the base no longer bounds
+them. Read-only is an action set: `ExecutionRestrictions` has no read-only
+flag, so a read-only lineage is one whose actions are only read actions. A
 typed public-search target or a read-only declaration does not mean that
 private information cannot leave through a query; do not infer it.
 
 The attribution keys the selection and the protected audit record
 (`AuditDelegateAttribution`, with the call's operation id and the role); it
-grants nothing. The helper's own decision and refusal are recorded under its
-own operation, also when it is refused before its provider send. One
-attribution can prepare helper requests until its run ends, and each request
-is its own operation that needs its own current lineage.
+grants nothing. The helper's own decision and its authorization refusal are
+recorded under its own operation, also when it is refused before its
+provider send. A helper the owner rates R2 or R3 settles at its model entry
+as `unsupported_entry` (R2) or `human_consent_required` (R3), whether or not
+a reviewer exists, because a model request carries no operation review, and
+nothing is sent. Through the web_search executor the model sees that as
+`operation_authorization_unavailable` feedback (the review settlement stays
+in the provider error's details). No audit row records that review refusal
+(a limit of every model request, not only this helper), so the audit shows
+only its preparation. One attribution can prepare helper requests until its
+run ends, and each request is its own operation that needs its own current
+lineage.
 
 Behaviour contract for a call that already entered: revoking the call's own
 lineage refuses later calls, but it does not cancel an invocation that
