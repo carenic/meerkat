@@ -1,0 +1,161 @@
+---
+title: "Troubleshooting"
+description: "Recover from installation, restart, account and tool-attachment problems and prepare a useful support report."
+icon: "wrench"
+---
+
+Start with the exact [supported archive and runtime profile](/connect/library/local-install#choose-a-supported-host).
+Source fixes and older artifacts can have different behavior. Record which
+archive and command failed before changing either.
+
+## A Connect conversation turn fails
+
+In the current standalone `meerkat-connect` source, a confirmed failed turn can
+return to the `You: ` prompt. Enter a new question there to continue the same
+conversation. Connect does not automatically retry the failed request.
+
+If Connect reports an uncertain effect, follow its restriction to status checks
+for that exact request. A new question does not authorize repeating the effect.
+If the CLI closes instead, starting it again creates a new conversation; it does
+not resume or replay the old request.
+
+## Bootstrap failed or was interrupted
+
+Do not rerun bootstrap into the same client, output or workspace. It preserves
+partial directories; a timeout or lost response can occur after an owner has
+written valid receipts. A receipt's presence alone does not establish that the
+whole bootstrap completed.
+
+1. Preserve the selected archive, command, fixed error code and partial outputs.
+   Check that the bootstrap/installer process has settled before further work.
+2. Inspect the exact client `installed.json`, host `prepared.json` and available
+   step logs. Compare them with the original inputs. Bootstrap normally verifies
+   the client through the installer's `--verify-existing`; do not replace that
+   check with a directory-exists test.
+3. If the host validates a complete existing client, use `prepare_host.py` with
+   its exact interpreter/hash and fresh output/workspace paths. Otherwise use
+   a new bootstrap client, configuration and workspace. Preserve the previous
+   attempt for inspection.
+
+The timeout starts cancellation and waits for cleanup; it is not a strict
+whole-command wall-clock limit. A late cancellation can leave completed owner
+outputs with an unconfirmed caller result. No automatic cleanup, retry or
+credential repair follows from that outcome.
+
+## Preparation refuses paths or runtimes
+
+| Symptom | Next step |
+| --- | --- |
+| Archive/tree/hash mismatch | Check the exact platform archive and its trusted hash. Extract a verified copy into a new location; do not edit retained files or bypass verification. |
+| Unsupported Python, Node, npm or libc | Use the [declared versions](/connect/library/local-install#choose-a-supported-host). Changing `--target` does not make a runtime compatible. |
+| `output_or_workspace_exists` or an existing client directory | Choose fresh disjoint paths with existing parents. Preserve the earlier attempt. |
+| `overlapping_directories` | Separate release, staging, output, workspace, client and relevant historical/recipe paths. Avoid names differing only by case or Unicode spelling. |
+| Missing Node/npm with Python-only work | Explicitly select `--families agno,services`; the default also selects Activepieces. |
+| Linux refuses Playwright, MCPB, Compose or the hosted-MCP connection checker | The [Linux profile](/connect/library/local-install#enable-additional-routes-deliberately) lacks those executables. Its recipe store/exporter is available separately. |
+
+For the frozen `20261005-release-guide` edition, ordinary direct preparation
+can miss a case/Unicode alias between future paths. If its output then occupies
+the future workspace, preserve it and choose clearly distinct names. Bootstrap
+already refuses those aliases. The `20261005-recipe-paths` edition and later editions also
+refuse them during direct preparation and also protect recipe database
+sidecars under that normalized-path rule. Avoid output or workspace names
+that alias a future `-wal`, `-shm` or `-journal` path. Older frozen archives
+are unchanged.
+
+## The setup MCP worked once and refuses to restart
+
+Its generated command creates one fresh workspace. It is not a restartable
+server command for that same directory. Keep one setup process alive for the
+original task, or use [saved-work readback](/connect/guides/manage-connections#read-saved-work-after-process-loss)
+with new configuration/workspace paths after the old workers settle.
+Do not delete the old workspace to make the original command run again.
+
+## A saved setup file does not resume installation
+
+That file selects retained requests. Use `--recover-manifest` for readback or
+`--prior-manifest` plus an exact request ID for a new configuration proposal.
+These are [different workflows](/connect/guides/manage-connections). Recovery restores
+no install or retry tools. `matched` is a current file observation; the old
+outcome can remain `unconfirmed`. Missing acquired files remain unresolved.
+
+If preparation rejects a saved file, verify its exact hash, original workspace,
+request anchors and original host bindings. Keep configured-install and
+acquisition-only requirements distinct. Do not rewrite hashes, discard a
+selected request or substitute a newer library to bypass the refusal.
+
+## The connector installed but no tools appear
+
+Installation emits a launch; the host still needs to approve and register it.
+For Meerkat, follow the [native MCP mapping and attachment guide](/connect/guides/native-mcp).
+A `staged` result can precede a missing-executable or connection failure.
+Check native catalog search/load and an actual operation, keeping the setup
+server's name and process stable. Two accounts can expose colliding tool names;
+use the host's explicit naming map instead of assuming server-name prefixes.
+
+## Report a setup problem
+
+Send the relevant host or release maintainer a bounded report containing:
+
+- Archive filename/SHA-256 and platform, architecture, libc and runtime versions.
+- The selected family/profile and exact command flags, with private values removed.
+- Which step failed, its fixed error code, job/request identifiers and whether
+  the process settled or the result is unconfirmed.
+- The relevant receipt/check result and the smallest useful log excerpt.
+
+Keep tokens, passwords, authorization URLs, callback material, private account
+content and whole saved-request files out of public reports. No public support
+endpoint is assigned yet; use your host's existing support route.
+
+## find_and_install returns unavailable
+
+This is the current intentional production boundary. The native work-publication, accepted authority and continuation composition are unfinished. Registering the tool or satisfying its content schema does not enable installation. Use current operation libraries through explicit host composition, or investigate via [read-only discovery](/connect/api/discovery).
+
+## A recipe exists but discovery cannot find it
+
+Check the compiled include list in `crates/toolkit-package/src/library.rs`. Drive `0.1.0` and Slack `0.3.0` files currently exist outside that registered inventory. Also confirm whether the host chose the metadata-only catalog or the versioned library. A stale paging snapshot requires a fresh listing.
+
+## A read fails with a digest or unknown-field error
+
+Use the exact identity, package digest and listed library digest. Do not substitute a newer version, normalize a publisher/name or omit required joined-recipe identity. The tools reject unknown fields and a guidance-only strategy cannot be promoted by adding made-up execution data.
+
+## Python refuses an unprepared client
+
+Call `prepare_httpx_client` once at the host construction site before sharing the client. Keep its response hook first throughout borrowed use. `require_prepared_httpx_client` checks without mutating. Do not reorder hooks during active operations or patch around the refusal in each call.
+
+## An SDK call succeeded but the agent cannot use the tool
+
+The SDK operation and the agent's runtime binding are separate. Observe `identity_resolved_tools` for the actual member and perform a real dispatch through that surface. Check profile selection, package/grant revisions and the current target incarnation.
+
+Some development/released upstream compositions differ in how customizer tools reach restored, repair, helper, raw or flow spawn paths. Do not infer those paths from the initial spawn or an SDK fake test. Select an accepted upstream graph and verify each path you claim to support.
+
+## Startup shows progress but never reports ready
+
+Keep progress separate from terminal readiness. The proposed typed acceptance/progress/settled startup protocol is unreleased and includes no built-in SDK stall timer. Caller cancellation/deadline or transport loss without observed settlement yields `InitOutcomeUnknown`; it does not establish rollback or a failed runtime. Reconcile through the actual startup owner before retrying.
+
+## Authentication completed but access is denied
+
+Check actual account identity, requested operations/resources, host grant and provider scope separately. Developer registration or administrator installation may still be missing. A saved connection is not a grant, and a broad provider credential does not establish the intended local restriction.
+
+## A write timed out or returned an HTTP error
+
+Inspect the typed effect outcome. Once entered, a write can remain unknown even on an error response. Preserve the original business invocation and reconcile according to that provider/domain contract. Retry-After is not permission to replay; a Gmail Message-ID search is not proof that an earlier send did not happen.
+
+## Slack retrieval finished but the summary is incomplete
+
+Inspect interval `coverage_gaps`, chain states and budgets. Older roots, hidden/deleted content, retention, permission and concurrent changes can limit results. `finished` only means the collector exhausted queued work. One page, a short page or an exhausted visible chain is not a global completeness proof.
+
+## A frontend receives events but cannot safely reply
+
+Provider authenticity does not establish application admission or destination audience. Check the selected principal/conversation, reply route, current audience evidence and egress state. A queued retry cannot widen the audience or choose a different destination.
+
+## Shutdown exceeds an operation deadline
+
+The deadline starts cancellation; retained cleanup is still awaited. Host hooks, Fetch, worker threads or native transport cleanup can be slow or noncooperative. Do not discard custody and claim a clean shutdown. Follow the selected lifecycle owner's uncertainty/fencing contract.
+
+## A database has the expected version but fails to open
+
+Private and accepted upstream schemas can reuse version numbers with different tables. Preserve the database and exact dependency identity. Use the owner's reviewed migration or a separately owned fresh fixture. Resetting state is not a compatibility fix.
+
+## The UI action shows uncertain acknowledgment
+
+Read a fresh authenticated owner projection. A callback rejection or lost acknowledgment does not prove that the command failed. The renderer intentionally does not retry or invent a new action. Recovery controls must come from the owner.

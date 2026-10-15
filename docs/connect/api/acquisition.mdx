@@ -1,0 +1,72 @@
+---
+title: "find_and_install"
+description: "Agent-led setup input, enrolled native admission and the limits of setup observations."
+icon: "download"
+---
+
+<Warning>
+Direct construction with `FindAndInstallTool::new` remains unavailable on context-aware dispatch. The enrolled installed path instead requires its bound native owner and authenticated invocation before it can admit or recover durable setup work and advance the helper. An unbound or retired owner cannot serve calls, and a context-free call is denied. This source path does not qualify the complete installed Console experience or original-task completion; constructing a dispatcher does not establish success.
+</Warning>
+
+## Optional local archive inspection
+
+The current [library edition](/connect/library/local-install) can expose
+`setup_inspect_acquired` when the host selects `--enable-acquired-inspection`.
+It reads only the primary archive of a successful Python or Node acquisition
+in that live setup session. Bind the exact `job_id` and `receipt_sha256`; use
+`after: null` to list members, then an exact `member` with `offset: 0` to read
+text. Follow returned cursors for additional pages. Listing returns at most 64
+members; text reads return at most 32 KiB from eligible UTF-8 members up to 1 MiB.
+
+This tool executes no package code, exposes no dependency archives and is
+unavailable in recovery mode. The agent still researches the integration,
+chooses the entrypoint and authors package and activation metadata. The
+`docs/verification/20261004-acquired-inspection/REPORT.md`
+records the guided macOS Fetch trial and two-request recovery; Linux verification
+is static only. The `docs/verification/20261004-acquired-inspection/DOWNSTREAM-HANDOFF.md`
+contains the exact archive pins and host prerequisites. This local tool does
+not change the native `find_and_install` boundary below.
+
+## Current model-facing input
+
+The source definition preserves the user's request without asking the original agent to preselect an integration. The strict schema accepts only these content fields:
+
+<ParamField body="request" type="string" required>
+  The complete nonempty original request, including constraints and ambiguity.
+</ParamField>
+<ParamField body="user_context" type="array">
+  Up to 256 strings or exact context references containing `owner`, `id`, `revision` and `content_digest`.
+</ParamField>
+<ParamField body="caller_observations" type="array">
+  Up to 256 strings containing the calling agent's labeled observations.
+</ParamField>
+
+Example content shape, **not an executable setup demo**:
+
+```json
+{
+  "request": "Read last week's launch updates in Slack and email me a summary.",
+  "user_context": ["Use the workspace and work address selected in this task."],
+  "caller_observations": ["The current agent has no Slack read operation."]
+}
+```
+
+Unknown fields are rejected. Model arguments do not supply authority, target agent, account, package, backend, correlation or continuation routing. Context references are content identities; they do not grant access to their contents.
+
+## Setup observations and continuation
+
+The enrolled path returns the operation identity, revision, acquisition phase and whether admission created it. Its typed worker observation distinguishes pending work, retry-safe work, dispatch-budget exhaustion, refused dispatch, admitted input, unresolved admission, unavailable native outcomes and a terminal acquisition. Admitted input includes its deduplication and source-settlement observations. These are setup handoff observations, not proof of installation, live service readiness or the user's task result. Any completion text reports only that the approved follow-up instruction was admitted.
+
+The `agents/setup-lead` package contains setup-agent instructions, declared tool purposes, a research-proposal schema and an inert validator. The model returns its supported choices and proposed work; the host attaches the independently retained original request. Service operations and frontend interactions use separate outcome shapes. The recorded component trial includes fourteen offline tests and an actual Codex research agent identifying an outside-catalog implementation from a vague remembered-name request and returning a validated proposal. That trial has recorded isolation and model-metadata limits; it is not formal held-out or native acquisition acceptance. This package alone does not execute installation or original-task continuation.
+
+The separate [trusted local installers](/connect/acquisition/local-install) consume an agent-chosen concrete `IntegrationPackage` and `ActivationManifest`. Node and Python have actual outside-catalog installation, separate restore and generic MCP read evidence on their selected macOS arm64 profiles. The Python execution proof uses original wheels, a complete exact dependency closure and ordinary offline pip; independent physical-installation readback accepts this bounded component. The host independently selects the input digest and trusted executables, and the canonical owner validates frozen inputs on each invocation. Neither projection JSON nor a read declaration grants authority, filters the whole MCP endpoint or supplies native registration. This installation component does not establish the complete native `find_and_install` workflow, protected human auth or original-task continuation.
+
+The intended setup workflow delegates interpretation to setup agents and returns separately verified role outcomes or a durable pending operation. Its owners must authenticate the real invocation, preserve request custody, commit setup work, activate at the supported runtime boundary and resume the original task.
+
+An admission acknowledgment remains distinct from worker launch, setup completion, live service readiness and business-task completion. A timeout can race a durable commit, so recovery must observe the exact existing operation through its owner.
+
+Private constructor and authority protocols are intentionally not presented as stable host APIs here. Use [host composition](/connect/guides/host-composition) and the accepted upstream contracts for the chosen release.
+
+## No generic management API is shipped
+
+Toolkit currently defines no universal public REST routes, remote RPC service or cloud management endpoint for this workflow. The local installation commands require an explicitly selected package and trusted host invocation; they do not expose native `find_and_install`. UI example callbacks are application ports. Adding such a transport must preserve the existing owners and authenticated request/response boundaries rather than create parallel lifecycle truth.
