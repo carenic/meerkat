@@ -2045,14 +2045,34 @@ pub(crate) fn runtime_driver_error_to_rpc(err: RuntimeDriverError) -> RpcError {
             message: reason,
             data: None,
         },
+        // The caller reused a key for different input: its own parameters
+        // conflict, and the data names the input the key is bound to.
+        RuntimeDriverError::InputIdempotencyConflict { existing_id } => RpcError {
+            code: error::INVALID_PARAMS,
+            message: format!("input idempotency conflicts with existing input {existing_id}"),
+            data: Some(serde_json::json!({ "existing_id": existing_id.to_string() })),
+        },
+        // The runtime's lifecycle state admits no such request now.
         RuntimeDriverError::NotReady { state } => RpcError {
             code: error::INVALID_REQUEST,
-            message: format!("runtime not ready for llm reconfiguration: {state}"),
+            message: format!("the session runtime is {state} and does not admit this request"),
+            data: None,
+        },
+        RuntimeDriverError::NotFound { runtime_id } => RpcError {
+            code: error::SESSION_NOT_FOUND,
+            message: format!("runtime not found: {runtime_id}"),
             data: None,
         },
         RuntimeDriverError::Destroyed => RpcError {
             code: error::SESSION_NOT_FOUND,
             message: "runtime destroyed".to_string(),
+            data: None,
+        },
+        // Nothing was registered or admitted; the refusal clears once the
+        // consent owner's settlement completes.
+        error @ RuntimeDriverError::ConsentOwnerLossUnsettled { .. } => RpcError {
+            code: meerkat_contracts::ErrorCode::SessionRuntimeUnavailable.jsonrpc_code(),
+            message: error.to_string(),
             data: None,
         },
         RuntimeDriverError::Internal(message) => RpcError {
@@ -2464,6 +2484,10 @@ pub struct SessionRuntime {
     create_session_after_prepare_bindings_error: Arc<StdMutex<Option<String>>>,
     #[cfg(test)]
     create_session_after_prepare_bindings_session_id: Arc<StdMutex<Option<SessionId>>>,
+    /// The refusal the next runtime-routed turn's input admission reports in
+    /// place of the runtime's own answer.
+    #[cfg(test)]
+    runtime_accept_fault: Arc<StdMutex<Option<RuntimeDriverError>>>,
     /// Startup fallback capacity used when no live config runtime is attached.
     max_sessions: usize,
     /// Override LLM client for all sessions (primarily for testing).
@@ -3473,6 +3497,8 @@ impl SessionRuntime {
             create_session_after_prepare_bindings_error: Arc::new(StdMutex::new(None)),
             #[cfg(test)]
             create_session_after_prepare_bindings_session_id: Arc::new(StdMutex::new(None)),
+            #[cfg(test)]
+            runtime_accept_fault: Arc::new(StdMutex::new(None)),
             max_sessions,
             default_llm_client,
             agent_llm_client_decorator: Arc::clone(&builder_agent_llm_client_decorator_slot),
@@ -3642,6 +3668,8 @@ impl SessionRuntime {
             create_session_after_prepare_bindings_error: Arc::new(StdMutex::new(None)),
             #[cfg(test)]
             create_session_after_prepare_bindings_session_id: Arc::new(StdMutex::new(None)),
+            #[cfg(test)]
+            runtime_accept_fault: Arc::new(StdMutex::new(None)),
             max_sessions,
             default_llm_client,
             agent_llm_client_decorator: Arc::clone(&builder_agent_llm_client_decorator_slot),
@@ -7950,6 +7978,32 @@ impl SessionRuntime {
             })
     }
 
+    /// Admit a runtime-routed turn's input with its completion waiter.
+    async fn accept_turn_input_with_completion(
+        &self,
+        session_id: &SessionId,
+        input: meerkat_runtime::input::Input,
+    ) -> Result<
+        (
+            meerkat_runtime::accept::AcceptOutcome,
+            Option<meerkat_runtime::completion::CompletionHandle>,
+        ),
+        RuntimeDriverError,
+    > {
+        #[cfg(test)]
+        if let Some(fault) = self
+            .runtime_accept_fault
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            return Err(fault);
+        }
+        self.runtime_adapter
+            .accept_input_with_completion(session_id, input)
+            .await
+    }
+
     /// Start a turn by routing through the runtime input/completion waiter path.
     ///
     /// Instead of calling `SessionService::start_turn()` directly, this method:
@@ -8313,17 +8367,13 @@ impl SessionRuntime {
             }
         };
         let (outcome, handle) = match self
-            .runtime_adapter
-            .accept_input_with_completion(session_id, input)
+            .accept_turn_input_with_completion(session_id, input)
             .await
         {
             Ok(pair) => pair,
             Err(e) => {
-                let primary = RpcError {
-                    code: error::INTERNAL_ERROR,
-                    message: format!("runtime accept failed: {e}"),
-                    data: None,
-                };
+                // An admission refusal keeps its typed code and data.
+                let primary = runtime_driver_error_to_rpc(e);
                 return Err(self
                     .unregister_new_runtime_registration_after_rpc_error(
                         &self.runtime_adapter,
@@ -8608,11 +8658,7 @@ impl SessionRuntime {
             .runtime_adapter
             .accept_input_without_wake(session_id, input)
             .await
-            .map_err(|e| RpcError {
-                code: error::INTERNAL_ERROR,
-                message: format!("runtime accept failed: {e}"),
-                data: None,
-            });
+            .map_err(runtime_driver_error_to_rpc);
         result = match result {
             Ok(outcome) => Ok(outcome),
             Err(primary) => Err(self
@@ -23858,6 +23904,145 @@ mod tests {
                 .await,
             "owned Gemini inline-video capability should still resolve"
         );
+    }
+
+    /// Runtime refusals keep typed JSON-RPC codes. A missing runtime, an
+    /// idempotency conflict and a runtime whose current lifecycle state
+    /// admits no input are not internal errors, and the not-ready refusal
+    /// names the state without borrowing another operation's wording.
+    #[test]
+    fn runtime_driver_errors_project_to_typed_rpc_codes() {
+        let invalid = runtime_driver_error_to_rpc(RuntimeDriverError::ValidationFailed {
+            reason: "bad input".to_string(),
+        });
+        assert_eq!(invalid.code, error::INVALID_PARAMS, "{invalid:?}");
+
+        let existing_id = meerkat_core::lifecycle::InputId::new();
+        let conflict = runtime_driver_error_to_rpc(RuntimeDriverError::InputIdempotencyConflict {
+            existing_id: existing_id.clone(),
+        });
+        assert_eq!(conflict.code, error::INVALID_PARAMS, "{conflict:?}");
+        assert_eq!(
+            conflict.data,
+            Some(serde_json::json!({ "existing_id": existing_id.to_string() })),
+            "the conflicting input is named in the data"
+        );
+
+        let missing = runtime_driver_error_to_rpc(RuntimeDriverError::NotFound {
+            runtime_id: meerkat_runtime::identifiers::LogicalRuntimeId::new("missing"),
+        });
+        assert_eq!(missing.code, error::SESSION_NOT_FOUND, "{missing:?}");
+
+        let retired = runtime_driver_error_to_rpc(RuntimeDriverError::NotReady {
+            state: RuntimeState::Retired,
+        });
+        assert_eq!(retired.code, error::INVALID_REQUEST, "{retired:?}");
+        assert!(
+            retired.message.contains("retired") && !retired.message.contains("llm"),
+            "the refusal names the runtime state alone: {}",
+            retired.message
+        );
+
+        let unsettled =
+            runtime_driver_error_to_rpc(RuntimeDriverError::ConsentOwnerLossUnsettled {
+                session_id: SessionId::new(),
+            });
+        assert_eq!(
+            unsettled.code,
+            meerkat_contracts::ErrorCode::SessionRuntimeUnavailable.jsonrpc_code(),
+            "{unsettled:?}"
+        );
+    }
+
+    /// An ordinary `turn/start` whose runtime admission is refused reports
+    /// the refusal's typed code and data, never a generic internal error.
+    #[tokio::test]
+    async fn turn_start_admission_refusal_keeps_its_typed_code() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = make_runtime(temp_factory(&temp), 4);
+        runtime.set_default_llm_client(Some(Arc::new(MockLlmClient)));
+        let session_id = runtime
+            .create_session(mock_build_config(), None, None, Vec::new())
+            .await
+            .expect("create_session");
+        let turn = |prompt: &'static str| {
+            let runtime = Arc::clone(&runtime);
+            let session_id = session_id.clone();
+            async move {
+                let (event_tx, _event_rx) = mpsc::channel(100);
+                runtime
+                    .start_turn_via_runtime(
+                        &session_id,
+                        prompt.into(),
+                        Vec::new(),
+                        event_tx,
+                        None,
+                        None,
+                        None,
+                        None,
+                    )
+                    .await
+            }
+        };
+        turn("the first turn").await.expect("the first turn runs");
+        let refuse_next_admission = |fault: RuntimeDriverError| {
+            *runtime
+                .runtime_accept_fault
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(fault);
+        };
+
+        refuse_next_admission(RuntimeDriverError::NotReady {
+            state: RuntimeState::Retired,
+        });
+        let not_ready = turn("refused while retired")
+            .await
+            .expect_err("a runtime that admits no input refuses the turn");
+        assert_eq!(not_ready.code, error::INVALID_REQUEST, "{not_ready:?}");
+        assert!(
+            not_ready.message.contains("retired"),
+            "the refusal names the runtime state: {}",
+            not_ready.message
+        );
+
+        let existing_id = meerkat_core::lifecycle::InputId::new();
+        refuse_next_admission(RuntimeDriverError::InputIdempotencyConflict {
+            existing_id: existing_id.clone(),
+        });
+        let conflict = turn("refused as a conflict")
+            .await
+            .expect_err("an idempotency conflict refuses the turn");
+        assert_eq!(conflict.code, error::INVALID_PARAMS, "{conflict:?}");
+        assert_eq!(
+            conflict.data,
+            Some(serde_json::json!({ "existing_id": existing_id.to_string() })),
+            "the conflicting input is named in the data"
+        );
+
+        #[cfg(feature = "local-authorization")]
+        {
+            refuse_next_admission(RuntimeDriverError::InputRefused {
+                refusal: meerkat_core::OperationRefused::new(
+                    meerkat_core::OperationRefusalKind::Denied,
+                ),
+            });
+            let refused = turn("refused by the native owner")
+                .await
+                .expect_err("a native refusal refuses the turn");
+            assert_eq!(
+                refused.code,
+                meerkat_contracts::ErrorCode::InputRefused.jsonrpc_code(),
+                "{refused:?}"
+            );
+            assert!(
+                refused.data.is_some(),
+                "the refusal keeps its typed detail: {refused:?}"
+            );
+        }
+
+        turn("a turn after the refusals")
+            .await
+            .expect("a refused admission leaves the session usable");
     }
 
     #[tokio::test]

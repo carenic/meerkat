@@ -1182,6 +1182,18 @@ same causes: `-32010` (provider error) for `llm_failure` and
 `-32005` for cancellation. Any other cause is `-32603`. The typed turn error
 (`kind`, `detail`, and the provider facts when known) is in `data.error`.
 
+A turn the session's runtime refuses to admit keeps the refusal's typed code
+(see [Error codes](#error-codes)): `-32602` for an input the runtime rejects
+as invalid (an idempotency conflict names the existing input in
+`data.existing_id`), `-32030` or `-32031` when the native owner refuses the
+input or its readiness is unavailable (the typed detail is in `data`),
+`-32001` when the session's runtime does not exist, `-32002` when another
+runtime owner hosts the session or its runtime teardown is still running,
+`-32032` when its runtime authority is unavailable, and `-32600` when the
+runtime's lifecycle state admits no new input (for example a retired
+runtime; the message names the state). Only a mechanical failure is
+`-32603`.
+
 <ParamField body="session_id" type="string" required>
   Session ID to continue.
 </ParamField>
@@ -1460,7 +1472,8 @@ Admit a correlated terminal peer response through the typed runtime ingress.
   Peer-returned terminal payload.
 </ParamField>
 
-Error `-32603` if runtime admission fails, `-32602` if the session locator is invalid.
+A refused runtime admission keeps its typed code, as for `turn/start`;
+`-32602` if the session locator is invalid.
 
 This is a queue-only runtime admission path; it does not create a second direct execution loop.
 
@@ -3127,12 +3140,14 @@ Neither stream-end notification is a callable RPC method.
 
 ## Error codes
 
-Standard JSON-RPC codes plus Meerkat-specific application codes:
+Standard JSON-RPC codes plus Meerkat-specific application codes. An error
+keeps the typed `data` its cause carries on every method; branch on the code
+and `data`, never on the message text.
 
 | Code | Name | Description |
 |------|------|-------------|
 | -32700 | Parse error | Invalid JSON |
-| -32600 | Invalid request | Not a valid JSON-RPC request |
+| -32600 | Invalid request | Not a valid JSON-RPC request, or a request the target's current state does not admit (for example a `turn/start` on a retired runtime) |
 | -32601 | Method not found | Unknown method |
 | -32602 | Invalid params | Missing or invalid parameters |
 | -32603 | Internal error | Server error |

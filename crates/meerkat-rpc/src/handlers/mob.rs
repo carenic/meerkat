@@ -2416,7 +2416,7 @@ pub async fn handle_member_status(
                                 match runtime.detached_job_await_activity(&session_id).await {
                                     Ok(activity) => activity,
                                     Err(error) => {
-                                        return RpcResponse::error(id, error.code, error.message);
+                                        return RpcResponse::from_error(id, error);
                                     }
                                 };
                             if let Some(activity) = await_activity {

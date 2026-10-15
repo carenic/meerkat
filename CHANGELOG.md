@@ -56,6 +56,21 @@ them.
   the admitted input's terminal (Behaviour-only: an attempt the runtime
   retries no longer ends the call, so a turn whose retry succeeds returns
   success).
+- `meerkat-rpc`: a turn or event the session's runtime refuses to admit keeps
+  the refusal's typed JSON-RPC code. `turn/start` and
+  `session/external_event` answered every refusal with `-32603` ("runtime
+  accept failed"); they, and `session/peer_response_terminal`, now answer
+  `-32602` for an invalid input (an idempotency conflict names the existing
+  input in `data.existing_id`), `-32030`/`-32031` for a native refusal or
+  unavailable readiness, `-32001` for a missing runtime, `-32002` for another
+  runtime owner or a teardown in progress, `-32032` for unavailable runtime
+  authority, and `-32600` when the runtime's lifecycle state admits no input
+  (for example a retired runtime; the message names the state and no longer
+  says "llm reconfiguration"). Only a mechanical failure stays `-32603`. RPC
+  handlers also stopped dropping an error's typed `data`: every method now
+  answers with the data its cause carries (for example the
+  unsupported-capability detail of a refused `session/create`), and a failed
+  runtime executor registration in `session/create` keeps its typed code.
 
 ## [0.9.1] - 2026-10-15
 

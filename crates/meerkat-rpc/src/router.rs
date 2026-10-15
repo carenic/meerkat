@@ -2919,7 +2919,7 @@ impl MethodRouter {
             // field reports the same status as the other surfaces.
             "capabilities/get" => match routed_arm(|| self.runtime.effective_config()).await {
                 Ok(config) => handlers::capabilities::handle_get(id, &config),
-                Err(e) => RpcResponse::error(id, e.code, e.message),
+                Err(e) => RpcResponse::from_error(id, e),
             },
             "runtime/host_info" => {
                 routed_arm(|| {
@@ -2969,7 +2969,7 @@ impl MethodRouter {
             // surfaces and matches what a session build resolves.
             "models/catalog" => match routed_arm(|| self.runtime.effective_config()).await {
                 Ok(config) => handlers::models::handle_catalog(id, &config),
-                Err(e) => RpcResponse::error(id, e.code, e.message),
+                Err(e) => RpcResponse::from_error(id, e),
             },
             // Auth + realm methods (Phase 4d).
             "auth/profile/list" => {
@@ -3426,10 +3426,7 @@ impl MethodRouter {
                     ),
                     // A store-layer failure must surface as a typed error, not
                     // be laundered into a "session not found".
-                    Err(err) => match err.data {
-                        Some(data) => RpcResponse::error_with_data(id, err.code, err.message, data),
-                        None => RpcResponse::error(id, err.code, err.message),
-                    },
+                    Err(err) => RpcResponse::from_error(id, err),
                 }
             }
             #[cfg(feature = "mob")]
@@ -3508,7 +3505,7 @@ impl MethodRouter {
                     ),
                     // A store/control-plane fault is surfaced as itself —
                     // never collapsed into a not-found.
-                    Err(err) => RpcResponse::error(id, err.code, err.message),
+                    Err(err) => RpcResponse::from_error(id, err),
                 }
             }
             #[cfg(feature = "mob")]
@@ -3574,7 +3571,7 @@ impl MethodRouter {
                 .await
             {
                 Ok(revision) => RpcResponse::success(id, revision),
-                Err(rpc_err) => RpcResponse::error(id, rpc_err.code, rpc_err.message),
+                Err(rpc_err) => RpcResponse::from_error(id, rpc_err),
             },
             #[cfg(feature = "mob")]
             Some(SessionOwner::Mob) => RpcResponse::error(
@@ -3623,7 +3620,7 @@ impl MethodRouter {
                 .await
             {
                 Ok(list) => RpcResponse::success(id, list),
-                Err(rpc_err) => RpcResponse::error(id, rpc_err.code, rpc_err.message),
+                Err(rpc_err) => RpcResponse::from_error(id, rpc_err),
             },
             #[cfg(feature = "mob")]
             Some(SessionOwner::Mob) => RpcResponse::error(
@@ -3691,7 +3688,7 @@ impl MethodRouter {
                 .await
             {
                 Ok(result) => RpcResponse::success(id, result),
-                Err(rpc_err) => RpcResponse::error(id, rpc_err.code, rpc_err.message),
+                Err(rpc_err) => RpcResponse::from_error(id, rpc_err),
             },
             #[cfg(feature = "mob")]
             Some(SessionOwner::Mob) => RpcResponse::error(
@@ -3743,7 +3740,7 @@ impl MethodRouter {
                 .await
             {
                 Ok(result) => RpcResponse::success(id, result),
-                Err(rpc_err) => RpcResponse::error(id, rpc_err.code, rpc_err.message),
+                Err(rpc_err) => RpcResponse::from_error(id, rpc_err),
             },
             #[cfg(feature = "mob")]
             Some(SessionOwner::Mob) => RpcResponse::error(
@@ -3785,7 +3782,7 @@ impl MethodRouter {
                 .await
             {
                 Ok(result) => RpcResponse::success(id, result),
-                Err(rpc_error) => RpcResponse::error(id, rpc_error.code, rpc_error.message),
+                Err(rpc_error) => RpcResponse::from_error(id, rpc_error),
             },
             #[cfg(feature = "mob")]
             Some(SessionOwner::Mob) => RpcResponse::error(
@@ -3928,7 +3925,7 @@ impl MethodRouter {
                     });
                     RpcResponse::success(id, result)
                 }
-                Err(rpc_err) => RpcResponse::error(id, rpc_err.code, rpc_err.message),
+                Err(rpc_err) => RpcResponse::from_error(id, rpc_err),
             },
             #[cfg(feature = "mob")]
             Some(SessionOwner::Mob) => RpcResponse::error(
@@ -3989,7 +3986,7 @@ impl MethodRouter {
                     });
                     RpcResponse::success(id, result)
                 }
-                Err(rpc_err) => RpcResponse::error(id, rpc_err.code, rpc_err.message),
+                Err(rpc_err) => RpcResponse::from_error(id, rpc_err),
             },
             #[cfg(feature = "mob")]
             Some(SessionOwner::Mob) => RpcResponse::error(
@@ -4026,70 +4023,63 @@ impl MethodRouter {
         #[cfg(feature = "mob")]
         let bridge_session_id = session_id.to_string();
         match routed_arm(|| self.resolve_session_owner(&session_id)).await {
-            Some(SessionOwner::Runtime) => match routed_arm(|| {
-                self.runtime.archive_session(&session_id)
-            })
-            .await
-            {
-                Ok(()) => {
-                    // Clean up session-owned mobs (implicit + explicit).
-                    #[cfg(feature = "mob")]
-                    if let Err(error) = routed_arm(|| {
-                        self.mob_state
-                            .destroy_bridge_session_mobs(&bridge_session_id)
-                    })
-                    .await
-                    {
-                        return mob_destroy_cleanup_error_response(id, error);
-                    }
-                    // The archive committed; join the runtime teardown until
-                    // terminal rather than reporting a saga still completing
-                    // (`UnregisterInProgress` after the caller grace) as a
-                    // failed unregister.
-                    if let Err(error) = routed_arm(|| {
-                        self.runtime_adapter
-                            .unregister_current_session_registration_until_terminal(&session_id)
-                    })
-                    .await
-                    {
-                        return RpcResponse::error(
-                            id,
-                            error::INTERNAL_ERROR,
-                            format!(
-                                "session archived but runtime unregister failed for {session_id}: {error}"
-                            ),
-                        );
-                    }
-                    RpcResponse::success(id, json!({"archived": true}))
-                }
-                Err(rpc_err) => {
-                    #[cfg(feature = "mob")]
-                    {
-                        let retained_cleanup = routed_arm(|| {
+            Some(SessionOwner::Runtime) => {
+                match routed_arm(|| self.runtime.archive_session(&session_id)).await {
+                    Ok(()) => {
+                        // Clean up session-owned mobs (implicit + explicit).
+                        #[cfg(feature = "mob")]
+                        if let Err(error) = routed_arm(|| {
                             self.mob_state
-                                .has_bridge_session_scoped_mobs(&bridge_session_id)
+                                .destroy_bridge_session_mobs(&bridge_session_id)
                         })
-                        .await;
-                        if rpc_err.code == error::SESSION_NOT_FOUND
-                            && retained_cleanup
-                            && let Err(error) = routed_arm(|| {
-                                self.mob_state
-                                    .destroy_bridge_session_mobs(&bridge_session_id)
-                            })
-                            .await
+                        .await
                         {
                             return mob_destroy_cleanup_error_response(id, error);
                         }
-                    }
-
-                    match rpc_err.data {
-                        Some(data) => {
-                            RpcResponse::error_with_data(id, rpc_err.code, rpc_err.message, data)
+                        // The archive committed; join the runtime teardown until
+                        // terminal rather than reporting a saga still completing
+                        // (`UnregisterInProgress` after the caller grace) as a
+                        // failed unregister.
+                        if let Err(error) = routed_arm(|| {
+                            self.runtime_adapter
+                                .unregister_current_session_registration_until_terminal(&session_id)
+                        })
+                        .await
+                        {
+                            return RpcResponse::error(
+                                id,
+                                error::INTERNAL_ERROR,
+                                format!(
+                                    "session archived but runtime unregister failed for {session_id}: {error}"
+                                ),
+                            );
                         }
-                        None => RpcResponse::error(id, rpc_err.code, rpc_err.message),
+                        RpcResponse::success(id, json!({"archived": true}))
+                    }
+                    Err(rpc_err) => {
+                        #[cfg(feature = "mob")]
+                        {
+                            let retained_cleanup = routed_arm(|| {
+                                self.mob_state
+                                    .has_bridge_session_scoped_mobs(&bridge_session_id)
+                            })
+                            .await;
+                            if rpc_err.code == error::SESSION_NOT_FOUND
+                                && retained_cleanup
+                                && let Err(error) = routed_arm(|| {
+                                    self.mob_state
+                                        .destroy_bridge_session_mobs(&bridge_session_id)
+                                })
+                                .await
+                            {
+                                return mob_destroy_cleanup_error_response(id, error);
+                            }
+                        }
+
+                        RpcResponse::from_error(id, rpc_err)
                     }
                 }
-            },
+            }
             #[cfg(feature = "mob")]
             Some(SessionOwner::Mob) => match routed_arm(|| {
                 self.mob_state
@@ -4250,7 +4240,7 @@ impl MethodRouter {
             Some(SessionOwner::Runtime) => {
                 match self.runtime.append_system_context(&session_id, req).await {
                     Ok(result) => RpcResponse::success(id, json!({"status": result.status})),
-                    Err(rpc_err) => RpcResponse::error(id, rpc_err.code, rpc_err.message),
+                    Err(rpc_err) => RpcResponse::from_error(id, rpc_err),
                 }
             }
             #[cfg(feature = "mob")]
@@ -4342,12 +4332,7 @@ impl MethodRouter {
                     // A store-layer failure must surface as a typed error, not
                     // be conflated with an archived session.
                     Err(err) => {
-                        return match err.data {
-                            Some(data) => {
-                                RpcResponse::error_with_data(id, err.code, err.message, data)
-                            }
-                            None => RpcResponse::error(id, err.code, err.message),
-                        };
+                        return RpcResponse::from_error(id, err);
                     }
                 }
                 self.runtime.comms_runtime(&session_id).await
@@ -4450,12 +4435,7 @@ impl MethodRouter {
                     // A store-layer failure must surface as a typed error, not
                     // be conflated with an archived session.
                     Err(err) => {
-                        return match err.data {
-                            Some(data) => {
-                                RpcResponse::error_with_data(id, err.code, err.message, data)
-                            }
-                            None => RpcResponse::error(id, err.code, err.message),
-                        };
+                        return RpcResponse::from_error(id, err);
                     }
                 }
                 self.runtime.comms_runtime(&session_id).await
@@ -12415,6 +12395,46 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .starts_with("[meerkat-instruction-activation-v1]")
+        );
+    }
+
+    /// A `session/create` refusal keeps its typed error data: a deferred
+    /// first prompt carrying inline video for a model without inline-video
+    /// support is refused with `INVALID_PARAMS` and the unsupported-capability
+    /// evidence in `error.data`, as `turn/start` reports the same refusal.
+    #[tokio::test]
+    async fn session_create_refusal_keeps_its_typed_error_data() {
+        let (router, _notif_rx) = test_router().await;
+        let prompt = serde_json::to_value(vec![meerkat_core::ContentBlock::Video {
+            media_type: "video/mp4".to_string(),
+            duration_ms: 1000,
+            data: meerkat_core::VideoData::Inline {
+                data: "AAAA".to_string(),
+            },
+        }])
+        .expect("serialize the video prompt");
+        let response = router
+            .dispatch(make_request(
+                "session/create",
+                serde_json::json!({
+                    "prompt": prompt,
+                    "model": "claude-sonnet-4-6",
+                    "initial_turn": "deferred"
+                }),
+            ))
+            .await
+            .unwrap();
+        let error = response
+            .error
+            .expect("inline video for a model without it is refused");
+        assert_eq!(error.code, crate::error::INVALID_PARAMS, "{error:?}");
+        let data = error
+            .data
+            .expect("the refusal keeps its typed unsupported-capability data");
+        assert_eq!(
+            data["unsupported_capability"]["capability"],
+            serde_json::json!("inline_video"),
+            "{data}"
         );
     }
 
