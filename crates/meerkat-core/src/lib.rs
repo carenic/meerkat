@@ -245,6 +245,7 @@ pub use config_store::{
     MemoryConfigStore, RealmConfigSource, RealmConfigWarning, TaggedConfigStore,
     apply_config_patch_preview, merge_patch,
 };
+pub use confinement::HostLaunchExemption;
 pub use confinement_config::{
     ConfinementConfig, ConfinementFlagMode, ConfinementFlags, ConfinementFlagsError,
     ConfinementLaunchKind, ConfinementLayerConflict, CustomConfinement, InvalidConfinementPath,

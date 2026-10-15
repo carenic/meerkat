@@ -422,9 +422,19 @@ async fn untrusted_skill_directories_are_not_loaded() {
             .collect::<Vec<_>>()
     };
     let refused = names(
-        resolve_repositories_with_roots_trusting(&cfg, Some(tmp.path()), None, None, &|path| {
-            path == untrusted.as_path() || path == project_skills.as_path()
-        })
+        resolve_repositories_with_roots_trusting(
+            &cfg,
+            Some(tmp.path()),
+            None,
+            None,
+            &meerkat_skills::SkillHostBoundary::trusted_host().with_untrusted_paths({
+                let untrusted = untrusted.clone();
+                let project_skills = project_skills.clone();
+                std::sync::Arc::new(move |path: &std::path::Path, _| {
+                    path == untrusted.as_path() || path == project_skills.as_path()
+                })
+            }),
+        )
         .await
         .unwrap()
         .expect("enabled config"),

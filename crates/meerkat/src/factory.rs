@@ -3676,7 +3676,8 @@ impl AgentFactory {
         auth_binding: &AuthBindingRef,
         auth_lease_handle: meerkat_core::handles::GeneratedAuthLeaseHandle,
     ) -> Result<meerkat_providers::CredentialReadiness, FactoryError> {
-        let mut env = meerkat_providers::ResolverEnvironment::with_process_env()
+        let mut env = self
+            .host_resolver_environment()
             .with_auth_lease_handle(auth_lease_handle);
         if let Some(persistence) = self.resolution_provider_auth_persistence()? {
             env = env.with_provider_auth_persistence(persistence);
@@ -3839,7 +3840,7 @@ impl AgentFactory {
         auth_binding: AuthBindingRef,
         auth_lease_handle: Option<meerkat_core::handles::GeneratedAuthLeaseHandle>,
     ) -> Result<meerkat_providers::ResolvedConnection, FactoryError> {
-        let mut env = meerkat_providers::ResolverEnvironment::with_process_env();
+        let mut env = self.host_resolver_environment();
         if let Some(auth_lease_handle) = auth_lease_handle {
             env = env.with_auth_lease_handle(auth_lease_handle);
         }
@@ -3916,7 +3917,7 @@ impl AgentFactory {
                 "failed to resolve web-search auth binding for provider {search_provider:?}"
             ));
         };
-        let mut env = meerkat_providers::ResolverEnvironment::with_process_env();
+        let mut env = self.host_resolver_environment();
         // A faulted credential backend is a hard typed fault, never folded
         // into the inherit-mode `Ok(None)` degradation.
         if let Some(persistence) = self
@@ -4533,14 +4534,47 @@ impl AgentFactory {
         self.host_confinement.as_ref()
     }
 
-    /// Whether the host confinement does not trust the skills directory at
-    /// `path`: a confined process could change it, so its skills are not
-    /// loaded ([`crate::HostConfinement::untrusted_directory`]).
+    /// How this factory's skill repositories meet its host confinement: the
+    /// skills directories, Git program and cache a confined process could
+    /// change are not trusted
+    /// ([`crate::HostConfinement::untrusted_paths`]), and a stdio skill
+    /// source launches under the `mcp_stdio` requirement, as a local MCP
+    /// stdio server does. Without a host confinement, the trusted host.
     #[cfg(all(feature = "skills", not(target_arch = "wasm32")))]
-    fn untrusted_skills_directory(&self, path: &std::path::Path) -> bool {
-        self.host_confinement
-            .as_ref()
-            .is_some_and(|host| host.untrusted_directory(path))
+    fn skill_host_boundary(&self) -> meerkat_skills::SkillHostBoundary {
+        use meerkat_core::ConfinementLaunchKind;
+        let Some(host) = &self.host_confinement else {
+            return meerkat_skills::SkillHostBoundary::trusted_host();
+        };
+        let boundary = meerkat_skills::SkillHostBoundary::trusted_host()
+            .with_untrusted_paths(host.untrusted_paths());
+        match (
+            host.requirement(ConfinementLaunchKind::McpStdio),
+            host.working_directory(ConfinementLaunchKind::McpStdio),
+        ) {
+            (Some(requirement), Some(working_directory)) => {
+                boundary.with_stdio_runner(std::sync::Arc::new(
+                    crate::skill_stdio_confinement::ConfinedStdioSkillRunner::new(
+                        requirement,
+                        working_directory.to_path_buf(),
+                    ),
+                ))
+            }
+            _ => boundary,
+        }
+    }
+
+    /// The resolver environment of this factory's provider resolutions: the
+    /// process environment and, under a host confinement, its guard for the
+    /// programs the host runs as itself, so a credential command a confined
+    /// process could change is refused before it runs.
+    fn host_resolver_environment(&self) -> meerkat_providers::ResolverEnvironment {
+        let env = meerkat_providers::ResolverEnvironment::with_process_env();
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(host) = &self.host_confinement {
+            return env.with_host_launch_guard(host.untrusted_paths());
+        }
+        env
     }
 
     /// Install a stock host's resolved OS process confinement: each launch
@@ -4879,7 +4913,7 @@ impl AgentFactory {
                         conventions_context_root,
                         conventions_user_root,
                         Some(runtime_root.as_path()),
-                        &|path| self.untrusted_skills_directory(path),
+                        &self.skill_host_boundary(),
                     )
                     .await
                     {
@@ -5276,7 +5310,7 @@ impl AgentFactory {
         .map_err(FactoryError::ConnectionTarget)?;
 
         #[allow(unused_mut)]
-        let mut env = meerkat_providers::ResolverEnvironment::with_process_env();
+        let mut env = self.host_resolver_environment();
         #[cfg(not(target_arch = "wasm32"))]
         {
             if let Some(persistence) = self.resolution_provider_auth_persistence()? {
@@ -5995,7 +6029,7 @@ impl AgentFactory {
                 self.resolve_self_hosted_connection(config, identity, &spec, preferred_realm)?;
 
             #[allow(unused_mut)]
-            let mut env = meerkat_providers::ResolverEnvironment::with_process_env();
+            let mut env = self.host_resolver_environment();
             #[cfg(not(target_arch = "wasm32"))]
             {
                 if let Some(persistence) = self.resolution_provider_auth_persistence()? {
@@ -7371,7 +7405,7 @@ impl AgentFactory {
                                 _conventions_context_root,
                                 _conventions_user_root,
                                 Some(_realm_scope_root.as_path()),
-                                &|path| self.untrusted_skills_directory(path),
+                                &self.skill_host_boundary(),
                             )
                             .await
                             {
@@ -9820,7 +9854,7 @@ impl AgentFactory {
                         // `rkat auth login`, server-side OAuth completion, etc.)
                         // are read during resolve_binding.
                         #[allow(unused_mut)]
-                        let mut env = meerkat_providers::ResolverEnvironment::with_process_env();
+                        let mut env = self.host_resolver_environment();
                         #[cfg(not(target_arch = "wasm32"))]
                         {
                             if let Some(persistence) = self
@@ -10060,7 +10094,7 @@ impl AgentFactory {
                     continue;
                 };
                 #[allow(unused_mut)]
-                let mut env = meerkat_providers::ResolverEnvironment::with_process_env();
+                let mut env = self.host_resolver_environment();
                 #[cfg(not(target_arch = "wasm32"))]
                 {
                     if let Some(persistence) = self

@@ -3,7 +3,6 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime};
 
@@ -344,7 +343,9 @@ fn run_command(
     cwd: Option<&Path>,
     git_ssh_command: Option<&str>,
 ) -> Result<(), SkillError> {
-    let mut command = Command::new(program);
+    // A host launch exemption: git runs as the host. Resolution refuses a
+    // repository whose git program or cache a confined process could change.
+    let mut command = meerkat_core::HostLaunchExemption::GitSkillSource.command(program);
     command.args(args);
     if let Some(cwd) = cwd {
         command.current_dir(cwd);

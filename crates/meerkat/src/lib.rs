@@ -357,6 +357,8 @@ pub use meerkat_workgraph::{
 mod command_hook_confinement;
 #[cfg(not(target_arch = "wasm32"))]
 mod host_confinement;
+#[cfg(all(feature = "skills", not(target_arch = "wasm32")))]
+mod skill_stdio_confinement;
 #[cfg(not(target_arch = "wasm32"))]
 pub use host_confinement::{
     HostAuthority, HostConfinement, HostConfinementError, HostConfinementNotice, HostInput,

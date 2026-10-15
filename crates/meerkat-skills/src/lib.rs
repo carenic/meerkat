@@ -24,11 +24,16 @@ pub use engine::DefaultSkillEngine;
 pub use registration::{SkillRegistration, collect_registered_skills};
 #[allow(deprecated)] // deprecated ambient wrapper stays exported through its window
 pub use resolve::{
-    resolve_repositories, resolve_repositories_with_roots, resolve_repositories_with_roots_trusting,
+    SkillHostBoundary, UntrustedPaths, resolve_repositories, resolve_repositories_with_roots,
+    resolve_repositories_with_roots_trusting,
 };
 #[cfg(not(target_arch = "wasm32"))]
 pub use source::FilesystemSkillSource;
 pub use source::{CompositeSkillSource, EmbeddedSkillSource, InMemorySkillSource, NamedSource};
+#[cfg(not(target_arch = "wasm32"))]
+pub use source::{
+    StdioSkillLaunch, StdioSkillOutput, StdioSkillRunner, TrustedHostStdioSkillRunner,
+};
 
 /// Retain this owner's capability registration in optimized archive linking.
 #[doc(hidden)]

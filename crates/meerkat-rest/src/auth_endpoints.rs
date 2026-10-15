@@ -1234,9 +1234,12 @@ pub async fn test_auth_binding(
 ) -> impl IntoResponse {
     match resolve_realm(&state, &body.realm_id).await {
         Ok(realm) => {
+            // A credential command a confined process could change is
+            // refused here as in the host's sessions.
             let env = meerkat_providers::ResolverEnvironment::with_process_env()
                 .with_provider_auth_persistence(state.provider_auth_persistence.clone())
-                .with_auth_lease_handle(state.auth_lease.clone());
+                .with_auth_lease_handle(state.auth_lease.clone())
+                .with_host_launch_guard(state.host_confinement.untrusted_paths());
             let auth_binding = AuthBindingRef {
                 realm: body.realm_id.clone(),
                 binding: binding_id.clone(),

@@ -47,25 +47,80 @@ pub async fn resolve_repositories_with_roots(
     user_root: Option<&Path>,
     cache_root: Option<&Path>,
 ) -> Result<Option<CompositeSkillSource>, SkillError> {
-    resolve_repositories_with_roots_trusting(config, context_root, user_root, cache_root, &|_| {
-        false
-    })
+    resolve_repositories_with_roots_trusting(
+        config,
+        context_root,
+        user_root,
+        cache_root,
+        &SkillHostBoundary::trusted_host(),
+    )
     .await
 }
 
-/// [`resolve_repositories_with_roots`], refusing each skills directory
-/// `untrusted` names: a filesystem repository's directory, the local cache
+/// Whether a confined process could change what the host reads at a path
+/// (`true`: anything under it as well).
+pub type UntrustedPaths = Arc<dyn Fn(&Path, bool) -> bool + Send + Sync>;
+
+/// How skill repository resolution meets a host that confines its agents'
+/// launches: the paths its confined processes could change, and how a stdio
+/// skill source's process launches. The default is the trusted host: every
+/// path is trusted and stdio skill sources run as the host.
+#[derive(Clone, Default)]
+pub struct SkillHostBoundary {
+    #[cfg(not(target_arch = "wasm32"))]
+    untrusted: Option<UntrustedPaths>,
+    #[cfg(not(target_arch = "wasm32"))]
+    stdio_runner: Option<Arc<dyn crate::source::StdioSkillRunner>>,
+}
+
+impl SkillHostBoundary {
+    /// The trusted host.
+    #[must_use]
+    pub fn trusted_host() -> Self {
+        Self::default()
+    }
+
+    /// Do not trust the paths `untrusted` names: a skills directory, the Git
+    /// skill cache or the `git` program a confined process could change is
+    /// refused.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[must_use]
+    pub fn with_untrusted_paths(mut self, untrusted: UntrustedPaths) -> Self {
+        self.untrusted = Some(untrusted);
+        self
+    }
+
+    /// Launch stdio skill sources through `runner` (a host passes one that
+    /// applies its `mcp_stdio` confinement).
+    #[cfg(not(target_arch = "wasm32"))]
+    #[must_use]
+    pub fn with_stdio_runner(mut self, runner: Arc<dyn crate::source::StdioSkillRunner>) -> Self {
+        self.stdio_runner = Some(runner);
+        self
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn untrusted(&self, path: &Path, subtree: bool) -> bool {
+        self.untrusted
+            .as_ref()
+            .is_some_and(|untrusted| untrusted(path, subtree))
+    }
+}
+
+/// [`resolve_repositories_with_roots`] for a host that confines its agents'
+/// launches ([`SkillHostBoundary`]). Each skills directory `host` does not
+/// trust is refused: a filesystem repository's directory, the local cache
 /// Git repositories are fetched into, and the project skills directory
-/// (`<context>/.rkat/skills`). A host that confines its launches names each
-/// directory one of its confined processes could change, so skills planted
-/// there never reach a session. Each refused directory is logged; the
-/// embedded skills and every other source still load.
+/// (`<context>/.rkat/skills`); so is a Git repository whose `git` program
+/// it does not trust. Stdio skill sources launch through the host's
+/// runner. Each refusal is logged; the embedded skills and every other
+/// source still load.
 pub async fn resolve_repositories_with_roots_trusting(
     config: &SkillsConfig,
     context_root: Option<&Path>,
     user_root: Option<&Path>,
     cache_root: Option<&Path>,
-    untrusted: &(dyn Fn(&Path) -> bool + Send + Sync),
+    host: &SkillHostBoundary,
 ) -> Result<Option<CompositeSkillSource>, SkillError> {
     if !config.enabled {
         return Ok(None);
@@ -76,7 +131,7 @@ pub async fn resolve_repositories_with_roots_trusting(
 
     #[cfg(target_arch = "wasm32")]
     {
-        let _ = (context_root, user_root, cache_root, untrusted);
+        let _ = (context_root, user_root, cache_root, host);
         if let Some(repo) = config.repositories.first() {
             let error = match &repo.transport {
                 SkillRepoTransport::Filesystem { .. } => unavailable_on_wasm("filesystem"),
@@ -115,7 +170,7 @@ pub async fn resolve_repositories_with_roots_trusting(
                     } else {
                         path.into()
                     };
-                    if untrusted(&full_path) {
+                    if host.untrusted(&full_path, true) {
                         refuse_untrusted_skills_directory(&full_path);
                         continue;
                     }
@@ -184,13 +239,16 @@ pub async fn resolve_repositories_with_roots_trusting(
                             path.into()
                         }
                     });
-                    let client = StdioExternalClient::new_with_timeout(
+                    let mut client = StdioExternalClient::new_with_timeout(
                         command.clone(),
                         args.clone(),
                         env.clone(),
                         resolved_cwd,
                         Duration::from_secs(*timeout_seconds),
                     );
+                    if let Some(runner) = &host.stdio_runner {
+                        client = client.with_runner(Arc::clone(runner));
+                    }
                     sources.push(NamedSource::new(
                         source_identity,
                         SourceNode::External(ExternalSkillSource::new_with_source_uuid(
@@ -215,8 +273,15 @@ pub async fn resolve_repositories_with_roots_trusting(
                         .or(user_root)
                         .unwrap_or_else(|| Path::new("."))
                         .join(".rkat/skill-cache/git");
-                    if untrusted(&cache_base) {
+                    if host.untrusted(&cache_base, true) {
                         refuse_untrusted_skills_directory(&cache_base);
+                        continue;
+                    }
+                    if let Some(route) = untrusted_git_program(host) {
+                        tracing::warn!(
+                            program = %route.display(),
+                            "Git skill repository not loaded: a confined process can change the git program"
+                        );
                         continue;
                     }
                     let git_ref = match ref_type {
@@ -250,7 +315,7 @@ pub async fn resolve_repositories_with_roots_trusting(
 
         if let Some(root) = context_root {
             let default_project_skills = root.join(".rkat/skills");
-            if default_project_skills.is_dir() && untrusted(&default_project_skills) {
+            if default_project_skills.is_dir() && host.untrusted(&default_project_skills, true) {
                 refuse_untrusted_skills_directory(&default_project_skills);
             } else if default_project_skills.is_dir() {
                 let project_identity =
@@ -271,6 +336,18 @@ pub async fn resolve_repositories_with_roots_trusting(
             sources, registry,
         )))
     }
+}
+
+/// The first file the `git` program could run from that `host` does not
+/// trust: a confined process could change it, or put one there that runs
+/// first ([`meerkat_core::confinement::program_routes`]).
+#[cfg(not(target_arch = "wasm32"))]
+fn untrusted_git_program(host: &SkillHostBoundary) -> Option<std::path::PathBuf> {
+    host.untrusted.as_ref()?;
+    let search_path = std::env::var_os("PATH");
+    meerkat_core::confinement::program_routes(Path::new("git"), None, search_path.as_deref())
+        .into_iter()
+        .find(|route| host.untrusted(route, false))
 }
 
 /// Log a skills directory the host does not trust, whose skills are not
@@ -318,4 +395,28 @@ fn unavailable_on_wasm(transport: &str) -> SkillError {
     SkillError::Load(
         format!("{transport} skill repository configured but unavailable on wasm").into(),
     )
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    /// A host refuses a Git repository when a confined process could change
+    /// a file the `git` program could run from; the trusted host never does.
+    #[test]
+    fn a_git_program_a_confined_process_could_change_is_not_trusted() {
+        assert_eq!(
+            untrusted_git_program(&SkillHostBoundary::trusted_host()),
+            None
+        );
+        let host = SkillHostBoundary::trusted_host().with_untrusted_paths(Arc::new(
+            |path: &Path, subtree| !subtree && path.file_name().is_some_and(|name| name == "git"),
+        ));
+        let route = untrusted_git_program(&host).expect("a route of the git program");
+        assert_eq!(route.file_name().unwrap(), "git");
+        let none_untrusted =
+            SkillHostBoundary::trusted_host().with_untrusted_paths(Arc::new(|_: &Path, _| false));
+        assert_eq!(untrusted_git_program(&none_untrusted), None);
+    }
 }

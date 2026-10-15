@@ -523,6 +523,9 @@ fn file_url_for_path(path: &Path) -> Result<String, String> {
 
 fn open_html_artifact_in_browser(path: &Path) -> Result<(), String> {
     let url = file_url_for_path(path)?;
+    // A host launch exemption (`HostLaunchExemption::BrowserOpener`): the
+    // browser opens in the user's desktop session, which a confined process
+    // cannot reach.
     webbrowser::open(&url).map_err(|e| e.to_string())
 }
 
@@ -2645,9 +2648,12 @@ fn read_connector_client_secret() -> anyhow::Result<String> {
     use std::io::IsTerminal;
     let stdin = std::io::stdin();
     let terminal = stdin.is_terminal();
+    // A host launch exemption: `stty` sets the mode of the operator's own
+    // terminal.
     #[cfg(unix)]
     let echo_off = terminal
-        && std::process::Command::new("stty")
+        && meerkat_core::HostLaunchExemption::TerminalControl
+            .command("stty")
             .arg("-echo")
             .stdin(std::process::Stdio::inherit())
             .status()
@@ -2664,7 +2670,8 @@ fn read_connector_client_secret() -> anyhow::Result<String> {
     let read = stdin.read_line(&mut line);
     #[cfg(unix)]
     if echo_off {
-        let _ = std::process::Command::new("stty")
+        let _ = meerkat_core::HostLaunchExemption::TerminalControl
+            .command("stty")
             .arg("echo")
             .stdin(std::process::Stdio::inherit())
             .status();
@@ -5685,6 +5692,18 @@ fn cli_host_confinement(
     )?)
 }
 
+/// The resolver environment of a CLI auth command: the process environment
+/// and the host confinement's guard for the programs the host runs as
+/// itself, so a credential command a confined process could change is
+/// refused as in a run.
+fn cli_resolver_environment(
+    config: &Config,
+    scope: &RuntimeScope,
+) -> anyhow::Result<meerkat_providers::ResolverEnvironment> {
+    Ok(meerkat_providers::ResolverEnvironment::with_process_env()
+        .with_host_launch_guard(cli_host_confinement(config, scope)?.untrusted_paths()))
+}
+
 /// Report this host's confinement once per process on stderr, the CLI's
 /// channel for its startup report: each launch kind's requested and
 /// effective confinement and what keeps the host's own inputs from its
@@ -6274,7 +6293,7 @@ async fn handle_auth_command(
                 .map_err(|e| anyhow::anyhow!("Cannot open TokenStore: {e}"))?
                 .open_with_refresh_authority()
                 .map_err(|e| anyhow::anyhow!("Cannot open TokenStore: {e}"))?;
-            let env = meerkat_providers::ResolverEnvironment::with_process_env()
+            let env = cli_resolver_environment(&config, scope)?
                 .with_provider_auth_persistence(persistence)
                 .with_auth_lease_handle(scope.auth_lease.clone());
             let auth_binding = meerkat_core::AuthBindingRef {
@@ -6579,7 +6598,6 @@ async fn refresh_auth_profile(
     scope: &RuntimeScope,
 ) -> anyhow::Result<()> {
     use meerkat_core::auth::AuthRefreshReason;
-    use meerkat_providers::ResolverEnvironment;
     use meerkat_providers::auth_store::{TokenKey, TokenStoreBackend};
 
     let section = config
@@ -6646,7 +6664,7 @@ async fn refresh_auth_profile(
         return Ok(());
     }
 
-    let env = ResolverEnvironment::with_process_env()
+    let env = cli_resolver_environment(config, scope)?
         .with_provider_auth_persistence(persistence.clone())
         .with_auth_lease_handle(scope.auth_lease.clone())
         .with_force_refresh(true);
@@ -8979,8 +8997,11 @@ fn doctor_self_hosted_registry() -> meerkat_providers::ProviderRuntimeRegistry {
         .with_runtime(Arc::new(meerkat_providers::SelfHostedProviderRuntime))
 }
 
-fn doctor_resolver_environment() -> meerkat_providers::ResolverEnvironment {
-    let mut env = meerkat_providers::ResolverEnvironment::with_process_env();
+fn doctor_resolver_environment(
+    host: &meerkat::HostConfinement,
+) -> meerkat_providers::ResolverEnvironment {
+    let mut env = meerkat_providers::ResolverEnvironment::with_process_env()
+        .with_host_launch_guard(host.untrusted_paths());
     #[cfg(not(target_arch = "wasm32"))]
     {
         if let Ok(backend) = meerkat_providers::auth_store::TokenStoreBackend::default_auto()
@@ -9009,6 +9030,7 @@ fn doctor_configured_self_hosted_target(
 
 async fn resolve_doctor_self_hosted_probe_connection(
     config: &Config,
+    host: &meerkat::HostConfinement,
     preferred_realm: &meerkat_core::RealmId,
     server_id: &str,
     server: &meerkat_core::SelfHostedServerConfig,
@@ -9017,7 +9039,7 @@ async fn resolve_doctor_self_hosted_probe_connection(
     let (realm, auth_binding) = (target.realm, target.auth_binding);
 
     let connection = doctor_self_hosted_registry()
-        .resolve(&realm, &auth_binding, &doctor_resolver_environment())
+        .resolve(&realm, &auth_binding, &doctor_resolver_environment(host))
         .await
         .map_err(|err| {
             anyhow::anyhow!(
@@ -9085,10 +9107,14 @@ async fn handle_doctor(scope: &RuntimeScope) -> anyhow::Result<()> {
         println!("ok\tself_hosted\tno self-hosted servers configured");
     } else {
         let http = doctor_probe_http_client()?;
+        // A credential command a confined process could change is refused
+        // here as in a run.
+        let host = cli_host_confinement(&config, scope)?;
 
         for (server_id, server) in &config.self_hosted.servers {
             let resolved = match resolve_doctor_self_hosted_probe_connection(
                 &config,
+                &host,
                 &scope.locator.realm,
                 server_id,
                 server,
@@ -9182,10 +9208,14 @@ async fn handle_doctor(scope: &RuntimeScope) -> anyhow::Result<()> {
         }
     }
 
-    let wasm_pack = TokioCommand::new("wasm-pack")
-        .arg("--version")
-        .output()
-        .await;
+    // A host launch exemption: developer build tooling the operator's
+    // command runs.
+    let wasm_pack = TokioCommand::from(
+        meerkat_core::HostLaunchExemption::DeveloperBuildTooling.command("wasm-pack"),
+    )
+    .arg("--version")
+    .output()
+    .await;
     match wasm_pack {
         Ok(output) if output.status.success() => {
             println!(

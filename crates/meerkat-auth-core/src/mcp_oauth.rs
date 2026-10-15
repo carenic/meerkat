@@ -694,22 +694,25 @@ pub enum McpOAuthBrowserLaunch {
 /// whose output is discarded. Nothing here logs the command line, so the
 /// authorize URL and state never reach `log` or `tracing` records.
 pub fn open_system_browser(url: &str) -> std::io::Result<()> {
-    use std::process::{Command, Stdio};
+    use meerkat_core::HostLaunchExemption;
+    use std::process::Stdio;
+    // A host launch exemption: the opener must reach the user's desktop
+    // session, which a confined process cannot.
     #[cfg(target_os = "macos")]
     let mut command = {
-        let mut command = Command::new("open");
+        let mut command = HostLaunchExemption::BrowserOpener.command("open");
         command.arg(url);
         command
     };
     #[cfg(target_os = "windows")]
     let mut command = {
-        let mut command = Command::new("rundll32");
+        let mut command = HostLaunchExemption::BrowserOpener.command("rundll32");
         command.arg("url.dll,FileProtocolHandler").arg(url);
         command
     };
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     let mut command = {
-        let mut command = Command::new("xdg-open");
+        let mut command = HostLaunchExemption::BrowserOpener.command("xdg-open");
         command.arg(url);
         command
     };

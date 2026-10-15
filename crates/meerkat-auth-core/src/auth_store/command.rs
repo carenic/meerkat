@@ -97,7 +97,12 @@ impl CommandCredentialRunner {
     }
 
     async fn run_once(&self) -> Result<PersistedTokens, CommandCredentialError> {
-        let mut cmd = Command::new(&self.spec.program);
+        // A host launch exemption: the credential command runs as the host.
+        // A resolver whose host confines its launches refuses one a confined
+        // process could change before it gets here.
+        let mut cmd = Command::from(
+            meerkat_core::HostLaunchExemption::CredentialHelper.command(&self.spec.program),
+        );
         cmd.args(&self.spec.args)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())

@@ -50,6 +50,10 @@ them.
 - `meerkat::HostMcpTargetRefusal` has a new variant `Refused { server_name,
   refusal }` (an MCP auth target only an untrusted `mcp.toml` defines; see
   Fixed); an exhaustive match must handle it.
+- `meerkat_llm_core::provider_runtime::ProviderAuthError` has a new variant
+  `HostLaunchRefused { exemption, refusal }` (a credential command a
+  confined process could change; see Fixed); an exhaustive match must handle
+  it.
 - `meerkat_rest::AppState` has a new public field `host_confinement`
   (`meerkat::HostConfinement`); a struct literal must add it
   (`HostConfinement::trusted_host()` keeps the previous behaviour).
@@ -62,6 +66,13 @@ them.
   config document is missing no longer composes (a missing parent), and
   `rkat realm delete` and `rkat realm prune` keep a realm another realm's
   document names as its parent, `--force` included (see Fixed).
+- Behaviour-only (not measured by the gate): under a host that confines
+  `mcp_stdio`, a stdio skill source runs confined (its program by absolute
+  path, only its configured environment, from the kind's working
+  directory), and under a host that confines every launch kind, a
+  credential command or Git skill repository a confined process could
+  change is refused (a credential command without `cwd` runs in, and is
+  judged by, the host's working directory). See Changed and Fixed.
 
 ### Deprecated
 
@@ -98,15 +109,35 @@ them.
   add a host's file credential store to its administration inputs;
   `HostConfinement::untrusted_directory` judges a convention directory as a
   whole; `meerkat_skills::resolve_repositories_with_roots_trusting` resolves
-  skill repositories without the directories a predicate does not trust.
+  skill repositories under a `meerkat_skills::SkillHostBoundary`: the paths
+  the host does not trust (`with_untrusted_paths`, an `UntrustedPaths`
+  predicate; `HostConfinement::untrusted_paths` builds one) and the runner
+  of stdio skill sources (`with_stdio_runner`).
+- `meerkat_core::HostLaunchExemption`: the typed list of the processes a
+  stock host runs as itself, outside its OS process confinement (the Git
+  skill source, the credential command, the browser opener, `stty` and
+  `wasm-pack`), each with its reason and a `command` constructor, and
+  `meerkat_core::confinement::program_routes`, the files a launch of a
+  program could execute.
+- `ResolverEnvironment::with_host_launch_guard` (a `HostLaunchGuard`) makes
+  credential resolution refuse a credential command a confined process could
+  change.
 - `meerkat::resolve_configured_mcp_target_in_realm_trusting` resolves an MCP
   auth target without the `mcp.toml` files a predicate does not trust.
+- `meerkat_skills::StdioSkillRunner` (with `StdioSkillLaunch`,
+  `StdioSkillOutput`, the default `TrustedHostStdioSkillRunner` and
+  `StdioExternalClient::with_runner`) is the launch seam of stdio skill
+  sources.
 - `SdkConfigStore::with_realm_document` builds a realm document store that
   keeps the realm's composed `[confinement]` and `[governance]`
   (`FileConfigStore::with_realm_chain`).
 
 ### Changed
 
+- A stdio skill source runs under the host's `mcp_stdio` confinement, as a
+  local MCP stdio server does: its program named by absolute path, only its
+  configured environment, from the kind's working directory, and a launch
+  the platform cannot confine is refused. It ran as the trusted host.
 - The generated Bazel targets of `meerkat-rest`'s tests get the
   `rkat-rest` binary, and the real-binary confinement tests of `rkat-rpc`
   and `rkat-rest` fail, rather than pass without having run, when their
@@ -161,6 +192,17 @@ them.
   registered or stored for it. Before, a confined process could plant a
   definition and point a login at a server of its choosing, which then held
   the user's authorization.
+- A credential command (an auth profile's `source = { kind = "command" }`)
+  runs as the host, outside its confinement; on a host that confines every
+  launch kind it is now refused, before it runs, when a confined process
+  could change its program (or a `PATH` directory a bare name is searched
+  in) or its working directory, on every resolution path (sessions, `rkat
+  auth test`/`refresh`, `rkat doctor`, REST `POST /auth/bindings/{id}/test`).
+  Before, a confined process could replace the program and have the host
+  run it unconfined with the host's credentials. A Git skill repository is
+  likewise not loaded when a confined process could change the `git`
+  program. The processes a host runs as itself are now a typed, tested list
+  (`HostLaunchExemption`).
 - `rkat-rpc`, `rkat-rest` and `rkat-mcp` read their working directory at
   startup only for a relative `--confinement-read` or `--confinement-write`
   path. They read it on every start, so a server whose working directory had

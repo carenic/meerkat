@@ -28,7 +28,10 @@ pub use filesystem::FilesystemSkillSource;
 pub use http::HttpSkillSource;
 pub use memory::InMemorySkillSource;
 #[cfg(not(target_arch = "wasm32"))]
-pub use protocol::{ExternalSkillSource, StdioExternalClient};
+pub use protocol::{
+    ExternalSkillSource, StdioExternalClient, StdioSkillLaunch, StdioSkillOutput, StdioSkillRunner,
+    TrustedHostStdioSkillRunner,
+};
 
 /// Typed source composition node for built-ins + bounded external seam.
 pub enum SourceNode {

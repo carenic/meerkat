@@ -1362,6 +1362,7 @@ fn live_factory_failure_class(error: &meerkat_client::FactoryError) -> &'static 
             ProviderAuthError::ExternalResolverMissing(_) => "external_resolver_missing",
             ProviderAuthError::NoRuntimeRegistered(_) => "provider_runtime_missing",
             ProviderAuthError::ResolvedProviderMismatch { .. } => "resolved_provider_mismatch",
+            ProviderAuthError::HostLaunchRefused { .. } => "host_launch_refused",
         },
         FactoryError::ConnectionTarget(error) => match error {
             ConnectionTargetError::MissingRealm => "missing_realm",

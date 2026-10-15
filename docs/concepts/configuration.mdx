@@ -575,8 +575,9 @@ share).
 `[confinement]` selects the OS process confinement a stock host (`rkat`,
 `rkat-rpc`, `rkat-rest` and `rkat-mcp`) applies to the processes its agents
 launch: shell tool calls, background jobs and monitors (`shell`), command
-hooks (`command_hooks`) and local MCP stdio servers (`mcp_stdio`). Without
-the section, every launch runs as the trusted host, as before.
+hooks (`command_hooks`), and local MCP stdio servers and stdio skill sources
+(`mcp_stdio`). Without the section, every launch runs as the trusted host,
+as before.
 
 ```toml
 # Every launch kind: the workspace preset.
@@ -620,10 +621,12 @@ user namespaces, and it refuses deny lists, Unix socket grants, nested grants,
 and granted paths that do not exist or pass through a symbolic link. Other
 platforms refuse every confined launch. A confined process finds its program,
 libraries and data only inside its granted subtrees and the platform
-baseline; grant anything else it needs with `read`. A confined command hook
-or MCP stdio server names its program by absolute path and receives only its
-configured environment, never the host's; a relative program name or a loader
-variable such as `LD_PRELOAD` refuses that launch.
+baseline; grant anything else it needs with `read`. A confined command hook,
+MCP stdio server or stdio skill source names its program by absolute path and
+receives only its configured environment, never the host's; a relative
+program name or a loader variable such as `LD_PRELOAD` refuses that launch. A
+confined stdio skill source starts in the kind's working directory, as an MCP
+stdio server does; its own `cwd` does not apply.
 
 ### Composition
 
@@ -712,6 +715,22 @@ an ancestor whose own document is missing fails the composition (a missing
 parent) instead of composing as if it required nothing, and `rkat realm
 delete` and `rkat realm prune` keep a realm another realm's document names
 as its parent.
+
+### Launches outside confinement
+
+Every process a stock host starts runs under its launch kind's confinement
+except these, which the host runs as itself (`HostLaunchExemption`):
+
+| Launch | Why it runs as the host |
+|---|---|
+| `git` for a Git skill repository | It fetches with the host's own Git credentials and network. A repository is not loaded when a confined process could change the `git` program (including a `PATH` directory searched before it) or the skill cache. |
+| A credential command (an auth profile's `source = { kind = "command" }`) | It produces the host's own provider credentials, which no confined process may read. It is refused before it runs when a confined process could change its program (including a `PATH` directory a bare name is searched in) or its working directory (the host's own when it names none). |
+| The browser opener (`open`, `xdg-open` or `rundll32`, and the CLI's HTML artifact opener) | It shows an OAuth authorization page or an HTML artifact in the user's desktop session, which a confined process cannot reach. It runs only the platform opener, with the URL as one argument. |
+| `stty` | Host terminal control: `rkat` hides a client secret typed at its own terminal. |
+| `wasm-pack` | Developer build tooling: `rkat doctor` reports its version. No model or configuration reaches it. |
+
+A test of the source enumerates every process launch in shipped code and
+fails on one that is neither confined nor in this list.
 
 ### Operator flags
 

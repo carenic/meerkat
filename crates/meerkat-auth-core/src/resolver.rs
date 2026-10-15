@@ -86,6 +86,17 @@ pub async fn resolve_simple_secret(
             refresh_interval_ms,
         } => {
             use crate::auth_store::{CommandCredentialRunner, CommandCredentialSpec};
+            // A credential command runs as the host, outside its OS process
+            // confinement: one a confined process could change never runs.
+            if let Some(guard) = env.host_launch_guard()
+                && credential_command_is_changeable(program, cwd.as_deref(), cmd_env, env, guard)
+            {
+                return Err(ProviderAuthError::HostLaunchRefused {
+                    exemption: meerkat_core::HostLaunchExemption::CredentialHelper,
+                    refusal:
+                        meerkat_core::confinement::ConfinementRefusal::UntrustedConfigurationSource,
+                });
+            }
             let spec = CommandCredentialSpec {
                 program: program.clone(),
                 args: args.clone(),
@@ -122,6 +133,39 @@ pub async fn resolve_simple_secret(
             Err(ProviderAuthError::Auth(AuthError::InteractiveLoginRequired))
         }
     }
+}
+
+/// Whether a confined process could change what a credential command runs
+/// as the host: its working directory (the host's own when it names none,
+/// which refuses the command when it cannot be read), or any file its
+/// program could resolve to through the launch's `PATH`
+/// ([`meerkat_core::confinement::program_routes`]).
+#[cfg(not(target_arch = "wasm32"))]
+fn credential_command_is_changeable(
+    program: &std::path::Path,
+    cwd: Option<&std::path::Path>,
+    command_env: &std::collections::BTreeMap<String, String>,
+    env: &ResolverEnvironment,
+    guard: &meerkat_llm_core::provider_runtime::HostLaunchGuard,
+) -> bool {
+    let Some(working_directory) = cwd
+        .map(std::path::Path::to_path_buf)
+        .or_else(|| std::env::current_dir().ok())
+    else {
+        return true;
+    };
+    let search_path = command_env
+        .get("PATH")
+        .cloned()
+        .or_else(|| (env.env_lookup)("PATH"));
+    guard(&working_directory, true)
+        || meerkat_core::confinement::program_routes(
+            program,
+            Some(&working_directory),
+            search_path.as_deref().map(std::ffi::OsStr::new),
+        )
+        .iter()
+        .any(|route| guard(route, false))
 }
 
 /// Observe a [`CredentialSourceSpec`]'s readiness for the api_key /

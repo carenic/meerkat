@@ -534,6 +534,18 @@ impl HostConfinement {
         self.writer_of(path, true).is_some()
     }
 
+    /// [`Self::writer_of`] as a predicate an owner can keep: whether a
+    /// confined process could change what the host reads at a path (`true`:
+    /// anything under it as well). A host hands it to the owners of the
+    /// programs it runs as itself ([`meerkat_core::HostLaunchExemption`]) and
+    /// of its skill sources, so a program, working directory or cache a
+    /// confined process could change is refused.
+    #[must_use]
+    pub fn untrusted_paths(&self) -> std::sync::Arc<dyn Fn(&Path, bool) -> bool + Send + Sync> {
+        let host = self.clone();
+        std::sync::Arc::new(move |path, subtree| host.writer_of(path, subtree).is_some())
+    }
+
     /// Refuse a new start whose administration inputs a confined process
     /// could change, naming the input, its path and the kind. A host that
     /// claims no guarantee admits every input.
