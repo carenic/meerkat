@@ -79,8 +79,9 @@ pub struct ToolConfig {
     /// names, any other name is deferred to the execution gate (logged at
     /// build); otherwise it fails the member's build with a typed error naming
     /// the vocabularies. To validate an MCP tool name at build, map it in the
-    /// server's `tool_names`. Denied tools stay listed and the execution gate
-    /// refuses every call by name.
+    /// server's `tool_names`. Denied tools are not offered to the model: every
+    /// build removes them from the member's visible tool list, and the
+    /// execution gate still refuses every call by name.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub deny: Vec<String>,
     /// MCP server names this profile connects to.
