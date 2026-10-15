@@ -4189,11 +4189,19 @@ impl MobMcpState {
     }
 
     pub async fn mob_list(&self) -> Result<Vec<(MobId, MobState)>, MobError> {
+        // The gate of `mob_handles_snapshot` (cross-mob enumeration is
+        // Owner-only), but every managed mob is listed: a destroyed mob still
+        // managed, such as the retry anchor of a destroy whose native part
+        // is incomplete, shows as `Destroyed`. Only its handle is withheld
+        // from snapshots.
+        self.require_console_owner(ControlScope::List)?;
+        self.ensure_restored().await?;
         Ok(self
-            .mob_handles_snapshot()
-            .await?
-            .into_iter()
-            .map(|(id, handle)| (id, handle.status_observation_snapshot()))
+            .mobs
+            .read()
+            .await
+            .iter()
+            .map(|(id, managed)| (id.clone(), managed.handle.status_observation_snapshot()))
             .collect())
     }
 
@@ -16696,9 +16704,10 @@ mod tests {
     }
 
     /// A mob whose phase is `Destroyed` is not handed out by
-    /// `mob_handles_snapshot` (nor listed by `mob_list`) while its managed
-    /// entry remains, as after a destroy through the mob's own handle: a
-    /// snapshot taken then would hold the destroyed mob's database observer.
+    /// `mob_handles_snapshot` while its managed entry remains, as after a
+    /// destroy through the mob's own handle: a snapshot taken then would hold
+    /// the destroyed mob's database observer. `mob_list` still lists it, as
+    /// `Destroyed`.
     #[tokio::test]
     async fn mob_handles_snapshot_skips_a_destroyed_mob() {
         let svc = Arc::new(MockSessionSvc::new());
@@ -16734,14 +16743,17 @@ mod tests {
             .map(|(mob_id, _)| mob_id)
             .collect();
         assert_eq!(snapshot, vec![kept.clone()]);
-        let listed: Vec<MobId> = state
+        let listed: BTreeMap<MobId, meerkat_mob::MobState> = state
             .mob_list()
             .await
             .expect("owner list")
             .into_iter()
-            .map(|(mob_id, _)| mob_id)
             .collect();
-        assert_eq!(listed, vec![kept]);
+        assert_eq!(
+            listed.keys().cloned().collect::<Vec<_>>(),
+            vec![destroyed.clone(), kept]
+        );
+        assert_eq!(listed[&destroyed], meerkat_mob::MobState::Destroyed);
     }
 
     /// A host's create hook is asked before anything of a new mob exists, on

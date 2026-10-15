@@ -79,8 +79,9 @@ them.
   again. Owner cleanups that destroy without retrying later, such as an
   archived owner session's mobs or an implicit mob recreated for a new
   model, answered `Incomplete` in that case. `MobMcpState::mob_handles_snapshot`
-  and `mob_list` also skip a mob whose phase is `Destroyed`, so a snapshot
-  taken while a destroy runs holds none of it.
+  also skips a mob whose phase is `Destroyed`, so a snapshot taken while a
+  destroy runs holds none of it; `mob_list` still lists such a mob, as
+  `Destroyed`.
 
 ## [0.9.1] - 2026-10-15
 
