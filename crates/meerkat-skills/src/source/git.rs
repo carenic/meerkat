@@ -79,6 +79,7 @@ pub struct GitSkillSource {
     checkout_dir: PathBuf,
     cache: Arc<RwLock<RemoteCache>>,
     failure_streak: Arc<RwLock<u32>>,
+    untrusted_targets: Option<crate::UntrustedPaths>,
 }
 
 impl GitSkillSource {
@@ -98,7 +99,17 @@ impl GitSkillSource {
             checkout_dir,
             cache: Arc::new(RwLock::new(RemoteCache::default())),
             failure_streak: Arc::new(RwLock::new(0)),
+            untrusted_targets: None,
         }
+    }
+
+    /// Judge each skill a link leads out of the checkout where the link
+    /// leads: one at a path `untrusted` names is not read, so a repository
+    /// cannot hand a confined process the skill it links to.
+    #[must_use]
+    pub fn with_untrusted_targets(mut self, untrusted: crate::UntrustedPaths) -> Self {
+        self.untrusted_targets = Some(untrusted);
+        self
     }
 
     fn refresh_if_needed(&self) -> Result<(), SkillError> {
@@ -210,6 +221,21 @@ impl GitSkillSource {
         let mut documents = std::collections::BTreeMap::new();
         let mut quarantined = Vec::new();
         for skill_dir in discover_skill_directories(&root) {
+            if let Some(untrusted) = &self.untrusted_targets
+                && (super::leads_out_to_untrusted(&self.checkout_dir, &skill_dir, true, untrusted)
+                    || super::leads_out_to_untrusted(
+                        &self.checkout_dir,
+                        &skill_dir.join("SKILL.md"),
+                        false,
+                        untrusted,
+                    ))
+            {
+                tracing::warn!(
+                    dir = %skill_dir.display(),
+                    "skipping Git skill: it links to a path a confined process can change"
+                );
+                continue;
+            }
             let Some(file_name) = skill_dir.file_name().and_then(|name| name.to_str()) else {
                 continue;
             };

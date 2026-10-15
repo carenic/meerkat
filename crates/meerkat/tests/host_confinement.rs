@@ -637,6 +637,102 @@ async fn a_stdio_skill_source_launches_under_the_mcp_stdio_confinement() {
     );
 }
 
+/// A skill that a trusted skills directory links to from elsewhere is
+/// judged where the link leads: a link into a path a confined process can
+/// write is not followed, so that process cannot supply the skill through
+/// it. The same kind of link to a path no confined process can write is
+/// followed.
+#[cfg(all(unix, feature = "skills"))]
+#[tokio::test]
+async fn a_skill_linked_out_of_a_trusted_skills_directory_is_judged_where_it_leads() {
+    let temp = tempfile::tempdir().unwrap();
+    let base = temp.path().canonicalize().unwrap();
+    let project = base.join("project");
+    let skills = project.join(".rkat").join("skills");
+    std::fs::create_dir_all(&skills).unwrap();
+    let writable = base.join("writable");
+    let elsewhere = base.join("elsewhere");
+    for (root, name) in [(&writable, "linked-skill"), (&elsewhere, "kept-skill")] {
+        let skill = root.join(name);
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(
+            skill.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: A linked skill\n---\n\n# Linked"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&skill, skills.join(name)).unwrap();
+    }
+    let factory = AgentFactory::new(base.join("sessions"))
+        .session_store(Arc::new(meerkat_store::MemoryStore::new()))
+        .runtime_root(base.join("runtime"))
+        .project_root(&project)
+        .context_root(project.clone())
+        .with_host_confinement(&writing_host(&writable));
+    let runtime = factory
+        .build_skill_runtime(&Config::default())
+        .await
+        .unwrap()
+        .expect("a skill runtime");
+    let names: Vec<String> = runtime
+        .list_skills(&meerkat_core::skills::SkillFilter::default())
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|skill| skill.name)
+        .collect();
+    assert!(
+        !names.iter().any(|name| name == "linked-skill"),
+        "a link into a write grant is not followed: {names:?}"
+    );
+    assert!(
+        names.iter().any(|name| name == "kept-skill"),
+        "a link outside every grant is followed: {names:?}"
+    );
+}
+
+/// The credential store is judged with the links in it: a store whose
+/// directory is outside every grant but holds a link into a path a
+/// confined process can write (even one that does not exist yet) refuses
+/// the start. A store without such links is admitted.
+#[cfg(unix)]
+#[test]
+fn a_link_in_the_credential_store_to_a_writable_path_refuses_the_start() {
+    let temp = tempfile::tempdir().unwrap();
+    let base = temp.path().canonicalize().unwrap();
+    let writable = base.join("writable");
+    let store = base.join("store");
+    let clean = base.join("clean");
+    for dir in [&writable, &store, &clean] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    std::fs::write(writable.join("token.json"), "{}").unwrap();
+    std::fs::write(clean.join("token.json"), "{}").unwrap();
+    let host = writing_host(&writable);
+
+    std::os::unix::fs::symlink(writable.join("token.json"), store.join("token.json")).unwrap();
+    let refused = host.admit_host_inputs(&[(meerkat::HostInput::CredentialStore, store.clone())]);
+    assert!(
+        matches!(
+            refused,
+            Err(meerkat::HostConfinementError::AdministrationInputWritable {
+                input: meerkat::HostInput::CredentialStore,
+                ..
+            })
+        ),
+        "{refused:?}"
+    );
+
+    std::fs::remove_file(store.join("token.json")).unwrap();
+    std::os::unix::fs::symlink(writable.join("later.json"), store.join("token.json")).unwrap();
+    assert!(
+        host.admit_host_inputs(&[(meerkat::HostInput::CredentialStore, store)])
+            .is_err(),
+        "a dangling link into a write grant refuses the start"
+    );
+    host.admit_host_inputs(&[(meerkat::HostInput::CredentialStore, clean)])
+        .expect("a store without links into a grant is admitted");
+}
+
 /// A credential command is a host launch exemption: the host runs it as
 /// itself, outside its OS process confinement, so it refuses one whose
 /// program or working directory a confined process could change, before

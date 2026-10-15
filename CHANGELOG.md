@@ -128,6 +128,9 @@ them.
   `StdioSkillOutput`, the default `TrustedHostStdioSkillRunner` and
   `StdioExternalClient::with_runner`) is the launch seam of stdio skill
   sources.
+- `FilesystemSkillSource::with_untrusted_targets` and
+  `GitSkillSource::with_untrusted_targets` judge a linked skill where its
+  link leads.
 - `SdkConfigStore::with_realm_document` builds a realm document store that
   keeps the realm's composed `[confinement]` and `[governance]`
   (`FileConfigStore::with_realm_chain`).
@@ -203,6 +206,11 @@ them.
   likewise not loaded when a confined process could change the `git`
   program. The processes a host runs as itself are now a typed, tested list
   (`HostLaunchExemption`).
+- A symbolic link no longer carries a confined process past a trusted input:
+  a skill linked out of a trusted skills directory (or out of a Git
+  checkout) to a path a confined process could change is not loaded, and a
+  start whose realm state or credential store links to such a path is
+  refused.
 - `rkat-rpc`, `rkat-rest` and `rkat-mcp` read their working directory at
   startup only for a relative `--confinement-read` or `--confinement-write`
   path. They read it on every start, so a server whose working directory had

@@ -33,6 +33,27 @@ pub use protocol::{
     TrustedHostStdioSkillRunner,
 };
 
+/// Whether `entry` under the source directory `root` resolves, through a
+/// link, to a path outside `root` that `untrusted` names (`subtree`: judged
+/// with everything under it). A skill a link leads to there could be
+/// supplied by a confined process, so it is not read. An entry that does
+/// not resolve is not read either way.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn leads_out_to_untrusted(
+    root: &std::path::Path,
+    entry: &std::path::Path,
+    subtree: bool,
+    untrusted: &crate::UntrustedPaths,
+) -> bool {
+    let Ok(target) = entry.canonicalize() else {
+        return false;
+    };
+    let inside = root
+        .canonicalize()
+        .is_ok_and(|root| target.starts_with(root));
+    !inside && untrusted(&target, subtree)
+}
+
 /// Typed source composition node for built-ins + bounded external seam.
 pub enum SourceNode {
     Embedded(EmbeddedSkillSource),

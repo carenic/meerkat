@@ -82,7 +82,7 @@ impl SkillHostBoundary {
 
     /// Do not trust the paths `untrusted` names: a skills directory, the Git
     /// skill cache or the `git` program a confined process could change is
-    /// refused.
+    /// refused, and a skill linked to such a path is not read.
     #[cfg(not(target_arch = "wasm32"))]
     #[must_use]
     pub fn with_untrusted_paths(mut self, untrusted: UntrustedPaths) -> Self {
@@ -112,7 +112,8 @@ impl SkillHostBoundary {
 /// trust is refused: a filesystem repository's directory, the local cache
 /// Git repositories are fetched into, and the project skills directory
 /// (`<context>/.rkat/skills`); so is a Git repository whose `git` program
-/// it does not trust. Stdio skill sources launch through the host's
+/// it does not trust. A skill linked out of a trusted directory is judged
+/// where the link leads. Stdio skill sources launch through the host's
 /// runner. Each refusal is logged; the embedded skills and every other
 /// source still load.
 pub async fn resolve_repositories_with_roots_trusting(
@@ -176,11 +177,14 @@ pub async fn resolve_repositories_with_roots_trusting(
                     }
                     sources.push(NamedSource::new(
                         source_identity,
-                        SourceNode::Filesystem(FilesystemSkillSource::new_with_identity(
-                            full_path,
-                            SkillScope::Project,
-                            repo.source_uuid.clone(),
-                            config.health_thresholds,
+                        SourceNode::Filesystem(judged_links(
+                            FilesystemSkillSource::new_with_identity(
+                                full_path,
+                                SkillScope::Project,
+                                repo.source_uuid.clone(),
+                                config.health_thresholds,
+                            ),
+                            host,
                         )),
                     ));
                 }
@@ -295,19 +299,23 @@ pub async fn resolve_repositories_with_roots_trusting(
                         }
                         GitSkillRepoAuth::SshKey { path } => GitSkillAuth::SshKey(path.clone()),
                     });
+                    let mut git = GitSkillSource::new(GitSkillConfig {
+                        repo_url: url.clone(),
+                        git_ref,
+                        cache_dir: cache_base,
+                        skills_root: skills_root.clone(),
+                        refresh_interval: Duration::from_secs(*refresh_seconds),
+                        auth,
+                        depth: *depth,
+                        source_uuid: repo.source_uuid.clone(),
+                        health_thresholds: config.health_thresholds,
+                    });
+                    if let Some(untrusted) = &host.untrusted {
+                        git = git.with_untrusted_targets(Arc::clone(untrusted));
+                    }
                     sources.push(NamedSource::new(
                         source_identity,
-                        SourceNode::Git(Box::new(GitSkillSource::new(GitSkillConfig {
-                            repo_url: url.clone(),
-                            git_ref,
-                            cache_dir: cache_base,
-                            skills_root: skills_root.clone(),
-                            refresh_interval: Duration::from_secs(*refresh_seconds),
-                            auth,
-                            depth: *depth,
-                            source_uuid: repo.source_uuid.clone(),
-                            health_thresholds: config.health_thresholds,
-                        }))),
+                        SourceNode::Git(Box::new(git)),
                     ));
                 }
             }
@@ -322,11 +330,14 @@ pub async fn resolve_repositories_with_roots_trusting(
                     active_source_identity(&registry, &records, &SourceUuid::project_local())?;
                 sources.push(NamedSource::new(
                     project_identity,
-                    SourceNode::Filesystem(FilesystemSkillSource::new_with_identity(
-                        default_project_skills,
-                        SkillScope::Project,
-                        SourceUuid::project_local(),
-                        config.health_thresholds,
+                    SourceNode::Filesystem(judged_links(
+                        FilesystemSkillSource::new_with_identity(
+                            default_project_skills,
+                            SkillScope::Project,
+                            SourceUuid::project_local(),
+                            config.health_thresholds,
+                        ),
+                        host,
                     )),
                 ));
             }
@@ -335,6 +346,16 @@ pub async fn resolve_repositories_with_roots_trusting(
         Ok(Some(CompositeSkillSource::from_named_with_registry(
             sources, registry,
         )))
+    }
+}
+
+/// `source`, judging each skill a link leads out of its directory by the
+/// paths `host` does not trust.
+#[cfg(not(target_arch = "wasm32"))]
+fn judged_links(source: FilesystemSkillSource, host: &SkillHostBoundary) -> FilesystemSkillSource {
+    match &host.untrusted {
+        Some(untrusted) => source.with_untrusted_targets(Arc::clone(untrusted)),
+        None => source,
     }
 }
 

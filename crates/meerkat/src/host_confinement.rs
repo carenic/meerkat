@@ -538,8 +538,8 @@ impl HostConfinement {
     /// confined process could change what the host reads at a path (`true`:
     /// anything under it as well). A host hands it to the owners of the
     /// programs it runs as itself ([`meerkat_core::HostLaunchExemption`]) and
-    /// of its skill sources, so a program, working directory or cache a
-    /// confined process could change is refused.
+    /// of its skill sources, so a program, working directory, cache or
+    /// linked skill a confined process could change is refused.
     #[must_use]
     pub fn untrusted_paths(&self) -> std::sync::Arc<dyn Fn(&Path, bool) -> bool + Send + Sync> {
         let host = self.clone();
@@ -547,14 +547,22 @@ impl HostConfinement {
     }
 
     /// Refuse a new start whose administration inputs a confined process
-    /// could change, naming the input, its path and the kind. A host that
-    /// claims no guarantee admits every input.
+    /// could change, naming the input, its path and the kind. An input the
+    /// host reads as a whole subtree is judged with the symbolic links in
+    /// it: the host follows a link out of the input to where it leads. A
+    /// host that claims no guarantee admits every input.
     pub fn admit_host_inputs(
         &self,
         inputs: &[(HostInput, PathBuf)],
     ) -> Result<(), HostConfinementError> {
         for (input, path) in inputs {
-            if let Some(kind) = self.writer_of(path, input.is_subtree()) {
+            let writer = self.writer_of(path, input.is_subtree()).or_else(|| {
+                input
+                    .is_subtree()
+                    .then(|| self.link_writer_under(path))
+                    .flatten()
+            });
+            if let Some(kind) = writer {
                 return Err(HostConfinementError::AdministrationInputWritable {
                     input: *input,
                     path: path.clone(),
@@ -563,6 +571,52 @@ impl HostConfinement {
             }
         }
         Ok(())
+    }
+
+    /// The first confined launch kind whose processes could change where a
+    /// symbolic link under `directory` leads (a link whose target does not
+    /// exist yet included), when the host claims the guarantee. The host
+    /// follows such a link when it reads the subtree, so a link out of a
+    /// protected input into a write grant hands the input to that kind.
+    fn link_writer_under(&self, directory: &Path) -> Option<ConfinementLaunchKind> {
+        if self.authority() != HostAuthority::Guarded {
+            return None;
+        }
+        let mut pending = vec![directory.to_path_buf()];
+        let mut visited = std::collections::HashSet::new();
+        while let Some(current) = pending.pop() {
+            let Ok(canonical) = std::fs::canonicalize(&current) else {
+                continue;
+            };
+            if !visited.insert(canonical) {
+                continue;
+            }
+            let Ok(entries) = std::fs::read_dir(&current) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let Ok(file_type) = entry.file_type() else {
+                    continue;
+                };
+                let path = entry.path();
+                if file_type.is_symlink() {
+                    let Ok(target) = std::fs::read_link(&path) else {
+                        continue;
+                    };
+                    let target = current.join(target);
+                    let subtree = target.is_dir();
+                    if let Some(kind) = self.writer_of(&target, subtree) {
+                        return Some(kind);
+                    }
+                    if subtree {
+                        pending.push(target);
+                    }
+                } else if file_type.is_dir() {
+                    pending.push(path);
+                }
+            }
+        }
+        None
     }
 
     /// The host's startup report: each launch kind's requested and effective

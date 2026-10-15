@@ -4535,8 +4535,8 @@ impl AgentFactory {
     }
 
     /// How this factory's skill repositories meet its host confinement: the
-    /// skills directories, Git program and cache a confined process could
-    /// change are not trusted
+    /// skills directories, Git program and cache, and linked skills a
+    /// confined process could change are not trusted
     /// ([`crate::HostConfinement::untrusted_paths`]), and a stdio skill
     /// source launches under the `mcp_stdio` requirement, as a local MCP
     /// stdio server does. Without a host confinement, the trusted host.
