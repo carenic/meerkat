@@ -1,19 +1,16 @@
 {
   "generated": true,
   "source_repository": "https://github.com/lukacf/meerkat-recall",
-  "source_branch": "docs/recall-09-availability",
-  "source_ref": "docs/recall-09-availability",
-  "source_commit": "ba14a43b1b6abd3c1c3d653781ce8168dae89986",
-  "source_version": "0.9.0",
+  "source_ref": "codex/recall091-published-docs",
+  "source_commit": "e332456ac5554b10255b531937f7aafb24e3d39b",
+  "source_version": "0.9.1",
   "source_docs_dirty": false,
   "public_pages": 45,
-  "content_sha256": "55305e69173739a32d31bbde3b75012d4dc074653c3e30bfa241225569b2ed68",
+  "content_sha256": "8c99fb0e13acece6cd54510844464d9feda2e18d64253f8450170066adaf5fda",
+  "content_hash_scope": "All mirrored files except _source.json, sorted by relative path; path NUL bytes NUL.",
   "mirror_adjustments": [
     "Local routes namespaced under /recall.",
-    "Current MDX content is pinned by source_commit. Existing technical Markdown and source links retain immutable d71722482183a802fcaeaaf41cb04ef7d16f4b85; their target content is unchanged.",
-    "Missing Living Wiki page icon supplied.",
-    "Pipeline Work Queue heading uses punctuation-free text for stable Mintlify/GitHub fragment.",
-    "Recall v0.9.0 is published; macOS static compatibility starts at 13.4, with isolated CLI validation on 26.5.2."
-  ],
-  "content_hash_scope": "All mirrored files except _source.json, sorted by relative path; path NUL bytes NUL."
+    "Existing immutable technical Markdown/source links retain their original public commit; linked target bytes are unchanged.",
+    "Missing Living Wiki icon supplied; Pipeline Work Queue heading retains its stable punctuation-free fragment."
+  ]
 }
