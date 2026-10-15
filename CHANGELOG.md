@@ -128,6 +128,15 @@ them.
   list, and the execution gate still refuses every call by name. A pack built
   by this release still fails validation on 0.9.1 and earlier hosts, which
   compare the description text.
+- The meerkat-mob test `durable_cursor_resumes_across_pump_restart` restarts
+  the controlling mob only once the member's durable event cursor covers
+  every row the first turn consumed. The pump writes that cursor after it
+  fans a page out, only while no ACK, obligation or completion waiter holds
+  cursor custody, and a controlling stop aborts a write still in flight; a
+  restart that raced the write re-read the turn's rows, as documented (losing
+  a cursor only re-reads events), which the test misread as a resume defect.
+  With 300 ms injected before the cursor write, the old test failed 10 of 10
+  runs with the CI failure's exact overlap and the new one passed 10 of 10.
 
 ## [0.9.1] - 2026-10-15
 
