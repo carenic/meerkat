@@ -3818,6 +3818,10 @@ where
     /// Explicit call-timeout override from the build/config composition seam.
     /// Takes precedence over profile-derived defaults.
     pub(crate) call_timeout_override: crate::config::CallTimeoutOverride,
+    /// Explicit stream-inactivity watchdog override from the config
+    /// composition seam. Takes precedence over the current model's own window;
+    /// `Inherit` falls back to it, then to the retry policy's window.
+    pub(crate) stream_inactivity_timeout_override: crate::config::CallTimeoutOverride,
     /// Structured-output extraction state carried into RunResult.
     pub(crate) extraction_state: extraction::ExtractionState,
     /// Last published hidden deferred-catalog names.

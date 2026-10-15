@@ -560,6 +560,7 @@ fn append_custom_models(
             params_schema: serde_json::json!({}),
             beta_headers: Vec::new(),
             call_timeout_secs: model.call_timeout_secs,
+            stream_inactivity_timeout_secs: None,
         };
 
         insert_unique(
@@ -671,6 +672,7 @@ fn append_self_hosted(
             params_schema: serde_json::json!({}),
             beta_headers: Vec::new(),
             call_timeout_secs: model.call_timeout_secs,
+            stream_inactivity_timeout_secs: model.stream_inactivity_timeout_secs,
         };
 
         insert_unique(
@@ -765,6 +767,7 @@ mod tests {
                 supports_reasoning: false,
                 supports_web_search: false,
                 call_timeout_secs: Some(600),
+                stream_inactivity_timeout_secs: None,
             },
         );
         config
@@ -930,6 +933,7 @@ mod tests {
                 supports_reasoning: false,
                 supports_web_search: false,
                 call_timeout_secs: Some(600),
+                stream_inactivity_timeout_secs: None,
             },
         );
     }
@@ -1005,6 +1009,7 @@ mod tests {
                 supports_reasoning: false,
                 supports_web_search: false,
                 call_timeout_secs: None,
+                stream_inactivity_timeout_secs: None,
             },
         );
         let err = match ModelRegistry::from_config(&config, test_catalog()) {
@@ -1044,6 +1049,7 @@ mod tests {
                 supports_reasoning: false,
                 supports_web_search: false,
                 call_timeout_secs: None,
+                stream_inactivity_timeout_secs: None,
             },
         );
         let err = match ModelRegistry::from_config(&config, test_catalog()) {

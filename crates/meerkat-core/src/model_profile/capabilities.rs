@@ -183,7 +183,8 @@ impl OpenAiResponsesParamCapabilities {
 /// - features (`supports_web_search`, `supports_inference_geo`,
 ///   `supports_compaction`, `supports_structured_output`,
 ///   `supports_legacy_penalties`, `supports_thinking_budget_legacy`)
-/// - metadata (`beta_headers`, `call_timeout_secs`)
+/// - metadata (`beta_headers`, `call_timeout_secs`,
+///   `stream_inactivity_timeout_secs`)
 #[derive(Debug, Clone, Copy)]
 pub struct ModelCapabilities {
     // ── Identity ──────────────────────────────────────────────────────
@@ -308,6 +309,13 @@ pub struct ModelCapabilities {
     /// Authoritative default call timeout in seconds for this model.
     /// `None` means the model has no profiled default (unknown family).
     pub call_timeout_secs: Option<u64>,
+    /// Meerkat-owned stream-inactivity watchdog window in seconds for this
+    /// model: how long its provider stream may stay silent before the agent
+    /// loop aborts the call as stalled. `None` keeps the global window
+    /// (`[retry] stream_inactivity_timeout`, 300 s by default). Rows set it
+    /// where the provider documents responses that can stay silent for
+    /// minutes.
+    pub stream_inactivity_timeout_secs: Option<u64>,
 }
 
 impl ModelCapabilities {

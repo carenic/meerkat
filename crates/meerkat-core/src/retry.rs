@@ -129,8 +129,11 @@ pub struct LlmRetrySchedule {
 ///
 /// Conservative on purpose: a healthy provider stream emits events far more
 /// often than this, while a hung continuation otherwise blocks the turn
-/// forever. Disable via `stream_inactivity_timeout = "disabled"` in the
-/// `[retry]` config section or [`RetryPolicy::with_stream_inactivity_timeout`].
+/// forever. A model whose profile declares its own window
+/// (`ModelProfile::stream_inactivity_timeout_secs`) uses that window instead
+/// while the config inherits. Disable via `stream_inactivity_timeout =
+/// "disabled"` in the `[retry]` config section or
+/// [`RetryPolicy::with_stream_inactivity_timeout`].
 pub const DEFAULT_STREAM_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(300);
 
 fn default_stream_inactivity_timeout() -> Option<Duration> {
@@ -164,7 +167,10 @@ pub struct RetryPolicy {
     /// [`DEFAULT_STREAM_INACTIVITY_TIMEOUT`] (300s) — ON by default because
     /// the failure mode is an unbounded mid-turn hang. Only applies to clients
     /// that report stream liveness (see
-    /// `AgentLlmClient::stream_activity_count`).
+    /// `AgentLlmClient::stream_activity_count`). An agent whose
+    /// stream-inactivity override inherits uses the current model's own
+    /// window first when its model defaults resolver declares one
+    /// (`AgentBuilder::with_stream_inactivity_timeout_override`).
     ///
     /// Not `skip_serializing_if`: `None` must round-trip as an explicit null
     /// so a disabled watchdog is not silently re-enabled by the missing-field

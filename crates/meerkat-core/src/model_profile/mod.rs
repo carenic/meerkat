@@ -76,6 +76,12 @@ pub struct ModelProfile {
     /// consumed by the factory/agent-loop resolver trait at call time.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub call_timeout_secs: Option<u64>,
+    /// Model-specific stream-inactivity watchdog window in seconds, or `None`
+    /// for the global window. Resolved at call time like
+    /// [`Self::call_timeout_secs`]: an explicit `[retry]
+    /// stream_inactivity_timeout` (a duration, or `"disabled"`) still wins.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_inactivity_timeout_secs: Option<u64>,
 }
 
 /// Catalog-owned beta header metadata for a model.
@@ -123,6 +129,7 @@ pub fn project_to_profile(caps: &ModelCapabilities) -> ModelProfile {
             .map(ModelBetaHeader::from)
             .collect(),
         call_timeout_secs: caps.call_timeout_secs,
+        stream_inactivity_timeout_secs: caps.stream_inactivity_timeout_secs,
     }
 }
 

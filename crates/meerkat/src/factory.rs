@@ -1680,6 +1680,17 @@ impl meerkat_core::ModelOperationalDefaultsResolver for RegistryBackedDefaultsRe
             .and_then(|p| p.call_timeout_secs)
             .map(std::time::Duration::from_secs)
     }
+
+    fn stream_inactivity_timeout_for(
+        &self,
+        provider: Provider,
+        model: &str,
+    ) -> Option<std::time::Duration> {
+        self.registry
+            .profile_for_provider(provider, model)
+            .and_then(|p| p.stream_inactivity_timeout_secs)
+            .map(std::time::Duration::from_secs)
+    }
 }
 
 fn provider_request_defaults_for(
@@ -8768,6 +8779,12 @@ impl AgentFactory {
             .with_tools_config(config.tools.clone())
             .provider_native_tool_policy(provider_native_tool_policy)
             .with_call_timeout_override(effective_call_timeout_override)
+            // An explicit `[retry] stream_inactivity_timeout` wins; when it
+            // inherits, the loop uses the current model's own window from the
+            // resolver above, then the policy's built-in window.
+            .with_stream_inactivity_timeout_override(
+                config.retry.stream_inactivity_timeout_override.clone(),
+            )
             // Config-owned budget warning threshold and extraction prompt reach
             // the agent here; without this every factory-built agent ran on the
             // template threshold and the built-in extraction prompt.
@@ -12264,6 +12281,7 @@ mod tests {
             params_schema: serde_json::json!({}),
             beta_headers: Vec::new(),
             call_timeout_secs: None,
+            stream_inactivity_timeout_secs: None,
         };
 
         let enabled = provider_request_defaults_for(
@@ -17475,6 +17493,7 @@ mod tests {
                 supports_reasoning: true,
                 supports_web_search: false,
                 call_timeout_secs: Some(600),
+                stream_inactivity_timeout_secs: None,
             },
         );
         config
@@ -17594,6 +17613,7 @@ mod tests {
             supports_reasoning: false,
             supports_web_search: false,
             call_timeout_secs: Some(600),
+            stream_inactivity_timeout_secs: None,
         }
     }
 
@@ -20383,6 +20403,7 @@ mod tests {
                 supports_reasoning: true,
                 supports_web_search: false,
                 call_timeout_secs: Some(600),
+                stream_inactivity_timeout_secs: None,
             },
         );
 

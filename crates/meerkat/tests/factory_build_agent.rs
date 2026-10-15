@@ -1479,6 +1479,7 @@ async fn build_agent_resolves_self_hosted_alias_from_registry() {
             supports_reasoning: false,
             supports_web_search: false,
             call_timeout_secs: Some(600),
+            stream_inactivity_timeout_secs: None,
         },
     );
 
@@ -1496,6 +1497,101 @@ async fn build_agent_resolves_self_hosted_alias_from_registry() {
     assert_eq!(metadata.model, "gemma-4-31b");
     assert_eq!(metadata.provider, Provider::SelfHosted);
     assert_eq!(metadata.self_hosted_server_id.as_deref(), Some("local"));
+}
+
+/// Answers the first stream with silence (no event ever arrives) and every
+/// later stream like [`MockLlmClient`].
+struct StallOnceLlmClient {
+    calls: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl LlmClient for StallOnceLlmClient {
+    fn project_replay_messages(
+        &self,
+        messages: &[meerkat_core::Message],
+    ) -> Result<Vec<meerkat_core::Message>, meerkat_client::LlmError> {
+        Ok(messages.to_vec())
+    }
+
+    fn stream<'a>(
+        &'a self,
+        request: &'a LlmRequest,
+    ) -> Pin<Box<dyn futures::Stream<Item = Result<LlmEvent, meerkat_client::LlmError>> + Send + 'a>>
+    {
+        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            return Box::pin(stream::pending());
+        }
+        static ANSWER: MockLlmClient = MockLlmClient;
+        ANSWER.stream(request)
+    }
+
+    fn provider(&self) -> meerkat_core::Provider {
+        meerkat_core::Provider::Other
+    }
+
+    async fn health_check(&self) -> Result<(), meerkat_client::LlmError> {
+        Ok(())
+    }
+}
+
+/// A model's own stream-inactivity window reaches the agent loop's
+/// watchdog: a self-hosted model that declares
+/// `stream_inactivity_timeout_secs` has a silent stream aborted after that
+/// window, not the global 300 s default, and the ordinary retry succeeds.
+#[tokio::test]
+async fn a_model_stream_inactivity_window_reaches_the_watchdog() {
+    let temp = tempfile::tempdir().unwrap();
+    let factory = temp_factory(&temp);
+    let mut config = Config::default();
+    config.self_hosted.servers.insert(
+        "local".to_string(),
+        SelfHostedServerConfig {
+            transport: SelfHostedTransport::OpenAiCompatible,
+            base_url: "http://127.0.0.1:11434".to_string(),
+            api_style: SelfHostedApiStyle::ChatCompletions,
+        },
+    );
+    let model: SelfHostedModelConfig = serde_json::from_value(json!({
+        "server": "local",
+        "remote_model": "gemma4:31b",
+        "display_name": "Gemma 4 31B",
+        "family": "gemma-4",
+        "context_window": 256_000,
+        "max_output_tokens": 8_192,
+        "stream_inactivity_timeout_secs": 1
+    }))
+    .expect("self-hosted model config");
+    config
+        .self_hosted
+        .models
+        .insert("gemma-4-31b".to_string(), model);
+    config.retry.max_retries = 1;
+    config.retry.initial_delay = std::time::Duration::ZERO;
+    config.retry.max_delay = std::time::Duration::ZERO;
+    config.retry.multiplier = 1.0;
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let build_config = AgentBuildConfig {
+        llm_client_override: Some(Arc::new(StallOnceLlmClient {
+            calls: Arc::clone(&calls),
+        })),
+        ..AgentBuildConfig::new("gemma-4-31b")
+    };
+    let mut agent = factory.build_agent(build_config, &config).await.unwrap();
+
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        agent.run("Hello".to_string().into()),
+    )
+    .await
+    .expect(
+        "the model's 1 s inactivity window must abort the silent stream long before \
+         the global 300 s default",
+    )
+    .expect("the retry after the stall succeeds");
+    assert!(result.text.contains("Hello from mock"), "{}", result.text);
+    assert_eq!(calls.load(Ordering::SeqCst), 2, "one stall, one retry");
 }
 
 #[tokio::test]
@@ -1530,6 +1626,7 @@ async fn build_llm_client_for_identity_rejects_self_hosted_server_mismatch() {
             supports_reasoning: true,
             supports_web_search: false,
             call_timeout_secs: Some(600),
+            stream_inactivity_timeout_secs: None,
         },
     );
 

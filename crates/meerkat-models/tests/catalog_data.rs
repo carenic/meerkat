@@ -1293,6 +1293,43 @@ fn call_timeout_secs_populated_for_known_models() {
     }
 }
 
+/// A row declares its own stream-inactivity window only where the provider
+/// documents responses that can stay silent for minutes, and then no longer
+/// than the row's call timeout; every other row keeps the global window.
+/// The profile carries the row's value.
+#[test]
+fn stream_inactivity_windows_follow_documented_long_silent_responses() {
+    for caps in all_capabilities() {
+        let expected = match (caps.provider, caps.id) {
+            // Google: set client timeouts to at least 15 minutes.
+            (Provider::Gemini, "gemini-4-argon") => Some(900),
+            // OpenAI: requests may take several minutes; no streaming.
+            (Provider::OpenAI, "gpt-5.5-pro") => Some(7200),
+            _ => None,
+        };
+        assert_eq!(
+            caps.stream_inactivity_timeout_secs, expected,
+            "{}: stream_inactivity_timeout_secs",
+            caps.id
+        );
+        if let Some(window) = caps.stream_inactivity_timeout_secs {
+            assert!(
+                caps.call_timeout_secs.is_some_and(|call| window <= call),
+                "{}: the window must not outlast the call timeout",
+                caps.id
+            );
+        }
+        assert_eq!(
+            profile_for(caps.provider, caps.id)
+                .expect("catalog row projects to a profile")
+                .stream_inactivity_timeout_secs,
+            caps.stream_inactivity_timeout_secs,
+            "{}",
+            caps.id
+        );
+    }
+}
+
 #[test]
 fn anthropic_opus_has_longer_timeout_than_haiku() {
     let opus = profile_for(Provider::Anthropic, "claude-opus-4-8").unwrap();

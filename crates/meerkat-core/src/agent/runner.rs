@@ -3213,6 +3213,7 @@ impl Agent<dyn AgentLlmClient, dyn AgentToolDispatcher, dyn AgentSessionStore> {
             cancel_after_boundary_rx,
             model_defaults_resolver: self.model_defaults_resolver.clone(),
             call_timeout_override: self.call_timeout_override.clone(),
+            stream_inactivity_timeout_override: self.stream_inactivity_timeout_override.clone(),
             extraction_state: super::extraction::ExtractionState::default(),
             last_hidden_deferred_catalog_names: Default::default(),
             last_pending_catalog_sources: Default::default(),

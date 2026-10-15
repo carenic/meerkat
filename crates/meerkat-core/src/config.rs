@@ -855,6 +855,10 @@ impl Config {
                     if model_table.contains_key("call_timeout_secs") {
                         merged.call_timeout_secs = model_layer.call_timeout_secs;
                     }
+                    if model_table.contains_key("stream_inactivity_timeout_secs") {
+                        merged.stream_inactivity_timeout_secs =
+                            model_layer.stream_inactivity_timeout_secs;
+                    }
                     merged_models.insert(model_id.clone(), merged);
                 }
                 self.self_hosted.models = merged_models;
@@ -1628,6 +1632,12 @@ pub struct SelfHostedModelConfig {
     pub supports_web_search: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub call_timeout_secs: Option<u64>,
+    /// This model's stream-inactivity watchdog window in seconds: how long
+    /// its stream may stay silent (a long prefill, for example) before the
+    /// call is aborted as stalled. Omitted keeps the global window; an
+    /// explicit `[retry] stream_inactivity_timeout` still wins.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_inactivity_timeout_secs: Option<u64>,
 }
 
 impl Default for SelfHostedModelConfig {
@@ -1649,6 +1659,7 @@ impl Default for SelfHostedModelConfig {
             supports_reasoning: false,
             supports_web_search: false,
             call_timeout_secs: None,
+            stream_inactivity_timeout_secs: None,
         }
     }
 }
@@ -2566,12 +2577,16 @@ pub struct RetryConfig {
     pub call_timeout_override: CallTimeoutOverride,
     /// Tri-state override for the per-provider-stream inactivity watchdog.
     ///
-    /// - `Inherit` (default / omitted): the built-in default window
-    ///   ([`crate::retry::DEFAULT_STREAM_INACTIVITY_TIMEOUT`], 300s) — the
+    /// - `Inherit` (default / omitted): the current model's own window when
+    ///   its profile declares one (a catalog row, or a self-hosted model's
+    ///   `stream_inactivity_timeout_secs`), else the built-in default window
+    ///   ([`crate::retry::DEFAULT_STREAM_INACTIVITY_TIMEOUT`], 300s). The
     ///   watchdog is ON by default because a silent provider stream otherwise
     ///   hangs the turn forever
-    /// - `Disabled` (`stream_inactivity_timeout = "disabled"`): no watchdog
-    /// - `Value(duration)` (`stream_inactivity_timeout = "120s"`): explicit window
+    /// - `Disabled` (`stream_inactivity_timeout = "disabled"`): no watchdog,
+    ///   whatever the model declares
+    /// - `Value(duration)` (`stream_inactivity_timeout = "120s"`): explicit
+    ///   window for every model
     #[serde(
         default,
         rename = "stream_inactivity_timeout",
@@ -2604,7 +2619,9 @@ impl From<RetryConfig> for RetryPolicy {
             CallTimeoutOverride::Value(d) => Some(d),
         };
         // Unlike call_timeout, `Inherit` resolves to the built-in ON default
-        // here: there is no lower profile layer for the stall watchdog.
+        // here: a policy has no model to ask. The agent loop consults the
+        // current model's profile window first while the composition seam's
+        // override inherits (`AgentBuilder::with_stream_inactivity_timeout_override`).
         let stream_inactivity_timeout = match config.stream_inactivity_timeout_override {
             CallTimeoutOverride::Inherit => Some(crate::retry::DEFAULT_STREAM_INACTIVITY_TIMEOUT),
             CallTimeoutOverride::Disabled => None,
@@ -4604,6 +4621,69 @@ max_input_tokens = 700
         assert_eq!(witness.context_window(), Some(1000));
         assert_eq!(witness.max_input_tokens(), Some(700));
         assert_eq!(witness.max_output_tokens(), Some(100));
+    }
+
+    /// A self-hosted model's stream-inactivity window merges by presence and
+    /// reaches its registry profile; an omitted value keeps the global window.
+    #[test]
+    fn test_merge_self_hosted_stream_inactivity_window_is_presence_based() {
+        let mut config = Config::default();
+        config
+            .merge_toml_str(
+                r#"
+[self_hosted]
+default_model = "slow-prefill"
+[self_hosted.servers.local]
+base_url = "http://localhost:11434"
+[self_hosted.models.slow-prefill]
+server = "local"
+remote_model = "slow-prefill"
+stream_inactivity_timeout_secs = 900
+[self_hosted.models.default-window]
+server = "local"
+remote_model = "default-window"
+"#,
+            )
+            .expect("base");
+        config
+            .merge_toml_str(
+                r"
+[self_hosted.models.slow-prefill]
+call_timeout_secs = 1200
+",
+            )
+            .expect("unrelated overlay");
+        assert_eq!(
+            config.self_hosted.models["slow-prefill"].stream_inactivity_timeout_secs,
+            Some(900)
+        );
+        config
+            .merge_toml_str(
+                r"
+[self_hosted.models.slow-prefill]
+stream_inactivity_timeout_secs = 600
+",
+            )
+            .expect("window override");
+        let restored: Config =
+            toml::from_str(&toml::to_string(&config).expect("serialize")).expect("roundtrip");
+        let registry = restored
+            .model_registry(*crate::model_profile::test_catalog::TEST_CATALOG)
+            .expect("registry");
+        let profile = |model| {
+            registry
+                .profile_for_provider(crate::Provider::SelfHosted, model)
+                .expect("self-hosted profile")
+        };
+        assert_eq!(
+            profile("slow-prefill").stream_inactivity_timeout_secs,
+            Some(600)
+        );
+        assert_eq!(profile("slow-prefill").call_timeout_secs, Some(1200));
+        assert_eq!(
+            profile("default-window").stream_inactivity_timeout_secs,
+            None
+        );
     }
 
     #[test]

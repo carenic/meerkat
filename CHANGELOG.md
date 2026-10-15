@@ -37,6 +37,16 @@ them.
 
 ### Breaking
 
+- Per-model stream-inactivity windows (see Added) add the public
+  `stream_inactivity_timeout_secs: Option<u64>` field to the following
+  constructible Rust structs; struct literals must set it (`None` keeps the
+  global window):
+  - `meerkat_core::model_profile::capabilities::ModelCapabilities::stream_inactivity_timeout_secs`
+  - `meerkat_core::model_profile::ModelProfile::stream_inactivity_timeout_secs`
+  - `meerkat_core::config::SelfHostedModelConfig::stream_inactivity_timeout_secs`
+
+  `ModelProfile` and `SelfHostedModelConfig` omit the field when it is unset,
+  so existing documents keep their bytes.
 - Behaviour-only (not measured by the gate): a model fallback switch
   (`AgentLlmFallbackSwitch`) whose `target_profile` witness was not judged
   for the target identity's own binding
@@ -57,6 +67,19 @@ them.
   `ModelProfileWitness` for an identity as its binding's backend serves it,
   and `ModelProfileWitness::judged_for_identity` says whether a witness was
   judged for exactly that identity, binding included (see Fixed).
+- Per-model stream-inactivity windows. A model's profile can carry its own
+  watchdog window: the catalog sets one where the provider documents
+  responses that can stay silent for minutes (`gemini-4-argon`, 900 s per
+  Google's 15-minute client-timeout guidance; `gpt-5.5-pro`, 7200 s, its call
+  timeout, since its requests can run for minutes without streaming), and a
+  self-hosted model can declare `stream_inactivity_timeout_secs` (for example
+  for a long prefill). The window is resolved for each LLM call like
+  `call_timeout`: an explicit `[retry] stream_inactivity_timeout` (a duration,
+  or `"disabled"`) wins, then the current model's window, then the built-in
+  300 s, so a model change or fallback uses the new model's window. The 300 s
+  window used to apply to every model. Rust embedders get the provided
+  `ModelOperationalDefaultsResolver::stream_inactivity_timeout_for` (default
+  `None`) and `AgentBuilder::with_stream_inactivity_timeout_override`.
 
 ### Changed
 

@@ -2264,6 +2264,33 @@ where
         }
     }
 
+    /// Resolve the stream-inactivity watchdog window for an LLM call to
+    /// `provider`/`model`, in the same order as the call timeout:
+    ///   1. Explicit override (Value/Disabled), from `[retry]
+    ///      stream_inactivity_timeout`
+    ///   2. The model's own window, from the injected resolver
+    ///   3. RetryPolicy.stream_inactivity_timeout (the built-in 300 s window
+    ///      unless a direct builder user set another)
+    ///
+    /// `Disabled` suppresses the model's window too. Resolved per call, so a
+    /// hot swap or model fallback uses the new model's window.
+    fn resolve_stream_inactivity_timeout_for(
+        &self,
+        provider: crate::Provider,
+        model: &str,
+    ) -> Option<std::time::Duration> {
+        use crate::config::CallTimeoutOverride;
+        match &self.stream_inactivity_timeout_override {
+            CallTimeoutOverride::Value(d) => Some(*d),
+            CallTimeoutOverride::Disabled => None,
+            CallTimeoutOverride::Inherit => self
+                .model_defaults_resolver
+                .as_ref()
+                .and_then(|r| r.stream_inactivity_timeout_for(provider, model))
+                .or(self.retry_policy.stream_inactivity_timeout),
+        }
+    }
+
     /// Hydrate one fully composed model request while its exact boundary state
     /// is still canonical pending rather than applied. A cancellation or blob
     /// fault here therefore leaves the context eligible for explicit run-exit
@@ -2303,9 +2330,10 @@ where
     /// - retry delay capped by remaining turn budget
     /// - per-call timeout from override/profile, wrapped with remaining turn budget
     /// - typed timeout-origin selection before await
-    /// - stream-inactivity watchdog (`RetryPolicy::stream_inactivity_timeout`)
-    ///   for liveness-reporting clients: a silent provider stream is aborted
-    ///   with the retryable `LlmFailureReason::StreamStalled`
+    /// - stream-inactivity watchdog (override, then the model's own window,
+    ///   then `RetryPolicy::stream_inactivity_timeout`) for liveness-reporting
+    ///   clients: a silent provider stream is aborted with the retryable
+    ///   `LlmFailureReason::StreamStalled`
     async fn select_model_fallback(
         &self,
         failure: &AgentError,
@@ -2414,12 +2442,24 @@ where
             } else {
                 None
             };
-            let effective_call_timeout = match controller.as_ref() {
-                Some(controller) => self.resolve_call_timeout_for(
-                    controller.selection().provider(),
-                    controller.selection().model(),
+            let (effective_call_timeout, effective_stall_window) = match controller.as_ref() {
+                Some(controller) => (
+                    self.resolve_call_timeout_for(
+                        controller.selection().provider(),
+                        controller.selection().model(),
+                    ),
+                    self.resolve_stream_inactivity_timeout_for(
+                        controller.selection().provider(),
+                        controller.selection().model(),
+                    ),
                 ),
-                None => self.resolve_effective_call_timeout(),
+                None => (
+                    self.resolve_effective_call_timeout(),
+                    self.resolve_stream_inactivity_timeout_for(
+                        self.client.provider(),
+                        self.client.model(),
+                    ),
+                ),
             };
             let remaining_turn = self.budget.remaining_duration();
 
@@ -2586,8 +2626,7 @@ where
             // The inactivity watchdog applies only when the client reports
             // stream liveness; clients without a probe keep the pre-watchdog
             // contract (hard timeouts only).
-            let stall_window =
-                stream_activity_count().and(self.retry_policy.stream_inactivity_timeout);
+            let stall_window = stream_activity_count().and(effective_stall_window);
 
             // Await the call under both deadlines. Each observed stream event
             // re-arms the stall window; the hard deadline is fixed at call
@@ -26169,6 +26208,110 @@ mod tests {
             .expect("alive stream must not be classified as stalled");
         assert_eq!(result.text, "slow but alive");
         assert_eq!(client.calls(), 1, "no retry for a live stream");
+    }
+
+    /// A model defaults resolver that declares one stream-inactivity window
+    /// for every model.
+    struct StallWindowResolver(Option<Duration>);
+
+    impl crate::ModelOperationalDefaultsResolver for StallWindowResolver {
+        fn call_timeout_for(&self, _provider: crate::Provider, _model: &str) -> Option<Duration> {
+            None
+        }
+
+        fn stream_inactivity_timeout_for(
+            &self,
+            _provider: crate::Provider,
+            _model: &str,
+        ) -> Option<Duration> {
+            self.0
+        }
+    }
+
+    fn stall_window_policy(window: Option<Duration>) -> crate::retry::RetryPolicy {
+        crate::retry::RetryPolicy {
+            max_retries: 1,
+            initial_delay: Duration::from_millis(1),
+            max_delay: Duration::from_millis(1),
+            multiplier: 1.0,
+            call_timeout: None,
+            stream_inactivity_timeout: window,
+        }
+    }
+
+    /// While the override inherits, the current model's own window wins over
+    /// the retry policy's: a model that declares 30 ms has its silent stream
+    /// aborted although the policy's window is an hour.
+    #[tokio::test]
+    async fn model_stream_inactivity_window_wins_over_the_policy_window() {
+        let client = Arc::new(StallThenSucceedClient::new());
+        let mut agent = with_test_turn_state_handle(AgentBuilder::new())
+            .retry_policy(stall_window_policy(Some(Duration::from_secs(3600))))
+            .with_model_defaults_resolver(Arc::new(StallWindowResolver(Some(
+                Duration::from_millis(30),
+            ))))
+            .build_standalone(client.clone(), Arc::new(NoTools), Arc::new(NoopStore))
+            .await;
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(30),
+            agent.run("stall once".to_string().into()),
+        )
+        .await
+        .expect("the model's 30 ms window must abort the silent stream")
+        .expect("the retry after the stall succeeds");
+        assert_eq!(result.text, "ok after stall retry");
+        assert_eq!(client.calls(), 2, "one stall, one retry");
+    }
+
+    /// An explicit override wins over the model's window: 30 ms applies
+    /// although the model declares an hour.
+    #[tokio::test]
+    async fn explicit_stream_inactivity_override_wins_over_the_model_window() {
+        let client = Arc::new(StallThenSucceedClient::new());
+        let mut agent = with_test_turn_state_handle(AgentBuilder::new())
+            .retry_policy(stall_window_policy(Some(Duration::from_secs(3600))))
+            .with_model_defaults_resolver(Arc::new(StallWindowResolver(Some(Duration::from_secs(
+                3600,
+            )))))
+            .with_stream_inactivity_timeout_override(crate::config::CallTimeoutOverride::Value(
+                Duration::from_millis(30),
+            ))
+            .build_standalone(client.clone(), Arc::new(NoTools), Arc::new(NoopStore))
+            .await;
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(30),
+            agent.run("stall once".to_string().into()),
+        )
+        .await
+        .expect("the explicit 30 ms window must abort the silent stream")
+        .expect("the retry after the stall succeeds");
+        assert_eq!(result.text, "ok after stall retry");
+        assert_eq!(client.calls(), 2, "one stall, one retry");
+    }
+
+    /// `Disabled` turns the watchdog off whatever the model declares: a
+    /// response silent for 150 ms completes on its first call although the
+    /// model's window is 30 ms.
+    #[tokio::test]
+    async fn disabled_stream_inactivity_override_turns_off_the_model_window() {
+        let client = Arc::new(SlowButAliveClient::new(Duration::from_millis(150), 1));
+        let mut agent = with_test_turn_state_handle(AgentBuilder::new())
+            .retry_policy(stall_window_policy(Some(Duration::from_millis(30))))
+            .with_model_defaults_resolver(Arc::new(StallWindowResolver(Some(
+                Duration::from_millis(30),
+            ))))
+            .with_stream_inactivity_timeout_override(crate::config::CallTimeoutOverride::Disabled)
+            .build_standalone(client.clone(), Arc::new(NoTools), Arc::new(NoopStore))
+            .await;
+
+        let result = agent
+            .run("slow first token".to_string().into())
+            .await
+            .expect("a disabled watchdog never aborts the call");
+        assert_eq!(result.text, "slow but alive");
+        assert_eq!(client.calls(), 1, "no stall, no retry");
     }
 
     #[tokio::test]
