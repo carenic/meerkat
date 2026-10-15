@@ -7064,9 +7064,10 @@ mod tests {
             McpActorMaterializationMode::Fresh,
             move |bindings| {
                 let router = Arc::new(meerkat_mcp::McpRouterAdapter::new(
-                    McpRouter::new_with_surface_handle(Arc::clone(
-                        bindings.external_tool_surface(),
-                    )),
+                    McpRouter::new_with_surface_handle_and_stdio_profile(
+                        Arc::clone(bindings.external_tool_surface()),
+                        meerkat_mcp::McpStdioLaunchProfile::trusted_host(),
+                    ),
                 ));
                 let router_tools: Arc<dyn AgentToolDispatcher> = router.clone();
                 let mut request = mock_deferred_materialization_request(session, bindings, None);
@@ -7193,9 +7194,10 @@ mod tests {
             McpActorMaterializationMode::Fresh,
             move |bindings| {
                 let router = Arc::new(meerkat_mcp::McpRouterAdapter::new(
-                    McpRouter::new_with_surface_handle(Arc::clone(
-                        bindings.external_tool_surface(),
-                    )),
+                    McpRouter::new_with_surface_handle_and_stdio_profile(
+                        Arc::clone(bindings.external_tool_surface()),
+                        meerkat_mcp::McpStdioLaunchProfile::trusted_host(),
+                    ),
                 ));
                 let router_tools: Arc<dyn AgentToolDispatcher> = router.clone();
                 let mut request = mock_deferred_materialization_request(session, bindings, None);
@@ -7493,9 +7495,10 @@ mod tests {
             McpActorMaterializationMode::Fresh,
             move |bindings| {
                 let router = Arc::new(meerkat_mcp::McpRouterAdapter::new(
-                    McpRouter::new_with_surface_handle(Arc::clone(
-                        bindings.external_tool_surface(),
-                    )),
+                    McpRouter::new_with_surface_handle_and_stdio_profile(
+                        Arc::clone(bindings.external_tool_surface()),
+                        meerkat_mcp::McpStdioLaunchProfile::trusted_host(),
+                    ),
                 ));
                 let router_tools: Arc<dyn AgentToolDispatcher> = router.clone();
                 let mut request = mock_deferred_materialization_request(session, bindings, None);
@@ -7731,9 +7734,10 @@ mod tests {
             McpActorMaterializationMode::Fresh,
             move |bindings| {
                 let router = Arc::new(meerkat_mcp::McpRouterAdapter::new(
-                    McpRouter::new_with_surface_handle(Arc::clone(
-                        bindings.external_tool_surface(),
-                    )),
+                    McpRouter::new_with_surface_handle_and_stdio_profile(
+                        Arc::clone(bindings.external_tool_surface()),
+                        meerkat_mcp::McpStdioLaunchProfile::trusted_host(),
+                    ),
                 ));
                 *slot.lock().expect("slot") = Some(Arc::clone(&router));
                 let router_tools: Arc<dyn AgentToolDispatcher> = router.clone();
@@ -7821,7 +7825,11 @@ mod tests {
         attach_test_mcp_router(
             &state,
             &session_id,
-            Arc::new(meerkat_mcp::McpRouterAdapter::new(McpRouter::new())),
+            Arc::new(meerkat_mcp::McpRouterAdapter::new(
+                McpRouter::new_with_stdio_profile(
+                    meerkat_mcp::McpStdioLaunchProfile::trusted_host(),
+                ),
+            )),
         )
         .await;
 
@@ -10214,9 +10222,10 @@ requirement = { baseline = "command_runtime_v1", read = { kind = "paths", paths 
             McpActorMaterializationMode::Fresh,
             move |bindings| {
                 let router = Arc::new(meerkat_mcp::McpRouterAdapter::new(
-                    McpRouter::new_with_surface_handle(Arc::clone(
-                        bindings.external_tool_surface(),
-                    )),
+                    McpRouter::new_with_surface_handle_and_stdio_profile(
+                        Arc::clone(bindings.external_tool_surface()),
+                        meerkat_mcp::McpStdioLaunchProfile::trusted_host(),
+                    ),
                 ));
                 let router_tools: Arc<dyn AgentToolDispatcher> = router.clone();
                 let request = CreateSessionRequest {
@@ -10355,9 +10364,10 @@ requirement = { baseline = "command_runtime_v1", read = { kind = "paths", paths 
             McpActorMaterializationMode::Fresh,
             move |bindings| {
                 let router = Arc::new(meerkat_mcp::McpRouterAdapter::new(
-                    McpRouter::new_with_surface_handle(Arc::clone(
-                        bindings.external_tool_surface(),
-                    )),
+                    McpRouter::new_with_surface_handle_and_stdio_profile(
+                        Arc::clone(bindings.external_tool_surface()),
+                        meerkat_mcp::McpStdioLaunchProfile::trusted_host(),
+                    ),
                 ));
                 let router_tools: Arc<dyn AgentToolDispatcher> = router.clone();
                 let request = CreateSessionRequest {
@@ -11520,9 +11530,10 @@ requirement = { baseline = "command_runtime_v1", read = { kind = "paths", paths 
             move |bindings| {
                 seed_active_external_surface(bindings.external_tool_surface().as_ref(), "demo");
                 let router = Arc::new(meerkat_mcp::McpRouterAdapter::new(
-                    McpRouter::new_with_surface_handle(Arc::clone(
-                        bindings.external_tool_surface(),
-                    )),
+                    McpRouter::new_with_surface_handle_and_stdio_profile(
+                        Arc::clone(bindings.external_tool_surface()),
+                        meerkat_mcp::McpStdioLaunchProfile::trusted_host(),
+                    ),
                 ));
                 let router_tools: Arc<dyn AgentToolDispatcher> = router.clone();
                 let mut request = mock_deferred_materialization_request(session, bindings, None);

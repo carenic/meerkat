@@ -48,6 +48,21 @@ them.
   literal must add it (or use `..Default::default()` or
   `AgentBuildConfig::new`).
 
+### Deprecated
+
+- The MCP router constructors that launch local stdio servers as the
+  trusted host without naming it: `McpRouter::new`,
+  `McpRouter::new_with_surface_handle`, `McpRouter::new_with_removal_timeout`,
+  `McpRouter::new_with_surface_handle_and_removal_timeout` and
+  `meerkat::mcp::standalone_router`. Use the forms that name the profile:
+  `McpRouter::new_with_stdio_profile`,
+  `McpRouter::new_with_surface_handle_and_stdio_profile` (then
+  `set_removal_timeout` for a custom drain) and
+  `meerkat::mcp::standalone_router_with_stdio_profile`, with the host's
+  profile (canonically `AgentFactory::mcp_stdio_launch_profile`) or
+  `McpStdioLaunchProfile::trusted_host()` for no OS confinement. Their
+  behaviour is unchanged, and `McpRouter::default()` stays the trusted host.
+
 ### Added
 
 - `FileConfigStore::with_realm_chain` declares a store's document a realm's

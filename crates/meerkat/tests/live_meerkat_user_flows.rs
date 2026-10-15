@@ -369,7 +369,8 @@ mod tool_invocation {
         let server_path = mcp_test_server::fixture_binary();
 
         // Create MCP router and connect to test server
-        let mut router = McpRouter::new();
+        let mut router =
+            McpRouter::new_with_stdio_profile(meerkat_mcp::McpStdioLaunchProfile::trusted_host());
         let config = McpServerConfig::stdio(
             "test",
             server_path.to_string_lossy().to_string(),
@@ -772,7 +773,8 @@ mod parallel_tools {
         let server_path = mcp_test_server::fixture_binary();
 
         // Create MCP router with test server
-        let mut router = McpRouter::new();
+        let mut router =
+            McpRouter::new_with_stdio_profile(meerkat_mcp::McpStdioLaunchProfile::trusted_host());
         let config = McpServerConfig::stdio(
             "test",
             server_path.to_string_lossy().to_string(),

@@ -11636,7 +11636,9 @@ mod tests {
         state.llm_client_override = Some(Arc::new(MockLlmClient));
 
         let target_session_id = create_completed_rest_runtime_session(&state).await;
-        let adapter = Arc::new(McpRouterAdapter::new(McpRouter::new()));
+        let adapter = Arc::new(McpRouterAdapter::new(McpRouter::new_with_stdio_profile(
+            meerkat_mcp::McpStdioLaunchProfile::trusted_host(),
+        )));
         let (lifecycle_tx, lifecycle_rx) = mpsc::unbounded_channel();
         state.mcp_sessions.write().await.insert(
             target_session_id.clone(),
@@ -11914,7 +11916,9 @@ mod tests {
             .unwrap();
         state.llm_client_override = Some(Arc::new(MockLlmClient));
         let session_id = create_archived_stale_rest_runtime_session(&state).await;
-        let adapter = Arc::new(McpRouterAdapter::new(McpRouter::new()));
+        let adapter = Arc::new(McpRouterAdapter::new(McpRouter::new_with_stdio_profile(
+            meerkat_mcp::McpStdioLaunchProfile::trusted_host(),
+        )));
         let (lifecycle_tx, lifecycle_rx) = mpsc::unbounded_channel();
         state.mcp_sessions.write().await.insert(
             session_id.clone(),
@@ -17451,7 +17455,9 @@ matching the required schema. Output ONLY the JSON, no additional text or markdo
             let session_id = SessionId::new();
             {
                 let mut map = state.mcp_sessions.write().await;
-                let adapter = Arc::new(McpRouterAdapter::new(McpRouter::new()));
+                let adapter = Arc::new(McpRouterAdapter::new(McpRouter::new_with_stdio_profile(
+                    meerkat_mcp::McpStdioLaunchProfile::trusted_host(),
+                )));
                 let (tx, rx) = mpsc::unbounded_channel();
                 map.insert(
                     session_id.clone(),

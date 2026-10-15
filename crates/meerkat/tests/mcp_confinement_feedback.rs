@@ -731,3 +731,69 @@ async fn standalone_router_keeps_the_host_stdio_launch_profile() {
     ));
     assert!(!marker.exists());
 }
+
+/// The deprecated constructors that leave the launch profile implicit keep
+/// their behaviour for existing embedders: a stdio server their router adds
+/// launches as the trusted host, exactly as with the explicit trusted-host
+/// profile that replaces them, and unlike a required profile.
+#[cfg(unix)]
+#[tokio::test]
+#[allow(deprecated)]
+async fn implicit_router_constructors_still_launch_as_the_trusted_host() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let requirement = ConfinementSpec {
+        baseline: PlatformBaseline::CommandRuntimeV1,
+        read: FilesystemAccess::Paths(vec![PathAccess::Subtree(root.clone())]),
+        write: FilesystemAccess::Paths(vec![PathAccess::Subtree(root.clone())]),
+        deny_read: vec![],
+        deny_write: vec![],
+        network: IpNetworkAccess::Denied,
+        unix_connect: vec![],
+        require_descendant_termination: true,
+    }
+    .try_into()
+    .unwrap();
+    let routers = [
+        ("standalone_router", meerkat::mcp::standalone_router(), true),
+        (
+            "standalone_router_with_stdio_profile(trusted_host)",
+            meerkat::mcp::standalone_router_with_stdio_profile(
+                McpStdioLaunchProfile::trusted_host(),
+            ),
+            true,
+        ),
+        (
+            "McpRouter::new_with_surface_handle",
+            McpRouter::new_with_surface_handle(Arc::new(
+                meerkat_runtime::RuntimeExternalToolSurfaceHandle::ephemeral(),
+            )),
+            true,
+        ),
+        (
+            "standalone_router_with_stdio_profile(required)",
+            meerkat::mcp::standalone_router_with_stdio_profile(McpStdioLaunchProfile::required(
+                requirement,
+                root.clone(),
+            )),
+            false,
+        ),
+    ];
+    for (index, (label, mut router, launches)) in routers.into_iter().enumerate() {
+        let marker = root.join(format!("launched-{index}"));
+        // The program exits without speaking MCP: its launch, not its
+        // handshake, is what each profile decides.
+        let config = meerkat_core::McpServerConfig::stdio(
+            format!("probe-{index}"),
+            "/bin/sh",
+            vec!["-c".into(), "printf entered > \"$MARKER\"".into()],
+            HashMap::from([("MARKER".into(), marker.display().to_string())]),
+        );
+        let added = tokio::time::timeout(Duration::from_secs(30), router.add_server(config))
+            .await
+            .unwrap();
+        assert!(added.is_err(), "{label}: the probe speaks no MCP");
+        assert_eq!(marker.exists(), launches, "{label}: {added:?}");
+        router.shutdown().await;
+    }
+}

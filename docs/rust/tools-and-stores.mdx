@@ -299,10 +299,14 @@ impl RealmStorageProvider for ExternalRealmProvider {
 Route tool calls across multiple MCP servers:
 
 ```rust
-use meerkat::{McpRouter, McpServerConfig};
+use meerkat::{McpServerConfig, McpStdioLaunchProfile};
 use std::collections::HashMap;
 
-let mut router = McpRouter::new();
+// Name the launch profile of local stdio servers: the host's
+// (`AgentFactory::mcp_stdio_launch_profile`), or the trusted host for none.
+let mut router = meerkat::mcp::standalone_router_with_stdio_profile(
+    McpStdioLaunchProfile::trusted_host(),
+);
 
 // Add stdio-based MCP server
 let config = McpServerConfig::stdio(

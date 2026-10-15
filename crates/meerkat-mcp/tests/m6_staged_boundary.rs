@@ -23,8 +23,12 @@ async fn sibling_router_cannot_apply_another_accounts_shared_session_intent() {
     assert_eq!(bindings.session_id(), &session_id);
     assert!(session_runtime_bindings_have_machine_authority(&bindings));
 
-    let work = McpRouterAdapter::new(McpRouter::new());
-    let personal = McpRouterAdapter::new(McpRouter::new());
+    let work = McpRouterAdapter::new(McpRouter::new_with_stdio_profile(
+        meerkat_mcp::McpStdioLaunchProfile::trusted_host(),
+    ));
+    let personal = McpRouterAdapter::new(McpRouter::new_with_stdio_profile(
+        meerkat_mcp::McpStdioLaunchProfile::trusted_host(),
+    ));
     for adapter in [&work, &personal] {
         // These are the exact same canonical handles the factory and dynamic
         // dispatcher composition bind; no standalone or filtered owner exists.
