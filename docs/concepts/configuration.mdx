@@ -669,7 +669,10 @@ administration from out of its confined processes' reach:
   request (login, completion, cancel, status or logout over JSON-RPC or
   REST, and `rkat mcp login`) that names a server only such a file defines
   is refused as not configured (`mcp_server_not_configured`) before anything
-  is discovered, registered or stored for it.
+  is discovered, registered or stored for it. The model sees a refused
+  server under its name when that is a plain server name, else under a
+  `refused-mcp-server-<n>` placeholder, and a refused definition never fails
+  the rest of the session's setup.
 - Links: an input or a skills directory is judged with the symbolic links in
   it. A start whose realm state or credential store links to a path a
   confined process could change (a target that does not exist yet

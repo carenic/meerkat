@@ -2251,7 +2251,10 @@ impl McpRouter {
     ) -> Result<(), McpError> {
         self.refuse_ungoverned_change(&config.name)?;
         let name = config.name.clone();
-        self.stage_add_payload(config)?;
+        // A refused definition is never connected, so it is not validated:
+        // one that would not validate is reported refused like any other,
+        // and never fails the rest of the session's setup.
+        self.stage_payload(config)?;
         self.refused_payloads.insert(name, refusal);
         Ok(())
     }
@@ -2267,6 +2270,11 @@ impl McpRouter {
 
     fn stage_add_payload(&mut self, config: McpServerConfig) -> Result<(), McpError> {
         Self::validate_tool_names(&config)?;
+        self.stage_payload(config)
+    }
+
+    /// Stage `config`'s add without validating it.
+    fn stage_payload(&mut self, config: McpServerConfig) -> Result<(), McpError> {
         let server_name = config.name.clone();
         // A new payload replaces any refused one staged under the name.
         self.refused_payloads.remove(&server_name);

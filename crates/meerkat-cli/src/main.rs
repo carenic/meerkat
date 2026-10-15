@@ -11617,9 +11617,13 @@ async fn create_mcp_tools(
 #[cfg(feature = "mcp")]
 fn report_refused_mcp_servers(refused: &[meerkat_core::mcp_config::RefusedMcpServer]) {
     for server in refused {
+        // The name comes from a file a confined process can write: it is
+        // shown escaped and bounded, never as terminal input.
+        let name: String = server.server.name.chars().take(64).collect();
         eprintln!(
             "warning: MCP server '{}' from the {} mcp.toml is refused: a confined process can write that file",
-            server.server.name, server.scope
+            name.escape_debug(),
+            server.scope
         );
     }
 }

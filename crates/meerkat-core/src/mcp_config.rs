@@ -719,6 +719,29 @@ pub struct McpServerRefusal {
     pub refusal: crate::confinement::ConfinementRefusal,
 }
 
+impl McpServerRefusal {
+    /// The name a session reports this refused server under: its own name
+    /// when that is a plain server name (1 to 64 ASCII letters, digits, `-`,
+    /// `_` or `.`), else `refused-mcp-server-<n>`, `n` its 1-based
+    /// `position` among the session's refusals. The definition comes from a
+    /// source the host does not trust, so other text in its name never
+    /// reaches the model or a log.
+    #[must_use]
+    pub fn reported_name(&self, position: usize) -> String {
+        let name = self.server.name.as_str();
+        let plain = !name.is_empty()
+            && name.len() <= 64
+            && name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'));
+        if plain {
+            name.to_owned()
+        } else {
+            format!("refused-mcp-server-{}", position + 1)
+        }
+    }
+}
+
 /// The MCP set of a realm-scoped session when an `mcp.toml` file may be
 /// writable by a confined process: the servers the host runs, and the file
 /// servers it refuses ([`McpConfig::effective_servers_from_roots_trusting`]).

@@ -7844,14 +7844,30 @@ impl AgentFactory {
             // A server the host refused before setup is staged refused:
             // applying it reports the typed refusal to the model as that
             // server's failed setup, and nothing in it connects or spawns.
-            for refused in &build_config.refused_mcp_servers {
+            // Its definition comes from a source the host does not trust, so
+            // it is staged under a name safe to show the model, distinct from
+            // every other server of the session.
+            let mut reported_names: std::collections::BTreeSet<String> = build_config
+                .mcp_servers
+                .iter()
+                .map(|server| server.name.clone())
+                .collect();
+            for (position, refused) in build_config.refused_mcp_servers.iter().enumerate() {
+                let mut name = refused.reported_name(position);
+                let mut suffix = 1usize;
+                while reported_names.contains(&name) {
+                    suffix += 1;
+                    name = format!("refused-mcp-server-{}-{suffix}", position + 1);
+                }
+                reported_names.insert(name.clone());
+                let mut server = refused.server.clone();
+                server.name = name.clone();
                 adapter
-                    .stage_add_refused(refused.server.clone(), refused.refusal)
+                    .stage_add_refused(server, refused.refusal)
                     .await
                     .map_err(|error| {
                         BuildAgentError::McpSetup(format!(
-                            "stage refused MCP server '{}': {error}",
-                            refused.server.name
+                            "stage refused MCP server '{name}': {error}"
                         ))
                     })?;
             }

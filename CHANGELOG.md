@@ -131,6 +131,8 @@ them.
 - `FilesystemSkillSource::with_untrusted_targets` and
   `GitSkillSource::with_untrusted_targets` judge a linked skill where its
   link leads.
+- `McpServerRefusal::reported_name`: the name a session reports a refused
+  server under.
 - `SdkConfigStore::with_realm_document` builds a realm document store that
   keeps the realm's composed `[confinement]` and `[governance]`
   (`FileConfigStore::with_realm_chain`).
@@ -143,6 +145,12 @@ them.
   the platform cannot confine is refused. It ran as the trusted host.
 - `rkat skill list` and `rkat skill inspect` load skills under the host
   confinement a run installs, so they show what a run loads.
+- A refused MCP server reaches the model under its own name only when that
+  is a plain server name (1 to 64 ASCII letters, digits, `-`, `_` or `.`),
+  else under a `refused-mcp-server-<n>` placeholder, and a refused
+  definition is not validated: one that would not validate is reported
+  refused instead of failing the session build. `rkat` prints a refused
+  server's name escaped and bounded.
 - The generated Bazel targets of `meerkat-rest`'s tests get the
   `rkat-rest` binary, and the real-binary confinement tests of `rkat-rpc`
   and `rkat-rest` fail, rather than pass without having run, when their
