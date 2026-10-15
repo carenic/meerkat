@@ -59,7 +59,7 @@ fn workgraph_service_or_error(
 ) -> Result<meerkat::WorkGraphService, RpcResponse> {
     runtime
         .workgraph_service()
-        .map_err(|err| RpcResponse::error(id.clone(), err.code, err.message))
+        .map_err(|err| RpcResponse::from_error(id.clone(), err))
 }
 
 pub async fn handle_get(

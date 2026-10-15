@@ -897,10 +897,20 @@ pub struct BuiltinConfigInput {
     /// Enable shell tools. Omit to inherit/default.
     #[serde(default)]
     pub enable_shell: Option<bool>,
-    /// Accepted and ignored in 0.9.1. Set the shell's default command timeout
-    /// with `[shell] timeout_secs` in the realm config.
+    /// Default command timeout, in seconds, of the shell tool in the session
+    /// this call builds: its `[shell] timeout_secs`. A shell call's own
+    /// `timeout_secs` still wins. Omit, `null` or `0` keep the realm's
+    /// configured value on a run, and the session's recorded value on a
+    /// resume.
     #[serde(default)]
     pub shell_timeout_secs: Option<u64>,
+}
+
+/// The session shell timeout a request asks for; `0` asks for none.
+fn requested_shell_timeout(config: Option<&BuiltinConfigInput>) -> Option<std::num::NonZeroU64> {
+    config
+        .and_then(|config| config.shell_timeout_secs)
+        .and_then(std::num::NonZeroU64::new)
 }
 
 /// Actions supported by the config tool.
@@ -4532,6 +4542,7 @@ async fn handle_meerkat_run_with_help_tools(
                 initial_tool_filter: None,
                 initial_tool_visibility_state: None,
                 shell_env: input.shell_env.clone(),
+                shell_timeout_secs: requested_shell_timeout(input.builtin_config.as_ref()),
                 resume_override_mask: ResumeOverrideMask {
                     model: input.model.is_some(),
                     provider: input.provider.is_some(),
@@ -5003,6 +5014,15 @@ async fn handle_meerkat_resume(
             initial_tool_filter: None,
             initial_tool_visibility_state: None,
             shell_env: None,
+            // A rebuild keeps the session's recorded timeout unless the
+            // resume asks for another.
+            shell_timeout_secs: requested_shell_timeout(input.builtin_config.as_ref()).or_else(
+                || {
+                    session
+                        .build_state()
+                        .and_then(|state| state.shell_timeout_secs)
+                },
+            ),
             resume_override_mask: ResumeOverrideMask {
                 model: input.model.is_some(),
                 provider: llm_binding.provider_overridden,
@@ -6409,6 +6429,52 @@ mod tests {
         );
         assert_refused_as_access_denied(&resumed, "call_tool_catalog_load");
         assert_eq!(after_load, offered, "the refused load attaches no tool");
+    }
+
+    /// `builtin_config.shell_timeout_secs` sets the shell's default command
+    /// timeout for the session it builds: a command that outlives a short
+    /// override is stopped by it instead of running to its end under the 30 s
+    /// default.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_meerkat_run_honours_a_short_shell_timeout_override() {
+        let store: Arc<dyn SessionStore> = Arc::new(meerkat::MemoryStore::new());
+        let runtime_store: Arc<dyn meerkat_runtime::RuntimeStore> =
+            Arc::new(meerkat_runtime::InMemoryRuntimeStore::new());
+        let llm = Arc::new(ToolCallScriptLlmClient::default());
+        let state = mcp_server_over(&store, &runtime_store, &llm).await;
+        llm.arm_call("shell", json!({"command": "sleep 5"}));
+        let run_input: MeerkatRunInput = serde_json::from_value(json!({
+            "prompt": "run the command",
+            "model": "claude-sonnet-4-5",
+            "provider": "anthropic",
+            "enable_builtins": true,
+            "enable_workgraph": false,
+            "builtin_config": {"enable_shell": true, "shell_timeout_secs": 1},
+        }))
+        .expect("run input");
+        let session = session_id_of(
+            Box::pin(handle_meerkat_run(&state, run_input, None, None))
+                .await
+                .expect("meerkat_run succeeds"),
+        );
+
+        let saved = load_saved_session(&state, &session).await;
+        let result = saved
+            .messages()
+            .iter()
+            .find_map(|message| match message {
+                meerkat_core::types::Message::ToolResults { results, .. } => results
+                    .iter()
+                    .find(|result| result.tool_use_id == "call_shell")
+                    .cloned(),
+                _ => None,
+            })
+            .expect("the shell call has a result");
+        let text = result.text_content();
+        assert!(
+            text.contains("timed out after"),
+            "the 1 s override stops the 5 s command: {text}"
+        );
     }
 
     struct OwnershipCheckingLlmClient {

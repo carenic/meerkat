@@ -14148,6 +14148,7 @@ async fn run_agent(
             initial_tool_filter: None,
             initial_tool_visibility_state: None,
             shell_env: None,
+            shell_timeout_secs: None,
             runtime_build_mode: meerkat_core::RuntimeBuildMode::SessionOwned(bindings),
             initial_turn_metadata: None,
             initial_work_authorization: None,

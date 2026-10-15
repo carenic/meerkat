@@ -359,6 +359,7 @@ impl McpScheduleContext {
                     application_tool_policy: meerkat_core::ApplicationToolPolicyBinding::Unmanaged,
                     tool_consequence_policy_registry: None,
                     shell_env: None,
+                    shell_timeout_secs: None,
                     resume_override_mask: {
                         #[cfg(test)]
                         {

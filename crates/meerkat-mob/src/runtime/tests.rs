@@ -2033,6 +2033,9 @@ struct MockSessionService {
     /// (the idempotent-success case).
     create_identity_already_active_no_live_sessions: RwLock<HashSet<SessionId>>,
     fail_start_turn: std::sync::atomic::AtomicBool,
+    /// Upcoming `start_turn` calls that fail like `fail_start_turn`; each
+    /// failing call consumes one.
+    fail_start_turns_remaining: AtomicU64,
     fail_inject: std::sync::atomic::AtomicBool,
     disable_interaction_event_injector: std::sync::atomic::AtomicBool,
     pause_interaction_event_injector: AtomicBool,
@@ -2260,6 +2263,7 @@ impl MockSessionService {
             create_identity_already_active_sessions: RwLock::new(HashSet::new()),
             create_identity_already_active_no_live_sessions: RwLock::new(HashSet::new()),
             fail_start_turn: std::sync::atomic::AtomicBool::new(false),
+            fail_start_turns_remaining: AtomicU64::new(0),
             fail_inject: std::sync::atomic::AtomicBool::new(false),
             disable_interaction_event_injector: std::sync::atomic::AtomicBool::new(false),
             pause_interaction_event_injector: AtomicBool::new(false),
@@ -2763,6 +2767,13 @@ impl MockSessionService {
     fn set_fail_start_turn(&self, enabled: bool) {
         self.fail_start_turn
             .store(enabled, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Fail only the next `count` `start_turn` calls, as `set_fail_start_turn`
+    /// fails every one.
+    fn fail_next_start_turns(&self, count: u64) {
+        self.fail_start_turns_remaining
+            .store(count, Ordering::Release);
     }
 
     #[allow(dead_code)]
@@ -3282,6 +3293,11 @@ impl MockSessionService {
     /// Stop holding turns and release every held one.
     fn release_held_start_turns(&self) {
         self.hold_start_turns.store(false, Ordering::Release);
+        self.held_start_turn_release.notify_waiters();
+    }
+
+    /// Release the turns held now and keep holding later ones.
+    fn release_current_held_start_turns(&self) {
         self.held_start_turn_release.notify_waiters();
     }
 
@@ -4149,6 +4165,12 @@ impl SessionService for MockSessionService {
         if self
             .fail_start_turn
             .load(std::sync::atomic::Ordering::Relaxed)
+            || self
+                .fail_start_turns_remaining
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok()
         {
             return Err(SessionError::Store(Box::new(std::io::Error::other(
                 "mock start_turn failure",
@@ -32704,11 +32726,11 @@ async fn test_cold_resume_of_a_running_mob_reports_a_late_orchestrator_notificat
         "the recorded reason is the delivery failure: {}",
         failure.2
     );
-    // The recorded failure reports the notification's first failed attempt;
-    // the runtime's remaining bounded attempts at that same input may follow
-    // it. Count only once the orchestrator's runtime holds no active input:
-    // every turn call since the restart is then that one resume notification
-    // (the runtime's own attempts at its single input), and no call follows.
+    // The failure is recorded once the notification's input failed
+    // terminally, after the runtime's bounded attempts at it, so that input
+    // has settled. Every turn call since the restart is that one resume
+    // notification (the runtime's own attempts at its single input), and no
+    // call follows.
     wait_for_session_runtime_inputs_settled(&runtime, &orchestrator_session).await;
     let calls_at_failure = service.non_host_start_turn_calls.load(Ordering::Acquire);
     let prompts = service.recorded_start_turn_prompts().await;
@@ -32732,6 +32754,328 @@ async fn test_cold_resume_of_a_running_mob_reports_a_late_orchestrator_notificat
         resumed.status().await.expect("status"),
         MobState::Running,
         "a late notification failure leaves the mob running"
+    );
+}
+
+/// The `OrchestratorResumeNotificationFailed` events recorded after `cursor`.
+async fn orchestrator_resume_notification_failures(
+    handle: &MobHandle,
+    cursor: u64,
+) -> Vec<(AgentIdentity, SessionId, String)> {
+    handle
+        .events()
+        .poll(cursor, 1000)
+        .await
+        .expect("poll events")
+        .into_iter()
+        .filter_map(|event| match event.kind {
+            MobEventKind::OrchestratorResumeNotificationFailed {
+                member_id,
+                session_id,
+                reason,
+            } => Some((member_id, session_id, reason)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Wait until at least one `OrchestratorResumeNotificationFailed` event
+/// follows `cursor`, and return them all.
+async fn wait_for_orchestrator_resume_notification_failures(
+    handle: &MobHandle,
+    cursor: u64,
+) -> Vec<(AgentIdentity, SessionId, String)> {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let found = orchestrator_resume_notification_failures(handle, cursor).await;
+            if !found.is_empty() {
+                break found;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the notification failure is recorded")
+}
+
+/// Create a running mob with one spawned TurnDriven orchestrator `lead-1`,
+/// let `arm` prepare `service`, then restart the mob cold. The resume hands
+/// the orchestrator's notification to the actor's lifecycle owner. Returns the
+/// resumed handle, the orchestrator's session, the event cursor before the
+/// restart and the number of turn prompts recorded before it.
+async fn cold_resume_running_mob_with_turn_driven_orchestrator(
+    service: &Arc<MockSessionService>,
+    arm: impl FnOnce(&MockSessionService),
+) -> (MobHandle, SessionId, u64, usize) {
+    let mut def = sample_definition();
+    for profile in def.profiles.values_mut().filter_map(|b| b.as_inline_mut()) {
+        profile.runtime_mode = crate::MobRuntimeMode::TurnDriven;
+    }
+    let storage = MobStorage::in_memory();
+    let events = storage.events.clone();
+    let runtime_metadata = storage.runtime_metadata.clone();
+    let handle = MobBuilder::new(def, storage)
+        .with_session_service(service.clone())
+        .create()
+        .await
+        .expect("create mob");
+    handle
+        .spawn_with_options(
+            ProfileName::from("lead"),
+            AgentIdentity::from("lead-1"),
+            None,
+            Some(crate::MobRuntimeMode::TurnDriven),
+            None,
+        )
+        .await
+        .expect("spawn orchestrator");
+    let orchestrator_session = handle
+        .resolve_bridge_session_id(&AgentIdentity::from("lead-1"))
+        .await
+        .expect("orchestrator session");
+    let cursor = handle
+        .events()
+        .latest_cursor()
+        .await
+        .expect("event cursor before the restart");
+    arm(service);
+    let prompts_before = service.recorded_start_turn_prompts().await.len();
+    crash_stop_and_release_routes(handle).await;
+    let resumed = tokio::time::timeout(
+        Duration::from_secs(10),
+        MobBuilder::for_resume(MobStorage::with_events_and_runtime_metadata(
+            events,
+            runtime_metadata,
+        ))
+        .with_session_service(service.clone())
+        .resume(),
+    )
+    .await
+    .expect("the reconstruction does not wait on the orchestrator's turn")
+    .expect("running mob reconstruction");
+    (resumed, orchestrator_session, cursor, prompts_before)
+}
+
+/// The turn prompts recorded since `prompts_before`, each checked to be the
+/// orchestrator's resume notification.
+async fn resume_notification_attempts_since(
+    service: &MockSessionService,
+    orchestrator_session: &SessionId,
+    prompts_before: usize,
+) -> usize {
+    let prompts = service.recorded_start_turn_prompts().await;
+    let since = &prompts[prompts_before..];
+    assert!(
+        since.iter().all(|(session_id, prompt)| {
+            session_id == orchestrator_session && prompt.contains("resumed with")
+        }),
+        "only the resume notification ran after the restart: {since:?}"
+    );
+    since.len()
+}
+
+/// The runtime retries a failed resume notification input within its bounded
+/// attempts, in the same wake. A notification whose first attempt fails and
+/// whose retry delivers it was delivered: no failure event is recorded.
+#[tokio::test]
+async fn test_cold_resume_notification_delivered_by_a_runtime_retry_records_no_failure() {
+    let service = Arc::new(MockSessionService::new());
+    let runtime = service.enable_runtime_adapter();
+    let (resumed, orchestrator_session, cursor, prompts_before) =
+        cold_resume_running_mob_with_turn_driven_orchestrator(&service, |service| {
+            service.fail_next_start_turns(1);
+        })
+        .await;
+
+    // The first attempt fails and the runtime's retry of the same input
+    // enters its turn; then that input settles.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while service.recorded_start_turn_prompts().await.len() < prompts_before + 2 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the runtime retries the failed notification input");
+    wait_for_session_runtime_inputs_settled(&runtime, &orchestrator_session).await;
+    // A failure event, if any, is appended once the notification's outcome
+    // is known; give it room to land before asserting there is none.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    assert_eq!(
+        orchestrator_resume_notification_failures(&resumed, cursor).await,
+        Vec::new(),
+        "a notification the runtime's retry delivered records no failure"
+    );
+    assert_eq!(
+        resume_notification_attempts_since(&service, &orchestrator_session, prompts_before).await,
+        2,
+        "one failed attempt and the retry that delivered the notification"
+    );
+    assert_eq!(
+        resumed.status().await.expect("status"),
+        MobState::Running,
+        "the delivered notification leaves the mob running"
+    );
+}
+
+/// A resume notification failure event is final. While the runtime still owes
+/// the notification input an attempt, nothing is recorded; once its bounded
+/// attempts are exhausted, exactly one failure is recorded, after the last
+/// attempt, and none follows it.
+#[tokio::test]
+async fn test_cold_resume_notification_failure_is_recorded_once_after_its_bounded_attempts() {
+    use meerkat_runtime::service_ext::SessionServiceRuntimeExt as _;
+    let service = Arc::new(MockSessionService::new());
+    let runtime = service.enable_runtime_adapter();
+    let mut held = service.held_start_turn_entries();
+    let entered_before = *held.borrow_and_update();
+    let (resumed, orchestrator_session, cursor, prompts_before) =
+        cold_resume_running_mob_with_turn_driven_orchestrator(&service, |service| {
+            service.hold_start_turns();
+            service.set_fail_start_turn(true);
+        })
+        .await;
+
+    // The first attempt enters its turn and fails once released.
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        held.wait_for(|entries| *entries > entered_before),
+    )
+    .await
+    .expect("the resume notification enters its turn")
+    .expect("held-turn signal");
+    service.release_current_held_start_turns();
+    // The runtime retries the same input: its second attempt is held while
+    // the runtime still owes the input a run.
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        held.wait_for(|entries| *entries > entered_before + 1),
+    )
+    .await
+    .expect("the runtime retries the failed notification input")
+    .expect("held-turn signal");
+    assert!(
+        !runtime
+            .list_active_inputs(&orchestrator_session)
+            .await
+            .expect("active inputs")
+            .is_empty(),
+        "the retried notification input is still active"
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        orchestrator_resume_notification_failures(&resumed, cursor).await,
+        Vec::new(),
+        "no failure is recorded while the runtime still owes the notification input an attempt"
+    );
+
+    service.release_held_start_turns();
+    let failures = wait_for_orchestrator_resume_notification_failures(&resumed, cursor).await;
+    // Recorded only once the input settled, after its last attempt.
+    let active = runtime
+        .list_active_inputs(&orchestrator_session)
+        .await
+        .expect("active inputs");
+    assert!(
+        active.is_empty(),
+        "the failure is recorded only once the notification input settled: {active:?}"
+    );
+    let attempts_at_failure =
+        resume_notification_attempts_since(&service, &orchestrator_session, prompts_before).await;
+    assert!(
+        attempts_at_failure >= 2,
+        "the failure follows the runtime's retries, saw {attempts_at_failure} attempts"
+    );
+    assert_eq!(failures.len(), 1, "exactly one failure event: {failures:?}");
+    let failure = failures.into_iter().next().expect("one failure");
+    assert_eq!(failure.0, AgentIdentity::from("lead-1"));
+    assert_eq!(failure.1, orchestrator_session);
+    assert!(
+        failure.2.contains("mock start_turn failure"),
+        "the recorded reason is the delivery failure: {}",
+        failure.2
+    );
+
+    // Nothing follows the final failure: no attempt and no second event.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        orchestrator_resume_notification_failures(&resumed, cursor)
+            .await
+            .len(),
+        1,
+        "exactly one failure event once the attempts are exhausted"
+    );
+    assert_eq!(
+        resume_notification_attempts_since(&service, &orchestrator_session, prompts_before).await,
+        attempts_at_failure,
+        "no attempt follows the recorded failure"
+    );
+    assert_eq!(
+        resumed.status().await.expect("status"),
+        MobState::Running,
+        "a final notification failure leaves the mob running"
+    );
+}
+
+/// An explicit resume reports its orchestrator notification's outcome, not a
+/// failed attempt the runtime retries: when the retry delivers the
+/// notification, the resume succeeds.
+#[tokio::test]
+async fn test_explicit_resume_succeeds_when_a_runtime_retry_delivers_the_notification() {
+    let service = Arc::new(MockSessionService::new());
+    let _ = service.enable_runtime_adapter();
+    let mut def = sample_definition();
+    for profile in def.profiles.values_mut().filter_map(|b| b.as_inline_mut()) {
+        profile.runtime_mode = crate::MobRuntimeMode::TurnDriven;
+    }
+    let storage = MobStorage::in_memory();
+    let events = storage.events.clone();
+    let runtime_metadata = storage.runtime_metadata.clone();
+    let handle = MobBuilder::new(def, storage)
+        .with_session_service(service.clone())
+        .create()
+        .await
+        .expect("create mob");
+    handle
+        .spawn_with_options(
+            ProfileName::from("lead"),
+            AgentIdentity::from("lead-1"),
+            None,
+            Some(crate::MobRuntimeMode::TurnDriven),
+            None,
+        )
+        .await
+        .expect("spawn orchestrator");
+    let orchestrator_session = handle
+        .resolve_bridge_session_id(&AgentIdentity::from("lead-1"))
+        .await
+        .expect("orchestrator session");
+    handle.stop().await.expect("stop");
+    service.fail_next_start_turns(1);
+    let prompts_before = service.recorded_start_turn_prompts().await.len();
+
+    crash_stop_and_release_routes(handle).await;
+    let resumed = MobBuilder::for_resume(MobStorage::with_events_and_runtime_metadata(
+        events,
+        runtime_metadata,
+    ))
+    .with_session_service(service.clone())
+    .resume()
+    .await
+    .expect("stopped mob reconstruction should succeed");
+    resumed
+        .resume()
+        .await
+        .expect("the explicit resume succeeds once the runtime's retry delivers the notification");
+    assert_eq!(
+        resume_notification_attempts_since(&service, &orchestrator_session, prompts_before).await,
+        2,
+        "one failed attempt and the retry that delivered the notification"
+    );
+    assert_eq!(
+        resumed.status().await.expect("status"),
+        MobState::Running,
+        "the resumed mob runs"
     );
 }
 

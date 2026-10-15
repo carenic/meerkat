@@ -135,6 +135,7 @@ import {
   type MonitorsStartResult,
   type MobWireMembersBatchEdge as WireMobWireMembersBatchEdge,
   type MobRotateSupervisorResult,
+  type MobClaimCallbackRouteResult,
   type MobConcludeObjectiveParams,
   type MobConcludeObjectiveResult,
   type McpAddParams,
@@ -3235,6 +3236,25 @@ export class MeerkatClient {
   async mobRotateSupervisor(mobId: string): Promise<MobRotateSupervisorResult> {
     const result = await this.request("mob/rotate_supervisor", { mob_id: mobId });
     return result as unknown as MobRotateSupervisorResult;
+  }
+
+  /**
+   * Claim a mob's member callback route for this connection.
+   * Wraps the `mob/claim_callback_route` RPC. A mob restored after a restart,
+   * or one whose owning connection closed, has no callback route: its
+   * members' callback tools fail `tool_unavailable` until a connection claims
+   * it. After the claim, its live and future members call the tools this
+   * connection registered. A claim while the connection that holds the route
+   * is still open is refused with `-32002`.
+   */
+  async mobClaimCallbackRoute(mobId: string): Promise<MobClaimCallbackRouteResult> {
+    const result = await this.request("mob/claim_callback_route", { mob_id: mobId });
+    MeerkatClient.requireStringField(
+      result,
+      "mob_id",
+      "Invalid mob/claim_callback_route response",
+    );
+    return result as unknown as MobClaimCallbackRouteResult;
   }
 
   /**

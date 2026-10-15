@@ -10802,7 +10802,10 @@ impl MobBuilder {
             // other orchestrator lifecycle delivery.
             // A delivery failure is also recorded as a mob event naming the
             // planned target, so a host observes it through the ordinary
-            // event channel after the resume has returned.
+            // event channel after the resume has returned. The realization
+            // ends at the notification input's terminal, so the event is
+            // recorded once, after the runtime's bounded retries, and never
+            // for a notification a retry delivers.
             for plan in deferred_orchestrator_resume_notifications {
                 let session_service = Arc::clone(&actor.session_service);
                 let provisioner = Arc::clone(&actor.provisioner);

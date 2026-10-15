@@ -79,7 +79,7 @@ pub async fn handle_external_event(
             Ok(result) => RpcResponse::success(id, result),
             Err(message) => RpcResponse::error(id, crate::error::INTERNAL_ERROR, message),
         },
-        Err(err) => RpcResponse::error(id, err.code, err.message),
+        Err(err) => RpcResponse::from_error(id, err),
     }
 }
 
@@ -116,7 +116,7 @@ pub async fn handle_peer_response_terminal(
             Ok(result) => RpcResponse::success(id, result),
             Err(message) => RpcResponse::error(id, crate::error::INTERNAL_ERROR, message),
         },
-        Err(err) => RpcResponse::error(id, err.code, err.message),
+        Err(err) => RpcResponse::from_error(id, err),
     }
 }
 
@@ -144,7 +144,7 @@ pub async fn handle_events_latest_cursor(
             crate::error::INVALID_REQUEST,
             "event replay is not enabled for this runtime host",
         ),
-        Err(err) => RpcResponse::error(id, err.code, err.message),
+        Err(err) => RpcResponse::from_error(id, err),
     }
 }
 
@@ -170,7 +170,7 @@ pub async fn handle_events_list_since(
             crate::error::INVALID_REQUEST,
             "event replay is not enabled for this runtime host",
         ),
-        Err(err) => RpcResponse::error(id, err.code, err.message),
+        Err(err) => RpcResponse::from_error(id, err),
     }
 }
 
@@ -192,7 +192,7 @@ pub async fn handle_events_snapshot(
             crate::error::INVALID_REQUEST,
             "event replay is not enabled for this runtime host",
         ),
-        Err(err) => RpcResponse::error(id, err.code, err.message),
+        Err(err) => RpcResponse::from_error(id, err),
     }
 }
 

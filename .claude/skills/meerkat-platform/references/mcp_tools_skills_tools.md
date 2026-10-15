@@ -237,9 +237,11 @@ RPC (the client answers inline):
 - Python `@client.tool(name, description=..., input_schema=...)`; TypeScript
   `client.registerTool(name, description, inputSchema, handler)`. RPC
   `session/create` also takes `external_tools`.
-- Mob members use the callbacks of the connection whose `mob/create` created
-  the mob. Known issue: a restored mob, or one not made by `mob/create`, has no
-  callback route; re-create it.
+- Mob members use the callbacks of the connection that holds the mob's
+  callback route: its `mob/create` connection, or the one that claimed it
+  with `mob/claim_callback_route`. A restored mob, or one not made by
+  `mob/create`, has no route until a connection claims it; until then a
+  member's callback fails `tool_unavailable`.
 - Give input schemas an object root; a root that declares another `type` is
   refused with an error naming the tool. For Anthropic, a root `oneOf`,
   `anyOf` or `allOf` of plain object schemas is folded into one object.

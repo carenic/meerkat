@@ -655,6 +655,33 @@ fn destroy_report_summary(report: &meerkat_mob::MobDestroyReport) -> String {
 
 type DefaultLlmClientProvider = Arc<dyn Fn() -> Option<Arc<dyn LlmClient>> + Send + Sync + 'static>;
 
+/// One mob's member external tools, as a [`MemberExternalToolsFactory`]
+/// builds them.
+pub struct MemberExternalTools {
+    /// The external tools the mob's members build with.
+    pub provider: meerkat_mob::ExternalToolsProvider,
+    /// Runs once, with the mob's id, when the mob built with `provider`
+    /// enters this state's managed set, before any other caller can find it
+    /// there. A build whose mob never enters it (a failed create, a create
+    /// that lost to a duplicate, a refused restore) never runs it.
+    pub on_managed: Option<MemberExternalToolsOnManaged>,
+}
+
+/// See [`MemberExternalTools::on_managed`].
+pub type MemberExternalToolsOnManaged = Box<dyn FnOnce(&MobId) + Send>;
+
+/// Builds the default external tools of one mob's members from the mob's id
+/// (see [`MobMcpState::with_member_external_tools_factory`]).
+pub type MemberExternalToolsFactory =
+    Arc<dyn Fn(&MobId) -> Option<MemberExternalTools> + Send + Sync>;
+
+/// The member external tools one build uses, and the hook that runs once
+/// the mob it builds is managed.
+type MemberExternalToolsBuild = (
+    Option<meerkat_mob::ExternalToolsProvider>,
+    Option<MemberExternalToolsOnManaged>,
+);
+
 #[doc(hidden)]
 #[derive(Default)]
 pub struct InMemoryArchiveFailureControl {
@@ -900,6 +927,8 @@ pub struct MobMcpState {
     default_llm_client: Option<Arc<dyn LlmClient>>,
     default_llm_client_provider: Option<DefaultLlmClientProvider>,
     external_tools_provider: Option<meerkat_mob::ExternalToolsProvider>,
+    /// Per-mob member external tools (see [`MemberExternalToolsFactory`]).
+    member_external_tools_factory: Option<MemberExternalToolsFactory>,
     /// Host selection of member destinations, inherited by every child mob.
     member_runtime_registration_hook: Option<Arc<dyn meerkat_mob::MemberRuntimeRegistrationHook>>,
     before_activation: std::sync::OnceLock<meerkat_mob::MobBeforeActivation>,
@@ -1109,6 +1138,7 @@ impl MobMcpState {
             default_llm_client: None,
             default_llm_client_provider: None,
             external_tools_provider: None,
+            member_external_tools_factory: None,
             member_runtime_registration_hook: None,
             before_activation: std::sync::OnceLock::new(),
             after_destroy: std::sync::OnceLock::new(),
@@ -2365,6 +2395,43 @@ impl MobMcpState {
         self
     }
 
+    /// Build each mob's member external tools from its id, for every mob
+    /// this state builds without caller-supplied member tools: a restored
+    /// mob, and one created other than through
+    /// [`Self::mob_create_definition_with_member_external_tools`]. A surface
+    /// that binds member tools per mob (an RPC connection's callback route,
+    /// which a later [`Self::mob_claim_member_external_tools`] rebinds)
+    /// supplies it. Without it, those mobs get
+    /// [`Self::with_external_tools_provider`]'s state-wide tools. A build's
+    /// [`MemberExternalTools::on_managed`] runs once its mob is managed.
+    pub fn with_member_external_tools_factory(
+        mut self,
+        factory: MemberExternalToolsFactory,
+    ) -> Self {
+        self.member_external_tools_factory = Some(factory);
+        self
+    }
+
+    /// The member external tools of the mob `mob_id` builds: the caller's
+    /// own, else the per-mob factory's, with the factory's on-managed hook.
+    fn member_external_tools_for(
+        &self,
+        mob_id: &MobId,
+        supplied: Option<meerkat_mob::ExternalToolsProvider>,
+    ) -> MemberExternalToolsBuild {
+        if let Some(supplied) = supplied {
+            return (Some(supplied), None);
+        }
+        match self
+            .member_external_tools_factory
+            .as_ref()
+            .and_then(|factory| factory(mob_id))
+        {
+            Some(tools) => (Some(tools.provider), tools.on_managed),
+            None => (None, None),
+        }
+    }
+
     /// Inherit the host's member destination selection into every child mob
     /// this state creates or restores, so no child member registers without
     /// its destination installed.
@@ -3219,13 +3286,26 @@ impl MobMcpState {
         path: &Path,
     ) -> Result<MobId, MobError> {
         let scope = child_tool_policy::ChildMobScope::default();
+        // The stored definition names the mob whose member tools this build
+        // binds. It is read in its own frame, like the resume below.
+        let created =
+            meerkat_runtime::stack_relief::box_in_own_frame(|| storage.created_definition())
+                .await?;
+        let (member_external_tools, on_managed) = match created {
+            Some(definition) => self.member_external_tools_for(&definition.id, None),
+            None => (None, None),
+        };
         // The builder and its resume are built in their own frame, and so is
         // the registration: at opt-level 0 each awaited future reserved twice
         // its size in this poll frame, beneath the mob's whole resume.
         let handle = meerkat_runtime::stack_relief::box_in_own_frame(|| {
-            self.configure_builder(MobBuilder::for_resume(storage), scope.clone(), None)
-                .before_activation(self.restore_scope_hook(scope))
-                .resume()
+            self.configure_builder(
+                MobBuilder::for_resume(storage),
+                scope.clone(),
+                member_external_tools,
+            )
+            .before_activation(self.restore_scope_hook(scope))
+            .resume()
         })
         .await?;
         #[cfg(test)]
@@ -3241,8 +3321,10 @@ impl MobMcpState {
                 hold.release.notified().await;
             }
         }
-        meerkat_runtime::stack_relief::box_in_own_frame(|| self.register_resumed_mob(handle, path))
-            .await
+        meerkat_runtime::stack_relief::box_in_own_frame(|| {
+            self.register_resumed_mob(handle, path, on_managed)
+        })
+        .await
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -3250,6 +3332,7 @@ impl MobMcpState {
         &self,
         handle: MobHandle,
         path: &Path,
+        on_managed: Option<MemberExternalToolsOnManaged>,
     ) -> Result<MobId, MobError> {
         let mob_id = handle.definition().id.clone();
         match self.mobs.write().await.entry(mob_id.clone()) {
@@ -3264,6 +3347,11 @@ impl MobMcpState {
                     handle,
                     storage_path: Some(path.to_path_buf()),
                 });
+                // Under the managed set's write lock: a caller that finds
+                // the mob also finds what its build bound.
+                if let Some(on_managed) = on_managed {
+                    on_managed(&mob_id);
+                }
                 self.note_mob_set_changed();
             }
             Entry::Occupied(_) => {
@@ -3472,16 +3560,21 @@ impl MobMcpState {
         }
         let scope = child_tool_policy::ChildMobScope::default();
         let (custody, custody_watch) = meerkat_mob::runtime::start_admitted_destroy_custody();
+        let (member_external_tools, on_managed) = self.member_external_tools_for(&mob_id, None);
         // Built in its own frame, like the resume in
         // `resume_persisted_mob_held`.
         let resumed = meerkat_runtime::stack_relief::box_in_own_frame(|| {
-            self.configure_builder(MobBuilder::for_resume(storage), scope.clone(), None)
-                .before_activation(self.restore_scope_hook(scope))
-                .admit_destroy_before_start(
-                    CommandAuthority::principal(self.console_principal.clone()),
-                    custody_watch,
-                )
-                .resume()
+            self.configure_builder(
+                MobBuilder::for_resume(storage),
+                scope.clone(),
+                member_external_tools,
+            )
+            .before_activation(self.restore_scope_hook(scope))
+            .admit_destroy_before_start(
+                CommandAuthority::principal(self.console_principal.clone()),
+                custody_watch,
+            )
+            .resume()
         })
         .await;
         let handle = match resumed {
@@ -3492,7 +3585,7 @@ impl MobMcpState {
             }
         };
         meerkat_runtime::stack_relief::box_in_own_frame(|| {
-            self.register_resumed_mob(handle, &path)
+            self.register_resumed_mob(handle, &path, on_managed)
         })
         .await
         .map_err(MobMcpDestroyError::Mob)?;
@@ -3774,6 +3867,42 @@ impl MobMcpState {
             .await
     }
 
+    /// Claim the member external tools of an existing mob for a caller (an
+    /// RPC connection claiming a mob's callback route).
+    ///
+    /// Admitted like a create: the console owner only (`SendCommand`), and
+    /// held by this state's admission while it runs, so a stood-down state
+    /// admits no claim. A restored mob is restored first, so the claim
+    /// reaches the tools its restored members were built with. `claim` is
+    /// the caller's own binding of what it claims; it runs while the managed
+    /// set is read with the mob in it (so after the mob's
+    /// [`MemberExternalTools::on_managed`]), and its answer is returned
+    /// unchanged.
+    pub async fn mob_claim_member_external_tools<T, F>(
+        &self,
+        mob_id: &MobId,
+        claim: F,
+    ) -> Result<T, MobError>
+    where
+        F: FnOnce() -> T + Send,
+        T: Send,
+    {
+        self.require_console_owner(ControlScope::SendCommand)?;
+        let _admission = self.admit("mob callback route claim")?;
+        self.ensure_restored().await?;
+        let mobs = self.mobs.read().await;
+        if !mobs.contains_key(mob_id) {
+            drop(mobs);
+            return Err(self
+                .held_child_mob_error(mob_id)
+                .await
+                .unwrap_or_else(|| MobError::MobNotFound(mob_id.clone())));
+        }
+        let answer = claim();
+        drop(mobs);
+        Ok(answer)
+    }
+
     pub async fn mob_create_from_mobpack(
         &self,
         definition: MobDefinition,
@@ -3838,11 +3967,12 @@ impl MobMcpState {
         })
         .await?;
         let (storage, storage_path) = self.storage_for_new_mob(&mob_id).await?;
+        let (member_external_tools, on_managed) = self.member_external_tools_for(&mob_id, None);
         let handle = self
             .configure_builder(
                 MobBuilder::new(definition, storage),
                 child_tool_policy::ChildMobScope::default(),
-                None,
+                member_external_tools,
             )
             .create()
             .await?;
@@ -3864,6 +3994,9 @@ impl MobMcpState {
                     handle,
                     storage_path,
                 });
+                if let Some(on_managed) = on_managed {
+                    on_managed(&mob_id);
+                }
                 self.note_mob_set_changed();
                 Ok(mob_id)
             }
@@ -4013,6 +4146,8 @@ impl MobMcpState {
                 .supply(&mut definition)?;
         }
         let scope = child_tool_policy::ChildMobScope::new(child);
+        let (member_external_tools, on_managed) =
+            self.member_external_tools_for(&mob_id, member_external_tools);
         let mut builder = self.configure_builder(
             MobBuilder::new(definition.clone(), storage),
             scope,
@@ -4059,6 +4194,9 @@ impl MobMcpState {
                     handle,
                     storage_path,
                 });
+                if let Some(on_managed) = on_managed {
+                    on_managed(&mob_id);
+                }
                 self.note_mob_set_changed();
             }
             Entry::Occupied(_) => {
@@ -14848,6 +14986,122 @@ mod tests {
         assert_eq!(
             *handle.admission_closed().borrow(),
             Some(meerkat_mob::MobAdmissionCloseReason::StandDown)
+        );
+        assert_eq!(
+            state.stand_down(far_deadline()).await,
+            MobStateStandDown::Clean
+        );
+    }
+
+    /// A member tools build binds only through the create that manages its
+    /// mob. Two creates of one id both build (the second passes the
+    /// existence check while the first waits at the insertion seam); only
+    /// the one that enters the managed set runs its on-managed hook.
+    #[tokio::test]
+    async fn only_the_create_that_manages_its_mob_runs_its_member_tools_hook() {
+        let built = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let managed = Arc::new(std::sync::Mutex::new(Vec::<MobId>::new()));
+        let factory: MemberExternalToolsFactory = Arc::new({
+            let built = Arc::clone(&built);
+            let managed = Arc::clone(&managed);
+            move |_mob_id: &MobId| {
+                built.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let managed = Arc::clone(&managed);
+                let provider: meerkat_mob::ExternalToolsProvider = Arc::new(|| None);
+                Some(MemberExternalTools {
+                    provider,
+                    on_managed: Some(Box::new(move |mob_id: &MobId| {
+                        managed
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .push(mob_id.clone());
+                    })),
+                })
+            }
+        });
+        let state = MobMcpState::new(
+            Arc::new(MockSessionSvc::new()),
+            meerkat_mob::MobControlPrincipal::Owner,
+        )
+        .expect("runtime custody")
+        .with_member_external_tools_factory(factory)
+        .into_shared();
+        let hold = Arc::new(InsertHold::default());
+        *state
+            .create_insert_hold
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::clone(&hold));
+        let reached = |hold: Arc<InsertHold>| async move {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while !hold.reached.load(std::sync::atomic::Ordering::SeqCst) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("a create reaches the insertion seam");
+        };
+
+        let first_state = Arc::clone(&state);
+        let first = tokio::spawn(async move {
+            first_state
+                .mob_create_definition(explicit_definition("hooked-once"))
+                .await
+        });
+        reached(Arc::clone(&hold)).await;
+        hold.reached
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let second_state = Arc::clone(&state);
+        let second = tokio::spawn(async move {
+            second_state
+                .mob_create_definition(explicit_definition("hooked-once"))
+                .await
+        });
+        // The second create builds too: it either fails its build or waits
+        // at the same seam.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !second.is_finished() && !hold.reached.load(std::sync::atomic::Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the second create builds");
+        assert_eq!(
+            built.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "both creates built member tools"
+        );
+        assert!(
+            managed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty(),
+            "no hook runs before a mob is managed"
+        );
+        // Release every create parked at the seam; a permit stored before a
+        // create registers is taken by it.
+        tokio::time::timeout(Duration::from_secs(20), async {
+            while !(first.is_finished() && second.is_finished()) {
+                hold.release.notify_one();
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("both creates finish once released");
+        let outcomes = [
+            first.await.expect("first create task"),
+            second.await.expect("second create task"),
+        ];
+        assert_eq!(
+            outcomes.iter().filter(|outcome| outcome.is_ok()).count(),
+            1,
+            "exactly one create manages the mob: {outcomes:?}"
+        );
+        assert_eq!(
+            *managed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            vec![MobId::from("hooked-once")],
+            "only the managing create ran its hook"
         );
         assert_eq!(
             state.stand_down(far_deadline()).await,

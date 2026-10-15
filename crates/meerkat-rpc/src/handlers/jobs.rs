@@ -189,7 +189,7 @@ pub async fn handle_cancel_on_route(
             };
         }
         Ok(false) => {}
-        Err(error) => return RpcResponse::error(id, error.code, error.message),
+        Err(error) => return RpcResponse::from_error(id, error),
     }
     let service = runtime.detached_job_service();
     match service.request_cancel(&job_id).await {
@@ -311,7 +311,7 @@ pub async fn handle_monitor_start(
     };
     let manager = match runtime.monitor_job_manager_for_session(&session_id).await {
         Ok(manager) => manager,
-        Err(error) => return RpcResponse::error(id, error.code, error.message),
+        Err(error) => return RpcResponse::from_error(id, error),
     };
     let working_dir = params.working_dir.as_deref().map(Path::new);
     let options = meerkat_tools::builtin::shell::MonitorStartOptions {
@@ -535,7 +535,7 @@ pub async fn handle_health(id: Option<RpcId>, runtime: &Arc<SessionRuntime>) -> 
             let awaiting_members = match runtime.detached_job_awaiting_member_count().await {
                 Ok(awaiting_members) => awaiting_members,
                 Err(error) => {
-                    return RpcResponse::error(id, error.code, error.message);
+                    return RpcResponse::from_error(id, error);
                 }
             };
             RpcResponse::success(

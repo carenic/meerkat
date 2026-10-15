@@ -1563,7 +1563,7 @@ async fn configured_mcp_target(
     let realm_config = runtime
         .effective_config()
         .await
-        .map_err(|error| RpcResponse::error(id.clone(), error.code, error.message))?;
+        .map_err(|error| RpcResponse::from_error(id.clone(), error))?;
     let (context_root, user_root) = runtime.skill_identity_roots();
     meerkat::resolve_configured_mcp_target_in_realm(
         mcp,

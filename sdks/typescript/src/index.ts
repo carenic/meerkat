@@ -446,6 +446,7 @@ export type {
   MobSpawnReceiptWire,
   MobSpawnSpecParams,
   MobRotateSupervisorResult,
+  MobClaimCallbackRouteResult,
   MobSupervisorSpecInput,
   MobToolConfigInput,
   MobTopologySpecInput,

@@ -3597,6 +3597,10 @@ pub struct SessionBuildState {
     pub additional_instructions: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shell_env: Option<HashMap<String, String>>,
+    /// The session's own shell command timeout, in seconds (see
+    /// `SessionBuildOptions::shell_timeout_secs`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shell_timeout_secs: Option<std::num::NonZeroU64>,
     /// Compatibility projection of mob operator authority.
     ///
     /// `MobToolAuthorityContext` deliberately loses its generated authority

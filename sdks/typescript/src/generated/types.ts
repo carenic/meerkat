@@ -2277,6 +2277,10 @@ export interface MobRotateSupervisorResult {
   report: SupervisorRotationReportWire;
 }
 
+export interface MobClaimCallbackRouteResult {
+  mob_id: string;
+}
+
 export interface MobSubmitWorkParams {
   content: WireContentInput;
   injected_context?: WireContentInput[] | null;

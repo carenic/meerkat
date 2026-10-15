@@ -140,6 +140,27 @@ fn rpc_mob_external_tools_provider_from_parts(
     })
 }
 
+/// The member external tools of one RPC mob: its callback route slot's
+/// tools, composed with the configured MCP tools.
+#[cfg(feature = "mob")]
+fn rpc_mob_slot_external_tools_provider(
+    runtime: &Arc<SessionRuntime>,
+    slot: Arc<crate::callback_dispatcher::MobCallbackRouteSlot>,
+    configured_mcp_tools: Option<Arc<dyn AgentToolDispatcher>>,
+) -> meerkat_mob::ExternalToolsProvider {
+    let runtime = Arc::downgrade(runtime);
+    let callback_tools_provider: Arc<
+        dyn Fn() -> Option<Arc<dyn AgentToolDispatcher>> + Send + Sync,
+    > = Arc::new(move || {
+        Some(Arc::new(
+            runtime
+                .upgrade()?
+                .callback_tool_dispatcher_for_mob_slot(&slot, vec![]),
+        ) as Arc<dyn AgentToolDispatcher>)
+    });
+    rpc_mob_external_tools_provider_from_parts(callback_tools_provider, configured_mcp_tools)
+}
+
 /// Compose the canonical RPC mob state before serving a transport.
 ///
 /// Shipping binaries use this seam to install process-scoped capabilities
@@ -179,8 +200,44 @@ pub fn compose_rpc_mob_state(
                 .map(|dispatcher| Arc::new(dispatcher) as Arc<dyn AgentToolDispatcher>)
         }
     });
-    let tools_provider =
-        rpc_mob_external_tools_provider_from_parts(callback_tools_provider, configured_mcp_tools);
+    let tools_provider = rpc_mob_external_tools_provider_from_parts(
+        callback_tools_provider,
+        configured_mcp_tools.clone(),
+    );
+    // Every mob built without its creator's route (a restored mob, or one
+    // created other than by `mob/create`) gets a route slot of its own, which
+    // `mob/claim_callback_route` binds to a connection. On a connection-owned
+    // server it starts unclaimed. A single-client host that installed the
+    // process-default route holds it with that route, so its restored mobs
+    // keep reaching its callbacks as before. The slot is indexed for claims
+    // only once its mob is managed, so a build whose mob never gets there (a
+    // create that lost to a duplicate) never shadows the live mob's slot.
+    let member_external_tools_factory: meerkat_mob_mcp::MemberExternalToolsFactory = Arc::new({
+        let runtime = Arc::downgrade(runtime);
+        move |_mob_id: &meerkat_mob::MobId| {
+            let live = runtime.upgrade()?;
+            let slot = Arc::new(match live.default_callback_route() {
+                Some(route) => crate::callback_dispatcher::MobCallbackRouteSlot::claimed_by(route),
+                None => crate::callback_dispatcher::MobCallbackRouteSlot::unclaimed(),
+            });
+            let provider = rpc_mob_slot_external_tools_provider(
+                &live,
+                Arc::clone(&slot),
+                configured_mcp_tools.clone(),
+            );
+            let index_on = Arc::downgrade(&live);
+            let on_managed: meerkat_mob_mcp::MemberExternalToolsOnManaged =
+                Box::new(move |mob_id: &meerkat_mob::MobId| {
+                    if let Some(runtime) = index_on.upgrade() {
+                        runtime.index_mob_callback_route_slot(mob_id.clone(), &slot);
+                    }
+                });
+            Some(meerkat_mob_mcp::MemberExternalTools {
+                provider,
+                on_managed: Some(on_managed),
+            })
+        }
+    });
     let mut state = meerkat_mob_mcp::MobMcpState::new_with_runtime_adapter(
         runtime.session_service(),
         Some(runtime.runtime_adapter()),
@@ -203,6 +260,7 @@ pub fn compose_rpc_mob_state(
     )
     .with_default_llm_client_provider(Some(llm_provider))
     .with_external_tools_provider(Some(tools_provider))
+    .with_member_external_tools_factory(member_external_tools_factory)
     // A top-level session that convenes a detached council is revived
     // through this runtime when its idle executor was retired meanwhile.
     .with_detached_owner_host(Arc::new(crate::detached_owner::RpcDetachedOwnerHost::new(
@@ -2030,31 +2088,34 @@ impl MethodRouter {
             .or_else(|| self.runtime.default_callback_route())
     }
 
-    /// `mob/create`: the new mob's members build their callback tools from
-    /// this connection's route. The route is given to that mob alone when it
-    /// is built, so a mob later created under the same id, or restored, never
-    /// reaches this connection's callbacks.
+    /// `mob/create`: the new mob's members call the callback tools of this
+    /// connection's route, through a route slot this connection holds for
+    /// that mob alone. A mob later created under the same id, or restored,
+    /// gets a slot of its own and never reaches this connection's callbacks
+    /// unless the connection claims it (`mob/claim_callback_route`).
     #[cfg(feature = "mob")]
     async fn handle_mob_create(
         &self,
         id: Option<crate::protocol::RpcId>,
         params: Option<&serde_json::value::RawValue>,
     ) -> RpcResponse {
-        let member_external_tools = self.callback_route.clone().map(|route| {
-            let runtime = Arc::downgrade(&self.runtime);
-            Arc::new(move || {
-                let runtime = runtime.upgrade()?;
-                Some(
-                    Arc::new(runtime.callback_tool_dispatcher_for_route(&route, vec![]))
-                        as Arc<dyn AgentToolDispatcher>,
-                )
-            }) as meerkat_mob::ExternalToolsProvider
+        let slot = self.callback_route().map(|route| {
+            Arc::new(crate::callback_dispatcher::MobCallbackRouteSlot::claimed_by(route))
+        });
+        let member_external_tools = slot.as_ref().map(|slot| {
+            rpc_mob_slot_external_tools_provider(&self.runtime, Arc::clone(slot), None)
         });
         handlers::mob::handle_create_with_member_external_tools(
             id,
             params,
             &self.mob_state,
             member_external_tools,
+            |mob_id| {
+                if let Some(slot) = &slot {
+                    self.runtime
+                        .index_mob_callback_route_slot(mob_id.clone(), slot);
+                }
+            },
         )
         .await
     }
@@ -2778,6 +2839,19 @@ impl MethodRouter {
                     .await
             }
             #[cfg(feature = "mob")]
+            "mob/claim_callback_route" => {
+                routed_arm(|| {
+                    handlers::mob::handle_claim_callback_route(
+                        id,
+                        params,
+                        &self.mob_state,
+                        &self.runtime,
+                        self.callback_route(),
+                    )
+                })
+                .await
+            }
+            #[cfg(feature = "mob")]
             "mob/submit_work" => {
                 routed_arm(|| handlers::mob::handle_submit_work(id, params, &self.mob_state)).await
             }
@@ -2919,7 +2993,7 @@ impl MethodRouter {
             // field reports the same status as the other surfaces.
             "capabilities/get" => match routed_arm(|| self.runtime.effective_config()).await {
                 Ok(config) => handlers::capabilities::handle_get(id, &config),
-                Err(e) => RpcResponse::error(id, e.code, e.message),
+                Err(e) => RpcResponse::from_error(id, e),
             },
             "runtime/host_info" => {
                 routed_arm(|| {
@@ -2969,7 +3043,7 @@ impl MethodRouter {
             // surfaces and matches what a session build resolves.
             "models/catalog" => match routed_arm(|| self.runtime.effective_config()).await {
                 Ok(config) => handlers::models::handle_catalog(id, &config),
-                Err(e) => RpcResponse::error(id, e.code, e.message),
+                Err(e) => RpcResponse::from_error(id, e),
             },
             // Auth + realm methods (Phase 4d).
             "auth/profile/list" => {
@@ -3426,10 +3500,7 @@ impl MethodRouter {
                     ),
                     // A store-layer failure must surface as a typed error, not
                     // be laundered into a "session not found".
-                    Err(err) => match err.data {
-                        Some(data) => RpcResponse::error_with_data(id, err.code, err.message, data),
-                        None => RpcResponse::error(id, err.code, err.message),
-                    },
+                    Err(err) => RpcResponse::from_error(id, err),
                 }
             }
             #[cfg(feature = "mob")]
@@ -3508,7 +3579,7 @@ impl MethodRouter {
                     ),
                     // A store/control-plane fault is surfaced as itself —
                     // never collapsed into a not-found.
-                    Err(err) => RpcResponse::error(id, err.code, err.message),
+                    Err(err) => RpcResponse::from_error(id, err),
                 }
             }
             #[cfg(feature = "mob")]
@@ -3574,7 +3645,7 @@ impl MethodRouter {
                 .await
             {
                 Ok(revision) => RpcResponse::success(id, revision),
-                Err(rpc_err) => RpcResponse::error(id, rpc_err.code, rpc_err.message),
+                Err(rpc_err) => RpcResponse::from_error(id, rpc_err),
             },
             #[cfg(feature = "mob")]
             Some(SessionOwner::Mob) => RpcResponse::error(
@@ -3623,7 +3694,7 @@ impl MethodRouter {
                 .await
             {
                 Ok(list) => RpcResponse::success(id, list),
-                Err(rpc_err) => RpcResponse::error(id, rpc_err.code, rpc_err.message),
+                Err(rpc_err) => RpcResponse::from_error(id, rpc_err),
             },
             #[cfg(feature = "mob")]
             Some(SessionOwner::Mob) => RpcResponse::error(
@@ -3691,7 +3762,7 @@ impl MethodRouter {
                 .await
             {
                 Ok(result) => RpcResponse::success(id, result),
-                Err(rpc_err) => RpcResponse::error(id, rpc_err.code, rpc_err.message),
+                Err(rpc_err) => RpcResponse::from_error(id, rpc_err),
             },
             #[cfg(feature = "mob")]
             Some(SessionOwner::Mob) => RpcResponse::error(
@@ -3743,7 +3814,7 @@ impl MethodRouter {
                 .await
             {
                 Ok(result) => RpcResponse::success(id, result),
-                Err(rpc_err) => RpcResponse::error(id, rpc_err.code, rpc_err.message),
+                Err(rpc_err) => RpcResponse::from_error(id, rpc_err),
             },
             #[cfg(feature = "mob")]
             Some(SessionOwner::Mob) => RpcResponse::error(
@@ -3785,7 +3856,7 @@ impl MethodRouter {
                 .await
             {
                 Ok(result) => RpcResponse::success(id, result),
-                Err(rpc_error) => RpcResponse::error(id, rpc_error.code, rpc_error.message),
+                Err(rpc_error) => RpcResponse::from_error(id, rpc_error),
             },
             #[cfg(feature = "mob")]
             Some(SessionOwner::Mob) => RpcResponse::error(
@@ -3928,7 +3999,7 @@ impl MethodRouter {
                     });
                     RpcResponse::success(id, result)
                 }
-                Err(rpc_err) => RpcResponse::error(id, rpc_err.code, rpc_err.message),
+                Err(rpc_err) => RpcResponse::from_error(id, rpc_err),
             },
             #[cfg(feature = "mob")]
             Some(SessionOwner::Mob) => RpcResponse::error(
@@ -3989,7 +4060,7 @@ impl MethodRouter {
                     });
                     RpcResponse::success(id, result)
                 }
-                Err(rpc_err) => RpcResponse::error(id, rpc_err.code, rpc_err.message),
+                Err(rpc_err) => RpcResponse::from_error(id, rpc_err),
             },
             #[cfg(feature = "mob")]
             Some(SessionOwner::Mob) => RpcResponse::error(
@@ -4026,70 +4097,63 @@ impl MethodRouter {
         #[cfg(feature = "mob")]
         let bridge_session_id = session_id.to_string();
         match routed_arm(|| self.resolve_session_owner(&session_id)).await {
-            Some(SessionOwner::Runtime) => match routed_arm(|| {
-                self.runtime.archive_session(&session_id)
-            })
-            .await
-            {
-                Ok(()) => {
-                    // Clean up session-owned mobs (implicit + explicit).
-                    #[cfg(feature = "mob")]
-                    if let Err(error) = routed_arm(|| {
-                        self.mob_state
-                            .destroy_bridge_session_mobs(&bridge_session_id)
-                    })
-                    .await
-                    {
-                        return mob_destroy_cleanup_error_response(id, error);
-                    }
-                    // The archive committed; join the runtime teardown until
-                    // terminal rather than reporting a saga still completing
-                    // (`UnregisterInProgress` after the caller grace) as a
-                    // failed unregister.
-                    if let Err(error) = routed_arm(|| {
-                        self.runtime_adapter
-                            .unregister_current_session_registration_until_terminal(&session_id)
-                    })
-                    .await
-                    {
-                        return RpcResponse::error(
-                            id,
-                            error::INTERNAL_ERROR,
-                            format!(
-                                "session archived but runtime unregister failed for {session_id}: {error}"
-                            ),
-                        );
-                    }
-                    RpcResponse::success(id, json!({"archived": true}))
-                }
-                Err(rpc_err) => {
-                    #[cfg(feature = "mob")]
-                    {
-                        let retained_cleanup = routed_arm(|| {
+            Some(SessionOwner::Runtime) => {
+                match routed_arm(|| self.runtime.archive_session(&session_id)).await {
+                    Ok(()) => {
+                        // Clean up session-owned mobs (implicit + explicit).
+                        #[cfg(feature = "mob")]
+                        if let Err(error) = routed_arm(|| {
                             self.mob_state
-                                .has_bridge_session_scoped_mobs(&bridge_session_id)
+                                .destroy_bridge_session_mobs(&bridge_session_id)
                         })
-                        .await;
-                        if rpc_err.code == error::SESSION_NOT_FOUND
-                            && retained_cleanup
-                            && let Err(error) = routed_arm(|| {
-                                self.mob_state
-                                    .destroy_bridge_session_mobs(&bridge_session_id)
-                            })
-                            .await
+                        .await
                         {
                             return mob_destroy_cleanup_error_response(id, error);
                         }
-                    }
-
-                    match rpc_err.data {
-                        Some(data) => {
-                            RpcResponse::error_with_data(id, rpc_err.code, rpc_err.message, data)
+                        // The archive committed; join the runtime teardown until
+                        // terminal rather than reporting a saga still completing
+                        // (`UnregisterInProgress` after the caller grace) as a
+                        // failed unregister.
+                        if let Err(error) = routed_arm(|| {
+                            self.runtime_adapter
+                                .unregister_current_session_registration_until_terminal(&session_id)
+                        })
+                        .await
+                        {
+                            return RpcResponse::error(
+                                id,
+                                error::INTERNAL_ERROR,
+                                format!(
+                                    "session archived but runtime unregister failed for {session_id}: {error}"
+                                ),
+                            );
                         }
-                        None => RpcResponse::error(id, rpc_err.code, rpc_err.message),
+                        RpcResponse::success(id, json!({"archived": true}))
+                    }
+                    Err(rpc_err) => {
+                        #[cfg(feature = "mob")]
+                        {
+                            let retained_cleanup = routed_arm(|| {
+                                self.mob_state
+                                    .has_bridge_session_scoped_mobs(&bridge_session_id)
+                            })
+                            .await;
+                            if rpc_err.code == error::SESSION_NOT_FOUND
+                                && retained_cleanup
+                                && let Err(error) = routed_arm(|| {
+                                    self.mob_state
+                                        .destroy_bridge_session_mobs(&bridge_session_id)
+                                })
+                                .await
+                            {
+                                return mob_destroy_cleanup_error_response(id, error);
+                            }
+                        }
+
+                        RpcResponse::from_error(id, rpc_err)
                     }
                 }
-            },
+            }
             #[cfg(feature = "mob")]
             Some(SessionOwner::Mob) => match routed_arm(|| {
                 self.mob_state
@@ -4250,7 +4314,7 @@ impl MethodRouter {
             Some(SessionOwner::Runtime) => {
                 match self.runtime.append_system_context(&session_id, req).await {
                     Ok(result) => RpcResponse::success(id, json!({"status": result.status})),
-                    Err(rpc_err) => RpcResponse::error(id, rpc_err.code, rpc_err.message),
+                    Err(rpc_err) => RpcResponse::from_error(id, rpc_err),
                 }
             }
             #[cfg(feature = "mob")]
@@ -4342,12 +4406,7 @@ impl MethodRouter {
                     // A store-layer failure must surface as a typed error, not
                     // be conflated with an archived session.
                     Err(err) => {
-                        return match err.data {
-                            Some(data) => {
-                                RpcResponse::error_with_data(id, err.code, err.message, data)
-                            }
-                            None => RpcResponse::error(id, err.code, err.message),
-                        };
+                        return RpcResponse::from_error(id, err);
                     }
                 }
                 self.runtime.comms_runtime(&session_id).await
@@ -4450,12 +4509,7 @@ impl MethodRouter {
                     // A store-layer failure must surface as a typed error, not
                     // be conflated with an archived session.
                     Err(err) => {
-                        return match err.data {
-                            Some(data) => {
-                                RpcResponse::error_with_data(id, err.code, err.message, data)
-                            }
-                            None => RpcResponse::error(id, err.code, err.message),
-                        };
+                        return RpcResponse::from_error(id, err);
                     }
                 }
                 self.runtime.comms_runtime(&session_id).await
@@ -5931,7 +5985,20 @@ mod tests {
         );
         assert_eq!(result["capabilities"]["features"]["event_replay"], false);
 
-        let text = serde_json::to_string(result).expect("result serializes");
+        // `mob/claim_callback_route` is a method name, not a topology claim:
+        // it is the one catalog name allowed past the token scan.
+        let mut projection = result.clone();
+        let methods = projection["endpoints"]["rpc_methods"]
+            .as_array_mut()
+            .expect("the projection lists the callable methods");
+        let listed = methods.len();
+        methods.retain(|method| method != "mob/claim_callback_route");
+        assert_eq!(
+            methods.len() + 1,
+            listed,
+            "the claim method is listed once: {result}"
+        );
+        let text = serde_json::to_string(&projection).expect("result serializes");
         for forbidden in ["topology", "registry", "lease", "claim", "project"] {
             assert!(
                 !text.contains(forbidden),
@@ -12415,6 +12482,46 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .starts_with("[meerkat-instruction-activation-v1]")
+        );
+    }
+
+    /// A `session/create` refusal keeps its typed error data: a deferred
+    /// first prompt carrying inline video for a model without inline-video
+    /// support is refused with `INVALID_PARAMS` and the unsupported-capability
+    /// evidence in `error.data`, as `turn/start` reports the same refusal.
+    #[tokio::test]
+    async fn session_create_refusal_keeps_its_typed_error_data() {
+        let (router, _notif_rx) = test_router().await;
+        let prompt = serde_json::to_value(vec![meerkat_core::ContentBlock::Video {
+            media_type: "video/mp4".to_string(),
+            duration_ms: 1000,
+            data: meerkat_core::VideoData::Inline {
+                data: "AAAA".to_string(),
+            },
+        }])
+        .expect("serialize the video prompt");
+        let response = router
+            .dispatch(make_request(
+                "session/create",
+                serde_json::json!({
+                    "prompt": prompt,
+                    "model": "claude-sonnet-4-6",
+                    "initial_turn": "deferred"
+                }),
+            ))
+            .await
+            .unwrap();
+        let error = response
+            .error
+            .expect("inline video for a model without it is refused");
+        assert_eq!(error.code, crate::error::INVALID_PARAMS, "{error:?}");
+        let data = error
+            .data
+            .expect("the refusal keeps its typed unsupported-capability data");
+        assert_eq!(
+            data["unsupported_capability"]["capability"],
+            serde_json::json!("inline_video"),
+            "{data}"
         );
     }
 

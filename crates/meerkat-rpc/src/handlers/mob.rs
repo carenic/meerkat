@@ -15,14 +15,15 @@ use meerkat_contracts::{
     ErrorCode, MobAdoptMemberIdentityDeclarationParams, MobAdoptMemberIdentityDeclarationResult,
     MobAppendSystemContextResult, MobApplyMemberToolDeclarationParams,
     MobApplyMemberToolDeclarationResult, MobCancelAllWorkResult, MobCancelWorkResult,
-    MobConcludeObjectiveParams, MobConcludeObjectiveResult, MobCreateParams, MobCreateResult,
-    MobDestroyResult, MobEventsResult, MobFlowCancelResult, MobFlowRunResult, MobFlowsResult,
-    MobForceCancelResult, MobHelperResult, MobLifecycleResult, MobListResult,
-    MobMemberListEntryWire, MobMemberToolDeclarationParams, MobMemberToolDeclarationResult,
-    MobMembersResult, MobProfileDeleteResult, MobResolveIdentityConvergenceBlockParams,
-    MobResolveIdentityConvergenceBlockResult, MobRespawnReceipt, MobRespawnResult, MobRetireResult,
-    MobRotateSupervisorResult, MobRunParams, MobRunResult, MobRunResultParams, MobSnapshotResult,
-    MobSpawnManyResult, MobSpawnManyResultEntry, MobSpawnResult, MobStatusResult, MobUnwireResult,
+    MobClaimCallbackRouteResult, MobConcludeObjectiveParams, MobConcludeObjectiveResult,
+    MobCreateParams, MobCreateResult, MobDestroyResult, MobEventsResult, MobFlowCancelResult,
+    MobFlowRunResult, MobFlowsResult, MobForceCancelResult, MobHelperResult, MobLifecycleResult,
+    MobListResult, MobMemberListEntryWire, MobMemberToolDeclarationParams,
+    MobMemberToolDeclarationResult, MobMembersResult, MobProfileDeleteResult,
+    MobResolveIdentityConvergenceBlockParams, MobResolveIdentityConvergenceBlockResult,
+    MobRespawnReceipt, MobRespawnResult, MobRetireResult, MobRotateSupervisorResult, MobRunParams,
+    MobRunResult, MobRunResultParams, MobSnapshotResult, MobSpawnManyResult,
+    MobSpawnManyResultEntry, MobSpawnResult, MobStatusResult, MobUnwireResult,
     MobWaitMembersResult, MobWireMembersBatchEdge, MobWireMembersBatchParams,
     MobWireMembersBatchResult, MobWireResult, SupervisorRotationIncompleteDataWire,
     SupervisorRotationIncompleteDetailsWire, SupervisorRotationReportWire,
@@ -388,16 +389,18 @@ pub async fn handle_create(
     params: Option<&RawValue>,
     state: &Arc<MobMcpState>,
 ) -> RpcResponse {
-    handle_create_with_member_external_tools(id, params, state, None).await
+    handle_create_with_member_external_tools(id, params, state, None, |_| {}).await
 }
 
 /// [`handle_create`] whose members build with `member_external_tools` (the
-/// creating connection's callback tools) in place of the state-wide source.
+/// creating connection's callback tools) in place of the state's own.
+/// `on_created` runs with the new mob's id once the create succeeds.
 pub(crate) async fn handle_create_with_member_external_tools(
     id: Option<RpcId>,
     params: Option<&RawValue>,
     state: &Arc<MobMcpState>,
     member_external_tools: Option<meerkat_mob::ExternalToolsProvider>,
+    on_created: impl FnOnce(&MobId),
 ) -> RpcResponse {
     let params: MobCreateParams = match parse_params(params) {
         Ok(p) => p,
@@ -419,12 +422,15 @@ pub(crate) async fn handle_create_with_member_external_tools(
     };
 
     match result {
-        Ok(mob_id) => RpcResponse::success(
-            id,
-            MobCreateResult {
-                mob_id: mob_id.to_string(),
-            },
-        ),
+        Ok(mob_id) => {
+            on_created(&mob_id);
+            RpcResponse::success(
+                id,
+                MobCreateResult {
+                    mob_id: mob_id.to_string(),
+                },
+            )
+        }
         Err(err) => mob_call_error(id, &err),
     }
 }
@@ -2086,6 +2092,87 @@ pub async fn handle_rotate_supervisor(
 }
 
 // ---------------------------------------------------------------------------
+// mob/claim_callback_route
+// ---------------------------------------------------------------------------
+
+/// `data` of a `mob/claim_callback_route` refused (`-32002`) because
+/// another open connection holds the route.
+#[derive(Debug, serde::Serialize)]
+struct MobCallbackRouteClaimRefusedData {
+    mob_id: String,
+    /// Why the claim was refused: `held_by_open_connection`.
+    reason: &'static str,
+}
+
+/// Handle `mob/claim_callback_route`: bind the mob's member callback route
+/// to the calling connection's `route`, so the mob's live and future
+/// members call the callback tools that connection registered.
+///
+/// Admitted like `mob/create`. A mob whose route no open connection holds
+/// (one restored after a restart, or one whose connection closed) is
+/// claimed; while another open connection holds it, the claim is refused
+/// with `-32002`.
+pub(crate) async fn handle_claim_callback_route(
+    id: Option<RpcId>,
+    params: Option<&RawValue>,
+    state: &Arc<MobMcpState>,
+    runtime: &Arc<SessionRuntime>,
+    route: Option<crate::callback_dispatcher::CallbackRoute>,
+) -> RpcResponse {
+    let params: MobIdParams = match parse_params(params) {
+        Ok(p) => p,
+        Err(resp) => return resp.with_id(id),
+    };
+    let mob_id = match parse_mob_id(id.clone(), &params.mob_id) {
+        Ok(m) => m,
+        Err(resp) => return resp,
+    };
+    let Some(route) = route else {
+        return RpcResponse::error(
+            id,
+            error::INVALID_REQUEST,
+            "this connection has no callback route to claim",
+        );
+    };
+    let claimed = state
+        .mob_claim_member_external_tools(&mob_id, || {
+            runtime
+                .mob_callback_route_slot(&mob_id)
+                .map(|slot| slot.claim(&route))
+        })
+        .await;
+    match claimed {
+        Ok(Some(Ok(()))) => RpcResponse::success(
+            id,
+            MobClaimCallbackRouteResult {
+                mob_id: mob_id.to_string(),
+            },
+        ),
+        Ok(Some(Err(refused))) => {
+            let message = format!("mob '{mob_id}': {refused}");
+            let reason = match refused {
+                crate::callback_dispatcher::MobCallbackRouteClaimRefused::HeldByOpenConnection => {
+                    "held_by_open_connection"
+                }
+            };
+            match serde_json::to_value(MobCallbackRouteClaimRefusedData {
+                mob_id: mob_id.to_string(),
+                reason,
+            }) {
+                Ok(data) => RpcResponse::error_with_data(id, error::SESSION_BUSY, message, data),
+                Err(_) => RpcResponse::error(id, error::SESSION_BUSY, message),
+            }
+        }
+        Ok(None) => RpcResponse::error(
+            id,
+            error::INVALID_REQUEST,
+            format!("mob '{mob_id}' has no callback route a connection can claim"),
+        ),
+        Err(err) => mob_call_error(id, &err),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // mob/submit_work, mob/cancel_work, mob/cancel_all_work (Finding C4)
 // ---------------------------------------------------------------------------
 //
@@ -2416,7 +2503,7 @@ pub async fn handle_member_status(
                                 match runtime.detached_job_await_activity(&session_id).await {
                                     Ok(activity) => activity,
                                     Err(error) => {
-                                        return RpcResponse::error(id, error.code, error.message);
+                                        return RpcResponse::from_error(id, error);
                                     }
                                 };
                             if let Some(activity) = await_activity {

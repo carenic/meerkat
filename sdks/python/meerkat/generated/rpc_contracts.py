@@ -132,6 +132,7 @@ from .types import (
     MobCancelAllWorkResult,
     MobCancelWorkParams,
     MobCancelWorkResult,
+    MobClaimCallbackRouteResult,
     MobConcludeObjectiveParams,
     MobConcludeObjectiveResult,
     MobCreateParams,
@@ -1441,6 +1442,14 @@ class RpcRequest(Protocol):
         params: MobIdParams,
         /,
     ) -> Awaitable[MobRotateSupervisorResult]: ...
+
+    @overload
+    def __call__(
+        self,
+        method: Literal["mob/claim_callback_route"],
+        params: MobIdParams,
+        /,
+    ) -> Awaitable[MobClaimCallbackRouteResult]: ...
 
     @overload
     def __call__(

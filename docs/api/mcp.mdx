@@ -886,8 +886,13 @@ extraction calls.
 </ParamField>
 
 <ParamField body="builtin_config.shell_timeout_secs" type="u64 | null" default="null">
-  Accepted and ignored in 0.9.1. Set the shell's default command timeout with
-  `[shell] timeout_secs` in the realm config.
+  Default command timeout, in seconds, of the shell tool in the session this
+  call builds: the session's own `[shell] timeout_secs`. A shell call's own
+  `timeout_secs` still wins. The session records it, so a `meerkat_resume`
+  that rebuilds the session keeps it unless the resume sets its own. Omit /
+  `null` / `0` keep the realm's `[shell] timeout_secs` (30 s unless
+  configured) on `meerkat_run`, and the session's recorded value on
+  `meerkat_resume`.
 </ParamField>
 
 <ParamField body="keep_alive" type="bool | null" default="null">
