@@ -25,8 +25,11 @@ under the [BuildBuddy rules below](#buildbuddy). Both release backends still
 require exact-main GitHub Actions CI (the Cargo-only pull-request lanes),
 and the tag path additionally runs the full BuildBuddy graph as its
 validation gate while the self-hosted graph is enabled
-(`MEERKAT_GCP_BUILDBUDDY_ENABLED` is `true`); otherwise the tag validates
-with the Cargo validation job. Windows binaries are cross-compiled
+(`MEERKAT_GCP_BUILDBUDDY_ENABLED` is `true`); otherwise the verified schema-4
+exact-tree CI attestation is the tag's validation, because that exact-main run
+already ran every check of the Cargo validation job (which still validates a
+tag whose attestation is a legacy schema, and every eligible manual dispatch
+that selects it). Windows binaries are cross-compiled
 and packaged on hosted Ubuntu, then verified on Windows; credentialed registry
 publishing stays GitHub-hosted.
 
@@ -245,7 +248,10 @@ embedding a separate runtime implementation.
    semver readiness produce separate artifacts; one cannot substitute for the
    other.
 3. The tag path verifies the exact-tree CI attestation instead of recomputing
-   the broad CI graph. After `require_ci_green`, `release_semver_gate` looks
+   the broad CI graph: with the self-hosted graph off, a verified schema-4
+   attestation passes `release_validate_gate` without `release_validate_cargo`,
+   so publication starts minutes after the tag when CI is already green.
+   After `require_ci_green`, `release_semver_gate` looks
    up `meerkat-semver-attestation-main-<tree_sha>` and requires unexpired
    evidence for that tree and version from a successful readiness `main` push.
 4. In parallel, verify registry credentials, consume declared-break evidence,

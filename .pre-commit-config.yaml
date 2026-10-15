@@ -287,7 +287,7 @@ repos:
         stages: [pre-push]
 
       - id: gcp-buildbuddy-workflow-gate-contract
-        name: self-hosted GCP graph stays default-off and tags validate with Cargo while it is off
+        name: self-hosted GCP graph stays default-off and tags validate on exact-tree CI while it is off
         entry: scripts/test-gcp-buildbuddy-workflow-gate.sh
         language: script
         pass_filenames: false

@@ -29,6 +29,8 @@ SLO_PASS="PASS Rust registry publication reads crates back before the SDKs and e
 SLO_FAIL="FAIL Rust registry publication does not read crates back before the SDKs or enforce the 30 minute publication SLO"
 DISPATCH_PASS="PASS Publishing dispatches are bound to their version's tag"
 DISPATCH_FAIL="FAIL A publishing dispatch without release_tag could publish a branch tip as the tagged version"
+TAG_VALIDATION_PASS="PASS Tag releases validate on the verified schema-4 exact-tree CI attestation instead of re-running Cargo validation"
+TAG_VALIDATION_FAIL="FAIL Tag releases must validate on the verified schema-4 exact-tree CI attestation"
 
 fail() {
   echo "release doctor workflow contract violated: $1" >&2
@@ -335,6 +337,33 @@ elif name == "dispatch-reflowed":
         "            github.event.inputs.publish_release_assets_only == 'true'))\n",
         "          (github.event_name == 'workflow_dispatch' && (github.event.inputs.publish_release_assets_only == 'true' || github.event.inputs.publish_web_sdk_only == 'true' || github.event.inputs.publish_release_packages == 'true' || github.event.inputs.release_tag != ''))\n",
     )
+elif name == "tag-validation-cargo-on-attested-tags":
+    # The pre-change route: a tag re-runs Cargo validation whenever the
+    # self-hosted graph is off, whatever its exact-tree CI already covered.
+    replace_once(
+        " &&\n       needs.require_ci_green.outputs.ci_attestation_schema != '4') ||\n",
+        ") ||\n",
+    )
+elif name == "tag-validation-gate-any-schema":
+    # The gate trusts any verified attestation, so a legacy schema that does
+    # not name the CI lanes skips Cargo validation too.
+    replace_once(
+        '            if [[ "${ci_attestation_schema}" == "4" ]]; then\n',
+        '            if [[ -n "${ci_attestation_schema}" ]]; then\n',
+    )
+elif name == "tag-validation-schema-unwritten":
+    # The verifier no longer exposes the schema it verified.
+    replace_once('          echo "schema=${schema}" >> "${GITHUB_OUTPUT}"\n', "")
+elif name == "tag-validation-reflowed":
+    # Equivalent: the tag disjunct on one line, its operands reordered.
+    replace_once(
+        "      (github.event_name != 'workflow_dispatch' &&\n"
+        "       vars.MEERKAT_GCP_BUILDBUDDY_ENABLED != 'true' &&\n"
+        "       needs.require_ci_green.outputs.ci_attestation_schema != '4') ||\n",
+        "      (needs.require_ci_green.outputs.ci_attestation_schema != '4' && "
+        "vars.MEERKAT_GCP_BUILDBUDDY_ENABLED != 'true' && "
+        "github.event_name != 'workflow_dispatch') ||\n",
+    )
 elif name == "both-defects":
     replace_once(
         MEASUREMENT_STEP_IF,
@@ -405,6 +434,8 @@ mutate dispatch-ref-name "${TEST_ROOT}/dispatch-ref-name.yml"
 expect_pass dispatch-ref-name "${TEST_ROOT}/dispatch-ref-name.yml" dispatch-binding
 mutate dispatch-ref-name-expression "${TEST_ROOT}/dispatch-ref-name-expression.yml"
 expect_pass dispatch-ref-name-expression "${TEST_ROOT}/dispatch-ref-name-expression.yml" dispatch-binding
+mutate tag-validation-reflowed "${TEST_ROOT}/tag-validation-reflowed.yml"
+expect_pass tag-validation-reflowed "${TEST_ROOT}/tag-validation-reflowed.yml" tag-validation
 
 # 3. Dropping the behaviour fails and names the defect.
 mutate evidence-step-removed "${TEST_ROOT}/evidence-step-removed.yml"
@@ -466,6 +497,16 @@ mutate dispatch-branch-name "${TEST_ROOT}/dispatch-branch-name.yml"
 expect_fail_named dispatch-branch-name "${TEST_ROOT}/dispatch-branch-name.yml" \
   "accepts a package dispatch from refs/heads/release/v0.0.0 without release_tag" dispatch-binding
 
+mutate tag-validation-cargo-on-attested-tags "${TEST_ROOT}/tag-validation-cargo-on-attested-tags.yml"
+expect_fail_named tag-validation-cargo-on-attested-tags "${TEST_ROOT}/tag-validation-cargo-on-attested-tags.yml" \
+  "runs on a tag push with a verified schema-4 attestation" tag-validation
+mutate tag-validation-gate-any-schema "${TEST_ROOT}/tag-validation-gate-any-schema.yml"
+expect_fail_named tag-validation-gate-any-schema "${TEST_ROOT}/tag-validation-gate-any-schema.yml" \
+  "accepts a tag push with a verified legacy (schema 1) attestation and Cargo validation skipped" tag-validation
+mutate tag-validation-schema-unwritten "${TEST_ROOT}/tag-validation-schema-unwritten.yml"
+expect_fail_named tag-validation-schema-unwritten "${TEST_ROOT}/tag-validation-schema-unwritten.yml" \
+  "does not write \`schema\` to \$GITHUB_OUTPUT" tag-validation
+
 mutate readback-step-removed "${TEST_ROOT}/readback-step-removed.yml"
 expect_fail_named readback-step-removed "${TEST_ROOT}/readback-step-removed.yml" \
   "no step that reads every crate back" registry-slo
@@ -485,7 +526,7 @@ run_doctor() {
 }
 
 run_doctor "$WORKFLOW" "${TEST_ROOT}/doctor-committed.log"
-for line in "$SEMVER_PASS" "$SLO_PASS" "$DISPATCH_PASS"; do
+for line in "$SEMVER_PASS" "$SLO_PASS" "$DISPATCH_PASS" "$TAG_VALIDATION_PASS"; do
   if ! grep -Fxq "$line" "${TEST_ROOT}/doctor-committed.log"; then
     fail "doctor does not report \`${line}\` for the committed workflow" \
       "$(cat "${TEST_ROOT}/doctor-committed.log")"
@@ -506,6 +547,13 @@ run_doctor "${TEST_ROOT}/doctor-dispatch-unbound.yml" "${TEST_ROOT}/doctor-dispa
 if ! grep -Fq "$DISPATCH_FAIL" "${TEST_ROOT}/doctor-dispatch.log"; then
   fail "doctor does not report \`${DISPATCH_FAIL}\` for a workflow whose branch dispatch is unbound" \
     "$(cat "${TEST_ROOT}/doctor-dispatch.log")"
+fi
+
+mutate tag-validation-cargo-on-attested-tags "${TEST_ROOT}/doctor-tag-validation.yml"
+run_doctor "${TEST_ROOT}/doctor-tag-validation.yml" "${TEST_ROOT}/doctor-tag-validation.log"
+if ! grep -Fq "$TAG_VALIDATION_FAIL" "${TEST_ROOT}/doctor-tag-validation.log"; then
+  fail "doctor does not report \`${TAG_VALIDATION_FAIL}\` for a workflow that re-runs Cargo validation on attested tags" \
+    "$(cat "${TEST_ROOT}/doctor-tag-validation.log")"
 fi
 
 echo "release doctor workflow contract holds"

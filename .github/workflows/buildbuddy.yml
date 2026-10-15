@@ -763,7 +763,7 @@ jobs:
       - name: Require the self-hosted graph to be enabled
         if: ${{ vars.MEERKAT_GCP_BUILDBUDDY_ENABLED != 'true' }}
         run: |
-          echo "::error::BuildBuddy graph is disabled (repository variable MEERKAT_GCP_BUILDBUDDY_ENABLED is not 'true'): nothing was started and nothing was validated. Release tags validate with Cargo while it is off."
+          echo "::error::BuildBuddy graph is disabled (repository variable MEERKAT_GCP_BUILDBUDDY_ENABLED is not 'true'): nothing was started and nothing was validated. Release tags validate on their exact-tree CI attestation while it is off."
           exit 1
       - name: Check results
         run: |

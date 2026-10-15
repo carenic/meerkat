@@ -623,8 +623,9 @@ fn buildbuddy_workflow_is_called_only_by_nightly_and_release() {
     );
     // The self-hosted graph is default off behind one repository variable:
     // every job in buildbuddy.yml that starts, syncs or scales GCP carries it,
-    // and a tag validates with Cargo whenever it is off
-    // (scripts/test-gcp-buildbuddy-workflow-gate.sh plans both routes).
+    // and while it is off a tag validates on its exact-tree CI attestation,
+    // with Cargo only for a legacy one
+    // (scripts/test-gcp-buildbuddy-workflow-gate.sh plans every route).
     const GATE_ON: &str = "vars.MEERKAT_GCP_BUILDBUDDY_ENABLED == 'true'";
     const GATE_OFF: &str = "vars.MEERKAT_GCP_BUILDBUDDY_ENABLED != 'true'";
     let job_if = |workflow: &serde_yaml::Value, job: &str| -> String {
@@ -655,7 +656,7 @@ fn buildbuddy_workflow_is_called_only_by_nightly_and_release() {
     );
     assert!(
         job_if(&release_doc, "release_validate_cargo").contains(GATE_OFF),
-        "the tag validates with Cargo while the self-hosted graph is disabled"
+        "Cargo validates a legacy-attested tag only while the self-hosted graph is disabled"
     );
 }
 

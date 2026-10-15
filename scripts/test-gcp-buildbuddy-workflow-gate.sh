@@ -11,9 +11,11 @@
 #
 #   variable unset: no job that starts, syncs or scales anything in GCP is
 #     planned; nightly skips gcp-buildbuddy and still runs its chains; a tag
-#     validates with "Validate release state with Cargo" and the release
-#     validation gate accepts exactly that route; buildbuddy.yml, if called
-#     anyway, fails its gate instead of passing.
+#     whose exact-tree CI attestation is schema 4 validates on that
+#     attestation alone ("Validate release state with Cargo" is skipped), a
+#     tag with a legacy attestation validates with Cargo, and the release
+#     validation gate accepts exactly the planned route; buildbuddy.yml, if
+#     called anyway, fails its gate instead of passing.
 #   variable 'true': the previous route is unchanged (the full graph on tags,
 #     every GCP job in buildbuddy.yml, Cargo skipped on tags).
 #   always: the hosted BuildBuddy binary job does not depend on the gate.
@@ -256,11 +258,14 @@ STATUS_FUNCTIONS = re.compile(r"\b(always|success|failure|cancelled)\s*\(")
 
 
 class Scenario:
-    def __init__(self, event, gate, actor="lukacf", inputs=None, release_backend=None):
+    def __init__(self, event, gate, actor="lukacf", inputs=None, release_backend=None, outputs=None):
         self.event = event
         self.vars = {GATE_VAR: "true"} if gate else {}
         self.actor = actor
         self.inputs = dict(inputs or {})
+        # job -> {output: value} for the jobs whose outputs a scenario models;
+        # any other job that ran reports every output as "true" (change flags).
+        self.outputs = {job: dict(values) for job, values in (outputs or {}).items()}
         self.dispatch_inputs = {}
         if event == "workflow_dispatch":
             self.dispatch_inputs = {k: ("true" if v is True else "false" if v is False else str(v)) for k, v in self.inputs.items()}
@@ -330,8 +335,12 @@ def evaluate(node, scenario, needs, results):
             if parts[2] == "result":
                 return results.get(job, "skipped")
             if parts[2] == "outputs" and len(parts) == 4:
+                if results.get(job) != "success":
+                    return ""
+                if job in scenario.outputs:
+                    return scenario.outputs[job].get(parts[3], "")
                 # A job that ran reports every change flag as changed.
-                return "true" if results.get(job) == "success" else ""
+                return "true"
         sys.exit(f"unsupported context {node[1]!r}")
     sys.exit(f"unsupported node {node!r}")
 
@@ -535,38 +544,63 @@ def release_route(scenario):
     return {job: results[job] for job in VALIDATION + ("release_validate_gate",)}, results
 
 
+def attested(schema):
+    """require_ci_green's outputs on a tag run whose attestation has `schema`."""
+    return {"require_ci_green": {"ci_attestation_schema": schema}}
+
+
 for gate in (False, True):
-    scenario = Scenario("push", gate)
-    before = len(FAILURES)
-    route, results = release_route(scenario)
-    expected = {
-        "release_validate_cargo": "skipped" if gate else "success",
-        "release_validate_buildbuddy": "skipped",
-        "release_validate_buildbuddy_full": "success" if gate else "skipped",
-        "release_validate_gate": "success",
-    }
-    if route != expected:
-        fail(f"release tag push with {GATE_VAR} {'set' if gate else 'unset'}: route {route}, expected {expected}")
-    accepted, output = release_gate_accepts(scenario, results)
-    if not accepted:
-        fail(f"release validation gate rejects the planned tag route ({scenario.describe()}):\n{output}")
-    elif len(FAILURES) == before:
-        ok(f"release tag push ({scenario.describe()}) validates with "
-           f"{'the full BuildBuddy graph' if gate else 'Cargo'} and the gate accepts it")
-    # The gate must not accept the other route for the same variable state.
-    swapped = dict(results)
-    swapped["release_validate_cargo"], swapped["release_validate_buildbuddy_full"] = (
-        results["release_validate_buildbuddy_full"],
-        results["release_validate_cargo"],
-    )
-    accepted, _ = release_gate_accepts(scenario, swapped)
-    if accepted:
-        fail(f"release validation gate accepts the wrong route for {scenario.describe()}")
-    failed = dict(results)
-    failed["release_validate_cargo" if not gate else "release_validate_buildbuddy_full"] = "failure"
-    accepted, _ = release_gate_accepts(scenario, failed)
-    if accepted:
-        fail(f"release validation gate accepts a failed validation for {scenario.describe()}")
+    for schema in ("4", "1"):
+        scenario = Scenario("push", gate, outputs=attested(schema))
+        label = f"{scenario.describe()} attestation schema {schema}"
+        before = len(FAILURES)
+        route, results = release_route(scenario)
+        cargo_validates = not gate and schema != "4"
+        expected = {
+            "release_validate_cargo": "success" if cargo_validates else "skipped",
+            "release_validate_buildbuddy": "skipped",
+            "release_validate_buildbuddy_full": "success" if gate else "skipped",
+            "release_validate_gate": "success",
+        }
+        if route != expected:
+            fail(f"release tag push ({label}): route {route}, expected {expected}")
+        accepted, output = release_gate_accepts(scenario, results)
+        if not accepted:
+            fail(f"release validation gate rejects the planned tag route ({label}):\n{output}")
+        elif len(FAILURES) == before:
+            validator = (
+                "the full BuildBuddy graph" if gate
+                else "Cargo" if cargo_validates
+                else "the schema-4 exact-tree CI attestation (Cargo skipped)"
+            )
+            ok(f"release tag push ({label}) validates with {validator} and the gate accepts it")
+        # The gate must not accept another route for the same state: each
+        # validation job flipped between ran and skipped is refused.
+        for job in ("release_validate_cargo", "release_validate_buildbuddy_full"):
+            flipped = dict(results)
+            flipped[job] = "skipped" if results[job] == "success" else "success"
+            accepted, _ = release_gate_accepts(scenario, flipped)
+            if accepted:
+                fail(f"release validation gate accepts {job}={flipped[job]} for {label}")
+        if gate or cargo_validates:
+            failed = dict(results)
+            failed["release_validate_buildbuddy_full" if gate else "release_validate_cargo"] = "failure"
+            accepted, _ = release_gate_accepts(scenario, failed)
+            if accepted:
+                fail(f"release validation gate accepts a failed validation for {label}")
+        else:
+            # The attestation is the validation: the same skipped route is
+            # refused when the verified attestation is not schema 4, and when
+            # require_ci_green did not succeed.
+            legacy = Scenario("push", gate, outputs=attested("1"))
+            accepted, _ = release_gate_accepts(legacy, results)
+            if accepted:
+                fail(f"release validation gate accepts a skipped Cargo validation with a legacy attestation ({legacy.describe()})")
+            red_ci = dict(results)
+            red_ci["require_ci_green"] = "failure"
+            accepted, _ = release_gate_accepts(scenario, red_ci)
+            if accepted:
+                fail(f"release validation gate accepts a tag whose exact-main CI did not succeed ({label})")
 
 for gate in (False, True):
     for actor, backend, selected in (
@@ -577,7 +611,7 @@ for gate in (False, True):
         scenario = Scenario("workflow_dispatch", gate, actor=actor, inputs={
             "publish_web_sdk_only": False,
             "publish_release_assets_only": False,
-        }, release_backend=backend)
+        }, release_backend=backend, outputs={"require_ci_green": {}})
         route, results = release_route(scenario)
         ran_jobs = [job for job in VALIDATION if route[job] == "success"]
         if ran_jobs != [selected]:

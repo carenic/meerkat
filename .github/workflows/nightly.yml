@@ -69,7 +69,7 @@ on:
         # dispatch warms the remote cache for the tag run. While
         # MEERKAT_GCP_BUILDBUDDY_ENABLED is not 'true' such a dispatch starts
         # nothing in GCP and fails (buildbuddy.yml's gate), and the tag
-        # validates with Cargo instead (release.yml).
+        # validates on its exact-tree CI attestation instead (release.yml).
         description: Run only the full BuildBuddy graph (pre-tag check / cache warm-up).
         required: false
         default: false
