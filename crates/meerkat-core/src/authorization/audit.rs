@@ -80,10 +80,44 @@ pub enum OperationObservation {
     ReviewAttemptStarted {
         attempt_ref: crate::approval::review::ReviewAttemptRef,
     },
-    Entry,
+    /// A synchronous entry attempt at the named boundary. Several boundaries
+    /// can observe the entry of one operation (each staging point on a tool
+    /// call's dispatch chain, then its effect), so each names itself; none
+    /// is proof that the physical effect ran.
+    Entry(OperationEntryBoundary),
     Outcome(OperationObservedOutcome),
     Refused(OperationRefusalKind),
     AuthorizationUnavailable,
+}
+
+/// The operation boundary that observed an entry attempt. It identifies the
+/// layer that staged the entry, so the entries of one operation can be told
+/// apart; it grants nothing and is not a lifecycle state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum OperationEntryBoundary {
+    /// A tool call's staging on its dispatch chain: the session's root
+    /// dispatch, or an adapter on the way to the owning tool
+    /// ([`crate::ToolDispatchContext::observe_tool_entry`]).
+    ToolDispatch,
+    /// The call-level execution policy gate's staging of a tool call
+    /// ([`crate::ExecutionPolicyGatedDispatcher`]).
+    ToolExecutionPolicy,
+    /// The owning tool leaf's single consuming entry, immediately before
+    /// its effect or transport handoff
+    /// ([`crate::ToolDispatchContext::enter_reviewed_effect`]).
+    ToolEffect,
+    /// An MCP resource read's transport entry.
+    McpResourceRead,
+    /// Applying a live MCP attachment control.
+    McpAttachment,
+    /// A model request's transport entry.
+    ModelRequest,
+    /// A system context append to a session.
+    ContextAppend,
+    /// A source read for an operation's review context.
+    ReviewContextRead,
 }
 
 impl std::fmt::Debug for OperationObservation {

@@ -712,7 +712,11 @@ impl<T: AgentToolDispatcher + ?Sized + 'static> AgentToolDispatcher
         } else {
             context
         };
-        let current_context = match base.observe_tool_entry(call, None) {
+        let current_context = match base.observe_tool_entry_at(
+            call,
+            None,
+            crate::authorization::OperationEntryBoundary::ToolExecutionPolicy,
+        ) {
             Ok(current) => current,
             Err(error) => {
                 return custody
@@ -773,7 +777,11 @@ impl<T: AgentToolDispatcher + ?Sized + 'static> AgentToolDispatcher
         } else {
             context
         };
-        let current_context = match base.observe_tool_entry(call, Some(plan)) {
+        let current_context = match base.observe_tool_entry_at(
+            call,
+            Some(plan),
+            crate::authorization::OperationEntryBoundary::ToolExecutionPolicy,
+        ) {
             Ok(current) => current,
             Err(error) => {
                 return custody
@@ -1703,7 +1711,7 @@ pub(crate) mod tests {
                 event: OperationObservation,
             ) -> Result<(), OperationObservationError> {
                 assert!(self.binding.same_operation(binding));
-                if matches!(&event, OperationObservation::Entry) && self.probe.refresh_on_entry {
+                if matches!(&event, OperationObservation::Entry(_)) && self.probe.refresh_on_entry {
                     self.probe.refreshed.store(true, Ordering::SeqCst);
                 }
                 self.probe
@@ -1821,11 +1829,15 @@ pub(crate) mod tests {
                 let observations = probe.observations.lock().unwrap();
                 let layers = if nested { 2 } else { 1 };
                 assert_eq!(observations.len(), layers * 2);
-                assert!(
-                    observations[..layers]
-                        .iter()
-                        .all(|(_, event)| { matches!(event, OperationObservation::Entry) })
-                );
+                assert!(observations[..layers].iter().all(|(_, event)| {
+                    // Each gate names its own staging boundary.
+                    matches!(
+                        event,
+                        OperationObservation::Entry(
+                            crate::authorization::OperationEntryBoundary::ToolExecutionPolicy
+                        )
+                    )
+                }));
                 assert!(observations[layers..].iter().all(|(refreshed, event)| {
                     *refreshed == refresh_on_entry
                         && matches!(event, OperationObservation::Outcome(_))

@@ -451,7 +451,9 @@ async fn app_resource_timeout_returns_through_native_outcome_and_releases_lease(
         );
         assert!(matches!(
             audit.observations.lock().unwrap().as_slice(),
-            [OperationObservation::Entry]
+            [OperationObservation::Entry(
+                meerkat_core::OperationEntryBoundary::McpResourceRead
+            )]
         ));
         tokio::time::pause();
         tokio::time::advance(Duration::from_secs(16)).await;
@@ -464,7 +466,7 @@ async fn app_resource_timeout_returns_through_native_outcome_and_releases_lease(
         assert!(matches!(
             audit.observations.lock().unwrap().as_slice(),
             [
-                OperationObservation::Entry,
+                OperationObservation::Entry(meerkat_core::OperationEntryBoundary::McpResourceRead),
                 OperationObservation::Outcome(OperationObservedOutcome::SourceReadUnavailable),
             ]
         ));
@@ -514,7 +516,7 @@ async fn app_resource_outer_cancellation_observes_unavailable_before_lease_relea
         assert!(matches!(
             audit.observations.lock().unwrap().as_slice(),
             [
-                OperationObservation::Entry,
+                OperationObservation::Entry(meerkat_core::OperationEntryBoundary::McpResourceRead),
                 OperationObservation::Outcome(OperationObservedOutcome::SourceReadUnavailable),
             ]
         ));

@@ -32235,7 +32235,7 @@ mod tests {
                 ) -> Result<(), OperationObservationError> {
                     assert!(self.binding.same_operation(binding));
                     match observation {
-                        OperationObservation::Entry
+                        OperationObservation::Entry(_)
                             if matches!(&binding.facts().operation,
                                 AuthorizationOperation::Tool(tool) if tool.name == "audit_blocked") =>
                         {
@@ -32330,7 +32330,9 @@ mod tests {
                     checked.current().map_err(AgentError::from)?;
                     // Exercise the model's entry observation too; only the named
                     // tool entry is injected to fail, not controller permission.
-                    checked.observe_entry().map_err(AgentError::from)?;
+                    checked
+                        .observe_entry(crate::OperationEntryBoundary::ModelRequest)
+                        .map_err(AgentError::from)?;
                     let request = self.model.requests.fetch_add(1, Ordering::SeqCst);
                     let (blocks, stop) = if request == 0 {
                         let mut names = ["audit_blocked", "healthy"];

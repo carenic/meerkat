@@ -7,8 +7,8 @@
 use std::sync::Arc;
 
 use meerkat_core::authorization::{
-    MandatoryHookWithholding, OperationObservationError, OperationObservedOutcome,
-    OperationRefusalKind,
+    MandatoryHookWithholding, OperationEntryBoundary, OperationObservationError,
+    OperationObservedOutcome, OperationRefusalKind,
 };
 use meerkat_core::exact_operation::OperationExecutionScope;
 use meerkat_core::{InputId, OperationId, PrincipalRef, RunId, SessionId};
@@ -156,7 +156,14 @@ pub enum AuditObservation {
         target: Arc<AuditTarget>,
     },
     /// A synchronous boundary attempt, not proof the physical body ran.
-    Entry,
+    /// `boundary` names the boundary that observed it: several boundaries
+    /// can record the entry of one operation. Records written before
+    /// boundaries were recorded omit it and read as `None` (unattributed);
+    /// every new record names its boundary.
+    Entry {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        boundary: Option<OperationEntryBoundary>,
+    },
     Outcome {
         outcome: OperationObservedOutcome,
     },
@@ -276,7 +283,7 @@ impl AuthorizationAuditObservation {
                 SafeAuditObservation::AuthorizationUnavailable
             }
             AuditObservation::Refused { .. } => SafeAuditObservation::Refused,
-            AuditObservation::Entry => SafeAuditObservation::EntryAttempt,
+            AuditObservation::Entry { .. } => SafeAuditObservation::EntryAttempt,
             AuditObservation::Outcome { .. } => SafeAuditObservation::Returned,
             AuditObservation::MandatoryHookWithheld { .. } => {
                 SafeAuditObservation::MandatoryHookWithheld
@@ -383,6 +390,79 @@ mod tests {
         assert_eq!(serde_json::to_value(decoded).unwrap(), old);
     }
 
+    /// An entry record names the boundary that observed it, so the entries
+    /// several boundaries stage for one operation can be told apart. An
+    /// unknown boundary is refused, never read as some other boundary.
+    #[test]
+    fn entry_records_round_trip_their_boundary() {
+        let record = serde_json::json!({
+            "operation_id": OperationId::new(),
+            "execution_scope": OperationExecutionScope::Domain,
+            "run_id": null,
+            "context_revision": null,
+            "observation": {"kind": "entry", "boundary": "tool_effect"},
+        });
+        let decoded: AuthorizationAuditObservation =
+            serde_json::from_value(record.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&decoded).unwrap(), record);
+        assert_eq!(
+            decoded.safe_projection(),
+            SafeAuditObservation::EntryAttempt
+        );
+        let mut unknown = record;
+        unknown["observation"]["boundary"] = serde_json::json!("future_boundary");
+        assert!(serde_json::from_value::<AuthorizationAuditObservation>(unknown).is_err());
+    }
+
+    /// A new record decodes to its typed boundary; a record written before
+    /// boundaries were recorded decodes as an unattributed entry.
+    #[test]
+    fn entry_records_decode_to_their_typed_boundary() {
+        let observation = |value: serde_json::Value| {
+            serde_json::from_value::<AuthorizationAuditObservation>(serde_json::json!({
+                "operation_id": OperationId::new(),
+                "execution_scope": OperationExecutionScope::Domain,
+                "run_id": null,
+                "context_revision": null,
+                "observation": value,
+            }))
+            .unwrap()
+            .observation
+        };
+        assert!(matches!(
+            observation(serde_json::json!({"kind": "entry", "boundary": "tool_dispatch"})),
+            AuditObservation::Entry {
+                boundary: Some(OperationEntryBoundary::ToolDispatch)
+            }
+        ));
+        assert!(matches!(
+            observation(serde_json::json!({"kind": "entry"})),
+            AuditObservation::Entry { boundary: None }
+        ));
+    }
+
+    /// A reader built before entries named their boundary still decodes a
+    /// new entry record, as a plain entry: the added field is ignored, not
+    /// refused.
+    #[test]
+    fn pre_boundary_readers_still_decode_new_entry_records() {
+        #[derive(Deserialize)]
+        #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+        enum PreBoundaryObservation {
+            Entry,
+            Outcome {
+                #[allow(dead_code)]
+                outcome: OperationObservedOutcome,
+            },
+        }
+        let decoded: PreBoundaryObservation = serde_json::from_value(serde_json::json!({
+            "kind": "entry",
+            "boundary": "tool_effect",
+        }))
+        .unwrap();
+        assert!(matches!(decoded, PreBoundaryObservation::Entry));
+    }
+
     #[test]
     fn protected_review_joins_round_trip_but_do_not_appear_in_safe_projection() {
         let candidate = OperationId::new();
@@ -407,7 +487,9 @@ mod tests {
                     attempt_ref: "private-attempt".into(),
                     role,
                 }),
-                observation: AuditObservation::Entry,
+                observation: AuditObservation::Entry {
+                    boundary: Some(OperationEntryBoundary::ReviewContextRead),
+                },
                 ..start.clone()
             };
             let value = serde_json::to_value(&child).unwrap();

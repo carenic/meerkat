@@ -127,7 +127,7 @@ fn unavailable_clock_never_records_a_false_policy_refusal() {
     assert!(!matches!(
         events[0].observation,
         AuditObservation::Prepared { .. }
-            | AuditObservation::Entry
+            | AuditObservation::Entry { .. }
             | AuditObservation::Outcome { .. }
     ));
     assert_eq!(

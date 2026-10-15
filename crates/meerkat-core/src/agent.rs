@@ -1526,8 +1526,10 @@ impl ToolDispatchContext {
     ///
     /// Call exactly once, after argument and preparation work and any waits,
     /// immediately before the body or handoff, with the context the leaf was
-    /// handed. It runs [`Self::observe_tool_entry`] (staging, the final
-    /// authorization check and the review check point), then spends a
+    /// handed. It runs [`Self::observe_tool_entry_at`] at the effect boundary
+    /// ([`crate::authorization::OperationEntryBoundary::ToolEffect`]:
+    /// staging, the final authorization check and the review check point),
+    /// then spends a
     /// retained review allow once for the exact entering decision. Nothing
     /// external runs between that spend and the caller's effect; the review
     /// `Used` projection is delivered after dispatch returns. A second call
@@ -1554,7 +1556,11 @@ impl ToolDispatchContext {
         plan: Option<&crate::ResolvedToolExecutionPlan>,
     ) -> Result<(Option<Self>, crate::approval::review::ReviewedEntryCustody), crate::ToolError>
     {
-        let entering = self.observe_tool_entry(call, plan)?;
+        let entering = self.observe_tool_entry_at(
+            call,
+            plan,
+            crate::authorization::OperationEntryBoundary::ToolEffect,
+        )?;
         let current = entering.as_ref().unwrap_or(self);
         let custody = match (self.review_entry.as_ref(), current.prepared_authorization()) {
             (Some(entry), Some(check)) => entry.consume_held(check)?,
@@ -1636,15 +1642,36 @@ impl ToolDispatchContext {
     /// synchronous staging work. Adapters call this after their own awaits.
     /// Several adapter boundaries may observe the same operation ID; these
     /// observations do not count physical effects or authorize another call.
+    /// The entry names the dispatch staging boundary
+    /// ([`crate::authorization::OperationEntryBoundary::ToolDispatch`]); a
+    /// staging point with an identity of its own uses
+    /// [`Self::observe_tool_entry_at`].
     pub fn observe_tool_entry(
         &self,
         call: ToolCallView<'_>,
         plan: Option<&crate::ResolvedToolExecutionPlan>,
     ) -> Result<Option<Self>, crate::ToolError> {
+        self.observe_tool_entry_at(
+            call,
+            plan,
+            crate::authorization::OperationEntryBoundary::ToolDispatch,
+        )
+    }
+
+    /// [`Self::observe_tool_entry`] at the named `boundary`, so the entries
+    /// that several boundaries record for one operation stay distinguishable.
+    pub fn observe_tool_entry_at(
+        &self,
+        call: ToolCallView<'_>,
+        plan: Option<&crate::ResolvedToolExecutionPlan>,
+        boundary: crate::authorization::OperationEntryBoundary,
+    ) -> Result<Option<Self>, crate::ToolError> {
         let first = self.check_tool_authorization(call, plan)?;
         let current = first.as_ref().unwrap_or(self);
         if let Some(prepared) = current.prepared_authorization() {
-            prepared.observe_entry().map_err(crate::ToolError::from)?;
+            prepared
+                .observe_entry(boundary)
+                .map_err(crate::ToolError::from)?;
         }
         let final_context = current.check_tool_authorization(call, plan)?;
         let entering = final_context.or(first);

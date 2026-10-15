@@ -108,7 +108,12 @@ impl NativeRunAuthorization {
                 return Err(unavailable());
             }
             check.check_current(&source)?;
-            check.observe(&source, OperationObservation::Entry)?;
+            check.observe(
+                &source,
+                OperationObservation::Entry(
+                    meerkat_core::OperationEntryBoundary::ReviewContextRead,
+                ),
+            )?;
             // Entry records an attempted read, not disclosure or completion.
             // No custom observation/policy callback runs under driver custody.
             let read = {

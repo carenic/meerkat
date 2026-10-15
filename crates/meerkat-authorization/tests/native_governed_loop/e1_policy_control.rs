@@ -735,11 +735,14 @@ async fn exercise(server: &Server) {
         == refused.observation.operation_id
         && matches!(
             record.observation.observation,
-            AuditObservation::Entry | AuditObservation::Outcome { .. }
+            AuditObservation::Entry { .. } | AuditObservation::Outcome { .. }
         )));
     assert!(audit.iter().any(|record| record.observation.operation_id
         == allowed.observation.operation_id
-        && matches!(record.observation.observation, AuditObservation::Entry)));
+        && matches!(
+            record.observation.observation,
+            AuditObservation::Entry { .. }
+        )));
     assert!(audit.iter().any(|record| record.observation.operation_id
         == allowed.observation.operation_id
         && matches!(
@@ -769,7 +772,10 @@ async fn exercise(server: &Server) {
             audit
                 .iter()
                 .any(|record| &record.observation.operation_id == operation_id
-                    && matches!(record.observation.observation, AuditObservation::Entry))
+                    && matches!(
+                        record.observation.observation,
+                        AuditObservation::Entry { .. }
+                    ))
         );
     }
     assert!(

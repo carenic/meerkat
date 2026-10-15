@@ -447,7 +447,7 @@ async fn exercise_required_shell(server: &Server) {
             .collect();
         assert_eq!(observations.len(), 3);
         assert!(matches!(observations[0], AuditObservation::Prepared { .. }));
-        assert!(matches!(observations[1], AuditObservation::Entry));
+        assert!(matches!(observations[1], AuditObservation::Entry { .. }));
         assert!(matches!(
             observations[2],
             AuditObservation::Outcome {
@@ -476,7 +476,10 @@ async fn exercise_required_shell(server: &Server) {
             audit
                 .iter()
                 .filter(|record| &record.observation.operation_id == model_id
-                    && matches!(record.observation.observation, AuditObservation::Entry))
+                    && matches!(
+                        record.observation.observation,
+                        AuditObservation::Entry { .. }
+                    ))
                 .count(),
             1
         );

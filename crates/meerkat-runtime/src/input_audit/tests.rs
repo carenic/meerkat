@@ -49,7 +49,9 @@ fn event(sink: &NativeInputAuditSink) -> AuthorizationAuditObservation {
         run_id: Some(sink.run_id.clone()),
         context_revision: None,
         review_attribution: None,
-        observation: AuditObservation::Entry,
+        observation: AuditObservation::Entry {
+            boundary: Some(meerkat_core::OperationEntryBoundary::ToolDispatch),
+        },
     }
 }
 fn count(audit: &InputAuthorizationAudit) -> usize {
@@ -270,7 +272,7 @@ impl meerkat_core::authorization::PreparedOperationAuthorization for Infrastruct
         assert!(self.binding.same_operation(binding));
         let mut event = self.event.clone();
         match observation {
-            meerkat_core::authorization::OperationObservation::Entry => {}
+            meerkat_core::authorization::OperationObservation::Entry(_) => {}
             meerkat_core::authorization::OperationObservation::Outcome(outcome)
                 if self.allow_outcome =>
             {
@@ -328,12 +330,16 @@ fn assert_entry_infrastructure_and_independent_sibling(
     let error = failed
         .current()
         .unwrap()
-        .observe_entry()
+        .observe_entry(meerkat_core::OperationEntryBoundary::ToolDispatch)
         .expect_err("no body may enter");
     let (other_audit, other_sink) = fixture();
     let other_event = event(&other_sink);
     let other = infrastructure_entry_check(Arc::new(other_sink), other_event);
-    other.current().unwrap().observe_entry().unwrap();
+    other
+        .current()
+        .unwrap()
+        .observe_entry(meerkat_core::OperationEntryBoundary::ToolDispatch)
+        .unwrap();
     assert_eq!(count(&other_audit), 1, "independent sibling remains usable");
     assert_eq!(
         error, OperationObservationError,
@@ -378,7 +384,9 @@ fn observation_infrastructure_native_poison_after_entry_preserves_frozen_prefix(
     let observation = event(&sink);
     let check = infrastructure_check(Arc::new(sink), observation.clone(), true);
     let entered = check.current().unwrap();
-    entered.observe_entry().unwrap();
+    entered
+        .observe_entry(meerkat_core::OperationEntryBoundary::ToolDispatch)
+        .unwrap();
     let frozen = audit.freeze_for_persistence().unwrap();
     let prefix = serde_json::to_vec(&frozen).unwrap();
     let prior: Vec<StoredAuthorizationAuditObservation> = serde_json::from_slice(&prefix).unwrap();
@@ -386,7 +394,7 @@ fn observation_infrastructure_native_poison_after_entry_preserves_frozen_prefix(
     assert_eq!(prior[0].observation.operation_id, observation.operation_id);
     assert!(matches!(
         prior[0].observation.observation,
-        AuditObservation::Entry
+        AuditObservation::Entry { .. }
     ));
 
     let AuditPayload::Pending(records) = &audit.0 else {
@@ -427,7 +435,9 @@ fn observation_infrastructure_native_poison_after_entry_preserves_frozen_prefix(
     let other_event = event(&other_sink);
     let other = infrastructure_check(Arc::new(other_sink), other_event.clone(), true);
     let other_entered = other.current().unwrap();
-    other_entered.observe_entry().unwrap();
+    other_entered
+        .observe_entry(meerkat_core::OperationEntryBoundary::ToolDispatch)
+        .unwrap();
     other_entered
         .observe_outcome(OperationObservedOutcome::HttpResponse { status: 200 })
         .unwrap();
@@ -444,7 +454,7 @@ fn observation_infrastructure_native_poison_after_entry_preserves_frozen_prefix(
     );
     assert!(matches!(
         other_records[0].observation.observation,
-        AuditObservation::Entry
+        AuditObservation::Entry { .. }
     ));
     assert!(matches!(
         other_records[1].observation.observation,

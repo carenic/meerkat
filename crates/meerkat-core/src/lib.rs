@@ -192,11 +192,12 @@ pub use authorization::{
     AuthorizationOperation, MandatoryHookCause, MandatoryHookProviderTool,
     MandatoryHookWithheldEffect, MandatoryHookWithholding, MandatoryHookWithholdingRecord,
     ModelAuthorizationFacts, ModelAuthorizationUse, OperationAuthorizationError,
-    OperationAuthorizationFacts, OperationRefusalKind, OperationRefused, OperationReviewTier,
-    OwnerQualifiedTarget, PreparedAuthorizationBinding, PreparedOperationAuthorization,
-    PublicationAuthorizationFacts, PublicationMode, PublicationRecipient, SourceAuthorizationFacts,
-    SourceAuthorizationTarget, SourceAuthorizationUse, ToolAuthorizationFacts,
-    ToolAuthorizationTarget, WorkAuthorization, WorkAuthorizationContext,
+    OperationAuthorizationFacts, OperationEntryBoundary, OperationRefusalKind, OperationRefused,
+    OperationReviewTier, OwnerQualifiedTarget, PreparedAuthorizationBinding,
+    PreparedOperationAuthorization, PublicationAuthorizationFacts, PublicationMode,
+    PublicationRecipient, SourceAuthorizationFacts, SourceAuthorizationTarget,
+    SourceAuthorizationUse, ToolAuthorizationFacts, ToolAuthorizationTarget, WorkAuthorization,
+    WorkAuthorizationContext,
 };
 pub use blob::{
     BlobAddressAttestation, BlobId, BlobPayload, BlobRef, BlobStore, BlobStoreError,

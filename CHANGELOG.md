@@ -54,9 +54,35 @@ them.
   targeted selection names a `peer`, `peer_directory` or `memory` target
   cannot be read by a binary without this change. Associations that name
   none of them are unchanged.
+- Audit entries name their boundary (see Added). `meerkat-core`:
+  `OperationObservation::Entry` is now `Entry(OperationEntryBoundary)`
+  instead of a unit variant, so a match needs `Entry(_)` or a boundary, and
+  `PreparedOperationCheck::observe_entry` takes the observing boundary,
+  `observe_entry(boundary: OperationEntryBoundary)`; a custom model
+  transport (for example an `LlmClient::stream_prepared` fixture) passes
+  `OperationEntryBoundary::ModelRequest`.
+  `meerkat-authorization-contracts`: `AuditObservation::Entry` is now the
+  struct variant `Entry { boundary: Option<OperationEntryBoundary> }`
+  instead of a unit variant, so a match needs `Entry { .. }`. Persisted
+  audit records (not measured by the gate): a new entry record adds the
+  boundary (`{"kind": "entry", "boundary": "tool_effect"}`); a record
+  written before decodes with `boundary: None` and re-encodes unchanged,
+  and a reader built before this change ignores the field and still decodes
+  the record as an entry. `SafeAuditObservation::EntryAttempt` is unchanged.
 
 ### Added
 
+- Typed boundary identity on authorization audit entries. Several
+  boundaries can record the entry of one operation (each staging point on a
+  tool call's dispatch chain, then its effect), and each now names itself
+  with the new `meerkat_core::OperationEntryBoundary`: `ToolDispatch` (the
+  root dispatch or an adapter staging the call), `ToolExecutionPolicy` (the
+  call-level execution policy gate), `ToolEffect` (the owning leaf's entry
+  immediately before its effect or transport handoff), `McpResourceRead`,
+  `McpAttachment`, `ModelRequest`, `ContextAppend` and `ReviewContextRead`.
+  The new `ToolDispatchContext::observe_tool_entry_at` stages a tool entry
+  at a named boundary; `observe_tool_entry` keeps its signature and names
+  `ToolDispatch`.
 - Typed grant targets for peer (comms) and memory operations.
   `meerkat-core`: `ToolOperationTarget` gains `PeerSend { peer, kind }` (one
   delivery to exactly one peer, by its canonical `PeerId`),

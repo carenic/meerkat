@@ -456,7 +456,7 @@ impl LlmClient for ScriptedProvider {
             .current()
             .expect("final controller entry check");
         check
-            .observe_entry()
+            .observe_entry(meerkat_core::OperationEntryBoundary::ModelRequest)
             .expect("native audit stages actual transport entry");
         check
             .observe_outcome(OperationObservedOutcome::HttpResponse { status: 200 })
@@ -769,7 +769,7 @@ async fn generated_grant_denial_reaches_controller_and_permitted_tool_finishes_s
             == denied_attempt.observation.operation_id
             && matches!(
                 record.observation.observation,
-                AuditObservation::Entry | AuditObservation::Outcome { .. }
+                AuditObservation::Entry { .. } | AuditObservation::Outcome { .. }
             )),
         "denied attempt never became a physical entry or outcome"
     );
@@ -784,7 +784,28 @@ async fn generated_grant_denial_reaches_controller_and_permitted_tool_finishes_s
         .expect("native audit identifies permitted read preparation");
     assert!(audit.iter().any(|record| record.observation.operation_id
         == allowed_attempt.observation.operation_id
-        && matches!(record.observation.observation, AuditObservation::Entry)));
+        && matches!(
+            record.observation.observation,
+            AuditObservation::Entry { .. }
+        )));
+    // Every boundary that staged the permitted operation names itself, the
+    // session's root dispatch first, so the entries stay distinguishable.
+    let boundaries: Vec<_> = audit
+        .iter()
+        .filter(|record| {
+            record.observation.operation_id == allowed_attempt.observation.operation_id
+        })
+        .filter_map(|record| match &record.observation.observation {
+            AuditObservation::Entry { boundary } => Some(*boundary),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        boundaries.first(),
+        Some(&Some(meerkat_core::OperationEntryBoundary::ToolDispatch)),
+        "{boundaries:?}"
+    );
+    assert!(boundaries.iter().all(Option::is_some), "{boundaries:?}");
     assert!(audit.iter().any(|record| record.observation.operation_id
         == allowed_attempt.observation.operation_id
         && matches!(

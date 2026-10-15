@@ -218,7 +218,9 @@ impl RepresentativeProvider {
                     .prepare(model_facts())
                     .expect("actual controller preparation");
                 let current = prepared.current().expect("current before Entry");
-                current.observe_entry().expect("native Entry");
+                current
+                    .observe_entry(meerkat_core::OperationEntryBoundary::ModelRequest)
+                    .expect("native Entry");
                 let current = current
                     .current()
                     .expect("current before scripted transport");
@@ -777,7 +779,7 @@ fn assert_success_audit(
         ));
         assert!(matches!(
             records[1].observation.observation,
-            AuditObservation::Entry
+            AuditObservation::Entry { .. }
         ));
         let AuditObservation::Prepared { target, .. } = &p.observation.observation else {
             unreachable!("selected Prepared record")
@@ -1340,7 +1342,7 @@ async fn native_representative_correctness() {
                     == refusal.observation.operation_id
                     && matches!(
                         r.observation.observation,
-                        AuditObservation::Entry | AuditObservation::Outcome { .. }
+                        AuditObservation::Entry { .. } | AuditObservation::Outcome { .. }
                     )),
                 "denied preparation never entered"
             );
