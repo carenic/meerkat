@@ -103,12 +103,17 @@ them.
   Homebrew follows it. Intel macOS binaries are now cross-compiled on Apple
   silicon (`macos-15`) on both release backends, instead of BuildBuddy or the
   `macos-15-intel` runner.
-- The release workflow's Cargo caches are never saved by a dispatch (which
-  writes the `main` scope every tag run restores from) and never cache
-  `~/.cargo/bin`; the registry publisher, which holds the crates.io, PyPI and
-  npm tokens, restores no cache at all. The workflow token is read-only by
-  default, with OIDC and attestation writes only on the build jobs and
-  release writes only on the publishers.
+- The release workflow's caches are never saved by a dispatch (which writes
+  the `main` scope every tag run restores from), including the Windows SDK
+  cache inside the Windows cross-build action and the Bazel repository cache
+  of the BuildBuddy setup, and never cache `~/.cargo/bin`; the registry
+  publisher, which holds the crates.io, PyPI and npm tokens, restores no
+  cache at all. The BuildBuddy release binary build no longer restores the
+  Bazel repository cache (its build never read that directory), and
+  `windows-cross-validate.yml` no longer saves the Windows SDK cache from a
+  dispatch, so the attesting build jobs restore nothing a dispatch saved. The
+  workflow token is read-only by default, with OIDC and attestation writes
+  only on the build jobs and release writes only on the publishers.
 - A pre-tag prebuild is reusable as soon as its critical binaries and Web
   SDK package are built: the tag publishes those right away, and its
   trailing publisher waits for the prebuild's Intel macOS and Windows lanes

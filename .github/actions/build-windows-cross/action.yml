@@ -16,6 +16,15 @@ inputs:
     description: SHA-256 of the pinned cargo-xwin Linux x86_64 tarball.
     required: false
     default: "c492c6dfb7e5ac0eee586b796e0fc950ba13077e7f0bbb046f445d71790d5360"
+  save-sdk-cache:
+    description: >-
+      'true' saves the downloaded MSVC CRT and Windows SDK (cargo-xwin's
+      cache, linked into the binaries) after a build that missed the cache.
+      Callers pass false on a workflow_dispatch: a dispatch on main saves into
+      the default branch's cache scope, which every later run restores,
+      release tag runs included.
+    required: false
+    default: "false"
 
 outputs:
   dist-dir:
@@ -66,8 +75,11 @@ runs:
         tar -xzf "${RUNNER_TEMP}/${archive}" -C "${RUNNER_TEMP}/xwin-bin" cargo-xwin
         cargo xwin --version
 
+    # Restored here, saved after the build only when the caller allows it
+    # (never from a workflow_dispatch; see save-sdk-cache).
     - name: Restore Windows SDK cache
-      uses: actions/cache@v4
+      id: sdk-cache
+      uses: actions/cache/restore@v4
       with:
         path: ${{ runner.temp }}/xwin-cache
         key: xwin-sdk-${{ runner.os }}-cargo-xwin-${{ inputs.cargo-xwin-version }}
@@ -102,6 +114,13 @@ runs:
         # Package names (for cargo build -p); binary names differ via [[bin]].
         cargo xwin build --locked --release --target x86_64-pc-windows-msvc \
           -p rkat -p meerkat-rpc -p meerkat-rest -p meerkat-mcp-server
+
+    - name: Save Windows SDK cache
+      if: ${{ inputs.save-sdk-cache == 'true' && steps.sdk-cache.outputs.cache-hit != 'true' }}
+      uses: actions/cache/save@v4
+      with:
+        path: ${{ runner.temp }}/xwin-cache
+        key: xwin-sdk-${{ runner.os }}-cargo-xwin-${{ inputs.cargo-xwin-version }}
 
     - name: Package Windows archives
       id: package

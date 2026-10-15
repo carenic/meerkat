@@ -12,6 +12,10 @@ inputs:
     description: BuildBuddy CI mode.
     required: false
     default: full-fresh
+  repository-cache:
+    description: "Bazel external repository cache: true, restore, or false (see setup-buildbuddy-ci)."
+    required: false
+    default: "true"
 
 runs:
   using: composite
@@ -20,6 +24,7 @@ runs:
       uses: ./.github/actions/setup-buildbuddy-ci
       with:
         profile: ${{ inputs.profile }}
+        repository-cache: ${{ inputs.repository-cache }}
 
     - name: Run BuildBuddy lane
       shell: bash

@@ -629,6 +629,9 @@ jobs:
           lane: release-validate
           profile: native
           mode: release-validate
+          # Dispatch-only: restore, never save into the default branch's
+          # cache scope, which every tag run restores.
+          repository-cache: restore
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -1385,6 +1388,9 @@ jobs:
         uses: ./.release-tooling/.github/actions/build-windows-cross
         with:
           version: ${{ steps.version.outputs.version }}
+          # The SDK cache is linked into attested binaries: a dispatch on main
+          # would save it into the scope every tag run restores.
+          save-sdk-cache: ${{ github.event_name != 'workflow_dispatch' }}
 
       # An asset recovery runs this workflow from main against the tag, so
       # its attestations name main's commit, not the tag. Each archive
@@ -1711,6 +1717,11 @@ jobs:
       - uses: ./.github/actions/setup-buildbuddy-ci
         with:
           profile: native
+          # The archives are attested: no cache entry another run (a
+          # dispatch included) saved may reach them. Costs nothing: this
+          # job's Bazel wrapper uses /tmp/meerkat-bazel-repository-cache, so
+          # the restored directory never reached the build.
+          repository-cache: "false"
 
       - name: Build release binaries via BuildBuddy
         shell: bash
