@@ -48535,7 +48535,8 @@ impl MobActor {
         // The supervisor authority deletion is prepared and committed in its
         // own frame: at opt-level 0 every move of its prepared machine
         // transition reserved a slot of that transition's full size in this
-        // poll frame, beneath every member disposal above.
+        // poll frame, which stays on the stack beneath the frames of every
+        // member disposal this function awaits.
         boxed_arm_future(|| {
             self.scrub_supervisor_authority_for_destroy(&mut report, &runtime_metadata_snapshot)
         })

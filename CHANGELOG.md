@@ -60,7 +60,8 @@ them.
   handles its command result in its own frame; bodies are unchanged.
   Measured on the debug test binary, the three paths now take 191,680,
   886,000 and 264,496 bytes. A child-process regression test runs the
-  restart re-link on 2 MiB workers. No behaviour change.
+  restart re-link on 1.125 MiB workers, below a host's 2 MiB. No behaviour
+  change.
 - A restarted host's mob restore, a delivery's receipt wait and a mob's
   destroy fit a 1 MiB worker stack in a debug build. At opt-level 0 an
   awaited future reserves twice its size in the poll frame that awaits it,
