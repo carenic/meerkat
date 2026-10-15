@@ -32,11 +32,20 @@ requirement = { baseline = "command_runtime_v1", read = { kind = "paths", paths 
 /// the observed startup latency under a fully parallel crate run.
 const STARTUP_DEADLINE: Duration = Duration::from_secs(200);
 
-/// Cargo and nextest advertise the crate's own binary to its integration
-/// tests through the runtime environment.
-fn rkat_rest_binary() -> Option<PathBuf> {
-    let advertised = std::env::var_os("CARGO_BIN_EXE_rkat-rest").map(PathBuf::from)?;
-    advertised.exists().then_some(advertised)
+/// The crate's own binary: nextest and the generated Bazel targets
+/// advertise it in the runtime environment, and Cargo at compile time. A
+/// test without it fails rather than passing without having run.
+fn rkat_rest_binary() -> PathBuf {
+    let advertised = std::env::var_os("CARGO_BIN_EXE_rkat-rest")
+        .map(PathBuf::from)
+        .or_else(|| option_env!("CARGO_BIN_EXE_rkat-rest").map(PathBuf::from))
+        .expect("CARGO_BIN_EXE_rkat-rest is set by cargo, nextest and the generated Bazel targets");
+    assert!(
+        advertised.exists(),
+        "the rkat-rest binary {} does not exist",
+        advertised.display()
+    );
+    advertised
 }
 
 /// A free local port for the server's `[rest]` section.
@@ -171,12 +180,7 @@ fn in_a_removed_directory(binary: &Path, removed: &Path, args: &[String]) -> Com
 /// start instead of guessing a base.
 #[test]
 fn rkat_rest_starts_without_a_working_directory_when_no_flag_needs_it() {
-    let Some(binary) = rkat_rest_binary() else {
-        eprintln!(
-            "skipping: rkat-rest binary not advertised (CARGO_BIN_EXE_rkat-rest unset or missing)"
-        );
-        return;
-    };
+    let binary = rkat_rest_binary();
     let temp = TempDir::new().expect("temp dir");
 
     let (args, port) = scope_args(temp.path(), "rest-removed-cwd");
@@ -223,12 +227,7 @@ fn rkat_rest_starts_without_a_working_directory_when_no_flag_needs_it() {
 /// inputs from its confined processes, besides the warnings.
 #[test]
 fn the_rkat_rest_startup_report_reaches_the_default_log() {
-    let Some(binary) = rkat_rest_binary() else {
-        eprintln!(
-            "skipping: rkat-rest binary not advertised (CARGO_BIN_EXE_rkat-rest unset or missing)"
-        );
-        return;
-    };
+    let binary = rkat_rest_binary();
     let temp = TempDir::new().expect("temp dir");
     let (args, port) = scope_args(temp.path(), "rest-confinement-reported");
     std::fs::create_dir_all(temp.path().join("user").join(".rkat")).expect("user root");

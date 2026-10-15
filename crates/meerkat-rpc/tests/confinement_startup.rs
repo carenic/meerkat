@@ -41,11 +41,20 @@ const PROTECTED_INPUTS_REPORT: &str = "kept from every confined process: the rea
 /// a fully parallel crate run and below the CI unit profile's ceiling.
 const EXIT_DEADLINE: Duration = Duration::from_secs(200);
 
-/// Cargo and nextest advertise the crate's own binary to its integration
-/// tests through the runtime environment.
-fn rkat_rpc_binary() -> Option<PathBuf> {
-    let advertised = std::env::var_os("CARGO_BIN_EXE_rkat-rpc").map(PathBuf::from)?;
-    advertised.exists().then_some(advertised)
+/// The crate's own binary: nextest and the generated Bazel targets
+/// advertise it in the runtime environment, and Cargo at compile time. A
+/// test without it fails rather than passing without having run.
+fn rkat_rpc_binary() -> PathBuf {
+    let advertised = std::env::var_os("CARGO_BIN_EXE_rkat-rpc")
+        .map(PathBuf::from)
+        .or_else(|| option_env!("CARGO_BIN_EXE_rkat-rpc").map(PathBuf::from))
+        .expect("CARGO_BIN_EXE_rkat-rpc is set by cargo, nextest and the generated Bazel targets");
+    assert!(
+        advertised.exists(),
+        "the rkat-rpc binary {} does not exist",
+        advertised.display()
+    );
+    advertised
 }
 
 struct Run {
@@ -196,12 +205,7 @@ fn scope_args<'a>(realm: &'a str, state_root: &'a Path, user_root: &'a Path) -> 
 
 #[test]
 fn workspace_confinement_without_a_context_root_refuses_rkat_rpc_startup() {
-    let Some(binary) = rkat_rpc_binary() else {
-        eprintln!(
-            "skipping: rkat-rpc binary not advertised (CARGO_BIN_EXE_rkat-rpc unset or missing)"
-        );
-        return;
-    };
+    let binary = rkat_rpc_binary();
     let temp = TempDir::new().expect("temp dir");
     let state_root = temp.path().join("state");
     let user_root = temp.path().join("user");
@@ -229,12 +233,7 @@ fn workspace_confinement_without_a_context_root_refuses_rkat_rpc_startup() {
 /// before the server serves, naming the input and its remedy.
 #[test]
 fn confinement_that_could_change_the_realm_state_refuses_rkat_rpc_startup() {
-    let Some(binary) = rkat_rpc_binary() else {
-        eprintln!(
-            "skipping: rkat-rpc binary not advertised (CARGO_BIN_EXE_rkat-rpc unset or missing)"
-        );
-        return;
-    };
+    let binary = rkat_rpc_binary();
     let temp = TempDir::new().expect("temp dir");
     let base = temp.path().canonicalize().expect("canonical temp");
     let project = base.join("project");
@@ -275,12 +274,7 @@ fn confinement_that_could_change_the_realm_state_refuses_rkat_rpc_startup() {
 
 #[test]
 fn the_user_documents_confinement_reaches_the_rkat_rpc_startup_report() {
-    let Some(binary) = rkat_rpc_binary() else {
-        eprintln!(
-            "skipping: rkat-rpc binary not advertised (CARGO_BIN_EXE_rkat-rpc unset or missing)"
-        );
-        return;
-    };
+    let binary = rkat_rpc_binary();
     let temp = TempDir::new().expect("temp dir");
     let project = temp.path().join("project");
     let state_root = temp.path().join("state");
@@ -340,12 +334,7 @@ fn the_user_documents_confinement_reaches_the_rkat_rpc_startup_report() {
 /// bytes. A write that keeps the edge commits.
 #[test]
 fn rkat_rpc_config_writes_cannot_drop_inherited_confinement() {
-    let Some(binary) = rkat_rpc_binary() else {
-        eprintln!(
-            "skipping: rkat-rpc binary not advertised (CARGO_BIN_EXE_rkat-rpc unset or missing)"
-        );
-        return;
-    };
+    let binary = rkat_rpc_binary();
     let temp = TempDir::new().expect("temp dir");
     let state_root = temp.path().join("state");
     let user_root = temp.path().join("user");
@@ -409,12 +398,7 @@ fn rkat_rpc_config_writes_cannot_drop_inherited_confinement() {
 #[cfg(unix)]
 #[test]
 fn rkat_rpc_starts_without_a_working_directory_when_no_flag_needs_it() {
-    let Some(binary) = rkat_rpc_binary() else {
-        eprintln!(
-            "skipping: rkat-rpc binary not advertised (CARGO_BIN_EXE_rkat-rpc unset or missing)"
-        );
-        return;
-    };
+    let binary = rkat_rpc_binary();
     let temp = TempDir::new().expect("temp dir");
     let state_root = temp.path().join("state");
     let user_root = temp.path().join("user");
@@ -446,12 +430,7 @@ fn rkat_rpc_starts_without_a_working_directory_when_no_flag_needs_it() {
 /// refused before the server serves, naming the store.
 #[test]
 fn confinement_that_could_change_the_credential_store_refuses_rkat_rpc_startup() {
-    let Some(binary) = rkat_rpc_binary() else {
-        eprintln!(
-            "skipping: rkat-rpc binary not advertised (CARGO_BIN_EXE_rkat-rpc unset or missing)"
-        );
-        return;
-    };
+    let binary = rkat_rpc_binary();
     let temp = TempDir::new().expect("temp dir");
     let base = temp.path().canonicalize().expect("canonical temp");
     // The user's config directory, and with it the default credential store,

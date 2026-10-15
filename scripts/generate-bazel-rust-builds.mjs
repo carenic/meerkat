@@ -2413,6 +2413,10 @@ for (const pkg of localPackages.values()) {
         data.push("//crates/meerkat-mcp-server:rkat_mcp_bin");
         env.push(`        "CARGO_BIN_EXE_rkat-mcp": "$(rootpath //crates/meerkat-mcp-server:rkat_mcp_bin)",`);
       }
+      if (key === "meerkat-rest") {
+        data.push("//crates/meerkat-rest:rkat_rest_bin");
+        env.push(`        "CARGO_BIN_EXE_rkat-rest": "$(rootpath //crates/meerkat-rest:rkat_rest_bin)",`);
+      }
       if (key === "xtask") {
         const rustfmt = "@@rules_rust++rust+rustfmt_nightly-2026-04-16__aarch64-apple-darwin_tools//:rustfmt_bin";
         const rustfmtLib = "@@rules_rust++rust+rustfmt_nightly-2026-04-16__aarch64-apple-darwin_tools//:rustc_lib";

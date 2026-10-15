@@ -87,6 +87,10 @@ them.
 
 ### Changed
 
+- The generated Bazel targets of `meerkat-rest`'s tests get the
+  `rkat-rest` binary, and the real-binary confinement tests of `rkat-rpc`
+  and `rkat-rest` fail, rather than pass without having run, when their
+  binary is missing.
 - CI's `Closure tests` rows have 60 minutes instead of 40, and the
   `ci-integration` profile gives its four slow nested-Cargo and
   whole-workspace tests 16 slow periods (960 s) instead of 8, so a cold row
