@@ -1939,6 +1939,49 @@ def check_token_permissions(text: str) -> list[str]:
                 violations.append(f"job `{job}` step `{step.name}` persists the workflow token in its checkout")
     return violations
 
+# Jobs that hold a registry or publish token (or write the GitHub release).
+TOKEN_JOBS = (
+    "registry_credentials_preflight",
+    REGISTRY_JOB,
+    WEB_SDK_PUBLISH_JOB,
+    CRITICAL_PUBLISH_JOB,
+    ASSET_PUBLISH_JOB,
+    "update_homebrew",
+    "attach_semver_baseline",
+)
+CACHE_ACTIONS = ("Swatinem/rust-cache", "actions/cache")
+
+
+def check_release_caches(text: str) -> list[str]:
+    """No release cache can be poisoned by a dispatch or reach a token job.
+
+    A dispatch runs on main and saves into the default branch's cache scope,
+    which every tag run restores from, so no release cache is saved by a
+    dispatch; ~/.cargo/bin is never cached, so a restored binary cannot
+    shadow a tool on PATH; and the jobs holding registry or publish tokens
+    restore no cache at all.
+    """
+    violations: list[str] = []
+    dispatch = EventContext(label="a dispatch", event_name="workflow_dispatch", ref="refs/heads/main")
+    for job in _job_names(text):
+        for step in _steps_of(text, job):
+            uses = step.fields.get("uses", "")
+            if not any(action in uses for action in CACHE_ACTIONS):
+                continue
+            if job in TOKEN_JOBS:
+                violations.append(f"job `{job}` holds a registry or publish token and restores a cache (`{uses}`)")
+                continue
+            inputs = step.nested("with")
+            if "rust-cache" in uses:
+                if inputs.get("cache-bin") != "false":
+                    violations.append(f"job `{job}` caches ~/.cargo/bin (`cache-bin` is not false)")
+                save_if = inputs.get("save-if")
+                if save_if is None or truthy(evaluate(save_if, dispatch)):
+                    violations.append(f"job `{job}` saves its rust-cache on {dispatch.label}")
+            else:
+                violations.append(f"job `{job}` uses `{uses}`, which saves from any run")
+    return violations
+
 def _readiness_push(needed: str, baseline: str) -> EventContext:
     return EventContext(
         label=f"a main push with needed={needed!r} and notes baseline {baseline!r}",
@@ -2012,6 +2055,7 @@ CHECKS: dict[str, Callable[[str], list[str]]] = {
     "semver-baseline": check_semver_baseline,
     "trailing-platforms": check_trailing_platforms,
     "token-permissions": check_token_permissions,
+    "release-caches": check_release_caches,
 }
 
 # Checks of release-semver-readiness.yml; run them by name with

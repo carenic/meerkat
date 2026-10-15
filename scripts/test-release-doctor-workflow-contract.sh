@@ -527,6 +527,18 @@ elif name == "token-write-default":
         "permissions:\n  actions: read\n  checks: read\n  contents: read\n",
         "permissions:\n  actions: read\n  checks: read\n  contents: write\n  id-token: write\n",
     )
+elif name == "cache-registry-restore":
+    # The pre-review registry publisher restored a cache with its tokens.
+    job = text.index("  publish_registries:\n")
+    needle = "      - name: Install Python + Node tooling\n"
+    at = text.index(needle, job)
+    text = text[:at] + "      - name: Cache cargo registry\n        uses: Swatinem/rust-cache@v2\n\n" + text[at:]
+elif name == "cache-dispatch-save":
+    # A build cache saved by dispatch runs, which tag runs restore.
+    job = text.index("  build_binaries_windows_cross:\n")
+    needle = "          save-if: ${{ github.event_name != 'workflow_dispatch' }}\n"
+    at = text.index(needle, job)
+    text = text[:at] + text[at + len(needle):]
 elif name == "both-defects":
     replace_once(
         MEASUREMENT_STEP_IF,
@@ -733,6 +745,13 @@ expect_fail_named trailing-selects-intel "${TEST_ROOT}/trailing-selects-intel.ym
 mutate token-write-default "${TEST_ROOT}/token-write-default.yml"
 expect_fail_named token-write-default "${TEST_ROOT}/token-write-default.yml" \
   "the workflow default grants \`contents: write\` to every job" token-permissions
+
+mutate cache-registry-restore "${TEST_ROOT}/cache-registry-restore.yml"
+expect_fail_named cache-registry-restore "${TEST_ROOT}/cache-registry-restore.yml" \
+  "job \`publish_registries\` holds a registry or publish token and restores a cache" release-caches
+mutate cache-dispatch-save "${TEST_ROOT}/cache-dispatch-save.yml"
+expect_fail_named cache-dispatch-save "${TEST_ROOT}/cache-dispatch-save.yml" \
+  "job \`build_binaries_windows_cross\` saves its rust-cache on a dispatch" release-caches
 
 mutate readback-step-removed "${TEST_ROOT}/readback-step-removed.yml"
 expect_fail_named readback-step-removed "${TEST_ROOT}/readback-step-removed.yml" \

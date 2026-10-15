@@ -313,6 +313,12 @@ else
   bad "Release workflow grants write or OIDC scopes beyond the jobs that need them (${token_contract//$'\n'/; })"
 fi
 
+if caches_contract="$(workflow_contract release-caches)"; then
+  pass "Release caches are never saved by a dispatch, never cache ~/.cargo/bin, and never reach a token-holding job"
+else
+  bad "A release cache can be written by a dispatch or reach a token-holding job (${caches_contract//$'\n'/; })"
+fi
+
 if tag_validation_contract="$(workflow_contract tag-validation)"; then
   pass "Tag releases validate on the verified schema-4 exact-tree CI attestation instead of re-running Cargo validation"
 else

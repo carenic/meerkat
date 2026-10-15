@@ -539,6 +539,13 @@ jobs:
 
       - name: Cache cargo registry
         uses: Swatinem/rust-cache@v2
+        with:
+          # Release caches never come from a dispatch: a dispatch runs on main
+          # and would save into the default branch's scope, which every later
+          # tag run restores from. ~/.cargo/bin is never cached, so no restored
+          # binary can shadow cargo, git or the platform tools on PATH.
+          save-if: ${{ github.event_name != 'workflow_dispatch' }}
+          cache-bin: "false"
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -815,6 +822,12 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: release-semver-breaks
+          # Release caches never come from a dispatch: a dispatch runs on main
+          # and would save into the default branch's scope, which every later
+          # tag run restores from. ~/.cargo/bin is never cached, so no restored
+          # binary can shadow cargo, git or the platform tools on PATH.
+          save-if: ${{ github.event_name != 'workflow_dispatch' }}
+          cache-bin: "false"
 
       - name: Install cargo-semver-checks
         if: >-
@@ -1090,6 +1103,12 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           key: release-${{ matrix.platform.target }}
+          # Release caches never come from a dispatch: a dispatch runs on main
+          # and would save into the default branch's scope, which every later
+          # tag run restores from. ~/.cargo/bin is never cached, so no restored
+          # binary can shadow cargo, git or the platform tools on PATH.
+          save-if: ${{ github.event_name != 'workflow_dispatch' }}
+          cache-bin: "false"
 
       # The workspace is trusted for Git in the step after Checkout (see
       # there). audiopus-sys falls back to building bundled Opus and requires
@@ -1180,7 +1199,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          codesign --force --sign - "target/${{ matrix.platform.target }}/release/${{ matrix.surface.bin }}"
+          /usr/bin/codesign --force --sign - "target/${{ matrix.platform.target }}/release/${{ matrix.surface.bin }}"
 
       # The test-code marker guard comes from the workflow ref: an asset
       # recovery of an older tag builds a tree that predates it. Sparse, so
@@ -1344,6 +1363,12 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           key: release-x86_64-pc-windows-msvc-cross
+          # Release caches never come from a dispatch: a dispatch runs on main
+          # and would save into the default branch's scope, which every later
+          # tag run restores from. ~/.cargo/bin is never cached, so no restored
+          # binary can shadow cargo, git or the platform tools on PATH.
+          save-if: ${{ github.event_name != 'workflow_dispatch' }}
+          cache-bin: "false"
 
       - name: Resolve release version
         id: version
@@ -1513,6 +1538,12 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           key: release-x86_64-apple-darwin-cross
+          # Release caches never come from a dispatch: a dispatch runs on main
+          # and would save into the default branch's scope, which every later
+          # tag run restores from. ~/.cargo/bin is never cached, so no restored
+          # binary can shadow cargo, git or the platform tools on PATH.
+          save-if: ${{ github.event_name != 'workflow_dispatch' }}
+          cache-bin: "false"
 
       - name: Cross-compile the surface binary
         shell: bash
@@ -1524,7 +1555,7 @@ jobs:
 
       - name: Ad-hoc codesign the binary
         shell: bash
-        run: codesign --force --sign - "target/x86_64-apple-darwin/release/${{ matrix.surface.bin }}"
+        run: /usr/bin/codesign --force --sign - "target/x86_64-apple-darwin/release/${{ matrix.surface.bin }}"
 
       # The test-code marker guard comes from the workflow ref: an asset
       # recovery of an older tag builds a tree that predates it. Sparse, so
@@ -2063,9 +2094,12 @@ jobs:
       - name: Cache cargo registry
         uses: Swatinem/rust-cache@v2
         with:
-          # A dispatch runs on main and would save into the default branch's
-          # scope, which every later tag run restores from.
+          # Release caches never come from a dispatch: a dispatch runs on main
+          # and would save into the default branch's scope, which every later
+          # tag run restores from. ~/.cargo/bin is never cached, so no restored
+          # binary can shadow cargo, git or the platform tools on PATH.
           save-if: ${{ github.event_name != 'workflow_dispatch' }}
+          cache-bin: "false"
 
       - name: Install Python + Node tooling
         uses: actions/setup-python@v5
@@ -2680,6 +2714,12 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: release-semver-rustdoc
+          # Release caches never come from a dispatch: a dispatch runs on main
+          # and would save into the default branch's scope, which every later
+          # tag run restores from. ~/.cargo/bin is never cached, so no restored
+          # binary can shadow cargo, git or the platform tools on PATH.
+          save-if: ${{ github.event_name != 'workflow_dispatch' }}
+          cache-bin: "false"
 
       - name: Generate rustdoc JSON for every publishable library crate
         shell: bash
@@ -2777,9 +2817,11 @@ jobs:
 
       - uses: ./.github/actions/setup-rust-ci
 
-      - name: Cache cargo registry
-        uses: Swatinem/rust-cache@v2
-
+      # No cache: this job holds the crates.io, PyPI and npm tokens, and a
+      # restored cache (written by any earlier run on main, a dispatch
+      # included) could put a binary ahead of cargo or python on PATH. It
+      # packages without compiling (cargo publish --no-verify), so a cold
+      # registry costs only the index and source downloads.
       - name: Install Python + Node tooling
         uses: actions/setup-python@v5
         with:

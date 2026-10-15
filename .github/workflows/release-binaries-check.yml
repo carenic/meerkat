@@ -138,7 +138,7 @@ jobs:
         run: |
           set -euo pipefail
           src="target/x86_64-apple-darwin/release/${{ matrix.surface.bin }}"
-          codesign --force --sign - "${src}"
+          /usr/bin/codesign --force --sign - "${src}"
           version="$(awk '
             /^\[workspace.package\]/ { in_workspace_package = 1; next }
             /^\[/ { in_workspace_package = 0 }

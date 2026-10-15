@@ -48,7 +48,7 @@ good() {
 check() {
   local status
   set +e
-  PATH="${TEST_ROOT}/bin:${PATH}" "${CHECK}" "${TEST_ROOT}/rkat" 1.2.3 >"${TEST_ROOT}/$1.log" 2>&1
+  MEERKAT_MACOS_TOOL_DIR="${TEST_ROOT}/bin" "${CHECK}" "${TEST_ROOT}/rkat" 1.2.3 >"${TEST_ROOT}/$1.log" 2>&1
   status=$?
   set -e
   if [[ "${status}" -ne "$2" ]]; then
