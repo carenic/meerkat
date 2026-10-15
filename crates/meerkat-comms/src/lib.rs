@@ -79,11 +79,12 @@ pub use runtime::comms_runtime::{
 pub use runtime::comms_runtime::{constant_time_str_eq, validate_pairing_secret};
 
 pub use agent::dispatcher::{
-    CommsToolDispatcher, DynCommsToolDispatcher, NoOpDispatcher, comms_tool_defs,
+    CommsExecutionAuthority, CommsToolDispatcher, DynCommsToolDispatcher, NoOpDispatcher,
+    comms_tool_defs,
 };
 pub use mcp::tools::{
-    RuntimeCommsCommandHandle, ToolContext, comms_tool_unavailable_reason, handle_tools_call,
-    handle_tools_call_with_context, tools_list,
+    RuntimeCommsCommandHandle, ToolContext, comms_tool_operation_target,
+    comms_tool_unavailable_reason, handle_tools_call, handle_tools_call_with_context, tools_list,
 };
 
 // Capability registration

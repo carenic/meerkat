@@ -456,6 +456,41 @@ impl MemorySearchScope {
     pub fn includes(&self, metadata: &MemoryMetadata) -> bool {
         self.owner.includes(metadata)
     }
+
+    /// The exact scope this search reads, as an operation target names it.
+    pub fn scope_ref(&self) -> MemoryScopeRef {
+        MemoryScopeRef::Session {
+            session_id: self.session_id().clone(),
+        }
+    }
+}
+
+/// The exact memory scope one memory operation acts on, as its memory owner
+/// names it. It is a typed operation fact
+/// ([`crate::ToolOperationTarget::MemoryOperation`]) and the grant target an
+/// operation's lineage is selected by; never a permission.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+#[non_exhaustive]
+pub enum MemoryScopeRef {
+    /// The canonical semantic memory of one session ([`MemoryOwner`]): the
+    /// memory `memory_search` reads.
+    Session { session_id: crate::types::SessionId },
+    /// One scope of a memory owner a trusted host composes: `owner` is the
+    /// stable name the host gives that owner, and `scope` the owner's own
+    /// stable key for the scope. Scopes of different owners never coincide.
+    Host { owner: String, scope: String },
+}
+
+impl MemoryScopeRef {
+    /// Every name the scope carries is present: a host scope needs both its
+    /// owner name and its scope key.
+    pub fn is_named(&self) -> bool {
+        match self {
+            Self::Session { .. } => true,
+            Self::Host { owner, scope } => !owner.is_empty() && !scope.is_empty(),
+        }
+    }
 }
 
 /// Typed owner/scope for semantic memory indexing.

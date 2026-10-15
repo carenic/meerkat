@@ -2,8 +2,8 @@
 
 use async_trait::async_trait;
 use meerkat_comms::{
-    Router, RuntimeCommsCommandHandle, ToolContext, TrustedPeersView, comms_tool_defs,
-    comms_tool_unavailable_reason, handle_tools_call_with_context,
+    CommsExecutionAuthority, Router, RuntimeCommsCommandHandle, ToolContext, TrustedPeersView,
+    comms_tool_defs, comms_tool_unavailable_reason, handle_tools_call_with_context,
 };
 use meerkat_core::AgentToolDispatcher;
 use meerkat_core::ToolCallArguments;
@@ -16,9 +16,15 @@ use serde_json::Value;
 use std::sync::Arc;
 
 /// Tool dispatcher that provides comms tools.
+///
+/// Its comms owner ([`CommsExecutionAuthority`]) attaches each call's typed
+/// operation target to the plan it resolves (the one peer a delivery
+/// reaches, or the trusted-peer directory) and runs only a plan it resolved
+/// for exactly that target.
 pub struct CommsToolSurface {
     tool_context: ToolContext,
     tool_defs: Arc<[Arc<ToolDef>]>,
+    execution_authority: CommsExecutionAuthority,
 }
 
 impl CommsToolSurface {
@@ -33,6 +39,7 @@ impl CommsToolSurface {
         Self {
             tool_context,
             tool_defs,
+            execution_authority: CommsExecutionAuthority::new(),
         }
     }
 
@@ -50,6 +57,7 @@ impl CommsToolSurface {
         Self {
             tool_context,
             tool_defs,
+            execution_authority: CommsExecutionAuthority::new(),
         }
     }
 
@@ -70,6 +78,7 @@ impl CommsToolSurface {
         Self {
             tool_context,
             tool_defs,
+            execution_authority: CommsExecutionAuthority::new(),
         }
     }
 
@@ -144,6 +153,64 @@ impl AgentToolDispatcher for CommsToolSurface {
             })
             .collect::<Vec<_>>()
             .into()
+    }
+
+    /// Every comms plan carries the call's typed operation target from the
+    /// comms owner: the one peer a delivery reaches, or the trusted-peer
+    /// directory.
+    fn resolve_execution_plan(
+        &self,
+        call: ToolCallView<'_>,
+        dispatch_context: &ToolDispatchContext,
+        resolution_context: &meerkat_core::ToolExecutionResolutionContext,
+    ) -> Result<meerkat_core::ResolvedToolExecutionPlan, meerkat_core::ToolExecutionResolutionError>
+    {
+        if !self.tool_defs.iter().any(|tool| tool.name == call.name) {
+            return Err(meerkat_core::ToolExecutionResolutionError::NotFound {
+                tool_name: call.name.to_string(),
+            });
+        }
+        self.execution_authority.resolve_plan(
+            &self.tool_context,
+            call,
+            self.execution_binding_fingerprint(call.name)?,
+            dispatch_context,
+            resolution_context,
+        )
+    }
+
+    /// A resolved plan runs only when the comms owner resolved it for
+    /// exactly this call's current target and binding.
+    async fn dispatch_resolved_with_context(
+        &self,
+        call: ToolCallView<'_>,
+        context: &ToolDispatchContext,
+        plan: &meerkat_core::ResolvedToolExecutionPlan,
+    ) -> Result<meerkat_core::ops::ToolDispatchOutcome, ToolError> {
+        if !self.tool_defs.iter().any(|tool| tool.name == call.name) {
+            return Err(ToolError::NotFound {
+                name: call.name.to_string(),
+            });
+        }
+        if plan.mode() != meerkat_core::ToolExecutionMode::Fast {
+            return Err(ToolError::unavailable(
+                call.name,
+                meerkat_core::ToolUnavailableReason::ExecutionModeOwnerUnavailable,
+            ));
+        }
+        let binding = self
+            .execution_binding_fingerprint(call.name)
+            .map_err(ToolError::from)?;
+        if !self
+            .execution_authority
+            .resolved(call, &binding, context, plan)
+        {
+            return Err(ToolError::unavailable(
+                call.name,
+                meerkat_core::ToolUnavailableReason::ExecutionOwnerChanged,
+            ));
+        }
+        self.dispatch_with_context(call, context).await
     }
 
     async fn dispatch(
@@ -327,6 +394,154 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    fn resolution() -> meerkat_core::ToolExecutionResolutionContext {
+        meerkat_core::ToolExecutionResolutionContext::new(
+            meerkat_core::ToolDeadlineChain::new(vec![
+                meerkat_core::ToolDeadlineContributor::finite(
+                    meerkat_core::ToolDeadlineOwner::CoreToolDispatch,
+                    std::time::Duration::from_secs(600),
+                ),
+            ])
+            .expect("deadline chain"),
+        )
+    }
+
+    fn raw_args(value: Value) -> Box<serde_json::value::RawValue> {
+        serde_json::value::RawValue::from_string(value.to_string()).expect("raw arguments")
+    }
+
+    fn send_args(peer: meerkat_core::comms::PeerId) -> Box<serde_json::value::RawValue> {
+        raw_args(serde_json::json!({
+            "peer_id": peer,
+            "body": "hello",
+            "handling_mode": "queue",
+        }))
+    }
+
+    /// The operation targets a resolved plan carries, as their owners
+    /// render them.
+    fn plan_targets(plan: &meerkat_core::ResolvedToolExecutionPlan) -> Vec<String> {
+        plan.owner_witnesses()
+            .iter()
+            .filter_map(|witness| witness.operation_target())
+            .map(|target| format!("{target:?}"))
+            .collect()
+    }
+
+    /// A delivery's plan names the peer the call is addressed to, and the
+    /// roster read's plan names the trusted-peer directory: typed facts an
+    /// operation policy owner can map, never the tool name.
+    #[test]
+    fn comms_plans_carry_their_typed_operation_target() {
+        let (router, trusted_peers) = make_tool_context();
+        let surface = CommsToolSurface::new(router, trusted_peers);
+        let peer = meerkat_core::comms::PeerId::new();
+        let args = send_args(peer);
+        let plan = surface
+            .resolve_execution_plan(
+                ToolCallView {
+                    id: "send-1",
+                    name: "send_message",
+                    args: &args,
+                },
+                &ToolDispatchContext::default(),
+                &resolution(),
+            )
+            .expect("send_message plan");
+        let targets = plan_targets(&plan);
+        assert_eq!(
+            targets.len(),
+            1,
+            "a delivery plan names exactly one operation target: {targets:?}"
+        );
+        assert!(
+            targets[0].contains(&peer.to_string()),
+            "the delivery target names the addressed peer: {targets:?}"
+        );
+
+        let empty = raw_args(serde_json::json!({}));
+        let plan = surface
+            .resolve_execution_plan(
+                ToolCallView {
+                    id: "peers-1",
+                    name: "peers",
+                    args: &empty,
+                },
+                &ToolDispatchContext::default(),
+                &resolution(),
+            )
+            .expect("peers plan");
+        assert_eq!(
+            plan_targets(&plan).len(),
+            1,
+            "the roster read names its operation target"
+        );
+    }
+
+    /// The comms owner revalidates its own target at dispatch: a plan
+    /// resolved for one peer never delivers to another.
+    #[tokio::test]
+    async fn a_plan_resolved_for_one_peer_never_dispatches_to_another() {
+        let (router, trusted_peers) = make_tool_context();
+        let surface = CommsToolSurface::new(router, trusted_peers);
+        let resolved_for = send_args(meerkat_core::comms::PeerId::new());
+        let plan = surface
+            .resolve_execution_plan(
+                ToolCallView {
+                    id: "send-1",
+                    name: "send_message",
+                    args: &resolved_for,
+                },
+                &ToolDispatchContext::default(),
+                &resolution(),
+            )
+            .expect("send_message plan");
+        let other = send_args(meerkat_core::comms::PeerId::new());
+        let result = surface
+            .dispatch_resolved_with_context(
+                ToolCallView {
+                    id: "send-1",
+                    name: "send_message",
+                    args: &other,
+                },
+                &ToolDispatchContext::default(),
+                &plan,
+            )
+            .await;
+        assert!(
+            matches!(
+                result,
+                Err(ToolError::Unavailable {
+                    reason: ToolUnavailableReason::ExecutionOwnerChanged,
+                    ..
+                })
+            ),
+            "a plan for another peer must not dispatch: {result:?}"
+        );
+
+        // The call the plan was resolved for passes the owner's check; the
+        // handler's own trust check then refuses the untrusted peer.
+        let result = surface
+            .dispatch_resolved_with_context(
+                ToolCallView {
+                    id: "send-1",
+                    name: "send_message",
+                    args: &resolved_for,
+                },
+                &ToolDispatchContext::default(),
+                &plan,
+            )
+            .await;
+        assert!(
+            matches!(
+                &result,
+                Err(ToolError::ExecutionFailed { message })
+                    if message.starts_with("peer_not_found_or_not_trusted")
+            ),
+            "the resolved call reaches the comms handler: {result:?}"
+        );
     }
 
     #[tokio::test]

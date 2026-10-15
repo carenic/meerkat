@@ -5,6 +5,7 @@
 //! and delegates to its `search()` method.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
 use meerkat_core::AgentToolDispatcher;
@@ -13,6 +14,7 @@ use meerkat_core::memory::{MemorySearchScope, MemoryStore, MemoryStoreError};
 use meerkat_core::types::{
     ContentBlock, ToolCallView, ToolDef, ToolProvenance, ToolResult, ToolSourceKind,
 };
+use meerkat_core::{MemoryOperation, ToolOperationTarget};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
@@ -60,12 +62,17 @@ fn input_schema() -> Value {
 ///
 /// Wraps an `Arc<dyn MemoryStore>` and exposes semantic search as an
 /// agent-callable tool. Created by the factory when the `memory-store-session`
-/// feature is enabled.
+/// feature is enabled. It is the owner of its plans: each carries the typed
+/// [`meerkat_core::ToolOperationTarget::MemoryOperation`] read of the scope
+/// this dispatcher searches, and only a plan it resolved dispatches.
 pub struct MemorySearchDispatcher {
     store: Arc<dyn MemoryStore>,
     scope: MemorySearchScope,
     tool_defs: Arc<[Arc<ToolDef>]>,
+    execution_authority_key: String,
 }
+
+static NEXT_MEMORY_EXECUTION_AUTHORITY_ID: AtomicU64 = AtomicU64::new(1);
 
 impl MemorySearchDispatcher {
     /// Create a new memory search dispatcher backed by the given store.
@@ -96,6 +103,10 @@ impl MemorySearchDispatcher {
             store,
             scope,
             tool_defs: Arc::from(vec![tool_def]),
+            execution_authority_key: format!(
+                "memory-search:{}",
+                NEXT_MEMORY_EXECUTION_AUTHORITY_ID.fetch_add(1, Ordering::Relaxed)
+            ),
         }
     }
 
@@ -105,6 +116,15 @@ impl MemorySearchDispatcher {
         session_id: meerkat_core::types::SessionId,
     ) -> Self {
         Self::new(store, MemorySearchScope::for_session(session_id))
+    }
+
+    /// The typed operation this dispatcher runs: a read of exactly the
+    /// scope it searches.
+    fn operation_target(&self) -> ToolOperationTarget {
+        ToolOperationTarget::MemoryOperation {
+            scope: self.scope.scope_ref(),
+            operation: MemoryOperation::Read,
+        }
     }
 }
 
@@ -120,6 +140,70 @@ impl AgentToolDispatcher for MemorySearchDispatcher {
         } else {
             meerkat_core::LiveBridgeEffectKind::ExternalIo
         }
+    }
+
+    /// The plan carries this owner's witness with the typed read of the
+    /// scope it searches.
+    fn resolve_execution_plan(
+        &self,
+        call: ToolCallView<'_>,
+        _dispatch_context: &meerkat_core::ToolDispatchContext,
+        resolution_context: &meerkat_core::ToolExecutionResolutionContext,
+    ) -> Result<meerkat_core::ResolvedToolExecutionPlan, meerkat_core::ToolExecutionResolutionError>
+    {
+        if call.name != TOOL_NAME {
+            return Err(meerkat_core::ToolExecutionResolutionError::NotFound {
+                tool_name: call.name.to_string(),
+            });
+        }
+        let witness = meerkat_core::ToolExecutionOwnerWitness::new(
+            self.execution_authority_key.clone(),
+            call.name,
+            self.execution_binding_fingerprint(call.name)?,
+        )?
+        .with_operation_target(self.operation_target());
+        meerkat_core::ToolExecutionContract::default()
+            .resolve_default(resolution_context.deadlines().clone())?
+            .with_owner_witness(witness)
+    }
+
+    /// A resolved plan runs only when this owner resolved it for exactly the
+    /// scope it searches and its current binding.
+    async fn dispatch_resolved_with_context(
+        &self,
+        call: ToolCallView<'_>,
+        context: &meerkat_core::ToolDispatchContext,
+        plan: &meerkat_core::ResolvedToolExecutionPlan,
+    ) -> Result<meerkat_core::ops::ToolDispatchOutcome, ToolError> {
+        if call.name != TOOL_NAME {
+            return Err(ToolError::NotFound {
+                name: call.name.into(),
+            });
+        }
+        if plan.mode() != meerkat_core::ToolExecutionMode::Fast {
+            return Err(ToolError::unavailable(
+                call.name,
+                meerkat_core::ToolUnavailableReason::ExecutionModeOwnerUnavailable,
+            ));
+        }
+        let binding = self
+            .execution_binding_fingerprint(call.name)
+            .map_err(ToolError::from)?;
+        let target = self.operation_target();
+        let resolved_here = plan
+            .owner_witness(&self.execution_authority_key)
+            .is_some_and(|witness| {
+                witness.owner_key() == call.name
+                    && witness.binding_fingerprint() == &binding
+                    && witness.operation_target() == Some(&target)
+            });
+        if !resolved_here {
+            return Err(ToolError::unavailable(
+                call.name,
+                meerkat_core::ToolUnavailableReason::ExecutionOwnerChanged,
+            ));
+        }
+        self.dispatch_with_context(call, context).await
     }
 
     async fn dispatch(
@@ -561,5 +645,121 @@ mod tests {
             .expect("memory tool should have provenance");
         assert_eq!(prov.kind, meerkat_core::types::ToolSourceKind::Memory);
         assert_eq!(prov.source_id, "memory");
+    }
+
+    fn resolution() -> meerkat_core::ToolExecutionResolutionContext {
+        meerkat_core::ToolExecutionResolutionContext::new(
+            meerkat_core::ToolDeadlineChain::new(vec![
+                meerkat_core::ToolDeadlineContributor::finite(
+                    meerkat_core::ToolDeadlineOwner::CoreToolDispatch,
+                    std::time::Duration::from_secs(600),
+                ),
+            ])
+            .unwrap(),
+        )
+    }
+
+    /// A `memory_search` plan names the memory scope it reads: the
+    /// session's own semantic memory the dispatcher was scoped to. An
+    /// operation policy owner maps that typed fact, never the tool name.
+    #[test]
+    fn memory_search_plan_carries_its_memory_scope_target() {
+        let store: Arc<dyn MemoryStore> = Arc::new(crate::SimpleMemoryStore::new());
+        let session_id = SessionId::new();
+        let dispatcher = dispatcher(store, &session_id);
+        let (id, raw, name) = make_call(r#"{"query": "anything"}"#);
+        let plan = dispatcher
+            .resolve_execution_plan(
+                call_view(&id, &raw, &name),
+                &meerkat_core::ToolDispatchContext::default(),
+                &resolution(),
+            )
+            .unwrap();
+        let targets: Vec<String> = plan
+            .owner_witnesses()
+            .iter()
+            .filter_map(|witness| witness.operation_target())
+            .map(|target| format!("{target:?}"))
+            .collect();
+        assert_eq!(targets.len(), 1, "one memory target: {targets:?}");
+        assert!(
+            targets[0].contains(&session_id.to_string()),
+            "the target names the searched session's memory: {targets:?}"
+        );
+    }
+
+    /// The exact typed target: a read of the dispatcher's own session memory.
+    #[test]
+    fn memory_search_target_is_a_read_of_its_session_memory() {
+        let store: Arc<dyn MemoryStore> = Arc::new(crate::SimpleMemoryStore::new());
+        let session_id = SessionId::new();
+        let dispatcher = dispatcher(store, &session_id);
+        let (id, raw, name) = make_call(r#"{"query": "anything"}"#);
+        let plan = dispatcher
+            .resolve_execution_plan(
+                call_view(&id, &raw, &name),
+                &meerkat_core::ToolDispatchContext::default(),
+                &resolution(),
+            )
+            .unwrap();
+        let targets: Vec<_> = plan
+            .owner_witnesses()
+            .iter()
+            .filter_map(|witness| witness.operation_target())
+            .collect();
+        assert_eq!(
+            targets,
+            vec![&ToolOperationTarget::MemoryOperation {
+                scope: meerkat_core::MemoryScopeRef::Session { session_id },
+                operation: MemoryOperation::Read,
+            }]
+        );
+    }
+
+    /// The memory owner runs only a plan it resolved itself: a plan without
+    /// its witness (resolved by another owner, or none) is refused.
+    #[tokio::test]
+    async fn memory_search_dispatches_only_its_own_plan() {
+        let store: Arc<dyn MemoryStore> = Arc::new(crate::SimpleMemoryStore::new());
+        let session_id = SessionId::new();
+        let dispatcher = dispatcher(store, &session_id);
+        let (id, raw, name) = make_call(r#"{"query": "anything"}"#);
+        let foreign = meerkat_core::ToolExecutionContract::default()
+            .resolve_default(resolution().deadlines().clone())
+            .unwrap();
+        let result = dispatcher
+            .dispatch_resolved_with_context(
+                call_view(&id, &raw, &name),
+                &meerkat_core::ToolDispatchContext::default(),
+                &foreign,
+            )
+            .await;
+        assert!(
+            matches!(
+                result,
+                Err(ToolError::Unavailable {
+                    reason: meerkat_core::ToolUnavailableReason::ExecutionOwnerChanged,
+                    ..
+                })
+            ),
+            "a plan this owner did not resolve must not dispatch: {result:?}"
+        );
+
+        let own = dispatcher
+            .resolve_execution_plan(
+                call_view(&id, &raw, &name),
+                &meerkat_core::ToolDispatchContext::default(),
+                &resolution(),
+            )
+            .unwrap();
+        let outcome = dispatcher
+            .dispatch_resolved_with_context(
+                call_view(&id, &raw, &name),
+                &meerkat_core::ToolDispatchContext::default(),
+                &own,
+            )
+            .await
+            .unwrap();
+        assert!(!outcome.result.is_error);
     }
 }

@@ -546,19 +546,45 @@ pub enum ToolOperationTarget {
         connector: crate::mcp_config::McpConnectorApproval,
         account: std::sync::Arc<crate::OperationAccount>,
     },
+    /// One comms delivery to exactly one peer, by its canonical
+    /// [`crate::comms::PeerId`] (the routing and trust key, never a display
+    /// name). Produced by the comms tools' owner for the peer the call
+    /// actually routes to: the explicit `peer_id` of a send, or the sender
+    /// of the turn's triggering message a reply selects. Revalidated by that
+    /// owner at dispatch, so a plan resolved for one peer never delivers to
+    /// another.
+    PeerSend {
+        peer: crate::comms::PeerId,
+        kind: PeerSendKind,
+    },
+    /// A read of the session's own trusted-peer directory (the comms
+    /// `peers` roster): peer identities, addresses and metadata. It
+    /// delivers nothing and stands for no later delivery.
+    PeerDirectoryRead,
+    /// One operation of a memory owner on exactly one memory scope, as that
+    /// owner names it. Produced by the memory tool's owner for the scope the
+    /// call actually reaches, and revalidated by it at dispatch.
+    MemoryOperation {
+        scope: crate::memory::MemoryScopeRef,
+        operation: MemoryOperation,
+    },
 }
 
 impl ToolOperationTarget {
     /// The account the owner states this exact operation acts with: `None`
-    /// for the session's own catalog control, which acts with no account of
-    /// its own.
+    /// for the session's own catalog control, comms deliveries, peer
+    /// directory and memory operations, which act with the session's own
+    /// identity and no account of their own.
     #[must_use]
     pub fn account(&self) -> Option<&crate::OperationAccount> {
         match self {
             Self::McpServerOperation { account, .. }
             | Self::RegisteredToolBundleOperation { account, .. }
             | Self::CheckedMcpServerOperation { account, .. } => Some(account),
-            Self::CatalogControl { .. } => None,
+            Self::CatalogControl { .. }
+            | Self::PeerSend { .. }
+            | Self::PeerDirectoryRead
+            | Self::MemoryOperation { .. } => None,
         }
     }
 }
@@ -569,6 +595,34 @@ impl ToolOperationTarget {
 pub enum CatalogOperation {
     Search,
     Load,
+}
+
+/// The kind of delivery a comms operation makes to its one peer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum PeerSendKind {
+    /// A message that expects no correlated response (`send_message`, and
+    /// `reply_to_peer` answering the turn's peer message).
+    Message,
+    /// A typed request that expects a correlated response (`send_request`).
+    Request,
+    /// A typed response to a request the peer sent (`send_response`).
+    Response,
+}
+
+/// The kind of operation a memory owner performs on one memory scope.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum MemoryOperation {
+    /// Reads, searches or lists the scope's records.
+    Read,
+    /// Creates or replaces a record in the scope.
+    Write,
+    /// Removes or tombstones a record in the scope.
+    Delete,
+    /// Submits a record for the scope's reviewing owner to commit; nothing
+    /// is written to the scope by the operation itself.
+    Propose,
 }
 
 impl ToolExecutionOwnerWitness {

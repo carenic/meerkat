@@ -398,8 +398,9 @@ pub use memory::{
     CompactionStageReceipt, CompactionStageReconcileReceipt, EmbeddingModel, HnswParams,
     MemoryEnumerationPage, MemoryEnumerationRequest, MemoryIndexBatch, MemoryIndexReceipt,
     MemoryIndexRequest, MemoryIndexScope, MemoryMetadata, MemoryOwner, MemoryRankingPolicy,
-    MemoryRecord, MemoryResult, MemoryScopeDropReceipt, MemorySearchScope, MemorySource,
-    MemoryStore, MemoryStoreError, MessageRange, SESSION_COMPACTION_PROJECTION_INTENTS_KEY,
+    MemoryRecord, MemoryResult, MemoryScopeDropReceipt, MemoryScopeRef, MemorySearchScope,
+    MemorySource, MemoryStore, MemoryStoreError, MessageRange,
+    SESSION_COMPACTION_PROJECTION_INTENTS_KEY,
 };
 pub use model_defaults::ModelOperationalDefaultsResolver;
 pub use model_profile::catalog::ModelReleaseStage;
@@ -606,8 +607,8 @@ pub use tool_consequence_policy::{
 pub use tool_execution::{
     CatalogOperation, CoreDispatchDeadline, DeadlineChainError, DeadlineChainExtensionError,
     DetachedToolExecutionPolicy, EphemeralToolBindingFingerprint, IdempotencyScope,
-    ResolvedExecutionKind, ResolvedToolExecutionPlan, RestartClass, RunnerIdentity,
-    StreamingToolExecutionPolicy, ToolCredentialContextRef, ToolDeadlineChain,
+    MemoryOperation, PeerSendKind, ResolvedExecutionKind, ResolvedToolExecutionPlan, RestartClass,
+    RunnerIdentity, StreamingToolExecutionPolicy, ToolCredentialContextRef, ToolDeadlineChain,
     ToolDeadlineContributor, ToolDeadlineOwner, ToolDeadlineSource, ToolExecutionApplicability,
     ToolExecutionContract, ToolExecutionContractError, ToolExecutionDeclarationError,
     ToolExecutionMode, ToolExecutionOwnerWitness, ToolExecutionResolutionContext,

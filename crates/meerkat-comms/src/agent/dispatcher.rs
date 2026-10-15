@@ -1,8 +1,8 @@
 //! CommsToolDispatcher - Implements AgentToolDispatcher for comms tools.
 
 use crate::mcp::tools::{
-    RuntimeCommsCommandHandle, ToolContext, comms_tool_unavailable_reason,
-    handle_tools_call_with_context, tools_list,
+    RuntimeCommsCommandHandle, ToolContext, comms_tool_operation_target,
+    comms_tool_unavailable_reason, handle_tools_call_with_context, tools_list,
 };
 use crate::{Router, TrustedPeersView};
 use async_trait::async_trait;
@@ -13,16 +13,114 @@ use meerkat_core::ToolCatalogCapabilities;
 use meerkat_core::ToolCatalogEntry;
 use meerkat_core::ToolDispatchContext;
 use meerkat_core::ToolDispatchOutcome;
+use meerkat_core::ToolOperationTarget;
 use meerkat_core::agent::ExternalToolUpdate;
 use meerkat_core::error::ToolError;
 use meerkat_core::types::{ToolCallView, ToolDef, ToolProvenance, ToolResult, ToolSourceKind};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static NEXT_COMMS_EXECUTION_AUTHORITY_ID: AtomicU64 = AtomicU64::new(1);
+
+/// The execution owner of the comms tools. Every comms plan it resolves
+/// carries its witness with the call's typed operation target
+/// ([`comms_tool_operation_target`]): the one peer a delivery reaches, or
+/// the session's trusted-peer directory. A plan dispatches only when this
+/// same owner resolved it for exactly the call's current target and
+/// binding, so a plan resolved for one peer never delivers to another.
+#[derive(Debug)]
+pub struct CommsExecutionAuthority {
+    key: String,
+}
+
+impl Default for CommsExecutionAuthority {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CommsExecutionAuthority {
+    pub fn new() -> Self {
+        Self {
+            key: format!(
+                "comms-tools:{}",
+                NEXT_COMMS_EXECUTION_AUTHORITY_ID.fetch_add(1, Ordering::Relaxed)
+            ),
+        }
+    }
+
+    /// Resolve the plan of the comms tool `call` with this owner's witness
+    /// for `binding`, carrying the call's typed operation target.
+    ///
+    /// # Errors
+    /// The tool is unavailable without runtime command authority, or the
+    /// call names no single addressee (`InvalidArguments`, with the reason
+    /// the handler itself gives).
+    pub fn resolve_plan(
+        &self,
+        tool_context: &ToolContext,
+        call: ToolCallView<'_>,
+        binding: meerkat_core::EphemeralToolBindingFingerprint,
+        dispatch_context: &ToolDispatchContext,
+        resolution_context: &meerkat_core::ToolExecutionResolutionContext,
+    ) -> Result<meerkat_core::ResolvedToolExecutionPlan, meerkat_core::ToolExecutionResolutionError>
+    {
+        if let Some(reason) = callability_for_context(tool_context, call.name).unavailable_reason()
+        {
+            return Err(meerkat_core::ToolExecutionResolutionError::Unavailable {
+                tool_name: call.name.to_string(),
+                reason,
+            });
+        }
+        let target = Self::target(call, dispatch_context).map_err(|reason| {
+            meerkat_core::ToolExecutionResolutionError::InvalidArguments {
+                tool_name: call.name.to_string(),
+                reason,
+            }
+        })?;
+        let witness =
+            meerkat_core::ToolExecutionOwnerWitness::new(self.key.clone(), call.name, binding)?
+                .with_operation_target(target);
+        meerkat_core::ToolExecutionContract::default()
+            .resolve_default(resolution_context.deadlines().clone())?
+            .with_owner_witness(witness)
+    }
+
+    /// Whether this owner resolved `plan` for exactly `call`'s current
+    /// operation target and `binding`.
+    pub fn resolved(
+        &self,
+        call: ToolCallView<'_>,
+        binding: &meerkat_core::EphemeralToolBindingFingerprint,
+        dispatch_context: &ToolDispatchContext,
+        plan: &meerkat_core::ResolvedToolExecutionPlan,
+    ) -> bool {
+        let Ok(target) = Self::target(call, dispatch_context) else {
+            return false;
+        };
+        plan.owner_witness(&self.key).is_some_and(|witness| {
+            witness.owner_key() == call.name
+                && witness.binding_fingerprint() == binding
+                && witness.operation_target() == Some(&target)
+        })
+    }
+
+    fn target(
+        call: ToolCallView<'_>,
+        dispatch_context: &ToolDispatchContext,
+    ) -> Result<ToolOperationTarget, String> {
+        let args =
+            ToolCallArguments::from_raw_json(call.args).map_err(|error| error.to_string())?;
+        comms_tool_operation_target(call.name, args.as_value(), dispatch_context)
+    }
+}
 
 /// Tool dispatcher that provides comms tools.
 pub struct CommsToolDispatcher<T: AgentToolDispatcher = NoOpDispatcher> {
     tool_context: ToolContext,
     inner: Option<Arc<T>>,
     tool_defs: Arc<[Arc<ToolDef>]>,
+    execution_authority: CommsExecutionAuthority,
 }
 
 impl CommsToolDispatcher<NoOpDispatcher> {
@@ -37,6 +135,7 @@ impl CommsToolDispatcher<NoOpDispatcher> {
             tool_context,
             inner: None,
             tool_defs,
+            execution_authority: CommsExecutionAuthority::new(),
         }
     }
 
@@ -55,6 +154,7 @@ impl CommsToolDispatcher<NoOpDispatcher> {
             tool_context,
             inner: None,
             tool_defs,
+            execution_authority: CommsExecutionAuthority::new(),
         }
     }
 }
@@ -71,6 +171,7 @@ impl<T: AgentToolDispatcher> CommsToolDispatcher<T> {
             tool_context,
             inner: Some(inner),
             tool_defs,
+            execution_authority: CommsExecutionAuthority::new(),
         }
     }
 }
@@ -116,20 +217,33 @@ fn callability_for_context(ctx: &ToolContext, name: &str) -> ToolCallability {
         .map_or_else(ToolCallability::callable, ToolCallability::unavailable)
 }
 
-fn resolve_comms_execution_plan(
-    tool_context: &ToolContext,
+/// Run a comms tool `call` under `plan` only when `authority` resolved that
+/// plan for exactly the call's current target and `binding`; anything else
+/// is a plan of another owner or another addressee.
+fn ensure_comms_plan(
+    authority: &CommsExecutionAuthority,
     call: ToolCallView<'_>,
-    resolution_context: &meerkat_core::ToolExecutionResolutionContext,
-) -> Result<meerkat_core::ResolvedToolExecutionPlan, meerkat_core::ToolExecutionResolutionError> {
-    if let Some(reason) = callability_for_context(tool_context, call.name).unavailable_reason() {
-        return Err(meerkat_core::ToolExecutionResolutionError::Unavailable {
-            tool_name: call.name.to_string(),
-            reason,
-        });
+    binding: Result<
+        meerkat_core::EphemeralToolBindingFingerprint,
+        meerkat_core::ToolExecutionResolutionError,
+    >,
+    context: &ToolDispatchContext,
+    plan: &meerkat_core::ResolvedToolExecutionPlan,
+) -> Result<(), ToolError> {
+    if plan.mode() != meerkat_core::ToolExecutionMode::Fast {
+        return Err(ToolError::unavailable(
+            call.name,
+            meerkat_core::ToolUnavailableReason::ExecutionModeOwnerUnavailable,
+        ));
     }
-    meerkat_core::ToolExecutionContract::default()
-        .resolve_default(resolution_context.deadlines().clone())
-        .map_err(Into::into)
+    let binding = binding.map_err(ToolError::from)?;
+    if !authority.resolved(call, &binding, context, plan) {
+        return Err(ToolError::unavailable(
+            call.name,
+            meerkat_core::ToolUnavailableReason::ExecutionOwnerChanged,
+        ));
+    }
+    Ok(())
 }
 
 /// Canonical JSON-to-ToolDef conversion for comms tools.
@@ -339,7 +453,13 @@ impl<T: AgentToolDispatcher + 'static> AgentToolDispatcher for CommsToolDispatch
     ) -> Result<meerkat_core::ResolvedToolExecutionPlan, meerkat_core::ToolExecutionResolutionError>
     {
         if is_comms_tool(call.name) {
-            resolve_comms_execution_plan(&self.tool_context, call, resolution_context)
+            self.execution_authority.resolve_plan(
+                &self.tool_context,
+                call,
+                self.execution_binding_fingerprint(call.name)?,
+                dispatch_context,
+                resolution_context,
+            )
         } else if let Some(inner) = &self.inner {
             inner.resolve_execution_plan(call, dispatch_context, resolution_context)
         } else {
@@ -356,12 +476,13 @@ impl<T: AgentToolDispatcher + 'static> AgentToolDispatcher for CommsToolDispatch
         plan: &meerkat_core::ResolvedToolExecutionPlan,
     ) -> Result<meerkat_core::ToolDispatchOutcome, ToolError> {
         if is_comms_tool(call.name) {
-            if plan.mode() != meerkat_core::ToolExecutionMode::Fast {
-                return Err(ToolError::unavailable(
-                    call.name,
-                    meerkat_core::ToolUnavailableReason::ExecutionModeOwnerUnavailable,
-                ));
-            }
+            ensure_comms_plan(
+                &self.execution_authority,
+                call,
+                self.execution_binding_fingerprint(call.name),
+                context,
+                plan,
+            )?;
             self.dispatch_with_context(call, context).await
         } else if let Some(inner) = &self.inner {
             inner
@@ -410,6 +531,7 @@ pub struct DynCommsToolDispatcher {
     tool_context: ToolContext,
     inner: Arc<dyn AgentToolDispatcher>,
     tool_defs: Arc<[Arc<ToolDef>]>,
+    execution_authority: CommsExecutionAuthority,
 }
 
 impl DynCommsToolDispatcher {
@@ -428,6 +550,7 @@ impl DynCommsToolDispatcher {
             tool_context,
             inner,
             tool_defs,
+            execution_authority: CommsExecutionAuthority::new(),
         }
     }
 
@@ -447,6 +570,7 @@ impl DynCommsToolDispatcher {
             tool_context,
             inner,
             tool_defs,
+            execution_authority: CommsExecutionAuthority::new(),
         }
     }
 }
@@ -596,7 +720,13 @@ impl AgentToolDispatcher for DynCommsToolDispatcher {
     ) -> Result<meerkat_core::ResolvedToolExecutionPlan, meerkat_core::ToolExecutionResolutionError>
     {
         if is_comms_tool(call.name) {
-            resolve_comms_execution_plan(&self.tool_context, call, resolution_context)
+            self.execution_authority.resolve_plan(
+                &self.tool_context,
+                call,
+                self.execution_binding_fingerprint(call.name)?,
+                dispatch_context,
+                resolution_context,
+            )
         } else {
             self.inner
                 .resolve_execution_plan(call, dispatch_context, resolution_context)
@@ -610,12 +740,13 @@ impl AgentToolDispatcher for DynCommsToolDispatcher {
         plan: &meerkat_core::ResolvedToolExecutionPlan,
     ) -> Result<meerkat_core::ToolDispatchOutcome, ToolError> {
         if is_comms_tool(call.name) {
-            if plan.mode() != meerkat_core::ToolExecutionMode::Fast {
-                return Err(ToolError::unavailable(
-                    call.name,
-                    meerkat_core::ToolUnavailableReason::ExecutionModeOwnerUnavailable,
-                ));
-            }
+            ensure_comms_plan(
+                &self.execution_authority,
+                call,
+                self.execution_binding_fingerprint(call.name),
+                context,
+                plan,
+            )?;
             self.dispatch_with_context(call, context).await
         } else {
             self.inner
@@ -1045,6 +1176,87 @@ mod tests {
             message.starts_with("no_reply_capability"),
             "expected typed no_reply_capability error, got: {message}"
         );
+    }
+
+    fn send_args(peer: meerkat_core::comms::PeerId) -> Box<serde_json::value::RawValue> {
+        serde_json::value::RawValue::from_string(
+            serde_json::json!({
+                "peer_id": peer,
+                "body": "hello",
+                "handling_mode": "queue",
+            })
+            .to_string(),
+        )
+        .expect("valid args")
+    }
+
+    /// Both comms dispatchers attach the typed target of the addressed peer
+    /// to the plans they resolve for a delivery, and refuse at dispatch a
+    /// plan resolved for another peer.
+    #[tokio::test]
+    async fn comms_dispatcher_plans_carry_and_revalidate_the_addressed_peer() {
+        let (router, trusted_peers) = test_router();
+        let dispatchers: Vec<Arc<dyn AgentToolDispatcher>> = vec![
+            Arc::new(CommsToolDispatcher::new(
+                Arc::clone(&router),
+                trusted_peers.clone(),
+            )),
+            Arc::new(DynCommsToolDispatcher::new(
+                router,
+                trusted_peers,
+                Arc::new(NoOpDispatcher),
+            )),
+        ];
+        for dispatcher in dispatchers {
+            let peer = meerkat_core::comms::PeerId::new();
+            let args = send_args(peer);
+            let call = ToolCallView {
+                id: "send-1",
+                name: "send_message",
+                args: &args,
+            };
+            let plan = dispatcher
+                .resolve_execution_plan(
+                    call,
+                    &ToolDispatchContext::default(),
+                    &execution_resolution_context(),
+                )
+                .expect("send_message plan");
+            let targets: Vec<String> = plan
+                .owner_witnesses()
+                .iter()
+                .filter_map(|witness| witness.operation_target())
+                .map(|target| format!("{target:?}"))
+                .collect();
+            assert_eq!(targets.len(), 1, "one delivery target: {targets:?}");
+            assert!(
+                targets[0].contains(&peer.to_string()),
+                "the target names the addressed peer: {targets:?}"
+            );
+
+            let other = send_args(meerkat_core::comms::PeerId::new());
+            let result = dispatcher
+                .dispatch_resolved_with_context(
+                    ToolCallView {
+                        id: "send-1",
+                        name: "send_message",
+                        args: &other,
+                    },
+                    &ToolDispatchContext::default(),
+                    &plan,
+                )
+                .await;
+            assert!(
+                matches!(
+                    result,
+                    Err(ToolError::Unavailable {
+                        reason: meerkat_core::ToolUnavailableReason::ExecutionOwnerChanged,
+                        ..
+                    })
+                ),
+                "a plan for another peer must not dispatch: {result:?}"
+            );
+        }
     }
 
     #[test]

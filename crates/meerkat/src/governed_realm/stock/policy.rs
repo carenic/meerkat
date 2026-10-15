@@ -52,6 +52,12 @@
 //! - builtin tools and host tools that are not a registered bundle's
 //!   operation (a dispatcher plan with no owner-produced operation target)
 //!   and provider-hosted tool targets;
+//! - comms deliveries, the trusted-peer directory read and memory
+//!   operations. Their plans carry typed targets (`PeerSend`,
+//!   `PeerDirectoryRead`, `MemoryOperation`), but stock issues no grant for
+//!   those targets, so under a per-target selection the grant owner denies
+//!   them before this owner is asked; an older single worker grant reaches
+//!   this owner, which leaves them unmapped;
 //! - blobs, runtime inputs, transcript ranges and external sources;
 //! - publications;
 //! - hosted capabilities, alternate models and live model channels.

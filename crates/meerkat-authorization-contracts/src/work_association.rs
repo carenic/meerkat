@@ -110,6 +110,21 @@ pub enum GrantTarget {
     /// `CheckedMcpServerOperation`. Its lineage never covers the server's
     /// ordinary operations, and the server's lineage never covers it.
     CheckedMcpRoute { route: String, server: String },
+    /// Deliveries to exactly one peer, by its canonical identity (the comms
+    /// routing and trust key, never a display name): the target of the
+    /// owner-produced `PeerSend`. Each peer is its own target: one peer's
+    /// lineage never covers another peer, the peer directory or the base,
+    /// and the base never covers a delivery.
+    Peer { peer: meerkat_core::comms::PeerId },
+    /// Reads of the session's own trusted-peer directory: the target of the
+    /// owner-produced `PeerDirectoryRead`. Its lineage covers no delivery.
+    PeerDirectory,
+    /// Operations on exactly one memory scope, as its memory owner names
+    /// it: the target of the owner-produced `MemoryOperation`. Each scope is
+    /// its own target; the base never covers a memory operation.
+    Memory {
+        scope: meerkat_core::memory::MemoryScopeRef,
+    },
 }
 
 /// One target's selected exact lineage.
@@ -161,6 +176,10 @@ impl WorkAuthorityBasis {
                         GrantTarget::CheckedMcpRoute { route, server } => {
                             !route.is_empty() && !server.is_empty()
                         }
+                        // A peer is named by its typed identity; the peer
+                        // directory is the session's own.
+                        GrantTarget::Peer { .. } | GrantTarget::PeerDirectory => true,
+                        GrantTarget::Memory { scope } => scope.is_named(),
                     };
                     if !named {
                         return Err(AssociationError::Shape);
@@ -1376,6 +1395,141 @@ mod tests {
                 (checked_route("checked", "setup"), checked),
                 (server("setup"), chain),
             ],
+        );
+        assert_eq!(
+            InputAuthorityAssociation::new(unordered),
+            Err(AssociationError::Shape)
+        );
+    }
+
+    fn peer(value: u128) -> GrantTarget {
+        GrantTarget::Peer {
+            peer: meerkat_core::comms::PeerId::from_uuid(uuid::Uuid::from_u128(value)),
+        }
+    }
+
+    fn host_memory(owner: &str, scope: &str) -> GrantTarget {
+        GrantTarget::Memory {
+            scope: meerkat_core::memory::MemoryScopeRef::Host {
+                owner: owner.into(),
+                scope: scope.into(),
+            },
+        }
+    }
+
+    /// Each peer, the peer directory and each memory scope is a target of
+    /// its own: it selects only its own lineage, never another peer's or
+    /// scope's, and never the base. The wire shape is pinned, a host memory
+    /// scope needs both of its names, and the order stays canonical across
+    /// target kinds.
+    #[test]
+    fn peer_directory_and_memory_targets_select_only_their_own_lineage() {
+        let mut value = candidate();
+        let chain = fixture_lineage_mut(&mut value).to_vec();
+        let lineage = |name: &str| {
+            let mut lineage = chain.clone();
+            lineage[0].grant_id = id(name);
+            lineage
+        };
+        let session = meerkat_core::SessionId::from_uuid(uuid::Uuid::from_u128(9));
+        let session_memory = GrantTarget::Memory {
+            scope: meerkat_core::memory::MemoryScopeRef::Session {
+                session_id: session.clone(),
+            },
+        };
+        value.authority_basis = targeted(
+            Some(chain.clone()),
+            vec![
+                (server("alpha"), chain.clone()),
+                (peer(1), lineage("peer-one")),
+                (GrantTarget::PeerDirectory, lineage("peer-directory")),
+                (session_memory.clone(), lineage("session-memory")),
+                (
+                    host_memory("agent_memory", "identity/alice"),
+                    lineage("alice"),
+                ),
+            ],
+        );
+        let association = InputAuthorityAssociation::new(value.clone()).expect("association");
+        let basis = &association.candidate().authority_basis;
+        assert_eq!(
+            basis.lineage_for(Some(&peer(1))),
+            Some(lineage("peer-one").as_slice())
+        );
+        assert_eq!(
+            basis.lineage_for(Some(&peer(2))),
+            None,
+            "another peer has no lineage, and the base never stands in"
+        );
+        assert_eq!(
+            basis.lineage_for(Some(&GrantTarget::PeerDirectory)),
+            Some(lineage("peer-directory").as_slice())
+        );
+        assert_eq!(
+            basis.lineage_for(Some(&host_memory("agent_memory", "identity/alice"))),
+            Some(lineage("alice").as_slice())
+        );
+        assert_eq!(
+            basis.lineage_for(Some(&host_memory("agent_memory", "identity/bob"))),
+            None,
+            "another scope of the same owner has no lineage"
+        );
+        assert_eq!(
+            basis.lineage_for(Some(&host_memory("other_memory", "identity/alice"))),
+            None,
+            "the same key of another owner has no lineage"
+        );
+        assert_eq!(
+            basis.lineage_for(Some(&session_memory)),
+            Some(lineage("session-memory").as_slice())
+        );
+
+        let wire = serde_json::to_value(&association).expect("wire");
+        let targets = &wire["authority_basis"]["targets"];
+        assert_eq!(
+            targets[1]["target"],
+            serde_json::json!({
+                "kind": "peer",
+                "peer": "00000000-0000-0000-0000-000000000001",
+            })
+        );
+        assert_eq!(
+            targets[2]["target"],
+            serde_json::json!({"kind": "peer_directory"})
+        );
+        assert_eq!(
+            targets[3]["target"],
+            serde_json::json!({
+                "kind": "memory",
+                "scope": {"kind": "session", "session_id": session.to_string()},
+            })
+        );
+        assert_eq!(
+            targets[4]["target"],
+            serde_json::json!({
+                "kind": "memory",
+                "scope": {"kind": "host", "owner": "agent_memory", "scope": "identity/alice"},
+            })
+        );
+        let decoded: InputAuthorityAssociation = serde_json::from_value(wire).expect("decode");
+        assert_eq!(decoded, association);
+
+        for target in [
+            host_memory("", "identity/alice"),
+            host_memory("agent_memory", ""),
+        ] {
+            let mut invalid = value.clone();
+            invalid.authority_basis = targeted(None, vec![(target, chain.clone())]);
+            assert_eq!(
+                InputAuthorityAssociation::new(invalid),
+                Err(AssociationError::Shape)
+            );
+        }
+        // One canonical order across target kinds.
+        let mut unordered = value;
+        unordered.authority_basis = targeted(
+            None,
+            vec![(peer(1), chain.clone()), (server("alpha"), chain)],
         );
         assert_eq!(
             InputAuthorityAssociation::new(unordered),

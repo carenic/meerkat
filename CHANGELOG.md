@@ -35,6 +35,55 @@ them.
 
 ## [Unreleased]
 
+### Breaking
+
+- Behaviour-only (not measured by the gate): comms and `memory_search`
+  operations carry typed operation targets (see Added). Under a targeted
+  grant basis (`WorkAuthorityBasis::TargetedGrantLineages`) each resolves
+  only the lineage selected for its own target and is denied without one;
+  the base lineage no longer covers them. A stock realm issues no peer,
+  peer-directory or memory grant, so its per-target selections now deny
+  these operations at the grant owner, where the stock policy used to
+  report them unmapped (`operation_authorization_unavailable`).
+- Behaviour-only (not measured by the gate): a comms tool call whose
+  addressee cannot be determined (arguments that do not parse as the tool's
+  input, or a `reply_to_peer` that selects no single delivery of the turn)
+  now fails at execution-plan resolution with `invalid_arguments` and the
+  handler's own reason, where it failed at dispatch with `execution_failed`.
+- Persisted format (not measured by the gate): a work association whose
+  targeted selection names a `peer`, `peer_directory` or `memory` target
+  cannot be read by a binary without this change. Associations that name
+  none of them are unchanged.
+
+### Added
+
+- Typed grant targets for peer (comms) and memory operations.
+  `meerkat-core`: `ToolOperationTarget` gains `PeerSend { peer, kind }` (one
+  delivery to exactly one peer, by its canonical `PeerId`),
+  `PeerDirectoryRead` (a read of the session's own trusted-peer directory)
+  and `MemoryOperation { scope, operation }`, with the new `PeerSendKind`
+  (`Message`, `Request`, `Response`), `MemoryOperation` (`Read`, `Write`,
+  `Delete`, `Propose`) and `MemoryScopeRef` (`Session { session_id }`,
+  `Host { owner, scope }`, with `is_named()`), and
+  `MemorySearchScope::scope_ref()`. `SessionId` implements `PartialOrd` and
+  `Ord`. The default plans of the comms tools carry these targets:
+  `CommsToolSurface` (meerkat-tools) and `CommsToolDispatcher` and
+  `DynCommsToolDispatcher` (meerkat-comms), through the new
+  `meerkat_comms::CommsExecutionAuthority` and
+  `meerkat_comms::comms_tool_operation_target`, attach the peer each
+  delivery reaches (the `peer_id` of `send_message`, `send_request` and
+  `send_response`; for `reply_to_peer`, the sender of the turn's peer
+  message it selects) and the peer directory for `peers`.
+  `MemorySearchDispatcher` attaches a `Read` of the session memory it
+  searches. Each owner revalidates its own target at dispatch, so a plan
+  resolved for one peer never delivers to another.
+  `meerkat-authorization-contracts`: `GrantTarget` gains `Peer { peer }`,
+  `PeerDirectory` and `Memory { scope }`, and `meerkat-authorization`'s
+  `operation_grant_target` selects them on the normal targeted grant path:
+  one lineage per peer, per memory scope and for the peer directory, never a
+  wildcard and never the base. An embedding host maps the typed facts to its
+  own actions and selects one grant per target.
+
 ### Changed
 
 - CI's `Closure tests` rows have 60 minutes instead of 40, and the
