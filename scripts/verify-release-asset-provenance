@@ -124,8 +124,11 @@ if [[ -n "${source_run}" ]]; then
   fi
   # A prebuild never waited for exact-main CI: only the tag run of exactly
   # its commit, which required that CI itself, may publish its archives.
+  # Every release.yml dispatch lists the gate, but only a prebuild runs it
+  # (its always() condition never skips there): a skipped gate marks an
+  # ordinary dispatch, whose archives an asset recovery may reuse.
   prebuild_gate="$(awk -F '\t' '$1 == "Release prebuild gate" { print $2 }' <<<"${jobs_json}")"
-  if [[ -n "${prebuild_gate}" && "${prebuild}" != "true" ]]; then
+  if [[ -n "${prebuild_gate}" && "${prebuild_gate}" != "skipped" && "${prebuild}" != "true" ]]; then
     echo "run ${source_run} is a pre-tag prebuild; only the tag run of its exact commit may publish its archives (--prebuild)" >&2
     exit 1
   fi

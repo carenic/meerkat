@@ -7,9 +7,10 @@
 # each stamp names the tag commit. The default gate is the full
 # "Release binary build gate"; --source-gate "Release critical binary build
 # gate" accepts the critical archives of a prebuild whose trailing lanes are
-# still running, and no other job name is accepted. A prebuild run (one with
-# a "Release prebuild gate" job) never waited for exact-main CI: it is refused
-# unless --prebuild comes from the tag run of exactly its commit.
+# still running, and no other job name is accepted. A prebuild run (one whose
+# "Release prebuild gate" job ran; every other dispatch lists it as skipped)
+# never waited for exact-main CI: it is refused unless --prebuild comes from
+# the tag run of exactly its commit.
 
 set -euo pipefail
 
@@ -119,6 +120,15 @@ gates null '"failure"'
 verify critical-gate-failed 1 --source-gate "Release critical binary build gate"
 gates '"success"' '"success"'
 verify unknown-gate 2 --source-gate "Release prebuild gate"
+
+# An ordinary dispatch lists the prebuild gate as skipped: an asset recovery
+# reuses its archives, and it is never a prebuild for a tag run.
+gates '"success"' '"success"' '"skipped"'
+verify recovery-from-dispatch-with-skipped-prebuild-gate 0
+verify critical-recovery-from-dispatch-with-skipped-prebuild-gate 0 --source-gate "Release critical binary build gate"
+CALLER_REF=refs/tags/v0.0.0 verify skipped-prebuild-gate-is-no-prebuild 1 --prebuild
+grep -Fq "needs a successful Release prebuild gate (skipped)" "${TEST_ROOT}/skipped-prebuild-gate-is-no-prebuild.log" ||
+  fail "skipped-prebuild-gate-is-no-prebuild: the skipped gate is not named" "$(cat "${TEST_ROOT}/skipped-prebuild-gate-is-no-prebuild.log")"
 
 # A prebuild run: refused for an asset recovery, accepted only by the tag run
 # of exactly its commit.
