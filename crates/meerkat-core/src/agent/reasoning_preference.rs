@@ -243,14 +243,7 @@ pub(crate) fn baseline_effort(
             .as_ref()
             .and_then(|thinking| thinking.thinking_level)
             .or(tag.thinking_level)
-            .map(|level| match level {
-                crate::lifecycle::run_primitive::GeminiThinkingLevel::Minimal => {
-                    EffortLevel::Minimal
-                }
-                crate::lifecycle::run_primitive::GeminiThinkingLevel::Low => EffortLevel::Low,
-                crate::lifecycle::run_primitive::GeminiThinkingLevel::Medium => EffortLevel::Medium,
-                crate::lifecycle::run_primitive::GeminiThinkingLevel::High => EffortLevel::High,
-            }),
+            .map(GeminiThinkingLevel::as_effort_level),
         Some(ProviderTag::Unknown { .. }) | None => None,
     };
     explicit.map_or(

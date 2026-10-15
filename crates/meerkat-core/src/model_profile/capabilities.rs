@@ -370,6 +370,44 @@ impl ModelCapabilities {
         }
         None
     }
+
+    /// Why this Gemini row refuses the thinking level in `tag`, or `None`
+    /// when the provider would accept it. Checked locally, before the
+    /// provider call, so an unsupported explicit level is a typed refusal and
+    /// never a provider 400 (Gemini answers "Thinking level MINIMAL is not
+    /// supported for this model" for `minimal` on a model that refuses it).
+    ///
+    /// Covers the level the Gemini lowering sends: the nested
+    /// `thinking.thinking_level`, else the flat `thinking_level`. A
+    /// thinking-level row refuses a level outside its `effort_levels`; a row
+    /// that records no levels accepts every level.
+    pub fn gemini_provider_tag_rejection(
+        &self,
+        tag: &crate::lifecycle::run_primitive::GeminiProviderTag,
+    ) -> Option<String> {
+        let level = tag
+            .thinking
+            .as_ref()
+            .and_then(|thinking| thinking.thinking_level)
+            .or(tag.thinking_level)?;
+        if self.thinking != ThinkingSupport::GeminiThinkingLevel
+            || self.effort_levels.is_empty()
+            || self.effort_levels.contains(&level.as_effort_level())
+        {
+            return None;
+        }
+        let accepted = self
+            .effort_levels
+            .iter()
+            .map(|level| level.as_wire_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        Some(format!(
+            "Gemini model '{}' does not accept thinking level '{}'; accepted: [{accepted}]",
+            self.id,
+            level.as_str()
+        ))
+    }
 }
 
 /// A capability value that is only available when a specific beta header is set.
@@ -592,5 +630,67 @@ mod tests {
         assert_eq!(OpenAiTextVerbosity::High.as_wire_str(), "high");
         assert_eq!(OpenAiPromptCacheMode::Explicit.as_wire_str(), "explicit");
         assert_eq!(OpenAiPromptCacheTtl::ThirtyMinutes.as_wire_str(), "30m");
+    }
+
+    #[test]
+    fn gemini_rows_refuse_only_the_thinking_levels_they_do_not_record() {
+        use crate::lifecycle::run_primitive::{
+            GeminiProviderTag, GeminiThinkingConfig, GeminiThinkingLevel,
+        };
+        use crate::model_profile::test_catalog::{TEST_CATALOG, VIDEO_MODEL};
+        let unrecorded = *TEST_CATALOG
+            .capabilities_for(crate::Provider::Gemini, VIDEO_MODEL)
+            .expect("test Gemini row");
+        let low_to_high = ModelCapabilities {
+            effort_levels: &[EffortLevel::Low, EffortLevel::Medium, EffortLevel::High],
+            ..unrecorded
+        };
+        let flat = |level| GeminiProviderTag {
+            thinking_level: Some(level),
+            ..Default::default()
+        };
+        let nested = |level| GeminiProviderTag {
+            thinking: Some(GeminiThinkingConfig {
+                include_thoughts: None,
+                thinking_level: Some(level),
+                thinking_budget: None,
+            }),
+            ..Default::default()
+        };
+
+        let refusal = low_to_high
+            .gemini_provider_tag_rejection(&flat(GeminiThinkingLevel::Minimal))
+            .expect("minimal is outside the row");
+        assert!(refusal.contains("'minimal'"), "{refusal}");
+        assert!(refusal.contains("[low, medium, high]"), "{refusal}");
+        assert!(
+            low_to_high
+                .gemini_provider_tag_rejection(&nested(GeminiThinkingLevel::Minimal))
+                .is_some()
+        );
+        // The nested level is the one sent, so it is the one judged.
+        let mut nested_wins = nested(GeminiThinkingLevel::Low);
+        nested_wins.thinking_level = Some(GeminiThinkingLevel::Minimal);
+        assert!(
+            low_to_high
+                .gemini_provider_tag_rejection(&nested_wins)
+                .is_none()
+        );
+        assert!(
+            low_to_high
+                .gemini_provider_tag_rejection(&flat(GeminiThinkingLevel::High))
+                .is_none()
+        );
+        assert!(
+            low_to_high
+                .gemini_provider_tag_rejection(&GeminiProviderTag::default())
+                .is_none()
+        );
+        // A row that records no levels accepts every level.
+        assert!(
+            unrecorded
+                .gemini_provider_tag_rejection(&flat(GeminiThinkingLevel::Minimal))
+                .is_none()
+        );
     }
 }

@@ -1827,6 +1827,32 @@ fn validate_anthropic_request_shaping(
     }
 }
 
+/// Refuse a Gemini thinking level the resolved catalog row rejects (the
+/// API answers 400 for `minimal` on a model that does not accept it) when
+/// the agent is built, instead of failing its first request. Uncatalogued
+/// models keep the pass-through.
+fn validate_gemini_request_shaping(
+    provider: Provider,
+    model: &str,
+    provider_params: Option<&meerkat_core::lifecycle::run_primitive::ProviderParamsOverride>,
+) -> Result<(), BuildAgentError> {
+    use meerkat_core::lifecycle::run_primitive::ProviderTag;
+    if provider != Provider::Gemini {
+        return Ok(());
+    }
+    let Some(ProviderTag::Gemini(tag)) =
+        provider_params.and_then(|params| params.provider_tag.as_ref())
+    else {
+        return Ok(());
+    };
+    match meerkat_models::capabilities_for(Provider::Gemini, model)
+        .and_then(|capabilities| capabilities.gemini_provider_tag_rejection(tag))
+    {
+        Some(rejection) => Err(BuildAgentError::Config(rejection)),
+        None => Ok(()),
+    }
+}
+
 /// Typed create-session model hints supplied by a public surface.
 ///
 /// `None` means omitted by the caller. In particular, this type does not carry
@@ -8775,6 +8801,7 @@ impl AgentFactory {
             &model,
             build_config.provider_params.as_ref(),
         )?;
+        validate_gemini_request_shaping(provider, &model, build_config.provider_params.as_ref())?;
         if let Some(params) = build_config.provider_params.clone() {
             builder = builder.provider_params(params);
         }
@@ -12468,6 +12495,70 @@ mod tests {
             )
             .is_ok(),
             "rows without GPT-5.6-and-later cache capabilities keep accepting it"
+        );
+    }
+
+    /// A Gemini thinking level the cataloged model refuses is refused when
+    /// the agent is built, nested or flat; accepted levels, uncatalogued
+    /// models and other providers pass.
+    #[test]
+    fn unsupported_gemini_thinking_level_is_refused_at_build() {
+        use meerkat_core::lifecycle::run_primitive::{
+            GeminiProviderTag, GeminiThinkingConfig, GeminiThinkingLevel, ProviderParamsOverride,
+            ProviderTag,
+        };
+        let params = |level, nested: bool| ProviderParamsOverride {
+            provider_tag: Some(ProviderTag::Gemini(if nested {
+                GeminiProviderTag {
+                    thinking: Some(GeminiThinkingConfig {
+                        include_thoughts: None,
+                        thinking_level: Some(level),
+                        thinking_budget: None,
+                    }),
+                    ..Default::default()
+                }
+            } else {
+                GeminiProviderTag {
+                    thinking_level: Some(level),
+                    ..Default::default()
+                }
+            })),
+            ..Default::default()
+        };
+        for nested in [false, true] {
+            let Err(BuildAgentError::Config(message)) = validate_gemini_request_shaping(
+                Provider::Gemini,
+                "gemini-3.8-flash",
+                Some(&params(GeminiThinkingLevel::Minimal, nested)),
+            ) else {
+                panic!("minimal must be refused at build for gemini-3.8-flash");
+            };
+            assert!(message.contains("'minimal'"), "{message}");
+            assert!(message.contains("low, medium, high"), "{message}");
+            for (model, level) in [
+                ("gemini-3.8-flash", GeminiThinkingLevel::Low),
+                ("gemini-3.5-flash-lite", GeminiThinkingLevel::Minimal),
+                ("gemini-uncatalogued-preview", GeminiThinkingLevel::Minimal),
+            ] {
+                assert!(
+                    validate_gemini_request_shaping(
+                        Provider::Gemini,
+                        model,
+                        Some(&params(level, nested))
+                    )
+                    .is_ok(),
+                    "{model} {level:?}"
+                );
+            }
+        }
+        assert!(
+            validate_gemini_request_shaping(
+                Provider::OpenAI,
+                "gemini-3.8-flash",
+                Some(&params(GeminiThinkingLevel::Minimal, false)),
+            )
+            .is_ok(),
+            "only a Gemini build is judged by the Gemini rows"
         );
     }
 

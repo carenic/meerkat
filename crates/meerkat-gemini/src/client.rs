@@ -469,6 +469,15 @@ impl GeminiClient {
     /// Schema proto. It is not a supported host API.
     #[doc(hidden)]
     pub fn build_request_body(&self, request: &LlmRequest) -> Result<Value, LlmError> {
+        // Refuse a thinking level the cataloged model does not accept before
+        // anything is lowered, so it fails typed here and never as a provider
+        // 400. Uncatalogued models keep the pass-through.
+        if let Some(message) = gemini_tag(request).and_then(|tag| {
+            meerkat_models::capabilities_for(Provider::Gemini, &request.model)?
+                .gemini_provider_tag_rejection(tag)
+        }) {
+            return Err(LlmError::InvalidRequest { message });
+        }
         let mut contents = Vec::new();
         let mut system_instruction_parts = Vec::new();
         let mut leading_system_prefix = true;
@@ -3926,6 +3935,99 @@ mod tests {
         );
         assert!(thinking_config.get("thinkingBudget").is_none());
         Ok(())
+    }
+
+    fn thinking_level_request(model: &str, level: GeminiThinkingLevel, nested: bool) -> LlmRequest {
+        let tag = if nested {
+            GeminiProviderTag {
+                thinking: Some(
+                    meerkat_core::lifecycle::run_primitive::GeminiThinkingConfig {
+                        include_thoughts: None,
+                        thinking_level: Some(level),
+                        thinking_budget: None,
+                    },
+                ),
+                ..Default::default()
+            }
+        } else {
+            GeminiProviderTag {
+                thinking_level: Some(level),
+                ..Default::default()
+            }
+        };
+        let mut request = LlmRequest::new(
+            model,
+            vec![Message::User(UserMessage::text("test".to_string()))],
+        );
+        request.provider_params = Some(ProviderTag::Gemini(tag));
+        request
+    }
+
+    /// A thinking level the cataloged model refuses (the API answers 400
+    /// "Thinking level MINIMAL is not supported for this model") is refused
+    /// locally with a typed error before anything is sent, whether the level
+    /// is set in the nested `thinking` config or flat.
+    #[test]
+    fn a_thinking_level_the_model_refuses_is_refused_locally() {
+        let client = GeminiClient::new("test-key".to_string());
+        for model in [
+            "gemini-4-argon",
+            "gemini-3.8-flash",
+            "gemini-3.7-flash",
+            "gemini-3.1-pro-preview",
+        ] {
+            for nested in [false, true] {
+                let request = thinking_level_request(model, GeminiThinkingLevel::Minimal, nested);
+                match client.build_request_body(&request) {
+                    Err(LlmError::InvalidRequest { message }) => {
+                        assert!(
+                            message.contains(model) && message.contains("'minimal'"),
+                            "{model} (nested: {nested}): {message}"
+                        );
+                    }
+                    other => panic!(
+                        "{model} (nested: {nested}): expected a typed local refusal, got {other:?}"
+                    ),
+                }
+            }
+        }
+    }
+
+    /// The levels a cataloged model accepts are sent, `minimal` included on
+    /// the rows that record it; a model without a catalog row keeps the
+    /// pass-through.
+    #[test]
+    fn a_thinking_level_the_model_accepts_is_sent() {
+        let client = GeminiClient::new("test-key".to_string());
+        for (model, level, wire) in [
+            ("gemini-3.8-flash", GeminiThinkingLevel::Low, "low"),
+            ("gemini-4-argon", GeminiThinkingLevel::High, "high"),
+            (
+                "gemini-3.5-flash-lite",
+                GeminiThinkingLevel::Minimal,
+                "minimal",
+            ),
+            (
+                "gemini-3.1-flash-lite",
+                GeminiThinkingLevel::Minimal,
+                "minimal",
+            ),
+            (
+                "gemini-uncatalogued-preview",
+                GeminiThinkingLevel::Minimal,
+                "minimal",
+            ),
+        ] {
+            for nested in [false, true] {
+                let body = client
+                    .build_request_body(&thinking_level_request(model, level, nested))
+                    .unwrap_or_else(|error| panic!("{model} (nested: {nested}): {error}"));
+                assert_eq!(
+                    body["generationConfig"]["thinkingConfig"]["thinkingLevel"], wire,
+                    "{model} (nested: {nested})"
+                );
+            }
+        }
     }
 
     #[test]

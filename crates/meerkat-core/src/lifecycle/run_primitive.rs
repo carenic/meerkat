@@ -737,6 +737,18 @@ impl GeminiThinkingLevel {
             Self::High => "high",
         }
     }
+
+    /// This level in the shared effort vocabulary the catalog rows use
+    /// (`ModelCapabilities::effort_levels`).
+    pub fn as_effort_level(self) -> crate::model_profile::capabilities::EffortLevel {
+        use crate::model_profile::capabilities::EffortLevel;
+        match self {
+            Self::Minimal => EffortLevel::Minimal,
+            Self::Low => EffortLevel::Low,
+            Self::Medium => EffortLevel::Medium,
+            Self::High => EffortLevel::High,
+        }
+    }
 }
 
 /// Typed shape of Gemini's thinking knob.

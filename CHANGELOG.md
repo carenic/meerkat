@@ -35,6 +35,14 @@ them.
 
 ## [Unreleased]
 
+### Added
+
+- `meerkat_core::model_profile::capabilities::ModelCapabilities::gemini_provider_tag_rejection`
+  says why a Gemini catalog row refuses the thinking level of a
+  `GeminiProviderTag` (see Fixed), and
+  `meerkat_core::lifecycle::run_primitive::GeminiThinkingLevel::as_effort_level`
+  names a Gemini thinking level in the catalog's `EffortLevel` vocabulary.
+
 ### Changed
 
 - CI's `Closure tests` rows have 60 minutes instead of 40, and the
@@ -70,6 +78,13 @@ them.
   `gemini-3.1-flash-lite`, the GA model the Gemini CLI itself sends to Code
   Assist. Every Code Assist substitute is a catalog Gemini model that accepts
   the requested model's thinking levels.
+- An explicit Gemini `thinking_level` (nested or flat) that the selected
+  catalog model does not accept, such as `minimal` on `gemini-4-argon`,
+  `gemini-3.8-flash`, `gemini-3.7-flash` or `gemini-3.1-pro-preview`, was sent
+  and failed with the provider's 400. The Gemini client now refuses it before
+  sending with a typed `LlmError::InvalidRequest` naming the levels the model
+  accepts, and a build whose provider params carry one fails with
+  `BuildAgentError::Config`. Models outside the catalog keep the pass-through.
 
 ## [0.9.1] - 2026-10-15
 
