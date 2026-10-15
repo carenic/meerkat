@@ -67,7 +67,9 @@ struct DelegateOrigin {
 /// work, and the delegate's role. Minted only by the core dispatch owner
 /// from that call ([`crate::ToolDispatchContext::tool_delegate_attribution`]);
 /// a historical audit id cannot construct it. Retaining it keeps no call
-/// live and grants no operation, and it has no serialized form.
+/// live and grants no operation, and it has no serialized form. One
+/// attribution can prepare delegate requests until its run ends; each is its
+/// own operation with a fresh id and needs its own current lineage.
 ///
 /// ```compile_fail
 /// fn requires_serialization<T: serde::Serialize>() {}
@@ -94,9 +96,10 @@ impl ToolDelegateAttribution {
 
     /// The delegate of `parent`, a dispatch's own prepared call, for `role`.
     /// The call's plan must carry exactly the builtin operation the role
-    /// requires (a target only that builtin's registration owner produces
-    /// and revalidates), and the check must be prepared in `work`. Anything
-    /// else is malformed facts.
+    /// requires (the target the builtin's registration owner states and
+    /// revalidates, or that an in-process owner states for its own call),
+    /// and the check must be prepared in `work`. Anything else is malformed
+    /// facts.
     pub(crate) fn for_dispatch(
         parent: &PreparedOperationCheck,
         work: &WorkAuthorizationContext,

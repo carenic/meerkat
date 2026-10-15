@@ -547,11 +547,13 @@ pub enum ToolOperationTarget {
         account: std::sync::Arc<crate::OperationAccount>,
     },
     /// One operation of a Meerkat builtin tool: the operation the builtin
-    /// implementation itself declares, produced only by the registration
-    /// owner of that builtin (the composite dispatcher that registered it)
-    /// and revalidated by that same registration at dispatch. A tool merely
+    /// implementation itself declares, stated by the registration owner of
+    /// that builtin (the composite dispatcher that registered it) and
+    /// revalidated by that same registration at dispatch. A tool merely
     /// named like the builtin, from any other owner (a host dispatcher, a
-    /// registered bundle, an undeclared builtin), has no such target.
+    /// registered bundle, an undeclared builtin), has no such target unless
+    /// that owner states it itself, which an in-process dispatcher can: like
+    /// every target, it is the dispatching owner's fact, never a permission.
     BuiltinOperation { operation: BuiltinToolOperation },
 }
 

@@ -285,6 +285,17 @@ fn http_client(server: &Server) -> Arc<dyn LlmClient> {
     http_client_with_binding(server, binding)
 }
 fn http_client_with_binding(server: &Server, binding: AuthBindingRef) -> Arc<dyn LlmClient> {
+    http_client_with_authorizer(
+        server,
+        binding,
+        Arc::new(FixtureAuthorizer(server.receiver.clone())),
+    )
+}
+fn http_client_with_authorizer(
+    server: &Server,
+    binding: AuthBindingRef,
+    authorizer: Arc<dyn HttpAuthorizer>,
+) -> Arc<dyn LlmClient> {
     let model = server.model();
     let identity = SessionLlmIdentity {
         model: model.into(),
@@ -313,7 +324,7 @@ fn http_client_with_binding(server: &Server, binding: AuthBindingRef) -> Arc<dyn
         }),
         credential_identity: AuthCredentialIdentity::Binding(binding),
         auth_lease: Arc::new(DynamicLease::from_authorizer(
-            Arc::new(FixtureAuthorizer(server.receiver.clone())),
+            authorizer,
             AuthMetadata::default(),
             "synthetic-e1",
         )),

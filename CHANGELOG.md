@@ -47,14 +47,23 @@ them.
   `delegate_attribution: Option<AuditDelegateAttribution>` (struct literals
   add `delegate_attribution: None`). No exhaustive public enum gains a
   variant: `ToolOperationTarget` and `GrantTarget` are non-exhaustive.
-  Persisted format (not measured by the gate): `GrantTarget`'s new
-  `BuiltinToolOperation { operation }` and
+  Persisted format (not measured by the gate; the stored version is
+  unchanged): `GrantTarget`'s new `BuiltinToolOperation { operation }` and
   `DelegatedHostedSearch { route, capability }` are ordered after every
   earlier target kind, so existing selections keep their order and
-  canonical bytes, but a work association whose targeted selection names one
-  of them, and an audit record with a delegate attribution, cannot be read
-  by a binary without this change. Associations and records that use
-  neither are unchanged.
+  canonical bytes. A binary without this change cannot read a work
+  association whose targeted selection names one of them, nor an input row
+  whose audit holds a delegate attribution. Every governed web_search helper
+  decision records one, under any grant basis, so this reaches every
+  governed session that ran web_search. 0.9.1 treats such input rows as
+  corrupt and recovery skips them; drain governed work before downgrading.
+  Associations and rows that use neither are unchanged.
+- Behaviour-only (not measured by the gate): the builtin web_search call's
+  plan now carries a `ToolOperationTarget::BuiltinOperation` target under
+  every grant basis, a single `GrantLineage` included. A host policy owner
+  that refuses operation targets it does not map now refuses web_search
+  where it used to allow it; this fails closed, and mapping the target
+  restores it.
 - Behaviour-only (not measured by the gate): under a targeted grant basis
   the builtin web_search call selects only its `BuiltinToolOperation`
   lineage and its helper's model request only its `DelegatedHostedSearch`
@@ -65,9 +74,11 @@ them.
   facts before its helper runs. A stock realm with a per-target selection
   refuses web_search as Denied (no lineage is selected for it) instead of
   Unavailable; a legacy single stock grant still leaves it Unavailable. A
-  web_search plan resolved by one composite dispatcher, or by the same
-  composite before it replaced a builtin registration, is refused at
-  dispatch as `ExecutionOwnerChanged`.
+  web_search plan is refused at dispatch as `ExecutionOwnerChanged` when it
+  reaches another composite dispatcher, when the same composite replaced a
+  builtin registration after resolving it, or when another owner (such as
+  an external tool) now holds the name: a plan that carries the composite's
+  builtin witness runs only on that builtin.
 
 ### Added
 
@@ -78,10 +89,12 @@ them.
   registered (the tool declares it through `BuiltinTool::builtin_operation`;
   tools without a declaration keep their plans) and revalidates it at
   dispatch against its exact registration: another composite, another owner
-  key, or a plan resolved before the composite replaced its web_search
-  executor (even with an identical schema) is `ExecutionOwnerChanged`, and
-  no executor runs. A tool merely named web_search (a host dispatcher's, a
-  registered bundle's or an undeclared builtin) has no such target. The
+  key, a plan resolved before the composite replaced its web_search
+  executor (even with an identical schema), or a plan whose name another
+  owner now holds is `ExecutionOwnerChanged`, and no executor runs. A tool
+  merely named web_search (a host dispatcher's, a registered bundle's or an
+  undeclared builtin) has no such target unless its owner states it itself,
+  which an in-process dispatcher can. The
   helper's own model request is the typed delegate of exactly that call:
   `ToolDispatchContext::tool_delegate_attribution(call,
   ToolDelegateRole::HostedSearchInference)` mints a `ToolDelegateAttribution`
@@ -91,7 +104,9 @@ them.
   owners. The delegate binds only an inference with exactly one hosted search
   capability (`WebSearch`, or `GoogleSearch` for a Gemini helper) and no live
   channel, under the call's work, execution scope, run and context revision
-  with a fresh operation id, and never moves to another run. Under a
+  with a fresh operation id, and never moves to another run. One
+  attribution can prepare helper requests until its run ends; each is its
+  own operation and needs its own current lineage. Under a
   targeted basis `operation_grant_target` selects
   `GrantTarget::BuiltinToolOperation { operation }` for the call and
   `GrantTarget::DelegatedHostedSearch { route, capability }` for the helper,
@@ -109,8 +124,10 @@ them.
   `ServerToolKind` derives `PartialOrd`, `Ord` and `Hash`. Stock issues no
   grant for either target and leaves both unmapped; this is not stock
   coverage of web_search. Limit: web_search has no reviewed entry point, so
-  a call its owner requires R2 review for settles as `unsupported_entry` and
-  R3 as `human_consent_required` (local feedback); it never runs unreviewed.
+  a review its owner requires settles as local feedback and the search never
+  runs: R2 is `reviewer_missing` without a reviewer and `unsupported_entry`
+  with one; R3 is `human_consent_required` without a human consent route and
+  `unsupported_entry` with one.
 
 ### Changed
 

@@ -32,6 +32,10 @@ enum Case {
     /// The helper's own lineage is revoked after the call entered and before
     /// the helper's entry: nothing is sent.
     DelegateRevokedBeforeEntry,
+    /// The helper's own lineage is revoked after its request was prepared,
+    /// while its client authorizes the request and before the physical send:
+    /// the send's own current check refuses it and nothing is sent.
+    DelegateRevokedAfterPrepare,
     /// A host tool merely named web_search: no typed target, no delegate.
     HostToolNamedWebSearch,
 }
@@ -206,6 +210,32 @@ impl meerkat_llm_core::WebSearchExecutor for BeforeHelper {
         self.inner
             .execute_web_search_authorized(request, authorization)
             .await
+    }
+}
+
+/// The helper client's authorizer with one change of the grant owner's state
+/// run while it authorizes the helper's request: after the provider client
+/// prepared the request's authorization, before the physical send.
+struct BeforeSend {
+    inner: FixtureAuthorizer,
+    before: Arc<Mutex<Option<Box<dyn FnOnce() + Send>>>>,
+}
+
+#[async_trait]
+impl HttpAuthorizer for BeforeSend {
+    async fn authorize(
+        &self,
+        request: &mut meerkat_core::HttpAuthorizationRequest<'_>,
+    ) -> Result<(), meerkat_core::AuthError> {
+        let before = self.before.lock().unwrap().take();
+        if let Some(before) = before {
+            before();
+        }
+        self.inner.authorize(request).await
+    }
+
+    fn label(&self) -> &'static str {
+        "e1-private-loopback"
     }
 }
 
@@ -394,7 +424,15 @@ async fn exercise_search(controller_server: &Server, helper_server: &Server, cas
         profile: None,
         origin: BindingOrigin::Configured,
     };
-    let helper_client = http_client_with_binding(helper_server, helper_binding);
+    let before_send: Arc<Mutex<Option<Box<dyn FnOnce() + Send>>>> = Arc::default();
+    let helper_client = http_client_with_authorizer(
+        helper_server,
+        helper_binding,
+        Arc::new(BeforeSend {
+            inner: FixtureAuthorizer(helper_server.receiver.clone()),
+            before: Arc::clone(&before_send),
+        }),
+    );
     let helper_endpoint = format!("{}/v1/messages", helper_server.base_url);
     // The key the grant selection names: the helper's own resolved route,
     // exactly as its requests report it.
@@ -553,6 +591,9 @@ async fn exercise_search(controller_server: &Server, helper_server: &Server, cas
             _ => None,
         }),
     });
+    if case == Case::DelegateRevokedAfterPrepare {
+        *before_send.lock().unwrap() = Some(revoke(delegated.clone()));
+    }
     let host_tools = Arc::new(HostSearchTools::default());
     let records = Arc::new(RecordingTools::default());
     // The record tools that actually serve this case's sibling read.
@@ -796,6 +837,45 @@ async fn exercise_search(controller_server: &Server, helper_server: &Server, cas
                         | AuditObservation::Outcome { .. }
                 )));
             }
+            Case::DelegateRevokedAfterPrepare => {
+                assert_refusal_feedback(
+                    &bodies[1],
+                    SEARCH_CALL,
+                    ToolError::AuthorizationRefused { refusal: denied() },
+                );
+                assert_eq!(
+                    helper_server
+                        .receiver
+                        .authorized_requests
+                        .load(Ordering::SeqCst),
+                    1,
+                    "the client authorized the prepared request"
+                );
+                assert_eq!(
+                    helper_sends, 0,
+                    "nothing is sent once its lineage is revoked"
+                );
+                assert_eq!(
+                    owner.helper_seen.load(Ordering::SeqCst),
+                    1,
+                    "the owner decided the prepared request once; its refresh is refused by the grant owner"
+                );
+                assert!(has(|observation| matches!(
+                    observation,
+                    AuditObservation::Prepared { .. }
+                )));
+                assert!(has(|observation| matches!(
+                    observation,
+                    AuditObservation::Refused {
+                        reason: OperationRefusalKind::Denied,
+                        ..
+                    }
+                )));
+                assert!(!has(|observation| matches!(
+                    observation,
+                    AuditObservation::Entry | AuditObservation::Outcome { .. }
+                )));
+            }
             Case::OwnerUnavailable => {
                 assert_refusal_feedback(
                     &bodies[1],
@@ -912,6 +992,11 @@ async fn outer_revocation_keeps_the_entered_invocation_and_refuses_the_next_call
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn delegate_revocation_before_helper_entry_prevents_its_send() {
     run_case(Case::DelegateRevokedBeforeEntry).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delegate_revocation_after_its_preparation_prevents_its_send() {
+    run_case(Case::DelegateRevokedAfterPrepare).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

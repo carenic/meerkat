@@ -1222,19 +1222,27 @@ impl AgentToolDispatcher for CompositeDispatcher {
                 name: call.name.into(),
                 reason: e.to_string(),
             })?;
-        match self.resolve_tool_owner(call.name) {
+        let owner = self.resolve_tool_owner(call.name);
+        // A builtin operation's plan runs only on the exact registration
+        // that resolved it, and a plan carrying this composite's builtin
+        // witness only on that builtin, whatever owns the name now: another
+        // composite, another owner key, a replaced or disabled registration,
+        // or the name's next owner is an owner change.
+        let owner_changed = match &owner {
+            ResolvedToolOwner::Builtin(tool) => match tool.builtin_operation() {
+                Some(operation) => !self.builtin_operation_witness_matches(call, plan, operation),
+                None => plan.owner_witness(&self.builtin_authority_key()).is_some(),
+            },
+            _ => plan.owner_witness(&self.builtin_authority_key()).is_some(),
+        };
+        if owner_changed {
+            return Err(ToolError::unavailable(
+                call.name,
+                meerkat_core::ToolUnavailableReason::ExecutionOwnerChanged,
+            ));
+        }
+        match owner {
             ResolvedToolOwner::Builtin(tool) => {
-                // A builtin operation's plan runs only on the exact
-                // registration that resolved it: another composite, another
-                // owner key or a replaced registration is an owner change.
-                if let Some(operation) = tool.builtin_operation()
-                    && !self.builtin_operation_witness_matches(call, plan, operation)
-                {
-                    return Err(ToolError::unavailable(
-                        call.name,
-                        meerkat_core::ToolUnavailableReason::ExecutionOwnerChanged,
-                    ));
-                }
                 if !tool
                     .execution_contract()
                     .supported_modes()

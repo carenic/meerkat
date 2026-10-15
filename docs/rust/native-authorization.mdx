@@ -289,9 +289,16 @@ The Meerkat-owned `web_search` builtin is two governed operations. Your
   `ToolOperationTarget::BuiltinOperation { operation:
   BuiltinToolOperation::WebSearch }`. The composite dispatcher that
   registered the builtin states it and revalidates it at dispatch against
-  its exact registration. A tool merely named `web_search` from any other
-  owner (your own dispatcher, a registered bundle) has no such target. The
-  call acts with no account of its own (`target.account()` is `None`).
+  its exact registration; a plan that carries its witness runs only on that
+  builtin, even after another owner takes the name. A tool merely named
+  `web_search` from any other owner (your own dispatcher, a registered
+  bundle) has no such target unless that owner states it itself: an
+  in-process dispatcher can, so the target is the dispatching owner's
+  statement, never proof that the Meerkat builtin runs. The call acts with
+  no account of its own (`target.account()` is `None`). Every governed
+  `web_search` call carries this target under every grant basis, so an
+  owner that refuses targets it does not map refuses `web_search` until it
+  maps it.
 - Its helper (`AuthorizationOperation::Model`, usage `Inference`, always the
   `Operation` purpose). `binding.delegate_attribution()` names the call:
   `parent_binding()` is the call's binding with the target above, and
@@ -312,13 +319,18 @@ controller lineage, and every contributing original must select the same
 keys. A single `GrantLineage` basis covers both like any other operation.
 
 The attribution keys the selection and the protected audit record
-(`AuditDelegateAttribution`); it grants nothing. Revoking the call's lineage
-refuses later calls but does not cancel an invocation that already entered:
-its helper still passes its own current lineage, contributor and entry
-checks. Revoking the helper's or a contributor's lineage before the helper's
-entry prevents its send. `web_search` has no reviewed entry point, so a
-required R2 settles as `unsupported_entry` and R3 as
-`human_consent_required`. The stock governed realm issues neither grant.
+(`AuditDelegateAttribution`); it grants nothing. One attribution can prepare
+helper requests until its run ends, and each request is its own operation
+that needs its own current lineage. Revoking the call's lineage refuses
+later calls but does not cancel an invocation that already entered: its
+helper still passes its own current lineage, contributor and entry checks.
+Revoking the helper's or a contributor's lineage before the helper's send
+prevents it, also after the helper's request was prepared. `web_search` has
+no reviewed entry point, so a review its owner requires settles as local
+feedback and the search never runs: R2 is `reviewer_missing` without a
+reviewer and `unsupported_entry` with one; R3 is `human_consent_required`
+without a human consent route and `unsupported_entry` with one. The stock
+governed realm issues neither grant.
 
 ## Attach and pin the controller before submitting work
 

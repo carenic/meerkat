@@ -461,3 +461,309 @@ async fn a_tool_named_web_search_from_another_owner_has_no_builtin_target() {
     }
     assert_eq!(searches.load(Ordering::SeqCst), 0, "no executor ran");
 }
+
+/// A plan carrying this composite's builtin witness runs only on that
+/// builtin, whatever owns the name now. Re-registering web_search as
+/// disabled hands the name to an external tool that also advertises it: the
+/// plan the builtin resolved before is an owner change and never reaches the
+/// external tool, whose own current plan still runs on it.
+#[tokio::test]
+async fn a_builtin_plan_never_runs_on_the_next_owner_of_its_name() {
+    let builtin_searches = Arc::new(AtomicUsize::new(0));
+    let external_searches = Arc::new(AtomicUsize::new(0));
+    let external: Arc<dyn AgentToolDispatcher> =
+        Arc::new(HostSearch(crate::builtin::web_search::WebSearchTool::new(
+            Arc::new(AnySeamSearch(Arc::clone(&external_searches))),
+        )));
+    let mut composite = CompositeDispatcher::new(
+        Arc::new(MemoryTaskStore::new()),
+        &BuiltinToolConfig::default(),
+        Some(PathBuf::from(env!("CARGO_MANIFEST_DIR"))),
+        None,
+        Some(external),
+        None,
+    )
+    .expect("composite dispatcher");
+    composite.register_web_search_tool(
+        Arc::new(CountingSearch(Arc::clone(&builtin_searches))),
+        ToolCategoryOverride::Enable,
+    );
+    let args =
+        serde_json::value::RawValue::from_string(json!({"query": "fixed query"}).to_string())
+            .expect("raw arguments");
+    let call = ToolCallView {
+        id: "search-call",
+        name: "web_search",
+        args: &args,
+    };
+    let context = ToolDispatchContext::default();
+    let resolution = meerkat_core::ToolExecutionResolutionContext::new(deadlines());
+    let builtin_target = meerkat_core::ToolOperationTarget::BuiltinOperation {
+        operation: meerkat_core::BuiltinToolOperation::WebSearch,
+    };
+    let old = composite
+        .resolve_execution_plan(call, &context, &resolution)
+        .expect("the enabled builtin owns web_search");
+    assert_eq!(old.single_operation_target(), Ok(Some(&builtin_target)));
+
+    composite.register_web_search_tool(
+        Arc::new(CountingSearch(Arc::clone(&builtin_searches))),
+        ToolCategoryOverride::Disable,
+    );
+    let current = composite
+        .resolve_execution_plan(call, &context, &resolution)
+        .expect("the external tool now owns web_search");
+    assert_eq!(
+        current.single_operation_target(),
+        Ok(None),
+        "the external tool's plan carries no builtin target"
+    );
+
+    let result = composite
+        .dispatch_resolved_with_context(call, &context, &old)
+        .await;
+    assert!(
+        owner_changed(&result),
+        "the builtin's plan on the name's next owner: {result:?}"
+    );
+    assert_eq!(
+        (
+            builtin_searches.load(Ordering::SeqCst),
+            external_searches.load(Ordering::SeqCst)
+        ),
+        (0, 0),
+        "no executor ran for the builtin's plan"
+    );
+
+    composite
+        .dispatch_resolved_with_context(call, &context, &current)
+        .await
+        .expect("the external tool runs its own plan");
+    assert_eq!(
+        (
+            builtin_searches.load(Ordering::SeqCst),
+            external_searches.load(Ordering::SeqCst)
+        ),
+        (0, 1)
+    );
+}
+
+/// Allows every operation at one owner review tier.
+struct Tiered(meerkat_core::authorization::OperationReviewTier);
+impl meerkat_core::authorization::PreparedOperationAuthorization for Tiered {
+    fn review_tier(&self) -> meerkat_core::authorization::OperationReviewTier {
+        self.0
+    }
+
+    fn check_current(
+        &self,
+        _binding: &meerkat_core::authorization::PreparedAuthorizationBinding,
+    ) -> Result<(), meerkat_core::OperationAuthorizationError> {
+        Ok(())
+    }
+}
+
+struct TieredWork(meerkat_core::authorization::OperationReviewTier);
+impl meerkat_core::authorization::WorkAuthorization for TieredWork {
+    fn prepare(
+        &self,
+        _binding: &meerkat_core::authorization::PreparedAuthorizationBinding,
+    ) -> Result<
+        Arc<dyn meerkat_core::authorization::PreparedOperationAuthorization>,
+        meerkat_core::OperationAuthorizationError,
+    > {
+        Ok(Arc::new(Tiered(self.0)))
+    }
+}
+
+/// A reviewer that counts every review it is asked for.
+#[derive(Default)]
+struct CountingReviewer(AtomicUsize);
+
+#[async_trait]
+impl meerkat_core::approval::review::OperationReviewer for CountingReviewer {
+    async fn review(
+        &self,
+        _candidate: &meerkat_core::approval::review::ReviewCandidate<'_>,
+    ) -> Result<
+        meerkat_core::approval::review::ReviewVerdict,
+        meerkat_core::approval::review::ReviewerFailure,
+    > {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Ok(meerkat_core::approval::review::ReviewVerdict::Allow)
+    }
+}
+
+/// A human consent route that counts every time it is reached.
+#[derive(Default)]
+struct CountingConsentRoute(AtomicUsize);
+
+impl meerkat_core::approval::consent::HumanConsentRoute for CountingConsentRoute {
+    fn present(
+        &self,
+        _candidate: &meerkat_core::approval::consent::ConsentPresentationCandidate<'_>,
+    ) -> Result<
+        meerkat_core::approval::consent::ConsentPresentation,
+        meerkat_core::approval::consent::ConsentRouteUnavailable,
+    > {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Err(meerkat_core::approval::consent::ConsentRouteUnavailable)
+    }
+
+    fn eligibility(
+        &self,
+        _approver: &meerkat_core::approval::consent::AuthenticatedApprover,
+        _approval: &meerkat_core::ApprovalRecord,
+    ) -> Result<
+        Arc<dyn meerkat_core::approval::consent::ConsentEligibility>,
+        meerkat_core::approval::consent::ConsentIneligible,
+    > {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Err(meerkat_core::approval::consent::ConsentIneligible)
+    }
+
+    fn notice(&self, _notice: meerkat_core::approval::consent::ConsentNotice) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+/// How a required review settles one governed web_search call.
+#[derive(Debug, Clone, Copy)]
+enum Settles {
+    Unavailable(meerkat_core::ReviewUnavailableKind),
+    Unsatisfied(meerkat_core::ReviewUnsatisfiedKind),
+}
+
+/// web_search has no reviewed entry point, so a review its owner requires
+/// settles as typed local feedback and the search never runs. R2 is
+/// `reviewer_missing` without a reviewer and `unsupported_entry` with one;
+/// R3 is `human_consent_required` without a human consent route (with or
+/// without a reviewer) and `unsupported_entry` with one. No reviewer or
+/// consent route is asked. R1 runs the search under the same composition.
+#[tokio::test]
+async fn a_required_review_settles_web_search_as_local_feedback_per_tier() {
+    use meerkat_core::authorization::OperationReviewTier::{R1, R2, R3};
+    use meerkat_core::{ReviewUnavailableKind, ReviewUnsatisfiedKind};
+    let searches = Arc::new(AtomicUsize::new(0));
+    let reviewer = Arc::new(CountingReviewer::default());
+    let route = Arc::new(CountingConsentRoute::default());
+    let review = |route: Option<Arc<CountingConsentRoute>>| {
+        let review = meerkat_core::approval::review::BoundOperationReview::new(
+            reviewer.clone(),
+            meerkat_core::ApprovalService::new(),
+            std::time::Duration::from_secs(30),
+        );
+        Some(Arc::new(match route {
+            Some(route) => review.with_human_consent(route, std::time::Duration::from_secs(60)),
+            None => review,
+        }))
+    };
+    let mut composite = CompositeDispatcher::new(
+        Arc::new(MemoryTaskStore::new()),
+        &BuiltinToolConfig::default(),
+        Some(PathBuf::from(env!("CARGO_MANIFEST_DIR"))),
+        None,
+        None,
+        None,
+    )
+    .expect("composite dispatcher");
+    composite.register_web_search_tool(
+        Arc::new(AnySeamSearch(Arc::clone(&searches))),
+        ToolCategoryOverride::Enable,
+    );
+    let dispatcher = Arc::new(composite);
+    let args =
+        serde_json::value::RawValue::from_string(json!({"query": "fixed query"}).to_string())
+            .expect("raw arguments");
+    let call = ToolCallView {
+        id: "search-call",
+        name: "web_search",
+        args: &args,
+    };
+    let resolution = meerkat_core::ToolExecutionResolutionContext::new(deadlines());
+    let dispatch = |tier, review| {
+        let context = ToolDispatchContext::default()
+            .with_work_authorization(Some(meerkat_core::WorkAuthorizationContext::new(
+                Arc::new(TieredWork(tier)),
+                meerkat_core::exact_operation::OperationExecutionScope::Domain,
+            )))
+            .with_operation_review(review);
+        let dispatcher = Arc::clone(&dispatcher);
+        let resolution = resolution.clone();
+        async move {
+            let plan = meerkat_core::agent::resolve_tool_execution_plan_fenced(
+                &dispatcher,
+                call,
+                &context,
+                &resolution,
+            )
+            .expect("plan");
+            meerkat_core::agent::dispatch_tool_execution_plan_fenced(
+                &dispatcher,
+                call,
+                &context,
+                &plan,
+            )
+            .await
+        }
+    };
+    for (label, tier, review, settles) in [
+        (
+            "R2 without a reviewer",
+            R2,
+            None,
+            Settles::Unavailable(ReviewUnavailableKind::ReviewerMissing),
+        ),
+        (
+            "R2 with a reviewer",
+            R2,
+            review(None),
+            Settles::Unavailable(ReviewUnavailableKind::UnsupportedEntry),
+        ),
+        (
+            "R3 without any review",
+            R3,
+            None,
+            Settles::Unsatisfied(ReviewUnsatisfiedKind::HumanConsentRequired),
+        ),
+        (
+            "R3 with a reviewer and no human consent route",
+            R3,
+            review(None),
+            Settles::Unsatisfied(ReviewUnsatisfiedKind::HumanConsentRequired),
+        ),
+        (
+            "R3 with a human consent route",
+            R3,
+            review(Some(route.clone())),
+            Settles::Unavailable(ReviewUnavailableKind::UnsupportedEntry),
+        ),
+    ] {
+        let result = dispatch(tier, review).await;
+        let settled = match settles {
+            Settles::Unavailable(expected) => matches!(
+                &result,
+                Err(ToolError::ReviewUnavailable { kind }) if *kind == expected
+            ),
+            Settles::Unsatisfied(expected) => matches!(
+                &result,
+                Err(ToolError::ReviewUnsatisfied { kind, .. }) if *kind == expected
+            ),
+        };
+        assert!(settled, "{label}: expected {settles:?}, got {result:?}");
+    }
+    assert_eq!(
+        (
+            searches.load(Ordering::SeqCst),
+            reviewer.0.load(Ordering::SeqCst),
+            route.0.load(Ordering::SeqCst)
+        ),
+        (0, 0, 0),
+        "no search ran and no reviewer or consent route was asked"
+    );
+
+    dispatch(R1, review(Some(route.clone())))
+        .await
+        .expect("R1 runs the search");
+    assert_eq!(searches.load(Ordering::SeqCst), 1);
+}
