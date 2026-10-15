@@ -48,8 +48,10 @@ them.
 - `meerkat-mob-mcp`: a host can now release what it holds of a mob that
   `MobMcpState` destroys before the destroy's storage cleanup runs. The new
   `MobMcpState::set_after_destroy` installs a `MobAfterDestroy` hook that gets
-  the mob's id once its native destroy completed, before the storage cleanup
-  that destroy owes, and again before each retry of an outstanding cleanup.
+  the mob's id once its native destroy completed and the mob left the managed
+  set, before the storage cleanup that destroy owes, and again before each
+  retry of an outstanding cleanup. A panic in the hook is caught and logged,
+  so it can neither keep the id managed nor skip the cleanup.
   A host that kept the read handle its `set_before_activation` hook received
   had no such point: the handle kept the mob's database observer alive, so
   the destroy answered `Incomplete` ("storage cleanup outstanding: the

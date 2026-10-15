@@ -527,12 +527,14 @@ the actual executing caller's resolver; registration conveys no inherited
 parent authority and exposes no tools unless the host selects their bundle.
 
 `MobMcpState::set_after_destroy` is the release counterpart for the mobs that
-state destroys. Once a destroy completed natively, its `MobAfterDestroy` hook
-gets the mob's id before the storage cleanup the destroy owes, and again
-before each retry of an outstanding cleanup. A host drops the read handle it
-kept there: a handle still held keeps that cleanup outstanding, and the
-destroy answers `Incomplete`. Another mob may be managed under the same id by
-then, so the host releases only what observes the destroyed mob.
+state destroys. Once a destroy completed natively and the mob left the
+managed set, its `MobAfterDestroy` hook gets the mob's id before the storage
+cleanup the destroy owes, and again before each retry of an outstanding
+cleanup. A host drops the read handle it kept there: a handle still held keeps
+that cleanup outstanding, and the destroy answers `Incomplete`. Another mob
+may be managed under the same id by then, so the host releases only what
+observes the destroyed mob. The hook must not block; a panic in it is caught
+and logged, and the destroy goes on.
 
 ## Compaction contract
 

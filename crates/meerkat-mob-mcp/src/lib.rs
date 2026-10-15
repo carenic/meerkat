@@ -406,7 +406,8 @@ struct AdmittedDestroy {
     mobs: Arc<RwLock<BTreeMap<MobId, ManagedMob>>>,
     retired_mobs: Arc<std::sync::Mutex<BTreeMap<MobId, Arc<RetiredMob>>>>,
     mob_set_epoch: tokio::sync::watch::Sender<u64>,
-    /// The host's release hook, run once the native destroy completed.
+    /// The host's release hook, run once the native destroy completed and
+    /// the mob left the managed set.
     after_destroy: Option<MobAfterDestroy>,
 }
 
@@ -470,12 +471,6 @@ impl AdmittedDestroy {
                 records.insert(mob_id.clone(), Arc::clone(&retired));
             }
         }
-        // Destroyed natively and recorded: the host releases what it still
-        // holds of the mob before the storage cleanup drains its database
-        // observer.
-        if let Some(release) = &after_destroy {
-            release(&mob_id);
-        }
         // Remove the managed entry only while it is still the destroyed mob:
         // a handle registered under the id while the destroy ran is another
         // mob, which stays managed (and keeps its storage cleanup owed).
@@ -494,7 +489,28 @@ impl AdmittedDestroy {
             mob_set_epoch.send_modify(|epoch| *epoch += 1);
         }
         drop(removed);
+        // Destroyed natively, recorded and no longer managed: the host
+        // releases what it still holds of the mob before the storage cleanup
+        // drains its database observer. Running it only now, and containing
+        // a panic in it, keeps a failing hook from holding the id managed.
+        run_after_destroy(after_destroy.as_ref(), &mob_id);
         MobMcpState::settle_retired_destroy(&mobs, &mob_id, &retired).await
+    }
+}
+
+/// Run the host's after-destroy hook for `mob_id`, if one is bound. A panic
+/// in the hook is caught and logged, and the destroy goes on as if the hook
+/// had returned: what the host failed to release only keeps the storage
+/// cleanup outstanding, as a held handle does.
+fn run_after_destroy(hook: Option<&MobAfterDestroy>, mob_id: &MobId) {
+    let Some(hook) = hook else {
+        return;
+    };
+    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| hook(mob_id))).is_err() {
+        tracing::error!(
+            mob_id = %mob_id,
+            "the host's after-destroy hook panicked; the destroy continues"
+        );
     }
 }
 
@@ -805,8 +821,9 @@ pub enum DetachedCompletionDelivery {
 }
 
 /// Host release hook for the mobs a [`MobMcpState`] destroys: called with a
-/// destroyed mob's id once its native destroy completed, before the storage
-/// cleanup that destroy owes. See [`MobMcpState::set_after_destroy`].
+/// destroyed mob's id once its native destroy completed and it left the
+/// managed set, before the storage cleanup that destroy owes. See
+/// [`MobMcpState::set_after_destroy`].
 pub type MobAfterDestroy = Arc<dyn Fn(&MobId) + Send + Sync>;
 
 pub struct MobMcpState {
@@ -1510,10 +1527,8 @@ impl MobMcpState {
         mob_id: &MobId,
         retired: &RetiredMob,
     ) -> Result<meerkat_mob::MobDestroyReport, MobMcpDestroyError> {
-        if retired.cleanup_owed()
-            && let Some(release) = self.after_destroy.get()
-        {
-            release(mob_id);
+        if retired.cleanup_owed() {
+            run_after_destroy(self.after_destroy.get(), mob_id);
         }
         Self::settle_retired_destroy(&self.mobs, mob_id, retired).await
     }
@@ -2283,16 +2298,19 @@ impl MobMcpState {
     }
 
     /// Release host services bound to a mob this state destroys. Once a
-    /// destroy completed natively, the hook gets the mob's id before the
-    /// storage cleanup that destroy owes, and again before each retry of an
-    /// outstanding cleanup. A handle of the mob the host still holds then,
-    /// such as the read handle [`Self::set_before_activation`] handed it,
-    /// keeps that cleanup outstanding, so the host drops it here.
+    /// destroy completed natively and the mob left the managed set, the hook
+    /// gets the mob's id before the storage cleanup that destroy owes, and
+    /// again before each retry of an outstanding cleanup. A handle of the
+    /// mob the host still holds then, such as the read handle
+    /// [`Self::set_before_activation`] handed it, keeps that cleanup
+    /// outstanding, so the host drops it here.
     ///
     /// By the time the hook runs, another mob may be managed under the same
     /// id: release only what observes the destroyed mob, such as a handle
-    /// whose phase is `Destroyed`. The hook runs on the destroy's own task
-    /// and must not block. Install once before any destroy is admitted.
+    /// whose phase is `Destroyed`. The first call runs on the destroy's own
+    /// task, a retry's on the retrying caller's task; the hook must not
+    /// block. A panic in it is caught and logged, and the destroy goes on.
+    /// Install once before any destroy is admitted.
     pub fn set_after_destroy(&self, hook: MobAfterDestroy) -> Result<(), MobError> {
         self.after_destroy
             .set(hook)
@@ -16369,6 +16387,57 @@ mod tests {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .is_empty()
         );
+    }
+
+    /// A panicking after-destroy hook is contained. The hook runs once the
+    /// destroyed mob left the managed set, so the panic cannot keep its id
+    /// managed; the destroy goes on with its storage cleanup, and the id can
+    /// be created again at once.
+    #[tokio::test]
+    async fn a_panicking_after_destroy_hook_neither_keeps_the_id_nor_skips_the_cleanup() {
+        let svc = Arc::new(MockSessionSvc::new());
+        let root = tempfile::tempdir().expect("tempdir");
+        let state = persistent_destroy_state(&svc, root.path());
+        let still_managed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (observer, seen) = (Arc::downgrade(&state), Arc::clone(&still_managed));
+        let hook: MobAfterDestroy = Arc::new(move |mob_id: &MobId| {
+            let managed = observer.upgrade().is_some_and(|state| {
+                state
+                    .mobs
+                    .try_read()
+                    .map_or(true, |mobs| mobs.contains_key(mob_id))
+            });
+            seen.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(managed);
+            panic!("the host's release failed");
+        });
+        state
+            .set_after_destroy(hook)
+            .expect("bind the destroy hook");
+        let mob_id = state
+            .mob_create_definition(explicit_definition("panicking-release-destroy"))
+            .await
+            .expect("create explicit mob");
+        let storage_path = destroy_test_storage_path(root.path(), &mob_id);
+
+        let report = state
+            .mob_destroy(&mob_id)
+            .await
+            .expect("a panicking hook does not fail the destroy");
+        assert!(report.errors.is_empty(), "{report:?}");
+        assert_eq!(
+            *still_managed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            vec![false],
+            "the hook ran once, after the destroyed mob left the managed set"
+        );
+        assert!(existing_storage_files(&storage_path).is_empty());
+        state
+            .mob_create_definition(explicit_definition("panicking-release-destroy"))
+            .await
+            .expect("the destroyed mob's id is free again at once");
     }
 
     /// An agent's destroy is continued only by the exact caller it was
