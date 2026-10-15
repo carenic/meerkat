@@ -115,19 +115,18 @@ them.
   allows tokio's test-util marker in a packaged binary. Cargo-built release
   binaries never compiled it.
 
-- Adaptive mobpack validation compares the bundled
-  `adaptive/layer-decision.schema.json` with the runtime's canonical
-  LayerDecision schema after removing the documentation keywords (`title`,
-  `description`) from both. A reworded doc comment reaches that schema as
-  description text, so it no longer makes packs built by an earlier release
-  fail with `StaleAdaptiveSchema`; a structural difference still does.
-  Property names and instance data (`const`, `enum`, `default`, `examples`)
-  are never stripped. With that, the `ToolConfig::deny` doc comment, which is
-  also the `deny` description in the LayerDecision schema, says what #1807
-  made true: every build removes denied tools from the member's visible tool
-  list, and the execution gate still refuses every call by name. A pack built
-  by this release still fails validation on 0.9.1 and earlier hosts, which
-  compare the description text.
+- Adaptive mobpack validation no longer counts doc-only schema text as a
+  schema change. It compares the bundled `adaptive/layer-decision.schema.json`
+  with the runtime's canonical LayerDecision schema after removing the
+  documentation keywords (`title`, `description`) from both, so a reworded
+  Rust doc comment, which reaches that schema as description text, no longer
+  makes packs built by another release fail with `StaleAdaptiveSchema`; a
+  structural difference still does. Property names and instance data
+  (`const`, `enum`, `default`, `examples`) are never stripped. This release
+  keeps the 0.9.1 text of the `ToolConfig::deny` doc comment, so packs it
+  builds still validate on 0.9.1 and earlier hosts, which compare that text
+  exactly; rewording it (since #1807 every build removes denied tools from
+  the member's visible tool list) waits for a later release.
 - The meerkat-mob test `durable_cursor_resumes_across_pump_restart` restarts
   the controlling mob only once the member's durable event cursor covers
   every row the first turn consumed. The pump writes that cursor after it

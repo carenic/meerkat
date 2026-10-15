@@ -366,8 +366,8 @@ fn validate_adaptive_policy_document(policy_bytes: &[u8]) -> Result<(), PackVali
 /// equality, i.e. key order and formatting do not matter). The builder emits
 /// exactly this artifact, so a structural divergence means the pack was built
 /// by older or hand-rolled tooling and fails closed with a regenerate hint. A
-/// reworded doc comment changes only `description`/`title` text, so it does
-/// not invalidate packs built before it.
+/// reworded doc comment changes only `description`/`title` text, so packs
+/// built with an earlier or later wording still match.
 fn validate_layer_decision_schema(schema_bytes: &[u8]) -> Result<(), PackValidationError> {
     let mut bundled: serde_json::Value = serde_json::from_slice(schema_bytes).map_err(|err| {
         PackValidationError::InvalidAdaptiveFile {
@@ -1285,6 +1285,151 @@ max_aggregate_tool_calls = 100\n";
                 "items": [{}]
             })
         );
+    }
+
+    /// How the `ToolConfig::deny` doc comment ends in 0.9.1, as schemars
+    /// renders it into the LayerDecision schema's `deny` description (doc
+    /// lines joined with "\n"). 0.9.1 and earlier hosts compare a pack's
+    /// bundled schema with their own including this text.
+    const DENY_DOC_0_9_1_TAIL: &str = "server's `tool_names`. Denied tools stay listed and the execution gate\n\
+refuses every call by name.";
+
+    /// The rewording of that ending (what #1807 made true), deferred to a
+    /// release after 0.9.2 so that packs built by 0.9.2 still load on 0.9.1.
+    const DENY_DOC_REWORDED_TAIL: &str = "server's `tool_names`. Denied tools are not offered to the model: every\n\
+build removes them from the member's visible tool list, and the\n\
+execution gate still refuses every call by name.";
+
+    /// Apply `edit` to every `deny` property schema in a LayerDecision schema
+    /// and return how many it edited.
+    fn edit_deny_property_schemas(
+        value: &mut serde_json::Value,
+        edit: &mut dyn FnMut(&mut serde_json::Map<String, serde_json::Value>),
+    ) -> usize {
+        match value {
+            serde_json::Value::Object(map) => {
+                let mut edited = 0;
+                if let Some(serde_json::Value::Object(deny)) = map
+                    .get_mut("properties")
+                    .and_then(|properties| properties.get_mut("deny"))
+                {
+                    edit(deny);
+                    edited += 1;
+                }
+                for child in map.values_mut() {
+                    edited += edit_deny_property_schemas(child, edit);
+                }
+                edited
+            }
+            serde_json::Value::Array(items) => {
+                let mut edited = 0;
+                for item in items {
+                    edited += edit_deny_property_schemas(item, edit);
+                }
+                edited
+            }
+            _ => 0,
+        }
+    }
+
+    /// A bundled schema whose `deny` description ends with `tail` instead of
+    /// the wording this host renders.
+    fn schema_with_deny_doc_tail(tail: &str) -> serde_json::Value {
+        let mut schema = canonical_layer_decision_schema().unwrap();
+        let edited = edit_deny_property_schemas(&mut schema, &mut |deny| {
+            let description = deny
+                .get("description")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            let body = description
+                .strip_suffix(DENY_DOC_0_9_1_TAIL)
+                .or_else(|| description.strip_suffix(DENY_DOC_REWORDED_TAIL))
+                .unwrap_or_else(|| panic!("unknown deny doc wording: {description:?}"))
+                .to_owned();
+            deny.insert(
+                "description".to_string(),
+                serde_json::Value::String(body + tail),
+            );
+        });
+        assert!(
+            edited >= 1,
+            "the LayerDecision schema must carry ToolConfig::deny"
+        );
+        schema
+    }
+
+    #[test]
+    fn test_this_host_still_renders_the_0_9_1_deny_doc_text() {
+        // 0.9.1 and earlier hosts compare a pack's bundled schema with their
+        // own, doc text included. A pack this host builds loads there only
+        // while it renders the 0.9.1 wording, so the rewording waits until
+        // hosts that ignore schema doc text (0.9.2 and later) replace them.
+        let mut canonical = canonical_layer_decision_schema().unwrap();
+        let mut descriptions = Vec::new();
+        let edited = edit_deny_property_schemas(&mut canonical, &mut |deny| {
+            descriptions.push(
+                deny.get("description")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned),
+            );
+        });
+        assert!(
+            edited >= 1,
+            "the LayerDecision schema must carry ToolConfig::deny"
+        );
+        for description in descriptions {
+            let description = description.expect("ToolConfig::deny carries its doc text");
+            assert!(
+                description.ends_with(DENY_DOC_0_9_1_TAIL),
+                "keep the 0.9.1 deny wording until 0.9.1 hosts are gone: {description:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_packs_with_the_0_9_1_or_the_reworded_deny_doc_validate() {
+        // This host ignores schema doc text, so it loads packs built by 0.9.1
+        // and packs built by a later host that rewords the doc comment.
+        for tail in [DENY_DOC_0_9_1_TAIL, DENY_DOC_REWORDED_TAIL] {
+            let mut files = adaptive_pack_files();
+            files.insert(
+                LAYER_DECISION_SCHEMA_PATH.to_string(),
+                serde_json::to_vec_pretty(&schema_with_deny_doc_tail(tail)).unwrap(),
+            );
+            validate_extracted_pack_files(&files).unwrap_or_else(|err| {
+                panic!("a pack whose deny doc ends {tail:?} must validate: {err}")
+            });
+        }
+    }
+
+    #[test]
+    fn test_a_structural_deny_change_is_still_a_stale_schema() {
+        // A real schema change still fails closed, under either doc wording:
+        // `deny` changes from an array of names to a single string.
+        for tail in [DENY_DOC_0_9_1_TAIL, DENY_DOC_REWORDED_TAIL] {
+            let mut bundled = schema_with_deny_doc_tail(tail);
+            edit_deny_property_schemas(&mut bundled, &mut |deny| {
+                deny.remove("items");
+                deny.insert(
+                    "type".to_string(),
+                    serde_json::Value::String("string".to_string()),
+                );
+            });
+            let mut files = adaptive_pack_files();
+            files.insert(
+                LAYER_DECISION_SCHEMA_PATH.to_string(),
+                serde_json::to_vec(&bundled).unwrap(),
+            );
+            let err = validate_extracted_pack_files(&files).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    PackValidationError::StaleAdaptiveSchema { ref path }
+                        if path == "adaptive/layer-decision.schema.json"
+                ),
+                "a structural deny change must stay stale: {err}"
+            );
+        }
     }
 
     #[test]
