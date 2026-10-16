@@ -523,14 +523,19 @@ fn file_url_for_path(path: &Path) -> Result<String, String> {
 
 fn open_html_artifact_in_browser(
     path: &Path,
-    untrusted: &meerkat_core::confinement::UntrustedPathFn,
+    untrusted: Option<&meerkat_core::confinement::UntrustedPathFn>,
 ) -> Result<(), String> {
     let url = file_url_for_path(path)?;
     // A host launch exemption (`HostLaunchExemption::BrowserOpener`): the
     // browser opens in the user's desktop session, which a confined process
-    // cannot reach. The opener, and every program it starts by name, come
-    // from a `PATH` without the directories a confined process could change.
-    meerkat::open_system_browser_trusting(&url, untrusted).map_err(|e| e.to_string())
+    // cannot reach. Under confinement the opener, and every program it
+    // starts by name, come from a `PATH` without the directories a confined
+    // process could change.
+    match untrusted {
+        Some(untrusted) => meerkat::open_system_browser_trusting(&url, untrusted),
+        None => meerkat::open_system_browser(&url),
+    }
+    .map_err(|e| e.to_string())
 }
 
 async fn print_completed_run_result(
@@ -539,7 +544,7 @@ async fn print_completed_run_result(
     stream: bool,
     scope: &RuntimeScope,
     include_ref_in_summary: bool,
-    host_launch_guard: &meerkat_core::confinement::UntrustedPathFn,
+    host_launch_guard: Option<&meerkat_core::confinement::UntrustedPathFn>,
 ) -> anyhow::Result<()> {
     match output.format {
         CliOutputFormat::Json => {
@@ -2648,8 +2653,11 @@ enum ConnectorClientCommands {
 }
 
 /// Read a connector client secret from stdin: one line, trailing newline
-/// removed. On a terminal, input is not echoed.
-fn read_connector_client_secret() -> anyhow::Result<String> {
+/// removed. On a terminal, input is not echoed. `untrusted` is the host's
+/// judgement under confinement ([`cli_scope_launch_guard`]).
+fn read_connector_client_secret(
+    untrusted: Option<&meerkat_core::confinement::UntrustedPathFn>,
+) -> anyhow::Result<String> {
     use std::io::IsTerminal;
     let stdin = std::io::stdin();
     let terminal = stdin.is_terminal();
@@ -2657,13 +2665,16 @@ fn read_connector_client_secret() -> anyhow::Result<String> {
     // operator's own terminal.
     #[cfg(unix)]
     let echo_off = terminal
-        && meerkat_core::HostLaunchExemption::terminal_control()
+        && meerkat_core::HostLaunchExemption::terminal_control(untrusted)
             .arg("-echo")
             .stdin(std::process::Stdio::inherit())
             .status()
             .is_ok_and(|status| status.success());
     #[cfg(not(unix))]
-    let echo_off = false;
+    let echo_off = {
+        let _ = untrusted;
+        false
+    };
     if terminal && !echo_off {
         anyhow::bail!("cannot hide terminal input here; pipe the client secret on stdin");
     }
@@ -2674,7 +2685,7 @@ fn read_connector_client_secret() -> anyhow::Result<String> {
     let read = stdin.read_line(&mut line);
     #[cfg(unix)]
     if echo_off {
-        let _ = meerkat_core::HostLaunchExemption::terminal_control()
+        let _ = meerkat_core::HostLaunchExemption::terminal_control(untrusted)
             .arg("echo")
             .stdin(std::process::Stdio::inherit())
             .status();
@@ -2756,7 +2767,10 @@ async fn handle_connector_client_command(
                 registered_redirect_uris,
             };
             let secret = if secret_stdin {
-                meerkat::ConnectorClientSecretUpdate::Set(read_connector_client_secret()?)
+                let untrusted = cli_scope_launch_guard(scope).await;
+                meerkat::ConnectorClientSecretUpdate::Set(read_connector_client_secret(
+                    untrusted.as_deref(),
+                )?)
             } else {
                 meerkat::ConnectorClientSecretUpdate::Keep
             };
@@ -2765,7 +2779,8 @@ async fn handle_connector_client_command(
             println!("Connector client '{id}' configured in realm '{realm}'.");
         }
         ConnectorClientCommands::RotateSecret { id } => {
-            let secret = read_connector_client_secret()?;
+            let untrusted = cli_scope_launch_guard(scope).await;
+            let secret = read_connector_client_secret(untrusted.as_deref())?;
             let store = cli_realm_doc_store(scope, &realm).await?;
             meerkat::rotate_connector_client_secret(store, &persistence, &realm, &id, &secret)
                 .await?;
@@ -5696,32 +5711,31 @@ fn cli_host_confinement(
 }
 
 /// What the processes a CLI factory's host confines could change
-/// ([`meerkat::HostConfinement::untrusted_paths`]): the judgement the
-/// programs the host runs as itself (a browser opener) take their `PATH` by.
+/// ([`meerkat::HostConfinement::launch_guard`]): the judgement the programs
+/// the host runs as itself (a browser opener) take their environment by.
+/// `None` when the host confines no launch kind.
 fn cli_host_launch_guard(
     factory: &AgentFactory,
-) -> Arc<meerkat_core::confinement::UntrustedPathFn> {
+) -> Option<Arc<meerkat_core::confinement::UntrustedPathFn>> {
     factory
         .host_confinement()
-        .cloned()
-        .unwrap_or_default()
-        .untrusted_paths()
+        .and_then(meerkat::HostConfinement::launch_guard)
 }
 
 /// [`cli_host_launch_guard`] for a command that builds no factory: the host
 /// confinement of `scope` ([`cli_host_confinement`]). A configuration that
 /// does not load or lower trusts no directory, so a program the host runs as
-/// itself is then found only by absolute path.
+/// itself then gets no path from its environment.
 async fn cli_scope_launch_guard(
     scope: &RuntimeScope,
-) -> Arc<meerkat_core::confinement::UntrustedPathFn> {
+) -> Option<Arc<meerkat_core::confinement::UntrustedPathFn>> {
     let host = match load_config_with_warnings(scope).await {
         Ok((config, _, _)) => cli_host_confinement(&config, scope).ok(),
         Err(_) => None,
     };
     match host {
-        Some(host) => host.untrusted_paths(),
-        None => Arc::new(|_: &Path, _: bool| true),
+        Some(host) => host.launch_guard(),
+        None => Some(Arc::new(|_: &Path, _: bool| true)),
     }
 }
 
@@ -5733,8 +5747,11 @@ fn cli_resolver_environment(
     config: &Config,
     scope: &RuntimeScope,
 ) -> anyhow::Result<meerkat_providers::ResolverEnvironment> {
-    Ok(meerkat_providers::ResolverEnvironment::with_process_env()
-        .with_host_launch_guard(cli_host_confinement(config, scope)?.untrusted_paths()))
+    let env = meerkat_providers::ResolverEnvironment::with_process_env();
+    Ok(match cli_host_confinement(config, scope)?.launch_guard() {
+        Some(guard) => env.with_host_launch_guard(guard),
+        None => env,
+    })
 }
 
 /// Report this host's confinement once per process on stderr, the CLI's
@@ -8659,9 +8676,11 @@ async fn interactive_login(
     // The opener, and every program it starts by name, come from a `PATH`
     // without the directories this host's confined processes could change.
     let untrusted = cli_scope_launch_guard(scope).await;
-    let browser_ok = launch_provider_authorize_url(&login_start.authorize_url, |url| {
-        meerkat::open_system_browser_trusting(url, untrusted.as_ref())
-    });
+    let browser_ok =
+        launch_provider_authorize_url(&login_start.authorize_url, |url| match &untrusted {
+            Some(untrusted) => meerkat::open_system_browser_trusting(url, untrusted.as_ref()),
+            None => meerkat::open_system_browser(url),
+        });
     if browser_ok {
         print_ok("Browser launched. Complete the sign-in there.");
     } else {
@@ -9037,8 +9056,10 @@ fn doctor_self_hosted_registry() -> meerkat_providers::ProviderRuntimeRegistry {
 fn doctor_resolver_environment(
     host: &meerkat::HostConfinement,
 ) -> meerkat_providers::ResolverEnvironment {
-    let mut env = meerkat_providers::ResolverEnvironment::with_process_env()
-        .with_host_launch_guard(host.untrusted_paths());
+    let mut env = meerkat_providers::ResolverEnvironment::with_process_env();
+    if let Some(guard) = host.launch_guard() {
+        env = env.with_host_launch_guard(guard);
+    }
     #[cfg(not(target_arch = "wasm32"))]
     {
         if let Ok(backend) = meerkat_providers::auth_store::TokenStoreBackend::default_auto()
@@ -9249,14 +9270,14 @@ async fn handle_doctor(scope: &RuntimeScope) -> anyhow::Result<()> {
     // command runs, found on a `PATH` without the directories this host's
     // confined processes could change (none, when the confinement does not
     // lower).
-    let wasm_pack_guard: Arc<meerkat_core::confinement::UntrustedPathFn> =
+    let wasm_pack_guard: Option<Arc<meerkat_core::confinement::UntrustedPathFn>> =
         match cli_host_confinement(&config, scope) {
-            Ok(host) => host.untrusted_paths(),
-            Err(_) => Arc::new(|_: &Path, _: bool| true),
+            Ok(host) => host.launch_guard(),
+            Err(_) => Some(Arc::new(|_: &Path, _: bool| true)),
         };
-    let wasm_pack = TokioCommand::from(meerkat_core::HostLaunchExemption::wasm_pack(Some(
-        wasm_pack_guard.as_ref(),
-    )))
+    let wasm_pack = TokioCommand::from(meerkat_core::HostLaunchExemption::wasm_pack(
+        wasm_pack_guard.as_deref(),
+    ))
     .arg("--version")
     .output()
     .await;
@@ -11177,9 +11198,10 @@ struct CliMcpHostAuthResolver {
     service: meerkat::HostAuthService,
     authority: meerkat::McpOAuthAuthority,
     mode: CliMcpAuthMode,
-    /// What the host's confined processes could change: the browser opener
-    /// takes its `PATH` by it.
-    untrusted: Arc<meerkat_core::confinement::UntrustedPathFn>,
+    /// What the host's confined processes could change, `None` when it
+    /// confines no launch kind: the browser opener takes its environment by
+    /// it.
+    untrusted: Option<Arc<meerkat_core::confinement::UntrustedPathFn>>,
 }
 
 #[cfg(feature = "mcp")]
@@ -11212,7 +11234,7 @@ impl meerkat_mcp::McpAuthResolver for CliMcpHostAuthResolver {
             &self.service,
             target,
             www_authenticate,
-            Arc::clone(&self.untrusted),
+            self.untrusted.clone(),
         )
         .await
         .map_err(|error| match error {
@@ -11258,11 +11280,17 @@ async fn cli_mcp_browser_login(
     service: &meerkat::HostAuthService,
     target: &meerkat::McpServerIdentity,
     www_authenticate: Option<&str>,
-    untrusted: Arc<meerkat_core::confinement::UntrustedPathFn>,
+    untrusted: Option<Arc<meerkat_core::confinement::UntrustedPathFn>>,
 ) -> Result<meerkat::McpOAuthLoginComplete, meerkat::HostAuthError> {
-    cli_mcp_browser_login_with(service, target, www_authenticate, move |url| {
-        meerkat::open_system_browser_trusting(&url, untrusted.as_ref())
-    })
+    cli_mcp_browser_login_with(
+        service,
+        target,
+        www_authenticate,
+        move |url| match &untrusted {
+            Some(untrusted) => meerkat::open_system_browser_trusting(&url, untrusted.as_ref()),
+            None => meerkat::open_system_browser(&url),
+        },
+    )
     .await
 }
 
@@ -11416,7 +11444,7 @@ fn cli_mcp_host_auth_service(
 fn open_mcp_auth_resolver(
     scope: &RuntimeScope,
     mode: CliMcpAuthMode,
-    untrusted: Arc<meerkat_core::confinement::UntrustedPathFn>,
+    untrusted: Option<Arc<meerkat_core::confinement::UntrustedPathFn>>,
 ) -> anyhow::Result<Option<Arc<dyn meerkat_mcp::McpAuthResolver>>> {
     let service = open_cli_mcp_host_auth_service(scope)?;
     let authority = service.mcp_oauth_authority()?;
@@ -11434,7 +11462,7 @@ fn open_mcp_auth_resolver(
 fn open_cli_mcp_loader_auth_resolver(
     scope: &RuntimeScope,
     mode: CliMcpAuthMode,
-    untrusted: Arc<meerkat_core::confinement::UntrustedPathFn>,
+    untrusted: Option<Arc<meerkat_core::confinement::UntrustedPathFn>>,
 ) -> anyhow::Result<Arc<dyn meerkat_mcp::McpAuthResolver>> {
     let persistence = open_cli_mcp_auth_persistence()?;
     let token_store = persistence.token_store();
@@ -11590,7 +11618,7 @@ async fn create_mcp_tools(
             Some(open_cli_mcp_loader_auth_resolver(
                 scope,
                 mcp_auth,
-                host_confinement.untrusted_paths(),
+                host_confinement.launch_guard(),
             )?)
         } else {
             None
@@ -14678,7 +14706,7 @@ async fn run_agent(
                     stream,
                     storage_scope,
                     storage_fell_back,
-                    host_launch_guard.as_ref(),
+                    host_launch_guard.as_deref(),
                 )
                 .await?;
             }
@@ -15455,7 +15483,7 @@ async fn resume_session_with_llm_override(
                     stream,
                     scope,
                     true,
-                    host_launch_guard.as_ref(),
+                    host_launch_guard.as_deref(),
                 )
                 .await?;
             }
@@ -22915,7 +22943,7 @@ mod tests {
                 .expect("the native MCP OAuth owner"),
             service,
             mode: CliMcpAuthMode::Stored,
-            untrusted: meerkat::HostConfinement::default().untrusted_paths(),
+            untrusted: None,
         });
         let target = |account: Option<&str>| {
             let mut server = meerkat_core::McpServerConfig::streamable_http(
@@ -29113,7 +29141,7 @@ default_model = "gemma"
             authority: service.mcp_oauth_authority().unwrap(),
             service: service.clone(),
             mode: CliMcpAuthMode::Stored,
-            untrusted: meerkat::HostConfinement::default().untrusted_paths(),
+            untrusted: None,
         };
         let stored_only =
             meerkat_mcp::McpAuthResolver::interactive_login(&resolver, &target, None).await;
@@ -36227,7 +36255,7 @@ mod cli_mcp_host_auth_resolver_tests {
             service,
             authority,
             mode: CliMcpAuthMode::Stored,
-            untrusted: meerkat::HostConfinement::default().untrusted_paths(),
+            untrusted: None,
         };
         assert_eq!(
             meerkat_mcp::McpAuthResolver::credential_realm(&resolver),

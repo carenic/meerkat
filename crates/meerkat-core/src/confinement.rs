@@ -371,12 +371,12 @@ impl HostLaunchExemption {
     /// `PATH` lookup finds it, and it starts no program of its own.
     #[cfg(not(target_arch = "wasm32"))]
     #[must_use]
-    pub fn terminal_control() -> std::process::Command {
+    pub fn terminal_control(untrusted: Option<&UntrustedPathFn>) -> std::process::Command {
         let program = ["/bin/stty", "/usr/bin/stty"]
             .into_iter()
             .find(|program| Path::new(program).is_file())
             .unwrap_or("/bin/stty");
-        Self::TerminalControl.launch(program, None)
+        Self::TerminalControl.launch(program, untrusted)
     }
 
     /// `wasm-pack`.
@@ -396,10 +396,13 @@ impl HostLaunchExemption {
     }
 
     /// The command of this exemption for `program`, found and running with
-    /// only the variables of `environment` (the host's) that
-    /// [`trusted_environment`] keeps: its `PATH` without relative
-    /// directories, and without the directories `untrusted` names when the
-    /// host names what it does not trust.
+    /// `environment` (the host's). Under a host that confines its agents'
+    /// launches (`untrusted` given), only the variables
+    /// [`trusted_environment`] keeps: no variable that loads code from
+    /// elsewhere, and a `PATH` without relative directories or the
+    /// directories `untrusted` names. Without one there is no confined
+    /// process to plant anything, and the host's environment passes as it
+    /// is.
     #[cfg(not(target_arch = "wasm32"))]
     fn launch_in(
         self,
@@ -410,7 +413,10 @@ impl HostLaunchExemption {
         let _ = self;
         let mut command = std::process::Command::new(program);
         command.env_clear();
-        command.envs(trusted_environment(environment, untrusted));
+        match untrusted {
+            Some(untrusted) => command.envs(trusted_environment(environment, untrusted)),
+            None => command.envs(environment),
+        };
         command
     }
 }
@@ -436,11 +442,13 @@ pub fn trusted_search_path(
     std::env::join_paths(kept).unwrap_or_default()
 }
 
-/// The environment a host launch exemption runs with, from `environment`
-/// (the host's own): every variable except one that makes the launched
-/// program, or a program it starts, load code or startup options from
-/// somewhere else ([`is_load_injection_variable`]), which is dropped, with
-/// the paths a confined process could change taken out of the values
+/// The environment a host launch exemption runs with under a host that
+/// confines its agents' launches (`untrusted`: what its confined processes
+/// could change), from `environment` (the host's own): every variable
+/// except one that makes the launched program, or a program it starts, load
+/// code or startup options from somewhere else
+/// ([`is_load_injection_variable`]), which is dropped, with the paths a
+/// confined process could change taken out of the values
 /// ([`trusted_variable_value`]): `PATH` without its relative directories
 /// and the directories `untrusted` names, any other list of absolute paths
 /// likewise, and a value that is one path `untrusted` names dropped. A
@@ -451,7 +459,7 @@ pub fn trusted_search_path(
 #[must_use]
 pub fn trusted_environment(
     environment: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
-    untrusted: Option<&UntrustedPathFn>,
+    untrusted: &UntrustedPathFn,
 ) -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
     environment
         .into_iter()
@@ -464,11 +472,12 @@ pub fn trusted_environment(
 }
 
 /// Give `command` the environment an operator configured for it
-/// (`configured`, such as a credential command's `env`), each value without
-/// the paths a confined process could change ([`trusted_variable_value`]):
-/// a configured variable left without a value is not passed on at all. A
-/// configured variable is the operator's own, so no name is refused for
-/// itself.
+/// (`configured`, such as a credential command's `env`). Under a host that
+/// confines its agents' launches (`untrusted` given) each value loses the
+/// paths a confined process could change ([`trusted_variable_value`]), and
+/// a configured variable left without a value is not passed on at all.
+/// A configured variable is the operator's own, so no name is refused for
+/// itself, and without such a host every value passes as configured.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn apply_configured_environment<'a>(
     command: &mut std::process::Command,
@@ -476,6 +485,10 @@ pub fn apply_configured_environment<'a>(
     untrusted: Option<&UntrustedPathFn>,
 ) {
     for (name, value) in configured {
+        let Some(untrusted) = untrusted else {
+            command.env(name, value);
+            continue;
+        };
         let name = std::ffi::OsStr::new(name);
         match trusted_variable_value(name, std::ffi::OsStr::new(value), untrusted) {
             Some(value) => command.env(name, value),
@@ -493,10 +506,8 @@ pub fn apply_configured_environment<'a>(
 fn trusted_variable_value(
     name: &std::ffi::OsStr,
     value: &std::ffi::OsStr,
-    untrusted: Option<&UntrustedPathFn>,
+    untrusted: &UntrustedPathFn,
 ) -> Option<std::ffi::OsString> {
-    let trust_all = |_: &Path, _: bool| false;
-    let untrusted = untrusted.unwrap_or(&trust_all);
     let entries: Vec<PathBuf> = std::env::split_paths(value).collect();
     let search_path = name.to_string_lossy().eq_ignore_ascii_case("PATH");
     let path_list = entries.iter().any(|entry| entry.is_absolute())
@@ -1002,5 +1013,40 @@ mod tests {
             Some("http://proxy.invalid:8080")
         );
         assert_eq!(variable("DISPLAY").as_deref(), Some(":0"));
+    }
+
+    /// Without a host that confines its agents' launches there is no
+    /// confined process to plant anything: a host launch keeps the host's
+    /// environment exactly, module paths and relative `PATH` directories
+    /// included.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_launch_without_host_confinement_keeps_its_environment() {
+        let temp = tempfile::tempdir().unwrap();
+        let seen = temp.path().join("environment-seen");
+        let environment: Vec<(std::ffi::OsString, std::ffi::OsString)> = [
+            ("PATH", "/usr/bin:/bin:relative-tools"),
+            ("PYTHONPATH", "/opt/project/src"),
+            ("NODE_OPTIONS", "--max-old-space-size=4096"),
+        ]
+        .into_iter()
+        .map(|(name, value)| (name.into(), value.into()))
+        .collect();
+
+        let status = HostLaunchExemption::CredentialHelper
+            .launch_in("/bin/sh", environment, None)
+            .arg("-c")
+            .arg(format!("env > '{}'", seen.display()))
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let seen = std::fs::read_to_string(&seen).unwrap();
+        for kept in [
+            "PATH=/usr/bin:/bin:relative-tools",
+            "PYTHONPATH=/opt/project/src",
+            "NODE_OPTIONS=--max-old-space-size=4096",
+        ] {
+            assert!(seen.lines().any(|line| line == kept), "{kept}:\n{seen}");
+        }
     }
 }

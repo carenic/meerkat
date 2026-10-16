@@ -763,19 +763,21 @@ constructor per program):
 | `stty`, by absolute path (`/bin/stty`, else `/usr/bin/stty`) | Host terminal control: `rkat` hides a client secret typed at its own terminal. |
 | `wasm-pack` | Developer build tooling: `rkat doctor` reports its version. |
 
-Each of these runs, with every program it starts by name (an interpreter
-named through `env`, `ssh` or `git-lfs` under Git, the programs a browser
-opener tries), from a `PATH` without relative directories and, under a host
-that confines its agents' launches, without the directories a confined
-process could change. None of them is a program a confined process put on
-the `PATH`. Each also runs without the variables that make a program load
-code or startup options from elsewhere (`LD_*`, `DYLD_*`, `PYTHON*`,
+Under a host that confines its agents' launches, each of these runs, with
+every program it starts by name (an interpreter named through `env`, `ssh`
+or `git-lfs` under Git, the programs a browser opener tries), from a `PATH`
+without relative directories or the directories a confined process could
+change, so none of them is a program a confined process put on the `PATH`.
+Each also runs there without the variables that make a program load code
+or startup options from elsewhere (`LD_*`, `DYLD_*`, `PYTHON*`,
 `NODE_OPTIONS`, `NODE_PATH`, `PERL5LIB`, `PERL5OPT`, `RUBYLIB`, `RUBYOPT`,
 `BASH_ENV`, `ENV`, `GIT_DIR`, `GIT_WORK_TREE`, `GIT_EXEC_PATH` and the
 like), and with the paths a confined process could change taken out of
 every other variable: a list of directories keeps the trusted ones, and a
 variable that names one such path is not passed on. A credential command's
-own `env` is passed on with the same paths taken out.
+own `env` is passed on with the same paths taken out. A host that confines
+no launch kind has no confined process to plant anything, and runs them
+with its own environment as it is.
 
 A test of the source enumerates every process launch in shipped code and
 fails on one that is neither confined nor in this list.
