@@ -13276,15 +13276,22 @@ impl SessionRuntime {
         );
         // A guarded host's live router is guarded as its factory's own
         // routers are: each stdio attempt begins the host's guard first, for
-        // this session and its mob member.
+        // this session and its mob member. A resumed session's persisted
+        // member stands when the build names none, as the factory adopts it.
         let router = match self.factory.mcp_attempt_guards() {
-            Some(guards) => router.with_attempt_guards(
-                guards.clone(),
-                meerkat::McpConstructionOwner::new(
-                    session_id.clone(),
-                    build_config.mob_member_binding.clone(),
-                ),
-            ),
+            Some(guards) => {
+                let member = build_config.mob_member_binding.clone().or_else(|| {
+                    build_config
+                        .resume_session
+                        .as_ref()
+                        .and_then(Session::session_metadata)
+                        .and_then(|metadata| metadata.mob_member_binding)
+                });
+                router.with_attempt_guards(
+                    guards.clone(),
+                    meerkat::McpConstructionOwner::new(session_id.clone(), member),
+                )
+            }
             None => router,
         };
         let adapter = Arc::new(McpRouterAdapter::new(router));

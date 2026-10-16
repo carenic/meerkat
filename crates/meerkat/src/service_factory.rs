@@ -1587,6 +1587,17 @@ impl FactoryAgentBuilder {
     }
 }
 
+/// The factory's MCP attempt guards ([`AgentFactory::mcp_attempt_guards`]),
+/// for the session routers a surface builds around this builder's service.
+#[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
+impl meerkat_session::McpAttemptGuardSource for FactoryAgentBuilder {
+    type Guards = meerkat_mcp::McpAttemptGuards;
+
+    fn mcp_attempt_guards(&self) -> Option<&Self::Guards> {
+        self.factory.mcp_attempt_guards()
+    }
+}
+
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl SessionAgentBuilder for FactoryAgentBuilder {

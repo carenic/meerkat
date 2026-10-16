@@ -14052,6 +14052,30 @@ mod tests {
                 .expect("member with no configured MCP server")
         }
 
+        /// A fresh governed member with no configured MCP server, built by a
+        /// factory carrying `guards`.
+        async fn governed_member_with_guards(guards: meerkat_mcp::McpAttemptGuards) -> DynAgent {
+            let session = Session::new();
+            let runtime = meerkat_runtime::MeerkatMachine::ephemeral();
+            let bindings = runtime
+                .prepare_bindings(session.id().clone())
+                .await
+                .expect("session runtime bindings")
+                .__with_configured_mcp_attachment(Arc::new(AllowConfigured));
+            let mut build = AgentBuildConfig::new("claude-sonnet-4-5");
+            build.resume_session = Some(session);
+            build.llm_client_override = Some(Arc::new(meerkat_client::TestClient::default()));
+            build.runtime_build_mode = RuntimeBuildMode::SessionOwned(bindings);
+            build.override_builtins = ToolCategoryOverride::Disable;
+            let temp = tempfile::tempdir().expect("temp session store");
+            AgentFactory::new(temp.path().join("sessions"))
+                .builtins(false)
+                .with_mcp_attempt_guards(guards)
+                .build_agent(build, &Config::default())
+                .await
+                .expect("governed member with no configured MCP server")
+        }
+
         async fn spawned(marker: &std::path::Path) -> bool {
             for _ in 0..50 {
                 if marker.exists() {
@@ -14060,6 +14084,72 @@ mod tests {
                 tokio::time::sleep(std::time::Duration::from_millis(40)).await;
             }
             false
+        }
+
+        /// A governed member's live attachment begins its factory's attempt
+        /// guard before the server can start: a refusing host starts nothing,
+        /// even under a control that allows the apply. A REST state's
+        /// members on a governed runtime are built through this same
+        /// factory path.
+        #[tokio::test]
+        async fn a_governed_members_live_attachment_begins_the_factory_guard() {
+            #[derive(Default)]
+            struct Refusing(std::sync::Mutex<Vec<meerkat_mcp::McpAttemptGuardRequest>>);
+            #[async_trait::async_trait]
+            impl meerkat_mcp::McpAttemptGuardFactory for Refusing {
+                async fn begin(
+                    &self,
+                    request: meerkat_mcp::McpAttemptGuardRequest,
+                    _cancel: meerkat_mcp::McpAttemptCancellation,
+                ) -> Result<Option<Box<dyn meerkat_mcp::McpAttemptGuard>>, McpAttachmentRefusal>
+                {
+                    self.0.lock().unwrap().push(request);
+                    Err(McpAttachmentRefusal::Denied)
+                }
+            }
+
+            let markers = tempfile::tempdir().unwrap();
+            let refusing = Arc::new(Refusing::default());
+            let guards = meerkat_mcp::McpAttemptGuards::new(
+                Arc::clone(&refusing) as Arc<dyn meerkat_mcp::McpAttemptGuardFactory>,
+                meerkat_mcp::McpAttemptGuardBounds::DEFAULT,
+            );
+            let agent = governed_member_with_guards(guards.clone()).await;
+            let surface = Arc::clone(
+                agent
+                    .live_mcp_attachment()
+                    .expect("the governed member owns its router"),
+            );
+            let server = sentinel("guarded-first", &markers.path().join("guarded-first"));
+            let outcome = surface
+                .attach(LiveMcpAttachment {
+                    control: Arc::new(Control {
+                        server: server.clone(),
+                        apply: Ok(()),
+                    }),
+                    server,
+                    persist: None,
+                })
+                .await
+                .map(|receipt| receipt.outcome);
+            assert_eq!(
+                outcome,
+                Ok(McpAttachmentOutcome {
+                    persisted: false,
+                    staged: true,
+                }),
+                "staging is not a connection claim"
+            );
+            assert!(
+                !spawned(&markers.path().join("guarded-first")).await,
+                "the refusing guard starts nothing"
+            );
+            let requests = refusing.0.lock().unwrap().clone();
+            assert_eq!(requests.len(), 1, "the guard began once: {requests:?}");
+            assert_eq!(requests[0].key.server, "guarded-first");
+            let _ = guards
+                .close_and_join(tokio::time::Instant::now() + std::time::Duration::from_secs(10))
+                .await;
         }
 
         /// A governed member built with no configured server still owns its

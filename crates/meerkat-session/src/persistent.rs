@@ -9299,11 +9299,13 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
         self.runtime_store.clone()
     }
 
-    /// The builder this service builds its sessions' agents with: for a
-    /// surface's service, the agent factory it was built around, whose
-    /// host-installed settings the surface's own routers read.
-    pub fn builder(&self) -> &B {
-        self.inner.builder()
+    /// The host's MCP attempt guards this service's builder carries, if any:
+    /// the session routers a surface builds itself install them.
+    pub fn mcp_attempt_guards(&self) -> Option<&B::Guards>
+    where
+        B: crate::McpAttemptGuardSource,
+    {
+        self.inner.mcp_attempt_guards()
     }
 
     /// Observe the exact committed runtime session authority without loading a

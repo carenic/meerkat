@@ -3251,6 +3251,18 @@ fn summary_updated_at_ms(updated_at: SystemTime) -> u64 {
 // Agent abstraction
 // ---------------------------------------------------------------------------
 
+/// A session builder that carries a host's MCP attempt guards, so the
+/// session routers a surface builds itself install the same installation as
+/// the agents' own routers ([`EphemeralSessionService::mcp_attempt_guards`]).
+/// The guards' type is the builder's; this crate does not name it.
+pub trait McpAttemptGuardSource {
+    /// The host's guard installation.
+    type Guards;
+
+    /// The installed guards, if any.
+    fn mcp_attempt_guards(&self) -> Option<&Self::Guards>;
+}
+
 /// Trait for building agents from session creation requests.
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
@@ -4326,9 +4338,12 @@ pub struct EphemeralSessionService<B: SessionAgentBuilder> {
 }
 
 impl<B: SessionAgentBuilder + 'static> EphemeralSessionService<B> {
-    /// The builder this service builds its sessions' agents with.
-    pub fn builder(&self) -> &B {
-        &self.builder
+    /// The host's MCP attempt guards this service's builder carries, if any.
+    pub fn mcp_attempt_guards(&self) -> Option<&B::Guards>
+    where
+        B: McpAttemptGuardSource,
+    {
+        self.builder.mcp_attempt_guards()
     }
 
     /// Deliver a hard interrupt to one exact live run.

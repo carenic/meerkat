@@ -96,9 +96,12 @@ them.
     which installs them on REST's own factory (its own routers on a
     governed runtime included), and gives the MCP server its guards with
     `MeerkatMcpState::new_with_bootstrap_options_confinement_and_attempt_guards`
-    for its fresh, resumed and scheduled sessions' routers.
-    `PersistentSessionService::builder` and `EphemeralSessionService::builder`
-    return the builder a service builds its agents with.
+    for its fresh, resumed and scheduled sessions' routers. A resumed mob
+    member's routers keep its member scope.
+    `PersistentSessionService::mcp_attempt_guards` and
+    `EphemeralSessionService::mcp_attempt_guards` return the guards of a
+    builder that carries them (`meerkat_session::McpAttemptGuardSource`;
+    the facade's `FactoryAgentBuilder` does).
   - Begin is called only for stdio attempts, before the attempt's secret
     resolution, attachment control entry or spawn. HTTP and SSE attempts
     are neither guarded nor refused by it.

@@ -440,6 +440,8 @@ impl McpScheduleContext {
             ),
             self.mcp_attempt_guards.as_ref(),
             session_id,
+            // A scheduled session is never a mob member here.
+            None,
         )));
         let server_configs = scheduled_realm_mcp_servers(
             &self.config_runtime,

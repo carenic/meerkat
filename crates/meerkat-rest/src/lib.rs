@@ -8141,13 +8141,10 @@ fn session_mcp_router(state: &AppState, session_id: &SessionId) -> McpRouter {
                 state.realm.clone(),
             ),
         );
-    // The guards of the factory this state's sessions are built with.
-    match state
-        .session_service
-        .builder()
-        .factory()
-        .mcp_attempt_guards()
-    {
+    // The guards of the factory this state's sessions are built with. A
+    // REST router serves a session REST created itself, which is never a
+    // mob member, so the owner is the session alone.
+    match state.session_service.mcp_attempt_guards() {
         Some(guards) => router.with_attempt_guards(
             guards.clone(),
             meerkat::McpConstructionOwner::new(session_id.clone(), None),
@@ -17663,14 +17660,7 @@ matching the required schema. Output ONLY the JSON, no additional text or markdo
             // The loader installs the guards on the state's own factory, so
             // the routers that factory builds (on a governed runtime) are
             // guarded too.
-            assert!(
-                state
-                    .session_service
-                    .builder()
-                    .factory()
-                    .mcp_attempt_guards()
-                    .is_some()
-            );
+            assert!(state.session_service.mcp_attempt_guards().is_some());
             let marker = temp.path().join("rest-guarded-live-add-marker");
             let session_id = SessionId::new();
             let adapter = McpRouterAdapter::new(session_mcp_router(&state, &session_id));

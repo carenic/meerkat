@@ -1046,25 +1046,26 @@ fn mcp_realm_config_source(
     ))
 }
 
-/// The one local MCP launch boundary of this server's routers, built once at
-/// construction from the host's resolved confinement: its `mcp_stdio`
-/// requirement, or the trusted host.
 /// `router` with the host's MCP attempt guards, when given, for the
-/// session it serves.
+/// session it serves and that session's mob member, if it is one.
 pub(crate) fn guarded_router(
     router: McpRouter,
     guards: Option<&meerkat_mcp::McpAttemptGuards>,
     session_id: &meerkat::SessionId,
+    member: Option<meerkat_core::MobMemberBinding>,
 ) -> McpRouter {
     match guards {
         Some(guards) => router.with_attempt_guards(
             guards.clone(),
-            meerkat_mcp::McpConstructionOwner::new(session_id.clone(), None),
+            meerkat_mcp::McpConstructionOwner::new(session_id.clone(), member),
         ),
         None => router,
     }
 }
 
+/// The one local MCP launch boundary of this server's routers, built once at
+/// construction from the host's resolved confinement: its `mcp_stdio`
+/// requirement, or the trusted host.
 fn host_mcp_stdio_launch_profile(
     confinement: &meerkat::HostConfinement,
 ) -> meerkat_mcp::McpStdioLaunchProfile {
@@ -1611,6 +1612,10 @@ impl MeerkatMcpState {
 
         // Create factory with max-permissive flags; per-request overrides
         // in SessionBuildOptions control what tools are actually enabled.
+        // It builds no MCP router of its own (its sessions configure no
+        // servers and its runtime carries no configured attachment
+        // authority), so the host's attempt guards live with the routers
+        // this server builds below.
         let mut factory = AgentFactory::new(store_path)
             .session_store(session_store.clone())
             .runtime_root(realm_paths.root.clone())
@@ -4559,6 +4564,8 @@ async fn handle_meerkat_run_with_help_tools(
                     ),
                     attempt_guards_for_plan.as_ref(),
                     &session_for_plan,
+                    // A fresh `meerkat_run` session is never a mob member.
+                    None,
                 )))
             });
             let external_tools = match help_tools_for_plan.as_ref() {
@@ -5175,6 +5182,9 @@ async fn handle_meerkat_resume(
         let stdio_profile_for_plan = state.mcp_stdio_launch_profile.clone();
         let attempt_guards_for_plan = state.mcp_attempt_guards.clone();
         let session_for_plan = session_id.clone();
+        // A resumed mob member's guards are scoped to its member, as its
+        // factory-built routers' are (the build adopts the same binding).
+        let member_for_plan = stored_metadata.mob_member_binding.clone();
         materialize_mcp_actor_transaction(
             &state.service,
             &state.runtime_adapter,
@@ -5204,6 +5214,7 @@ async fn handle_meerkat_resume(
                         ),
                         attempt_guards_for_plan.as_ref(),
                         &session_for_plan,
+                        member_for_plan,
                     )))
                 });
                 let mcp_tools: Arc<dyn AgentToolDispatcher> = adapter.clone();
@@ -6700,6 +6711,14 @@ mod tests {
     async fn state_with_persisted_session_and_llm(
         llm_client: Arc<dyn LlmClient>,
     ) -> (MeerkatMcpState, String) {
+        state_with_persisted_session_for(llm_client, None).await
+    }
+
+    /// A persisted session, a mob member's when `member` is given.
+    async fn state_with_persisted_session_for(
+        llm_client: Arc<dyn LlmClient>,
+        member: Option<meerkat_core::MobMemberBinding>,
+    ) -> (MeerkatMcpState, String) {
         let store: Arc<dyn SessionStore> = Arc::new(meerkat::MemoryStore::new());
         let runtime_store: Arc<dyn meerkat_runtime::RuntimeStore> =
             Arc::new(meerkat_runtime::InMemoryRuntimeStore::new());
@@ -6731,7 +6750,7 @@ mod tests {
                 backend: Some(state.backend.clone()),
                 config_generation: None,
                 auth_binding: None,
-                mob_member_binding: None,
+                mob_member_binding: member,
             })
             .expect("session metadata should serialize");
         session
@@ -6929,36 +6948,173 @@ mod tests {
         assert!(!marker.exists(), "a refused seeded server never starts");
     }
 
+    /// A host guard factory that refuses every attempt and keeps what it
+    /// was asked.
+    #[derive(Default)]
+    struct RefusingGuards(StdMutex<Vec<meerkat_mcp::McpAttemptGuardRequest>>);
+
+    #[async_trait::async_trait]
+    impl meerkat_mcp::McpAttemptGuardFactory for RefusingGuards {
+        async fn begin(
+            &self,
+            request: meerkat_mcp::McpAttemptGuardRequest,
+            _cancel: meerkat_mcp::McpAttemptCancellation,
+        ) -> Result<
+            Option<Box<dyn meerkat_mcp::McpAttemptGuard>>,
+            meerkat_core::mcp_attachment::McpAttachmentRefusal,
+        > {
+            self.0.lock().unwrap().push(request);
+            Err(meerkat_core::mcp_attachment::McpAttachmentRefusal::Denied)
+        }
+    }
+
+    fn refusing_guards() -> (Arc<RefusingGuards>, meerkat_mcp::McpAttemptGuards) {
+        let refusing = Arc::new(RefusingGuards::default());
+        let guards = meerkat_mcp::McpAttemptGuards::new(
+            Arc::clone(&refusing) as Arc<dyn meerkat_mcp::McpAttemptGuardFactory>,
+            meerkat_mcp::McpAttemptGuardBounds::DEFAULT,
+        );
+        (refusing, guards)
+    }
+
+    /// Stage a stdio server on `router` and assert the host's guard was asked
+    /// once, for this router, and refused it before its process started;
+    /// returns what the guard was asked.
+    #[cfg(unix)]
+    async fn assert_guard_refuses_stdio_launch(
+        router: &meerkat_mcp::McpRouterAdapter,
+        refusing: &RefusingGuards,
+        root: &std::path::Path,
+    ) -> meerkat_mcp::McpAttemptGuardRequest {
+        let marker = root.join("guarded-launch-marker");
+        router
+            .stage_add(meerkat_core::McpServerConfig::stdio(
+                "guarded-server",
+                "/bin/sh",
+                vec!["-c".into(), "printf entered > \"$MARKER\"".into()],
+                HashMap::from([("MARKER".into(), marker.display().to_string())]),
+            ))
+            .await
+            .expect("stage the server");
+        router.apply_staged().await.expect("apply the staged add");
+        let deltas = router
+            .wait_until_ready(std::time::Duration::from_secs(15))
+            .await
+            .expect("the add settles");
+        assert!(
+            deltas.iter().any(|delta| {
+                delta.target == "guarded-server"
+                    && delta.phase == meerkat_core::ExternalToolDeltaPhase::Failed
+            }),
+            "the host's guard refuses the launch: {deltas:?}"
+        );
+        assert!(!marker.exists(), "a refused server never starts");
+        let requests = refusing.0.lock().unwrap().clone();
+        assert_eq!(requests.len(), 1, "the guard began once: {requests:?}");
+        assert_eq!(requests[0].key.server, "guarded-server");
+        assert_eq!(requests[0].key.construction, router.construction_id());
+        requests[0].clone()
+    }
+
+    /// A fresh `meerkat_run` builds its session's router with the host's
+    /// attempt guards, for that session (never a mob member's).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fresh_run_router_begins_the_installed_attempt_guards() {
+        let temp = tempfile::tempdir().unwrap();
+        let (refusing, guards) = refusing_guards();
+        let mut state = MeerkatMcpState::new_with_store_options_and_llm(
+            Arc::new(meerkat::MemoryStore::new()),
+            Arc::new(meerkat_runtime::InMemoryRuntimeStore::new()),
+            None,
+            Some(Arc::new(TestClient::for_provider(Provider::Anthropic))),
+        )
+        .await;
+        state.mcp_attempt_guards = Some(guards);
+        let input: MeerkatRunInput = serde_json::from_value(json!({
+            "prompt": "Hello",
+            "model": "claude-opus-4-8",
+            "provider": "anthropic"
+        }))
+        .expect("run input");
+        let result = Box::pin(handle_meerkat_run(&state, input, None, None))
+            .await
+            .expect("the fresh run completes");
+        let session_id = meerkat::SessionId::parse(
+            unwrap_payload(result)["session_id"]
+                .as_str()
+                .expect("run result names its session"),
+        )
+        .expect("valid session id");
+        let router = state
+            .runtime_ingress_context()
+            .logical_router(&session_id)
+            .await
+            .expect("the fresh session publishes its router");
+        let request = assert_guard_refuses_stdio_launch(&router, &refusing, temp.path()).await;
+        assert_eq!(request.owner.session_id, session_id);
+        assert_eq!(request.owner.member, None);
+    }
+
+    /// A resume whose session has no live router rebuilds it with the host's
+    /// attempt guards, scoped to the resumed session's mob member (as its
+    /// factory-built routers are).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn resume_rebuilds_its_router_with_the_guards_and_the_member_scope() {
+        let temp = tempfile::tempdir().unwrap();
+        let (refusing, guards) = refusing_guards();
+        let member = meerkat_core::MobMemberBinding {
+            mob_id: "mob".into(),
+            role: "worker".into(),
+            member: "worker-1".into(),
+        };
+        let (mut state, session_id) = state_with_persisted_session_for(
+            Arc::new(TestClient::for_provider(Provider::Anthropic)),
+            Some(member.clone()),
+        )
+        .await;
+        state.mcp_attempt_guards = Some(guards);
+        let parsed = meerkat::SessionId::parse(&session_id).expect("valid session id");
+        let result = Box::pin(handle_meerkat_resume(
+            &state,
+            bounded_resume_input(session_id, vec![]),
+            None,
+            None,
+        ))
+        .await;
+        assert!(
+            result.is_ok()
+                || result.as_ref().is_err_and(|error| {
+                    error
+                        .message
+                        .contains("failed to update peer ingress context")
+                }),
+            "the resume reaches its post-completion boundary: {result:?}"
+        );
+        let router = state
+            .runtime_ingress_context()
+            .logical_router(&parsed)
+            .await
+            .expect("the resume publishes the rebuilt router");
+        let request = assert_guard_refuses_stdio_launch(&router, &refusing, temp.path()).await;
+        assert_eq!(request.owner.session_id, parsed);
+        assert_eq!(
+            request.owner.member,
+            Some(member),
+            "a resumed mob member's guard is scoped to its member"
+        );
+    }
+
     /// Schedule seeding installs the host's MCP attempt guards: a seeded
     /// stdio server begins the host's guard before anything of it runs, and
     /// a refusing host's server never starts.
     #[cfg(unix)]
     #[tokio::test]
     async fn schedule_seeding_begins_the_installed_attempt_guards() {
-        #[derive(Default)]
-        struct Refusing(StdMutex<Vec<meerkat_mcp::McpAttemptGuardRequest>>);
-        #[async_trait::async_trait]
-        impl meerkat_mcp::McpAttemptGuardFactory for Refusing {
-            async fn begin(
-                &self,
-                request: meerkat_mcp::McpAttemptGuardRequest,
-                _cancel: meerkat_mcp::McpAttemptCancellation,
-            ) -> Result<
-                Option<Box<dyn meerkat_mcp::McpAttemptGuard>>,
-                meerkat_core::mcp_attachment::McpAttachmentRefusal,
-            > {
-                self.0.lock().unwrap().push(request);
-                Err(meerkat_core::mcp_attachment::McpAttachmentRefusal::Denied)
-            }
-        }
-
         let temp = tempfile::tempdir().unwrap();
         let marker = temp.path().join("guarded-seeded-marker");
-        let refusing = Arc::new(Refusing::default());
-        let guards = meerkat_mcp::McpAttemptGuards::new(
-            Arc::clone(&refusing) as Arc<dyn meerkat_mcp::McpAttemptGuardFactory>,
-            meerkat_mcp::McpAttemptGuardBounds::DEFAULT,
-        );
+        let (refusing, guards) = refusing_guards();
         let state = MeerkatMcpState::new_with_store_and_attempt_guards(
             Arc::new(meerkat::MemoryStore::new()),
             guards.clone(),
