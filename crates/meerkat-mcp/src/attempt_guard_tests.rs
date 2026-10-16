@@ -1414,3 +1414,104 @@ async fn close_and_join_sees_a_guard_still_being_handed_over() {
     );
     adapter.shutdown().await;
 }
+
+/// Whether `pid` has exited, is exiting, or has SIGKILL pending (Linux
+/// `/proc`).
+#[cfg(target_os = "linux")]
+fn killed_or_gone(pid: u32) -> bool {
+    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return true;
+    };
+    let Some((_, after_name)) = stat.rsplit_once(')') else {
+        return true;
+    };
+    let fields: Vec<&str> = after_name.split_whitespace().collect();
+    // The state, then (six fields on) the kernel's process flags.
+    if matches!(fields.first(), Some(&("Z" | "X" | "x"))) {
+        return true;
+    }
+    const PF_EXITING: u64 = 0x4;
+    if fields
+        .get(6)
+        .and_then(|flags| flags.parse::<u64>().ok())
+        .is_some_and(|flags| flags & PF_EXITING != 0)
+    {
+        return true;
+    }
+    let Ok(status) = std::fs::read_to_string(format!("/proc/{pid}/status")) else {
+        return true;
+    };
+    const SIGKILL: u64 = 1 << 8;
+    status
+        .lines()
+        .filter_map(|line| {
+            line.strip_prefix("ShdPnd:")
+                .or_else(|| line.strip_prefix("SigPnd:"))
+        })
+        .filter_map(|mask| u64::from_str_radix(mask.trim(), 16).ok())
+        .any(|mask| mask & SIGKILL != 0)
+}
+
+/// An abandoned attempt's process is killed before its guard learns it was
+/// abandoned: the custody drops its process (killing its group) before the
+/// guard's holder. A host may release a resource when it sees `Abandoned`.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_abandoned_process_is_killed_before_its_guard_learns_it() {
+    let probe = Probe::new();
+    let guards = installation(&probe, McpAttemptGuardBounds::DEFAULT);
+    let pid = Arc::new(AtomicU64::new(0));
+    let observed: Arc<StdMutex<Vec<bool>>> = Arc::default();
+    {
+        let pid = Arc::clone(&pid);
+        let observed = Arc::clone(&observed);
+        guards.on_process_end_for_test(move |end| {
+            if matches!(end, McpAttemptProcessEnd::Abandoned) {
+                let pid = u32::try_from(pid.load(Ordering::SeqCst)).unwrap();
+                observed.lock().unwrap().push(killed_or_gone(pid));
+            }
+        });
+    }
+    let adapter = guarded(&guards, session_owner());
+    let dir = tempfile::tempdir().unwrap();
+    let pid_file = dir.path().join("pid");
+    // The server outlives its stdin closing (it then sleeps in the same
+    // process), so only the custody's kill can end it.
+    add(
+        &adapter,
+        shell(
+            "abandoned-pid",
+            &format!(
+                "echo $$ > '{}'\n{SERVE}exec sleep 1000\n",
+                pid_file.display()
+            ),
+        ),
+    )
+    .await;
+    until_notice(&adapter, "abandoned-pid", ExternalToolDeltaPhase::Applied).await;
+    let server_pid: u64 = std::fs::read_to_string(&pid_file)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    pid.store(server_pid, Ordering::SeqCst);
+    assert!(
+        !killed_or_gone(u32::try_from(server_pid).unwrap()),
+        "the server runs while installed"
+    );
+    drop(adapter);
+    let (settled, disposition) = probe.one_finish("abandoned-pid").await;
+    assert!(settled, "an installed attempt settles");
+    assert!(matches!(
+        disposition.process,
+        McpAttemptProcessEnd::Abandoned
+    ));
+    assert_eq!(
+        *observed.lock().unwrap(),
+        vec![true],
+        "the process was killed before its guard learned it was abandoned"
+    );
+    let _ = guards
+        .close_and_join(tokio::time::Instant::now() + WAIT)
+        .await;
+}

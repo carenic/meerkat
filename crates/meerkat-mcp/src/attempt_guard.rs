@@ -493,7 +493,14 @@ struct Installation {
     /// on it (tests only).
     #[cfg(test)]
     handover_hold: tokio::sync::watch::Sender<bool>,
+    /// Observes, synchronously, each process end a record learns (tests
+    /// only).
+    #[cfg(test)]
+    on_process_end: Mutex<Option<ProcessEndObserver>>,
 }
+
+#[cfg(test)]
+type ProcessEndObserver = Arc<dyn Fn(&McpAttemptProcessEnd) + Send + Sync>;
 
 #[derive(Default)]
 struct InstallationState {
@@ -519,7 +526,19 @@ impl McpAttemptGuards {
             state: Mutex::new(InstallationState::default()),
             #[cfg(test)]
             handover_hold: tokio::sync::watch::channel(false).0,
+            #[cfg(test)]
+            on_process_end: Mutex::new(None),
         }))
+    }
+
+    /// Observe, synchronously, each process end a record learns (tests
+    /// only).
+    #[cfg(test)]
+    pub(crate) fn on_process_end_for_test(
+        &self,
+        observer: impl Fn(&McpAttemptProcessEnd) + Send + Sync + 'static,
+    ) {
+        *lock(&self.0.on_process_end) = Some(Arc::new(observer));
     }
 
     /// Hold every attempt between receiving its begin's answer and acting on
@@ -1461,6 +1480,10 @@ impl AttemptGuardRecord {
 
     /// How the attempt's process ended; the first one stands.
     pub(crate) fn process_ended(&self, end: McpAttemptProcessEnd) {
+        #[cfg(test)]
+        if let Some(observer) = lock(&self.installation.on_process_end).clone() {
+            observer(&end);
+        }
         let mut state = lock(&self.state);
         if state.process.is_none() {
             state.process = Some(end);
