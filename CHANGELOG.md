@@ -239,8 +239,8 @@ them.
   written; an edge whose chain does not resolve is refused as invalid. In
   0.9.1 such a write made the realm drop its former ancestors'
   requirements from the next start, so a config writer could turn
-  confinement an ancestor realm required into unconfined launches. The
-  refusal message now also names the parent edge.
+  confinement an ancestor realm required into unconfined launches (the
+  0.9.1 known issue). The refusal message now also names the parent edge.
 - A realm's own config document decides its own parent edge. A section
   another document states for the realm (an ordinary write to an ancestor
   realm's document could add one) never replaces it. Before, such a section
@@ -1052,6 +1052,12 @@ them.
   `--max-total-tokens`, `--max-duration`, `--max-tool-calls`) nor the pack's
   deploy defaults (`[budget]`, `[models]`, `max_tokens`, `[compaction]`)
   apply to those members.
+- An ordinary config write can change or remove a realm's
+  `[realm.<id>].parent` edge. From the next start that realm no longer
+  composes the `[confinement]` of its former ancestors (governance
+  inheritance follows the same edge). A requirement in the user document or
+  set with the `--confinement` flags is not affected; put confinement that
+  must hold there.
 
 ## [0.9.0] - 2026-10-13
 
