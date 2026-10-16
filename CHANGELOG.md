@@ -57,6 +57,11 @@ them.
   with the caller's inputs, and fails on a call it cannot read, on any tag
   restore of that cache, and on any dispatch-like run that saves it. CI
   only.
+- **The nightly full BuildBuddy graph no longer passes every repository
+  secret.** `nightly.yml` calls `buildbuddy.yml` with exactly the secrets
+  that workflow declares instead of `secrets: inherit`, and the release
+  doctor's token check now fails on `secrets: inherit` in any workflow of
+  the repository, not only `release.yml`. CI only.
 
 ## [0.9.2] - 2026-10-16
 

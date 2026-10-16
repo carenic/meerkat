@@ -389,7 +389,23 @@ jobs:
     uses: ./.github/workflows/buildbuddy.yml
     with:
       mode: full-fresh
-    secrets: inherit
+    # Exactly the secrets buildbuddy.yml declares, never `secrets: inherit`:
+    # no registry or publish token reaches the called workflow.
+    secrets:
+      MEERKAT_GCP_BUILDBUDDY_API_KEY: ${{ secrets.MEERKAT_GCP_BUILDBUDDY_API_KEY }}
+      BUILDBUDDY_ENDPOINT: ${{ secrets.BUILDBUDDY_ENDPOINT }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      RKAT_ANTHROPIC_API_KEY: ${{ secrets.RKAT_ANTHROPIC_API_KEY }}
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      RKAT_OPENAI_API_KEY: ${{ secrets.RKAT_OPENAI_API_KEY }}
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      RKAT_GEMINI_API_KEY: ${{ secrets.RKAT_GEMINI_API_KEY }}
+      GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+      GOOGLE_APPLICATION_CREDENTIALS_JSON: ${{ secrets.GOOGLE_APPLICATION_CREDENTIALS_JSON }}
+      MEERKAT_E2E_AUTH_OPENAI_OAUTH_TOKENS_JSON: ${{ secrets.MEERKAT_E2E_AUTH_OPENAI_OAUTH_TOKENS_JSON }}
+      MEERKAT_E2E_AUTH_ANTHROPIC_MODEL: ${{ secrets.MEERKAT_E2E_AUTH_ANTHROPIC_MODEL }}
+      MEERKAT_E2E_AUTH_GEMINI_MODEL: ${{ secrets.MEERKAT_E2E_AUTH_GEMINI_MODEL }}
+      MEERKAT_E2E_AUTH_VERTEX_CANARY: ${{ secrets.MEERKAT_E2E_AUTH_VERTEX_CANARY }}
 
   clippy-full:
     name: Clippy (all targets, all features)

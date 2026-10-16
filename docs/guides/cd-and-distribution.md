@@ -466,8 +466,10 @@ The release workflow's own `GITHUB_TOKEN` is read-only by default: only the
 build jobs may mint OIDC tokens and write build attestations, only the
 release publishers may write the GitHub release, and neither the build nor
 the publisher checkouts persist the token. The full-graph validation passes
-`buildbuddy.yml` only the `MEERKAT_GCP_BUILDBUDDY_API_KEY` secret, never
-`secrets: inherit` (`scripts/release-doctor` checks all of this). No GitHub
+`buildbuddy.yml` only the `MEERKAT_GCP_BUILDBUDDY_API_KEY` secret, and no
+workflow in the repository uses `secrets: inherit`: the nightly full graph
+lists the secrets `buildbuddy.yml` declares (`scripts/release-doctor` checks
+all of this). No GitHub
 Actions cache step in its jobs, or in the local actions they call (the
 Windows SDK cache of `build-windows-cross`, the Bazel repository cache of
 `setup-buildbuddy-ci`), is saved by a dispatch, which would write the `main`

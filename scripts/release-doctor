@@ -308,9 +308,9 @@ else
 fi
 
 if token_contract="$(workflow_contract token-permissions)"; then
-  pass "Release workflow token is read-only except for the jobs that attest or publish, which never persist it in a checkout; no reusable workflow inherits every secret"
+  pass "Release workflow token is read-only except for the jobs that attest or publish, which never persist it in a checkout; no workflow passes every secret to a reusable workflow"
 else
-  bad "Release workflow grants write or OIDC scopes beyond the jobs that need them (${token_contract//$'\n'/; })"
+  bad "Release workflow grants write or OIDC scopes beyond the jobs that need them, or a workflow passes every secret to a reusable workflow (${token_contract//$'\n'/; })"
 fi
 
 if web_tools_contract="$(workflow_contract web-sdk-tools)"; then

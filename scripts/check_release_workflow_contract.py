@@ -1935,8 +1935,9 @@ def check_token_permissions(text: str) -> list[str]:
     full-graph caller, for buildbuddy.yml's OIDC) may mint OIDC tokens, only
     the build jobs may write attestations, and only the release publishers
     may write repository contents. No checkout in a job granted a write
-    scope persists the token, and no reusable workflow receives every secret
-    (`secrets: inherit`).
+    scope persists the token. No job of any workflow in the repository
+    passes every secret to a reusable workflow (`secrets: inherit`): a
+    caller lists the secrets the called workflow reads.
     """
     violations: list[str] = []
     lines = text.splitlines()
@@ -1958,6 +1959,17 @@ def check_token_permissions(text: str) -> list[str]:
             inputs = step.nested("with")
             if CHECKOUT_ACTION in step.fields.get("uses", "") and inputs.get("persist-credentials") != "false":
                 violations.append(f"job `{job}` step `{step.name}` persists the workflow token in its checkout")
+    # The other workflows hand a called workflow the same repository secrets.
+    for path in sorted((REPO_ROOT / ".github" / "workflows").glob("*.y*ml")):
+        if path.name == DEFAULT_WORKFLOW.name:
+            continue
+        source = path.read_text(encoding="utf-8")
+        for job in _job_names(source):
+            if parse_mapping(job_block(source, job), 4).get("secrets", "").strip() == "inherit":
+                violations.append(
+                    f"{path.name} job `{job}` passes every repository secret to a reusable workflow "
+                    "(`secrets: inherit`)"
+                )
     return violations
 
 # Jobs that hold a registry or publish token (or write the GitHub release):

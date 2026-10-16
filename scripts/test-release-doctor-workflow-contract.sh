@@ -38,7 +38,7 @@ BASELINE_FAIL="FAIL The semver baseline rustdoc must stay off every path a user 
 TRAILING_PASS="PASS Linux and macOS arm64 assets publish without waiting for the trailing Intel macOS and Windows lanes; no upload replaces a published asset"
 TRAILING_FAIL="FAIL The trailing Intel macOS and Windows lanes must not gate the critical assets, and no upload may replace a published asset"
 WEB_TOOLS_PASS="PASS The Web SDK release build checks every download's sha256 and wasm-pack installs nothing: wasm-bindgen (Cargo.lock's version) and wasm-opt are pinned"
-TOKEN_PASS="PASS Release workflow token is read-only except for the jobs that attest or publish, which never persist it in a checkout; no reusable workflow inherits every secret"
+TOKEN_PASS="PASS Release workflow token is read-only except for the jobs that attest or publish, which never persist it in a checkout; no workflow passes every secret to a reusable workflow"
 CACHES_PASS="PASS GitHub Actions caches in release.yml jobs, the local actions they call and, on a tag, the reusable workflows they call are never saved on a dispatch and never cache ~/.cargo/bin; token jobs restore none, a tag run restores no Bazel repository cache, OIDC or attesting jobs restore none that a dispatch-like run of any workflow saves, and no dispatch-like run saves the Bazel repository cache (reusable workflows never run on a dispatch)"
 CACHES_FAIL="FAIL A release cache can be saved on a dispatch, cache ~/.cargo/bin, reach a token, OIDC or attesting job, or a tag run"
 
@@ -710,6 +710,18 @@ elif name == "dispatch-saves-repository-cache":
         "          repository-cache: restore\n",
         "",
     )
+elif name == "nightly-secrets-inherit":
+    # The pre-review nightly full graph passed buildbuddy.yml every
+    # repository secret.
+    path = root / ".github/workflows/nightly.yml"
+    lines = path.read_text().splitlines(keepends=True)
+    at = lines.index("    secrets:\n", lines.index("  gcp-buildbuddy:\n"))
+    end = at + 1
+    while end < len(lines) and lines[end].startswith("      "):
+        end += 1
+    if end == at + 1:
+        raise SystemExit(f"fixture `{name}` found no secrets mapping in nightly.yml; update the fixture")
+    path.write_text("".join(lines[:at] + ["    secrets: inherit\n"] + lines[end:]))
 elif name == "cache-token-job-action":
     # A cache inside the local action a token job calls.
     replace_once(
@@ -952,6 +964,9 @@ expect_fail_named token-publisher-persisted "${TEST_ROOT}/token-publisher-persis
 mutate secrets-inherit "${TEST_ROOT}/secrets-inherit.yml"
 expect_fail_named secrets-inherit "${TEST_ROOT}/secrets-inherit.yml" \
   "job \`release_validate_buildbuddy_full\` passes every repository secret to a reusable workflow" token-permissions
+mutate_tree nightly-secrets-inherit "${TEST_ROOT}/nightly-secrets-inherit"
+expect_tree_fail_named nightly-secrets-inherit "${TEST_ROOT}/nightly-secrets-inherit" \
+  "nightly.yml job \`gcp-buildbuddy\` passes every repository secret to a reusable workflow" token-permissions
 
 mutate web-sdk-pack-mode-dropped "${TEST_ROOT}/web-sdk-pack-mode-dropped.yml"
 expect_fail_named web-sdk-pack-mode-dropped "${TEST_ROOT}/web-sdk-pack-mode-dropped.yml" \

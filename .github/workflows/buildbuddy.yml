@@ -40,7 +40,8 @@ on:
     secrets:
       # The self-hosted control plane's own org API key for the CI
       # submitters. This workflow never reads the BuildBuddy Cloud key
-      # (BUILDBUDDY_API_KEY), which callers pass along with `secrets: inherit`.
+      # (BUILDBUDDY_API_KEY). Callers list the secrets they pass; none uses
+      # `secrets: inherit` (scripts/release-doctor checks every workflow).
       MEERKAT_GCP_BUILDBUDDY_API_KEY:
         required: false
       BUILDBUDDY_ENDPOINT:
