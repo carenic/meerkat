@@ -149,7 +149,12 @@ const SITES: &[(&str, &str, usize, Launch)] = &[
 
 fn repo_root() -> PathBuf {
     // CARGO_MANIFEST_DIR -> crates/meerkat; parent x2 = workspace root.
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    // Read at run time (cargo, nextest and the Bazel test rule set it), so an
+    // archived test binary never carries the builder's path.
+    let manifest_dir = PathBuf::from(
+        std::env::var_os("CARGO_MANIFEST_DIR")
+            .expect("CARGO_MANIFEST_DIR is set for test processes"),
+    );
     let root = manifest_dir
         .parent()
         .expect("crates/meerkat has a parent")

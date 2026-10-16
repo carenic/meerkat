@@ -8,6 +8,16 @@ use crate::builtin::MemoryTaskStore;
 use serde_json::json;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+/// This crate's directory, read when the test runs: cargo, nextest (also
+/// from an archive) and the Bazel test rule set CARGO_MANIFEST_DIR for the
+/// test process, so an archived test binary never carries the builder's path.
+fn manifest_dir() -> PathBuf {
+    PathBuf::from(
+        std::env::var_os("CARGO_MANIFEST_DIR")
+            .expect("CARGO_MANIFEST_DIR is set for test processes"),
+    )
+}
+
 /// Counts the searches it runs and answers each as completed.
 struct CountingSearch(Arc<AtomicUsize>);
 
@@ -36,7 +46,7 @@ fn web_search_composite(searches: &Arc<AtomicUsize>) -> CompositeDispatcher {
     let mut dispatcher = CompositeDispatcher::new(
         Arc::new(MemoryTaskStore::new()),
         &BuiltinToolConfig::default(),
-        Some(PathBuf::from(env!("CARGO_MANIFEST_DIR"))),
+        Some(manifest_dir()),
         None,
         None,
         None,
@@ -416,7 +426,7 @@ async fn a_tool_named_web_search_from_another_owner_has_no_builtin_target() {
         CompositeDispatcher::new(
             Arc::new(MemoryTaskStore::new()),
             &BuiltinToolConfig::default(),
-            Some(PathBuf::from(env!("CARGO_MANIFEST_DIR"))),
+            Some(manifest_dir()),
             None,
             external,
             None,
@@ -478,7 +488,7 @@ async fn a_builtin_plan_never_runs_on_the_next_owner_of_its_name() {
     let mut composite = CompositeDispatcher::new(
         Arc::new(MemoryTaskStore::new()),
         &BuiltinToolConfig::default(),
-        Some(PathBuf::from(env!("CARGO_MANIFEST_DIR"))),
+        Some(manifest_dir()),
         None,
         Some(external),
         None,
@@ -661,7 +671,7 @@ async fn a_required_review_settles_web_search_as_local_feedback_per_tier() {
     let mut composite = CompositeDispatcher::new(
         Arc::new(MemoryTaskStore::new()),
         &BuiltinToolConfig::default(),
-        Some(PathBuf::from(env!("CARGO_MANIFEST_DIR"))),
+        Some(manifest_dir()),
         None,
         None,
         None,

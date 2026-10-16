@@ -426,7 +426,10 @@ mod tests {
         let mut composite = crate::builtin::CompositeDispatcher::new(
             Arc::new(crate::builtin::MemoryTaskStore::new()),
             &crate::builtin::BuiltinToolConfig::default(),
-            Some(std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))),
+            Some(std::path::PathBuf::from(
+                std::env::var_os("CARGO_MANIFEST_DIR")
+                    .expect("CARGO_MANIFEST_DIR is set for test processes"),
+            )),
             None,
             None,
             None,

@@ -3356,7 +3356,10 @@ mod tests {
         let mut composite = meerkat_tools::builtin::CompositeDispatcher::new(
             Arc::new(meerkat_tools::builtin::MemoryTaskStore::new()),
             &meerkat_tools::builtin::BuiltinToolConfig::default(),
-            Some(std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))),
+            Some(std::path::PathBuf::from(
+                std::env::var_os("CARGO_MANIFEST_DIR")
+                    .expect("CARGO_MANIFEST_DIR is set for test processes"),
+            )),
             None,
             None,
             None,
