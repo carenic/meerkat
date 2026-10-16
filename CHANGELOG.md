@@ -80,6 +80,10 @@ them.
   `ToolError::ReviewUnavailable` or `ToolError::ReviewUnsatisfied`. Plain
   authority unavailability, and a review detail that does not decode, still
   give `operation_authorization_unavailable`.
+- `meerkat` built without its `session-store` feature (its default feature
+  set included) no longer warns that `ConsentAwareJobSource` is never
+  constructed. The crate-private consent-aware job source is now compiled
+  only with the session-store runtime delivery host that builds it.
 
 ## [0.9.2] - 2026-10-16
 
