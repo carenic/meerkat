@@ -691,12 +691,11 @@ pub enum McpOAuthBrowserLaunch {
 ///
 /// The URL is passed as one process argument (no shell) to the platform
 /// opener (`/usr/bin/open`, `xdg-open`, or the system `rundll32.exe
-/// url.dll,FileProtocolHandler`), whose output is discarded, run from a
-/// `PATH` without relative directories
-/// ([`meerkat_core::HostLaunchExemption::browser_opener`]). Nothing here
-/// logs the command line, so the authorize URL and state never reach `log`
-/// or `tracing` records. A host that confines its agents' launches opens
-/// with [`open_system_browser_trusting`].
+/// url.dll,FileProtocolHandler`), whose output is discarded, run with the
+/// host's environment ([`meerkat_core::HostLaunchExemption::browser_opener`]).
+/// Nothing here logs the command line, so the authorize URL and state never
+/// reach `log` or `tracing` records. A host that confines its agents'
+/// launches opens with [`open_system_browser_trusting`].
 pub fn open_system_browser(url: &str) -> std::io::Result<()> {
     // A host launch exemption: the opener must reach the user's desktop
     // session, which a confined process cannot.

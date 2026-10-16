@@ -1238,8 +1238,11 @@ pub async fn test_auth_binding(
             // refused here as in the host's sessions.
             let env = meerkat_providers::ResolverEnvironment::with_process_env()
                 .with_provider_auth_persistence(state.provider_auth_persistence.clone())
-                .with_auth_lease_handle(state.auth_lease.clone())
-                .with_host_launch_guard(state.host_confinement.untrusted_paths());
+                .with_auth_lease_handle(state.auth_lease.clone());
+            let env = match state.host_confinement.launch_guard() {
+                Some(guard) => env.with_host_launch_guard(guard),
+                None => env,
+            };
             let auth_binding = AuthBindingRef {
                 realm: body.realm_id.clone(),
                 binding: binding_id.clone(),

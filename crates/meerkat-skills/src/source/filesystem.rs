@@ -24,7 +24,9 @@ pub struct FilesystemSkillSource {
     source_uuid: SourceUuid,
     thresholds: SourceHealthThresholds,
     health: Arc<RwLock<SourceHealthSnapshot>>,
-    untrusted_targets: Option<crate::UntrustedPaths>,
+    // A shared predicate, which a panic cannot leave half-changed, so the
+    // source stays `UnwindSafe` and `RefUnwindSafe`.
+    untrusted_targets: Option<std::panic::AssertUnwindSafe<crate::UntrustedPaths>>,
 }
 
 impl FilesystemSkillSource {
@@ -60,7 +62,7 @@ impl FilesystemSkillSource {
     /// in a directory the host trusts.
     #[must_use]
     pub fn with_untrusted_targets(mut self, untrusted: crate::UntrustedPaths) -> Self {
-        self.untrusted_targets = Some(untrusted);
+        self.untrusted_targets = Some(std::panic::AssertUnwindSafe(untrusted));
         self
     }
 
@@ -69,6 +71,7 @@ impl FilesystemSkillSource {
     /// host does not trust.
     fn links_to_untrusted(&self, skill_dir: &Path) -> bool {
         self.untrusted_targets.as_ref().is_some_and(|untrusted| {
+            let untrusted = &untrusted.0;
             super::leads_out_to_untrusted(&self.root, skill_dir, true, untrusted)
                 || super::leads_out_to_untrusted(
                     &self.root,

@@ -148,7 +148,9 @@ impl StdioSkillRunner for TrustedHostStdioSkillRunner {
 pub struct StdioExternalClient {
     launch: StdioSkillLaunch,
     timeout: Duration,
-    runner: Arc<dyn StdioSkillRunner>,
+    // A shared runner, which a panic cannot leave half-changed, so the client
+    // stays `UnwindSafe` and `RefUnwindSafe`.
+    runner: std::panic::AssertUnwindSafe<Arc<dyn StdioSkillRunner>>,
 }
 
 impl StdioExternalClient {
@@ -176,7 +178,7 @@ impl StdioExternalClient {
                 cwd,
             },
             timeout,
-            runner: Arc::new(TrustedHostStdioSkillRunner),
+            runner: std::panic::AssertUnwindSafe(Arc::new(TrustedHostStdioSkillRunner)),
         }
     }
 
@@ -185,7 +187,7 @@ impl StdioExternalClient {
     /// confinement.
     #[must_use]
     pub fn with_runner(mut self, runner: Arc<dyn StdioSkillRunner>) -> Self {
-        self.runner = runner;
+        self.runner = std::panic::AssertUnwindSafe(runner);
         self
     }
 

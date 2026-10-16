@@ -537,6 +537,7 @@ impl ConfigStore for MemoryConfigStore {
         let mut current = self.config.write().await;
         keep_governance(&current.governance, &config.governance)?;
         keep_confinement(&current.confinement, &config.confinement)?;
+        keep_credential_commands(&credential_commands(&current), &config)?;
         config.validate_for_write(self.catalog, &current.tools.mcp_servers)?;
         *current = config;
         Ok(())
@@ -549,6 +550,7 @@ impl ConfigStore for MemoryConfigStore {
         let updated: Config = serde_json::from_value(value).map_err(ConfigError::Json)?;
         keep_governance(&config.governance, &updated.governance)?;
         keep_confinement(&config.confinement, &updated.confinement)?;
+        keep_credential_commands(&credential_commands(&config), &updated)?;
         updated.validate_for_write(self.catalog, &config.tools.mcp_servers)?;
         *config = updated.clone();
         Ok(updated)
@@ -610,7 +612,10 @@ pub struct FileConfigStore {
     path: PathBuf,
     create_if_missing: bool,
     catalog: ModelCatalog,
-    realm_chain: Option<RealmChainGuard>,
+    // The realm chain's documents are a shared source, which a panic cannot
+    // leave half-changed, so the store stays `UnwindSafe` and
+    // `RefUnwindSafe`.
+    realm_chain: Option<std::panic::AssertUnwindSafe<RealmChainGuard>>,
 }
 
 impl FileConfigStore {
@@ -678,7 +683,10 @@ impl FileConfigStore {
         head: crate::connection::RealmId,
         documents: Arc<dyn RealmConfigSource>,
     ) -> Self {
-        self.realm_chain = Some(RealmChainGuard { head, documents });
+        self.realm_chain = Some(std::panic::AssertUnwindSafe(RealmChainGuard {
+            head,
+            documents,
+        }));
         self
     }
 
@@ -798,6 +806,7 @@ impl ConfigStore for FileConfigStore {
             PersistedConfigDocument::parse(&content).map(|document| document.into_loaded().0)?;
         keep_governance(&persisted.governance, &patched.config.governance)?;
         keep_confinement(&persisted.confinement, &patched.config.confinement)?;
+        keep_credential_commands(&credential_commands(&persisted), &patched.config)?;
         if let Some(chain) = &self.realm_chain {
             chain
                 .keep_composed_administration(
@@ -824,6 +833,7 @@ impl ConfigStore for FileConfigStore {
         keep_governance(&governance, &config.governance)?;
         let confinement = persisted_confinement(&content)?;
         keep_confinement(&confinement, &config.confinement)?;
+        keep_credential_commands(&persisted_credential_commands(&content), &config)?;
         if let Some(chain) = &self.realm_chain {
             chain
                 .keep_composed_administration(
@@ -917,6 +927,76 @@ fn persisted_confinement(content: &str) -> Result<crate::ConfinementConfig, Conf
             .clone()
             .try_into()
             .map_err(|_| ConfigError::ConfinementAdministration),
+    }
+}
+
+/// What each credential command of a document runs, by realm and auth
+/// profile: its program, arguments, environment and working directory
+/// (its timeout and caching are ordinary config).
+type CredentialCommands = std::collections::BTreeMap<
+    (String, String),
+    (
+        PathBuf,
+        Vec<String>,
+        std::collections::BTreeMap<String, String>,
+        Option<PathBuf>,
+    ),
+>;
+
+/// The credential commands `config` states.
+fn credential_commands(config: &Config) -> CredentialCommands {
+    config
+        .realm
+        .iter()
+        .flat_map(|(realm, section)| {
+            section.auth.iter().filter_map(move |(profile, auth)| {
+                let crate::connection::CredentialSourceSpec::Command {
+                    program,
+                    args,
+                    cwd,
+                    env,
+                    ..
+                } = &auth.source
+                else {
+                    return None;
+                };
+                Some((
+                    (realm.clone(), profile.clone()),
+                    (program.clone(), args.clone(), env.clone(), cwd.clone()),
+                ))
+            })
+        })
+        .collect()
+}
+
+/// The credential commands a persisted document states, for a full replace
+/// that does not otherwise parse the old document. A document that does not
+/// load states none here, so no write adds one over it.
+fn persisted_credential_commands(content: &str) -> CredentialCommands {
+    PersistedConfigDocument::parse(content)
+        .map(|document| credential_commands(&document.into_loaded().0))
+        .unwrap_or_default()
+}
+
+/// Refuse a write that adds a credential command or changes what one runs
+/// ([`ConfigError::CredentialCommandAdministration`], naming the auth
+/// profile): the host runs it as itself, outside its OS process
+/// confinement, so ordinary config write permission is not its
+/// administration. The host adds or changes one by editing the document
+/// itself. A write that keeps each command the document states, changes
+/// only a command's timeout or caching, or removes one is ordinary config.
+fn keep_credential_commands(
+    committed: &CredentialCommands,
+    written: &Config,
+) -> Result<(), ConfigError> {
+    match credential_commands(written)
+        .into_iter()
+        .find(|(key, command)| committed.get(key) != Some(command))
+    {
+        Some(((realm, profile), _)) => {
+            Err(ConfigError::CredentialCommandAdministration { realm, profile })
+        }
+        None => Ok(()),
     }
 }
 
@@ -1881,6 +1961,48 @@ mod tests {
         assert_eq!(tokio::fs::read_to_string(&path).await.unwrap(), HEAD);
     }
 
+    /// A user document that states `[governance]` but no `[realm.global]`
+    /// governs no other realm; a write adding `[realm.global]` (as a sign-in
+    /// that provisions credentials under it does) would put that governance
+    /// on every realm's chain, so it is refused, and the refusal says to add
+    /// the section by hand. The bootstrap template states the section, so a
+    /// user document created from it never meets this.
+    #[tokio::test]
+    async fn adding_the_global_realm_section_is_refused_with_its_remedy() {
+        let user = REVIEW_RULE.to_string();
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("config.toml");
+        tokio::fs::write(&path, &user).await.unwrap();
+        let store = FileConfigStore::new(
+            path.clone(),
+            *crate::model_profile::test_catalog::TEST_CATALOG,
+        )
+        .with_realm_chain(
+            crate::connection::RealmId::global(),
+            Arc::new(MapSource {
+                docs: std::collections::BTreeMap::new(),
+            }),
+        );
+        let refused = store
+            .patch(ConfigDelta(serde_json::json!({"realm": {"global": {}}})))
+            .await
+            .expect_err("adding [realm.global] would spread the user's governance");
+        assert!(
+            refused
+                .to_string()
+                .contains("add [realm.global] to the user document by hand"),
+            "{refused}"
+        );
+        assert_eq!(tokio::fs::read_to_string(&path).await.unwrap(), user);
+        assert!(
+            Config::template()
+                .unwrap()
+                .realm
+                .contains_key(crate::connection::RealmId::global().as_str()),
+            "the bootstrap template states [realm.global]"
+        );
+    }
+
     /// The user document's `[realm.global]` section puts the `global` realm,
     /// and with it the user document's `[governance]`, on the chain of every
     /// realm that states no parent of its own. A write to the user document
@@ -1921,6 +2043,86 @@ mod tests {
             .patch(ConfigDelta(serde_json::json!({"max_tokens": 2048})))
             .await
             .expect("an unrelated edit of the user document commits");
+    }
+
+    /// A store keeps the auto traits it had before it could declare a realm
+    /// chain.
+    #[test]
+    fn the_file_store_stays_unwind_safe() {
+        fn unwind_safe<T: std::panic::UnwindSafe + std::panic::RefUnwindSafe>() {}
+        unwind_safe::<FileConfigStore>();
+    }
+
+    /// A credential command runs as the host, outside its confinement, so it
+    /// is administered by the host in the document itself: an ordinary
+    /// write can neither add one nor change its program, arguments,
+    /// environment or working directory (refused as confinement
+    /// administration, naming the auth profile), and nothing is written. A
+    /// write that keeps it, changes only its timeout, or removes it commits.
+    #[tokio::test]
+    async fn a_config_write_cannot_add_or_change_a_credential_command() {
+        const STATED: &str = "[realm.global.auth.helper]\n\
+                              provider = \"openai\"\n\
+                              auth_method = \"api_key\"\n\
+                              source = { kind = \"command\", program = \"/usr/bin/helper\", args = [\"--token\"] }\n";
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("config.toml");
+        tokio::fs::write(&path, "max_tokens = 4096\n")
+            .await
+            .unwrap();
+        let store = FileConfigStore::new(
+            path.clone(),
+            *crate::model_profile::test_catalog::TEST_CATALOG,
+        );
+        let refused = |result: Result<Config, ConfigError>| {
+            let refused = result.expect_err("a credential command is host administration");
+            assert!(
+                refused.administered_section()
+                    == Some(crate::config::AdministeredSection::Confinement)
+                    && refused.to_string().contains("helper"),
+                "{refused}"
+            );
+        };
+        refused(store.patch(ConfigDelta(serde_json::json!({"realm": {"global": {"auth": {"helper": {
+                "provider": "openai",
+                "auth_method": "api_key",
+                "source": {"kind": "command", "program": "/bin/sh", "args": ["-c", "printf sk-x"]}
+            }}}}}))).await);
+        assert_eq!(
+            tokio::fs::read_to_string(&path).await.unwrap(),
+            "max_tokens = 4096\n"
+        );
+
+        tokio::fs::write(&path, STATED).await.unwrap();
+        for patch in [
+            serde_json::json!({"realm": {"global": {"auth": {"helper": {"source": {"args": ["--other"]}}}}}}),
+            serde_json::json!({"realm": {"global": {"auth": {"helper": {"source": {"program": "/bin/sh"}}}}}}),
+            serde_json::json!({"realm": {"global": {"auth": {"helper": {"source": {"env": {"PATH": "/tmp"}}}}}}}),
+            serde_json::json!({"realm": {"global": {"auth": {"helper": {"source": {"cwd": "/tmp"}}}}}}),
+        ] {
+            refused(store.patch(ConfigDelta(patch)).await);
+            assert_eq!(tokio::fs::read_to_string(&path).await.unwrap(), STATED);
+        }
+        store
+            .patch(ConfigDelta(serde_json::json!({"realm": {"global": {"auth": {"helper": {"source": {"timeout_ms": 9000}}}}}})))
+            .await
+            .expect("a timeout is ordinary config");
+        store
+            .patch(ConfigDelta(
+                serde_json::json!({"realm": {"global": {"auth": {"helper": null}}}}),
+            ))
+            .await
+            .expect("removing a credential command is ordinary config");
+
+        let memory = MemoryConfigStore::new(
+            Config::default(),
+            *crate::model_profile::test_catalog::TEST_CATALOG,
+        );
+        refused(memory.patch(ConfigDelta(serde_json::json!({"realm": {"global": {"auth": {"helper": {
+                "provider": "openai",
+                "auth_method": "api_key",
+                "source": {"kind": "command", "program": "/bin/sh", "args": ["-c", "printf sk-x"]}
+            }}}}}))).await);
     }
 
     /// A chain member other than the head and `global` composes only from

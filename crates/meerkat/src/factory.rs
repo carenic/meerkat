@@ -4590,8 +4590,12 @@ impl AgentFactory {
         let Some(host) = &self.host_confinement else {
             return meerkat_skills::SkillHostBoundary::trusted_host();
         };
-        let boundary = meerkat_skills::SkillHostBoundary::trusted_host()
-            .with_untrusted_paths(host.untrusted_paths());
+        let boundary = match host.launch_guard() {
+            Some(guard) => {
+                meerkat_skills::SkillHostBoundary::trusted_host().with_untrusted_paths(guard)
+            }
+            None => meerkat_skills::SkillHostBoundary::trusted_host(),
+        };
         match (
             host.requirement(ConfinementLaunchKind::McpStdio),
             host.working_directory(ConfinementLaunchKind::McpStdio),
@@ -4615,8 +4619,12 @@ impl AgentFactory {
     fn host_resolver_environment(&self) -> meerkat_providers::ResolverEnvironment {
         let env = meerkat_providers::ResolverEnvironment::with_process_env();
         #[cfg(not(target_arch = "wasm32"))]
-        if let Some(host) = &self.host_confinement {
-            return env.with_host_launch_guard(host.untrusted_paths());
+        if let Some(guard) = self
+            .host_confinement
+            .as_ref()
+            .and_then(crate::HostConfinement::launch_guard)
+        {
+            return env.with_host_launch_guard(guard);
         }
         env
     }

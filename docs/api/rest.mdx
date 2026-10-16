@@ -1097,7 +1097,8 @@ A `PUT` or `PATCH` that would administer a section the host administers in the
 document itself returns `400` with code `CONFIG_WRITE_REFUSED`, and nothing is
 written. `details.type` names the section: `governance_administration_required`
 (change, remove or restate `[governance]`) or
-`confinement_administration_required` (add, change or remove `[confinement]`).
+`confinement_administration_required` (add, change or remove `[confinement]`,
+or add a credential command or change what one runs).
 A write that changes realm sections (a parent edge, or the user document's
 `[realm.global]`) so that a realm would compose a different section is
 refused with the same types, and its message names the change and the realm,

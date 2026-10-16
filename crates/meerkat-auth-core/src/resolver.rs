@@ -92,7 +92,7 @@ pub async fn resolve_simple_secret(
             // home directory, never from the host's working directory (which
             // a confined process may be able to change). A configured working
             // directory is judged with everything under it; the home
-            // directory as the directory itself and the files in it, since
+            // directory as the directory itself, not what is under it, since
             // the user's projects, and the write grants on them, may lie
             // under it.
             let guard = env.host_launch_guard();

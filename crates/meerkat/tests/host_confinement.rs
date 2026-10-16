@@ -950,6 +950,48 @@ async fn a_credential_command_never_runs_an_interpreter_planted_on_its_path() {
     );
 }
 
+/// A host launch exemption never hands the program it runs a module or
+/// library path a confined process could change: here a credential
+/// command whose configured `PYTHONPATH` points into a write grant sees
+/// none, so a module planted there is never loaded.
+#[cfg(all(unix, feature = "openai"))]
+#[tokio::test]
+async fn a_credential_command_is_not_handed_a_module_path_a_confined_process_could_change() {
+    use std::collections::BTreeMap;
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let base = temp.path().canonicalize().unwrap();
+    let writable = base.join("writable");
+    let trusted = base.join("trusted");
+    for dir in [&writable, &trusted] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    let seen = base.join("module-path-seen");
+    let helper = trusted.join("helper");
+    std::fs::write(
+        &helper,
+        format!(
+            "#!/bin/sh\nprintf '%s' \"${{PYTHONPATH-unset}}\" > '{}'\nprintf sk-from-helper\n",
+            seen.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    preflight_command(
+        &base,
+        &writing_host(&writable),
+        helper,
+        Vec::new(),
+        Some(trusted.clone()),
+        BTreeMap::from([("PYTHONPATH".to_string(), writable.display().to_string())]),
+    )
+    .await
+    .expect("the command runs");
+    assert_eq!(std::fs::read_to_string(&seen).unwrap(), "unset");
+}
+
 /// A credential command without a working directory of its own runs, under
 /// a confining host, from the user's home directory rather than the host's
 /// working directory (which a confined process may be able to change), so

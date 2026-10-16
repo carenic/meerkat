@@ -13005,6 +13005,39 @@ requirement = { baseline = "command_runtime_v1", read = { kind = "paths", paths 
         );
     }
 
+    /// A credential command runs as the host, outside its confinement: a REST
+    /// config write that adds one is refused (HTTP 400, the confinement
+    /// discriminator, naming the auth profile) and the document keeps its
+    /// bytes.
+    #[tokio::test]
+    async fn test_config_writes_cannot_add_a_credential_command() {
+        let temp = TempDir::new().unwrap();
+        let state = AppState::load_from(temp.path().to_path_buf())
+            .await
+            .unwrap();
+        let document = PathBuf::from(&state.resolved_paths.config_path);
+        let before = std::fs::read_to_string(&document).ok();
+        let refused = patch_config(
+            State(state.clone()),
+            Json(PatchConfigRequest::Wrapped {
+                patch: serde_json::json!({"realm": {"global": {"auth": {"helper": {
+                "provider": "openai",
+                "auth_method": "api_key",
+                "source": {"kind": "command", "program": "/bin/sh", "args": ["-c", "printf sk-x"]}
+            }}}}}),
+                expected_generation: None,
+            }),
+        )
+        .await
+        .expect_err("a config write cannot add a credential command");
+        assert!(
+            is_administration_refusal(&refused, "confinement_administration_required")
+                && format!("{refused:?}").contains("helper"),
+            "{refused:?}"
+        );
+        assert_eq!(std::fs::read_to_string(&document).ok(), before);
+    }
+
     /// A REST config write cannot cut the served realm from the parent whose
     /// `[confinement]` it composes: a patch or a full replace that removes
     /// the realm's parent edge is refused (HTTP 400, the confinement

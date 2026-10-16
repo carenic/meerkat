@@ -726,6 +726,14 @@ as invalid. A change that composes the same sections, such as a parent
 stating the same requirement, is ordinary config. Re-parent a confined or
 governed realm by editing its document as its host.
 
+A credential command (an auth profile's `source = { kind = "command" }`)
+runs as the host, outside confinement, so it is administered the same way:
+a config write that adds one, or changes its program, arguments,
+environment or working directory, is refused with
+`confinement_administration_required`, naming the auth profile, on every
+config write surface. Its timeout and caching, and removing it, are
+ordinary config.
+
 The user document decides for other realms too: its `[realm.global]`
 section puts `global`, and with it the user document's `[governance]`, on
 the chain of every realm whose own documents state none, and a realm with no
@@ -733,7 +741,12 @@ document of its own takes the section the user document states for it. A
 write to the user document is also refused when such a realm would compose
 a different section afterwards. Each refusal names the change and the realm,
 for example
-`removing [realm.global] would change the [governance] section a realm whose own document states no parent and no [realm.global] composes`.
+`removing [realm.global] would change the [governance] section a realm whose own document states no parent and no [realm.global] composes`,
+and says what to do instead. The user document a host creates from its
+template states `[realm.global]`. One that states `[governance]` but no
+`[realm.global]` cannot gain the section through a config write, nor
+through a sign-in that provisions credentials under it: add `[realm.global]`
+to it by hand.
 
 Only a store that declares the realm's chain enforces this, as the stock
 hosts' stores do (`FileConfigStore::with_realm_chain`,
@@ -757,17 +770,26 @@ constructor per program):
 | Launch | Why it runs as the host |
 |---|---|
 | `git` for a Git skill repository | It fetches with the host's own Git credentials and network. A repository is not loaded when a confined process could change the skill cache, and a skill that a link leads out of the checkout to is not read. |
-| A credential command (an auth profile's `source = { kind = "command" }`) | It produces the host's own provider credentials, which no confined process may read. Without a `cwd` it runs from the user's home directory, never from the host's working directory. It is refused before it runs when a confined process could change its program, the interpreter its `#!` line names by path, or its working directory (the home directory itself, and the files in it, when it names none). A refused command ends the binding's resolution with the refusal: no other credential (another realm's binding, the global realm's, the environment's) stands in for it. |
+| A credential command (an auth profile's `source = { kind = "command" }`) | It produces the host's own provider credentials, which no confined process may read. Without a `cwd` it runs from the user's home directory, never from the host's working directory. It is refused before it runs when a confined process could change its program, the interpreter its `#!` line names by path, or its working directory (when it names none, the home directory itself, not what is under it). A refused command ends the binding's resolution with the refusal: no other credential (another realm's binding, the global realm's, the environment's) stands in for it. The host administers a credential command in the config document: add one or change what it runs by editing the document as its host. |
 | The browser opener (`/usr/bin/open` on macOS, `xdg-open` on Linux, the system `rundll32.exe` on Windows) | It shows an OAuth authorization page or an HTML artifact in the user's desktop session, which a confined process cannot reach. The URL is one argument. |
 | `stty`, by absolute path (`/bin/stty`, else `/usr/bin/stty`) | Host terminal control: `rkat` hides a client secret typed at its own terminal. |
 | `wasm-pack` | Developer build tooling: `rkat doctor` reports its version. |
 
-Each of these runs, with every program it starts by name (an interpreter
-named through `env`, `ssh` or `git-lfs` under Git, the programs a browser
-opener tries), from a `PATH` without relative directories and, under a host
-that confines its agents' launches, without the directories a confined
-process could change. None of them is a program a confined process put on
-the `PATH`.
+Under a host that confines its agents' launches, each of these runs, with
+every program it starts by name (an interpreter named through `env`, `ssh`
+or `git-lfs` under Git, the programs a browser opener tries), from a `PATH`
+without relative directories or the directories a confined process could
+change, so none of them is a program a confined process put on the `PATH`.
+Each also runs there without the variables that make a program load code
+or startup options from elsewhere (`LD_*`, `DYLD_*`, `PYTHON*`,
+`NODE_OPTIONS`, `NODE_PATH`, `PERL5LIB`, `PERL5OPT`, `RUBYLIB`, `RUBYOPT`,
+`BASH_ENV`, `ENV`, `GIT_DIR`, `GIT_WORK_TREE`, `GIT_EXEC_PATH` and the
+like), and with the paths a confined process could change taken out of
+every other variable: a list of directories keeps the trusted ones, and a
+variable that names one such path is not passed on. A credential command's
+own `env` is passed on with the same paths taken out. A host that confines
+no launch kind has no confined process to plant anything, and runs them
+with its own environment as it is.
 
 A test of the source enumerates every process launch in shipped code and
 fails on one that is neither confined nor in this list.

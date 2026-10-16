@@ -79,7 +79,9 @@ pub struct GitSkillSource {
     checkout_dir: PathBuf,
     cache: Arc<RwLock<RemoteCache>>,
     failure_streak: Arc<RwLock<u32>>,
-    untrusted: Option<crate::UntrustedPaths>,
+    // A shared predicate, which a panic cannot leave half-changed, so the
+    // source stays `UnwindSafe` and `RefUnwindSafe`.
+    untrusted: Option<std::panic::AssertUnwindSafe<crate::UntrustedPaths>>,
 }
 
 impl GitSkillSource {
@@ -110,7 +112,7 @@ impl GitSkillSource {
     /// confined process put there.
     #[must_use]
     pub fn with_untrusted_paths(mut self, untrusted: crate::UntrustedPaths) -> Self {
-        self.untrusted = Some(untrusted);
+        self.untrusted = Some(std::panic::AssertUnwindSafe(untrusted));
         self
     }
 
@@ -301,7 +303,14 @@ impl GitSkillSource {
             }
             _ => None,
         };
-        run_git_command(args, cwd, ssh_command.as_deref(), self.untrusted.as_deref())
+        run_git_command(
+            args,
+            cwd,
+            ssh_command.as_deref(),
+            self.untrusted
+                .as_ref()
+                .map(|untrusted| untrusted.0.as_ref()),
+        )
     }
 
     fn authenticated_url(&self) -> String {
@@ -406,7 +415,19 @@ fn discover_skill_directories(base: &Path) -> Vec<PathBuf> {
         if path.file_name().and_then(|name| name.to_str()) == Some(".git") {
             continue;
         }
-        if path.is_dir() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        // A link is a candidate where it is, and the scan judges where it
+        // leads; discovery never descends through one, so a link in a
+        // repository (to `/`, say) cannot walk the host's filesystem.
+        if file_type.is_symlink() {
+            if path.join("SKILL.md").is_file() {
+                out.push(path);
+            }
+            continue;
+        }
+        if file_type.is_dir() {
             if path.join("SKILL.md").is_file() {
                 out.push(path);
             } else {
@@ -575,6 +596,38 @@ mod tests {
             .map(|descriptor| descriptor.key.skill_name.as_str())
             .collect();
         assert_eq!(names, vec!["kept-skill"]);
+    }
+
+    /// The skill sources keep the auto traits they had before they took a
+    /// host's judgement or runner.
+    #[test]
+    fn skill_sources_stay_unwind_safe() {
+        fn unwind_safe<T: std::panic::UnwindSafe + std::panic::RefUnwindSafe>() {}
+        unwind_safe::<GitSkillSource>();
+        unwind_safe::<crate::source::FilesystemSkillSource>();
+        unwind_safe::<crate::source::StdioExternalClient>();
+    }
+
+    /// Discovery never descends through a link, so a link in a repository
+    /// (to `/`, say) cannot walk the host's filesystem on each refresh; a
+    /// linked skill is judged where it leads by the scan.
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn discovery_does_not_descend_through_a_link() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().canonicalize().unwrap();
+        let outside = base.join("outside");
+        std::fs::create_dir_all(outside.join("deep")).unwrap();
+        std::fs::write(outside.join("deep").join("SKILL.md"), "# Deep").unwrap();
+        let checkout = base.join("checkout");
+        std::fs::create_dir_all(checkout.join("kept-skill")).unwrap();
+        std::fs::write(checkout.join("kept-skill").join("SKILL.md"), "# Kept").unwrap();
+        std::os::unix::fs::symlink(&outside, checkout.join("walk")).unwrap();
+
+        let mut found = discover_skill_directories(&checkout);
+        found.sort();
+        assert_eq!(found, vec![checkout.join("kept-skill")]);
     }
 
     #[test]

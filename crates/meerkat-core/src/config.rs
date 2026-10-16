@@ -3053,6 +3053,18 @@ pub enum AdministeredSection {
     Governance,
 }
 
+/// What the host does instead of a refused write that changes realm
+/// sections ([`ConfigError::CompositionAdministration`]): a missing
+/// `[realm.global]` (as a sign-in that provisions credentials under it
+/// adds) is added to the user document by hand.
+fn composition_remedy(change: &str) -> &'static str {
+    if change.contains("adding [realm.global]") {
+        "add [realm.global] to the user document by hand, as its host"
+    } else {
+        "make the change by editing the document as its host"
+    }
+}
+
 impl std::fmt::Display for AdministeredSection {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
@@ -3127,7 +3139,8 @@ pub enum ConfigError {
     /// administration: the host administers them in the documents
     /// themselves. Nothing is written.
     #[error(
-        "{change} would change the [{administered}] section {composer} composes; the host administers it in the config documents, so a config write cannot change it"
+        "{change} would change the [{administered}] section {composer} composes; the host administers it in the config documents, so a config write cannot change it ({})",
+        composition_remedy(.change)
     )]
     CompositionAdministration {
         /// The section the realm would compose differently.
@@ -3137,6 +3150,23 @@ pub enum ConfigError {
         change: String,
         /// The realm that would compose it differently.
         composer: String,
+    },
+
+    /// A write would add a credential command (an auth profile's
+    /// `source = { kind = "command" }`) or change what one runs: its
+    /// program, arguments, environment or working directory. The host runs
+    /// a credential command as itself, outside its OS process confinement,
+    /// so the command is confinement administration: the host administers
+    /// it in the document itself. Keeping one, changing only its timeout
+    /// or caching, or removing it is ordinary config. Nothing is written.
+    #[error(
+        "the credential command of auth profile '{profile}' in [realm.{realm}] runs as the host, outside its confinement; the host administers it in the config document, so a config write cannot add it or change what it runs (edit the document as its host)"
+    )]
+    CredentialCommandAdministration {
+        /// The realm section that states the auth profile.
+        realm: String,
+        /// The auth profile whose source is the command.
+        profile: String,
     },
 
     /// A less trusted config document states confinement for a launch kind
@@ -3161,6 +3191,7 @@ impl ConfigError {
             Self::ConfinementAdministration => Some(AdministeredSection::Confinement),
             Self::GovernanceAdministration => Some(AdministeredSection::Governance),
             Self::CompositionAdministration { administered, .. } => Some(*administered),
+            Self::CredentialCommandAdministration { .. } => Some(AdministeredSection::Confinement),
             _ => None,
         }
     }

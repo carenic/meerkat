@@ -546,6 +546,19 @@ impl HostConfinement {
         std::sync::Arc::new(move |path, subtree| host.writer_of(path, subtree).is_some())
     }
 
+    /// [`Self::untrusted_paths`] for the programs the host runs as itself
+    /// ([`meerkat_core::HostLaunchExemption`]) and its skill sources, `None`
+    /// when no launch kind is confined ([`HostAuthority::NotConfined`]):
+    /// there is no confined process to plant anything, so such a program
+    /// runs with the host's environment exactly as an unconfined host runs
+    /// it.
+    #[must_use]
+    pub fn launch_guard(
+        &self,
+    ) -> Option<std::sync::Arc<dyn Fn(&Path, bool) -> bool + Send + Sync>> {
+        (self.authority() != HostAuthority::NotConfined).then(|| self.untrusted_paths())
+    }
+
     /// Refuse a new start whose administration inputs a confined process
     /// could change, naming the input, its path and the kind. An input the
     /// host reads as a whole subtree is judged with the symbolic links in

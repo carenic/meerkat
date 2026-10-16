@@ -254,6 +254,27 @@ them.
   compose a different `[confinement]` or `[governance]` afterwards, such as
   removing or adding `[realm.global]` when the user document states
   `[governance]` (see Fixed).
+- Behaviour-only (not measured by the gate): under a host that confines
+  any launch kind, the programs the host runs as itself (credential
+  commands, `git` for Git skill repositories, the browser opener, `stty`,
+  `wasm-pack`) no longer inherit the variables that make a program load
+  code or startup options from elsewhere (`LD_*`, `DYLD_*`, `PYTHON*`,
+  `NODE_OPTIONS`, `NODE_PATH`, `PERL5LIB`, `PERL5OPT`, `RUBYLIB`, `RUBYOPT`,
+  `BASH_ENV`, `ENV`, `GIT_DIR`, `GIT_WORK_TREE`, `GIT_EXEC_PATH` and the
+  like), and lose the paths a confined process could change from the
+  others; a credential command that needs such a variable states it in its
+  own `env` (see Fixed). A host that confines no launch kind runs them with
+  its environment as before.
+- `meerkat_core::ConfigError` has a new variant
+  `CredentialCommandAdministration { realm, profile }`: a config write that
+  adds a credential command or changes what one runs (see Fixed); an
+  exhaustive match must handle it. `ConfigError::administered_section`
+  gives it as `Confinement`.
+- Behaviour-only (not measured by the gate): a config write that adds a
+  credential command, or changes its program, arguments, environment or
+  working directory, is refused with `confinement_administration_required`
+  on every config write surface; the host edits the document instead (see
+  Fixed).
 
 ### Security
 
@@ -515,10 +536,17 @@ them.
   `wasm-pack`), each with its reason and one fixed-program constructor
   (`git`, `credential_command`, `browser_opener`, `terminal_control`,
   `wasm_pack`), and `meerkat_core::confinement::program_routes`, the files
-  a launch of a program could execute. Each constructor launches with a
-  `PATH` cleaned by `meerkat_core::confinement::trusted_search_path`, which
-  drops relative directories and the directories an `UntrustedPathFn`
-  judgement does not trust.
+  a launch of a program could execute. Given a host's judgement (an
+  `UntrustedPathFn`), each constructor launches with a `PATH` cleaned by
+  `meerkat_core::confinement::trusted_search_path`, which drops relative
+  directories and the directories the judgement does not trust; without
+  one the host's environment passes as it is.
+- `meerkat_core::confinement::trusted_environment` gives the environment a
+  host launch exemption runs with under confinement, and
+  `meerkat_core::confinement::apply_configured_environment` applies an
+  operator's configured environment to one, each without the paths a
+  confined process could change; `HostConfinement::launch_guard` gives the
+  host's judgement for them, `None` when no launch kind is confined.
 - `meerkat::open_system_browser_trusting` opens a URL with the platform
   browser opener under a host's `UntrustedPathFn`, and
   `CommandCredentialRunner::with_untrusted_paths` runs a credential command
@@ -659,6 +687,12 @@ them.
   scans every workspace crate under Bazel too (its generated target carries
   every package's sources), and it scans the code after a test-only match
   arm, field or argument, which it skipped.
+- The user document a host creates from its template states
+  `[realm.global]`, so its settings and sign-ins reach every realm from the
+  start, and `rkat auth login`, the startup migration of a legacy sign-in
+  and a connector client for `global` never need to add it. A user document
+  that states `[governance]` but no `[realm.global]` cannot gain the
+  section through a config write: the refusal says to add it by hand.
 - CI's `Closure tests` rows have 60 minutes instead of 40, and the
   `ci-integration` profile gives its four slow nested-Cargo and
   whole-workspace tests 16 slow periods (960 s) instead of 8, so a cold row
@@ -1007,8 +1041,8 @@ them.
   written; an edge whose chain does not resolve is refused as invalid. In
   0.9.1 such a write made the realm drop its former ancestors'
   requirements from the next start, so a config writer could turn
-  confinement an ancestor realm required into unconfined launches. The
-  refusal message now also names the parent edge.
+  confinement an ancestor realm required into unconfined launches (the
+  0.9.1 known issue). The refusal message now also names the parent edge.
 - A realm's own config document decides its own parent edge. A section
   another document states for the realm (an ordinary write to an ancestor
   realm's document could add one) never replaces it. Before, such a section
@@ -1052,8 +1086,10 @@ them.
 - A symbolic link no longer carries a confined process past a trusted input:
   a skill linked out of a trusted skills directory to a path a confined
   process could change is not loaded, a skill linked out of a Git checkout
-  is not loaded wherever the link leads, and a start whose realm state or
-  credential store links to such a path is refused.
+  is not loaded wherever the link leads (and finding a repository's skills
+  no longer descends through a link, so a link to `/` cannot walk the
+  host's filesystem), and a start whose realm state or credential store
+  links to such a path is refused.
 - The `rkat` mob deploy RPC host's config store addresses the realm's
   document as the realm config source maps it, so the reserved `global`
   realm's is the user document it composes, not a file under the state
@@ -1092,9 +1128,10 @@ them.
   opener of `rkat run --browser`, `rkat mcp login` and provider OAuth
   login, `stty`, `wasm-pack` for `rkat doctor`, a credential command and
   `git`), and every program they start by name (an interpreter named
-  through `env`, a wrapper's helpers, `ssh` or `git-lfs` under Git), run
-  from a `PATH` without relative directories and without the directories a
-  confined process could change. `rkat` opens a browser with the platform
+  through `env`, a wrapper's helpers, `ssh` or `git-lfs` under Git), run,
+  under a host that confines any launch kind, from a `PATH` without
+  relative directories and without the directories a confined process
+  could change. `rkat` opens a browser with the platform
   opener (`xdg-open`, `/usr/bin/open`, the system `rundll32.exe`) instead of
   the `webbrowser` crate, and runs `stty` by absolute path. Before, with a
   directory a confined process can write on `PATH` (an activated virtual
@@ -1116,7 +1153,7 @@ them.
   realm that did not state `[realm.global]` itself, at its next start. A
   refusal of changed realm sections names the change and the realm.
 - A credential command without `cwd` runs from the user's home directory,
-  judged as that directory and the files in it, instead of from the host's
+  judged as that directory itself, instead of from the host's
   working directory, which a host that confines every launch kind refused
   whenever a confined process could write it (as for `rkat` run from its
   workspace). A credential command the host refuses ends its binding's
@@ -1127,6 +1164,39 @@ them.
   refused from an untrusted `mcp.toml` to the model under its plain name or
   a `refused-mcp-server-<n>` placeholder, as sessions on a governed realm
   do. They reported it under its raw name, which a confined process chose.
+- The programs a host runs as itself no longer inherit a module or library
+  path a confined process could change. With `rkat` run from a shell whose
+  `PYTHONPATH` or `LD_LIBRARY_PATH` points into the workspace, a confined
+  process could plant a module or library there that the next credential
+  helper, Git fetch, browser opener or `stty` loaded unconfined. Under such
+  a host they now run without the loader, interpreter, shell and Git
+  variables that load code from elsewhere, and every other inherited or
+  configured variable loses the paths a confined process could change.
+- An ordinary config write can no longer add a credential command, or
+  change what one runs, through `config/set`, `config/patch`, `PUT`/`PATCH
+  /config`, the MCP config tool, `rkat config` or the SDK store: it is
+  refused with `confinement_administration_required`, naming the auth
+  profile, and nothing is written. Before, a config client this release's
+  other guards stop could add `source = { kind = "command", program =
+  "/bin/sh", ... }` and have the host run it unconfined, at once through
+  `POST /auth/bindings/{id}/test`.
+
+### Known limitations
+
+- The config write guard composes the documents it reads without a lock
+  spanning them, so a write to another realm's document can race it.
+- Several state roots that share one user document: the guard composes the
+  realms the user document states a section for from its own state root's
+  documents only.
+- `webbrowser` stays an unused dependency of `rkat` and
+  `meerkat-auth-core`; removing it needs a lock refresh.
+- On a host without `/bin/stty` or `/usr/bin/stty` (NixOS), `rkat` cannot
+  hide a client secret typed at its terminal and asks for it on stdin
+  instead.
+- `meerkat::open_system_browser` and
+  `McpOAuthPendingLogin::launch_system_browser` stay public without a host's
+  judgement (only relative `PATH` directories are dropped); a host that
+  confines its agents' launches uses `open_system_browser_trusting`.
 
 ## [0.9.1] - 2026-10-15
 
@@ -1785,6 +1855,12 @@ them.
   `--max-total-tokens`, `--max-duration`, `--max-tool-calls`) nor the pack's
   deploy defaults (`[budget]`, `[models]`, `max_tokens`, `[compaction]`)
   apply to those members.
+- An ordinary config write can change or remove a realm's
+  `[realm.<id>].parent` edge. From the next start that realm no longer
+  composes the `[confinement]` of its former ancestors (governance
+  inheritance follows the same edge). A requirement in the user document or
+  set with the `--confinement` flags is not affected; put confinement that
+  must hold there.
 
 ## [0.9.0] - 2026-10-13
 

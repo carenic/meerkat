@@ -277,7 +277,10 @@ except these, which it runs as itself (`meerkat_core::HostLaunchExemption`):
   refused before it runs (`ProviderAuthError::HostLaunchRefused`) when a
   confined process could change its program, the interpreter its `#!` line
   names by path, or its working directory, and the refusal ends the
-  binding's resolution (no other credential stands in for it).
+  binding's resolution (no other credential stands in for it). A config
+  write cannot add one or change what it runs
+  (`confinement_administration_required`, naming the auth profile); the
+  host edits the document.
 - Browser opener (`HostLaunchExemption::browser_opener`: `/usr/bin/open`,
   `xdg-open`, the system `rundll32.exe`; OAuth logins and the CLI's HTML
   artifact): must reach the user's desktop session; the URL is one argument.
@@ -286,11 +289,19 @@ except these, which it runs as itself (`meerkat_core::HostLaunchExemption`):
 - `wasm-pack` (`HostLaunchExemption::wasm_pack`): developer build tooling
   (`rkat doctor`).
 
-Each runs, with every program it starts by name (an interpreter named
-through `env`, `ssh` or `git-lfs` under Git, the programs a browser opener
-tries), from a `PATH` without relative directories and, under a confining
-host, without the directories a confined process could change
-(`meerkat_core::confinement::trusted_search_path`).
+Under a host that confines any launch kind, each runs, with every program
+it starts by name (an interpreter named through `env`, `ssh` or `git-lfs`
+under Git, the programs a browser opener tries), from a `PATH` without
+relative directories or the directories a confined process could change
+(`meerkat_core::confinement::trusted_search_path`), and inherits no variable
+that makes a program load code or startup options from elsewhere (`LD_*`,
+`DYLD_*`, `PYTHON*`, `NODE_OPTIONS`, `NODE_PATH`, `PERL5LIB`, `PERL5OPT`,
+`RUBYLIB`, `RUBYOPT`, `BASH_ENV`, `ENV`, `GIT_DIR`, `GIT_WORK_TREE`,
+`GIT_EXEC_PATH`, ...), and every other variable loses the paths a confined
+process could change (`trusted_environment`); a credential command's own
+`env` loses them too (`apply_configured_environment`). Without
+confinement they run with the host's environment as it is
+(`HostConfinement::launch_guard` is `None`).
 
 A source test fails on any process launch in shipped code that is neither
 confined nor in this list.
