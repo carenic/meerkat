@@ -3721,13 +3721,16 @@ impl PendingRuntimeExecutorAttachment {
                     .interrupted_tool_notices
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(notices);
-                // The publication already woke the loop, which runs on its own
-                // runtime and can spend that wake on a pre-dequeue check made
-                // before this hand-off. Wake the exact attached loop again so
-                // an idle session records the notices now, not at its next
-                // input.
-                if self.should_wake
-                    && entry.epoch_id == witness.epoch_id
+                // The publication may have woken the loop, which runs on its
+                // own runtime and can spend that wake on a pre-dequeue check
+                // made before this hand-off, or not woken it at all: a
+                // replacement that fenced its predecessor's inputs has no
+                // queued work to wake for. Wake the exact attached loop now
+                // that the notices are in place, so an idle session records
+                // them now, not at its next input. A retained publication's
+                // slot is still pending here; its lease wakes the loop when it
+                // commits, after this hand-off.
+                if entry.epoch_id == witness.epoch_id
                     && let RuntimeLoopAttachmentSlot::Attached(attachment) = &entry.attachment_slot
                     && attachment.id == witness.attachment_id
                 {

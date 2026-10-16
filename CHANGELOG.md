@@ -49,6 +49,11 @@ them.
   `MeerkatMachine::arm_attachment_interrupted_notice_handoff_test_hook` and
   `MeerkatMachine::arm_runtime_loop_after_empty_interrupted_notice_check_test_hook`,
   doc-hidden).
+- The same notice is recorded at attach when the attachment replaces a
+  predecessor whose queued inputs it fences. Fencing them left the
+  replacement no queued work, so it published without waking its loop and
+  skipped the wake after the hand-off as well; the hand-off now wakes the
+  exact attached loop whenever it hands notices over.
 
 ## [0.9.2] - 2026-10-16
 
