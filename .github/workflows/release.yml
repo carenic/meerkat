@@ -111,7 +111,7 @@ jobs:
       sha: ${{ steps.release_ref.outputs.sha }}
     steps:
       - name: Checkout release ref
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag != '' && github.event.inputs.release_tag || github.ref }}
           fetch-depth: 0
@@ -261,7 +261,7 @@ jobs:
       - name: Require successful exact-main CI
         id: ci_run
         if: ${{ !(github.event_name == 'workflow_dispatch' && github.event.inputs.prebuild_release_artifacts == 'true') }}
-        uses: actions/github-script@v7
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         env:
           RELEASE_SHA: ${{ steps.release_ref.outputs.sha }}
         with:
@@ -416,14 +416,14 @@ jobs:
       # itself a reuse.
       - name: Setup Node for reused CI evidence
         if: ${{ github.event_name != 'workflow_dispatch' }}
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: "22"
 
       # The classifier runs the parent's docs and changelog stampers.
       - name: Setup Python for reused CI evidence
         if: ${{ github.event_name != 'workflow_dispatch' }}
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.14"
 
@@ -531,7 +531,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag != '' && github.event.inputs.release_tag || github.ref }}
           fetch-depth: 0
@@ -539,7 +539,7 @@ jobs:
       - uses: ./.github/actions/setup-rust-ci
 
       - name: Cache cargo registry
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           # Release caches never come from a dispatch: a dispatch runs on main
           # and would save into the default branch's scope, which every later
@@ -549,12 +549,12 @@ jobs:
           cache-bin: "false"
 
       - name: Setup Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.14"
 
       - name: Setup Node
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: "22"
 
@@ -620,7 +620,7 @@ jobs:
       MEERKAT_BUILDBUDDY_CI_JOBS: ${{ vars.MEERKAT_RELEASE_BUILDBUDDY_JOBS || vars.MEERKAT_BUILDBUDDY_CI_JOBS || '64' }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag != '' && github.event.inputs.release_tag || github.ref }}
           fetch-depth: 0
@@ -635,7 +635,7 @@ jobs:
           repository-cache: restore
 
       - name: Setup Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.14"
 
@@ -754,10 +754,10 @@ jobs:
       # workflow commit. Package build and publish jobs below still check out
       # the immutable release tag selected by release_tag.
       - name: Checkout workflow helpers
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
       - name: Setup Node
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: "22"
 
@@ -794,7 +794,7 @@ jobs:
     timeout-minutes: 45
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag != '' && github.event.inputs.release_tag || github.ref }}
           fetch-depth: 0
@@ -806,7 +806,7 @@ jobs:
       # ref, while every published source checkout remains the release tag.
       - name: Checkout semver recovery policy
         if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.semver_evidence_job_id != '' }}
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ github.sha }}
           path: .semver-recovery-policy
@@ -827,7 +827,7 @@ jobs:
             github.event.inputs.semver_evidence_job_id == '' &&
             github.event.inputs.release_tag == ''
           }}
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           shared-key: release-semver-breaks
           # Release caches never come from a dispatch: a dispatch runs on main
@@ -844,7 +844,7 @@ jobs:
             github.event.inputs.semver_evidence_job_id == '' &&
             github.event.inputs.release_tag == ''
           }}
-        uses: taiki-e/install-action@cargo-semver-checks
+        uses: taiki-e/install-action@0c0cd218980b4b04e3636f5d7f1216716931ed74 # cargo-semver-checks
         env:
           HOME: ${{ runner.temp }}/install-action-home-${{ github.job }}
 
@@ -980,7 +980,7 @@ jobs:
       run_attempt: ${{ steps.lookup.outputs.run_attempt }}
     steps:
       - name: Checkout release tooling
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           sparse-checkout: |
             scripts/release-find-prebuild
@@ -1085,7 +1085,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.prebuild_release_artifacts == 'true' && github.sha || github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag != '' && github.event.inputs.release_tag || github.ref }}
           persist-credentials: false
@@ -1108,7 +1108,7 @@ jobs:
         run: rustup target add ${{ matrix.platform.target }}
 
       - name: Cache cargo registry
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           key: release-${{ matrix.platform.target }}
           # Release caches never come from a dispatch: a dispatch runs on main
@@ -1213,7 +1213,7 @@ jobs:
       # recovery of an older tag builds a tree that predates it. Sparse, so
       # the checkout adds no Cargo or Bazel package to the build.
       - name: Checkout release binary guard
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ github.sha }}
           path: .release-tooling
@@ -1305,12 +1305,12 @@ jobs:
           echo "stamped ${stamped} archive(s) with ${RELEASE_TAG} ${tree}"
 
       - name: Attest build provenance
-        uses: actions/attest-build-provenance@v4
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4
         with:
           subject-path: dist/*
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: meerkat-${{ matrix.platform.target }}-${{ matrix.platform.runs-on }}-${{ matrix.surface.bin }}
           path: dist/*
@@ -1350,7 +1350,7 @@ jobs:
       version: ${{ steps.version.outputs.version }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.prebuild_release_artifacts == 'true' && github.sha || github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag != '' && github.event.inputs.release_tag || github.ref }}
           persist-credentials: false
@@ -1362,7 +1362,7 @@ jobs:
       # the workflow's own ref beside the tag checkout and run the tooling
       # from there (same shape as the semver recovery policy checkout).
       - name: Checkout release tooling
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ github.sha }}
           path: .release-tooling
@@ -1370,7 +1370,7 @@ jobs:
       - uses: ./.github/actions/setup-rust-ci
 
       - name: Cache cargo registry
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           key: release-x86_64-pc-windows-msvc-cross
           # Release caches never come from a dispatch: a dispatch runs on main
@@ -1444,14 +1444,14 @@ jobs:
           echo "stamped ${stamped} archive(s) with ${RELEASE_TAG} ${tree}"
 
       - name: Attest build provenance
-        uses: actions/attest-build-provenance@v4
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4
         with:
           subject-path: dist/*
 
       # Same artifact name the native Windows job produced, so the publisher,
       # the asset recovery mode, and the release manifest see no change.
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: meerkat-x86_64-pc-windows-msvc-windows-latest
           path: dist/*
@@ -1465,7 +1465,7 @@ jobs:
     timeout-minutes: 20
     steps:
       - name: Download Windows artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: meerkat-x86_64-pc-windows-msvc-windows-latest
           path: dist
@@ -1537,7 +1537,7 @@ jobs:
             bin: rkat-mcp
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.prebuild_release_artifacts == 'true' && github.sha || github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag != '' && github.event.inputs.release_tag || github.ref }}
           persist-credentials: false
@@ -1548,7 +1548,7 @@ jobs:
         run: rustup target add x86_64-apple-darwin
 
       - name: Cache cargo registry
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           key: release-x86_64-apple-darwin-cross
           # Release caches never come from a dispatch: a dispatch runs on main
@@ -1574,7 +1574,7 @@ jobs:
       # recovery of an older tag builds a tree that predates it. Sparse, so
       # the checkout adds no Cargo or Bazel package to the build.
       - name: Checkout release binary guard
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ github.sha }}
           path: .release-tooling
@@ -1659,12 +1659,12 @@ jobs:
           echo "stamped ${stamped} archive(s) with ${RELEASE_TAG} ${tree}"
 
       - name: Attest build provenance
-        uses: actions/attest-build-provenance@v4
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4
         with:
           subject-path: dist/*
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: meerkat-x86_64-apple-darwin-macos-15-${{ matrix.surface.bin }}
           path: dist/*
@@ -1716,7 +1716,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.prebuild_release_artifacts == 'true' && github.sha || github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag != '' && github.event.inputs.release_tag || github.ref }}
           persist-credentials: false
@@ -1775,7 +1775,7 @@ jobs:
       # recovery of an older tag builds a tree that predates it. Sparse, so
       # the checkout adds no Cargo or Bazel package to the build.
       - name: Checkout release binary guard
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ github.sha }}
           path: .release-tooling
@@ -1906,12 +1906,12 @@ jobs:
           echo "stamped ${stamped} archive(s) with ${RELEASE_TAG} ${tree}"
 
       - name: Attest build provenance
-        uses: actions/attest-build-provenance@v4
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4
         with:
           subject-path: dist/*
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: meerkat-${{ matrix.target }}-buildbuddy
           path: dist/*
@@ -1941,21 +1941,21 @@ jobs:
       contents: write
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           fetch-depth: 0
           persist-credentials: false
 
       - name: Download this run's release archives
         if: ${{ needs.release_prebuild.outputs.run_id == '' }}
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: meerkat-*
           path: release-artifacts
 
       - name: Download the archives of the exact-commit prebuild
         if: ${{ needs.release_prebuild.outputs.run_id != '' }}
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: meerkat-*
           path: release-artifacts
@@ -2065,7 +2065,7 @@ jobs:
       # never replaced. The manifest is not written here: it describes the
       # complete set, which only publish_github_release sees.
       - name: Publish Linux and macOS arm64 release assets
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           files: |
             critical-release-artifacts/*.tar.gz
@@ -2103,7 +2103,7 @@ jobs:
     timeout-minutes: 180
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           # Recovery dispatches run the workflow definition from main, but the
           # package must always be built from the explicitly selected release.
@@ -2113,7 +2113,7 @@ jobs:
       - uses: ./.github/actions/setup-rust-ci
 
       - name: Cache cargo registry
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           # Release caches never come from a dispatch: a dispatch runs on main
           # and would save into the default branch's scope, which every later
@@ -2123,12 +2123,12 @@ jobs:
           cache-bin: "false"
 
       - name: Install Python + Node tooling
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.14"
 
       - name: Setup Node
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: "22"
 
@@ -2254,12 +2254,12 @@ jobs:
       # A tag run that reuses a prebuild's package verifies this attestation
       # (release.yml at the tag commit on refs/heads/main) before publishing.
       - name: Attest Web SDK package provenance
-        uses: actions/attest-build-provenance@v4
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4
         with:
           subject-path: web-sdk-package/rkat-web-*.tgz
 
       - name: Upload Web SDK package
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: rkat-web-package
           path: |
@@ -2457,14 +2457,14 @@ jobs:
       # Recovery runs execute the current workflow against an older release
       # tag, so load helpers from the workflow ref rather than that old tag.
       - name: Checkout workflow helpers
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           fetch-depth: 0
           persist-credentials: false
 
       - name: Download all artifacts
         if: ${{ (github.event_name != 'workflow_dispatch' || github.event.inputs.assets_run_id == '') && needs.release_prebuild.outputs.run_id == '' }}
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: release-artifacts
 
@@ -2509,7 +2509,7 @@ jobs:
       # them to that run before anything is published.
       - name: Download the archives of the exact-commit prebuild
         if: ${{ needs.release_prebuild.outputs.run_id != '' }}
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: release-artifacts
           pattern: meerkat-*
@@ -2521,7 +2521,7 @@ jobs:
       # binds them to that run before anything is published.
       - name: Download the archives of the earlier release run
         if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.assets_run_id != '' }}
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: release-artifacts
           pattern: meerkat-*
@@ -2641,7 +2641,7 @@ jobs:
         run: scripts/check-release-source-test-hooks "${RELEASE_TAG}"
 
       - name: Publish release archives
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           files: |
             prepared-release-artifacts/*.tar.gz
@@ -2716,7 +2716,7 @@ jobs:
       # present, keeping the public manifest a complete release authority.
       - name: Publish complete release manifest
         if: ${{ steps.manifest.outputs.upload == 'true' }}
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           files: |
             published-release-artifacts/checksums.sha256
@@ -2738,7 +2738,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout workflow helpers
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
       # The only Homebrew update: the formula needs every Unix archive, Intel
       # macOS included, so it follows the trailing publisher and reads the
@@ -2773,14 +2773,14 @@ jobs:
     timeout-minutes: 60
     steps:
       - name: Checkout release tag
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag || github.ref_name }}
 
       - uses: ./.github/actions/setup-rust-ci
 
       - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           shared-key: release-semver-rustdoc
           # Release caches never come from a dispatch: a dispatch runs on main
@@ -2811,7 +2811,7 @@ jobs:
           ls -la "${RUNNER_TEMP}/semver-baseline/semver-rustdoc-${version}.tar.zst"
 
       - name: Upload baseline rustdoc for the release attachment
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: semver-rustdoc-baseline
           path: ${{ runner.temp }}/semver-baseline/semver-rustdoc-*.tar.zst
@@ -2834,7 +2834,7 @@ jobs:
     timeout-minutes: 10
     steps:
       - name: Download baseline rustdoc
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: semver-rustdoc-baseline
           path: semver-baseline
@@ -2889,7 +2889,7 @@ jobs:
     timeout-minutes: 180
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag != '' && github.event.inputs.release_tag || github.ref }}
 
@@ -2901,11 +2901,11 @@ jobs:
       # packages without compiling (cargo publish --no-verify), so a cold
       # registry costs only the index and source downloads.
       - name: Install Python + Node tooling
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.14"
       - name: Setup Node
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: "22"
 
@@ -3079,14 +3079,14 @@ jobs:
     timeout-minutes: 15
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           # Bind helper scripts and package metadata to the same release as
           # the artifact, even when a later main dispatches the recovery job.
           ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag != '' && github.event.inputs.release_tag || github.ref }}
 
       - name: Setup Node
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: "22"
 
@@ -3149,7 +3149,7 @@ jobs:
           echo "source run ${SOURCE_RUN}: release.yml ${run_event} run ${pinned}; passed: $(printf '%s, ' "${required[@]}" | sed 's/, $//')"
 
       - name: Download Web SDK package
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: rkat-web-package
           path: web-sdk-package

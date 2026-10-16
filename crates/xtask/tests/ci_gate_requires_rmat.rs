@@ -406,7 +406,13 @@ fn cargo_diagnostic_workflow_preserves_the_full_gate_set() {
             .and_then(serde_yaml::Value::as_str)
             .is_some_and(|run| run.contains("make machine-verify"))
     }));
-    assert!(cargo.contains("actions/setup-java@v5"));
+    assert!(
+        cargo.lines().any(|line| {
+            let line = line.trim();
+            line.starts_with("uses: actions/setup-java@") && line.ends_with(" # v5")
+        }),
+        "cargo.yml installs Java with actions/setup-java, pinned to v5's commit"
+    );
     assert!(cargo.contains("uses: ./.github/actions/setup-tlc-ci"));
     assert!(cargo.contains("scripts/machine-authority-changed"));
     assert!(cargo.contains("machine_authority_changed:"));

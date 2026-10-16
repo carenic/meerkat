@@ -262,7 +262,7 @@ else
 fi
 
 if grep -Fq 'Restore Bazel external repositories' .github/actions/setup-buildbuddy-ci/action.yml &&
-  grep -Fq 'actions/cache/restore@v5' .github/actions/setup-buildbuddy-ci/action.yml &&
+  grep -Eq 'actions/cache/restore@[0-9a-f]{40} # v5$' .github/actions/setup-buildbuddy-ci/action.yml &&
   grep -Fq "env.MEERKAT_BAZEL_BACKEND == 'gcp-buildbuddy'" .github/actions/setup-buildbuddy-ci/action.yml &&
   grep -Fq 'Cache Bazel external repositories' .github/actions/setup-buildbuddy-ci/action.yml &&
   grep -Fq "env.MEERKAT_BAZEL_BACKEND != 'gcp-buildbuddy'" .github/actions/setup-buildbuddy-ci/action.yml &&

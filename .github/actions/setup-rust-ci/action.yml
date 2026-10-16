@@ -11,8 +11,11 @@ runs:
   using: composite
   steps:
     - name: Install Rust
-      uses: dtolnay/rust-toolchain@1.94.1
+      uses: dtolnay/rust-toolchain@ee868d7805ade43a1b47dd054727ab76c9108b4f # 1.94.1
       with:
+        # Pinned to a commit, the action cannot read the toolchain from its
+        # ref name, so it is named here (rust-toolchain.toml's channel).
+        toolchain: 1.94.1
         # The CI lanes run fmt/clippy directly; the dtolnay action installs a
         # minimal profile, so name the components explicitly.
         components: ${{ inputs.components }}

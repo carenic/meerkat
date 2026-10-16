@@ -79,7 +79,7 @@ runs:
     # (never from a workflow_dispatch; see save-sdk-cache).
     - name: Restore Windows SDK cache
       id: sdk-cache
-      uses: actions/cache/restore@v4
+      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
       with:
         path: ${{ runner.temp }}/xwin-cache
         key: xwin-sdk-${{ runner.os }}-cargo-xwin-${{ inputs.cargo-xwin-version }}
@@ -117,7 +117,7 @@ runs:
 
     - name: Save Windows SDK cache
       if: ${{ inputs.save-sdk-cache == 'true' && steps.sdk-cache.outputs.cache-hit != 'true' }}
-      uses: actions/cache/save@v4
+      uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
       with:
         path: ${{ runner.temp }}/xwin-cache
         key: xwin-sdk-${{ runner.os }}-cargo-xwin-${{ inputs.cargo-xwin-version }}
