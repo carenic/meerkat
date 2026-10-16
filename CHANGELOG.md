@@ -171,6 +171,11 @@ them.
   credits a partitioned binary only when every partition of one selection
   is planned, and `scripts/ci-verify-row-binaries.mjs` accepts tests left to
   sibling partitions only for a row that names its partition.
+- CI's pull-request unit row of a chain exception (meerkat-rpc, which
+  compiles meerkat-mob) runs alone instead of being packed with other
+  packages: in run 38859112297 it carried xtask and meerkat-live and ran
+  1801 s, the longest lane. The other packages fill the remaining unit
+  rows, so a workspace-mode plan keeps ten.
 
 ## [0.9.1] - 2026-10-15
 
