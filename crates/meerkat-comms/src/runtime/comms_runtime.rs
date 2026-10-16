@@ -809,6 +809,17 @@ impl CoreCommsRuntime for CommsRuntime {
         signer_pubkey: [u8; 32],
         declared_address: String,
     ) -> Result<(), SendError> {
+        // The router addresses the staged Response to this key, so it must
+        // be `dest`'s own, as for a correlated endpoint: a key that derives
+        // another peer id would deliver a response meant for `dest` to that
+        // other peer.
+        let signer_pubkey = PubKey::new(signer_pubkey);
+        let signer_peer_id = signer_pubkey.to_peer_id();
+        if signer_peer_id != dest {
+            return Err(SendError::Validation(format!(
+                "declared reply signer derives peer id {signer_peer_id}, not destination {dest}"
+            )));
+        }
         // Skip-if-routable: trust-store entries always win at send time, so
         // staging for an already-routable peer would only leave a stale
         // one-shot entry behind. The trust store (public + private union) is
@@ -819,7 +830,7 @@ impl CoreCommsRuntime for CommsRuntime {
         self.router.stage_reply_endpoint(
             dest,
             crate::router::DeclaredReplyEndpoint {
-                pubkey: PubKey::new(signer_pubkey),
+                pubkey: signer_pubkey,
                 address: declared_address,
             },
         );
@@ -11351,6 +11362,53 @@ mod tests {
         assert!(
             matches!(message, Err(crate::router::SendError::PeerNotFound(_))),
             "staged endpoint must not grant Message sendability, got {message:?}"
+        );
+    }
+
+    /// A declared reply endpoint is staged only under the destination's own
+    /// signing key: a key that derives another peer id is refused and
+    /// nothing is staged, so a Response to the destination still has no
+    /// route.
+    #[tokio::test]
+    async fn stage_declared_reply_endpoint_refuses_a_signer_of_another_peer() {
+        let suffix = Uuid::new_v4().simple().to_string();
+        let sender =
+            CommsRuntime::inproc_only(&format!("declared-signer-sender-{suffix}")).unwrap();
+        let dest = Keypair::generate().public_key().to_peer_id();
+        let other_signer = Keypair::generate().public_key();
+
+        let refused = CoreCommsRuntime::stage_declared_reply_endpoint(
+            &sender,
+            dest,
+            *other_signer.as_bytes(),
+            "tcp://127.0.0.1:9".to_string(),
+        )
+        .await;
+        assert!(
+            matches!(refused, Err(SendError::Validation(_))),
+            "a signer that does not derive the destination must be refused, got {refused:?}"
+        );
+
+        let response = sender
+            .router()
+            .send_with_id(
+                dest,
+                Uuid::new_v4(),
+                MessageKind::Response {
+                    in_reply_to: Uuid::new_v4(),
+                    status: Status::Completed,
+                    result: serde_json::json!({"ok": true}),
+                    blocks: None,
+                    content_taint: None,
+                    handling_mode: None,
+                    objective_id: None,
+                },
+                None,
+            )
+            .await;
+        assert!(
+            matches!(response, Err(crate::router::SendError::PeerNotFound(_))),
+            "a refused staging leaves no endpoint behind, got {response:?}"
         );
     }
 

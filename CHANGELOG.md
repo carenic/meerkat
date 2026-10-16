@@ -148,6 +148,12 @@ them.
   the envelope declares, the same identity trust and routing use in that
   mode. Before, the runtime checked only that the request id named a request
   this session had received and could still answer.
+- `CommsRuntime::stage_declared_reply_endpoint` refuses, with
+  `SendError::Validation`, a signing key that does not derive the destination
+  peer id, as `stage_correlated_reply_endpoint` already did, and stages
+  nothing. The router addresses a Response sent through a staged endpoint to
+  that key, so a mismatched key would have carried a response meant for one
+  peer to another.
 
 ## [0.9.2] - 2026-10-16
 
