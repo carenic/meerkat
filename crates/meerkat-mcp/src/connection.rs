@@ -303,6 +303,11 @@ pub(crate) struct StdioChildCustody {
     /// held weakly: its router owns them, so a process or a clone of this
     /// custody never keeps them alive.
     diagnostics: std::sync::Weak<crate::stdio_diagnostics::StdioAttemptRecord>,
+    /// The attempt's guard record while its process end is unknown, shared
+    /// with a running close. Declared after `slot`: when the last holder of
+    /// a held process drops, its group is killed before the guard learns it
+    /// was abandoned.
+    guard: Arc<GuardHolder>,
     /// Bumped whenever a close's state changes after its task started, so
     /// its waiters recheck the slot.
     close_progress: Arc<tokio::sync::watch::Sender<u64>>,
@@ -405,23 +410,86 @@ impl Drop for StdioChild {
 struct ClosingOwner {
     slot: Arc<std::sync::Mutex<CustodySlot>>,
     close_progress: Arc<tokio::sync::watch::Sender<u64>>,
+    guard: Arc<GuardHolder>,
     finished: bool,
 }
 
 impl ClosingOwner {
     fn finish(mut self, receipt: McpStdioCloseReceipt) {
         self.finished = true;
-        *lock_slot(&self.slot) = CustodySlot::Closed(Arc::new(receipt));
+        let receipt = Arc::new(receipt);
+        let record = {
+            let mut slot = lock_slot(&self.slot);
+            *slot = CustodySlot::Closed(Arc::clone(&receipt));
+            self.guard.take()
+        };
+        // Outside the slot lock: the guard learns the close's own receipt.
+        if let Some(record) = record {
+            record.process_ended(crate::McpAttemptProcessEnd::Closed(receipt));
+        }
     }
 }
 
 impl Drop for ClosingOwner {
     fn drop(&mut self) {
         if !self.finished {
-            *lock_slot(&self.slot) = CustodySlot::Abandoned;
+            let record = {
+                let mut slot = lock_slot(&self.slot);
+                *slot = CustodySlot::Abandoned;
+                self.guard.take()
+            };
+            if let Some(record) = record {
+                record.process_ended(crate::McpAttemptProcessEnd::Abandoned);
+            }
         }
         self.close_progress
             .send_modify(|seen| *seen = seen.wrapping_add(1));
+    }
+}
+
+/// An attempt's guard record, held with its process custody until the
+/// process end is known. Taken and set only under the custody's slot lock;
+/// the record is told outside it.
+#[derive(Default)]
+pub(crate) struct GuardHolder {
+    record: std::sync::Mutex<Option<Arc<crate::attempt_guard::AttemptGuardRecord>>>,
+    /// Whether a process was spawned under this custody.
+    spawned: std::sync::atomic::AtomicBool,
+}
+
+impl GuardHolder {
+    fn take(&self) -> Option<Arc<crate::attempt_guard::AttemptGuardRecord>> {
+        self.record
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    }
+
+    fn hold(&self, record: Arc<crate::attempt_guard::AttemptGuardRecord>) {
+        *self
+            .record
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(record);
+    }
+}
+
+impl Drop for GuardHolder {
+    /// The last holder is gone with the process end still unknown: a spawned
+    /// process was killed by its holder's drop (abandoned), or nothing was
+    /// spawned.
+    fn drop(&mut self) {
+        let record = self
+            .record
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(record) = record {
+            record.process_ended(if *self.spawned.get_mut() {
+                crate::McpAttemptProcessEnd::Abandoned
+            } else {
+                crate::McpAttemptProcessEnd::NotSpawned
+            });
+        }
     }
 }
 
@@ -502,6 +570,41 @@ impl StdioChildCustody {
         &self,
     ) -> std::sync::Weak<crate::stdio_diagnostics::StdioAttemptRecord> {
         self.diagnostics.clone()
+    }
+
+    /// Hold the attempt's guard record until the process end is known: told
+    /// `NotSpawned` when the custody is retired before a spawn, the close's
+    /// receipt when its close finishes, `Abandoned` when that close is
+    /// dropped or the last holder of a spawned process drops.
+    pub(crate) fn hold_guard(&self, record: Arc<crate::attempt_guard::AttemptGuardRecord>) {
+        let known = {
+            let slot = lock_slot(&self.slot);
+            match &*slot {
+                CustodySlot::Retired => Some(crate::McpAttemptProcessEnd::NotSpawned),
+                CustodySlot::Closed(receipt) => {
+                    Some(crate::McpAttemptProcessEnd::Closed(Arc::clone(receipt)))
+                }
+                CustodySlot::Abandoned => Some(crate::McpAttemptProcessEnd::Abandoned),
+                CustodySlot::Vacant | CustodySlot::Held(_) | CustodySlot::Closing { .. } => {
+                    self.guard.hold(Arc::clone(&record));
+                    None
+                }
+            }
+        };
+        if let Some(end) = known {
+            record.process_ended(end);
+        }
+    }
+
+    /// The guard record taken out of the custody when its process end
+    /// becomes known, told outside the slot lock.
+    fn tell_guard(
+        record: Option<Arc<crate::attempt_guard::AttemptGuardRecord>>,
+        end: crate::McpAttemptProcessEnd,
+    ) {
+        if let Some(record) = record {
+            record.process_ended(end);
+        }
     }
 
     /// Spawn the server and take custody of it; returns its stdout and stdin
@@ -646,6 +749,9 @@ impl StdioChildCustody {
                 direct_kill_requests: Arc::clone(&self.direct_kill_requests),
             }),
         );
+        self.guard
+            .spawned
+            .store(true, std::sync::atomic::Ordering::Release);
         // One custody holds one process; a replaced one is killed by its drop.
         drop(replaced);
         Ok((stdout, stdin))
@@ -741,6 +847,7 @@ impl StdioChildCustody {
         T: Send + 'static,
         F: std::future::Future<Output = T> + Send + 'static,
     {
+        let mut never_spawned = None;
         let held = {
             let mut slot = lock_slot(&self.slot);
             match std::mem::replace(&mut *slot, CustodySlot::Closing { started }) {
@@ -748,6 +855,7 @@ impl StdioChildCustody {
                 // Closed before any spawn: no process may start after it.
                 CustodySlot::Vacant | CustodySlot::Retired => {
                     *slot = CustodySlot::Retired;
+                    never_spawned = self.guard.take();
                     Err(CustodyNotHeld::NeverSpawned)
                 }
                 other => {
@@ -764,6 +872,7 @@ impl StdioChildCustody {
                 }
             }
         };
+        Self::tell_guard(never_spawned, crate::McpAttemptProcessEnd::NotSpawned);
         let held = match held {
             Ok(held) => held,
             Err(not_held) => return Err((first, not_held)),
@@ -771,6 +880,7 @@ impl StdioChildCustody {
         let owner = ClosingOwner {
             slot: Arc::clone(&self.slot),
             close_progress: Arc::clone(&self.close_progress),
+            guard: Arc::clone(&self.guard),
             finished: false,
         };
         let bounds = self.bounds;
@@ -827,10 +937,16 @@ impl StdioChildCustody {
 
     /// Retire a custody whose process was never spawned, so none ever is.
     fn retire_if_vacant(&self) {
-        let mut slot = lock_slot(&self.slot);
-        if matches!(*slot, CustodySlot::Vacant) {
-            *slot = CustodySlot::Retired;
-        }
+        let never_spawned = {
+            let mut slot = lock_slot(&self.slot);
+            if matches!(*slot, CustodySlot::Vacant) {
+                *slot = CustodySlot::Retired;
+                self.guard.take()
+            } else {
+                None
+            }
+        };
+        Self::tell_guard(never_spawned, crate::McpAttemptProcessEnd::NotSpawned);
     }
 
     /// [`Self::terminate`], or, when another call already started the close,
@@ -3237,6 +3353,9 @@ struct CloseIndexShared {
     state: std::sync::Mutex<CloseIndexState>,
     /// Becomes `true` when the close begins, so admitted attempts stop.
     closing: tokio::sync::watch::Sender<bool>,
+    /// The router's attempt guards, cancelled with `RouterClosed` when the
+    /// close begins, before any attempt is stopped.
+    guards: std::sync::OnceLock<std::sync::Weak<crate::attempt_guard::RouterGuards>>,
 }
 
 #[derive(Default)]
@@ -3312,6 +3431,11 @@ impl CloseIndex {
         }
     }
 
+    /// Install the router's attempt guards, cancelled when the close begins.
+    pub(crate) fn set_attempt_guards(&self, guards: &Arc<crate::attempt_guard::RouterGuards>) {
+        let _ = self.0.guards.set(Arc::downgrade(guards));
+    }
+
     /// Freeze admission and start, now, every close this index covers that
     /// has not started, without any router lock or in-flight call: a held
     /// stdio server's client is closed and then its process, under that
@@ -3322,6 +3446,11 @@ impl CloseIndex {
     /// once). A close already running is joined. A later call returns a
     /// ticket over the same closes. Call it within a Tokio runtime.
     pub(crate) fn begin_close(&self) -> McpCloseTicket {
+        // The router is closing: its attempts' guards learn it first, so an
+        // attempt stopped below is cancelled as `RouterClosed`.
+        if let Some(guards) = self.0.guards.get().and_then(std::sync::Weak::upgrade) {
+            guards.close(crate::McpAttemptCancelCause::RouterClosed);
+        }
         let now = tokio::time::Instant::now();
         let closes = {
             let mut state = self.state();

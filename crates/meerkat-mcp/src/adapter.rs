@@ -179,6 +179,8 @@ pub struct McpRouterAdapter {
     /// ([`Self::begin_close`]). Once it is closing, dispatch and every
     /// staging entry refuse before taking a router guard.
     close_index: crate::connection::CloseIndex,
+    /// The router's construction identity, outside the router lock.
+    construction: crate::McpConstructionId,
     /// Test-only acknowledgement sent just before a bind's first read of the
     /// surface handle slot (it reads the slot, then claims it to write).
     #[cfg(test)]
@@ -440,6 +442,7 @@ impl McpRouterAdapter {
         let held_surface_lineages = router.held_surface_lineages();
         let surface_ownership = router.surface_ownership_slot();
         let close_index = router.close_index();
+        let construction = router.construction_id();
         let (shutdown_report, report) = tokio::sync::watch::channel(None);
         Self {
             router: AsyncRwLock::new(Some(router)),
@@ -457,9 +460,18 @@ impl McpRouterAdapter {
             shutdown_report: std::sync::Mutex::new(Some(shutdown_report)),
             shutdown_observer: McpRouterShutdownObserver { report },
             close_index,
+            construction,
             #[cfg(test)]
             bind_claim_attempt: std::sync::Mutex::new(None),
         }
+    }
+
+    /// The construction identity of this adapter's router
+    /// ([`McpRouter::construction_id`]): the
+    /// [`crate::McpAttemptKey::construction`] of its attempts.
+    #[must_use]
+    pub fn construction_id(&self) -> crate::McpConstructionId {
+        self.construction
     }
 
     fn execution_authority_key(&self) -> String {
@@ -1880,6 +1892,10 @@ mod shutdown_observer_tests;
 #[cfg(all(test, unix))]
 #[path = "stdio_diagnostics_tests.rs"]
 mod stdio_diagnostics_tests;
+
+#[cfg(all(test, unix))]
+#[path = "attempt_guard_tests.rs"]
+mod attempt_guard_tests;
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]

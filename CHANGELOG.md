@@ -67,6 +67,35 @@ them.
   - The model's setup-failure notice is unchanged and carries no class.
   - `meerkat_core::redact::redact_secret_shapes` is the line-preserving
     redaction helper. `panic_safe_detail` output is unchanged.
+- `meerkat-mcp`, `meerkat`: host attempt guards for stdio MCP servers. A
+  host builds one `McpAttemptGuards` installation around its
+  `McpAttemptGuardFactory` and passes it to the routers it builds
+  (`McpRouter::with_attempt_guards`, or
+  `AgentFactory::with_mcp_attempt_guards` for each construction's own
+  router, owned by its session and mob member).
+  - Begin is called only for stdio attempts, before the attempt's secret
+    resolution, attachment control entry or spawn. HTTP and SSE attempts
+    are neither guarded nor refused by it.
+  - A begin refusal refuses the attempt with nothing spawned; `Ok(None)`
+    lets it proceed unguarded. Both are recorded as a `Begin` completion.
+  - A guard is finished exactly once: `settle` when its attempt's
+    connection was installed, `cancel` otherwise, once both the open
+    outcome (`McpAttemptOpenOutcome`) and how the process ended
+    (`McpAttemptProcessEnd`) are known.
+  - A begin is never dropped. When its attempt stops waiting (the begin
+    bound, a router stop or drop, the attempt dropped, or the installation
+    closing), the attempt's `McpAttemptCancellation` is requested with its
+    cause, and a guard returned later is cancelled.
+  - Before the next begin for the same owner (mob member, else session) and
+    server, the router awaits that pair's running begins and started
+    finishes, bounded by the settle bound. It never waits for a live
+    process. A finish still running then refuses the attempt
+    (`PriorGuardUnsettled`).
+  - `McpRouterShutdownReport::guards` reports the router's guard calls;
+    `McpAttemptGuards::close_and_join` joins and reports the rest, those of
+    dropped routers included. Bounds default to 10 s to begin and 5 s to
+    cancel or settle, at most 60 s each.
+  - Without an installation nothing changes.
 
 ### Changed
 

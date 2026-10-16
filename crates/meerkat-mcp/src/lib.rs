@@ -5,6 +5,7 @@
 mod adapter;
 pub mod apps;
 mod attempt;
+mod attempt_guard;
 mod checked_route;
 mod client_service;
 mod connect_attempt;
@@ -22,6 +23,14 @@ mod transport;
 pub use adapter::McpRouterAdapter;
 pub use adapter::{McpNotReady, McpReloadFailure, McpReloadReport};
 pub use adapter::{McpRouterShutdownObservation, McpRouterShutdownObserver};
+pub use attempt_guard::{
+    McpAttemptCancelCause, McpAttemptCancellation, McpAttemptDisposition, McpAttemptGuard,
+    McpAttemptGuardBounds, McpAttemptGuardBoundsError, McpAttemptGuardFactory,
+    McpAttemptGuardRequest, McpAttemptGuards, McpAttemptKey, McpAttemptNotInstalled,
+    McpAttemptOpenOutcome, McpAttemptOperation, McpAttemptProcessEnd, McpAttemptRefusal,
+    McpConstructionId, McpConstructionOwner, McpGuardCompletion, McpGuardCompletionRecord,
+    McpGuardFinishError, McpGuardStage,
+};
 pub use checked_route::{CheckedMcpRoute, CheckedMcpRouteError, CheckedMcpRouteSpec};
 pub use client_service::McpClientServiceFactory;
 pub use connect_attempt::{

@@ -2774,6 +2774,10 @@ pub struct AgentFactory {
     /// adapter, adopted before anything is staged.
     #[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
     mcp_adapter_custody: Option<Arc<dyn McpAdapterCustody>>,
+    /// The host's attempt guards, installed on each construction's own MCP
+    /// router with that construction's session and mob member.
+    #[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
+    mcp_attempt_guards: Option<meerkat_mcp::McpAttemptGuards>,
     #[cfg(feature = "comms")]
     pub enable_comms: bool,
     pub enable_memory: bool,
@@ -4045,6 +4049,8 @@ impl AgentFactory {
             mcp_adapter_composer: None,
             #[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
             mcp_adapter_custody: None,
+            #[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
+            mcp_attempt_guards: None,
             #[cfg(feature = "comms")]
             enable_comms: false,
             enable_memory: false,
@@ -4237,6 +4243,8 @@ impl AgentFactory {
             mcp_adapter_composer: None,
             #[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
             mcp_adapter_custody: None,
+            #[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
+            mcp_attempt_guards: None,
             #[cfg(feature = "comms")]
             enable_comms: false,
             enable_memory: false,
@@ -4656,6 +4664,20 @@ impl AgentFactory {
     #[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
     pub fn with_mcp_adapter_custody(mut self, custody: Arc<dyn McpAdapterCustody>) -> Self {
         self.mcp_adapter_custody = Some(custody);
+        self
+    }
+
+    /// Guard every stdio MCP server attempt of each construction's own
+    /// router with the host's installation (see
+    /// [`meerkat_mcp::McpAttemptGuards`]), for that construction's session
+    /// and mob member. Remote (HTTP and SSE) attempts are neither guarded
+    /// nor refused by it. Routers a host builds itself and passes in as
+    /// external tools are not covered: install the guards on them with
+    /// [`meerkat_mcp::McpRouter::with_attempt_guards`].
+    #[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
+    #[must_use]
+    pub fn with_mcp_attempt_guards(mut self, guards: meerkat_mcp::McpAttemptGuards) -> Self {
+        self.mcp_attempt_guards = Some(guards);
         self
     }
 
@@ -7742,6 +7764,17 @@ impl AgentFactory {
                 }
                 _ => None,
             };
+            // The host's attempt guards begin for every stdio attempt of this
+            // construction, which acts for its session and mob member.
+            if let Some(guards) = &self.mcp_attempt_guards {
+                router = router.with_attempt_guards(
+                    guards.clone(),
+                    meerkat_mcp::McpConstructionOwner::new(
+                        session.id().clone(),
+                        build_config.mob_member_binding.clone(),
+                    ),
+                );
+            }
             // The construction owns the router from here: its cleanup is
             // armed before anything is staged or connected, so abandoning the
             // construction at any later await shuts those connections down.
@@ -22408,6 +22441,217 @@ mod prepared_agent_tests {
             }
             other => panic!("the shutdown reported: {other:?}"),
         }
+    }
+
+    /// A recording attempt-guard factory for the facade tests.
+    #[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
+    #[derive(Default)]
+    struct RecordingGuards {
+        requests: std::sync::Mutex<Vec<meerkat_mcp::McpAttemptGuardRequest>>,
+        finishes: std::sync::Mutex<Vec<(bool, meerkat_mcp::McpAttemptDisposition)>>,
+    }
+
+    #[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
+    struct RecordingGuard(Arc<RecordingGuards>);
+
+    #[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
+    #[async_trait::async_trait]
+    impl meerkat_mcp::McpAttemptGuard for RecordingGuard {
+        async fn settle(
+            self: Box<Self>,
+            disposition: meerkat_mcp::McpAttemptDisposition,
+        ) -> Result<(), meerkat_mcp::McpGuardFinishError> {
+            self.0.finishes.lock().unwrap().push((true, disposition));
+            Ok(())
+        }
+        async fn cancel(
+            self: Box<Self>,
+            disposition: meerkat_mcp::McpAttemptDisposition,
+        ) -> Result<(), meerkat_mcp::McpGuardFinishError> {
+            self.0.finishes.lock().unwrap().push((false, disposition));
+            Ok(())
+        }
+    }
+
+    #[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
+    struct RecordingGuardFactory(Arc<RecordingGuards>);
+
+    #[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
+    #[async_trait::async_trait]
+    impl meerkat_mcp::McpAttemptGuardFactory for RecordingGuardFactory {
+        async fn begin(
+            &self,
+            request: meerkat_mcp::McpAttemptGuardRequest,
+            _cancel: meerkat_mcp::McpAttemptCancellation,
+        ) -> Result<
+            Option<Box<dyn meerkat_mcp::McpAttemptGuard>>,
+            meerkat_core::mcp_attachment::McpAttachmentRefusal,
+        > {
+            self.0.requests.lock().unwrap().push(request);
+            Ok(Some(Box::new(RecordingGuard(Arc::clone(&self.0)))))
+        }
+    }
+
+    #[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
+    fn recording_guards() -> (Arc<RecordingGuards>, meerkat_mcp::McpAttemptGuards) {
+        let recording = Arc::new(RecordingGuards::default());
+        let guards = meerkat_mcp::McpAttemptGuards::new(
+            Arc::new(RecordingGuardFactory(Arc::clone(&recording))),
+            meerkat_mcp::McpAttemptGuardBounds::DEFAULT,
+        );
+        (recording, guards)
+    }
+
+    /// r1 15: each configured stdio server of a construction gets a guard
+    /// request whose construction id is the adopted adapter's, for the
+    /// construction's session and mob member.
+    #[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
+    #[tokio::test]
+    async fn configured_servers_begin_guards_for_the_adopted_construction() {
+        #[derive(Default)]
+        struct Adopting {
+            adopted: std::sync::Mutex<Vec<Arc<meerkat_mcp::McpRouterAdapter>>>,
+        }
+        impl McpAdapterCustody for Adopting {
+            fn adopt(
+                &self,
+                adapter: &Arc<meerkat_mcp::McpRouterAdapter>,
+            ) -> Result<(), McpAdapterCustodyClosed> {
+                self.adopted.lock().unwrap().push(Arc::clone(adapter));
+                Ok(())
+            }
+        }
+        let custody = Arc::new(Adopting::default());
+        let (recording, guards) = recording_guards();
+        let snapshots = Arc::new(AtomicUsize::new(0));
+        let factory = AgentFactory::minimal()
+            .builtins(true)
+            .with_mcp_adapter_custody(Arc::clone(&custody) as Arc<dyn McpAdapterCustody>)
+            .with_mcp_attempt_guards(guards.clone());
+        let build = mcp_fixture_build(&snapshots);
+        let member = build.mob_member_binding.clone();
+        let prepared = factory
+            .prepare_agent(build, &Config::default())
+            .await
+            .expect("prepared");
+        let adapter = Arc::clone(&custody.adopted.lock().unwrap()[0]);
+        let requests = recording.requests.lock().unwrap().clone();
+        assert_eq!(requests.len(), 1, "one configured server, one attempt");
+        assert_eq!(requests[0].key.server, "fixture");
+        assert_eq!(requests[0].key.construction, adapter.construction_id());
+        assert_eq!(requests[0].owner.member, member);
+        prepared.abort().await;
+        let _ = guards
+            .close_and_join(tokio::time::Instant::now() + std::time::Duration::from_secs(30))
+            .await;
+    }
+
+    /// r1 16: a rebuild keeps the session and changes the construction; a
+    /// reset changes both and keeps the mob member.
+    #[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
+    #[tokio::test]
+    async fn a_rebuild_and_a_reset_change_the_construction() {
+        let (recording, guards) = recording_guards();
+        let snapshots = Arc::new(AtomicUsize::new(0));
+        let factory = AgentFactory::minimal()
+            .builtins(true)
+            .with_mcp_attempt_guards(guards.clone());
+        // One registration: its session's constructions are rebuilds.
+        let runtime = meerkat_runtime::MeerkatMachine::ephemeral();
+        let session = meerkat_core::Session::new();
+        let bindings = runtime
+            .prepare_bindings(session.id().clone())
+            .await
+            .unwrap();
+        let registered = || {
+            let mut build = mcp_fixture_build(&snapshots);
+            build.resume_session = Some(session.clone());
+            build.runtime_build_mode =
+                meerkat_core::RuntimeBuildMode::SessionOwned(bindings.clone());
+            build
+        };
+        factory
+            .prepare_agent(registered(), &Config::default())
+            .await
+            .expect("first")
+            .abort()
+            .await;
+        factory
+            .prepare_agent(registered(), &Config::default())
+            .await
+            .expect("rebuild")
+            .abort()
+            .await;
+        factory
+            .prepare_agent(mcp_fixture_build(&snapshots), &Config::default())
+            .await
+            .expect("reset")
+            .abort()
+            .await;
+        let requests = recording.requests.lock().unwrap().clone();
+        assert_eq!(requests.len(), 3);
+        let (first, rebuild, reset) = (&requests[0], &requests[1], &requests[2]);
+        assert_eq!(first.owner.session_id, *session.id());
+        assert_eq!(rebuild.owner.session_id, first.owner.session_id);
+        assert_ne!(rebuild.key.construction, first.key.construction);
+        assert_ne!(reset.owner.session_id, first.owner.session_id);
+        assert_ne!(reset.key.construction, rebuild.key.construction);
+        assert_eq!(reset.owner.member, first.owner.member);
+        let _ = guards
+            .close_and_join(tokio::time::Instant::now() + std::time::Duration::from_secs(30))
+            .await;
+    }
+
+    /// r1 17: aborting a prepared agent finishes every guard; dropping it
+    /// finishes them in the background, and the installation reports them.
+    #[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
+    #[tokio::test]
+    async fn an_aborted_or_dropped_prepared_agent_finishes_its_guards() {
+        let (recording, guards) = recording_guards();
+        let snapshots = Arc::new(AtomicUsize::new(0));
+        let factory = AgentFactory::minimal()
+            .builtins(true)
+            .with_mcp_attempt_guards(guards.clone());
+        factory
+            .prepare_agent(mcp_fixture_build(&snapshots), &Config::default())
+            .await
+            .expect("prepared")
+            .abort()
+            .await;
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            while recording.finishes.lock().unwrap().is_empty() {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the aborted construction's guard finished");
+        assert!(
+            recording.finishes.lock().unwrap()[0].0,
+            "an installed attempt settles"
+        );
+        drop(
+            factory
+                .prepare_agent(mcp_fixture_build(&snapshots), &Config::default())
+                .await
+                .expect("prepared"),
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            while recording.finishes.lock().unwrap().len() < 2 {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the dropped construction's guard finished in the background");
+        let dropped = recording.requests.lock().unwrap()[1].key.clone();
+        let records = guards
+            .close_and_join(tokio::time::Instant::now() + std::time::Duration::from_secs(30))
+            .await;
+        assert!(
+            records.iter().any(|record| record.key == dropped
+                && record.stage == meerkat_mcp::McpGuardStage::Settle
+                && record.completion == meerkat_mcp::McpGuardCompletion::Completed),
+            "the installation reports the dropped construction's settle: {records:#?}"
+        );
     }
 
     /// A session-owned construction installs its MCP adapter into its
