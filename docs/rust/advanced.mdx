@@ -325,7 +325,9 @@ let retry = RetryPolicy {
     call_timeout: None,
     // Per-stream inactivity watchdog (default 300s, on). A stream that
     // reports no events for the window aborts with the retryable
-    // `StreamStalled` failure. `None` disables the watchdog.
+    // `StreamStalled` failure. `None` disables the watchdog. Factory-built
+    // agents use the model's own window instead while `[retry]
+    // stream_inactivity_timeout` is omitted.
     stream_inactivity_timeout: Some(Duration::from_secs(300)),
 };
 ```

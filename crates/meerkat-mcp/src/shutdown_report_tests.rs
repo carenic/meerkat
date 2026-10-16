@@ -9,9 +9,10 @@ use crate::connection::CustodyNotHeld;
 use std::collections::HashMap;
 
 fn surface_router() -> McpRouter {
-    McpRouter::new_with_surface_handle(Arc::new(
-        meerkat_runtime::RuntimeExternalToolSurfaceHandle::ephemeral(),
-    ))
+    McpRouter::new_with_surface_handle_and_stdio_profile(
+        Arc::new(meerkat_runtime::RuntimeExternalToolSurfaceHandle::ephemeral()),
+        crate::McpStdioLaunchProfile::trusted_host(),
+    )
 }
 
 #[cfg(unix)]

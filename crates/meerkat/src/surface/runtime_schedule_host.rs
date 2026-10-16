@@ -25,6 +25,14 @@ use meerkat_core::types::{ContentInput, SessionId};
 use meerkat_runtime::MeerkatMachine;
 use meerkat_schedule::{IdentityTargetBinding, ScheduleDeliveryIdentity, ScheduleRunnableHost};
 
+/// Spawn a runtime-backed schedule host that delivers session targets
+/// through `service` and reports mob targets as unsupported.
+///
+/// The host's session host holds `service` and stays attached to
+/// `schedule_service` for as long as any clone of it lives. An embedder that
+/// tears the session service down while its process keeps running clears the
+/// factory builder's `default_schedule_tools` slot afterwards; see
+/// [`spawn_schedule_host`].
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_runtime_backed_schedule_host<B: SessionAgentBuilder + 'static>(
     service: Arc<PersistentSessionService<B>>,
@@ -64,6 +72,13 @@ pub fn spawn_runtime_backed_schedule_host<B: SessionAgentBuilder + 'static>(
 /// through this host's occurrence driver; `None` leaves host-runnable
 /// targets probing as missing (the schedule's `MissingTargetPolicy` then
 /// applies).
+///
+/// `service` (through the host's session host) and `mob_host` stay attached
+/// to `schedule_service` for as long as any clone of it lives, and agent
+/// schedule tools in the factory builder's `default_schedule_tools` slot
+/// hold such a clone. An embedder that tears them down while its process
+/// keeps running clears that slot, and any registry of its own that holds
+/// the mob state, after teardown succeeds; see [`spawn_schedule_host`].
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_runtime_backed_schedule_host_with_mobs<B: SessionAgentBuilder + 'static>(
     service: Arc<PersistentSessionService<B>>,
@@ -97,7 +112,8 @@ pub fn spawn_runtime_backed_schedule_host_with_mobs<B: SessionAgentBuilder + 'st
 /// executor attachment and completes its admission, it announces
 /// [`crate::ContinuationHostBindings::source_custody_changed`], so the
 /// delivery owners retry the rows they hold blocked. The announcement grants
-/// nothing: they read the actual owners again.
+/// nothing: they read the actual owners again. Teardown is as for
+/// [`spawn_runtime_backed_schedule_host_with_mobs`].
 #[cfg(not(target_arch = "wasm32"))]
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_runtime_backed_schedule_host_with_mobs_and_continuations<

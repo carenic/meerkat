@@ -216,7 +216,7 @@ pub async fn handle_export_atif_bounded(
                     "event replay is not enabled for this runtime host",
                 );
             }
-            Err(error) => return RpcResponse::error(id, error.code, error.message),
+            Err(error) => return RpcResponse::from_error(id, error),
         };
         let page_events = page.events;
         let has_more = page.has_more;
@@ -260,7 +260,7 @@ pub async fn handle_export_atif_bounded(
         Some(model) => Some(model),
         None => match runtime.read_session_rich(&session_id).await {
             Ok(info) => info.map(|info| info.model),
-            Err(error) => return RpcResponse::error(id, error.code, error.message),
+            Err(error) => return RpcResponse::from_error(id, error),
         },
     };
     RpcResponse::success(
@@ -619,7 +619,7 @@ pub(crate) async fn create_session_with_params_on_route_and_configured_mcp(
     };
     let effective_config = match runtime.effective_config().await {
         Ok(config) => config,
-        Err(err) => return RpcResponse::error(id, err.code, err.message),
+        Err(err) => return RpcResponse::from_error(id, err),
     };
     // Reconstruct server-owned binding provenance before the shared resolver;
     // clients carry only realm/binding/profile atoms.
@@ -794,7 +794,7 @@ pub(crate) async fn create_session_with_params_on_route_and_configured_mcp(
     let session_id = match created {
         Ok(sid) => sid,
         Err(rpc_err) => {
-            return RpcResponse::error(id, rpc_err.code, rpc_err.message);
+            return RpcResponse::from_error(id, rpc_err);
         }
     };
     // Later recovery or live orchestration of this session rebuilds its
@@ -810,21 +810,16 @@ pub(crate) async fn create_session_with_params_on_route_and_configured_mcp(
     if params.initial_turn != Some(InitialTurn::Deferred)
         && let Err(error) = runtime.ensure_runtime_executor(&session_id).await
     {
-        if let Err(cleanup_error) = runtime.archive_session(&session_id).await {
-            return RpcResponse::error(
-                id,
-                error::INTERNAL_ERROR,
-                format!(
-                    "runtime executor registration failed: {}; staged session cleanup failed: {}",
-                    error.message, cleanup_error.message
-                ),
-            );
-        }
-        return RpcResponse::error(
-            id,
-            error::INTERNAL_ERROR,
-            format!("runtime executor registration failed: {}", error.message),
-        );
+        // The registration failure keeps its typed code and data.
+        let mut error = error;
+        error.message = match runtime.archive_session(&session_id).await {
+            Ok(()) => format!("runtime executor registration failed: {}", error.message),
+            Err(cleanup_error) => format!(
+                "runtime executor registration failed: {}; staged session cleanup failed: {}",
+                error.message, cleanup_error.message
+            ),
+        };
+        return RpcResponse::from_error(id, error);
     }
 
     if let Some(context) = request_context.as_ref() {
@@ -935,7 +930,7 @@ pub(crate) async fn create_session_with_params_on_route_and_configured_mcp(
         {
             Ok(r) => r,
             Err(rpc_err) => {
-                return RpcResponse::error(id, rpc_err.code, rpc_err.message);
+                return RpcResponse::from_error(id, rpc_err);
             }
         }
     };
@@ -1007,7 +1002,7 @@ pub async fn handle_list(
 
     let summaries = match runtime.list_sessions_rich(query).await {
         Ok(s) => s,
-        Err(err) => return RpcResponse::error(id, err.code, err.message),
+        Err(err) => return RpcResponse::from_error(id, err),
     };
     let sessions: Vec<meerkat_contracts::WireSessionSummary> = summaries
         .into_iter()
@@ -1052,7 +1047,7 @@ pub async fn handle_read(
             error::SESSION_NOT_FOUND,
             format!("Session not found: {session_id}"),
         ),
-        Err(err) => RpcResponse::error(id, err.code, err.message),
+        Err(err) => RpcResponse::from_error(id, err),
     }
 }
 
@@ -1429,7 +1424,7 @@ pub async fn handle_archive(
 
     match runtime.archive_session(&session_id).await {
         Ok(()) => RpcResponse::success(id, serde_json::json!({"archived": true})),
-        Err(rpc_err) => RpcResponse::error(id, rpc_err.code, rpc_err.message),
+        Err(rpc_err) => RpcResponse::from_error(id, rpc_err),
     }
 }
 
@@ -1462,6 +1457,6 @@ pub async fn handle_inject_context(
                 status: result.status,
             },
         ),
-        Err(rpc_err) => RpcResponse::error(id, rpc_err.code, rpc_err.message),
+        Err(rpc_err) => RpcResponse::from_error(id, rpc_err),
     }
 }

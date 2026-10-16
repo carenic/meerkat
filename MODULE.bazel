@@ -11,10 +11,20 @@ bazel_dep(name = "rules_rust", version = "0.70.0")
 # MODULE.bazel.lock store those paths workspace-relative and rebases them onto
 # the consuming workspace root when the local_crate_mirror repository is
 # fetched.
+#
+# crate_universe also resolves one feature set per external crate across every
+# dependency kind, dev included, and a crate annotation cannot remove a
+# feature. The second patch moves each feature that
+# scripts/non-shipping-features.json lists under "external_crate_features"
+# (tokio's test-util) into a select on //tools/bazel:release_build, so release
+# builds of the shipped binaries drop it while the test lanes keep it.
 single_version_override(
     module_name = "rules_rust",
     patch_strip = 1,
-    patches = ["//tools/third-party/patches:rules_rust-portable-path-deps.patch"],
+    patches = [
+        "//tools/third-party/patches:rules_rust-portable-path-deps.patch",
+        "//tools/third-party/patches:rules_rust-release-stripped-crate-features.patch",
+    ],
 )
 bazel_dep(name = "rules_shell", version = "0.8.0")
 bazel_dep(name = "platforms", version = "1.1.0")

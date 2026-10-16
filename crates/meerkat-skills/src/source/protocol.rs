@@ -18,53 +18,57 @@ use crate::source::remote::{
     parse_remote_catalog, parse_remote_document,
 };
 
-/// Client that speaks the external skill-source protocol over stdio.
-pub struct StdioExternalClient {
-    command: String,
-    args: Vec<String>,
-    env: BTreeMap<String, String>,
-    cwd: Option<PathBuf>,
-    timeout: Duration,
+/// One run of a stdio skill source's process, as configured: its program,
+/// arguments, environment and working directory.
+#[derive(Clone)]
+pub struct StdioSkillLaunch {
+    pub command: String,
+    pub args: Vec<String>,
+    pub env: BTreeMap<String, String>,
+    pub cwd: Option<PathBuf>,
 }
 
-impl StdioExternalClient {
-    pub fn new(
-        command: impl Into<String>,
-        args: Vec<String>,
-        env: BTreeMap<String, String>,
-        cwd: Option<PathBuf>,
-    ) -> Self {
-        Self {
-            command: command.into(),
-            args,
-            env,
-            cwd,
-            timeout: Duration::from_secs(15),
-        }
-    }
+/// What one run of a stdio skill source's process produced.
+#[derive(Debug)]
+pub struct StdioSkillOutput {
+    pub status: std::process::ExitStatus,
+    pub stdout: String,
+    /// Empty when the run discards the process's diagnostics.
+    pub stderr: String,
+}
 
-    pub fn new_with_timeout(
-        command: impl Into<String>,
-        args: Vec<String>,
-        env: BTreeMap<String, String>,
-        cwd: Option<PathBuf>,
+/// Runs a stdio skill source's process for one request: `input` on its
+/// stdin, until it exits, or until `timeout` passes, when it is killed and
+/// the run fails. A host that confines its local stdio launches (the
+/// `mcp_stdio` launch kind) supplies one that applies that confinement; the
+/// default ([`TrustedHostStdioSkillRunner`]) runs the process as the host.
+#[async_trait::async_trait]
+pub trait StdioSkillRunner: Send + Sync {
+    async fn run(
+        &self,
+        launch: &StdioSkillLaunch,
+        input: &[u8],
         timeout: Duration,
-    ) -> Self {
-        Self {
-            command: command.into(),
-            args,
-            env,
-            cwd,
-            timeout,
-        }
-    }
+    ) -> Result<StdioSkillOutput, SkillError>;
+}
 
-    async fn request(&self, request: &StdioRequest<'_>) -> Result<String, SkillError> {
-        let payload = serde_json::to_vec(request)
-            .map_err(|e| SkillError::Load(format!("stdio request encode failed: {e}").into()))?;
-        let mut command = Command::new(&self.command);
-        command.args(&self.args).envs(&self.env);
-        if let Some(cwd) = &self.cwd {
+/// Runs a stdio skill source's process as the host, unconfined: its
+/// program, with the host's environment and the configured one, in the
+/// configured working directory.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TrustedHostStdioSkillRunner;
+
+#[async_trait::async_trait]
+impl StdioSkillRunner for TrustedHostStdioSkillRunner {
+    async fn run(
+        &self,
+        launch: &StdioSkillLaunch,
+        input: &[u8],
+        timeout: Duration,
+    ) -> Result<StdioSkillOutput, SkillError> {
+        let mut command = Command::new(&launch.command);
+        command.args(&launch.args).envs(&launch.env);
+        if let Some(cwd) = &launch.cwd {
             command.current_dir(cwd);
         }
         command
@@ -105,26 +109,20 @@ impl StdioExternalClient {
                 })
         });
 
-        if let Some(mut stdin) = child.stdin.take() {
-            if let Err(e) = stdin.write_all(&payload).await {
-                let _ = child.kill().await;
-                return Err(SkillError::Load(
-                    format!("stdio skill source write failed: {e}").into(),
-                ));
-            }
-            if let Err(e) = stdin.write_all(b"\n").await {
-                let _ = child.kill().await;
-                return Err(SkillError::Load(
-                    format!("stdio skill source write failed: {e}").into(),
-                ));
-            }
+        if let Some(mut stdin) = child.stdin.take()
+            && let Err(e) = stdin.write_all(input).await
+        {
+            let _ = child.kill().await;
+            return Err(SkillError::Load(
+                format!("stdio skill source write failed: {e}").into(),
+            ));
         }
 
         let status = tokio::select! {
             status = child.wait() => status.map_err(|e| {
                 SkillError::Load(format!("stdio skill source wait failed: {e}").into())
             })?,
-            () = tokio::time::sleep(self.timeout) => {
+            () = tokio::time::sleep(timeout) => {
                 let _ = child.kill().await;
                 let _ = stdout_task.await;
                 let _ = stderr_task.await;
@@ -138,12 +136,79 @@ impl StdioExternalClient {
         let stderr = stderr_task.await.map_err(|e| {
             SkillError::Load(format!("stdio stderr task join failed: {e}").into())
         })??;
-        if !status.success() {
+        Ok(StdioSkillOutput {
+            status,
+            stdout,
+            stderr,
+        })
+    }
+}
+
+/// Client that speaks the external skill-source protocol over stdio.
+pub struct StdioExternalClient {
+    launch: StdioSkillLaunch,
+    timeout: Duration,
+    // A shared runner, which a panic cannot leave half-changed, so the client
+    // stays `UnwindSafe` and `RefUnwindSafe`.
+    runner: std::panic::AssertUnwindSafe<Arc<dyn StdioSkillRunner>>,
+}
+
+impl StdioExternalClient {
+    pub fn new(
+        command: impl Into<String>,
+        args: Vec<String>,
+        env: BTreeMap<String, String>,
+        cwd: Option<PathBuf>,
+    ) -> Self {
+        Self::new_with_timeout(command, args, env, cwd, Duration::from_secs(15))
+    }
+
+    pub fn new_with_timeout(
+        command: impl Into<String>,
+        args: Vec<String>,
+        env: BTreeMap<String, String>,
+        cwd: Option<PathBuf>,
+        timeout: Duration,
+    ) -> Self {
+        Self {
+            launch: StdioSkillLaunch {
+                command: command.into(),
+                args,
+                env,
+                cwd,
+            },
+            timeout,
+            runner: std::panic::AssertUnwindSafe(Arc::new(TrustedHostStdioSkillRunner)),
+        }
+    }
+
+    /// Run the source's process through `runner`. A host that confines its
+    /// local stdio launches passes one that applies its `mcp_stdio`
+    /// confinement.
+    #[must_use]
+    pub fn with_runner(mut self, runner: Arc<dyn StdioSkillRunner>) -> Self {
+        self.runner = std::panic::AssertUnwindSafe(runner);
+        self
+    }
+
+    async fn request(&self, request: &StdioRequest<'_>) -> Result<String, SkillError> {
+        let mut payload = serde_json::to_vec(request)
+            .map_err(|e| SkillError::Load(format!("stdio request encode failed: {e}").into()))?;
+        payload.push(b'\n');
+        let output = self
+            .runner
+            .run(&self.launch, &payload, self.timeout)
+            .await?;
+        if !output.status.success() {
             return Err(SkillError::Load(
-                format!("stdio skill source exited with {status}: {stderr}").into(),
+                format!(
+                    "stdio skill source exited with {}: {}",
+                    output.status, output.stderr
+                )
+                .into(),
             ));
         }
-        Ok(stdout)
+        Ok(output.stdout)
     }
 }
 
@@ -215,7 +280,7 @@ impl ExternalSkillSource<StdioExternalClient> {
                 &raw,
                 &self.source_uuid,
                 SkillScope::Project,
-                &self.client.command,
+                &self.client.launch.command,
             )
         }) {
             Ok(parsed) => {
@@ -235,7 +300,11 @@ impl ExternalSkillSource<StdioExternalClient> {
                     self.failure_streak.read().map(|f| *f).unwrap_or_default()
                 };
                 if streak >= self.thresholds.unhealthy_failure_streak {
-                    return Err(stale_source_error(&self.client.command, streak, &err));
+                    return Err(stale_source_error(
+                        &self.client.launch.command,
+                        streak,
+                        &err,
+                    ));
                 }
                 if self
                     .cache

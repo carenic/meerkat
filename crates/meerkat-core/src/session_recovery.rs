@@ -571,6 +571,7 @@ pub fn resolve_effective_turn_config(
         // owning surface re-supplies declarative MCP servers on resume (mob
         // members re-derive them from the durable profile).
         mcp_servers: Vec::new(),
+        refused_mcp_servers: Vec::new(),
         recoverable_tool_defs: Some(recoverable_tool_defs.clone()),
         blob_store_override: None,
         llm_client_override: context.llm_client_override,
@@ -684,6 +685,7 @@ pub fn resolve_effective_turn_config(
             .shell_env
             .clone()
             .or_else(|| build_state.shell_env.clone()),
+        shell_timeout_secs: build_state.shell_timeout_secs,
         mob_tool_authority_context: None,
         call_timeout_override: build_state.call_timeout_override,
         resume_override_mask,
@@ -820,6 +822,7 @@ mod tests {
                     "MEERKAT_MODE".to_string(),
                     "test".to_string(),
                 )])),
+                shell_timeout_secs: std::num::NonZeroU64::new(7),
                 mob_tool_authority_context: Some(
                     crate::service::MobToolAuthorityContext::generated_for_test(
                         crate::service::OpaquePrincipalToken::new("persisted-authority"),
@@ -994,6 +997,7 @@ mod tests {
             build.call_timeout_override,
             CallTimeoutOverride::Value(Duration::from_secs(42))
         );
+        assert_eq!(build.shell_timeout_secs, std::num::NonZeroU64::new(7));
         assert_eq!(
             build
                 .budget_limits

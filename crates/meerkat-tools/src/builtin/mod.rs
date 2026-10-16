@@ -233,6 +233,15 @@ pub trait BuiltinTool: Send + Sync {
         meerkat_core::approval::review::ReviewEntrySupport::Unsupported
     }
 
+    /// The typed builtin operation this tool implementation declares, if
+    /// any. Its registration owner (the composite dispatcher) states it as
+    /// the call's [`meerkat_core::ToolOperationTarget::BuiltinOperation`]
+    /// and revalidates it at dispatch. The default declares none: the tool's
+    /// plans carry no target, whatever the tool is named.
+    fn builtin_operation(&self) -> Option<meerkat_core::BuiltinToolOperation> {
+        None
+    }
+
     /// Async operation IDs started by this tool call, if any.
     ///
     /// Default is none. Tools that start background or delegated work should

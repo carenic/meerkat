@@ -10,7 +10,7 @@ impl SessionServiceRuntimeExt for MeerkatMachine {
         session_id: &SessionId,
         input: Input,
     ) -> Result<AcceptOutcome, RuntimeDriverError> {
-        match self
+        let result = self
             .execute_meerkat_machine_command(
                 None,
                 MeerkatMachineCommand::AcceptWithCompletion {
@@ -22,18 +22,19 @@ impl SessionServiceRuntimeExt for MeerkatMachine {
                     expected_attachment: None,
                 },
             )
-            .await
-            .map_err(MeerkatMachine::driver_error_from_command_error)?
-        {
-            MeerkatMachineCommandResult::AcceptWithCompletion {
-                outcome,
-                handle: _,
-                admission_signal: _,
-            } => Ok(outcome),
-            other => Err(RuntimeDriverError::Internal(format!(
-                "unexpected MeerkatMachineCommandResult for SessionServiceRuntimeExt::accept_input: {other:?}"
-            ))),
-        }
+            .await;
+        MeerkatMachine::driver_command_answer(
+            result,
+            "SessionServiceRuntimeExt::accept_input",
+            |result| match result {
+                MeerkatMachineCommandResult::AcceptWithCompletion {
+                    outcome,
+                    handle: _,
+                    admission_signal: _,
+                } => Ok(outcome),
+                other => Err(Box::new(other)),
+            },
+        )
     }
 
     async fn accept_input_with_completion(
@@ -56,19 +57,20 @@ impl SessionServiceRuntimeExt for MeerkatMachine {
         session_id: &SessionId,
     ) -> Result<RuntimeState, RuntimeDriverError> {
         let runtime_id = MeerkatMachine::logical_runtime_id(session_id);
-        match self
+        let result = self
             .execute_meerkat_machine_command(
                 None,
                 MeerkatMachineCommand::RuntimeState { runtime_id },
             )
-            .await
-            .map_err(MeerkatMachine::driver_error_from_command_error)?
-        {
-            MeerkatMachineCommandResult::RuntimeState(state) => Ok(state),
-            other => Err(RuntimeDriverError::Internal(format!(
-                "unexpected MeerkatMachineCommandResult for SessionServiceRuntimeExt::runtime_state: {other:?}"
-            ))),
-        }
+            .await;
+        MeerkatMachine::driver_command_answer(
+            result,
+            "SessionServiceRuntimeExt::runtime_state",
+            |result| match result {
+                MeerkatMachineCommandResult::RuntimeState(state) => Ok(state),
+                other => Err(Box::new(other)),
+            },
+        )
     }
 
     async fn retire_runtime(
@@ -76,16 +78,17 @@ impl SessionServiceRuntimeExt for MeerkatMachine {
         session_id: &SessionId,
     ) -> Result<RetireReport, RuntimeDriverError> {
         let runtime_id = MeerkatMachine::logical_runtime_id(session_id);
-        match self
+        let result = self
             .execute_meerkat_machine_command(None, MeerkatMachineCommand::Retire { runtime_id })
-            .await
-            .map_err(MeerkatMachine::driver_error_from_command_error)?
-        {
-            MeerkatMachineCommandResult::RetireReport(report) => Ok(report),
-            other => Err(RuntimeDriverError::Internal(format!(
-                "unexpected MeerkatMachineCommandResult for SessionServiceRuntimeExt::retire_runtime: {other:?}"
-            ))),
-        }
+            .await;
+        MeerkatMachine::driver_command_answer(
+            result,
+            "SessionServiceRuntimeExt::retire_runtime",
+            |result| match result {
+                MeerkatMachineCommandResult::RetireReport(report) => Ok(report),
+                other => Err(Box::new(other)),
+            },
+        )
     }
 
     async fn reset_runtime(
@@ -93,16 +96,17 @@ impl SessionServiceRuntimeExt for MeerkatMachine {
         session_id: &SessionId,
     ) -> Result<ResetReport, RuntimeDriverError> {
         let runtime_id = MeerkatMachine::logical_runtime_id(session_id);
-        match self
+        let result = self
             .execute_meerkat_machine_command(None, MeerkatMachineCommand::Reset { runtime_id })
-            .await
-            .map_err(MeerkatMachine::driver_error_from_command_error)?
-        {
-            MeerkatMachineCommandResult::ResetReport(report) => Ok(report),
-            other => Err(RuntimeDriverError::Internal(format!(
-                "unexpected MeerkatMachineCommandResult for SessionServiceRuntimeExt::reset_runtime: {other:?}"
-            ))),
-        }
+            .await;
+        MeerkatMachine::driver_command_answer(
+            result,
+            "SessionServiceRuntimeExt::reset_runtime",
+            |result| match result {
+                MeerkatMachineCommandResult::ResetReport(report) => Ok(report),
+                other => Err(Box::new(other)),
+            },
+        )
     }
 
     async fn input_state(
@@ -110,7 +114,7 @@ impl SessionServiceRuntimeExt for MeerkatMachine {
         session_id: &SessionId,
         input_id: &InputId,
     ) -> Result<Option<StoredInputState>, RuntimeDriverError> {
-        match self
+        let result = self
             .execute_meerkat_machine_command(
                 None,
                 MeerkatMachineCommand::InputState {
@@ -118,18 +122,15 @@ impl SessionServiceRuntimeExt for MeerkatMachine {
                     input_id: input_id.clone(),
                 },
             )
-            .await
-            .map_err(MeerkatMachine::driver_error_from_command_error)?
-        {
-            // A public row read releases its result payload only to a reader
-            // the input's scoped destination permits; lifecycle facts stay.
-            MeerkatMachineCommandResult::InputState(state) => {
-                Ok(self.release_public_row(session_id, state).await)
-            }
-            other => Err(RuntimeDriverError::Internal(format!(
-                "unexpected MeerkatMachineCommandResult for SessionServiceRuntimeExt::input_state: {other:?}"
-            ))),
-        }
+            .await;
+        crate::stack_relief::box_in_own_frame(|| {
+            self.input_state_command_result(
+                session_id,
+                "SessionServiceRuntimeExt::input_state",
+                result,
+            )
+        })
+        .await
     }
 
     async fn input_terminal_completion(
@@ -209,7 +210,7 @@ impl SessionServiceRuntimeExt for MeerkatMachine {
         session_id: &SessionId,
         idempotency_key: &str,
     ) -> Result<Option<StoredInputState>, RuntimeDriverError> {
-        match self
+        let result = self
             .execute_meerkat_machine_command(
                 None,
                 MeerkatMachineCommand::InputStateByIdempotencyKey {
@@ -217,18 +218,15 @@ impl SessionServiceRuntimeExt for MeerkatMachine {
                     idempotency_key: idempotency_key.to_string(),
                 },
             )
-            .await
-            .map_err(MeerkatMachine::driver_error_from_command_error)?
-        {
-            // A public row read releases its result payload only to a reader
-            // the input's scoped destination permits; lifecycle facts stay.
-            MeerkatMachineCommandResult::InputState(state) => {
-                Ok(self.release_public_row(session_id, state).await)
-            }
-            other => Err(RuntimeDriverError::Internal(format!(
-                "unexpected MeerkatMachineCommandResult for SessionServiceRuntimeExt::input_state_by_idempotency_key: {other:?}"
-            ))),
-        }
+            .await;
+        crate::stack_relief::box_in_own_frame(|| {
+            self.input_state_command_result(
+                session_id,
+                "SessionServiceRuntimeExt::input_state_by_idempotency_key",
+                result,
+            )
+        })
+        .await
     }
 
     async fn durable_input_state_by_idempotency_key(
@@ -236,7 +234,7 @@ impl SessionServiceRuntimeExt for MeerkatMachine {
         session_id: &SessionId,
         idempotency_key: &str,
     ) -> Result<Option<StoredInputState>, RuntimeDriverError> {
-        match self
+        let result = self
             .execute_meerkat_machine_command(
                 None,
                 MeerkatMachineCommand::DurableInputStateByIdempotencyKey {
@@ -244,18 +242,15 @@ impl SessionServiceRuntimeExt for MeerkatMachine {
                     idempotency_key: idempotency_key.to_string(),
                 },
             )
-            .await
-            .map_err(MeerkatMachine::driver_error_from_command_error)?
-        {
-            // A public row read releases its result payload only to a reader
-            // the input's scoped destination permits; lifecycle facts stay.
-            MeerkatMachineCommandResult::InputState(state) => {
-                Ok(self.release_public_row(session_id, state).await)
-            }
-            other => Err(RuntimeDriverError::Internal(format!(
-                "unexpected MeerkatMachineCommandResult for SessionServiceRuntimeExt::durable_input_state_by_idempotency_key: {other:?}"
-            ))),
-        }
+            .await;
+        crate::stack_relief::box_in_own_frame(|| {
+            self.input_state_command_result(
+                session_id,
+                "SessionServiceRuntimeExt::durable_input_state_by_idempotency_key",
+                result,
+            )
+        })
+        .await
     }
 
     async fn interaction_terminal_status(
@@ -266,7 +261,7 @@ impl SessionServiceRuntimeExt for MeerkatMachine {
         Option<crate::terminal_status::Sourced<crate::terminal_status::InteractionTerminalReport>>,
         RuntimeDriverError,
     > {
-        match self
+        let result = self
             .execute_meerkat_machine_command(
                 None,
                 MeerkatMachineCommand::InteractionTerminalStatus {
@@ -274,14 +269,15 @@ impl SessionServiceRuntimeExt for MeerkatMachine {
                     selector,
                 },
             )
-            .await
-            .map_err(MeerkatMachine::driver_error_from_command_error)?
-        {
-            MeerkatMachineCommandResult::InteractionTerminalStatus(report) => Ok(report),
-            other => Err(RuntimeDriverError::Internal(format!(
-                "unexpected MeerkatMachineCommandResult for SessionServiceRuntimeExt::interaction_terminal_status: {other:?}"
-            ))),
-        }
+            .await;
+        MeerkatMachine::driver_command_answer(
+            result,
+            "SessionServiceRuntimeExt::interaction_terminal_status",
+            |result| match result {
+                MeerkatMachineCommandResult::InteractionTerminalStatus(report) => Ok(report),
+                other => Err(Box::new(other)),
+            },
+        )
     }
 
     async fn run_terminal_status(
@@ -292,7 +288,7 @@ impl SessionServiceRuntimeExt for MeerkatMachine {
         crate::terminal_status::Sourced<crate::terminal_status::RunTerminalReport>,
         RuntimeDriverError,
     > {
-        match self
+        let result = self
             .execute_meerkat_machine_command(
                 None,
                 MeerkatMachineCommand::RunTerminalStatus {
@@ -300,35 +296,37 @@ impl SessionServiceRuntimeExt for MeerkatMachine {
                     run_id: run_id.clone(),
                 },
             )
-            .await
-            .map_err(MeerkatMachine::driver_error_from_command_error)?
-        {
-            MeerkatMachineCommandResult::RunTerminalStatus(report) => Ok(report),
-            other => Err(RuntimeDriverError::Internal(format!(
-                "unexpected MeerkatMachineCommandResult for SessionServiceRuntimeExt::run_terminal_status: {other:?}"
-            ))),
-        }
+            .await;
+        MeerkatMachine::driver_command_answer(
+            result,
+            "SessionServiceRuntimeExt::run_terminal_status",
+            |result| match result {
+                MeerkatMachineCommandResult::RunTerminalStatus(report) => Ok(report),
+                other => Err(Box::new(other)),
+            },
+        )
     }
 
     async fn list_active_inputs(
         &self,
         session_id: &SessionId,
     ) -> Result<Vec<InputId>, RuntimeDriverError> {
-        match self
+        let result = self
             .execute_meerkat_machine_command(
                 None,
                 MeerkatMachineCommand::ListActiveInputs {
                     session_id: session_id.clone(),
                 },
             )
-            .await
-            .map_err(MeerkatMachine::driver_error_from_command_error)?
-        {
-            MeerkatMachineCommandResult::ActiveInputs(inputs) => Ok(inputs),
-            other => Err(RuntimeDriverError::Internal(format!(
-                "unexpected MeerkatMachineCommandResult for SessionServiceRuntimeExt::list_active_inputs: {other:?}"
-            ))),
-        }
+            .await;
+        MeerkatMachine::driver_command_answer(
+            result,
+            "SessionServiceRuntimeExt::list_active_inputs",
+            |result| match result {
+                MeerkatMachineCommandResult::ActiveInputs(inputs) => Ok(inputs),
+                other => Err(Box::new(other)),
+            },
+        )
     }
 
     async fn reconfigure_session_llm_identity(
@@ -346,23 +344,24 @@ impl SessionServiceRuntimeExt for MeerkatMachine {
         &self,
         session_id: &SessionId,
     ) -> Result<Option<SessionLlmCapabilitySurface>, RuntimeDriverError> {
-        match self
+        let result = self
             .execute_meerkat_machine_command(
                 None,
                 MeerkatMachineCommand::ResolvedSessionLlmCapabilities {
                     session_id: session_id.clone(),
                 },
             )
-            .await
-            .map_err(MeerkatMachine::driver_error_from_command_error)?
-        {
-            MeerkatMachineCommandResult::ResolvedSessionLlmCapabilities(capabilities) => {
-                Ok(capabilities)
-            }
-            other => Err(RuntimeDriverError::Internal(format!(
-                "unexpected MeerkatMachineCommandResult for SessionServiceRuntimeExt::resolved_session_llm_capabilities: {other:?}"
-            ))),
-        }
+            .await;
+        MeerkatMachine::driver_command_answer(
+            result,
+            "SessionServiceRuntimeExt::resolved_session_llm_capabilities",
+            |result| match result {
+                MeerkatMachineCommandResult::ResolvedSessionLlmCapabilities(capabilities) => {
+                    Ok(capabilities)
+                }
+                other => Err(Box::new(other)),
+            },
+        )
     }
 
     async fn configure_model_routing_baseline(
@@ -371,7 +370,7 @@ impl SessionServiceRuntimeExt for MeerkatMachine {
         baseline_model: meerkat_core::lifecycle::run_primitive::ModelId,
         realtime_capable: bool,
     ) -> Result<(), RuntimeDriverError> {
-        match self
+        let result = self
             .execute_meerkat_machine_command(
                 None,
                 MeerkatMachineCommand::ConfigureModelRoutingBaseline {
@@ -380,35 +379,37 @@ impl SessionServiceRuntimeExt for MeerkatMachine {
                     realtime_capable,
                 },
             )
-            .await
-            .map_err(MeerkatMachine::driver_error_from_command_error)?
-        {
-            MeerkatMachineCommandResult::Unit => Ok(()),
-            other => Err(RuntimeDriverError::Internal(format!(
-                "unexpected MeerkatMachineCommandResult for SessionServiceRuntimeExt::configure_model_routing_baseline: {other:?}"
-            ))),
-        }
+            .await;
+        MeerkatMachine::driver_command_answer(
+            result,
+            "SessionServiceRuntimeExt::configure_model_routing_baseline",
+            |result| match result {
+                MeerkatMachineCommandResult::Unit => Ok(()),
+                other => Err(Box::new(other)),
+            },
+        )
     }
 
     async fn session_model_routing_status(
         &self,
         session_id: &SessionId,
     ) -> Result<meerkat_core::image_generation::SessionModelRoutingStatus, RuntimeDriverError> {
-        match self
+        let result = self
             .execute_meerkat_machine_command(
                 None,
                 MeerkatMachineCommand::SessionModelRoutingStatus {
                     session_id: session_id.clone(),
                 },
             )
-            .await
-            .map_err(MeerkatMachine::driver_error_from_command_error)?
-        {
-            MeerkatMachineCommandResult::SessionModelRoutingStatus(status) => Ok(status),
-            other => Err(RuntimeDriverError::Internal(format!(
-                "unexpected MeerkatMachineCommandResult for SessionServiceRuntimeExt::session_model_routing_status: {other:?}"
-            ))),
-        }
+            .await;
+        MeerkatMachine::driver_command_answer(
+            result,
+            "SessionServiceRuntimeExt::session_model_routing_status",
+            |result| match result {
+                MeerkatMachineCommandResult::SessionModelRoutingStatus(status) => Ok(status),
+                other => Err(Box::new(other)),
+            },
+        )
     }
 
     async fn request_switch_turn(
@@ -433,7 +434,7 @@ impl SessionServiceRuntimeExt for MeerkatMachine {
         } else {
             None
         };
-        match self
+        let result = self
             .execute_meerkat_machine_command(
                 None,
                 MeerkatMachineCommand::RequestSwitchTurn {
@@ -441,14 +442,15 @@ impl SessionServiceRuntimeExt for MeerkatMachine {
                     request: Box::new(request),
                 },
             )
-            .await
-            .map_err(MeerkatMachine::driver_error_from_command_error)?
-        {
-            MeerkatMachineCommandResult::SwitchTurnControlResult(result) => Ok(result),
-            other => Err(RuntimeDriverError::Internal(format!(
-                "unexpected MeerkatMachineCommandResult for SessionServiceRuntimeExt::request_switch_turn: {other:?}"
-            ))),
-        }
+            .await;
+        MeerkatMachine::driver_command_answer(
+            result,
+            "SessionServiceRuntimeExt::request_switch_turn",
+            |result| match result {
+                MeerkatMachineCommandResult::SwitchTurnControlResult(result) => Ok(result),
+                other => Err(Box::new(other)),
+            },
+        )
     }
 
     async fn committed_model_routing_handoffs_awaiting_decision(
@@ -536,7 +538,7 @@ impl SessionServiceRuntimeExt for MeerkatMachine {
         handoff: crate::meerkat_machine_types::CommittedModelRoutingHandoff,
     ) -> Result<crate::meerkat_machine_types::ModelRoutingHandoffRealization, RuntimeDriverError>
     {
-        match self
+        let result = self
             .execute_meerkat_machine_command(
                 None,
                 MeerkatMachineCommand::RealizeCommittedModelRoutingHandoff {
@@ -544,37 +546,39 @@ impl SessionServiceRuntimeExt for MeerkatMachine {
                     handoff: Box::new(handoff),
                 },
             )
-            .await
-            .map_err(MeerkatMachine::driver_error_from_command_error)?
-        {
-            MeerkatMachineCommandResult::ModelRoutingHandoffRealization(realization) => {
-                Ok(*realization)
-            }
-            other => Err(RuntimeDriverError::Internal(format!(
-                "unexpected MeerkatMachineCommandResult for SessionServiceRuntimeExt::realize_committed_model_routing_handoff_under_turn_finalization_boundary: {other:?}"
-            ))),
-        }
+            .await;
+        MeerkatMachine::driver_command_answer(
+            result,
+            "SessionServiceRuntimeExt::realize_committed_model_routing_handoff_under_turn_finalization_boundary",
+            |result| match result {
+                MeerkatMachineCommandResult::ModelRoutingHandoffRealization(realization) => {
+                    Ok(*realization)
+                }
+                other => Err(Box::new(other)),
+            },
+        )
     }
 
     async fn admit_model_routing_assistant_turn(
         &self,
         session_id: &SessionId,
     ) -> Result<(), RuntimeDriverError> {
-        match self
+        let result = self
             .execute_meerkat_machine_command(
                 None,
                 MeerkatMachineCommand::AdmitModelRoutingAssistantTurn {
                     session_id: session_id.clone(),
                 },
             )
-            .await
-            .map_err(MeerkatMachine::driver_error_from_command_error)?
-        {
-            MeerkatMachineCommandResult::Unit => Ok(()),
-            other => Err(RuntimeDriverError::Internal(format!(
-                "unexpected MeerkatMachineCommandResult for SessionServiceRuntimeExt::admit_model_routing_assistant_turn: {other:?}"
-            ))),
-        }
+            .await;
+        MeerkatMachine::driver_command_answer(
+            result,
+            "SessionServiceRuntimeExt::admit_model_routing_assistant_turn",
+            |result| match result {
+                MeerkatMachineCommandResult::Unit => Ok(()),
+                other => Err(Box::new(other)),
+            },
+        )
     }
 
     async fn begin_image_operation(
@@ -582,7 +586,7 @@ impl SessionServiceRuntimeExt for MeerkatMachine {
         session_id: &SessionId,
         request: crate::meerkat_machine_types::ImageOperationRoutingRequest,
     ) -> Result<crate::meerkat_machine_types::ImageOperationRoutingResult, RuntimeDriverError> {
-        match self
+        let result = self
             .execute_meerkat_machine_command(
                 None,
                 MeerkatMachineCommand::BeginImageOperation {
@@ -590,14 +594,15 @@ impl SessionServiceRuntimeExt for MeerkatMachine {
                     request: Box::new(request),
                 },
             )
-            .await
-            .map_err(MeerkatMachine::driver_error_from_command_error)?
-        {
-            MeerkatMachineCommandResult::ImageOperationRoutingResult(result) => Ok(result),
-            other => Err(RuntimeDriverError::Internal(format!(
-                "unexpected MeerkatMachineCommandResult for SessionServiceRuntimeExt::begin_image_operation: {other:?}"
-            ))),
-        }
+            .await;
+        MeerkatMachine::driver_command_answer(
+            result,
+            "SessionServiceRuntimeExt::begin_image_operation",
+            |result| match result {
+                MeerkatMachineCommandResult::ImageOperationRoutingResult(result) => Ok(result),
+                other => Err(Box::new(other)),
+            },
+        )
     }
 
     async fn deny_image_operation_plan(
@@ -606,7 +611,7 @@ impl SessionServiceRuntimeExt for MeerkatMachine {
         operation_id: meerkat_core::image_generation::ImageOperationId,
         reason: meerkat_core::image_generation::ImageOperationDenialReason,
     ) -> Result<meerkat_core::image_generation::ImageOperationPhase, RuntimeDriverError> {
-        match self
+        let result = self
             .execute_meerkat_machine_command(
                 None,
                 MeerkatMachineCommand::DenyImageOperationPlan {
@@ -615,14 +620,15 @@ impl SessionServiceRuntimeExt for MeerkatMachine {
                     reason,
                 },
             )
-            .await
-            .map_err(MeerkatMachine::driver_error_from_command_error)?
-        {
-            MeerkatMachineCommandResult::ImageOperationPhase(phase) => Ok(phase),
-            other => Err(RuntimeDriverError::Internal(format!(
-                "unexpected MeerkatMachineCommandResult for SessionServiceRuntimeExt::deny_image_operation_plan: {other:?}"
-            ))),
-        }
+            .await;
+        MeerkatMachine::driver_command_answer(
+            result,
+            "SessionServiceRuntimeExt::deny_image_operation_plan",
+            |result| match result {
+                MeerkatMachineCommandResult::ImageOperationPhase(phase) => Ok(phase),
+                other => Err(Box::new(other)),
+            },
+        )
     }
 
     async fn activate_image_operation_override(
@@ -630,7 +636,7 @@ impl SessionServiceRuntimeExt for MeerkatMachine {
         session_id: &SessionId,
         operation_id: meerkat_core::image_generation::ImageOperationId,
     ) -> Result<meerkat_core::image_generation::ImageOperationPhase, RuntimeDriverError> {
-        match self
+        let result = self
             .execute_meerkat_machine_command(
                 None,
                 MeerkatMachineCommand::ActivateImageOperationOverride {
@@ -638,14 +644,15 @@ impl SessionServiceRuntimeExt for MeerkatMachine {
                     operation_id,
                 },
             )
-            .await
-            .map_err(MeerkatMachine::driver_error_from_command_error)?
-        {
-            MeerkatMachineCommandResult::ImageOperationPhase(phase) => Ok(phase),
-            other => Err(RuntimeDriverError::Internal(format!(
-                "unexpected MeerkatMachineCommandResult for SessionServiceRuntimeExt::activate_image_operation_override: {other:?}"
-            ))),
-        }
+            .await;
+        MeerkatMachine::driver_command_answer(
+            result,
+            "SessionServiceRuntimeExt::activate_image_operation_override",
+            |result| match result {
+                MeerkatMachineCommandResult::ImageOperationPhase(phase) => Ok(phase),
+                other => Err(Box::new(other)),
+            },
+        )
     }
 
     async fn complete_image_operation(
@@ -654,7 +661,7 @@ impl SessionServiceRuntimeExt for MeerkatMachine {
         operation_id: meerkat_core::image_generation::ImageOperationId,
         terminal: meerkat_core::image_generation::ImageOperationTerminalClass,
     ) -> Result<meerkat_core::image_generation::ImageOperationPhase, RuntimeDriverError> {
-        match self
+        let result = self
             .execute_meerkat_machine_command(
                 None,
                 MeerkatMachineCommand::CompleteImageOperation {
@@ -663,14 +670,15 @@ impl SessionServiceRuntimeExt for MeerkatMachine {
                     terminal,
                 },
             )
-            .await
-            .map_err(MeerkatMachine::driver_error_from_command_error)?
-        {
-            MeerkatMachineCommandResult::ImageOperationPhase(phase) => Ok(phase),
-            other => Err(RuntimeDriverError::Internal(format!(
-                "unexpected MeerkatMachineCommandResult for SessionServiceRuntimeExt::complete_image_operation: {other:?}"
-            ))),
-        }
+            .await;
+        MeerkatMachine::driver_command_answer(
+            result,
+            "SessionServiceRuntimeExt::complete_image_operation",
+            |result| match result {
+                MeerkatMachineCommandResult::ImageOperationPhase(phase) => Ok(phase),
+                other => Err(Box::new(other)),
+            },
+        )
     }
 
     async fn classify_image_operation_terminal(
@@ -681,7 +689,7 @@ impl SessionServiceRuntimeExt for MeerkatMachine {
         provider_text: meerkat_core::image_generation::ProviderTextDisposition,
     ) -> Result<meerkat_core::image_generation::ImageOperationTerminalClass, RuntimeDriverError>
     {
-        match self
+        let result = self
             .execute_meerkat_machine_command(
                 None,
                 MeerkatMachineCommand::ClassifyImageOperationTerminal {
@@ -691,14 +699,15 @@ impl SessionServiceRuntimeExt for MeerkatMachine {
                     provider_text,
                 },
             )
-            .await
-            .map_err(MeerkatMachine::driver_error_from_command_error)?
-        {
-            MeerkatMachineCommandResult::ImageOperationTerminalClass(terminal) => Ok(terminal),
-            other => Err(RuntimeDriverError::Internal(format!(
-                "unexpected MeerkatMachineCommandResult for SessionServiceRuntimeExt::classify_image_operation_terminal: {other:?}"
-            ))),
-        }
+            .await;
+        MeerkatMachine::driver_command_answer(
+            result,
+            "SessionServiceRuntimeExt::classify_image_operation_terminal",
+            |result| match result {
+                MeerkatMachineCommandResult::ImageOperationTerminalClass(terminal) => Ok(terminal),
+                other => Err(Box::new(other)),
+            },
+        )
     }
 
     async fn restore_image_operation_override(
@@ -706,7 +715,7 @@ impl SessionServiceRuntimeExt for MeerkatMachine {
         session_id: &SessionId,
         operation_id: meerkat_core::image_generation::ImageOperationId,
     ) -> Result<meerkat_core::image_generation::ImageOperationPhase, RuntimeDriverError> {
-        match self
+        let result = self
             .execute_meerkat_machine_command(
                 None,
                 MeerkatMachineCommand::RestoreImageOperationOverride {
@@ -714,14 +723,15 @@ impl SessionServiceRuntimeExt for MeerkatMachine {
                     operation_id,
                 },
             )
-            .await
-            .map_err(MeerkatMachine::driver_error_from_command_error)?
-        {
-            MeerkatMachineCommandResult::ImageOperationPhase(phase) => Ok(phase),
-            other => Err(RuntimeDriverError::Internal(format!(
-                "unexpected MeerkatMachineCommandResult for SessionServiceRuntimeExt::restore_image_operation_override: {other:?}"
-            ))),
-        }
+            .await;
+        MeerkatMachine::driver_command_answer(
+            result,
+            "SessionServiceRuntimeExt::restore_image_operation_override",
+            |result| match result {
+                MeerkatMachineCommandResult::ImageOperationPhase(phase) => Ok(phase),
+                other => Err(Box::new(other)),
+            },
+        )
     }
 }
 
@@ -991,6 +1001,65 @@ impl MeerkatMachine {
                 Self::driver_error_from_control_plane_error(err)
             }
         }
+    }
+
+    /// The handling of an input-row command's result for the trait method
+    /// `method` (`InputState`, `InputStateByIdempotencyKey` or
+    /// `DurableInputStateByIdempotencyKey`), built in its own frame by the
+    /// trait method that awaits the command: at opt-level 0 every move of
+    /// the result and of its input row through `?`, the match and the row
+    /// release reserved a slot of the row's full size in that poll frame,
+    /// which sits beneath the whole command dispatch.
+    async fn input_state_command_result(
+        &self,
+        session_id: &SessionId,
+        method: &str,
+        result: Result<MeerkatMachineCommandResult, MeerkatMachineCommandError>,
+    ) -> Result<Option<StoredInputState>, RuntimeDriverError> {
+        match result.map_err(Self::driver_error_from_command_error)? {
+            // A public row read releases its result payload only to a reader
+            // the input's scoped destination permits; lifecycle facts stay.
+            MeerkatMachineCommandResult::InputState(state) => {
+                Ok(self.release_public_row(session_id, state).await)
+            }
+            other => Err(RuntimeDriverError::Internal(format!(
+                "unexpected MeerkatMachineCommandResult for {method}: {other:?}"
+            ))),
+        }
+    }
+
+    /// The answer of the `SessionServiceRuntimeExt` method `method` from its
+    /// machine command's `result`: the command's error, `answer`'s value for
+    /// the expected result, or an internal error naming any other result
+    /// (which `answer` hands back boxed).
+    /// A plain function the trait method calls after its one await: at
+    /// opt-level 0 every move of the result through `?` and the match
+    /// reserved a slot of the result's full size in the trait method's poll
+    /// frame, which sits beneath the whole command dispatch.
+    fn driver_command_answer<T>(
+        result: Result<MeerkatMachineCommandResult, MeerkatMachineCommandError>,
+        method: &str,
+        answer: impl FnOnce(MeerkatMachineCommandResult) -> Result<T, Box<MeerkatMachineCommandResult>>,
+    ) -> Result<T, RuntimeDriverError> {
+        answer(result.map_err(Self::driver_error_from_command_error)?).map_err(|other| {
+            RuntimeDriverError::Internal(format!(
+                "unexpected MeerkatMachineCommandResult for {method}: {other:?}"
+            ))
+        })
+    }
+
+    /// [`Self::driver_command_answer`] for the `RuntimeControlPlane` method
+    /// `method`.
+    fn control_command_answer<T>(
+        result: Result<MeerkatMachineCommandResult, MeerkatMachineCommandError>,
+        method: &str,
+        answer: impl FnOnce(MeerkatMachineCommandResult) -> Result<T, Box<MeerkatMachineCommandResult>>,
+    ) -> Result<T, RuntimeControlPlaneError> {
+        answer(result.map_err(Self::control_plane_error_from_command_error)?).map_err(|other| {
+            RuntimeControlPlaneError::Internal(format!(
+                "unexpected MeerkatMachineCommandResult for {method}: {other:?}"
+            ))
+        })
     }
 
     pub(super) fn control_plane_error_from_command_error(
@@ -2498,7 +2567,7 @@ impl crate::traits::RuntimeControlPlane for MeerkatMachine {
         runtime_id: &LogicalRuntimeId,
         input: Input,
     ) -> Result<AcceptOutcome, RuntimeControlPlaneError> {
-        match self
+        let result = self
             .execute_meerkat_machine_command(
                 None,
                 MeerkatMachineCommand::Ingest {
@@ -2506,30 +2575,24 @@ impl crate::traits::RuntimeControlPlane for MeerkatMachine {
                     input,
                 },
             )
-            .await
-            .map_err(MeerkatMachine::control_plane_error_from_command_error)?
-        {
+            .await;
+        MeerkatMachine::control_command_answer(result, "ingest", |result| match result {
             MeerkatMachineCommandResult::AcceptOutcome(outcome) => Ok(outcome),
-            other => Err(RuntimeControlPlaneError::Internal(format!(
-                "unexpected MeerkatMachineCommandResult for ingest: {other:?}"
-            ))),
-        }
+            other => Err(Box::new(other)),
+        })
     }
 
     async fn publish_event(
         &self,
         event: crate::runtime_event::RuntimeEventEnvelope,
     ) -> Result<(), RuntimeControlPlaneError> {
-        match self
+        let result = self
             .execute_meerkat_machine_command(None, MeerkatMachineCommand::PublishEvent { event })
-            .await
-            .map_err(MeerkatMachine::control_plane_error_from_command_error)?
-        {
+            .await;
+        MeerkatMachine::control_command_answer(result, "publish_event", |result| match result {
             MeerkatMachineCommandResult::Unit => Ok(()),
-            other => Err(RuntimeControlPlaneError::Internal(format!(
-                "unexpected MeerkatMachineCommandResult for publish_event: {other:?}"
-            ))),
-        }
+            other => Err(Box::new(other)),
+        })
     }
 
     async fn retire(
@@ -2543,105 +2606,90 @@ impl crate::traits::RuntimeControlPlane for MeerkatMachine {
         &self,
         runtime_id: &LogicalRuntimeId,
     ) -> Result<RecycleReport, RuntimeControlPlaneError> {
-        match self
+        let result = self
             .execute_meerkat_machine_command(
                 None,
                 MeerkatMachineCommand::Recycle {
                     runtime_id: runtime_id.clone(),
                 },
             )
-            .await
-            .map_err(MeerkatMachine::control_plane_error_from_command_error)?
-        {
+            .await;
+        MeerkatMachine::control_command_answer(result, "recycle", |result| match result {
             MeerkatMachineCommandResult::RecycleReport(report) => Ok(report),
-            other => Err(RuntimeControlPlaneError::Internal(format!(
-                "unexpected MeerkatMachineCommandResult for recycle: {other:?}"
-            ))),
-        }
+            other => Err(Box::new(other)),
+        })
     }
 
     async fn reset(
         &self,
         runtime_id: &LogicalRuntimeId,
     ) -> Result<crate::traits::ResetReport, RuntimeControlPlaneError> {
-        match self
+        let result = self
             .execute_meerkat_machine_command(
                 None,
                 MeerkatMachineCommand::Reset {
                     runtime_id: runtime_id.clone(),
                 },
             )
-            .await
-            .map_err(MeerkatMachine::control_plane_error_from_command_error)?
-        {
+            .await;
+        MeerkatMachine::control_command_answer(result, "reset", |result| match result {
             MeerkatMachineCommandResult::ResetReport(report) => Ok(report),
-            other => Err(RuntimeControlPlaneError::Internal(format!(
-                "unexpected MeerkatMachineCommandResult for reset: {other:?}"
-            ))),
-        }
+            other => Err(Box::new(other)),
+        })
     }
 
     async fn recover(
         &self,
         runtime_id: &LogicalRuntimeId,
     ) -> Result<RecoveryReport, RuntimeControlPlaneError> {
-        match self
+        let result = self
             .execute_meerkat_machine_command(
                 None,
                 MeerkatMachineCommand::Recover {
                     runtime_id: runtime_id.clone(),
                 },
             )
-            .await
-            .map_err(MeerkatMachine::control_plane_error_from_command_error)?
-        {
+            .await;
+        MeerkatMachine::control_command_answer(result, "recover", |result| match result {
             MeerkatMachineCommandResult::RecoveryReport(report) => Ok(report),
-            other => Err(RuntimeControlPlaneError::Internal(format!(
-                "unexpected MeerkatMachineCommandResult for recover: {other:?}"
-            ))),
-        }
+            other => Err(Box::new(other)),
+        })
     }
 
     async fn destroy(
         &self,
         runtime_id: &LogicalRuntimeId,
     ) -> Result<DestroyReport, RuntimeControlPlaneError> {
-        match self
+        let result = self
             .execute_meerkat_machine_command(
                 None,
                 MeerkatMachineCommand::Destroy {
                     runtime_id: runtime_id.clone(),
                 },
             )
-            .await
-            .map_err(MeerkatMachine::control_plane_error_from_command_error)?
-        {
+            .await;
+        MeerkatMachine::control_command_answer(result, "destroy", |result| match result {
             MeerkatMachineCommandResult::DestroyReport(report) => Ok(report),
-            other => Err(RuntimeControlPlaneError::Internal(format!(
-                "unexpected MeerkatMachineCommandResult for destroy: {other:?}"
-            ))),
-        }
+            other => Err(Box::new(other)),
+        })
     }
 
     async fn runtime_state(
         &self,
         runtime_id: &LogicalRuntimeId,
     ) -> Result<RuntimeState, RuntimeControlPlaneError> {
-        match self
+        let result = self
             .execute_meerkat_machine_command(
                 None,
                 MeerkatMachineCommand::RuntimeState {
                     runtime_id: runtime_id.clone(),
                 },
             )
-            .await
-            .map_err(MeerkatMachine::control_plane_error_from_command_error)?
-        {
+            .await;
+        MeerkatMachine::control_command_answer(result, "runtime_state", |result| match result {
             MeerkatMachineCommandResult::RuntimeState(state) => Ok(state),
-            other => Err(RuntimeControlPlaneError::Internal(format!(
-                "unexpected MeerkatMachineCommandResult for runtime_state: {other:?}"
-            ))),
-        }
+            other => Err(Box::new(other)),
+        })
     }
 
     async fn load_boundary_receipt(
@@ -2650,7 +2698,7 @@ impl crate::traits::RuntimeControlPlane for MeerkatMachine {
         run_id: &RunId,
         sequence: u64,
     ) -> Result<Option<meerkat_core::lifecycle::RunBoundaryReceipt>, RuntimeControlPlaneError> {
-        match self
+        let result = self
             .execute_meerkat_machine_command(
                 None,
                 MeerkatMachineCommand::LoadBoundaryReceipt {
@@ -2659,14 +2707,13 @@ impl crate::traits::RuntimeControlPlane for MeerkatMachine {
                     sequence,
                 },
             )
-            .await
-            .map_err(MeerkatMachine::control_plane_error_from_command_error)?
-        {
-            MeerkatMachineCommandResult::BoundaryReceipt(receipt) => Ok(receipt),
-            other => Err(RuntimeControlPlaneError::Internal(format!(
-                "unexpected MeerkatMachineCommandResult for load_boundary_receipt: {other:?}"
-            ))),
-        }
+            .await;
+        MeerkatMachine::control_command_answer(result, "load_boundary_receipt", |result| {
+            match result {
+                MeerkatMachineCommandResult::BoundaryReceipt(receipt) => Ok(receipt),
+                other => Err(Box::new(other)),
+            }
+        })
     }
 }
 
@@ -2699,10 +2746,14 @@ mod tests {
             &self,
             events: &[meerkat_core::event::AgentEvent],
         ) -> Result<Vec<CoreInteractionTerminalPublicationReceipt>, CoreExecutorError> {
+            // Register for the release before the call counter moves: the
+            // tests release the first call with `notify_waiters()` once they
+            // see `calls == 1`, and it reaches only an existing `Notified`.
+            let released = self.release_first.notified();
             let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
             if call == 1 {
                 self.first_entered.notify_one();
-                self.release_first.notified().await;
+                released.await;
                 self.first_returning.notify_one();
             }
             self.batches
@@ -3577,7 +3628,9 @@ mod tests {
                 )
                 .await
         });
-        entered.notified().await;
+        crate::tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())
+            .await
+            .expect("the wedged RuntimeStore read should start");
         let registration_probe = crate::tokio::time::timeout(
             std::time::Duration::from_secs(1),
             restarted.lock_session_registration_transaction(&session_id),
@@ -3800,7 +3853,9 @@ mod tests {
                 )
                 .await
         });
-        entered.notified().await;
+        crate::tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())
+            .await
+            .expect("the publication receipt CAS should start and wedge");
 
         let retry_lease = machine
             .prepare_session_archive_lease(&session_id)
@@ -3836,8 +3891,9 @@ mod tests {
         drop(probe);
 
         release.notify_waiters();
-        first
+        crate::tokio::time::timeout(std::time::Duration::from_secs(10), first)
             .await
+            .expect("receipt-CAS convergence task must finish after its release")
             .expect("receipt-CAS convergence task must join")
             .expect("released receipt CAS must converge");
         assert_eq!(publisher.calls.load(Ordering::SeqCst), 1);

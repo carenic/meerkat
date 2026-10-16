@@ -671,7 +671,7 @@ async fn exercise_a2(server: &Server, order: Order) {
         |record| record.observation.operation_id == denied_operation_id
             && matches!(
                 record.observation.observation,
-                AuditObservation::Entry | AuditObservation::Outcome { .. }
+                AuditObservation::Entry { .. } | AuditObservation::Outcome { .. }
             )
     ));
     let mut tool_ids = vec![denied_operation_id.clone()];
@@ -686,7 +686,10 @@ async fn exercise_a2(server: &Server, order: Order) {
             audit
                 .iter()
                 .filter(|record| record.observation.operation_id == op
-                    && matches!(record.observation.observation, AuditObservation::Entry))
+                    && matches!(
+                        record.observation.observation,
+                        AuditObservation::Entry { .. }
+                    ))
                 .count(),
             1
         );
@@ -727,7 +730,10 @@ async fn exercise_a2(server: &Server, order: Order) {
             audit
                 .iter()
                 .filter(|record| &record.observation.operation_id == op
-                    && matches!(record.observation.observation, AuditObservation::Entry))
+                    && matches!(
+                        record.observation.observation,
+                        AuditObservation::Entry { .. }
+                    ))
                 .count(),
             1
         );

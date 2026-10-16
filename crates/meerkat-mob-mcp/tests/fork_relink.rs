@@ -4318,3 +4318,307 @@ async fn children_sharing_a_job_id_are_each_retried_as_their_own_job() {
     assert_eq!(completion_records(&fixture, &c_owner, &job_id).await, 1);
     fixture.teardown().await;
 }
+
+/// The worker stack size, in bytes, of the child processes the stack-budget
+/// tests below start. Their fixtures do nothing without it; a diagnosis can
+/// run a fixture with a smaller size to measure its headroom.
+const RELINK_WORKER_STACK_ENV: &str = "MEERKAT_TEST_FORK_RELINK_WORKER_STACK_BYTES";
+/// The child-process fixture of [`restart_relink_fits_the_worker_stack_budget`].
+const RELINK_STACK_CHILD_TEST: &str = "restart_relink_on_a_sized_worker_stack_child";
+/// The child-process fixture of [`session_create_fits_the_worker_stack_budget`].
+const SESSION_CREATE_STACK_CHILD_TEST: &str = "session_create_on_a_sized_worker_stack_child";
+/// The worker stack, 1.125 MiB, that the stack-budget tests give their
+/// child processes. It is below the 2 MiB an embedding host gives its tokio
+/// runtime (Tokio's default), so the paths they cover keep headroom under
+/// that limit. In a debug build these scenarios needed 1,228,800 bytes of
+/// worker stack before their deepest paths built their large futures in
+/// their own frames (1,212,416 overflowed), and need 851,968 since. This
+/// budget fails the former and leaves about 38% over the latter, so a
+/// regression that eats that headroom fails here long before it nears a
+/// host's 2 MiB.
+const WORKER_STACK_BUDGET: usize = 1_179_648;
+/// The stack of a child's driver thread, which builds the fixture and waits
+/// on the scenario: the debug test-thread budget `.cargo/config.toml` sets.
+/// What the scenario measures runs on the workers.
+const STACK_CHILD_DRIVER_STACK: usize = 8 * 1024 * 1024;
+/// How long the parent waits for a child test process before killing it.
+const STACK_CHILD_DEADLINE: Duration = Duration::from_mins(5);
+/// How long a child's scenario may run.
+const STACK_CHILD_SCENARIO_DEADLINE: Duration = Duration::from_mins(3);
+
+/// A restarted host re-links a fork child on a tokio worker with the
+/// [`WORKER_STACK_BUDGET`], in a debug build, and then destroys the restored
+/// mob from a task on its workers.
+/// Inserting the restored mob's handle spawns the re-link pass as a task. The
+/// pass first reads the forker's durable input index for the job's completion
+/// through the runtime's machine command dispatch, then settles the child and
+/// delivers its outcome. At opt-level 0 every branch of a function reserves
+/// its own stack slots, so the dispatch matches and the re-link's per-child
+/// futures had poll frames that together needed more than 2 MiB: an
+/// embedding host's worker overflowed its guard page on restart. The mob
+/// actor's destroy of the restored mob runs on a worker as well. A stack
+/// overflow aborts the whole process, so the scenario runs in a child
+/// process, and this test asserts that the child exits successfully.
+#[test]
+fn restart_relink_fits_the_worker_stack_budget() {
+    assert_stack_child_passes(RELINK_STACK_CHILD_TEST);
+}
+
+/// An embedding host constructs sessions from tasks on tokio workers with the
+/// [`WORKER_STACK_BUDGET`], in a debug build: it creates a runtime-backed
+/// session (the agent build, the session's runtime registration and its
+/// materialization run on the workers), then builds a mob member, whose
+/// session the mob actor provisions on a worker as well, and finally
+/// destroys the mob from a task on its workers. Run in a child process, like
+/// [`restart_relink_fits_the_worker_stack_budget`].
+#[test]
+fn session_create_fits_the_worker_stack_budget() {
+    assert_stack_child_passes(SESSION_CREATE_STACK_CHILD_TEST);
+}
+
+/// Run this binary's ignored child-process fixture `fixture_test` on workers
+/// with the [`WORKER_STACK_BUDGET`], and assert that the child passes. A
+/// stack overflow aborts the whole process, so it is observed from outside.
+fn assert_stack_child_passes(fixture_test: &str) {
+    let output_dir = tempfile::tempdir().expect("child output dir");
+    let output_path = output_dir.path().join("child-output.txt");
+    let stdout = std::fs::File::create(&output_path).expect("child output file");
+    let stderr = stdout.try_clone().expect("child output file");
+    let mut child = std::process::Command::new(std::env::current_exe().expect("test binary"))
+        .args([
+            "--exact",
+            fixture_test,
+            "--ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(RELINK_WORKER_STACK_ENV, WORKER_STACK_BUDGET.to_string())
+        .stdin(std::process::Stdio::null())
+        .stdout(stdout)
+        .stderr(stderr)
+        .spawn()
+        .expect("start the child test process");
+    let started = std::time::Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("poll the child test process") {
+            break status;
+        }
+        if started.elapsed() > STACK_CHILD_DEADLINE {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!(
+                "the child test process did not finish within {STACK_CHILD_DEADLINE:?}\n{}",
+                child_output_tail(&output_path)
+            );
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    let output = std::fs::read_to_string(&output_path).unwrap_or_default();
+    assert!(
+        status.success() && output.contains("test result: ok. 1 passed"),
+        "{fixture_test} must fit a {WORKER_STACK_BUDGET}-byte worker stack; the child test \
+         process exited with {status}\n{}",
+        child_output_tail(&output_path)
+    );
+}
+
+/// The last lines of the child test process's output, where a stack overflow
+/// names its thread.
+fn child_output_tail(path: &std::path::Path) -> String {
+    let output = std::fs::read_to_string(path).unwrap_or_default();
+    let lines = output.lines().collect::<Vec<_>>();
+    lines[lines.len().saturating_sub(200)..].join("\n")
+}
+
+/// The child process of [`restart_relink_fits_the_worker_stack_budget`].
+#[test]
+#[ignore = "child-process fixture of restart_relink_fits_the_worker_stack_budget"]
+fn restart_relink_on_a_sized_worker_stack_child() {
+    run_on_sized_workers(restart_relink_on_a_worker_scenario);
+}
+
+/// The child process of [`session_create_fits_the_worker_stack_budget`].
+#[test]
+#[ignore = "child-process fixture of session_create_fits_the_worker_stack_budget"]
+fn session_create_on_a_sized_worker_stack_child() {
+    run_on_sized_workers(session_create_on_a_worker_scenario);
+}
+
+/// Run `scenario` on a runtime whose workers have the stack size
+/// [`RELINK_WORKER_STACK_ENV`] gives. Does nothing without it, so the
+/// fixtures stay inert unless a stack-budget test starts them.
+fn run_on_sized_workers<F>(scenario: fn() -> F)
+where
+    F: std::future::Future<Output = ()> + 'static,
+{
+    let Some(worker_stack) = std::env::var_os(RELINK_WORKER_STACK_ENV) else {
+        return;
+    };
+    let worker_stack = worker_stack
+        .to_str()
+        .and_then(|bytes| bytes.parse::<usize>().ok())
+        .expect("the worker stack size in bytes");
+    let driver = std::thread::Builder::new()
+        .name("stack-child-driver".into())
+        .stack_size(STACK_CHILD_DRIVER_STACK)
+        .spawn(move || {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .thread_name("stack-child-worker")
+                .thread_stack_size(worker_stack)
+                .enable_all()
+                .build()
+                .expect("runtime with sized workers");
+            runtime.block_on(async {
+                tokio::time::timeout(STACK_CHILD_SCENARIO_DEADLINE, Box::pin(scenario()))
+                    .await
+                    .expect("the scenario finishes in time");
+            });
+            runtime.shutdown_timeout(Duration::from_secs(10));
+        })
+        .expect("start the driver thread");
+    if let Err(panic) = driver.join() {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+/// A child finished its job, but its custodian died with the old process.
+/// The restarted host inserts the surviving mob's handle, which spawns the
+/// re-link pass on one of the runtime's workers, and the pass delivers the
+/// child's outcome once.
+async fn restart_relink_on_a_worker_scenario() {
+    let fixture =
+        CouncilFixture::new_runtime_backed(|_| ScriptedTurn::Text(CHILD_REPLY.to_string()));
+    fixture.seed_source_mob(&["forker"]).await;
+    let owner = forker_session(&fixture).await;
+    let handle = fixture
+        .state
+        .handle_for(&fixture.source_mob_id())
+        .await
+        .unwrap();
+    let job_id = "job-relinked-on-a-2-mib-worker".to_string();
+    let (_fork, run) = handle
+        .fork_member_then_run_detached(
+            &AgentIdentity::from("forker"),
+            child_spec("relink-stack-child"),
+            None,
+            "fork_off_result",
+            16 * 1024,
+            meerkat_core::DurableForkSourceAdmission::Quiescent,
+            None,
+            Some(ForkJobBinding {
+                job_id: job_id.clone(),
+                owner_session_id: owner.clone(),
+                retained_work: None,
+            }),
+        )
+        .await
+        .expect("fork");
+    // No custodian: the outcome is observed here and never delivered, as if
+    // the process had died right after the child finished.
+    assert!(matches!(
+        run.outcome().await,
+        Some(ForkChildRunOutcome::Completed(_))
+    ));
+    assert_eq!(completion_records(&fixture, &owner, &job_id).await, 0);
+
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    let runtime = fixture.runtime_adapter.clone().expect("runtime-backed");
+    let restarted = Arc::new(
+        meerkat_mob_mcp::MobMcpState::new_with_runtime_adapter(
+            fixture.service.clone(),
+            Some(runtime),
+            meerkat_mob::MobControlPrincipal::Owner,
+        )
+        .expect("construct runtime authority"),
+    );
+    fixture.bind_continuations(&restarted);
+    restarted
+        .try_mob_insert_handle(fixture.source_mob_id(), handle.clone())
+        .await
+        .expect("insert the restored mob");
+    await_completion_record(&fixture, &owner, &job_id).await;
+    assert_eq!(completion_records(&fixture, &owner, &job_id).await, 1);
+
+    // The host destroys the restored mob from a task on its workers.
+    tokio::spawn({
+        let restarted = Arc::clone(&restarted);
+        let mob_id = fixture.source_mob_id();
+        async move { restarted.mob_destroy(&mob_id).await }
+    })
+    .await
+    .expect("the destroy task")
+    .expect("destroy the restored mob");
+    fixture.teardown().await;
+}
+
+/// An embedding host constructs sessions from tasks on its workers: it
+/// creates a runtime-backed session (agent build, runtime registration and
+/// materialization; its turns are the runtime's), then builds a mob member,
+/// whose session the mob actor provisions on a worker as well, and destroys
+/// the mob from a task on its workers.
+async fn session_create_on_a_worker_scenario() {
+    use meerkat_core::service::SessionService as _;
+    let fixture = Arc::new(CouncilFixture::new_runtime_backed(|_| {
+        ScriptedTurn::Text(CHILD_REPLY.to_string())
+    }));
+    let service = Arc::clone(&fixture.service);
+    let created = tokio::spawn(async move {
+        service
+            .create_session(meerkat_core::service::CreateSessionRequest {
+                injected_context: Vec::new(),
+                model: "claude-haiku-4-5-20251001".to_string(),
+                prompt: meerkat_core::types::ContentInput::Text(CHILD_TASK.to_string()),
+                system_prompt: meerkat_core::SystemPromptOverride::Inherit,
+                max_tokens: None,
+                event_tx: None,
+                initial_turn: meerkat_core::service::InitialTurnPolicy::Defer,
+                deferred_prompt_policy: meerkat_core::service::DeferredPromptPolicy::Discard,
+                build: Some(meerkat_core::service::SessionBuildOptions::default()),
+                labels: None,
+            })
+            .await
+    })
+    .await
+    .expect("the create task")
+    .expect("create the session");
+    assert!(
+        fixture
+            .service
+            .read(&created.session_id)
+            .await
+            .is_ok_and(|view| view.state.session_id == created.session_id),
+        "the created session reads back"
+    );
+
+    tokio::spawn({
+        let fixture = Arc::clone(&fixture);
+        async move { fixture.seed_source_mob(&["member"]).await }
+    })
+    .await
+    .expect("the member build task");
+    let handle = fixture
+        .state
+        .handle_for(&fixture.source_mob_id())
+        .await
+        .expect("the source mob");
+    assert!(
+        handle
+            .get_member(&AgentIdentity::from("member"))
+            .await
+            .expect("read the member")
+            .is_some(),
+        "the member is seated"
+    );
+    // A handle kept across the destroy would still hold the mob's stores.
+    drop(handle);
+
+    // The host destroys the mob from a task on its workers.
+    tokio::spawn({
+        let fixture = Arc::clone(&fixture);
+        async move { fixture.state.mob_destroy(&fixture.source_mob_id()).await }
+    })
+    .await
+    .expect("the destroy task")
+    .expect("destroy the mob");
+    fixture.teardown().await;
+}

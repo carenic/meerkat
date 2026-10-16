@@ -121,7 +121,7 @@ parsing messages.
 
 ### Transport error mapping summary
 
-- **JSON-RPC**: `NotFound`/`Busy` keep dedicated codes (-32001/-32002), durable resume holds use `SessionNotRunning` (-32003), and typed agent causes use the canonical `meerkat_contracts::ErrorCode::jsonrpc_code()` values. Remaining session variants collapse to -32603 with the message preserved. A failed runtime-routed turn (`turn/start`, `mob/turn_start`) maps the typed cause of its terminal to the same codes (`llm_failure` and `retry_exhausted` -32010, `budget_exhausted` and `time_budget_exceeded` -32011, `hook_denied` -32012, other causes -32603), with the typed turn error in `data.error`.
+- **JSON-RPC**: `NotFound`/`Busy` keep dedicated codes (-32001/-32002), durable resume holds use `SessionNotRunning` (-32003), and typed agent causes use the canonical `meerkat_contracts::ErrorCode::jsonrpc_code()` values. Remaining session variants collapse to -32603 with the message preserved. A failed runtime-routed turn (`turn/start`, `mob/turn_start`) maps the typed cause of its terminal to the same codes (`llm_failure` and `retry_exhausted` -32010, `budget_exhausted` and `time_budget_exceeded` -32011, `hook_denied` -32012, other causes -32603), with the typed turn error in `data.error`. A runtime that refuses to admit a turn or event keeps the refusal's typed code: an invalid input -32602, a native refusal or unavailable readiness -32030/-32031, no runtime under the session's id in the runtime driver -32001, another owner or a teardown in progress -32002, unavailable runtime authority -32032, and a lifecycle state that admits no input (a retired runtime, or the destroyed runtime of a session that is gone) -32600. Every method keeps an error's typed `data`.
 - **REST**: Endpoint-typed `ApiError` mapping (`NotFound` -> 404; `Busy` -> 400 on create/turn, 409 on interrupt conflicts; archived/unavailable history -> 400; agent/internal -> 500). Where canonical wire errors are emitted, `ErrorCode::http_status()` decides the status. Error body includes `{ "code": "...", "message": "..." }`.
 - **MCP Server**: Tool calls return `is_error: true` with the error message and code in the content.
 - **CLI**: General commands use 0 for success, 1 for error, and 2 for graceful budget exhaustion. Multi-host mob commands additionally preserve the typed operator failures: 45 scope denied, 46 host unavailable, 47 stale cursor, and 48 stale fence. Error details are printed to stderr.
@@ -156,27 +156,27 @@ v1 (recorded v2 hardening).
 ```toml
 # Minimal: just the agent loop
 [dependencies]
-meerkat = { version = "=0.9.1", default-features = false, features = ["anthropic"] }
+meerkat = { version = "=0.9.2", default-features = false, features = ["anthropic"] }
 
 # Add persistence
-meerkat = { version = "=0.9.1", default-features = false, features = ["anthropic", "session-store"] }
+meerkat = { version = "=0.9.2", default-features = false, features = ["anthropic", "session-store"] }
 
 # Add compaction
-meerkat = { version = "=0.9.1", default-features = false, features = ["anthropic", "session-store", "session-compaction"] }
+meerkat = { version = "=0.9.2", default-features = false, features = ["anthropic", "session-store", "session-compaction"] }
 
 # Add facade-local predicate-schedule helper re-exports. The schedule service
 # and WorkGraph substrate are already linked.
-meerkat = { version = "=0.9.1", default-features = false, features = ["anthropic", "session-store", "schedule"] }
+meerkat = { version = "=0.9.2", default-features = false, features = ["anthropic", "session-store", "schedule"] }
 
 # Broad native facade with WebSocket live support
-meerkat = { version = "=0.9.1", features = [
+meerkat = { version = "=0.9.2", features = [
   "all-providers", "openai-realtime", "session-store", "session-compaction",
   "memory-store-session", "comms", "mcp", "skills", "schedule", "live",
   "atif", # 0.8.23+
 ] }
 
 # WebRTC is separate and still needs `rkat-rpc --live-webrtc` at runtime
-meerkat = { version = "=0.9.1", features = ["openai-realtime", "live-webrtc"] }
+meerkat = { version = "=0.9.2", features = ["openai-realtime", "live-webrtc"] }
 ```
 
 ## Runtime capabilities

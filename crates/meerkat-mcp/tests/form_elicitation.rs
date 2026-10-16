@@ -659,7 +659,8 @@ async fn form_native_staged_router_uses_canonical_session_and_selected_host() {
         let config = http_config(endpoint.as_ref().unwrap(), Mode::Streamable);
         let (factory, trace) = factory(vec![(config.clone(), "native-staged")], true);
         retained_adapter = Some(Arc::new(McpRouterAdapter::new(
-            McpRouter::new().with_client_service_factory(factory),
+            McpRouter::new_with_stdio_profile(meerkat_mcp::McpStdioLaunchProfile::trusted_host())
+                .with_client_service_factory(factory),
         )));
         let adapter = retained_adapter.as_ref().unwrap();
         adapter.bind_external_tool_surface_handle(Arc::clone(bindings.external_tool_surface()));
@@ -764,8 +765,11 @@ async fn form_native_immediate_router_path_uses_the_same_factory() {
         let config = http_config(endpoint.as_ref().unwrap(), Mode::Streamable);
         let (factory, trace) = factory(vec![(config.clone(), "native-immediate")], true);
         retained_router = Some(
-            McpRouter::new_with_surface_handle(Arc::clone(bindings.external_tool_surface()))
-                .with_client_service_factory(factory),
+            McpRouter::new_with_surface_handle_and_stdio_profile(
+                Arc::clone(bindings.external_tool_surface()),
+                meerkat_mcp::McpStdioLaunchProfile::trusted_host(),
+            )
+            .with_client_service_factory(factory),
         );
         let router = retained_router.as_mut().unwrap();
         *router.mcp_lifecycle_handle_slot().write().unwrap() =

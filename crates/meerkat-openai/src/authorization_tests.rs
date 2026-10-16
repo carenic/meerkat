@@ -162,7 +162,7 @@ impl PreparedOperationAuthorization for Check {
             return Err(OperationObservationError);
         }
         let fail = match &observation {
-            OperationObservation::Entry => self.fail_entry.load(Ordering::SeqCst),
+            OperationObservation::Entry(_) => self.fail_entry.load(Ordering::SeqCst),
             OperationObservation::Outcome(_) => self.fail_outcome.load(Ordering::SeqCst),
             OperationObservation::ReviewAttemptStarted { .. } => false,
             OperationObservation::AuthorizationUnavailable => false,
@@ -836,7 +836,7 @@ async fn http_audit_records_entry_and_status_and_preserves_success_if_outcome_st
             assert!(matches!(
                 observations.as_slice(),
                 [
-                    OperationObservation::Entry,
+                    OperationObservation::Entry(_),
                     OperationObservation::Outcome(OperationObservedOutcome::HttpResponse {
                         status: 200
                     })
@@ -875,7 +875,7 @@ async fn failed_entry_audit_prevents_physical_http_request() {
         assert!(server.bodies.lock().unwrap().is_empty());
         assert!(matches!(
             policy.observations.lock().unwrap().as_slice(),
-            [OperationObservation::Entry]
+            [OperationObservation::Entry(_)]
         ));
         assert!(
             !results
@@ -936,7 +936,7 @@ async fn transport_failure_retains_original_error_beside_outcome_diagnostic() {
         assert!(matches!(
             policy.observations.lock().unwrap().as_slice(),
             [
-                OperationObservation::Entry,
+                OperationObservation::Entry(_),
                 OperationObservation::Outcome(OperationObservedOutcome::TransportError)
             ]
         ));

@@ -78,9 +78,19 @@ fn gemini_file_poll_interval() -> Duration {
     }
 }
 
+/// The model the Code Assist wire sends for `model`.
+///
+/// Code Assist serves the GA Gemini models: `gemini-3.1-flash-lite` is the
+/// base flash-lite model the Gemini CLI itself sends there. A preview id
+/// goes out as its GA model, as the public API routes it. Every substitute is
+/// a catalog Gemini model that accepts every thinking level of the requested
+/// model's row, which the request was judged against (pinned by a test).
+///
+/// Until 0.9.2 both flash-lite ids went out as `gemini-2.5-flash`, a model
+/// Google limits to users who had used it before 2026-09-18.
 fn code_assist_model(model: &str) -> &str {
     match model {
-        "gemini-3.1-flash-lite" | "gemini-3.1-flash-lite-preview" => "gemini-2.5-flash",
+        "gemini-3.1-flash-lite-preview" => "gemini-3.1-flash-lite",
         other => other,
     }
 }
@@ -459,6 +469,15 @@ impl GeminiClient {
     /// Schema proto. It is not a supported host API.
     #[doc(hidden)]
     pub fn build_request_body(&self, request: &LlmRequest) -> Result<Value, LlmError> {
+        // Refuse a thinking level the cataloged model does not accept before
+        // anything is lowered, so it fails typed here and never as a provider
+        // 400. Uncatalogued models keep the pass-through.
+        if let Some(message) = gemini_tag(request).and_then(|tag| {
+            meerkat_models::capabilities_for(Provider::Gemini, &request.model)?
+                .gemini_provider_tag_rejection(tag)
+        }) {
+            return Err(LlmError::InvalidRequest { message });
+        }
         let mut contents = Vec::new();
         let mut system_instruction_parts = Vec::new();
         let mut leading_system_prefix = true;
@@ -3360,6 +3379,39 @@ mod tests {
         }
     }
 
+    /// The Code Assist wire substitutes only catalog Gemini models, so it
+    /// never sends a model the catalog has dropped: Gemini 2.5 models are
+    /// limited to users who used them before 2026-09-18. The substitute must
+    /// also accept every thinking level of the requested model's row, which
+    /// the request was judged against.
+    #[test]
+    fn code_assist_wire_models_are_catalog_models() {
+        for requested in meerkat_models::allowed_models(Provider::Gemini) {
+            let wire = code_assist_model(requested);
+            let requested_row = meerkat_models::capabilities_for(Provider::Gemini, requested)
+                .expect("an allowed model has a catalog row");
+            let wire_row = meerkat_models::capabilities_for(Provider::Gemini, wire)
+                .unwrap_or_else(|| {
+                    panic!("Code Assist sends '{requested}' as '{wire}', which is not a catalog Gemini model")
+                });
+            for level in requested_row.effort_levels {
+                assert!(
+                    wire_row.effort_levels.contains(level),
+                    "'{wire}' (sent for '{requested}') refuses thinking level {level:?}"
+                );
+            }
+        }
+        // Both flash-lite ids reach Code Assist as the GA model it serves.
+        assert_eq!(
+            code_assist_model("gemini-3.1-flash-lite"),
+            "gemini-3.1-flash-lite"
+        );
+        assert_eq!(
+            code_assist_model("gemini-3.1-flash-lite-preview"),
+            "gemini-3.1-flash-lite"
+        );
+    }
+
     #[tokio::test]
     async fn code_assist_stream_uses_internal_endpoint_and_wrapper()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -3373,16 +3425,16 @@ mod tests {
         let client = GeminiClient::new_with_base_url(String::new(), base_url.clone())
             .with_code_assist_wire();
         let plain = client
-            .plain_model_route("gemini-3.1-flash-lite")
+            .plain_model_route("gemini-3.1-flash-lite-preview")
             .expect("request-free CodeAssist lowering");
         assert!(seen.lock().expect("seen mutex").is_empty());
-        assert_eq!(plain.wire_model(), "gemini-2.5-flash");
+        assert_eq!(plain.wire_model(), "gemini-3.1-flash-lite");
         assert_eq!(
             plain.endpoint(),
-            client.stream_generate_content_url("gemini-3.1-flash-lite")
+            client.stream_generate_content_url("gemini-3.1-flash-lite-preview")
         );
         let request = LlmRequest::new(
-            "gemini-3.1-flash-lite",
+            "gemini-3.1-flash-lite-preview",
             vec![Message::User(UserMessage::text("hello".to_string()))],
         );
 
@@ -3400,7 +3452,7 @@ mod tests {
         assert_eq!(deltas, vec!["hello from code assist"]);
         let bodies = seen.lock().expect("seen mutex");
         let body = bodies.first().expect("captured Code Assist request");
-        assert_eq!(body["model"], "gemini-2.5-flash");
+        assert_eq!(body["model"], "gemini-3.1-flash-lite");
         assert_eq!(body["model"], plain.wire_model());
         assert!(
             body.get("user_prompt_id").and_then(Value::as_str).is_some(),
@@ -3883,6 +3935,99 @@ mod tests {
         );
         assert!(thinking_config.get("thinkingBudget").is_none());
         Ok(())
+    }
+
+    fn thinking_level_request(model: &str, level: GeminiThinkingLevel, nested: bool) -> LlmRequest {
+        let tag = if nested {
+            GeminiProviderTag {
+                thinking: Some(
+                    meerkat_core::lifecycle::run_primitive::GeminiThinkingConfig {
+                        include_thoughts: None,
+                        thinking_level: Some(level),
+                        thinking_budget: None,
+                    },
+                ),
+                ..Default::default()
+            }
+        } else {
+            GeminiProviderTag {
+                thinking_level: Some(level),
+                ..Default::default()
+            }
+        };
+        let mut request = LlmRequest::new(
+            model,
+            vec![Message::User(UserMessage::text("test".to_string()))],
+        );
+        request.provider_params = Some(ProviderTag::Gemini(tag));
+        request
+    }
+
+    /// A thinking level the cataloged model refuses (the API answers 400
+    /// "Thinking level MINIMAL is not supported for this model") is refused
+    /// locally with a typed error before anything is sent, whether the level
+    /// is set in the nested `thinking` config or flat.
+    #[test]
+    fn a_thinking_level_the_model_refuses_is_refused_locally() {
+        let client = GeminiClient::new("test-key".to_string());
+        for model in [
+            "gemini-4-argon",
+            "gemini-3.8-flash",
+            "gemini-3.7-flash",
+            "gemini-3.1-pro-preview",
+        ] {
+            for nested in [false, true] {
+                let request = thinking_level_request(model, GeminiThinkingLevel::Minimal, nested);
+                match client.build_request_body(&request) {
+                    Err(LlmError::InvalidRequest { message }) => {
+                        assert!(
+                            message.contains(model) && message.contains("'minimal'"),
+                            "{model} (nested: {nested}): {message}"
+                        );
+                    }
+                    other => panic!(
+                        "{model} (nested: {nested}): expected a typed local refusal, got {other:?}"
+                    ),
+                }
+            }
+        }
+    }
+
+    /// The levels a cataloged model accepts are sent, `minimal` included on
+    /// the rows that record it; a model without a catalog row keeps the
+    /// pass-through.
+    #[test]
+    fn a_thinking_level_the_model_accepts_is_sent() {
+        let client = GeminiClient::new("test-key".to_string());
+        for (model, level, wire) in [
+            ("gemini-3.8-flash", GeminiThinkingLevel::Low, "low"),
+            ("gemini-4-argon", GeminiThinkingLevel::High, "high"),
+            (
+                "gemini-3.5-flash-lite",
+                GeminiThinkingLevel::Minimal,
+                "minimal",
+            ),
+            (
+                "gemini-3.1-flash-lite",
+                GeminiThinkingLevel::Minimal,
+                "minimal",
+            ),
+            (
+                "gemini-uncatalogued-preview",
+                GeminiThinkingLevel::Minimal,
+                "minimal",
+            ),
+        ] {
+            for nested in [false, true] {
+                let body = client
+                    .build_request_body(&thinking_level_request(model, level, nested))
+                    .unwrap_or_else(|error| panic!("{model} (nested: {nested}): {error}"));
+                assert_eq!(
+                    body["generationConfig"]["thinkingConfig"]["thinkingLevel"], wire,
+                    "{model} (nested: {nested})"
+                );
+            }
+        }
     }
 
     #[test]

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 """Generated wire types for Meerkat SDK.
 
-Contract version: 0.9.1
+Contract version: 0.9.2
 """
 
 import sys
@@ -17,7 +17,7 @@ else:
 from .errors import MeerkatError
 
 
-CONTRACT_VERSION = "0.9.1"
+CONTRACT_VERSION = "0.9.2"
 
 
 Value = Any
@@ -2986,6 +2986,13 @@ class MobRotateSupervisorResult:
     mob_id: str
     ok: bool
     report: SupervisorRotationReportWire
+
+
+@dataclass
+class MobClaimCallbackRouteResult:
+    """Response payload for `mob/claim_callback_route`: the calling connection
+now holds the mob's member callback route."""
+    mob_id: str
 
 
 @dataclass

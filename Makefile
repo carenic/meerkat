@@ -494,9 +494,10 @@ deprecated-backend-gate:
 	@scripts/deprecated_backend_scan.sh
 
 # W2-F bridge-classifier gate: supervisor_bridge / local_bridge / bridge
-# wire types must not re-interpret `ResponseStatus`. All terminal-vs-progress
-# decisions go through `meerkat_core::interaction::classify_response_terminality`
-# so the canonical classifier stays the single source of truth.
+# wire types must not re-interpret `ResponseStatus`. Every terminal-vs-progress
+# decision consumes the machine-classified `TerminalityClass` that generated
+# machine authority emits (`response_terminality`), so the machine classifier
+# stays the single source of truth (crates/xtask/src/bridge_classifier.rs).
 bridge-no-responsestatus-gate:
 	@echo "$(GREEN)Running W2-F bridge-classifier gate...$(NC)"
 	@scripts/pre-push-bridge-no-responsestatus.sh

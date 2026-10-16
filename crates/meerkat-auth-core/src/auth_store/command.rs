@@ -66,6 +66,11 @@ pub enum CommandCredentialError {
 pub struct CommandCredentialRunner {
     spec: CommandCredentialSpec,
     cache: Mutex<Option<(PersistedTokens, Instant)>>,
+    // A shared predicate, which a panic cannot leave half-changed, so the
+    // runner stays `UnwindSafe`.
+    untrusted: Option<
+        std::panic::AssertUnwindSafe<std::sync::Arc<meerkat_core::confinement::UntrustedPathFn>>,
+    >,
 }
 
 impl CommandCredentialRunner {
@@ -73,7 +78,23 @@ impl CommandCredentialRunner {
         Self {
             spec,
             cache: Mutex::new(None),
+            untrusted: None,
         }
+    }
+
+    /// Run the command, and every program it starts by name, from a `PATH`
+    /// (its configured one, else the host's) without relative directories or
+    /// the directories `untrusted` names
+    /// ([`meerkat_core::confinement::trusted_search_path`]), and with no
+    /// variable that names a path `untrusted` names
+    /// ([`meerkat_core::confinement::trusted_environment`]).
+    #[must_use]
+    pub fn with_untrusted_paths(
+        mut self,
+        untrusted: std::sync::Arc<meerkat_core::confinement::UntrustedPathFn>,
+    ) -> Self {
+        self.untrusted = Some(std::panic::AssertUnwindSafe(untrusted));
+        self
     }
 
     pub fn spec(&self) -> &CommandCredentialSpec {
@@ -97,12 +118,29 @@ impl CommandCredentialRunner {
     }
 
     async fn run_once(&self) -> Result<PersistedTokens, CommandCredentialError> {
-        let mut cmd = Command::new(&self.spec.program);
+        // A host launch exemption: the credential command runs as the host.
+        // A resolver whose host confines its launches refuses one a confined
+        // process could change before it gets here.
+        let mut command = meerkat_core::HostLaunchExemption::credential_command(
+            &self.spec.program,
+            self.untrusted
+                .as_ref()
+                .map(|untrusted| untrusted.0.as_ref()),
+        );
+        // The configured environment is the operator's own; a value naming a
+        // path a confined process could change is still not passed on.
+        meerkat_core::confinement::apply_configured_environment(
+            &mut command,
+            &self.spec.env,
+            self.untrusted
+                .as_ref()
+                .map(|untrusted| untrusted.0.as_ref()),
+        );
+        let mut cmd = Command::from(command);
         cmd.args(&self.spec.args)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .envs(&self.spec.env);
+            .stderr(Stdio::piped());
         if let Some(cwd) = &self.spec.cwd {
             cmd.current_dir(cwd);
         }
@@ -149,6 +187,14 @@ impl CommandCredentialRunner {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    /// The runner keeps the auto trait it had before it took a host's
+    /// judgement.
+    #[test]
+    fn the_runner_stays_unwind_safe() {
+        fn unwind_safe<T: std::panic::UnwindSafe>() {}
+        unwind_safe::<CommandCredentialRunner>();
+    }
 
     #[test]
     fn command_credential_spec_debug_redacts_args_and_env_values() {

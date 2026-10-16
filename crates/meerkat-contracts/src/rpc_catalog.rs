@@ -986,6 +986,12 @@ pub fn rpc_method_catalog(options: RpcMethodCatalogOptions) -> Vec<RpcMethodDesc
                 "MobRotateSupervisorResult",
             ),
             RpcMethodDescriptor::typed(
+                "mob/claim_callback_route",
+                "Bind a mob's member callback route to this connection",
+                "MobIdParams",
+                "MobClaimCallbackRouteResult",
+            ),
+            RpcMethodDescriptor::typed(
                 "mob/submit_work",
                 "Submit a unit of work to a mob member through the work lane",
                 "MobSubmitWorkParams",
@@ -1846,6 +1852,11 @@ mod tests {
                 "mob/rotate_supervisor",
                 Some("MobIdParams"),
                 Some("MobRotateSupervisorResult"),
+            ),
+            (
+                "mob/claim_callback_route",
+                Some("MobIdParams"),
+                Some("MobClaimCallbackRouteResult"),
             ),
             (
                 "mob/wait_kickoff",

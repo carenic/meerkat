@@ -569,7 +569,10 @@ done
             meerkat_core::ToolMutationClass::ReadOnly,
             "the persisted read-only declaration classifies the operation"
         );
-        let mut router = crate::mcp::standalone_router().with_call_context_provider(provider);
+        let mut router = crate::mcp::standalone_router_with_stdio_profile(
+            meerkat_mcp::McpStdioLaunchProfile::trusted_host(),
+        )
+        .with_call_context_provider(provider);
         router.add_server(reloaded[0].clone()).await.unwrap();
 
         assert_eq!(
@@ -605,8 +608,10 @@ done
 
         // Control: the same server without a binding, under the same
         // provider, is called normally.
-        let mut plain =
-            crate::mcp::standalone_router().with_call_context_provider(control_provider);
+        let mut plain = crate::mcp::standalone_router_with_stdio_profile(
+            meerkat_mcp::McpStdioLaunchProfile::trusted_host(),
+        )
+        .with_call_context_provider(control_provider);
         plain.add_server(unbound).await.unwrap();
         plain
             .call_tool("gmail_read_text_part", &serde_json::json!({}))

@@ -285,7 +285,15 @@ pub async fn handle_call(
         .await
     {
         Ok(value) => RpcResponse::success(id, value),
-        Err(error) => RpcResponse::error(id, error.code, error.message),
+        // The tool error keeps its typed data.
+        Err(error) => RpcResponse::from_error(
+            id,
+            crate::protocol::RpcError {
+                code: error.code,
+                message: error.message,
+                data: error.data,
+            },
+        ),
     }
 }
 

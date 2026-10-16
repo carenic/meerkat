@@ -68,6 +68,7 @@ use std::collections::BTreeMap;
 use meerkat_mob::{
     AgentIdentity, ForkJobRecord, MemberRunState, MobControlPrincipal, MobError, MobHandle, MobId,
 };
+use meerkat_runtime::stack_relief::{OwnFrameFuture, box_in_own_frame};
 
 use crate::MobMcpState;
 use crate::agent_tools::{
@@ -381,7 +382,10 @@ async fn relink_mob_fork_children_where(
     // turn boundary, so one busy child must not hold up the others. They run
     // inside this pass's own task, not on tasks of their own, so a
     // stand-down that aborts the pass has stopped every child's settlement
-    // once the pass is dropped.
+    // once the pass is dropped. Each child's future, and the settlement it
+    // awaits, is built in its own frame and boxed: at opt-level 0 the join's
+    // per-child poll frame and this future's own poll frame otherwise each
+    // reserved the settlement's full size (about 155 KiB) beneath it.
     let tasks = children
         .into_iter()
         .map(|(child, job, owner)| {
@@ -389,17 +393,19 @@ async fn relink_mob_fork_children_where(
             let delivery = delivery.clone();
             let mob_id = mob_id.clone();
             let handle = handle.clone();
-            async move {
-                let action = relink_owned_child(
-                    service,
-                    &delivery,
-                    &mob_id,
-                    &handle,
-                    &child,
-                    &job,
-                    owner,
-                    COMMIT_PENDING_CEILING,
-                )
+            box_in_own_frame(move || async move {
+                let action = box_in_own_frame(|| {
+                    relink_owned_child(
+                        service,
+                        &delivery,
+                        &mob_id,
+                        &handle,
+                        &child,
+                        &job,
+                        owner,
+                        COMMIT_PENDING_CEILING,
+                    )
+                })
                 .await;
                 ForkRelinkReport {
                     mob_id,
@@ -407,7 +413,7 @@ async fn relink_mob_fork_children_where(
                     job_id: job.job_id.clone(),
                     action,
                 }
-            }
+            })
         })
         .collect::<Vec<_>>();
     futures::future::join_all(tasks).await
@@ -507,16 +513,18 @@ pub async fn relink_child_within(
     commit_pending_ceiling: Duration,
 ) -> ForkRelinkAction {
     let owner = JobOwner::resolve(handle, child, &job.owner_session_id).await;
-    relink_owned_child(
-        service,
-        delivery,
-        mob_id,
-        handle,
-        child,
-        job,
-        owner,
-        commit_pending_ceiling,
-    )
+    box_in_own_frame(|| {
+        relink_owned_child(
+            service,
+            delivery,
+            mob_id,
+            handle,
+            child,
+            job,
+            owner,
+            commit_pending_ceiling,
+        )
+    })
     .await
 }
 
@@ -541,13 +549,20 @@ async fn relink_owned_child(
     // idempotent). The delivered outcome is read typed from the committed
     // record: `restart_interrupted` shares the record's `failed` notice
     // status and must stay seated.
+    //
+    // The read, like every large future this settlement awaits, is built in
+    // its own frame: at opt-level 0 this poll frame otherwise reserved all of
+    // them at once (316,592 bytes), beneath the read's whole path through
+    // the runtime's command dispatch.
     if let Some(runtime) = runtime
-        && let Some(admitted) = crate::detached_delivery::admitted_detached_completion(
-            runtime,
-            &job.owner_session_id,
-            TOOL_FORK_OFF,
-            &job.job_id,
-        )
+        && let Some(admitted) = box_in_own_frame(|| {
+            crate::detached_delivery::admitted_detached_completion(
+                runtime,
+                &job.owner_session_id,
+                TOOL_FORK_OFF,
+                &job.job_id,
+            )
+        })
         .await
     {
         // While the completion input is pending its outcome is only in the
@@ -576,7 +591,9 @@ async fn relink_owned_child(
     // that outcome alone: submitted again, idempotently by its key.
     match recorded_terminal(handle, child, job).await {
         Ok(Some(recorded)) => {
-            let action = submit_terminal(delivery, &owner, mob_id, job, &recorded).await;
+            let action =
+                box_in_own_frame(|| submit_terminal(delivery, &owner, mob_id, job, &recorded))
+                    .await;
             let retires = serde_json::from_value::<CommittedOutcome>(recorded.outcome.clone())
                 .is_ok_and(|committed| committed.status.retires_child());
             if retires
@@ -601,17 +618,19 @@ async fn relink_owned_child(
         Err(error) => return ForkRelinkAction::Failed(error),
     }
     if let Some(turn_delivery) = &job.turn_delivery {
-        return relink_by_receipt(
-            &service,
-            delivery,
-            &owner,
-            mob_id,
-            handle,
-            child,
-            job,
-            turn_delivery,
-            commit_pending_ceiling,
-        )
+        return box_in_own_frame(|| {
+            relink_by_receipt(
+                &service,
+                delivery,
+                &owner,
+                mob_id,
+                handle,
+                child,
+                job,
+                turn_delivery,
+                commit_pending_ceiling,
+            )
+        })
         .await;
     }
     if let Some(completion) = durable_reply(&service, mob_id, handle, child, job).await {
@@ -633,7 +652,7 @@ async fn relink_owned_child(
             }
             return limit_elapsed(&service, delivery, &owner, mob_id, handle, child, job).await;
         }
-        let observe = observe_child(runtime, handle, child);
+        let observe = box_in_own_frame(|| observe_child(runtime, handle, child));
         let observed = match remaining_ms {
             None => Some(observe.await),
             Some(remaining_ms) => {
@@ -1090,14 +1109,15 @@ async fn relink_by_receipt(
                 RECEIPT_WAIT_SLICE.min(Duration::from_millis(remaining_ms))
             })
         };
-        let read = handle
-            .wait_bounded_work_for_identity_with_delivery_identity(
+        let read = box_in_own_frame(|| {
+            handle.wait_bounded_work_for_identity_with_delivery_identity(
                 child,
                 turn_delivery,
                 &spec,
                 meerkat_core::time_compat::Instant::now() + slice,
             )
-            .await;
+        })
+        .await;
         // The input's last phase while it is still owed a terminal; `None`
         // when the read was inconclusive.
         if read.is_ok() {
@@ -1168,15 +1188,17 @@ async fn relink_by_receipt(
         // that does not answer in time is inconclusive, and the deadline is
         // evaluated again before anything else.
         let status_bound = within_limit(STATUS_READ_TIMEOUT, deadline_ms);
-        let status =
-            match tokio::time::timeout(status_bound, observe_child_run(runtime, handle, child))
-                .await
-            {
-                Ok(status) => status,
-                Err(_elapsed) => ChildObservation::Unobserved(format!(
-                    "the child's status read did not answer within {status_bound:?}"
-                )),
-            };
+        let status = match tokio::time::timeout(
+            status_bound,
+            box_in_own_frame(|| observe_child_run(runtime, handle, child)),
+        )
+        .await
+        {
+            Ok(status) => status,
+            Err(_elapsed) => ChildObservation::Unobserved(format!(
+                "the child's status read did not answer within {status_bound:?}"
+            )),
+        };
         if deadline_ms.is_some_and(|deadline| now_ms() >= deadline) {
             continue;
         }
@@ -1193,16 +1215,17 @@ async fn relink_by_receipt(
         // wait on the runtime, never outlasting the limit: a read given only
         // the waiter's evidence floor can end while the receipt's own commit
         // still holds the session driver, and then it says nothing.
-        let last_read = handle
-            .wait_bounded_work_for_identity_with_delivery_identity(
+        let last_read = box_in_own_frame(|| {
+            handle.wait_bounded_work_for_identity_with_delivery_identity(
                 child,
                 turn_delivery,
                 &spec,
                 meerkat_core::time_compat::Instant::now()
                     + within_limit(RECEIPT_WAIT_SLICE, deadline_ms),
             )
-            .await
-            .map(|report| report.into_parts().1);
+        })
+        .await
+        .map(|report| report.into_parts().1);
         // The read can end past the limit (the waiter keeps a 100 ms evidence
         // floor); the limit then decides, where only a completed turn wins,
         // including the one this read found.
@@ -1227,7 +1250,11 @@ async fn relink_by_receipt(
                     // run could still answer it after this read. Fence it first:
                     // settle that exact input, then the job's outcome is its
                     // terminal.
-                    match fence_job_input(handle, child, turn_delivery, &spec, &input_id).await {
+                    match box_in_own_frame(|| {
+                        fence_job_input(handle, child, turn_delivery, &spec, &input_id)
+                    })
+                    .await
+                    {
                         FencedJobInput::Terminal(record) => {
                             return deliver_receipt(
                                 service, delivery, owner, mob_id, handle, child, job, *record,
@@ -1250,18 +1277,20 @@ async fn relink_by_receipt(
                                 "fork_off re-link could not settle the job input at the ceiling; \
                                  retiring the child to fence it"
                             );
-                            return fence_by_retirement(
-                                service,
-                                delivery,
-                                owner,
-                                mob_id,
-                                handle,
-                                child,
-                                job,
-                                turn_delivery,
-                                &spec,
-                                reason,
-                            )
+                            return box_in_own_frame(|| {
+                                fence_by_retirement(
+                                    service,
+                                    delivery,
+                                    owner,
+                                    mob_id,
+                                    handle,
+                                    child,
+                                    job,
+                                    turn_delivery,
+                                    &spec,
+                                    reason,
+                                )
+                            })
                             .await;
                         }
                     }
@@ -1459,15 +1488,16 @@ async fn fence_by_retirement(
     }
     // The retired member's runtime no longer runs anything; a terminal it
     // finalized before retiring is durable and read from the store.
-    let settled = handle
-        .wait_bounded_work_for_identity_with_delivery_identity(
+    let settled = box_in_own_frame(|| {
+        handle.wait_bounded_work_for_identity_with_delivery_identity(
             child,
             turn_delivery,
             spec,
             meerkat_core::time_compat::Instant::now() + RECEIPT_WAIT_SLICE,
         )
-        .await
-        .map(|report| report.into_parts().1);
+    })
+    .await
+    .map(|report| report.into_parts().1);
     if let Ok(meerkat_mob::DeliveryTerminalWait::Terminal(record)) = settled {
         return deliver_receipt(
             service, delivery, owner, mob_id, handle, child, job, *record, reason,
@@ -1519,71 +1549,75 @@ fn in_flight_step(
 /// Deliver the outcome a job turn's terminal receipt records. A receipt of
 /// an end the restart caused delivers `restart_interrupted` with
 /// `restart_reason`.
+///
+/// The future is built in its own frame and boxed, as [`deliver`]'s is.
 #[allow(clippy::too_many_arguments)]
-async fn deliver_receipt(
-    service: &Arc<dyn meerkat_mob::MobSessionService>,
-    delivery: &RelinkDelivery,
-    owner: &JobOwner,
-    mob_id: &MobId,
-    handle: &MobHandle,
-    child: &AgentIdentity,
-    job: &ForkJobRecord,
+fn deliver_receipt<'a>(
+    service: &'a Arc<dyn meerkat_mob::MobSessionService>,
+    delivery: &'a RelinkDelivery,
+    owner: &'a JobOwner,
+    mob_id: &'a MobId,
+    handle: &'a MobHandle,
+    child: &'a AgentIdentity,
+    job: &'a ForkJobRecord,
     record: meerkat_mob::DeliveryTerminalRecord,
     restart_reason: Option<RestartInterruptedReason>,
-) -> ForkRelinkAction {
-    let interrupted = || {
-        let mut completion = restart_interrupted(mob_id, child);
-        completion.restart_reason = restart_reason;
-        completion
-    };
-    let terminal = record.terminal().clone();
-    let failure = match record.into_resolution() {
-        meerkat_mob::DeliveryTerminalResolution::Receipt {
-            result: Ok(turn), ..
-        } => {
-            let mut completion = ForkOffCompletion::empty(
-                child.to_string(),
-                member_ref(mob_id, child),
-                ForkOffCompletionStatus::Completed,
-            );
-            completion.record_completed_turn(&turn);
-            return deliver(delivery, owner, mob_id, handle, child, job, completion).await;
-        }
-        meerkat_mob::DeliveryTerminalResolution::Receipt {
-            result: Err(failure),
-            ..
-        } => failure,
-        // No run answered the input (superseded, coalesced, consumed on
-        // accept, cancelled when the restarted host revived the child, or
-        // abandoned before a run began), or a resolution this build does not
-        // know: the turn did not survive.
-        _ => {
+) -> OwnFrameFuture<'a, ForkRelinkAction> {
+    box_in_own_frame(move || async move {
+        let interrupted = || {
+            let mut completion = restart_interrupted(mob_id, child);
+            completion.restart_reason = restart_reason;
+            completion
+        };
+        let terminal = record.terminal().clone();
+        let failure = match record.into_resolution() {
+            meerkat_mob::DeliveryTerminalResolution::Receipt {
+                result: Ok(turn), ..
+            } => {
+                let mut completion = ForkOffCompletion::empty(
+                    child.to_string(),
+                    member_ref(mob_id, child),
+                    ForkOffCompletionStatus::Completed,
+                );
+                completion.record_completed_turn(&turn);
+                return deliver(delivery, owner, mob_id, handle, child, job, completion).await;
+            }
+            meerkat_mob::DeliveryTerminalResolution::Receipt {
+                result: Err(failure),
+                ..
+            } => failure,
+            // No run answered the input (superseded, coalesced, consumed on
+            // accept, cancelled when the restarted host revived the child, or
+            // abandoned before a run began), or a resolution this build does not
+            // know: the turn did not survive.
+            _ => {
+                return deliver(delivery, owner, mob_id, handle, child, job, interrupted()).await;
+            }
+        };
+        if receipt_failure(&failure, &terminal) == ReceiptFailure::RestartCaused {
             return deliver(delivery, owner, mob_id, handle, child, job, interrupted()).await;
         }
-    };
-    if receipt_failure(&failure, &terminal) == ReceiptFailure::RestartCaused {
-        return deliver(delivery, owner, mob_id, handle, child, job, interrupted()).await;
-    }
-    let mut completion = ForkOffCompletion::empty(
-        child.to_string(),
-        member_ref(mob_id, child),
-        ForkOffCompletionStatus::Failed,
-    );
-    completion.error = Some(failure.to_string());
-    let action = deliver(delivery, owner, mob_id, handle, child, job, completion).await;
-    // The live custodian retires a child whose own turn failed; so does the
-    // re-link, once that outcome is settled.
-    if retires_after_delivery(&action, service, mob_id, child, job).await
-        && let Err(error) = handle.retire_with_descendants(child.clone()).await
-    {
-        report_child_retirement_incomplete(
-            mob_id,
-            child,
-            &error,
-            "fork_off re-link delivered a failed job; its child",
+        let mut completion = ForkOffCompletion::empty(
+            child.to_string(),
+            member_ref(mob_id, child),
+            ForkOffCompletionStatus::Failed,
         );
-    }
-    action
+        completion.error = Some(failure.to_string());
+        let action = deliver(delivery, owner, mob_id, handle, child, job, completion).await;
+        // The live custodian retires a child whose own turn failed; so does the
+        // re-link, once that outcome is settled.
+        if retires_after_delivery(&action, service, mob_id, child, job).await
+            && let Err(error) = handle.retire_with_descendants(child.clone()).await
+        {
+            report_child_retirement_incomplete(
+                mob_id,
+                child,
+                &error,
+                "fork_off re-link delivered a failed job; its child",
+            );
+        }
+        action
+    })
 }
 
 /// Whose end a job turn's failed receipt records.
@@ -1644,34 +1678,38 @@ fn restart_interrupted(mob_id: &MobId, child: &AgentIdentity) -> ForkOffCompleti
 /// cancelled, and its job record, so the next pass delivers it. A delivery
 /// deduplicated against a record admitted earlier retires the child only when
 /// that record's outcome retires it (see [`retires_after_delivery`]).
-async fn limit_elapsed(
-    service: &Arc<dyn meerkat_mob::MobSessionService>,
-    delivery: &RelinkDelivery,
-    owner: &JobOwner,
-    mob_id: &MobId,
-    handle: &MobHandle,
-    child: &AgentIdentity,
-    job: &ForkJobRecord,
-) -> ForkRelinkAction {
-    let _ = handle.force_cancel_member(child.clone()).await;
-    let mut completion = ForkOffCompletion::empty(
-        child.to_string(),
-        member_ref(mob_id, child),
-        ForkOffCompletionStatus::MaxRunElapsed,
-    );
-    completion.max_run_secs = job.max_run_ms.map(|limit| limit / 1000);
-    let action = deliver(delivery, owner, mob_id, handle, child, job, completion).await;
-    if retires_after_delivery(&action, service, mob_id, child, job).await
-        && let Err(error) = handle.retire_with_descendants(child.clone()).await
-    {
-        report_child_retirement_incomplete(
-            mob_id,
-            child,
-            &error,
-            "fork_off re-link delivered max_run_elapsed; its child (seated, cancelled, for its forker)",
+///
+/// The future is built in its own frame and boxed, as [`deliver`]'s is.
+fn limit_elapsed<'a>(
+    service: &'a Arc<dyn meerkat_mob::MobSessionService>,
+    delivery: &'a RelinkDelivery,
+    owner: &'a JobOwner,
+    mob_id: &'a MobId,
+    handle: &'a MobHandle,
+    child: &'a AgentIdentity,
+    job: &'a ForkJobRecord,
+) -> OwnFrameFuture<'a, ForkRelinkAction> {
+    box_in_own_frame(move || async move {
+        let _ = handle.force_cancel_member(child.clone()).await;
+        let mut completion = ForkOffCompletion::empty(
+            child.to_string(),
+            member_ref(mob_id, child),
+            ForkOffCompletionStatus::MaxRunElapsed,
         );
-    }
-    action
+        completion.max_run_secs = job.max_run_ms.map(|limit| limit / 1000);
+        let action = deliver(delivery, owner, mob_id, handle, child, job, completion).await;
+        if retires_after_delivery(&action, service, mob_id, child, job).await
+            && let Err(error) = handle.retire_with_descendants(child.clone()).await
+        {
+            report_child_retirement_incomplete(
+                mob_id,
+                child,
+                &error,
+                "fork_off re-link delivered max_run_elapsed; its child (seated, cancelled, for its forker)",
+            );
+        }
+        action
+    })
 }
 
 /// How a re-link describes a child retirement that did not complete. A typed
@@ -1890,36 +1928,42 @@ fn completion_in_block(
 /// Commit the job's outcome once, as the child mob's `ForkJobTerminal`, and
 /// submit it to the job's owner as a continuation. A job whose terminal is
 /// already recorded keeps that outcome: the recorded one is submitted.
+///
+/// The future is built in its own frame and boxed: the settlement awaits a
+/// delivery from many branches, and at opt-level 0 each inline await site
+/// reserved the whole future in the awaiting poll frame.
 #[allow(clippy::too_many_arguments)]
-async fn deliver(
-    delivery: &RelinkDelivery,
-    owner: &JobOwner,
-    child_mob: &MobId,
-    handle: &MobHandle,
-    child: &AgentIdentity,
-    job: &ForkJobRecord,
+fn deliver<'a>(
+    delivery: &'a RelinkDelivery,
+    owner: &'a JobOwner,
+    child_mob: &'a MobId,
+    handle: &'a MobHandle,
+    child: &'a AgentIdentity,
+    job: &'a ForkJobRecord,
     completion: ForkOffCompletion,
-) -> ForkRelinkAction {
-    if let JobOwner::Gone = owner {
-        return ForkRelinkAction::OwnerGone;
-    }
-    let outcome = match serde_json::to_value(&completion) {
-        Ok(outcome) => outcome,
-        Err(error) => return ForkRelinkAction::Failed(error.to_string()),
-    };
-    let terminal = match committed_terminal(
-        handle,
-        child,
-        job,
-        completion.status.terminal_status(),
-        outcome,
-    )
-    .await
-    {
-        Ok(terminal) => terminal,
-        Err(error) => return ForkRelinkAction::Failed(error),
-    };
-    submit_terminal(delivery, owner, child_mob, job, &terminal).await
+) -> OwnFrameFuture<'a, ForkRelinkAction> {
+    box_in_own_frame(move || async move {
+        if let JobOwner::Gone = owner {
+            return ForkRelinkAction::OwnerGone;
+        }
+        let outcome = match serde_json::to_value(&completion) {
+            Ok(outcome) => outcome,
+            Err(error) => return ForkRelinkAction::Failed(error.to_string()),
+        };
+        let terminal = match committed_terminal(
+            handle,
+            child,
+            job,
+            completion.status.terminal_status(),
+            outcome,
+        )
+        .await
+        {
+            Ok(terminal) => terminal,
+            Err(error) => return ForkRelinkAction::Failed(error),
+        };
+        box_in_own_frame(|| submit_terminal(delivery, owner, child_mob, job, &terminal)).await
+    })
 }
 
 /// `child`'s committed terminal for `job`, recording one from `status` and

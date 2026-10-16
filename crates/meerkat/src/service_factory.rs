@@ -689,6 +689,10 @@ impl SessionAgent for FactoryAgent {
         self.agent.tool_scope_snapshot()
     }
 
+    fn tool_catalog_view(&self) -> Option<meerkat_core::ToolCatalogView> {
+        self.agent.tool_catalog_view()
+    }
+
     fn visible_tool_defs(&self) -> Vec<meerkat_core::ToolDef> {
         self.agent.visible_tool_defs()
     }
@@ -1298,6 +1302,13 @@ pub struct FactoryAgentBuilder {
     /// Wrapped in `Arc<StdRwLock<...>>` so surfaces can attach scheduler tool
     /// visibility after the builder is consumed into a session service, while
     /// keeping runtime/service ownership in the surface.
+    ///
+    /// The tools hold their `ScheduleService`, which keeps a spawned schedule
+    /// host's session and mob hosts attached, and the session service owns
+    /// this builder, so the slot keeps the session service and the mob state
+    /// alive. An embedder that tears them down while its process keeps
+    /// running keeps a clone of this `Arc` and writes `None` through it once
+    /// teardown has succeeded; see [`crate::surface::spawn_schedule_host`].
     pub default_schedule_tools:
         Arc<std::sync::RwLock<Option<Arc<dyn meerkat_core::AgentToolDispatcher>>>>,
     /// Default WorkGraph tools injected into all builds.
@@ -1663,8 +1674,12 @@ impl SessionAgentBuilder for FactoryAgentBuilder {
             .build
             .as_ref()
             .and_then(|build| build.external_tools.clone());
-        self.build_agent_with_external_tools(req, external_tools, event_tx)
-            .await
+        // Built in its own frame: at opt-level 0 the awaited build reserved
+        // twice its size in this poll frame, beneath the session's create.
+        meerkat_runtime::stack_relief::box_in_own_frame(|| {
+            self.build_agent_with_external_tools(req, external_tools, event_tx)
+        })
+        .await
     }
 
     async fn build_agent_taking_tools(
@@ -1676,8 +1691,11 @@ impl SessionAgentBuilder for FactoryAgentBuilder {
             .build
             .as_mut()
             .and_then(|build| build.external_tools.take());
-        self.build_agent_with_external_tools(req, external_tools, event_tx)
-            .await
+        // Built in its own frame, as in `build_agent`.
+        meerkat_runtime::stack_relief::box_in_own_frame(|| {
+            self.build_agent_with_external_tools(req, external_tools, event_tx)
+        })
+        .await
     }
 }
 
@@ -1817,7 +1835,10 @@ impl FactoryAgentBuilder {
             build_config.image_generation_executor_override = Some(executor);
         }
 
-        let config = self.resolve_config().await?;
+        // Built in its own frame, like the build below: at opt-level 0 each
+        // awaited future reserved twice its size in this poll frame.
+        let config =
+            meerkat_runtime::stack_relief::box_in_own_frame(|| self.resolve_config()).await?;
 
         // Capture the session_context handle before build_agent consumes the
         // RuntimeBuildMode. Needed so the session task can fire
@@ -1868,16 +1889,32 @@ impl FactoryAgentBuilder {
         // tool-dispatch poll (mob spawn/delegate). Build on a fresh task so
         // child-agent construction never stacks onto the caller's poll
         // chain (2 MiB production worker-stack budget).
+        //
+        // The relieved build and both constructions inside it are built in
+        // their own frames: at opt-level 0 each awaited future reserved
+        // twice its size in the poll frame awaiting it.
         let factory = self.factory.clone();
-        let agent = meerkat_runtime::stack_relief::relieve_caller_stack(move || async move {
-            match surface_gate {
-                Some(gate) => {
-                    factory
-                        .build_agent_through_surface_gate(build_config, &config, gate.as_ref())
+        let agent = meerkat_runtime::stack_relief::box_in_own_frame(move || {
+            meerkat_runtime::stack_relief::relieve_caller_stack(move || async move {
+                match surface_gate {
+                    Some(gate) => {
+                        meerkat_runtime::stack_relief::box_in_own_frame(|| {
+                            factory.build_agent_through_surface_gate(
+                                build_config,
+                                &config,
+                                gate.as_ref(),
+                            )
+                        })
                         .await
+                    }
+                    None => {
+                        meerkat_runtime::stack_relief::box_in_own_frame(|| {
+                            factory.build_agent(build_config, &config)
+                        })
+                        .await
+                    }
                 }
-                None => factory.build_agent(build_config, &config).await,
-            }
+            })
         })
         .await
         .map_err(|error| {
@@ -2443,6 +2480,7 @@ mod tests {
                 supports_reasoning: false,
                 supports_web_search: false,
                 call_timeout_secs: None,
+                stream_inactivity_timeout_secs: None,
             },
         );
         config
@@ -4590,9 +4628,10 @@ mod tests {
             .prepare_bindings(session.id().clone())
             .await
             .map_err(|err| format!("prepare bindings: {err}"))?;
-        let mut router = meerkat_mcp::McpRouter::new_with_surface_handle(Arc::clone(
-            bindings.external_tool_surface(),
-        ));
+        let mut router = meerkat_mcp::McpRouter::new_with_surface_handle_and_stdio_profile(
+            Arc::clone(bindings.external_tool_surface()),
+            meerkat_mcp::McpStdioLaunchProfile::trusted_host(),
+        );
         router
             .stage_add(meerkat_core::McpServerConfig::stdio(
                 "planner",

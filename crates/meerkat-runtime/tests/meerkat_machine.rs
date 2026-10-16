@@ -322,7 +322,8 @@ impl meerkat_runtime::MachineSessionArchivePostCommitHook for GatedArchiveHook {
     ) -> Result<(), meerkat_runtime::RuntimeControlPlaneError> {
         let attempt = self.attempts.fetch_add(1, Ordering::SeqCst);
         if attempt == 0 {
-            self.entered.notify_waiters();
+            // notify_one stores a permit if the test is not waiting yet.
+            self.entered.notify_one();
             self.release.notified().await;
         }
         self.completions.fetch_add(1, Ordering::SeqCst);
@@ -989,7 +990,9 @@ async fn cancelled_archive_post_commit_hook_retries_after_durable_retired() {
             )
             .await
     });
-    hook.entered.notified().await;
+    tokio::time::timeout(Duration::from_secs(5), hook.entered.notified())
+        .await
+        .expect("the archive post-commit hook should start");
     assert_eq!(
         load_runtime_state(store.as_ref(), &runtime_id)
             .await

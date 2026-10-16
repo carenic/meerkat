@@ -897,10 +897,20 @@ pub struct BuiltinConfigInput {
     /// Enable shell tools. Omit to inherit/default.
     #[serde(default)]
     pub enable_shell: Option<bool>,
-    /// Accepted and ignored in 0.9.1. Set the shell's default command timeout
-    /// with `[shell] timeout_secs` in the realm config.
+    /// Default command timeout, in seconds, of the shell tool in the session
+    /// this call builds: its `[shell] timeout_secs`. A shell call's own
+    /// `timeout_secs` still wins. Omit, `null` or `0` keep the realm's
+    /// configured value on a run, and the session's recorded value on a
+    /// resume.
     #[serde(default)]
     pub shell_timeout_secs: Option<u64>,
+}
+
+/// The session shell timeout a request asks for; `0` asks for none.
+fn requested_shell_timeout(config: Option<&BuiltinConfigInput>) -> Option<std::num::NonZeroU64> {
+    config
+        .and_then(|config| config.shell_timeout_secs)
+        .and_then(std::num::NonZeroU64::new)
 }
 
 /// Actions supported by the config tool.
@@ -987,12 +997,9 @@ fn map_config_runtime_error(err: ConfigRuntimeError) -> ToolCallError {
         ),
         // An ordinary write is not administration of a section the realm's
         // trusted host administers; nothing was written.
-        ConfigRuntimeError::Config(
-            refused @ (meerkat_core::ConfigError::GovernanceAdministration
-            | meerkat_core::ConfigError::ConfinementAdministration),
-        ) => {
-            let refusal = match refused {
-                meerkat_core::ConfigError::ConfinementAdministration => {
+        ConfigRuntimeError::Config(refused) if refused.administered_section().is_some() => {
+            let refusal = match refused.administered_section() {
+                Some(meerkat_core::AdministeredSection::Confinement) => {
                     WireConfigWriteRefusal::ConfinementAdministrationRequired
                 }
                 _ => WireConfigWriteRefusal::GovernanceAdministrationRequired,
@@ -1157,18 +1164,21 @@ fn tagged_realm_config_store(
     realm_id: &meerkat_core::connection::RealmId,
     backend: meerkat_store::RealmBackend,
     instance_id: Option<&str>,
-    source: &meerkat_store::FilesystemRealmConfigSource,
+    source: &Arc<meerkat_store::FilesystemRealmConfigSource>,
 ) -> Arc<dyn ConfigStore> {
     let paths = meerkat_store::realm_paths_in(realms_root, realm_id.as_str());
     // Head doc routed through the shared source mapping: the reserved
     // `global` realm reads/writes the user-global document, so an explicit
     // state root cannot shadow global config with
-    // `<state_root>/global/config.toml`.
+    // `<state_root>/global/config.toml`. It composes with the same ancestors
+    // as at start, so a config write cannot cut the realm from their
+    // `[confinement]`.
     let config_doc = source.config_doc_path(realm_id);
-    let base: Arc<dyn ConfigStore> = Arc::new(FileConfigStore::new(
-        config_doc.clone(),
-        meerkat_models::canonical(),
-    ));
+    let documents: Arc<dyn meerkat_core::RealmConfigSource> = source.clone();
+    let base: Arc<dyn ConfigStore> = Arc::new(
+        FileConfigStore::new(config_doc.clone(), meerkat_models::canonical())
+            .with_realm_chain(realm_id.clone(), documents),
+    );
     let tagged = meerkat_core::TaggedConfigStore::new(
         base,
         meerkat_core::ConfigStoreMetadata {
@@ -1193,7 +1203,7 @@ async fn realm_config_store(
     backend_hint: Option<meerkat_store::RealmBackend>,
     origin_hint: Option<meerkat_store::RealmOrigin>,
     instance_id: Option<&str>,
-    source: &meerkat_store::FilesystemRealmConfigSource,
+    source: &Arc<meerkat_store::FilesystemRealmConfigSource>,
 ) -> Result<Arc<dyn ConfigStore>, String> {
     let manifest = meerkat_store::ensure_realm_manifest_in(
         realms_root,
@@ -1516,11 +1526,18 @@ impl MeerkatMcpState {
             &config.confinement,
             conventions_context_root.as_deref(),
         )?;
-        // A start whose confined processes could change the realm state or
-        // the user config document is refused before it serves.
-        let host_inputs = meerkat::HostConfinement::host_inputs(
+        // A start whose confined processes could change the realm state, the
+        // user config document or the credential store is refused before it
+        // serves.
+        let mut host_inputs = meerkat::HostConfinement::host_inputs(
             &realms_root,
             layout.global_config_path().as_deref(),
+        );
+        host_inputs.extend(
+            meerkat::TokenStoreBackend::default_auto()
+                .ok()
+                .as_ref()
+                .and_then(meerkat::HostConfinement::credential_store_input),
         );
         host_confinement.admit_host_inputs(&host_inputs)?;
         host_confinement.log_startup(
@@ -4484,6 +4501,7 @@ async fn handle_meerkat_run_with_help_tools(
                 // The session service decides hosting when it creates the actor.
                 hosting: meerkat_core::session_hosting::SessionHostingIntent::default(),
                 mcp_servers: Vec::new(),
+                refused_mcp_servers: Vec::new(),
                 recoverable_tool_defs: (!input.tools.is_empty())
                     .then(|| recoverable_callback_tool_defs(&input.tools)),
                 llm_client_override: None,
@@ -4532,6 +4550,7 @@ async fn handle_meerkat_run_with_help_tools(
                 initial_tool_filter: None,
                 initial_tool_visibility_state: None,
                 shell_env: input.shell_env.clone(),
+                shell_timeout_secs: requested_shell_timeout(input.builtin_config.as_ref()),
                 resume_override_mask: ResumeOverrideMask {
                     model: input.model.is_some(),
                     provider: input.provider.is_some(),
@@ -4950,6 +4969,7 @@ async fn handle_meerkat_resume(
             // The session service decides hosting when it creates the actor.
             hosting: meerkat_core::session_hosting::SessionHostingIntent::default(),
             mcp_servers: Vec::new(),
+            refused_mcp_servers: Vec::new(),
             recoverable_tool_defs: (!input.tools.is_empty())
                 .then(|| recoverable_callback_tool_defs(&input.tools)),
             llm_client_override: None,
@@ -5003,6 +5023,15 @@ async fn handle_meerkat_resume(
             initial_tool_filter: None,
             initial_tool_visibility_state: None,
             shell_env: None,
+            // A rebuild keeps the session's recorded timeout unless the
+            // resume asks for another.
+            shell_timeout_secs: requested_shell_timeout(input.builtin_config.as_ref()).or_else(
+                || {
+                    session
+                        .build_state()
+                        .and_then(|state| state.shell_timeout_secs)
+                },
+            ),
             resume_override_mask: ResumeOverrideMask {
                 model: input.model.is_some(),
                 provider: llm_binding.provider_overridden,
@@ -6411,6 +6440,52 @@ mod tests {
         assert_eq!(after_load, offered, "the refused load attaches no tool");
     }
 
+    /// `builtin_config.shell_timeout_secs` sets the shell's default command
+    /// timeout for the session it builds: a command that outlives a short
+    /// override is stopped by it instead of running to its end under the 30 s
+    /// default.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_meerkat_run_honours_a_short_shell_timeout_override() {
+        let store: Arc<dyn SessionStore> = Arc::new(meerkat::MemoryStore::new());
+        let runtime_store: Arc<dyn meerkat_runtime::RuntimeStore> =
+            Arc::new(meerkat_runtime::InMemoryRuntimeStore::new());
+        let llm = Arc::new(ToolCallScriptLlmClient::default());
+        let state = mcp_server_over(&store, &runtime_store, &llm).await;
+        llm.arm_call("shell", json!({"command": "sleep 5"}));
+        let run_input: MeerkatRunInput = serde_json::from_value(json!({
+            "prompt": "run the command",
+            "model": "claude-sonnet-4-5",
+            "provider": "anthropic",
+            "enable_builtins": true,
+            "enable_workgraph": false,
+            "builtin_config": {"enable_shell": true, "shell_timeout_secs": 1},
+        }))
+        .expect("run input");
+        let session = session_id_of(
+            Box::pin(handle_meerkat_run(&state, run_input, None, None))
+                .await
+                .expect("meerkat_run succeeds"),
+        );
+
+        let saved = load_saved_session(&state, &session).await;
+        let result = saved
+            .messages()
+            .iter()
+            .find_map(|message| match message {
+                meerkat_core::types::Message::ToolResults { results, .. } => results
+                    .iter()
+                    .find(|result| result.tool_use_id == "call_shell")
+                    .cloned(),
+                _ => None,
+            })
+            .expect("the shell call has a result");
+        let text = result.text_content();
+        assert!(
+            text.contains("timed out after"),
+            "the 1 s override stops the 5 s command: {text}"
+        );
+    }
+
     struct OwnershipCheckingLlmClient {
         old_executor_stopped: Arc<AtomicBool>,
         turn_started: Arc<AtomicBool>,
@@ -7052,9 +7127,10 @@ mod tests {
             McpActorMaterializationMode::Fresh,
             move |bindings| {
                 let router = Arc::new(meerkat_mcp::McpRouterAdapter::new(
-                    McpRouter::new_with_surface_handle(Arc::clone(
-                        bindings.external_tool_surface(),
-                    )),
+                    McpRouter::new_with_surface_handle_and_stdio_profile(
+                        Arc::clone(bindings.external_tool_surface()),
+                        meerkat_mcp::McpStdioLaunchProfile::trusted_host(),
+                    ),
                 ));
                 let router_tools: Arc<dyn AgentToolDispatcher> = router.clone();
                 let mut request = mock_deferred_materialization_request(session, bindings, None);
@@ -7181,9 +7257,10 @@ mod tests {
             McpActorMaterializationMode::Fresh,
             move |bindings| {
                 let router = Arc::new(meerkat_mcp::McpRouterAdapter::new(
-                    McpRouter::new_with_surface_handle(Arc::clone(
-                        bindings.external_tool_surface(),
-                    )),
+                    McpRouter::new_with_surface_handle_and_stdio_profile(
+                        Arc::clone(bindings.external_tool_surface()),
+                        meerkat_mcp::McpStdioLaunchProfile::trusted_host(),
+                    ),
                 ));
                 let router_tools: Arc<dyn AgentToolDispatcher> = router.clone();
                 let mut request = mock_deferred_materialization_request(session, bindings, None);
@@ -7481,9 +7558,10 @@ mod tests {
             McpActorMaterializationMode::Fresh,
             move |bindings| {
                 let router = Arc::new(meerkat_mcp::McpRouterAdapter::new(
-                    McpRouter::new_with_surface_handle(Arc::clone(
-                        bindings.external_tool_surface(),
-                    )),
+                    McpRouter::new_with_surface_handle_and_stdio_profile(
+                        Arc::clone(bindings.external_tool_surface()),
+                        meerkat_mcp::McpStdioLaunchProfile::trusted_host(),
+                    ),
                 ));
                 let router_tools: Arc<dyn AgentToolDispatcher> = router.clone();
                 let mut request = mock_deferred_materialization_request(session, bindings, None);
@@ -7719,9 +7797,10 @@ mod tests {
             McpActorMaterializationMode::Fresh,
             move |bindings| {
                 let router = Arc::new(meerkat_mcp::McpRouterAdapter::new(
-                    McpRouter::new_with_surface_handle(Arc::clone(
-                        bindings.external_tool_surface(),
-                    )),
+                    McpRouter::new_with_surface_handle_and_stdio_profile(
+                        Arc::clone(bindings.external_tool_surface()),
+                        meerkat_mcp::McpStdioLaunchProfile::trusted_host(),
+                    ),
                 ));
                 *slot.lock().expect("slot") = Some(Arc::clone(&router));
                 let router_tools: Arc<dyn AgentToolDispatcher> = router.clone();
@@ -7809,7 +7888,11 @@ mod tests {
         attach_test_mcp_router(
             &state,
             &session_id,
-            Arc::new(meerkat_mcp::McpRouterAdapter::new(McpRouter::new())),
+            Arc::new(meerkat_mcp::McpRouterAdapter::new(
+                McpRouter::new_with_stdio_profile(
+                    meerkat_mcp::McpStdioLaunchProfile::trusted_host(),
+                ),
+            )),
         )
         .await;
 
@@ -8354,6 +8437,200 @@ mode = "custom"
 working_directory = "/"
 requirement = { baseline = "command_runtime_v1", read = { kind = "paths", paths = [] }, write = { kind = "paths", paths = [] }, deny_read = [], deny_write = [], network = { kind = "denied" }, unix_connect = [], require_descendant_termination = true }
 "#;
+
+    /// A `meerkat_config` write cannot cut the served realm from the parent
+    /// whose `[confinement]` it composes: a patch that removes the realm's
+    /// parent edge, or a full replace without it, is refused with the
+    /// confinement discriminator and writes nothing. A write that keeps the
+    /// edge commits.
+    #[tokio::test]
+    async fn test_config_writes_cannot_drop_inherited_confinement() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let realms = temp.path().join("realms");
+        let team_text = "[realm.team]\nparent = \"org\"\n";
+        let org_text = format!("[realm.org]\n\n{UNENFORCEABLE_CONFINEMENT}");
+        for (realm, text) in [("org", org_text.as_str()), ("team", team_text)] {
+            let path = meerkat_store::realm_paths_in(&realms, realm).config_path;
+            std::fs::create_dir_all(path.parent().expect("realm dir")).expect("realm dir");
+            std::fs::write(&path, text).expect("realm document");
+        }
+        let mut bootstrap = RuntimeBootstrap::default();
+        bootstrap.realm.selection = RealmSelection::Explicit {
+            realm_id: "team".into(),
+        };
+        bootstrap.realm.state_root = Some(realms.clone());
+        bootstrap.context.user_config_root = Some(temp.path().join("user"));
+        let state = MeerkatMcpState::new_with_bootstrap_options_and_llm(
+            bootstrap,
+            false,
+            Some(Arc::new(TestClient::for_provider(Provider::Anthropic))),
+            None,
+        )
+        .await
+        .expect("the team realm serves");
+        let team_doc = meerkat_store::realm_paths_in(&realms, "team").config_path;
+        let generation = config_generation(&state).await;
+
+        let detached = Config {
+            max_tokens: Some(1024),
+            ..Config::default()
+        };
+        for arguments in [
+            json!({"action": "patch", "patch": {"realm": {"team": {"parent": null}}}}),
+            json!({"action": "patch", "patch": {"realm": {"team": null}}}),
+            json!({"action": "set", "config": detached}),
+        ] {
+            let refused = Box::pin(handle_tools_call(&state, "meerkat_config", &arguments))
+                .await
+                .expect_err("a write cannot drop the inherited confinement");
+            assert_eq!(refused.code, -32602, "{arguments}");
+            assert_eq!(
+                refused.data,
+                Some(json!({"type": "confinement_administration_required"})),
+                "{arguments}: {}",
+                refused.message
+            );
+        }
+        assert_eq!(std::fs::read_to_string(&team_doc).expect("team"), team_text);
+        assert_eq!(config_generation(&state).await, generation);
+
+        Box::pin(handle_tools_call(
+            &state,
+            "meerkat_config",
+            &json!({"action": "patch", "patch": {"max_tokens": 2048}}),
+        ))
+        .await
+        .expect("a patch that keeps the edge commits");
+        let committed = std::fs::read_to_string(&team_doc).expect("team");
+        assert!(committed.contains("parent = \"org\""), "{committed}");
+    }
+
+    /// A `meerkat_config` write cannot cut the served realm from the parent
+    /// whose `[governance]` it composes: a patch that removes the realm's
+    /// parent edge, or a full replace without it, is refused with the
+    /// governance discriminator and writes nothing. A write that keeps the
+    /// edge commits.
+    #[tokio::test]
+    async fn test_config_writes_cannot_drop_inherited_governance() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let realms = temp.path().join("realms");
+        let team_text = "[realm.team]\nparent = \"org\"\n";
+        let org_text = "[realm.org]\n\n[[governance.review.rules]]\ntarget = { kind = \"mcp_server\", server = \"mail\" }\ntier = \"r2\"\n";
+        for (realm, text) in [("org", org_text), ("team", team_text)] {
+            let path = meerkat_store::realm_paths_in(&realms, realm).config_path;
+            std::fs::create_dir_all(path.parent().expect("realm dir")).expect("realm dir");
+            std::fs::write(&path, text).expect("realm document");
+        }
+        let mut bootstrap = RuntimeBootstrap::default();
+        bootstrap.realm.selection = RealmSelection::Explicit {
+            realm_id: "team".into(),
+        };
+        bootstrap.realm.state_root = Some(realms.clone());
+        bootstrap.context.user_config_root = Some(temp.path().join("user"));
+        let state = MeerkatMcpState::new_with_bootstrap_options_and_llm(
+            bootstrap,
+            false,
+            Some(Arc::new(TestClient::for_provider(Provider::Anthropic))),
+            None,
+        )
+        .await
+        .expect("the team realm serves");
+        let team_doc = meerkat_store::realm_paths_in(&realms, "team").config_path;
+        let generation = config_generation(&state).await;
+
+        let detached = Config {
+            max_tokens: Some(1024),
+            ..Config::default()
+        };
+        for arguments in [
+            json!({"action": "patch", "patch": {"realm": {"team": {"parent": null}}}}),
+            json!({"action": "patch", "patch": {"realm": {"team": null}}}),
+            json!({"action": "set", "config": detached}),
+        ] {
+            let refused = Box::pin(handle_tools_call(&state, "meerkat_config", &arguments))
+                .await
+                .expect_err("a write cannot drop the inherited governance");
+            assert_eq!(refused.code, -32602, "{arguments}");
+            assert_eq!(
+                refused.data,
+                Some(json!({"type": "governance_administration_required"})),
+                "{arguments}: {}",
+                refused.message
+            );
+        }
+        assert_eq!(std::fs::read_to_string(&team_doc).expect("team"), team_text);
+        assert_eq!(config_generation(&state).await, generation);
+
+        Box::pin(handle_tools_call(
+            &state,
+            "meerkat_config",
+            &json!({"action": "patch", "patch": {"max_tokens": 2048}}),
+        ))
+        .await
+        .expect("a patch that keeps the edge commits");
+        let committed = std::fs::read_to_string(&team_doc).expect("team");
+        assert!(committed.contains("parent = \"org\""), "{committed}");
+    }
+
+    /// Served as the global realm, the MCP config tool writes the user
+    /// document, whose `[realm.global]` section puts the user document's
+    /// `[governance]` on the chain of every realm that states no parent of
+    /// its own. A patch that removes that section is refused with the
+    /// governance discriminator, naming the section, and writes nothing; an
+    /// unrelated edit commits.
+    #[tokio::test]
+    async fn test_user_document_writes_cannot_drop_the_governance_other_realms_compose() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let realms = temp.path().join("realms");
+        let user_root = temp.path().join("user");
+        std::fs::create_dir_all(user_root.join(".rkat")).expect("user root");
+        let user_doc = user_root.join(".rkat").join("config.toml");
+        let user_text = "[realm.global]\n\n[[governance.review.rules]]\ntarget = { kind = \"mcp_server\", server = \"mail\" }\ntier = \"r2\"\n";
+        std::fs::write(&user_doc, user_text).expect("user document");
+        let mut bootstrap = RuntimeBootstrap::default();
+        bootstrap.realm.selection = RealmSelection::Explicit {
+            realm_id: "global".into(),
+        };
+        bootstrap.realm.state_root = Some(realms);
+        bootstrap.context.user_config_root = Some(user_root);
+        let state = MeerkatMcpState::new_with_bootstrap_options_and_llm(
+            bootstrap,
+            false,
+            Some(Arc::new(TestClient::for_provider(Provider::Anthropic))),
+            None,
+        )
+        .await
+        .expect("the global realm serves");
+
+        let refused = Box::pin(handle_tools_call(
+            &state,
+            "meerkat_config",
+            &json!({"action": "patch", "patch": {"realm": {"global": null}}}),
+        ))
+        .await
+        .expect_err("the patch would drop the governance other realms compose");
+        assert_eq!(refused.code, -32602);
+        assert_eq!(
+            refused.data,
+            Some(json!({"type": "governance_administration_required"})),
+            "{}",
+            refused.message
+        );
+        assert!(
+            refused.message.contains("[realm.global]"),
+            "{}",
+            refused.message
+        );
+        assert_eq!(std::fs::read_to_string(&user_doc).expect("user"), user_text);
+
+        Box::pin(handle_tools_call(
+            &state,
+            "meerkat_config",
+            &json!({"action": "patch", "patch": {"max_tokens": 2048}}),
+        ))
+        .await
+        .expect("an unrelated edit commits");
+    }
 
     /// A start whose confined processes could change the realm state is
     /// refused before the server serves, naming the input and its remedy.
@@ -10135,9 +10412,10 @@ requirement = { baseline = "command_runtime_v1", read = { kind = "paths", paths 
             McpActorMaterializationMode::Fresh,
             move |bindings| {
                 let router = Arc::new(meerkat_mcp::McpRouterAdapter::new(
-                    McpRouter::new_with_surface_handle(Arc::clone(
-                        bindings.external_tool_surface(),
-                    )),
+                    McpRouter::new_with_surface_handle_and_stdio_profile(
+                        Arc::clone(bindings.external_tool_surface()),
+                        meerkat_mcp::McpStdioLaunchProfile::trusted_host(),
+                    ),
                 ));
                 let router_tools: Arc<dyn AgentToolDispatcher> = router.clone();
                 let request = CreateSessionRequest {
@@ -10276,9 +10554,10 @@ requirement = { baseline = "command_runtime_v1", read = { kind = "paths", paths 
             McpActorMaterializationMode::Fresh,
             move |bindings| {
                 let router = Arc::new(meerkat_mcp::McpRouterAdapter::new(
-                    McpRouter::new_with_surface_handle(Arc::clone(
-                        bindings.external_tool_surface(),
-                    )),
+                    McpRouter::new_with_surface_handle_and_stdio_profile(
+                        Arc::clone(bindings.external_tool_surface()),
+                        meerkat_mcp::McpStdioLaunchProfile::trusted_host(),
+                    ),
                 ));
                 let router_tools: Arc<dyn AgentToolDispatcher> = router.clone();
                 let request = CreateSessionRequest {
@@ -11441,9 +11720,10 @@ requirement = { baseline = "command_runtime_v1", read = { kind = "paths", paths 
             move |bindings| {
                 seed_active_external_surface(bindings.external_tool_surface().as_ref(), "demo");
                 let router = Arc::new(meerkat_mcp::McpRouterAdapter::new(
-                    McpRouter::new_with_surface_handle(Arc::clone(
-                        bindings.external_tool_surface(),
-                    )),
+                    McpRouter::new_with_surface_handle_and_stdio_profile(
+                        Arc::clone(bindings.external_tool_surface()),
+                        meerkat_mcp::McpStdioLaunchProfile::trusted_host(),
+                    ),
                 ));
                 let router_tools: Arc<dyn AgentToolDispatcher> = router.clone();
                 let mut request = mock_deferred_materialization_request(session, bindings, None);

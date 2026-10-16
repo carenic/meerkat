@@ -110,6 +110,48 @@ pub enum GrantTarget {
     /// `CheckedMcpServerOperation`. Its lineage never covers the server's
     /// ordinary operations, and the server's lineage never covers it.
     CheckedMcpRoute { route: String, server: String },
+    /// Deliveries to exactly one peer, by its canonical identity (the comms
+    /// routing and trust key, never a display name): the target of the
+    /// owner-produced `PeerSend`. Each peer is its own target: one peer's
+    /// lineage never covers another peer, the peer directory or the base,
+    /// and the base never covers a delivery. It covers only the comms
+    /// tools' deliveries (`send_message`, `reply_to_peer`, `send_request`
+    /// and `send_response`): other tools that reach agents, such as
+    /// `delegate`, `council`, `mob_spawn_member` and a mob member's calls up
+    /// to its mob's operator, carry no peer target and stay on the base
+    /// lineage, which a peer's lineage neither widens nor narrows. A
+    /// `send_response` addressee is the caller's assertion, not a verified
+    /// requester. Holds when every wrapper between the root and the owner
+    /// forwards plan resolution and resolved dispatch with its context; a
+    /// governed comms plan without the owner's target is refused. Not an
+    /// egress fence for mob members (see the changelog).
+    Peer { peer: meerkat_core::comms::PeerId },
+    /// Reads of the session's own trusted-peer directory: the target of the
+    /// owner-produced `PeerDirectoryRead`. Its lineage covers no delivery.
+    PeerDirectory,
+    /// Operations on exactly one memory scope, as its memory owner names
+    /// it: the target of the owner-produced `MemoryOperation`. Each scope is
+    /// its own target; the base never covers a memory operation. Holds on
+    /// the same forwarding as `Peer`.
+    Memory {
+        scope: meerkat_core::memory::MemoryScopeRef,
+    },
+    /// One builtin tool operation: the target of the owner-produced
+    /// `BuiltinOperation` (the builtin web_search call). Its lineage covers
+    /// only that operation, never the base, the catalog or the controller.
+    BuiltinToolOperation {
+        operation: meerkat_core::BuiltinToolOperation,
+    },
+    /// The hosted-search helper of a governed builtin web_search call, on
+    /// the helper's own lowered model route `route` (its canonical
+    /// `ControllerRouteKey`) with the hosted search `capability` its request
+    /// enables. Selected only for a model operation attributed as that
+    /// call's delegate. Another route or capability, the controller's
+    /// lineage and an ordinary inference never use it.
+    DelegatedHostedSearch {
+        route: String,
+        capability: meerkat_core::ServerToolKind,
+    },
 }
 
 /// One target's selected exact lineage.
@@ -160,6 +202,19 @@ impl WorkAuthorityBasis {
                         }
                         GrantTarget::CheckedMcpRoute { route, server } => {
                             !route.is_empty() && !server.is_empty()
+                        }
+                        // A peer is named by its typed identity; the peer
+                        // directory is the session's own.
+                        GrantTarget::Peer { .. } | GrantTarget::PeerDirectory => true,
+                        GrantTarget::Memory { scope } => scope.is_named(),
+                        GrantTarget::BuiltinToolOperation { .. } => true,
+                        GrantTarget::DelegatedHostedSearch { route, capability } => {
+                            meerkat_core::ControllerRouteKey::parse(route).is_some()
+                                && matches!(
+                                    capability,
+                                    meerkat_core::ServerToolKind::WebSearch
+                                        | meerkat_core::ServerToolKind::GoogleSearch
+                                )
                         }
                     };
                     if !named {
@@ -1376,6 +1431,280 @@ mod tests {
                 (checked_route("checked", "setup"), checked),
                 (server("setup"), chain),
             ],
+        );
+        assert_eq!(
+            InputAuthorityAssociation::new(unordered),
+            Err(AssociationError::Shape)
+        );
+    }
+
+    fn builtin_web_search() -> GrantTarget {
+        GrantTarget::BuiltinToolOperation {
+            operation: meerkat_core::BuiltinToolOperation::WebSearch,
+        }
+    }
+
+    fn delegated(route: &str, capability: meerkat_core::ServerToolKind) -> GrantTarget {
+        GrantTarget::DelegatedHostedSearch {
+            route: route.into(),
+            capability,
+        }
+    }
+
+    fn route_key(model: &str) -> String {
+        meerkat_core::ControllerModelFacts::new(
+            controller_selection(model),
+            "https://search.invalid/v1/responses".into(),
+            "search-wire-model".into(),
+        )
+        .route_key()
+        .as_str()
+        .to_owned()
+    }
+
+    /// The builtin web_search operation and a delegated hosted search are
+    /// targets of their own, ordered after every earlier target kind, each
+    /// with one wire shape. A delegated search names a canonical route key
+    /// and a hosted search capability (web search or Google Search
+    /// grounding); other route text or another capability is a malformed
+    /// shape. An association without them keeps its exact bytes.
+    #[test]
+    fn delegated_hosted_search_targets_validate_route_and_capability() {
+        use meerkat_core::ServerToolKind;
+        let mut value = candidate();
+        let chain = fixture_lineage_mut(&mut value).to_vec();
+        let mut existing = value.clone();
+        existing.authority_basis = targeted(
+            Some(chain.clone()),
+            vec![
+                (server("mail"), chain.clone()),
+                (bundle_operation("mail", "read_mail"), chain.clone()),
+                (checked_route("checked", "mail"), chain.clone()),
+            ],
+        );
+        let existing = InputAuthorityAssociation::new(existing).expect("earlier target kinds");
+        let decoded: InputAuthorityAssociation =
+            serde_json::from_value(serde_json::to_value(&existing).expect("wire")).expect("decode");
+        assert_eq!(
+            decoded.canonical_bytes().expect("bytes"),
+            existing.canonical_bytes().expect("bytes"),
+            "an existing association decodes and re-encodes byte-identically"
+        );
+
+        let route = route_key("search-model");
+        let other = route_key("other-search-model");
+        assert_ne!(route, other);
+        let mut searching = value.clone();
+        searching.authority_basis = targeted(
+            None,
+            vec![
+                (checked_route("checked", "mail"), chain.clone()),
+                (builtin_web_search(), chain.clone()),
+                (delegated(&route, ServerToolKind::WebSearch), chain.clone()),
+                (
+                    delegated(&route, ServerToolKind::GoogleSearch),
+                    chain.clone(),
+                ),
+            ],
+        );
+        let association = InputAuthorityAssociation::new(searching).expect("both new target kinds");
+        let basis = &association.candidate().authority_basis;
+        assert_eq!(
+            basis.lineage_for(Some(&builtin_web_search())),
+            Some(chain.as_slice())
+        );
+        assert_eq!(
+            basis.lineage_for(Some(&delegated(&route, ServerToolKind::WebSearch))),
+            Some(chain.as_slice())
+        );
+        assert_eq!(
+            basis.lineage_for(Some(&delegated(&other, ServerToolKind::WebSearch))),
+            None,
+            "another route has no lineage"
+        );
+        assert_eq!(basis.lineage_for(None), None, "never the base");
+        let wire = serde_json::to_value(&association).expect("wire");
+        assert_eq!(
+            wire["authority_basis"]["targets"][1]["target"],
+            serde_json::json!({"kind": "builtin_tool_operation", "operation": "web_search"})
+        );
+        assert_eq!(
+            wire["authority_basis"]["targets"][2]["target"],
+            serde_json::json!({
+                "kind": "delegated_hosted_search",
+                "route": route,
+                "capability": {"kind": "web_search"},
+            })
+        );
+        assert_eq!(
+            wire["authority_basis"]["targets"][3]["target"]["capability"],
+            serde_json::json!({"kind": "google_search"})
+        );
+        let decoded: InputAuthorityAssociation =
+            serde_json::from_value(wire.clone()).expect("decode");
+        assert_eq!(decoded, association);
+        assert_eq!(
+            decoded.canonical_bytes().expect("bytes"),
+            association.canonical_bytes().expect("bytes")
+        );
+        assert!(checked_route("checked", "mail") < builtin_web_search());
+        assert!(builtin_web_search() < delegated(&route, ServerToolKind::WebSearch));
+
+        for target in [
+            delegated("", ServerToolKind::WebSearch),
+            delegated("model-route/v1/not-a-digest", ServerToolKind::WebSearch),
+            delegated(&route.to_uppercase(), ServerToolKind::WebSearch),
+            delegated(
+                &route,
+                ServerToolKind::ProviderNative {
+                    name: "web_search".into(),
+                },
+            ),
+        ] {
+            let mut invalid = value.clone();
+            invalid.authority_basis = targeted(None, vec![(target, chain.clone())]);
+            assert_eq!(
+                InputAuthorityAssociation::new(invalid),
+                Err(AssociationError::Shape)
+            );
+        }
+        let mut unknown = wire.clone();
+        unknown["authority_basis"]["targets"][2]["target"]["account"] = serde_json::json!("x");
+        assert!(serde_json::from_value::<InputAuthorityAssociation>(unknown).is_err());
+        let mut unknown_operation = wire;
+        unknown_operation["authority_basis"]["targets"][1]["target"]["operation"] =
+            serde_json::json!("shell");
+        assert!(serde_json::from_value::<InputAuthorityAssociation>(unknown_operation).is_err());
+    }
+
+    fn peer(value: u128) -> GrantTarget {
+        GrantTarget::Peer {
+            peer: meerkat_core::comms::PeerId::from_uuid(uuid::Uuid::from_u128(value)),
+        }
+    }
+
+    fn host_memory(owner: &str, scope: &str) -> GrantTarget {
+        GrantTarget::Memory {
+            scope: meerkat_core::memory::MemoryScopeRef::Host {
+                owner: owner.into(),
+                scope: scope.into(),
+            },
+        }
+    }
+
+    /// Each peer, the peer directory and each memory scope is a target of
+    /// its own: it selects only its own lineage, never another peer's or
+    /// scope's, and never the base. The wire shape is pinned, a host memory
+    /// scope needs both of its names, and the order stays canonical across
+    /// target kinds.
+    #[test]
+    fn peer_directory_and_memory_targets_select_only_their_own_lineage() {
+        let mut value = candidate();
+        let chain = fixture_lineage_mut(&mut value).to_vec();
+        let lineage = |name: &str| {
+            let mut lineage = chain.clone();
+            lineage[0].grant_id = id(name);
+            lineage
+        };
+        let session = meerkat_core::SessionId::from_uuid(uuid::Uuid::from_u128(9));
+        let session_memory = GrantTarget::Memory {
+            scope: meerkat_core::memory::MemoryScopeRef::Session {
+                session_id: session.clone(),
+            },
+        };
+        value.authority_basis = targeted(
+            Some(chain.clone()),
+            vec![
+                (server("alpha"), chain.clone()),
+                (peer(1), lineage("peer-one")),
+                (GrantTarget::PeerDirectory, lineage("peer-directory")),
+                (session_memory.clone(), lineage("session-memory")),
+                (
+                    host_memory("agent_memory", "identity/alice"),
+                    lineage("alice"),
+                ),
+            ],
+        );
+        let association = InputAuthorityAssociation::new(value.clone()).expect("association");
+        let basis = &association.candidate().authority_basis;
+        assert_eq!(
+            basis.lineage_for(Some(&peer(1))),
+            Some(lineage("peer-one").as_slice())
+        );
+        assert_eq!(
+            basis.lineage_for(Some(&peer(2))),
+            None,
+            "another peer has no lineage, and the base never stands in"
+        );
+        assert_eq!(
+            basis.lineage_for(Some(&GrantTarget::PeerDirectory)),
+            Some(lineage("peer-directory").as_slice())
+        );
+        assert_eq!(
+            basis.lineage_for(Some(&host_memory("agent_memory", "identity/alice"))),
+            Some(lineage("alice").as_slice())
+        );
+        assert_eq!(
+            basis.lineage_for(Some(&host_memory("agent_memory", "identity/bob"))),
+            None,
+            "another scope of the same owner has no lineage"
+        );
+        assert_eq!(
+            basis.lineage_for(Some(&host_memory("other_memory", "identity/alice"))),
+            None,
+            "the same key of another owner has no lineage"
+        );
+        assert_eq!(
+            basis.lineage_for(Some(&session_memory)),
+            Some(lineage("session-memory").as_slice())
+        );
+
+        let wire = serde_json::to_value(&association).expect("wire");
+        let targets = &wire["authority_basis"]["targets"];
+        assert_eq!(
+            targets[1]["target"],
+            serde_json::json!({
+                "kind": "peer",
+                "peer": "00000000-0000-0000-0000-000000000001",
+            })
+        );
+        assert_eq!(
+            targets[2]["target"],
+            serde_json::json!({"kind": "peer_directory"})
+        );
+        assert_eq!(
+            targets[3]["target"],
+            serde_json::json!({
+                "kind": "memory",
+                "scope": {"kind": "session", "session_id": session.to_string()},
+            })
+        );
+        assert_eq!(
+            targets[4]["target"],
+            serde_json::json!({
+                "kind": "memory",
+                "scope": {"kind": "host", "owner": "agent_memory", "scope": "identity/alice"},
+            })
+        );
+        let decoded: InputAuthorityAssociation = serde_json::from_value(wire).expect("decode");
+        assert_eq!(decoded, association);
+
+        for target in [
+            host_memory("", "identity/alice"),
+            host_memory("agent_memory", ""),
+        ] {
+            let mut invalid = value.clone();
+            invalid.authority_basis = targeted(None, vec![(target, chain.clone())]);
+            assert_eq!(
+                InputAuthorityAssociation::new(invalid),
+                Err(AssociationError::Shape)
+            );
+        }
+        // One canonical order across target kinds.
+        let mut unordered = value;
+        unordered.authority_basis = targeted(
+            None,
+            vec![(peer(1), chain.clone()), (server("alpha"), chain)],
         );
         assert_eq!(
             InputAuthorityAssociation::new(unordered),

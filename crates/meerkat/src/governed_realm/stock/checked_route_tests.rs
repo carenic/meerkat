@@ -240,9 +240,10 @@ fn server_config() -> McpServerConfig {
 
 /// One session's own adapter over its own connection to the fixture.
 async fn adapter() -> Arc<McpRouterAdapter> {
-    let mut router = McpRouter::new_with_surface_handle(Arc::new(
-        meerkat_runtime::RuntimeExternalToolSurfaceHandle::ephemeral(),
-    ));
+    let mut router = McpRouter::new_with_surface_handle_and_stdio_profile(
+        Arc::new(meerkat_runtime::RuntimeExternalToolSurfaceHandle::ephemeral()),
+        meerkat_mcp::McpStdioLaunchProfile::trusted_host(),
+    );
     tokio::time::timeout(LIMIT, router.add_server(server_config()))
         .await
         .unwrap()

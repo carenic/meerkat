@@ -2185,6 +2185,9 @@ enum SessionCommand {
     ToolScopeSnapshot {
         reply_tx: oneshot::Sender<Option<meerkat_core::ToolScopeSnapshot>>,
     },
+    ToolCatalogView {
+        reply_tx: oneshot::Sender<Option<meerkat_core::ToolCatalogView>>,
+    },
     VisibleToolDefs {
         reply_tx: oneshot::Sender<Vec<meerkat_core::ToolDef>>,
     },
@@ -2453,6 +2456,7 @@ impl SessionCommand {
             // Read-only snapshots and lookups (#1226).
             | Self::ExecutionSnapshot { .. }
             | Self::ToolScopeSnapshot { .. }
+            | Self::ToolCatalogView { .. }
             | Self::VisibleToolDefs { .. }
             | Self::ExternalToolSurfaceSnapshot { .. }
             | Self::ResolveLiveAssistantPlaybackTarget { .. } => false,
@@ -3718,6 +3722,12 @@ pub trait SessionAgent: Send {
 
     /// Take a diagnostic snapshot of the live tool-scope state, if supported.
     fn tool_scope_snapshot(&self) -> Option<meerkat_core::ToolScopeSnapshot> {
+        None
+    }
+
+    /// How the live session's next model request projects its tool catalog
+    /// ([`meerkat_core::ToolCatalogView`]), if supported.
+    fn tool_catalog_view(&self) -> Option<meerkat_core::ToolCatalogView> {
         None
     }
 
@@ -5493,6 +5503,37 @@ impl<B: SessionAgentBuilder + 'static> EphemeralSessionService<B> {
         let (reply_tx, reply_rx) = oneshot::channel();
         command_tx
             .send(SessionCommand::ToolScopeSnapshot { reply_tx })
+            .await
+            .map_err(|_| {
+                SessionError::Agent(meerkat_core::error::AgentError::InternalError(
+                    "Session task has exited".to_string(),
+                ))
+            })?;
+
+        reply_rx.await.map_err(|_| {
+            SessionError::Agent(meerkat_core::error::AgentError::InternalError(
+                "Session task dropped the reply channel".to_string(),
+            ))
+        })
+    }
+
+    /// How a live session's next model request projects its tool catalog:
+    /// the catalog mode and how each catalog entry shows to the model
+    /// ([`meerkat_core::ToolCatalogView`]). Read through the session task
+    /// without changing anything; `None` when the session's agent cannot
+    /// report it.
+    pub async fn tool_catalog_view(
+        &self,
+        id: &SessionId,
+    ) -> Result<Option<meerkat_core::ToolCatalogView>, SessionError> {
+        let command_tx = {
+            let command_tx = self.session_command_tx(id).await?;
+            command_tx.clone()
+        };
+
+        let (reply_tx, reply_rx) = oneshot::channel();
+        command_tx
+            .send(SessionCommand::ToolCatalogView { reply_tx })
             .await
             .map_err(|_| {
                 SessionError::Agent(meerkat_core::error::AgentError::InternalError(
@@ -9818,6 +9859,9 @@ async fn drain_session_task_commands<A: SessionAgent>(
             SessionCommand::ToolScopeSnapshot { reply_tx } => {
                 let _ = reply_tx.send(agent.tool_scope_snapshot());
             }
+            SessionCommand::ToolCatalogView { reply_tx } => {
+                let _ = reply_tx.send(agent.tool_catalog_view());
+            }
             SessionCommand::VisibleToolDefs { reply_tx } => {
                 let _ = reply_tx.send(agent.visible_tool_defs());
             }
@@ -10902,6 +10946,9 @@ async fn session_task<A: SessionAgent>(
             }
             SessionCommand::ToolScopeSnapshot { reply_tx } => {
                 let _ = reply_tx.send(agent.tool_scope_snapshot());
+            }
+            SessionCommand::ToolCatalogView { reply_tx } => {
+                let _ = reply_tx.send(agent.tool_catalog_view());
             }
             SessionCommand::VisibleToolDefs { reply_tx } => {
                 let _ = reply_tx.send(agent.visible_tool_defs());

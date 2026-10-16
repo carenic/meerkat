@@ -1654,7 +1654,7 @@ async fn governed_jsonl_public_entry_preserves_refusal_sibling_feedback_and_comp
             assert_eq!(records.len(), 3);
             assert!(matches!(
                 records[1].observation.observation,
-                AuditObservation::Entry
+                AuditObservation::Entry { .. }
             ));
             match &record.observation.observation {
                 AuditObservation::Prepared { target, .. }
@@ -2148,7 +2148,7 @@ async fn governed_jsonl_refusal_retains_actor_seed_and_context_then_same_run_rea
                     && matches!(
                         &record.observation.observation,
                         AuditObservation::Prepared { .. }
-                            | AuditObservation::Entry
+                            | AuditObservation::Entry { .. }
                             | AuditObservation::Outcome { .. }
                     )),
             "the denied delete has no operation entry or outcome"
@@ -2183,7 +2183,7 @@ async fn governed_jsonl_refusal_retains_actor_seed_and_context_then_same_run_rea
                         && matches!(
                             &record.observation.observation,
                             AuditObservation::Prepared { .. }
-                                | AuditObservation::Entry
+                                | AuditObservation::Entry { .. }
                                 | AuditObservation::Outcome { .. }
                         )
                 ),
@@ -2207,7 +2207,10 @@ async fn governed_jsonl_refusal_retains_actor_seed_and_context_then_same_run_rea
             .iter()
             .position(|record| {
                 &record.observation.operation_id == read_id
-                    && matches!(&record.observation.observation, AuditObservation::Entry)
+                    && matches!(
+                        &record.observation.observation,
+                        AuditObservation::Entry { .. }
+                    )
             })
             .expect("actual read operation entry");
         let read_outcome_at = final_audit
@@ -2235,7 +2238,10 @@ async fn governed_jsonl_refusal_retains_actor_seed_and_context_then_same_run_rea
                 .iter()
                 .position(|record| {
                     &record.observation.operation_id == operation_id
-                        && matches!(&record.observation.observation, AuditObservation::Entry)
+                        && matches!(
+                            &record.observation.observation,
+                            AuditObservation::Entry { .. }
+                        )
                 })
                 .expect("actual model operation entry");
             let outcome_at = final_audit

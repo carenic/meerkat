@@ -287,6 +287,10 @@ impl SessionAgent for SnapshotAgent {
         Some(self.tool_scope_snapshot.clone())
     }
 
+    fn tool_catalog_view(&self) -> Option<meerkat_core::ToolCatalogView> {
+        Some(snapshot_catalog_view(&self.tool_scope_snapshot))
+    }
+
     fn external_tool_surface_snapshot(&self) -> Option<meerkat_core::ExternalToolSurfaceSnapshot> {
         self.external_tool_surface_snapshot.clone()
     }
@@ -598,6 +602,34 @@ fn make_recording_service(
         RecordingTurnAgentBuilder { recorded },
         10,
     ))
+}
+
+/// The catalog view the snapshot agent reports: its known tools, visible as
+/// its tool-scope snapshot says.
+fn snapshot_catalog_view(
+    snapshot: &meerkat_core::ToolScopeSnapshot,
+) -> meerkat_core::ToolCatalogView {
+    meerkat_core::ToolCatalogView {
+        mode: meerkat_core::ToolCatalogMode::Inline,
+        exact_catalog: true,
+        pending_sources: Vec::new(),
+        staged_changes_pending: snapshot.staged_revision != snapshot.active_revision,
+        entries: snapshot
+            .known_base_names
+            .iter()
+            .map(|name| meerkat_core::ToolCatalogViewEntry {
+                name: name.clone(),
+                plane: meerkat_core::ToolPlaneClass::Session,
+                deferred_eligibility: meerkat_core::ToolCatalogDeferredEligibility::InlineOnly,
+                callability: meerkat_core::ToolCallability::Callable,
+                visibility: if snapshot.visible_names.contains(name) {
+                    meerkat_core::ToolCatalogVisibility::Visible
+                } else {
+                    meerkat_core::ToolCatalogVisibility::Hidden
+                },
+            })
+            .collect(),
+    }
 }
 
 fn make_snapshot_service(
@@ -1328,6 +1360,20 @@ async fn tool_scope_snapshot_returns_live_agent_tool_scope_state() {
         .expect("tool-scope snapshot should be present");
 
     assert_eq!(actual, expected);
+
+    // The typed catalog query reaches the same live agent through the
+    // session task and returns its view unchanged.
+    let view = service
+        .tool_catalog_view(&created.session_id)
+        .await
+        .expect("tool catalog view query should succeed")
+        .expect("tool catalog view should be present");
+    assert_eq!(view, snapshot_catalog_view(&expected));
+    assert!(view.staged_changes_pending);
+    assert!(matches!(
+        service.tool_catalog_view(&SessionId::new()).await,
+        Err(SessionError::NotFound { .. })
+    ));
 }
 
 #[tokio::test]

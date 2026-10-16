@@ -443,7 +443,12 @@ GitHub-hosted runners and sized to a 25-minute lane execution budget:
   hosted 4-vCPU runner needs about 64 min), and the plan otherwise records
   the lane it leaves to the hook (`hook_retained_lanes`). Each row lists and
   runs one shared selection and first checks that nextest selects exactly
-  its planned binaries (`scripts/ci-verify-row-binaries.mjs`). The plan
+  its planned binaries (`scripts/ci-verify-row-binaries.mjs`). The binary
+  holding the nested-Cargo canaries (the `downstream-cargo-canary` test
+  group in `.config/nextest.toml`) has rows of its own, one
+  `--partition count:K/N` per canary, so the canaries run on separate
+  runners; the coverage check credits it only when every partition is
+  planned. The plan
   fails when `scripts/ci-hook-coverage.mjs` finds a hook binary in scope
   without a row (other than a lib binary the plan leaves to the hook): it
   reads the hook's lanes from `scripts/pre-push-unit.sh`, binds every line
@@ -628,7 +633,7 @@ Installed via `make install-hooks`. Two stages:
 - `scripts/pre-push-machines.sh`, as two hooks behind the machine-authority classifier and the exact pushed refs: `machine-codegen-drift` (`--codegen-only`: machine and protocol codegen under the clean-tree contract, the only local drift check; the dispatcher refuses `SKIP=machine-codegen-drift`) and `machine-codegen-verify` (`--verify-only`: the canonical TLC lane)
 - `scripts/pre-push-audit-generated-headers.sh`
 - `scripts/pre-push-bridge-no-responsestatus.sh` (thin wrapper over `xtask bridge-classifier`)
-- `scripts/pre-push-bazel-locks.sh` (generated BUILD freshness, offline MODULE.bazel.lock recorded-input check, the release test-code gate `scripts/check-bazel-release-features.py` (every Bazel release build passes `--define=meerkat_release_build=1`, under which no target the shipped binaries link enables a feature from `scripts/non-shipping-features.json`), `bb mod deps --lockfile_mode=error` when the pinned CLI is present; `--require-bb` makes that last gate mandatory and the release preflight passes it)
+- `scripts/pre-push-bazel-locks.sh` (generated BUILD freshness, offline MODULE.bazel.lock recorded-input check, the release test-code gate `scripts/check-bazel-release-features.py` (every Bazel release build passes `--define=meerkat_release_build=1`, under which no target the shipped binaries link enables a feature from `scripts/non-shipping-features.json`, and no crate_universe repository of an external crate listed there under `external_crate_features` enables one of its listed features: tokio's `test-util`, which `tools/third-party/patches/rules_rust-release-stripped-crate-features.patch` moves behind the release select), `bb mod deps --lockfile_mode=error` when the pinned CLI is present; `--require-bb` makes that last gate mandatory and the release preflight passes it)
 - `scripts/test-lock-consistency-gate.sh`, `scripts/test-bazel-module-lock-gate.sh`, `scripts/test-crate-enumeration-gate.sh`, `scripts/test-crate-license-files-gate.sh`, `scripts/test-release-test-code-guards.sh`, `scripts/test-release-doctor-workflow-contract.sh` (contract tests: each new release-infra gate must still fail on the defect it was written for; the last one also proves the release doctor's `release.yml` assertions survive rewording)
 - `scripts/test-release-find-prebuild.sh` (stubbed `gh`, no network: the tag run's prebuild lookup selects only a prebuild of exactly the tag commit whose critical artifacts are ready, the newest one, waits for a gate that has not concluded within its budget, and fails instead of reading an API error as "no prebuild")
 - `scripts/test-check-macos-x86-release-binary.sh` (stubbed Apple tools: the Intel macOS cross-build check refuses a non-x86_64 binary, a wrong or failing `--version` under Rosetta, a non-system library and a too-new minimum macOS)
@@ -716,7 +721,7 @@ Six files must agree on the same version:
 | `sdks/web/package.json` | `version` |
 | `artifacts/schemas/version.json` | `contract_version` |
 
-Additionally, all internal crate dependencies in `Cargo.toml` (47 path deps) must match the workspace version.
+Additionally, all internal crate dependencies in `Cargo.toml` (47 path deps) must require the workspace version exactly (`version = "=X.Y.Z"`; cargo-release keeps the `=` when it bumps). 0.x patch releases may break API, so every requirement a release crate publishes on a workspace crate is exact; `make check-rust-release-config` checks the manifests and `make check-rust-release-packaging` the packaged archives.
 
 **`make verify-version-parity`** runs in CI and fails on any drift. After changing versions or wire types:
 

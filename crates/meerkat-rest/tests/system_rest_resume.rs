@@ -147,6 +147,7 @@ async fn inner_test_rest_resume_metadata() {
         ),
         auth_lease: runtime_adapter.generated_auth_lease_handle(),
         provider_registry,
+        host_confinement: meerkat::HostConfinement::trusted_host(),
     };
 
     let app = router(state_run);
@@ -308,6 +309,7 @@ async fn inner_test_rest_resume_metadata() {
         ),
         auth_lease: runtime_adapter2.generated_auth_lease_handle(),
         provider_registry: provider_registry2,
+        host_confinement: meerkat::HostConfinement::trusted_host(),
     };
 
     let app = router(state_resume);

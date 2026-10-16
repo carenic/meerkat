@@ -5,6 +5,7 @@
 
 mod audit;
 mod connector_approval;
+mod delegated_search;
 mod targeted;
 mod tool_application;
 

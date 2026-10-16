@@ -359,10 +359,7 @@ pub async fn start_turn_with_params(
         // The typed data (the turn error, a callback-pending payload) stays
         // on the response with its typed code.
         Err(rpc_err) => {
-            return match rpc_err.data {
-                Some(data) => RpcResponse::error_with_data(id, rpc_err.code, rpc_err.message, data),
-                None => RpcResponse::error(id, rpc_err.code, rpc_err.message),
-            };
+            return RpcResponse::from_error(id, rpc_err);
         }
     };
 
@@ -401,7 +398,7 @@ pub async fn handle_interrupt(
             id,
             InterruptResult::from_outcome(session_id.to_string(), outcome),
         ),
-        Err(err) => RpcResponse::error(id, err.code, err.message),
+        Err(err) => RpcResponse::from_error(id, err),
     }
 }
 
@@ -429,7 +426,7 @@ pub async fn handle_stop_run(
     };
     let receipt = match runtime.stop_run(&session_id, &run_id, params.reason).await {
         Ok(receipt) => receipt,
-        Err(err) => return RpcResponse::error(id, err.code, err.message),
+        Err(err) => return RpcResponse::from_error(id, err),
     };
     match meerkat::surface::wire_run_stop_receipt(&receipt) {
         Ok(receipt) => RpcResponse::success(

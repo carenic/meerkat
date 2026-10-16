@@ -58,9 +58,12 @@ where
 
     let handle = tokio::spawn(async move {
         // Materialize the (potentially large) future on this fresh task's
-        // stack — not the caller's — and box it so this wrapper's own
-        // generator stays at closure-capture size.
-        let future: std::pin::Pin<Box<Fut>> = Box::pin(make_future());
+        // stack - not the caller's - and box it so this wrapper's own
+        // generator stays at closure-capture size. It is built in
+        // `box_in_own_frame`'s frame, which returns before the first poll:
+        // built here, it reserved its full size in this task's poll frame,
+        // beneath the whole relieved chain.
+        let future: OwnFrameFuture<'static, T> = box_in_own_frame(make_future);
         future.await
     });
     let _guard = AbortOnDrop(handle.abort_handle());

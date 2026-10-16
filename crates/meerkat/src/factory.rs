@@ -810,6 +810,12 @@ pub struct AgentBuildConfig {
     /// Declarative MCP server configs materialized by this build into a
     /// session-owned MCP router composed with `external_tools` and builtins.
     pub mcp_servers: Vec<meerkat_core::mcp_config::McpServerConfig>,
+    /// Configured MCP servers the host refused for this build (for example
+    /// an `mcp.toml` a confined process can write), each with its typed
+    /// reason. The build stages each refused in its session-owned router, so
+    /// the model sees the refusal as that server's failed setup in its MCP
+    /// system notice; nothing in it is expanded, connected or spawned.
+    pub refused_mcp_servers: Vec<meerkat_core::mcp_config::McpServerRefusal>,
     /// Serializable tool definitions that can rebuild recoverable
     /// surface-owned dispatchers after persistence or runtime restart.
     pub recoverable_tool_defs: Option<Vec<meerkat_core::ToolDef>>,
@@ -956,6 +962,10 @@ pub struct AgentBuildConfig {
     pub wait_for_mcp: bool,
     /// Per-agent environment variables injected into shell tool subprocesses.
     pub shell_env: Option<std::collections::HashMap<String, String>>,
+    /// The session's own shell command timeout, in seconds: its
+    /// `[shell] timeout_secs` for this build (see
+    /// `meerkat_core::service::SessionBuildOptions::shell_timeout_secs`).
+    pub shell_timeout_secs: Option<std::num::NonZeroU64>,
     /// Optional session checkpointer for host-mode persistence.
     pub checkpointer: Option<Arc<dyn meerkat_core::SessionCheckpointer>>,
     /// Explicit call-timeout override at the build seam.
@@ -1157,6 +1167,7 @@ impl std::fmt::Debug for AgentBuildConfig {
             .field("additional_instructions", &self.additional_instructions)
             .field("wait_for_mcp", &self.wait_for_mcp)
             .field("mcp_servers", &self.mcp_servers)
+            .field("refused_mcp_servers", &self.refused_mcp_servers)
             .field("runtime_build_mode", &self.runtime_build_mode)
             .field(
                 "initial_tool_visibility_state",
@@ -1250,7 +1261,9 @@ impl AgentBuildConfig {
             additional_instructions: None,
             wait_for_mcp: false,
             mcp_servers: Vec::new(),
+            refused_mcp_servers: Vec::new(),
             shell_env: None,
+            shell_timeout_secs: None,
             checkpointer: None,
             call_timeout_override: meerkat_core::CallTimeoutOverride::default(),
             resume_override_mask: meerkat_core::service::ResumeOverrideMask::default(),
@@ -1341,6 +1354,7 @@ impl AgentBuildConfig {
         self.provider_params = build.provider_params.clone();
         self.external_tools = build.external_tools.clone();
         self.mcp_servers = build.mcp_servers.clone();
+        self.refused_mcp_servers = build.refused_mcp_servers.clone();
         self.recoverable_tool_defs = build.recoverable_tool_defs.clone();
         self.blob_store_override = build.blob_store_override.clone();
         self.llm_client_override = build
@@ -1392,6 +1406,7 @@ impl AgentBuildConfig {
         self.application_tool_policy = build.application_tool_policy.clone();
         self.tool_consequence_policy_registry = build.tool_consequence_policy_registry.clone();
         self.shell_env = build.shell_env.clone();
+        self.shell_timeout_secs = build.shell_timeout_secs;
         self.checkpointer = build.checkpointer.clone();
         self.call_timeout_override = build.call_timeout_override.clone();
         self.resume_override_mask = build.resume_override_mask;
@@ -1429,6 +1444,7 @@ impl AgentBuildConfig {
             // The session service decides hosting when it creates the actor.
             hosting: meerkat_core::session_hosting::SessionHostingIntent::default(),
             mcp_servers: self.mcp_servers.clone(),
+            refused_mcp_servers: self.refused_mcp_servers.clone(),
             recoverable_tool_defs: self.recoverable_tool_defs.clone(),
             blob_store_override: self.blob_store_override.clone(),
             llm_client_override: self
@@ -1475,6 +1491,7 @@ impl AgentBuildConfig {
             application_tool_policy: self.application_tool_policy.clone(),
             tool_consequence_policy_registry: self.tool_consequence_policy_registry.clone(),
             shell_env: self.shell_env.clone(),
+            shell_timeout_secs: self.shell_timeout_secs,
             checkpointer: self.checkpointer.clone(),
             call_timeout_override: self.call_timeout_override.clone(),
             resume_override_mask: self.resume_override_mask,
@@ -1680,6 +1697,17 @@ impl meerkat_core::ModelOperationalDefaultsResolver for RegistryBackedDefaultsRe
             .and_then(|p| p.call_timeout_secs)
             .map(std::time::Duration::from_secs)
     }
+
+    fn stream_inactivity_timeout_for(
+        &self,
+        provider: Provider,
+        model: &str,
+    ) -> Option<std::time::Duration> {
+        self.registry
+            .profile_for_provider(provider, model)
+            .and_then(|p| p.stream_inactivity_timeout_secs)
+            .map(std::time::Duration::from_secs)
+    }
 }
 
 fn provider_request_defaults_for(
@@ -1821,6 +1849,32 @@ fn validate_anthropic_request_shaping(
     }
     match meerkat_models::capabilities_for(Provider::Anthropic, model)
         .and_then(|capabilities| capabilities.anthropic_provider_tag_rejection(&tag))
+    {
+        Some(rejection) => Err(BuildAgentError::Config(rejection)),
+        None => Ok(()),
+    }
+}
+
+/// Refuse a Gemini thinking level the resolved catalog row rejects (the
+/// API answers 400 for `minimal` on a model that does not accept it) when
+/// the agent is built, instead of failing its first request. Uncatalogued
+/// models keep the pass-through.
+fn validate_gemini_request_shaping(
+    provider: Provider,
+    model: &str,
+    provider_params: Option<&meerkat_core::lifecycle::run_primitive::ProviderParamsOverride>,
+) -> Result<(), BuildAgentError> {
+    use meerkat_core::lifecycle::run_primitive::ProviderTag;
+    if provider != Provider::Gemini {
+        return Ok(());
+    }
+    let Some(ProviderTag::Gemini(tag)) =
+        provider_params.and_then(|params| params.provider_tag.as_ref())
+    else {
+        return Ok(());
+    };
+    match meerkat_models::capabilities_for(Provider::Gemini, model)
+        .and_then(|capabilities| capabilities.gemini_provider_tag_rejection(tag))
     {
         Some(rejection) => Err(BuildAgentError::Config(rejection)),
         None => Ok(()),
@@ -3666,7 +3720,8 @@ impl AgentFactory {
         auth_binding: &AuthBindingRef,
         auth_lease_handle: meerkat_core::handles::GeneratedAuthLeaseHandle,
     ) -> Result<meerkat_providers::CredentialReadiness, FactoryError> {
-        let mut env = meerkat_providers::ResolverEnvironment::with_process_env()
+        let mut env = self
+            .host_resolver_environment()
             .with_auth_lease_handle(auth_lease_handle);
         if let Some(persistence) = self.resolution_provider_auth_persistence()? {
             env = env.with_provider_auth_persistence(persistence);
@@ -3829,7 +3884,7 @@ impl AgentFactory {
         auth_binding: AuthBindingRef,
         auth_lease_handle: Option<meerkat_core::handles::GeneratedAuthLeaseHandle>,
     ) -> Result<meerkat_providers::ResolvedConnection, FactoryError> {
-        let mut env = meerkat_providers::ResolverEnvironment::with_process_env();
+        let mut env = self.host_resolver_environment();
         if let Some(auth_lease_handle) = auth_lease_handle {
             env = env.with_auth_lease_handle(auth_lease_handle);
         }
@@ -3906,7 +3961,7 @@ impl AgentFactory {
                 "failed to resolve web-search auth binding for provider {search_provider:?}"
             ));
         };
-        let mut env = meerkat_providers::ResolverEnvironment::with_process_env();
+        let mut env = self.host_resolver_environment();
         // A faulted credential backend is a hard typed fault, never folded
         // into the inherit-mode `Ok(None)` degradation.
         if let Some(persistence) = self
@@ -4499,6 +4554,17 @@ impl AgentFactory {
 
     /// Set the native host confinement requirement for automatically composed
     /// shell tools. Each build compiles it into its own shell dispatcher.
+    ///
+    /// This per-kind builder does not install a [`crate::HostConfinement`],
+    /// so the programs the host runs as itself (credential commands, the
+    /// browser opener, `git`) are not judged by it: their
+    /// [`crate::HostConfinement::launch_guard`] is `None`. An embedder that
+    /// confines a kind this way, and also wants those launches cleaned and
+    /// their changeable programs refused, installs the same confinement with
+    /// [`Self::with_host_confinement`] (which also drives these per-kind
+    /// builders). Calling `with_host_confinement(&trusted_host)` after a
+    /// per-kind builder leaves the kind confined with no guard, so prefer
+    /// one `with_host_confinement` with the whole requirement.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn with_shell_confinement(
         mut self,
@@ -4521,6 +4587,57 @@ impl AgentFactory {
     #[cfg(not(target_arch = "wasm32"))]
     pub fn host_confinement(&self) -> Option<&crate::HostConfinement> {
         self.host_confinement.as_ref()
+    }
+
+    /// How this factory's skill repositories meet its host confinement: the
+    /// skills directories, Git program and cache, and linked skills a
+    /// confined process could change are not trusted
+    /// ([`crate::HostConfinement::untrusted_paths`]), and a stdio skill
+    /// source launches under the `mcp_stdio` requirement, as a local MCP
+    /// stdio server does. Without a host confinement, the trusted host.
+    #[cfg(all(feature = "skills", not(target_arch = "wasm32")))]
+    fn skill_host_boundary(&self) -> meerkat_skills::SkillHostBoundary {
+        use meerkat_core::ConfinementLaunchKind;
+        let Some(host) = &self.host_confinement else {
+            return meerkat_skills::SkillHostBoundary::trusted_host();
+        };
+        let boundary = match host.launch_guard() {
+            Some(guard) => {
+                meerkat_skills::SkillHostBoundary::trusted_host().with_untrusted_paths(guard)
+            }
+            None => meerkat_skills::SkillHostBoundary::trusted_host(),
+        };
+        match (
+            host.requirement(ConfinementLaunchKind::McpStdio),
+            host.working_directory(ConfinementLaunchKind::McpStdio),
+        ) {
+            (Some(requirement), Some(working_directory)) => {
+                boundary.with_stdio_runner(std::sync::Arc::new(
+                    crate::skill_stdio_confinement::ConfinedStdioSkillRunner::new(
+                        requirement,
+                        working_directory.to_path_buf(),
+                    ),
+                ))
+            }
+            _ => boundary,
+        }
+    }
+
+    /// The resolver environment of this factory's provider resolutions: the
+    /// process environment and, under a host confinement, its guard for the
+    /// programs the host runs as itself, so a credential command a confined
+    /// process could change is refused before it runs.
+    fn host_resolver_environment(&self) -> meerkat_providers::ResolverEnvironment {
+        let env = meerkat_providers::ResolverEnvironment::with_process_env();
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(guard) = self
+            .host_confinement
+            .as_ref()
+            .and_then(crate::HostConfinement::launch_guard)
+        {
+            return env.with_host_launch_guard(guard);
+        }
+        env
     }
 
     /// Install a stock host's resolved OS process confinement: each launch
@@ -4854,11 +4971,12 @@ impl AgentFactory {
                         .clone()
                         .or_else(|| self.project_root.clone())
                         .unwrap_or_else(|| self.store_path.clone());
-                    match meerkat_skills::resolve_repositories_with_roots(
+                    match meerkat_skills::resolve_repositories_with_roots_trusting(
                         &config.skills,
                         conventions_context_root,
                         conventions_user_root,
                         Some(runtime_root.as_path()),
+                        &self.skill_host_boundary(),
                     )
                     .await
                     {
@@ -5255,7 +5373,7 @@ impl AgentFactory {
         .map_err(FactoryError::ConnectionTarget)?;
 
         #[allow(unused_mut)]
-        let mut env = meerkat_providers::ResolverEnvironment::with_process_env();
+        let mut env = self.host_resolver_environment();
         #[cfg(not(target_arch = "wasm32"))]
         {
             if let Some(persistence) = self.resolution_provider_auth_persistence()? {
@@ -5317,6 +5435,15 @@ impl AgentFactory {
                         .map_err(FactoryError::ClientBuild)?;
                     return Ok(LlmClientForIdentity { client, selection });
                 }
+                // A credential command the host refused ends resolution with
+                // the refusal: no later candidate (an ancestor's binding,
+                // the global realm's, the environment's default) silently
+                // stands in for the operator's command.
+                Err(
+                    error @ meerkat_llm_core::provider_runtime::ProviderAuthError::HostLaunchRefused {
+                        ..
+                    },
+                ) => return Err(FactoryError::ProviderAuth(error)),
                 Err(error) => {
                     first_resolution_error.get_or_insert(error);
                     if explicit_auth_binding {
@@ -5974,7 +6101,7 @@ impl AgentFactory {
                 self.resolve_self_hosted_connection(config, identity, &spec, preferred_realm)?;
 
             #[allow(unused_mut)]
-            let mut env = meerkat_providers::ResolverEnvironment::with_process_env();
+            let mut env = self.host_resolver_environment();
             #[cfg(not(target_arch = "wasm32"))]
             {
                 if let Some(persistence) = self.resolution_provider_auth_persistence()? {
@@ -6438,11 +6565,15 @@ impl AgentFactory {
         build_config: AgentBuildConfig,
         config: &Config,
     ) -> Result<DynAgent, BuildAgentError> {
-        self.build_agent_inner(
-            build_config,
-            config,
-            ControllerClientRequirement::NotRequested,
-        )
+        // Built in its own frame: at opt-level 0 the awaited build reserved
+        // twice its size in this poll frame, beneath the whole construction.
+        meerkat_runtime::stack_relief::box_in_own_frame(|| {
+            self.build_agent_inner(
+                build_config,
+                config,
+                ControllerClientRequirement::NotRequested,
+            )
+        })
         .await
         .map(|(agent, _)| agent)
     }
@@ -6462,9 +6593,11 @@ impl AgentFactory {
         build_config: AgentBuildConfig,
         config: &Config,
     ) -> Result<(DynAgent, meerkat_core::ControllerModelClient), BuildAgentError> {
-        let (agent, controller) = self
-            .build_agent_inner(build_config, config, ControllerClientRequirement::Required)
-            .await?;
+        // Built in its own frame, as in `build_agent`.
+        let (agent, controller) = meerkat_runtime::stack_relief::box_in_own_frame(|| {
+            self.build_agent_inner(build_config, config, ControllerClientRequirement::Required)
+        })
+        .await?;
         let controller = controller.ok_or(BuildAgentError::ControllerUnavailable)?;
         Ok((agent, controller))
     }
@@ -6482,12 +6615,16 @@ impl AgentFactory {
         build_config: AgentBuildConfig,
         config: &Config,
     ) -> Result<PreparedAgent, BuildAgentError> {
-        Box::pin(self.assemble_agent(
-            build_config,
-            config,
-            ControllerClientRequirement::NotRequested,
-            AgentBuildPhase::Prepare,
-        ))
+        // Built in its own frame: boxed here, the assembly future was first
+        // materialized at its full size in this poll frame.
+        meerkat_runtime::stack_relief::box_in_own_frame(|| {
+            self.assemble_agent(
+                build_config,
+                config,
+                ControllerClientRequirement::NotRequested,
+                AgentBuildPhase::Prepare,
+            )
+        })
         .await
         .map(PreparedAgent::new)
     }
@@ -6499,12 +6636,15 @@ impl AgentFactory {
         build_config: AgentBuildConfig,
         config: &Config,
     ) -> Result<PreparedAgent, BuildAgentError> {
-        Box::pin(self.assemble_agent(
-            build_config,
-            config,
-            ControllerClientRequirement::Required,
-            AgentBuildPhase::Prepare,
-        ))
+        // Built in its own frame, as in `prepare_agent`.
+        meerkat_runtime::stack_relief::box_in_own_frame(|| {
+            self.assemble_agent(
+                build_config,
+                config,
+                ControllerClientRequirement::Required,
+                AgentBuildPhase::Prepare,
+            )
+        })
         .await
         .map(PreparedAgent::new)
     }
@@ -6535,7 +6675,12 @@ impl AgentFactory {
                         .to_string(),
                 ));
             }
-            let (agent, controller) = Self::complete_assembly(assembly, Some(selection)).await?;
+            // Built in its own frame: at opt-level 0 the awaited completion
+            // reserved twice its size in this poll frame.
+            let (agent, controller) = meerkat_runtime::stack_relief::box_in_own_frame(|| {
+                Self::complete_assembly(assembly, Some(selection))
+            })
+            .await?;
             if let Some(outside) = agent
                 .visible_tool_defs()
                 .iter()
@@ -6574,7 +6719,13 @@ impl AgentFactory {
         config: &Config,
         gate: &dyn meerkat_core::ToolSurfaceGate,
     ) -> Result<DynAgent, BuildAgentError> {
-        let prepared = self.prepare_agent(build_config, config).await?;
+        // The preparation and the finish are built in their own frames: at
+        // opt-level 0 each awaited future reserved twice its size in this
+        // poll frame, beneath the whole construction.
+        let prepared = meerkat_runtime::stack_relief::box_in_own_frame(|| {
+            self.prepare_agent(build_config, config)
+        })
+        .await?;
         let selection = match gate.decide(prepared.tool_surface()).await {
             Ok(selection) => selection,
             Err(refusal) => {
@@ -6582,7 +6733,7 @@ impl AgentFactory {
                 return Err(BuildAgentError::Config(refusal.to_string()));
             }
         };
-        self.finish_agent(prepared, selection)
+        meerkat_runtime::stack_relief::box_in_own_frame(|| self.finish_agent(prepared, selection))
             .await
             .map(|(agent, _)| agent)
     }
@@ -6593,15 +6744,24 @@ impl AgentFactory {
         config: &Config,
         controller_requirement: ControllerClientRequirement,
     ) -> Result<(DynAgent, Option<meerkat_core::ControllerModelClient>), BuildAgentError> {
-        let mut assembly = Box::pin(self.assemble_agent(
-            build_config,
-            config,
-            controller_requirement,
-            AgentBuildPhase::Complete,
-        ))
+        // The assembly and its completion are built in their own frames:
+        // boxed here, the assembly future was first materialized at its full
+        // size in this poll frame, and the awaited completion reserved twice
+        // its size, beneath the whole construction.
+        let mut assembly = meerkat_runtime::stack_relief::box_in_own_frame(|| {
+            self.assemble_agent(
+                build_config,
+                config,
+                controller_requirement,
+                AgentBuildPhase::Complete,
+            )
+        })
         .await?;
         let mut cleanup = std::mem::take(&mut assembly.cleanup);
-        let mut built = Self::complete_assembly(assembly, None).await;
+        let mut built = meerkat_runtime::stack_relief::box_in_own_frame(|| {
+            Self::complete_assembly(assembly, None)
+        })
+        .await;
         if let Ok((agent, _)) = &mut built {
             cleanup.install_live_mcp(agent);
             cleanup.disarm(agent);
@@ -6633,13 +6793,21 @@ impl AgentFactory {
         }
         self.validate_runtime_profile(&build_config, config)?;
         let mut effective_config;
-        let config = if let Some(fallback) = &build_config.model_fallback {
-            effective_config = config.clone();
-            effective_config.model_fallback = fallback.clone();
-            &effective_config
-        } else {
-            config
-        };
+        let config =
+            if build_config.model_fallback.is_some() || build_config.shell_timeout_secs.is_some() {
+                effective_config = config.clone();
+                if let Some(fallback) = &build_config.model_fallback {
+                    effective_config.model_fallback = fallback.clone();
+                }
+                // The session's own shell timeout is its `[shell] timeout_secs`:
+                // the shell tool reads it through its one timeout policy.
+                if let Some(timeout_secs) = build_config.shell_timeout_secs {
+                    effective_config.shell.timeout_secs = timeout_secs.get();
+                }
+                &effective_config
+            } else {
+                config
+            };
         config
             .model_fallback
             .validate()
@@ -7345,11 +7513,12 @@ impl AgentFactory {
                     } else {
                         #[cfg(not(target_arch = "wasm32"))]
                         {
-                            match meerkat_skills::resolve_repositories_with_roots(
+                            match meerkat_skills::resolve_repositories_with_roots_trusting(
                                 &config.skills,
                                 _conventions_context_root,
                                 _conventions_user_root,
                                 Some(_realm_scope_root.as_path()),
+                                &self.skill_host_boundary(),
                             )
                             .await
                             {
@@ -7678,7 +7847,10 @@ impl AgentFactory {
                 if bindings.configured_mcp_attachment().is_some()
         );
         #[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
-        if !build_config.mcp_servers.is_empty() || live_mcp_attachable {
+        if !build_config.mcp_servers.is_empty()
+            || !build_config.refused_mcp_servers.is_empty()
+            || live_mcp_attachable
+        {
             // A registration's surface outlives this construction: its router
             // borrows it and releases only what it staged. A standalone
             // construction's private surface is its router's own.
@@ -7782,6 +7954,34 @@ impl AgentFactory {
                     ))
                 })?;
             }
+            // A server the host refused before setup is staged refused:
+            // applying it reports the typed refusal to the model as that
+            // server's failed setup, and nothing in it connects or spawns.
+            // Its definition comes from a source the host does not trust, so
+            // it is staged under a name safe to show the model, distinct from
+            // every other server of the session.
+            let reported_names = meerkat_core::mcp_config::refused_server_names(
+                build_config
+                    .mcp_servers
+                    .iter()
+                    .map(|server| server.name.as_str()),
+                build_config
+                    .refused_mcp_servers
+                    .iter()
+                    .map(|refused| &refused.server),
+            );
+            for (refused, name) in build_config.refused_mcp_servers.iter().zip(reported_names) {
+                let mut server = refused.server.clone();
+                server.name = name.clone();
+                adapter
+                    .stage_add_refused(server, refused.refusal)
+                    .await
+                    .map_err(|error| {
+                        BuildAgentError::McpSetup(format!(
+                            "stage refused MCP server '{name}': {error}"
+                        ))
+                    })?;
+            }
             adapter.apply_staged().await.map_err(|error| {
                 BuildAgentError::McpSetup(format!("apply staged MCP servers: {error}"))
             })?;
@@ -7822,7 +8022,7 @@ impl AgentFactory {
             });
         }
         #[cfg(not(all(feature = "mcp", not(target_arch = "wasm32"))))]
-        if !build_config.mcp_servers.is_empty() {
+        if !build_config.mcp_servers.is_empty() || !build_config.refused_mcp_servers.is_empty() {
             // Fail closed: silently dropping requested MCP servers would be
             // a capability downgrade the caller cannot observe.
             return Err(BuildAgentError::McpSetup(
@@ -8577,6 +8777,7 @@ impl AgentFactory {
             app_context: build_config.app_context.clone(),
             additional_instructions: build_config.additional_instructions.clone(),
             shell_env: build_config.shell_env.clone(),
+            shell_timeout_secs: build_config.shell_timeout_secs,
             mob_tool_authority_context: build_config.mob_tool_authority_context.clone(),
             call_timeout_override: build_config.call_timeout_override.clone(),
             mcp_attachment_intents: recorded_mcp_attachment_intents,
@@ -8742,6 +8943,12 @@ impl AgentFactory {
             .with_tools_config(config.tools.clone())
             .provider_native_tool_policy(provider_native_tool_policy)
             .with_call_timeout_override(effective_call_timeout_override)
+            // An explicit `[retry] stream_inactivity_timeout` wins; when it
+            // inherits, the loop uses the current model's own window from the
+            // resolver above, then the policy's built-in window.
+            .with_stream_inactivity_timeout_override(
+                config.retry.stream_inactivity_timeout_override.clone(),
+            )
             // Config-owned budget warning threshold and extraction prompt reach
             // the agent here; without this every factory-built agent ran on the
             // template threshold and the built-in extraction prompt.
@@ -8775,6 +8982,7 @@ impl AgentFactory {
             &model,
             build_config.provider_params.as_ref(),
         )?;
+        validate_gemini_request_shaping(provider, &model, build_config.provider_params.as_ref())?;
         if let Some(params) = build_config.provider_params.clone() {
             builder = builder.provider_params(params);
         }
@@ -9310,7 +9518,7 @@ impl AgentFactory {
             session_id,
         )?;
         let primary_target_profile = registry
-            .profile_witness_for_provider(identity.provider, &identity.model)
+            .profile_witness_for_identity(config, identity)
             .ok_or_else(|| {
                 BuildAgentError::Config(format!(
                     "model fallback cannot bind active model '{}:{}' because it is absent from the effective model registry",
@@ -9326,19 +9534,20 @@ impl AgentFactory {
         }];
         let (identities, mut skipped) =
             self.model_fallback_identities(config, registry, identity)?;
+        let absent_target = |identity: &SessionLlmIdentity| {
+            BuildAgentError::Config(format!(
+                "model fallback target '{}:{}' is absent from the effective model registry",
+                identity.provider.as_str(),
+                identity.model
+            ))
+        };
         for identity in identities {
-            let target_profile = match registry
-                .profile_witness_for_provider(identity.provider, &identity.model)
+            if registry
+                .entry_for_provider(identity.provider, &identity.model)
+                .is_none()
             {
-                Some(profile) => profile,
-                None => {
-                    return Err(BuildAgentError::Config(format!(
-                        "model fallback target '{}:{}' is absent from the effective model registry",
-                        identity.provider.as_str(),
-                        identity.model
-                    )));
-                }
-            };
+                return Err(absent_target(&identity));
+            }
             let built = match self
                 .build_llm_client_with_selection_for_identity_in_realm(
                     config,
@@ -9380,6 +9589,13 @@ impl AgentFactory {
             let mut identity = identity;
             let selected_credential =
                 LlmCredentialSelection::bind_unselected(built.selection, &mut identity);
+            // The target is judged as the binding its client uses serves it
+            // (the one it names, or the one just bound): a backend can narrow
+            // the model row, as the ChatGPT backend does for mid-conversation
+            // System messages. The activation keeps this witness.
+            let target_profile = registry
+                .profile_witness_for_identity(config, &identity)
+                .ok_or_else(|| absent_target(&identity))?;
             let adapter = events
                 .adapter(built.client, identity.model.clone(), identity.provider)?
                 .with_event_tap(event_tap.clone());
@@ -9781,7 +9997,7 @@ impl AgentFactory {
                         // `rkat auth login`, server-side OAuth completion, etc.)
                         // are read during resolve_binding.
                         #[allow(unused_mut)]
-                        let mut env = meerkat_providers::ResolverEnvironment::with_process_env();
+                        let mut env = self.host_resolver_environment();
                         #[cfg(not(target_arch = "wasm32"))]
                         {
                             if let Some(persistence) = self
@@ -9854,6 +10070,18 @@ impl AgentFactory {
                                         resolved_model,
                                     ));
                                     break;
+                                }
+                                // A refused credential command ends
+                                // resolution with the refusal; no later
+                                // candidate silently stands in for it.
+                                Err(
+                                    err @ meerkat_llm_core::provider_runtime::ProviderAuthError::HostLaunchRefused {
+                                        ..
+                                    },
+                                ) => {
+                                    return Err(BuildAgentError::LlmClient(
+                                        FactoryError::ProviderAuth(err),
+                                    ));
                                 }
                                 Err(err) => {
                                     first_resolution_error.get_or_insert(err);
@@ -10021,7 +10249,7 @@ impl AgentFactory {
                     continue;
                 };
                 #[allow(unused_mut)]
-                let mut env = meerkat_providers::ResolverEnvironment::with_process_env();
+                let mut env = self.host_resolver_environment();
                 #[cfg(not(target_arch = "wasm32"))]
                 {
                     if let Some(persistence) = self
@@ -12229,6 +12457,7 @@ mod tests {
             params_schema: serde_json::json!({}),
             beta_headers: Vec::new(),
             call_timeout_secs: None,
+            stream_inactivity_timeout_secs: None,
         };
 
         let enabled = provider_request_defaults_for(
@@ -12471,6 +12700,70 @@ mod tests {
         );
     }
 
+    /// A Gemini thinking level the cataloged model refuses is refused when
+    /// the agent is built, nested or flat; accepted levels, uncatalogued
+    /// models and other providers pass.
+    #[test]
+    fn unsupported_gemini_thinking_level_is_refused_at_build() {
+        use meerkat_core::lifecycle::run_primitive::{
+            GeminiProviderTag, GeminiThinkingConfig, GeminiThinkingLevel, ProviderParamsOverride,
+            ProviderTag,
+        };
+        let params = |level, nested: bool| ProviderParamsOverride {
+            provider_tag: Some(ProviderTag::Gemini(if nested {
+                GeminiProviderTag {
+                    thinking: Some(GeminiThinkingConfig {
+                        include_thoughts: None,
+                        thinking_level: Some(level),
+                        thinking_budget: None,
+                    }),
+                    ..Default::default()
+                }
+            } else {
+                GeminiProviderTag {
+                    thinking_level: Some(level),
+                    ..Default::default()
+                }
+            })),
+            ..Default::default()
+        };
+        for nested in [false, true] {
+            let Err(BuildAgentError::Config(message)) = validate_gemini_request_shaping(
+                Provider::Gemini,
+                "gemini-3.8-flash",
+                Some(&params(GeminiThinkingLevel::Minimal, nested)),
+            ) else {
+                panic!("minimal must be refused at build for gemini-3.8-flash");
+            };
+            assert!(message.contains("'minimal'"), "{message}");
+            assert!(message.contains("low, medium, high"), "{message}");
+            for (model, level) in [
+                ("gemini-3.8-flash", GeminiThinkingLevel::Low),
+                ("gemini-3.5-flash-lite", GeminiThinkingLevel::Minimal),
+                ("gemini-uncatalogued-preview", GeminiThinkingLevel::Minimal),
+            ] {
+                assert!(
+                    validate_gemini_request_shaping(
+                        Provider::Gemini,
+                        model,
+                        Some(&params(level, nested))
+                    )
+                    .is_ok(),
+                    "{model} {level:?}"
+                );
+            }
+        }
+        assert!(
+            validate_gemini_request_shaping(
+                Provider::OpenAI,
+                "gemini-3.8-flash",
+                Some(&params(GeminiThinkingLevel::Minimal, false)),
+            )
+            .is_ok(),
+            "only a Gemini build is judged by the Gemini rows"
+        );
+    }
+
     /// A realm whose OpenAI binding is the private ChatGPT backend.
     fn chatgpt_backend_cache_config() -> (Config, AuthBindingRef) {
         let mut config = Config::default();
@@ -12495,8 +12788,10 @@ mod tests {
 
     /// The ChatGPT backend serves the GPT catalog rows, but its wire carries
     /// no ordered System message after the leading prefix. The session's
-    /// profile says so; the public API, and an identity that names no
-    /// binding, keep the row's capability.
+    /// profile says so; the public API, an identity that names no binding,
+    /// and the synthetic env-var default (an API-key backend) keep the
+    /// row's capability. A named binding the config does not resolve has an
+    /// unknown backend, so it does not keep the capability.
     #[test]
     fn a_chatgpt_backend_identity_resolves_without_mid_conversation_system_messages() {
         let (mut config, chatgpt_binding) = chatgpt_backend_cache_config();
@@ -12533,6 +12828,62 @@ mod tests {
         assert!(
             supports(None),
             "an identity naming no binding keeps the row"
+        );
+        assert!(
+            supports(Some(AuthBindingRef {
+                realm: RealmId::parse("env_default").expect("valid realm"),
+                binding: BindingId::parse("default").expect("valid binding"),
+                profile: None,
+                origin: meerkat_core::BindingOrigin::SyntheticEnvDefault,
+            })),
+            "the env-var default names an API-key backend and keeps the row"
+        );
+        assert!(
+            !supports(Some(configured_auth_binding("missing", "default_openai"))),
+            "a binding in a realm the config lacks has an unknown backend"
+        );
+        assert!(
+            !supports(Some(configured_auth_binding("public", "missing_binding"))),
+            "a binding the realm lacks has an unknown backend"
+        );
+    }
+
+    /// The witness minted for an identity carries the judgment of its own
+    /// binding, and is judged for exactly that identity.
+    #[test]
+    fn an_identity_witness_carries_its_binding_judgment() {
+        let (config, chatgpt_binding) = chatgpt_backend_cache_config();
+        let registry = config
+            .model_registry(meerkat_models::canonical())
+            .expect("model registry");
+        let identity = |auth_binding: Option<AuthBindingRef>| SessionLlmIdentity {
+            model: "gpt-5.6-sol".to_string(),
+            provider: Provider::OpenAI,
+            self_hosted_server_id: None,
+            provider_params: None,
+            auth_binding,
+        };
+        let bound = identity(Some(chatgpt_binding));
+        let witness = registry
+            .profile_witness_for_identity(&config, &bound)
+            .expect("cataloged model");
+        assert!(
+            !witness.profile().supports_mid_conversation_system_messages,
+            "the ChatGPT backend's judgment is carried"
+        );
+        assert!(witness.judged_for_identity(&bound));
+        assert!(
+            !witness.judged_for_identity(&identity(None)),
+            "a witness judged through a binding does not stand for the row"
+        );
+        let row = registry
+            .profile_witness_for_provider(Provider::OpenAI, "gpt-5.6-sol")
+            .expect("cataloged model");
+        assert!(row.profile().supports_mid_conversation_system_messages);
+        assert!(row.judged_for_identity(&identity(None)));
+        assert!(
+            !row.judged_for_identity(&bound),
+            "the row does not stand for a bound identity"
         );
     }
 
@@ -14644,6 +14995,168 @@ mod tests {
         assert!(
             bindings.auth_lease().snapshot(&lease).credential_present,
             "the resolved default's lease is held after the switch"
+        );
+    }
+
+    /// Run one sticky fallback from an Anthropic source onto `gpt-5.5`
+    /// through realm `fallback_test`, whose OpenAI binding is the private
+    /// ChatGPT backend, and return the session's resolved capability surface
+    /// afterwards. `bound` names that binding on both the source and the
+    /// fallback target; otherwise neither names one, and the target is served
+    /// by the binding its client resolution selects (the ChatGPT one).
+    #[cfg(not(target_arch = "wasm32"))]
+    async fn chatgpt_backend_sticky_fallback_capabilities(
+        bound: bool,
+    ) -> meerkat_runtime::SessionLlmCapabilitySurface {
+        use meerkat_runtime::SessionServiceRuntimeExt as _;
+
+        let primary_model = "claude-sonnet-4-5";
+        let backup_model = "gpt-5.5";
+        let backup_binding = configured_auth_binding("fallback_test", "default_openai");
+        let primary_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let backup_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let temp = tempfile::tempdir().unwrap();
+        let mut factory = AgentFactory::new(temp.path().join("sessions"))
+            .without_provider_auth_persistence()
+            .builtins(false);
+        factory.provider_registry = Arc::new(
+            meerkat_llm_core::provider_runtime::ProviderRuntimeRegistry::empty()
+                .with_runtime(Arc::new(ScriptedStickyFallbackProviderRuntime {
+                    provider: Provider::Anthropic,
+                    client: Arc::new(ScriptedStickyFallbackClient {
+                        provider: Provider::Anthropic,
+                        fail_recoverably: true,
+                        calls: Arc::clone(&primary_calls),
+                    }),
+                }))
+                .with_runtime(Arc::new(ScriptedStickyFallbackProviderRuntime {
+                    provider: Provider::OpenAI,
+                    client: Arc::new(ScriptedStickyFallbackClient {
+                        provider: Provider::OpenAI,
+                        fail_recoverably: false,
+                        calls: Arc::clone(&backup_calls),
+                    }),
+                })),
+        );
+
+        let mut config = Config::default();
+        let mut realm = if bound {
+            inline_realm_section(&[
+                ("anthropic", "test-primary-key"),
+                ("openai", "test-backup-key"),
+            ])
+        } else {
+            // Only the fallback's provider has a configured binding: the
+            // source is served by the environment default.
+            inline_realm_section(&[("openai", "test-backup-key")])
+        };
+        realm
+            .backend
+            .get_mut("default_openai")
+            .expect("OpenAI backend")
+            .backend_kind = "chatgpt_backend".to_string();
+        realm
+            .auth
+            .get_mut("default_openai")
+            .expect("OpenAI auth")
+            .auth_method = "managed_chatgpt_oauth".to_string();
+        config.realm.insert("fallback_test".to_string(), realm);
+        config.model_fallback.enabled = Some(true);
+        config.model_fallback.policy.cross_provider = true;
+        config.model_fallback.policy.trigger_after_attempts = 1;
+        config.model_fallback.policy.require_tool_parity = false;
+        config.model_fallback.chain = vec![ModelFallbackTarget {
+            model: backup_model.to_string(),
+            provider: Some(Provider::OpenAI),
+            auth_binding: bound.then(|| backup_binding.clone()),
+        }];
+        config.retry.max_retries = 1;
+        config.retry.initial_delay = std::time::Duration::ZERO;
+        config.retry.max_delay = std::time::Duration::ZERO;
+        config.retry.multiplier = 1.0;
+
+        let runtime = meerkat_runtime::MeerkatMachine::ephemeral();
+        let session = Session::new();
+        let session_id = session.id().clone();
+        let bindings = runtime
+            .prepare_bindings(session_id.clone())
+            .await
+            .expect("ephemeral machine should prepare real session-owned bindings");
+        let mut build = AgentBuildConfig::new(primary_model);
+        build.max_tokens = Some(1024);
+        build.provider = Some(Provider::Anthropic);
+        build.realm_id = Some(RealmId::parse("fallback_test").expect("test realm"));
+        if bound {
+            build.auth_binding = Some(configured_auth_binding(
+                "fallback_test",
+                "default_anthropic",
+            ));
+        }
+        build.resume_session = Some(session);
+        build.runtime_build_mode = RuntimeBuildMode::SessionOwned(bindings);
+        build.override_builtins = ToolCategoryOverride::Disable;
+
+        let mut agent = factory
+            .build_agent(build, &config)
+            .await
+            .expect("real factory should build the fallback chain");
+        agent.set_runtime_execution_kind(Some(
+            meerkat_core::lifecycle::RuntimeExecutionKind::ContentTurn,
+        ));
+        let result = agent
+            .run(meerkat_core::ContentInput::Text(
+                "exercise fallback".to_string(),
+            ))
+            .await
+            .expect("recoverable primary failure should retry successfully on backup");
+        assert_eq!(result.text, "backup success");
+        assert_eq!(backup_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        let active_identity = agent
+            .session()
+            .session_metadata()
+            .expect("fallback should retain canonical session metadata")
+            .llm_identity();
+        assert_eq!(active_identity.model, backup_model);
+        assert_eq!(
+            active_identity.auth_binding,
+            Some(backup_binding),
+            "the fallback is served through the ChatGPT-backend binding"
+        );
+        runtime
+            .resolved_session_llm_capabilities(&session_id)
+            .await
+            .expect("resolved capability read")
+            .expect("the fallback records a resolved capability surface")
+    }
+
+    /// A sticky fallback onto a target that names the ChatGPT-backend binding
+    /// records what that backend serves: its wire carries no ordered System
+    /// message after the leading prefix, whatever the GPT row says. The
+    /// activation keeps the target's own judgment instead of re-minting the
+    /// model row.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    async fn sticky_fallback_onto_a_chatgpt_binding_records_its_backend_capability() {
+        let capabilities = chatgpt_backend_sticky_fallback_capabilities(true).await;
+        assert!(
+            !capabilities.supports_mid_conversation_system_messages,
+            "the ChatGPT backend refuses a later System row; the fallback must not \
+             record the gpt-5.5 row's capability"
+        );
+    }
+
+    /// A fallback target that names no binding is judged through the binding
+    /// its client resolution selects, here the realm's ChatGPT-backend one,
+    /// not by the model row.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    async fn unbound_fallback_target_is_judged_by_the_binding_it_resolves() {
+        let capabilities = chatgpt_backend_sticky_fallback_capabilities(false).await;
+        assert!(
+            !capabilities.supports_mid_conversation_system_messages,
+            "the target resolves the ChatGPT-backend binding; the row's capability \
+             must not stand for it"
         );
     }
 
@@ -17175,6 +17688,7 @@ mod tests {
                 supports_reasoning: true,
                 supports_web_search: false,
                 call_timeout_secs: Some(600),
+                stream_inactivity_timeout_secs: None,
             },
         );
         config
@@ -17294,6 +17808,7 @@ mod tests {
             supports_reasoning: false,
             supports_web_search: false,
             call_timeout_secs: Some(600),
+            stream_inactivity_timeout_secs: None,
         }
     }
 
@@ -20083,6 +20598,7 @@ mod tests {
                 supports_reasoning: true,
                 supports_web_search: false,
                 call_timeout_secs: Some(600),
+                stream_inactivity_timeout_secs: None,
             },
         );
 

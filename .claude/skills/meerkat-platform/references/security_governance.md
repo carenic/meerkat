@@ -65,6 +65,9 @@ work can use in 0.9.0:
 
 Builtin tools (shell, files, tasks and the like) and provider-hosted tools have
 no stock grant target and are refused (`operation_authorization_unavailable`).
+The builtin `web_search` names its own operation target, which stock never
+grants, so a per-target stock selection refuses it (`operation_refused`)
+before any owner is asked.
 
 ### Commands
 
@@ -183,8 +186,10 @@ max_output_tokens = 1024
 - Rust hosts attach review with `AgentFactory::with_operation_review` /
   `AgentBuilder::with_operation_review` (`BoundOperationReview`). A tool
   without a reviewed entry point (for example `web_search` and comms `send`)
-  settles a required R2 as `unsupported_entry` and R3 as
-  `human_consent_required`; it never runs unreviewed.
+  never runs under a required review: R2 settles as `reviewer_missing`
+  without a reviewer and as `unsupported_entry` with one; R3 settles as
+  `human_consent_required` without a human consent route and as
+  `unsupported_entry` with one.
 - What the reviewer sees (0.9.0): for an R2 or R3 operation the owners state
   its action account and current mandate (the grant that admits it, with its
   bounds and expiry), read once after R1 is ruled out and sent to the R2
@@ -285,6 +290,20 @@ exclusive execution custody. Other entry points: `meerkat_rpc::governed_jsonl`
 `meerkat::governed_realm::stock_host` (a host's own stores under a stock
 governed realm), and `StockCallerPosture::HostAuthenticated` for callers a
 host authenticated.
+
+The builtin `web_search` is two operations, each mapped from typed facts and
+never from the tool name. The call's plan carries the owner-produced
+`ToolOperationTarget::BuiltinOperation { operation:
+BuiltinToolOperation::WebSearch }`; its helper's model request is an
+`Inference` whose binding carries a `ToolDelegateAttribution` (role
+`HostedSearchInference`, naming the call), with the helper's own route and its
+`WebSearch` or `GoogleSearch` capability, never the controller's. In a
+`TargetedGrantLineages` basis select `GrantTarget::BuiltinToolOperation` for
+the call and `GrantTarget::DelegatedHostedSearch { route, capability }` (the
+helper's own route key) for the helper; the base, catalog and controller
+lineages never cover either. The attribution grants nothing: revoking the
+call's lineage refuses later calls but not one already entered, whose helper
+still needs its own current lineage.
 
 Typed outcomes (`OperationAuthorizationError`): `Refused` (ordinary denial,
 local feedback), `Unavailable` (owner could not decide; repair it, do not

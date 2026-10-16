@@ -855,6 +855,10 @@ impl Config {
                     if model_table.contains_key("call_timeout_secs") {
                         merged.call_timeout_secs = model_layer.call_timeout_secs;
                     }
+                    if model_table.contains_key("stream_inactivity_timeout_secs") {
+                        merged.stream_inactivity_timeout_secs =
+                            model_layer.stream_inactivity_timeout_secs;
+                    }
                     merged_models.insert(model_id.clone(), merged);
                 }
                 self.self_hosted.models = merged_models;
@@ -1075,6 +1079,20 @@ impl Config {
         if self.limits.max_turn_duration == Some(Duration::ZERO) {
             return Err(ConfigError::Validation(
                 "limits.max_turn_duration must be greater than 0 when set".to_string(),
+            ));
+        }
+        // A zero stream-inactivity window would stall every model call before
+        // its first event. `"disabled"` is the way to turn the watchdog off.
+        // A short nonzero window still loads (configs that set one load
+        // today); see `RetryConfig::stream_inactivity_timeout_override`.
+        if matches!(
+            self.retry.stream_inactivity_timeout_override,
+            CallTimeoutOverride::Value(window) if window.is_zero()
+        ) {
+            return Err(ConfigError::Validation(
+                "retry.stream_inactivity_timeout must be greater than 0 when set; use \"disabled\" \
+                 to turn the stream-inactivity watchdog off"
+                    .to_string(),
             ));
         }
         if self.compaction.auto_compact_threshold == 0 {
@@ -1628,6 +1646,14 @@ pub struct SelfHostedModelConfig {
     pub supports_web_search: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub call_timeout_secs: Option<u64>,
+    /// This model's stream-inactivity watchdog window in seconds: how long
+    /// its stream may stay silent (a long prefill, for example) before the
+    /// call is aborted as stalled. Omitted keeps the global window; an
+    /// explicit `[retry] stream_inactivity_timeout` still wins. Config
+    /// validation refuses a window below
+    /// [`crate::MIN_MODEL_STREAM_INACTIVITY_TIMEOUT`] (60 s).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_inactivity_timeout_secs: Option<u64>,
 }
 
 impl Default for SelfHostedModelConfig {
@@ -1649,6 +1675,7 @@ impl Default for SelfHostedModelConfig {
             supports_reasoning: false,
             supports_web_search: false,
             call_timeout_secs: None,
+            stream_inactivity_timeout_secs: None,
         }
     }
 }
@@ -2566,12 +2593,20 @@ pub struct RetryConfig {
     pub call_timeout_override: CallTimeoutOverride,
     /// Tri-state override for the per-provider-stream inactivity watchdog.
     ///
-    /// - `Inherit` (default / omitted): the built-in default window
-    ///   ([`crate::retry::DEFAULT_STREAM_INACTIVITY_TIMEOUT`], 300s) — the
+    /// - `Inherit` (default / omitted): the current model's own window when
+    ///   its profile declares one (a catalog row, or a self-hosted model's
+    ///   `stream_inactivity_timeout_secs`), else the built-in default window
+    ///   ([`crate::retry::DEFAULT_STREAM_INACTIVITY_TIMEOUT`], 300s). The
     ///   watchdog is ON by default because a silent provider stream otherwise
     ///   hangs the turn forever
-    /// - `Disabled` (`stream_inactivity_timeout = "disabled"`): no watchdog
-    /// - `Value(duration)` (`stream_inactivity_timeout = "120s"`): explicit window
+    /// - `Disabled` (`stream_inactivity_timeout = "disabled"`): no watchdog,
+    ///   whatever the model declares
+    /// - `Value(duration)` (`stream_inactivity_timeout = "120s"`): explicit
+    ///   window for every model. [`Config::validate`] refuses a zero window;
+    ///   a nonzero one is used as given. A window under
+    ///   [`crate::MIN_MODEL_STREAM_INACTIVITY_TIMEOUT`] can abort and retry a
+    ///   stream whose answer already arrived: the watchdog keeps running while
+    ///   a provider adapter waits for a trailer after the model's final event
     #[serde(
         default,
         rename = "stream_inactivity_timeout",
@@ -2604,7 +2639,9 @@ impl From<RetryConfig> for RetryPolicy {
             CallTimeoutOverride::Value(d) => Some(d),
         };
         // Unlike call_timeout, `Inherit` resolves to the built-in ON default
-        // here: there is no lower profile layer for the stall watchdog.
+        // here: a policy has no model to ask. The agent loop consults the
+        // current model's profile window first while the composition seam's
+        // override inherits (`AgentBuilder::with_stream_inactivity_timeout_override`).
         let stream_inactivity_timeout = match config.stream_inactivity_timeout_override {
             CallTimeoutOverride::Inherit => Some(crate::retry::DEFAULT_STREAM_INACTIVITY_TIMEOUT),
             CallTimeoutOverride::Disabled => None,
@@ -3005,6 +3042,38 @@ pub enum ConfigScope {
 #[serde(transparent)]
 pub struct ConfigDelta(pub serde_json::Value);
 
+/// A config section the host administers in the documents themselves: an
+/// ordinary config write cannot change it, nor change what a realm composes
+/// of it ([`ConfigError::administered_section`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdministeredSection {
+    /// `[confinement]`.
+    Confinement,
+    /// `[governance]`.
+    Governance,
+}
+
+/// What the host does instead of a refused write that changes realm
+/// sections ([`ConfigError::CompositionAdministration`]): a missing
+/// `[realm.global]` (as a sign-in that provisions credentials under it
+/// adds) is added to the user document by hand.
+fn composition_remedy(change: &str) -> &'static str {
+    if change.contains("adding [realm.global]") {
+        "add [realm.global] to the user document by hand, as its host"
+    } else {
+        "make the change by editing the document as its host"
+    }
+}
+
+impl std::fmt::Display for AdministeredSection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Confinement => "confinement",
+            Self::Governance => "governance",
+        })
+    }
+}
+
 /// Configuration errors
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -3055,11 +3124,50 @@ pub enum ConfigError {
     /// A write would add, change or remove the document's `[confinement]`
     /// section ([`crate::ConfinementConfig`]). Ordinary config write
     /// permission is not confinement administration: the host administers
-    /// the section in the document itself. Nothing is written.
+    /// the section in the documents themselves. Nothing is written.
     #[error(
-        "the confinement section is administered by the host in the config document; a config write cannot add, change or remove it"
+        "the confinement section is administered by the host in the config documents; a config write cannot add, change or remove it"
     )]
     ConfinementAdministration,
+
+    /// A write would change the realm sections a document states (a realm's
+    /// parent edge, or the `[realm.global]` section that puts the user
+    /// document on the chain of every realm whose own documents state none)
+    /// so that a realm composes a different `[confinement]` or
+    /// `[governance]` from the documents on its chain, adding or dropping a
+    /// requirement alike. Ordinary config write permission is not their
+    /// administration: the host administers them in the documents
+    /// themselves. Nothing is written.
+    #[error(
+        "{change} would change the [{administered}] section {composer} composes; the host administers it in the config documents, so a config write cannot change it ({})",
+        composition_remedy(.change)
+    )]
+    CompositionAdministration {
+        /// The section the realm would compose differently.
+        administered: AdministeredSection,
+        /// The realm sections the write changes, for example `removing
+        /// [realm.global]`.
+        change: String,
+        /// The realm that would compose it differently.
+        composer: String,
+    },
+
+    /// A write would add a credential command (an auth profile's
+    /// `source = { kind = "command" }`) or change what one runs: its
+    /// program, arguments, environment or working directory. The host runs
+    /// a credential command as itself, outside its OS process confinement,
+    /// so the command is confinement administration: the host administers
+    /// it in the document itself. Keeping one, changing only its timeout
+    /// or caching, or removing it is ordinary config. Nothing is written.
+    #[error(
+        "the credential command of auth profile '{profile}' in [realm.{realm}] runs as the host, outside its confinement; the host administers it in the config document, so a config write cannot add it or change what it runs (edit the document as its host)"
+    )]
+    CredentialCommandAdministration {
+        /// The realm section that states the auth profile.
+        realm: String,
+        /// The auth profile whose source is the command.
+        profile: String,
+    },
 
     /// A less trusted config document states confinement for a launch kind
     /// differently from the more trusted document that decided it.
@@ -3071,6 +3179,23 @@ pub enum ConfigError {
 }
 
 impl ConfigError {
+    /// The administered section a refused write would change, when this
+    /// error is such a refusal ([`Self::ConfinementAdministration`],
+    /// [`Self::GovernanceAdministration`],
+    /// [`Self::CompositionAdministration`]): surfaces report it as
+    /// `confinement_administration_required` or
+    /// `governance_administration_required`.
+    #[must_use]
+    pub fn administered_section(&self) -> Option<AdministeredSection> {
+        match self {
+            Self::ConfinementAdministration => Some(AdministeredSection::Confinement),
+            Self::GovernanceAdministration => Some(AdministeredSection::Governance),
+            Self::CompositionAdministration { administered, .. } => Some(*administered),
+            Self::CredentialCommandAdministration { .. } => Some(AdministeredSection::Confinement),
+            _ => None,
+        }
+    }
+
     /// A rule refused the document as it is persisted, not a caller's
     /// candidate. The stored state is at fault, so a validation refusal here
     /// becomes an internal error; surfaces keep `Validation` for the caller's
@@ -3418,11 +3543,7 @@ pub(crate) fn compose_effective_config_with_chain(
     }
     // Confinement folds over its own layer order, from the most trusted
     // document: the user document first even when it is not on the chain.
-    let mut confinement = crate::ConfinementConfig::default();
-    for (_, layer) in confinement_layers(docs, &chain) {
-        confinement.fold_less_trusted(layer);
-    }
-    effective.confinement = confinement;
+    effective.confinement = fold_confinement(docs, &chain);
     // NOTE (Finding D, non-blocking per adversarial review): `effective.realm`
     // is the outer-key union of every folded doc's sections (via Config::merge),
     // so a doc that hand-places a foreign `[realm.X]` (X != its owning realm)
@@ -3459,6 +3580,19 @@ pub(crate) fn confinement_layers<'a>(
     layers
 }
 
+/// The `[confinement]` a composition over `chain` folds from `docs`, each
+/// layer under the more trusted ones ([`confinement_layers`]).
+fn fold_confinement(
+    docs: &std::collections::BTreeMap<crate::connection::RealmId, Config>,
+    chain: &crate::connection::RealmChain,
+) -> crate::ConfinementConfig {
+    let mut confinement = crate::ConfinementConfig::default();
+    for (_, layer) in confinement_layers(docs, chain) {
+        confinement.fold_less_trusted(layer);
+    }
+    confinement
+}
+
 /// Refuse a composition in which a less trusted document weakens or
 /// replaces a confinement requirement ([`crate::check_confinement_layers`]).
 #[cfg(not(target_arch = "wasm32"))]
@@ -3473,18 +3607,45 @@ pub(crate) fn check_composed_confinement(
     )
 }
 
-/// The chain [`compose_effective_config`] folds for `head`: the chain
-/// authority over the union of every fetched document's realm sections, so it
-/// sees each member's parent edge regardless of which document carried it.
-/// Outer-key only: sub-maps are never merged across realms.
+/// The chain [`compose_effective_config`] folds for `head`, resolved by the
+/// chain authority over each member's own document. A realm with its own
+/// document is configured by that document alone: its own section decides
+/// its parent edge, and it has none when the section is absent. A section
+/// another document states for a realm never stands in for it, so a chain
+/// through an ancestor whose own document is missing does not resolve (a
+/// missing parent) instead of composing as if that ancestor, and every
+/// realm above it, required nothing. Only the head, which may have no
+/// document, takes a section another document states for it when its own
+/// states none, and any document's `[realm.global]` section configures the
+/// reserved `global` root. Outer-key only: sub-maps are never merged across
+/// realms.
 fn composition_chain(
     docs: &std::collections::BTreeMap<crate::connection::RealmId, Config>,
     head: &crate::connection::RealmId,
 ) -> Result<crate::connection::RealmChain, crate::connection::RealmChainError> {
+    let global = crate::connection::RealmId::global();
     let mut topology = Config::default();
     for doc in docs.values() {
         for (realm_id, section) in &doc.realm {
-            topology.realm.insert(realm_id.clone(), section.clone());
+            if realm_id == head.as_str() || realm_id == global.as_str() {
+                topology.realm.insert(realm_id.clone(), section.clone());
+            }
+        }
+    }
+    for (owner, doc) in docs {
+        match doc.realm.get(owner.as_str()) {
+            Some(section) => {
+                topology
+                    .realm
+                    .insert(owner.as_str().to_owned(), section.clone());
+            }
+            None if owner != head && !owner.is_global() => {
+                topology.realm.insert(
+                    owner.as_str().to_owned(),
+                    crate::connection::RealmConfigSection::default(),
+                );
+            }
+            None => {}
         }
     }
     crate::connection::RealmChain::resolve(&topology, head)
@@ -4606,6 +4767,69 @@ max_input_tokens = 700
         assert_eq!(witness.max_output_tokens(), Some(100));
     }
 
+    /// A self-hosted model's stream-inactivity window merges by presence and
+    /// reaches its registry profile; an omitted value keeps the global window.
+    #[test]
+    fn test_merge_self_hosted_stream_inactivity_window_is_presence_based() {
+        let mut config = Config::default();
+        config
+            .merge_toml_str(
+                r#"
+[self_hosted]
+default_model = "slow-prefill"
+[self_hosted.servers.local]
+base_url = "http://localhost:11434"
+[self_hosted.models.slow-prefill]
+server = "local"
+remote_model = "slow-prefill"
+stream_inactivity_timeout_secs = 900
+[self_hosted.models.default-window]
+server = "local"
+remote_model = "default-window"
+"#,
+            )
+            .expect("base");
+        config
+            .merge_toml_str(
+                r"
+[self_hosted.models.slow-prefill]
+call_timeout_secs = 1200
+",
+            )
+            .expect("unrelated overlay");
+        assert_eq!(
+            config.self_hosted.models["slow-prefill"].stream_inactivity_timeout_secs,
+            Some(900)
+        );
+        config
+            .merge_toml_str(
+                r"
+[self_hosted.models.slow-prefill]
+stream_inactivity_timeout_secs = 600
+",
+            )
+            .expect("window override");
+        let restored: Config =
+            toml::from_str(&toml::to_string(&config).expect("serialize")).expect("roundtrip");
+        let registry = restored
+            .model_registry(*crate::model_profile::test_catalog::TEST_CATALOG)
+            .expect("registry");
+        let profile = |model| {
+            registry
+                .profile_for_provider(crate::Provider::SelfHosted, model)
+                .expect("self-hosted profile")
+        };
+        assert_eq!(
+            profile("slow-prefill").stream_inactivity_timeout_secs,
+            Some(600)
+        );
+        assert_eq!(profile("slow-prefill").call_timeout_secs, Some(1200));
+        assert_eq!(
+            profile("default-window").stream_inactivity_timeout_secs,
+            None
+        );
+    }
+
     #[test]
     fn custom_model_input_ceiling_roundtrips_and_reaches_registry() {
         let config: Config = toml::from_str(
@@ -5503,6 +5727,45 @@ stream_inactivity_timeout = "disabled"
             config.retry.stream_inactivity_timeout_override,
             CallTimeoutOverride::Disabled
         );
+    }
+
+    /// A zero stream-inactivity window would stall every model call at once,
+    /// so config validation refuses it. `"disabled"` turns the watchdog off,
+    /// and a short window (even one under the per-model minimum) still loads.
+    #[test]
+    fn test_validate_rejects_zero_stream_inactivity_timeout() {
+        for zero in ["0s", "0ms"] {
+            let config: Config = toml::from_str(&format!(
+                "[retry]\nstream_inactivity_timeout = \"{zero}\"\n"
+            ))
+            .expect("a zero duration parses");
+            assert_eq!(
+                config.retry.stream_inactivity_timeout_override,
+                CallTimeoutOverride::Value(Duration::ZERO)
+            );
+            let err = config
+                .validate(*crate::model_profile::test_catalog::TEST_CATALOG)
+                .expect_err("a zero stream_inactivity_timeout should be invalid");
+            assert!(
+                matches!(
+                    &err,
+                    ConfigError::Validation(message)
+                        if message.contains("retry.stream_inactivity_timeout")
+                ),
+                "unexpected validation error: {err}"
+            );
+        }
+        for accepted in ["1s", "30s", "disabled"] {
+            let config: Config = toml::from_str(&format!(
+                "[retry]\nstream_inactivity_timeout = \"{accepted}\"\n"
+            ))
+            .expect("the window parses");
+            let result = config.validate(*crate::model_profile::test_catalog::TEST_CATALOG);
+            assert!(
+                result.is_ok(),
+                "stream_inactivity_timeout = {accepted:?} must still load: {result:?}"
+            );
+        }
     }
 
     #[test]

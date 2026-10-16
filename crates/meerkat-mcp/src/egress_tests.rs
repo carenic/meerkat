@@ -694,8 +694,11 @@ async fn a_required_profile_never_uses_the_ambient_proxy() {
 async fn a_router_retains_the_profile_for_every_connection() {
     let (port, fixture) = spawn_mcp_fixture(None).await;
     let handle = Arc::new(meerkat_runtime::RuntimeExternalToolSurfaceHandle::ephemeral());
-    let mut router = crate::McpRouter::new_with_surface_handle(handle)
-        .with_http_egress_profile(local_profile(port));
+    let mut router = crate::McpRouter::new_with_surface_handle_and_stdio_profile(
+        handle,
+        crate::McpStdioLaunchProfile::trusted_host(),
+    )
+    .with_http_egress_profile(local_profile(port));
     let refused = router
         .add_server(http_config(
             "egress-router",

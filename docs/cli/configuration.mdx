@@ -143,8 +143,11 @@ Serde's duration representation with `secs` and `nanos`.
 `tools.mcp_servers` is also accepted in runtime config, although the CLI's
 user/project MCP convention files are managed separately as described below.
 
-Streaming retries have a 300-second inactivity watchdog by default. Override
-it with a humantime value, or disable only this watchdog explicitly:
+Streaming retries have an inactivity watchdog: 300 seconds by default, or the
+model's own window where it declares one (see
+[retry and stream watchdog settings](/concepts/configuration#retry-and-stream-watchdog-settings)).
+Override it for every model with a humantime value above zero (keep it at 60
+seconds or more), or disable only this watchdog explicitly:
 
 ```toml
 [retry]
@@ -184,8 +187,12 @@ rkat --confinement trusted-host run "Inspect the system"
 `--confinement-network`, `--confinement-read` and `--confinement-write` need
 `--confinement workspace`; relative paths resolve against the working
 directory. A launch the platform cannot confine as required is refused with
-typed feedback to the model and never runs unconfined; `rkat` warns once on
-stderr for each launch kind this host cannot confine.
+typed feedback to the model and never runs unconfined. `rkat` prints its
+confinement report once on stderr: each launch kind's requested and effective
+confinement and what keeps its own inputs from its confined processes
+(`info:` lines), and a `warning:` line for each launch kind this host cannot
+confine, a guarantee it does not claim, and each untrusted convention
+source.
 
 `rkat` refuses a command whose confined processes could change its realm
 state or user config document (see
@@ -254,7 +261,13 @@ supports_temperature = true
 supports_thinking = true
 supports_reasoning = true
 call_timeout_secs = 600
+stream_inactivity_timeout_secs = 600
 ```
+
+`stream_inactivity_timeout_secs` sets this model's stream-inactivity window,
+for example to cover a long prefill before the first token. It must be at
+least 60 seconds; config validation refuses a shorter window. Omit it to use
+the `[retry]` window.
 
 `vision = true` covers image input. With `api_style = "chat_completions"`,
 `image_tool_results` must remain `false`; that result shape is available only

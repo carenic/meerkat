@@ -89,9 +89,9 @@ impl PreparedOperationAuthorization for Check {
         if !self.binding.same_operation(binding) {
             return Err(OperationObservationError);
         }
-        let entry = matches!(&observation, OperationObservation::Entry);
+        let entry = matches!(&observation, OperationObservation::Entry(_));
         let fail = match &observation {
-            OperationObservation::Entry => self.fail_entry.load(Ordering::SeqCst),
+            OperationObservation::Entry(_) => self.fail_entry.load(Ordering::SeqCst),
             OperationObservation::Outcome(_) => self.fail_outcome.load(Ordering::SeqCst),
             OperationObservation::ReviewAttemptStarted { .. } => false,
             OperationObservation::AuthorizationUnavailable => false,
@@ -567,10 +567,11 @@ async fn http_audit_records_entry_and_status_and_preserves_success_if_outcome_st
             ));
             assert_eq!(server.bodies.lock().unwrap().len(), 1);
             let observations = policy.observations.lock().unwrap();
+            // The provider's transport names its own entry boundary.
             assert!(matches!(
                 observations.as_slice(),
                 [
-                    OperationObservation::Entry,
+                    OperationObservation::Entry(meerkat_core::OperationEntryBoundary::ModelRequest),
                     OperationObservation::Outcome(OperationObservedOutcome::HttpResponse {
                         status: 200
                     })
@@ -609,7 +610,7 @@ async fn failed_entry_audit_prevents_physical_http_request() {
         assert!(server.bodies.lock().unwrap().is_empty());
         assert!(matches!(
             policy.observations.lock().unwrap().as_slice(),
-            [OperationObservation::Entry]
+            [OperationObservation::Entry(_)]
         ));
         assert!(
             !results
@@ -670,7 +671,7 @@ async fn transport_failure_retains_original_error_beside_outcome_diagnostic() {
         assert!(matches!(
             policy.observations.lock().unwrap().as_slice(),
             [
-                OperationObservation::Entry,
+                OperationObservation::Entry(_),
                 OperationObservation::Outcome(OperationObservedOutcome::TransportError)
             ]
         ));
@@ -699,7 +700,7 @@ async fn observation_infrastructure_entry_failure_never_sends_or_enters_denial_r
     assert!(
         matches!(
             failed_policy.observations.lock().unwrap().as_slice(),
-            [OperationObservation::Entry]
+            [OperationObservation::Entry(_)]
         ),
         "no recursive Refused or fabricated physical Outcome observation"
     );
@@ -769,7 +770,7 @@ async fn observation_infrastructure_post_entry_refusal_append_failure_never_send
         matches!(
             policy.observations.lock().unwrap().as_slice(),
             [
-                OperationObservation::Entry,
+                OperationObservation::Entry(_),
                 OperationObservation::Refused(OperationRefusalKind::Denied),
             ]
         ),
@@ -976,7 +977,7 @@ async fn prepared_forced_choice_rechecks_final_authority_before_http() {
             assert!(matches!(
                 observations.as_slice(),
                 [
-                    OperationObservation::Entry,
+                    OperationObservation::Entry(_),
                     OperationObservation::Refused(OperationRefusalKind::Denied),
                 ]
             ));
@@ -1003,10 +1004,11 @@ async fn prepared_forced_choice_rechecks_final_authority_before_http() {
             );
             assert_eq!(bodies[0]["tools"].as_array().unwrap().len(), 1);
             assert_eq!(bodies[0]["tools"][0]["name"], "lookup");
+            // The provider's transport names its own entry boundary.
             assert!(matches!(
                 observations.as_slice(),
                 [
-                    OperationObservation::Entry,
+                    OperationObservation::Entry(meerkat_core::OperationEntryBoundary::ModelRequest),
                     OperationObservation::Outcome(OperationObservedOutcome::HttpResponse {
                         status: 200
                     })
@@ -1116,7 +1118,7 @@ async fn prepared_forced_choice_provider_rejection_keeps_http_outcome_and_typed_
         matches!(
             policy.observations.lock().unwrap().as_slice(),
             [
-                OperationObservation::Entry,
+                OperationObservation::Entry(_),
                 OperationObservation::Outcome(OperationObservedOutcome::HttpResponse {
                     status: 400
                 })

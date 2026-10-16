@@ -6337,6 +6337,73 @@ mod tests {
         }
     }
 
+    /// An agent's `mob_create` names the calling session to the host's create
+    /// hook whatever the model's definition holds: a model cannot drop the
+    /// owner session, and an id spelled like the session's implicit
+    /// delegation mob does not make the mob one.
+    #[tokio::test]
+    async fn mob_create_names_its_owner_session_to_the_before_create_hook() {
+        let state = MobMcpState::new_in_memory();
+        let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorder = Arc::clone(&asked);
+        state
+            .set_before_create(Arc::new(move |request: crate::MobCreateRequest| {
+                recorder
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(request);
+                Box::pin(async { Ok(()) })
+            }))
+            .expect("bind the create hook");
+        let session_id = SessionId::new();
+        let surface = AgentMobToolSurface::new(
+            Arc::clone(&state),
+            None,
+            create_only_authority(),
+            "claude-sonnet-4-5".to_string(),
+            session_id.clone(),
+            None,
+            None,
+            None,
+        );
+        let claimed = format!("implicit-{session_id}");
+        let create_args = serde_json::value::RawValue::from_string(
+            json!({
+                "definition": {
+                    "id": claimed,
+                    "profiles": {
+                        "worker": {
+                            "model": "claude-sonnet-4-5",
+                            "tools": { "comms": true },
+                            "peer_description": "worker",
+                            "runtime_mode": "turn_driven"
+                        }
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        surface
+            .dispatch(ToolCallView {
+                id: "claim-implicit-1",
+                name: "mob_create",
+                args: &create_args,
+            })
+            .await
+            .expect("the hook admits the create");
+        assert_eq!(
+            *asked
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            vec![crate::MobCreateRequest {
+                mob_id: MobId::from(claimed.as_str()),
+                owner_bridge_session_id: Some(session_id),
+                implicit_delegation_mob: false,
+            }]
+        );
+    }
+
     /// Gate for remediation row #211: `mob_create` must produce the durable
     /// create outcome and the operator grant as a single atomic effect bundle,
     /// with the grant keyed on the *intended* definition id. There must be no

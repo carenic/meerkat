@@ -236,7 +236,7 @@ fn protected_graph(
                     .iter()
                     .filter(|record| matches!(
                         record.observation.observation,
-                        AuditObservation::Entry
+                        AuditObservation::Entry { .. }
                     ))
                     .count(),
                 1

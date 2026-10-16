@@ -33,6 +33,7 @@ def main() -> int:
 
     publishable = set()
     workspace_packages = {}
+    member_dirs: dict[str, pathlib.Path] = {}
     metadata_errors = []
     for path in paths:
         manifest = path / "Cargo.toml"
@@ -43,6 +44,7 @@ def main() -> int:
         name = package.get("name")
         if not name:
             continue
+        member_dirs[name] = path.resolve()
         if package.get("publish", "default") is False:
             continue
         publishable.add(name)
@@ -61,6 +63,9 @@ def main() -> int:
     missing = sorted(publishable - expected)
     unexpected = sorted(expected - publishable)
     order_errors = dependency_order_errors(workspace_packages, expected_order)
+    requirement_errors = internal_dependency_requirement_errors(
+        root, workspace, workspace_packages, member_dirs
+    )
     bazel_errors = bazel_release_binary_version_env_errors(root, workspace_version)
     patch_errors = patch_config_errors(root, expected_order)
     docs_errors = documented_release_order_errors(root, expected_order)
@@ -70,6 +75,7 @@ def main() -> int:
         or unexpected
         or metadata_errors
         or order_errors
+        or requirement_errors
         or bazel_errors
         or patch_errors
         or docs_errors
@@ -92,6 +98,13 @@ def main() -> int:
         if order_errors:
             print("Release crate list is not dependency ordered:", file=sys.stderr)
             for err in order_errors:
+                print(f"  - {err}", file=sys.stderr)
+        if requirement_errors:
+            print(
+                "Release crates publish a non-exact requirement on a workspace crate:",
+                file=sys.stderr,
+            )
+            for err in requirement_errors:
                 print(f"  - {err}", file=sys.stderr)
         if bazel_errors:
             print("BuildBuddy release binaries have invalid Cargo version metadata:", file=sys.stderr)
@@ -402,6 +415,128 @@ def release_dependencies(package_manifest: dict) -> set[str]:
         collect(target.get("build-dependencies"))
 
     return deps
+
+
+DEPENDENCY_TABLES = (
+    ("dependencies", False),
+    ("build-dependencies", False),
+    ("dev-dependencies", True),
+)
+
+
+def manifest_dependency_tables(package_manifest: dict):
+    """Yield (table label, is_dev, table) for every dependency table, target ones included."""
+
+    for table, is_dev in DEPENDENCY_TABLES:
+        yield table, is_dev, package_manifest.get(table) or {}
+    for target, target_tables in (package_manifest.get("target") or {}).items():
+        for table, is_dev in DEPENDENCY_TABLES:
+            yield f"target.{target}.{table}", is_dev, (target_tables or {}).get(table) or {}
+
+
+def internal_dependency_requirement_errors(
+    root: pathlib.Path,
+    workspace: dict,
+    workspace_packages: dict[str, dict],
+    member_dirs: dict[str, pathlib.Path],
+) -> list[str]:
+    """Every requirement a release crate publishes on a workspace crate is exact.
+
+    meerkat 0.x patch releases may break public API, so a published crate must
+    resolve exactly the sibling crates it was released with. A caret
+    requirement (`version = "0.9.0"` is `^0.9.0`) let a consumer that pinned
+    `=0.9.0` resolve 0.9.1 of some siblings. `cargo package` keeps the version
+    of every normal, build and target dependency, and of every dev-dependency
+    that has one (it strips a path-only dev-dependency), so each of those that
+    names a workspace member must read `=<workspace version>`, the form
+    cargo-release keeps exact when it bumps the workspace.
+
+    A dependency is a workspace crate when its package name is a member's or
+    its path is a member's directory (meerkat-cli's directory publishes as
+    `rkat`). A requirement inherited from `[workspace.dependencies]` is
+    reported once, at that entry, with the crates that publish it. Every
+    internal entry there is held to the same rule even while no release crate
+    uses it, so the next crate to inherit it is exact.
+    """
+
+    version = workspace["workspace"]["package"]["version"]
+    exact = f"={version}"
+    workspace_deps = workspace.get("workspace", {}).get("dependencies", {})
+    member_names = set(member_dirs)
+    member_paths = set(member_dirs.values())
+    workspace_root = root.resolve()
+
+    def is_internal(key: str, spec, declared_in: pathlib.Path) -> bool:
+        if not isinstance(spec, dict):
+            return key in member_names
+        if str(spec.get("package", key)) in member_names:
+            return True
+        path = spec.get("path")
+        return isinstance(path, str) and (declared_in / path).resolve() in member_paths
+
+    def requirement_of(spec) -> str | None:
+        if isinstance(spec, str):
+            return spec
+        if isinstance(spec, dict):
+            value = spec.get("version")
+            return value if isinstance(value, str) else None
+        return None
+
+    errors: list[str] = []
+    publishers: dict[str, list[str]] = {}
+    for crate in sorted(workspace_packages):
+        crate_dir = member_dirs[crate]
+        for table, is_dev, deps in manifest_dependency_tables(workspace_packages[crate]):
+            for key, spec in deps.items():
+                inherited = isinstance(spec, dict) and spec.get("workspace") is True
+                resolved = workspace_deps.get(key) if inherited else spec
+                declared_in = workspace_root if inherited else crate_dir
+                if resolved is None or not is_internal(key, resolved, declared_in):
+                    continue
+                requirement = requirement_of(resolved)
+                if requirement is None and is_dev:
+                    # cargo package strips a path-only dev-dependency.
+                    continue
+                if inherited:
+                    publishers.setdefault(key, []).append(f"{crate} [{table}]")
+                    continue
+                if requirement is None:
+                    errors.append(
+                        f"{crate}: [{table}] `{key}` names a workspace crate without a "
+                        f"version, so it cannot be published; require `{exact}`"
+                    )
+                elif requirement != exact:
+                    errors.append(
+                        f"{crate}: [{table}] `{key}` publishes `{requirement}`; a "
+                        f"requirement on a workspace crate must be exact (`{exact}`)"
+                    )
+
+    for key in sorted(set(workspace_deps) | set(publishers)):
+        spec = workspace_deps.get(key)
+        if spec is None or not is_internal(key, spec, workspace_root):
+            continue
+        requirement = requirement_of(spec)
+        users = publishers.get(key, [])
+        if requirement is None and not users:
+            # A path-only entry (used only as a dev-dependency) publishes
+            # nothing.
+            continue
+        if requirement == exact:
+            continue
+        published_by = f" (published by {', '.join(users)})" if users else ""
+        if requirement is None:
+            errors.append(
+                f"Cargo.toml [workspace.dependencies] `{key}` has no version{published_by}; "
+                f"require `{exact}`"
+            )
+        else:
+            errors.append(
+                f"Cargo.toml [workspace.dependencies] `{key}` requires `{requirement}`"
+                f"{published_by}; a requirement on a workspace crate must be exact "
+                f"(`{exact}`)"
+            )
+
+    return errors
 
 
 if __name__ == "__main__":

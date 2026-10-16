@@ -847,6 +847,12 @@
       "result_type": "MobRotateSupervisorResult"
     },
     {
+      "description": "Bind a mob's member callback route to this connection",
+      "name": "mob/claim_callback_route",
+      "params_type": "MobIdParams",
+      "result_type": "MobClaimCallbackRouteResult"
+    },
+    {
       "description": "Submit a unit of work to a mob member through the work lane",
       "name": "mob/submit_work",
       "params_type": "MobSubmitWorkParams",

@@ -943,6 +943,10 @@ pub struct SessionBuildOptions {
     /// canonical external-tool surface authority (no test-code ephemeral
     /// handle incantation required from embedders).
     pub mcp_servers: Vec<crate::mcp_config::McpServerConfig>,
+    /// Configured MCP servers the host refused for this build, each with its
+    /// typed reason. The factory reports each to the model as that server's
+    /// failed setup, and nothing in it is expanded, connected or spawned.
+    pub refused_mcp_servers: Vec<crate::mcp_config::McpServerRefusal>,
     /// Serializable tool definitions used to reconstruct recoverable
     /// surface-owned dispatchers during session resume/rebuild.
     pub recoverable_tool_defs: Option<Vec<crate::ToolDef>>,
@@ -1118,6 +1122,12 @@ pub struct SessionBuildOptions {
     /// Set by the application's `SessionAgentBuilder` — never by the LLM.
     /// Values are not included in the agent's context window.
     pub shell_env: Option<std::collections::HashMap<String, String>>,
+    /// Default command timeout, in seconds, of this build's shell tool: the
+    /// session's own `[shell] timeout_secs`. A shell call's own
+    /// `timeout_secs` still wins. `None` keeps the realm's configured value
+    /// (30 s unless configured). The build records it in the session's
+    /// build state, so a recovered session keeps it.
+    pub shell_timeout_secs: Option<std::num::NonZeroU64>,
     /// Explicit call-timeout override at the build seam.
     ///
     /// - `Inherit` (default): defer to config override, then profile default
@@ -1878,6 +1888,7 @@ impl Default for SessionBuildOptions {
             external_tools: None,
             hosting: crate::session_hosting::SessionHostingIntent::default(),
             mcp_servers: Vec::new(),
+            refused_mcp_servers: Vec::new(),
             recoverable_tool_defs: None,
             blob_store_override: None,
             llm_client_override: None,
@@ -1920,6 +1931,7 @@ impl Default for SessionBuildOptions {
             application_tool_policy: crate::ApplicationToolPolicyBinding::Unmanaged,
             tool_consequence_policy_registry: None,
             shell_env: None,
+            shell_timeout_secs: None,
             call_timeout_override: crate::CallTimeoutOverride::Inherit,
             resume_override_mask: ResumeOverrideMask::default(),
             mob_tools: None,
@@ -2005,6 +2017,7 @@ impl std::fmt::Debug for SessionBuildOptions {
                 "tool_dispatch_admission",
                 &self.tool_dispatch_admission.is_some(),
             )
+            .field("shell_timeout_secs", &self.shell_timeout_secs)
             .field("call_timeout_override", &self.call_timeout_override)
             .field("resume_override_mask", &self.resume_override_mask)
             .field("mob_tools", &self.mob_tools.is_some())

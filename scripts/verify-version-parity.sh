@@ -122,17 +122,21 @@ if $CONTRACT_OK; then
 fi
 
 # ── 3. Internal crate dep versions ─────────────────────────────────────────
-# All internal deps in workspace Cargo.toml should match workspace.package.version
+# All internal deps in workspace Cargo.toml must require exactly
+# workspace.package.version (`=X.Y.Z`): 0.x patch releases may break API, so a
+# published crate must resolve exactly the sibling crates it shipped with.
+# scripts/check_rust_release_packaging.py holds every packaged requirement to
+# the same rule.
 
 echo ""
 echo "Internal dependency versions:"
 INTERNAL_OK=true
 while IFS= read -r line; do
-    # Extract: crate-name = { version = "X.Y.Z", ... }
+    # Extract: crate-name = { version = "=X.Y.Z", ... }
     dep_name=$(echo "$line" | sed 's/ *=.*//')
     dep_ver=$(echo "$line" | sed -n 's/.*version = "\([^"]*\)".*/\1/p')
-    if [ -n "$dep_ver" ] && [ "$dep_ver" != "$CARGO_VER" ]; then
-        red "  FAIL: $dep_name has version \"$dep_ver\", expected \"$CARGO_VER\""
+    if [ -n "$dep_ver" ] && [ "$dep_ver" != "=$CARGO_VER" ]; then
+        red "  FAIL: $dep_name has version \"$dep_ver\", expected \"=$CARGO_VER\""
         INTERNAL_OK=false
         FAIL=1
     fi

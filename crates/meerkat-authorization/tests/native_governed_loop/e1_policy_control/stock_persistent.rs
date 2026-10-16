@@ -115,7 +115,10 @@ fn stored_audit_decoder_accepts_only_valid_arrays_or_omitted_empty_prefix() {
             run_id: None,
             context_revision: None,
             review_attribution: None,
-            observation: AuditObservation::Entry,
+            delegate_attribution: None,
+            observation: AuditObservation::Entry {
+                boundary: Some(meerkat_core::OperationEntryBoundary::ToolDispatch),
+            },
         },
     };
     let expected = vec![record];
@@ -264,7 +267,7 @@ fn assert_stock_turn_audit_with_models(
         && matches!(
             record.observation.observation,
             AuditObservation::Prepared { .. }
-                | AuditObservation::Entry
+                | AuditObservation::Entry { .. }
                 | AuditObservation::Outcome { .. }
         )));
     let prepared: Vec<_> = audit
@@ -292,7 +295,7 @@ fn assert_stock_turn_audit_with_models(
         read_sequence[0],
         AuditObservation::Prepared { .. }
     ));
-    assert!(matches!(read_sequence[1], AuditObservation::Entry));
+    assert!(matches!(read_sequence[1], AuditObservation::Entry { .. }));
     assert!(matches!(
         read_sequence[2],
         AuditObservation::Outcome {
@@ -323,7 +326,7 @@ fn assert_stock_turn_audit_with_models(
             .collect();
         assert_eq!(sequence.len(), 3, "one exact entered model audit sequence");
         assert!(matches!(sequence[0], AuditObservation::Prepared { .. }));
-        assert!(matches!(sequence[1], AuditObservation::Entry));
+        assert!(matches!(sequence[1], AuditObservation::Entry { .. }));
         assert!(matches!(
             sequence[2],
             AuditObservation::Outcome {

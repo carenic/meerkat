@@ -74,3 +74,10 @@ enabled = false
 [presentation.html]
 # Used by `rkat run --html` / `--browser` unless overridden per run.
 default_template = "polished"
+
+# The user document's own realm section: it puts this document (the reserved
+# `global` realm) on the chain of every realm, so the settings, sign-ins and
+# `[governance]` stated here reach every realm. A config write cannot add or
+# remove it once realms compose this document's `[governance]`; edit this
+# file by hand to change it.
+[realm.global]

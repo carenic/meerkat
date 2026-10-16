@@ -418,6 +418,7 @@ pub struct LlmRequestAuthorization {
     context_revision: Option<CanonicalContextRevision>,
     usage: ModelAuthorizationUse,
     review_attribution: Option<crate::approval::review::ReviewOperationAttribution>,
+    delegate_attribution: Option<crate::authorization::ToolDelegateAttribution>,
 }
 
 impl LlmRequestAuthorization {
@@ -433,6 +434,7 @@ impl LlmRequestAuthorization {
             context_revision: None,
             usage,
             review_attribution: None,
+            delegate_attribution: None,
         }
     }
 
@@ -449,6 +451,25 @@ impl LlmRequestAuthorization {
             context_revision: facts.context_revision.clone(),
             usage: ModelAuthorizationUse::Inference,
             review_attribution: Some(attribution),
+            delegate_attribution: None,
+        }
+    }
+
+    /// A builtin tool's own model request as the typed delegate of the call
+    /// that entered the tool: a fresh inference operation under that call's
+    /// work and coordinates. It is decided by its own owners from its own
+    /// facts; nothing of the call's decision is inherited, and preparation
+    /// refuses facts that are not the delegate role's own.
+    pub fn for_tool_delegate(attribution: crate::authorization::ToolDelegateAttribution) -> Self {
+        let facts = attribution.parent_binding().facts();
+        Self {
+            work: attribution.work_authorization().clone(),
+            operation_id: OperationId::new(),
+            run_id: facts.run_id.clone(),
+            context_revision: facts.context_revision.clone(),
+            usage: ModelAuthorizationUse::Inference,
+            review_attribution: None,
+            delegate_attribution: Some(attribution),
         }
     }
 
@@ -488,13 +509,21 @@ impl LlmRequestAuthorization {
             context_revision: self.context_revision.clone(),
             operation: AuthorizationOperation::Model(target),
         };
-        let binding = match &self.review_attribution {
-            Some(attribution) => attribution.bind_child(
+        let binding = match (&self.review_attribution, &self.delegate_attribution) {
+            (Some(attribution), None) => attribution.bind_child(
                 facts,
                 &self.work,
                 crate::approval::review::ReviewOperationRole::ReviewerInference,
             )?,
-            None => PreparedAuthorizationBinding::new(facts),
+            (None, Some(attribution)) => attribution.bind_child(facts, &self.work)?,
+            (None, None) => PreparedAuthorizationBinding::new(facts),
+            // No constructor sets both; an operation has one origin.
+            (Some(_), Some(_)) => {
+                return Err(crate::authorization::OperationRefused::new(
+                    crate::authorization::OperationRefusalKind::MalformedFacts,
+                )
+                .into());
+            }
         };
         PreparedOperationCheck::prepare(self.work.clone(), binding)
     }

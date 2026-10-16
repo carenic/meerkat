@@ -163,7 +163,14 @@ function assertHookParity(plan, label) {
         assert.ok(row.packages.includes(binary.split("::")[0]), `${label}: ${row.name} selects the package of ${binary}`);
       }
     }
-    if (row.lane !== "headcanonical") runs.push(...row.binaries);
+    // The partitions of one selection run its binaries once between them
+    // (the coverage check requires every partition): count the group once.
+    if (row.partition !== undefined) {
+      assert.match(row.partition, /^count:[1-9][0-9]*\/[1-9][0-9]*$/, `${label}: ${row.name} runs a count partition`);
+    }
+    if (row.lane !== "headcanonical" && (row.partition === undefined || row.partition.startsWith("count:1/"))) {
+      runs.push(...row.binaries);
+    }
   }
   assert.equal(new Set(runs).size, runs.length, `${label}: each hook binary runs in one row (HeadCanonical's own build aside)`);
   for (const lane of OTHER_E2E_LANES) {
@@ -294,6 +301,55 @@ function assertArchivedLanes(plan, label) {
     plan.unit_deferred,
     plan.unit_deferred_chain.filter((name) => !plan.unit_chain_exceptions.includes(name)),
     "workspace mode defers exactly the chain less its exceptions",
+  );
+  // An exception compiles meerkat-mob: its row runs alone, never packed with
+  // another package's compile and tests.
+  for (const name of plan.unit_chain_exceptions) {
+    const rows = plan.unit_shards.filter((shard) => shard.packages.includes(name));
+    assert.deepEqual(rows.map((shard) => shard.packages), [[name]], `${name}'s unit row runs alone`);
+    assert.equal(rows[0].package_flags, `-p ${name}`);
+  }
+  assert.ok(plan.unit_shards.length <= 11, `workspace unit rows stay near the shard cap: ${plan.unit_shards.length}`);
+  // The nested-Cargo canaries' binary (the downstream-cargo-canary test
+  // group) runs as count partitions of its own, one per canary, and in no
+  // packed row; the coverage check credits it only with every partition.
+  const canaryTest = "agent_builder_policy_canary";
+  const canaryRows = plan.closure_test_rows.filter((row) => row.test_flags === `--test ${canaryTest}`);
+  assert.deepEqual(canaryRows.map((row) => row.partition), ["count:1/3", "count:2/3", "count:3/3"], "one count partition per canary");
+  for (const row of canaryRows) {
+    assert.deepEqual(row.binaries, [`meerkat::${canaryTest}`]);
+    assert.equal(row.package_flags, "--workspace", "a canary row is a whole-workspace row");
+    assert.equal(row.no_tests, "fail", "an empty canary partition fails");
+  }
+  assert.ok(
+    plan.closure_test_rows.every((row) => row.partition || !row.test_flags.split(/\s+/).includes(canaryTest)),
+    "no packed row holds the canaries' binary",
+  );
+  const canaryCoverage = checkHookCoverage(plan);
+  assert.equal(
+    canaryCoverage.map[`meerkat::test::${canaryTest}`],
+    "closure-tests: tests meerkat canaries 1/3, tests meerkat canaries 2/3, tests meerkat canaries 3/3",
+  );
+  for (const [label, change] of [
+    ["a dropped partition", (rows) => rows.filter((row) => row.partition !== "count:2/3")],
+    ["a repeated partition", (rows) => rows.map((row) => (row.partition === "count:2/3" ? { ...row, partition: "count:1/3" } : row))],
+    ["partitions of another count", (rows) => rows.map((row) => (row.partition === "count:3/3" ? { ...row, partition: "count:3/4" } : row))],
+    ["a partition of another selection", (rows) => rows.map((row) => (row.partition === "count:1/3" ? { ...row, profile: "fast" } : row))],
+  ]) {
+    const copy = JSON.parse(JSON.stringify(plan));
+    copy.closure_test_rows = change(copy.closure_test_rows);
+    const result = checkHookCoverage(copy);
+    assert.ok(result.missing.includes(`meerkat::test::${canaryTest}`), `${label} leaves the canaries' binary uncovered`);
+    assert.ok(result.errors.some((error) => error.includes("every partition 1..N of one selection is required")), `${label} is reported`);
+  }
+  const workspaceGithub = run(["--format", "github", "--", "Cargo.lock"]);
+  assert.equal(workspaceGithub.status, 0, workspaceGithub.stderr);
+  const closureMatrixLine = workspaceGithub.stdout.split("\n").find((line) => line.startsWith("closure_test_matrix="));
+  const closureInclude = JSON.parse(closureMatrixLine.slice("closure_test_matrix=".length)).include;
+  assert.deepEqual(
+    closureInclude.filter((row) => row.partition !== "").map((row) => [row.name, row.partition]),
+    [["tests meerkat canaries 1/3", "count:1/3"], ["tests meerkat canaries 2/3", "count:2/3"], ["tests meerkat canaries 3/3", "count:3/3"]],
+    "the matrix carries each canary row's partition, and only theirs",
   );
   assertLanes(plan, "workspace with exceptions");
 }
@@ -1293,15 +1349,30 @@ for (const path of [
   const ownSelection = mutated(run, run.replace('"${selection[@]}"', '${PACKAGES} "${test_flags[@]}" --profile "${PROFILE}"'));
   assert.ok(ownSelection.some((error) => error.includes("job closure-tests: the step runs")), "a run that does not use the listed selection is refused");
   const narrowed = mutated(
-    '          selection=(${PACKAGES} "${test_flags[@]}" --profile "${PROFILE}" "${filter_args[@]}")\n',
-    '          selection=(${PACKAGES} "${test_flags[@]}" --profile "${PROFILE}" "${filter_args[@]}")\n          [[ "${NO_TESTS}" == warn ]] && filter_args=(-E "none()")\n',
+    '          selection=(${PACKAGES} "${test_flags[@]}" --profile "${PROFILE}" "${filter_args[@]}" "${partition_args[@]}")\n',
+    '          selection=(${PACKAGES} "${test_flags[@]}" --profile "${PROFILE}" "${filter_args[@]}" "${partition_args[@]}")\n          [[ "${NO_TESTS}" == warn ]] && filter_args=(-E "none()")\n',
   );
   assert.ok(narrowed.some((error) => error.includes("job closure-tests: the step runs")), "a later selection change is refused");
-  const unchecked = mutated('          node scripts/ci-verify-row-binaries.mjs "${RUNNER_TEMP}/closure-test-list.json" ${BINARIES}\n', "");
+  const unchecked = mutated('          node scripts/ci-verify-row-binaries.mjs "${RUNNER_TEMP}/closure-test-list.json" "${partition_args[@]}" ${BINARIES}\n', "");
   assert.ok(unchecked.some((error) => error.includes("job closure-tests: the step runs")), "a step without the binary check is refused");
+  // A partitioned row's check must know its partition, and its partition
+  // cannot be changed or dropped after the input mapping.
+  const unpartitionedCheck = mutated(
+    '          node scripts/ci-verify-row-binaries.mjs "${RUNNER_TEMP}/closure-test-list.json" "${partition_args[@]}" ${BINARIES}\n',
+    '          node scripts/ci-verify-row-binaries.mjs "${RUNNER_TEMP}/closure-test-list.json" --partition count:1/1 ${BINARIES}\n',
+  );
+  assert.ok(unpartitionedCheck.some((error) => error.includes("job closure-tests: the step runs")), "an altered binary check partition is refused");
+  const partitionLine = '          if [[ -n "${PARTITION}" ]]; then partition_args=(--partition "${PARTITION}"); fi\n';
+  const repartitioned = mutated(partitionLine, partitionLine.replace('--partition "${PARTITION}"', "--partition count:1/2"));
+  assert.ok(repartitioned.some((error) => error.includes("job closure-tests: the step runs")), "an altered partition is refused");
+  const unpartitioned = mutated(partitionLine, "");
+  assert.ok(unpartitioned.some((error) => error.includes("job closure-tests: the step runs")), "a dropped partition is refused");
+  const partitionMapping = "          MIN_STACK: ${{ matrix.rust_min_stack }}\n          PARTITION: ${{ matrix.partition }}\n";
+  const partitionRemapped = mutated(partitionMapping, "          MIN_STACK: ${{ matrix.rust_min_stack }}\n          PARTITION: count:1/2\n");
+  assert.ok(partitionRemapped.some((error) => error.includes("step env PARTITION")), "an altered PARTITION mapping is refused");
   // An input reassigned before it is read leaves every pinned line intact:
   // the line that reassigns it names it, and is refused.
-  const selectionLine = '          selection=(${PACKAGES} "${test_flags[@]}" --profile "${PROFILE}" "${filter_args[@]}")\n';
+  const selectionLine = '          selection=(${PACKAGES} "${test_flags[@]}" --profile "${PROFILE}" "${filter_args[@]}" "${partition_args[@]}")\n';
   const repackaged = mutated(selectionLine, `          PACKAGES='-p meerkat-integration-tests'\n${selectionLine}`);
   assert.ok(repackaged.some((error) => error.includes("job closure-tests: the step runs")), "a PACKAGES reassignment is refused");
   const reprofiled = mutated(selectionLine, `          export PROFILE=ci-pr\n${selectionLine}`);
@@ -1412,6 +1483,7 @@ for (const path of [
       binaries: row.binaries.join(" "),
       no_tests: row.no_tests,
       rust_min_stack: String(row.rust_min_stack),
+      partition: row.partition ?? "",
     })),
   );
 }
@@ -1487,6 +1559,24 @@ for (const path of [
     );
     assert.equal(verify({ "p::a": suite({ t1: defaultFiltered }) }, ["p::a"]).status, 1, "a profile-filtered test fails");
     assert.equal(verify({ "p::a": suite({}, "skipped") }, ["p::a"]).status, 1, "a skipped binary fails");
+    // A partitioned row leaves its other partitions' tests to its sibling
+    // rows, and only a row that names its partition may.
+    const otherPartition = { "filter-match": { status: "mismatch", reason: "partition" } };
+    const partitioned = verify({ "p::a": suite({ t1: match, t2: otherPartition }) }, ["--partition", "count:1/2", "p::a"]);
+    assert.equal(partitioned.status, 0, partitioned.stderr);
+    assert.match(partitioned.stdout, /1 in the other partitions of count:1\/2/);
+    assert.equal(verify({ "p::a": suite({ t1: match, t2: otherPartition }) }, ["p::a"]).status, 1, "an unnamed partition fails");
+    assert.equal(
+      verify({ "p::a": suite({ t1: otherPartition }) }, ["--partition", "count:2/2", "p::a"]).status,
+      1,
+      "a partition that selects nothing fails",
+    );
+    assert.equal(
+      verify({ "p::a": suite({ t1: match, t2: defaultFiltered }) }, ["--partition", "count:1/2", "p::a"]).status,
+      1,
+      "a partitioned row still fails a profile-filtered test",
+    );
+    assert.equal(verify({ "p::a": suite({ t1: match }) }, ["--partition", "hash:1/2", "p::a"]).status, 2, "only count partitions");
   } finally {
     rmSync(scratch, { recursive: true, force: true });
   }

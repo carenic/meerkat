@@ -86,10 +86,43 @@ pub async fn resolve_simple_secret(
             refresh_interval_ms,
         } => {
             use crate::auth_store::{CommandCredentialRunner, CommandCredentialSpec};
+            // A credential command runs as the host, outside its OS process
+            // confinement: one a confined process could change never runs.
+            // Without a working directory of its own it runs from the user's
+            // home directory, never from the host's working directory (which
+            // a confined process may be able to change). A configured working
+            // directory is judged with everything under it; the home
+            // directory as the directory itself, not what is under it, since
+            // the user's projects, and the write grants on them, may lie
+            // under it.
+            let guard = env.host_launch_guard();
+            let (cwd, cwd_subtree) = match cwd {
+                Some(cwd) => (Some(cwd.clone()), true),
+                None => match dirs::home_dir() {
+                    Some(home) => (Some(home), false),
+                    None => (None, true),
+                },
+            };
+            if let Some(guard) = guard
+                && credential_command_is_changeable(
+                    program,
+                    cwd.as_deref(),
+                    cwd_subtree,
+                    cmd_env,
+                    env,
+                    guard,
+                )
+            {
+                return Err(ProviderAuthError::HostLaunchRefused {
+                    exemption: meerkat_core::HostLaunchExemption::CredentialHelper,
+                    refusal:
+                        meerkat_core::confinement::ConfinementRefusal::UntrustedConfigurationSource,
+                });
+            }
             let spec = CommandCredentialSpec {
                 program: program.clone(),
                 args: args.clone(),
-                cwd: cwd.clone(),
+                cwd,
                 env: cmd_env
                     .iter()
                     .map(|(k, v)| (k.clone(), v.clone()))
@@ -97,7 +130,11 @@ pub async fn resolve_simple_secret(
                 timeout_ms: *timeout_ms,
                 refresh_interval_ms: *refresh_interval_ms,
             };
-            let runner = CommandCredentialRunner::new(spec);
+            let runner = match guard {
+                Some(guard) => CommandCredentialRunner::new(spec)
+                    .with_untrusted_paths(std::sync::Arc::clone(guard)),
+                None => CommandCredentialRunner::new(spec),
+            };
             let tokens = resolve_command_credential_via_lease(env, binding, &runner).await?;
             tokens.primary_secret.ok_or_else(|| {
                 ProviderAuthError::SourceResolutionFailed(
@@ -122,6 +159,86 @@ pub async fn resolve_simple_secret(
             Err(ProviderAuthError::Auth(AuthError::InteractiveLoginRequired))
         }
     }
+}
+
+/// Whether a confined process could change what a credential command runs
+/// as the host: its working directory (`cwd_subtree`: with everything under
+/// it; the host's own when none is given, which refuses the command when it
+/// cannot be read), any file its program could resolve to through its
+/// cleaned `PATH` ([`meerkat_core::confinement::program_routes`],
+/// [`meerkat_core::confinement::trusted_search_path`]), or the interpreter a
+/// script's `#!` line names by path. A program only its configured `PATH`
+/// finds, in a directory the cleaned one drops, is one a confined process
+/// could have put there, so it is refused as well.
+#[cfg(not(target_arch = "wasm32"))]
+fn credential_command_is_changeable(
+    program: &std::path::Path,
+    cwd: Option<&std::path::Path>,
+    cwd_subtree: bool,
+    command_env: &std::collections::BTreeMap<String, String>,
+    env: &ResolverEnvironment,
+    guard: &meerkat_llm_core::provider_runtime::HostLaunchGuard,
+) -> bool {
+    use meerkat_core::confinement::{program_routes, trusted_search_path};
+    let Some(working_directory) = cwd
+        .map(std::path::Path::to_path_buf)
+        .or_else(|| std::env::current_dir().ok())
+    else {
+        return true;
+    };
+    if guard(&working_directory, cwd_subtree) {
+        return true;
+    }
+    let configured = command_env
+        .get("PATH")
+        .cloned()
+        .or_else(|| (env.env_lookup)("PATH"));
+    // An empty cleaned `PATH` is removed at launch, so the platform's
+    // default system directories apply.
+    let cleaned = configured
+        .as_deref()
+        .map(|search_path| trusted_search_path(std::ffi::OsStr::new(search_path), guard.as_ref()))
+        .filter(|search_path| !search_path.is_empty());
+    let routes = program_routes(program, Some(&working_directory), cleaned.as_deref());
+    if routes.iter().any(|route| {
+        guard(route, false) || script_interpreter_is_changeable(route, &working_directory, guard)
+    }) {
+        return true;
+    }
+    let found = |routes: &[std::path::PathBuf]| routes.last().is_some_and(|route| route.is_file());
+    !found(&routes)
+        && found(&program_routes(
+            program,
+            Some(&working_directory),
+            configured.as_deref().map(std::ffi::OsStr::new),
+        ))
+}
+
+/// Whether `program` is a script whose `#!` line names an interpreter (by
+/// absolute path, or relative to `working_directory`) a confined process
+/// could change. An interpreter named through `env` is found on the cleaned
+/// `PATH` the command runs with.
+#[cfg(not(target_arch = "wasm32"))]
+fn script_interpreter_is_changeable(
+    program: &std::path::Path,
+    working_directory: &std::path::Path,
+    guard: &meerkat_llm_core::provider_runtime::HostLaunchGuard,
+) -> bool {
+    use std::io::Read;
+    let mut head = [0u8; 256];
+    let Ok(read) = std::fs::File::open(program).and_then(|mut file| file.read(&mut head)) else {
+        return false;
+    };
+    let Some(line) = head[..read].strip_prefix(b"#!") else {
+        return false;
+    };
+    let line = line.split(|byte| *byte == b'\n').next().unwrap_or_default();
+    let interpreter = String::from_utf8_lossy(line);
+    interpreter
+        .split_whitespace()
+        .next()
+        .map(|interpreter| working_directory.join(interpreter))
+        .is_some_and(|interpreter| guard(&interpreter, false))
 }
 
 /// Observe a [`CredentialSourceSpec`]'s readiness for the api_key /
