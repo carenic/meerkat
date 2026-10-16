@@ -22,8 +22,9 @@ import {
 } from "./ci-hook-coverage.mjs";
 import {
   GOVERNANCE_DOC_PATTERNS,
+  MOB_CHAIN_CLIPPY_HEADS,
+  MOB_CHAIN_INVALIDATED,
   UNIT_SOLO_PACKAGES,
-  WORKSPACE_PR_PUSH_CLIPPY,
   lockScope,
   parseCargoLock,
 } from "./ci-cargo-lanes.mjs";
@@ -151,11 +152,21 @@ function assertEventSplit(plan, label) {
       assert.equal(shard.targets, "--all-targets", `${label}: ${shard.name} lints every target`);
     }
   }
-  const pushClippy = plan.mode === "workspace" ? plan.packages.filter((name) => WORKSPACE_PR_PUSH_CLIPPY.includes(name)) : [];
-  assert.deepEqual(deferred.clippy_packages, pushClippy, `${label}: a workspace pull request leaves the chain heads' Clippy to the push`);
+  // The chain heads' whole Clippy waits for the push only when the change
+  // invalidates meerkat-mob's build (always in workspace mode), and says so.
+  const heads = plan.packages.filter((name) => MOB_CHAIN_CLIPPY_HEADS.includes(name));
+  if (plan.mode === "workspace") {
+    assert.deepEqual(deferred.clippy_packages, heads, `${label}: a workspace pull request leaves the chain heads' Clippy to the push`);
+  }
+  assert.ok(deferred.clippy_packages.every((name) => heads.includes(name)), `${label}: only chain heads lint on the push alone`);
+  assert.equal(
+    deferred.clippy_packages_reason,
+    deferred.clippy_packages.length > 0 ? MOB_CHAIN_INVALIDATED : "",
+    `${label}: the deferral names its reason`,
+  );
   assert.deepEqual(
     deferred.clippy_test_targets,
-    plan.packages.filter((name) => chain(name) && !pushClippy.includes(name)),
+    plan.packages.filter((name) => chain(name) && !deferred.clippy_packages.includes(name)),
     `${label}: the chain's test targets lint on the push`,
   );
 }
@@ -569,14 +580,14 @@ for (const path of [
     }
   }
   // The whole workspace: the mob-chain packages lint their lib and bin
-  // targets, except the chain heads in WORKSPACE_PR_PUSH_CLIPPY, which lint
+  // targets, except the chain heads in MOB_CHAIN_CLIPPY_HEADS, which lint
   // on the push only; the facade and the packed shards lint every target;
   // the suites and lanes that compile the chain, and the facade's GPT Live
   // suites, wait for the push.
   const pr = planFor(["Cargo.toml"], ["--event", "pull_request"]);
   const shardOf = (name) => pr.shards.find((shard) => shard.packages.includes(name));
   assert.equal(shardOf("meerkat-mob").targets, "--lib");
-  for (const name of WORKSPACE_PR_PUSH_CLIPPY) {
+  for (const name of MOB_CHAIN_CLIPPY_HEADS) {
     assert.equal(shardOf(name), undefined, `${name} lints on the push in a workspace-mode pull request`);
   }
   assert.deepEqual(pr.deferred_to_push.clippy_packages, ["meerkat-integration-tests", "meerkat-rpc", "rkat"]);
@@ -595,18 +606,59 @@ for (const path of [
   assert.equal(lines.closure_test_count, "0");
   assert.equal(lines.feature_check_count, "0");
   assert.match(lines.deferred_to_push, /^17 closure-tests rows; the closure check; \d+ feature-combination jobs; /);
-  assert.match(lines.deferred_to_push, /; the Clippy of meerkat-integration-tests, meerkat-rpc, rkat; /);
+  assert.match(lines.deferred_to_push, /; the Clippy of meerkat-integration-tests, meerkat-rpc, rkat \(mob chain invalidated\); /);
   // A packages-mode pull request lints a chain head itself (lib and bin
-  // targets): the chain below it is cached there.
-  for (const [path, name, targets] of [
-    ["crates/meerkat-rpc/src/lib.rs", "meerkat-rpc", "--lib --bins"],
-    ["crates/meerkat-cli/src/main.rs", "rkat", "--bins"],
-    ["tests/integration/src/lib.rs", "meerkat-integration-tests", "--lib --bins"],
+  // targets) while meerkat-mob's build stays cached: a change to the heads,
+  // or to crates above meerkat-mob, leaves it alone.
+  for (const [paths, lints] of [
+    [["crates/meerkat-rpc/src/lib.rs"], { "meerkat-rpc": "--lib --bins" }],
+    [["crates/meerkat-cli/src/main.rs"], { rkat: "--bins" }],
+    [["tests/integration/src/lib.rs"], { "meerkat-integration-tests": "--lib --bins" }],
+    [
+      ["tests/integration/src/lib.rs", "crates/meerkat-rpc/src/lib.rs", "crates/meerkat-cli/src/main.rs"],
+      { "meerkat-integration-tests": "--lib --bins", "meerkat-rpc": "--lib --bins", rkat: "--bins" },
+    ],
+    [["crates/meerkat-mob-mcp/src/lib.rs", "crates/meerkat-rpc/src/lib.rs"], { "meerkat-rpc": "--lib --bins" }],
   ]) {
-    const head = planFor([path], ["--event", "pull_request"]);
-    assert.equal(head.mode, "packages", `${path}: packages mode`);
-    assert.deepEqual(head.deferred_to_push.clippy_packages, [], `${path}: no Clippy left to the push`);
-    assert.equal(head.shards.find((shard) => shard.packages.includes(name))?.targets, targets, `${path}: ${name} lints ${targets}`);
+    const label = paths.join(" ");
+    const head = planFor(paths, ["--event", "pull_request"]);
+    assert.equal(head.mode, "packages", `${label}: packages mode`);
+    assert.deepEqual(head.deferred_to_push.clippy_packages, [], `${label}: no Clippy left to the push`);
+    for (const [name, targets] of Object.entries(lints)) {
+      assert.equal(head.shards.find((shard) => shard.packages.includes(name))?.targets, targets, `${label}: ${name} lints ${targets}`);
+    }
+  }
+  // A change to meerkat-mob or to a crate its library compiles invalidates
+  // its build, and the heads' lanes would compile the whole chain uncached:
+  // the pull request leaves their whole Clippy to the push and names the
+  // reason. The push lints every target of them, in every case.
+  for (const [paths, deferredHeads] of [
+    [["crates/meerkat-core/src/lib.rs", "crates/meerkat-rpc/src/lib.rs"], ["meerkat-rpc"]],
+    [["crates/meerkat-mob/src/lib.rs", "crates/meerkat-cli/src/main.rs"], ["rkat"]],
+    [
+      ["crates/meerkat-runtime/src/lib.rs", "tests/integration/src/lib.rs", "crates/meerkat-rpc/src/lib.rs", "crates/meerkat-cli/src/main.rs"],
+      ["meerkat-integration-tests", "meerkat-rpc", "rkat"],
+    ],
+  ]) {
+    const label = paths.join(" ");
+    const head = planFor(paths, ["--event", "pull_request"]);
+    assert.equal(head.mode, "packages", `${label}: packages mode`);
+    assert.deepEqual(head.deferred_to_push.clippy_packages, deferredHeads, `${label}: the heads' Clippy waits for the push`);
+    assert.equal(head.deferred_to_push.clippy_packages_reason, MOB_CHAIN_INVALIDATED, `${label}: and names the reason`);
+    for (const name of deferredHeads) {
+      assert.equal(head.shards.find((shard) => shard.packages.includes(name)), undefined, `${label}: no ${name} shard in the pull request`);
+    }
+    const summary = Object.fromEntries(
+      run(["--format", "github", "--event", "pull_request", "--", ...paths]).stdout.trim().split("\n").map((line) => [line.slice(0, line.indexOf("=")), line.slice(line.indexOf("=") + 1)]),
+    );
+    assert.ok(
+      summary.deferred_to_push.includes(`the Clippy of ${deferredHeads.join(", ")} (${MOB_CHAIN_INVALIDATED})`),
+      `${label}: the pull request's summary lists them: ${summary.deferred_to_push}`,
+    );
+    const push = planFor(paths, ["--event", "push"]);
+    for (const name of deferredHeads) {
+      assert.equal(push.shards.find((shard) => shard.packages.includes(name))?.targets, "--all-targets", `${label}: the push lints every target of ${name}`);
+    }
   }
   for (const row of JSON.parse(lines.shard_matrix).include) {
     assert.ok(["--all-targets", "--lib", "--bins", "--lib --bins"].includes(row.targets), `${row.name} carries its targets`);

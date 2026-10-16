@@ -354,6 +354,32 @@ fn pull_requests_leave_the_chain_and_closure_lanes_to_the_push() {
         job_if("feature-check").contains("needs.changes.outputs.feature_check_count != '0'"),
         "feature-check runs the rows the plan names"
     );
+    // The push lints every target of every changed package, the chain heads
+    // a pull request left to it included, and a Clippy failure is a red CI
+    // gate: neither the job nor its lint step may soft-fail.
+    let clippy = jobs
+        .get(serde_yaml::Value::String("clippy".to_string()))
+        .and_then(serde_yaml::Value::as_mapping)
+        .expect("clippy job");
+    assert!(
+        clippy.get("continue-on-error").is_none(),
+        "the Clippy job never soft-fails"
+    );
+    let lint_step = clippy
+        .get("steps")
+        .and_then(serde_yaml::Value::as_sequence)
+        .expect("clippy steps")
+        .iter()
+        .find(|step| {
+            step.get("run")
+                .and_then(serde_yaml::Value::as_str)
+                .is_some_and(|run| run.contains("./scripts/repo-cargo clippy"))
+        })
+        .expect("the Clippy lint step");
+    assert!(
+        lint_step.get("continue-on-error").is_none(),
+        "the Clippy lint step never soft-fails"
+    );
     for contract in [
         "a push plan left lanes to a later push",
         "forbid_failure \"Closure check\" \"${CLOSURE_CHECK_RESULT}\"",

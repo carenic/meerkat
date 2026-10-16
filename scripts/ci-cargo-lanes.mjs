@@ -43,9 +43,9 @@
 // governed JSONL and confinement-positive lanes, the feature suites marked
 // `pullRequest: false`, the test targets of the mob-chain packages (their
 // pull-request Clippy lints lib and bin targets only; their tests run on
-// main), in workspace mode the whole Clippy of the chain heads in
-// WORKSPACE_PR_PUSH_CLIPPY, and the wasm lanes that only the
-// reverse-dependency closure selected. On 4-vCPU hosted runners each of those needs 9-30 minutes
+// main), the whole Clippy of the chain heads in MOB_CHAIN_CLIPPY_HEADS when
+// the change invalidates meerkat-mob's build (always in workspace mode), and
+// the wasm lanes that only the reverse-dependency closure selected. On 4-vCPU hosted runners each of those needs 9-30 minutes
 // (meerkat-mob alone compiles for 5-11 minutes whenever it misses the cache),
 // so no pull request fits the 20-minute cap from the start of the pre-push
 // hook to a green CI gate with them. The plan lists what a pull request left
@@ -495,16 +495,18 @@ export const CLIPPY_HEAD_SHARDS = [
   ["meerkat-integration-tests", "surface-build-fixtures"],
 ];
 
-// The chain heads whose Clippy a workspace-mode pull request leaves to the
-// push. In that mode meerkat-mob misses the cache, and each of these lanes
-// compiles the whole chain below its package first: on runs 38859112297
-// and 38931641220, every target, rkat took 719-1114 s, meerkat-rpc
-// 745-1158 s and meerkat-integration-tests (with surface-build-fixtures)
-// 945-1057 s, and their lib targets alone sit on the same chain. A
-// packages-mode pull request lints them (lib and bin targets), since the
-// chain below them is cached there. Names are checked against cargo
-// metadata.
-export const WORKSPACE_PR_PUSH_CLIPPY = ["rkat", "meerkat-integration-tests", "meerkat-rpc"];
+// The chain heads whose Clippy a pull request leaves to the push when it
+// invalidates meerkat-mob's build: a workspace-mode plan, or a change to
+// meerkat-mob or to a crate its library compiles. meerkat-mob then misses the
+// cache, and each of these lanes compiles the whole chain below its package
+// first: on runs 38859112297 and 38931641220, every target, rkat took
+// 719-1114 s, meerkat-rpc 745-1158 s and meerkat-integration-tests (with
+// surface-build-fixtures) 945-1057 s, and their lib targets alone sit on the
+// same chain. A pull request that leaves meerkat-mob's build alone lints them
+// (lib and bin targets), since the chain below them is cached. The push
+// lints them in every case. Names are checked against cargo metadata.
+export const MOB_CHAIN_CLIPPY_HEADS = ["rkat", "meerkat-integration-tests", "meerkat-rpc"];
+export const MOB_CHAIN_INVALIDATED = "mob chain invalidated";
 export const CLIPPY_PACKED_SHARDS = 5;
 
 function parseBazelFeatureSets(pkg) {
@@ -1744,6 +1746,7 @@ function plan(args) {
     integration_suites: [],
     unit_feature_suites: [],
     clippy_packages: [],
+    clippy_packages_reason: "",
     clippy_test_targets: [],
     governed_jsonl: false,
     mcp_confinement_positive: false,
@@ -1815,14 +1818,30 @@ function plan(args) {
   if (result.rust_changed) {
     const shardCap = result.mode === "workspace" ? args.workspaceShards : args.maxShards;
     // Clippy lanes: every changed package. A pull request lints the
-    // mob-chain packages' lib and bin targets only, and in workspace mode
-    // leaves the Clippy of WORKSPACE_PR_PUSH_CLIPPY to the push.
-    for (const name of WORKSPACE_PR_PUSH_CLIPPY) {
-      if (!byName.has(name)) throw new Error(`workspace pull-request Clippy deferral names unknown package ${name}`);
+    // mob-chain packages' lib and bin targets only, and leaves the Clippy of
+    // MOB_CHAIN_CLIPPY_HEADS to the push when it invalidates meerkat-mob's
+    // build: in workspace mode, or when meerkat-mob or a crate its library
+    // compiles (normal and build dependencies, transitively) changed.
+    for (const name of [...MOB_CHAIN_CLIPPY_HEADS, HEAVY_ANCHOR]) {
+      if (!byName.has(name)) throw new Error(`mob-chain Clippy deferral names unknown package ${name}`);
     }
-    deferred.clippy_packages = deferToPush && result.mode === "workspace"
-      ? result.packages.filter((name) => WORKSPACE_PR_PUSH_CLIPPY.includes(name))
+    const mobBuild = new Set([HEAVY_ANCHOR]);
+    const mobQueue = [byName.get(HEAVY_ANCHOR)];
+    while (mobQueue.length) {
+      for (const dep of mobQueue.pop().dependencies) {
+        if (dep.source !== null || dep.kind === "dev") continue;
+        const depPkg = byName.get(dep.name);
+        if (depPkg && !mobBuild.has(depPkg.name)) {
+          mobBuild.add(depPkg.name);
+          mobQueue.push(depPkg);
+        }
+      }
+    }
+    const mobInvalidated = result.mode === "workspace" || result.packages.some((name) => mobBuild.has(name));
+    deferred.clippy_packages = deferToPush && mobInvalidated
+      ? result.packages.filter((name) => MOB_CHAIN_CLIPPY_HEADS.includes(name))
       : [];
+    deferred.clippy_packages_reason = deferred.clippy_packages.length > 0 ? MOB_CHAIN_INVALIDATED : "";
     const clippyPackages = result.packages.filter((name) => !deferred.clippy_packages.includes(name));
     result.shards = clippyShards(
       clippyPackages,
@@ -2193,7 +2212,9 @@ function deferredSummary(deferred) {
   if (deferred.feature_check_jobs > 0) parts.push(`${deferred.feature_check_jobs} feature-combination jobs`);
   if (deferred.integration_suites.length > 0) parts.push(`integration suites ${deferred.integration_suites.join(", ")}`);
   if (deferred.unit_feature_suites.length > 0) parts.push(`feature suites ${deferred.unit_feature_suites.join(", ")}`);
-  if (deferred.clippy_packages.length > 0) parts.push(`the Clippy of ${deferred.clippy_packages.join(", ")}`);
+  if (deferred.clippy_packages.length > 0) {
+    parts.push(`the Clippy of ${deferred.clippy_packages.join(", ")} (${deferred.clippy_packages_reason})`);
+  }
   if (deferred.clippy_test_targets.length > 0) parts.push(`the test targets' Clippy of ${deferred.clippy_test_targets.join(", ")}`);
   if (deferred.governed_jsonl) parts.push("governed JSONL");
   if (deferred.mcp_confinement_positive) parts.push("MCP confinement positive");

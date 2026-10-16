@@ -371,11 +371,13 @@ and its CI must be green before a release tag (`require_ci_green`):
   `feature-check`, `governed-jsonl`, `mcp-confinement-positive`, the
   integration suites whose package compiles meerkat-mob, the feature suites
   marked `pullRequest: false`, the mob-chain packages' test-target Clippy,
-  and in workspace mode the whole Clippy of the chain heads rkat,
-  meerkat-integration-tests and meerkat-rpc (`WORKSPACE_PR_PUSH_CLIPPY`:
-  there meerkat-mob misses the cache and their lanes compile the whole chain
-  first; a packages-mode pull request lints them). The gate refuses a push
-  plan that left anything to a later push.
+  and the whole Clippy of the chain heads rkat, meerkat-integration-tests and
+  meerkat-rpc (`MOB_CHAIN_CLIPPY_HEADS`) whenever the change invalidates
+  meerkat-mob's build (workspace mode, or a change to meerkat-mob or a crate
+  its library compiles), listed as "mob chain invalidated": their lanes then
+  compile the whole chain uncached. A pull request that leaves meerkat-mob's
+  build alone lints them. The gate refuses a push plan that left anything to
+  a later push, and the push lints every target of every changed package.
   A release projection is the one exception: when the diff from HEAD's
   first parent is only the forward patch projection `scripts/release-hook.sh`
   writes (`scripts/release-projection-only.mjs`, the pre-push hook's own
@@ -424,8 +426,9 @@ and its CI must be green before a release tag (`require_ci_green`):
 - `clippy`: one lane per shard of every directly changed package
   (`clippy --no-deps <targets> --all-features -D warnings`, every target
   except a pull request's meerkat-mob chain shards, which lint their lib and
-  bin targets because their tests run on the push; a workspace-mode pull
-  request leaves the Clippy of `WORKSPACE_PR_PUSH_CLIPPY` to the push); a
+  bin targets because their tests run on the push; a pull request that
+  invalidates meerkat-mob's build leaves the Clippy of
+  `MOB_CHAIN_CLIPPY_HEADS` to the push); a
   whole-workspace plan gives the heads of the long check chains fixed
   shards of their own (`CLIPPY_HEAD_SHARDS`) and packs the rest. Its
   `RUSTC_WRAPPER` is `scripts/ci-clippy-sccache-wrapper`, which sends the
