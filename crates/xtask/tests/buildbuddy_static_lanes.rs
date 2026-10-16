@@ -506,14 +506,17 @@ fn public_version_surfaces_are_in_sync() {
     let dependencies = workspace["workspace"]["dependencies"]
         .as_table()
         .expect("workspace dependencies");
+    // Internal requirements are exact (`=X.Y.Z`): 0.x patch releases may
+    // break API, so a published crate pins its siblings to its own release.
+    let exact_requirement = format!("={cargo_version}");
     for (name, value) in dependencies {
         if name.starts_with("meerkat") {
             let Some(dep_version) = value.get("version").and_then(|v| v.as_str()) else {
                 continue;
             };
             assert_eq!(
-                dep_version, cargo_version,
-                "internal dependency {name} has stale version"
+                dep_version, exact_requirement,
+                "internal dependency {name} must require the workspace version exactly"
             );
         }
     }
