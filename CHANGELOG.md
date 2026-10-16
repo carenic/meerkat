@@ -35,6 +35,17 @@ them.
 
 ## [Unreleased]
 
+### Breaking
+
+- Behaviour-only (not measured by the gate): for a governed web_search
+  helper whose owner rates its model request R2 or R3, the tool error code
+  changes from `operation_authorization_unavailable` to `review_unavailable`
+  (R2) or `review_unsatisfied` (R3), and the Anthropic, OpenAI and Gemini
+  web_search executors return `LlmError::OperationReviewRefused` instead of
+  `LlmError::OperationAuthorizationUnavailable` for them (see Fixed). A host
+  that branched on the old code or variant for these settlements must branch
+  on the review ones.
+
 ### Fixed
 
 - A governed web_search helper whose owner rates its model request R2 or R3
