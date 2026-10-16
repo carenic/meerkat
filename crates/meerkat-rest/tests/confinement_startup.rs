@@ -32,14 +32,15 @@ requirement = { baseline = "command_runtime_v1", read = { kind = "paths", paths 
 /// the observed startup latency under a fully parallel crate run.
 const STARTUP_DEADLINE: Duration = Duration::from_secs(200);
 
-/// The crate's own binary: nextest and the generated Bazel targets
-/// advertise it in the runtime environment, and Cargo at compile time. A
-/// test without it fails rather than passing without having run.
+/// The crate's own binary, from the runtime environment only: Cargo,
+/// nextest (including an archived test run on another machine) and the
+/// generated Bazel targets set it there. A compile-time path would be stale
+/// in an archive. A test without it fails rather than passing without having
+/// run.
 fn rkat_rest_binary() -> PathBuf {
     let advertised = std::env::var_os("CARGO_BIN_EXE_rkat-rest")
         .map(PathBuf::from)
-        .or_else(|| option_env!("CARGO_BIN_EXE_rkat-rest").map(PathBuf::from))
-        .expect("CARGO_BIN_EXE_rkat-rest is set by cargo, nextest and the generated Bazel targets");
+        .expect("CARGO_BIN_EXE_rkat-rest is set at runtime by cargo, nextest and the generated Bazel targets");
     assert!(
         advertised.exists(),
         "the rkat-rest binary {} does not exist",

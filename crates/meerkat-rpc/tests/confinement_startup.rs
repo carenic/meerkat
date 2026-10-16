@@ -41,14 +41,15 @@ const PROTECTED_INPUTS_REPORT: &str = "kept from every confined process: the rea
 /// a fully parallel crate run and below the CI unit profile's ceiling.
 const EXIT_DEADLINE: Duration = Duration::from_secs(200);
 
-/// The crate's own binary: nextest and the generated Bazel targets
-/// advertise it in the runtime environment, and Cargo at compile time. A
-/// test without it fails rather than passing without having run.
+/// The crate's own binary, from the runtime environment only: Cargo,
+/// nextest (including an archived test run on another machine) and the
+/// generated Bazel targets set it there. A compile-time path would be stale
+/// in an archive. A test without it fails rather than passing without having
+/// run.
 fn rkat_rpc_binary() -> PathBuf {
     let advertised = std::env::var_os("CARGO_BIN_EXE_rkat-rpc")
         .map(PathBuf::from)
-        .or_else(|| option_env!("CARGO_BIN_EXE_rkat-rpc").map(PathBuf::from))
-        .expect("CARGO_BIN_EXE_rkat-rpc is set by cargo, nextest and the generated Bazel targets");
+        .expect("CARGO_BIN_EXE_rkat-rpc is set at runtime by cargo, nextest and the generated Bazel targets");
     assert!(
         advertised.exists(),
         "the rkat-rpc binary {} does not exist",
