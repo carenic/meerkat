@@ -52,6 +52,16 @@ them.
   `LiveToolDispatchError::from_session_error` classifies it as
   `LiveToolDispatchError::Tool` with `ToolError::ReviewUnavailable` or
   `ToolError::ReviewUnsatisfied` (see Fixed).
+- Behaviour-only (not measured by the gate): a live tool call that its
+  session fails with a model request's settled review, authority
+  unavailability or observation unavailability together with settlement
+  diagnostics is classified like the same failure without them:
+  `LiveToolDispatchError::Tool` instead of `LiveToolDispatchError::Session`
+  with code `AGENT_ERROR` (see Fixed). Through `LiveAdapterHost`, the review
+  and authority cases now reach the live model as typed tool feedback instead
+  of a prose tool error, and in the observation case `apply_observation`
+  returns `LiveAdapterHostError::OperationObservationUnavailable` instead of
+  submitting a prose tool error.
 
 ### Fixed
 
@@ -80,6 +90,20 @@ them.
   `ToolError::ReviewUnavailable` or `ToolError::ReviewUnsatisfied`. Plain
   authority unavailability, and a review detail that does not decode, still
   give `operation_authorization_unavailable`.
+- `LiveToolDispatchError::from_session_error` now also classifies a model
+  failure that its session reports with settlement diagnostics. Core keeps
+  such a failure inside `AgentError::WithSettlementFailures`, and the
+  classifier matched only an unwrapped model error, so a settled review,
+  authority unavailability or observation unavailability with diagnostics
+  fell through to `LiveToolDispatchError::Session` (code `AGENT_ERROR`) and
+  reached the live model as a prose tool error. The classifier now reads the
+  primary error: a settled review and authority unavailability give the same
+  typed tool feedback as without diagnostics, and the diagnostics travel in
+  the live tool result's `settlement_failures`; observation unavailability
+  leaves the tool feedback path as
+  `LiveAdapterHostError::OperationObservationUnavailable` carrying them. An
+  operation refusal keeps its classification and is never read as review
+  feedback, also when its details carry a review.
 - `meerkat` built without its `session-store` feature (its default feature
   set included) no longer warns that `ConsentAwareJobSource` is never
   constructed. The crate-private consent-aware job source is now compiled

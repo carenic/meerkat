@@ -445,6 +445,41 @@ mod tests {
         }
     }
 
+    /// Settlement diagnostics around a settled review change nothing at this
+    /// seam: the typed settlement is read from the primary error.
+    #[test]
+    fn wrapped_review_settlement_projection_keeps_its_typed_refusal() {
+        use meerkat_core::{OperationReviewRefusal, ReviewUnavailableKind, ReviewUnsatisfiedKind};
+        let diagnostics = vec![meerkat_core::ToolDispatchSettlementFailure {
+            admission_source: meerkat_core::ToolDispatchAdmissionSource::AuthorizationAudit,
+            effect_kind: meerkat_core::LiveBridgeEffectKind::ToolDispatch,
+            physical_outcome: meerkat_core::LiveBridgeEffectOutcome::Unknown,
+            failure_kind:
+                meerkat_core::ToolDispatchTerminalErrorKind::OperationObservationUnavailable,
+        }];
+        for refusal in [
+            OperationReviewRefusal::Unavailable {
+                kind: ReviewUnavailableKind::UnsupportedEntry,
+            },
+            OperationReviewRefusal::Unsatisfied {
+                kind: ReviewUnsatisfiedKind::HumanConsentRequired,
+            },
+        ] {
+            let wrapped = LlmError::OperationReviewRefused { refusal }
+                .into_agent_error("anthropic")
+                .with_settlement_failures(diagnostics.clone());
+            assert!(
+                matches!(wrapped, AgentError::WithSettlementFailures { .. }),
+                "{wrapped:?}"
+            );
+            let error = map_agent_error_to_llm_error(wrapped);
+            assert!(
+                matches!(&error, LlmError::OperationReviewRefused { refusal: kept } if *kept == refusal),
+                "{error:?}"
+            );
+        }
+    }
+
     /// A fake LLM client that yields one canned outcome per call. The outcome
     /// is moved out so a single configured result is consumed exactly once.
     struct FakeClient {
