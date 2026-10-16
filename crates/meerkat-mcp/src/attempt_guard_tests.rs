@@ -246,9 +246,10 @@ fn installation(probe: &Arc<Probe>, bounds: McpAttemptGuardBounds) -> McpAttempt
 }
 
 fn surface_router() -> McpRouter {
-    McpRouter::new_with_surface_handle(Arc::new(
-        meerkat_runtime::RuntimeExternalToolSurfaceHandle::ephemeral(),
-    ))
+    McpRouter::new_with_surface_handle_and_stdio_profile(
+        Arc::new(meerkat_runtime::RuntimeExternalToolSurfaceHandle::ephemeral()),
+        crate::McpStdioLaunchProfile::trusted_host(),
+    )
 }
 
 fn guarded(guards: &McpAttemptGuards, owner: McpConstructionOwner) -> Arc<McpRouterAdapter> {
@@ -1371,4 +1372,45 @@ async fn a_second_guard_installation_is_refused() {
     adapter.shutdown().await;
     let (settled, _) = first.one_finish("twice").await;
     assert!(settled);
+}
+
+/// R1: a guard its begin already handed over is still awaited and reported
+/// by a concurrent `close_and_join`: it is registered before the begin
+/// completes, not after the attempt picks it up.
+#[tokio::test]
+async fn close_and_join_sees_a_guard_still_being_handed_over() {
+    let probe = Probe::new();
+    let guards = installation(&probe, McpAttemptGuardBounds::DEFAULT);
+    guards.hold_handover_for_test(true);
+    let adapter = guarded(&guards, session_owner());
+    add(&adapter, shell("handed", SERVE)).await;
+    probe
+        .until("the begin returns", |probe| {
+            probe.calls().iter().any(
+                |(_, call)| matches!(call, Call::BeginReturned { key } if key.server == "handed"),
+            )
+        })
+        .await;
+    // The begin task has nothing left to wait for.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let records = guards
+        .close_and_join(tokio::time::Instant::now() + Duration::from_secs(2))
+        .await;
+    let key = probe.begins("handed")[0].clone();
+    assert!(
+        records
+            .iter()
+            .any(|record| record.key == key && record.stage != McpGuardStage::Begin),
+        "the handed-over guard is reported: {records:#?}"
+    );
+    guards.hold_handover_for_test(false);
+    let (settled, disposition) = probe.one_finish("handed").await;
+    assert!(!settled);
+    assert_eq!(
+        disposition.open,
+        McpAttemptOpenOutcome::Cancelled {
+            cause: McpAttemptCancelCause::InstallationClosed
+        }
+    );
+    adapter.shutdown().await;
 }

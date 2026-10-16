@@ -489,6 +489,10 @@ struct Installation {
     factory: Arc<dyn McpAttemptGuardFactory>,
     bounds: McpAttemptGuardBounds,
     state: Mutex<InstallationState>,
+    /// Holds each attempt between receiving its begin's answer and acting
+    /// on it (tests only).
+    #[cfg(test)]
+    handover_hold: tokio::sync::watch::Sender<bool>,
 }
 
 #[derive(Default)]
@@ -513,7 +517,16 @@ impl McpAttemptGuards {
             factory,
             bounds,
             state: Mutex::new(InstallationState::default()),
+            #[cfg(test)]
+            handover_hold: tokio::sync::watch::channel(false).0,
         }))
+    }
+
+    /// Hold every attempt between receiving its begin's answer and acting on
+    /// it (tests only).
+    #[cfg(test)]
+    pub(crate) fn hold_handover_for_test(&self, hold: bool) {
+        self.0.handover_hold.send_replace(hold);
     }
 
     #[must_use]
@@ -1079,26 +1092,22 @@ impl RouterGuards {
         let runtime = tokio::runtime::Handle::current();
         let (handoff, delivered) = tokio::sync::oneshot::channel();
         spawn_begin(
-            installation,
+            self,
             &runtime,
             McpAttemptGuardRequest {
-                key: key.clone(),
+                key,
                 owner: Arc::clone(&self.owner),
                 server: server.clone(),
                 operation,
             },
             cancel.clone(),
             handoff,
-            scope.clone(),
+            scope,
             task,
         );
         let mut waiting = BeginWait {
             delivered: Some(delivered),
             cancel: cancel.clone(),
-            installation: Arc::clone(installation),
-            runtime: runtime.clone(),
-            key: key.clone(),
-            scope: scope.clone(),
         };
         let deadline = tokio::time::Instant::now() + bounds.begin();
         let answer = tokio::select! {
@@ -1116,48 +1125,50 @@ impl RouterGuards {
             return Err(unavailable());
         };
         waiting.disarm();
-        if cancel.is_requested() {
+        #[cfg(test)]
+        {
+            let mut held = installation.handover_hold.subscribe();
+            let _ = held.wait_for(|held| !*held).await;
+        }
+        if let Some(cause) = cancel.cause() {
             // Answered, but the attempt was cancelled meanwhile: the guard is
-            // late, and the attempt stops.
-            if let Ok(Ok(Some(guard))) = answer {
-                installation.spawn_finish(
-                    &runtime,
-                    guard,
-                    scope,
-                    McpAttemptDisposition {
-                        key,
-                        open: McpAttemptOpenOutcome::Cancelled {
-                            cause: cancel
-                                .cause()
-                                .unwrap_or(McpAttemptCancelCause::AttemptDropped),
-                        },
-                        process: McpAttemptProcessEnd::NotSpawned,
-                    },
-                );
+            // late, and the attempt stops with nothing spawned.
+            if let Ok(Ok(Some(record))) = answer {
+                record.cancel_unspawned(cause);
             }
             return Err(unavailable());
         }
         match answer {
-            Ok(Ok(Some(guard))) => {
-                let record = Arc::new(AttemptGuardRecord {
-                    key,
-                    scope,
-                    installation: Arc::clone(installation),
-                    runtime,
-                    state: Mutex::new(RecordState {
-                        guard: Some(guard),
-                        open: None,
-                        process: None,
-                    }),
-                });
-                self.register_record(&record);
-                Ok(Some(record))
-            }
-            Ok(Ok(None)) => Ok(None),
+            // The record arrives registered (see `spawn_begin`).
+            Ok(Ok(record)) => Ok(record),
             Ok(Err(refusal)) => Err(crate::McpError::AttachmentRefused(refusal)),
             // The begin ended without an answer (it panicked).
             Err(_) => Err(unavailable()),
         }
+    }
+
+    /// The record of a guard `begin` returned for `key`, registered with
+    /// this router and the installation before it is handed to its attempt.
+    fn record(
+        &self,
+        key: McpAttemptKey,
+        scope: GuardScope,
+        runtime: tokio::runtime::Handle,
+        guard: Box<dyn McpAttemptGuard>,
+    ) -> Arc<AttemptGuardRecord> {
+        let record = Arc::new(AttemptGuardRecord {
+            key,
+            scope,
+            installation: Arc::clone(&self.installation),
+            runtime,
+            state: Mutex::new(RecordState {
+                guard: Some(guard),
+                open: None,
+                process: None,
+            }),
+        });
+        self.register_record(&record);
+        record
     }
 
     fn register_attempt(&self, cancel: &McpAttemptCancellation) -> AttemptRegistration<'_> {
@@ -1289,14 +1300,18 @@ pub(crate) fn open_for_error(
     }
 }
 
-type BeginAnswer = Result<Option<Box<dyn McpAttemptGuard>>, McpAttachmentRefusal>;
+/// What a begin hands its attempt: its guard's record, already registered,
+/// or no guard, or the factory's refusal.
+type BeginAnswer = Result<Option<Arc<AttemptGuardRecord>>, McpAttachmentRefusal>;
 
-/// Run the attempt's tracked begin (`task`) on `runtime`, never dropped. Its
-/// answer goes to the waiting attempt; when the attempt is gone, a guard it
-/// returns is cancelled here, in the begin's own task, before the begin is
-/// complete. A refusal is recorded on the begin as `Refused{Guard}`.
+/// Run the attempt's tracked begin (`task`) for `router` on `runtime`, never
+/// dropped. A guard it returns is recorded and registered here, before the
+/// begin is complete, so a join that sees the begin complete sees the guard
+/// held (or its finish tracked); the record then goes to the waiting
+/// attempt. When the attempt is gone, the record is cancelled here, nothing
+/// spawned. A refusal is recorded on the begin as `Refused{Guard}`.
 fn spawn_begin(
-    installation: &Arc<Installation>,
+    router: &Arc<RouterGuards>,
     runtime: &tokio::runtime::Handle,
     request: McpAttemptGuardRequest,
     cancel: McpAttemptCancellation,
@@ -1305,40 +1320,43 @@ fn spawn_begin(
     task: Arc<GuardTask>,
 ) {
     let key = request.key.clone();
-    let factory = Arc::clone(&installation.factory);
-    let installation = Arc::clone(installation);
+    let factory = Arc::clone(&router.installation.factory);
+    let router = Arc::clone(router);
+    let record_runtime = runtime.clone();
     runtime.spawn(async move {
         let began = AssertUnwindSafe(factory.begin(request, cancel.clone()))
             .catch_unwind()
             .await;
-        if let Ok(Err(_)) = &began {
-            task.begin_outcome(McpAttemptOpenOutcome::Refused {
-                refusal: McpAttemptRefusal::Guard,
-            });
-        }
         let completion = match began {
             Err(_) => McpGuardCompletion::Panicked,
-            Ok(answer) => match handoff.send(answer) {
-                Ok(()) if cancel.is_requested() => McpGuardCompletion::Cancelled,
-                Ok(()) => McpGuardCompletion::Completed,
-                Err(answer) => {
-                    if let Ok(Some(guard)) = answer {
-                        let disposition = McpAttemptDisposition {
-                            key,
-                            open: McpAttemptOpenOutcome::Cancelled {
-                                cause: cancel
+            Ok(answer) => {
+                let answer = match answer {
+                    Ok(Some(guard)) => Ok(Some(router.record(key, scope, record_runtime, guard))),
+                    Ok(None) => Ok(None),
+                    Err(refusal) => {
+                        task.begin_outcome(McpAttemptOpenOutcome::Refused {
+                            refusal: McpAttemptRefusal::Guard,
+                        });
+                        Err(refusal)
+                    }
+                };
+                match handoff.send(answer) {
+                    Ok(()) if cancel.is_requested() => McpGuardCompletion::Cancelled,
+                    Ok(()) => McpGuardCompletion::Completed,
+                    Err(answer) => {
+                        // The attempt is gone: its guard is cancelled, and
+                        // its finish tracked before this begin completes.
+                        if let Ok(Some(record)) = answer {
+                            record.cancel_unspawned(
+                                cancel
                                     .cause()
                                     .unwrap_or(McpAttemptCancelCause::AttemptDropped),
-                            },
-                            process: McpAttemptProcessEnd::NotSpawned,
-                        };
-                        let late = finish_task(&scope, &disposition);
-                        installation.track(&late);
-                        late.complete(run_finish(guard, disposition).await);
+                            );
+                        }
+                        McpGuardCompletion::Cancelled
                     }
-                    McpGuardCompletion::Cancelled
                 }
-            },
+            }
         };
         task.complete(completion);
     });
@@ -1349,10 +1367,6 @@ fn spawn_begin(
 struct BeginWait {
     delivered: Option<tokio::sync::oneshot::Receiver<BeginAnswer>>,
     cancel: McpAttemptCancellation,
-    installation: Arc<Installation>,
-    runtime: tokio::runtime::Handle,
-    key: McpAttemptKey,
-    scope: GuardScope,
 }
 
 impl BeginWait {
@@ -1375,19 +1389,12 @@ impl BeginWait {
             return;
         };
         delivered.close();
-        if let Ok(Ok(Some(guard))) = delivered.try_recv() {
-            let disposition = McpAttemptDisposition {
-                key: self.key.clone(),
-                open: McpAttemptOpenOutcome::Cancelled {
-                    cause: self
-                        .cancel
-                        .cause()
-                        .unwrap_or(McpAttemptCancelCause::AttemptDropped),
-                },
-                process: McpAttemptProcessEnd::NotSpawned,
-            };
-            self.installation
-                .spawn_finish(&self.runtime, guard, self.scope.clone(), disposition);
+        if let Ok(Ok(Some(record))) = delivered.try_recv() {
+            record.cancel_unspawned(
+                self.cancel
+                    .cause()
+                    .unwrap_or(McpAttemptCancelCause::AttemptDropped),
+            );
         }
     }
 }
@@ -1435,6 +1442,19 @@ impl AttemptGuardRecord {
         let mut state = lock(&self.state);
         if state.open.is_none() {
             state.open = Some(outcome);
+        }
+        self.finish_if_known(state);
+    }
+
+    /// The attempt stopped before anything of it ran: cancelled with
+    /// `cause` (unless its outcome is already known), nothing spawned.
+    fn cancel_unspawned(&self, cause: McpAttemptCancelCause) {
+        let mut state = lock(&self.state);
+        if state.open.is_none() {
+            state.open = Some(McpAttemptOpenOutcome::Cancelled { cause });
+        }
+        if state.process.is_none() {
+            state.process = Some(McpAttemptProcessEnd::NotSpawned);
         }
         self.finish_if_known(state);
     }
