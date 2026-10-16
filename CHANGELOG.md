@@ -35,6 +35,14 @@ them.
 
 ## [Unreleased]
 
+### Breaking
+
+- Behaviour-only (not measured by the gate): `meerkat-mcp` closes a stdio
+  MCP server's stderr shortly after its process is gone. A descendant that
+  outlives the server and still writes to stderr then gets `EPIPE` (or
+  `SIGPIPE`); on a trusted-host launch it used to inherit the host's stderr
+  and could keep writing there (see Changed).
+
 ### Added
 
 - `meerkat-core`, `meerkat-mcp`: typed host diagnostics for a stdio MCP
