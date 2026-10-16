@@ -31,6 +31,10 @@
 // build does, so the row compiles the hook's own units (a package-scoped row
 // compiles its dependencies with fewer features and is not the hook's
 // build). HeadCanonical is credited for its own, package-scoped command.
+// A row that runs one count partition (`partition: count:K/N`, the
+// nested-Cargo canaries' rows) credits nothing alone: rows of one exact
+// selection are credited together, and only when they hold every partition
+// 1..N exactly once.
 //
 // A plan may leave hook lanes to the hook (hook_retained_lanes, by the
 // lane's label in the hook script): the lib binaries such a lane runs need
@@ -76,6 +80,7 @@ export const CI_ROW_STEPS = [
       BINARIES: "${{ matrix.binaries }}",
       NO_TESTS: "${{ matrix.no_tests }}",
       MIN_STACK: "${{ matrix.rust_min_stack }}",
+      PARTITION: "${{ matrix.partition }}",
     },
     exports: ["RUST_MIN_STACK"],
     lines: [
@@ -83,11 +88,13 @@ export const CI_ROW_STEPS = [
       "read -r -a test_flags <<<\"${TESTS}\"",
       "filter_args=()",
       "if [[ -n \"${FILTER}\" ]]; then filter_args=(-E \"${FILTER}\"); fi",
-      "selection=(${PACKAGES} \"${test_flags[@]}\" --profile \"${PROFILE}\" \"${filter_args[@]}\")",
+      "partition_args=()",
+      "if [[ -n \"${PARTITION}\" ]]; then partition_args=(--partition \"${PARTITION}\"); fi",
+      "selection=(${PACKAGES} \"${test_flags[@]}\" --profile \"${PROFILE}\" \"${filter_args[@]}\" \"${partition_args[@]}\")",
       "if [[ -n \"${MIN_STACK}\" ]]; then export RUST_MIN_STACK=\"${MIN_STACK}\"; fi",
       "fixture=\"$(scripts/mcp-test-server-fixture --if-needed ${PACKAGES})\"",
       "./scripts/repo-cargo nextest list \"${selection[@]}\" --message-format json >\"${RUNNER_TEMP}/closure-test-list.json\"",
-      "node scripts/ci-verify-row-binaries.mjs \"${RUNNER_TEMP}/closure-test-list.json\" ${BINARIES}",
+      "node scripts/ci-verify-row-binaries.mjs \"${RUNNER_TEMP}/closure-test-list.json\" \"${partition_args[@]}\" ${BINARIES}",
       "./scripts/repo-cargo nextest run \"${selection[@]}\" --no-tests=\"${NO_TESTS}\" --no-fail-fast --status-level slow --final-status-level slow",
     ],
     targets: null,
@@ -100,7 +107,7 @@ export const CI_ROW_STEPS = [
 // word.
 function boundLine(spec) {
   const names = [...Object.keys(spec.env), ...spec.exports].join("|");
-  return new RegExp(`nextest|ci-verify-row-binaries|\\b(selection|test_flags|filter_args|${names})\\b`);
+  return new RegExp(`nextest|ci-verify-row-binaries|\\b(selection|test_flags|filter_args|partition_args|${names})\\b`);
 }
 
 // Shell text as logical lines: continuations joined, blanks collapsed,
@@ -549,6 +556,11 @@ export function checkHookCoverage(plan, { metadata = readMetadata(), nextestText
 
   // What the planned rows run under the hook's feature set.
   const covered = new Map();
+  // A partitioned row runs one count partition (`--partition count:K/N`) of
+  // its selection. It credits nothing alone: a group of rows with one exact
+  // selection credits its binaries only when it holds every partition 1..N
+  // exactly once, since together those run every test of the selection.
+  const partitionGroups = new Map();
   let headCanonical = null;
   for (const spec of CI_ROW_STEPS) {
     for (const row of plan[spec.field] ?? []) {
@@ -573,8 +585,22 @@ export function checkHookCoverage(plan, { metadata = readMetadata(), nextestText
       if (unlisted.length > 0 || unrun.length > 0) {
         errors.push(`row ${row.name}: runs binaries it does not list (${unlisted.join(", ") || "none"}) or lists binaries it does not run (${unrun.join(", ") || "none"})`);
       }
-      for (const { pkg, target } of read.runs) {
-        const key = `${pkg.name}::${nextestKind(target)}::${target.name}`;
+      const keys = read.runs.map(({ pkg, target }) => `${pkg.name}::${nextestKind(target)}::${target.name}`);
+      if (row.partition != null) {
+        const part = /^count:([1-9][0-9]*)\/([1-9][0-9]*)$/.exec(String(row.partition));
+        if (!part || Number(part[1]) > Number(part[2]) || Number(part[2]) < 2) {
+          errors.push(`row ${row.name}: unsupported partition ${JSON.stringify(row.partition)}; expected count:K/N with 1 <= K <= N, N >= 2`);
+          continue;
+        }
+        const selection = [spec.job, row.package_flags, row.test_flags, row.profile, row.filter ?? "", listed.join(" ")].join("\n");
+        const group = partitionGroups.get(selection) ?? { counts: new Set(), indices: [], names: [], keys, workspace: read.workspace, spec };
+        group.counts.add(Number(part[2]));
+        group.indices.push(Number(part[1]));
+        group.names.push(row.name);
+        partitionGroups.set(selection, group);
+        continue;
+      }
+      for (const key of keys) {
         if (read.workspace && !covered.has(key)) {
           covered.set(key, `${spec.job}: ${row.name}`);
         }
@@ -587,6 +613,22 @@ export function checkHookCoverage(plan, { metadata = readMetadata(), nextestText
           && hookProfile({ kind: "test", binary: hc.test, package: hc.package })
           && read.runs.length === 1;
         if (exact) headCanonical = `${spec.job}: ${row.name}`;
+      }
+    }
+  }
+  for (const group of partitionGroups.values()) {
+    const [count] = [...group.counts];
+    const indices = [...group.indices].sort((a, b) => a - b);
+    const complete = group.counts.size === 1
+      && indices.length === count
+      && indices.every((index, position) => index === position + 1);
+    if (!complete) {
+      errors.push(`partitioned rows ${group.names.join(", ")} hold partitions ${indices.join(",")} of count ${[...group.counts].join("/")}; every partition 1..N of one selection is required`);
+      continue;
+    }
+    for (const key of group.keys) {
+      if (group.workspace && !covered.has(key)) {
+        covered.set(key, `${group.spec.job}: ${group.names.join(", ")}`);
       }
     }
   }

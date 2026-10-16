@@ -785,6 +785,20 @@ them.
   `budget_conflict`, and a row without recorded levels stays
   `unknown_supported_levels`; each leaves the request unchanged. Every Gemini
   model used to report `unknown_supported_levels`.
+- CI's nested-Cargo canaries (the `downstream-cargo-canary` test group, the
+  three `downstream_*` tests of `meerkat::agent_builder_policy_canary`) no
+  longer run one after another in a packed `Closure tests` row: their
+  binary gets rows of its own, one `--partition count:K/N` per canary, so
+  they run side by side on separate runners (in run 38859112297 they took
+  447, 80 and 376 s in a row, 903 s of a 1760 s row). The coverage check
+  credits a partitioned binary only when every partition of one selection
+  is planned, and `scripts/ci-verify-row-binaries.mjs` accepts tests left to
+  sibling partitions only for a row that names its partition.
+- CI's pull-request unit row of a chain exception (meerkat-rpc, which
+  compiles meerkat-mob) runs alone instead of being packed with other
+  packages: in run 38859112297 it carried xtask and meerkat-live and ran
+  1801 s, the longest lane. The other packages fill the remaining unit
+  rows, so a workspace-mode plan keeps ten.
 
 ### Deprecated
 

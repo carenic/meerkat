@@ -443,7 +443,12 @@ GitHub-hosted runners and sized to a 25-minute lane execution budget:
   hosted 4-vCPU runner needs about 64 min), and the plan otherwise records
   the lane it leaves to the hook (`hook_retained_lanes`). Each row lists and
   runs one shared selection and first checks that nextest selects exactly
-  its planned binaries (`scripts/ci-verify-row-binaries.mjs`). The plan
+  its planned binaries (`scripts/ci-verify-row-binaries.mjs`). The binary
+  holding the nested-Cargo canaries (the `downstream-cargo-canary` test
+  group in `.config/nextest.toml`) has rows of its own, one
+  `--partition count:K/N` per canary, so the canaries run on separate
+  runners; the coverage check credits it only when every partition is
+  planned. The plan
   fails when `scripts/ci-hook-coverage.mjs` finds a hook binary in scope
   without a row (other than a lib binary the plan leaves to the hook): it
   reads the hook's lanes from `scripts/pre-push-unit.sh`, binds every line
