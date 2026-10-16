@@ -55,7 +55,8 @@ them.
   it). A `Cargo.lock` change that is the only global path is scoped to the
   members that resolve a changed lock entry instead of the whole workspace,
   falling back to the workspace on anything the scoping cannot read. The TLC
-  audits run in three shards instead of two, and a `governance-gates` job
+  audits run in three shards instead of two, xtask's unit tests (5-7
+  minutes) run in a lane of their own, and a `governance-gates` job
   runs the typed governance gates (`rmat-audit`, `seam-inventory`,
   `runtime-authority-bypass`, `machine-authority-docs-gate`) when machine
   authority or a dogma document changes. The pre-push hook no longer runs the

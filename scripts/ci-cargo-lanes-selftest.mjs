@@ -20,7 +20,7 @@ import {
   profileFilter,
   workspaceFeatures,
 } from "./ci-hook-coverage.mjs";
-import { GOVERNANCE_DOC_PATTERNS, lockScope, parseCargoLock } from "./ci-cargo-lanes.mjs";
+import { GOVERNANCE_DOC_PATTERNS, UNIT_SOLO_PACKAGES, lockScope, parseCargoLock } from "./ci-cargo-lanes.mjs";
 import { readMetadata, workspacePackages } from "./rust-test-selector.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -339,6 +339,11 @@ function assertArchivedLanes(plan, label) {
   }
   assert.deepEqual(plan.unit_deferred, plan.unit_deferred_chain, "workspace mode defers exactly the chain");
   assert.ok(plan.unit_shards.length <= 11, `workspace unit rows stay near the shard cap: ${plan.unit_shards.length}`);
+  // A package whose unit tests run long gets a lane of its own.
+  for (const name of UNIT_SOLO_PACKAGES) {
+    const lanes = plan.unit_shards.filter((shard) => shard.packages.includes(name));
+    assert.deepEqual(lanes.map((shard) => shard.packages), [[name]], `${name} runs its unit tests in a lane of its own`);
+  }
   // The nested-Cargo canaries' binary (the downstream-cargo-canary test
   // group) runs as count partitions of its own, one per canary, and in no
   // packed row; the coverage check credits it only with every partition.
@@ -790,6 +795,19 @@ for (const path of [
   for (const shard of [...plan.unit_shards, ...plan.unit_feature_shards]) {
     assert.ok(shard.estimated_minutes <= plan.pr_unit_budget_minutes, `${shard.name} fits the pull-request budget`);
   }
+  // Its tests run 5-7 minutes on a hosted runner, so it never shares its
+  // lane: another changed package packs apart from it.
+  const mixed = planFor(["crates/xtask/src/machines.rs", "crates/meerkat-core/src/lib.rs", "crates/meerkat-tools/src/lib.rs"]);
+  assert.deepEqual(
+    mixed.unit_shards.filter((shard) => shard.packages.includes("xtask")).map((shard) => shard.packages),
+    [["xtask"]],
+    "xtask's unit lane holds xtask alone",
+  );
+  assert.deepEqual(
+    mixed.unit_shards.flatMap((shard) => shard.packages).sort(),
+    ["meerkat-core", "meerkat-tools", "xtask"],
+    "and every changed package still has a unit lane",
+  );
 }
 
 // Embedded inputs the facade compiles in through include macros select the

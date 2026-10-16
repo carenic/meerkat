@@ -220,6 +220,14 @@ const LINK_COST_PER_DEP = 8000;
 const COST_UNITS_PER_MINUTE = 35000;
 const LANE_SETUP_MINUTES = 1;
 export const PR_UNIT_BUDGET_MINUTES = 17;
+// Packages whose unit tests run long get a unit lane of their own, so their
+// test time does not stack on other crates' builds; the line-and-closure
+// model counts only the build. xtask's lib and bin tests (the governance
+// audits over the live workspace) ran 298-441 s on runs 38859112297 and
+// 38931641220, and the pull-request lane that packed xtask with three other
+// crates took 933 s, 488 s of it building. The lane counts toward the
+// plan's shard cap.
+export const UNIT_SOLO_PACKAGES = ["xtask"];
 const HEAVY_ANCHOR = "meerkat-mob";
 
 // Hook-parity rows (see the header). Every row runs on the hook's test-thread
@@ -1813,7 +1821,16 @@ function plan(args) {
     const runsInPullRequest = (name) => !heavyChain.has(name);
     result.unit_deferred = result.packages.filter((name) => !runsInPullRequest(name));
     result.unit_packages = result.packages.filter(runsInPullRequest).sort();
-    result.unit_shards = packWithinBudget(result.unit_packages, weights, shardCap, model);
+    const soloUnits = result.unit_packages.filter((name) => UNIT_SOLO_PACKAGES.includes(name));
+    result.unit_shards = [
+      ...packWithinBudget(
+        result.unit_packages.filter((name) => !soloUnits.includes(name)),
+        weights,
+        Math.max(1, shardCap - soloUnits.length),
+        model,
+      ),
+      ...soloUnits.map((name) => packShards([name], weights, 1, model)[0]),
+    ];
     for (const shard of result.unit_shards) {
       if (shard.estimated_minutes > PR_UNIT_BUDGET_MINUTES) {
         throw new Error(

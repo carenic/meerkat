@@ -430,7 +430,9 @@ and its CI must be green before a release tag (`require_ci_green`):
   of every kind, then normal and build deps only) defer their unit tests to
   `push: main` because their lanes need 17-22 min on 4 vCPU, meerkat-rpc's
   default-feature row (its MCP restart controls) included. xtask and
-  machine-dsl-tests do not build mob and run in the pull request.
+  machine-dsl-tests do not build mob and run in the pull request; xtask, whose
+  tests run 5-7 minutes on 4 vCPU, gets a unit lane of its own
+  (`UNIT_SOLO_PACKAGES`) so they do not stack on other crates' builds.
 - Feature-gated unit suites (`FEATURE_UNIT_SUITES` in
   `scripts/ci-cargo-lanes.mjs`): the unit lanes build default features only,
   so each suite adds a `nextest -p <package> --features <list>` row to
