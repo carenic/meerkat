@@ -14817,6 +14817,45 @@ provider_params = { provider_tag = { provider = "anthropic", cache_control = "di
         assert_eq!(kept["config"]["confinement"], section);
     }
 
+    /// A credential command runs as the host, outside its confinement: a
+    /// JSON-RPC config write that adds one, or changes what it runs, is the
+    /// caller's error carrying confinement's typed refusal and naming the
+    /// auth profile, and writes nothing.
+    #[tokio::test]
+    async fn config_writes_cannot_add_or_change_a_credential_command() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("config.toml");
+        let unstated = "max_tokens = 4096\n";
+        tokio::fs::write(&path, unstated).await.unwrap();
+        let (router, _notif_rx) = test_router_with_config_store(Arc::new(
+            meerkat_core::FileConfigStore::new(path.clone(), meerkat_models::canonical()),
+        ))
+        .await;
+        let refused = router
+            .dispatch(make_request(
+                "config/patch",
+                serde_json::json!({ "patch": serde_json::json!({"realm": {"global": {"auth": {"helper": {
+                "provider": "openai",
+                "auth_method": "api_key",
+                "source": {"kind": "command", "program": "/bin/sh", "args": ["-c", "printf sk-x"]}
+            }}}}}) }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            (
+                error_code(&refused),
+                refused.error.as_ref().and_then(|error| error.data.clone())
+            ),
+            (
+                error::INVALID_PARAMS,
+                Some(serde_json::json!({ "type": "confinement_administration_required" })),
+            )
+        );
+        assert!(error_message(&refused).contains("helper"), "{refused:?}");
+        assert_eq!(tokio::fs::read_to_string(&path).await.unwrap(), unstated);
+    }
+
     /// 13. A notification (request with no id) returns None (no response).
     #[tokio::test]
     async fn notification_is_silently_dropped() {

@@ -98,6 +98,16 @@ them.
   `GIT_EXEC_PATH` and the like), and lose the paths a confined process
   could change from the others. A credential command that needs such a
   variable states it in its own `env` (see Fixed).
+- `meerkat_core::ConfigError` has a new variant
+  `CredentialCommandAdministration { realm, profile }`: a config write that
+  adds a credential command or changes what one runs (see Fixed); an
+  exhaustive match must handle it. `ConfigError::administered_section`
+  gives it as `Confinement`.
+- Behaviour-only (not measured by the gate): a config write that adds a
+  credential command, or changes its program, arguments, environment or
+  working directory, is refused with `confinement_administration_required`
+  on every config write surface; the host edits the document instead (see
+  Fixed).
 
 ### Deprecated
 
@@ -351,6 +361,14 @@ them.
   run without the loader, interpreter, shell and Git variables that load
   code from elsewhere, and every other inherited or configured variable
   loses the paths a confined process could change.
+- An ordinary config write can no longer add a credential command, or
+  change what one runs, through `config/set`, `config/patch`, `PUT`/`PATCH
+  /config`, the MCP config tool, `rkat config` or the SDK store: it is
+  refused with `confinement_administration_required`, naming the auth
+  profile, and nothing is written. Before, a config client this release's
+  other guards stop could add `source = { kind = "command", program =
+  "/bin/sh", ... }` and have the host run it unconfined, at once through
+  `POST /auth/bindings/{id}/test`.
 
 ## [0.9.1] - 2026-10-15
 

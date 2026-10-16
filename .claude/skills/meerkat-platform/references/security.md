@@ -277,7 +277,10 @@ except these, which it runs as itself (`meerkat_core::HostLaunchExemption`):
   refused before it runs (`ProviderAuthError::HostLaunchRefused`) when a
   confined process could change its program, the interpreter its `#!` line
   names by path, or its working directory, and the refusal ends the
-  binding's resolution (no other credential stands in for it).
+  binding's resolution (no other credential stands in for it). A config
+  write cannot add one or change what it runs
+  (`confinement_administration_required`, naming the auth profile); the
+  host edits the document.
 - Browser opener (`HostLaunchExemption::browser_opener`: `/usr/bin/open`,
   `xdg-open`, the system `rundll32.exe`; OAuth logins and the CLI's HTML
   artifact): must reach the user's desktop session; the URL is one argument.

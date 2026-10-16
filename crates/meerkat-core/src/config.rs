@@ -3102,6 +3102,23 @@ pub enum ConfigError {
         composer: String,
     },
 
+    /// A write would add a credential command (an auth profile's
+    /// `source = { kind = "command" }`) or change what one runs: its
+    /// program, arguments, environment or working directory. The host runs
+    /// a credential command as itself, outside its OS process confinement,
+    /// so the command is confinement administration: the host administers
+    /// it in the document itself. Keeping one, changing only its timeout
+    /// or caching, or removing it is ordinary config. Nothing is written.
+    #[error(
+        "the credential command of auth profile '{profile}' in [realm.{realm}] runs as the host, outside its confinement; the host administers it in the config document, so a config write cannot add it or change what it runs (edit the document as its host)"
+    )]
+    CredentialCommandAdministration {
+        /// The realm section that states the auth profile.
+        realm: String,
+        /// The auth profile whose source is the command.
+        profile: String,
+    },
+
     /// A less trusted config document states confinement for a launch kind
     /// differently from the more trusted document that decided it.
     #[error(transparent)]
@@ -3124,6 +3141,7 @@ impl ConfigError {
             Self::ConfinementAdministration => Some(AdministeredSection::Confinement),
             Self::GovernanceAdministration => Some(AdministeredSection::Governance),
             Self::CompositionAdministration { administered, .. } => Some(*administered),
+            Self::CredentialCommandAdministration { .. } => Some(AdministeredSection::Confinement),
             _ => None,
         }
     }
