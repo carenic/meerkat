@@ -350,7 +350,7 @@ them.
   realm that did not state `[realm.global]` itself, at its next start. A
   refusal of changed realm sections names the change and the realm.
 - A credential command without `cwd` runs from the user's home directory,
-  judged as that directory and the files in it, instead of from the host's
+  judged as that directory itself, instead of from the host's
   working directory, which a host that confines every launch kind refused
   whenever a confined process could write it (as for `rkat` run from its
   workspace). A credential command the host refuses ends its binding's
@@ -377,6 +377,23 @@ them.
   other guards stop could add `source = { kind = "command", program =
   "/bin/sh", ... }` and have the host run it unconfined, at once through
   `POST /auth/bindings/{id}/test`.
+
+### Known limitations
+
+- The config write guard composes the documents it reads without a lock
+  spanning them, so a write to another realm's document can race it.
+- Several state roots that share one user document: the guard composes the
+  realms the user document states a section for from its own state root's
+  documents only.
+- `webbrowser` stays an unused dependency of `rkat` and
+  `meerkat-auth-core`; removing it needs a lock refresh.
+- On a host without `/bin/stty` or `/usr/bin/stty` (NixOS), `rkat` cannot
+  hide a client secret typed at its terminal and asks for it on stdin
+  instead.
+- `meerkat::open_system_browser` and
+  `McpOAuthPendingLogin::launch_system_browser` stay public without a host's
+  judgement (only relative `PATH` directories are dropped); a host that
+  confines its agents' launches uses `open_system_browser_trusting`.
 
 ## [0.9.1] - 2026-10-15
 
