@@ -2206,6 +2206,10 @@ pub fn meerkat_machine_schema_metadata() -> MachineSchemaMetadata {
                 "PeerResponseAddresseeVerdict",
                 &["UnknownRequest", "Requester", "NotRequester"],
             ),
+            NamedTypeBinding::string_enum(
+                "PeerResponseSenderVerdict",
+                &["UnknownRequest", "Addressee", "NotAddressee"],
+            ),
             NamedTypeBinding::string_enum("PeerTerminalDisposition", &["Completed", "Failed"]),
             NamedTypeBinding::string_enum(
                 "PostAdmissionSignalKind",

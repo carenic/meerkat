@@ -4629,10 +4629,21 @@ impl EphemeralRuntimeDriver {
         let Ok(corr_id) = uuid::Uuid::parse_str(request_id) else {
             return;
         };
+        // The observation's signer, as ingress admitted it. Only the peer
+        // the request was sent to can cancel it: the generated rejection is
+        // guarded on the recorded addressee, and an observation without a
+        // canonical signer cancels nothing.
+        let crate::input::InputOrigin::Peer { peer_id, .. } = &peer.header.source else {
+            return;
+        };
+        let Ok(responder) = meerkat_core::comms::PeerId::parse(peer_id) else {
+            return;
+        };
 
         if let Err(error) = self.dsl_apply(
             mm_dsl::MeerkatMachineInput::PeerResponseRejected {
                 corr_id: corr_id.into(),
+                responder: mm_dsl::PeerId(responder.to_string()),
             },
             "PeerResponseRejected(invalid peer terminal observation)",
         ) {
@@ -7090,6 +7101,7 @@ mod tests {
             .dsl_apply(
                 mm_dsl::MeerkatMachineInput::PeerRequestSent {
                     corr_id: request_id.into(),
+                    addressee: mm_dsl::PeerId(peer_id.to_string()),
                 },
                 "PeerRequestSent(test)",
             )

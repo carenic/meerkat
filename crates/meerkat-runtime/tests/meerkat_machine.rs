@@ -2479,7 +2479,10 @@ async fn runtime_comms_terminal_response_wake_drains_requester_queue() {
     let request_id = Uuid::new_v4();
     bindings
         .peer_interaction()
-        .request_sent(PeerCorrelationId::from_uuid(request_id))
+        .request_sent(
+            PeerCorrelationId::from_uuid(request_id),
+            responder_comms.public_key().to_peer_id(),
+        )
         .expect("seed requester outbound request state");
     responder_bindings
         .peer_interaction()
@@ -6666,6 +6669,602 @@ async fn a_coalescing_admission_tells_the_host_once() {
         }),
         "the coalesced terminal is readable"
     );
+}
+
+/// A response to an outbound peer request is accepted only from the peer the
+/// request was sent to: the verified signer of the response's envelope must be
+/// the request's addressee.
+///
+/// Three in-process peers, each with its own attached MeerkatMachine session:
+/// `requester` sends a typed request to `addressee`, and `impostor` is another
+/// peer the requester trusts that learned the request's id. The requester and
+/// the addressee run comms drains, so every frame crosses the real ingress
+/// path (signed envelope, generated classification, drain). The impostor holds
+/// its own inbound record for the requester's request id, as a peer that
+/// learned the id would, so its send path signs and sends its responses
+/// exactly like a genuine answer.
+mod peer_response_sender {
+    use super::*;
+    use meerkat_comms::runtime::comms_runtime::CommsRuntime as InprocCommsRuntime;
+    use meerkat_core::agent::CommsRuntime as CoreCommsRuntime;
+    use meerkat_core::comms::{
+        CommsCommand, InputStreamMode, PeerAddress, PeerId, PeerName, PeerRoute, PeerTransport,
+        SendError, SendReceipt, TrustedPeerDescriptor,
+    };
+    use meerkat_core::lifecycle::core_executor::{
+        CoreApplyOutput, CoreExecutor, CoreExecutorError,
+    };
+    use meerkat_core::lifecycle::run_primitive::RunPrimitive;
+    use meerkat_core::types::HandlingMode;
+    use meerkat_core::{
+        InboundPeerRequestState, InteractionContent, InteractionId, OutboundPeerRequestState,
+        PeerCorrelationId, ResponseStatus,
+    };
+    use meerkat_runtime::meerkat_machine::dsl as mm_dsl;
+    use serde_json::json;
+    use uuid::Uuid;
+
+    /// Applies every run at once and records each primitive it applied, so a
+    /// test reads which peer content reached the session.
+    #[derive(Clone, Default)]
+    struct RecordingExecutor {
+        runs: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl CoreExecutor for RecordingExecutor {
+        async fn apply(
+            &mut self,
+            run_id: RunId,
+            primitive: RunPrimitive,
+        ) -> Result<CoreApplyOutput, CoreExecutorError> {
+            self.runs
+                .lock()
+                .unwrap()
+                .push(serde_json::to_string(&primitive).expect("run primitive serializes"));
+            let boundary = match &primitive {
+                RunPrimitive::StagedInput(staged) => staged.boundary,
+                RunPrimitive::ImmediateAppend(_) => RunApplyBoundary::Immediate,
+                _ => RunApplyBoundary::RunStart,
+            };
+            Ok(CoreApplyOutput::with_untyped_snapshot(
+                RunBoundaryReceiptDraft {
+                    run_id,
+                    boundary,
+                    contributing_input_ids: primitive.contributing_input_ids().to_vec(),
+                    conversation_digest: None,
+                    message_count: 0,
+                },
+                None,
+                None,
+            ))
+        }
+
+        async fn cancel_after_boundary(
+            &mut self,
+            _reason: String,
+        ) -> Result<(), CoreExecutorError> {
+            Ok(())
+        }
+
+        async fn stop_runtime_executor(
+            &mut self,
+            _reason: String,
+        ) -> Result<(), CoreExecutorError> {
+            Ok(())
+        }
+    }
+
+    /// One in-process peer with its own MeerkatMachine session.
+    struct Peer {
+        name: String,
+        comms: Arc<InprocCommsRuntime>,
+        adapter: Arc<MeerkatMachine>,
+        sid: SessionId,
+        bindings: meerkat_core::SessionRuntimeBindings,
+        runs: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl Peer {
+        async fn prepared(role: &str, suffix: &str) -> Self {
+            let name = format!("sender-{role}-{suffix}");
+            let comms =
+                Arc::new(InprocCommsRuntime::inproc_only(&name).expect("inproc comms runtime"));
+            let adapter = Arc::new(MeerkatMachine::ephemeral());
+            let sid = SessionId::new();
+            let bindings = adapter
+                .prepare_bindings(sid.clone())
+                .await
+                .expect("prepare runtime bindings");
+            bindings
+                .install_peer_comms_on(comms.as_ref())
+                .expect("install peer-comms handle");
+            comms.install_peer_request_response_authority(
+                meerkat_comms::PeerRequestResponseAuthority::new(
+                    Arc::clone(bindings.peer_interaction()),
+                    Arc::clone(bindings.interaction_stream()),
+                ),
+            );
+            Self {
+                name,
+                comms,
+                adapter,
+                sid,
+                bindings,
+                runs: Arc::default(),
+            }
+        }
+
+        fn peer_id(&self) -> PeerId {
+            self.comms.public_key().to_peer_id()
+        }
+
+        fn route(&self) -> PeerRoute {
+            PeerRoute::with_display_name(
+                self.peer_id(),
+                PeerName::new(self.name.clone()).expect("peer name"),
+            )
+        }
+
+        fn descriptor(&self) -> TrustedPeerDescriptor {
+            TrustedPeerDescriptor {
+                peer_id: self.peer_id(),
+                name: PeerName::new(self.name.clone()).expect("peer name"),
+                address: PeerAddress::new(PeerTransport::Inproc, self.comms.participant_name()),
+                pubkey: *self.comms.public_key().as_bytes(),
+            }
+        }
+
+        async fn trust(&self, peer: &Peer) {
+            let comms: Arc<dyn CoreCommsRuntime> = self.comms.clone();
+            self.adapter
+                .stage_add_direct_peer_endpoint(
+                    &self.sid,
+                    mm_dsl::PeerEndpoint::from(&peer.descriptor()),
+                    comms,
+                )
+                .await
+                .expect("generated trust should apply");
+        }
+
+        /// Attach a recording executor and, for `drain`, the comms drain that
+        /// classifies and routes this peer's ingress.
+        async fn attach(&self, drain: bool) {
+            self.adapter
+                .register_session_with_executor(
+                    self.sid.clone(),
+                    Box::new(RecordingExecutor {
+                        runs: Arc::clone(&self.runs),
+                    }),
+                )
+                .await
+                .expect("runtime executor registration should succeed");
+            if drain {
+                let comms: Arc<dyn CoreCommsRuntime> = self.comms.clone();
+                assert!(
+                    self.adapter
+                        .update_peer_ingress_context(&self.sid, true, Some(comms))
+                        .await
+                        .expect("update peer ingress context"),
+                    "{} should spawn its comms drain",
+                    self.name
+                );
+            }
+        }
+
+        fn runs(&self) -> Vec<String> {
+            self.runs.lock().unwrap().clone()
+        }
+    }
+
+    struct Fixture {
+        requester: Peer,
+        addressee: Peer,
+        impostor: Peer,
+    }
+
+    impl Fixture {
+        async fn new() -> Self {
+            let suffix = Uuid::new_v4().simple().to_string();
+            let requester = Peer::prepared("requester", &suffix).await;
+            let addressee = Peer::prepared("addressee", &suffix).await;
+            let impostor = Peer::prepared("impostor", &suffix).await;
+            requester.trust(&addressee).await;
+            requester.trust(&impostor).await;
+            addressee.trust(&requester).await;
+            impostor.trust(&requester).await;
+            requester.attach(true).await;
+            addressee.attach(true).await;
+            impostor.attach(false).await;
+            Self {
+                requester,
+                addressee,
+                impostor,
+            }
+        }
+
+        /// The requester's typed request, as a session sends it.
+        async fn send_request(&self) -> InteractionId {
+            let receipt = CoreCommsRuntime::send(
+                self.requester.comms.as_ref(),
+                CommsCommand::PeerRequest {
+                    to: self.addressee.route(),
+                    intent: "checksum_token".to_string(),
+                    params: json!({ "subject": "sender" }),
+                    blocks: None,
+                    content_taint: None,
+                    handling_mode: HandlingMode::Queue,
+                    stream: InputStreamMode::None,
+                    objective_id: None,
+                },
+            )
+            .await
+            .expect("the request reaches the addressee");
+            let SendReceipt::PeerRequestSent { envelope_id, .. } = receipt else {
+                panic!("expected a peer request receipt, got {receipt:?}");
+            };
+            let request_id = InteractionId(envelope_id);
+            self.wait_until_the_addressee_holds(request_id).await;
+            request_id
+        }
+
+        /// The addressee's drain recorded the request, so it can answer.
+        async fn wait_until_the_addressee_holds(&self, request_id: InteractionId) {
+            let handle = self.addressee.bindings.peer_interaction();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while handle.inbound_state(PeerCorrelationId::from_uuid(request_id.0))
+                    != Some(InboundPeerRequestState::Received)
+                {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("the addressee's drain records the request");
+        }
+
+        /// The impostor records `request_id` as a request the requester sent it,
+        /// as a peer that learned the id would: its own send path then signs
+        /// and sends responses to the requester.
+        fn impostor_learns(&self, request_id: InteractionId) {
+            self.impostor
+                .bindings
+                .peer_interaction()
+                .request_received(
+                    PeerCorrelationId::from_uuid(request_id.0),
+                    HandlingMode::Queue,
+                    self.requester.peer_id(),
+                )
+                .expect("the impostor records the learned request id");
+        }
+
+        async fn respond(
+            &self,
+            from: &Peer,
+            request_id: InteractionId,
+            status: ResponseStatus,
+            token: &str,
+        ) -> Result<SendReceipt, SendError> {
+            CoreCommsRuntime::send(
+                from.comms.as_ref(),
+                CommsCommand::PeerResponse {
+                    to: self.requester.route(),
+                    in_reply_to: request_id,
+                    status,
+                    result: json!({ "token": token }),
+                    blocks: None,
+                    content_taint: None,
+                    handling_mode: None,
+                    objective_id: None,
+                },
+            )
+            .await
+        }
+
+        fn outbound_state(&self, request_id: InteractionId) -> Option<OutboundPeerRequestState> {
+            self.requester
+                .bindings
+                .peer_interaction()
+                .outbound_state(PeerCorrelationId::from_uuid(request_id.0))
+        }
+
+        /// Wait until a run of the requester's session carries one of `tokens`.
+        async fn wait_for_a_requester_run_with_any(&self, tokens: &[&str]) {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !self
+                    .requester
+                    .runs()
+                    .iter()
+                    .any(|run| tokens.iter().any(|token| run.contains(token)))
+                {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "no requester run carries any of {tokens:?}: {:#?}",
+                    self.requester.runs()
+                )
+            });
+        }
+    }
+
+    fn assert_refused_at_ingress(what: &str, sent: &Result<SendReceipt, SendError>) {
+        assert!(
+            matches!(sent, Err(SendError::AdmissionDropped { .. })),
+            "the spoofed {what} response must be refused at the requester's ingress, got {sent:?}"
+        );
+    }
+
+    /// The reply-waiter path (a mid-turn tool waiting on one exact response):
+    /// a progress and a terminal response from a peer the request was not sent
+    /// to are refused at the requester's ingress and never reach the waiter;
+    /// the addressee's response then completes the request.
+    #[tokio::test]
+    async fn a_response_from_a_peer_the_request_was_not_sent_to_never_reaches_the_reply_waiter() {
+        let fixture = Fixture::new().await;
+        let (reply, envelope_id) = fixture
+            .requester
+            .comms
+            .send_peer_request_with_reply_waiter(
+                fixture.addressee.route(),
+                "checksum_token",
+                json!({ "subject": "sender" }),
+            )
+            .await
+            .expect("the request reaches the addressee");
+        let request_id = InteractionId(envelope_id);
+        fixture.wait_until_the_addressee_holds(request_id).await;
+        fixture.impostor_learns(request_id);
+
+        let spoofed_progress = fixture
+            .respond(
+                &fixture.impostor,
+                request_id,
+                ResponseStatus::Accepted,
+                "spoofed-progress",
+            )
+            .await;
+        let spoofed_terminal = fixture
+            .respond(
+                &fixture.impostor,
+                request_id,
+                ResponseStatus::Completed,
+                "spoofed-terminal",
+            )
+            .await;
+        fixture
+            .respond(
+                &fixture.addressee,
+                request_id,
+                ResponseStatus::Completed,
+                "genuine-terminal",
+            )
+            .await
+            .expect("the addressee answers");
+
+        let candidate = tokio::time::timeout(Duration::from_secs(5), reply)
+            .await
+            .expect("the reply waiter resolves")
+            .expect("the reply waiter receives a response");
+        assert_eq!(
+            candidate.from_peer_id(),
+            Some(fixture.addressee.peer_id()),
+            "the reply waiter must receive the addressee's response, got {:?}",
+            candidate.interaction.content
+        );
+        assert!(
+            matches!(
+                &candidate.interaction.content,
+                InteractionContent::Response {
+                    status: ResponseStatus::Completed,
+                    result,
+                    ..
+                } if result["token"] == "genuine-terminal"
+            ),
+            "got {:?}",
+            candidate.interaction.content
+        );
+        assert_eq!(
+            fixture.outbound_state(request_id),
+            None,
+            "the addressee's terminal response completes the request"
+        );
+        assert_refused_at_ingress("progress", &spoofed_progress);
+        assert_refused_at_ingress("terminal", &spoofed_terminal);
+    }
+
+    /// The session path: neither a spoofed progress nor a spoofed terminal
+    /// response reaches the requester's session, and the request stays open
+    /// for the addressee, whose terminal response completes it.
+    #[tokio::test]
+    async fn a_spoofed_progress_and_terminal_never_reach_the_requesters_session() {
+        let fixture = Fixture::new().await;
+        let request_id = fixture.send_request().await;
+        fixture.impostor_learns(request_id);
+
+        let spoofed_progress = fixture
+            .respond(
+                &fixture.impostor,
+                request_id,
+                ResponseStatus::Accepted,
+                "spoofed-progress",
+            )
+            .await;
+        let spoofed_terminal = fixture
+            .respond(
+                &fixture.impostor,
+                request_id,
+                ResponseStatus::Completed,
+                "spoofed-terminal",
+            )
+            .await;
+        fixture
+            .respond(
+                &fixture.addressee,
+                request_id,
+                ResponseStatus::Completed,
+                "genuine-terminal",
+            )
+            .await
+            .expect("the addressee answers");
+
+        fixture
+            .wait_for_a_requester_run_with_any(&["genuine-terminal", "spoofed-terminal"])
+            .await;
+        let runs = fixture.requester.runs();
+        assert!(
+            !runs.iter().any(|run| run.contains("spoofed-")),
+            "spoofed response content reached the requester's session: {runs:#?}"
+        );
+        assert!(
+            runs.iter().any(|run| run.contains("genuine-terminal")),
+            "the addressee's response reaches the requester's session: {runs:#?}"
+        );
+        assert_eq!(fixture.outbound_state(request_id), None);
+        assert_refused_at_ingress("progress", &spoofed_progress);
+        assert_refused_at_ingress("terminal", &spoofed_terminal);
+    }
+
+    /// The addressee is recorded before the request frame leaves the
+    /// requester, so an answer sent the moment the addressee's drain holds the
+    /// request is the addressee's and completes the request.
+    #[tokio::test]
+    async fn an_immediate_answer_from_the_addressee_completes_the_request() {
+        let fixture = Fixture::new().await;
+        let request_id = InteractionId(Uuid::new_v4());
+        let answer = async {
+            let handle = fixture.addressee.bindings.peer_interaction();
+            while handle.inbound_state(PeerCorrelationId::from_uuid(request_id.0))
+                != Some(InboundPeerRequestState::Received)
+            {
+                tokio::task::yield_now().await;
+            }
+            fixture
+                .respond(
+                    &fixture.addressee,
+                    request_id,
+                    ResponseStatus::Completed,
+                    "immediate-terminal",
+                )
+                .await
+        };
+        let request = fixture.requester.comms.send_peer_request_with_id(
+            request_id.0,
+            fixture.addressee.route(),
+            "checksum_token",
+            json!({ "subject": "sender" }),
+        );
+        let (answered, sent) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(answer, request)
+        })
+        .await
+        .expect("the request and its immediate answer complete");
+        sent.expect("the request reaches the addressee");
+        answered.expect("the addressee's immediate answer is sent");
+        fixture
+            .wait_for_a_requester_run_with_any(&["immediate-terminal"])
+            .await;
+        assert_eq!(
+            fixture.outbound_state(request_id),
+            None,
+            "the addressee's immediate answer completes the request"
+        );
+    }
+
+    /// Unchanged: a response to a request id the requester does not hold
+    /// (never sent, already answered, timed out, or from before a restart) is
+    /// admitted at ingress as before and refused by the drain's unknown-id
+    /// path: nothing reaches the session and open requests are untouched.
+    #[tokio::test]
+    async fn a_response_to_an_unknown_request_id_is_queued_and_refused_as_before() {
+        let fixture = Fixture::new().await;
+        let request_id = fixture.send_request().await;
+        let unknown = InteractionId(Uuid::new_v4());
+        fixture.impostor_learns(unknown);
+
+        fixture
+            .respond(
+                &fixture.impostor,
+                unknown,
+                ResponseStatus::Completed,
+                "unknown-terminal",
+            )
+            .await
+            .expect("a response to an unknown id is admitted at ingress as before");
+        assert_eq!(
+            fixture.outbound_state(request_id),
+            Some(OutboundPeerRequestState::Sent),
+            "a response to another id leaves the open request untouched"
+        );
+
+        // The addressee's answer is drained after the unknown-id response.
+        fixture
+            .respond(
+                &fixture.addressee,
+                request_id,
+                ResponseStatus::Completed,
+                "genuine-terminal",
+            )
+            .await
+            .expect("the addressee answers");
+        fixture
+            .wait_for_a_requester_run_with_any(&["genuine-terminal"])
+            .await;
+        let runs = fixture.requester.runs();
+        assert!(
+            !runs.iter().any(|run| run.contains("unknown-terminal")),
+            "a response to an unknown id never reaches the session: {runs:#?}"
+        );
+        assert_eq!(fixture.outbound_state(request_id), None);
+    }
+
+    /// Unchanged: the addressee's progress response moves the request to
+    /// `AcceptedProgress` and reaches the session, as before; its terminal
+    /// response then completes the request.
+    #[tokio::test]
+    async fn the_addressees_progress_is_applied_as_before() {
+        let fixture = Fixture::new().await;
+        let request_id = fixture.send_request().await;
+
+        fixture
+            .respond(
+                &fixture.addressee,
+                request_id,
+                ResponseStatus::Accepted,
+                "genuine-progress",
+            )
+            .await
+            .expect("the addressee's progress response is sent");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while fixture.outbound_state(request_id)
+                != Some(OutboundPeerRequestState::AcceptedProgress)
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the addressee's progress moves the request to AcceptedProgress");
+
+        fixture
+            .respond(
+                &fixture.addressee,
+                request_id,
+                ResponseStatus::Completed,
+                "genuine-terminal",
+            )
+            .await
+            .expect("the addressee answers");
+        fixture
+            .wait_for_a_requester_run_with_any(&["genuine-terminal"])
+            .await;
+        let runs = fixture.requester.runs();
+        assert!(
+            runs.iter().any(|run| run.contains("genuine-progress")),
+            "the addressee's progress reaches the session as before: {runs:#?}"
+        );
+        assert_eq!(fixture.outbound_state(request_id), None);
+    }
 }
 
 /// A response to an inbound peer request goes only to the peer that sent the

@@ -994,6 +994,26 @@ impl From<PeerResponseAddresseeVerdict> for meerkat_core::PeerResponseAddresseeV
     }
 }
 
+/// Machine-owned verdict on the sender of a response to an outbound peer
+/// request, mirroring [`meerkat_core::PeerResponseSenderVerdict`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum PeerResponseSenderVerdict {
+    #[default]
+    UnknownRequest,
+    Addressee,
+    NotAddressee,
+}
+
+impl From<PeerResponseSenderVerdict> for meerkat_core::PeerResponseSenderVerdict {
+    fn from(verdict: PeerResponseSenderVerdict) -> Self {
+        match verdict {
+            PeerResponseSenderVerdict::Addressee => Self::Addressee,
+            PeerResponseSenderVerdict::NotAddressee => Self::NotAddressee,
+            PeerResponseSenderVerdict::UnknownRequest => Self::UnknownRequest,
+        }
+    }
+}
+
 /// Typed terminal disposition carried on `PeerResponseTerminalArrived`.
 /// Mirror of [`meerkat_core::handles::PeerTerminalDisposition`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]

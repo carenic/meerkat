@@ -308,6 +308,20 @@ pub fn spawn_comms_drain(
                         commit_non_runtime_claim(claim, "silent peer lifecycle handled");
                     }
                     PeerInputClass::ResponseProgress | PeerInputClass::ResponseTerminal => {
+                        // The frame's verified signer as ingress admitted it.
+                        // Ingress already dropped frames from any peer but the
+                        // request's addressee; the generated response
+                        // transitions take the signer and refuse any other
+                        // peer again. A frame without an admitted signer is
+                        // never applied.
+                        let Some(responder) = candidate.from_peer_id() else {
+                            tracing::warn!(
+                                interaction_id = %candidate.interaction.id,
+                                "comms_drain: rejected peer response without an admitted sender identity"
+                            );
+                            commit_non_runtime_claim(claim, "sender-less peer response rejected");
+                            continue;
+                        };
                         // Response progress/terminal status is fixed by the
                         // ingress classifier and carried on the candidate. Do
                         // not re-match raw `ResponseStatus` here.
@@ -415,7 +429,9 @@ pub fn spawn_comms_drain(
                             {
                                 let corr_id =
                                     meerkat_core::PeerCorrelationId::from_uuid(interaction_id.0);
-                                if let Err(err) = handle.response_terminal(corr_id, disposition) {
+                                if let Err(err) =
+                                    handle.response_terminal(corr_id, disposition, responder)
+                                {
                                     tracing::warn!(
                                         error = %err,
                                         corr_id = %corr_id,
@@ -529,7 +545,7 @@ pub fn spawn_comms_drain(
                             {
                                 let corr_id =
                                     meerkat_core::PeerCorrelationId::from_uuid(in_reply_to.0);
-                                if let Err(err) = handle.response_progress(corr_id) {
+                                if let Err(err) = handle.response_progress(corr_id, responder) {
                                     tracing::warn!(
                                         error = %err,
                                         corr_id = %corr_id,
@@ -936,7 +952,16 @@ fn reject_peer_response_observation_via_authority(
         );
         return;
     };
-    if let Err(err) = handle.response_rejected(corr_id) {
+    let Some(responder) = candidate.from_peer_id() else {
+        tracing::warn!(
+            reason = reason,
+            corr_id = %corr_id,
+            interaction_id = %candidate.interaction.id,
+            "comms_drain: peer response observation has no admitted sender identity"
+        );
+        return;
+    };
+    if let Err(err) = handle.response_rejected(corr_id, responder) {
         tracing::warn!(
             error = %err,
             reason = reason,
@@ -8751,6 +8776,7 @@ mod tests {
         fn request_sent(
             &self,
             _corr_id: meerkat_core::PeerCorrelationId,
+            _addressee: PeerId,
         ) -> Result<(), meerkat_core::handles::DslTransitionError> {
             Ok(())
         }
@@ -8758,6 +8784,7 @@ mod tests {
         fn response_progress(
             &self,
             corr_id: meerkat_core::PeerCorrelationId,
+            _responder: PeerId,
         ) -> Result<(), meerkat_core::handles::DslTransitionError> {
             if self
                 .reject_response_progress
@@ -8775,6 +8802,7 @@ mod tests {
             &self,
             corr_id: meerkat_core::PeerCorrelationId,
             _disposition: meerkat_core::handles::PeerTerminalDisposition,
+            _responder: PeerId,
         ) -> Result<(), meerkat_core::handles::DslTransitionError> {
             if self
                 .reject_response_terminal
@@ -8791,6 +8819,7 @@ mod tests {
         fn response_rejected(
             &self,
             _corr_id: meerkat_core::PeerCorrelationId,
+            _responder: PeerId,
         ) -> Result<(), meerkat_core::handles::DslTransitionError> {
             self.response_rejected_count
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);

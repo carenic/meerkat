@@ -3265,7 +3265,10 @@ impl CommsRuntime {
             self.require_peer_request_response_authority("PeerRequest")?;
         let stream_handle = stream_reserved.then_some(stream_authority);
 
-        if let Err(err) = peer_handle.request_sent(corr_id) {
+        // The machine records the addressee before the request frame can
+        // leave, so every response to it finds the peer it was sent to
+        // recorded: only that peer's verified signer may answer it.
+        if let Err(err) = peer_handle.request_sent(corr_id, to.peer_id) {
             tracing::warn!(
                 error = %err,
                 corr_id = %corr_id,
@@ -5935,6 +5938,7 @@ mod tests {
         fn request_sent(
             &self,
             corr_id: meerkat_core::PeerCorrelationId,
+            _addressee: meerkat_core::comms::PeerId,
         ) -> Result<(), meerkat_core::handles::DslTransitionError> {
             let mut outbound = self.outbound.lock();
             if outbound.contains_key(&corr_id) {
@@ -5950,6 +5954,7 @@ mod tests {
         fn response_progress(
             &self,
             corr_id: meerkat_core::PeerCorrelationId,
+            _responder: meerkat_core::comms::PeerId,
         ) -> Result<(), meerkat_core::handles::DslTransitionError> {
             let mut outbound = self.outbound.lock();
             if !outbound.contains_key(&corr_id) {
@@ -5969,6 +5974,7 @@ mod tests {
             &self,
             corr_id: meerkat_core::PeerCorrelationId,
             _disposition: meerkat_core::handles::PeerTerminalDisposition,
+            _responder: meerkat_core::comms::PeerId,
         ) -> Result<(), meerkat_core::handles::DslTransitionError> {
             if self.outbound.lock().remove(&corr_id).is_none() {
                 return Err(Self::guard_rejected(
@@ -5983,6 +5989,7 @@ mod tests {
         fn response_rejected(
             &self,
             corr_id: meerkat_core::PeerCorrelationId,
+            _responder: meerkat_core::comms::PeerId,
         ) -> Result<(), meerkat_core::handles::DslTransitionError> {
             if self.outbound.lock().remove(&corr_id).is_none() {
                 return Err(Self::guard_rejected(
@@ -7528,6 +7535,7 @@ mod tests {
         meerkat_core::handles::PeerInteractionHandle::request_sent(
             receiver_peer_handle.as_ref(),
             corr_id,
+            sender.public_key().to_peer_id(),
         )
         .expect("receiver machine authority should expect the response");
 
@@ -10611,8 +10619,13 @@ mod tests {
 
         let interaction_id = meerkat_core::InteractionId(Uuid::new_v4());
         let corr_id = meerkat_core::PeerCorrelationId::from_uuid(interaction_id.0);
-        meerkat_core::handles::PeerInteractionHandle::request_sent(peer_handle.as_ref(), corr_id)
-            .unwrap();
+        let addressee = meerkat_core::comms::PeerId::new();
+        meerkat_core::handles::PeerInteractionHandle::request_sent(
+            peer_handle.as_ref(),
+            corr_id,
+            addressee,
+        )
+        .unwrap();
         runtime
             .reserve_interaction_stream_channels(
                 corr_id,
@@ -10677,8 +10690,13 @@ mod tests {
         ));
         let interaction_id = meerkat_core::InteractionId(Uuid::new_v4());
         let corr_id = meerkat_core::PeerCorrelationId::from_uuid(interaction_id.0);
-        meerkat_core::handles::PeerInteractionHandle::request_sent(peer_handle.as_ref(), corr_id)
-            .unwrap();
+        let addressee = meerkat_core::comms::PeerId::new();
+        meerkat_core::handles::PeerInteractionHandle::request_sent(
+            peer_handle.as_ref(),
+            corr_id,
+            addressee,
+        )
+        .unwrap();
         runtime
             .reserve_interaction_stream_channels(
                 corr_id,
@@ -10693,6 +10711,7 @@ mod tests {
             peer_handle.as_ref(),
             corr_id,
             meerkat_core::handles::PeerTerminalDisposition::Completed,
+            addressee,
         )
         .unwrap();
         sender
@@ -10783,8 +10802,13 @@ mod tests {
 
         let interaction_id = meerkat_core::InteractionId(Uuid::new_v4());
         let corr_id = meerkat_core::PeerCorrelationId::from_uuid(interaction_id.0);
-        meerkat_core::handles::PeerInteractionHandle::request_sent(peer_handle.as_ref(), corr_id)
-            .unwrap();
+        let addressee = meerkat_core::comms::PeerId::new();
+        meerkat_core::handles::PeerInteractionHandle::request_sent(
+            peer_handle.as_ref(),
+            corr_id,
+            addressee,
+        )
+        .unwrap();
         runtime
             .reserve_interaction_stream_channels(
                 corr_id,

@@ -743,7 +743,11 @@ async fn contract_mob_002b_terminal_transition_drives_registry_cleanup_via_effec
     // projection only. It must not destroy the independent stream reservation:
     // a response is allowed to win the race with caller attachment.
     handle
-        .response_terminal(corr_id, PeerTerminalDisposition::Completed)
+        .response_terminal(
+            corr_id,
+            PeerTerminalDisposition::Completed,
+            receiver.public_key().to_peer_id(),
+        )
         .expect("terminal transition must succeed");
 
     // DSL map entry is gone (removed on terminal).
@@ -842,13 +846,16 @@ async fn contract_mob_002c_dsl_reject_refuses_shell_commit() {
 
     // Seed the DSL with a `Sent` entry for a specific corr_id.
     let corr_id = meerkat_core::PeerCorrelationId::new();
-    handle.request_sent(corr_id).expect("initial request_sent");
+    let addressee = receiver.public_key().to_peer_id();
+    handle
+        .request_sent(corr_id, addressee)
+        .expect("initial request_sent");
 
     // Now call the handle again for the same corr_id — DSL must reject
     // (duplicate), matching the behavior the comms runtime's send path
     // would observe.
     let err = handle
-        .request_sent(corr_id)
+        .request_sent(corr_id, addressee)
         .expect_err("duplicate request_sent must reject");
     assert_eq!(err.context, "PeerInteractionHandle::request_sent");
 
