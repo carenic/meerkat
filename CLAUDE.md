@@ -358,9 +358,14 @@ and its CI must be green before a release tag (`require_ci_green`):
   Rust paths, a missing base, or global build configuration escalate to the
   workspace). A push to `main` diffs against the newest commit before HEAD
   whose main CI run completed green with an attestation
-  (`scripts/ci-push-base.mjs`, run from HEAD's first parent's tree), not the
-  payload base, so a superseded, cancelled or failed main run's changes are
-  planned again; without such a commit the push plans the whole workspace. A `Cargo.lock` change that is the only global path is scoped:
+  (`scripts/ci-push-base.mjs`), not the payload base, so a superseded,
+  cancelled or failed main run's changes are planned again.
+  `scripts/ci-push-plan-base.mjs` runs the finder from HEAD's first parent
+  only when that parent is the payload base (`github.event.before`), and
+  accepts only a full sha of an ancestor of HEAD other than HEAD (the
+  checkout's history, or GitHub's compare API where it is shallow); a push
+  of several commits, a refused answer or no such commit plans the whole
+  workspace. A `Cargo.lock` change that is the only global path is scoped:
   the package entries it adds, removes or changes are walked up the head
   lock's dependency lists to the members that resolve them, which become the
   changed packages; a header or other-table change, an unresolvable entry, or

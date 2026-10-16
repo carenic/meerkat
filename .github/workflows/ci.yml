@@ -395,27 +395,27 @@ jobs:
           fi
           # The ordinary plan's base. A push to main diffs against the newest
           # commit before HEAD whose main CI run completed green and left its
-          # exact-tree attestation (scripts/ci-push-base.mjs, from HEAD's
-          # first parent's tree so a commit cannot narrow its own push), not
-          # against the payload base: a newer main push cancels the run of an
-          # older one, and a run can fail, so the payload base's changes may
-          # never have run the lanes a pull request leaves to the push.
-          # Without such a commit, or on any lookup failure, the plan is the
-          # whole workspace. A release projection keeps its first parent,
+          # exact-tree attestation, not against the payload base: a newer
+          # main push cancels the run of an older one, and a run can fail, so
+          # the payload base's changes may never have run the lanes a pull
+          # request leaves to the push. scripts/ci-push-plan-base.mjs runs
+          # the finder (scripts/ci-push-base.mjs) from HEAD's first parent,
+          # and only when that parent is the payload base, so no pushed
+          # commit supplies it (a push of several commits plans the whole
+          # workspace), and accepts only a full sha of an ancestor of HEAD
+          # other than HEAD. Otherwise, or on any lookup failure, the plan is
+          # the whole workspace. A release projection keeps its first parent,
           # whose workspace-mode run the evidence above verified; a pull
           # request keeps its merge base and a release-branch push its
           # payload base.
           plan_base="${classification_base}"
           if [[ "${#plan_args[@]}" -eq 0 && "${EVENT_NAME}" == "push" && "${GITHUB_REF}" == "refs/heads/main" ]]; then
             plan_base=""
-            push_base_tool="${RUNNER_TEMP}/push-base-tools/ci-push-base.mjs"
-            mkdir -p "$(dirname "${push_base_tool}")"
-            if git show "HEAD^1:scripts/ci-push-base.mjs" > "${push_base_tool}" 2>/dev/null \
-              && found_base="$(node "${push_base_tool}" --repository "${GITHUB_REPOSITORY}" --head "$(git rev-parse HEAD)")"; then
+            if found_base="$(node scripts/ci-push-plan-base.mjs --repository "${GITHUB_REPOSITORY}" --payload-base "${BASE_SHA}")"; then
               plan_base="${found_base}"
               echo "push base: ${plan_base} (payload base ${BASE_SHA})"
             else
-              echo "::warning title=CI push base::no green, attested main CI run of an ancestor of HEAD was found; planning the whole workspace."
+              echo "::warning title=CI push base::no qualifying green, attested main CI run before HEAD (reason above); planning the whole workspace."
             fi
           fi
           # The classifier exits non-zero rather than emit an empty plan for a

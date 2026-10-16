@@ -74,7 +74,9 @@ them.
   run completed green with its attestation instead of the push's payload
   base, so the changes of a cancelled, superseded or failed main run still
   run the push-only lanes; it plans the whole workspace when no such commit
-  is found.
+  is found, when the push carries more than one commit (the finder runs from
+  HEAD's first parent only when that parent is the push's payload base), or
+  when the finder's answer is not a full sha of an ancestor of HEAD.
 
 ## [0.9.2] - 2026-10-16
 
