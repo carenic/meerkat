@@ -306,3 +306,75 @@ fn run_git(cwd: &Path, args: &[&str]) {
         .unwrap();
     assert!(status.success(), "git {args:?} failed");
 }
+
+/// A Git skill source runs no command smuggled through its ssh-key path: the
+/// path goes into `GIT_SSH_COMMAND`, which git runs through a shell, so a
+/// path crafted to carry a shell command must not execute it. A marker file
+/// the payload would create stays absent.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_git_skill_ssh_key_path_runs_no_smuggled_command() {
+    let tmp = tempfile::tempdir().unwrap();
+    let marker = tmp.path().join("ssh-key-payload-ran");
+    // The path is read as one argument to `ssh -i`; a shell that parsed it
+    // would run the trailing command.
+    let crafted = format!("/nonexistent-key; touch {} #", marker.display());
+    let source = GitSkillSource::new(GitSkillConfig {
+        repo_url: "git@nonexistent.invalid:owner/repo.git".to_string(),
+        git_ref: GitRef::Branch("main".to_string()),
+        cache_dir: tmp.path().join("cache"),
+        skills_root: None,
+        refresh_interval: Duration::from_secs(300),
+        auth: Some(meerkat_skills::source::git::GitSkillAuth::SshKey(crafted)),
+        depth: Some(1),
+        source_uuid: source_uuid("c0ffee00-0000-4000-8000-000000000001"),
+        health_thresholds: Default::default(),
+    });
+
+    // The refresh fails (the key is rejected, or ssh cannot reach the host);
+    // either way the smuggled command never runs.
+    let _ = source.list(&SkillFilter::default()).await;
+    assert!(
+        !marker.exists(),
+        "the ssh-key path must not run a smuggled command"
+    );
+}
+
+/// A Git skill `git_ref` that reads as an option must not reach git as one:
+/// a ref crafted to carry `--upload-pack=<cmd>` runs no command. A marker
+/// file the payload would create stays absent.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_git_skill_ref_that_looks_like_an_option_runs_no_command() {
+    let tmp = tempfile::tempdir().unwrap();
+    let remote = tmp.path().join("remote.git");
+    let work = tmp.path().join("work");
+    let skill_dir = work.join("git-skill");
+    fs::create_dir_all(&skill_dir).unwrap();
+    fs::write(
+        skill_dir.join("SKILL.md"),
+        skill_body("git-skill", "from git", "git body"),
+    )
+    .unwrap();
+    init_test_repo(&remote, &work);
+
+    let marker = tmp.path().join("ref-payload-ran");
+    let crafted = format!("--upload-pack=touch {}", marker.display());
+    let source = GitSkillSource::new(GitSkillConfig {
+        repo_url: remote.to_string_lossy().to_string(),
+        git_ref: GitRef::Branch(crafted),
+        cache_dir: tmp.path().join("cache"),
+        skills_root: None,
+        refresh_interval: Duration::from_secs(300),
+        auth: None,
+        depth: None,
+        source_uuid: source_uuid("c0ffee00-0000-4000-8000-000000000002"),
+        health_thresholds: Default::default(),
+    });
+
+    let _ = source.list(&SkillFilter::default()).await;
+    assert!(
+        !marker.exists(),
+        "a ref that looks like an option must not run a command"
+    );
+}

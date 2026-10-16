@@ -366,6 +366,18 @@ them.
   refused from an untrusted `mcp.toml` to the model under its plain name or
   a `refused-mcp-server-<n>` placeholder, as sessions on a governed realm
   do. They reported it under its raw name, which a confined process chose.
+- A Git skill repository's ssh-key path no longer reaches `GIT_SSH_COMMAND`,
+  which git runs through a shell, unquoted: a key path is validated
+  (absolute, an existing regular file, no control characters or single
+  quote, no leading `-`) and single-quoted, so a path crafted to carry a
+  shell command runs none. The `git_ref` and repository URL are refused when
+  they read as an option (a leading `-`) or carry whitespace or control
+  characters, the URL's transport must be `ssh`/`https`/`http`/`git`/`file`
+  or a local path, and every `git` invocation passes `--end-of-options`
+  before its refs and URL. Before, a configuration source a confined process
+  could write (or a config-tool client) could run a command on the host
+  through the ssh-key path. The Git skills scan root is also not walked when
+  a link leads it out of the checkout.
 - The programs a host runs as itself no longer inherit a module or library
   path a confined process could change. With `rkat` run from a shell whose
   `PYTHONPATH` or `LD_LIBRARY_PATH` points into the workspace, a confined
