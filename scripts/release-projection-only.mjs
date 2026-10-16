@@ -129,8 +129,11 @@ function normalizeCargoManifest(text, version) {
         );
       }
       if (section === "workspace.dependencies" && line.includes("path =")) {
+        // Internal requirements publish exact (`=X.Y.Z`). The operator stays
+        // outside the placeholder, so a bump that drops or adds it is not a
+        // projection.
         return line.replace(
-          new RegExp(`(\\bversion\\s*=\\s*\")${escapeRegExp(version)}(\")`),
+          new RegExp(`(\\bversion\\s*=\\s*\"=?)${escapeRegExp(version)}(\")`),
           "$1@@MEERKAT_RELEASE_VERSION@@$2",
         );
       }

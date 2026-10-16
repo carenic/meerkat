@@ -45,9 +45,12 @@ fn control(persist: Result<(), McpAttachmentRefusal>) -> Arc<dyn McpAttachmentAu
 }
 
 fn adapter() -> meerkat_mcp::McpRouterAdapter {
-    meerkat_mcp::McpRouterAdapter::new(meerkat_mcp::McpRouter::new_with_surface_handle(Arc::new(
-        meerkat_runtime::RuntimeExternalToolSurfaceHandle::ephemeral(),
-    )))
+    meerkat_mcp::McpRouterAdapter::new(
+        meerkat_mcp::McpRouter::new_with_surface_handle_and_stdio_profile(
+            Arc::new(meerkat_runtime::RuntimeExternalToolSurfaceHandle::ephemeral()),
+            meerkat_mcp::McpStdioLaunchProfile::trusted_host(),
+        ),
+    )
 }
 
 fn project(dir: &tempfile::TempDir) -> McpConfigMutationAuthority {

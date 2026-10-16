@@ -36,7 +36,7 @@ impl AuthorizationAuditSink for FailingEntrySink {
             *self.blocked_operation.lock().expect("injected target") =
                 Some(event.operation_id.clone());
         }
-        if matches!(event.observation, AuditObservation::Entry)
+        if matches!(event.observation, AuditObservation::Entry { .. })
             && self
                 .blocked_operation
                 .lock()
@@ -136,7 +136,7 @@ impl LlmClient for DeferredProvider {
             .current()
             .expect("current controller");
         checked
-            .observe_entry()
+            .observe_entry(meerkat_core::OperationEntryBoundary::ModelRequest)
             .expect("only named tool entry is injected");
         checked
             .observe_outcome(OperationObservedOutcome::HttpResponse { status: 200 })

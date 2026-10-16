@@ -9,6 +9,17 @@
   "paths": {
     "./": [
       {
+        "package": "meerkat",
+        "target": "test:host_launch_sites",
+        "scope": "target",
+        "tests": [
+          "every_process_launch_in_shipped_code_is_confined_or_a_typed_exemption"
+        ],
+        "sources": [
+          "crates/meerkat/tests/host_launch_sites.rs"
+        ]
+      },
+      {
         "package": "meerkat-integration-tests",
         "target": "lib",
         "scope": "package",

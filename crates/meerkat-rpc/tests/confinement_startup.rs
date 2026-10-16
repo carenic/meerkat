@@ -11,6 +11,7 @@
 
 #![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 
+use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
@@ -32,17 +33,29 @@ requirement = { baseline = "command_runtime_v1", read = { kind = "paths", paths 
 /// launch kind this host cannot confine.
 const INSTALLED_REPORT: &str = "confinement: requested custom";
 const UNENFORCEABLE_REPORT: &str = "cannot be enforced on this host";
+/// The report's informational line naming the host's protected inputs.
+const PROTECTED_INPUTS_REPORT: &str = "kept from every confined process: the realm state at";
 
 /// Last-resort bound for a server that neither exits nor answers, as in
 /// `realm_config_ingress.rs`: well above the observed startup latency under
 /// a fully parallel crate run and below the CI unit profile's ceiling.
 const EXIT_DEADLINE: Duration = Duration::from_secs(200);
 
-/// Cargo and nextest advertise the crate's own binary to its integration
-/// tests through the runtime environment.
-fn rkat_rpc_binary() -> Option<PathBuf> {
-    let advertised = std::env::var_os("CARGO_BIN_EXE_rkat-rpc").map(PathBuf::from)?;
-    advertised.exists().then_some(advertised)
+/// The crate's own binary, from the runtime environment only: Cargo,
+/// nextest (including an archived test run on another machine) and the
+/// generated Bazel targets set it there. A compile-time path would be stale
+/// in an archive. A test without it fails rather than passing without having
+/// run.
+fn rkat_rpc_binary() -> PathBuf {
+    let advertised = std::env::var_os("CARGO_BIN_EXE_rkat-rpc")
+        .map(PathBuf::from)
+        .expect("CARGO_BIN_EXE_rkat-rpc is set at runtime by cargo, nextest and the generated Bazel targets");
+    assert!(
+        advertised.exists(),
+        "the rkat-rpc binary {} does not exist",
+        advertised.display()
+    );
+    advertised
 }
 
 struct Run {
@@ -56,9 +69,29 @@ struct Run {
 /// and close its stdin once it answers, so a booted server shuts down on EOF.
 /// A server that refuses to start exits without answering.
 fn run_rkat_rpc(binary: &Path, cwd: &Path, args: &[&str]) -> Run {
-    let mut child = Command::new(binary)
-        .current_dir(cwd)
-        .args(args)
+    run_rkat_rpc_with_requests(binary, cwd, args, &[]).0
+}
+
+/// [`run_rkat_rpc`], handing the server `requests` (ids 2, 3, ...) once it
+/// answered `initialize` and closing its stdin once it answered every one.
+/// Returns each answered request's response by id.
+fn run_rkat_rpc_with_requests(
+    binary: &Path,
+    cwd: &Path,
+    args: &[&str],
+    requests: &[(&str, serde_json::Value)],
+) -> (Run, BTreeMap<u64, serde_json::Value>) {
+    let mut command = Command::new(binary);
+    command.current_dir(cwd).args(args);
+    run_rpc_command(command, requests)
+}
+
+/// Run the server `command` starts as [`run_rkat_rpc_with_requests`] does.
+fn run_rpc_command(
+    mut command: Command,
+    requests: &[(&str, serde_json::Value)],
+) -> (Run, BTreeMap<u64, serde_json::Value>) {
+    let mut child = command
         .env_remove("RUST_LOG")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -93,10 +126,33 @@ fn run_rkat_rpc(binary: &Path, cwd: &Path, args: &[&str]) -> Run {
 
     let deadline = Instant::now() + EXIT_DEADLINE;
     let mut answered = false;
+    let mut responses: BTreeMap<u64, serde_json::Value> = BTreeMap::new();
+    let last_id = 1 + requests.len() as u64;
     let status = loop {
         while let Ok(line) = stdout_rx.try_recv() {
-            if line.contains("\"id\":1") {
+            let Ok(message) = serde_json::from_str::<serde_json::Value>(&line) else {
+                continue;
+            };
+            let Some(id) = message.get("id").and_then(serde_json::Value::as_u64) else {
+                continue;
+            };
+            responses.insert(id, message);
+            if id == 1 && !answered {
                 answered = true;
+                if let Some(pipe) = stdin.as_mut() {
+                    for (offset, (method, params)) in requests.iter().enumerate() {
+                        let request = serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": 2 + offset as u64,
+                            "method": method,
+                            "params": params,
+                        });
+                        let _ = pipe.write_all(format!("{request}\n").as_bytes());
+                    }
+                    let _ = pipe.flush();
+                }
+            }
+            if answered && (1..=last_id).all(|id| responses.contains_key(&id)) {
                 // EOF on stdin shuts the booted server down.
                 drop(stdin.take());
             }
@@ -123,11 +179,14 @@ fn run_rkat_rpc(binary: &Path, cwd: &Path, args: &[&str]) -> Run {
     stdout_reader
         .join()
         .expect("stdout reader thread should finish");
-    Run {
-        answered,
-        status,
-        stderr,
-    }
+    (
+        Run {
+            answered,
+            status,
+            stderr,
+        },
+        responses,
+    )
 }
 
 /// The scope arguments of one isolated run: a memory realm under `temp`,
@@ -147,12 +206,7 @@ fn scope_args<'a>(realm: &'a str, state_root: &'a Path, user_root: &'a Path) -> 
 
 #[test]
 fn workspace_confinement_without_a_context_root_refuses_rkat_rpc_startup() {
-    let Some(binary) = rkat_rpc_binary() else {
-        eprintln!(
-            "skipping: rkat-rpc binary not advertised (CARGO_BIN_EXE_rkat-rpc unset or missing)"
-        );
-        return;
-    };
+    let binary = rkat_rpc_binary();
     let temp = TempDir::new().expect("temp dir");
     let state_root = temp.path().join("state");
     let user_root = temp.path().join("user");
@@ -180,12 +234,7 @@ fn workspace_confinement_without_a_context_root_refuses_rkat_rpc_startup() {
 /// before the server serves, naming the input and its remedy.
 #[test]
 fn confinement_that_could_change_the_realm_state_refuses_rkat_rpc_startup() {
-    let Some(binary) = rkat_rpc_binary() else {
-        eprintln!(
-            "skipping: rkat-rpc binary not advertised (CARGO_BIN_EXE_rkat-rpc unset or missing)"
-        );
-        return;
-    };
+    let binary = rkat_rpc_binary();
     let temp = TempDir::new().expect("temp dir");
     let base = temp.path().canonicalize().expect("canonical temp");
     let project = base.join("project");
@@ -226,12 +275,7 @@ fn confinement_that_could_change_the_realm_state_refuses_rkat_rpc_startup() {
 
 #[test]
 fn the_user_documents_confinement_reaches_the_rkat_rpc_startup_report() {
-    let Some(binary) = rkat_rpc_binary() else {
-        eprintln!(
-            "skipping: rkat-rpc binary not advertised (CARGO_BIN_EXE_rkat-rpc unset or missing)"
-        );
-        return;
-    };
+    let binary = rkat_rpc_binary();
     let temp = TempDir::new().expect("temp dir");
     let project = temp.path().join("project");
     let state_root = temp.path().join("state");
@@ -259,6 +303,11 @@ fn the_user_documents_confinement_reaches_the_rkat_rpc_startup_report() {
         "the user document's requirement reaches the startup report; stderr:\n{}",
         configured.stderr
     );
+    assert!(
+        configured.stderr.contains(PROTECTED_INPUTS_REPORT),
+        "the report's informational lines reach the default log too; stderr:\n{}",
+        configured.stderr
+    );
 
     let mut args = scope_args("rpc-confinement-flagged", &state_root, &user_root);
     args.extend([
@@ -277,5 +326,478 @@ fn the_user_documents_confinement_reaches_the_rkat_rpc_startup_report() {
         !flagged.stderr.contains(INSTALLED_REPORT),
         "the operator's flag replaces the documents; stderr:\n{}",
         flagged.stderr
+    );
+}
+
+/// A `config/patch` or `config/set` cannot cut the served realm from the
+/// parent whose `[confinement]` it composes: the real server refuses the
+/// write with the confinement discriminator and the realm document keeps its
+/// bytes. A write that keeps the edge commits.
+#[test]
+fn rkat_rpc_config_writes_cannot_drop_inherited_confinement() {
+    let binary = rkat_rpc_binary();
+    let temp = TempDir::new().expect("temp dir");
+    let state_root = temp.path().join("state");
+    let user_root = temp.path().join("user");
+    std::fs::create_dir_all(&user_root).expect("user root should initialize");
+    let team_text = "[realm.team]\nparent = \"org\"\n";
+    let org_text = format!("[realm.org]\n\n{UNENFORCEABLE_CONFINEMENT}");
+    for (realm, text) in [("org", org_text.as_str()), ("team", team_text)] {
+        let document = state_root.join(realm).join("config.toml");
+        std::fs::create_dir_all(document.parent().expect("realm dir"))
+            .expect("realm dir should initialize");
+        std::fs::write(&document, text).expect("realm document should be written");
+    }
+
+    let args = scope_args("team", &state_root, &user_root);
+    let (run, responses) = run_rkat_rpc_with_requests(
+        &binary,
+        temp.path(),
+        &args,
+        &[
+            (
+                "config/patch",
+                serde_json::json!({ "patch": { "realm": { "team": { "parent": null } } } }),
+            ),
+            (
+                "config/patch",
+                serde_json::json!({ "patch": { "realm": { "team": null } } }),
+            ),
+            (
+                "config/patch",
+                serde_json::json!({ "patch": { "max_tokens": 2048 } }),
+            ),
+        ],
+    );
+    assert!(
+        run.answered,
+        "the team realm serves; exit={:?} stderr:\n{}",
+        run.status, run.stderr
+    );
+    for id in [2, 3] {
+        let error = &responses[&id]["error"];
+        assert_eq!(
+            error["data"],
+            serde_json::json!({ "type": "confinement_administration_required" }),
+            "request {id}: {}",
+            responses[&id]
+        );
+    }
+    assert!(
+        responses[&4].get("error").is_none(),
+        "a patch that keeps the edge commits: {}",
+        responses[&4]
+    );
+    let committed = std::fs::read_to_string(state_root.join("team").join("config.toml"))
+        .expect("team document");
+    assert!(committed.contains("parent = \"org\""), "{committed}");
+    assert!(committed.contains("max_tokens = 2048"), "{committed}");
+}
+
+/// Without a confinement flag that names a relative path the server never
+/// reads its working directory, so it serves from one that was removed.
+#[cfg(unix)]
+#[test]
+fn rkat_rpc_starts_without_a_working_directory_when_no_flag_needs_it() {
+    let binary = rkat_rpc_binary();
+    let temp = TempDir::new().expect("temp dir");
+    let state_root = temp.path().join("state");
+    let user_root = temp.path().join("user");
+    let removed = temp.path().join("removed");
+    for dir in [&user_root, &removed] {
+        std::fs::create_dir_all(dir).expect("directory should initialize");
+    }
+
+    // The shell removes its working directory, then becomes the server.
+    let mut command = Command::new("/bin/sh");
+    command
+        .arg("-c")
+        .arg("cd \"$1\" && rmdir \"$1\" && shift && exec \"$@\"")
+        .arg("sh")
+        .arg(&removed)
+        .arg(&binary)
+        .args(scope_args("rpc-removed-cwd", &state_root, &user_root));
+    let (run, _) = run_rpc_command(command, &[]);
+    assert!(
+        run.answered,
+        "a server without confinement flags serves from a removed working directory; \
+         exit={:?} stderr:\n{}",
+        run.status, run.stderr
+    );
+}
+
+/// A start whose confined processes could change the host's credential store
+/// (the tokens and keys its providers, MCP servers and connectors use) is
+/// refused before the server serves, naming the store.
+#[test]
+fn confinement_that_could_change_the_credential_store_refuses_rkat_rpc_startup() {
+    let binary = rkat_rpc_binary();
+    let temp = TempDir::new().expect("temp dir");
+    let base = temp.path().canonicalize().expect("canonical temp");
+    // The user's config directory, and with it the default credential store,
+    // lives under the only write grant.
+    let home = base.join("home");
+    let state = base.join("state");
+    let user_root = base.join("user");
+    for dir in [home.join(".config"), state.clone(), user_root.join(".rkat")] {
+        std::fs::create_dir_all(&dir).expect("directory should initialize");
+    }
+    std::fs::write(
+        user_root.join(".rkat").join("config.toml"),
+        format!(
+            "[confinement.all]\nmode = \"custom\"\nworking_directory = \"{home}\"\nrequirement = {{ baseline = \"command_runtime_v1\", read = {{ kind = \"paths\", paths = [{{ kind = \"subtree\", path = \"{home}\" }}] }}, write = {{ kind = \"paths\", paths = [{{ kind = \"subtree\", path = \"{home}\" }}] }}, deny_read = [], deny_write = [], network = {{ kind = \"denied\" }}, unix_connect = [], require_descendant_termination = false }}\n",
+            home = home.display()
+        ),
+    )
+    .expect("user document should be written");
+
+    let mut command = Command::new(&binary);
+    command
+        .current_dir(&base)
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .args(scope_args("rpc-credential-writer", &state, &user_root));
+    let (run, _) = run_rpc_command(command, &[]);
+
+    assert!(
+        !run.answered && !run.status.success(),
+        "rkat-rpc must refuse a start whose confined processes could change its credential \
+         store; exit={:?} stderr:\n{}",
+        run.status,
+        run.stderr
+    );
+    assert!(
+        run.stderr.contains("the credential store"),
+        "the refusal names the input; stderr:\n{}",
+        run.stderr
+    );
+}
+
+/// A `config/patch` cannot cut the served realm from the parent whose
+/// `[governance]` it composes: the real server refuses the write with the
+/// governance discriminator and the realm document keeps its bytes. A write
+/// that keeps the edge commits.
+#[test]
+fn rkat_rpc_config_writes_cannot_drop_inherited_governance() {
+    let binary = rkat_rpc_binary();
+    let temp = TempDir::new().expect("temp dir");
+    let state_root = temp.path().join("state");
+    let user_root = temp.path().join("user");
+    std::fs::create_dir_all(&user_root).expect("user root should initialize");
+    let team_text = "[realm.team]\nparent = \"org\"\n";
+    let org_text = "[realm.org]\n\n[[governance.review.rules]]\ntarget = { kind = \"mcp_server\", server = \"mail\" }\ntier = \"r2\"\n";
+    for (realm, text) in [("org", org_text), ("team", team_text)] {
+        let document = state_root.join(realm).join("config.toml");
+        std::fs::create_dir_all(document.parent().expect("realm dir"))
+            .expect("realm dir should initialize");
+        std::fs::write(&document, text).expect("realm document should be written");
+    }
+
+    let args = scope_args("team", &state_root, &user_root);
+    let (run, responses) = run_rkat_rpc_with_requests(
+        &binary,
+        temp.path(),
+        &args,
+        &[
+            (
+                "config/patch",
+                serde_json::json!({ "patch": { "realm": { "team": { "parent": null } } } }),
+            ),
+            (
+                "config/patch",
+                serde_json::json!({ "patch": { "realm": { "team": null } } }),
+            ),
+            (
+                "config/patch",
+                serde_json::json!({ "patch": { "max_tokens": 2048 } }),
+            ),
+        ],
+    );
+    assert!(
+        run.answered,
+        "the team realm serves; exit={:?} stderr:\n{}",
+        run.status, run.stderr
+    );
+    for id in [2, 3] {
+        let error = &responses[&id]["error"];
+        assert_eq!(
+            error["data"],
+            serde_json::json!({ "type": "governance_administration_required" }),
+            "request {id}: {}",
+            responses[&id]
+        );
+    }
+    assert!(
+        responses[&4].get("error").is_none(),
+        "a patch that keeps the edge commits: {}",
+        responses[&4]
+    );
+    let committed = std::fs::read_to_string(state_root.join("team").join("config.toml"))
+        .expect("team document");
+    assert!(committed.contains("parent = \"org\""), "{committed}");
+    assert!(committed.contains("max_tokens = 2048"), "{committed}");
+}
+
+/// An MCP auth request addresses only servers the host installed: on a
+/// server whose confined processes can write the project `mcp.toml`, a
+/// server only that file defines is refused as not configured, naming the
+/// refusal, so a planted entry cannot point a login at a server of its
+/// choosing.
+#[test]
+fn rkat_rpc_mcp_auth_refuses_a_server_only_an_untrusted_mcp_toml_defines() {
+    let binary = rkat_rpc_binary();
+    let temp = TempDir::new().expect("temp dir");
+    let base = temp.path().canonicalize().expect("canonical temp");
+    let project = base.join("project");
+    let home = base.join("home");
+    let state = base.join("state");
+    let user_root = base.join("user");
+    for dir in [
+        project.join(".rkat"),
+        home.join(".config"),
+        state.clone(),
+        user_root.join(".rkat"),
+    ] {
+        std::fs::create_dir_all(&dir).expect("directory should initialize");
+    }
+    std::fs::write(
+        project.join(".rkat").join("mcp.toml"),
+        "[[servers]]\nname = \"planted\"\nurl = \"https://planted.example/mcp\"\n",
+    )
+    .expect("project mcp.toml should be written");
+    std::fs::write(
+        user_root.join(".rkat").join("config.toml"),
+        format!(
+            "[confinement.all]\nmode = \"custom\"\nworking_directory = \"{dir}\"\nrequirement = {{ baseline = \"command_runtime_v1\", read = {{ kind = \"paths\", paths = [{{ kind = \"subtree\", path = \"{dir}\" }}] }}, write = {{ kind = \"paths\", paths = [{{ kind = \"subtree\", path = \"{dir}\" }}] }}, deny_read = [], deny_write = [], network = {{ kind = \"denied\" }}, unix_connect = [], require_descendant_termination = false }}\n",
+            dir = project.display()
+        ),
+    )
+    .expect("user document should be written");
+
+    let mut command = Command::new(&binary);
+    command
+        .current_dir(&base)
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .args(scope_args("rpc-untrusted-mcp", &state, &user_root))
+        .args([
+            "--context-root",
+            project.to_str().expect("utf-8 project root"),
+        ]);
+    let (run, responses) = run_rpc_command(
+        command,
+        &[(
+            "auth/status/get",
+            serde_json::json!({
+                "mcp": {
+                    "server_name": "planted",
+                    "server_url": "https://planted.example/mcp",
+                }
+            }),
+        )],
+    );
+    assert!(
+        run.answered,
+        "the server serves; exit={:?} stderr:\n{}",
+        run.status, run.stderr
+    );
+    let error = &responses[&2]["error"];
+    assert_eq!(
+        error["data"]["reason"], "mcp_server_not_configured",
+        "{}",
+        responses[&2]
+    );
+    assert!(
+        error["message"]
+            .as_str()
+            .is_some_and(|text| text.contains("confined process")),
+        "{}",
+        responses[&2]
+    );
+}
+
+/// The governed JSONL route resolves the realm's default binding to build
+/// its controller client at startup. A credential command it names runs as
+/// the host, outside confinement, so a host that confines its launches
+/// refuses one whose program a confined process could change: the governed
+/// controller factory installs the same confinement as the connection
+/// factory, so startup is refused instead of running the command.
+#[cfg(feature = "local-authorization")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_governed_route_credential_command_under_confinement_is_refused() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let binary = rkat_rpc_binary();
+    let temp = TempDir::new().expect("temp dir");
+    let base = temp.path().canonicalize().expect("canonical temp");
+    let state = base.join("state");
+    let user_root = base.join("user");
+    let home = base.join("home");
+    let writable = base.join("writable");
+    for dir in [&state, &user_root, &home, &writable, &home.join(".config")] {
+        std::fs::create_dir_all(dir).expect("directory should initialize");
+    }
+    // The realm's default-binding credential is a command whose program
+    // lives under the only write grant.
+    let helper = writable.join("helper.sh");
+    std::fs::write(&helper, "#!/bin/sh\nprintf 'sk-governed-token'\n").expect("helper");
+    std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+    const REALM: &str = "governed-cmd";
+    drop(
+        meerkat::open_realm_persistence_with_provider(
+            &meerkat::DiskStorageProvider,
+            &state,
+            REALM,
+            Some(meerkat_store::RealmBackend::Sqlite),
+            None,
+            None,
+        )
+        .await
+        .expect("materialize the realm"),
+    );
+    let realm = meerkat_core::connection::RealmId::parse(REALM).expect("realm id");
+    meerkat::governed_realm::stock::govern_stock_realm(
+        &state,
+        REALM,
+        &meerkat::governed_realm::stock::StockPrincipals::for_local_operator(&realm)
+            .expect("local operator principals"),
+    )
+    .await
+    .expect("govern the realm");
+
+    let document = state.join(REALM).join("config.toml");
+    std::fs::write(
+        &document,
+        format!(
+            "[confinement.all]\nmode = \"custom\"\nworking_directory = \"{home}\"\nrequirement = {{ baseline = \"command_runtime_v1\", read = {{ kind = \"paths\", paths = [{{ kind = \"subtree\", path = \"{writable}\" }}] }}, write = {{ kind = \"paths\", paths = [{{ kind = \"subtree\", path = \"{writable}\" }}] }}, deny_read = [], deny_write = [], network = {{ kind = \"denied\" }}, unix_connect = [], require_descendant_termination = false }}\n\n[realm.{REALM}]\ndefault_binding = \"ctl\"\n\n[realm.{REALM}.backend.api]\nprovider = \"openai\"\nbackend_kind = \"openai_api\"\n\n[realm.{REALM}.auth.cmd]\nprovider = \"openai\"\nauth_method = \"api_key\"\nsource = {{ kind = \"command\", program = \"{helper}\" }}\n\n[realm.{REALM}.binding.ctl]\nbackend_profile = \"api\"\nauth_profile = \"cmd\"\ndefault_model = \"gpt-5.4\"\nprovider_default = true\n",
+            home = home.display(),
+            writable = writable.display(),
+            helper = helper.display(),
+        ),
+    )
+    .expect("realm document should be written");
+
+    let mut command = Command::new(&binary);
+    command
+        .current_dir(&base)
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .args([
+            "--realm",
+            REALM,
+            "--realm-backend",
+            "sqlite",
+            "--state-root",
+            state.to_str().expect("utf-8 state root"),
+            "--user-config-root",
+            user_root.to_str().expect("utf-8 user root"),
+        ]);
+    let (run, _) = run_rpc_command(command, &[]);
+
+    assert!(
+        !run.answered && !run.status.success(),
+        "the governed controller refuses a credential command its confinement flags; exit={:?} \
+         stderr:\n{}",
+        run.status,
+        run.stderr
+    );
+    assert!(
+        run.stderr.contains("credential command") || run.stderr.to_lowercase().contains("confined"),
+        "the refusal names the credential command; stderr:\n{}",
+        run.stderr
+    );
+}
+
+/// The governed JSONL route also builds its configured reviewer through the
+/// host's confinement. With the controller's own credential trusted (an
+/// inline secret), a reviewer binding whose credential is a command under a
+/// write grant is refused, so startup fails: the reviewer factory carries
+/// the same confinement as the controller and connection factories.
+#[cfg(feature = "local-authorization")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_governed_reviewer_credential_command_under_confinement_is_refused() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let binary = rkat_rpc_binary();
+    let temp = TempDir::new().expect("temp dir");
+    let base = temp.path().canonicalize().expect("canonical temp");
+    let state = base.join("state");
+    let user_root = base.join("user");
+    let home = base.join("home");
+    let writable = base.join("writable");
+    for dir in [&state, &user_root, &home, &writable, &home.join(".config")] {
+        std::fs::create_dir_all(dir).expect("directory should initialize");
+    }
+    let helper = writable.join("helper.sh");
+    std::fs::write(&helper, "#!/bin/sh\nprintf 'sk-reviewer-token'\n").expect("helper");
+    std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+    const REALM: &str = "governed-reviewer";
+    drop(
+        meerkat::open_realm_persistence_with_provider(
+            &meerkat::DiskStorageProvider,
+            &state,
+            REALM,
+            Some(meerkat_store::RealmBackend::Sqlite),
+            None,
+            None,
+        )
+        .await
+        .expect("materialize the realm"),
+    );
+    let realm = meerkat_core::connection::RealmId::parse(REALM).expect("realm id");
+    meerkat::governed_realm::stock::govern_stock_realm(
+        &state,
+        REALM,
+        &meerkat::governed_realm::stock::StockPrincipals::for_local_operator(&realm)
+            .expect("local operator principals"),
+    )
+    .await
+    .expect("govern the realm");
+
+    // The controller's own credential is a trusted inline secret, so startup
+    // reaches the reviewer; only the reviewer's binding is a command under
+    // the write grant.
+    let document = state.join(REALM).join("config.toml");
+    std::fs::write(
+        &document,
+        format!(
+            "[confinement.all]\nmode = \"custom\"\nworking_directory = \"{home}\"\nrequirement = {{ baseline = \"command_runtime_v1\", read = {{ kind = \"paths\", paths = [{{ kind = \"subtree\", path = \"{writable}\" }}] }}, write = {{ kind = \"paths\", paths = [{{ kind = \"subtree\", path = \"{writable}\" }}] }}, deny_read = [], deny_write = [], network = {{ kind = \"denied\" }}, unix_connect = [], require_descendant_termination = false }}\n\n[[governance.review.rules]]\ntarget = {{ kind = \"mcp_server\", server = \"mail\" }}\ntier = \"r2\"\n\n[governance.review.reviewer]\nmax_output_tokens = 64\nidentity = {{ model = \"gpt-5.4\", provider = \"openai\", auth_binding = {{ realm = \"{REALM}\", binding = \"rev\" }} }}\n\n[realm.{REALM}]\ndefault_binding = \"ctl\"\n\n[realm.{REALM}.backend.api]\nprovider = \"openai\"\nbackend_kind = \"openai_api\"\n\n[realm.{REALM}.auth.inline]\nprovider = \"openai\"\nauth_method = \"api_key\"\nsource = {{ kind = \"inline_secret\", secret = \"sk-controller-inline\" }}\n\n[realm.{REALM}.auth.cmd]\nprovider = \"openai\"\nauth_method = \"api_key\"\nsource = {{ kind = \"command\", program = \"{helper}\" }}\n\n[realm.{REALM}.binding.ctl]\nbackend_profile = \"api\"\nauth_profile = \"inline\"\ndefault_model = \"gpt-5.4\"\nprovider_default = true\n\n[realm.{REALM}.binding.rev]\nbackend_profile = \"api\"\nauth_profile = \"cmd\"\ndefault_model = \"gpt-5.4\"\n",
+            home = home.display(),
+            writable = writable.display(),
+            helper = helper.display(),
+        ),
+    )
+    .expect("realm document should be written");
+
+    let mut command = Command::new(&binary);
+    command
+        .current_dir(&base)
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .args([
+            "--realm",
+            REALM,
+            "--realm-backend",
+            "sqlite",
+            "--state-root",
+            state.to_str().expect("utf-8 state root"),
+            "--user-config-root",
+            user_root.to_str().expect("utf-8 user root"),
+        ]);
+    let (run, _) = run_rpc_command(command, &[]);
+
+    assert!(
+        !run.answered && !run.status.success(),
+        "the governed reviewer refuses a credential command its confinement flags; exit={:?} \
+         stderr:\n{}",
+        run.status,
+        run.stderr
+    );
+    assert!(
+        run.stderr.contains("credential command") || run.stderr.to_lowercase().contains("confined"),
+        "the refusal names the credential command; stderr:\n{}",
+        run.stderr
     );
 }

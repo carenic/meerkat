@@ -304,6 +304,7 @@ impl McpScheduleContext {
                     // The session service decides hosting when it creates the actor.
                     hosting: meerkat_core::session_hosting::SessionHostingIntent::default(),
                     mcp_servers: Vec::new(),
+                    refused_mcp_servers: Vec::new(),
                     recoverable_tool_defs: None,
                     llm_client_override: {
                         #[cfg(test)]
@@ -364,6 +365,7 @@ impl McpScheduleContext {
                     application_tool_policy: meerkat_core::ApplicationToolPolicyBinding::Unmanaged,
                     tool_consequence_policy_registry: None,
                     shell_env: None,
+                    shell_timeout_secs: None,
                     resume_override_mask: {
                         #[cfg(test)]
                         {

@@ -256,7 +256,10 @@ fn assert_tool_returned(
         audit
             .iter()
             .any(|record| record.observation.operation_id == operation
-                && matches!(record.observation.observation, AuditObservation::Entry))
+                && matches!(
+                    record.observation.observation,
+                    AuditObservation::Entry { .. }
+                ))
     );
     assert!(
         audit
@@ -333,7 +336,7 @@ fn assert_queued_controller_fallback(
                 && matches!(
                     record.observation.observation,
                     AuditObservation::Prepared { .. }
-                        | AuditObservation::Entry
+                        | AuditObservation::Entry { .. }
                         | AuditObservation::Outcome { .. }
                 )),
         "refused hosted request must not prepare or enter: {diagnostic}"
@@ -365,7 +368,10 @@ fn assert_queued_controller_fallback(
         assert!(
             audit.iter().any(|entry| entry.observation.operation_id
                 == record.observation.operation_id
-                && matches!(entry.observation.observation, AuditObservation::Entry)),
+                && matches!(
+                    entry.observation.observation,
+                    AuditObservation::Entry { .. }
+                )),
             "each actual model request has entry evidence: {diagnostic}"
         );
     }
@@ -653,7 +659,7 @@ async fn exercise_queued(server: &Server, barriers: Arc<QueueBarriers>) {
                 |record| record.observation.operation_id == denied[0].observation.operation_id
                     && matches!(
                         record.observation.observation,
-                        AuditObservation::Entry | AuditObservation::Outcome { .. }
+                        AuditObservation::Entry { .. } | AuditObservation::Outcome { .. }
                     )
             )
     );

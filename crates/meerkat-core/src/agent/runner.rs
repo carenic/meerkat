@@ -1395,6 +1395,59 @@ where
         self.tool_scope.snapshot()
     }
 
+    /// How this agent's next model request projects its tool catalog, read
+    /// without changing anything ([`crate::ToolCatalogView`]): the catalog
+    /// mode and, per catalog entry, its deferral eligibility, callability
+    /// and visibility to the model, by the rules each model-call boundary
+    /// applies. `None` when the tool scope's state cannot be read.
+    pub fn tool_catalog_view(&self) -> Option<crate::ToolCatalogView> {
+        let capabilities = self.tools.tool_catalog_capabilities();
+        let exact_catalog = capabilities.exact_catalog;
+        let catalog = self.tools.tool_catalog();
+        let projection = crate::tool_catalog::catalog_boundary_projection(
+            capabilities,
+            exact_catalog.then_some(catalog.as_ref()),
+            crate::select_tool_catalog_mode(self.tools.as_ref()),
+        );
+        let mode = if projection.defers {
+            crate::ToolCatalogMode::Deferred
+        } else {
+            crate::ToolCatalogMode::Inline
+        };
+        let preview = self
+            .tool_scope
+            .preview_catalog_visibility(
+                self.tools.tools(),
+                projection.control_tool_names,
+                projection.deferred_tool_names,
+            )
+            .ok()?;
+        Some(crate::ToolCatalogView {
+            mode,
+            exact_catalog,
+            pending_sources: if exact_catalog {
+                self.tools.pending_catalog_sources().to_vec()
+            } else {
+                Vec::new()
+            },
+            staged_changes_pending: preview.staged_changes_pending,
+            entries: catalog
+                .iter()
+                .map(|entry| crate::ToolCatalogViewEntry {
+                    name: entry.tool.name.clone(),
+                    plane: entry.plane,
+                    deferred_eligibility: entry.deferred_eligibility.clone(),
+                    callability: entry.callability,
+                    visibility: preview
+                        .visibility
+                        .get(&entry.tool.name)
+                        .copied()
+                        .unwrap_or(crate::ToolCatalogVisibility::Hidden),
+                })
+                .collect(),
+        })
+    }
+
     /// The provider-visible tool definitions as shared handles. Unchanged
     /// tools keep their allocation across calls, so callers can detect a
     /// change by pointer instead of comparing schemas.
@@ -3213,6 +3266,7 @@ impl Agent<dyn AgentLlmClient, dyn AgentToolDispatcher, dyn AgentSessionStore> {
             cancel_after_boundary_rx,
             model_defaults_resolver: self.model_defaults_resolver.clone(),
             call_timeout_override: self.call_timeout_override.clone(),
+            stream_inactivity_timeout_override: self.stream_inactivity_timeout_override.clone(),
             extraction_state: super::extraction::ExtractionState::default(),
             last_hidden_deferred_catalog_names: Default::default(),
             last_pending_catalog_sources: Default::default(),

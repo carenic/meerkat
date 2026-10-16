@@ -1,6 +1,7 @@
 use crate::tool_execution::ToolExecutionContract;
-use crate::types::{ToolDef, ToolProvenance, ToolSourceKind};
+use crate::types::{ToolDef, ToolName, ToolProvenance, ToolSourceKind};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::sync::Arc;
 
 /// Canonical names of the catalog control plane, never MCP exposure aliases.
@@ -136,6 +137,10 @@ pub enum ToolUnavailableReason {
     /// execution-plan resolution.
     ExecutionOwnerChanged,
     TemporarilyUnavailable,
+    /// The tool is served over a mob's callback route, and no connected
+    /// client holds that route: no connection claimed it in this process,
+    /// or the connection that held it closed.
+    CallbackRouteUnclaimed,
 }
 
 impl std::fmt::Display for ToolUnavailableReason {
@@ -156,6 +161,9 @@ impl std::fmt::Display for ToolUnavailableReason {
             }
             ToolUnavailableReason::TemporarilyUnavailable => {
                 f.write_str("tool is temporarily unavailable")
+            }
+            ToolUnavailableReason::CallbackRouteUnclaimed => {
+                f.write_str("no connected client holds the callback route that serves it")
             }
         }
     }
@@ -301,6 +309,112 @@ pub fn select_catalog_mode_from_snapshot(
         ToolCatalogMode::Deferred
     } else {
         ToolCatalogMode::Inline
+    }
+}
+
+/// How a session's next model request shows one catalog entry to the model
+/// ([`ToolCatalogView`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ToolCatalogVisibility {
+    /// The request carries the tool: the model sees it and can call it.
+    Visible,
+    /// The tool is deferred-eligible and hidden behind the deferred catalog:
+    /// the model finds it with `tool_catalog_search` and asks for it with
+    /// `tool_catalog_load`, and sees it from the boundary after an accepted
+    /// load.
+    Deferred,
+    /// The model does not see the tool: the session's tool filters hide it,
+    /// its audience is not the model, or it is not currently callable.
+    Hidden,
+}
+
+/// One catalog entry of a [`ToolCatalogView`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolCatalogViewEntry {
+    pub name: ToolName,
+    pub plane: ToolPlaneClass,
+    /// Whether the entry may be deferred, with its typed source owner when
+    /// it may.
+    pub deferred_eligibility: ToolCatalogDeferredEligibility,
+    pub callability: ToolCallability,
+    pub visibility: ToolCatalogVisibility,
+}
+
+/// A live session's tool catalog as its next model request would project
+/// it, read without changing anything: the catalog mode and how each catalog
+/// entry shows to the model. It follows the rules each model-call boundary
+/// applies, from the session's current catalog and its active visibility
+/// state. A staged change (an accepted `tool_catalog_load`, a staged filter)
+/// applies at the next boundary and is reported as pending until then.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolCatalogView {
+    /// `Deferred` when the next request hides deferred-eligible tools behind
+    /// the catalog control plane: the exact catalog selects the deferred
+    /// mode and a control plane exists or may be composed. `Inline`
+    /// otherwise.
+    pub mode: ToolCatalogMode,
+    /// The dispatcher reports an exact catalog; without one the mode is
+    /// always inline.
+    pub exact_catalog: bool,
+    /// Sources still connecting, which keep an exact catalog in the deferred
+    /// mode while present.
+    pub pending_sources: Vec<String>,
+    /// A visibility change is staged and applies at the next boundary; until
+    /// then the entries report the active state.
+    pub staged_changes_pending: bool,
+    /// Every catalog entry, in catalog order.
+    pub entries: Vec<ToolCatalogViewEntry>,
+}
+
+/// The names one model-call boundary projects from the dispatcher's exact
+/// catalog, and whether deferral applies at all: control-plane entries are
+/// always visible, and session-plane deferred-eligible entries are deferred
+/// only when the catalog selects the deferred mode and a control plane exists
+/// or may be composed.
+#[derive(Debug, Default)]
+pub(crate) struct CatalogBoundaryProjection {
+    pub(crate) defers: bool,
+    pub(crate) control_tool_names: HashSet<ToolName>,
+    pub(crate) deferred_tool_names: HashSet<ToolName>,
+}
+
+/// The projection of `catalog` (present only for an exact catalog) under the
+/// `selected_mode` its snapshot selects.
+pub(crate) fn catalog_boundary_projection(
+    capabilities: ToolCatalogCapabilities,
+    catalog: Option<&[ToolCatalogEntry]>,
+    selected_mode: ToolCatalogMode,
+) -> CatalogBoundaryProjection {
+    let (true, Some(catalog)) = (capabilities.exact_catalog, catalog) else {
+        return CatalogBoundaryProjection::default();
+    };
+    let control_tool_names = catalog
+        .iter()
+        .filter(|entry| entry.plane == ToolPlaneClass::Control)
+        .map(|entry| entry.tool.name.clone())
+        .collect::<HashSet<_>>();
+    let defers = (!control_tool_names.is_empty() || capabilities.may_require_catalog_control_plane)
+        && matches!(selected_mode, ToolCatalogMode::Deferred);
+    let deferred_tool_names = if defers {
+        catalog
+            .iter()
+            .filter(|entry| entry.plane == ToolPlaneClass::Session)
+            .filter(|entry| {
+                matches!(
+                    entry.deferred_eligibility,
+                    ToolCatalogDeferredEligibility::DeferredEligible { .. }
+                )
+            })
+            .map(|entry| entry.tool.name.clone())
+            .collect()
+    } else {
+        HashSet::new()
+    };
+    CatalogBoundaryProjection {
+        defers,
+        control_tool_names,
+        deferred_tool_names,
     }
 }
 

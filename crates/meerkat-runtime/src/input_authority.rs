@@ -1941,6 +1941,168 @@ pub(crate) mod tests {
             ),
             "a failure to read is retryable, never a refusal"
         );
+
+        // A selected row that is not a contributor (a resumed run's staged
+        // resume input) is accepted only from its own retained resume row.
+        let c_input = driver.input("caller-c");
+        let c_state = accepted_state(driver.accept_input(c_input).await.expect("c"));
+        let c = own_authority(&c_state);
+        let d_input = driver.input("caller-d");
+        let d_state = accepted_state(driver.accept_input(d_input).await.expect("d"));
+        let d = own_authority(&d_state);
+        let resume_id = InputId::new();
+        let bound = |original: &RetainedInputAuthority| {
+            let (binding, batch) = association_binding(original.association()).expect("binding");
+            (binding.expect("binding"), batch.expect("batch key"))
+        };
+        // The resumed run: these contributors, its one selected row the
+        // resume input, bound under `canonical`.
+        let resumed_identity = |contributors: &[RetainedInputAuthority],
+                                canonical: &RetainedInputAuthority| {
+            crate::retained_work::identity_from(
+                &runtime,
+                meerkat_core::lifecycle::RunId::new(),
+                contributors,
+                &std::collections::BTreeMap::from([(resume_id.to_string(), bound(canonical))]),
+                Some(selection.clone()),
+            )
+            .expect("identity")
+        };
+        // The identity a resume row records: the run it resumes.
+        let recorded = |runtime: &LogicalRuntimeId, originals: &[RetainedInputAuthority]| {
+            retained_identity(runtime, originals, &selection)
+        };
+        let resume_row =
+            |carried: Vec<RetainedInputAuthority>,
+             record: Option<meerkat_core::retained_work::RetainedWorkIdentity>| {
+                let mut row = state.clone();
+                row.input_id = resume_id.clone();
+                row.authority_contributors = carried;
+                row.retained_resume =
+                    record.map(|identity| crate::retained_work::RetainedResumeRecord {
+                        identity,
+                        delivery: crate::retained_work::RetainedResumeDelivery {
+                            address: runtime.clone(),
+                            delivery_id: crate::delivery_inbox::RuntimeDeliveryId::new(
+                                "continuation:resume",
+                            )
+                            .expect("id"),
+                            delivery_sequence: 1,
+                            submission_digest: "submission".into(),
+                        },
+                    });
+                row
+            };
+        let held = |rows: Vec<crate::input_state::InputState>| {
+            move |input_id: &InputId| {
+                Ok::<_, RuntimeDriverError>(
+                    rows.iter().find(|row| &row.input_id == input_id).cloned(),
+                )
+            }
+        };
+        let resumed_a = resumed_identity(std::slice::from_ref(&a), &a);
+        assert_eq!(
+            resolve_contributors(
+                &runtime,
+                &resumed_a,
+                held(vec![
+                    state.clone(),
+                    resume_row(
+                        vec![a.clone()],
+                        Some(recorded(&runtime, std::slice::from_ref(&a)))
+                    ),
+                ])
+            )
+            .expect("a verified resume row"),
+            vec![a.clone()]
+        );
+        let refused_cases = [
+            (
+                "a recorded identity naming other originals",
+                resumed_a.clone(),
+                vec![
+                    state.clone(),
+                    resume_row(
+                        vec![a.clone()],
+                        Some(recorded(&runtime, std::slice::from_ref(&c))),
+                    ),
+                ],
+            ),
+            (
+                "a recorded identity of another runtime",
+                resumed_a.clone(),
+                vec![
+                    state.clone(),
+                    resume_row(
+                        vec![a.clone()],
+                        Some(recorded(
+                            &LogicalRuntimeId::new("another-runtime"),
+                            std::slice::from_ref(&a),
+                        )),
+                    ),
+                ],
+            ),
+            (
+                "a recorded identity of a different length",
+                resumed_a.clone(),
+                vec![
+                    state.clone(),
+                    resume_row(
+                        vec![a.clone()],
+                        Some(recorded(&runtime, &[a.clone(), c.clone()])),
+                    ),
+                ],
+            ),
+            (
+                "carried originals beyond the contributors",
+                resumed_a.clone(),
+                vec![
+                    state.clone(),
+                    c_state.clone(),
+                    resume_row(
+                        vec![a.clone(), c.clone()],
+                        Some(recorded(&runtime, &[a.clone(), c.clone()])),
+                    ),
+                ],
+            ),
+            (
+                "carried originals that are not one contiguous window",
+                resumed_identity(&[a.clone(), c.clone(), d.clone()], &a),
+                vec![
+                    state.clone(),
+                    c_state.clone(),
+                    d_state.clone(),
+                    resume_row(
+                        vec![a.clone(), d.clone()],
+                        Some(recorded(&runtime, &[a.clone(), d.clone()])),
+                    ),
+                ],
+            ),
+            (
+                "a row that carries the originals but is not a resume",
+                resumed_a.clone(),
+                vec![state.clone(), resume_row(vec![a.clone()], None)],
+            ),
+        ];
+        for (case, identity, rows) in refused_cases {
+            assert!(
+                no_binding(resolve_contributors(&runtime, &identity, held(rows))),
+                "{case}"
+            );
+        }
+        assert!(
+            matches!(
+                resolve_contributors(&runtime, &resumed_a, |input_id: &InputId| {
+                    if input_id == &resume_id {
+                        Err(crate::input_authority::unavailable())
+                    } else {
+                        Ok(Some(state.clone()))
+                    }
+                }),
+                Err(RuntimeDriverError::ValidationFailed { .. })
+            ),
+            "a failure to read a selected resume row is retryable, never a refusal"
+        );
     }
 
     #[tokio::test]

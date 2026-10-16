@@ -177,8 +177,9 @@ under `### Breaking`. The common ones:
 - In a governed realm, sessions a schedule materializes are not bound to an
   agent yet, so their configured MCP servers are unavailable.
 - `rkat-rpc`: a mob's members reach callback tools only through the
-  connection whose `mob/create` created that mob; a restored mob has no
-  callback route. Re-create it to bind a live connection.
+  connection that holds the mob's callback route (its creator, or the
+  connection that claimed it). A restored mob has no route until a
+  connection calls `mob/claim_callback_route`.
 
 ## Checklist
 

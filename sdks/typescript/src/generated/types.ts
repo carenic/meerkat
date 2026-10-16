@@ -1,9 +1,9 @@
 // Generated wire types for Meerkat SDK
-// Contract version: 0.9.1
+// Contract version: 0.9.2
 
 import { MeerkatError } from "./errors.js";
 
-export const CONTRACT_VERSION = "0.9.1";
+export const CONTRACT_VERSION = "0.9.2";
 
 export type Value = unknown;
 
@@ -2275,6 +2275,10 @@ export interface MobRotateSupervisorResult {
   mob_id: string;
   ok: boolean;
   report: SupervisorRotationReportWire;
+}
+
+export interface MobClaimCallbackRouteResult {
+  mob_id: string;
 }
 
 export interface MobSubmitWorkParams {

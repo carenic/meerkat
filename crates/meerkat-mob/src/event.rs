@@ -950,7 +950,15 @@ pub enum MobEventKind {
     ///
     /// Diagnostic only: the mob keeps running and its phase is unchanged.
     /// `member_id` and `session_id` name the exact notification target the
-    /// resume planned; `reason` is the delivery failure.
+    /// resume planned; `reason` is the delivery failure. It is final: it is
+    /// recorded once the notification's runtime input has failed terminally,
+    /// after the runtime's bounded retries, and never for a notification a
+    /// retry delivers. A retried input whose session stops progressing (no
+    /// run holds the input, it gains no attempt, and the session runs no
+    /// turn, for a whole check period) is reported with the failed
+    /// attempt. Only the in-process lifecycle task waiting for the input
+    /// records it, so a crash between the first failed attempt and the
+    /// input's terminal loses the event.
     OrchestratorResumeNotificationFailed {
         member_id: AgentIdentity,
         session_id: SessionId,

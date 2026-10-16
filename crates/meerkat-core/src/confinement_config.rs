@@ -390,6 +390,22 @@ pub enum ConfinementFlagsError {
 }
 
 impl ConfinementFlags {
+    /// Whether [`Self::selection`] resolves a path against its base: a
+    /// `--confinement workspace` selection with a relative
+    /// `--confinement-read` or `--confinement-write` path. Otherwise the
+    /// selection never reads its base, so a process reads its working
+    /// directory for it only when this holds, and one started without such
+    /// a path does not depend on that directory (it may have been removed).
+    #[must_use]
+    pub fn needs_working_directory(&self) -> bool {
+        self.mode == Some(ConfinementFlagMode::Workspace)
+            && self
+                .read
+                .iter()
+                .chain(&self.write)
+                .any(|path| path.is_relative())
+    }
+
     /// The selection the flags state, or `None` without `--confinement`.
     /// Relative paths resolve against `base`, the process's working
     /// directory; `.` and `..` components are refused, not normalized.
@@ -676,6 +692,45 @@ requirement = { baseline = "command_runtime_v1", read = { kind = "paths", paths 
                 network: WorkspaceNetwork::Unrestricted,
                 read: vec!["/opt/tool".into()],
                 write: vec!["/work/target".into()],
+            })))
+        );
+    }
+
+    #[test]
+    fn only_a_relative_workspace_path_needs_the_working_directory() {
+        let workspace = |read: &[&str], write: &[&str]| ConfinementFlags {
+            mode: Some(ConfinementFlagMode::Workspace),
+            network: None,
+            read: read.iter().map(PathBuf::from).collect(),
+            write: write.iter().map(PathBuf::from).collect(),
+        };
+        assert!(!ConfinementFlags::default().needs_working_directory());
+        assert!(
+            !ConfinementFlags {
+                mode: Some(ConfinementFlagMode::TrustedHost),
+                ..ConfinementFlags::default()
+            }
+            .needs_working_directory()
+        );
+        assert!(!workspace(&[], &[]).needs_working_directory());
+        assert!(!workspace(&["/opt/tool"], &["/tmp/build"]).needs_working_directory());
+        assert!(workspace(&["tool"], &[]).needs_working_directory());
+        assert!(workspace(&["/opt/tool"], &["build"]).needs_working_directory());
+        // Without the workspace mode a path is a usage error, never resolved.
+        assert!(
+            !ConfinementFlags {
+                write: vec!["build".into()],
+                ..ConfinementFlags::default()
+            }
+            .needs_working_directory()
+        );
+        // A selection that needs no base never reads it.
+        assert_eq!(
+            workspace(&["/opt/tool"], &[]).selection(Path::new("")),
+            Ok(Some(LaunchConfinement::Workspace(WorkspaceConfinement {
+                network: WorkspaceNetwork::Denied,
+                read: vec!["/opt/tool".into()],
+                write: vec![],
             })))
         );
     }

@@ -204,9 +204,10 @@ impl Fixture {
     }
 
     async fn router(&self, apps: bool) -> McpRouter {
-        let mut router = McpRouter::new_with_surface_handle(Arc::new(
-            meerkat_runtime::RuntimeExternalToolSurfaceHandle::ephemeral(),
-        ));
+        let mut router = McpRouter::new_with_surface_handle_and_stdio_profile(
+            Arc::new(meerkat_runtime::RuntimeExternalToolSurfaceHandle::ephemeral()),
+            crate::McpStdioLaunchProfile::trusted_host(),
+        );
         if apps {
             router = router
                 .with_client_service_factory(Arc::new(crate::apps::McpAppsClientServiceFactory));
@@ -451,7 +452,9 @@ async fn app_resource_timeout_returns_through_native_outcome_and_releases_lease(
         );
         assert!(matches!(
             audit.observations.lock().unwrap().as_slice(),
-            [OperationObservation::Entry]
+            [OperationObservation::Entry(
+                meerkat_core::OperationEntryBoundary::McpResourceRead
+            )]
         ));
         tokio::time::pause();
         tokio::time::advance(Duration::from_secs(16)).await;
@@ -464,7 +467,7 @@ async fn app_resource_timeout_returns_through_native_outcome_and_releases_lease(
         assert!(matches!(
             audit.observations.lock().unwrap().as_slice(),
             [
-                OperationObservation::Entry,
+                OperationObservation::Entry(meerkat_core::OperationEntryBoundary::McpResourceRead),
                 OperationObservation::Outcome(OperationObservedOutcome::SourceReadUnavailable),
             ]
         ));
@@ -514,7 +517,7 @@ async fn app_resource_outer_cancellation_observes_unavailable_before_lease_relea
         assert!(matches!(
             audit.observations.lock().unwrap().as_slice(),
             [
-                OperationObservation::Entry,
+                OperationObservation::Entry(meerkat_core::OperationEntryBoundary::McpResourceRead),
                 OperationObservation::Outcome(OperationObservedOutcome::SourceReadUnavailable),
             ]
         ));

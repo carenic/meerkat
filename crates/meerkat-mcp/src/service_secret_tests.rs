@@ -440,7 +440,10 @@ fn the_launch_configuration_carries_resolved_secrets_under_the_connector_project
 #[tokio::test]
 async fn a_refused_secret_server_leaves_its_permitted_sibling_serving() {
     let handle = Arc::new(meerkat_runtime::RuntimeExternalToolSurfaceHandle::ephemeral());
-    let mut router = crate::McpRouter::new_with_surface_handle(handle);
+    let mut router = crate::McpRouter::new_with_surface_handle_and_stdio_profile(
+        handle,
+        crate::McpStdioLaunchProfile::trusted_host(),
+    );
     let refused = router.add_server(secret_server("search")).await;
     assert!(
         matches!(

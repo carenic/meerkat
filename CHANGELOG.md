@@ -35,6 +35,14 @@ them.
 
 ## [Unreleased]
 
+### Breaking
+
+- Behaviour-only (not measured by the gate): `meerkat-mcp` closes a stdio
+  MCP server's stderr shortly after its process is gone. A descendant that
+  outlives the server and still writes to stderr then gets `EPIPE` (or
+  `SIGPIPE`); on a trusted-host launch it used to inherit the host's stderr
+  and could keep writing there (see Changed).
+
 ### Added
 
 - `meerkat-core`, `meerkat-mcp`: typed host diagnostics for a stdio MCP
@@ -60,8 +68,11 @@ them.
     them, resolved secrets and the connector binding first; each line of a
     multi-line value is also tracked.
   - A private key cut at the tail's edge is redacted up to its END marker.
-  - Control characters other than line feed and tab are removed, so the
-    tail carries no terminal escape sequences.
+  - Control characters other than line feed and tab are removed, and so
+    are the bidirectional and zero-width format characters, so the tail
+    carries no terminal escape sequences and cannot reorder or hide its
+    text. Launch values are matched after that strip, so bytes the strip
+    removes cannot split one past the redaction.
   - Redaction is defence in depth only. The tail never reaches the model,
     lifecycle notices, events or errors.
   - The model's setup-failure notice is unchanged and carries no class.
@@ -128,15 +139,6 @@ them.
   router lock once it has taken the router, so a reader (an attempt guard's
   finish among them) no longer waits for the shutdown to finish; it finds
   the router gone.
-- The release workflow's `Build Web SDK package` job runs beside the release
-  validation and the semver gate once `Require green CI` passes, instead of
-  after them. Its Cargo build runs four jobs instead of one: the release
-  tree's `scripts/release-web-sdk-rustc-wrapper` compiles the machine
-  catalog crate (12.8 GiB in one rustc) apart from the other memory-heavy
-  wasm32 crates, so the build peaked at 13.0 GiB instead of 18.8 GiB at four
-  plain jobs; a tree without a wrapper that matches its crates builds at one
-  job. Locally, on four vCPUs, the Cargo phase took about 11 minutes instead
-  of 24 at one job (33m43s in the v0.9.1 tag run).
 - `meerkat-mcp`: a stdio MCP server's stderr is now piped and drained by its
   process custody. Before, it was inherited on a trusted-host launch and
   discarded under confinement.
@@ -148,6 +150,569 @@ them.
   - Shortly after the process is gone, the drain stops, forwarding
     included, and closes its end. A descendant still writing to stderr then
     gets `EPIPE` (or `SIGPIPE`).
+
+## [0.9.2] - 2026-10-16
+
+### Breaking
+
+- Per-model stream-inactivity windows (see Added) add the public
+  `stream_inactivity_timeout_secs: Option<u64>` field to the following
+  constructible Rust structs; struct literals must set it (`None` keeps the
+  global window):
+  - `meerkat_core::model_profile::capabilities::ModelCapabilities::stream_inactivity_timeout_secs`
+  - `meerkat_core::model_profile::ModelProfile::stream_inactivity_timeout_secs`
+  - `meerkat_core::config::SelfHostedModelConfig::stream_inactivity_timeout_secs`
+
+  `ModelProfile` and `SelfHostedModelConfig` omit the field when it is unset,
+  so existing documents keep their bytes.
+- Behaviour-only (not measured by the gate): a model fallback switch
+  (`AgentLlmFallbackSwitch`) whose `target_profile` witness was not judged
+  for the target identity's own binding
+  (`ModelProfileWitness::judged_for_identity`) is refused with
+  `AgentError::ConfigError`; the activation used to replace it with the
+  model row's profile. A custom `AgentLlmClient` that proposes fallbacks to
+  targets that name a binding must mint their witnesses with
+  `ModelRegistry::profile_witness_for_identity`.
+- Builtin web_search target and delegated hosted search (see Added).
+  `meerkat-authorization`: `grant_policy::operation_grant_target` takes the
+  operation's `&PreparedAuthorizationBinding` instead of its
+  `&OperationAuthorizationFacts`: a delegated hosted search selects its own
+  route's lineage from its binding, where the facts alone would select the
+  base. Callers pass the binding they already hold.
+  `meerkat-authorization-contracts`: `AuthorizationAuditObservation` gains
+  `delegate_attribution: Option<AuditDelegateAttribution>` (struct literals
+  add `delegate_attribution: None`). No exhaustive public enum gains a
+  variant: `ToolOperationTarget` and `GrantTarget` are non-exhaustive.
+  Persisted format (not measured by the gate; the stored version is
+  unchanged): `GrantTarget`'s new `BuiltinToolOperation { operation }` and
+  `DelegatedHostedSearch { route, capability }` are ordered after every
+  earlier target kind, so existing selections keep their order and
+  canonical bytes. A binary without this change cannot read a work
+  association whose targeted selection names one of them, nor an input row
+  whose audit holds a delegate attribution. Every governed web_search helper
+  decision records one, under any grant basis, so this reaches every
+  governed session that ran web_search. 0.9.1 treats such input rows as
+  corrupt and recovery skips them; drain governed work before downgrading.
+  Associations and rows that use neither are unchanged.
+- Behaviour-only (not measured by the gate): the builtin web_search call's
+  plan now carries a `ToolOperationTarget::BuiltinOperation` target under
+  every grant basis, a single `GrantLineage` included. A host policy owner
+  that refuses operation targets it does not map now refuses web_search
+  where it used to allow it; this fails closed, and mapping the target
+  restores it.
+- Behaviour-only (not measured by the gate): under a targeted grant basis
+  the builtin web_search call selects only its `BuiltinToolOperation`
+  lineage and its helper's model request only its `DelegatedHostedSearch`
+  lineage, never the base, so a host that admitted the helper's inference
+  under the base now sees Denied until it selects the delegate (a single
+  `GrantLineage` basis is unchanged). A governed web_search whose context
+  does not carry the dispatch's own prepared call is refused as malformed
+  facts before its helper runs. A stock realm with a per-target selection
+  refuses web_search as Denied (no lineage is selected for it) instead of
+  Unavailable; a legacy single stock grant still leaves it Unavailable. A
+  web_search plan is refused at dispatch as `ExecutionOwnerChanged` when it
+  reaches another composite dispatcher that registered web_search as its
+  own builtin, when the same composite replaced a
+  builtin registration after resolving it, or when another owner (such as
+  an external tool) now holds the name: a plan that carries the composite's
+  builtin witness runs only on that builtin.
+- Behaviour-only (not measured by the gate): comms and `memory_search`
+  operations carry typed operation targets (see Added). Under a targeted
+  grant basis (`WorkAuthorityBasis::TargetedGrantLineages`) each resolves
+  only the lineage selected for its own target and is denied without one;
+  the base lineage no longer covers them. A stock realm issues no peer,
+  peer-directory or memory grant, so its per-target selections now deny
+  these operations at the grant owner, where the stock policy used to
+  report them unmapped (`operation_authorization_unavailable`).
+- Behaviour-only (not measured by the gate): a comms tool call whose
+  addressee cannot be determined (arguments that do not parse as the tool's
+  input, or a `reply_to_peer` that selects no single delivery of the turn)
+  now fails at execution-plan resolution with `invalid_arguments` and the
+  handler's own reason, where it failed at dispatch with `execution_failed`.
+- Behaviour-only (not measured by the gate): under governed work the comms
+  tools and `memory_search` run only when the dispatch's prepared
+  authorization names exactly the typed target they are about to reach (the
+  peer a delivery reaches, the peer directory, or the read of the memory
+  scope searched). A wrapper that forwards their `dispatch_with_context` but
+  resolves its own plan without that target (which a base lineage would
+  cover), or with another one, is now refused with `authorization_refused`
+  (malformed facts) before any delivery or memory read. Forward
+  `resolve_execution_plan` and `dispatch_resolved_with_context` to the
+  owning dispatcher instead. A context that carries work authorization
+  without its prepared check, or the reverse, is malformed for them (as for
+  `ToolDispatchContext::check_tool_authorization`), never ungoverned.
+  Ungoverned dispatch is unchanged.
+- Behaviour-only (not measured by the gate): under governed work the fenced
+  tool dispatch (`dispatch_tool_execution_plan_fenced`, which the agent
+  loop uses) refuses, before preparation, a plan for a tool whose root
+  catalog provenance is comms or memory unless every operation target it
+  carries is of that owner's kind (a peer delivery or the peer directory
+  for comms, a memory operation for memory) and it carries one, with
+  `authorization_refused` (malformed facts). Another owner's target, such
+  as the bundle target a registered Rust bundle attaches to a plan that
+  names none, does not stand in for it. Such a plan comes from a wrapper
+  that does not forward `resolve_execution_plan` to the owner and may also
+  drop the dispatch context, where the owner could no longer check its
+  target. This includes the deprecated
+  `SendTool` and `PeersTool` builtins (see Deprecated).
+- Behaviour-only (not measured by the gate): the comms dispatchers
+  (`CommsToolSurface`, `CommsToolDispatcher`, `DynCommsToolDispatcher`) and
+  `MemorySearchDispatcher` own their execution plans: their
+  `dispatch_resolved_with_context` refuses, as unavailable
+  (`ExecutionOwnerChanged`), a plan they did not resolve themselves for
+  exactly the call's current target and binding. A wrapper that forwards
+  `dispatch_resolved_with_context` to them but resolves its own plan (does
+  not forward `resolve_execution_plan`) no longer runs these tools; forward
+  both.
+- Behaviour-only (not measured by the gate): a host `OperationPolicyOwner`
+  now reads an owner-produced target for the comms tools and
+  `memory_search`: `single_tool_operation_target` returns
+  `Some(PeerSend { .. })`, `Some(PeerDirectoryRead)` or
+  `Some(MemoryOperation { .. })` where it returned `None`. An owner that
+  mapped these tools in its target-less arm (for example by tool name) no
+  longer reaches that arm for them; map the new targets instead.
+- Persisted format (not measured by the gate): a work association whose
+  targeted selection names a `peer`, `peer_directory` or `memory` target
+  cannot be read by a binary without this change (such as 0.9.1), and
+  neither can a `prepared` authorization audit record of any operation of
+  such work, which embeds the work's whole authority basis
+  (`AuditPolicyRead::operation_authorities`). Such a binary fails to decode
+  the record with an unknown-variant error naming the target kind; it never
+  reads it as another target. Associations and audit records that name none
+  of them are unchanged.
+- Audit entries name their boundary (see Added). `meerkat-core`:
+  `OperationObservation::Entry` is now `Entry(OperationEntryBoundary)`
+  instead of a unit variant, so a match needs `Entry(_)` or a boundary, and
+  `PreparedOperationCheck::observe_entry` takes the observing boundary,
+  `observe_entry(boundary: OperationEntryBoundary)`; a custom model
+  transport (for example an `LlmClient::stream_prepared` fixture) passes
+  `OperationEntryBoundary::ModelRequest`.
+  `meerkat-authorization-contracts`: `AuditObservation::Entry` is now the
+  struct variant `Entry { boundary: Option<OperationEntryBoundary> }`
+  instead of a unit variant, so a match needs `Entry { .. }`. Persisted
+  audit records (not measured by the gate): a new entry record adds the
+  boundary (`{"kind": "entry", "boundary": "tool_effect"}`); a record
+  written before decodes with `boundary: None` and re-encodes unchanged,
+  and a reader built before this change ignores the field and still decodes
+  the record as an entry. `SafeAuditObservation::EntryAttempt` is unchanged.
+- `meerkat-core`: `SessionBuildOptions` and `SessionBuildState` gain
+  `shell_timeout_secs: Option<NonZeroU64>`, and `meerkat`'s
+  `AgentBuildConfig` gains the same field (see Fixed: MCP
+  `builtin_config.shell_timeout_secs`). Struct-literal constructors must add
+  it; `None` keeps the previous behaviour. `SessionBuildState` skips it when
+  unset, so stored sessions keep their bytes.
+- `meerkat-core`: `ToolUnavailableReason` gains `CallbackRouteUnclaimed` (see
+  Added: `mob/claim_callback_route`). The enum is not `#[non_exhaustive]`;
+  exhaustive matches must add the variant.
+- Behaviour-only (not measured by the gate): `meerkat-mob`'s
+  `MobProvisioner::start_turn` for a runtime-backed member resolves at the
+  admitted input's terminal, not at an execution attempt the runtime
+  retries, so a turn whose retry succeeds returns success (see Fixed). The
+  wait checks every 120 s that the input's session is still progressing,
+  and a retried input counts as parked, ending the call with the failed
+  attempt, only when at a check no run holds it, it gained no attempt since
+  the last check, and its session has no running turn. A retry queued
+  behind another run of the session keeps waiting; a session that ran other
+  inputs during the period but is idle at the check, with the retry still
+  queued, counts as parked.
+- Behaviour-only (not measured by the gate): `meerkat-rpc` answers a turn or
+  event its session's runtime refuses to admit with the refusal's typed
+  JSON-RPC code instead of `-32603` (see Fixed), and its not-ready refusal
+  reads "the session runtime is <state> and does not admit this request"
+  instead of "runtime not ready for llm reconfiguration: <state>".
+- Behaviour-only (not measured by the gate): a config write that changes a
+  realm's own parent edge is refused (`confinement_administration_required`,
+  or invalid params when the new edge does not resolve) when the realm would
+  compose a different `[confinement]`, and a section one config document
+  states for another realm no longer replaces that realm's own edge (see
+  Fixed). Re-parent such a realm by editing its document as its host.
+- `meerkat_core::service::SessionBuildOptions` and `meerkat::AgentBuildConfig`
+  have a new `refused_mcp_servers` field (`Vec<McpServerRefusal>`); a struct
+  literal must add it (or use `..Default::default()` or
+  `AgentBuildConfig::new`).
+- `meerkat::HostMcpTargetRefusal` has a new variant `Refused { server_name,
+  refusal }` (an MCP auth target only an untrusted `mcp.toml` defines; see
+  Fixed); an exhaustive match must handle it.
+- `meerkat_llm_core::provider_runtime::ProviderAuthError` has a new variant
+  `HostLaunchRefused { exemption, refusal }` (a credential command a
+  confined process could change; see Fixed); an exhaustive match must handle
+  it.
+- `meerkat_rest::AppState` has a new public field `host_confinement`
+  (`meerkat::HostConfinement`); a struct literal must add it
+  (`HostConfinement::trusted_host()` keeps the previous behaviour).
+- Behaviour-only (not measured by the gate): a config write that changes the
+  realm sections of a realm's own document (its parent edge, or a
+  `[realm.global]` section) is also refused with
+  `governance_administration_required` when the realm would compose a
+  different `[governance]` (see Fixed).
+- Behaviour-only (not measured by the gate): a realm whose ancestor's own
+  config document is missing no longer composes (a missing parent), and
+  `rkat realm delete` and `rkat realm prune` keep a realm another realm's
+  document names as its parent, `--force` included (see Fixed).
+- Behaviour-only (not measured by the gate): under a host that confines
+  `mcp_stdio`, a stdio skill source runs confined (its program by absolute
+  path, only its configured environment, from the kind's working
+  directory), and under a host that confines every launch kind, a
+  credential command or Git skill cache a confined process could change is
+  refused. See Changed and Fixed.
+- `meerkat_core::ConfigError` has a new variant `CompositionAdministration
+  { administered, change, composer }`: a config write that changes realm
+  sections so that a realm would compose a different `[confinement]` or
+  `[governance]` (see Fixed). Refusals of changed realm sections use it
+  instead of `ConfinementAdministration` and `GovernanceAdministration`; an
+  exhaustive match must handle it. `ConfigError::administered_section`
+  gives the section of all three.
+- Behaviour-only (not measured by the gate): a credential command without
+  `cwd` runs from the user's home directory on every host, not from the
+  host's working directory, and a credential command the host refuses ends
+  its binding's resolution with `HostLaunchRefused` instead of falling back
+  to the next credential (see Fixed).
+- Behaviour-only (not measured by the gate): a write to the user document
+  that changes its realm sections is refused too when another realm would
+  compose a different `[confinement]` or `[governance]` afterwards, such as
+  removing or adding `[realm.global]` when the user document states
+  `[governance]` (see Fixed).
+- Behaviour-only (not measured by the gate): under a host that confines
+  any launch kind, the programs the host runs as itself (credential
+  commands, `git` for Git skill repositories, the browser opener, `stty`,
+  `wasm-pack`) no longer inherit the variables that make a program load
+  code or startup options from elsewhere (`LD_*`, `DYLD_*`, `PYTHON*`,
+  `NODE_OPTIONS`, `NODE_PATH`, `PERL5LIB`, `PERL5OPT`, `RUBYLIB`, `RUBYOPT`,
+  `BASH_ENV`, `ENV`, `GIT_DIR`, `GIT_WORK_TREE`, `GIT_EXEC_PATH` and the
+  like), and lose the paths a confined process could change from the
+  others; a credential command that needs such a variable states it in its
+  own `env` (see Fixed). A host that confines no launch kind runs them with
+  its environment as before.
+- `meerkat_core::ConfigError` has a new variant
+  `CredentialCommandAdministration { realm, profile }`: a config write that
+  adds a credential command or changes what one runs (see Fixed); an
+  exhaustive match must handle it. `ConfigError::administered_section`
+  gives it as `Confinement`.
+- Behaviour-only (not measured by the gate): a config write that adds a
+  credential command, or changes its program, arguments, environment or
+  working directory, is refused with `confinement_administration_required`
+  on every config write surface; the host edits the document instead (see
+  Fixed).
+
+### Security
+
+- Cargo.lock moves quinn-proto from 0.11.14 to 0.11.19, clearing
+  RUSTSEC-2026-0185, RUSTSEC-2026-0338, RUSTSEC-2026-0339, RUSTSEC-2026-0340
+  and RUSTSEC-2026-0342. No build compiled it: it is reachable only through
+  reqwest's weak `quinn` feature, which nothing enables
+  (`cargo tree --workspace --all-features --target all -i quinn-proto` is
+  empty), but lockfile scanners flagged it. Lockfile only; the new version
+  also locks the unused rand_pcg 0.10.2.
+
+### Added
+
+- `meerkat_core::model_profile::capabilities::ModelCapabilities::gemini_provider_tag_rejection`
+  says why a Gemini catalog row refuses the thinking level of a
+  `GeminiProviderTag` (see Fixed), and
+  `meerkat_core::lifecycle::run_primitive::GeminiThinkingLevel::as_effort_level`
+  names a Gemini thinking level in the catalog's `EffortLevel` vocabulary.
+- `meerkat_core::ModelRegistry::profile_witness_for_identity` mints a
+  `ModelProfileWitness` for an identity as its binding's backend serves it,
+  and `ModelProfileWitness::judged_for_identity` says whether a witness was
+  judged for exactly that identity, binding included (see Fixed).
+- Per-model stream-inactivity windows. A model's profile can carry its own
+  watchdog window: the catalog sets one where the provider documents
+  responses that can stay silent for minutes (`gemini-4-argon`, 900 s per
+  Google's 15-minute client-timeout guidance; `gpt-5.5-pro`, 7200 s, its call
+  timeout, since its requests can run for minutes without streaming), and a
+  self-hosted model can declare `stream_inactivity_timeout_secs` (for example
+  for a long prefill; config validation refuses a window below 60 s,
+  `meerkat_core::MIN_MODEL_STREAM_INACTIVITY_TIMEOUT`, twice the 30 s
+  post-finish trailer wait of the OpenAI-compatible client, so the watchdog
+  cannot race that wait). The window is resolved for each LLM call like
+  `call_timeout`: an explicit `[retry] stream_inactivity_timeout` (a duration,
+  or `"disabled"`) wins, then the current model's window, then the built-in
+  300 s, so a model change or fallback uses the new model's window. The 300 s
+  window used to apply to every model. Rust embedders get the provided
+  `ModelOperationalDefaultsResolver::stream_inactivity_timeout_for` (default
+  `None`) and `AgentBuilder::with_stream_inactivity_timeout_override`.
+- `meerkat-mob-mcp`: `MobMcpState::set_before_create` installs a
+  `MobBeforeCreate` hook that admits or refuses every mob the state creates
+  (an agent's `mob_create`, the implicit delegation mob, a temporary council,
+  a host's definition or mobpack create) before anything of the mob exists.
+  It gets a `MobCreateRequest` built by the create path itself: the mob id,
+  the owner bridge session (`None` only for a host's own create) and whether
+  the mob is that session's implicit delegation mob, which counts only under
+  the id derived from the session. The hook fails closed: a refusal or a
+  panic refuses the create with an error `MobMcpState::is_create_refusal`
+  recognizes, carrying the reason in its message and structured data (`kind`
+  `MOB_CREATE_REFUSED_KIND`). Restoring a persisted mob never asks it, and
+  neither does a handle a host registers itself with `mob_insert_handle` or
+  `try_mob_insert_handle`.
+- Governed builtin web_search: a typed operation target for the call and a
+  delegated hosted-search lineage for its helper. The composite dispatcher
+  states `ToolOperationTarget::BuiltinOperation { operation:
+  BuiltinToolOperation::WebSearch }` for the web_search builtin it
+  registered (the tool declares it through `BuiltinTool::builtin_operation`;
+  tools without a declaration keep their plans) and revalidates it at
+  dispatch against its exact registration: another composite that
+  registered web_search as its own builtin, another owner
+  key, a plan resolved before the composite replaced its web_search
+  executor (even with an identical schema), or a plan whose name another
+  owner now holds is `ExecutionOwnerChanged`, and no executor runs. This
+  rejects stale, wrong-owner and tampered plans within trusted Rust
+  composition; witness constructors are public, so it is not cryptographic
+  resistance to hostile in-process Rust code. A tool
+  merely named web_search (a host dispatcher's, a registered bundle's or an
+  undeclared builtin) has no such target unless its owner states it itself,
+  which an in-process dispatcher can. The
+  helper's own model request is the typed delegate of exactly that call:
+  `ToolDispatchContext::tool_delegate_attribution(call,
+  ToolDelegateRole::HostedSearchInference)` mints a `ToolDelegateAttribution`
+  only from the dispatch's own prepared call (matched by identity) whose plan
+  carries that target, `LlmRequestAuthorization::for_tool_delegate` carries
+  it, and `PreparedAuthorizationBinding::delegate_attribution` exposes it to
+  owners. The delegate binds only an inference with exactly one hosted search
+  capability (`WebSearch`, or `GoogleSearch` for a Gemini helper) and no live
+  channel, under the call's work, execution scope, run and context revision
+  with a fresh operation id, and never moves to another run. One
+  attribution can prepare helper requests until its run ends; each is its
+  own operation and needs its own current lineage. Under a
+  targeted basis `operation_grant_target` selects
+  `GrantTarget::BuiltinToolOperation { operation }` for the call and
+  `GrantTarget::DelegatedHostedSearch { route, capability }` for the helper,
+  where `route` is the helper's own `ControllerRouteKey`; the work and every
+  original (named contributors and further originals) use the same
+  selector, with their current ceilings and the earliest expiry. Choosing
+  a target erases no restriction: hosts issue the target lineages and every
+  contributor's ceiling with the original time, operation (including
+  read-only, which is an action set: `ExecutionRestrictions` has no
+  read-only flag), resource-domain and private-data restrictions, and a
+  typed public-search target or read-only declaration does not mean private
+  information cannot leave. The
+  attribution grants, inherits and exempts nothing: it keys the selection
+  and the protected audit record (`AuditDelegateAttribution {
+  parent_operation_id, role }`), which also records the helper's own
+  decision and authorization refusal before its provider send. A helper
+  rated R2 or R3 settles at its model entry as `unsupported_entry` or
+  `human_consent_required` whether or not a reviewer exists, and nothing
+  is sent; the model sees it as `operation_authorization_unavailable`
+  feedback, and no audit row records that review refusal (a limit of every
+  model request). Behaviour contract:
+  revoking the call's own lineage refuses later calls but does not cancel
+  an invocation that already entered, which may still make its authorized
+  helper request (the helper passes its own work, contributor, route,
+  capability and entry checks and inherits nothing of the call); revoking
+  the helper's or a contributor's lineage before the helper's send prevents
+  it. Neither undoes a provider effect or ends the run on a local refusal.
+  `ResolvedToolExecutionPlan::single_operation_target` states the one-target
+  rule `grant_policy::single_tool_operation_target` now forwards to, and
+  `ServerToolKind` derives `PartialOrd`, `Ord` and `Hash`. Stock issues no
+  grant for either target and leaves both unmapped: stock is unsupported for
+  this route, not stock coverage of web_search. Limit: operation review of
+  web_search is an unsupported slice, not review coverage. It has no
+  reviewed entry point, so a review its owner requires settles as local
+  feedback and the search never runs: R2 is `reviewer_missing` without a
+  reviewer and `unsupported_entry` with one; R3 is `human_consent_required`
+  without a human consent route and `unsupported_entry` with one.
+- Typed catalog mode and visibility query. `meerkat_core::ToolCatalogView`
+  (with `ToolCatalogViewEntry` and `ToolCatalogVisibility`: `Visible`,
+  `Deferred` or `Hidden`) reports how a live session's next model request
+  projects its tool catalog: the catalog mode it takes (deferred only when
+  the exact catalog selects it and a catalog control plane exists or may be
+  composed), sources still connecting, whether a staged visibility change
+  waits for the next boundary, and for each catalog entry its deferral
+  eligibility (with its typed source owner), callability and visibility to
+  the model. It is read without changing anything, by the rules each
+  model-call boundary applies; the boundary now computes its control and
+  deferred names through the same projection. `Agent::tool_catalog_view`,
+  `SessionAgent::tool_catalog_view` (defaulted to `None`),
+  `EphemeralSessionService::tool_catalog_view`,
+  `PersistentSessionService::tool_catalog_view` and
+  `MobSessionService::tool_catalog_view` (defaulted to `Ok(None)`) expose it
+  beside the existing tool-scope snapshot queries. Like those siblings it
+  is not exposed over JSON-RPC or REST. A host that attaches a
+  deferred-eligible operation can ask whether the session defers it instead
+  of inferring that from the operation's source kind.
+- Typed boundary identity on authorization audit entries. Several
+  boundaries can record the entry of one operation (each staging point on a
+  tool call's dispatch chain, then its effect), and each now names itself
+  with the new `meerkat_core::OperationEntryBoundary`: `ToolDispatch` (the
+  root dispatch or an adapter staging the call), `ToolExecutionPolicy` (the
+  call-level execution policy gate), `ToolEffect` (the owning leaf's entry
+  immediately before its effect or transport handoff), `McpResourceRead`,
+  `McpAttachment`, `ModelRequest`, `ContextAppend` and `ReviewContextRead`.
+  The new `ToolDispatchContext::observe_tool_entry_at` stages a tool entry
+  at a named boundary; `observe_tool_entry` keeps its signature and names
+  `ToolDispatch`.
+- Typed grant targets for peer (comms) and memory operations.
+  `meerkat-core`: `ToolOperationTarget` gains `PeerSend { peer, kind }` (one
+  delivery to exactly one peer, by its canonical `PeerId`),
+  `PeerDirectoryRead` (a read of the session's own trusted-peer directory)
+  and `MemoryOperation { scope, operation }`, with the new `PeerSendKind`
+  (`Message`, `Request`, `Response`), `MemoryOperation` (`Read`, `Write`,
+  `Delete`, `Propose`) and `MemoryScopeRef` (`Session { session_id }`,
+  `Host { owner, scope }`, with `is_named()`), and
+  `MemorySearchScope::scope_ref()`. `SessionId` implements `PartialOrd` and
+  `Ord`. The default plans of the comms tools carry these targets:
+  `CommsToolSurface` (meerkat-tools) and `CommsToolDispatcher` and
+  `DynCommsToolDispatcher` (meerkat-comms), through the new
+  `meerkat_comms::CommsExecutionAuthority` and
+  `meerkat_comms::comms_tool_operation_target`, attach the peer each
+  delivery reaches (the `peer_id` of `send_message`, `send_request` and
+  `send_response`; for `reply_to_peer`, the sender of the turn's peer
+  message it selects) and the peer directory for `peers`.
+  `MemorySearchDispatcher` attaches a `Read` of the session memory it
+  searches. Each owner revalidates its own target at dispatch, so a plan
+  resolved for one peer never delivers to another, and under governed work
+  each runs only when the prepared authorization names exactly that target,
+  through the new `ToolDispatchContext::require_authorized_operation_target`
+  (for any owner whose effect a typed target selects) and
+  `CommsExecutionAuthority::require_authorized_target`. These guarantees
+  hold when every wrapper between the root dispatcher and the owner
+  forwards `resolve_execution_plan` and `dispatch_resolved_with_context`
+  with its context; the fenced dispatch refuses a governed comms or memory
+  plan that carries no target of its owner's kind.
+  `meerkat-authorization-contracts`: `GrantTarget` gains `Peer { peer }`,
+  `PeerDirectory` and `Memory { scope }`, and `meerkat-authorization`'s
+  `operation_grant_target` selects them on the normal targeted grant path:
+  one lineage per peer, per memory scope and for the peer directory, never a
+  wildcard and never the base. An embedding host maps the typed facts to its
+  own actions and selects one grant per target. The peer targets cover only
+  the five comms tools (`send_message`, `reply_to_peer`, `send_request` and
+  `send_response` select `Peer`, and `peers` selects `PeerDirectory`).
+  Other tools that reach agents, such as `delegate`, `council`,
+  `mob_spawn_member` and a mob member's calls up to its mob's operator,
+  carry no peer target and stay on the work's base lineage, which a `Peer`
+  lineage neither widens nor narrows. A `send_response` delivery's
+  addressee is the caller's assertion: the runtime checks that its request
+  id names a request this session received and can still answer, but
+  records no requester, so its `Peer` target names the peer the response is
+  delivered to, not a verified requester. `PeerSendKind` is descriptive, not
+  an authority boundary: lineage selection ignores it, so a host maps
+  `Response` to the same action as `Message`. A `Peer` lineage fences only
+  this session's own comms-tool deliveries and is not an egress fence for
+  mob members: `mob_spawn_member` delivers a caller-chosen initial message
+  to a member that can inherit tools, and `mob_wire` accepts an external
+  peer binding within the mob's scope, so a member can send to that peer
+  under its own admission. A host that uses `Peer` lineages as an egress
+  fence keeps the mob tools (at least `mob_wire` with external bindings)
+  off the base lineage.
+- `meerkat-rpc`: `mob/claim_callback_route {mob_id}` binds a mob's member
+  callback route to the calling connection (#1459). A mob restored after a
+  restart had no callback route: its members were rebuilt before any
+  connection could offer one, so their callback tools were absent until the
+  mob was re-created. Every member of an RPC mob now calls its callback
+  tools through a per-mob route slot. `mob/create` still gives it to the
+  creating connection; a restored mob's slot starts empty on a
+  connection-owned server such as `rkat-rpc` (an embedding host that
+  installed the process-default callback channel keeps it held by that
+  route), and the claim fills it for the mob's live members and later ones
+  alike. The claim needs the console owner and the mob state's admission
+  (the host's create hook is not asked, since a claim creates nothing), and
+  is refused with `-32002` (`data.reason`: `held_by_open_connection`) while
+  the connection that holds the route is open. When that connection closes,
+  or before any claim, a member's callback fails `tool_unavailable` with the
+  `CallbackRouteUnclaimed` reason ("no connected client holds the callback
+  route that serves it") instead of reaching a closed route, and a detached
+  callback call writes nothing durable. Once the holder has closed, the
+  first claim wins, including the pending detached callback jobs the closed
+  connection's tools started: a claimer that registers tools of the same
+  name and runner reconciles and cancels them. The
+  Python (`mob_claim_callback_route`) and TypeScript
+  (`mobClaimCallbackRoute`) clients wrap it, and `meerkat-contracts` adds
+  `MobClaimCallbackRouteResult`. For hosts: `meerkat-mob-mcp` adds
+  `MemberExternalToolsFactory`, `MemberExternalTools` and
+  `MemberExternalToolsOnManaged` (member external tools built per mob,
+  restored mobs included, with a hook that runs once the mob is managed),
+  `MobMcpState::with_member_external_tools_factory` and
+  `MobMcpState::mob_claim_member_external_tools`; `meerkat-rpc` adds
+  `MobCallbackRouteSlot`, `MobCallbackRouteClaimRefused`,
+  `CallbackToolDispatcher::from_mob_slot` (and `_with_job_runtime`),
+  `CallbackRoute::same_connection` and
+  `SessionRuntime::callback_tool_dispatcher_for_mob_slot`.
+- `FileConfigStore::with_realm_chain` declares a store's document a realm's
+  own document, composed with the other documents a `RealmConfigSource`
+  supplies, so its writes keep the `[confinement]` the realm composes (see
+  Fixed).
+- `ConfinementFlags::needs_working_directory` says whether a
+  `--confinement*` selection resolves a relative path against the working
+  directory.
+- `meerkat_core::McpServerRefusal`: a configured MCP server the host refused
+  before setup, with its typed `ConfinementRefusal`. The new
+  `SessionBuildOptions::refused_mcp_servers` and
+  `AgentBuildConfig::refused_mcp_servers` carry such refusals into a session
+  build, where the factory stages each one refused
+  (`McpRouterAdapter::stage_add_refused`), so the model sees the refusal in
+  that server's failed-setup MCP system notice.
+- `HostInput::CredentialStore` and `HostConfinement::credential_store_input`
+  add a host's file credential store to its administration inputs;
+  `HostConfinement::untrusted_directory` judges a convention directory as a
+  whole; `meerkat_skills::resolve_repositories_with_roots_trusting` resolves
+  skill repositories under a `meerkat_skills::SkillHostBoundary`: the paths
+  the host does not trust (`with_untrusted_paths`, an `UntrustedPaths`
+  predicate; `HostConfinement::untrusted_paths` builds one) and the runner
+  of stdio skill sources (`with_stdio_runner`).
+- `meerkat_core::HostLaunchExemption`: the typed list of the processes a
+  stock host runs as itself, outside its OS process confinement (the Git
+  skill source, the credential command, the browser opener, `stty` and
+  `wasm-pack`), each with its reason and one fixed-program constructor
+  (`git`, `credential_command`, `browser_opener`, `terminal_control`,
+  `wasm_pack`), and `meerkat_core::confinement::program_routes`, the files
+  a launch of a program could execute. Given a host's judgement (an
+  `UntrustedPathFn`), each constructor launches with a `PATH` cleaned by
+  `meerkat_core::confinement::trusted_search_path`, which drops relative
+  directories and the directories the judgement does not trust; without
+  one the host's environment passes as it is.
+- `meerkat_core::confinement::trusted_environment` gives the environment a
+  host launch exemption runs with under confinement, and
+  `meerkat_core::confinement::apply_configured_environment` applies an
+  operator's configured environment to one, each without the paths a
+  confined process could change; `HostConfinement::launch_guard` gives the
+  host's judgement for them, `None` when no launch kind is confined.
+- `meerkat::open_system_browser_trusting` opens a URL with the platform
+  browser opener under a host's `UntrustedPathFn`, and
+  `CommandCredentialRunner::with_untrusted_paths` runs a credential command
+  under one.
+- `ResolverEnvironment::with_host_launch_guard` (a `HostLaunchGuard`) makes
+  credential resolution refuse a credential command a confined process could
+  change.
+- `meerkat::resolve_configured_mcp_target_in_realm_trusting` resolves an MCP
+  auth target without the `mcp.toml` files a predicate does not trust.
+- `meerkat_skills::StdioSkillRunner` (with `StdioSkillLaunch`,
+  `StdioSkillOutput`, the default `TrustedHostStdioSkillRunner` and
+  `StdioExternalClient::with_runner`) is the launch seam of stdio skill
+  sources.
+- `FilesystemSkillSource::with_untrusted_targets` judges a linked skill
+  where its link leads, and `GitSkillSource::with_untrusted_paths` runs
+  `git` from a `PATH` without the directories a host does not trust.
+- `McpServerRefusal::reported_name`: the name a session reports a refused
+  server under, and `meerkat_core::mcp_config::refused_server_names`, the
+  distinct names a session stages its refused servers under.
+- `meerkat_core::AdministeredSection` (`Confinement`, `Governance`) and
+  `ConfigError::administered_section`, the section a refused config write
+  would change.
+- `SdkConfigStore::with_realm_document` builds a realm document store that
+  keeps the realm's composed `[confinement]` and `[governance]`
+  (`FileConfigStore::with_realm_chain`).
+- `meerkat-live`: `LiveQuietAppendTiming` and
+  `LiveSidebandCommand::append_text_chat_context`, a quiet (thinking-lane)
+  context append that waits out a voiced model response.
+  `meerkat-openai`: `PublicLiveBrokerSession::append_text_chat_context`.
+
+### Changed
+
+- `meerkat-runtime`: `AuthenticatedOriginalSource::authenticated_original`
+  now documents the contract host adapters must meet, which
+  `retained_original` already stated: native admission calls it
+  synchronously while it holds the session's mutation gate and driver lock,
+  so it performs no I/O, never blocks and takes no native lock its caller
+  may already hold. A read that blocks there holds up that session's other
+  admissions and the start of its admitted runs for as long as it blocks.
+- The release workflow's `Build Web SDK package` job runs beside the release
+  validation and the semver gate once `Require green CI` passes, instead of
+  after them. Its Cargo build runs four jobs instead of one: the release
+  tree's `scripts/release-web-sdk-rustc-wrapper` compiles the machine
+  catalog crate (12.8 GiB in one rustc) apart from the other memory-heavy
+  wasm32 crates, so the build peaked at 13.0 GiB instead of 18.8 GiB at four
+  plain jobs; a tree without a wrapper that matches its crates builds at one
+  job. Locally, on four vCPUs, the Cargo phase took about 11 minutes instead
+  of 24 at one job (33m43s in the v0.9.1 tag run).
 - `Publish Web SDK package` also requires the release validation gate and
   `Breaks declared and notes stamped` (both skipped only on Web-only
   recovery). It publishes only a package whose source stamp (commit, package
@@ -231,6 +796,32 @@ them.
   SDK package are built: the tag publishes those right away, and its
   trailing publisher waits for the prebuild's Intel macOS and Windows lanes
   (the prebuild run's full binary build gate) before adding their archives.
+- A stdio skill source runs under the host's `mcp_stdio` confinement, as a
+  local MCP stdio server does: its program named by absolute path, only its
+  configured environment, from the kind's working directory, and a launch
+  the platform cannot confine is refused. It ran as the trusted host.
+- `rkat skill list` and `rkat skill inspect` load skills under the host
+  confinement a run installs, so they show what a run loads.
+- A refused MCP server reaches the model under its own name only when that
+  is a plain server name (1 to 64 ASCII letters, digits, `-`, `_` or `.`),
+  else under a `refused-mcp-server-<n>` placeholder, and a refused
+  definition is not validated: one that would not validate is reported
+  refused instead of failing the session build. `rkat` prints a refused
+  server's name escaped and bounded.
+- The generated Bazel targets of `meerkat-rest`'s tests get the
+  `rkat-rest` binary, and the real-binary confinement tests of `rkat-rpc`
+  and `rkat-rest` fail, rather than pass without having run, when their
+  binary is missing.
+- The source test that classifies every process launch in shipped code
+  scans every workspace crate under Bazel too (its generated target carries
+  every package's sources), and it scans the code after a test-only match
+  arm, field or argument, which it skipped.
+- The user document a host creates from its template states
+  `[realm.global]`, so its settings and sign-ins reach every realm from the
+  start, and `rkat auth login`, the startup migration of a legacy sign-in
+  and a connector client for `global` never need to add it. A user document
+  that states `[governance]` but no `[realm.global]` cannot gain the
+  section through a config write: the refusal says to add it by hand.
 - CI's `Closure tests` rows have 60 minutes instead of 40, and the
   `ci-integration` profile gives its four slow nested-Cargo and
   whole-workspace tests 16 slow periods (960 s) instead of 8, so a cold row
@@ -264,6 +855,579 @@ them.
   strict UTF-8, both sides of every change must be regular non-executable
   files, only a forward patch release qualifies, and a CHANGELOG over 1 MiB
   no longer makes classification fail.
+- meerkat-mcp's protected SSE transport parses event streams with
+  `sse_stream::SseStream::from_bytes_stream`. sse-stream 0.2.4 deprecated the
+  `from_byte_stream` spelling it used, so a lockfile update past 0.2.3 failed
+  `clippy -D warnings`. The requirement is now `0.2.4` (the first release
+  with the new name) and Cargo.lock moves sse-stream from 0.2.3 to 0.2.6,
+  whose rewritten line parser the MCP SSE tests now run against.
+- Release crates require their sibling crates exactly. `[workspace.dependencies]`
+  pinned every internal crate as `version = "0.9.1"`, which Cargo reads as
+  `^0.9.1`, so a published crate (meerkat-runtime 0.9.0, for example)
+  accepted any later 0.9.x of its siblings, and a consumer that pinned one
+  meerkat crate `=0.9.0` could still resolve 0.9.1 of others; 0.x patch
+  releases may break API. Every internal entry is now `=X.Y.Z`, which
+  cargo-release keeps exact when it bumps the workspace.
+  `scripts/check_rust_release_packaging.py` (`make check-rust-release-config`,
+  run in PR CI) fails when a release crate would publish a non-exact
+  requirement on a workspace crate (a path-only dev-dependency, which
+  `cargo package` strips, is exempt), `scripts/check-rust-release-packaging.sh`
+  checks the same in every packaged archive
+  (`scripts/check_packaged_internal_requirements.py`),
+  `scripts/verify-version-parity.sh` requires the `=`, and the
+  release-projection classifier treats `=X.Y.Z` as the version projection.
+  `scripts/test-release-projection-only.sh` bumps this repository's own
+  Cargo.toml, Cargo.lock and CHANGELOG.md to the next patch release and
+  requires the classifier to accept that bump, and to refuse it with one `=`
+  dropped.
+- The live provider matrix (`meerkat-client` test
+  `live_client_provider_matrix`, which needs provider keys and the
+  `integration-real-tests` feature and is run by hand with `--ignored`; no
+  lane runs it) sends current catalog models, the cheapest per provider
+  (`claude-haiku-5-5`, `gpt-6-luna`, `gemini-3.1-flash-lite`), and the
+  catalog's image-generation defaults. It sent retired ids such as
+  `claude-3-haiku-20240307`, so its live tests failed. A new `meerkat-client`
+  test, `provider_matrix_catalog`, needs no keys or features and runs in the
+  ordinary test lanes: it fails when the matrix names a model outside Core's
+  catalog.
+- A turn's reasoning-effort preference (set on a live channel's delegated
+  member turns) is now lowered onto Gemini requests too, as it already was
+  for OpenAI and Anthropic. When the selected model's catalog row lists the
+  level among its accepted thinking levels, the request sends it as
+  `thinking_level` (in the nested `thinking` config when the request has
+  one), and `request_reasoning_lowered` reports `applied`. A level the row does
+  not list is `unsupported_level`, a request that already sets a thinking
+  budget (the generic `thinking_budget_tokens` or Gemini's own) is
+  `budget_conflict`, and a row without recorded levels stays
+  `unknown_supported_levels`; each leaves the request unchanged. Every Gemini
+  model used to report `unknown_supported_levels`.
+- CI's nested-Cargo canaries (the `downstream-cargo-canary` test group, the
+  three `downstream_*` tests of `meerkat::agent_builder_policy_canary`) no
+  longer run one after another in a packed `Closure tests` row: their
+  binary gets rows of its own, one `--partition count:K/N` per canary, so
+  they run side by side on separate runners (in run 38859112297 they took
+  447, 80 and 376 s in a row, 903 s of a 1760 s row). The coverage check
+  credits a partitioned binary only when every partition of one selection
+  is planned, and `scripts/ci-verify-row-binaries.mjs` accepts tests left to
+  sibling partitions only for a row that names its partition.
+- CI's pull-request unit row of a chain exception (meerkat-rpc, which
+  compiles meerkat-mob) runs alone instead of being packed with other
+  packages: in run 38859112297 it carried xtask and meerkat-live and ran
+  1801 s, the longest lane. The other packages fill the remaining unit
+  rows, so a workspace-mode plan keeps ten.
+
+### Deprecated
+
+- The MCP router constructors that launch local stdio servers as the
+  trusted host without naming it: `McpRouter::new`,
+  `McpRouter::new_with_surface_handle`, `McpRouter::new_with_removal_timeout`,
+  `McpRouter::new_with_surface_handle_and_removal_timeout` and
+  `meerkat::mcp::standalone_router`. Use the forms that name the profile:
+  `McpRouter::new_with_stdio_profile`,
+  `McpRouter::new_with_surface_handle_and_stdio_profile` (then
+  `set_removal_timeout` for a custom drain) and
+  `meerkat::mcp::standalone_router_with_stdio_profile`, with the host's
+  profile (canonically `AgentFactory::mcp_stdio_launch_profile`) or
+  `McpStdioLaunchProfile::trusted_host()` for no OS confinement. Their
+  behaviour is unchanged, and `McpRouter::default()` stays the trusted host.
+- `meerkat::resolve_configured_mcp_target` and
+  `meerkat::resolve_configured_mcp_target_in_realm`, which trust every
+  `mcp.toml`, one a confined process can write included. Use
+  `meerkat::resolve_configured_mcp_target_in_realm_trusting` with the host's
+  `HostConfinement::untrusted_source`. Their behaviour is unchanged.
+- `meerkat_tools::builtin::comms::{SendTool, PeersTool, CommsToolSet}`. They
+  call the comms handler without the dispatch context and without a typed
+  operation target, so governed work refuses them at the fenced dispatch
+  (see Breaking), and `SendTool`'s `send` has no handler and always fails.
+  Use `CommsToolSurface`, whose plans carry the typed targets. Removal is
+  planned for 0.9.3.
+
+### Fixed
+
+- `scripts/rust-lane-doctor` no longer passes its shell entrypoint scan when
+  the scan did not run. The scan ended in `rg ... || true`, so a missing
+  ripgrep or an unreadable scan root read as "no raw Cargo entrypoint", even
+  with one present. The doctor now reads rg's exit status: 0 (a raw Cargo
+  entrypoint) and any status other than 1 (no match) fail, the latter with the
+  rg exit status and its output. `scripts/test-ci-nextest-archive.sh` probes
+  all four outcomes.
+- The Makefile comment on `bridge-no-responsestatus-gate` no longer names the
+  removed `classify_response_terminality`; like the gate, it points at the
+  machine-classified `response_terminality`.
+- meerkat-runtime tests no longer lose the release of a blocked test fake.
+  `notify_waiters()` wakes only a `Notified` that already exists, and the
+  interrupt-yielding executor rig counted its `apply` before it created its
+  release future, so a test that released the next apply as soon as it saw
+  the count could leave that apply parked (with 200 ms injected at that point,
+  7 of the 9 rig tests failed). The rig, the reentrant and external cleanup
+  executors, the destroy-commit store, the archive-publication fake and the
+  six in-memory store test hooks now create the release future before they
+  signal that they started; the archive post-commit hook signals with
+  `notify_one`. The waits that follow a release are bounded at 5 s (the join
+  of the released receipt-CAS archive task at 10 s), so a lost release fails
+  with a message instead of hanging the run.
+- BuildBuddy (Bazel) release builds of the shipped binaries no longer compile
+  tokio's `test-util` feature, the one test-only feature 0.9.1 left in them.
+  crate_universe resolves one feature set per external crate across every
+  dependency kind (26 workspace members dev-depend on tokio with
+  `test-util`), and a crate annotation can add a feature but not remove one.
+  A second rules_rust patch,
+  `tools/third-party/patches/rules_rust-release-stripped-crate-features.patch`,
+  moves each feature that `scripts/non-shipping-features.json` lists under
+  the new `external_crate_features` key out of the crate's rendered static
+  `crate_features` and into a select on `//tools/bazel:release_build`: the
+  test lanes keep it, `--define=meerkat_release_build=1` drops it. The
+  patched extension reads the whole file, so any edit to
+  `scripts/non-shipping-features.json` (a new test-only feature in its
+  `features` list too) changes `MODULE.bazel.lock`: refresh it with
+  `make buildbuddy-lock-update`. `scripts/check-bazel-release-features.py`
+  now also fails when a listed feature stays enabled in a release build of
+  any repository MODULE.bazel.lock renders for the crate (or when a listed
+  crate has none), and `scripts/check-release-binary-markers` allows tokio's
+  test-util marker only in the binaries of a release before 0.9.2, named by
+  `VERSION` (the release workflow's packaging and publishing steps pass the
+  release version), so an asset recovery of an older tag, which runs the
+  current guard, still accepts that tag's BuildBuddy binaries. With `VERSION`
+  unset, unparsable, or 0.9.2 and later, the marker fails a binary like every
+  other one. Cargo-built release binaries never compiled it.
+- Adaptive mobpack validation no longer counts doc-only schema text as a
+  schema change. It compares the bundled `adaptive/layer-decision.schema.json`
+  with the runtime's canonical LayerDecision schema after removing the
+  documentation keywords (`title`, `description`) from both, so on 0.9.2 and
+  later hosts a reworded Rust doc comment, which reaches that schema as
+  description text, no longer makes packs built by another release fail with
+  `StaleAdaptiveSchema`; a structural difference still does. Property names
+  and instance data (`const`, `enum`, `default`, `examples`) are never
+  stripped. 0.9.1 hosts still compare the whole schema exactly, doc text
+  included, so this release's canonical schema is exactly the 0.9.1 one (a
+  meerkat-mob-pack test pins it, whole, against the 0.9.1 schema) and packs
+  it builds validate on 0.9.1 hosts. Rewording the `ToolConfig::deny` doc
+  comment (since #1807 every build removes denied tools from the member's
+  visible tool list) waits for a later release.
+- The meerkat-mob test `durable_cursor_resumes_across_pump_restart` restarts
+  the controlling mob only once the member's durable event cursor covers
+  every row the first turn consumed. The pump writes that cursor after it
+  fans a page out, only while no ACK, obligation or completion waiter holds
+  cursor custody, and a controlling stop aborts a write still in flight; a
+  restart that raced the write re-read the turn's rows, as documented (losing
+  a cursor only re-reads events), which the test misread as a resume defect.
+  With 300 ms injected before the cursor write, the old test failed 10 of 10
+  runs with the CI failure's exact overlap and the new one passed 10 of 10.
+- The schedule embedding docs now state the teardown step a Rust host owns
+  when its process keeps running. A schedule host attaches its session and
+  mob hosts to the `ScheduleService` for as long as any clone of the service
+  lives, and agent schedule tools in a factory builder's
+  `default_schedule_tools` slot hold such a clone while the session service
+  owns that builder, so after teardown the session service and the mob state
+  stay owned (a mob store's `drain_observers` refuses with other owners)
+  until the host clears that slot, and any registry of its own that holds
+  them, once teardown has succeeded. `spawn_schedule_host`, the
+  runtime-backed schedule host spawners, `SharedScheduleTargetAdapter::new`,
+  `set_default_schedule_tools`, `FactoryAgentBuilder::default_schedule_tools`,
+  `ScheduleService::attach_identity_target_probe` and the scheduling guide
+  say so. Behaviour is unchanged; 0.8.51 already worked this way.
+- A restarted host's fork_off re-link no longer overflows a 2 MiB worker
+  stack in a debug build. Inserting a restored mob's handle spawns the
+  re-link pass, whose first step reads the forker's durable input index for
+  each job's completion through the runtime's machine command dispatch. At
+  opt-level 0 every branch of a function reserves its own stack slots, so
+  the poll frames on that read's path took 2,088,192 bytes: the session and
+  machine command dispatchers took 968,080 and 350,784 bytes, and the
+  re-link's settlement and per-child join frames 632,576. An embedding
+  host's worker overflowed its guard page there. The pass's later receipt
+  wait and outcome delivery reached 2,113,536 and 2,837,920 bytes. Each
+  dispatcher arm and each large re-link future is now built in its own frame
+  (`stack_relief::box_in_own_frame`), and the durable idempotency-key read
+  handles its command result in its own frame; bodies are unchanged.
+  Measured on the debug test binary, the three paths now take 191,680,
+  886,000 and 264,496 bytes. A child-process regression test runs the
+  restart re-link on 1.125 MiB workers, below a host's 2 MiB. No behaviour
+  change.
+- A restarted host's mob restore, a delivery's receipt wait and a mob's
+  destroy fit a 1 MiB worker stack in a debug build. At opt-level 0 an
+  awaited future reserves twice its size in the poll frame that awaits it,
+  so the deepest worker stack these paths took was 1,143,512 bytes for the
+  restore of persisted mobs (the restore pass's own frame 542,048),
+  1,070,344 for the receipt wait (its wait, observation and read frames
+  570,240, the runtime's `input_terminal_receipt` 242,352) and 1,211,016 for
+  a destroy's member disposal. The restore and the resume and teardown of
+  held child mobs, the receipt wait's reads and waits, the runtime's
+  terminal receipt read and wait, the destroy, each of its disposal steps
+  and its supervisor authority scrub now build their futures in their own
+  frames (`stack_relief::box_in_own_frame`, the mob actor's
+  `boxed_arm_future`). The runtime's result-matching
+  `SessionServiceRuntimeExt` and `RuntimeControlPlane` methods handle their
+  command's result in a plain helper after their one await, so their poll
+  frames fell from about 37,000 to about 15,000 bytes. Bodies are unchanged.
+  Measured on the debug test binary, those paths now take under 300,000
+  (restore), 383,352 (receipt wait) and 371,272 (member disposal) bytes; a
+  destroy's member retire admission, the deepest path left, takes 835,688
+  (was 1,093,448). No behaviour change.
+- Session construction fits a 1 MiB worker stack in a debug build. A
+  relieved agent build took 1,096,968 bytes of its task's stack and a
+  runtime-backed `create_session` 850,824: `stack_relief::relieve_caller_stack`
+  materialized the build future in its task's poll frame before boxing it,
+  and the facade's agent build seams and the persistent session service's
+  create, actor materialization and full-session save awaited their futures
+  inline. Those futures are now built in their own frames. Measured on the
+  debug test binary, the agent build takes 833,000 bytes
+  (`AgentFactory::assemble_agent`'s own 344,112-byte frame is the largest
+  left) and the create 589,032. No behaviour change.
+- Google Code Assist (the `rkat auth login google` route) requests for
+  `gemini-3.1-flash-lite` and `gemini-3.1-flash-lite-preview` went out as
+  `gemini-2.5-flash`, which Google has limited to users who had used it before
+  2026-09-18, so they failed for newer accounts. Both now go out as
+  `gemini-3.1-flash-lite`, the GA model the Gemini CLI itself sends to Code
+  Assist. Every Code Assist substitute is a catalog Gemini model that accepts
+  the requested model's thinking levels.
+- An explicit Gemini `thinking_level` (nested or flat) that the selected
+  catalog model does not accept, such as `minimal` on `gemini-4-argon`,
+  `gemini-3.8-flash`, `gemini-3.7-flash` or `gemini-3.1-pro-preview`, was sent
+  and failed with the provider's 400. The Gemini client now refuses it before
+  sending with a typed `LlmError::InvalidRequest` naming the levels the model
+  accepts, and a build whose provider params carry one fails with
+  `BuildAgentError::Config`. Models outside the catalog keep the pass-through.
+- A sticky model fallback onto a target served through the private ChatGPT
+  backend recorded the GPT catalog row's capabilities for the session,
+  including `supports_mid_conversation_system_messages`, which that backend's
+  wire refuses: the factory judged every fallback target by its model row
+  (a target that names no binding before its binding was even selected), and
+  the activation re-minted the target's profile from the row. Instruction
+  activations were then admitted onto a backend that fails every later turn
+  that carries them. Fallback targets are now judged through the binding their
+  client uses, and the activation keeps that judgment. Ordinary System appends
+  stay ungated, as before. `ModelRegistry::profile_for_identity` now also fails
+  closed for a named binding the config does not resolve: its backend is
+  unknown, so the profile no longer keeps the row's
+  `supports_mid_conversation_system_messages`. An identity that names no
+  binding, or the synthetic env-var default (an API-key backend), keeps the
+  row as before.
+- `[retry] stream_inactivity_timeout = "0s"` was accepted and stalled every
+  model call before its first event. `Config::validate` now refuses a zero
+  window with `ConfigError::Validation`; `"disabled"` turns the watchdog off.
+  A nonzero window still loads as before. The docs now say that an explicit
+  window under 60 s can abort and retry a stream whose answer already
+  arrived, since the watchdog keeps running while a provider adapter waits
+  for a trailer after the model's final event.
+- `meerkat-mob-mcp`: a host can now release what it holds of a mob that
+  `MobMcpState` destroys before the destroy's storage cleanup runs. The new
+  `MobMcpState::set_after_destroy` installs a `MobAfterDestroy` hook that gets
+  the mob's id once its native destroy completed and the mob left the managed
+  set, before the storage cleanup that destroy owes, and again before each
+  retry of an outstanding cleanup. A panic in the hook is caught and logged,
+  so it can neither keep the id managed nor skip the cleanup.
+  A host that kept the read handle its `set_before_activation` hook received
+  had no such point: the handle kept the mob's database observer alive, so
+  the destroy answered `Incomplete` ("storage cleanup outstanding: the
+  observer drain refused: 3 owner handle(s) still observe this mob
+  database"), and the destroyed mob's database, file watch and threads stayed
+  while its id could not be reused.
+- `meerkat-mob-mcp`: a destroy's storage cleanup no longer stays outstanding
+  because something held the destroyed mob's handle a moment longer than the
+  release hook ran. An observer drain that other owner handles refuse is
+  retried ten times, 100 ms apart, each after the after-destroy hook ran
+  again. Owner cleanups that destroy without retrying later, such as an
+  archived owner session's mobs or an implicit mob recreated for a new
+  model, answered `Incomplete` in that case. `MobMcpState::mob_handles_snapshot`
+  also skips a mob whose phase is `Destroyed`, so a snapshot taken while a
+  destroy runs holds none of it; `mob_list` still lists such a mob, as
+  `Destroyed`.
+- `meerkat-mob`: an orchestrator resume notification's failure is reported
+  only once it is final. The runtime retries a failed notification input
+  within its bounded attempts; `OrchestratorResumeNotificationFailed` used to
+  be recorded after the first failed attempt while those retries still ran.
+  It is now recorded once, after the input's terminal failure, and not at
+  all when a retry delivers the notification. An explicit `MobHandle::resume`
+  and the orchestrator lifecycle notifications report the same final outcome
+  (see Breaking: `MobProvisioner::start_turn`). On a governed scoped host, a
+  retried input whose result is withheld from the mob counts as completed.
+  The event is recorded by the in-process lifecycle task waiting for the
+  input, so a crash between the first failed attempt and the input's
+  terminal loses it.
+- `meerkat-rpc`: a turn or event the session's runtime refuses to admit keeps
+  the refusal's typed JSON-RPC code. `turn/start` and
+  `session/external_event` answered every refusal with `-32603` ("runtime
+  accept failed"); they, and `session/peer_response_terminal`, now answer
+  `-32602` for an invalid input (an idempotency conflict names the existing
+  input in `data.existing_id`), `-32030`/`-32031` for a native refusal or
+  unavailable readiness, `-32001` when the runtime driver has no runtime
+  under the session's id, `-32002` for another runtime owner or a teardown
+  in progress, `-32032` for unavailable runtime authority, and `-32600` when
+  the runtime's lifecycle state admits no input (a retired runtime, or the
+  destroyed runtime of a session that is gone; the message names the
+  state). Only a mechanical failure stays `-32603`. RPC
+  handlers also stopped dropping an error's typed `data`: every method now
+  answers with the data its cause carries (for example the
+  unsupported-capability detail of a refused `session/create`), and a failed
+  runtime executor registration in `session/create` keeps its typed code.
+- `meerkat-mcp-server`: `meerkat_run` and `meerkat_resume` honour
+  `builtin_config.shell_timeout_secs`, which 0.9.1 accepted and ignored. It
+  sets the default command timeout of the session's shell tool (the
+  session's own `[shell] timeout_secs`; a shell call's own `timeout_secs`
+  still wins). The session records it, so a `meerkat_resume` that rebuilds
+  the session keeps it unless the resume sets its own. Omitted, `null` or
+  `0` keep the realm's configured value.
+- The release semver gate (`make semver-breaks`) reads cargo-semver-checks'
+  `type_marked_deprecated` and `function_marked_deprecated` findings: a
+  struct, enum, union or trait newly marked `#[deprecated]` (reported as
+  `Struct PeersTool in <file>:<line>`) and a newly deprecated function
+  (`function meerkat::mcp::standalone_router in <file>:<line>`).
+  `scripts/check_semver_breaks.py` had no reader for those shapes, so such a
+  deprecation failed the gate as unreadable even when `### Deprecated` named
+  it.
+- An ordinary config write can no longer cut a realm from the ancestors
+  whose `[confinement]` it composes. A write that changes or removes the
+  realm's own `[realm.<id>].parent` edge (`config/set`, `config/patch`,
+  `PUT`/`PATCH /config`, the MCP config tool, `rkat config set`/`patch`) is
+  refused with `confinement_administration_required` when the realm would
+  compose a different `[confinement]` through the new edge, and nothing is
+  written; an edge whose chain does not resolve is refused as invalid. In
+  0.9.1 such a write made the realm drop its former ancestors'
+  requirements from the next start, so a config writer could turn
+  confinement an ancestor realm required into unconfined launches (the
+  0.9.1 known issue). The refusal message now also names the parent edge.
+- A realm's own config document decides its own parent edge. A section
+  another document states for the realm (an ordinary write to an ancestor
+  realm's document could add one) never replaces it. Before, such a section
+  in a document that sorted after the realm's own replaced its edge during
+  composition and cut the realm from that ancestor and its `[confinement]`.
+- An ancestor realm whose own config document is missing no longer
+  composes as if it required nothing. Every chain member other than the
+  head and `global` is configured by its own document alone, so a chain
+  through a missing ancestor fails as a missing parent, and `rkat realm
+  delete` and `rkat realm prune` keep a realm that another realm's document
+  names as its parent, naming the child. Before, a section an ordinary
+  write placed in another document (`{"realm":{"org":{}}}`) kept a deleted
+  ancestor on the chain, and the realm started without the `[confinement]`
+  of that ancestor and of every realm above it.
+- An ordinary config write can no longer cut a realm from the ancestors
+  whose `[governance]` it composes. A write that changes the realm sections
+  of its own document (the parent edge, or a `[realm.global]` section that
+  puts the user document on its chain) is refused with
+  `governance_administration_required` when the realm would compose a
+  different `[governance]`, on every surface with the realm chain (JSON-RPC,
+  REST, the MCP config tool, `rkat config`, and the governed stock
+  finalization store). In 0.9.1 such a write dropped the ancestors' review
+  rules from the next start.
+- An MCP auth request (`auth/login/*`, `auth/status/get`, `auth/logout`
+  over JSON-RPC, the REST login, completion and cancel routes, and `rkat mcp
+  login`) on a host whose confined processes can write an `mcp.toml` no
+  longer addresses a server only that file defines: it is refused as not
+  configured (`mcp_server_not_configured`) before anything is discovered,
+  registered or stored for it. Before, a confined process could plant a
+  definition and point a login at a server of its choosing, which then held
+  the user's authorization.
+- A credential command (an auth profile's `source = { kind = "command" }`)
+  runs as the host, outside its confinement; on a host that confines every
+  launch kind it is now refused, before it runs, when a confined process
+  could change its program, the interpreter its `#!` line names by path, or
+  its working directory, on every resolution path (sessions, `rkat auth
+  test`/`refresh`, `rkat doctor`, REST `POST /auth/bindings/{id}/test`).
+  Before, a confined process could replace the program and have the host
+  run it unconfined with the host's credentials. The processes a host runs
+  as itself are now a typed, tested list (`HostLaunchExemption`).
+- A symbolic link no longer carries a confined process past a trusted input:
+  a skill linked out of a trusted skills directory to a path a confined
+  process could change is not loaded, a skill linked out of a Git checkout
+  is not loaded wherever the link leads (and finding a repository's skills
+  no longer descends through a link, so a link to `/` cannot walk the
+  host's filesystem), and a start whose realm state or credential store
+  links to such a path is refused.
+- The `rkat` mob deploy RPC host's config store addresses the realm's
+  document as the realm config source maps it, so the reserved `global`
+  realm's is the user document it composes, not a file under the state
+  root.
+- `rkat-rpc`, `rkat-rest` and `rkat-mcp` read their working directory at
+  startup only for a relative `--confinement-read` or `--confinement-write`
+  path. They read it on every start, so a server whose working directory had
+  been removed failed to start even without a confinement flag.
+- The startup confinement report is visible as documented. `rkat` prints
+  every line of it once on stderr (informational lines as `info:`), where it
+  printed only the warnings, and `rkat-rest`'s default log filter includes
+  it (`meerkat::host_confinement=info`), where it showed none of it, and
+  the binary's own startup lines (`rkat_rest=info`, such as its listening
+  address), which the filter also left out. Each host reports each launch
+  kind's requested and effective confinement and what keeps its own inputs
+  from its confined processes, not only what needs action.
+- On a governed realm, `rkat` reports each MCP server it refuses from an
+  `mcp.toml` a confined process can write to the model, as that server's
+  failed setup with the typed `untrusted_configuration_source` refusal. In
+  0.9.1 the governed route left those servers out with only a warning on
+  stderr (the 0.9.1 known limitation), so the model could not tell why a
+  configured server was missing.
+- A host that confines every launch kind keeps its file credential store
+  and its skills directories from its confined processes, as it keeps its
+  realm state and user config document. A start in which a confined process
+  could change the credential store (the tokens, keys and secrets of its
+  providers, MCP servers, connectors and comms identity; by default under
+  the user's config directory, `meerkat/credentials`) is refused, naming it.
+  A skills directory a confined process can write (the project
+  `.rkat/skills`, a filesystem skill repository, the Git skill cache) is not
+  trusted: its skills are not loaded, and the startup report names the
+  project skills directory. In 0.9.1 neither was checked, so a confined
+  process could plant credentials the host then used, or skills whose
+  instructions reached the model.
+- The programs a host runs as itself, outside its confinement (the browser
+  opener of `rkat run --browser`, `rkat mcp login` and provider OAuth
+  login, `stty`, `wasm-pack` for `rkat doctor`, a credential command and
+  `git`), and every program they start by name (an interpreter named
+  through `env`, a wrapper's helpers, `ssh` or `git-lfs` under Git), run,
+  under a host that confines any launch kind, from a `PATH` without
+  relative directories and without the directories a confined process
+  could change. `rkat` opens a browser with the platform
+  opener (`xdg-open`, `/usr/bin/open`, the system `rundll32.exe`) instead of
+  the `webbrowser` crate, and runs `stty` by absolute path. Before, with a
+  directory a confined process can write on `PATH` (an activated virtual
+  environment, `node_modules/.bin`, a relative entry), a confined process
+  could plant a program there, such as `xdg-open`, that the host then ran
+  unconfined.
+- A write to the user document (the `global` realm's own, written by `rkat
+  config` and by `rkat-rpc`, `rkat-rest` and `rkat-mcp` serving `global`)
+  can no longer change the `[confinement]` or `[governance]` other realms
+  compose. Its `[realm.global]` section puts `global`, and with it the user
+  document's `[governance]`, on the chain of every realm whose own
+  documents state none, and a realm without a document takes the section
+  the user document states for it. A write that changes either so that
+  such a realm would compose differently is refused
+  (`governance_administration_required` or
+  `confinement_administration_required`), and nothing is written. Before,
+  the check composed only the `global` realm itself, so a patch removing
+  `[realm.global]` dropped the user document's review rules from every
+  realm that did not state `[realm.global]` itself, at its next start. A
+  refusal of changed realm sections names the change and the realm.
+- A credential command without `cwd` runs from the user's home directory,
+  judged as that directory itself, instead of from the host's
+  working directory, which a host that confines every launch kind refused
+  whenever a confined process could write it (as for `rkat` run from its
+  workspace). A credential command the host refuses ends its binding's
+  resolution with `HostLaunchRefused`. Before, a session moved on to the
+  next credential (an ancestor realm's binding, the global realm's, the
+  environment's default such as `OPENAI_API_KEY`) without saying so.
+- `rkat run` and `rkat resume` on an ungoverned realm report an MCP server
+  refused from an untrusted `mcp.toml` to the model under its plain name or
+  a `refused-mcp-server-<n>` placeholder, as sessions on a governed realm
+  do. They reported it under its raw name, which a confined process chose.
+- A Git skill repository's ssh-key path no longer reaches `GIT_SSH_COMMAND`,
+  which git runs through a shell, unquoted: a key path is validated
+  (absolute, an existing regular file, no control characters or single
+  quote, no leading `-`) and single-quoted, so a path crafted to carry a
+  shell command runs none. The `git_ref` and repository URL are refused when
+  they read as an option (a leading `-`) or carry whitespace or control
+  characters, the URL's transport must be `ssh`/`https`/`http`/`git`/`file`
+  or a local path (a remote-helper address with `::`, such as `ext::`, and
+  any other `scheme://` are refused), and every `git` invocation passes
+  `--end-of-options` before its refs and URL and runs with
+  `GIT_ALLOW_PROTOCOL=ssh:https:http:git:file`, so host git config such as
+  `protocol.allow=always` cannot re-enable `ext`. A local repository (a
+  `file://` URL or an absolute path) a confined process could change is
+  refused, since clone runs its upload-pack against that repository's own
+  config. Before, a configuration source a confined process could write (or
+  a config-tool client) could run a command on the host through the ssh-key
+  path or a remote-helper URL. The Git skills scan root is also not walked
+  when a link leads it out of the checkout.
+- The governed `rkat-rpc` route builds its controller client and its
+  reviewer through the host's confinement, as it already built the
+  connection factory, so a credential command either names runs as the host
+  under the same guard: one whose program a confined process could change is
+  refused, and (under confinement) it is cleaned of the paths and variables
+  a confined process could change. Before, the controller and reviewer
+  factories were built without confinement, so a governed realm's credential
+  command skipped the guard and kept the full environment.
+- The programs a host runs as itself no longer inherit a module or library
+  path a confined process could change. With `rkat` run from a shell whose
+  `PYTHONPATH` or `LD_LIBRARY_PATH` points into the workspace, a confined
+  process could plant a module or library there that the next credential
+  helper, Git fetch, browser opener or `stty` loaded unconfined. Under such
+  a host they now run without the loader, interpreter, shell and Git
+  variables that load code from elsewhere, and every other inherited or
+  configured variable loses the paths a confined process could change.
+- An ordinary config write can no longer add a credential command, or
+  change what one runs, through `config/set`, `config/patch`, `PUT`/`PATCH
+  /config`, the MCP config tool, `rkat config` or the SDK store: it is
+  refused with `confinement_administration_required`, naming the auth
+  profile, and nothing is written. Before, a config client this release's
+  other guards stop could add `source = { kind = "command", program =
+  "/bin/sh", ... }` and have the host run it unconfined, at once through
+  `POST /auth/bindings/{id}/test`.
+- `meerkat-runtime`: a retained continuation produced during an already
+  resumed run is admitted to the same original instead of being refused as
+  `no_admissible_work_binding`. The resumed run's identity names the
+  original contributors, but its selected row is the staged resume input,
+  which resolution refused because it is not a contributor. Resolution now
+  accepts such a selected row only from the runtime's own row under that
+  key, which must be the canonical rendering of an input id: an admitted
+  retained resume whose carried originals equal, by full equality (input
+  id, association and replay digest), one contiguous, same-order window of
+  the contributors resolved from their own rows, whose recorded identity
+  names exactly those originals, and whose selected binding and batch key
+  are the ones recomputed from its canonical original. Anything else is
+  still refused, and the host still checks current authorization for every
+  original. As before for the contributors, this proves the rows still exist
+  and are exact; it does not prove that the selected row was staged in that
+  run. The same resolution backs MCP observation of retained work and the
+  outcome of a live bridge operation dispatched from a resumed run
+  (`live_bridge_outcome_authority`): both now resolve for a resumed run,
+  and the bridge outcome is attributed to the original the run resumes
+  (its requester, represented subject, logical executor and realm), where
+  it was unavailable before.
+- Live e2e scenario S101 reads the voice model's committed speech from the
+  history rows' `transcript` blocks (and any display `text`). It read only
+  `text` blocks, which a GPT Live session never commits for speech, so it
+  reported every heard response as not committed. Its history line now
+  prints each assistant row's block types and text.
+- GPT Live: text typed in the chat during a call (a host-typed turn's rows,
+  mirrored to the voice as quiet text-chat context) no longer reaches the
+  provider while the voice model is still speaking. Appended inside a
+  voiced response, the context could be absorbed by it, and a later
+  question was answered without it (Live e2e scenario S98 recalled a typed
+  update's old value). The public Live broker now holds a text-chat append
+  while the model's response is audible and sends it, in order, once the
+  response has ended (1600 ms of output silence, the rule deferred result
+  cues already use); with the model silent it goes at once. A close before
+  the release settles a held append as interrupted by close, like held
+  delegation commentary. Only text-chat rows are held. The runtime sends a
+  call's context rows one at a time and waits for each acknowledgement, so
+  rows queued behind a held text-chat row (runtime-work replays, superseded
+  typed rows, causal replays, voiced conversational rows) wait for it too,
+  in order: up to the rest of the model's response plus 1.6 seconds. A held
+  row keeps its fragments' receipt slots until it is sent.
+- GPT Live: releasing held delegation commentary (background-work results
+  held behind an unanswered utterance) now stops at the first failed send,
+  as releasing held text-chat context does. It went on to send the next
+  held result, so a later result could reach the provider ahead of an
+  earlier one whose delivery failed. Nothing after the failed send is
+  tried; the session is marked ambiguous, and the results left settle when
+  the transport closes.
+
+### Known limitations
+
+- The config write guard composes the documents it reads without a lock
+  spanning them, so a write to another realm's document can race it.
+- Several state roots that share one user document: the guard composes the
+  realms the user document states a section for from its own state root's
+  documents only.
+- `webbrowser` stays an unused dependency of `rkat` and
+  `meerkat-auth-core`; removing it needs a lock refresh.
+- On a host without `/bin/stty` or `/usr/bin/stty` (NixOS), `rkat` cannot
+  hide a client secret typed at its terminal and asks for it on stdin
+  instead.
+- `meerkat::open_system_browser` and
+  `McpOAuthPendingLogin::launch_system_browser` stay public without a host's
+  judgement (only relative `PATH` directories are dropped); a host that
+  confines its agents' launches uses `open_system_browser_trusting`.
+- A config write cannot add a credential command (see Fixed), but it can
+  still change an auth profile's `provider`/`auth_method` or a binding's
+  backend, so an administered command's token could be resolved for a
+  writer-chosen endpoint: the backend a credential is sent to is not yet
+  administered like the command itself.
+- A Git skill repository's HTTPS token is still passed on the `git clone`
+  command line (as `https://x-access-token:<token>@...`), where another
+  local process could read it from the process table; prefer an ssh key or
+  a credential helper until this moves off the command line.
+- The Git skill URL/ref validation and `GIT_ALLOW_PROTOCOL` keep a
+  configuration a confined process could write from running a command, but
+  the host still trusts the repository content it fetches; a repository is
+  loaded only from a trusted configuration, not made safe by it.
 
 ## [0.9.1] - 2026-10-15
 
@@ -25730,7 +26894,8 @@ tag, so its comparison link uses v0.3.0 as the exact ancestry base.
 
 Initial development release.
 
-[Unreleased]: https://github.com/lukacf/meerkat/compare/v0.9.1...HEAD
+[Unreleased]: https://github.com/lukacf/meerkat/compare/v0.9.2...HEAD
+[0.9.2]: https://github.com/lukacf/meerkat/compare/v0.9.1...v0.9.2
 [0.9.1]: https://github.com/lukacf/meerkat/compare/v0.9.0...v0.9.1
 [0.9.0]: https://github.com/lukacf/meerkat/compare/v0.8.52...v0.9.0
 [0.8.52]: https://github.com/lukacf/meerkat/compare/v0.8.51...v0.8.52

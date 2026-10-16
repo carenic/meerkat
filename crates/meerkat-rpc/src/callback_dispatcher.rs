@@ -242,6 +242,106 @@ impl CallbackRoute {
     pub fn is_closed(&self) -> bool {
         self.tx.is_closed()
     }
+
+    /// Whether `other` is the same connection's route.
+    pub fn same_connection(&self, other: &Self) -> bool {
+        self.tx.same_channel(&other.tx)
+    }
+}
+
+/// The callback route of one mob's members, held for the mob by the
+/// connection that claimed it.
+///
+/// `mob/create` claims it for the creating connection, and
+/// `mob/claim_callback_route` for the caller's. A mob no connection of this
+/// process has claimed (one restored after a restart) holds none. A route
+/// whose connection closed is released: no callback reaches it, a member's
+/// call fails `tool_unavailable` with
+/// [`meerkat_core::ToolUnavailableReason::CallbackRouteUnclaimed`], and
+/// another connection may claim the slot. The released route's tool
+/// definitions stay advertised until then, so a member's call of one fails
+/// with that reason instead of as an unknown tool. A claim never takes the
+/// route from a connection that is still open.
+///
+/// Every dispatcher built on the slot reads it at each use, so a claim
+/// reaches the mob's live members and the ones built later alike.
+#[derive(Default)]
+pub struct MobCallbackRouteSlot {
+    route: StdRwLock<Option<CallbackRoute>>,
+    generation: AtomicU64,
+}
+
+/// Why a claim of a mob's callback route was refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum MobCallbackRouteClaimRefused {
+    /// Another connection that is still open holds the route.
+    #[error("another open connection holds this mob's callback route")]
+    HeldByOpenConnection,
+}
+
+impl MobCallbackRouteSlot {
+    /// A slot no connection holds.
+    pub fn unclaimed() -> Self {
+        Self::default()
+    }
+
+    /// A slot `route`'s connection holds.
+    pub fn claimed_by(route: CallbackRoute) -> Self {
+        Self {
+            route: StdRwLock::new(Some(route)),
+            generation: AtomicU64::new(0),
+        }
+    }
+
+    /// Claim the slot for `route`'s connection. A connection that already
+    /// holds it keeps it; a connection that is still open is never displaced.
+    pub fn claim(&self, route: &CallbackRoute) -> Result<(), MobCallbackRouteClaimRefused> {
+        let mut held = self
+            .route
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match held.as_ref() {
+            Some(current) if current.same_connection(route) => Ok(()),
+            Some(current) if !current.is_closed() => {
+                Err(MobCallbackRouteClaimRefused::HeldByOpenConnection)
+            }
+            _ => {
+                *held = Some(route.clone());
+                self.generation.fetch_add(1, Ordering::AcqRel);
+                Ok(())
+            }
+        }
+    }
+
+    /// The route whose tools the slot advertises: the one claimed last,
+    /// whether or not its connection is still open.
+    fn advertised_route(&self) -> Option<CallbackRoute> {
+        self.route
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// The route a callback reaches now: the claimed one, while its
+    /// connection is open.
+    fn live_route(&self) -> Option<CallbackRoute> {
+        self.advertised_route().filter(|route| !route.is_closed())
+    }
+
+    /// Advances at every claim that changes the holder.
+    fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+}
+
+/// Where a callback dispatcher sends its calls.
+enum CallbackRouteSource {
+    /// The route it was built on: a session's connection, or the
+    /// process-default channel.
+    Fixed(CallbackRoute),
+    /// A mob's claimable route slot, read at every use.
+    MobSlot(Arc<MobCallbackRouteSlot>),
 }
 
 /// Live callback-tool registry whose semantic mutation and epoch advancement
@@ -341,14 +441,13 @@ impl CallbackToolRegistry {
 /// static and take precedence on name collision with globals. Most sessions have
 /// no inline tools (the field is empty).
 pub struct CallbackToolDispatcher {
-    /// Live tool definitions — shared with `SessionRuntime::registered_tools_slot`.
-    registered_tools: Arc<CallbackToolRegistry>,
+    /// The route whose live registry the tools come from and whose channel
+    /// and id space the calls use.
+    route: CallbackRouteSource,
     /// Per-session inline tools (static, usually empty). Win on name collision.
     inline_tools: Vec<ToolDef>,
     /// Inline tool names cached for fast collision lookup.
     inline_names: HashSet<String>,
-    callback_tx: mpsc::Sender<CallbackRequestEnvelope>,
-    id_counter: Arc<AtomicU64>,
     detached_jobs: Option<DetachedCallbackJobRuntime>,
     /// Snapshot of global tool names from the last `poll_external_updates` (or creation).
     /// Used to detect additions/removals between polls.
@@ -404,28 +503,97 @@ impl CallbackToolDispatcher {
         id_counter: Arc<AtomicU64>,
         inline_tools: Vec<ToolDef>,
     ) -> Self {
+        Self::from_source(
+            CallbackRouteSource::Fixed(CallbackRoute::from_parts(
+                callback_tx,
+                id_counter,
+                registered_tools,
+            )),
+            inline_tools,
+        )
+    }
+
+    /// Create a callback dispatcher for a mob's members, bound to the mob's
+    /// claimable route slot: it follows every later claim of the slot.
+    pub fn from_mob_slot(slot: Arc<MobCallbackRouteSlot>, inline_tools: Vec<ToolDef>) -> Self {
+        Self::from_source(CallbackRouteSource::MobSlot(slot), inline_tools)
+    }
+
+    /// [`Self::from_mob_slot`] that can also own detached callback jobs.
+    pub fn from_mob_slot_with_job_runtime(
+        slot: Arc<MobCallbackRouteSlot>,
+        inline_tools: Vec<ToolDef>,
+        realm_id: impl Into<String>,
+        job_store: Arc<dyn meerkat::DetachedJobStore>,
+        blob_store: Arc<dyn meerkat_core::BlobStore>,
+    ) -> Self {
+        let mut dispatcher = Self::from_mob_slot(slot, inline_tools);
+        dispatcher.detached_jobs = Some(DetachedCallbackJobRuntime::new(
+            realm_id, job_store, blob_store,
+        ));
+        dispatcher
+    }
+
+    fn from_source(route: CallbackRouteSource, inline_tools: Vec<ToolDef>) -> Self {
         let inline_names: HashSet<String> =
             inline_tools.iter().map(|t| t.name.to_string()).collect();
-        let last_seen_globals = registered_tools
-            .state
-            .read()
-            .map(|state| {
-                state
-                    .tools
-                    .iter()
-                    .filter(|registered| !inline_names.contains(registered.tool.name.as_str()))
-                    .map(|registered| registered.tool.name.to_string())
-                    .collect()
-            })
-            .unwrap_or_default();
-        Self {
-            registered_tools,
+        let mut dispatcher = Self {
+            route,
             inline_tools,
             inline_names,
-            callback_tx,
-            id_counter,
             detached_jobs: None,
-            last_seen_globals: StdRwLock::new(last_seen_globals),
+            last_seen_globals: StdRwLock::new(HashSet::new()),
+        };
+        let last_seen_globals = dispatcher.current_global_names();
+        dispatcher.last_seen_globals = StdRwLock::new(last_seen_globals);
+        dispatcher
+    }
+
+    /// The registry whose tools this dispatcher advertises.
+    fn advertised_registry(&self) -> Option<Arc<CallbackToolRegistry>> {
+        match &self.route {
+            CallbackRouteSource::Fixed(route) => Some(route.registry()),
+            CallbackRouteSource::MobSlot(slot) => {
+                slot.advertised_route().map(|route| route.registry())
+            }
+        }
+    }
+
+    /// The route a call of `tool_name` goes to now. A fixed route is used
+    /// as is (a closed one fails at the send); a mob slot without an open
+    /// claimed route fails here, typed.
+    fn call_route(&self, tool_name: &str) -> Result<CallbackRoute, ToolError> {
+        match &self.route {
+            CallbackRouteSource::Fixed(route) => Ok(route.clone()),
+            CallbackRouteSource::MobSlot(slot) => slot.live_route().ok_or_else(|| {
+                ToolError::unavailable(
+                    tool_name,
+                    meerkat_core::ToolUnavailableReason::CallbackRouteUnclaimed,
+                )
+            }),
+        }
+    }
+
+    /// Why a call whose route's connection closed mid-call is unavailable:
+    /// a mob slot is released with its connection.
+    fn route_gone_reason(&self) -> meerkat_core::ToolUnavailableReason {
+        match &self.route {
+            CallbackRouteSource::Fixed(_) => {
+                meerkat_core::ToolUnavailableReason::NotCurrentlyCallable
+            }
+            CallbackRouteSource::MobSlot(_) => {
+                meerkat_core::ToolUnavailableReason::CallbackRouteUnclaimed
+            }
+        }
+    }
+
+    /// The route detached callback jobs are started and reconciled on.
+    fn job_route(&self) -> Result<CallbackRoute, String> {
+        match &self.route {
+            CallbackRouteSource::Fixed(route) => Ok(route.clone()),
+            CallbackRouteSource::MobSlot(slot) => slot.live_route().ok_or_else(|| {
+                meerkat_core::ToolUnavailableReason::CallbackRouteUnclaimed.to_string()
+            }),
         }
     }
 
@@ -475,14 +643,17 @@ impl CallbackToolDispatcher {
         dispatcher
     }
 
-    fn next_id(&self) -> RpcId {
-        let n = self.id_counter.fetch_add(1, Ordering::Relaxed);
+    fn next_id(route: &CallbackRoute) -> RpcId {
+        let n = route.id_counter.fetch_add(1, Ordering::Relaxed);
         RpcId::Str(format!("srv-{n}"))
     }
 
     /// Current global tool names excluding inline collisions.
     fn current_global_names(&self) -> HashSet<String> {
-        self.registered_tools
+        let Some(registry) = self.advertised_registry() else {
+            return HashSet::new();
+        };
+        registry
             .state
             .read()
             .map(|state| {
@@ -500,16 +671,18 @@ impl CallbackToolDispatcher {
         if self.inline_names.contains(name) {
             return true;
         }
-        self.registered_tools
-            .state
-            .read()
-            .map(|state| {
-                state
-                    .tools
-                    .iter()
-                    .any(|registered| registered.tool.name == name)
-            })
-            .unwrap_or(false)
+        self.advertised_registry().is_some_and(|registry| {
+            registry
+                .state
+                .read()
+                .map(|state| {
+                    state
+                        .tools
+                        .iter()
+                        .any(|registered| registered.tool.name == name)
+                })
+                .unwrap_or(false)
+        })
     }
 
     async fn submit_detached(
@@ -524,6 +697,9 @@ impl CallbackToolDispatcher {
                 meerkat_core::ToolUnavailableReason::ExecutionModeOwnerUnavailable,
             )
         })?;
+        // The route first: a call no open connection can take writes nothing
+        // durable, so no later holder of the route can run it.
+        let route = self.call_route(call.name)?;
         let (spec, arguments) = detached_callback_job_spec(&runtime.realm_id, call, context, plan)?;
         // The blob contract carries base64-encoded bytes: store the base64 of
         // the exact argument bytes the call carried.
@@ -552,8 +728,8 @@ impl CallbackToolDispatcher {
         };
         let wire_receipt = meerkat::project_job_receipt(receipt.clone());
 
-        let callback_tx = self.callback_tx.clone();
-        let id_counter = Arc::clone(&self.id_counter);
+        let callback_tx = route.sender();
+        let id_counter = route.id_counter();
         tokio::spawn(async move {
             if let Err(error) =
                 start_detached_callback_attempt(runtime, callback_tx, id_counter, receipt.job_id)
@@ -632,9 +808,10 @@ impl CallbackToolDispatcher {
                 .iter()
                 .map(|attempt| attempt.authority.clone())
                 .collect::<Vec<_>>();
+            let route = self.job_route()?;
             let result: meerkat_contracts::CallbackJobReconcileResult = send_callback_request(
-                self.callback_tx.clone(),
-                Arc::clone(&self.id_counter),
+                route.sender(),
+                route.id_counter(),
                 "callback/job/reconcile",
                 &meerkat_contracts::CallbackJobReconcileParams { attempts },
             )
@@ -732,8 +909,9 @@ impl CallbackToolDispatcher {
                             .is_some_and(|due_at_ms| now_ms >= due_at_ms)))
         }) {
             let runtime = runtime.clone();
-            let callback_tx = self.callback_tx.clone();
-            let id_counter = Arc::clone(&self.id_counter);
+            let route = self.job_route()?;
+            let callback_tx = route.sender();
+            let id_counter = route.id_counter();
             tokio::spawn(async move {
                 if let Err(error) =
                     start_detached_callback_attempt(runtime, callback_tx, id_counter, job.job_id)
@@ -747,7 +925,10 @@ impl CallbackToolDispatcher {
     }
 
     fn owns_detached_callback_spec(&self, spec: &meerkat::JobSpec) -> bool {
-        self.registered_tools
+        let Some(registry) = self.advertised_registry() else {
+            return false;
+        };
+        registry
             .state
             .read()
             .map(|state| {
@@ -794,9 +975,10 @@ impl CallbackToolDispatcher {
             .current_attempt_id
             .as_deref()
             .ok_or_else(|| format!("active detached callback {job_id} has no attempt id"))?;
+        let route = self.job_route()?;
         let result: meerkat_contracts::CallbackJobCancelResult = send_callback_request(
-            self.callback_tx.clone(),
-            Arc::clone(&self.id_counter),
+            route.sender(),
+            route.id_counter(),
             "callback/job/cancel",
             &meerkat_contracts::CallbackJobCancelParams {
                 authority: meerkat_contracts::JobAttemptAuthority {
@@ -822,7 +1004,8 @@ impl AgentToolDispatcher for CallbackToolDispatcher {
             .iter()
             .map(|t| Arc::new(t.clone()))
             .collect();
-        if let Ok(global) = self.registered_tools.state.read() {
+        let registry = self.advertised_registry();
+        if let Some(Ok(global)) = registry.as_ref().map(|registry| registry.state.read()) {
             for registered in &global.tools {
                 if !self.inline_names.contains(registered.tool.name.as_str()) {
                     result.push(Arc::new(registered.tool.clone()));
@@ -848,7 +1031,8 @@ impl AgentToolDispatcher for CallbackToolDispatcher {
                     .with_execution_contract(meerkat_core::ToolExecutionContract::default())
             })
             .collect();
-        if let Ok(global) = self.registered_tools.state.read() {
+        let registry = self.advertised_registry();
+        if let Some(Ok(global)) = registry.as_ref().map(|registry| registry.state.read()) {
             for registered in &global.tools {
                 if !self.inline_names.contains(registered.tool.name.as_str()) {
                     result.push(callback_catalog_entry(
@@ -862,7 +1046,34 @@ impl AgentToolDispatcher for CallbackToolDispatcher {
     }
 
     fn execution_binding_epoch(&self, _tool_name: &str) -> u64 {
-        self.registered_tools.generation()
+        self.advertised_registry()
+            .map_or(0, |registry| registry.generation())
+    }
+
+    /// A mob slot's claims rebind every tool it advertises: the slot's claim
+    /// generation is part of the binding, beside the route registry's own.
+    fn execution_binding_fingerprint(
+        &self,
+        tool_name: &str,
+    ) -> Result<
+        meerkat_core::EphemeralToolBindingFingerprint,
+        meerkat_core::ToolExecutionResolutionError,
+    > {
+        let catalog = self.tool_catalog();
+        let entry = catalog
+            .iter()
+            .find(|entry| entry.tool.name == tool_name)
+            .ok_or_else(|| meerkat_core::ToolExecutionResolutionError::NotFound {
+                tool_name: tool_name.to_string(),
+            })?;
+        let fingerprint = meerkat_core::ephemeral_tool_catalog_binding_fingerprint(entry)
+            .with_live_authority(0, self.execution_binding_epoch(tool_name));
+        Ok(match &self.route {
+            CallbackRouteSource::Fixed(_) => fingerprint,
+            CallbackRouteSource::MobSlot(slot) => {
+                fingerprint.with_live_authority(1, slot.generation())
+            }
+        })
     }
 
     fn resolve_execution_plan(
@@ -892,6 +1103,14 @@ impl AgentToolDispatcher for CallbackToolDispatcher {
 
     async fn dispatch(&self, call: ToolCallView<'_>) -> Result<ToolDispatchOutcome, ToolError> {
         if !self.is_known(call.name) {
+            if let CallbackRouteSource::MobSlot(slot) = &self.route
+                && slot.live_route().is_none()
+            {
+                return Err(ToolError::unavailable(
+                    call.name,
+                    meerkat_core::ToolUnavailableReason::CallbackRouteUnclaimed,
+                ));
+            }
             return Err(ToolError::not_found(call.name));
         }
 
@@ -931,7 +1150,8 @@ impl AgentToolDispatcher for CallbackToolDispatcher {
             arguments: &'a RawValue,
         }
 
-        let request_id = self.next_id();
+        let route = self.call_route(call.name)?;
+        let request_id = Self::next_id(&route);
         let params = CallbackParams {
             tool_use_id: call.id,
             name: call.name,
@@ -958,7 +1178,8 @@ impl AgentToolDispatcher for CallbackToolDispatcher {
 
         let (response_tx, response_rx) = oneshot::channel();
 
-        self.callback_tx
+        route
+            .tx
             .send(CallbackRequestEnvelope::new(
                 request,
                 response_tx,
@@ -967,23 +1188,13 @@ impl AgentToolDispatcher for CallbackToolDispatcher {
             .await
             // The route's owning connection is gone: the tool is unavailable
             // to this session. It never falls back to another connection.
-            .map_err(|_| {
-                ToolError::unavailable(
-                    call.name,
-                    meerkat_core::ToolUnavailableReason::NotCurrentlyCallable,
-                )
-            })?;
+            .map_err(|_| ToolError::unavailable(call.name, self.route_gone_reason()))?;
 
         let response_handoff = tokio::time::timeout(CALLBACK_TIMEOUT, response_rx)
             .await
             .map_err(|_| callback_timeout_error(call.name))?
             // The owning connection closed and failed its pending callbacks.
-            .map_err(|_| {
-                ToolError::unavailable(
-                    call.name,
-                    meerkat_core::ToolUnavailableReason::NotCurrentlyCallable,
-                )
-            })?;
+            .map_err(|_| ToolError::unavailable(call.name, self.route_gone_reason()))?;
 
         let response = response_handoff.response();
 
@@ -3060,5 +3271,216 @@ mod tests {
         assert_eq!(update.notices.len(), 1);
         assert_eq!(update.notices[0].target, "callback:late_global");
         assert_eq!(update.notices[0].operation, ToolConfigChangeOperation::Add);
+    }
+
+    fn is_unclaimed_route_error(result: &Result<ToolDispatchOutcome, ToolError>) -> bool {
+        matches!(
+            result,
+            Err(ToolError::Unavailable {
+                reason: meerkat_core::ToolUnavailableReason::CallbackRouteUnclaimed,
+                ..
+            })
+        )
+    }
+
+    /// Answer the next `tool/execute` request on `rx` with `content` and
+    /// return the request's params.
+    async fn answer_next_callback(
+        rx: &mut mpsc::Receiver<CallbackRequestEnvelope>,
+        content: &str,
+    ) -> serde_json::Value {
+        let (request, response_tx, _outbound_permit) = rx.recv().await.unwrap().into_parts();
+        assert_eq!(request.method, "tool/execute");
+        let params: serde_json::Value =
+            serde_json::from_str(request.params.as_deref().unwrap().get()).unwrap();
+        assert!(
+            response_tx
+                .send(CallbackResponseHandoff::unmetered_for_test(
+                    RpcResponse::success(
+                        request.id,
+                        serde_json::json!({"content": content, "is_error": false}),
+                    )
+                ))
+                .is_ok()
+        );
+        params
+    }
+
+    fn route_with_tool(name: &str) -> (CallbackRoute, mpsc::Receiver<CallbackRequestEnvelope>) {
+        let (tx, rx) = mpsc::channel(4);
+        let route = CallbackRoute::new(tx);
+        route
+            .registry()
+            .replace_or_add(vec![make_tool_def(name)])
+            .unwrap();
+        (route, rx)
+    }
+
+    #[tokio::test]
+    async fn mob_slot_dispatcher_follows_a_route_claimed_after_it_was_built() {
+        let slot = Arc::new(MobCallbackRouteSlot::unclaimed());
+        let dispatcher = CallbackToolDispatcher::from_mob_slot(Arc::clone(&slot), vec![]);
+        let args = RawValue::from_string("{}".to_string()).unwrap();
+
+        // Before any claim, a member's call fails typed, not as an unknown
+        // tool, and the dispatcher advertises nothing.
+        assert!(dispatcher.tools().is_empty());
+        let unclaimed = dispatcher
+            .dispatch(ToolCallView {
+                id: "tc-unclaimed",
+                name: "search",
+                args: &args,
+            })
+            .await;
+        assert!(is_unclaimed_route_error(&unclaimed), "{unclaimed:?}");
+
+        // A claim reaches the dispatcher built before it.
+        let (route, mut rx) = route_with_tool("search");
+        assert_eq!(slot.claim(&route), Ok(()));
+        let names: Vec<String> = dispatcher
+            .tools()
+            .iter()
+            .map(|tool| tool.name.to_string())
+            .collect();
+        assert_eq!(names, vec!["search".to_string()]);
+        let call = dispatcher.dispatch(ToolCallView {
+            id: "tc-claimed",
+            name: "search",
+            args: &args,
+        });
+        let (outcome, params) = tokio::join!(call, answer_next_callback(&mut rx, "found"));
+        assert_eq!(params["tool_use_id"], "tc-claimed");
+        assert_eq!(params["name"], "search");
+        assert_eq!(outcome.unwrap().result.text_content(), "found");
+    }
+
+    #[tokio::test]
+    async fn mob_slot_is_claimed_only_once_its_holder_closed_and_calls_follow_the_claim() {
+        let (owner, owner_rx) = route_with_tool("search");
+        let slot = Arc::new(MobCallbackRouteSlot::claimed_by(owner.clone()));
+        let dispatcher = CallbackToolDispatcher::from_mob_slot(Arc::clone(&slot), vec![]);
+        let (other, mut other_rx) = route_with_tool("search");
+        let args = RawValue::from_string("{}".to_string()).unwrap();
+
+        // An open holder is never displaced; its own claim keeps it.
+        assert_eq!(
+            slot.claim(&other),
+            Err(MobCallbackRouteClaimRefused::HeldByOpenConnection)
+        );
+        assert_eq!(slot.claim(&owner), Ok(()));
+        let held_binding = dispatcher.execution_binding_fingerprint("search").unwrap();
+
+        // The holder's connection closes: the slot is released, and a call
+        // fails typed instead of reaching the closed route. The released
+        // route's tools stay advertised until another claim.
+        drop(owner_rx);
+        let released = dispatcher
+            .dispatch(ToolCallView {
+                id: "tc-released",
+                name: "search",
+                args: &args,
+            })
+            .await;
+        assert!(is_unclaimed_route_error(&released), "{released:?}");
+        assert_eq!(dispatcher.tools().len(), 1);
+
+        // Another connection may now claim it; the claim rebinds the tool,
+        // and calls go to the new holder.
+        assert_eq!(slot.claim(&other), Ok(()));
+        assert_ne!(
+            dispatcher.execution_binding_fingerprint("search").unwrap(),
+            held_binding
+        );
+        let call = dispatcher.dispatch(ToolCallView {
+            id: "tc-reclaimed",
+            name: "search",
+            args: &args,
+        });
+        let (outcome, params) = tokio::join!(call, answer_next_callback(&mut other_rx, "other"));
+        assert_eq!(params["tool_use_id"], "tc-reclaimed");
+        assert_eq!(outcome.unwrap().result.text_content(), "other");
+    }
+
+    /// A detached call through a mob slot whose holder closed is refused
+    /// before anything durable is written: no stored arguments and no job,
+    /// so no later claim or same-named registration can run a call the
+    /// model was told failed.
+    #[tokio::test]
+    async fn detached_call_on_a_released_mob_slot_writes_no_artifact_and_no_job() {
+        let registry = Arc::new(CallbackToolRegistry::default());
+        registry
+            .replace_or_add_with_contracts(vec![(
+                make_provenanced_tool_def("durable"),
+                detached_execution_contract(),
+            )])
+            .unwrap();
+        let (owner_tx, owner_rx) = mpsc::channel(2);
+        let owner = CallbackRoute::from_parts(owner_tx, Arc::new(AtomicU64::new(0)), registry);
+        let slot = Arc::new(MobCallbackRouteSlot::claimed_by(owner));
+        let job_store = Arc::new(meerkat::MemoryDetachedJobStore::new());
+        let blob_store = Arc::new(meerkat::MemoryBlobStore::new());
+        let dispatcher: Arc<dyn AgentToolDispatcher> =
+            Arc::new(CallbackToolDispatcher::from_mob_slot_with_job_runtime(
+                Arc::clone(&slot),
+                vec![],
+                "realm-a",
+                job_store.clone(),
+                blob_store.clone(),
+            ));
+        // The holder's connection closes; its detached tool stays advertised.
+        drop(owner_rx);
+        let args = RawValue::from_string(r#"{"target":"lan"}"#.to_string()).unwrap();
+        let call = ToolCallView {
+            id: "tc-released-detached",
+            name: "durable",
+            args: &args,
+        };
+        let context = meerkat_core::ToolDispatchContext::default().with_runtime_identity(
+            meerkat_core::SessionId::new(),
+            Some(meerkat_core::interaction::InteractionId(
+                uuid::Uuid::from_u128(0xdead_feed),
+            )),
+        );
+        let resolution_context = meerkat_core::ToolExecutionResolutionContext::new(
+            meerkat_core::ToolDeadlineChain::new(vec![
+                meerkat_core::ToolDeadlineContributor::finite(
+                    meerkat_core::ToolDeadlineOwner::CoreToolDispatch,
+                    std::time::Duration::from_secs(30),
+                ),
+            ])
+            .unwrap(),
+        );
+        let plan = meerkat_core::resolve_tool_execution_plan_fenced(
+            &dispatcher,
+            call,
+            &context,
+            &resolution_context,
+        )
+        .unwrap();
+
+        let outcome =
+            meerkat_core::dispatch_tool_execution_plan_fenced(&dispatcher, call, &context, &plan)
+                .await;
+        assert!(is_unclaimed_route_error(&outcome), "{outcome:?}");
+        assert!(
+            meerkat::DetachedJobStore::list_all(&*job_store, 16)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a refused detached call submits no job"
+        );
+        let arguments = meerkat_core::BlobStore::put_artifact(
+            &meerkat::MemoryBlobStore::new(),
+            CALLBACK_ARGUMENTS_MEDIA_TYPE,
+            &standard_base64(args.get().as_bytes()),
+        )
+        .await
+        .unwrap();
+        assert!(
+            meerkat_core::BlobStore::get(&*blob_store, &arguments.blob_id)
+                .await
+                .is_err(),
+            "a refused detached call stores no arguments"
+        );
     }
 }

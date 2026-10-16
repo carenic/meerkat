@@ -192,11 +192,12 @@ pub use authorization::{
     AuthorizationOperation, MandatoryHookCause, MandatoryHookProviderTool,
     MandatoryHookWithheldEffect, MandatoryHookWithholding, MandatoryHookWithholdingRecord,
     ModelAuthorizationFacts, ModelAuthorizationUse, OperationAuthorizationError,
-    OperationAuthorizationFacts, OperationRefusalKind, OperationRefused, OperationReviewTier,
-    OwnerQualifiedTarget, PreparedAuthorizationBinding, PreparedOperationAuthorization,
-    PublicationAuthorizationFacts, PublicationMode, PublicationRecipient, SourceAuthorizationFacts,
-    SourceAuthorizationTarget, SourceAuthorizationUse, ToolAuthorizationFacts,
-    ToolAuthorizationTarget, WorkAuthorization, WorkAuthorizationContext,
+    OperationAuthorizationFacts, OperationEntryBoundary, OperationRefusalKind, OperationRefused,
+    OperationReviewTier, OwnerQualifiedTarget, PreparedAuthorizationBinding,
+    PreparedOperationAuthorization, PublicationAuthorizationFacts, PublicationMode,
+    PublicationRecipient, SourceAuthorizationFacts, SourceAuthorizationTarget,
+    SourceAuthorizationUse, ToolAuthorizationFacts, ToolAuthorizationTarget, WorkAuthorization,
+    WorkAuthorizationContext,
 };
 pub use blob::{
     BlobAddressAttestation, BlobId, BlobPayload, BlobRef, BlobStore, BlobStoreError,
@@ -225,9 +226,9 @@ pub use completion_feed::{
     CompletionFeed, CompletionSeq,
 };
 pub use config::{
-    AgentConfig, BudgetConfig, CallTimeoutOverride, CommandRuntimeConfig, CommsAuthMode,
-    CommsRuntimeConfig, CommsRuntimeMode, Config, ConfigDelta, ConfigError, ConfigScope,
-    ConfigWarning, HookAdapterConfig, HookEntryConfig, HookInProcessHandlerId,
+    AdministeredSection, AgentConfig, BudgetConfig, CallTimeoutOverride, CommandRuntimeConfig,
+    CommsAuthMode, CommsRuntimeConfig, CommsRuntimeMode, Config, ConfigDelta, ConfigError,
+    ConfigScope, ConfigWarning, HookAdapterConfig, HookEntryConfig, HookInProcessHandlerId,
     HookInProcessRuntimeConfig, HookRunOverrides, HookRuntimeKind, HooksConfig, HttpRuntimeConfig,
     LimitsConfig, ModelDefaults, PlainEventSource, ProviderToolsConfig, RetryConfig,
     SelfHostedApiStyle, SelfHostedConfig, SelfHostedModelConfig, SelfHostedServerConfig,
@@ -245,6 +246,7 @@ pub use config_store::{
     MemoryConfigStore, RealmConfigSource, RealmConfigWarning, TaggedConfigStore,
     apply_config_patch_preview, merge_patch,
 };
+pub use confinement::HostLaunchExemption;
 pub use confinement_config::{
     ConfinementConfig, ConfinementFlagMode, ConfinementFlags, ConfinementFlagsError,
     ConfinementLaunchKind, ConfinementLayerConflict, CustomConfinement, InvalidConfinementPath,
@@ -377,8 +379,8 @@ pub use live_execution::{
 pub use mcp_config::{
     EffectiveMcpServersError, McpAccountDeclaration, McpConfig, McpConfigError,
     McpConnectorApproval, McpScope, McpSecretEnvDeclarationError, McpServerAccess,
-    McpServerAccessError, McpServerConfig, McpServerDefinitionConflict, McpServerSource,
-    McpServerWithScope, McpServerWithSource,
+    McpServerAccessError, McpServerConfig, McpServerDefinitionConflict, McpServerRefusal,
+    McpServerSource, McpServerWithScope, McpServerWithSource,
 };
 #[cfg(not(target_arch = "wasm32"))]
 pub use mcp_config::{McpRealmPersistError, McpRealmPersistTarget};
@@ -398,8 +400,9 @@ pub use memory::{
     CompactionStageReceipt, CompactionStageReconcileReceipt, EmbeddingModel, HnswParams,
     MemoryEnumerationPage, MemoryEnumerationRequest, MemoryIndexBatch, MemoryIndexReceipt,
     MemoryIndexRequest, MemoryIndexScope, MemoryMetadata, MemoryOwner, MemoryRankingPolicy,
-    MemoryRecord, MemoryResult, MemoryScopeDropReceipt, MemorySearchScope, MemorySource,
-    MemoryStore, MemoryStoreError, MessageRange, SESSION_COMPACTION_PROJECTION_INTENTS_KEY,
+    MemoryRecord, MemoryResult, MemoryScopeDropReceipt, MemoryScopeRef, MemorySearchScope,
+    MemorySource, MemoryStore, MemoryStoreError, MessageRange,
+    SESSION_COMPACTION_PROJECTION_INTENTS_KEY,
 };
 pub use model_defaults::ModelOperationalDefaultsResolver;
 pub use model_profile::catalog::ModelReleaseStage;
@@ -465,7 +468,7 @@ pub use realtime_transcript_sidecar::{
 };
 pub use retry::{
     DEFAULT_STREAM_INACTIVITY_TIMEOUT, LlmRetryFailure, LlmRetryFailureKind, LlmRetryPlan,
-    LlmRetrySchedule, RetryPolicy, select_retry_delay,
+    LlmRetrySchedule, MIN_MODEL_STREAM_INACTIVITY_TIMEOUT, RetryPolicy, select_retry_delay,
 };
 pub use runtime_bootstrap::{
     ContextConfig, DualRootResolution, REALM_MANIFEST_FILE_NAME, RealmConfig, RealmLocator,
@@ -587,8 +590,9 @@ pub use tool_application::{
 pub use tool_bundle::RegisteredToolBundleDispatcher;
 pub use tool_catalog::{
     ToolCallability, ToolCatalogCapabilities, ToolCatalogDeferredEligibility, ToolCatalogEntry,
-    ToolCatalogLoadRejectedReason, ToolCatalogLoadResolution, ToolCatalogMode, ToolPlaneClass,
-    ToolUnavailableReason, deferred_session_entry_count, deferred_session_schema_volume,
+    ToolCatalogLoadRejectedReason, ToolCatalogLoadResolution, ToolCatalogMode, ToolCatalogView,
+    ToolCatalogViewEntry, ToolCatalogVisibility, ToolPlaneClass, ToolUnavailableReason,
+    deferred_session_entry_count, deferred_session_schema_volume,
     select_catalog_mode_from_snapshot,
 };
 pub use tool_consequence_policy::{
@@ -604,14 +608,15 @@ pub use tool_consequence_policy::{
     ToolConsequencePolicySnapshot, ToolConsequenceRequest, ToolConsequenceVerdict,
 };
 pub use tool_execution::{
-    CatalogOperation, CoreDispatchDeadline, DeadlineChainError, DeadlineChainExtensionError,
-    DetachedToolExecutionPolicy, EphemeralToolBindingFingerprint, IdempotencyScope,
-    ResolvedExecutionKind, ResolvedToolExecutionPlan, RestartClass, RunnerIdentity,
-    StreamingToolExecutionPolicy, ToolCredentialContextRef, ToolDeadlineChain,
-    ToolDeadlineContributor, ToolDeadlineOwner, ToolDeadlineSource, ToolExecutionApplicability,
-    ToolExecutionContract, ToolExecutionContractError, ToolExecutionDeclarationError,
-    ToolExecutionMode, ToolExecutionOwnerWitness, ToolExecutionResolutionContext,
-    ToolExecutionResolutionError, ToolOperationTarget, ToolOutputPolicy, ToolProgressPolicy,
+    BuiltinToolOperation, CatalogOperation, CoreDispatchDeadline, DeadlineChainError,
+    DeadlineChainExtensionError, DetachedToolExecutionPolicy, EphemeralToolBindingFingerprint,
+    IdempotencyScope, MemoryOperation, PeerSendKind, ResolvedExecutionKind,
+    ResolvedToolExecutionPlan, RestartClass, RunnerIdentity, StreamingToolExecutionPolicy,
+    ToolCredentialContextRef, ToolDeadlineChain, ToolDeadlineContributor, ToolDeadlineOwner,
+    ToolDeadlineSource, ToolExecutionApplicability, ToolExecutionContract,
+    ToolExecutionContractError, ToolExecutionDeclarationError, ToolExecutionMode,
+    ToolExecutionOwnerWitness, ToolExecutionResolutionContext, ToolExecutionResolutionError,
+    ToolOperationTarget, ToolOutputPolicy, ToolProgressPolicy,
     ephemeral_tool_catalog_binding_fingerprint,
 };
 pub use tool_execution_policy::{

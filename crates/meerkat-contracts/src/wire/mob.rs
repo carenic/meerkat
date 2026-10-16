@@ -2917,6 +2917,14 @@ pub struct MobDestroyResult {
     pub destroy_report: Value,
 }
 
+/// Response payload for `mob/claim_callback_route`: the calling connection
+/// now holds the mob's member callback route.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct MobClaimCallbackRouteResult {
+    pub mob_id: String,
+}
+
 /// Response payload for `mob/rotate_supervisor`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]

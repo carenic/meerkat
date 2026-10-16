@@ -30,6 +30,7 @@ use meerkat_core::interaction::{InteractionId, ResponseStatus};
 use meerkat_core::tool_catalog::ToolUnavailableReason;
 use meerkat_core::types::{ContentBlock, HandlingMode, ImageData};
 use meerkat_core::{CurrentTurnImageRef, ToolDispatchContext};
+use meerkat_core::{PeerSendKind, ToolOperationTarget};
 
 const RUNTIME_COMMAND_AUTHORITY_UNAVAILABLE_CODE: &str = "runtime_command_authority_unavailable";
 
@@ -444,6 +445,55 @@ pub async fn handle_tools_call_with_context(
                 .map_err(|e| format!("Invalid arguments: {e}"))?;
             handle_peers(ctx).await
         }
+        _ => Err(format!("Unknown tool: {name}")),
+    }
+}
+
+/// The typed operation target of one comms tool call, derived from the same
+/// typed input and turn context its handler routes by: the one peer a
+/// delivery reaches (the `peer_id` of `send_message`, `send_request` and
+/// `send_response`; for `reply_to_peer`, the sender of the turn's peer
+/// message the reply selects), or the session's trusted-peer directory for
+/// `peers`. It is a fact for an operation policy owner, never a permission:
+/// the handler still checks trust, runtime command authority and delivery.
+/// The `send_response` addressee is the caller's own `peer_id`: the runtime
+/// checks that the request id names a request this session received and
+/// can still answer, but not that the addressed peer sent it.
+///
+/// # Errors
+/// The reason the call names no single addressee: arguments that do not
+/// parse as the tool's input, or a reply that selects no single delivery of
+/// this turn. These are the refusals the handler itself returns.
+pub fn comms_tool_operation_target(
+    name: &str,
+    args: &Value,
+    dispatch_context: &ToolDispatchContext,
+) -> Result<ToolOperationTarget, String> {
+    fn parse_input<T: serde::de::DeserializeOwned>(args: &Value) -> Result<T, String> {
+        serde_json::from_value(args.clone()).map_err(|error| error.to_string())
+    }
+    let delivery = |peer, kind| ToolOperationTarget::PeerSend { peer, kind };
+    match name {
+        "send_message" => {
+            let input: SendMessageInput = parse_input(args)?;
+            Ok(delivery(input.peer_id, PeerSendKind::Message))
+        }
+        "reply_to_peer" => {
+            let input: ReplyToPeerInput = parse_input(args)?;
+            let reply_context = peer_reply_dispatch_context(dispatch_context)?;
+            let capability =
+                select_reply_capability(&reply_context.deliveries, input.reply_to.as_deref())?;
+            Ok(delivery(capability.peer_id, PeerSendKind::Message))
+        }
+        "send_request" => {
+            let input: SendRequestInput = parse_input(args)?;
+            Ok(delivery(input.peer_id, PeerSendKind::Request))
+        }
+        "send_response" => {
+            let input: SendResponseInput = parse_input(args)?;
+            Ok(delivery(input.peer_id, PeerSendKind::Response))
+        }
+        "peers" => Ok(ToolOperationTarget::PeerDirectoryRead),
         _ => Err(format!("Unknown tool: {name}")),
     }
 }
@@ -1583,6 +1633,107 @@ mod tests {
             COMMS_PEER_REPLY_DISPATCH_CONTEXT_KEY.to_string(),
             serde_json::to_value(&context).expect("reply context serializes"),
         )]))
+    }
+
+    /// Each comms tool's typed target comes from the same input and turn
+    /// context its handler routes by: the explicit peer of a send, the
+    /// sender of the turn's peer message for a reply, the trusted-peer
+    /// directory for the roster read. A call naming no single addressee has
+    /// no target, with the handler's own refusal as the reason.
+    #[test]
+    fn comms_tool_operation_targets_name_the_peer_the_handler_routes_to() {
+        let peer = PeerId::new();
+        let none = ToolDispatchContext::default();
+        let send = |kind| ToolOperationTarget::PeerSend { peer, kind };
+        assert_eq!(
+            comms_tool_operation_target(
+                "send_message",
+                &json!({"peer_id": peer, "body": "hi", "handling_mode": "queue"}),
+                &none
+            ),
+            Ok(send(PeerSendKind::Message))
+        );
+        assert_eq!(
+            comms_tool_operation_target(
+                "send_request",
+                &json!({
+                    "peer_id": peer,
+                    "intent": "checksum_token",
+                    "params": {"subject": "check"},
+                    "handling_mode": "queue"
+                }),
+                &none
+            ),
+            Ok(send(PeerSendKind::Request))
+        );
+        assert_eq!(
+            comms_tool_operation_target(
+                "send_response",
+                &json!({
+                    "peer_id": peer,
+                    "in_reply_to": uuid::Uuid::from_u128(5).to_string(),
+                    "status": "accepted"
+                }),
+                &none
+            ),
+            Ok(send(PeerSendKind::Response))
+        );
+        assert_eq!(
+            comms_tool_operation_target("peers", &json!({}), &none),
+            Ok(ToolOperationTarget::PeerDirectoryRead)
+        );
+
+        let sender = PeerId::new();
+        let reply = json!({"body": "done", "handling_mode": "queue"});
+        assert_eq!(
+            comms_tool_operation_target(
+                "reply_to_peer",
+                &reply,
+                &reply_dispatch_context(vec![reply_capability(sender, 7)])
+            ),
+            Ok(ToolOperationTarget::PeerSend {
+                peer: sender,
+                kind: PeerSendKind::Message,
+            })
+        );
+        let two =
+            reply_dispatch_context(vec![reply_capability(sender, 7), reply_capability(peer, 8)]);
+        assert_eq!(
+            comms_tool_operation_target(
+                "reply_to_peer",
+                &json!({
+                    "reply_to": uuid::Uuid::from_u128(8).to_string(),
+                    "body": "done",
+                    "handling_mode": "queue"
+                }),
+                &two
+            ),
+            Ok(send(PeerSendKind::Message)),
+            "an explicit selector reaches the sender of that delivery"
+        );
+
+        for (name, args, context, refusal) in [
+            (
+                "reply_to_peer",
+                reply.clone(),
+                none.clone(),
+                "no_reply_capability",
+            ),
+            ("reply_to_peer", reply, two, "ambiguous_reply"),
+        ] {
+            let error = comms_tool_operation_target(name, &args, &context)
+                .expect_err("a reply without one selected delivery has no addressee");
+            assert!(error.starts_with(refusal), "{error}");
+        }
+        assert!(
+            comms_tool_operation_target(
+                "send_message",
+                &json!({"body": "hi", "handling_mode": "queue"}),
+                &none
+            )
+            .is_err(),
+            "a send without a peer has no addressee"
+        );
     }
 
     #[tokio::test]

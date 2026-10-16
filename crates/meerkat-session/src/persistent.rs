@@ -7387,6 +7387,16 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
         self.inner.tool_scope_snapshot(id).await
     }
 
+    /// How a live session's next model request projects its tool catalog
+    /// ([`meerkat_core::ToolCatalogView`]); `None` when the session's agent
+    /// cannot report it.
+    pub async fn tool_catalog_view(
+        &self,
+        id: &SessionId,
+    ) -> Result<Option<meerkat_core::ToolCatalogView>, SessionError> {
+        self.inner.tool_catalog_view(id).await
+    }
+
     pub async fn live_visible_tool_defs(
         &self,
         id: &SessionId,
@@ -13046,7 +13056,21 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
             .map_err(SessionError::from)
     }
 
-    async fn create_session_with_admission(
+    /// [`Self::create_session_with_admission_inner`], built in its own frame:
+    /// every create and actor materialization entry point awaits this
+    /// future, and at opt-level 0 an inline await reserved twice its size in
+    /// each of their poll frames, beneath the whole create.
+    fn create_session_with_admission<'a>(
+        &'a self,
+        req: CreateSessionRequest,
+        admission: PersistentCreateAdmission<'a>,
+    ) -> meerkat_runtime::stack_relief::OwnFrameFuture<'a, Result<RunResult, SessionError>> {
+        meerkat_runtime::stack_relief::box_in_own_frame(move || {
+            self.create_session_with_admission_inner(req, admission)
+        })
+    }
+
+    async fn create_session_with_admission_inner(
         &self,
         mut req: CreateSessionRequest,
         admission: PersistentCreateAdmission<'_>,
@@ -13148,7 +13172,16 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
                 // actor body: materializing the older committed body first
                 // would prepare its initial boundary against an already-ahead
                 // physical head and necessarily lose the predecessor CAS.
-                match self.recover_committed_boundary(resume_session_id).await? {
+                //
+                // This recovery, the archived-resume check and the inner
+                // create below are built in their own frames: at opt-level 0
+                // each awaited future reserved twice its size in this poll
+                // frame.
+                match meerkat_runtime::stack_relief::box_in_own_frame(|| {
+                    self.recover_committed_boundary(resume_session_id)
+                })
+                .await?
+                {
                     CommittedBoundaryRecovery::AlreadyCommitted
                     | CommittedBoundaryRecovery::Recovered { .. } => {}
                     CommittedBoundaryRecovery::Unprovable { reason } => {
@@ -13495,11 +13528,13 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
                 )
                 .await?;
                 if let Some(resume_session_id) = resume_session_id.as_ref() {
-                    self.reject_archived_resume_under_recovery_gate(
-                        resume_session_id,
-                        prepared_observation.as_ref(),
-                        archived_resume_allowed,
-                    )
+                    meerkat_runtime::stack_relief::box_in_own_frame(|| {
+                        self.reject_archived_resume_under_recovery_gate(
+                            resume_session_id,
+                            prepared_observation.as_ref(),
+                            archived_resume_allowed,
+                        )
+                    })
                     .await?;
                 }
                 Some(guard)
@@ -13517,14 +13552,14 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
             .install_create_time_event_projection(&mut req, materialization_session_id)
             .await;
         let callback_session_id = resume_session_id.clone();
-        let (result, _actor_witness) = match self
-            .inner
-            .create_session_with_admission_and_witness(
+        let (result, _actor_witness) = match meerkat_runtime::stack_relief::box_in_own_frame(|| {
+            self.inner.create_session_with_admission_and_witness(
                 req,
                 reserved_create_admission,
                 actor_witness_slot,
             )
-            .await
+        })
+        .await
         {
             Ok(result) => result,
             Err(error) => {
@@ -16512,10 +16547,14 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
     /// WARNs while the save stays pending past the slow-await threshold
     /// (diagnostics only).
     async fn persist_full_session(&self, id: &SessionId) -> Result<(usize, String), SessionError> {
+        // Built in its own frame: boxed here, the save future was first
+        // materialized at its full size in this poll frame.
         meerkat_core::slow_await::warn_if_slow(
             id,
             "session: full-session save",
-            Box::pin(self.persist_full_session_unwatched(id)),
+            meerkat_runtime::stack_relief::box_in_own_frame(|| {
+                self.persist_full_session_unwatched(id)
+            }),
         )
         .await
     }
@@ -16527,7 +16566,12 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
         match self.runtime_store.session_persistence_profile() {
             RuntimeSessionPersistenceProfile::WholeBlobV1 => {
                 let session = self.export_session_with_labels(id).await?;
-                let persisted = self.save_normalized_session(session).await?;
+                // Built in its own frame: at opt-level 0 the awaited save
+                // reserved twice its size in this poll frame.
+                let persisted = meerkat_runtime::stack_relief::box_in_own_frame(|| {
+                    self.save_normalized_session(session)
+                })
+                .await?;
                 let message_count = persisted.messages().len();
                 // Byte-identical to `transcript_messages_digest`, but served
                 // from the persisted session's retained midstate when the

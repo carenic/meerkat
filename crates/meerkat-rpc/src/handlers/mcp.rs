@@ -53,7 +53,7 @@ pub async fn handle_add(
             .await
         {
             Ok(persisted) => persisted,
-            Err(err) => return RpcResponse::error(id, err.code, err.message),
+            Err(err) => return RpcResponse::from_error(id, err),
         };
 
         let response = meerkat::surface::mcp_live_response(
@@ -108,7 +108,7 @@ pub async fn handle_remove(
             .await
         {
             Ok(persisted) => persisted,
-            Err(err) => return RpcResponse::error(id, err.code, err.message),
+            Err(err) => return RpcResponse::from_error(id, err),
         };
 
         let response = meerkat::surface::mcp_live_response(
@@ -160,7 +160,7 @@ pub async fn handle_reload(
             .mcp_stage_reload(&session_id, params.server_name.clone())
             .await
         {
-            return RpcResponse::error(id, err.code, err.message);
+            return RpcResponse::from_error(id, err);
         }
 
         let response = meerkat::surface::mcp_live_response(

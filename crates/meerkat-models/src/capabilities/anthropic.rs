@@ -143,6 +143,7 @@ pub const CAPABILITIES: &[ModelCapabilities] = &[
         supports_thinking_budget_legacy: false,
         beta_headers: ADAPTIVE_COMPACTION_BETAS,
         call_timeout_secs: Some(300),
+        stream_inactivity_timeout_secs: None,
         supports_forced_tool_choice: true,
     },
     // Claude Fable 5
@@ -223,6 +224,7 @@ pub const CAPABILITIES: &[ModelCapabilities] = &[
         supports_thinking_budget_legacy: false,
         beta_headers: ADAPTIVE_COMPACTION_BETAS,
         call_timeout_secs: Some(300),
+        stream_inactivity_timeout_secs: None,
         supports_forced_tool_choice: true,
     },
     // Claude Opus 5.5
@@ -284,6 +286,7 @@ pub const CAPABILITIES: &[ModelCapabilities] = &[
         supports_thinking_budget_legacy: false,
         beta_headers: ADAPTIVE_COMPACTION_BETAS,
         call_timeout_secs: Some(300),
+        stream_inactivity_timeout_secs: None,
         // Live probe 2026-10-01: tool_choice any/tool answers 400 "not
         // supported for this model" with and without thinking.
         supports_forced_tool_choice: false,
@@ -338,6 +341,7 @@ pub const CAPABILITIES: &[ModelCapabilities] = &[
         supports_thinking_budget_legacy: false,
         beta_headers: ADAPTIVE_COMPACTION_BETAS,
         call_timeout_secs: Some(300),
+        stream_inactivity_timeout_secs: None,
         supports_forced_tool_choice: true,
     },
     // Claude Opus 4.8
@@ -397,6 +401,7 @@ pub const CAPABILITIES: &[ModelCapabilities] = &[
         supports_thinking_budget_legacy: false,
         beta_headers: ADAPTIVE_COMPACTION_BETAS,
         call_timeout_secs: Some(300),
+        stream_inactivity_timeout_secs: None,
         supports_forced_tool_choice: true,
     },
     // Claude Opus 4.7
@@ -455,6 +460,7 @@ pub const CAPABILITIES: &[ModelCapabilities] = &[
         supports_thinking_budget_legacy: false,
         beta_headers: ADAPTIVE_COMPACTION_BETAS,
         call_timeout_secs: Some(300),
+        stream_inactivity_timeout_secs: None,
         supports_forced_tool_choice: true,
     },
     // Claude Sonnet 5.5
@@ -525,6 +531,7 @@ pub const CAPABILITIES: &[ModelCapabilities] = &[
         supports_thinking_budget_legacy: false,
         beta_headers: ADAPTIVE_COMPACTION_BETAS,
         call_timeout_secs: Some(120),
+        stream_inactivity_timeout_secs: None,
         // Forced `tool_choice` (`any`/`tool`) returns 400 on Sonnet 5.5,
         // including on token counting (what's new and the migration guide,
         // "Forced tool use is not supported"); refuse it locally, as for
@@ -609,6 +616,7 @@ pub const CAPABILITIES: &[ModelCapabilities] = &[
         supports_thinking_budget_legacy: false,
         beta_headers: ADAPTIVE_COMPACTION_BETAS,
         call_timeout_secs: Some(120),
+        stream_inactivity_timeout_secs: None,
         supports_forced_tool_choice: true,
     },
     // Claude Sonnet 4.6
@@ -664,6 +672,7 @@ pub const CAPABILITIES: &[ModelCapabilities] = &[
         supports_thinking_budget_legacy: true,
         beta_headers: ADAPTIVE_COMPACTION_BETAS,
         call_timeout_secs: Some(120),
+        stream_inactivity_timeout_secs: None,
         supports_forced_tool_choice: true,
     },
     // Claude Sonnet 4.5
@@ -723,6 +732,7 @@ pub const CAPABILITIES: &[ModelCapabilities] = &[
         supports_thinking_budget_legacy: true,
         beta_headers: LEGACY_THINKING_BETAS,
         call_timeout_secs: Some(120),
+        stream_inactivity_timeout_secs: None,
         supports_forced_tool_choice: true,
     },
     // Claude Haiku 5.5
@@ -807,6 +817,7 @@ pub const CAPABILITIES: &[ModelCapabilities] = &[
         supports_thinking_budget_legacy: false,
         beta_headers: ADAPTIVE_COMPACTION_BETAS,
         call_timeout_secs: Some(120),
+        stream_inactivity_timeout_secs: None,
         supports_forced_tool_choice: true,
     },
     // Claude Haiku 4.5
@@ -857,6 +868,7 @@ pub const CAPABILITIES: &[ModelCapabilities] = &[
         supports_thinking_budget_legacy: true,
         beta_headers: LEGACY_THINKING_BETAS,
         call_timeout_secs: Some(60),
+        stream_inactivity_timeout_secs: None,
         supports_forced_tool_choice: true,
     },
     // Claude Haiku 4.5 alias
@@ -901,6 +913,7 @@ pub const CAPABILITIES: &[ModelCapabilities] = &[
         supports_thinking_budget_legacy: true,
         beta_headers: LEGACY_THINKING_BETAS,
         call_timeout_secs: Some(60),
+        stream_inactivity_timeout_secs: None,
         supports_forced_tool_choice: true,
     },
     // Claude Opus 4.5
@@ -957,6 +970,7 @@ pub const CAPABILITIES: &[ModelCapabilities] = &[
         supports_thinking_budget_legacy: true,
         beta_headers: LEGACY_THINKING_BETAS,
         call_timeout_secs: Some(300),
+        stream_inactivity_timeout_secs: None,
         supports_forced_tool_choice: true,
     },
 ];

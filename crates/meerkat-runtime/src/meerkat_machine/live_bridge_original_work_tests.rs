@@ -465,6 +465,235 @@ async fn admission_records_the_exact_staged_original_work_and_the_outcome_resolv
     assert_ne!(again.identity(), &later);
 }
 
+/// Admit a completion of `original_run` as a governed retained resume, the
+/// way the delivery owner does, and return the resume input's id.
+async fn resume_original_run(
+    fixture: &GovernedBridge,
+    original_run: RetainedWorkIdentity,
+) -> InputId {
+    use crate::delivery_inbox::{
+        RuntimeDeliveryId, RuntimeDeliveryInbox, RuntimeDeliveryKind, RuntimeDeliverySubmission,
+    };
+    let inbox = RuntimeDeliveryInbox::new(Arc::new(crate::store::InMemoryRuntimeStore::new()));
+    let delivery = RuntimeDeliveryId::new("continuation:resume").expect("id");
+    inbox
+        .submit(
+            &fixture.runtime_id,
+            RuntimeDeliverySubmission::new(
+                delivery.clone(),
+                RuntimeDeliveryKind::Continuation,
+                "fork_off",
+                1,
+                "fork_off:job-1",
+                b"completion".to_vec(),
+            )
+            .expect("submission"),
+        )
+        .await
+        .expect("commit");
+    let request = inbox
+        .retained_resume_request(&fixture.runtime_id, &delivery, 1, move |_stored| {
+            Ok(original_run)
+        })
+        .await
+        .expect("request from the head row");
+    let continuation = crate::input::Input::Prompt(crate::input::PromptInput::continuation(
+        InputId::new(),
+        "fork_off:job-1",
+        "the fork finished".into(),
+        meerkat_core::types::HandlingMode::Queue,
+    ));
+    match fixture
+        .machine
+        .accept_retained_resume(&fixture.session_id, continuation, request)
+        .await
+        .expect("the original run's continuation resumes it")
+        .0
+    {
+        AcceptOutcome::Accepted { state, .. } => state.input_id,
+        other => panic!("accepted, got {other:?}"),
+    }
+}
+
+/// Record a bridge operation carrying `original_work` through the generated
+/// input, as recovery would load it, and return its exact identity.
+async fn record_operation_with(
+    fixture: &GovernedBridge,
+    provider_turn_ref: &str,
+    original_work: String,
+) -> meerkat_core::exact_operation::ExactOperationIdentity<
+    meerkat_core::LiveBridgeOperationCorrelation,
+> {
+    use crate::meerkat_machine::dsl as mm;
+    let binding = &fixture.binding;
+    let interaction_id = meerkat_core::InteractionId::new();
+    fixture
+        .machine
+        .apply_session_dsl_input(
+            &fixture.session_id,
+            mm::MeerkatMachineInput::ObserveLiveProviderTurnStarted {
+                channel_id: binding.channel_id().to_string(),
+                runtime_id: mm::AgentRuntimeId::from_domain(binding.runtime_id()),
+                fence_token: mm::FenceToken(binding.fence_token()),
+                generation: mm::Generation(binding.generation()),
+                interaction_id: interaction_id.to_string(),
+                provider_turn_ref: provider_turn_ref.to_string(),
+            },
+            "test:ObserveLiveProviderTurnStarted",
+        )
+        .await
+        .expect("provider turn lineage");
+    let operation = meerkat_core::OperationId::new();
+    let canonical_context_revision = meerkat_core::Session::with_id(fixture.session_id.clone())
+        .canonical_context_revision()
+        .expect("context revision");
+    fixture
+        .machine
+        .apply_session_dsl_input(
+            &fixture.session_id,
+            mm::MeerkatMachineInput::AdmitLiveBridgeOperation {
+                session_id: fixture.session_id.to_string(),
+                channel_id: binding.channel_id().to_string(),
+                runtime_id: mm::AgentRuntimeId::from_domain(binding.runtime_id()),
+                fence_token: mm::FenceToken(binding.fence_token()),
+                generation: mm::Generation(binding.generation()),
+                interaction_id: interaction_id.to_string(),
+                operation_id: mm::OperationId::from_domain(&operation),
+                provider_turn_ref: provider_turn_ref.to_string(),
+                provider_delegation_ref: format!("{provider_turn_ref}:delegation"),
+                provider_call_ref: format!("{provider_turn_ref}:call"),
+                agent_identity: mm::AgentIdentity::from("test-durable-member"),
+                canonical_context_revision: canonical_context_revision.as_str().to_string(),
+                request_digest: meerkat_core::LiveBridgeRequestDigest::derive("check")
+                    .expect("digest")
+                    .as_str()
+                    .to_string(),
+                original_work,
+                structural_lineage_proven: true,
+            },
+            "test:RecordedOriginalWork",
+        )
+        .await
+        .expect("operation recorded");
+    let provider = meerkat_core::LiveBridgeProviderCorrelation::new(
+        provider_turn_ref,
+        format!("{provider_turn_ref}:delegation"),
+        format!("{provider_turn_ref}:call"),
+    )
+    .expect("provider correlation");
+    let correlation = meerkat_core::LiveBridgeOperationCorrelation::new(
+        binding.channel_id().clone(),
+        interaction_id,
+        provider,
+    )
+    .expect("bridge correlation");
+    meerkat_core::exact_operation::ExactOperationIdentity::for_domain(operation, correlation)
+}
+
+/// The resumed-run twin of
+/// `admission_records_the_exact_staged_original_work_and_the_outcome_resolves_it`:
+/// a bridge operation dispatched from a run that resumed retained work
+/// records that run's identity, and its outcome resolves to the original the
+/// run resumes, through the staged resume row. A recorded identity whose
+/// resume row binding was changed is unavailable.
+#[tokio::test]
+async fn a_resumed_runs_bridge_outcome_resolves_to_the_original_it_resumes() {
+    let fixture = governed_bridge().await;
+    let (original, _, resumed_run) = staged_resumed_run(&fixture).await;
+
+    let admission = admit_bridge(&fixture, "provider:turn:resumed", Some(&resumed_run))
+        .await
+        .expect("the exact resumed batch admits");
+    let authority = fixture
+        .machine
+        .live_bridge_outcome_authority(&fixture.session_id, admission.operation())
+        .await
+        .expect("the resumed run's outcome resolves");
+    assert_eq!(authority.identity(), &resumed_run);
+    // Attributed to the original the run resumes: its own retained authority,
+    // read from its row, and its participants, not the resume input's.
+    let own = {
+        let driver = fixture.driver.lock().await;
+        let DriverEntry::Ephemeral(driver) = &*driver else {
+            panic!("storeless")
+        };
+        driver
+            .input_state(&original)
+            .and_then(|row| {
+                row.authority_contributors
+                    .iter()
+                    .find(|retained| retained.input_id() == &original)
+                    .cloned()
+            })
+            .expect("the original retains its association")
+    };
+    assert_eq!(authority.contributors(), std::slice::from_ref(&own));
+    let participants = own.association().candidate();
+    assert_eq!(authority.requester(), &participants.requester);
+    assert_eq!(authority.logical_executor(), &participants.logical_executor);
+    assert_eq!(
+        authority.represented_subject(),
+        participants.represented_subject.as_ref()
+    );
+    assert_eq!(authority.realm(), &participants.ingress_namespace.realm);
+
+    // The same chain on its own channel, with an operation recorded with the
+    // resumed run's identity but its resume row binding changed.
+    let tampered = governed_bridge().await;
+    let (_, resume, resumed_run) = staged_resumed_run(&tampered).await;
+    let mut selected = resumed_run.selected_input_bindings().clone();
+    selected
+        .get_mut(&resume.to_string())
+        .expect("the staged resume row")
+        .binding = "another-binding".into();
+    let changed = with(&resumed_run, None, None, Some(selected));
+    let operation = record_operation_with(
+        &tampered,
+        "provider:turn:changed",
+        serde_json::to_string(&changed).expect("identity"),
+    )
+    .await;
+    assert!(
+        tampered
+            .machine
+            .live_bridge_operation_has_original_work(&tampered.session_id, &operation)
+            .await
+            .expect("operation present"),
+        "the changed binding is recorded"
+    );
+    let outcome = tampered
+        .machine
+        .live_bridge_outcome_authority(&tampered.session_id, &operation)
+        .await;
+    assert!(
+        matches!(
+            outcome,
+            Err(
+                crate::live_execution::LiveBridgeOutcomeBindingError::Unavailable(
+                    RuntimeDriverError::RetainedResumeRefused {
+                        reason:
+                            crate::retained_work::RetainedResumeRefusal::NoAdmissibleWorkBinding,
+                    }
+                )
+            )
+        ),
+        "a changed resume row binding is no admissible work binding: {outcome:?}"
+    );
+}
+
+/// An original staged and finished as a run, a completion of that run
+/// admitted as resume R1, and R1 staged as the current run. Returns the
+/// original's id, R1's id and the resumed run's minted identity.
+async fn staged_resumed_run(fixture: &GovernedBridge) -> (InputId, InputId, RetainedWorkIdentity) {
+    let original = admit_original(fixture, "original-requester").await;
+    let original_run = stage_run(fixture, std::slice::from_ref(&original)).await;
+    finish_run(fixture, original_run.run_id()).await;
+    let resume = resume_original_run(fixture, original_run.clone()).await;
+    let resumed_run = stage_run(fixture, std::slice::from_ref(&resume)).await;
+    assert_eq!(resumed_run.contributors(), original_run.contributors());
+    (original, resume, resumed_run)
+}
+
 #[tokio::test]
 async fn admission_refuses_anything_but_the_exact_dispatching_batch() {
     let fixture = governed_bridge().await;

@@ -332,14 +332,17 @@ impl SecretDigests {
 
     fn track<'a>(&mut self, values: impl IntoIterator<Item = &'a str>) {
         for value in values {
+            // The tail is matched once its controls are stripped, so a value
+            // is tracked as it would appear there.
+            let value = strip_controls(value);
             // A multi-line value is also tracked line by line, so a value cut
             // at the tail's edge does not show its remaining lines.
             let lines = value
                 .contains('\n')
-                .then(|| value.lines().map(|line| line.trim_end_matches('\r')))
+                .then(|| value.lines())
                 .into_iter()
                 .flatten();
-            for candidate in std::iter::once(value).chain(lines) {
+            for candidate in std::iter::once(value.as_str()).chain(lines) {
                 if !self.track_one(candidate.as_bytes()) {
                     return;
                 }
@@ -452,8 +455,11 @@ fn cut_start(bytes: &[u8]) -> usize {
 
 fn render_tail(bytes: &[u8], truncated: bool, secrets: &SecretDigests) -> String {
     let start = if truncated { cut_start(bytes) } else { 0 };
-    let exact = secrets.redact(&bytes[start..]);
-    let text = strip_controls(&String::from_utf8_lossy(&exact));
+    // Decoded and stripped before the exact pass: a launch value split by
+    // bytes the strip removes is whole again when that pass looks for it.
+    let text = strip_controls(&String::from_utf8_lossy(&bytes[start..]));
+    let exact = secrets.redact(text.as_bytes());
+    let text = String::from_utf8_lossy(&exact).into_owned();
     // A private key cut at the edge starts the tail inside its body: with
     // no BEGIN marker before its END marker, everything up to that END
     // marker is redacted.
@@ -465,11 +471,23 @@ fn render_tail(bytes: &[u8], truncated: bool, secrets: &SecretDigests) -> String
 }
 
 /// `text` without control characters (C0, DEL and C1) other than line feed
-/// and tab, so the tail cannot carry terminal escape sequences, carriage
-/// returns or other control codes to whoever prints it.
+/// and tab, and without the bidirectional and zero-width format characters
+/// (U+061C, U+200B to U+200F, U+202A to U+202E and U+2066 to U+2069): the
+/// tail can neither carry terminal escape sequences, carriage returns or
+/// other control codes to whoever prints it, nor reorder or hide its text
+/// there.
 fn strip_controls(text: &str) -> String {
     text.chars()
-        .filter(|character| !character.is_control() || matches!(character, '\n' | '\t'))
+        .filter(|character| {
+            (!character.is_control() || matches!(character, '\n' | '\t'))
+                && !matches!(
+                    character,
+                    '\u{061C}'
+                        | '\u{200B}'..='\u{200F}'
+                        | '\u{202A}'..='\u{202E}'
+                        | '\u{2066}'..='\u{2069}'
+                )
+        })
         .collect()
 }
 
@@ -935,6 +953,39 @@ mod tests {
         record.append_stderr("a\x1b[31mred\x1b[0m\x07 bell\r\n\u{9b}c\u{7f}d\tt\n".as_bytes());
         let tail = record.stderr_tail().expect("captured");
         assert_eq!(tail.text, "a[31mred[0m bell\ncd\tt\n");
+    }
+
+    /// The bidirectional and zero-width format characters are removed too,
+    /// so a server cannot reorder or hide the text an operator prints.
+    #[test]
+    fn bidirectional_and_zero_width_format_characters_are_removed() {
+        let record = record_with(&[]);
+        record.append_stderr(
+            "a\u{202A}b\u{202B}c\u{202C}d\u{202D}e\u{202E}f\u{2066}g\u{2067}h\u{2068}i\u{2069}j\u{200B}k\u{200C}l\u{200D}m\u{200E}n\u{200F}o\u{061C}p\n"
+                .as_bytes(),
+        );
+        let tail = record.stderr_tail().expect("captured");
+        assert_eq!(tail.text, "abcdefghijklmnop\n");
+    }
+
+    /// A launch value split by bytes the strip removes is redacted: the
+    /// exact pass runs after the strip, not before it.
+    #[test]
+    fn a_launch_value_split_by_stripped_bytes_is_redacted() {
+        let record = record_with(&["correcthorsebattery"]);
+        // No `key=` style prefix: the shape pass would hide a miss.
+        record.append_stderr(b"first correct\x01horsebattery done\n");
+        record.append_stderr("then correct\u{202E}horse\u{200B}battery end\n".as_bytes());
+        let tail = record.stderr_tail().expect("captured");
+        assert!(!tail.text.contains("correcthorse"), "{:?}", tail.text);
+        assert_eq!(tail.text, "first [REDACTED] done\nthen [REDACTED] end\n");
+
+        // A launch value carrying such bytes itself is matched as the tail
+        // shows it once they are stripped.
+        let record = record_with(&["correct\x01horse\u{2066}battery"]);
+        record.append_stderr(b"echo correct\x01horse\xe2\x81\xa6battery\n");
+        let tail = record.stderr_tail().expect("captured");
+        assert_eq!(tail.text, "echo [REDACTED]\n");
     }
 
     #[test]

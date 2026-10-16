@@ -285,6 +285,17 @@ fn http_client(server: &Server) -> Arc<dyn LlmClient> {
     http_client_with_binding(server, binding)
 }
 fn http_client_with_binding(server: &Server, binding: AuthBindingRef) -> Arc<dyn LlmClient> {
+    http_client_with_authorizer(
+        server,
+        binding,
+        Arc::new(FixtureAuthorizer(server.receiver.clone())),
+    )
+}
+fn http_client_with_authorizer(
+    server: &Server,
+    binding: AuthBindingRef,
+    authorizer: Arc<dyn HttpAuthorizer>,
+) -> Arc<dyn LlmClient> {
     let model = server.model();
     let identity = SessionLlmIdentity {
         model: model.into(),
@@ -313,7 +324,7 @@ fn http_client_with_binding(server: &Server, binding: AuthBindingRef) -> Arc<dyn
         }),
         credential_identity: AuthCredentialIdentity::Binding(binding),
         auth_lease: Arc::new(DynamicLease::from_authorizer(
-            Arc::new(FixtureAuthorizer(server.receiver.clone())),
+            authorizer,
             AuthMetadata::default(),
             "synthetic-e1",
         )),
@@ -735,11 +746,14 @@ async fn exercise(server: &Server) {
         == refused.observation.operation_id
         && matches!(
             record.observation.observation,
-            AuditObservation::Entry | AuditObservation::Outcome { .. }
+            AuditObservation::Entry { .. } | AuditObservation::Outcome { .. }
         )));
     assert!(audit.iter().any(|record| record.observation.operation_id
         == allowed.observation.operation_id
-        && matches!(record.observation.observation, AuditObservation::Entry)));
+        && matches!(
+            record.observation.observation,
+            AuditObservation::Entry { .. }
+        )));
     assert!(audit.iter().any(|record| record.observation.operation_id
         == allowed.observation.operation_id
         && matches!(
@@ -769,7 +783,10 @@ async fn exercise(server: &Server) {
             audit
                 .iter()
                 .any(|record| &record.observation.operation_id == operation_id
-                    && matches!(record.observation.observation, AuditObservation::Entry))
+                    && matches!(
+                        record.observation.observation,
+                        AuditObservation::Entry { .. }
+                    ))
         );
     }
     assert!(
@@ -884,6 +901,9 @@ mod stock_persistent;
 
 #[path = "e1_policy_control/model_reviewer.rs"]
 mod model_reviewer;
+
+#[path = "e1_policy_control/delegated_web_search.rs"]
+mod delegated_web_search;
 
 #[cfg(all(target_os = "macos", feature = "integration-real-tests"))]
 #[path = "e1_policy_control/shell_confinement.rs"]

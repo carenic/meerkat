@@ -69,9 +69,12 @@ fn exits_before_initialize(name: &str) -> McpServerConfig {
 }
 
 fn adapter() -> Arc<McpRouterAdapter> {
-    Arc::new(McpRouterAdapter::new(McpRouter::new_with_surface_handle(
-        Arc::new(meerkat_runtime::RuntimeExternalToolSurfaceHandle::ephemeral()),
-    )))
+    Arc::new(McpRouterAdapter::new(
+        McpRouter::new_with_surface_handle_and_stdio_profile(
+            Arc::new(meerkat_runtime::RuntimeExternalToolSurfaceHandle::ephemeral()),
+            crate::McpStdioLaunchProfile::trusted_host(),
+        ),
+    ))
 }
 
 /// A prepared control that always permits the apply.

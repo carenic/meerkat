@@ -372,8 +372,10 @@ rkat run -p self-hosted "Say hello"   # uses [self_hosted] default_model
 - Other alias keys: `display_name`, `family`, `tier`, `max_input_tokens`,
   `image_tool_results` (effective only with `api_style = "responses"`),
   `inline_video`, `supports_temperature` (default true), `supports_thinking`,
-  `call_timeout_secs`, `supports_web_search` (keep false: there is no
-  self-hosted native search).
+  `call_timeout_secs`, `stream_inactivity_timeout_secs` (this model's
+  stream-inactivity window in seconds, at least 60, for a long prefill for
+  example; omitted: the `[retry]` window), `supports_web_search` (keep false:
+  there is no self-hosted native search).
 - Self-hosted credentials come only from realm bindings (realm model in
   references/providers_and_auth_credentials.md); there is no env-var
   fast path. Use `auth_method = "static_bearer"` with

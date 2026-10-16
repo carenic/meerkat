@@ -433,6 +433,32 @@ effective tool-access policy at creation time. This prevents a scheduled
 helper from gaining tools the creator could not use. Public host APIs reject
 helper-tooling modes that depend on an active parent context.
 
+## Tearing down an embedded schedule host
+
+Rust hosts that compose scheduling themselves (agent-side schedule tools in
+the factory builder's `default_schedule_tools` slot, and a schedule host from
+`spawn_runtime_backed_schedule_host`, its `_with_mobs` variants or
+`spawn_schedule_host`) own one teardown step. The schedule host attaches its
+session and mob hosts to the `ScheduleService` as the create-time target
+probe, and every clone of the service keeps that probe for as long as the
+clone lives. The runtime-backed session host holds the session service, a
+mob host holds the mob state, the schedule tools in the builder's slot hold
+a clone of the service, and the session service owns the builder, so these
+keep one another alive after the schedule host stops.
+
+After a successful teardown (the schedule host shut down and joined, every
+other task that holds the `ScheduleService` stopped, and the session service
+shut down), clear the builder's `default_schedule_tools` slot and every other
+holder of the service or of its hosts, such as a registry that resolves
+schedule targets to mob state. The builder moves into the session service, so
+keep a clone of the slot before that and write `None` through it, or call
+`meerkat::surface::set_default_schedule_tools` with `None` while you still
+hold the builder. Do not clear anything earlier: agent builds read the slot
+until the session service is down. Skipping this step keeps the session
+service and the mob state owned, and a mob store's observer drain
+(`SqliteMobStores::drain_observers`) refuses because other owners are still
+alive. A process that exits after teardown needs no extra step.
+
 ## See also
 
 - [JSON-RPC API](/api/rpc)

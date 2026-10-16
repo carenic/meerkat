@@ -86,7 +86,7 @@ Primary crates:
 - `MobBuilder::for_resume(storage)`
 - `.with_session_service(Arc<dyn MobSessionService>)`
 - `.allow_ephemeral_sessions(bool)`
-- `.notify_orchestrator_on_resume(bool)` (a notification that fails after the resume returned is recorded as an `OrchestratorResumeNotificationFailed` mob event; the mob keeps running)
+- `.notify_orchestrator_on_resume(bool)` (a notification that fails after the resume returned is recorded as an `OrchestratorResumeNotificationFailed` mob event once its input has failed terminally, after the runtime's bounded retries; one a retry delivers records nothing; the mob keeps running. The event is recorded in process: a crash before the input's terminal loses it)
 - `.with_default_llm_client(client)` — override LLM client (primarily for testing)
 - `.register_tool_bundle(name, dispatcher)` / `.register_tool_bundle_with_account(name, account, dispatcher)` (states the `OperationAccount` the bundle's operations act with)
 - `.create().await`
@@ -474,9 +474,13 @@ surface contracts.
 ```
 
 A mob's members reach the callback tools registered on the JSON-RPC
-connection whose `mob/create` created that mob. A mob restored after a
-restart, or created any other way, has no callback route; re-create it to
-bind a live connection.
+connection that holds the mob's callback route: the connection whose
+`mob/create` created it, or the one that claimed it with
+`mob/claim_callback_route {mob_id}`. A mob restored after a restart, created
+any other way, or whose connection closed, has no route: its members'
+callbacks fail `tool_unavailable` until a connection claims it. The claim
+reaches live and later members alike; while the holding connection is open,
+another connection's claim is refused with `-32002`.
 
 ### REST
 

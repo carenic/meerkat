@@ -683,7 +683,9 @@ impl LlmClient for ScriptedModel {
             .expect("native controller authorization")
             .current()
             .expect("final controller entry check");
-        check.observe_entry().expect("transport entry");
+        check
+            .observe_entry(meerkat_core::OperationEntryBoundary::ModelRequest)
+            .expect("transport entry");
         check
             .observe_outcome(OperationObservedOutcome::HttpResponse { status: 200 })
             .expect("fixture response");
@@ -923,7 +925,7 @@ async fn a_stock_prompt_loads_reads_and_has_its_write_refused() {
         assert!(
             observed
                 .iter()
-                .any(|observation| matches!(observation, AuditObservation::Entry)),
+                .any(|observation| matches!(observation, AuditObservation::Entry { .. })),
             "{call} reached its native entry"
         );
     }
@@ -1647,7 +1649,7 @@ async fn a_bundle_operation_runs_beside_its_refused_sibling_and_after_reopen() {
     assert!(
         tool_audit(&audit, "read")
             .iter()
-            .any(|observation| matches!(observation, AuditObservation::Entry)),
+            .any(|observation| matches!(observation, AuditObservation::Entry { .. })),
         "the read reached its native entry"
     );
     realm.close(vec![session]).await;

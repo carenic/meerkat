@@ -14711,8 +14711,12 @@ async fn persistent_destroy_durable_commit_observes_canonical_destroy_truth() {
                 .commit_machine_lifecycle(runtime_id, commit, input_states)
                 .await?;
             if runtime_state == RuntimeState::Destroyed {
+                // Register for the release before signalling: the test
+                // releases with `notify_waiters()`, which reaches only a
+                // `Notified` that already exists.
+                let released = self.release_destroy_commit.notified();
                 self.destroy_commit_started.notify_one();
-                self.release_destroy_commit.notified().await;
+                released.await;
             }
             Ok(())
         }
@@ -15300,7 +15304,10 @@ async fn meerkat_machine_spine_snapshot_attached_steered_prompt_requests_immedia
         .await
         .expect("attached steered prompt should finish after the executor is released");
 
-    match completion_handle.wait_authorized().await {
+    match tokio::time::timeout(Duration::from_secs(5), completion_handle.wait_authorized())
+        .await
+        .expect("queued work should complete after its apply is released")
+    {
         CompletionOutcome::CompletedWithoutResult => {}
         other => panic!(
             "expected attached steered prompt to complete through the live loop, got {other:?}"
@@ -15504,7 +15511,10 @@ async fn meerkat_machine_spine_snapshot_attached_steered_prompt_splits_completio
         .await
         .expect("attached steered prompt should finish after the executor is released");
 
-    match completion_handle.wait_authorized().await {
+    match tokio::time::timeout(Duration::from_secs(5), completion_handle.wait_authorized())
+        .await
+        .expect("queued work should complete after its apply is released")
+    {
         CompletionOutcome::CompletedWithoutResult => {}
         other => panic!(
             "expected attached steered prompt to complete while wait_all remains live, got {other:?}"
@@ -15566,7 +15576,10 @@ async fn meerkat_machine_spine_snapshot_attached_steered_prompt_splits_completio
             },
         )
         .expect("operation should complete after attached steered completion");
-    let wait_result = wait_future.await.expect("wait_all should still resolve");
+    let wait_result = tokio::time::timeout(Duration::from_secs(5), wait_future)
+        .await
+        .expect("wait_all should resolve after the release")
+        .expect("wait_all should still resolve");
     assert_eq!(wait_result.satisfied.wait_request_id, wait_request_id);
     assert_eq!(
         wait_result.satisfied.operation_ids,
@@ -15817,7 +15830,10 @@ async fn meerkat_machine_spine_snapshot_attached_steered_prompt_preserves_comple
         .await
         .expect("attached steered prompt should finish after the executor is released");
 
-    match completion_handle.wait_authorized().await {
+    match tokio::time::timeout(Duration::from_secs(5), completion_handle.wait_authorized())
+        .await
+        .expect("queued work should complete after its apply is released")
+    {
         CompletionOutcome::CompletedWithoutResult => {}
         other => panic!(
             "expected attached steered prompt to complete after wait_all settled first, got {other:?}"
@@ -16081,7 +16097,10 @@ async fn meerkat_machine_spine_snapshot_attached_steered_prompt_destroy_splits_c
             },
         )
         .expect("operation should complete after destroy");
-    let wait_result = wait_future.await.expect("wait_all should still resolve");
+    let wait_result = tokio::time::timeout(Duration::from_secs(5), wait_future)
+        .await
+        .expect("wait_all should resolve after the release")
+        .expect("wait_all should still resolve");
     assert_eq!(wait_result.satisfied.wait_request_id, wait_request_id);
     assert_eq!(
         wait_result.satisfied.operation_ids,
@@ -19169,7 +19188,10 @@ async fn cancel_after_boundary_on_attached_runtime_calls_live_handle_and_queues_
         .await
         .expect("apply should finish after the executor is released");
 
-    match completion_handle.wait_authorized().await {
+    match tokio::time::timeout(Duration::from_secs(5), completion_handle.wait_authorized())
+        .await
+        .expect("queued work should complete after its apply is released")
+    {
         CompletionOutcome::CompletedWithoutResult => {}
         other => panic!(
             "expected attached queued prompt to complete normally before queued boundary cancel drains, got {other:?}"
@@ -19498,8 +19520,12 @@ mod stop_teardown_coordinator_class {
             primitive: RunPrimitive,
         ) -> Result<CoreApplyOutput, CoreExecutorError> {
             if let Some((started, release)) = &self.block_apply {
+                // Register for the release before signalling: a test may
+                // release with `notify_waiters()`, which reaches only a
+                // `Notified` that already exists.
+                let released = release.notified();
                 started.notify_one();
-                release.notified().await;
+                released.await;
             }
             Ok(CoreApplyOutput::with_untyped_snapshot(
                 RunBoundaryReceiptDraft {
@@ -21982,8 +22008,12 @@ mod stop_under_gate_deadlock_class {
             primitive: RunPrimitive,
         ) -> Result<CoreApplyOutput, CoreExecutorError> {
             if let Some((started, release)) = &self.block_apply {
+                // Register for the release before signalling: a test may
+                // release with `notify_waiters()`, which reaches only a
+                // `Notified` that already exists.
+                let released = release.notified();
                 started.notify_one();
-                release.notified().await;
+                released.await;
             }
             Ok(CoreApplyOutput::with_untyped_snapshot(
                 RunBoundaryReceiptDraft {
@@ -24796,8 +24826,11 @@ impl CoreExecutor for InterruptYieldingBlockingExecutor {
         run_id: RunId,
         primitive: RunPrimitive,
     ) -> Result<CoreApplyOutput, CoreExecutorError> {
-        self.apply_calls.fetch_add(1, Ordering::SeqCst);
+        // Register for the release before the counter moves: tests release a
+        // later apply once `wait_for_apply_calls` sees its count, and
+        // `notify_waiters()` reaches only a `Notified` that already exists.
         let allowed_to_finish = self.allow_finish.notified();
+        self.apply_calls.fetch_add(1, Ordering::SeqCst);
         self.apply_started.notify_one();
         allowed_to_finish.await;
         Ok(CoreApplyOutput::with_untyped_snapshot(
@@ -26017,7 +26050,10 @@ async fn meerkat_machine_spine_snapshot_attached_steered_prompt_defers_stop_unti
         .await
         .expect("attached steered prompt should finish after the executor is released");
 
-    match completion_handle.wait_authorized().await {
+    match tokio::time::timeout(Duration::from_secs(5), completion_handle.wait_authorized())
+        .await
+        .expect("queued work should complete after its apply is released")
+    {
         CompletionOutcome::CompletedWithoutResult => {}
         other => panic!(
             "expected attached steered completion to finish normally before queued stop drains, got {other:?}"
@@ -26650,7 +26686,10 @@ async fn meerkat_machine_spine_snapshot_preserves_completion_waiters_after_retir
 
     allow_finish.notify_waiters();
 
-    match handle.wait_authorized().await {
+    match tokio::time::timeout(Duration::from_secs(5), handle.wait_authorized())
+        .await
+        .expect("queued work should complete after its apply is released")
+    {
         CompletionOutcome::CompletedWithoutResult => {}
         other => panic!("expected retire+drain to complete queued work, got {other:?}"),
     }
@@ -26835,7 +26874,10 @@ async fn meerkat_machine_spine_snapshot_preserves_completion_waiters_after_recov
         .await
         .expect("attached loop should finish replaying the recovered queued work");
 
-    match handle.wait_authorized().await {
+    match tokio::time::timeout(Duration::from_secs(5), handle.wait_authorized())
+        .await
+        .expect("queued work should complete after its apply is released")
+    {
         CompletionOutcome::CompletedWithoutResult => {}
         other => panic!("expected recover+replay to complete queued work, got {other:?}"),
     }
@@ -27027,7 +27069,10 @@ async fn meerkat_machine_spine_snapshot_preserves_completion_waiters_after_recyc
         .await
         .expect("attached loop should finish replaying the preserved queued work");
 
-    match handle.wait_authorized().await {
+    match tokio::time::timeout(Duration::from_secs(5), handle.wait_authorized())
+        .await
+        .expect("queued work should complete after its apply is released")
+    {
         CompletionOutcome::CompletedWithoutResult => {}
         other => panic!("expected recycle+replay to complete queued work, got {other:?}"),
     }
@@ -28394,7 +28439,10 @@ async fn meerkat_machine_spine_snapshot_preserves_wait_all_after_recover_with_ru
             },
         )
         .expect("operation should complete after recover+replay");
-    let wait_result = wait_future.await.expect("wait_all should still resolve");
+    let wait_result = tokio::time::timeout(Duration::from_secs(5), wait_future)
+        .await
+        .expect("wait_all should resolve after the release")
+        .expect("wait_all should still resolve");
     assert_eq!(wait_result.satisfied.wait_request_id, wait_request_id);
     assert_eq!(
         wait_result.satisfied.operation_ids,
@@ -28637,7 +28685,10 @@ async fn meerkat_machine_spine_snapshot_recover_with_runtime_loop_splits_complet
         .await
         .expect("attached loop should finish replaying the recovered queued work");
 
-    match completion_handle.wait_authorized().await {
+    match tokio::time::timeout(Duration::from_secs(5), completion_handle.wait_authorized())
+        .await
+        .expect("queued work should complete after its apply is released")
+    {
         CompletionOutcome::CompletedWithoutResult => {}
         other => panic!("expected recover+replay to complete queued work, got {other:?}"),
     }
@@ -28696,7 +28747,10 @@ async fn meerkat_machine_spine_snapshot_recover_with_runtime_loop_splits_complet
             },
         )
         .expect("operation should complete after recover+replay");
-    let wait_result = wait_future.await.expect("wait_all should still resolve");
+    let wait_result = tokio::time::timeout(Duration::from_secs(5), wait_future)
+        .await
+        .expect("wait_all should resolve after the release")
+        .expect("wait_all should still resolve");
     assert_eq!(wait_result.satisfied.wait_request_id, wait_request_id);
     assert_eq!(
         wait_result.satisfied.operation_ids,
@@ -28958,7 +29012,10 @@ async fn meerkat_machine_spine_snapshot_preserves_wait_all_after_recycle_with_ru
             },
         )
         .expect("operation should complete after recycle+replay");
-    let wait_result = wait_future.await.expect("wait_all should still resolve");
+    let wait_result = tokio::time::timeout(Duration::from_secs(5), wait_future)
+        .await
+        .expect("wait_all should resolve after the release")
+        .expect("wait_all should still resolve");
     assert_eq!(wait_result.satisfied.wait_request_id, wait_request_id);
     assert_eq!(
         wait_result.satisfied.operation_ids,
@@ -29186,7 +29243,10 @@ async fn meerkat_machine_spine_snapshot_recycle_with_runtime_loop_splits_complet
         .await
         .expect("attached loop should finish replaying the preserved queued work");
 
-    match completion_handle.wait_authorized().await {
+    match tokio::time::timeout(Duration::from_secs(5), completion_handle.wait_authorized())
+        .await
+        .expect("queued work should complete after its apply is released")
+    {
         CompletionOutcome::CompletedWithoutResult => {}
         other => panic!("expected recycle+replay to complete queued work, got {other:?}"),
     }
@@ -29248,7 +29308,10 @@ async fn meerkat_machine_spine_snapshot_recycle_with_runtime_loop_splits_complet
             },
         )
         .expect("operation should complete after recycle+replay");
-    let wait_result = wait_future.await.expect("wait_all should still resolve");
+    let wait_result = tokio::time::timeout(Duration::from_secs(5), wait_future)
+        .await
+        .expect("wait_all should resolve after the release")
+        .expect("wait_all should still resolve");
     assert_eq!(wait_result.satisfied.wait_request_id, wait_request_id);
     assert_eq!(
         wait_result.satisfied.operation_ids,
@@ -32411,7 +32474,10 @@ async fn meerkat_machine_spine_snapshot_preserves_wait_all_after_retire_with_run
             },
         )
         .expect("operation should complete after retire+drain");
-    let wait_result = wait_future.await.expect("wait_all should still resolve");
+    let wait_result = tokio::time::timeout(Duration::from_secs(5), wait_future)
+        .await
+        .expect("wait_all should resolve after the release")
+        .expect("wait_all should still resolve");
     assert_eq!(wait_result.satisfied.wait_request_id, wait_request_id);
     assert_eq!(
         wait_result.satisfied.operation_ids,
@@ -32644,7 +32710,10 @@ async fn meerkat_machine_spine_snapshot_retire_with_runtime_loop_splits_completi
         .await
         .expect("attached loop should finish draining the preserved queued work");
 
-    match completion_handle.wait_authorized().await {
+    match tokio::time::timeout(Duration::from_secs(5), completion_handle.wait_authorized())
+        .await
+        .expect("queued work should complete after its apply is released")
+    {
         CompletionOutcome::CompletedWithoutResult => {}
         other => panic!(
             "expected retire+drain to complete queued work while wait_all remains live, got {other:?}"
@@ -32708,7 +32777,10 @@ async fn meerkat_machine_spine_snapshot_retire_with_runtime_loop_splits_completi
             },
         )
         .expect("operation should complete after retire+drain");
-    let wait_result = wait_future.await.expect("wait_all should still resolve");
+    let wait_result = tokio::time::timeout(Duration::from_secs(5), wait_future)
+        .await
+        .expect("wait_all should resolve after the release")
+        .expect("wait_all should still resolve");
     assert_eq!(wait_result.satisfied.wait_request_id, wait_request_id);
     assert_eq!(
         wait_result.satisfied.operation_ids,
@@ -44993,7 +45065,10 @@ async fn reconfigure_session_llm_identity_succeeds_while_running() {
     );
 
     allow_finish.notify_waiters();
-    let completion = completion_handle.wait_authorized().await;
+    let completion =
+        tokio::time::timeout(Duration::from_secs(5), completion_handle.wait_authorized())
+            .await
+            .expect("running turn should complete after its apply is released");
     assert!(
         matches!(completion, CompletionOutcome::CompletedWithoutResult),
         "running turn should still complete normally after reconfigure: {completion:?}"
@@ -45646,9 +45721,12 @@ impl RuntimeParityFixture {
             .adapter
             .stop_runtime_executor(&self.session_id, "runtime parity cleanup".to_string())
             .await;
-        let _ =
-            crate::traits::RuntimeControlPlane::destroy(self.adapter.as_ref(), &self.runtime_id)
-                .await;
+        let _ = tokio::time::timeout(
+            Duration::from_secs(5),
+            crate::traits::RuntimeControlPlane::destroy(self.adapter.as_ref(), &self.runtime_id),
+        )
+        .await
+        .expect("runtime parity cleanup destroy should finish");
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }

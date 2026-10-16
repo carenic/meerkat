@@ -526,6 +526,30 @@ factories, so children can use a configured host service. Each factory uses
 the actual executing caller's resolver; registration conveys no inherited
 parent authority and exposes no tools unless the host selects their bundle.
 
+`MobMcpState::set_after_destroy` is the release counterpart for the mobs that
+state destroys. Once a destroy completed natively and the mob left the
+managed set, its `MobAfterDestroy` hook gets the mob's id before the storage
+cleanup the destroy owes, and again before each retry of an outstanding
+cleanup. A host drops the read handle it kept there: a handle still held keeps
+that cleanup outstanding, and the destroy answers `Incomplete`. Another mob
+may be managed under the same id by then, so the host releases only what
+observes the destroyed mob. The hook must not block; a panic in it is caught
+and logged, and the destroy goes on. An observer drain that other owner
+handles refuse is retried for about a second, the hook running again before
+each try, so a holder that lets go shortly after the hook does not leave the
+cleanup outstanding.
+
+`MobMcpState::set_before_create` is the admission counterpart for the mobs
+that state creates. Before anything of a new mob exists, its `MobBeforeCreate`
+hook gets a `MobCreateRequest` that the create path builds itself: the mob
+id, the owner bridge session (absent only for a host's own create) and
+whether the mob is that session's implicit delegation mob. Every create path
+asks it; restoring a persisted mob creates nothing and does not, and neither
+does a handle a host registers itself with `mob_insert_handle`. The hook
+fails closed: a refusal or a panic refuses the create with an error
+`MobMcpState::is_create_refusal` recognizes, and the reason is in its message
+and structured data.
+
 ## Compaction contract
 
 Compaction is optional. Ordinary recoverable failures preserve uncompacted

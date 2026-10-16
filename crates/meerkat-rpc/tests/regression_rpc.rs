@@ -995,6 +995,7 @@ async fn initialize_methods_list_complete() {
             "mob/snapshot",
             "mob/destroy",
             "mob/rotate_supervisor",
+            "mob/claim_callback_route",
             "mob/submit_work",
             "mob/cancel_work",
             "mob/cancel_all_work",

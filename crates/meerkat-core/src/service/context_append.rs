@@ -196,7 +196,9 @@ impl PreparedSystemContextAppend {
                 policy: observed.policy,
             };
         }
-        if let Err(error) = check.observe_entry() {
+        if let Err(error) =
+            check.observe_entry(crate::authorization::OperationEntryBoundary::ContextAppend)
+        {
             return ObservedAuthorizationResult {
                 result: Err(error.into()),
                 policy: observed.policy,
@@ -560,7 +562,9 @@ mod tests {
         ) -> Result<(), crate::authorization::OperationObservationError> {
             if matches!(
                 observation,
-                crate::authorization::OperationObservation::Entry
+                crate::authorization::OperationObservation::Entry(
+                    crate::authorization::OperationEntryBoundary::ContextAppend
+                )
             ) {
                 self.owner.entries.fetch_add(1, Ordering::AcqRel);
             }
@@ -768,7 +772,9 @@ mod tests {
         ) -> Result<(), crate::authorization::OperationObservationError> {
             if matches!(
                 observation,
-                crate::authorization::OperationObservation::Entry
+                crate::authorization::OperationObservation::Entry(
+                    crate::authorization::OperationEntryBoundary::ContextAppend
+                )
             ) {
                 self.entries.fetch_add(1, Ordering::AcqRel);
             }
@@ -1285,7 +1291,9 @@ mod tests {
         ) -> Result<(), crate::authorization::OperationObservationError> {
             if matches!(
                 observation,
-                crate::authorization::OperationObservation::Entry
+                crate::authorization::OperationObservation::Entry(
+                    crate::authorization::OperationEntryBoundary::ContextAppend
+                )
             ) {
                 match std::mem::replace(&mut *self.owner.on_entry.lock(), EntryChange::Unchanged) {
                     EntryChange::Unchanged => {}

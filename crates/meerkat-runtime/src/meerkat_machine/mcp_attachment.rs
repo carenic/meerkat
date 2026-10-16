@@ -261,7 +261,7 @@ impl NativeMcpAttachment {
             return Err(McpAttachmentRefusal::NotCurrent);
         }
         current
-            .observe_entry()
+            .observe_entry(meerkat_core::OperationEntryBoundary::McpAttachment)
             .map_err(|_| McpAttachmentRefusal::Unavailable)?;
         let refreshed = current.current().map_err(refusal)?;
         refreshed

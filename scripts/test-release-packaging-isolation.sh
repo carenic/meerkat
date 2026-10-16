@@ -134,10 +134,26 @@ if [[ "$unique_lanes" -ne "$EXPECTED_PACKAGES" ]]; then
 fi
 
 # A real gzip tarball with the layout cargo produces, so the packaging check's
-# license-file inspection reads it like a published archive.
+# license-file and internal-requirement inspection reads it like a published
+# archive. beta requires alpha, and gamma requires beta through a renamed
+# target dev-dependency, as a normalized manifest writes them;
+# CARET_INTERNAL_CRATE makes that crate's internal requirement caret.
 archive_root="$call_tmp.archive/$crate-0.0.0"
 mkdir -p "$archive_root"
-printf 'fixture archive\n' > "$archive_root/Cargo.toml"
+internal_requirement="=0.0.0"
+[[ "${CARET_INTERNAL_CRATE:-}" == "$crate" ]] && internal_requirement="0.0.0"
+{
+  printf '[package]\nname = "%s"\nversion = "0.0.0"\n' "$crate"
+  case "$crate" in
+    beta)
+      printf '\n[dependencies.alpha]\nversion = "%s"\n' "$internal_requirement"
+      ;;
+    gamma)
+      printf '\n[target."cfg(unix)".dev-dependencies.renamed-beta]\npackage = "beta"\nversion = "%s"\n' \
+        "$internal_requirement"
+      ;;
+  esac
+} > "$archive_root/Cargo.toml"
 if [[ "${OMIT_MIT_CRATE:-}" != "$crate" ]]; then
   printf 'MIT\n' > "$archive_root/LICENSE-MIT"
 fi
@@ -315,5 +331,22 @@ if [[ "$status" -eq 0 ]]; then
 fi
 grep -Fq "unsupported license expression for gamma: GPL-3.0-only" "$unknown_log" ||
   fail "the unsupported expression was not named" "$(cat "$unknown_log")"
+
+# A packaged caret requirement on a sibling release crate fails, named by
+# archive, table and dependency key.
+caret_state="$TEST_ROOT/caret-internal"
+caret_log="$TEST_ROOT/caret-internal.log"
+status="$(run_checker "$CHECKER" "$caret_state" "$caret_log" CARET_INTERNAL_CRATE=gamma)"
+if [[ "$status" -eq 0 ]]; then
+  fail "a packaged caret requirement on a release crate was accepted"
+fi
+grep -Fq 'gamma-0.0.0.crate: [target.cfg(unix).dev-dependencies] `renamed-beta` requires `0.0.0`, not `=0.0.0`' \
+  "$caret_log" ||
+  fail "the inexact packaged requirement was not named" "$(cat "$caret_log")"
+if grep -Fq 'beta-0.0.0.crate:' "$caret_log"; then
+  fail "an exact packaged requirement was reported" "$(cat "$caret_log")"
+fi
+[[ ! -f "$caret_state/facade-target" ]] ||
+  fail "the facade smoke ran after an inexact packaged requirement"
 
 echo "release packaging isolation contract holds"

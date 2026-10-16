@@ -207,7 +207,8 @@ impl MobEventEmitter {
     }
 
     /// Report that an orchestrator resume notification held by the actor's
-    /// lifecycle owner did not deliver to its planned target.
+    /// lifecycle owner did not deliver to its planned target: its input
+    /// failed terminally, after the runtime's bounded retries.
     ///
     /// Diagnostic only: it never changes the mob's phase.
     pub async fn orchestrator_resume_notification_failed(

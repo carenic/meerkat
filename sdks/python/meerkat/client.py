@@ -117,6 +117,7 @@ from .generated.types import (
     McpServerConfig,
     MobBindHostParams,
     MobBindHostResult,
+    MobClaimCallbackRouteResult,
     MobConcludeObjectiveParams,
     MobConcludeObjectiveResult,
     MobDefinitionInput,
@@ -4086,6 +4087,23 @@ class MeerkatClient:
         ``ok: true``.
         """
         return await self._request("mob/rotate_supervisor", {"mob_id": mob_id})
+
+    async def mob_claim_callback_route(
+        self, mob_id: str
+    ) -> MobClaimCallbackRouteResult:
+        """Claim a mob's member callback route for this connection.
+
+        Wraps the ``mob/claim_callback_route`` RPC. A mob restored after a
+        restart, or one whose owning connection closed, has no callback
+        route: its members' callback tools fail ``tool_unavailable`` until a
+        connection claims it. After the claim, its live and future members
+        call the tools this connection registered. A claim while the
+        connection that holds the route is still open is refused with
+        ``-32002``.
+        """
+        return await self._request(
+            "mob/claim_callback_route", {"mob_id": mob_id}
+        )
 
     async def mob_submit_work(
         self,

@@ -82,6 +82,10 @@ pub enum HostInput {
     /// The user config document (`<user config root>/.rkat/config.toml`),
     /// the reserved global realm's document.
     UserDocument,
+    /// The host's file credential store: the tokens, keys and secrets its
+    /// providers, MCP servers, connectors and comms identity authenticate
+    /// with.
+    CredentialStore,
 }
 
 impl HostInput {
@@ -95,12 +99,15 @@ impl HostInput {
             Self::UserDocument => {
                 "keep the user config root outside every confinement write grant, or start the host with --user-config-root <dir> outside them"
             }
+            Self::CredentialStore => {
+                "keep the credential store outside every confinement write grant (it lives in the user's config directory, XDG_CONFIG_HOME on Linux)"
+            }
         }
     }
 
     /// Whether the host reads the whole subtree under the input's path.
     const fn is_subtree(self) -> bool {
-        matches!(self, Self::RealmState)
+        matches!(self, Self::RealmState | Self::CredentialStore)
     }
 }
 
@@ -109,6 +116,7 @@ impl std::fmt::Display for HostInput {
         f.write_str(match self {
             Self::RealmState => "the realm state",
             Self::UserDocument => "the user config document",
+            Self::CredentialStore => "the credential store",
         })
     }
 }
@@ -517,15 +525,57 @@ impl HostConfinement {
         self.writer_of(path, false).is_some()
     }
 
+    /// Whether the convention directory at `path` (a skills directory) is
+    /// untrusted: the host claims the guarantee and a confined process could
+    /// change anything under it, the directory included. Its skills are then
+    /// not loaded.
+    #[must_use]
+    pub fn untrusted_directory(&self, path: &Path) -> bool {
+        self.writer_of(path, true).is_some()
+    }
+
+    /// [`Self::writer_of`] as a predicate an owner can keep: whether a
+    /// confined process could change what the host reads at a path (`true`:
+    /// anything under it as well). A host hands it to the owners of the
+    /// programs it runs as itself ([`meerkat_core::HostLaunchExemption`]) and
+    /// of its skill sources, so a program, working directory, cache or
+    /// linked skill a confined process could change is refused.
+    #[must_use]
+    pub fn untrusted_paths(&self) -> std::sync::Arc<dyn Fn(&Path, bool) -> bool + Send + Sync> {
+        let host = self.clone();
+        std::sync::Arc::new(move |path, subtree| host.writer_of(path, subtree).is_some())
+    }
+
+    /// [`Self::untrusted_paths`] for the programs the host runs as itself
+    /// ([`meerkat_core::HostLaunchExemption`]) and its skill sources, `None`
+    /// when no launch kind is confined ([`HostAuthority::NotConfined`]):
+    /// there is no confined process to plant anything, so such a program
+    /// runs with the host's environment exactly as an unconfined host runs
+    /// it.
+    #[must_use]
+    pub fn launch_guard(
+        &self,
+    ) -> Option<std::sync::Arc<dyn Fn(&Path, bool) -> bool + Send + Sync>> {
+        (self.authority() != HostAuthority::NotConfined).then(|| self.untrusted_paths())
+    }
+
     /// Refuse a new start whose administration inputs a confined process
-    /// could change, naming the input, its path and the kind. A host that
-    /// claims no guarantee admits every input.
+    /// could change, naming the input, its path and the kind. An input the
+    /// host reads as a whole subtree is judged with the symbolic links in
+    /// it: the host follows a link out of the input to where it leads. A
+    /// host that claims no guarantee admits every input.
     pub fn admit_host_inputs(
         &self,
         inputs: &[(HostInput, PathBuf)],
     ) -> Result<(), HostConfinementError> {
         for (input, path) in inputs {
-            if let Some(kind) = self.writer_of(path, input.is_subtree()) {
+            let writer = self.writer_of(path, input.is_subtree()).or_else(|| {
+                input
+                    .is_subtree()
+                    .then(|| self.link_writer_under(path))
+                    .flatten()
+            });
+            if let Some(kind) = writer {
                 return Err(HostConfinementError::AdministrationInputWritable {
                     input: *input,
                     path: path.clone(),
@@ -534,6 +584,58 @@ impl HostConfinement {
             }
         }
         Ok(())
+    }
+
+    /// The first confined launch kind whose processes could change where a
+    /// symbolic link under `directory` leads (a link whose target does not
+    /// exist yet included), when the host claims the guarantee. The host
+    /// follows such a link when it reads the subtree, so a link out of a
+    /// protected input into a write grant hands the input to that kind.
+    ///
+    /// Cost: a guarded host start reads every directory of each subtree
+    /// input (the realm state root among them) once, visiting each
+    /// directory once, so the walk grows with the number of directories the
+    /// realm state holds (one per session or job store, for example). A
+    /// trusted host does not walk.
+    fn link_writer_under(&self, directory: &Path) -> Option<ConfinementLaunchKind> {
+        if self.authority() != HostAuthority::Guarded {
+            return None;
+        }
+        let mut pending = vec![directory.to_path_buf()];
+        let mut visited = std::collections::HashSet::new();
+        while let Some(current) = pending.pop() {
+            let Ok(canonical) = std::fs::canonicalize(&current) else {
+                continue;
+            };
+            if !visited.insert(canonical) {
+                continue;
+            }
+            let Ok(entries) = std::fs::read_dir(&current) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let Ok(file_type) = entry.file_type() else {
+                    continue;
+                };
+                let path = entry.path();
+                if file_type.is_symlink() {
+                    let Ok(target) = std::fs::read_link(&path) else {
+                        continue;
+                    };
+                    let target = current.join(target);
+                    let subtree = target.is_dir();
+                    if let Some(kind) = self.writer_of(&target, subtree) {
+                        return Some(kind);
+                    }
+                    if subtree {
+                        pending.push(target);
+                    }
+                } else if file_type.is_dir() {
+                    pending.push(path);
+                }
+            }
+        }
+        None
     }
 
     /// The host's startup report: each launch kind's requested and effective
@@ -605,11 +707,16 @@ impl HostConfinement {
                     });
                 }
                 for source in convention_sources {
-                    if self.untrusted_source(source) {
+                    let untrusted = if source.is_dir() {
+                        self.untrusted_directory(source)
+                    } else {
+                        self.untrusted_source(source)
+                    };
+                    if untrusted {
                         notices.push(HostConfinementNotice {
                             warning: true,
                             text: format!(
-                                "untrusted configuration source '{}': a confined process can write it, so its MCP servers and hooks are refused",
+                                "untrusted configuration source '{}': a confined process can write it, so the MCP servers, hooks and skills it defines are refused",
                                 source.display()
                             ),
                         });
@@ -619,6 +726,23 @@ impl HostConfinement {
             HostAuthority::NotConfined => {}
         }
         notices
+    }
+
+    /// The host input of a credential store kept in files (`None` for one
+    /// kept elsewhere): add it to [`Self::host_inputs`] for each store the
+    /// host's factories and handlers read and write, canonically
+    /// [`meerkat_providers::auth_store::TokenStoreBackend::default_auto`].
+    #[must_use]
+    pub fn credential_store_input(
+        store: &meerkat_providers::auth_store::TokenStoreBackend,
+    ) -> Option<(HostInput, PathBuf)> {
+        match store {
+            meerkat_providers::auth_store::TokenStoreBackend::File { root }
+            | meerkat_providers::auth_store::TokenStoreBackend::Auto { root, .. } => {
+                Some((HostInput::CredentialStore, root.clone()))
+            }
+            _ => None,
+        }
     }
 
     /// The administration inputs of a host whose realm state lives under
@@ -635,10 +759,11 @@ impl HostConfinement {
         inputs
     }
 
-    /// The convention sources a host reads servers or hooks from: the
-    /// project and user `mcp.toml` files, and the project `config.toml`
+    /// The convention sources a host reads servers, hooks or skills from:
+    /// the project and user `mcp.toml` files, the project `config.toml`
     /// whose hooks are layered in (the user `config.toml` is the user config
-    /// document, an administration input).
+    /// document, an administration input), and the project skills
+    /// directory.
     #[must_use]
     pub fn convention_sources(
         context_root: Option<&Path>,
@@ -648,6 +773,7 @@ impl HostConfinement {
         if let Some(context) = context_root {
             sources.push(context.join(".rkat").join("mcp.toml"));
             sources.push(context.join(".rkat").join("config.toml"));
+            sources.push(context.join(".rkat").join("skills"));
         }
         if let Some(user) = user_config_root {
             sources.push(user.join(".rkat").join("mcp.toml"));
@@ -1177,6 +1303,102 @@ mod tests {
                 .startup_report(&inputs, &[])
                 .is_empty()
         );
+    }
+
+    /// The file credential store is an administration input: a start whose
+    /// confined processes could change it is refused naming it, and outside
+    /// every grant it is admitted and reported among the inputs kept from
+    /// them. A store kept elsewhere adds no input.
+    #[test]
+    fn a_writable_credential_store_refuses_the_start() {
+        use meerkat_providers::auth_store::TokenStoreBackend;
+        let (_temp, base) = tree();
+        let work = base.join("work");
+        let host = confined(&ConfinementConfig::for_all(custom(&work, &[&work], &[])));
+        let writable = TokenStoreBackend::File {
+            root: work.join("credentials"),
+        };
+        let input =
+            HostConfinement::credential_store_input(&writable).expect("a file store is an input");
+        assert_eq!(
+            input,
+            (HostInput::CredentialStore, work.join("credentials"))
+        );
+        let mut inputs = HostConfinement::host_inputs(&base.join("state"), None);
+        inputs.push(input);
+        let refused = host.admit_host_inputs(&inputs).unwrap_err();
+        assert!(
+            matches!(
+                refused,
+                HostConfinementError::AdministrationInputWritable {
+                    input: HostInput::CredentialStore,
+                    ..
+                }
+            ),
+            "{refused}"
+        );
+        assert!(
+            refused.to_string().contains("the credential store"),
+            "{refused}"
+        );
+
+        let outside = TokenStoreBackend::File {
+            root: base.join("credentials"),
+        };
+        let mut inputs = HostConfinement::host_inputs(&base.join("state"), None);
+        inputs.extend(HostConfinement::credential_store_input(&outside));
+        host.admit_host_inputs(&inputs).unwrap();
+        let report = host.startup_report(&inputs, &[]);
+        assert!(
+            report
+                .iter()
+                .any(|notice| !notice.warning && notice.text.contains("the credential store at")),
+            "{report:?}"
+        );
+        assert_eq!(
+            HostConfinement::credential_store_input(&TokenStoreBackend::Ephemeral),
+            None
+        );
+    }
+
+    /// A skills directory is a convention source judged as a whole: a host
+    /// whose confined processes can write anything under the project skills
+    /// directory does not trust it and names it in its report; one they
+    /// cannot reach is trusted.
+    #[test]
+    fn a_writable_skills_directory_is_not_trusted() {
+        let (_temp, base) = tree();
+        let work = base.join("work");
+        let skills = work.join(".rkat").join("skills");
+        std::fs::create_dir_all(skills.join("planted")).unwrap();
+        let nested = confined(&ConfinementConfig::for_all(custom(
+            &work,
+            &[&skills.join("planted")],
+            &[],
+        )));
+        assert!(
+            nested.untrusted_directory(&skills),
+            "a writable directory under it is enough"
+        );
+        assert!(!nested.untrusted_source(&skills));
+        let sources = HostConfinement::convention_sources(Some(&work), None);
+        assert!(sources.contains(&skills), "{sources:?}");
+        let report = nested.startup_report(
+            &HostConfinement::host_inputs(&base.join("state"), None),
+            &sources,
+        );
+        assert!(
+            report.iter().any(|notice| notice.warning
+                && notice.text.contains(&skills.display().to_string())
+                && notice.text.contains("skills")),
+            "{report:?}"
+        );
+        let elsewhere = confined(&ConfinementConfig::for_all(custom(
+            &base.join("scratch"),
+            &[&base.join("scratch")],
+            &[],
+        )));
+        assert!(!elsewhere.untrusted_directory(&skills));
     }
 
     /// The startup report names each kind's requested and effective

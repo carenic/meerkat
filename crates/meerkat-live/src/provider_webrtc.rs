@@ -773,6 +773,22 @@ impl LiveSidebandAnnouncement {
     }
 }
 
+/// When a quiet (thinking-lane) context append may reach the provider
+/// ([`LiveSidebandCommand::quiet_append_timing`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum LiveQuietAppendTiming {
+    /// As soon as the provider adapter can send it.
+    Immediate,
+    /// Never inside a voiced model response: an adapter that observes the
+    /// model's output holds the append while the response is audible and
+    /// sends it, in append order, once the response has ended; with the
+    /// model silent it goes at once. Text typed in the chat during a call
+    /// is such context: landing inside a response, the response can absorb
+    /// it and later answers lack it.
+    AfterVoicedResponse,
+}
+
 #[derive(PartialEq, Eq)]
 enum LiveSidebandCommandKind {
     AppendThinking {
@@ -780,6 +796,7 @@ enum LiveSidebandCommandKind {
         attempt: LiveSidebandAppendAttempt,
         cursor: u64,
         text: String,
+        timing: LiveQuietAppendTiming,
     },
     AppendInstructions {
         binding: ProviderWebrtcBinding,
@@ -901,6 +918,25 @@ impl LiveSidebandCommand {
         authority: LiveSidebandAppendAuthority,
         text: impl Into<String>,
     ) -> Result<Self, LiveSidebandCommandError> {
+        Self::quiet_context(authority, text, LiveQuietAppendTiming::Immediate)
+    }
+
+    /// Quiet text-chat context (rows the user typed and read in the chat
+    /// during the call): the thinking lane like
+    /// [`Self::append_thinking_context`], held while the model's response is
+    /// audible ([`LiveQuietAppendTiming::AfterVoicedResponse`]).
+    pub fn append_text_chat_context(
+        authority: LiveSidebandAppendAuthority,
+        text: impl Into<String>,
+    ) -> Result<Self, LiveSidebandCommandError> {
+        Self::quiet_context(authority, text, LiveQuietAppendTiming::AfterVoicedResponse)
+    }
+
+    fn quiet_context(
+        authority: LiveSidebandAppendAuthority,
+        text: impl Into<String>,
+        timing: LiveQuietAppendTiming,
+    ) -> Result<Self, LiveSidebandCommandError> {
         let text = require_sideband_text(text)?;
         authority.consume_once()?;
         Ok(Self {
@@ -909,6 +945,7 @@ impl LiveSidebandCommand {
                 attempt: authority.attempt,
                 cursor: authority.cursor,
                 text,
+                timing,
             },
         })
     }
@@ -1101,6 +1138,20 @@ impl LiveSidebandCommand {
         }
     }
 
+    /// When a quiet (thinking-lane) context append may reach the provider;
+    /// `None` for every other command. Read it before
+    /// [`Self::__into_provider_command`], which carries the lane and text.
+    #[must_use]
+    pub fn quiet_append_timing(&self) -> Option<LiveQuietAppendTiming> {
+        match &self.kind {
+            LiveSidebandCommandKind::AppendThinking { timing, .. } => Some(*timing),
+            LiveSidebandCommandKind::AppendInstructions { .. }
+            | LiveSidebandCommandKind::AppendSession { .. }
+            | LiveSidebandCommandKind::ReleaseDelegation { .. }
+            | LiveSidebandCommandKind::NarrateDelegation { .. } => None,
+        }
+    }
+
     /// Consume this authorized command into a provider-readable carrier. The
     /// returned enum is not accepted by the sideband send API and therefore
     /// cannot be used to forge a command in the opposite direction.
@@ -1113,6 +1164,7 @@ impl LiveSidebandCommand {
                 attempt,
                 cursor,
                 text,
+                timing: _,
             } => LiveSidebandProviderCommand::AppendThinkingContext {
                 binding,
                 attempt,
@@ -1690,6 +1742,10 @@ mod tests {
                 .expect("one quiet context delivery");
         assert_eq!(command.binding(), &expected);
         assert!(!format!("{command:?}").contains("private historical fact"));
+        assert_eq!(
+            command.quiet_append_timing(),
+            Some(LiveQuietAppendTiming::Immediate)
+        );
         assert!(matches!(
             command.__into_provider_command(),
             LiveSidebandProviderCommand::AppendThinkingContext { cursor: 29, text, .. }
@@ -1699,6 +1755,45 @@ mod tests {
             LiveSidebandCommand::append_session_context(duplicate, "cannot switch the lane"),
             Err(LiveSidebandCommandError::AuthorityAlreadyConsumed),
         );
+    }
+
+    /// Text-chat context rides the same quiet lane and consumes the same
+    /// authority once, timed to wait out a voiced response.
+    #[test]
+    fn text_chat_context_is_quiet_and_waits_out_a_voiced_response() {
+        let authority = LiveSidebandAppendAuthority {
+            binding: binding(),
+            attempt: LiveSidebandAppendAttempt("text-chat-row".to_string()),
+            cursor: 31,
+            consumed: Arc::new(AtomicBool::new(false)),
+        };
+        let duplicate = authority.clone();
+        let command = LiveSidebandCommand::append_text_chat_context(authority, "typed row")
+            .expect("one quiet text-chat delivery");
+        assert_eq!(
+            command.quiet_append_timing(),
+            Some(LiveQuietAppendTiming::AfterVoicedResponse)
+        );
+        assert!(matches!(
+            command.__into_provider_command(),
+            LiveSidebandProviderCommand::AppendThinkingContext { cursor: 31, text, .. }
+                if text == "typed row"
+        ));
+        assert_eq!(
+            LiveSidebandCommand::append_text_chat_context(duplicate, "again"),
+            Err(LiveSidebandCommandError::AuthorityAlreadyConsumed),
+        );
+        let voiced = LiveSidebandCommand::append_session_context(
+            LiveSidebandAppendAuthority {
+                binding: binding(),
+                attempt: LiveSidebandAppendAttempt("voiced-row".to_string()),
+                cursor: 32,
+                consumed: Arc::new(AtomicBool::new(false)),
+            },
+            "voiced row",
+        )
+        .expect("one voiced delivery");
+        assert_eq!(voiced.quiet_append_timing(), None, "not a quiet append");
     }
 
     /// A release marked with the members its work asked and whose answers

@@ -538,9 +538,11 @@ async fn launched(
     log: &Path,
     session: &SessionId,
 ) -> (meerkat_mcp::McpRouter, Value) {
-    let mut router = crate::mcp::standalone_router()
-        .with_client_service_factory(Arc::new(meerkat_mcp::apps::McpAppsClientServiceFactory))
-        .with_call_context_provider(Arc::new(Launcher));
+    let mut router = crate::mcp::standalone_router_with_stdio_profile(
+        meerkat_mcp::McpStdioLaunchProfile::trusted_host(),
+    )
+    .with_client_service_factory(Arc::new(meerkat_mcp::apps::McpAppsClientServiceFactory))
+    .with_call_context_provider(Arc::new(Launcher));
     tokio::time::timeout(LIMIT, router.add_server(config))
         .await
         .expect("the server connects in time")
@@ -647,8 +649,10 @@ async fn connector_bound_views_are_refused_before_transport_without_the_credenti
     let unlisted_read = read_view(&router, &session, &record, OTHER_URI).await.err();
     let unlisted_call = display(&router, &session).await.err();
     let unprepared_log = temp.path().join("unprepared.log");
-    let mut unprepared = crate::mcp::standalone_router()
-        .with_client_service_factory(Arc::new(meerkat_mcp::apps::McpAppsClientServiceFactory));
+    let mut unprepared = crate::mcp::standalone_router_with_stdio_profile(
+        meerkat_mcp::McpStdioLaunchProfile::trusted_host(),
+    )
+    .with_client_service_factory(Arc::new(meerkat_mcp::apps::McpAppsClientServiceFactory));
     tokio::time::timeout(
         LIMIT,
         unprepared.add_server(bound(apps_server("apps", &unprepared_log))),

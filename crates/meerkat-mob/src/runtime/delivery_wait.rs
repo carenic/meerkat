@@ -279,9 +279,19 @@ impl super::MobHandle {
             .as_ref()
             .ok_or(DeliveryTerminalWaitError::RuntimeAdapterUnavailable)?;
         let end = observe::call_end(deadline);
+        // The member read and the observation are built in their own frames:
+        // at opt-level 0 each awaited future reserved twice its size in this
+        // poll frame, beneath the whole receipt wait.
+        //
         // For a member the machine state no longer (or never) knows this
         // replays the mob event log, so it is bounded like every other step.
-        let Some(member) = observe::within(end, self.durable_bounded_member_state(identity)).await
+        let Some(member) = observe::within(
+            end,
+            meerkat_runtime::stack_relief::box_in_own_frame(|| {
+                self.durable_bounded_member_state(identity)
+            }),
+        )
+        .await
         else {
             return Ok(DeliveryTerminalWaitReport {
                 member: None,
@@ -299,14 +309,17 @@ impl super::MobHandle {
                 },
             });
         };
-        let work = observe::observe_delivery_terminal(
-            runtime,
-            &session_id,
-            &delivery_identity.idempotency_key,
-            result_spec,
-            matches!(member, DurableBoundedMemberState::Retired { .. }),
-            end,
-        )
+        let member_retired = matches!(member, DurableBoundedMemberState::Retired { .. });
+        let work = meerkat_runtime::stack_relief::box_in_own_frame(|| {
+            observe::observe_delivery_terminal(
+                runtime,
+                &session_id,
+                &delivery_identity.idempotency_key,
+                result_spec,
+                member_retired,
+                end,
+            )
+        })
         .await?;
         Ok(DeliveryTerminalWaitReport {
             member: Some(member),
@@ -357,10 +370,13 @@ impl super::MobHandle {
             .runtime_adapter
             .as_ref()
             .ok_or(DeliveryTerminalWaitError::RuntimeAdapterUnavailable)?;
-        let member = self
-            .durable_bounded_member_state(identity)
-            .await
-            .map_err(DeliveryTerminalWaitError::MemberState)?;
+        // The member read and the final wait are built in their own frames,
+        // as in `wait_bounded_work_for_identity_with_delivery_identity`.
+        let member = meerkat_runtime::stack_relief::box_in_own_frame(|| {
+            self.durable_bounded_member_state(identity)
+        })
+        .await
+        .map_err(DeliveryTerminalWaitError::MemberState)?;
         let Some(session_id) = member.session_id().cloned() else {
             return Ok(DeliveryTerminalWaitReport {
                 member: Some(member),
@@ -392,12 +408,14 @@ impl super::MobHandle {
             .cancel_input_if_present(&session_id, input_id, "delivery settled by its observer")
             .await
             .map_err(DeliveryTerminalWaitError::RuntimeRead)?;
-        self.wait_bounded_work_for_identity_with_delivery_identity(
-            identity,
-            delivery_identity,
-            result_spec,
-            deadline,
-        )
+        meerkat_runtime::stack_relief::box_in_own_frame(|| {
+            self.wait_bounded_work_for_identity_with_delivery_identity(
+                identity,
+                delivery_identity,
+                result_spec,
+                deadline,
+            )
+        })
         .await
     }
 
@@ -481,6 +499,7 @@ mod observe {
     use crate::tokio;
     use meerkat_core::time_compat::Instant;
     use meerkat_core::types::SessionId;
+    use meerkat_runtime::stack_relief::box_in_own_frame;
     use meerkat_runtime::terminal_status::{
         InputTerminalReceiptRead, InputTerminalReceiptWait, InteractionSelector, Sourced,
     };
@@ -556,10 +575,13 @@ mod observe {
                 || InteractionSelector::IdempotencyKey(self.idempotency_key.to_string()),
                 |input_id| InteractionSelector::InputId(input_id.clone()),
             );
-            match self
-                .runtime
-                .input_terminal_receipt(self.session_id, selector)
-                .await
+            // Built in its own frame: at opt-level 0 the awaited read reserved
+            // twice its size in this poll frame.
+            match box_in_own_frame(|| {
+                self.runtime
+                    .input_terminal_receipt(self.session_id, selector)
+            })
+            .await
             {
                 Ok(Some(read)) => self.classify(read),
                 Ok(None)
@@ -678,8 +700,14 @@ mod observe {
             if remaining.is_zero() {
                 break;
             }
-            let Ok(observation) =
-                tokio::time::timeout(remaining, observer.read(input_id.as_ref())).await
+            // Every read and wait below is built in its own frame: at opt-level
+            // 0 each awaited future, inline in its timeout, reserved twice its
+            // size in this poll frame, beneath every read it runs.
+            let Ok(observation) = tokio::time::timeout(
+                remaining,
+                box_in_own_frame(|| observer.read(input_id.as_ref())),
+            )
+            .await
             else {
                 break;
             };
@@ -711,7 +739,7 @@ mod observe {
                 // its publication, so it is awaited for the whole budget.
                 match tokio::time::timeout(
                     remaining,
-                    runtime.wait_input_terminal_receipt(session_id, &armed_on),
+                    box_in_own_frame(|| runtime.wait_input_terminal_receipt(session_id, &armed_on)),
                 )
                 .await
                 {
@@ -738,7 +766,9 @@ mod observe {
                 // so wait for it instead of re-reading on a backoff.
                 match tokio::time::timeout(
                     remaining,
-                    runtime.wait_input_admitted_by_idempotency_key(session_id, idempotency_key),
+                    box_in_own_frame(|| {
+                        runtime.wait_input_admitted_by_idempotency_key(session_id, idempotency_key)
+                    }),
                 )
                 .await
                 {
@@ -764,10 +794,11 @@ mod observe {
         }
 
         // Final evidence read in the floor kept back before `end`.
-        let observation = match within(end, observer.read(input_id.as_ref())).await {
-            Some(observation) => Some(observation?),
-            None => None,
-        };
+        let observation =
+            match within(end, box_in_own_frame(|| observer.read(input_id.as_ref()))).await {
+                Some(observation) => Some(observation?),
+                None => None,
+            };
         Ok(match observation {
             Some(Observation::Terminal(record)) => DeliveryTerminalWait::Terminal(record),
             Some(Observation::Pending(facts)) => {

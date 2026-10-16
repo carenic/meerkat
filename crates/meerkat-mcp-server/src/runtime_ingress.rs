@@ -3311,7 +3311,11 @@ mod tests {
         let session_id =
             create_deferred_session_with_generated_authority(&context, "runtime cleanup target")
                 .await;
-        let router = Arc::new(McpRouterAdapter::new(meerkat_mcp::McpRouter::new()));
+        let router = Arc::new(McpRouterAdapter::new(
+            meerkat_mcp::McpRouter::new_with_stdio_profile(
+                meerkat_mcp::McpStdioLaunchProfile::trusted_host(),
+            ),
+        ));
         let attachment = context
             .configure_session_with_router(
                 &session_id,
@@ -3365,7 +3369,11 @@ mod tests {
     async fn normal_post_stop_cleanup_locks_boundary_before_attachment_operation_gate() {
         let temp = tempfile::tempdir().expect("tempdir");
         let context = build_test_context_with_capacity(&temp, 2).await;
-        let router = Arc::new(McpRouterAdapter::new(meerkat_mcp::McpRouter::new()));
+        let router = Arc::new(McpRouterAdapter::new(
+            meerkat_mcp::McpRouter::new_with_stdio_profile(
+                meerkat_mcp::McpStdioLaunchProfile::trusted_host(),
+            ),
+        ));
         let (created, attachment) = create_session_with_test_mcp_config(
             &context,
             "post-stop lock order",
@@ -3424,7 +3432,11 @@ mod tests {
     async fn mcp_degraded_cleanup_is_exact_and_non_terminalizing() {
         let temp = tempfile::tempdir().expect("tempdir");
         let context = build_test_context_with_capacity(&temp, 2).await;
-        let router = Arc::new(McpRouterAdapter::new(meerkat_mcp::McpRouter::new()));
+        let router = Arc::new(McpRouterAdapter::new(
+            meerkat_mcp::McpRouter::new_with_stdio_profile(
+                meerkat_mcp::McpStdioLaunchProfile::trusted_host(),
+            ),
+        ));
         let (created, attachment) = create_session_with_test_mcp_config(
             &context,
             "MCP degraded cleanup",
@@ -3716,7 +3728,11 @@ mod tests {
     async fn post_commit_validation_retirement_failure_preserves_coherent_assembly() {
         let temp = tempfile::tempdir().expect("tempdir");
         let context = build_test_context_with_capacity(&temp, 2).await;
-        let router = Arc::new(McpRouterAdapter::new(meerkat_mcp::McpRouter::new()));
+        let router = Arc::new(McpRouterAdapter::new(
+            meerkat_mcp::McpRouter::new_with_stdio_profile(
+                meerkat_mcp::McpStdioLaunchProfile::trusted_host(),
+            ),
+        ));
         let (created, attachment) = create_session_with_test_mcp_config(
             &context,
             "retirement failure coherence",
@@ -3784,7 +3800,11 @@ mod tests {
             "actor-missing router update",
         )
         .await;
-        let original_router = Arc::new(McpRouterAdapter::new(meerkat_mcp::McpRouter::new()));
+        let original_router = Arc::new(McpRouterAdapter::new(
+            meerkat_mcp::McpRouter::new_with_stdio_profile(
+                meerkat_mcp::McpStdioLaunchProfile::trusted_host(),
+            ),
+        ));
         let attachment = context
             .configure_session_with_router(
                 &session_id,
@@ -3800,7 +3820,11 @@ mod tests {
             .await
             .expect("open actor-missing recovery window");
 
-        let replacement_router = Arc::new(McpRouterAdapter::new(meerkat_mcp::McpRouter::new()));
+        let replacement_router = Arc::new(McpRouterAdapter::new(
+            meerkat_mcp::McpRouter::new_with_stdio_profile(
+                meerkat_mcp::McpStdioLaunchProfile::trusted_host(),
+            ),
+        ));
         let error = context
             .configure_session_with_router(
                 &session_id,
@@ -3836,7 +3860,11 @@ mod tests {
     async fn stale_attachment_cannot_publish_over_or_clean_up_replacement() {
         let temp = tempfile::tempdir().expect("tempdir");
         let context = build_test_context_with_capacity(&temp, 2).await;
-        let router = Arc::new(McpRouterAdapter::new(meerkat_mcp::McpRouter::new()));
+        let router = Arc::new(McpRouterAdapter::new(
+            meerkat_mcp::McpRouter::new_with_stdio_profile(
+                meerkat_mcp::McpStdioLaunchProfile::trusted_host(),
+            ),
+        ));
         let (created, attachment_a) = create_session_with_test_mcp_config(
             &context,
             "exact attachment replacement",
@@ -4283,7 +4311,11 @@ mod tests {
     async fn actor_missing_accept_requires_explicit_resume_and_preserves_exact_sidecar() {
         let temp = tempfile::tempdir().expect("tempdir");
         let context = build_test_context_with_capacity(&temp, 1).await;
-        let router = Arc::new(McpRouterAdapter::new(meerkat_mcp::McpRouter::new()));
+        let router = Arc::new(McpRouterAdapter::new(
+            meerkat_mcp::McpRouter::new_with_stdio_profile(
+                meerkat_mcp::McpStdioLaunchProfile::trusted_host(),
+            ),
+        ));
         let callback_tools: Arc<dyn AgentToolDispatcher> =
             Arc::new(crate::MpcToolDispatcher::new(&[]));
         let (created, attachment) = create_session_with_test_mcp_config(

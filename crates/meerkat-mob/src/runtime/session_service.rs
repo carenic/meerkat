@@ -1680,6 +1680,16 @@ pub trait MobSessionService:
         Ok(None)
     }
 
+    /// How the live session's next model request projects its tool catalog
+    /// ([`meerkat_core::ToolCatalogView`]). `None` when this service cannot
+    /// report it.
+    async fn tool_catalog_view(
+        &self,
+        _session_id: &SessionId,
+    ) -> Result<Option<meerkat_core::ToolCatalogView>, SessionError> {
+        Ok(None)
+    }
+
     /// The live session's actual visible tool definitions, as its built
     /// agent owns them. `None` when this service cannot report them.
     async fn live_visible_tool_defs(
@@ -2739,6 +2749,13 @@ where
         session_id: &SessionId,
     ) -> Result<Option<ToolScopeSnapshot>, SessionError> {
         meerkat_session::EphemeralSessionService::<B>::tool_scope_snapshot(self, session_id).await
+    }
+
+    async fn tool_catalog_view(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Option<meerkat_core::ToolCatalogView>, SessionError> {
+        meerkat_session::EphemeralSessionService::<B>::tool_catalog_view(self, session_id).await
     }
 
     async fn live_visible_tool_defs(
@@ -3813,6 +3830,13 @@ where
         session_id: &SessionId,
     ) -> Result<Option<ToolScopeSnapshot>, SessionError> {
         meerkat_session::PersistentSessionService::<B>::tool_scope_snapshot(self, session_id).await
+    }
+
+    async fn tool_catalog_view(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Option<meerkat_core::ToolCatalogView>, SessionError> {
+        meerkat_session::PersistentSessionService::<B>::tool_catalog_view(self, session_id).await
     }
 
     async fn live_visible_tool_defs(

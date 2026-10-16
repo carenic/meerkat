@@ -38,16 +38,22 @@ pub struct ModelRegistryEntry {
 /// Registry-minted provenance for one exact provider/model capability profile.
 ///
 /// The fields are deliberately private: callers can only obtain this witness
-/// through [`ModelRegistry::profile_witness_for_provider`], which validates the
-/// exact typed provider/model pair against one effective-registry authority.
-/// This keeps a [`ModelProfile`] from being detached from either the catalog
-/// identity or the registry instance that minted it when it crosses a
-/// model-fallback commit boundary.
+/// through [`ModelRegistry::profile_witness_for_provider`] or
+/// [`ModelRegistry::profile_witness_for_identity`], which validate the exact
+/// typed provider/model pair against one effective-registry authority. This
+/// keeps a [`ModelProfile`] from being detached from either the catalog
+/// identity, the binding it was judged through, or the registry instance that
+/// minted it when it crosses a model-fallback commit boundary.
 #[derive(Clone)]
 pub struct ModelProfileWitness {
     registry_authority: ModelRegistryAuthority,
     provider: Provider,
     model: String,
+    /// The binding the profile was judged through: the identity's own
+    /// binding for [`ModelRegistry::profile_witness_for_identity`], `None`
+    /// for [`ModelRegistry::profile_witness_for_provider`] (the model row
+    /// alone).
+    judged_binding: Option<crate::AuthBindingRef>,
     profile: ModelProfile,
     context_window: Option<u32>,
     max_input_tokens: Option<u32>,
@@ -63,6 +69,7 @@ impl fmt::Debug for ModelProfileWitness {
             .debug_struct("ModelProfileWitness")
             .field("provider", &self.provider)
             .field("model", &self.model)
+            .field("judged_binding", &self.judged_binding)
             .field("profile", &self.profile)
             .field("context_window", &self.context_window)
             .field("max_input_tokens", &self.max_input_tokens)
@@ -113,6 +120,15 @@ impl ModelProfileWitness {
     /// Whether this witness was minted for the supplied session identity.
     pub fn matches_identity(&self, identity: &crate::SessionLlmIdentity) -> bool {
         self.provider == identity.provider && self.model == identity.model
+    }
+
+    /// Whether this witness states `identity`'s capabilities as its own
+    /// binding serves them: minted for the same provider and model, and
+    /// judged through the binding `identity` names (an identity that names
+    /// none is judged by the model row). See
+    /// [`ModelRegistry::profile_witness_for_identity`].
+    pub fn judged_for_identity(&self, identity: &crate::SessionLlmIdentity) -> bool {
+        self.matches_identity(identity) && self.judged_binding == identity.auth_binding
     }
 
     pub(crate) fn was_minted_by(&self, authority: ModelRegistryAuthority) -> bool {
@@ -373,8 +389,13 @@ impl ModelRegistry {
     /// model's profile, less what the backend its configured binding names in
     /// `config` cannot carry
     /// ([`crate::BackendProfile::admits_mid_conversation_system_messages`]).
-    /// An identity that names no binding, or one `config` does not resolve,
-    /// keeps the model's profile.
+    ///
+    /// An identity that names no binding keeps the model's profile, and so
+    /// does one naming the synthetic env-var default: that binding is never
+    /// resolved from `config`, and it only ever names a provider's API-key
+    /// backend. A named binding that `config` does not resolve fails closed:
+    /// its backend is unknown, so the profile does not claim
+    /// `supports_mid_conversation_system_messages`.
     pub fn profile_for_identity(
         &self,
         config: &crate::Config,
@@ -383,10 +404,15 @@ impl ModelRegistry {
         let mut profile = self.profile_for_provider(identity.provider, &identity.model)?;
         if profile.supports_mid_conversation_system_messages
             && let Some(auth_binding) = identity.auth_binding.as_ref()
-            && let Ok(target) = crate::resolve_explicit_auth_binding_target(config, auth_binding)
-            && !target.backend.admits_mid_conversation_system_messages()
         {
-            profile.supports_mid_conversation_system_messages = false;
+            let backend_admits =
+                match crate::resolve_explicit_auth_binding_target(config, auth_binding) {
+                    Ok(target) => target.backend.admits_mid_conversation_system_messages(),
+                    Err(_) => auth_binding.is_env_default(),
+                };
+            if !backend_admits {
+                profile.supports_mid_conversation_system_messages = false;
+            }
         }
         Some(profile)
     }
@@ -402,12 +428,47 @@ impl ModelRegistry {
         provider: Provider,
         model_id: &str,
     ) -> Option<ModelProfileWitness> {
-        let entry = self.entry_for_provider(provider, model_id)?;
         let profile = self.profile_for_provider(provider, model_id)?;
+        self.mint_profile_witness(provider, model_id, None, profile)
+    }
+
+    /// Mint provenance for `identity`'s profile as its backend serves it
+    /// ([`Self::profile_for_identity`]), recording the binding it was judged
+    /// through.
+    ///
+    /// A backend can narrow the model row (the ChatGPT backend refuses the
+    /// mid-conversation System messages the GPT rows declare), so this is the
+    /// witness a model-fallback target is judged by: the agent keeps it when
+    /// it activates the target and refuses one judged for another binding
+    /// ([`ModelProfileWitness::judged_for_identity`]). Unknown pairs and
+    /// provider/model mismatches fail closed.
+    pub fn profile_witness_for_identity(
+        &self,
+        config: &crate::Config,
+        identity: &crate::SessionLlmIdentity,
+    ) -> Option<ModelProfileWitness> {
+        let profile = self.profile_for_identity(config, identity)?;
+        self.mint_profile_witness(
+            identity.provider,
+            &identity.model,
+            identity.auth_binding.clone(),
+            profile,
+        )
+    }
+
+    fn mint_profile_witness(
+        &self,
+        provider: Provider,
+        model_id: &str,
+        judged_binding: Option<crate::AuthBindingRef>,
+        profile: ModelProfile,
+    ) -> Option<ModelProfileWitness> {
+        let entry = self.entry_for_provider(provider, model_id)?;
         Some(ModelProfileWitness {
             registry_authority: self.authority,
             provider,
             model: model_id.to_string(),
+            judged_binding,
             profile,
             context_window: entry.context_window,
             max_input_tokens: entry.max_input_tokens,
@@ -509,6 +570,7 @@ fn append_custom_models(
             params_schema: serde_json::json!({}),
             beta_headers: Vec::new(),
             call_timeout_secs: model.call_timeout_secs,
+            stream_inactivity_timeout_secs: None,
         };
 
         insert_unique(
@@ -587,6 +649,16 @@ fn append_self_hosted(
                 model.server
             ))
         })?;
+        let min_window = crate::retry::MIN_MODEL_STREAM_INACTIVITY_TIMEOUT.as_secs();
+        if let Some(window) = model.stream_inactivity_timeout_secs
+            && window < min_window
+        {
+            return Err(ConfigError::Validation(format!(
+                "self_hosted.models.{model_id}.stream_inactivity_timeout_secs is {window}; it must \
+                 be at least {min_window}, or the stream-inactivity watchdog races the post-finish \
+                 trailer wait of the model's stream"
+            )));
+        }
         let self_hosted = SelfHostedServerRef {
             server_id: model.server.clone(),
             remote_model: model.remote_model.clone(),
@@ -620,6 +692,7 @@ fn append_self_hosted(
             params_schema: serde_json::json!({}),
             beta_headers: Vec::new(),
             call_timeout_secs: model.call_timeout_secs,
+            stream_inactivity_timeout_secs: model.stream_inactivity_timeout_secs,
         };
 
         insert_unique(
@@ -714,6 +787,7 @@ mod tests {
                 supports_reasoning: false,
                 supports_web_search: false,
                 call_timeout_secs: Some(600),
+                stream_inactivity_timeout_secs: None,
             },
         );
         config
@@ -859,6 +933,54 @@ mod tests {
         );
     }
 
+    /// A self-hosted model's own stream-inactivity window must be at least
+    /// the minimum (0 included), or it races the post-finish trailer wait;
+    /// the minimum itself and longer windows reach the profile.
+    #[test]
+    fn self_hosted_stream_inactivity_window_below_the_minimum_is_refused() {
+        let minimum = crate::retry::MIN_MODEL_STREAM_INACTIVITY_TIMEOUT.as_secs();
+        let with_window = |window| {
+            let mut config = config_with_self_hosted();
+            match config.self_hosted.models.get_mut("gemma-4-31b") {
+                Some(model) => model.stream_inactivity_timeout_secs = Some(window),
+                None => panic!("missing self-hosted model"),
+            }
+            config
+        };
+        for window in [0, 1, minimum - 1] {
+            match ModelRegistry::from_config(&with_window(window), test_catalog()) {
+                Err(ConfigError::Validation(message)) => assert!(
+                    message.contains("stream_inactivity_timeout_secs")
+                        && message.contains(&format!("at least {minimum}")),
+                    "{message}"
+                ),
+                Err(other) => panic!("window {window}: expected a validation error, got {other}"),
+                Ok(_) => panic!("window {window} must be refused"),
+            }
+            match with_window(window).validate(test_catalog()) {
+                Err(ConfigError::Validation(message)) => assert!(
+                    message.contains("stream_inactivity_timeout_secs"),
+                    "{message}"
+                ),
+                other => panic!("window {window}: config validation must refuse it, got {other:?}"),
+            }
+        }
+        for window in [minimum, 900] {
+            if let Err(err) = with_window(window).validate(test_catalog()) {
+                panic!("window {window}: config validation refused it: {err}");
+            }
+            let registry = match ModelRegistry::from_config(&with_window(window), test_catalog()) {
+                Ok(registry) => registry,
+                Err(err) => panic!("window {window}: {err}"),
+            };
+            let profile = match registry.profile_for_provider(Provider::SelfHosted, "gemma-4-31b") {
+                Some(profile) => profile,
+                None => panic!("missing self-hosted profile"),
+            };
+            assert_eq!(profile.stream_inactivity_timeout_secs, Some(window));
+        }
+    }
+
     fn insert_second_self_hosted_model(config: &mut Config) {
         config.self_hosted.models.insert(
             "gemma-4-9b".to_string(),
@@ -879,6 +1001,7 @@ mod tests {
                 supports_reasoning: false,
                 supports_web_search: false,
                 call_timeout_secs: Some(600),
+                stream_inactivity_timeout_secs: None,
             },
         );
     }
@@ -954,6 +1077,7 @@ mod tests {
                 supports_reasoning: false,
                 supports_web_search: false,
                 call_timeout_secs: None,
+                stream_inactivity_timeout_secs: None,
             },
         );
         let err = match ModelRegistry::from_config(&config, test_catalog()) {
@@ -993,6 +1117,7 @@ mod tests {
                 supports_reasoning: false,
                 supports_web_search: false,
                 call_timeout_secs: None,
+                stream_inactivity_timeout_secs: None,
             },
         );
         let err = match ModelRegistry::from_config(&config, test_catalog()) {

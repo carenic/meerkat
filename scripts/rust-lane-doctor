@@ -133,17 +133,24 @@ else
   pass "Makefile test-all delegates to the filtered fast profile"
 fi
 
+# ripgrep exits 0 when it finds a match and 1 when it finds none. Any other
+# status (2 for an unreadable path or a bad pattern, 127 when rg is missing)
+# means the scan did not run; that must fail, never read as "no bypass".
+raw_cargo_shell_scan_status=0
 raw_cargo_shell_hits="$(
   rg -n '^\s*(cargo|exec cargo)\s+(check|test|nextest|run|xtask|build|unit|int|e2e|clippy|fmt|machete)\b|\bcargo run -p xtask\b' \
     scripts specs \
     --glob '*.sh' \
-    --glob '!scripts/repo-cargo' 2>/dev/null || true
-)"
-if [[ -n "${raw_cargo_shell_hits}" ]]; then
+    --glob '!scripts/repo-cargo' 2>&1
+)" || raw_cargo_shell_scan_status=$?
+if [[ "${raw_cargo_shell_scan_status}" -eq 0 ]]; then
   bad "shell build/test entrypoints bypass scripts/repo-cargo"
   printf '%s\n' "${raw_cargo_shell_hits}" >&2
-else
+elif [[ "${raw_cargo_shell_scan_status}" -eq 1 ]]; then
   pass "shell build/test entrypoints use the repo Cargo wrapper"
+else
+  bad "shell build/test entrypoint scan failed (rg exit ${raw_cargo_shell_scan_status}; 127 means ripgrep is not installed)"
+  printf '%s\n' "${raw_cargo_shell_hits}" >&2
 fi
 
 raw_cargo_workflow_hits="$(python3 - <<'PYTHON'

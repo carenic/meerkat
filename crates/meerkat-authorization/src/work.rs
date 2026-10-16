@@ -406,7 +406,7 @@ impl LocalWorkAuthorization {
                 }
                 WorkAuthorityBasis::GrantLineage { lineage } => lineage.as_slice(),
                 WorkAuthorityBasis::TargetedGrantLineages { .. } => {
-                    let target = crate::grant_policy::operation_grant_target(binding.facts())?;
+                    let target = crate::grant_policy::operation_grant_target(binding)?;
                     basis.lineage_for(target.as_ref()).ok_or_else(denied)?
                 }
             };

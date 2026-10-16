@@ -53,7 +53,9 @@ use crate::client::{OpenAiReplayProjectionMode, project_openai_replay_messages_f
 ///   fixed. 30s is one to two orders of magnitude above any plausible trailer
 ///   latency.
 /// - It must be strictly SHORTER than
-///   [`meerkat_core::DEFAULT_STREAM_INACTIVITY_TIMEOUT`], and by a wide margin.
+///   [`meerkat_core::DEFAULT_STREAM_INACTIVITY_TIMEOUT`], and by a wide margin,
+///   and no longer than half of any per-model window (config validation keeps
+///   those at or above [`meerkat_core::MIN_MODEL_STREAM_INACTIVITY_TIMEOUT`]).
 ///   That watchdog re-arms on the finish-event chunk, so its window and this one
 ///   start at ~the same instant; if the two were equal, finish-then-silence
 ///   would be a coin flip between this adapter's non-destructive end-of-stream
@@ -2760,6 +2762,26 @@ mod tests {
              well inside the stream-inactivity window ({stall:?}), or the adapter's \
              end-of-stream races the agent loop's retryable stall verdict"
         );
+        // A model can declare its own window: config validation refuses a
+        // self-hosted one below the minimum, and every catalog row's window
+        // must clear it too, so no per-model window comes within twice this
+        // trailer wait.
+        let minimum = meerkat_core::MIN_MODEL_STREAM_INACTIVITY_TIMEOUT;
+        assert!(
+            DEFAULT_POST_FINISH_TRAILER_WINDOW * 2 <= minimum,
+            "the shortest per-model stream-inactivity window ({minimum:?}) must be at least \
+             twice the post-finish trailer window ({DEFAULT_POST_FINISH_TRAILER_WINDOW:?})"
+        );
+        for caps in meerkat_models::all_capabilities() {
+            if let Some(window) = caps.stream_inactivity_timeout_secs {
+                assert!(
+                    Duration::from_secs(window) >= minimum,
+                    "catalog row {} declares a {window} s stream-inactivity window, under the \
+                     {minimum:?} minimum",
+                    caps.id
+                );
+            }
+        }
     }
 
     #[tokio::test]

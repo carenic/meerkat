@@ -85,7 +85,9 @@ impl MeerkatMachine {
     /// store for rows that left it, compared through
     /// [`resolve_contributors`] (runtime, controller, association and
     /// submission digests, selected bindings, every contributor in staged
-    /// order).
+    /// order). The rows of selected keys that are not contributors (the
+    /// staged resume inputs of a resumed run) are read the same way, and
+    /// resolution verifies them.
     ///
     /// The owned row data is extracted under the session and driver guards,
     /// which are dropped before any archived store I/O. This proves the rows
@@ -109,18 +111,33 @@ impl MeerkatMachine {
                 .driver
                 .clone()
         };
+        let wanted: Vec<InputId> = identity
+            .contributors()
+            .iter()
+            .map(|contributor| contributor.input_id.clone())
+            .chain(
+                identity
+                    .selected_input_bindings()
+                    .keys()
+                    .filter_map(|key| crate::retained_work::selected_input_id(key))
+                    .filter(|input_id| {
+                        !identity
+                            .contributors()
+                            .iter()
+                            .any(|contributor| &contributor.input_id == input_id)
+                    }),
+            )
+            .collect();
         let mut rows: HashMap<InputId, InputState> = HashMap::new();
         {
             let driver = driver.lock().await;
-            for contributor in identity.contributors() {
+            for input_id in &wanted {
                 let live = match &*driver {
-                    DriverEntry::Ephemeral(driver) => driver.input_state(&contributor.input_id),
-                    DriverEntry::Persistent(driver) => {
-                        driver.inner_ref().input_state(&contributor.input_id)
-                    }
+                    DriverEntry::Ephemeral(driver) => driver.input_state(input_id),
+                    DriverEntry::Persistent(driver) => driver.inner_ref().input_state(input_id),
                 };
                 if let Some(state) = live {
-                    rows.insert(contributor.input_id.clone(), state.clone());
+                    rows.insert(input_id.clone(), state.clone());
                 }
             }
         }
@@ -128,12 +145,12 @@ impl MeerkatMachine {
         // Terminal rows leave the live ledger once durably committed; their
         // retained authority stays on the stored row.
         if let Some(store) = self.store.as_ref() {
-            for contributor in identity.contributors() {
-                if rows.contains_key(&contributor.input_id) {
+            for input_id in &wanted {
+                if rows.contains_key(input_id) {
                     continue;
                 }
                 let stored = store
-                    .load_input_state(&runtime_id, &contributor.input_id)
+                    .load_input_state(&runtime_id, input_id)
                     .await
                     .map_err(|error| {
                         RuntimeDriverError::Internal(format!(
@@ -141,7 +158,7 @@ impl MeerkatMachine {
                         ))
                     })?;
                 if let Some(stored) = stored {
-                    rows.insert(contributor.input_id.clone(), stored.state);
+                    rows.insert(input_id.clone(), stored.state);
                 }
             }
         }
@@ -372,6 +389,495 @@ mod tests {
             body.into(),
             meerkat_core::types::HandlingMode::Queue,
         ))
+    }
+
+    /// A governed fixture whose session has a runtime binding, so its rows
+    /// can be staged into runs the way the runtime loop stages them.
+    async fn governed_staging() -> Governed {
+        let machine = MeerkatMachine::ephemeral();
+        let host = Arc::new(TestIngress::isolated(machine.generated_auth_lease_handle()));
+        let installed: Arc<dyn crate::input_authority::NativeWorkAuthorizationHost> =
+            Arc::clone(&host) as Arc<dyn crate::input_authority::NativeWorkAuthorizationHost>;
+        let machine = machine
+            .with_native_work_authorization_host(installed)
+            .expect("configured host");
+        let session_id = SessionId::new();
+        machine
+            .register_session(session_id.clone())
+            .await
+            .expect("register");
+        machine
+            .prepare_bindings(session_id.clone())
+            .await
+            .expect("runtime binding");
+        let (driver, runtime_id) = {
+            let sessions = machine.sessions.read().await;
+            let entry = sessions.get(&session_id).expect("session");
+            (Arc::clone(&entry.driver), entry.runtime_id.clone())
+        };
+        {
+            let mut driver = driver.lock().await;
+            let DriverEntry::Ephemeral(driver) = &mut *driver else {
+                panic!("storeless")
+            };
+            driver.set_executor_work_authorization_support(true);
+        }
+        Governed {
+            machine,
+            session_id,
+            host,
+            driver,
+            runtime_id,
+        }
+    }
+
+    /// Stage `inputs` as one run the way the runtime loop does, and return
+    /// the identity the driver minted for that staged work context.
+    async fn stage_run(
+        fixture: &Governed,
+        inputs: &[InputId],
+    ) -> meerkat_core::retained_work::RetainedWorkIdentity {
+        let run = meerkat_core::lifecycle::RunId::new();
+        let mut driver = fixture.driver.lock().await;
+        let DriverEntry::Ephemeral(driver) = &mut *driver else {
+            panic!("storeless")
+        };
+        let context = driver
+            .batch_work_authorization(&run, inputs)
+            .expect("staged batch")
+            .expect("work context");
+        driver
+            .contract_begin_run_authority(run.clone())
+            .expect("actual run");
+        driver
+            .machine_realize_authorized_stage_batch(
+                crate::meerkat_machine::driver::test_authorized_stage_for_run(
+                    inputs.to_vec(),
+                    run.clone(),
+                ),
+            )
+            .expect("staged");
+        context.retained_work().cloned().expect("minted identity")
+    }
+
+    /// End `run` the way a completed turn does (run terminal, then the
+    /// service turn commit), so a later input is admitted and staged.
+    async fn finish_run(fixture: &Governed, run: &meerkat_core::lifecycle::RunId) {
+        use crate::meerkat_machine::dsl as mm;
+        let entry = fixture.driver.lock().await;
+        let shared = entry.shared_dsl_authority();
+        let mut machine = shared.lock().expect("generated owner");
+        mm::MeerkatMachineMutator::apply(
+            &mut *machine,
+            mm::MeerkatMachineInput::RunCompleted {
+                run_id: mm::RunId::from_domain(run),
+            },
+        )
+        .expect("run terminal");
+        mm::MeerkatMachineMutator::apply(
+            &mut *machine,
+            mm::MeerkatMachineInput::ServiceTurnCommitted {
+                run_id: mm::RunId::from_domain(run),
+            },
+        )
+        .expect("service turn committed");
+    }
+
+    /// The request minted from a committed continuation row of its own
+    /// delivery, carrying `identity`.
+    async fn request_from_delivery(
+        runtime_id: &LogicalRuntimeId,
+        identity: meerkat_core::retained_work::RetainedWorkIdentity,
+        delivery_id: &str,
+        admission_key: &str,
+    ) -> RetainedResumeRequest {
+        let inbox = RuntimeDeliveryInbox::new(Arc::new(InMemoryRuntimeStore::new()));
+        inbox
+            .submit(
+                runtime_id,
+                RuntimeDeliverySubmission::new(
+                    RuntimeDeliveryId::new(delivery_id).expect("id"),
+                    RuntimeDeliveryKind::Continuation,
+                    "fork_off",
+                    1,
+                    admission_key,
+                    delivery_id.as_bytes().to_vec(),
+                )
+                .expect("submission"),
+            )
+            .await
+            .expect("commit");
+        inbox
+            .retained_resume_request(
+                runtime_id,
+                &RuntimeDeliveryId::new(delivery_id).expect("id"),
+                1,
+                move |_stored| Ok(identity),
+            )
+            .await
+            .expect("request from the head row")
+    }
+
+    fn keyed_continuation(admission_key: &str, body: &str) -> Input {
+        Input::Prompt(crate::input::PromptInput::continuation(
+            InputId::new(),
+            admission_key,
+            body.into(),
+            meerkat_core::types::HandlingMode::Queue,
+        ))
+    }
+
+    /// The exact chain a governed host runs: an original run retains work, a
+    /// producer's completion resumes it, the resumed run is staged and
+    /// retains work again, and that run's completion resumes the same
+    /// original. The resumed run's identity, minted by the driver when it
+    /// staged the resume input, names the original contributors; its
+    /// continuation is admitted with them, never refused as an invalid
+    /// binding.
+    #[tokio::test]
+    async fn a_continuation_of_a_resumed_run_resumes_the_same_original() {
+        let fixture = governed_staging().await;
+        let a = admit_original(&fixture, "caller-a").await;
+        let original_run = stage_run(&fixture, std::slice::from_ref(a.input_id())).await;
+        finish_run(&fixture, original_run.run_id()).await;
+
+        let first = request_from_delivery(
+            &fixture.runtime_id,
+            original_run.clone(),
+            "continuation:first",
+            "fork_off:job-1",
+        )
+        .await;
+        let (outcome, _) = fixture
+            .machine
+            .accept_retained_resume(
+                &fixture.session_id,
+                keyed_continuation("fork_off:job-1", "the first fork finished"),
+                first,
+            )
+            .await
+            .expect("the original run's continuation resumes it");
+        let AcceptOutcome::Accepted {
+            state: resumed_input,
+            ..
+        } = outcome
+        else {
+            panic!("accepted, got {outcome:?}")
+        };
+
+        let resumed_run = stage_run(&fixture, std::slice::from_ref(&resumed_input.input_id)).await;
+        finish_run(&fixture, resumed_run.run_id()).await;
+        assert_eq!(
+            resumed_run.contributors(),
+            original_run.contributors(),
+            "the resumed run keeps the original's contributors"
+        );
+
+        let second = request_from_delivery(
+            &fixture.runtime_id,
+            resumed_run.clone(),
+            "continuation:second",
+            "fork_off:job-2",
+        )
+        .await;
+        let (outcome, _) = fixture
+            .machine
+            .accept_retained_resume(
+                &fixture.session_id,
+                keyed_continuation("fork_off:job-2", "the second fork finished"),
+                second,
+            )
+            .await
+            .expect("the resumed run's continuation resumes the same original");
+        let AcceptOutcome::Accepted { state, .. } = outcome else {
+            panic!("accepted, got {outcome:?}")
+        };
+        assert_eq!(state.authority_contributors, vec![a]);
+        assert_eq!(
+            state.retained_resume.map(|record| record.identity),
+            Some(resumed_run)
+        );
+    }
+
+    /// The chain up to a resumed run: original A staged as a run, a
+    /// completion carrying that run's identity admitted as resume R1, and R1
+    /// staged as the resumed run. Returns A, R1's id and the resumed run's
+    /// minted identity.
+    async fn resumed_run(
+        fixture: &Governed,
+        requester: &str,
+        job: &str,
+    ) -> (
+        RetainedInputAuthority,
+        InputId,
+        meerkat_core::retained_work::RetainedWorkIdentity,
+    ) {
+        let original = admit_original(fixture, requester).await;
+        let original_run = stage_run(fixture, std::slice::from_ref(original.input_id())).await;
+        finish_run(fixture, original_run.run_id()).await;
+        let request = request_from_delivery(
+            &fixture.runtime_id,
+            original_run,
+            &format!("continuation:{job}"),
+            job,
+        )
+        .await;
+        let (outcome, _) = fixture
+            .machine
+            .accept_retained_resume(
+                &fixture.session_id,
+                keyed_continuation(job, "the fork finished"),
+                request,
+            )
+            .await
+            .expect("the original run's continuation resumes it");
+        let AcceptOutcome::Accepted { state, .. } = outcome else {
+            panic!("accepted, got {outcome:?}")
+        };
+        let resumed = stage_run(fixture, std::slice::from_ref(&state.input_id)).await;
+        finish_run(fixture, resumed.run_id()).await;
+        (original, state.input_id, resumed)
+    }
+
+    /// Admit a continuation carrying `identity` under the admission key `job`.
+    async fn resume_with(
+        fixture: &Governed,
+        identity: meerkat_core::retained_work::RetainedWorkIdentity,
+        job: &str,
+    ) -> Result<AcceptOutcome, RuntimeDriverError> {
+        let request = request_from_delivery(
+            &fixture.runtime_id,
+            identity,
+            &format!("continuation:{job}"),
+            job,
+        )
+        .await;
+        fixture
+            .machine
+            .accept_retained_resume(
+                &fixture.session_id,
+                keyed_continuation(job, "the fork finished"),
+                request,
+            )
+            .await
+            .map(|(outcome, _)| outcome)
+    }
+
+    /// `identity` with its selected rows replaced.
+    fn with_selected(
+        identity: &meerkat_core::retained_work::RetainedWorkIdentity,
+        selected: BTreeMap<String, meerkat_core::retained_work::SelectedInputBinding>,
+    ) -> meerkat_core::retained_work::RetainedWorkIdentity {
+        meerkat_core::retained_work::RetainedWorkIdentity::new(
+            identity.runtime_id(),
+            identity.run_id().clone(),
+            identity.contributors().to_vec(),
+            selected,
+            identity.controller().cloned(),
+        )
+    }
+
+    /// `identity` with the selected row `from` keyed `to` instead, keeping
+    /// its binding unless `binding` replaces it.
+    fn rekeyed(
+        identity: &meerkat_core::retained_work::RetainedWorkIdentity,
+        from: &InputId,
+        to: &str,
+        binding: Option<meerkat_core::retained_work::SelectedInputBinding>,
+    ) -> meerkat_core::retained_work::RetainedWorkIdentity {
+        let mut selected = identity.selected_input_bindings().clone();
+        let kept = selected
+            .remove(&from.to_string())
+            .expect("the selected resume row");
+        selected.insert(to.to_string(), binding.unwrap_or(kept));
+        with_selected(identity, selected)
+    }
+
+    fn no_admissible_binding(result: &Result<AcceptOutcome, RuntimeDriverError>) -> bool {
+        matches!(
+            result,
+            Err(RuntimeDriverError::RetainedResumeRefused {
+                reason: RetainedResumeRefusal::NoAdmissibleWorkBinding
+            })
+        )
+    }
+
+    /// A chain one level deeper: the run that staged the second resume
+    /// retains work again, and its continuation still resumes the original.
+    #[tokio::test]
+    async fn a_continuation_two_resumes_deep_resumes_the_same_original() {
+        let fixture = governed_staging().await;
+        let (a, _, resumed) = resumed_run(&fixture, "caller-a", "fork_off:job-1").await;
+        let outcome = resume_with(&fixture, resumed, "fork_off:job-2")
+            .await
+            .expect("the resumed run's continuation resumes the original");
+        let AcceptOutcome::Accepted {
+            state: second_resume,
+            ..
+        } = outcome
+        else {
+            panic!("accepted, got {outcome:?}")
+        };
+        let twice_resumed =
+            stage_run(&fixture, std::slice::from_ref(&second_resume.input_id)).await;
+        finish_run(&fixture, twice_resumed.run_id()).await;
+        let outcome = resume_with(&fixture, twice_resumed.clone(), "fork_off:job-3")
+            .await
+            .expect("a continuation two resumes deep resumes the same original");
+        let AcceptOutcome::Accepted { state, .. } = outcome else {
+            panic!("accepted, got {outcome:?}")
+        };
+        assert_eq!(state.authority_contributors, vec![a]);
+        assert_eq!(
+            state.retained_resume.map(|record| record.identity),
+            Some(twice_resumed)
+        );
+    }
+
+    /// A selected key that is not a contributor is accepted only as this
+    /// runtime's own resume row of exactly the contributors, bound as staging
+    /// bound it; every other key or binding is no admissible work binding.
+    #[tokio::test]
+    async fn a_selected_row_that_is_not_a_verified_resume_of_the_contributors_is_refused() {
+        let fixture = governed_staging().await;
+        let (_, r1, resumed) = resumed_run(&fixture, "caller-a", "fork_off:job-a").await;
+        // An unrelated original B of this runtime, and a resume of B.
+        let (b, rb, _) = resumed_run(&fixture, "caller-b", "fork_off:job-b").await;
+        // Another runtime's resumed run, and its resume row.
+        let elsewhere = governed_staging().await;
+        let (_, foreign_resume, foreign_run) =
+            resumed_run(&elsewhere, "caller-a", "fork_off:job-x").await;
+
+        // B's own binding: a resume of B bound exactly as staging binds it, so
+        // only the window check (its carried originals are not the
+        // contributors) refuses it.
+        let (b_binding, b_batch) =
+            crate::input_authority::association_binding(b.association()).expect("binding");
+        let bound_under_b = meerkat_core::retained_work::SelectedInputBinding {
+            binding: b_binding.expect("binding"),
+            batch_key: b_batch.expect("batch key"),
+        };
+        let mut changed_binding = resumed.selected_input_bindings()[&r1.to_string()].clone();
+        changed_binding.binding = "another-binding".into();
+        let mut changed_batch = resumed.selected_input_bindings()[&r1.to_string()].clone();
+        changed_batch.batch_key = "another-batch".into();
+        let cases = [
+            (
+                "another runtime's resumed run",
+                foreign_run,
+                "fork_off:case-foreign-run",
+            ),
+            (
+                "another runtime's resume row",
+                rekeyed(&resumed, &r1, &foreign_resume.to_string(), None),
+                "fork_off:case-foreign-row",
+            ),
+            (
+                "a selected key with no row",
+                rekeyed(&resumed, &r1, &InputId::new().to_string(), None),
+                "fork_off:case-no-row",
+            ),
+            (
+                "a non-canonical key for the resume row",
+                rekeyed(&resumed, &r1, &r1.to_string().to_uppercase(), None),
+                "fork_off:case-non-canonical",
+            ),
+            (
+                "a row that is not a resume",
+                rekeyed(&resumed, &r1, &b.input_id().to_string(), None),
+                "fork_off:case-not-a-resume",
+            ),
+            (
+                "a resume of other originals",
+                rekeyed(&resumed, &r1, &rb.to_string(), None),
+                "fork_off:case-other-originals",
+            ),
+            (
+                "a resume of other originals, bound under them",
+                rekeyed(&resumed, &r1, &rb.to_string(), Some(bound_under_b)),
+                "fork_off:case-other-originals-own-binding",
+            ),
+            (
+                "a changed binding",
+                rekeyed(&resumed, &r1, &r1.to_string(), Some(changed_binding)),
+                "fork_off:case-binding",
+            ),
+            (
+                "a changed batch key",
+                rekeyed(&resumed, &r1, &r1.to_string(), Some(changed_batch)),
+                "fork_off:case-batch-key",
+            ),
+        ];
+        for (case, identity, job) in cases {
+            let result = resume_with(&fixture, identity, job).await;
+            assert!(no_admissible_binding(&result), "{case}: {result:?}");
+        }
+        // The exact resumed run still resumes its original.
+        assert!(matches!(
+            resume_with(&fixture, resumed, "fork_off:case-exact").await,
+            Ok(AcceptOutcome::Accepted { .. })
+        ));
+    }
+
+    /// A resumed run's continuation replayed is admitted once: the replay of
+    /// the same input with the same delivery is deduplicated.
+    #[tokio::test]
+    async fn a_resumed_runs_continuation_replayed_is_admitted_once() {
+        let fixture = governed_staging().await;
+        let (_, _, resumed) = resumed_run(&fixture, "caller-a", "fork_off:job-1").await;
+        let continuation = keyed_continuation("fork_off:job-2", "the second fork finished");
+        let mut admitted = None;
+        for attempt in ["first", "replay"] {
+            let request = request_from_delivery(
+                &fixture.runtime_id,
+                resumed.clone(),
+                "continuation:second",
+                "fork_off:job-2",
+            )
+            .await;
+            let (outcome, _) = fixture
+                .machine
+                .accept_retained_resume(&fixture.session_id, continuation.clone(), request)
+                .await
+                .expect("answered");
+            match (attempt, outcome) {
+                ("first", AcceptOutcome::Accepted { input_id, .. }) => admitted = Some(input_id),
+                ("replay", AcceptOutcome::Deduplicated { existing_id, .. }) => {
+                    assert_eq!(
+                        Some(existing_id),
+                        admitted,
+                        "the replay names the admitted input"
+                    );
+                }
+                (attempt, outcome) => panic!("{attempt}: {outcome:?}"),
+            }
+        }
+    }
+
+    /// The retained work of a resumed run resolves for MCP observation like
+    /// the original's: the observation reaches the registration (which has
+    /// no MCP adapter installed here). A resumed identity whose resume row is
+    /// not held here is not current.
+    #[tokio::test]
+    async fn a_resumed_runs_retained_work_resolves_for_mcp_observation() {
+        use crate::meerkat_machine::McpObservationRefusal;
+        let fixture = governed_staging().await;
+        let (_, r1, resumed) = resumed_run(&fixture, "caller-a", "fork_off:job-1").await;
+        assert!(matches!(
+            fixture
+                .machine
+                .observe_original_mcp_operation(&resumed, "server", "tool")
+                .await,
+            Err(McpObservationRefusal::NotInstalled)
+        ));
+        let unheld = rekeyed(&resumed, &r1, &InputId::new().to_string(), None);
+        assert!(matches!(
+            fixture
+                .machine
+                .observe_original_mcp_operation(&unheld, "server", "tool")
+                .await,
+            Err(McpObservationRefusal::OriginalUnavailable)
+        ));
     }
 
     /// Launch A, admit an unrelated B, complete A: the resume carries A's
