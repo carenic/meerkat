@@ -4182,19 +4182,6 @@ fn instructions_event_id(token: GptLiveAppendToken, index: usize) -> String {
     format!("meerkat-instructions-{}-{index}", token.0)
 }
 
-/// Largest payload of one fragmented append, a conservative byte bound for
-/// the provider's 500-token append limit.
-const CONTEXT_FRAGMENT_MAX_BYTES: usize = 500;
-
-/// Split `text` into ordered fragments of at most [`CONTEXT_FRAGMENT_MAX_BYTES`]
-/// whose concatenation is exactly `text`. A fragment ends at the end of the
-/// last whitespace run inside its window, so no word (or number, or quoted
-/// phrase) is cut in two and the next fragment starts on a non-blank
-/// character; fragments are therefore often shorter than the bound. A single
-/// token longer than the bound has no whitespace to cut at and falls back to
-/// a byte split on a UTF-8 character boundary, which the provider still
-/// accepts (the bound is what matters on the wire, the seam only matters for
-/// recall). The result is bounded by the caller's pending-append limit.
 /// Send released appends in order, each one's fragments in order, and stop
 /// at the first failed send: nothing after it is tried. Returns the tokens
 /// sent whole and the token whose send failed.
@@ -4218,6 +4205,19 @@ where
     (sent, None)
 }
 
+/// Largest payload of one fragmented append, a conservative byte bound for
+/// the provider's 500-token append limit.
+const CONTEXT_FRAGMENT_MAX_BYTES: usize = 500;
+
+/// Split `text` into ordered fragments of at most [`CONTEXT_FRAGMENT_MAX_BYTES`]
+/// whose concatenation is exactly `text`. A fragment ends at the end of the
+/// last whitespace run inside its window, so no word (or number, or quoted
+/// phrase) is cut in two and the next fragment starts on a non-blank
+/// character; fragments are therefore often shorter than the bound. A single
+/// token longer than the bound has no whitespace to cut at and falls back to
+/// a byte split on a UTF-8 character boundary, which the provider still
+/// accepts (the bound is what matters on the wire, the seam only matters for
+/// recall). The result is bounded by the caller's pending-append limit.
 fn context_fragments(mut text: &str) -> Vec<&str> {
     let mut fragments = Vec::new();
     while !text.is_empty() {
