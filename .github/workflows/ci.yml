@@ -664,7 +664,8 @@ jobs:
   # in `ratchets` only proves the artifacts match the DSL). Each shard of
   # the canonical TLC lane needs only a JDK and the TLC jar
   # (setup-tlc-ci; the audit parts never run xtask), runs in parallel, and
-  # fits the PR budget.
+  # fits the PR budget: three shards of 396-506 s of audits on a hosted
+  # runner, where two ran 592 and 812 s on run 38859112297.
   # The `machine-verify --all` sweep stays on nightly, the release gate and
   # the release-tag graph.
   tlc-audits:
@@ -678,7 +679,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        part: [audits-a, audits-b]
+        part: [audits-a, audits-b, audits-c]
     env:
       # A 4-vCPU runner: four TLC workers, and a heap that leaves room for
       # the runner.
