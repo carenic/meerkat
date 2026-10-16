@@ -99,6 +99,10 @@ them.
   `PeerResponseAddresseeResolved`; `MeerkatMachineSignal` gains
   `ResolvePeerResponseAddressee`; `MeerkatMachineSignalVariant` gains
   `ResolvePeerResponseAddressee`.
+- Behaviour-only (not measured by the gate): `CommsRuntime::send` refuses a
+  `PeerResponse` whose `to` is not the recorded requester; host `comms/send`
+  fails with `send_failed` and `send_response` with `invalid_arguments` where
+  they delivered (see Fixed).
 
 ### Added
 

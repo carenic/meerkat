@@ -2707,13 +2707,19 @@ pub trait PeerInteractionHandle: Send + Sync {
 
     /// Ask the generated machine authority whether a response to the inbound
     /// request `corr_id`, progress or terminal, may be addressed to
-    /// `addressee`: only the requester recorded by [`Self::request_received`]
-    /// may receive it. Read-only. Callers ask before any transport, so a
-    /// refused response reaches no one and the request stays answerable.
+    /// `addressee`. Read-only. Callers ask before any transport, so a refused
+    /// response reaches no one and the request stays answerable.
     ///
-    /// Production handles implement this through generated MeerkatMachine
-    /// authority; a handle that cannot judge must return an error, which
-    /// callers treat as a refusal.
+    /// Contract for implementations: keep the `requester` given to
+    /// [`Self::request_received`] for each inbound request, unchanged, until
+    /// [`Self::response_replied`] answers it, and answer
+    /// [`PeerResponseAddresseeVerdict::Requester`] only when `addressee` is
+    /// that requester. Any other peer is
+    /// [`PeerResponseAddresseeVerdict::NotRequester`], and an id with no
+    /// recorded request is [`PeerResponseAddresseeVerdict::UnknownRequest`].
+    /// A handle that cannot judge must return an error, which callers treat
+    /// as a refusal. Production handles implement this through generated
+    /// MeerkatMachine authority.
     fn resolve_response_addressee(
         &self,
         corr_id: PeerCorrelationId,

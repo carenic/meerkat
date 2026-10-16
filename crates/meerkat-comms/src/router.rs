@@ -771,6 +771,10 @@ impl Router {
     /// at the boundary and handle the typed
     /// [`TrustResolveError::Ambiguous`](crate::trust::TrustResolveError::Ambiguous)
     /// case explicitly — the router will not guess.
+    ///
+    /// This raw transport is outside the runtime's guarantee that a response
+    /// goes only to the request's requester: a Response sent here is not
+    /// checked against it, as one sent through `CommsRuntime::send` is.
     pub async fn send(&self, dest: PeerId, kind: MessageKind) -> Result<SendOutcome, SendError> {
         self.send_with_id(dest, Uuid::new_v4(), kind, None).await
     }
@@ -792,6 +796,9 @@ impl Router {
     /// proved by the selected transport. Meerkat peer transports require a
     /// signed durable-resolution fact for runtime-bound peer input. Response
     /// retains its legacy queued/no-ack semantics.
+    ///
+    /// Like [`Router::send`], this raw transport is outside the runtime's
+    /// guarantee that a response goes only to the request's requester.
     pub async fn send_with_id(
         &self,
         dest: PeerId,

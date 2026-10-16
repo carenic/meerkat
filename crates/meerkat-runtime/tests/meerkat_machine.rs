@@ -7014,8 +7014,13 @@ mod peer_response_addressee {
             )
             .await;
             assert!(
-                refused.is_err(),
-                "a {status:?} response addressed to a peer that did not send the request must be refused, got {refused:?}"
+                matches!(
+                    &refused,
+                    Err(SendError::ResponseAddresseeNotRequester { in_reply_to, addressee })
+                        if *in_reply_to == fixture.request_id
+                            && *addressee == fixture.bystander.peer_id()
+                ),
+                "a {status:?} response addressed to a peer that did not send the request must be refused as not the requester, got {refused:?}"
             );
             assert!(
                 fixture.bystander.received().await.is_empty(),

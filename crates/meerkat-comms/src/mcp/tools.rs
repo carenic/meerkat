@@ -346,6 +346,7 @@ pub async fn handle_tools_call_with_context(
 /// Why a comms tool call was refused, by the tool error class a dispatcher
 /// reports for it.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum CommsToolCallError {
     /// The arguments name a delivery the runtime refuses for this session:
     /// a `send_response` addressed to a peer that did not send the request
