@@ -2065,22 +2065,38 @@ impl PublicLiveBrokerSession {
             // as soon as provider ordering answers it. The state lock stays
             // held while they are sent, so a result appended concurrently
             // cannot overtake them.
-            for (token, event) in state.take_releasable_held_commentary() {
-                // Captured and recorded like every other append
-                // (`deliver_append`): a held result released here is a real
-                // provider append, and replay and the result-timing oracles
-                // key on it.
-                self.instrument_outgoing_append(&event);
-                if self.sender.send(event).await.is_err() {
+            let released: Vec<_> = state
+                .take_releasable_held_commentary()
+                .into_iter()
+                .map(|(token, event)| (token, vec![event]))
+                .collect();
+            if !released.is_empty() {
+                let (sent, failed) = send_released_in_order(released, |event| {
+                    // Captured and recorded like every other append
+                    // (`deliver_append`): a held result released here is a
+                    // real provider append, and replay and the result-timing
+                    // oracles key on it.
+                    self.instrument_outgoing_append(&event);
+                    let send = self.sender.send(event);
+                    async move { send.await.is_ok() }
+                })
+                .await;
+                for token in sent {
+                    tracing::info!(
+                        token = token.0,
+                        "public Live held delegation commentary released"
+                    );
+                }
+                if let Some(token) = failed {
+                    // Nothing after the failed append is tried: a failed send
+                    // fences every later append (`append_delivery_ambiguous`),
+                    // a later result must not reach the provider ahead of an
+                    // earlier one, and the transport's close settles every
+                    // reservation left.
                     state.append_delivery_ambiguous = true;
                     tracing::warn!(
                         token = token.0,
                         "released public Live delegation commentary could not be sent; the transport is gone and its close settles the delivery"
-                    );
-                } else {
-                    tracing::info!(
-                        token = token.0,
-                        "public Live held delegation commentary released"
                     );
                 }
             }
@@ -4179,6 +4195,29 @@ const CONTEXT_FRAGMENT_MAX_BYTES: usize = 500;
 /// a byte split on a UTF-8 character boundary, which the provider still
 /// accepts (the bound is what matters on the wire, the seam only matters for
 /// recall). The result is bounded by the caller's pending-append limit.
+/// Send released appends in order, each one's fragments in order, and stop
+/// at the first failed send: nothing after it is tried. Returns the tokens
+/// sent whole and the token whose send failed.
+async fn send_released_in_order<F, Fut>(
+    released: Vec<(GptLiveAppendToken, Vec<ClientEvent>)>,
+    mut send: F,
+) -> (Vec<GptLiveAppendToken>, Option<GptLiveAppendToken>)
+where
+    F: FnMut(ClientEvent) -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let mut sent = Vec::with_capacity(released.len());
+    for (token, events) in released {
+        for event in events {
+            if !send(event).await {
+                return (sent, Some(token));
+            }
+        }
+        sent.push(token);
+    }
+    (sent, None)
+}
+
 fn context_fragments(mut text: &str) -> Vec<&str> {
     let mut fragments = Vec::new();
     while !text.is_empty() {
@@ -7670,6 +7709,47 @@ mod tests {
         state.drop_held_commentary_for_close();
         assert!(state.held_commentary.is_empty());
         assert!(released_tokens(&mut state).is_empty());
+    }
+
+    /// Released commentary goes out in append order and stops at the first
+    /// failed send. A failed send fences every later append, and a later
+    /// result must not reach the provider ahead of an earlier one; the
+    /// transport's close settles the reservations left.
+    #[tokio::test]
+    async fn released_commentary_stops_at_the_first_failed_send() {
+        let mut state = state_with_spoken_delegation();
+        state
+            .apply_frame(frame(input_delta_at("one more thing", 2500.0)))
+            .unwrap();
+        let mut held = Vec::new();
+        for delegation in ["dlg_a", "dlg_b", "dlg_c"] {
+            let (token, event) = result_append(&mut state, delegation);
+            assert!(state.hold_or_send_commentary(token, event).is_none());
+            held.push(token);
+        }
+        state
+            .apply_frame(frame(output_delta_span("sure", 5000.0, 5200.0)))
+            .unwrap();
+        let released: Vec<_> = state
+            .take_releasable_held_commentary()
+            .into_iter()
+            .map(|(token, event)| (token, vec![event]))
+            .collect();
+        assert_eq!(
+            released.iter().map(|(token, _)| *token).collect::<Vec<_>>(),
+            held
+        );
+        let mut attempts = 0_usize;
+        let (sent, failed) = send_released_in_order(released, |_| {
+            attempts += 1;
+            // The second result's send fails.
+            let ok = attempts != 2;
+            async move { ok }
+        })
+        .await;
+        assert_eq!(sent, [held[0]]);
+        assert_eq!(failed, Some(held[1]));
+        assert_eq!(attempts, 2, "the third result is not tried");
     }
 
     #[test]
