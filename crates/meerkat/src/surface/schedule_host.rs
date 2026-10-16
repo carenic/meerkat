@@ -4822,4 +4822,177 @@ mod tests {
             Some(OccurrenceFailureClass::TargetMissing)
         );
     }
+
+    /// A session host with a fixed identity judgement whose lifetime a test
+    /// watches through a `Weak` of `_alive`.
+    struct FixedIdentityHost {
+        _alive: Arc<()>,
+        identity: TargetProbeOutcome,
+    }
+
+    #[async_trait]
+    impl SurfaceScheduleSessionHost for FixedIdentityHost {
+        async fn probe_session_target(
+            &self,
+            _binding: &SessionTargetBinding,
+        ) -> Result<TargetProbeOutcome, ScheduleDomainError> {
+            Ok(TargetProbeOutcome::Ready)
+        }
+
+        async fn probe_identity_target(
+            &self,
+            _binding: &IdentityTargetBinding,
+        ) -> Result<TargetProbeOutcome, ScheduleDomainError> {
+            Ok(self.identity.clone())
+        }
+
+        async fn materialize_session(
+            &self,
+            _occurrence: &Occurrence,
+            _create: &SessionMaterializationSpec,
+        ) -> Result<SessionId, ScheduleDomainError> {
+            Err(ScheduleDomainError::Internal(
+                "delivery is out of scope for this test".to_string(),
+            ))
+        }
+
+        async fn deliver_prompt(
+            &self,
+            _session_id: &SessionId,
+            _occurrence: &Occurrence,
+            _identity: &ScheduleDeliveryIdentity,
+            _dispatch: ScheduledPromptDispatch,
+        ) -> Result<DeliveryDispatch, ScheduleDomainError> {
+            Err(ScheduleDomainError::Internal(
+                "delivery is out of scope for this test".to_string(),
+            ))
+        }
+
+        async fn deliver_event(
+            &self,
+            _session_id: &SessionId,
+            _occurrence: &Occurrence,
+            _identity: &ScheduleDeliveryIdentity,
+            _dispatch: ScheduledEventDispatch,
+        ) -> Result<DeliveryDispatch, ScheduleDomainError> {
+            Err(ScheduleDomainError::Internal(
+                "delivery is out of scope for this test".to_string(),
+            ))
+        }
+    }
+
+    /// Install agent schedule tools on `service` (as a factory builder's
+    /// `default_schedule_tools` slot holds them), spawn a host whose session
+    /// host vouches for every identity, and stop that host. Returns the tools
+    /// and a watch on the stopped host's session host.
+    async fn stop_a_host_under_installed_tools(
+        service: &ScheduleService,
+    ) -> (
+        meerkat_schedule::ScheduleToolDispatcher,
+        std::sync::Weak<()>,
+    ) {
+        let tools = meerkat_schedule::ScheduleToolDispatcher::new(service.clone());
+        let alive = Arc::new(());
+        let watch = Arc::downgrade(&alive);
+        let session_host: Arc<dyn SurfaceScheduleSessionHost> = Arc::new(FixedIdentityHost {
+            _alive: alive,
+            identity: TargetProbeOutcome::Ready,
+        });
+        let mob_host: Arc<dyn SurfaceScheduleMobHost> = Arc::new(NoopScheduleMobHost::new(
+            "mob targets unsupported in this test",
+        ));
+        let adapter = Arc::new(SharedScheduleTargetAdapter::new(
+            service.clone(),
+            session_host,
+            mob_host,
+        ));
+        spawn_schedule_host(service.clone(), adapter, "stopped-host")
+            .shutdown()
+            .await;
+        (tools, watch)
+    }
+
+    fn memory_schedule_service() -> ScheduleService {
+        ScheduleService::new(
+            Arc::new(meerkat_schedule::MemoryScheduleStore::new()) as Arc<dyn ScheduleStore>
+        )
+    }
+
+    /// Schedule tools installed on a builder hold a clone of the service, and
+    /// the session service owns that builder. Once the host has stopped they
+    /// must not keep its session host (and through it the session service)
+    /// alive, so an embedder needs no manual clear after teardown.
+    #[tokio::test]
+    async fn a_stopped_schedule_host_releases_its_session_host_under_installed_tools() {
+        let service = memory_schedule_service();
+        let (tools, watch) = stop_a_host_under_installed_tools(&service).await;
+        let released = tokio::time::timeout(Duration::from_secs(5), async {
+            while watch.upgrade().is_some() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(
+            released.is_ok(),
+            "the stopped host's session host is still owned through the schedule tools"
+        );
+        drop(tools);
+    }
+
+    /// After its host has stopped, an identity-target create through the
+    /// installed tools is a typed unavailable result, never a judgement by
+    /// the stopped host.
+    #[tokio::test]
+    async fn installed_schedule_tools_report_a_stopped_host_as_unavailable() {
+        use meerkat_core::AgentToolDispatcher;
+
+        let service = memory_schedule_service();
+        let (tools, _watch) = stop_a_host_under_installed_tools(&service).await;
+        let arguments = serde_json::to_string(&identity_create_request("domain:ops"))
+            .expect("encode create arguments");
+        let raw =
+            serde_json::value::RawValue::from_string(arguments).expect("encode tool arguments");
+        let error = tools
+            .dispatch(meerkat_core::ToolCallView {
+                id: "create-after-teardown",
+                name: "meerkat_schedule_create",
+                args: raw.as_ref(),
+            })
+            .await
+            .expect_err("no stopped host may judge an identity target");
+        assert!(
+            matches!(error, meerkat_core::ToolError::Unavailable { .. }),
+            "expected a typed unavailable result, found {error:?}"
+        );
+    }
+
+    /// A host attached after the first one stopped judges identity targets
+    /// itself: the first attach no longer wins once its host is gone.
+    #[tokio::test]
+    async fn a_host_attached_after_teardown_judges_identity_targets() {
+        let service = memory_schedule_service();
+        let (_tools, _watch) = stop_a_host_under_installed_tools(&service).await;
+        let refusing: Arc<dyn SurfaceScheduleSessionHost> = Arc::new(FixedIdentityHost {
+            _alive: Arc::new(()),
+            identity: TargetProbeOutcome::Missing {
+                detail: Some("unknown to the second host".to_string()),
+            },
+        });
+        let mob_host: Arc<dyn SurfaceScheduleMobHost> = Arc::new(NoopScheduleMobHost::new(
+            "mob targets unsupported in this test",
+        ));
+        let _second = SharedScheduleTargetAdapter::new(service.clone(), refusing, mob_host);
+        let error = service
+            .create(identity_create_request("domain:ops"))
+            .await
+            .expect_err("the second host refuses the identity");
+        assert!(
+            matches!(
+                &error,
+                ScheduleDomainError::InvalidSchedule(reason)
+                    if reason.contains("unknown to the second host")
+            ),
+            "expected the second host's refusal, found {error:?}"
+        );
+    }
 }
