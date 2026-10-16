@@ -35,6 +35,18 @@ them.
 
 ## [Unreleased]
 
+### Fixed
+
+- The meerkat-runtime test
+  `quiescent_close_of_a_settled_owner_resumes_the_same_session_without_replay`
+  no longer races its runtime loop. It admitted an input without a wake as
+  soon as the first input's completion resolved, while the loop's lap after
+  that run could still check its queue, take the input and finish it before
+  the close looked, so the close answered `Closed` instead of `Busy` under
+  load. The test now waits for the loop to park before it queues the input.
+  Test-only: the close never answers `Closed` while a non-terminal input
+  exists.
+
 ## [0.9.2] - 2026-10-16
 
 ### Breaking
