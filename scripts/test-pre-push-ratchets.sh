@@ -11,10 +11,13 @@
 # except a pull request's meerkat-mob chain shards, which lint their lib and
 # bin targets; and the CI gate requires them whenever Rust changed), and the
 # ratchets and governance-gates jobs, example-web and wasm-check run the
-# ratchets for the same changed paths. This test pins those facts, checks the package claim on
-# sample changes against the agent gate's own selection, and checks that the
-# manual hook keeps the agent gate's ratchets and runs no Clippy and no
-# tests.
+# ratchets for the same changed paths. This test pins those facts, checks the
+# package claim on sample changes against the agent gate's own selection,
+# checks that every ratchet the agent gate selects for a sample change has a
+# CI step the plan selects for that change on both events, and checks that
+# the manual hook keeps the agent gate's ratchets and runs no Clippy and no
+# tests. CI runs it (make ci-lanes-selftest, in Format + governance), and it
+# needs no Python package beyond the standard library.
 set -euo pipefail
 
 REPO_ROOT="${REPO_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}"
@@ -36,13 +39,30 @@ if grep -Eq 'pre-push-clippy|id: cargo-clippy' "$config"; then
   fail "a pre-push hook still runs the Clippy body"
 fi
 python3 - "$config" <<'PY' || fail "a push-stage hook runs a lane CI runs before merge"
+import re
 import sys
 
-import yaml
+# The config's own layout, read without a YAML package: each hook starts at
+# `      - id: NAME` and its keys are indented eight spaces; stages are flow
+# lists. Anything else is refused rather than guessed.
+text = open(sys.argv[1]).read()
+default = re.search(r"(?m)^default_stages: \[([^\]]*)\]$", text)
+assert default, "default_stages is not a flow list"
 
-config = yaml.safe_load(open(sys.argv[1]))
-default = config.get("default_stages", ["pre-commit"])
-stages = {hook["id"]: hook.get("stages", default) for repo in config["repos"] for hook in repo["hooks"]}
+def listed(value):
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+stages = {}
+for block in re.split(r"(?m)^      - id: ", text)[1:]:
+    hook_id = block.split("\n", 1)[0].strip()
+    keys = re.findall(r"(?m)^        stages:(.*)$", block)
+    assert len(keys) <= 1, f"{hook_id} names its stages twice"
+    if keys:
+        flow = re.fullmatch(r" \[([^\]]*)\]", keys[0])
+        assert flow, f"{hook_id}: stages is not a flow list"
+        stages[hook_id] = listed(flow.group(1))
+    else:
+        stages[hook_id] = listed(default.group(1))
 for hook_id in ("changed-path-ratchets", "machine-codegen-drift", "machine-codegen-verify", "cargo-test"):
     assert stages.get(hook_id) == ["manual"], f"{hook_id} runs in {stages.get(hook_id)}, not only manually"
 PY
@@ -163,5 +183,150 @@ expect_ratchet 'DRY-RUN make verify-schema-freshness' docs/api/rpc.mdx
 if scripts/cargo-agent-gate --ratchets-only --clippy-only --dry-run -- Cargo.lock >/dev/null 2>&1; then
   fail "--ratchets-only combined with --clippy-only was accepted"
 fi
+
+# 5. Every ratchet the hook ran keeps a CI step with the same trigger: for
+#    each sample change, every make target the agent gate's ratchets select
+#    maps to a CI job step that runs it, under a condition the plan's flag
+#    alone satisfies, and the plan sets that flag for the change on a pull
+#    request and on a push.
+python3 - "$ci" <<'PY' || fail "a ratchet the hook ran has no CI step with the same trigger"
+import json
+import re
+import subprocess
+import sys
+
+ci = open(sys.argv[1]).read()
+
+def run(*args):
+    result = subprocess.run(args, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise SystemExit(f"{' '.join(args)} failed ({result.returncode}): {result.stderr[-2000:]}")
+    return result.stdout
+
+# make target -> (CI job, plan flag). test-sdk-web is the Makefile's
+# `npm install`, `npm run build` (build:wasm, then build:ts), `npm test`
+# (build:ts first) and `npm run test:packed` in sdks/web; example-web runs
+# the same commands there.
+RATCHETS = {
+    "machine-authority-docs-gate": ("governance-gates", "governance_gates"),
+    "runtime-authority-bypass": ("governance-gates", "governance_gates"),
+    "seam-inventory": ("governance-gates", "governance_gates"),
+    "rmat-audit": ("governance-gates", "governance_gates"),
+    "verify-schema-freshness": ("ratchets", "generated_contract"),
+    "verify-sdk-codegen-freshness": ("ratchets", "generated_contract"),
+    "verify-sdk-event-inventory": ("ratchets", "generated_contract"),
+    "verify-rpc-surface-alignment": ("ratchets", "generated_contract"),
+    "verify-rest-surface-alignment": ("ratchets", "generated_contract"),
+    "test-sdk-web": ("example-web", "example_web"),
+    "wasm-check": ("wasm-check", "wasm"),
+}
+WEB_SDK_COMMANDS = ("npm run build:wasm", "npm test", "npm run test:packed")
+
+def job(name):
+    match = re.search(rf"\n  {re.escape(name)}:\n(.*?)(?=\n  [a-z][a-z0-9-]*:\n|\Z)", ci, re.S)
+    assert match, f"ci.yml has no {name} job"
+    return match.group(1)
+
+def condition(block, indent):
+    lines = re.findall(rf"(?m)^{' ' * indent}if:(.*)$", block)
+    if not lines:
+        return None
+    assert len(lines) == 1, f"two conditions at indent {indent}"
+    match = re.fullmatch(r" \$\{\{ (.*) \}\}", lines[0])
+    assert match, f"a condition this test cannot read: if:{lines[0]}"
+    return match.group(1)
+
+def disjuncts(expression):
+    parts, depth, start = [], 0, 0
+    for index, char in enumerate(expression):
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+        elif depth == 0 and expression.startswith("||", index):
+            parts.append(expression[start:index].strip())
+            start = index + 2
+    parts.append(expression[start:].strip())
+    return parts
+
+def runs_on_flag(expression, flag):
+    return expression is None or f"needs.changes.outputs.{flag} == 'true'" in disjuncts(expression)
+
+def steps(block):
+    found = []
+    for chunk in re.split(r"(?m)^      - name: ", block)[1:]:
+        lines = chunk.split("\n")
+        directory = re.search(r"(?m)^        working-directory: (\S+)$", chunk)
+        commands = []
+        for index, line in enumerate(lines):
+            if line.startswith("        run: "):
+                value = line[len("        run: "):]
+                if value == "|":
+                    for body in lines[index + 1:]:
+                        if body.strip() and not body.startswith("          "):
+                            break
+                        if body.strip():
+                            commands.append(body.strip())
+                else:
+                    commands.append(value.strip())
+        found.append({
+            "name": lines[0].strip(),
+            "if": condition(chunk, 8),
+            "directory": directory.group(1) if directory else None,
+            "commands": commands,
+        })
+    return found
+
+for target, (job_name, flag) in sorted(RATCHETS.items()):
+    block = job(job_name)
+    head = block.split("\n    steps:\n", 1)[0]
+    assert runs_on_flag(condition(head, 4), flag), f"job {job_name} does not run on {flag} alone"
+    selected = [step for step in steps(block) if runs_on_flag(step["if"], flag)]
+    if target == "test-sdk-web":
+        ran = {command for step in selected if step["directory"] == "sdks/web" for command in step["commands"]}
+        missing = [command for command in WEB_SDK_COMMANDS if command not in ran]
+        assert not missing, f"job {job_name} no longer runs {missing} in sdks/web on {flag}"
+        continue
+    assert any(
+        command.startswith("make ") and target in command.split()[1:]
+        for step in selected
+        for command in step["commands"]
+    ), f"job {job_name} has no step that runs make {target} on {flag}"
+
+samples = [
+    "docs/api/rpc.mdx",
+    "artifacts/schemas/version.json",
+    "sdks/python/meerkat/generated/types.py",
+    "crates/meerkat-machine-schema/src/lib.rs",
+    "specs/machines/sample.yaml",
+    "docs/architecture/meerkat-dogma.md",
+    "docs/architecture/meerkat-dogma-commentary.md",
+    "docs/internal/dogma-audits/sample.md",
+    ".claude/skills/meerkat-dogma-inquisition/SKILL.md",
+    "sdks/web/src/index.ts",
+    "sdks/web/package.json",
+    "crates/meerkat-web-runtime/src/lib.rs",
+    "crates/meerkat-web-runtime/Cargo.toml",
+]
+for path in samples:
+    gate = run("scripts/cargo-agent-gate", "--ratchets-only", "--machine-drift-by-hook", "--dry-run", "--", path)
+    targets = sorted({
+        target
+        for line in gate.splitlines()
+        if line.startswith("DRY-RUN make ")
+        for target in line[len("DRY-RUN make "):].split()
+    })
+    if not targets:
+        raise SystemExit(f"{path}: the agent gate selects no ratchet; the sample proves nothing")
+    for event in ("pull_request", "push"):
+        plan = json.loads(run("node", "scripts/ci-cargo-lanes.mjs", "--event", event, "--format", "json", "--", path))
+        for target in targets:
+            if target not in RATCHETS:
+                raise SystemExit(f"{path}: the hook runs make {target}, which this test maps to no CI step")
+            job_name, flag = RATCHETS[target]
+            if plan.get(flag) is not True:
+                raise SystemExit(f"{path} ({event}): the hook runs make {target}, but the plan's {flag} is {plan.get(flag)}")
+        print(f"covered: {path} ({event}): {' '.join(targets)}")
+PY
 
 echo "pre-push ratchets contracts hold"
