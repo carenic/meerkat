@@ -782,6 +782,10 @@ enum LoweredContextAppend {
     Session(String),
     /// `session.thinking.append`: quiet context, with its framing.
     Thinking(String),
+    /// `session.thinking.append` for text-chat rows: quiet context, with its
+    /// framing, that waits out a voiced model response
+    /// ([`meerkat_live::LiveQuietAppendTiming::AfterVoicedResponse`]).
+    TextChat(String),
 }
 
 /// Lower one generated context append by its kind; `None` for a kind this
@@ -825,8 +829,10 @@ fn lower_context_append(
             // A host-typed turn's rows (the text chat): the user typed
             // and read them in the chat, so they ride the quiet lane as
             // context; voiced, the model read them aloud and replayed
-            // stale results with them (S105 R3, #1614).
-            LoweredContextAppend::Thinking(format!("{LIVE_TEXT_CHAT_PREFIX}\n{text}"))
+            // stale results with them (S105 R3, #1614). They never land
+            // inside a voiced response: absorbed there, a later answer
+            // lacked the typed update (S98).
+            LoweredContextAppend::TextChat(format!("{LIVE_TEXT_CHAT_PREFIX}\n{text}"))
         }
         meerkat_runtime::live_execution::LiveContextAppendKind::RuntimeWorkReplay => {
             // Runtime work output the model has never seen (a job result
@@ -2830,6 +2836,17 @@ trait ExperimentalGptLiveBrokerSession: Send + Sync {
         })
     }
 
+    /// Quiet text-chat context that must not land inside a voiced model
+    /// response (`PublicLiveBrokerSession::append_text_chat_context`). A
+    /// session that does not observe the model's output sends it like any
+    /// quiet append.
+    async fn append_text_chat_context(
+        &self,
+        text: String,
+    ) -> Result<GptLiveAppendToken, GptLiveBrokerError> {
+        self.append_thinking_context(text).await
+    }
+
     async fn append_instructions_context(
         &self,
         _text: String,
@@ -2956,6 +2973,13 @@ impl ExperimentalGptLiveBrokerSession for PublicLiveBrokerSession {
         text: String,
     ) -> Result<GptLiveAppendToken, GptLiveBrokerError> {
         PublicLiveBrokerSession::append_thinking_context(self, text).await
+    }
+
+    async fn append_text_chat_context(
+        &self,
+        text: String,
+    ) -> Result<GptLiveAppendToken, GptLiveBrokerError> {
+        PublicLiveBrokerSession::append_text_chat_context(self, text).await
     }
 
     async fn append_instructions_context(
@@ -6347,6 +6371,9 @@ impl ExperimentalGptLiveWebrtcTransport {
             LoweredContextAppend::Thinking(text) => {
                 LiveSidebandCommand::append_thinking_context(sideband, text)
             }
+            LoweredContextAppend::TextChat(text) => {
+                LiveSidebandCommand::append_text_chat_context(sideband, text)
+            }
         }
         .map_err(|_| ExperimentalGptLiveBridgeError::ContextAuthorityRejected)?;
         self.dispatch_generated_append(authority, command).await
@@ -9045,15 +9072,27 @@ impl ProviderWebrtcSidebandSession for ExperimentalGptLiveSideband {
         if self.closing.load(Ordering::Acquire) {
             return Err(ProviderWebrtcBrokerError::Rejected);
         }
+        let quiet_timing = command.quiet_append_timing();
         match command.__into_provider_command() {
             LiveSidebandProviderCommand::AppendThinkingContext { attempt, text, .. } => {
+                // A timing this adapter does not know is refused before any
+                // reservation, never sent at a guessed time.
+                let text_chat = match quiet_timing {
+                    Some(meerkat_live::LiveQuietAppendTiming::Immediate) => false,
+                    Some(meerkat_live::LiveQuietAppendTiming::AfterVoicedResponse) => true,
+                    _ => return Err(ProviderWebrtcBrokerError::Rejected),
+                };
                 let reservation = self
                     .correlations
                     .lock()
                     .await
                     .appends
                     .reserve(SidebandAppendLane::Thinking, attempt)?;
-                let result = self.session.append_thinking_context(text).await;
+                let result = if text_chat {
+                    self.session.append_text_chat_context(text).await
+                } else {
+                    self.session.append_thinking_context(text).await
+                };
                 self.lower_append_delivery(reservation, result).await
             }
             LiveSidebandProviderCommand::AppendInstructionsContext {
@@ -9978,7 +10017,7 @@ mod tests {
         let row = "{\"role\":\"assistant\",\"text\":\"The numbers are 21 and 42.\"}";
         assert_eq!(
             super::lower_context_append(LiveContextAppendKind::TextChatReplay, row.to_string()),
-            Some(super::LoweredContextAppend::Thinking(format!(
+            Some(super::LoweredContextAppend::TextChat(format!(
                 "{}\n{row}",
                 super::LIVE_TEXT_CHAT_PREFIX
             )))

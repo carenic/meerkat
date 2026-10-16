@@ -163,6 +163,27 @@ them.
   files, only a forward patch release qualifies, and a CHANGELOG over 1 MiB
   no longer makes classification fail.
 
+### Added
+
+- `meerkat-live`: `LiveQuietAppendTiming` and
+  `LiveSidebandCommand::append_text_chat_context`, a quiet (thinking-lane)
+  context append that waits out a voiced model response.
+  `meerkat-openai`: `PublicLiveBrokerSession::append_text_chat_context`.
+
+### Fixed
+
+- GPT Live: text typed in the chat during a call (a host-typed turn's rows,
+  mirrored to the voice as quiet text-chat context) no longer reaches the
+  provider while the voice model is still speaking. Appended inside a
+  voiced response, the context could be absorbed by it, and a later
+  question was answered without it (Live e2e scenario S98 recalled a typed
+  update's old value). The public Live broker now holds a text-chat append
+  while the model's response is audible and sends it, in order, once the
+  response has ended (1600 ms of output silence, the rule deferred result
+  cues already use); with the model silent it goes at once. A close before
+  the release settles a held append as interrupted by close, like held
+  delegation commentary. Other quiet appends are unchanged.
+
 ## [0.9.1] - 2026-10-15
 
 ### Breaking
