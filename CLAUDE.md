@@ -515,9 +515,10 @@ and its CI must be green before a release tag (`require_ci_green`):
   eight shards, `sdk-host`, and the push-only lanes above. A red main run is
   a failed `CI gate` on the main commit and blocks `require_ci_green`.
 - `gate` (`CI gate`, the only required context): fail-closed aggregate; on
-  pull requests a 1500-second lane execution budget (classification plus
-  each lane's own run time, runner queue excluded) and a 2700-second
-  push-to-terminal runaway ceiling (each lane timed from the start of the
+  pull requests a 1080-second lane execution budget (classification plus
+  each lane's own run time, runner queue excluded) and a 1200-second
+  push-to-terminal runaway ceiling (the owner's cap is 20 minutes from the
+  start of the pre-push hook, which takes about a minute) (each lane timed from the start of the
   run attempt it ran in, runner queue on its path excluded); runner queue
   wait of 300 s or more on the critical path is a `CI runner queue wait`
   warning with a typed verdict, never a

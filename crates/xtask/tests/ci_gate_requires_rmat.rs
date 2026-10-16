@@ -126,13 +126,15 @@ fn ci_runs_fail_closed_cargo_lanes_on_hosted_runners() {
     // The budget measures what the code controls: lane execution (started to
     // completed) plus the classification it waits for. Runner queue wait is a
     // warning, and a generous push-to-terminal ceiling still fails a stuck CI.
+    // The owner's cap is 20 minutes from the start of the pre-push hook to a
+    // green gate, and the hook takes about a minute.
     assert!(
-        ci.contains("CI_MAX_EXEC_SECONDS: \"1500\""),
-        "the lane execution budget is 1500 seconds"
+        ci.contains("CI_MAX_EXEC_SECONDS: \"1080\""),
+        "the lane execution budget is 1080 seconds"
     );
     assert!(
-        ci.contains("CI_MAX_TERMINAL_SECONDS: \"2700\""),
-        "the push-to-terminal runaway ceiling is 2700 seconds"
+        ci.contains("CI_MAX_TERMINAL_SECONDS: \"1200\""),
+        "the push-to-terminal runaway ceiling is 1200 seconds"
     );
     assert!(
         ci.contains("title=CI runner queue wait") && ci.contains("budget_verdict="),

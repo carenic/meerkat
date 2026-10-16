@@ -51,9 +51,9 @@ name: CI
 #   wasm-timers     - shared timer ownership in Chrome and Node, selected
 #                     with the web runtime suites
 #   gate            - "CI gate": fail-closed aggregate; on pull requests a
-#                     1500-second lane execution budget (classification plus
+#                     1080-second lane execution budget (classification plus
 #                     each lane's own run time, runner queue excluded) and a
-#                     2700-second push-to-terminal runaway ceiling, also
+#                     1200-second push-to-terminal runaway ceiling, also
 #                     runner queue excluded; runner queue wait is reported as
 #                     a warning (the critical path,
 #                     slowest lane and queue are reported on every run that
@@ -241,21 +241,22 @@ env:
   # Queue wait on the critical path at or above CI_QUEUE_WARN_SECONDS is a
   # warning with a typed verdict (queue_delayed), never a failure.
   #
-  # Sizing (66 pull-request run attempts, 2026-09-30 to 2026-10-01):
-  #   execution path      p50 816 s, p90 968 s, max 1244 s
-  #   critical-path queue p50  39 s, p90 474 s, max 742 s
-  #   terminal            p50 897 s, p90 1173 s, max 1492 s
-  # The execution tail is the example-web lane's cold wasm release build
-  # (up to 1002 s of a 1172 s lane). The concurrent hosted jobs sat at 34-40
-  # for most of 02:00-04:30 UTC on 2026-10-01. Run 36809608388 failed the
-  # previous 1500 s push-to-terminal budget at 1511 s with every lane passing
-  # and an execution path of 1009 s: its closure check waited 647 s for a
-  # runner. 1500 s of execution is about 20% above the observed maximum and
-  # below the 40-minute lane timeouts, which only stop a hung lane. 2700 s of
-  # terminal is the 40-minute lane timeout plus classification and queue
-  # headroom: past it a run is stuck, whatever the cause.
-  CI_MAX_EXEC_SECONDS: "1500"
-  CI_MAX_TERMINAL_SECONDS: "2700"
+  # Sizing. The owner's cap is 20 minutes from the start of the pre-push
+  # hook to a green CI gate. The hook now takes about a minute (49-55 s of
+  # hooks a push on 2026-10-14..16 once the lanes CI runs left it), so 1080 s
+  # (18 minutes) of execution leaves about a minute of slack for the gate,
+  # and 1200 s (20 minutes) of terminal is the runaway backstop at the cap
+  # itself. On the workspace-mode pull-request runs 38859112297 and
+  # 38931641220 the lanes a pull request still plans ran at most 854 s
+  # (wasm32 check; example-web 842 s cold), after 28-31 s of
+  # classification. Runner queue stays out of both budgets, as before: the
+  # account's 40 hosted jobs are shared (a workspace-mode pull request plans
+  # 38-47 jobs), and #1526 run 37062437146 waited 2817 s for runners with
+  # every lane green. The earlier budgets, 1500 s and 2700 s, were sized on 66
+  # attempts of 2026-09-30..10-01 (execution path max 1244 s) before the
+  # chain and closure lanes moved to the push.
+  CI_MAX_EXEC_SECONDS: "1080"
+  CI_MAX_TERMINAL_SECONDS: "1200"
   CI_QUEUE_WARN_SECONDS: "300"
   # Target set for the closure-check lane: "lib" checks lib and bin targets
   # of the closure; "all" adds every test target (--all-targets), which
@@ -1946,8 +1947,9 @@ jobs:
     # step passed but the old 20-minute timeout cancelled it). This is the
     # cost of compiling the crates, not a cache that misses. 25 minutes is
     # about 25% above the slowest cold run, so a legitimate cold run is never
-    # cancelled here; the gate's CI_MAX_EXEC_SECONDS (1500 s of execution,
-    # about 60 s of it the change classification) still caps it.
+    # cancelled here. On a pull request the gate's CI_MAX_EXEC_SECONDS
+    # (1080 s of execution, about 30 s of it the change classification)
+    # caps it first: run 38931641220's cold lane took 842 s.
     timeout-minutes: 25
     env:
       RUSTC_WRAPPER: sccache

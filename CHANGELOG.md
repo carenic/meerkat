@@ -65,7 +65,10 @@ them.
   lane or the deterministic workspace test gate (they are manual hooks; CI
   runs each before merge or before a release tag), skips the release
   contract tests CI already runs on every pull request, and runs its two
-  slow harness contracts only when a push changes what they exercise.
+  slow harness contracts only when a push changes what they exercise. The
+  `CI gate`'s pull-request budgets drop to 1080 s of lane execution and
+  1200 s push-to-terminal (runner queue still excluded), from 1500 s and
+  2700 s.
 
 ## [0.9.2] - 2026-10-16
 

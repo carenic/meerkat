@@ -81,7 +81,7 @@
 // The pull-request unit plan must stay under PR_UNIT_BUDGET_MINUTES, a
 // surrogate packing cap and not a measured timing. It is 17 since the runtime
 // lane, whose closure counts its self dev-dependency, modelled 16.2 minutes.
-// The enforced limits are the CI gate's: 1500 s of lane execution and 2700 s
+// The enforced limits are the CI gate's: 1080 s of lane execution and 1200 s
 // push-to-terminal, runner queue excluded (CI_MAX_EXEC_SECONDS and
 // CI_MAX_TERMINAL_SECONDS in ci.yml); ordinary hosted runs supply the
 // measured timing.
