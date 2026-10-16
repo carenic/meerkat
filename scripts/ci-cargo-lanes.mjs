@@ -20,12 +20,26 @@
 //   ci-cargo-lanes.mjs [--base <rev> --head <rev>] [--max-shards N]
 //                      [--workspace-shards N] [--closure-test-rows N]
 //                      [--lib-row-runner LABEL]
+//                      [--base-lock FILE]
 //                      [--reuse-release-evidence <commit>:<run id>:<attempt>]
 //                      [--format json|github] [--] [changed-path ...]
 //   ci-cargo-lanes.mjs --paths-from-stdin [...]
 //
 // Without explicit paths, --base/--head, or stdin, the plan is the whole
 // workspace (no diff base means no evidence of what did not change).
+//
+// Cargo.lock. A lock change that is the only global path is scoped: the
+// package entries the diff adds, removes or changes (version, source,
+// checksum or dependency list) are walked up the head lock's own dependency
+// lists (every feature, every target, the members' dev dependencies: wider
+// than any one build), and the workspace members that reach one of them
+// become the changed packages. A header change, a change to any other lock
+// table, a dependency the lock cannot resolve, an unreadable or unparseable
+// lock, or a diff with no changed entry fails closed into the whole
+// workspace. Measured on this lock, one external entry's change reaches 1
+// to 52 of the 53 members. --base-lock names the base lock file for an
+// explicit path list (self-tests); with --base/--head the base side is read
+// from the base revision.
 //
 // Shards are packed by an estimated lane cost, not by crate count: a crate's
 // Rust line count (its lib-test binary compiles every inline test) plus a
@@ -144,6 +158,7 @@
 import { execFileSync, spawnSync } from "node:child_process";
 import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { join, relative, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 import {
   HOOK_SCRIPT,
   checkHookCoverage,
@@ -616,6 +631,7 @@ function parseArgs(argv) {
     changedPathsOnly: false,
     releaseEvidence: "",
     workspacePlanRequested: false,
+    baseLock: "",
   };
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
@@ -623,6 +639,9 @@ function parseArgs(argv) {
       args.base = argv[++i] ?? "";
     } else if (arg === "--head") {
       args.head = argv[++i] ?? "HEAD";
+    } else if (arg === "--base-lock") {
+      args.baseLock = argv[++i] ?? "";
+      if (!args.baseLock) throw new Error("--base-lock requires a file");
     } else if (arg === "--max-shards") {
       args.maxShards = Number.parseInt(argv[++i] ?? "", 10);
       if (!Number.isInteger(args.maxShards) || args.maxShards < 1) {
@@ -664,7 +683,7 @@ function parseArgs(argv) {
       break;
     } else if (arg === "--help" || arg === "-h") {
       process.stdout.write(
-        "usage: ci-cargo-lanes.mjs [--base <rev> --head <rev>] [--max-shards N] [--workspace-shards N] [--closure-test-rows N] [--lib-row-runner LABEL] [--reuse-release-evidence <commit>:<run id>:<attempt>] [--workspace-plan-requested] [--format json|github] [--paths-from-stdin] [--changed-paths-only] [--] [changed-path ...]\n",
+        "usage: ci-cargo-lanes.mjs [--base <rev> --head <rev>] [--max-shards N] [--workspace-shards N] [--closure-test-rows N] [--lib-row-runner LABEL] [--base-lock FILE] [--reuse-release-evidence <commit>:<run id>:<attempt>] [--workspace-plan-requested] [--format json|github] [--paths-from-stdin] [--changed-paths-only] [--] [changed-path ...]\n",
       );
       process.exit(0);
     } else if (arg.startsWith("-")) {
@@ -743,6 +762,173 @@ function collectChangedPaths(args) {
 // move.
 function explicitRemoved(paths) {
   return paths.filter((path) => !existsSync(resolve(root, path)));
+}
+
+// A Cargo.lock as written by Cargo: header lines (`version = N` and
+// comments) before the first table, then `[[package]]` tables of `key =
+// "string"` and `key = [ "string", ... ]` lines. Entries are keyed by name,
+// version and source (a path package has none). Any other table is kept as
+// raw text, so a change to it can be refused rather than read. Anything the
+// parser does not recognize throws.
+export function parseCargoLock(text) {
+  const header = [];
+  const others = [];
+  const entries = new Map();
+  let table = null;
+  let array = null;
+  const finish = () => {
+    if (table?.kind !== "package") return;
+    const entry = table.fields;
+    if (typeof entry.name !== "string" || typeof entry.version !== "string") {
+      throw new Error("a [[package]] entry has no name or version");
+    }
+    const key = lockEntryKey(entry);
+    if (entries.has(key)) throw new Error(`duplicate lock entry ${key}`);
+    entries.set(key, entry);
+  };
+  for (const raw of text.split("\n")) {
+    const line = raw.replace(/\r$/, "");
+    if (array) {
+      if (/^\]$/.test(line.trim())) {
+        array = null;
+        continue;
+      }
+      const item = /^\s*"([^"]*)",?$/.exec(line);
+      if (!item) throw new Error(`unreadable lock array line: ${JSON.stringify(line)}`);
+      array.push(item[1]);
+      continue;
+    }
+    const tableHeader = /^\[\[?([A-Za-z0-9_.-]+)\]\]?$/.exec(line);
+    if (tableHeader) {
+      finish();
+      table = tableHeader[1] === "package" && line.startsWith("[[")
+        ? { kind: "package", fields: {} }
+        : { kind: "other", text: [line] };
+      if (table.kind === "other") others.push(table.text);
+      continue;
+    }
+    if (table === null) {
+      if (line.trim() !== "") header.push(line);
+      continue;
+    }
+    if (table.kind === "other") {
+      table.text.push(line);
+      continue;
+    }
+    if (line.trim() === "") continue;
+    const scalar = /^([a-z_-]+) = "([^"]*)"$/.exec(line);
+    if (scalar) {
+      table.fields[scalar[1]] = scalar[2];
+      continue;
+    }
+    const inline = /^([a-z_-]+) = \[(.*)\]$/.exec(line);
+    if (inline) {
+      table.fields[inline[1]] = inline[2].trim() === ""
+        ? []
+        : inline[2].split(",").map((item) => item.trim()).filter(Boolean).map((item) => {
+          const quoted = /^"([^"]*)"$/.exec(item);
+          if (!quoted) throw new Error(`unreadable lock array item: ${JSON.stringify(item)}`);
+          return quoted[1];
+        });
+      continue;
+    }
+    const open = /^([a-z_-]+) = \[$/.exec(line);
+    if (open) {
+      array = [];
+      table.fields[open[1]] = array;
+      continue;
+    }
+    throw new Error(`unreadable lock line: ${JSON.stringify(line)}`);
+  }
+  if (array) throw new Error("the lock ends inside an array");
+  finish();
+  return { header: header.join("\n"), others: others.map((lines) => lines.join("\n").trimEnd()), entries };
+}
+
+function lockEntryKey(entry) {
+  return `${entry.name} ${entry.version}${entry.source ? ` (${entry.source})` : ""}`;
+}
+
+// The workspace members a Cargo.lock change can reach (see the header):
+// every entry the diff added, removed or changed, walked up the head lock's
+// own dependency lists (all features, all targets, the members' dev
+// dependencies) to the members that depend on it. Throws when the change
+// cannot be scoped; the caller then plans the whole workspace.
+export function lockScope(baseText, headText, memberNames) {
+  const base = parseCargoLock(baseText);
+  const head = parseCargoLock(headText);
+  if (base.header !== head.header) throw new Error("the lock header changed");
+  if (JSON.stringify(base.others) !== JSON.stringify(head.others)) {
+    throw new Error("a lock table other than [[package]] changed");
+  }
+  const body = (entry) => JSON.stringify(entry, Object.keys(entry).sort());
+  const changed = [];
+  for (const [key, entry] of head.entries) {
+    const before = base.entries.get(key);
+    if (!before || body(before) !== body(entry)) changed.push(key);
+  }
+  const removed = [...base.entries.keys()].filter((key) => !head.entries.has(key));
+  if (changed.length === 0 && removed.length === 0) {
+    throw new Error("the lock changed bytes but no package entry");
+  }
+  // A dependency is written as `name`, `name version` or `name version
+  // (source)`, whichever is unique in the lock.
+  const byName = new Map();
+  for (const [key, entry] of head.entries) byName.set(entry.name, [...(byName.get(entry.name) ?? []), key]);
+  const resolveDependency = (reference) => {
+    const match = /^(\S+)(?: (\S+))?(?: \((.+)\))?$/.exec(reference);
+    const candidates = (match ? byName.get(match[1]) ?? [] : []).filter((key) => {
+      const entry = head.entries.get(key);
+      return (!match[2] || entry.version === match[2]) && (!match[3] || entry.source === match[3]);
+    });
+    if (candidates.length !== 1) throw new Error(`lock dependency ${JSON.stringify(reference)} names ${candidates.length} entries`);
+    return candidates[0];
+  };
+  const dependents = new Map();
+  for (const [key, entry] of head.entries) {
+    for (const reference of entry.dependencies ?? []) {
+      const dependency = resolveDependency(reference);
+      dependents.set(dependency, [...(dependents.get(dependency) ?? []), key]);
+    }
+  }
+  // A removed entry is reached through the entries whose dependency lists
+  // dropped it, which changed with it.
+  const seen = new Set(changed);
+  const queue = [...changed];
+  for (let i = 0; i < queue.length; i += 1) {
+    for (const dependent of dependents.get(queue[i]) ?? []) {
+      if (!seen.has(dependent)) {
+        seen.add(dependent);
+        queue.push(dependent);
+      }
+    }
+  }
+  const members = [...seen]
+    .map((key) => head.entries.get(key))
+    .filter((entry) => !entry.source && memberNames.has(entry.name))
+    .map((entry) => entry.name);
+  if (members.length === 0) throw new Error("no workspace member depends on a changed lock entry");
+  return { members: [...new Set(members)].sort(), changed: changed.sort(), removed: removed.sort() };
+}
+
+// The lock text on each side of the diff: the base revision's (or
+// --base-lock's) and the head revision's (or the working tree's, for an
+// explicit path list). Null when a side cannot be read.
+function lockTexts(args) {
+  const read = (rev) => {
+    const result = spawnSync("git", ["show", `${rev}:Cargo.lock`], { cwd: root, encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
+    return result.status === 0 ? result.stdout : null;
+  };
+  const fromFile = (path) => {
+    try {
+      return readFileSync(resolve(root, path), "utf8");
+    } catch {
+      return null;
+    }
+  };
+  if (args.baseLock) return { base: fromFile(args.baseLock), head: args.explicitPaths ? fromFile("Cargo.lock") : read(args.head) };
+  if (args.explicitPaths || !args.base) return null;
+  return { base: read(args.base), head: read(args.head) };
 }
 
 // The CI workflow and its classifier define every lane, so a change to them
@@ -1254,6 +1440,7 @@ function plan(args) {
     closure: [],
     shards: [],
     unmapped_rust_paths: [],
+    lock_scope: null,
     generated_contract: false,
     machine_authority: false,
     machine_posters: false,
@@ -1279,9 +1466,28 @@ function plan(args) {
   } else if (changed === null) {
     workspaceReason = pathReason;
   } else {
+    // A Cargo.lock change that is the only global path selects the members
+    // whose resolved dependencies it changed (see the header); any doubt
+    // plans the whole workspace.
+    if (changed.includes("Cargo.lock") && changed.filter(isGlobalPath).length === 1) {
+      const texts = lockTexts(args);
+      try {
+        if (!texts) throw new Error("no base lock to compare (an explicit path list without --base-lock)");
+        if (texts.base === null || texts.head === null) throw new Error("a side of the lock diff is unreadable");
+        result.lock_scope = lockScope(texts.base, texts.head, new Set(allNames));
+      } catch (error) {
+        result.lock_scope = { error: error.message };
+      }
+    }
     for (const path of changed) {
+      if (path === "Cargo.lock" && result.lock_scope?.members) {
+        for (const name of result.lock_scope.members) seeds.add(name);
+        continue;
+      }
       if (isGlobalPath(path)) {
-        workspaceReason ||= `global build configuration changed: ${path}`;
+        workspaceReason ||= `global build configuration changed: ${path}${
+          path === "Cargo.lock" && result.lock_scope?.error ? ` (not scoped: ${result.lock_scope.error})` : ""
+        }`;
         continue;
       }
       if (!isRustSourcePath(path)) {
@@ -1464,7 +1670,9 @@ function plan(args) {
   } else if (seeds.size > 0) {
     result.rust_changed = true;
     result.mode = "packages";
-    result.reason = `${seeds.size} workspace package(s) own changed paths`;
+    result.reason = result.lock_scope?.members
+      ? `${seeds.size} workspace package(s) own changed paths or resolve a changed Cargo.lock entry (${result.lock_scope.changed.length} changed, ${result.lock_scope.removed.length} removed)`
+      : `${seeds.size} workspace package(s) own changed paths`;
     result.packages = [...seeds].sort();
     const seen = new Set(result.packages.map((name) => byName.get(name).id));
     const queue = [...seen];
@@ -1919,9 +2127,13 @@ function main() {
   );
 }
 
-try {
-  main();
-} catch (error) {
-  process.stderr.write(`ci-cargo-lanes: ${error?.message ?? error}\n`);
-  process.exit(1);
+// Run as a script; imported (the self-test reads the lock scoping), nothing
+// runs.
+if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) {
+  try {
+    main();
+  } catch (error) {
+    process.stderr.write(`ci-cargo-lanes: ${error?.message ?? error}\n`);
+    process.exit(1);
+  }
 }
