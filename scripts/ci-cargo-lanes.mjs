@@ -1420,7 +1420,20 @@ function plan(args) {
     result.unit_packages = [...new Set([...result.packages, ...result.unit_chain_exceptions])]
       .filter(runsInPullRequest)
       .sort();
-    result.unit_shards = packWithinBudget(result.unit_packages, weights, shardCap, model);
+    // An exception package compiles meerkat-mob, so its row is the longest
+    // pull-request unit lane on its own: it runs alone, and no other
+    // package's compile or tests extend it (run 38859112297 packed xtask and
+    // meerkat-live into meerkat-rpc's row: 1801 s, the run's longest lane).
+    const soloUnit = result.unit_packages.filter((name) => result.unit_chain_exceptions.includes(name));
+    result.unit_shards = [
+      ...packWithinBudget(
+        result.unit_packages.filter((name) => !soloUnit.includes(name)),
+        weights,
+        Math.max(1, shardCap - soloUnit.length),
+        model,
+      ),
+      ...soloUnit.map((name) => packShards([name], weights, 1, model)[0]),
+    ];
     for (const shard of result.unit_shards) {
       if (shard.estimated_minutes > PR_UNIT_BUDGET_MINUTES) {
         throw new Error(

@@ -295,6 +295,14 @@ function assertArchivedLanes(plan, label) {
     plan.unit_deferred_chain.filter((name) => !plan.unit_chain_exceptions.includes(name)),
     "workspace mode defers exactly the chain less its exceptions",
   );
+  // An exception compiles meerkat-mob: its row runs alone, never packed with
+  // another package's compile and tests.
+  for (const name of plan.unit_chain_exceptions) {
+    const rows = plan.unit_shards.filter((shard) => shard.packages.includes(name));
+    assert.deepEqual(rows.map((shard) => shard.packages), [[name]], `${name}'s unit row runs alone`);
+    assert.equal(rows[0].package_flags, `-p ${name}`);
+  }
+  assert.ok(plan.unit_shards.length <= 11, `workspace unit rows stay near the shard cap: ${plan.unit_shards.length}`);
   assertLanes(plan, "workspace with exceptions");
 }
 
