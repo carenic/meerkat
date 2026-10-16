@@ -34,8 +34,10 @@ grep -Fq 'exec "$AGENT_GATE" --committed --ratchets-only --machine-drift-by-hook
   fail "pre-push-ratchets.sh does not run the agent gate in ratchets-only mode"
 
 # 2. The required CI Clippy lanes the hook relies on: flags, trigger, gate.
-grep -Fxq '          ./scripts/repo-cargo clippy ${PACKAGES} --no-deps --all-targets --all-features -- -D warnings' "$ci" ||
-  fail "the CI Clippy lanes no longer run --no-deps --all-targets --all-features -- -D warnings"
+grep -Fxq '          ./scripts/repo-cargo clippy ${PACKAGES} --no-deps ${TARGETS} --all-features -- -D warnings' "$ci" ||
+  fail "the CI Clippy lanes no longer run --no-deps <targets> --all-features -- -D warnings"
+grep -Fxq '          TARGETS: ${{ matrix.targets }}' "$ci" ||
+  fail "the CI Clippy lanes no longer take their targets from the plan"
 python3 - "$ci" <<'PY' || fail "the CI Clippy job or its gate requirement changed"
 import re
 import sys
@@ -92,17 +94,25 @@ for path in samples:
     else:
         match = re.search(r"Cargo agent gate packages:\n((?:  \S+\n)+)", gate)
         hook = set(match.group(1).split()) if match else set()
-    plan = json.loads(run("node", "scripts/ci-cargo-lanes.mjs", "--format", "json", "--", path))
-    ci = {name for shard in plan["shards"] for name in shard["packages"]}
-    if plan["mode"] == "workspace":
-        print(f"covered: {path}: CI plans the whole workspace")
-        continue
-    if hook == "workspace":
-        raise SystemExit(f"{path}: the agent gate lints the workspace, the CI planner only {sorted(ci)}")
-    missing = hook - ci
-    if missing:
-        raise SystemExit(f"{path}: CI Clippy lanes miss {sorted(missing)} (planned {sorted(ci)})")
-    print(f"covered: {path}: hook {sorted(hook)} within CI {sorted(ci)}")
+    for event in ("pull_request", "push"):
+        plan = json.loads(run("node", "scripts/ci-cargo-lanes.mjs", "--event", event, "--format", "json", "--", path))
+        ci = {name for shard in plan["shards"] for name in shard["packages"]}
+        # Every target on the push; a pull request's mob-chain shards lint
+        # their lib and bin targets.
+        for shard in plan["shards"]:
+            chain = all(plan["package_model"][name]["heavy_chain"] for name in shard["packages"])
+            allowed = {"--all-targets", "--lib", "--bins", "--lib --bins"} if event == "pull_request" and chain else {"--all-targets"}
+            if shard["targets"] not in allowed:
+                raise SystemExit(f"{path} ({event}): shard {shard['name']} lints {shard['targets']}")
+        if plan["mode"] == "workspace":
+            print(f"covered: {path} ({event}): CI plans the whole workspace")
+            continue
+        if hook == "workspace":
+            raise SystemExit(f"{path} ({event}): the agent gate lints the workspace, the CI planner only {sorted(ci)}")
+        missing = hook - ci
+        if missing:
+            raise SystemExit(f"{path} ({event}): CI Clippy lanes miss {sorted(missing)} (planned {sorted(ci)})")
+        print(f"covered: {path} ({event}): hook {sorted(hook)} within CI {sorted(ci)}")
 PY
 
 # 4. --ratchets-only keeps the ratchets and runs no Clippy and no tests.

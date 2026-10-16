@@ -20,6 +20,7 @@
 //   ci-cargo-lanes.mjs [--base <rev> --head <rev>] [--max-shards N]
 //                      [--workspace-shards N] [--closure-test-rows N]
 //                      [--lib-row-runner LABEL]
+//                      [--event pull_request|push|workflow_dispatch]
 //                      [--base-lock FILE]
 //                      [--reuse-release-evidence <commit>:<run id>:<attempt>]
 //                      [--format json|github] [--] [changed-path ...]
@@ -27,6 +28,27 @@
 //
 // Without explicit paths, --base/--head, or stdin, the plan is the whole
 // workspace (no diff base means no evidence of what did not change).
+//
+// Pull request versus push. --event pull_request plans what a pull request
+// runs; any other event (the default) plans the push lanes, which are the
+// whole set. Every Rust-relevant pull request still lints and type-checks its
+// changed packages (Clippy), runs their unit tests outside the meerkat-mob
+// compile chain and the integration suites that do not compile meerkat-mob,
+// and runs the ratchets, the TLC audits, the Bazel graph check and the web
+// lanes whose own inputs changed. A pull request leaves to the push (to
+// `main` or a `release/**` branch, whose CI must be green before a release
+// tag) every lane that needs the meerkat-mob chain or a reverse-dependency
+// sweep: the closure-tests rows, the closure check, the feature-combination
+// checks, the integration suites whose package compiles meerkat-mob, the
+// governed JSONL and confinement-positive lanes, the feature suites marked
+// `pullRequest: false`, the test targets of the mob-chain packages (their
+// pull-request Clippy lints lib and bin targets only; their tests run on
+// main), and the wasm lanes that only the reverse-dependency closure
+// selected. On 4-vCPU hosted runners each of those needs 9-30 minutes
+// (meerkat-mob alone compiles for 5-11 minutes whenever it misses the cache),
+// so no pull request fits the 20-minute cap from the start of the pre-push
+// hook to a green CI gate with them. The plan lists what a pull request left
+// to the push (deferred_to_push), and the push plan runs all of it.
 //
 // Cargo.lock. A lock change that is the only global path is scoped: the
 // package entries the diff adds, removes or changes (version, source,
@@ -69,17 +91,19 @@
 // (rkat, rpc, rest, mcp-server, mob-mcp, mob-pack, ...). Those
 // crates' unit tests therefore run on the push-to-main run (no budget) and
 // on nightly; the chain is computed from cargo metadata, not listed here.
-// The pull-request unit lane runs none of them except the package that
-// PR_UNIT_CHAIN_EXCEPTIONS selects when one of its trigger packages changed.
-// Clippy of a changed crate always runs in the pull request (worst measured
-// lane 12:24 for mob).
+// The pull-request unit lane runs none of them. Clippy of a changed crate
+// always runs in the pull request; for a mob-chain crate it lints the lib and
+// bin targets there (run 38859112297: `--all-targets` of meerkat-mob took
+// 1226 s, its 54 test targets and lib test most of it) and every target on
+// the push.
 //
 // Hook-parity rows. The pre-push hook's cargo-test body
 // (scripts/pre-push-unit.sh) ran the whole workspace's lib and tests/*.rs
 // binaries, HeadCanonical and e2e-fast before every push. CI runs that
-// coverage as required rows (closure_test_rows, the closure-tests job) for
-// the test scope: the reverse-dependency closure of the changed packages,
-// every member when a global input changed. Every row but HeadCanonical
+// coverage as required rows (closure_test_rows, the closure-tests job) on the
+// push for the test scope: the reverse-dependency closure of the changed
+// packages, every member when a global input changed. A pull request runs
+// none of them (deferred_to_push). Every row but HeadCanonical
 // selects the whole workspace (`--workspace`) and names only its targets, so
 // Cargo resolves every crate's features exactly as the hook's single
 // workspace build does and builds only those targets' graphs: the row
@@ -107,7 +131,8 @@
 // and the executing step from ci.yml, credits only whole-workspace rows (and
 // HeadCanonical's own command), and the plan fails when any hook binary in
 // scope has no row and is not a lib binary of a lane the plan leaves to the
-// hook.
+// hook. A pull-request plan is checked the same way, against the rows its
+// push runs.
 // The test scope also holds the readers of changed non-Rust inputs
 // (scripts/ci-non-rust-readers.json, kept complete by its guard): a test
 // that reads docs/, specs/, sdks/, a fixture outside its crate or the whole
@@ -232,14 +257,19 @@ const LIB_TARGET_KINDS = new Set(["lib", "rlib", "dylib", "cdylib", "staticlib"]
 // .cargo/config.toml gives every lane (debug build, measured on 82fddfc33);
 // they pass at the 32 MiB the pre-push hook and the BuildBuddy unit lane use.
 // Their rows carry that stack until the frames fit 8 MiB.
+//
+// A suite with `pullRequest: false` runs on the push only: the facade's two
+// GPT Live suites compile its lib test under the realtime features, 1089 s
+// and 900 s on run 38859112297 (798 s and 621 s of it building), against
+// 293 s for its default-feature row, which the pull request keeps.
 const GPT_LIVE_TEST_STACK = 32 * 1024 * 1024;
 export const FEATURE_UNIT_SUITES = [
   // The shipping public GPT Live path (experimental_gpt_live::tests,
   // session_runtime::live_summary, service_factory) plus the realtime
   // credential and projection tests of the facade.
-  { package: "meerkat", id: "openai-live", features: ["openai-live", "openai-realtime", "memory-store", "test-realtime-fixtures"], rustMinStack: GPT_LIVE_TEST_STACK },
+  { package: "meerkat", id: "openai-live", features: ["openai-live", "openai-realtime", "memory-store", "test-realtime-fixtures"], rustMinStack: GPT_LIVE_TEST_STACK, pullRequest: false },
   // The deprecated private broker adds its admission and broker tests.
-  { package: "meerkat", id: "experimental-gpt-live", features: ["experimental-gpt-live", "openai-realtime", "memory-store", "test-realtime-fixtures"], rustMinStack: GPT_LIVE_TEST_STACK },
+  { package: "meerkat", id: "experimental-gpt-live", features: ["experimental-gpt-live", "openai-realtime", "memory-store", "test-realtime-fixtures"], rustMinStack: GPT_LIVE_TEST_STACK, pullRequest: false },
   { package: "meerkat-openai", id: "live", features: ["live", "experimental-gpt-live-gate0-harness", "test-realtime-fixtures"] },
   { package: "meerkat-live", id: "webrtc", features: ["webrtc"] },
   { package: "meerkat-session", id: "live", features: ["live", "session-store"] },
@@ -270,6 +300,10 @@ export const FEATURE_UNIT_SUITES = [
 // cached): runtime 168 s, machine-codegen 396 s (meerkat-mob is compiled as
 // a plain library, not its lib-test). Over the last 60 merges to main the
 // runtime suite would have run on 17 and the codegen suite on 25.
+// A suite whose package compiles meerkat-mob (the heavy chain) runs on the
+// push only: on run 38859112297 machine-codegen took 838 s, gpt-live-replay
+// 974 s and rpc-configured-turn-limit 1409 s, against 84-387 s for the
+// suites outside the chain, which a pull request keeps.
 const MACHINE_AUTHORITY_PACKAGES = [
   "meerkat-machine-schema",
   "meerkat-machine-dsl",
@@ -388,37 +422,13 @@ export const INTEGRATION_SUITES = [
 // `partitions` jobs that execute the archive with `--partition hash:k/n`.
 export const ARCHIVED_UNIT_LANES = [{ package: "meerkat-mob", partitions: 2 }];
 
-// The one exception to the chain deferral. meerkat-rpc compiles meerkat-mob,
-// but its default features include local-authorization and mcp, and its lib
-// tests carry the MCP restart controls (governed_jsonl::tests::stock_governed_*:
-// a stock governed realm's MCP attachment is restored, or refused after a
-// revoke, across a host restart). Those controls must run before merge, so
-// meerkat-rpc's existing default-feature unit row joins the pull request when
-// a trigger package changed directly: meerkat-rpc itself or a native package
-// the controls exercise (the facade's governed realm, the core contracts, the
-// store and its SQLite backend, the runtime and session owners, the MCP
-// client, local authorization). It is packed and held to
-// PR_UNIT_BUDGET_MINUTES like every other unit lane. The rest of the chain
-// stays deferred (a meerkat-mob change alone selects nothing here), and
-// meerkat-rpc's feature suites stay on main. Names are checked against cargo
-// metadata, so a rename fails the plan instead of dropping the exception.
-export const PR_UNIT_CHAIN_EXCEPTIONS = [
-  {
-    package: "meerkat-rpc",
-    triggers: [
-      "meerkat-rpc",
-      "meerkat",
-      "meerkat-core",
-      "meerkat-store",
-      "meerkat-sqlite",
-      "meerkat-runtime",
-      "meerkat-session",
-      "meerkat-mcp",
-      "meerkat-authorization",
-      "meerkat-authorization-contracts",
-    ],
-  },
-];
+// No package of the chain runs its unit tests in the pull request.
+// meerkat-rpc's default-feature row (its lib tests carry the MCP restart
+// controls, governed_jsonl::tests::stock_governed_*) ran there as the one
+// exception: alone it took 1801 s on run 38859112297 (1313 s of it building
+// meerkat-mob and the rpc lib test), more than the whole pull-request
+// budget. It runs in the push-to-main unit lanes with the rest of the chain.
+
 // Feature-combination checks (#1687). Every Cargo lane builds a package with
 // its default features (plus FEATURE_UNIT_SUITES and --all-features), but the
 // Bazel graph builds each crate with the feature set the generated BUILD.bazel
@@ -436,6 +446,9 @@ export const PR_UNIT_CHAIN_EXCEPTIONS = [
 //   - the `$(CARGO) check` rows of the Make feature-matrix targets below.
 // The rows follow the clippy shards, whose packing is already sized for a
 // pull-request lane; each shard gives a Bazel-set job and a matrix job.
+// They run on the push only: on run 38859112297 the 16 jobs of a
+// whole-workspace plan took 119-1303 s, nine of them over 850 s, and a
+// pull request leaves them to the push (deferred_to_push).
 // Feature names come from the generated BUILD.bazel (kept fresh by the
 // bazel-locks-freshness gate) and the Makefile, and are validated against
 // cargo metadata, so a renamed feature fails the plan.
@@ -454,7 +467,11 @@ export const MAKE_FEATURE_MATRIX_TARGETS = ["test-minimal", "test-feature-matrix
 // sccache keys); the other packages pack into CLIPPY_PACKED_SHARDS more. A
 // changed-package plan keeps one shard per changed package up to
 // --max-shards. Names are checked against cargo metadata, so a renamed head
-// fails the plan instead of falling back to packing.
+// fails the plan instead of falling back to packing. In a pull-request plan
+// the mob-chain packages lint their lib and bin targets only (their tests
+// run on the push), so a group or a packing never mixes them with packages
+// that lint every target: a mixed group splits in two, and the chain
+// packages pack apart from the others.
 export const CLIPPY_HEAD_SHARDS = [
   ["rkat"],
   ["meerkat-rpc"],
@@ -631,6 +648,7 @@ function parseArgs(argv) {
     changedPathsOnly: false,
     releaseEvidence: "",
     workspacePlanRequested: false,
+    event: "push",
     baseLock: "",
   };
   for (let i = 0; i < argv.length; i += 1) {
@@ -639,6 +657,14 @@ function parseArgs(argv) {
       args.base = argv[++i] ?? "";
     } else if (arg === "--head") {
       args.head = argv[++i] ?? "HEAD";
+    } else if (arg === "--event") {
+      // A pull request plans its own lanes; every other event (a push, a
+      // manual dispatch) plans the push lanes, which are the whole set.
+      const event = argv[++i] ?? "";
+      if (!["pull_request", "push", "workflow_dispatch"].includes(event)) {
+        throw new Error("--event must be pull_request, push or workflow_dispatch");
+      }
+      args.event = event === "pull_request" ? "pull_request" : "push";
     } else if (arg === "--base-lock") {
       args.baseLock = argv[++i] ?? "";
       if (!args.baseLock) throw new Error("--base-lock requires a file");
@@ -683,7 +709,7 @@ function parseArgs(argv) {
       break;
     } else if (arg === "--help" || arg === "-h") {
       process.stdout.write(
-        "usage: ci-cargo-lanes.mjs [--base <rev> --head <rev>] [--max-shards N] [--workspace-shards N] [--closure-test-rows N] [--lib-row-runner LABEL] [--base-lock FILE] [--reuse-release-evidence <commit>:<run id>:<attempt>] [--workspace-plan-requested] [--format json|github] [--paths-from-stdin] [--changed-paths-only] [--] [changed-path ...]\n",
+        "usage: ci-cargo-lanes.mjs [--base <rev> --head <rev>] [--max-shards N] [--workspace-shards N] [--closure-test-rows N] [--lib-row-runner LABEL] [--event pull_request|push|workflow_dispatch] [--base-lock FILE] [--reuse-release-evidence <commit>:<run id>:<attempt>] [--workspace-plan-requested] [--format json|github] [--paths-from-stdin] [--changed-paths-only] [--] [changed-path ...]\n",
       );
       process.exit(0);
     } else if (arg.startsWith("-")) {
@@ -1395,13 +1421,37 @@ function hookParityRows({ scope, byName, unified, model, maxTestRows, nextestTex
 
 // Clippy shards: per changed package (packed past the cap) for a
 // changed-package plan, the fixed head groups plus packed shards for a
-// whole-workspace plan (see CLIPPY_HEAD_SHARDS).
-function clippyShards(pkgs, weights, mode, shardCap, byName) {
-  if (mode !== "workspace") return packShards(pkgs, weights, shardCap);
+// whole-workspace plan (see CLIPPY_HEAD_SHARDS). Every shard names the
+// targets it lints (`targets`): all of them, except in a pull-request plan,
+// where `prChain` (the mob chain) lints only its lib and bin targets. Chain
+// packages then never share a shard with the others: a mixed head group
+// keeps its chain packages as the head, and its other packages pack with the
+// rest. A chain package with neither a lib nor a bin target lints all of its
+// targets, as on the push.
+function clippyShards(pkgs, weights, mode, shardCap, byName, prChain = null) {
   for (const name of CLIPPY_HEAD_SHARDS.flat()) {
     if (!byName.has(name)) throw new Error(`Clippy head shard names unknown package ${name}`);
   }
-  const heads = CLIPPY_HEAD_SHARDS.map((group) => group.filter((name) => pkgs.includes(name))).filter((group) => group.length > 0);
+  const allTargets = (shard) => ({ ...shard, targets: "--all-targets" });
+  if (prChain === null) return headAndPackedShards(pkgs, weights, mode, shardCap, CLIPPY_HEAD_SHARDS).map(allTargets);
+  const chain = pkgs.filter((name) => prChain.has(name));
+  const others = pkgs.filter((name) => !prChain.has(name));
+  const chainHeads = CLIPPY_HEAD_SHARDS.map((group) => group.filter((name) => prChain.has(name)));
+  const otherHeads = CLIPPY_HEAD_SHARDS.filter((group) => group.every((name) => !prChain.has(name)));
+  const libAndBins = (shard) => {
+    const flags = targetFlags(shard.packages.map((name) => byName.get(name)), { tests: false });
+    return { ...shard, targets: flags.length > 0 ? flags.join(" ") : "--all-targets" };
+  };
+  return [
+    ...headAndPackedShards(chain, weights, mode, shardCap, chainHeads).map(libAndBins),
+    ...headAndPackedShards(others, weights, mode, shardCap, otherHeads).map(allTargets),
+  ].sort((a, b) => b.estimated_cost - a.estimated_cost || a.name.localeCompare(b.name));
+}
+
+function headAndPackedShards(pkgs, weights, mode, shardCap, headGroups) {
+  if (pkgs.length === 0) return [];
+  if (mode !== "workspace") return packShards(pkgs, weights, shardCap);
+  const heads = headGroups.map((group) => group.filter((name) => pkgs.includes(name))).filter((group) => group.length > 0);
   const inHeads = new Set(heads.flat());
   const headShards = heads.map((group) => packShards(group, weights, 1)[0]);
   const rest = packShards(pkgs.filter((name) => !inHeads.has(name)), weights, CLIPPY_PACKED_SHARDS);
@@ -1431,6 +1481,7 @@ function plan(args) {
 
   const result = {
     schema_version: 1,
+    event: args.event,
     diff: pathReason,
     changed_paths: changed ?? [],
     rust_changed: false,
@@ -1630,17 +1681,23 @@ function plan(args) {
       features: [...suite.features],
       package_flags: `-p ${suite.package} --features ${suite.features.join(",")}`,
       estimated_minutes: estimatedMinutes(weights.get(suite.package)),
+      pull_request: suite.pullRequest !== false,
       ...(suite.rustMinStack ? { rust_min_stack: suite.rustMinStack } : {}),
     };
   });
-
-  for (const exception of PR_UNIT_CHAIN_EXCEPTIONS) {
-    for (const name of [exception.package, ...exception.triggers]) {
-      if (!byName.has(name)) {
-        throw new Error(`pull-request unit exception ${exception.package} names unknown package ${name}`);
-      }
-    }
-  }
+  // What a pull-request plan leaves to the push (see the header); the push
+  // itself runs everything, and a release projection keeps its own plan.
+  const deferToPush = args.event === "pull_request" && !releaseProjection;
+  const deferred = {
+    closure_test_rows: 0,
+    closure_check: false,
+    feature_check_jobs: 0,
+    integration_suites: [],
+    unit_feature_suites: [],
+    clippy_test_targets: [],
+    governed_jsonl: false,
+    mcp_confinement_positive: false,
+  };
 
   const archivedPackages = new Map(
     ARCHIVED_UNIT_LANES.map((lane) => {
@@ -1666,7 +1723,8 @@ function plan(args) {
     result.reason = workspaceReason;
     result.packages = allNames;
     result.closure = allNames;
-    result.wasm = true;
+    // A pull request runs the wasm lanes for their own inputs only.
+    if (!deferToPush) result.wasm = true;
   } else if (seeds.size > 0) {
     result.rust_changed = true;
     result.mode = "packages";
@@ -1693,18 +1751,30 @@ function plan(args) {
     );
   }
 
-  // The browser examples and WASM timer tests execute this runtime. Select
-  // them for any changed package that reaches it through the same reverse
-  // dependency closure, including a whole-workspace build change.
-  if (result.closure.includes("meerkat-web-runtime")) {
+  // The browser examples and WASM timer tests execute this runtime. The push
+  // selects them for any changed package that reaches it through the same
+  // reverse dependency closure, including a whole-workspace build change; a
+  // pull request selects them only for their own inputs (the paths above):
+  // on run 38859112297 the three lanes took 619, 256 and 247 s on every
+  // pull request whose closure held the web runtime, nearly every Rust change.
+  if (!deferToPush && result.closure.includes("meerkat-web-runtime")) {
     result.wasm = true;
     result.example_web = true;
   }
 
   if (result.rust_changed) {
     const shardCap = result.mode === "workspace" ? args.workspaceShards : args.maxShards;
-    // Clippy lanes: every changed package.
-    result.shards = clippyShards(result.packages, weights, result.mode, shardCap, byName);
+    // Clippy lanes: every changed package. A pull request lints the
+    // mob-chain packages' lib and bin targets only.
+    result.shards = clippyShards(
+      result.packages,
+      weights,
+      result.mode,
+      shardCap,
+      byName,
+      deferToPush ? heavyChain : null,
+    );
+    deferred.clippy_test_targets = deferToPush ? result.packages.filter((name) => heavyChain.has(name)) : [];
     if (result.shards.length === 0) {
       throw new Error("internal error: Rust-relevant change produced no lanes");
     }
@@ -1713,31 +1783,12 @@ function plan(args) {
       if (!covered.has(name)) throw new Error(`internal error: package ${name} not covered by any shard`);
     }
     // Pull-request unit lanes: the changed packages outside the heavy chain,
-    // plus each exception package one of whose triggers changed, packed so
-    // that no lane models over the budget; the rest of the chain is deferred
+    // packed so that no lane models over the budget; the chain is deferred
     // to the push-to-main run and reported.
-    result.unit_chain_exceptions = PR_UNIT_CHAIN_EXCEPTIONS.filter((exception) =>
-      exception.triggers.some((name) => result.packages.includes(name)),
-    ).map((exception) => exception.package);
-    const runsInPullRequest = (name) => !heavyChain.has(name) || result.unit_chain_exceptions.includes(name);
+    const runsInPullRequest = (name) => !heavyChain.has(name);
     result.unit_deferred = result.packages.filter((name) => !runsInPullRequest(name));
-    result.unit_packages = [...new Set([...result.packages, ...result.unit_chain_exceptions])]
-      .filter(runsInPullRequest)
-      .sort();
-    // An exception package compiles meerkat-mob, so its row is the longest
-    // pull-request unit lane on its own: it runs alone, and no other
-    // package's compile or tests extend it (run 38859112297 packed xtask and
-    // meerkat-live into meerkat-rpc's row: 1801 s, the run's longest lane).
-    const soloUnit = result.unit_packages.filter((name) => result.unit_chain_exceptions.includes(name));
-    result.unit_shards = [
-      ...packWithinBudget(
-        result.unit_packages.filter((name) => !soloUnit.includes(name)),
-        weights,
-        Math.max(1, shardCap - soloUnit.length),
-        model,
-      ),
-      ...soloUnit.map((name) => packShards([name], weights, 1, model)[0]),
-    ];
+    result.unit_packages = result.packages.filter(runsInPullRequest).sort();
+    result.unit_shards = packWithinBudget(result.unit_packages, weights, shardCap, model);
     for (const shard of result.unit_shards) {
       if (shard.estimated_minutes > PR_UNIT_BUDGET_MINUTES) {
         throw new Error(
@@ -1757,16 +1808,21 @@ function plan(args) {
     result.main_archive_builds = archived.builds;
     result.main_archive_runs = archived.runs;
     // Feature-gated suites: all of them on main (an archived package's
-    // suites run as archived lanes); in the pull request those of a changed
-    // package that runs its unit tests there. The heavy chain's suites stay
-    // deferred with the package, an exception package's too: the exception
-    // covers its default-feature row only.
+    // suites run as archived lanes); with the unit lanes, those of a changed
+    // package outside the heavy chain, but in a pull request only the suites
+    // not marked `pullRequest: false`.
     result.main_feature_unit_shards = featureSuites.filter(
       (suite) => !archivedPackages.has(suite.packages[0]),
     );
-    result.unit_feature_shards = featureSuites.filter(
+    const changedSuites = featureSuites.filter(
       (suite) => result.unit_packages.includes(suite.packages[0]) && !heavyChain.has(suite.packages[0]),
     );
+    result.unit_feature_shards = changedSuites.filter(
+      (suite) => !deferToPush || suite.pull_request,
+    );
+    deferred.unit_feature_suites = changedSuites
+      .filter((suite) => !result.unit_feature_shards.includes(suite))
+      .map((suite) => suite.name);
     for (const suite of result.unit_feature_shards) {
       if (suite.estimated_minutes > PR_UNIT_BUDGET_MINUTES) {
         throw new Error(
@@ -1776,11 +1832,12 @@ function plan(args) {
     }
     // Feature checks keep the weight-packed shards: they compile one Bazel
     // set and a few matrix rows per shard, and the head split would only
-    // multiply their jobs.
+    // multiply their jobs. A pull request leaves them to the push.
     result.feature_check_shards = packShards(result.packages, weights, shardCap);
-    result.feature_check_jobs = featureChecks(result.feature_check_shards, byName);
+    const featureJobs = featureChecks(result.feature_check_shards, byName);
+    result.feature_check_jobs = deferToPush ? [] : featureJobs;
+    deferred.feature_check_jobs = featureJobs.length - result.feature_check_jobs.length;
   } else {
-    result.unit_chain_exceptions = [];
     result.unit_deferred = [];
     result.unit_packages = [];
     result.unit_shards = [];
@@ -1814,8 +1871,10 @@ function plan(args) {
   }
   // A release projection keeps the suites its changed paths select (their
   // tests read those files); the trigger-selected ones need a Rust change.
+  // A pull request leaves the suites whose package compiles meerkat-mob to
+  // the push.
   const changedPaths = changed ?? [];
-  result.integration_suites = INTEGRATION_SUITES.filter(
+  const selectedSuites = INTEGRATION_SUITES.filter(
     (suite) =>
       (result.rust_changed && suite.triggers.some((name) => result.packages.includes(name))) ||
       (suite.paths ?? []).some((prefix) => changedPaths.some((path) => path.startsWith(prefix))),
@@ -1825,9 +1884,23 @@ function plan(args) {
     package_flags: `-p ${suite.package}${suite.features?.length ? ` --features ${suite.features.join(",")}` : ""}`,
     ...(suite.tests?.length ? { test_flags: suite.tests.map((test) => `--test ${test}`).join(" ") } : {}),
   }));
+  result.integration_suites = selectedSuites.filter((suite) => !deferToPush || !heavyChain.has(suite.packages[0]));
+  deferred.integration_suites = selectedSuites
+    .filter((suite) => !result.integration_suites.includes(suite))
+    .map((suite) => suite.name);
 
   result.closure_flags = result.closure.map((name) => `-p ${name}`).join(" ");
   result.closure_beyond_packages = result.closure.filter((name) => !result.packages.includes(name));
+  // The compile-only checks of the closure, and the two exact-profile lanes
+  // (governed JSONL compiles meerkat-rpc's lib test, the confinement lane
+  // the facade's lib test under every feature: 866 and 863 s on run
+  // 38859112297), run on the push only.
+  result.closure_check = result.rust_changed && !deferToPush;
+  result.governed_jsonl = result.rust_changed && !deferToPush;
+  result.mcp_confinement_positive = result.rust_changed && !deferToPush;
+  deferred.closure_check = result.rust_changed && deferToPush;
+  deferred.governed_jsonl = result.rust_changed && deferToPush;
+  deferred.mcp_confinement_positive = result.rust_changed && deferToPush;
 
   // Hook-parity rows for the test scope. scripts/ci-hook-coverage.mjs checks
   // them against the hook's own selection; a gap fails the plan.
@@ -1856,7 +1929,7 @@ function plan(args) {
   // time; without one the plan leaves the hook's kind(lib) lane to the hook.
   result.lib_row_runner = args.libRowRunner || null;
   result.hook_retained_lanes = result.lib_row_runner ? [] : [hookLibLane(hook).label];
-  result.closure_test_rows = result.test_scope.length > 0
+  const rows = result.test_scope.length > 0
     ? hookParityRows({
       scope: result.test_scope,
       byName,
@@ -1868,7 +1941,11 @@ function plan(args) {
       libRowRunner: result.lib_row_runner,
     })
     : [];
-  const coverage = checkHookCoverage(result, { metadata, nextestText, hookText });
+  // A pull-request plan is checked against the rows its push runs.
+  const coverage = checkHookCoverage({ ...result, closure_test_rows: rows }, { metadata, nextestText, hookText });
+  result.closure_test_rows = deferToPush ? [] : rows;
+  deferred.closure_test_rows = rows.length - result.closure_test_rows.length;
+  result.deferred_to_push = deferToPush ? deferred : null;
   result.hook_coverage = {
     scope_packages: coverage.scope_packages,
     hook_binaries: coverage.hook_binaries,
@@ -2011,6 +2088,7 @@ function matrixOf(shards, { placeholder = true } = {}) {
   const include = shards.map((shard) => ({
     name: shard.name,
     packages: shard.package_flags,
+    ...(shard.targets ? { targets: shard.targets } : {}),
     ...(shard.test_flags ? { tests: shard.test_flags } : {}),
     ...(shard.rust_min_stack ? { rust_min_stack: String(shard.rust_min_stack) } : {}),
   }));
@@ -2037,9 +2115,26 @@ function closureMatrixOf(rows) {
   return JSON.stringify({ include });
 }
 
+// One line naming what a pull-request plan left to the push, for the gate's
+// notice; empty when nothing was left.
+function deferredSummary(deferred) {
+  if (!deferred) return "";
+  const parts = [];
+  if (deferred.closure_test_rows > 0) parts.push(`${deferred.closure_test_rows} closure-tests rows`);
+  if (deferred.closure_check) parts.push("the closure check");
+  if (deferred.feature_check_jobs > 0) parts.push(`${deferred.feature_check_jobs} feature-combination jobs`);
+  if (deferred.integration_suites.length > 0) parts.push(`integration suites ${deferred.integration_suites.join(", ")}`);
+  if (deferred.unit_feature_suites.length > 0) parts.push(`feature suites ${deferred.unit_feature_suites.join(", ")}`);
+  if (deferred.clippy_test_targets.length > 0) parts.push(`the test targets' Clippy of ${deferred.clippy_test_targets.join(", ")}`);
+  if (deferred.governed_jsonl) parts.push("governed JSONL");
+  if (deferred.mcp_confinement_positive) parts.push("MCP confinement positive");
+  return parts.join("; ");
+}
+
 function githubOutput(result) {
   const lines = [];
   const scalar = (key, value) => lines.push(`${key}=${value}`);
+  scalar("event", result.event);
   scalar("rust_changed", String(result.rust_changed));
   scalar("mode", result.mode);
   scalar("reason", result.reason.replaceAll("\n", " "));
@@ -2061,6 +2156,10 @@ function githubOutput(result) {
   scalar("package_count", String(result.packages.length));
   scalar("closure_count", String(result.closure.length));
   scalar("closure_flags", result.closure_flags);
+  scalar("closure_check", String(result.closure_check));
+  scalar("governed_jsonl", String(result.governed_jsonl));
+  scalar("mcp_confinement_positive", String(result.mcp_confinement_positive));
+  scalar("deferred_to_push", deferredSummary(result.deferred_to_push));
   scalar("shard_count", String(result.shards.length));
   // A matrix must never be empty when the lanes are conditioned on it; keep a
   // placeholder so `fromJSON` stays well-formed and the consumer job's `if:`
@@ -2123,7 +2222,7 @@ function main() {
     process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
   }
   process.stderr.write(
-    `ci-cargo-lanes: mode=${result.mode} release_projection=${result.release_projection !== null} packages=${result.packages.length} closure=${result.closure.length} clippy_shards=${result.shards.length} unit_shards=${result.unit_shards.length} feature_suites=${result.unit_feature_shards.length}/${result.main_feature_unit_shards.length} unit_deferred=${result.unit_deferred.length} unit_chain_exceptions=${result.unit_chain_exceptions.length} integration=${result.integration_suites.length} feature_check_jobs=${result.feature_check_jobs.length} test_scope=${result.test_scope.length} closure_tests=${result.closure_test_rows.length} hook_binaries=${result.hook_coverage.hook_binaries} hook_retained=${result.hook_coverage.hook_retained} (${result.reason})\n`,
+    `ci-cargo-lanes: event=${result.event} mode=${result.mode} release_projection=${result.release_projection !== null} packages=${result.packages.length} closure=${result.closure.length} clippy_shards=${result.shards.length} unit_shards=${result.unit_shards.length} feature_suites=${result.unit_feature_shards.length}/${result.main_feature_unit_shards.length} unit_deferred=${result.unit_deferred.length} integration=${result.integration_suites.length} feature_check_jobs=${result.feature_check_jobs.length} test_scope=${result.test_scope.length} closure_tests=${result.closure_test_rows.length} hook_binaries=${result.hook_coverage.hook_binaries} hook_retained=${result.hook_coverage.hook_retained} deferred_to_push=[${deferredSummary(result.deferred_to_push)}] (${result.reason})\n`,
   );
 }
 

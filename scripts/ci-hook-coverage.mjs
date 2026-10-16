@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 // Hook coverage equivalence: does a CI lane plan run every test binary that
 // the pre-push hook's cargo-test body (scripts/pre-push-unit.sh) runs, under
-// the feature set the hook builds it with?
+// the feature set the hook builds it with? The push runs these rows; a
+// pull-request plan runs none and is checked against its push's rows.
 //
 // The hook builds every workspace test binary in one invocation,
 //   cargo nextest list --workspace -E 'kind(lib) or kind(test)'
@@ -47,7 +48,8 @@
 // usage: ci-hook-coverage.mjs [--plan <file>|-] [--map]
 //   Reads a plan (ci-cargo-lanes.mjs --format json) and prints the coverage
 //   summary; exits 1 on a gap. --map prints every hook binary with the CI row
-//   that runs it, or the hook lane the plan leaves it to.
+//   that runs it, or the hook lane the plan leaves it to. A pull-request plan
+//   holds no rows: check its push plan instead.
 
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
@@ -666,6 +668,9 @@ function main() {
     else throw new Error(`unknown argument: ${args[index]}`);
   }
   const plan = JSON.parse(readFileSync(planPath === "-" ? 0 : planPath, "utf8"));
+  if (plan.event === "pull_request" && plan.deferred_to_push) {
+    throw new Error("a pull-request plan leaves its closure-tests rows to the push; plan the same change with --event push");
+  }
   const report = checkHookCoverage(plan);
   const summary = {
     scope_packages: report.scope_packages,

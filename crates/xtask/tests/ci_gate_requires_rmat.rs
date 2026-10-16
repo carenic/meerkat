@@ -261,7 +261,8 @@ fn ci_runs_fail_closed_cargo_lanes_on_hosted_runners() {
         assert!(ci.contains(contract), "CI gate must enforce `{contract}`");
     }
     for lane in [
-        "--no-deps --all-targets --all-features -- -D warnings",
+        "--no-deps ${TARGETS} --all-features -- -D warnings",
+        "\"--all-targets\"|\"--lib\"|\"--bins\"|\"--lib --bins\") ;;",
         "--lib --bins --profile ci-pr",
         "unit_shard_matrix",
         "main_unit_shard_matrix",
@@ -300,6 +301,63 @@ fn ci_runs_fail_closed_cargo_lanes_on_hosted_runners() {
         fmt_governance.get("if").is_none(),
         "docs-only changes must not skip the always-run format and governance lane"
     );
+}
+
+/// A pull request runs what fits the cap from the start of the pre-push hook
+/// to a green CI gate and leaves the lanes that compile the meerkat-mob chain
+/// or sweep the reverse-dependency closure to the push, whose CI must be
+/// green before a release tag. The classifier is told the event, the
+/// push-only lanes follow its flags, and the gate refuses a push plan that
+/// left anything to a later push.
+#[test]
+fn pull_requests_leave_the_chain_and_closure_lanes_to_the_push() {
+    let ci_yml = workflow_yml_path("ci.yml");
+    let ci = std::fs::read_to_string(&ci_yml)
+        .unwrap_or_else(|e| panic!("read {}: {e}", ci_yml.display()));
+    let doc = read_workflow(&ci_yml);
+    let jobs = doc
+        .get("jobs")
+        .and_then(serde_yaml::Value::as_mapping)
+        .expect("ci workflow jobs mapping");
+    let job_if = |job: &str| -> String {
+        jobs.get(serde_yaml::Value::String(job.to_string()))
+            .and_then(|job| job.get("if"))
+            .and_then(serde_yaml::Value::as_str)
+            .unwrap_or_default()
+            .to_owned()
+    };
+    assert!(
+        ci.contains("node scripts/ci-cargo-lanes.mjs --format github --event \"${EVENT_NAME}\""),
+        "the change classification must plan for the event it runs in"
+    );
+    for (job, flag) in [
+        ("closure-check", "closure_check"),
+        ("governed-jsonl", "governed_jsonl"),
+        ("mcp-confinement-positive", "mcp_confinement_positive"),
+    ] {
+        assert_eq!(
+            job_if(job),
+            format!("${{{{ needs.changes.outputs.{flag} == 'true' }}}}"),
+            "{job} runs exactly when the plan selects it"
+        );
+    }
+    assert!(
+        job_if("closure-tests").contains("needs.changes.outputs.closure_test_count != '0'"),
+        "closure-tests runs the rows the plan names"
+    );
+    assert!(
+        job_if("feature-check").contains("needs.changes.outputs.feature_check_count != '0'"),
+        "feature-check runs the rows the plan names"
+    );
+    for contract in [
+        "a push plan left lanes to a later push",
+        "forbid_failure \"Closure check\" \"${CLOSURE_CHECK_RESULT}\"",
+        "forbid_failure \"Governed JSONL\" \"${GOVERNED_JSONL_RESULT}\"",
+        "forbid_failure \"MCP confinement positive\" \"${MCP_CONFINEMENT_POSITIVE_RESULT}\"",
+        "left to the push (main or release/**): ${DEFERRED_TO_PUSH}",
+    ] {
+        assert!(ci.contains(contract), "CI gate must enforce `{contract}`");
+    }
 }
 
 #[test]

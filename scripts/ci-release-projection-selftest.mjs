@@ -525,6 +525,8 @@ if (args[0] === "api") {
     CLOSURE_CHECK_RESULT: "skipped", FEATURE_CHECK_RESULT: "skipped", FEATURE_CHECK_COUNT: "0",
     WASM: "false", WASM_CHECK_RESULT: "skipped", SDK_HOST_RESULT: "skipped", EXAMPLE_WEB_RESULT: "skipped",
     WASM_TIMERS_RESULT: "skipped", BAZEL_GRAPH_RESULT: "success", RUST_CHANGED: "false", IS_MAIN_PUSH: "true",
+    IS_PULL_REQUEST: "false", PLAN_EVENT: "push", CLOSURE_CHECK: "false", GOVERNED_JSONL: "false",
+    MCP_CONFINEMENT_POSITIVE: "false", DEFERRED_TO_PUSH: "",
     SDK_HOST: "false", BAZEL_GRAPH: "true", EXAMPLES_BROWSER: "false", EXAMPLE_WEB: "false",
     MODE: "release-projection", REASON: "release projection", SHARD_COUNT: "0", UNIT_SHARD_COUNT: "6",
     UNIT_DEFERRED: "", UNIT_DEFERRED_COUNT: "0", PACKAGE_COUNT: "0", CLOSURE_COUNT: "0",
@@ -533,7 +535,7 @@ if (args[0] === "api") {
   };
   const gate = (change) => spawnSync("bash", ["-c", gateCheck], { env: { ...process.env, ...gateEnv, ...change }, encoding: "utf8" });
   assert.equal(gate({}).status, 0, `the gate accepts a release-projection main push: ${gate({}).stdout}`);
-  assert.equal(gate({ IS_MAIN_PUSH: "false" }).status, 0, "and a release-projection pull request");
+  assert.equal(gate({ IS_MAIN_PUSH: "false", IS_PULL_REQUEST: "true" }).status, 0, "and a release-projection pull request");
   assert.equal(
     gate({ CLOSURE_TEST_COUNT: "13", CLOSURE_TESTS_RESULT: "success", INTEGRATION_COUNT: "1", INTEGRATION_RESULT: "success" }).status,
     0,
@@ -556,6 +558,44 @@ if (args[0] === "api") {
   ]) {
     assert.equal(gate(change).status, 1, `the gate refuses ${label}`);
   }
+  // An ordinary plan: a pull request passes without the lanes it left to
+  // the push and names them; the push must run them, and the gate refuses a
+  // push plan that left any.
+  const rustGate = {
+    ...gateEnv, MODE: "packages", REASON: "1 workspace package(s) own changed paths", RELEASE_PROJECTION: "false",
+    RELEASE_EVIDENCE_COMMIT: "", RELEASE_EVIDENCE_RUN_ID: "", RELEASE_EVIDENCE_RUN_ATTEMPT: "", RUST_CHANGED: "true",
+    SHARD_COUNT: "1", CLIPPY_RESULT: "success", UNIT_SHARD_COUNT: "1", UNIT_RESULT: "success", PACKAGE_COUNT: "1",
+    GENERATED_CONTRACT: "false", BAZEL_GRAPH: "false", BAZEL_GRAPH_RESULT: "skipped",
+  };
+  const pullRequestGate = {
+    ...rustGate, IS_MAIN_PUSH: "false", IS_PULL_REQUEST: "true", PLAN_EVENT: "pull_request",
+    DEFERRED_TO_PUSH: "17 closure-tests rows; the closure check; governed JSONL; MCP confinement positive",
+  };
+  const pushGate = {
+    ...rustGate, CLOSURE_CHECK: "true", GOVERNED_JSONL: "true", MCP_CONFINEMENT_POSITIVE: "true",
+    CLOSURE_CHECK_RESULT: "success", GOVERNED_JSONL_RESULT: "success", MCP_CONFINEMENT_POSITIVE_RESULT: "success",
+    CLOSURE_TEST_COUNT: "17", CLOSURE_TESTS_RESULT: "success", MAIN_UNIT_PACKED_RESULT: "success",
+    WASM_CHECK_RESULT: "success", SDK_HOST_RESULT: "success", EXAMPLE_WEB_RESULT: "success",
+    WASM_TIMERS_RESULT: "success", BAZEL_GRAPH_RESULT: "success",
+  };
+  const runGate = (env) => spawnSync("bash", ["-c", gateCheck], { env: { ...process.env, ...env }, encoding: "utf8" });
+  const pullRequestRun = runGate(pullRequestGate);
+  assert.equal(pullRequestRun.status, 0, `the gate accepts a pull request without the lanes it left to the push: ${pullRequestRun.stdout}`);
+  assert.match(pullRequestRun.stdout, /left to the push \(main or release\/\*\*\): 17 closure-tests rows/);
+  assert.equal(runGate(pushGate).status, 0, `the gate accepts a push that ran them: ${runGate(pushGate).stdout}`);
+  for (const [label, env] of [
+    ["a push plan without the closure check", { ...pushGate, CLOSURE_CHECK: "false", CLOSURE_CHECK_RESULT: "skipped" }],
+    ["a push plan without governed JSONL", { ...pushGate, GOVERNED_JSONL: "false", GOVERNED_JSONL_RESULT: "skipped" }],
+    ["a push plan without the confinement lane", { ...pushGate, MCP_CONFINEMENT_POSITIVE: "false", MCP_CONFINEMENT_POSITIVE_RESULT: "skipped" }],
+    ["a push plan that left lanes to a later push", { ...pushGate, DEFERRED_TO_PUSH: "the closure check" }],
+    ["a pull-request plan on a push", { ...pushGate, PLAN_EVENT: "pull_request" }],
+    ["a push whose closure check did not run", { ...pushGate, CLOSURE_CHECK_RESULT: "skipped" }],
+    ["a pull request whose skipped closure check failed", { ...pullRequestGate, CLOSURE_CHECK_RESULT: "failure" }],
+    ["a pull request whose governed JSONL lane failed", { ...pullRequestGate, GOVERNED_JSONL_RESULT: "failure" }],
+  ]) {
+    assert.equal(runGate(env).status, 1, `the gate refuses ${label}`);
+  }
+
   // The gate verifies the evidence after the lanes and records it.
   const verifyStep = extractStepRun(workflow, "Verify reused release-projection evidence");
   assert.match(verifyStep, /git show "\$\{parent\}:scripts\/\$\{script\}"/, "the gate runs the parent's scripts");
