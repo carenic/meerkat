@@ -182,7 +182,12 @@ them.
   response has ended (1600 ms of output silence, the rule deferred result
   cues already use); with the model silent it goes at once. A close before
   the release settles a held append as interrupted by close, like held
-  delegation commentary. Other quiet appends are unchanged.
+  delegation commentary. Only text-chat rows are held. The runtime sends a
+  call's context rows one at a time and waits for each acknowledgement, so
+  rows queued behind a held text-chat row (runtime-work replays, superseded
+  typed rows, causal replays, voiced conversational rows) wait for it too,
+  in order: up to the rest of the model's response plus 1.6 seconds. A held
+  row keeps its fragments' receipt slots until it is sent.
 
 ## [0.9.1] - 2026-10-15
 

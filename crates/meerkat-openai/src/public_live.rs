@@ -2123,24 +2123,27 @@ impl PublicLiveBrokerSession {
             // goes out, in order, once the response has ended. The state lock
             // stays held while it is sent, so a later text-chat append cannot
             // overtake it.
-            for (token, events) in state.take_releasable_held_text_chat() {
-                let mut sent = true;
-                for event in events {
+            let released = state.take_releasable_held_text_chat();
+            if !released.is_empty() {
+                let (sent, failed) = send_released_in_order(released, |event| {
                     self.instrument_outgoing_append(&event);
-                    if self.sender.send(event).await.is_err() {
-                        state.append_delivery_ambiguous = true;
-                        sent = false;
-                        tracing::warn!(
-                            token = token.0,
-                            "released public Live text-chat context could not be sent; the transport is gone and its close settles the delivery"
-                        );
-                        break;
-                    }
-                }
-                if sent {
+                    let send = self.sender.send(event);
+                    async move { send.await.is_ok() }
+                })
+                .await;
+                for token in sent {
                     tracing::info!(
                         token = token.0,
                         "public Live held text-chat context released"
+                    );
+                }
+                if let Some(token) = failed {
+                    // Nothing after the failed append is tried: the transport
+                    // is gone, and its close settles every reservation left.
+                    state.append_delivery_ambiguous = true;
+                    tracing::warn!(
+                        token = token.0,
+                        "released public Live text-chat context could not be sent; the transport is gone and its close settles the delivery"
                     );
                 }
             }
@@ -4300,6 +4303,29 @@ const CONTEXT_FRAGMENT_MAX_BYTES: usize = 500;
 /// a byte split on a UTF-8 character boundary, which the provider still
 /// accepts (the bound is what matters on the wire, the seam only matters for
 /// recall). The result is bounded by the caller's pending-append limit.
+/// Send released appends in order, each one's fragments in order, and stop
+/// at the first failed send: nothing after it is tried. Returns the tokens
+/// sent whole and the token whose send failed.
+async fn send_released_in_order<F, Fut>(
+    released: Vec<(GptLiveAppendToken, Vec<ClientEvent>)>,
+    mut send: F,
+) -> (Vec<GptLiveAppendToken>, Option<GptLiveAppendToken>)
+where
+    F: FnMut(ClientEvent) -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let mut sent = Vec::with_capacity(released.len());
+    for (token, events) in released {
+        for event in events {
+            if !send(event).await {
+                return (sent, Some(token));
+            }
+        }
+        sent.push(token);
+    }
+    (sent, None)
+}
+
 fn context_fragments(mut text: &str) -> Vec<&str> {
     let mut fragments = Vec::new();
     while !text.is_empty() {
@@ -8382,6 +8408,32 @@ mod tests {
             })
             .collect();
         assert_eq!(interrupted, [token, late]);
+    }
+
+    /// Released text-chat appends go out in order and stop at the first
+    /// failed send: the failed append's later fragments and every later
+    /// append are not tried.
+    #[tokio::test]
+    async fn released_text_chat_stops_at_the_first_failed_send() {
+        let mut state = state_with_spoken_delegation();
+        let (first, one) = text_chat_append(&mut state, "row one");
+        let (second, two) = text_chat_append(&mut state, &"two ".repeat(200));
+        let (third, three) = text_chat_append(&mut state, "row three");
+        assert_eq!(two.len(), 2, "the second append has two fragments");
+        let mut attempts = 0_usize;
+        let (sent, failed) =
+            send_released_in_order(vec![(first, one), (second, two), (third, three)], |_| {
+                attempts += 1;
+                // The first fragment of the second append fails.
+                let ok = attempts != 2;
+                async move { ok }
+            })
+            .await;
+        assert_eq!(sent, [first]);
+        assert_eq!(failed, Some(second));
+        assert_eq!(attempts, 2, "nothing after the failed send is tried");
+        let (sent, failed) = send_released_in_order(Vec::new(), |_| async { true }).await;
+        assert!(sent.is_empty() && failed.is_none());
     }
 
     fn continuation_markers(observations: &[GptLiveBrokerObservation]) -> Vec<(String, String)> {
