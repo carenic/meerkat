@@ -1164,6 +1164,26 @@ them.
   refused from an untrusted `mcp.toml` to the model under its plain name or
   a `refused-mcp-server-<n>` placeholder, as sessions on a governed realm
   do. They reported it under its raw name, which a confined process chose.
+- A Git skill repository's ssh-key path no longer reaches `GIT_SSH_COMMAND`,
+  which git runs through a shell, unquoted: a key path is validated
+  (absolute, an existing regular file, no control characters or single
+  quote, no leading `-`) and single-quoted, so a path crafted to carry a
+  shell command runs none. The `git_ref` and repository URL are refused when
+  they read as an option (a leading `-`) or carry whitespace or control
+  characters, the URL's transport must be `ssh`/`https`/`http`/`git`/`file`
+  or a local path, and every `git` invocation passes `--end-of-options`
+  before its refs and URL. Before, a configuration source a confined process
+  could write (or a config-tool client) could run a command on the host
+  through the ssh-key path. The Git skills scan root is also not walked when
+  a link leads it out of the checkout.
+- The governed `rkat-rpc` route builds its controller client and its
+  reviewer through the host's confinement, as it already built the
+  connection factory, so a credential command either names runs as the host
+  under the same guard: one whose program a confined process could change is
+  refused, and (under confinement) it is cleaned of the paths and variables
+  a confined process could change. Before, the controller and reviewer
+  factories were built without confinement, so a governed realm's credential
+  command skipped the guard and kept the full environment.
 - The programs a host runs as itself no longer inherit a module or library
   path a confined process could change. With `rkat` run from a shell whose
   `PYTHONPATH` or `LD_LIBRARY_PATH` points into the workspace, a confined
@@ -1197,6 +1217,15 @@ them.
   `McpOAuthPendingLogin::launch_system_browser` stay public without a host's
   judgement (only relative `PATH` directories are dropped); a host that
   confines its agents' launches uses `open_system_browser_trusting`.
+- A config write cannot add a credential command (see Fixed), but it can
+  still change an auth profile's `provider`/`auth_method` or a binding's
+  backend, so an administered command's token could be resolved for a
+  writer-chosen endpoint: the backend a credential is sent to is not yet
+  administered like the command itself.
+- The Git skill ssh-key path and `git_ref`/URL are validated and git runs
+  with `--end-of-options`, but the host still trusts the repository content
+  it fetches; a repository is loaded only from a trusted configuration, not
+  made safe by it.
 
 ## [0.9.1] - 2026-10-15
 
