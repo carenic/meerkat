@@ -28,11 +28,9 @@ use meerkat_schedule::{IdentityTargetBinding, ScheduleDeliveryIdentity, Schedule
 /// Spawn a runtime-backed schedule host that delivers session targets
 /// through `service` and reports mob targets as unsupported.
 ///
-/// The host's session host holds `service` and stays attached to
-/// `schedule_service` for as long as any clone of it lives. An embedder that
-/// tears the session service down while its process keeps running clears the
-/// factory builder's `default_schedule_tools` slot afterwards; see
-/// [`spawn_schedule_host`].
+/// The host's session host holds `service` and judges `schedule_service`'s
+/// identity targets only while the host runs; no clone of the schedule
+/// service keeps it after the host stops. See [`spawn_schedule_host`].
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_runtime_backed_schedule_host<B: SessionAgentBuilder + 'static>(
     service: Arc<PersistentSessionService<B>>,
@@ -73,12 +71,11 @@ pub fn spawn_runtime_backed_schedule_host<B: SessionAgentBuilder + 'static>(
 /// targets probing as missing (the schedule's `MissingTargetPolicy` then
 /// applies).
 ///
-/// `service` (through the host's session host) and `mob_host` stay attached
-/// to `schedule_service` for as long as any clone of it lives, and agent
-/// schedule tools in the factory builder's `default_schedule_tools` slot
-/// hold such a clone. An embedder that tears them down while its process
-/// keeps running clears that slot, and any registry of its own that holds
-/// the mob state, after teardown succeeds; see [`spawn_schedule_host`].
+/// `service` (through the host's session host) and `mob_host` judge
+/// `schedule_service`'s identity targets only while the host runs; no clone
+/// of the schedule service, such as one inside agent schedule tools in the
+/// factory builder's `default_schedule_tools` slot, keeps them after the
+/// host stops. See [`spawn_schedule_host`].
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_runtime_backed_schedule_host_with_mobs<B: SessionAgentBuilder + 'static>(
     service: Arc<PersistentSessionService<B>>,

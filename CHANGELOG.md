@@ -35,6 +35,41 @@ them.
 
 ## [Unreleased]
 
+### Breaking
+
+- `meerkat_schedule::ScheduleService::attach_identity_target_probe` takes
+  `&Arc<dyn ScheduleIdentityTargetProbe>` instead of
+  `Arc<dyn ScheduleIdentityTargetProbe>` and holds the probe weakly: the
+  caller owns it, and it judges identity targets only while the caller keeps
+  it (see Fixed).
+- Behaviour-only (not measured by the gate): the earliest attached
+  identity-target probe that is still alive judges, instead of the first one
+  ever attached. Once every attached probe is gone, an identity-target create,
+  or an update that sets an identity target, fails with
+  `ScheduleDomainError::DriverStopped`; `handle_schedule_tools_call` returns
+  it as `CAPABILITY_UNAVAILABLE` (-32001), and `ScheduleToolDispatcher` and
+  `ScheduleToolSurface` return `ToolError::Unavailable` with
+  `ToolUnavailableReason::TemporarilyUnavailable`. A service that never had a
+  probe attached still accepts identity targets unjudged.
+
+### Fixed
+
+- Agent schedule tools no longer keep a stopped schedule host's session and
+  mob hosts alive. `SharedScheduleTargetAdapter` now owns the create-time
+  identity-target probe it attaches and the `ScheduleService` holds it
+  weakly, so the schedule tools in a factory builder's
+  `default_schedule_tools` slot, which the session service owns, no longer
+  keep the session service and the mob state alive once the schedule host
+  has stopped, and a mob store's `drain_observers` no longer needs that slot
+  cleared. An embedder that tears these down while its process keeps running
+  drops the 0.9.2 teardown step: `spawn_schedule_host`, the runtime-backed
+  schedule host spawners, `SharedScheduleTargetAdapter::new`,
+  `set_default_schedule_tools`, `FactoryAgentBuilder::default_schedule_tools`
+  and the scheduling guide now say so. A schedule host started after
+  teardown for the same service judges identity targets itself instead of
+  being ignored because the first attach won, and store-only schedule tool
+  calls (get, list, pause and the rest) keep working after teardown.
+
 ## [0.9.2] - 2026-10-16
 
 ### Breaking

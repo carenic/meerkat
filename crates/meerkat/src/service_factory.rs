@@ -1303,12 +1303,11 @@ pub struct FactoryAgentBuilder {
     /// visibility after the builder is consumed into a session service, while
     /// keeping runtime/service ownership in the surface.
     ///
-    /// The tools hold their `ScheduleService`, which keeps a spawned schedule
-    /// host's session and mob hosts attached, and the session service owns
-    /// this builder, so the slot keeps the session service and the mob state
-    /// alive. An embedder that tears them down while its process keeps
-    /// running keeps a clone of this `Arc` and writes `None` through it once
-    /// teardown has succeeded; see [`crate::surface::spawn_schedule_host`].
+    /// The tools hold their `ScheduleService`, which holds a spawned schedule
+    /// host's session and mob hosts only weakly, so this slot keeps neither
+    /// the session service that owns this builder nor any mob state alive
+    /// after that host stops; teardown needs no clear here. See
+    /// [`crate::surface::spawn_schedule_host`].
     pub default_schedule_tools:
         Arc<std::sync::RwLock<Option<Arc<dyn meerkat_core::AgentToolDispatcher>>>>,
     /// Default WorkGraph tools injected into all builds.

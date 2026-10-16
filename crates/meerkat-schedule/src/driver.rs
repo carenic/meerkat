@@ -149,8 +149,9 @@ pub enum IdentityTargetDeliverability {
 /// Unlike [`ScheduleTargetProbe`] this is binding-level (no occurrence
 /// exists yet): it judges whether the identity form is deliverable at all on
 /// this surface, not whether the target is ready right now. Attached to a
-/// [`crate::ScheduleService`] via `attach_identity_target_probe`, it lets
-/// create/update refuse schedules whose every occurrence would misfire.
+/// [`crate::ScheduleService`] via `attach_identity_target_probe`, which holds
+/// it weakly while the attaching surface owns it, it lets create/update
+/// refuse schedules whose every occurrence would misfire.
 #[async_trait]
 pub trait ScheduleIdentityTargetProbe: Send + Sync {
     async fn probe_identity_target(
