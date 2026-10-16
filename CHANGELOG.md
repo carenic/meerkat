@@ -35,6 +35,36 @@ them.
 
 ## [Unreleased]
 
+### Changed
+
+- **Pull-request CI and the pre-push hook do less, to fit 20 minutes from
+  the start of the hook to a green `CI gate`.** The lane classifier
+  (`scripts/ci-cargo-lanes.mjs --event`) plans a pull request without the
+  lanes that compile the meerkat-mob chain or sweep the reverse-dependency
+  closure, and the push to `main` (or a `release/**` branch), whose CI must
+  be green before a release tag, runs them: the `closure-tests` rows,
+  `closure-check`, `feature-check`, `governed-jsonl`,
+  `mcp-confinement-positive`, the integration suites whose package compiles
+  meerkat-mob, the facade's two GPT Live feature suites, the test targets of
+  the mob-chain packages' Clippy (a pull request lints their lib and bin
+  targets), and the wasm lanes that only the reverse-dependency closure
+  selected. The plan names what a pull request left to the push
+  (`deferred_to_push`), the gate prints it, and the gate refuses a push plan
+  that left anything. meerkat-rpc's default-feature unit row no longer runs
+  in the pull request (`PR_UNIT_CHAIN_EXCEPTIONS` is gone; `main-unit` runs
+  it). A `Cargo.lock` change that is the only global path is scoped to the
+  members that resolve a changed lock entry instead of the whole workspace,
+  falling back to the workspace on anything the scoping cannot read. The TLC
+  audits run in three shards instead of two, and the `ratchets` job runs the
+  typed governance gates (`rmat-audit`, `seam-inventory`,
+  `runtime-authority-bypass`, `machine-authority-docs-gate`) on a
+  machine-authority change. The pre-push hook no longer runs the
+  changed-path ratchets, the machine codegen drift check, the canonical TLC
+  lane or the deterministic workspace test gate (they are manual hooks; CI
+  runs each before merge or before a release tag), skips the release
+  contract tests CI already runs on every pull request, and runs its two
+  slow harness contracts only when a push changes what they exercise.
+
 ## [0.9.2] - 2026-10-16
 
 ### Breaking

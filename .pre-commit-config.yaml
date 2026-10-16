@@ -131,12 +131,13 @@ repos:
 
   # Manual: the agent gate's changed-path ratchets (formal/governance
   # targets, generated contract freshness, Web SDK tests, wasm check). They
-  # ran on every push (497-2973 s on 2026-10-14..16) and CI runs each of them
-  # before merge: the ratchets job (generated contracts; machine drift and
-  # the typed governance gates on a machine-authority change), example-web
-  # (the Web SDK suites) and wasm-check, all selected by the same changed
-  # paths. No Clippy either: the required CI Clippy lanes lint every package
-  # this hook used to (scripts/test-pre-push-ratchets.sh pins all of it).
+  # ran on every push (497-2725 s a push on 2026-10-14..16) and CI runs each
+  # of them before merge: the ratchets job (generated contracts; machine
+  # drift and the typed governance gates on a machine-authority change),
+  # example-web (the Web SDK suites) and wasm-check, all selected by the same
+  # changed paths. No Clippy either: the required CI Clippy lanes lint every
+  # package this hook used to (scripts/test-pre-push-ratchets.sh pins all of
+  # it).
   - repo: local
     hooks:
       - id: changed-path-ratchets
@@ -209,11 +210,11 @@ repos:
         stages: [pre-push]
 
   # On push: the contracts of the hook harness and the release-infra gates.
-  # The two slow harness contracts (37 s and 91 s) run when a push changes
-  # what they exercise; the release contracts CI's Format + governance job
-  # runs on every pull request (release test-code guards, release doctor
-  # workflow assertions, prebuild lookup, Intel macOS binary check, asset
-  # provenance) are manual here.
+  # The two slow harness contracts (36-38 s and 87-91 s) run when a push
+  # changes what they exercise; the release contracts CI's Format +
+  # governance job runs on every pull request (release test-code guards,
+  # release doctor workflow assertions, prebuild lookup, Intel macOS binary
+  # check, asset provenance) are manual here.
   - repo: local
     hooks:
       - id: pre-push-ref-dispatch-contract
@@ -348,7 +349,7 @@ repos:
 
       # Manual: the deterministic workspace lanes (workspace unit,
       # integration-fast, HeadCanonical, e2e-fast) for the exact pushed refs.
-      # They took 1000-3071 s per push here. CI runs them: the changed
+      # They took 1011-3084 s a push here. CI runs them: the changed
       # packages' unit tests in the pull request, every member's unit tests
       # and the integration, HeadCanonical and e2e-fast rows for the test
       # scope on the push, and the workspace unit lane nightly.

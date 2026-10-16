@@ -350,10 +350,24 @@ list.
 `release/**` integration branches, PRs, and manual dispatch (any other branch
 head runs once, via its PR; a release-branch push runs the same push-only
 lanes as `main`, without the attestation). It is Cargo-only on
-GitHub-hosted runners and sized to a 25-minute lane execution budget:
-- `changes` classifies the diff with `scripts/ci-cargo-lanes.mjs` (fail
-  closed: every Rust-relevant change yields lanes; unmapped Rust paths, a
-  missing base, or global build configuration escalate to the workspace).
+GitHub-hosted runners. A pull request runs what fits the 20-minute cap from
+the start of the pre-push hook to a green `CI gate`; the push runs every lane,
+and its CI must be green before a release tag (`require_ci_green`):
+- `changes` classifies the diff with `scripts/ci-cargo-lanes.mjs --event
+  <event>` (fail closed: every Rust-relevant change yields lanes; unmapped
+  Rust paths, a missing base, or global build configuration escalate to the
+  workspace). A `Cargo.lock` change that is the only global path is scoped:
+  the package entries it adds, removes or changes are walked up the head
+  lock's dependency lists to the members that resolve them, which become the
+  changed packages; a header or other-table change, an unresolvable entry, or
+  an unreadable lock plans the workspace. On a pull request the plan leaves
+  every lane that compiles the meerkat-mob chain or sweeps the
+  reverse-dependency closure to the push and names it (`deferred_to_push`,
+  printed by the gate): the `closure-tests` rows, `closure-check`,
+  `feature-check`, `governed-jsonl`, `mcp-confinement-positive`, the
+  integration suites whose package compiles meerkat-mob, the feature suites
+  marked `pullRequest: false`, and the mob-chain packages' test-target
+  Clippy. The gate refuses a push plan that left anything to a later push.
   A release projection is the one exception: when the diff from HEAD's
   first parent is only the forward patch projection `scripts/release-hook.sh`
   writes (`scripts/release-projection-only.mjs`, the pre-push hook's own
@@ -383,18 +397,22 @@ GitHub-hosted runners and sized to a 25-minute lane execution budget:
   (`legacy-surface-gate`, `session-control-gate`, `deprecated-backend-gate`;
   ripgrep is installed first, and each scan refuses to run without it).
 - `ratchets`: generated-contract freshness when contract paths changed;
-  `machine-check-drift`/`protocol-check-drift` when machine authority changed;
+  `machine-check-drift`/`protocol-check-drift` and the typed governance gates
+  (`make rmat-audit seam-inventory runtime-authority-bypass
+  machine-authority-docs-gate`) when machine authority changed;
   `verify-machine-poster-coverage` when machine authority or a poster input
   (`scripts/machine-posters-changed`, a separate classifier so poster-only
   changes never start the machine lanes) changed.
-- `tlc-audits`: on a machine-authority change, the two hand-written TLC
+- `tlc-audits`: on a machine-authority change, the three hand-written TLC
   audit shards of the canonical TLC lane
-  (`machine_verify_all_tlc_test.sh --part audits-a|audits-b`) in parallel,
+  (`machine_verify_all_tlc_test.sh --part audits-a|audits-b|audits-c`) in parallel,
   needing only a JDK and the TLC jar (`.github/actions/setup-tlc-ci`, the one
   TLC install for every lane: an immutable repository mirror of the tlaplus
   v1.8.0 jar pinned by sha256); the `CI gate` requires them on such a change. The `machine-verify --all` sweep is not in PR CI.
 - `clippy`: one lane per shard of every directly changed package
-  (`clippy --no-deps --all-targets --all-features -D warnings`); a
+  (`clippy --no-deps <targets> --all-features -D warnings`, every target
+  except a pull request's meerkat-mob chain shards, which lint their lib and
+  bin targets because their tests run on the push); a
   whole-workspace plan gives the heads of the long check chains fixed
   shards of their own (`CLIPPY_HEAD_SHARDS`) and packs the rest. Its
   `RUSTC_WRAPPER` is `scripts/ci-clippy-sccache-wrapper`, which sends the
@@ -406,28 +424,30 @@ GitHub-hosted runners and sized to a 25-minute lane execution budget:
   mcp-server, rkat, web-runtime, integration-tests, machine-codegen;
   computed from each unit lane's real build graph: the package's own deps
   of every kind, then normal and build deps only) defer their unit tests to
-  `push: main` because their lanes need 17-22 min on 4 vCPU. The one
-  exception is meerkat-rpc's default-feature row (its MCP restart
-  controls), which also runs in the pull request when meerkat-rpc or one of
-  its trigger packages changed (`PR_UNIT_CHAIN_EXCEPTIONS` in
-  `scripts/ci-cargo-lanes.mjs`). xtask and machine-dsl-tests do not build
-  mob and run in the pull request.
+  `push: main` because their lanes need 17-22 min on 4 vCPU, meerkat-rpc's
+  default-feature row (its MCP restart controls) included. xtask and
+  machine-dsl-tests do not build mob and run in the pull request.
 - Feature-gated unit suites (`FEATURE_UNIT_SUITES` in
   `scripts/ci-cargo-lanes.mjs`): the unit lanes build default features only,
   so each suite adds a `nextest -p <package> --features <list>` row to
   `main-unit` on every Rust-relevant main push, and to `unit` when that
-  package changed outside the meerkat-mob chain. A new test behind a
-  non-default feature needs a suite, or no lane runs it.
+  package changed outside the meerkat-mob chain (on a pull request, unless
+  the suite is marked `pullRequest: false`: the facade's two GPT Live
+  suites). A new test behind a non-default feature needs a suite, or no lane
+  runs it.
 - `integration`: the `tests/*.rs` binaries (`nextest -p <package> --test
   '*'`) of each `INTEGRATION_SUITES` entry in `scripts/ci-cargo-lanes.mjs`
   whose trigger packages or paths changed (meerkat-runtime;
   meerkat-machine-codegen, whose parity tests also trigger on meerkat-mob;
   xtask with machine-authority, also on any `.github/workflows/` or `sdks/`
   edit, because its tests pin the workflows and read the SDK manifests and
-  generated types), on PRs and main pushes.
+  generated types), on main pushes, and on PRs for the suites whose package
+  does not compile meerkat-mob.
   The unit lanes run `--lib --bins` only; `closure-tests` runs the
   integration tests of every package in its test scope.
-- `closure-tests`: the pre-push hook's cargo-test coverage as required rows
+- `closure-tests` (push only): the deterministic workspace lanes of
+  `scripts/pre-push-unit.sh` (the hook's cargo-test body, now a manual hook)
+  as required rows
   for the test scope: the reverse-dependency closure of the changed packages
   (every member on a global change) plus the packages whose tests read a
   changed non-Rust input (`scripts/ci-non-rust-readers.json`, kept complete
@@ -437,11 +457,12 @@ GitHub-hosted runners and sized to a 25-minute lane execution budget:
   units: every `tests/*.rs` target the hook builds (by name, `ci-integration`
   profile, the fast selection), `e2e-fast`, and HeadCanonical with the
   hook's own package-scoped command, all on the hook's 32 MiB test-thread
-  stack. The lib tests stay in the hook's `kind(lib)` lane: one
+  stack. The lib tests get no row: one
   `--workspace --lib` row (filtered to the scope's packages) is planned only
   with `--lib-row-runner LABEL`, for a runner that builds it in time (a
   hosted 4-vCPU runner needs about 64 min), and the plan otherwise records
-  the lane it leaves to the hook (`hook_retained_lanes`). Each row lists and
+  the lane it leaves to `main-unit` (package-scoped) and nightly's workspace
+  unit lane (the workspace feature set) (`hook_retained_lanes`). Each row lists and
   runs one shared selection and first checks that nextest selects exactly
   its planned binaries (`scripts/ci-verify-row-binaries.mjs`). The binary
   holding the nested-Cargo canaries (the `downstream-cargo-canary` test
@@ -450,14 +471,19 @@ GitHub-hosted runners and sized to a 25-minute lane execution budget:
   runners; the coverage check credits it only when every partition is
   planned. The plan
   fails when `scripts/ci-hook-coverage.mjs` finds a hook binary in scope
-  without a row (other than a lib binary the plan leaves to the hook): it
+  without a row (other than a lib binary the plan leaves to those unit
+  lanes; a pull-request plan is checked against its push's rows): it
   reads the hook's lanes from `scripts/pre-push-unit.sh`, binds every line
   of the executing step that names a row input, the exported test-thread
   stack, the selection, nextest or the binary check (so none can reassign
   an input or the stack), and credits only whole-workspace rows.
-- `closure-check`: `cargo check --all-features` (lib and bin targets) over
-  the reverse-dependency closure of the changed packages.
-- `feature-check` (two jobs per clippy shard, Bazel set and matrix): compile-only checks of the
+- `closure-check` (push only): `cargo check --all-features` (lib and bin
+  targets) over the reverse-dependency closure of the changed packages.
+- `governed-jsonl` and `mcp-confinement-positive` (push only): the three
+  non-MCP governed JSONL tests of meerkat-rpc, and the Linux positive
+  confinement cases (`make test-mcp-confinement-positive`), on every Rust
+  change.
+- `feature-check` (push only; two jobs per clippy shard, Bazel set and matrix): compile-only checks of the
   shard's packages under the feature sets the Bazel graph builds them with
   (`--no-default-features` plus exactly the set their generated
   `BUILD.bazel` gives their tests, `--lib --bins --tests`; then each other
@@ -467,13 +493,16 @@ GitHub-hosted runners and sized to a 25-minute lane execution budget:
   read from `BUILD.bazel` and the Makefile and validated against cargo
   metadata, so a renamed feature fails the plan.
 - `wasm-check` (`make wasm-check`: wasm32 check and clippy of the web
-  runtime and the crates it links): every Rust-relevant main push, and pull
-  requests whose changed packages reach `meerkat-web-runtime`. The
-  `example-web` lane also runs the Web SDK's `npm test` (type tests over the
-  generated events, node unit suites).
+  runtime and the crates it links): every Rust-relevant push, and pull
+  requests that change the web runtime, `meerkat-contracts` or the CLI web
+  template (a push also for every change whose closure reaches
+  `meerkat-web-runtime`). `example-web` and `wasm-timers` follow the same
+  rule for their own inputs (`sdks/web/`, the runtime, the contracts,
+  examples 031-033); `example-web` also runs the Web SDK's `npm test` (type
+  tests over the generated events, node unit suites).
 - `push: main` only (no budget): `main-unit` over the whole workspace in
-  eight shards, `sdk-host`. A red main run is a failed `CI gate` on the main
-  commit and blocks `require_ci_green`.
+  eight shards, `sdk-host`, and the push-only lanes above. A red main run is
+  a failed `CI gate` on the main commit and blocks `require_ci_green`.
 - `gate` (`CI gate`, the only required context): fail-closed aggregate; on
   pull requests a 1500-second lane execution budget (classification plus
   each lane's own run time, runner queue excluded) and a 2700-second
@@ -498,7 +527,7 @@ GitHub-hosted runners and sized to a 25-minute lane execution budget:
 The dense Mob topology stress, the bounded TLC `machine-verify --all` sweep,
 the feature-matrix test runs, audit, the SDK suites, and the whole
 BuildBuddy/Bazel graph do not run in PR CI; integration-fast and e2e-fast run
-there for the test scope only (`closure-tests`). `cargo.yml`
+on the push for the test scope only (`closure-tests`). `cargo.yml`
 remains a separate reusable/manually dispatchable Cargo workflow with its own
 `Cargo lane gate`; `ci.yml` does not call it. Local Make commands still
 default to Cargo.
@@ -625,25 +654,29 @@ Installed via `make install-hooks`. Two stages:
 - `node scripts/generate-bazel-rust-builds.mjs` (regenerates Bazel rust build metadata)
 - `scripts/sync-meerkat-dogma-skill-docs.sh` (syncs dogma docs into the skill)
 
-**On push** (`pre-push`):
+**On push** (`pre-push`), sized to finish in a few minutes warm (the CI it
+duplicated is the authority; heavy lanes are CI's, below):
 - Secret detection (gitleaks)
 - Trailing whitespace, end-of-file, YAML/TOML validation, merge conflict check, large file check
 - `repo-cargo fmt --all -- --check`
-- `scripts/pre-push-ratchets.sh` (the agent gate's changed-path ratchets: formal/governance targets, generated contract freshness, Web SDK tests, wasm check; no Clippy, which is a required CI check: the CI planner gives every package the hook used to lint a Clippy lane with the same flags, pinned by `scripts/test-pre-push-ratchets.sh`)
-- `scripts/pre-push-machines.sh`, as two hooks behind the machine-authority classifier and the exact pushed refs: `machine-codegen-drift` (`--codegen-only`: machine and protocol codegen under the clean-tree contract, the only local drift check; the dispatcher refuses `SKIP=machine-codegen-drift`) and `machine-codegen-verify` (`--verify-only`: the canonical TLC lane)
 - `scripts/pre-push-audit-generated-headers.sh`
 - `scripts/pre-push-bridge-no-responsestatus.sh` (thin wrapper over `xtask bridge-classifier`)
 - `scripts/pre-push-bazel-locks.sh` (generated BUILD freshness, offline MODULE.bazel.lock recorded-input check, the release test-code gate `scripts/check-bazel-release-features.py` (every Bazel release build passes `--define=meerkat_release_build=1`, under which no target the shipped binaries link enables a feature from `scripts/non-shipping-features.json`, and no crate_universe repository of an external crate listed there under `external_crate_features` enables one of its listed features: tokio's `test-util`, which `tools/third-party/patches/rules_rust-release-stripped-crate-features.patch` moves behind the release select), `bb mod deps --lockfile_mode=error` when the pinned CLI is present; `--require-bb` makes that last gate mandatory and the release preflight passes it)
-- `scripts/test-lock-consistency-gate.sh`, `scripts/test-bazel-module-lock-gate.sh`, `scripts/test-crate-enumeration-gate.sh`, `scripts/test-crate-license-files-gate.sh`, `scripts/test-release-test-code-guards.sh`, `scripts/test-release-doctor-workflow-contract.sh` (contract tests: each new release-infra gate must still fail on the defect it was written for; the last one also proves the release doctor's `release.yml` assertions survive rewording)
-- `scripts/test-release-find-prebuild.sh` (stubbed `gh`, no network: the tag run's prebuild lookup selects only a prebuild of exactly the tag commit whose critical artifacts are ready, the newest one, waits for a gate that has not concluded within its budget, and fails instead of reading an API error as "no prebuild")
-- `scripts/test-check-macos-x86-release-binary.sh` (stubbed Apple tools: the Intel macOS cross-build check refuses a non-x86_64 binary, a wrong or failing `--version` under Rosetta, a non-system library and a too-new minimum macOS)
-- `scripts/test-verify-release-asset-provenance.sh` (stubbed `gh`: archives of an earlier run are accepted only through that run's named build gate, the full one by default and the critical one for a prebuild's critical archives, with stamps naming the tag commit)
+- `scripts/test-lock-consistency-gate.sh`, `scripts/test-bazel-module-lock-gate.sh`, `scripts/test-crate-enumeration-gate.sh`, `scripts/test-crate-license-files-gate.sh` (contract tests: each new release-infra gate must still fail on the defect it was written for)
 - `scripts/test-gcp-buildbuddy-workflow-gate.sh` (plans nightly, release and `buildbuddy.yml` jobs with `MEERKAT_GCP_BUILDBUDDY_ENABLED` unset and `true`: unset starts nothing in GCP and tags validate on an exact-tree CI attestation that covers the Cargo validation lanes, with Cargo otherwise; `true` keeps the full-graph route)
 - `scripts/test-gcp-buildbuddy-hardening.sh` (stubbed `gcloud`/`bb`, no network: the self-hosted control plane renders authenticated, TLS-only, executor-authorized config and installs exactly it; `ensure` creates only IAP/executor allows behind an explicit deny, never edits or re-enables a firewall rule, and refuses open, legacy, disabled or drifted rules, VMs, disks and digest-less images; executors get per-secret IAM and gRPCS only; the wrapper never sends an API key to a non-TLS endpoint, and the self-hosted path never uses the BuildBuddy Cloud key)
-- `scripts/pre-push-unit.sh` (deterministic Cargo/nextest gate: when fresh execution is needed, runs workspace unit, integration-fast, HeadCanonical cold-restart, and `e2e-fast` lanes; serializes identical source evidence and retries a timed-out lane once. `MEERKAT_BUILDBUDDY` does not switch this hook's backend)
+- The hook harness contracts: `scripts/test-pre-push-lane-retention.sh`, `scripts/test-pre-push-machines.sh`, `scripts/test-release-packaging-isolation.sh`, `scripts/test-ci-nextest-archive.sh` on every push, and the two slow ones only when a push changes what they exercise: `scripts/test-pre-push-dispatch.sh` (the dispatcher and the hook config) and `scripts/test-pre-push-unit-status.sh` (the deterministic gate, the release-projection and harness-only classifiers, and `scripts/test-pre-push-ratchets.sh`, which reads the CI planner, `ci.yml` and the agent gate)
 - `scripts/pre-push-prune-lanes.sh` (runs from the dispatcher only after a PASSED gate: keeps at most `MEERKAT_PRE_PUSH_KEEP_LANES` (default 2) `pre-push-<hash>` hook worktrees and Cargo target lanes per repo, never touching the current lane, a lane whose dispatcher lock is live, a lane referenced by any live process, a lane with any file activity inside `MEERKAT_PRE_PUSH_LANE_IDLE_SECS` (default 21600), or any non-lane name; logs one `kept:`/`pruned:` line per lane with its reason; `MEERKAT_PRE_PUSH_KEEP_LANES=all` disables it)
 
-The inner deterministic-test cache uses a source fingerprint that excludes
+**Manual** (`pre-commit run --hook-stage manual <id> --from-ref <base> --to-ref HEAD`):
+the push stage ran these before 0.9.3, 68-116 minutes of every push on 2026-10-14..16,
+and CI runs each of them before merge or before a release tag:
+- `changed-path-ratchets`: `scripts/pre-push-ratchets.sh` (the agent gate's changed-path ratchets: formal/governance targets, generated contract freshness, Web SDK tests, wasm check; no Clippy). CI: the `ratchets` job (generated contracts; drift and the typed governance gates on a machine-authority change), `example-web` and `wasm-check`, selected by the same paths; `scripts/test-pre-push-ratchets.sh` pins it
+- `machine-codegen-drift` / `machine-codegen-verify`: `scripts/pre-push-machines.sh --codegen-only|--verify-only` (machine and protocol codegen under the clean-tree contract; the canonical TLC lane). CI: the `ratchets` job's `machine-check-drift`/`protocol-check-drift` and the `tlc-audits` shards on a machine-authority change; the `machine-verify --all` sweep nightly and on the release gate
+- `cargo-test`: `scripts/pre-push-unit.sh` (deterministic Cargo/nextest gate: when fresh execution is needed, runs workspace unit, integration-fast, HeadCanonical cold-restart, and `e2e-fast` lanes; serializes identical source evidence and retries a timed-out lane once. `MEERKAT_BUILDBUDDY` does not switch this hook's backend). CI: the pull request's unit lanes for the changed packages, the push's `main-unit` and `closure-tests` rows, nightly's workspace unit lane
+- `release-test-code-guards-contract`, `release-doctor-workflow-contract`, `release-find-prebuild-contract`, `macos-x86-release-binary-check-contract`, `release-asset-provenance-contract`: CI's `Format + governance` job runs these on every pull request
+
+The manual deterministic gate's source-test cache uses a source fingerprint that excludes
 root `Cargo.lock` and `MODULE.bazel.lock`. On a lock-only cache hit, the current
 lock graph is compiled by the required CI Clippy lanes but is not re-tested locally;
 the reused tests ran against the prior lock graph, and CI remains
@@ -657,8 +690,7 @@ with the skipped set, reusable only by a later push of that tree that skips the
 same hooks; a push without that `SKIP` re-runs them.
 
 After the gate, passed or failed, the dispatcher prints each hook's wall time
-and the deterministic gate's lane times, and appends them to
-`.git/meerkat-hook-cache/timings.tsv`.
+and appends it to `.git/meerkat-hook-cache/timings.tsv`.
 
 **Manual local preflight**:
 - `pre-commit run --hook-stage manual agent-check-changed` (runs `scripts/agent-gate --staged`)
@@ -667,22 +699,23 @@ and the deterministic gate's lane times, and appends them to
 **Avoid duplicate final qualification**:
 
 Run the change-specific regression and required stress checks during development.
-For a candidate proceeding through normal commit hooks and one normal push, use
-that push for overlapping final lint, governance and deterministic tests instead
-of prepending another standalone `make test` or `make agent-gate`. If no normal
-push will run, retain an appropriate standalone gate before declaring the work
-qualified. This changes scheduling, not required coverage or hook behavior.
+For a candidate proceeding through normal commit hooks, one normal push and its
+pull request, use that pull request's CI for overlapping final lint, governance
+and deterministic tests instead of prepending another standalone `make test` or
+`make agent-gate`. If no pull request will run, retain an appropriate standalone
+gate before declaring the work qualified. This changes scheduling, not required
+coverage or hook behavior.
 
 Only deduplicate an inventory actually covered by the selected push backend,
-paths, test targets and features. The push runs no Clippy: its
+paths, test targets and features. The push hook runs no Clippy, no ratchets
+and no tests: CI runs them before merge (the pull request's Clippy, unit,
+integration, ratchet and TLC lanes) or on the push to `main` (the
+`closure-tests` rows, `main-unit`, the closure and feature checks). The manual
 `changed-path-ratchets` hook runs
-`agent-gate --committed --ratchets-only --machine-drift-by-hook` (governance,
-generated-contract, Web SDK and wasm ratchets; drift is left to
-`machine-codegen-drift`), and the required CI Clippy lanes lint every package
-it used to. Its path base is `CARGO_AGENT_BASE` or `origin/main` (then
-`main`/HEAD), which can differ from the dispatcher's remote-ref range. Check that
-the committed selection includes the intended delta. The deterministic push
-lane covers workspace default-feature `kind(lib)` and `kind(test)` inventories,
+`agent-gate --committed --ratchets-only --machine-drift-by-hook`; its path base is
+`CARGO_AGENT_BASE` or `origin/main` (then `main`/HEAD), which can differ from the
+dispatcher's remote-ref range. The manual deterministic lane covers workspace
+default-feature `kind(lib)` and `kind(test)` inventories,
 plus HeadCanonical `test-support` and `e2e-fast`. It does not prove package-only
 feature isolation, binary-target unit tests, required-feature targets absent
 from that inventory, doctests, ignored/live/system lanes, platform checks or the

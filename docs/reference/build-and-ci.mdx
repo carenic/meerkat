@@ -203,7 +203,10 @@ need the unbounded verification set.
 Pull-request CI is `.github/workflows/ci.yml`. It runs on pull requests,
 pushes to `main` and to `release/**` integration branches, and manual
 dispatches (any other branch head runs once, through its pull request), entirely with Cargo on GitHub-hosted `ubuntu-24.04` runners
-(4 vCPU), and it is sized to a 25-minute lane execution budget. Compiled
+(4 vCPU). A pull request runs what fits the owner's cap of 20 minutes from
+the start of the pre-push hook to a green `CI gate`, and the gate also
+enforces a 25-minute lane execution budget on it; the push runs every lane.
+Compiled
 objects are cached by sccache (content-addressed, shared by every lane and
 readable from `main` by every pull request); rust-cache holds only the
 registry, because per-lane target caches exceeded the repository's 10 GB
@@ -216,19 +219,31 @@ the exact-tree attestation; nightly and the release tag carry the rest):
 
 | Lane | `pull_request` | `push: main` | nightly | release tag |
 | --- | --- | --- | --- | --- |
-| `changes`: classify the diff with `scripts/ci-cargo-lanes.mjs` | yes | yes | - | - |
+| `changes`: classify the diff with `scripts/ci-cargo-lanes.mjs --event <event>`; a `Cargo.lock`-only global change is scoped to the members that resolve a changed lock entry | yes | yes | - | - |
 | `fmt-governance`: fmt, docs, semver self-test, version parity, lock consistency, release config, lane and path classifier self-tests, ripgrep tombstone scans (legacy surface, session-control routes, deprecated backend) | yes | yes | - | - |
-| `ratchets`: schema/SDK/RPC/REST freshness when contract paths changed; machine and protocol drift when machine authority changed; machine poster coverage and freshness when machine authority or a poster input (`scripts/machine-posters-changed`) changed | yes | yes | - | - |
-| `clippy` per shard of every changed package: `--no-deps --all-targets --all-features -D warnings` | yes | yes | whole workspace (`make lint`) | Bazel clippy lanes |
-| `unit` per shard: `nextest --lib --bins --profile ci-pr` for changed packages outside the meerkat-mob compile chain, plus meerkat-rpc's default-feature row (its MCP restart controls) when meerkat-rpc or one of its trigger packages changed (`PR_UNIT_CHAIN_EXCEPTIONS` in `scripts/ci-cargo-lanes.mjs`) | yes | - | `make test-unit` | Bazel unit lanes |
+| `ratchets`: schema/SDK/RPC/REST freshness when contract paths changed; machine and protocol drift plus the typed governance gates (`rmat-audit`, `seam-inventory`, `runtime-authority-bypass`, `machine-authority-docs-gate`) when machine authority changed; machine poster coverage and freshness when machine authority or a poster input (`scripts/machine-posters-changed`) changed | yes | yes | - | - |
+| `tlc-audits`: the three hand-written TLC audit shards (`audits-a`, `audits-b`, `audits-c`) on a machine-authority change | yes | yes | bounded TLC sweep (`make machine-verify`) | Bazel graph |
+| `clippy` per shard of every changed package: `--no-deps --all-features -D warnings` over every target; a pull request lints the meerkat-mob chain's lib and bin targets only | yes | yes | whole workspace (`make lint`) | Bazel clippy lanes |
+| `unit` per shard: `nextest --lib --bins --profile ci-pr` for changed packages outside the meerkat-mob compile chain, plus their feature-gated suites (`FEATURE_UNIT_SUITES`; a pull request skips those marked `pullRequest: false`) | yes | yes | `make test-unit` | Bazel unit lanes |
 | `main-unit` per shard: `nextest --lib --bins` over the whole workspace, including the meerkat-mob chain (mob, mob-adaptive, mob-mcp, mob-pack, rpc, rest, mcp-server, rkat, web-runtime, integration-tests, machine-codegen: the crates whose unit-lane build graph contains mob) | deferred | yes | `make test-unit` | Bazel unit lanes |
-| `integration` per suite: `nextest -p <package> --test '*'` (the crate's `tests/*.rs` binaries) for each `INTEGRATION_SUITES` entry in `scripts/ci-cargo-lanes.mjs` whose trigger packages changed: `meerkat-runtime` (machine schema/DSL/kernel crates, runtime) `meerkat-machine-codegen` (the same plus `meerkat-mob` and codegen), and `xtask` with `machine-authority` (xtask, or any `.github/workflows/` edit, since its tests pin the workflows) | when triggered | when triggered | `make test-int` | Bazel integration lanes |
-| `closure-check`: `cargo check --all-features` (lib and bin targets) over the reverse-dependency closure | yes | yes | - | - |
-| `wasm-check` | deferred | yes | browser contract suite | Bazel wasm-check |
+| `integration` per suite: `nextest -p <package> --test '*'` for each `INTEGRATION_SUITES` entry in `scripts/ci-cargo-lanes.mjs` whose trigger packages or paths changed | the suites whose package does not compile meerkat-mob | every selected suite | `make test-int` | Bazel integration lanes |
+| `closure-tests`: the deterministic workspace test lanes (`scripts/pre-push-unit.sh`) for the test scope: integration-fast, HeadCanonical and `e2e-fast` rows | deferred | yes | `make test-int`, `make e2e-fast` | Bazel integration lanes |
+| `closure-check`: `cargo check --all-features` (lib and bin targets) over the reverse-dependency closure | deferred | yes | - | - |
+| `feature-check`: the changed packages' Bazel feature sets and the Make feature-matrix check rows | deferred | yes | feature matrix | Bazel graph |
+| `governed-jsonl`, `mcp-confinement-positive`: the non-MCP governed JSONL tests and the Linux positive confinement cases | deferred | yes | - | - |
+| `wasm-check` | when the web runtime, the contracts or the CLI web template change | yes | browser contract suite | Bazel wasm-check |
 | `sdk-host`: Python + TypeScript SDK suites | deferred | yes | yes, plus Web SDK | Bazel SDK suites |
 | `example-web`: build the `sdks/web` wasm runtime once (wasm-pack 0.13.1, no wasm-opt), then run examples 031, 032 and 033 in Playwright Chromium | when `sdks/web/`, `crates/meerkat-web-runtime/`, `crates/meerkat-contracts/` or those examples change | yes | - | - |
-| integration-fast, `e2e-fast`, dense Mob topology, bounded TLC, feature matrices, minimal builds, audit, `e2e-system`, release packaging | - | - | yes | BuildBuddy `full-fresh` graph |
-| `gate` (`CI gate`): fail-closed aggregate; on pull requests a 1500-second lane execution budget and a 2700-second push-to-terminal runaway ceiling, both excluding runner queue, which is reported as a warning; schema-4 attestation on `main` | yes | yes (no budget) | - | consumed by `require_ci_green` |
+| dense Mob topology, feature matrices, minimal builds, audit, `e2e-system`, release packaging | - | - | yes | BuildBuddy `full-fresh` graph |
+| `gate` (`CI gate`): fail-closed aggregate; on pull requests a 1500-second lane execution budget and a 2700-second push-to-terminal runaway ceiling, both excluding runner queue, which is reported as a warning; it prints what the pull request left to the push and refuses a push plan that left anything; schema-4 attestation on `main` | yes | yes (no budget) | - | consumed by `require_ci_green` |
+
+"Deferred" lanes run on the push of the merge to `main` (or a `release/**`
+branch), whose CI must be green before a release tag. A pull request's plan
+names them (`deferred_to_push`) and the gate prints them. They are deferred
+because each needs 9-30 minutes on a 4-vCPU runner, mostly to compile the
+meerkat-mob chain (meerkat-mob alone compiles for 5-11 minutes whenever it
+misses the cache), and the owner's cap is 20 minutes from the start of the
+pre-push hook to a green `CI gate` on every pull request.
 
 How the budget is measured: the gate reads every completed lane from the
 Actions jobs API and splits its time into runner queue (`created_at` to
@@ -277,7 +292,9 @@ model (`1 + (lines + 8000 x dependency closure) / 35000` minutes, with a
 17-minute surrogate packing cap per pull-request unit lane; the cap is a
 model threshold, not a measured timing) is asserted by the self-test for every
 other crate. Clippy of a changed mob-chain crate still runs in the pull
-request (12 min measured for mob itself). A red `push: main` run shows as a
+request over its lib and bin targets (`--all-targets` of meerkat-mob took
+1226 s on run 38859112297, most of it its 54 test targets and lib test,
+which lint on the push). A red `push: main` run shows as a
 failed `CI gate` check on the main commit and blocks the release gate
 (`require_ci_green` needs a successful exact-main run).
 
@@ -288,8 +305,9 @@ workspace package, a missing diff base, or any global build-configuration
 path escalates to the whole workspace (packed into at most eight shards by
 estimated build-and-link cost); a
 classifier error fails the `changes` job and therefore the gate. The gate
-asserts that clippy, unit, and closure-check all ran and succeeded for a
-build-relevant change, and it fails when the classifier produced no lanes.
+asserts that clippy and unit (or a named unit deferral) ran and succeeded for
+a build-relevant change, that a push also ran closure-check, governed JSONL
+and the confinement lane, and it fails when the classifier produced no lanes.
 `make ci-lanes-selftest` (`scripts/ci-cargo-lanes-selftest.mjs`) pins these
 properties with fixtures for a core touch, docs-only, `Cargo.lock`-only,
 machine-authority-only, an unmapped `.rs`, and a missing base.
@@ -298,8 +316,8 @@ PR CI runs the directly changed packages, not their dependents: measured on
 a 4-vCPU runner, compiling the reverse-dependency closure of `meerkat-core`
 (44 of 50 crates) takes 15-18 minutes even when fanned out, which does not
 fit the budget together with the local pre-push hook. Dependents are covered
-by `closure-check` (compile only) in PR CI and by the full workspace lanes in
-nightly and on the release tag.
+on the push by `closure-check` (compile only) and the `closure-tests` rows,
+and by the full workspace lanes in nightly and on the release tag.
 
 The gate emits a schema-4 attestation for successful `main` pushes, binding
 the repository, exact commit SHA, Git tree SHA, workflow run and attempt,
