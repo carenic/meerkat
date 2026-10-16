@@ -671,7 +671,10 @@ impl FileConfigStore {
     /// compose either differently: a realm whose own document states no
     /// parent and no `[realm.global]` (the user document's `[realm.global]`
     /// decides whether `global` is on its chain), and each realm the user
-    /// document states a section for. Nothing is written.
+    /// document states a section for, both from its own document in
+    /// `documents` and as if it had none (on another state root that shares
+    /// the user document, it takes the user document's section). Nothing is
+    /// written.
     ///
     /// Only a store declared this way guards the realm's composition. A
     /// store built with [`Self::new`] alone, and a [`MemoryConfigStore`],
@@ -1083,10 +1086,13 @@ fn keep_composition(
 
 /// `documents` with the user document (the `global` realm's own) replaced
 /// by `user`: the documents a realm composes from after a write to the user
-/// document.
+/// document. With `without`, that realm's own document is left out too: the
+/// documents it composes from on a state root that holds no document of its
+/// own for it, where it takes the section the user document states for it.
 struct WithUserDocument {
     documents: Arc<dyn RealmConfigSource>,
     user: Config,
+    without: Option<crate::connection::RealmId>,
 }
 
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
@@ -1099,6 +1105,9 @@ impl RealmConfigSource for WithUserDocument {
         if realm.is_global() {
             return Ok(Some(self.user.clone()));
         }
+        if self.without.as_ref() == Some(realm) {
+            return Ok(None);
+        }
         self.documents.config_for_realm(realm).await
     }
 
@@ -1109,6 +1118,9 @@ impl RealmConfigSource for WithUserDocument {
         if realm.is_global() {
             return Ok(Some((self.user.clone(), Vec::new())));
         }
+        if self.without.as_ref() == Some(realm) {
+            return Ok(None);
+        }
         self.documents.config_for_realm_with_warnings(realm).await
     }
 
@@ -1116,7 +1128,7 @@ impl RealmConfigSource for WithUserDocument {
         &self,
         realm: &crate::connection::RealmId,
     ) -> Result<Option<toml::Value>, ConfigError> {
-        if realm.is_global() {
+        if realm.is_global() || self.without.as_ref() == Some(realm) {
             return Ok(None);
         }
         self.documents.raw_config_for_realm(realm).await
@@ -1240,7 +1252,12 @@ impl RealmChainGuard {
     /// Composed over the persisted and over the written user document: a
     /// realm with no document (for every realm whose own document states no
     /// parent and no `[realm.global]`), and each realm the user document
-    /// states a section for, from its own document as the host has it.
+    /// states a section for, from its own document as the host has it and
+    /// as if it had none. Several state roots can share one user document,
+    /// and one that holds no document of its own for a stated realm composes
+    /// that realm from the user document's section; a stated realm whose
+    /// chain resolves on no such state root, before or after the write,
+    /// composes nothing there either way.
     async fn keep_compositions_over_user_document(
         &self,
         change: &str,
@@ -1258,6 +1275,7 @@ impl RealmChainGuard {
         let mut composers = vec![(
             probe,
             "a realm whose own document states no parent and no [realm.global]".to_owned(),
+            false,
         )];
         let stated: std::collections::BTreeSet<&String> =
             persisted.keys().chain(written.keys()).collect();
@@ -1268,24 +1286,36 @@ impl RealmChainGuard {
             };
             if !realm.is_global() {
                 let composer = format!("realm '{}'", realm.as_str());
-                composers.push((realm, composer));
+                let without_document = format!(
+                    "realm '{}' (on a state root without its own document)",
+                    realm.as_str()
+                );
+                composers.push((realm.clone(), composer, false));
+                composers.push((realm, without_document, true));
             }
         }
-        let over = |realms: &RealmEdges| {
+        let over = |realms: &RealmEdges, without: Option<&RealmId>| {
             EffectiveConfigReader::new(Arc::new(WithUserDocument {
                 documents: Arc::clone(&self.documents),
                 user: administration_document(realms, confinement, governance),
+                without: without.cloned(),
             }))
         };
-        let (before_reader, after_reader) = (over(persisted), over(written));
-        for (realm, composer) in composers {
-            let before = before_reader.administered(&realm).await?;
-            let after = after_reader.administered(&realm).await.map_err(|error| {
-                ConfigError::Validation(format!(
-                    "the realm sections do not compose for {composer}: {error}"
-                ))
-            })?;
-            keep_composition(change, &composer, &before, &after)?;
+        for (realm, composer, without_document) in composers {
+            let without = without_document.then_some(&realm);
+            let before = over(persisted, without).administered(&realm).await;
+            let after = over(written, without).administered(&realm).await;
+            match (before, after) {
+                (Ok(before), Ok(after)) => keep_composition(change, &composer, &before, &after)?,
+                (Err(ConfigError::RealmChain(_)), Err(ConfigError::RealmChain(_)))
+                    if without_document => {}
+                (Err(error), _) => return Err(error),
+                (Ok(_), Err(error)) => {
+                    return Err(ConfigError::Validation(format!(
+                        "the realm sections do not compose for {composer}: {error}"
+                    )));
+                }
+            }
         }
         Ok(())
     }
@@ -2043,6 +2073,77 @@ mod tests {
             .patch(ConfigDelta(serde_json::json!({"max_tokens": 2048})))
             .await
             .expect("an unrelated edit of the user document commits");
+    }
+
+    /// Several state roots can share one user document. On a host whose
+    /// state root holds no document of its own for a realm the user
+    /// document states a section for, that realm takes the user document's
+    /// section, so a write to the user document is refused when such a
+    /// realm would compose differently, even on a host whose state root
+    /// holds the realm's own document, and nothing is written. A write
+    /// after which such a realm composes the same commits, and so does one
+    /// beside a stated realm that composes on no such host before or after
+    /// the write.
+    #[tokio::test]
+    async fn a_user_document_write_keeps_what_a_stated_realm_without_its_own_document_composes() {
+        use crate::connection::RealmId;
+
+        // On this host `team` has its own document, which states
+        // `[realm.global]`: it composes the user document's governance
+        // whatever the user document says about `team`. On a host whose
+        // state root holds no document for `team`, `team` takes the user
+        // document's `[realm.team]`, whose edge alone puts `global`, and
+        // with it the governance, on its chain.
+        let team_document = confinement_document("[realm.team]\n\n[realm.global]\n");
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("config.toml");
+        let store = FileConfigStore::new(
+            path.clone(),
+            *crate::model_profile::test_catalog::TEST_CATALOG,
+        )
+        .with_realm_chain(
+            RealmId::global(),
+            Arc::new(MapSource {
+                docs: std::iter::once(("team".to_string(), team_document)).collect(),
+            }),
+        );
+
+        let user = format!("[realm.team]\nparent = \"global\"\n\n{REVIEW_RULE}");
+        tokio::fs::write(&path, &user).await.unwrap();
+        let refused = store
+            .patch(ConfigDelta(serde_json::json!({"realm": {"team": null}})))
+            .await
+            .expect_err("team would lose the governance where it has no document of its own");
+        assert!(
+            matches!(
+                refused,
+                ConfigError::CompositionAdministration {
+                    administered: crate::config::AdministeredSection::Governance,
+                    ..
+                }
+            ) && refused.to_string().contains("realm 'team'"),
+            "{refused}"
+        );
+        assert_eq!(tokio::fs::read_to_string(&path).await.unwrap(), user);
+
+        // With `[realm.global]` in the user document, `team` composes
+        // `global` with or without its section there.
+        let user = format!("[realm.global]\n\n[realm.team]\nparent = \"global\"\n\n{REVIEW_RULE}");
+        tokio::fs::write(&path, &user).await.unwrap();
+        store
+            .patch(ConfigDelta(serde_json::json!({"realm": {"team": null}})))
+            .await
+            .expect("team composes the same governance without its section");
+
+        // A stated realm whose edge resolves on no host where it has no
+        // document of its own composes nothing there, before or after, so it
+        // does not refuse a write that changes other realm sections.
+        let user = format!("[realm.global]\n\n[realm.team]\nparent = \"org\"\n\n{REVIEW_RULE}");
+        tokio::fs::write(&path, &user).await.unwrap();
+        store
+            .patch(ConfigDelta(serde_json::json!({"realm": {"other": {}}})))
+            .await
+            .expect("no realm composes differently");
     }
 
     /// A store keeps the auto traits it had before it could declare a realm

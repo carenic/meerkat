@@ -35,6 +35,27 @@ them.
 
 ## [Unreleased]
 
+### Breaking
+
+- Behaviour-only (not measured by the gate): a write to the user document is
+  also refused when a realm the user document states a section for would
+  compose a different `[confinement]` or `[governance]` on a state root that
+  holds no document of its own for that realm (see Fixed).
+
+### Fixed
+
+- A write to the user document checks each realm the user document states a
+  section for both with that realm's own document from the writing host's
+  state root and as if the realm had none. Several state roots can share one
+  user document, and on one that holds no document for a realm, that realm
+  takes the user document's section for it. In 0.9.2 the check composed such
+  a realm only from the writing host's state root (the 0.9.2 known
+  limitation), so a write there could, for example, remove the
+  `parent = "global"` edge of `[realm.team]` that put the user document's
+  `[governance]` on `team`'s chain wherever `team` has no document. A stated
+  realm whose chain resolves on no such state root, before or after the
+  write, composes nothing there and does not refuse it.
+
 ## [0.9.2] - 2026-10-16
 
 ### Breaking
