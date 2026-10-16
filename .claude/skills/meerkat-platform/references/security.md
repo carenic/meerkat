@@ -293,7 +293,9 @@ Under a host that confines any launch kind, each runs, with every program
 it starts by name (an interpreter named through `env`, `ssh` or `git-lfs`
 under Git, the programs a browser opener tries), from a `PATH` without
 relative directories or the directories a confined process could change
-(`meerkat_core::confinement::trusted_search_path`), and inherits no variable
+(`meerkat_core::confinement::trusted_search_path`; a host that confines only
+some kinds reports no writer for an unconfined kind, so the launch still
+gets the deny list and the relative-`PATH` drop), and inherits no variable
 that makes a program load code or startup options from elsewhere (`LD_*`,
 `DYLD_*`, `PYTHON*`, `NODE_OPTIONS`, `NODE_PATH`, `PERL5LIB`, `PERL5OPT`,
 `RUBYLIB`, `RUBYOPT`, `BASH_ENV`, `ENV`, `GIT_DIR`, `GIT_WORK_TREE`,

@@ -419,6 +419,15 @@ them.
   `McpOAuthPendingLogin::launch_system_browser` stay public without a host's
   judgement (only relative `PATH` directories are dropped); a host that
   confines its agents' launches uses `open_system_browser_trusting`.
+- A config write cannot add a credential command (see Fixed), but it can
+  still change an auth profile's `provider`/`auth_method` or a binding's
+  backend, so an administered command's token could be resolved for a
+  writer-chosen endpoint: the backend a credential is sent to is not yet
+  administered like the command itself.
+- The Git skill ssh-key path and `git_ref`/URL are validated and git runs
+  with `--end-of-options`, but the host still trusts the repository content
+  it fetches; a repository is loaded only from a trusted configuration, not
+  made safe by it.
 
 ## [0.9.1] - 2026-10-15
 

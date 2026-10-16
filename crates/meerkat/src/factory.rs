@@ -4510,6 +4510,17 @@ impl AgentFactory {
 
     /// Set the native host confinement requirement for automatically composed
     /// shell tools. Each build compiles it into its own shell dispatcher.
+    ///
+    /// This per-kind builder does not install a [`crate::HostConfinement`],
+    /// so the programs the host runs as itself (credential commands, the
+    /// browser opener, `git`) are not judged by it: their
+    /// [`crate::HostConfinement::launch_guard`] is `None`. An embedder that
+    /// confines a kind this way, and also wants those launches cleaned and
+    /// their changeable programs refused, installs the same confinement with
+    /// [`Self::with_host_confinement`] (which also drives these per-kind
+    /// builders). Calling `with_host_confinement(&trusted_host)` after a
+    /// per-kind builder leaves the kind confined with no guard, so prefer
+    /// one `with_host_confinement` with the whole requirement.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn with_shell_confinement(
         mut self,
