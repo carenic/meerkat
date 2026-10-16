@@ -29846,6 +29846,7 @@ url = "https://user.example/mcp"
                 meerkat_runtime::handles::RuntimeExternalToolSurfaceHandle::ephemeral(),
             )),
             cli_mcp_stdio_profile(&factory),
+            Some(&SessionId::new()),
         )
         .await
         .expect("an untrusted file is refused, not an error")
