@@ -7,7 +7,12 @@
 //! real data dir is never read or written.
 
 #![cfg(feature = "session-store")]
-#![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
+#![allow(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    clippy::panic,
+    clippy::disallowed_methods
+)]
 
 use std::fs::FileTimes;
 use std::path::{Path, PathBuf};

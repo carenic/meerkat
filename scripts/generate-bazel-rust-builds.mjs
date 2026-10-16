@@ -1124,6 +1124,9 @@ function workspaceDataLabels(target, source = targetScanSource(target)) {
   if (source.includes("scripts/")) {
     labels.add("//:repo_governance_files");
   }
+  if (source.includes('"clippy.toml"')) {
+    labels.add("//:clippy_config");
+  }
   if (source.includes("tools/buildbuddy/")) {
     labels.add("//tools/buildbuddy:lane_scripts");
   }
@@ -1714,6 +1717,14 @@ function writeRootBuild(fastTestLabels, e2eSystemTestLabels, surfaceFeatureMatri
     `filegroup(`,
     `    name = "repo_governance_files",`,
     `    srcs = glob(["Makefile", "scripts/*"], allow_empty = True),`,
+    `    visibility = ["//visibility:public"],`,
+    `)`,
+    ``,
+    `# The workspace Clippy configuration, for tests that read what it`,
+    `# disallows (the process launch site inventory).`,
+    `filegroup(`,
+    `    name = "clippy_config",`,
+    `    srcs = ["clippy.toml"],`,
     `    visibility = ["//visibility:public"],`,
     `)`,
     ``,

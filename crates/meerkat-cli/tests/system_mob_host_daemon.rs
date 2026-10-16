@@ -16,7 +16,12 @@
 
 #![cfg(feature = "integration-real-tests")]
 #![cfg(unix)]
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::disallowed_methods
+)]
 
 #[path = "../../meerkat-mob/tests/support/probe.rs"]
 mod probe;

@@ -4,7 +4,12 @@
 //! tests drop that custodian (the "restart"), rebuild the mob state over the
 //! same durable stores, and check that the re-link pass delivers the outcome
 //! exactly once, and re-arms the opt-in max_run limit from the original start.
-#![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
+#![allow(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    clippy::panic,
+    clippy::disallowed_methods
+)]
 
 mod support;
 

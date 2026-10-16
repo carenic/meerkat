@@ -237,6 +237,8 @@ impl LinuxPolicy {
         // One slot per mount for setup's reopened sources, allocated before
         // fork: the child only writes its own copy.
         let mut sources = vec![-1; self.mounts.len()];
+        // A launch site of the confinement backend: the capability probe.
+        #[allow(clippy::disallowed_methods)]
         let pid = unsafe { libc::fork() };
         if pid == -1 {
             return Err(ConfinementRefusal::BackendUnavailable);
@@ -1061,6 +1063,8 @@ pub(super) fn spawn(
         .transpose()?;
     let mut command = if let Some((_, token)) = gate {
         const PROLOGUE: &str = "IFS= read -r meerkat_custody_gate <&3 || exit 125; case $meerkat_custody_gate in \"$1\") ;; *) exit 125 ;; esac; exec 3<&-; shift; exec \"$@\"";
+        // A launch site of the confinement backend: the gated launch.
+        #[allow(clippy::disallowed_methods)]
         let mut command = Command::new("/bin/sh");
         command.args([
             OsStr::new("-c"),
@@ -1072,6 +1076,8 @@ pub(super) fn spawn(
         command.args(&launch.arguments);
         command
     } else {
+        // A launch site of the confinement backend: the confined launch.
+        #[allow(clippy::disallowed_methods)]
         let mut command = Command::new(&launch.program);
         command.args(&launch.arguments);
         command

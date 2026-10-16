@@ -16,7 +16,12 @@
 
 #![cfg(feature = "integration-real-tests")]
 #![cfg(unix)]
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::disallowed_methods
+)]
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;

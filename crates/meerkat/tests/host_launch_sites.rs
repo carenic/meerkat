@@ -568,6 +568,104 @@ fn every_process_launch_in_shipped_code_is_confined_or_a_typed_exemption() {
     );
 }
 
+/// The paths `clippy.toml` disallows (`disallowed-methods`), in file order.
+fn clippy_disallowed_methods(root: &Path) -> Vec<String> {
+    let path = root.join("clippy.toml");
+    let text = fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+    let config: toml::Table = text
+        .parse()
+        .unwrap_or_else(|error| panic!("parse {}: {error}", path.display()));
+    config
+        .get("disallowed-methods")
+        .and_then(toml::Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|entry| match entry {
+                    toml::Value::String(path) => Some(path.clone()),
+                    toml::Value::Table(entry) => entry
+                        .get("path")
+                        .and_then(toml::Value::as_str)
+                        .map(str::to_owned),
+                    _ => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Clippy refuses every API that starts a process (`disallowed_methods` in
+/// `clippy.toml`, which resolves aliased imports and calls through
+/// re-exports), so a launch the text scan above cannot see still fails the
+/// lint: each expression the scan looks for is one of them.
+#[test]
+fn clippy_disallows_every_process_launch_api() {
+    let disallowed = clippy_disallowed_methods(&repo_root());
+    for required in [
+        "std::process::Command::new",
+        "tokio::process::Command::new",
+        "std::os::unix::process::CommandExt::exec",
+        "libc::popen",
+        "nix::unistd::execve",
+    ] {
+        assert!(
+            disallowed.iter().any(|path| path == required),
+            "clippy.toml disallows {required}: {disallowed:#?}"
+        );
+    }
+    for pattern in LAUNCH_PATTERNS {
+        let expression = pattern.trim_end_matches('(');
+        assert!(
+            disallowed
+                .iter()
+                .any(|path| path == expression || path.ends_with(&format!("::{expression}"))),
+            "clippy.toml disallows the launch the scan finds as {pattern}: {disallowed:#?}"
+        );
+    }
+}
+
+/// Shipped code allows the launch lint only at the sites `SITES` lists
+/// as starting a process themselves (the confinement backend, a confined
+/// kind's trusted-host branch, the exemptions' one constructor), once per
+/// launch expression there; an exempt launch goes through its exemption's
+/// fixed-program constructor and needs none. `SITES` stays the one list.
+#[test]
+fn the_launch_lint_is_allowed_only_at_the_listed_launch_sites() {
+    let root = repo_root();
+    let mut expected: BTreeMap<String, usize> = BTreeMap::new();
+    for (file, _, count, launch) in SITES {
+        if !matches!(launch, Launch::Exempt(_)) {
+            *expected.entry((*file).to_string()).or_default() += count;
+        }
+    }
+    let mut found: BTreeMap<String, usize> = BTreeMap::new();
+    for path in walk_rust_sources(&root) {
+        let relative = path
+            .strip_prefix(&root)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        let relative = relative.trim_start_matches("./").to_string();
+        if !is_shipped_source(&relative) {
+            continue;
+        }
+        let source = fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+        let code = shipped_code(&source);
+        let count = code.matches("clippy::disallowed_methods").count()
+            + code.matches("clippy::disallowed_types").count();
+        if count > 0 {
+            found.insert(relative, count);
+        }
+    }
+    assert_eq!(
+        found, expected,
+        "shipped code allows the process launch lint exactly once per launch expression \
+         of the sites SITES lists as launching themselves, and nowhere else"
+    );
+}
+
 #[test]
 fn every_host_launch_exemption_is_in_use_and_named_where_it_launches() {
     for exemption in HostLaunchExemption::ALL {

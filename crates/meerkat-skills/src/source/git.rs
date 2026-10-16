@@ -894,6 +894,7 @@ mod tests {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 pub mod tests_support {
     use std::path::Path;
     use std::process::Command;

@@ -1166,6 +1166,7 @@ impl DefaultHookEngine {
             None => {
                 // Absent host configuration preserves legacy trusted-host
                 // execution. A Required factory always installs an adapter.
+                #[allow(clippy::disallowed_methods)]
                 let mut command = Command::new(&configuration.command);
                 command
                     .args(&configuration.args)

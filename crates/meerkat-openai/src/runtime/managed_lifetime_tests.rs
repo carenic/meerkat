@@ -1,6 +1,11 @@
 //! A retained managed client must observe its actual credential owner on reuse.
 //! Parent-scoped HTTP plus a child process keeps existing OAuth fixture env local.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::disallowed_methods
+)]
 
 use super::OpenAiProviderRuntime;
 use axum::extract::State;

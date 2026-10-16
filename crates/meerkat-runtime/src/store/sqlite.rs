@@ -17079,7 +17079,7 @@ ORDER BY runtime_id";
     }
 
     #[cfg(test)]
-    #[allow(clippy::expect_used, clippy::unwrap_used)]
+    #[allow(clippy::expect_used, clippy::unwrap_used, clippy::disallowed_methods)]
     mod tests {
         use tempfile::TempDir;
 

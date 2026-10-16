@@ -1,4 +1,9 @@
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::disallowed_methods
+)]
 use super::*;
 use crate::transport::sse::{
     ReqwestSseClient, SseClient, SseClientConfig, SseClientTransport, SseTransportError,

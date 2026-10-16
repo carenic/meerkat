@@ -1,5 +1,10 @@
 #![cfg(feature = "integration-real-tests")]
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::disallowed_methods
+)]
 use std::path::PathBuf;
 use tokio::process::Command;
 use tokio::time::{Duration, timeout};

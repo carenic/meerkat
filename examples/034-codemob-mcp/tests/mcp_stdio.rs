@@ -1,3 +1,5 @@
+#![allow(clippy::disallowed_methods)]
+
 #[test]
 fn real_binary_stdio_contract() {
     let output = std::process::Command::new("python3")

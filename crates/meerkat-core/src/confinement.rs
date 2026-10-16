@@ -429,6 +429,8 @@ impl HostLaunchExemption {
         untrusted: Option<&UntrustedPathFn>,
     ) -> std::process::Command {
         let _ = self;
+        // The one command every exemption's fixed-program constructor builds.
+        #[allow(clippy::disallowed_methods)]
         let mut command = std::process::Command::new(program);
         command.env_clear();
         match untrusted {

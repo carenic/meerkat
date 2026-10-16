@@ -9,7 +9,12 @@
 //! OS, and the server still serves. The operator's `--confinement
 //! trusted-host` replaces the documents, so nothing is reported.
 
-#![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
+#![allow(
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unwrap_used,
+    clippy::disallowed_methods
+)]
 
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read, Write};

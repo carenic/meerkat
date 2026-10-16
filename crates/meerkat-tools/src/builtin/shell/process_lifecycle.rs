@@ -280,6 +280,7 @@ pub(super) async fn join_reader_bounded(mut handle: JoinHandle<()>, label: &str)
 }
 
 #[cfg(all(test, unix))]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     #[cfg(target_os = "macos")]

@@ -116,6 +116,8 @@ impl SpawnGate {
             .as_ref()
             .map(AsRawFd::as_raw_fd)
             .ok_or_else(|| std::io::Error::other("spawn gate already consumed"))?;
+        // A launch site: the gate shell of the shell's trusted-host branch.
+        #[allow(clippy::disallowed_methods)]
         let mut cmd = Command::new(GATE_SHELL);
         cmd.arg("-c")
             .arg(GATE_PROLOGUE)

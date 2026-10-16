@@ -5498,6 +5498,7 @@ rust_test(
     size = "medium",
     data = [
         ":package_runfiles",
+        "//:clippy_config",
         "//crates/meerkat-agent-build-authority:package_runfiles",
         "//crates/meerkat-anthropic:package_runfiles",
         "//crates/meerkat-atif:package_runfiles",

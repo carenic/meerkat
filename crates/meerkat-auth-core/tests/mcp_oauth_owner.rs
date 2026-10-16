@@ -1,5 +1,10 @@
 #![cfg(all(not(target_arch = "wasm32"), feature = "oauth"))]
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::disallowed_methods
+)]
 
 // The test crate and runtime depend on the SAME normal auth-core library.
 // Keeping these cases in lib-test would duplicate its OAuth trait identity.

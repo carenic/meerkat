@@ -1,3 +1,7 @@
+// Example code: the workspace's process launch lint (`clippy.toml`) is for
+// Meerkat's shipped crates.
+#![allow(clippy::disallowed_methods)]
+
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::Arc;

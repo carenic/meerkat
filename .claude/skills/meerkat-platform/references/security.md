@@ -311,7 +311,9 @@ confinement they run with the host's environment as it is
 (`HostConfinement::launch_guard` is `None`).
 
 A source test fails on any process launch in shipped code that is neither
-confined nor in this list.
+confined nor in this list, and Clippy (`disallowed_methods` in the workspace
+`clippy.toml`) refuses every process-launch API outside the sites that test
+lists.
 
 ### Platforms
 

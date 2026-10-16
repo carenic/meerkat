@@ -1,3 +1,6 @@
+// Developer tooling, never shipped: it runs git, cargo and other tools itself.
+#![allow(clippy::disallowed_methods)]
+
 pub mod audit_generated_headers;
 pub mod bridge_classifier;
 pub mod effect_authority;

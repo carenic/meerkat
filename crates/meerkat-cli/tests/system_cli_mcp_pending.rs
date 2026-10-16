@@ -1,5 +1,10 @@
 #![cfg(feature = "integration-real-tests")]
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::disallowed_methods
+)]
 //! Real-binary journey regression for the 0.8.21 resume wedge: a first turn
 //! run beside a slow-connecting MCP server commits the synthetic
 //! `[MCP_PENDING]` notice inside the HeadCanonical boundary prefix; resumed

@@ -50,6 +50,21 @@ them.
   (`HostConfinement::launch_guard`), `None` for a host that confines no launch
   kind. `rkat` opens every browser with it.
 
+### Changed
+
+- Clippy refuses every API that starts a process: the new workspace
+  `clippy.toml` disallows `std::process::Command::new`,
+  `tokio::process::Command::new`, `CommandExt::exec`, the `libc` `fork`,
+  `vfork`, `clone`, `exec*`, `posix_spawn*`, `system` and `popen` functions,
+  `nix::unistd::fork` and `exec*`, and `webbrowser::open*`, including when a
+  call goes through an aliased import or a re-export the source test cannot
+  see. Shipped code allows the lint only at the launch sites
+  `crates/meerkat/tests/host_launch_sites.rs` lists, once per launch
+  expression, and that test now checks it, so `SITES` stays the one list;
+  each host launch exemption keeps its one fixed-program constructor. Test
+  code, the `xtask` developer tooling and the examples allow the lint for
+  themselves.
+
 ### Deprecated
 
 - `meerkat::open_system_browser`

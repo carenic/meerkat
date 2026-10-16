@@ -119,6 +119,14 @@ filegroup(
     visibility = ["//visibility:public"],
 )
 
+# The workspace Clippy configuration, for tests that read what it
+# disallows (the process launch site inventory).
+filegroup(
+    name = "clippy_config",
+    srcs = ["clippy.toml"],
+    visibility = ["//visibility:public"],
+)
+
 filegroup(
     name = "workspace_runfiles",
     srcs = ["BUILD.bazel"] + glob(

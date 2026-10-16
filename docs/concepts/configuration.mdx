@@ -799,7 +799,12 @@ no launch kind has no confined process to plant anything, and runs them
 with its own environment as it is.
 
 A test of the source enumerates every process launch in shipped code and
-fails on one that is neither confined nor in this list.
+fails on one that is neither confined nor in this list. Clippy enforces it
+too: the workspace `clippy.toml` disallows every API that starts a process
+(`Command::new`, `exec`, `fork`, `posix_spawn`, `system`, `popen` and the
+like), and shipped code allows that lint only at the launch sites the test
+lists, so a launch the text scan cannot see, such as one through an aliased
+import, still fails the build's lint.
 
 ### Operator flags
 

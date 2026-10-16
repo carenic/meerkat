@@ -515,6 +515,9 @@ impl StdioChildCustody {
                 }
             }
             None => {
+                // A launch site: the trusted-host branch of an unconfined
+                // `mcp_stdio` launch.
+                #[allow(clippy::disallowed_methods)]
                 let mut cmd = Command::new(&stdio.command);
                 cmd.args(&stdio.args);
                 for (key, value) in &stdio.env {

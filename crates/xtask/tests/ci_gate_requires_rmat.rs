@@ -1,4 +1,4 @@
-#![allow(clippy::expect_used, clippy::panic)]
+#![allow(clippy::expect_used, clippy::panic, clippy::disallowed_methods)]
 
 //! Pinning tests for the CI workflow contract.
 //!
