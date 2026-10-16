@@ -4,7 +4,7 @@ description: "Configuration reference for Meta: module definitions, runtime opti
 icon: "gear"
 ---
 
-*Mirrored from MobKit main at [1fc1338dd988](https://github.com/lukacf/meerkat-meta/commit/1fc1338dd988f661e464e354496957651580fc87) on 2026-10-15; MobKit workspace version 0.9.1 at that commit.*
+*Mirrored from MobKit main at [334afa5be1d8](https://github.com/lukacf/meerkat-meta/commit/334afa5be1d8ec4aab76ee90e3b9c2dddf0b445e) on 2026-10-17; MobKit workspace version 0.9.2 at that commit.*
 
 Meta is configured through Rust types passed at startup. This page documents every configuration surface.
 
@@ -1076,6 +1076,15 @@ of reporting the previous launch's. On `rpc_gateway`, top-level `http_listen`,
 `allow_remote`, `http_public_base_url`, and `meerkat_config_path` are refused
 with `-32602` naming their `runtime_options.*` home. See
 [Deployment](/mobkit/guides/deployment).
+
+Both gateways also take `--allow-flow-editor-host-deploy` (on `rpc_gateway`
+with `--persistent`). Without an enforced access controller, the Flow Editor
+on the gateway's listener refuses deploys with `execute: true` and validation
+with `rkat_validate: true`, because both run `rkat` on the host; the flag
+allows them for every caller the route admits. It is launch-only, and on
+`meta_gateway` it joins the resume fingerprint. Rust hosts use
+`allow_flow_editor_host_deploy(true)` on `UnifiedRuntimeBuilder` or
+`UnifiedRuntime`. See [Flow Editor](/mobkit/guides/flow-editor).
 
 ### Console auth by surface
 
