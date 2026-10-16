@@ -163,6 +163,25 @@ them.
   files, only a forward patch release qualifies, and a CHANGELOG over 1 MiB
   no longer makes classification fail.
 
+### Fixed
+
+- `meerkat-runtime`: a retained continuation produced during an already
+  resumed run is admitted to the same original instead of being refused as
+  `no_admissible_work_binding`. The resumed run's identity names the
+  original contributors, but its selected row is the staged resume input,
+  which resolution refused because it is not a contributor. Resolution now
+  accepts such a selected row only from the runtime's own row under that
+  key: an admitted retained resume whose carried originals equal a
+  contiguous, same-order window of the contributors resolved from their own
+  rows (full digest comparison), whose recorded identity names those
+  originals, and whose selected binding and batch key are the ones
+  recomputed from its canonical original. Anything else is still refused,
+  and the host still checks current authorization for every original. As
+  before for the contributors, this proves the rows still exist and are
+  exact; it does not prove that the selected row was staged in that run. The
+  same resolution backs MCP observation of retained work, which now resolves
+  for a resumed run too.
+
 ## [0.9.1] - 2026-10-15
 
 ### Breaking
