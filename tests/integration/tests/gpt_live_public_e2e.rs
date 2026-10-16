@@ -7830,24 +7830,28 @@ fn assistant_row_text(row: &Value) -> String {
 }
 
 /// The assistant speech of one `block_assistant` history row: the text of its
-/// `transcript` and `text` blocks, joined in block order. The runtime commits
-/// what a voice model says as `AssistantBlock::Transcript` (block type
-/// `transcript`, source `spoken`, or `spoken_unmeasured` without playback
-/// evidence) and display output as `text`; [`assistant_row_text`] reads only
-/// the latter, so it finds no voice-model speech.
+/// `transcript` blocks, joined in block order, or of its `text` blocks when it
+/// has no transcript. The runtime commits what a voice model says as
+/// `AssistantBlock::Transcript` (block type `transcript`, source `spoken`, or
+/// `spoken_unmeasured` without playback evidence) and display output as
+/// `text`; [`assistant_row_text`] reads only the latter, so it finds no
+/// voice-model speech. A row carrying both is read once, from its spoken
+/// record, so the same words in both cannot count as two responses.
 fn assistant_speech_text(row: &Value) -> String {
-    row["blocks"]
+    let blocks = row["blocks"]
         .as_array()
-        .map(|blocks| {
-            blocks
-                .iter()
-                .filter(|block| {
-                    block["block_type"] == "transcript" || block["block_type"] == "text"
-                })
-                .filter_map(|block| block["data"]["text"].as_str())
-                .collect::<Vec<_>>()
-                .join("")
-        })
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let joined = |block_type: &str| {
+        let texts: Vec<&str> = blocks
+            .iter()
+            .filter(|block| block["block_type"] == block_type)
+            .filter_map(|block| block["data"]["text"].as_str())
+            .collect();
+        (!texts.is_empty()).then(|| texts.join(""))
+    };
+    joined("transcript")
+        .or_else(|| joined("text"))
         .unwrap_or_default()
 }
 
@@ -14320,6 +14324,35 @@ mod config_tests {
         assert_eq!(
             super::s101_committed_responses(&shown, &shown_at, &heard),
             [true, true, true]
+        );
+
+        // A row holding a spoken transcript and display text with the same
+        // words is one committed occurrence: it satisfies one heard
+        // "Okay." after the utterance, not two.
+        let both = serde_json::to_value(meerkat_contracts::WireSessionMessage::from(
+            Message::BlockAssistant(BlockAssistantMessage::new(
+                vec![
+                    AssistantBlock::Transcript {
+                        text: "Okay.".to_owned(),
+                        source: TranscriptSource::Spoken,
+                        meta: None,
+                    },
+                    AssistantBlock::Text {
+                        text: "Okay.".to_owned(),
+                        meta: None,
+                    },
+                ],
+                StopReason::EndTurn,
+            )),
+        ))
+        .unwrap();
+        let once = [
+            serde_json::json!({"role": "user", "content": "utterance"}),
+            both,
+        ];
+        assert_eq!(
+            super::s101_committed_responses(&once, &[0], &[("Okay.", 1), ("Okay.", 1)]),
+            [true, false]
         );
     }
 
