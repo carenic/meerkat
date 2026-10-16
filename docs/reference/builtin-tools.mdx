@@ -1535,7 +1535,7 @@ Send a response to a previously received request from a trusted peer. Requires a
 **Default enabled:** Yes (when comms is active and runtime command authority is attached)
 
 <ParamField body="peer_id" type="String" required>
-  Canonical peer ID from the `peers` tool.
+  Canonical peer ID of the peer that sent the request.
 </ParamField>
 
 <ParamField body="display_name" type="String">
@@ -1565,6 +1565,15 @@ Send a response to a previously received request from a trusted peer. Requires a
 ```json
 { "status": "sent", "kind": "peer_response", "receipt": { ... } }
 ```
+
+A response, progress or terminal, goes only to the request's requester: the
+canonical peer ID of the key that signed the request's envelope, which the
+runtime records when the request arrives (under open auth,
+`require_peer_auth = false`, the key the envelope declares). A `peer_id` that
+is not the requester fails with `invalid_arguments` and nothing is sent; the
+request stays open. `display_name` never changes the addressee. A request ID
+this session did not receive or has already answered fails with
+`execution_failed`, as before.
 
 **Source:** `crates/meerkat-comms/src/mcp/tools.rs`
 </Accordion>

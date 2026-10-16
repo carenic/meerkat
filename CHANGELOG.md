@@ -35,6 +35,120 @@ them.
 
 ## [Unreleased]
 
+### Breaking
+
+- `meerkat-core`: `PeerInteractionHandle::request_received` takes a third
+  parameter, `requester: PeerId`: the canonical peer id of the inbound
+  request's sender as ingress admitted it, never a field of the request's
+  payload. A caller holding the admitted `PeerInputCandidate` calls the new
+  provided `PeerInteractionHandle::request_received_from_ingress` instead,
+  which passes `PeerInputCandidate::from_peer_id`. `PeerInteractionHandle`
+  gains the required method `resolve_response_addressee(corr_id, addressee)
+  -> Result<PeerResponseAddresseeVerdict, DslTransitionError>`: an
+  implementor answers, from the requester it recorded, whether a response to
+  that inbound request may go to `addressee`. A handle that cannot judge
+  returns an error, which `CommsRuntime::send` treats as a refusal (see
+  Fixed).
+- `meerkat-machine-kernels`: generated machine-authority enums whose variants
+  were added, so their implicit discriminants change (`EffectKind::*`,
+  `SignalKind::*` and `TransitionId::*`); match them by variant name, not by
+  numeric cast or position.
+- `meerkat-machine-kernels`: new public fields on exhaustively constructible
+  structs (struct literals need them): `State` gains
+  `inbound_peer_request_requesters`; `inputs::PeerRequestReceived` gains
+  `requester`.
+- `meerkat-machine-kernels`: new variants on exhaustive enums (exhaustive
+  matches need arms for them): `Effect` gains `PeerResponseAddresseeResolved`;
+  `EffectKind` gains `PeerResponseAddresseeResolved`; `Signal` gains
+  `ResolvePeerResponseAddressee`; `SignalKind` gains
+  `ResolvePeerResponseAddressee`; `TransitionId` gains
+  `ResolvePeerResponseAddresseeRequesterIdle`,
+  `ResolvePeerResponseAddresseeRequesterAttached`,
+  `ResolvePeerResponseAddresseeRequesterRunning`,
+  `ResolvePeerResponseAddresseeRequesterRetired`,
+  `ResolvePeerResponseAddresseeRequesterStopped`,
+  `ResolvePeerResponseAddresseeRequesterDestroyed`,
+  `ResolvePeerResponseAddresseeNotRequesterIdle`,
+  `ResolvePeerResponseAddresseeNotRequesterAttached`,
+  `ResolvePeerResponseAddresseeNotRequesterRunning`,
+  `ResolvePeerResponseAddresseeNotRequesterRetired`,
+  `ResolvePeerResponseAddresseeNotRequesterStopped`,
+  `ResolvePeerResponseAddresseeNotRequesterDestroyed`,
+  `ResolvePeerResponseAddresseeUnknownRequestIdle`,
+  `ResolvePeerResponseAddresseeUnknownRequestAttached`,
+  `ResolvePeerResponseAddresseeUnknownRequestRunning`,
+  `ResolvePeerResponseAddresseeUnknownRequestRetired`,
+  `ResolvePeerResponseAddresseeUnknownRequestStopped` and
+  `ResolvePeerResponseAddresseeUnknownRequestDestroyed`.
+- `meerkat-machine-schema` and `meerkat-runtime` (`meerkat_machine::dsl`):
+  generated machine-authority enums whose variants were added, so their
+  implicit discriminants change (`MeerkatMachineEffect::*`,
+  `MeerkatMachineEffectVariant::*`, `MeerkatMachineSignal::*` and
+  `MeerkatMachineSignalVariant::*`) and so does the `PartialOrd` order of
+  `MeerkatMachineEffectVariant::*` and `MeerkatMachineSignalVariant::*`;
+  match them by variant name, not by numeric cast or position.
+- `meerkat-machine-schema` and `meerkat-runtime`: a new public field on an
+  exhaustively constructible struct (struct literals need it):
+  `MeerkatMachineState` gains `inbound_peer_request_requesters`.
+- `meerkat-machine-schema` and `meerkat-runtime`: a new field on an enum
+  struct variant (literals and patterns without `..` need it):
+  `MeerkatMachineInput::PeerRequestReceived` gains `requester`.
+- `meerkat-machine-schema` and `meerkat-runtime`: new variants on exhaustive
+  enums (exhaustive matches need arms for them): `MeerkatMachineEffect` gains
+  `PeerResponseAddresseeResolved`; `MeerkatMachineEffectVariant` gains
+  `PeerResponseAddresseeResolved`; `MeerkatMachineSignal` gains
+  `ResolvePeerResponseAddressee`; `MeerkatMachineSignalVariant` gains
+  `ResolvePeerResponseAddressee`.
+
+### Added
+
+- `meerkat-core`: `PeerResponseAddresseeVerdict` (`UnknownRequest`,
+  `Requester`, `NotRequester`; non-exhaustive), the machine's verdict on a
+  response's addressee; `PeerInteractionHandle::request_received_from_ingress`;
+  and `SendError::ResponseAddresseeNotRequester { in_reply_to, addressee }`
+  (`SendError` is non-exhaustive).
+- `meerkat-comms`: `handle_tools_call_typed`, the comms tool handler that
+  keeps a refusal's tool error class as `CommsToolCallError`
+  (`InvalidArguments`, `Failed`, with `into_tool_error`); the comms tool
+  dispatchers report through it. `handle_tools_call` and
+  `handle_tools_call_with_context` keep their `String` errors.
+- `meerkat-machine-schema`, `meerkat-runtime` and `meerkat-machine-kernels`:
+  the MeerkatMachine `inbound_peer_request_requesters` state map, the
+  read-only `ResolvePeerResponseAddressee` signal, its
+  `PeerResponseAddresseeResolved` effect, the `PeerResponseAddresseeVerdict`
+  machine enum, and the invariant
+  `inbound_peer_request_requesters_match_requests` (the requesters map has
+  exactly the keys of the inbound requests map).
+
+### Fixed
+
+- A peer response, progress or terminal, goes only to the peer that sent the
+  request it answers. MeerkatMachine records each inbound request's
+  requester, the canonical peer id of the envelope's signing key that
+  ingress admitted (never a payload field, display label or `from_route`),
+  at the generated transition that admits the request, and removes it with
+  the terminal reply. `CommsRuntime::send` asks the machine
+  (`ResolvePeerResponseAddressee`) before any transport and refuses a
+  `PeerResponse` addressed to any other peer with
+  `SendError::ResponseAddresseeNotRequester`: nothing is sent and the
+  request stays answerable, so a response to the requester still goes
+  through. This covers the agent `send_response` tool, host `comms/send`
+  (`peer_response`) and the mob responders. The tool reports the refusal as
+  `invalid_arguments` (its other refusals stay `execution_failed`); host
+  `comms/send` reports it as `send_failed`, with no wire change. The
+  addressee is compared as the canonical `PeerId` the transport routes by;
+  `display_name` never addresses a response. A response to a request id
+  this session never received, already answered, or received before a
+  restart keeps its unchanged refusal (`SendError::Validation`;
+  `execution_failed` from the tool, `send_failed` from `comms/send`). The
+  record is not persisted, as the inbound request map it belongs to is not:
+  after a restart no earlier request is answerable. With peer auth required,
+  ingress verifies the envelope's signature, so the requester is the holder
+  of that key; under open auth (`require_peer_auth = false`) it is the key
+  the envelope declares, the same identity trust and routing use in that
+  mode. Before, the runtime checked only that the request id named a request
+  this session had received and could still answer.
+
 ## [0.9.2] - 2026-10-16
 
 ### Breaking
