@@ -990,9 +990,11 @@ them.
   the session keeps it unless the resume sets its own. Omitted, `null` or
   `0` keep the realm's configured value.
 - The release semver gate (`make semver-breaks`) reads cargo-semver-checks'
-  `type_marked_deprecated` findings, a struct, enum, union or trait newly
-  marked `#[deprecated]` (reported as `Struct PeersTool in <file>:<line>`).
-  `scripts/check_semver_breaks.py` had no reader for that shape, so such a
+  `type_marked_deprecated` and `function_marked_deprecated` findings: a
+  struct, enum, union or trait newly marked `#[deprecated]` (reported as
+  `Struct PeersTool in <file>:<line>`) and a newly deprecated function
+  (`function meerkat::mcp::standalone_router in <file>:<line>`).
+  `scripts/check_semver_breaks.py` had no reader for those shapes, so such a
   deprecation failed the gate as unreadable even when `### Deprecated` named
   it.
 - An ordinary config write can no longer cut a realm from the ancestors

@@ -382,6 +382,10 @@ STRUCTURAL_EXTRACTORS = {
     # on the 0.9.2 integration report for meerkat-tools' `Struct PeersTool`).
     # Names only the type.
     "type_marked_deprecated": _symbols_type_marked_deprecated,
+    # "function <path> in <file>:<line>", the function_missing shape (v0.50.0
+    # template; first seen on the 0.9.2 integration report for
+    # `meerkat::mcp::standalone_router`). Names only the function.
+    "function_marked_deprecated": _symbols_function_missing,
 }
 
 
