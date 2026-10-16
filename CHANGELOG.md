@@ -378,6 +378,14 @@ them.
   could write (or a config-tool client) could run a command on the host
   through the ssh-key path. The Git skills scan root is also not walked when
   a link leads it out of the checkout.
+- The governed `rkat-rpc` route builds its controller client and its
+  reviewer through the host's confinement, as it already built the
+  connection factory, so a credential command either names runs as the host
+  under the same guard: one whose program a confined process could change is
+  refused, and (under confinement) it is cleaned of the paths and variables
+  a confined process could change. Before, the controller and reviewer
+  factories were built without confinement, so a governed realm's credential
+  command skipped the guard and kept the full environment.
 - The programs a host runs as itself no longer inherit a module or library
   path a confined process could change. With `rkat` run from a shell whose
   `PYTHONPATH` or `LD_LIBRARY_PATH` points into the workspace, a confined

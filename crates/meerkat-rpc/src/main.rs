@@ -945,8 +945,12 @@ async fn serve_stock_governed_jsonl(
     )?;
     config.agent.model = resolution.model.clone();
     let realm_paths = meerkat_store::realm_paths_in(&locator.state_root, locator.realm.as_str());
+    // The controller client resolves the realm's default binding: a
+    // credential command it names runs as the host, so it is refused and
+    // cleaned by the same confinement the connection factory installs.
     let client = AgentFactory::new(realm_paths.root.clone())
         .runtime_root(realm_paths.root.clone())
+        .with_host_confinement(&host_confinement)
         .build_llm_client_for_identity(
             &config,
             &meerkat_core::SessionLlmIdentity {
@@ -1021,8 +1025,11 @@ async fn serve_stock_governed_jsonl(
     // The realm owner's operation review: its configured reviewer is built
     // through the same full factory as the controller, and this pipe's
     // operator decides R3, through the persistence's one approval issuer.
-    let reviewer_factory =
-        AgentFactory::new(realm_paths.root.clone()).runtime_root(realm_paths.root.clone());
+    // The reviewer resolves its own binding's credential as the host too, so
+    // it carries the same confinement.
+    let reviewer_factory = AgentFactory::new(realm_paths.root.clone())
+        .runtime_root(realm_paths.root.clone())
+        .with_host_confinement(&host_confinement);
     let setup = meerkat_rpc::governed_jsonl::stock::stock_governed_jsonl_setup_reviewed(
         &governance,
         config,

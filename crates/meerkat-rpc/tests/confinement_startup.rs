@@ -614,3 +614,96 @@ fn rkat_rpc_mcp_auth_refuses_a_server_only_an_untrusted_mcp_toml_defines() {
         responses[&2]
     );
 }
+
+/// The governed JSONL route resolves the realm's default binding to build
+/// its controller client at startup. A credential command it names runs as
+/// the host, outside confinement, so a host that confines its launches
+/// refuses one whose program a confined process could change: the governed
+/// controller factory installs the same confinement as the connection
+/// factory, so startup is refused instead of running the command.
+#[cfg(feature = "local-authorization")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_governed_route_credential_command_under_confinement_is_refused() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let binary = rkat_rpc_binary();
+    let temp = TempDir::new().expect("temp dir");
+    let base = temp.path().canonicalize().expect("canonical temp");
+    let state = base.join("state");
+    let user_root = base.join("user");
+    let home = base.join("home");
+    let writable = base.join("writable");
+    for dir in [&state, &user_root, &home, &writable, &home.join(".config")] {
+        std::fs::create_dir_all(dir).expect("directory should initialize");
+    }
+    // The realm's default-binding credential is a command whose program
+    // lives under the only write grant.
+    let helper = writable.join("helper.sh");
+    std::fs::write(&helper, "#!/bin/sh\nprintf 'sk-governed-token'\n").expect("helper");
+    std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+    const REALM: &str = "governed-cmd";
+    drop(
+        meerkat::open_realm_persistence_with_provider(
+            &meerkat::DiskStorageProvider,
+            &state,
+            REALM,
+            Some(meerkat_store::RealmBackend::Sqlite),
+            None,
+            None,
+        )
+        .await
+        .expect("materialize the realm"),
+    );
+    let realm = meerkat_core::connection::RealmId::parse(REALM).expect("realm id");
+    meerkat::governed_realm::stock::govern_stock_realm(
+        &state,
+        REALM,
+        &meerkat::governed_realm::stock::StockPrincipals::for_local_operator(&realm)
+            .expect("local operator principals"),
+    )
+    .await
+    .expect("govern the realm");
+
+    let document = state.join(REALM).join("config.toml");
+    std::fs::write(
+        &document,
+        format!(
+            "[confinement.all]\nmode = \"custom\"\nworking_directory = \"{home}\"\nrequirement = {{ baseline = \"command_runtime_v1\", read = {{ kind = \"paths\", paths = [{{ kind = \"subtree\", path = \"{writable}\" }}] }}, write = {{ kind = \"paths\", paths = [{{ kind = \"subtree\", path = \"{writable}\" }}] }}, deny_read = [], deny_write = [], network = {{ kind = \"denied\" }}, unix_connect = [], require_descendant_termination = false }}\n\n[realm.{REALM}]\ndefault_binding = \"ctl\"\n\n[realm.{REALM}.backend.api]\nprovider = \"openai\"\nbackend_kind = \"openai_api\"\n\n[realm.{REALM}.auth.cmd]\nprovider = \"openai\"\nauth_method = \"api_key\"\nsource = {{ kind = \"command\", program = \"{helper}\" }}\n\n[realm.{REALM}.binding.ctl]\nbackend_profile = \"api\"\nauth_profile = \"cmd\"\ndefault_model = \"gpt-5.4\"\nprovider_default = true\n",
+            home = home.display(),
+            writable = writable.display(),
+            helper = helper.display(),
+        ),
+    )
+    .expect("realm document should be written");
+
+    let mut command = Command::new(&binary);
+    command
+        .current_dir(&base)
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .args([
+            "--realm",
+            REALM,
+            "--realm-backend",
+            "sqlite",
+            "--state-root",
+            state.to_str().expect("utf-8 state root"),
+            "--user-config-root",
+            user_root.to_str().expect("utf-8 user root"),
+        ]);
+    let (run, _) = run_rpc_command(command, &[]);
+
+    assert!(
+        !run.answered && !run.status.success(),
+        "the governed controller refuses a credential command its confinement flags; exit={:?} \
+         stderr:\n{}",
+        run.status,
+        run.stderr
+    );
+    assert!(
+        run.stderr.contains("credential command") || run.stderr.to_lowercase().contains("confined"),
+        "the refusal names the credential command; stderr:\n{}",
+        run.stderr
+    );
+}
