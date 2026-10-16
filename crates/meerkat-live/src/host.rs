@@ -1860,13 +1860,22 @@ impl LiveToolDispatchError {
             {
                 Self::Tool(ToolError::OperationObservationUnavailable)
             }
-            SessionError::Agent(meerkat_core::AgentError::Llm {
-                reason: meerkat_core::error::LlmFailureReason::ProviderError(ref provider),
-                ..
-            }) if provider.kind
+            SessionError::Agent(
+                ref agent @ meerkat_core::AgentError::Llm {
+                    reason: meerkat_core::error::LlmFailureReason::ProviderError(ref provider),
+                    ..
+                },
+            ) if provider.kind
                 == meerkat_core::error::LlmProviderErrorKind::OperationAuthorizationUnavailable =>
             {
-                Self::Tool(ToolError::OperationAuthorizationUnavailable)
+                // A required review a model request could not carry settles
+                // in this class. Keep its typed refusal so the live model gets
+                // the same review feedback as from any tool; a detail that
+                // does not decode stays authorization unavailable.
+                Self::Tool(agent.operation_review_refusal().map_or(
+                    ToolError::OperationAuthorizationUnavailable,
+                    ToolError::from,
+                ))
             }
             SessionError::NotFound { .. } => Self::SessionNotFound(session_id.clone()),
             SessionError::Unsupported(reason) => Self::Rejected(reason),
@@ -7813,6 +7822,175 @@ mod tests {
             "operation unavailable under current authorization",
         )
         .await;
+    }
+
+    /// An authority-unavailable model error carrying a settled review, in the
+    /// shape the LLM error projection gives it (`details.review`).
+    fn review_settled_model_error(
+        refusal: meerkat_core::OperationReviewRefusal,
+    ) -> meerkat_core::AgentError {
+        let error = meerkat_core::AgentError::llm(
+            "fixture",
+            meerkat_core::error::LlmFailureReason::ProviderError(
+                meerkat_core::error::LlmProviderError::non_retryable(
+                    meerkat_core::error::LlmProviderErrorKind::OperationAuthorizationUnavailable,
+                    serde_json::json!({ "review": refusal }),
+                ),
+            ),
+            refusal.to_string(),
+        );
+        assert_eq!(
+            error.operation_review_refusal(),
+            Some(refusal),
+            "the fixture is what core's own decoder reads"
+        );
+        error
+    }
+
+    /// Authority-unavailable model errors a session can fail a live tool
+    /// dispatch with, and the typed tool feedback each must give.
+    fn model_authority_cases() -> Vec<(&'static str, meerkat_core::AgentError, ToolError)> {
+        use meerkat_core::{OperationReviewRefusal, ReviewUnavailableKind, ReviewUnsatisfiedKind};
+        let r2 = OperationReviewRefusal::Unavailable {
+            kind: ReviewUnavailableKind::UnsupportedEntry,
+        };
+        let r3 = OperationReviewRefusal::Unsatisfied {
+            kind: ReviewUnsatisfiedKind::HumanConsentRequired,
+        };
+        let undecodable_review = meerkat_core::AgentError::llm(
+            "fixture",
+            meerkat_core::error::LlmFailureReason::ProviderError(
+                meerkat_core::error::LlmProviderError::non_retryable(
+                    meerkat_core::error::LlmProviderErrorKind::OperationAuthorizationUnavailable,
+                    serde_json::json!({"review": {"review": "not_a_settlement"}}),
+                ),
+            ),
+            "operation authorization unavailable",
+        );
+        vec![
+            ("r2", review_settled_model_error(r2), ToolError::from(r2)),
+            ("r3", review_settled_model_error(r3), ToolError::from(r3)),
+            (
+                "plain",
+                meerkat_core::AgentError::authorization_unavailable(),
+                ToolError::OperationAuthorizationUnavailable,
+            ),
+            (
+                "undecodable review",
+                undecodable_review,
+                ToolError::OperationAuthorizationUnavailable,
+            ),
+        ]
+    }
+
+    /// A settled model review keeps its typed refusal through the session
+    /// classification. Plain unavailability, and a review detail that does
+    /// not decode, stay authorization unavailable.
+    #[test]
+    fn model_review_settlement_session_mapping_keeps_its_typed_refusal() {
+        let sid = test_session_id();
+        let mismatches: Vec<_> = model_authority_cases()
+            .into_iter()
+            .filter_map(|(case, failure, expected)| {
+                let actual = match LiveToolDispatchError::from_session_error(
+                    &sid,
+                    meerkat_core::SessionError::Agent(failure),
+                ) {
+                    LiveToolDispatchError::Tool(error) => Ok(error),
+                    other => Err(format!("{other:?}")),
+                };
+                (actual != Ok(expected.clone())).then_some((case, actual, expected))
+            })
+            .collect();
+        assert!(mismatches.is_empty(), "{mismatches:#?}");
+    }
+
+    /// Fails each live tool call the way the production dispatchers report a
+    /// session failure: classified by `LiveToolDispatchError::from_session_error`.
+    struct SessionFailureDispatcher {
+        failure: StdMutex<Option<meerkat_core::AgentError>>,
+    }
+
+    #[async_trait]
+    impl LiveToolDispatcher for SessionFailureDispatcher {
+        async fn dispatch_live_tool_call(
+            &self,
+            session_id: &SessionId,
+            _call: ToolCall,
+        ) -> Result<ToolDispatchOutcome, LiveToolDispatchError> {
+            let failure = self
+                .failure
+                .lock()
+                .unwrap()
+                .take()
+                .expect("one dispatch per case");
+            Err(LiveToolDispatchError::from_session_error(
+                session_id,
+                meerkat_core::SessionError::Agent(failure),
+            ))
+        }
+    }
+
+    /// Through the live host, a settled model review reaches the live model as
+    /// the same typed review feedback any tool gives, and plain or undecodable
+    /// authority unavailability as `operation_authorization_unavailable`. Each
+    /// is an ordinary tool result, never a prose tool error.
+    #[tokio::test]
+    async fn model_review_settlement_reaches_live_feedback_as_typed_review() {
+        let mut mismatches = Vec::new();
+        for (case, failure, expected) in model_authority_cases() {
+            let sink = Arc::new(RecordingProjectionSink::default());
+            let dispatcher = Arc::new(SessionFailureDispatcher {
+                failure: StdMutex::new(Some(failure)),
+            });
+            let adapter = Arc::new(RecordingAdapter::default());
+            let host = LiveAdapterHost::new(Arc::clone(&sink) as _)
+                .with_live_tool_dispatcher(dispatcher as _);
+            let channel = host
+                .open_channel_with_generated_test_machine_authority(test_session_id())
+                .await
+                .unwrap();
+            host.attach_adapter(&channel, Arc::clone(&adapter) as _)
+                .await
+                .unwrap();
+            host.commit_status_with_generated_test_machine_authority(
+                &channel,
+                LiveAdapterStatus::Ready,
+            )
+            .await
+            .unwrap();
+            let outcome = host
+                .apply_observation(
+                    &channel,
+                    &LiveAdapterObservation::ToolCallRequested {
+                        provider_call_id: ToolCallId::new("governed-call"),
+                        tool_name: ToolName::new("calculator"),
+                        arguments: serde_json::json!({}),
+                    },
+                )
+                .await
+                .unwrap();
+            assert!(
+                matches!(outcome, ObservationOutcome::ToolCallDispatched { .. }),
+                "{case}: {outcome:?}"
+            );
+            assert!(
+                adapter.submitted_errors.lock().unwrap().is_empty(),
+                "{case}: typed feedback, not a prose tool error"
+            );
+            let submitted = adapter.submitted_results.lock().unwrap();
+            assert_eq!(submitted.len(), 1, "{case}");
+            assert_eq!(submitted[0].call_id.0, "governed-call", "{case}");
+            assert!(submitted[0].is_error, "{case}");
+            let payload: serde_json::Value =
+                serde_json::from_str(&meerkat_core::types::text_content(&submitted[0].content))
+                    .unwrap();
+            if payload != expected.to_error_payload() {
+                mismatches.push((case, payload, expected.to_error_payload()));
+            }
+            assert!(sink.terminal_errors.lock().unwrap().is_empty(), "{case}");
+        }
+        assert!(mismatches.is_empty(), "{mismatches:#?}");
     }
     // These controls exercise the existing dispatch and live-host owners.
     // JSON assertions allow the loss regression to compile before the carrier

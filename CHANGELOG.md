@@ -45,6 +45,13 @@ them.
   `LlmError::OperationAuthorizationUnavailable` for them (see Fixed). A host
   that branched on the old code or variant for these settlements must branch
   on the review ones.
+- Behaviour-only (not measured by the gate): a live tool call that its
+  session fails with a model request's settled review now reaches the live
+  model as `review_unavailable` (R2) or `review_unsatisfied` (R3) instead of
+  `operation_authorization_unavailable`, and
+  `LiveToolDispatchError::from_session_error` classifies it as
+  `LiveToolDispatchError::Tool` with `ToolError::ReviewUnavailable` or
+  `ToolError::ReviewUnsatisfied` (see Fixed).
 
 ### Fixed
 
@@ -63,6 +70,16 @@ them.
   gains no review support: its review entry stays unsupported and the
   installed reviewer is never asked. An owner that cannot decide the helper
   still gives `operation_authorization_unavailable`.
+- The live host gives the live model the same typed review feedback when a
+  session fails a live tool call with a model request's settled review (R2
+  `unsupported_entry`, R3 `human_consent_required`, carried in the
+  authority-unavailable model error's details).
+  `LiveToolDispatchError::from_session_error` classified every such error as
+  `ToolError::OperationAuthorizationUnavailable`; it now decodes the
+  settlement with core's `AgentError::operation_review_refusal` and gives
+  `ToolError::ReviewUnavailable` or `ToolError::ReviewUnsatisfied`. Plain
+  authority unavailability, and a review detail that does not decode, still
+  give `operation_authorization_unavailable`.
 
 ## [0.9.2] - 2026-10-16
 
