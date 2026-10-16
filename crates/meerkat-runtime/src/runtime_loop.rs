@@ -4921,6 +4921,10 @@ impl RuntimeLoopAuthorityBinding {
             .take_interrupted_tool_notices(&self.session_id)
             .await
         else {
+            #[cfg(any(test, feature = "test-support"))]
+            machine
+                .run_runtime_loop_after_empty_interrupted_notice_check_test_hook(&self.session_id)
+                .await;
             return;
         };
         let Some(handle) = executor.transcript_notice_handle() else {

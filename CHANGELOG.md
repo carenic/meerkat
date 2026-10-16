@@ -35,6 +35,21 @@ them.
 
 ## [Unreleased]
 
+### Fixed
+
+- An idle session recovered after an abrupt host stop records its typed
+  interrupted-run notice at attach even when its runtime loop checks for
+  owed notices before the attachment hands them over. The attach woke the
+  loop when it published and handed the notices to the session just after;
+  the loop runs on its own runtime, so it could spend that wake on a check
+  that found nothing and wait for the next input (the notice still reached
+  the model on that turn). The attachment now wakes the exact attached loop
+  again after the hand-off. `tool_process_custody_restart` forces that order
+  with two test-support gates (meerkat-runtime
+  `MeerkatMachine::arm_attachment_interrupted_notice_handoff_test_hook` and
+  `MeerkatMachine::arm_runtime_loop_after_empty_interrupted_notice_check_test_hook`,
+  doc-hidden).
+
 ## [0.9.2] - 2026-10-16
 
 ### Breaking
