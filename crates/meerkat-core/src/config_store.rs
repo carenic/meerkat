@@ -612,7 +612,10 @@ pub struct FileConfigStore {
     path: PathBuf,
     create_if_missing: bool,
     catalog: ModelCatalog,
-    realm_chain: Option<RealmChainGuard>,
+    // The realm chain's documents are a shared source, which a panic cannot
+    // leave half-changed, so the store stays `UnwindSafe` and
+    // `RefUnwindSafe`.
+    realm_chain: Option<std::panic::AssertUnwindSafe<RealmChainGuard>>,
 }
 
 impl FileConfigStore {
@@ -680,7 +683,10 @@ impl FileConfigStore {
         head: crate::connection::RealmId,
         documents: Arc<dyn RealmConfigSource>,
     ) -> Self {
-        self.realm_chain = Some(RealmChainGuard { head, documents });
+        self.realm_chain = Some(std::panic::AssertUnwindSafe(RealmChainGuard {
+            head,
+            documents,
+        }));
         self
     }
 
@@ -2037,6 +2043,14 @@ mod tests {
             .patch(ConfigDelta(serde_json::json!({"max_tokens": 2048})))
             .await
             .expect("an unrelated edit of the user document commits");
+    }
+
+    /// A store keeps the auto traits it had before it could declare a realm
+    /// chain.
+    #[test]
+    fn the_file_store_stays_unwind_safe() {
+        fn unwind_safe<T: std::panic::UnwindSafe + std::panic::RefUnwindSafe>() {}
+        unwind_safe::<FileConfigStore>();
     }
 
     /// A credential command runs as the host, outside its confinement, so it

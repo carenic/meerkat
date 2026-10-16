@@ -79,7 +79,9 @@ pub struct GitSkillSource {
     checkout_dir: PathBuf,
     cache: Arc<RwLock<RemoteCache>>,
     failure_streak: Arc<RwLock<u32>>,
-    untrusted: Option<crate::UntrustedPaths>,
+    // A shared predicate, which a panic cannot leave half-changed, so the
+    // source stays `UnwindSafe` and `RefUnwindSafe`.
+    untrusted: Option<std::panic::AssertUnwindSafe<crate::UntrustedPaths>>,
 }
 
 impl GitSkillSource {
@@ -110,7 +112,7 @@ impl GitSkillSource {
     /// confined process put there.
     #[must_use]
     pub fn with_untrusted_paths(mut self, untrusted: crate::UntrustedPaths) -> Self {
-        self.untrusted = Some(untrusted);
+        self.untrusted = Some(std::panic::AssertUnwindSafe(untrusted));
         self
     }
 
@@ -301,7 +303,14 @@ impl GitSkillSource {
             }
             _ => None,
         };
-        run_git_command(args, cwd, ssh_command.as_deref(), self.untrusted.as_deref())
+        run_git_command(
+            args,
+            cwd,
+            ssh_command.as_deref(),
+            self.untrusted
+                .as_ref()
+                .map(|untrusted| untrusted.0.as_ref()),
+        )
     }
 
     fn authenticated_url(&self) -> String {
@@ -587,6 +596,16 @@ mod tests {
             .map(|descriptor| descriptor.key.skill_name.as_str())
             .collect();
         assert_eq!(names, vec!["kept-skill"]);
+    }
+
+    /// The skill sources keep the auto traits they had before they took a
+    /// host's judgement or runner.
+    #[test]
+    fn skill_sources_stay_unwind_safe() {
+        fn unwind_safe<T: std::panic::UnwindSafe + std::panic::RefUnwindSafe>() {}
+        unwind_safe::<GitSkillSource>();
+        unwind_safe::<crate::source::FilesystemSkillSource>();
+        unwind_safe::<crate::source::StdioExternalClient>();
     }
 
     /// Discovery never descends through a link, so a link in a repository

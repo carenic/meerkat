@@ -66,7 +66,11 @@ pub enum CommandCredentialError {
 pub struct CommandCredentialRunner {
     spec: CommandCredentialSpec,
     cache: Mutex<Option<(PersistedTokens, Instant)>>,
-    untrusted: Option<std::sync::Arc<meerkat_core::confinement::UntrustedPathFn>>,
+    // A shared predicate, which a panic cannot leave half-changed, so the
+    // runner stays `UnwindSafe`.
+    untrusted: Option<
+        std::panic::AssertUnwindSafe<std::sync::Arc<meerkat_core::confinement::UntrustedPathFn>>,
+    >,
 }
 
 impl CommandCredentialRunner {
@@ -89,7 +93,7 @@ impl CommandCredentialRunner {
         mut self,
         untrusted: std::sync::Arc<meerkat_core::confinement::UntrustedPathFn>,
     ) -> Self {
-        self.untrusted = Some(untrusted);
+        self.untrusted = Some(std::panic::AssertUnwindSafe(untrusted));
         self
     }
 
@@ -119,14 +123,18 @@ impl CommandCredentialRunner {
         // process could change before it gets here.
         let mut command = meerkat_core::HostLaunchExemption::credential_command(
             &self.spec.program,
-            self.untrusted.as_deref(),
+            self.untrusted
+                .as_ref()
+                .map(|untrusted| untrusted.0.as_ref()),
         );
         // The configured environment is the operator's own; a value naming a
         // path a confined process could change is still not passed on.
         meerkat_core::confinement::apply_configured_environment(
             &mut command,
             &self.spec.env,
-            self.untrusted.as_deref(),
+            self.untrusted
+                .as_ref()
+                .map(|untrusted| untrusted.0.as_ref()),
         );
         let mut cmd = Command::from(command);
         cmd.args(&self.spec.args)
@@ -179,6 +187,14 @@ impl CommandCredentialRunner {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    /// The runner keeps the auto trait it had before it took a host's
+    /// judgement.
+    #[test]
+    fn the_runner_stays_unwind_safe() {
+        fn unwind_safe<T: std::panic::UnwindSafe>() {}
+        unwind_safe::<CommandCredentialRunner>();
+    }
 
     #[test]
     fn command_credential_spec_debug_redacts_args_and_env_values() {
