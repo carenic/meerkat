@@ -166,8 +166,8 @@
 // integration suites their paths select, exactly as an ordinary plan would
 // run them, plus a unit row (`--lib --bins`) for each reader package and for
 // meerkat-contracts, which owns ContractVersion::CURRENT: an ordinary plan
-// leaves lib tests to the pre-push hook, and the hook reuses the parent's
-// evidence for a projection. The SDK and example suites are reused; what a
+// leaves lib tests to the push-to-main unit lanes, which a projection does
+// not run (it reuses the parent's run). The SDK and example suites are reused; what a
 // version bump can break in them is a test or source that pins a version,
 // and the evidence finder refuses reuse when anything outside the
 // projection pins the old or new version (scripts/release-version-pins.mjs).
@@ -1175,8 +1175,8 @@ function packShards(pkgs, weights, maxShards, model = null) {
     .sort((a, b) => b.estimated_cost - a.estimated_cost || a.name.localeCompare(b.name));
 }
 
-// The hook's kind(lib) lane: the one a plan without a lib row leaves to the
-// hook.
+// The lane script's kind(lib) lane: the one a plan without a lib row leaves
+// to the push-to-main and nightly unit lanes.
 function hookLibLane(hook) {
   const lanes = hook.lanes.filter((lane) => lane.filter === "kind(lib)");
   if (lanes.length !== 1) {
@@ -1244,7 +1244,7 @@ function hookParityRows({ scope, byName, unified, model, maxTestRows, nextestTex
     byName.get(name).targets.some((target) => target.test !== false && target.kind.some((kind) => LIB_TARGET_KINDS.has(kind)));
 
   // Lib tests: one row, on the runner that can build it in time (none
-  // given: the hook keeps its kind(lib) lane). `--workspace --lib` builds
+  // given: the plan leaves the kind(lib) lane to the unit lanes). `--workspace --lib` builds
   // every member's lib test; no stable selection builds fewer under the
   // same resolution, so the scope narrows what runs, not what builds. The
   // filter keeps the hook's own kind(lib) (proc-macro crates' tests are not
@@ -1939,8 +1939,8 @@ function plan(args) {
   }
   if (releaseProjection) {
     // The readers' own lib and bin unit tests (an ordinary plan leaves lib
-    // tests to the pre-push hook, which reuses the parent's evidence for a
-    // projection) and meerkat-contracts', the owner of
+    // tests to the push-to-main unit lanes, which a projection does not run)
+    // and meerkat-contracts', the owner of
     // ContractVersion::CURRENT. No budget split: these are release lanes.
     if (!byName.has(RELEASE_PROJECTION_UNIT_PACKAGE)) {
       throw new Error(`release-projection unit package ${RELEASE_PROJECTION_UNIT_PACKAGE} is not a workspace package`);

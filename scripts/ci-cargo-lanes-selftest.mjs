@@ -148,11 +148,11 @@ function assertEventSplit(plan, label) {
 const HOOK_STACK = 32 * 1024 * 1024;
 const OTHER_E2E_LANES = ["e2e_auth_lane", "e2e_build_lane", "e2e_system_lane", "e2e_live_lane", "e2e_smoke_lane", "e2e_models_lane"];
 
-// The closure-tests rows: the pre-push hook's cargo-test coverage for the
-// test scope (the reverse-dependency closure plus the readers of changed
-// non-Rust inputs), each row naming exactly the binaries it runs. The lib row
-// exists only on a named runner; without one the plan leaves the hook's
-// kind(lib) lane to the hook.
+// The closure-tests rows: the deterministic workspace lanes' coverage
+// (scripts/pre-push-unit.sh) for the test scope (the reverse-dependency
+// closure plus the readers of changed non-Rust inputs), each row naming
+// exactly the binaries it runs. The lib row exists only on a named runner;
+// without one the plan leaves the kind(lib) lane to the unit lanes.
 function assertHookParity(plan, label) {
   assert.deepEqual(
     plan.test_scope,
@@ -171,9 +171,9 @@ function assertHookParity(plan, label) {
   const libRows = plan.closure_test_rows.filter((row) => row.lane === "lib");
   if (plan.lib_row_runner === null) {
     assert.deepEqual(libRows, [], `${label}: no lib row without a runner for it`);
-    assert.deepEqual(plan.hook_retained_lanes, ["workspace unit lane"], `${label}: the hook keeps its kind(lib) lane`);
+    assert.deepEqual(plan.hook_retained_lanes, ["workspace unit lane"], `${label}: the unit lanes keep the kind(lib) lane`);
   } else {
-    assert.deepEqual(plan.hook_retained_lanes, [], `${label}: a plan with a lib row leaves no lane to the hook`);
+    assert.deepEqual(plan.hook_retained_lanes, [], `${label}: a plan with a lib row leaves no lane without a row`);
     assert.equal(plan.hook_coverage.hook_retained, 0, `${label}: and no binary`);
     for (const row of libRows) assert.equal(row.runner, plan.lib_row_runner, `${label}: the lib row runs on its runner`);
   }
@@ -1424,7 +1424,7 @@ for (const path of [
   const lines = Object.fromEntries(github.stdout.trim().split("\n").map((line) => [line.slice(0, line.indexOf("=")), line.slice(line.indexOf("=") + 1)]));
   assert.equal(lines.closure_test_count, String(plan.closure_test_rows.length));
   assert.equal(JSON.parse(lines.closure_test_matrix).include.length, plan.closure_test_rows.length);
-  assert.equal(lines.hook_retained_lanes, "workspace unit lane", "the plan log names the lane it leaves to the hook");
+  assert.equal(lines.hook_retained_lanes, "workspace unit lane", "the plan log names the lane it leaves without a row");
   assert.equal(lines.hook_retained_count, String(plan.hook_coverage.hook_retained));
 }
 
@@ -1491,13 +1491,13 @@ for (const path of [
   assert.equal(unbound.errors.length, CI_ROW_STEPS.length, "every row-executing step is bound");
 }
 
-// What a plan may leave to the hook: the lib binaries of a lane the hook
-// runs, nothing else; and a row runs where its bound job runs.
+// What a plan may leave without a row: the lib binaries of a lane of the
+// lane script, nothing else; and a row runs where its bound job runs.
 {
   const plan = planFor(["crates/meerkat-mcp/src/lib.rs"]);
   const baseline = checkHookCoverage(plan);
-  assert.deepEqual([baseline.missing, baseline.errors], [[], []], "the rows and the hook's kind(lib) lane cover the hook");
-  assert.ok(baseline.hook_retained > 0, "the plan leaves lib binaries to the hook");
+  assert.deepEqual([baseline.missing, baseline.errors], [[], []], "the rows and the kind(lib) lane cover the lane script");
+  assert.ok(baseline.hook_retained > 0, "the plan leaves lib binaries to the unit lanes");
   const mutate = (change) => {
     const copy = JSON.parse(JSON.stringify(plan));
     change(copy);
@@ -1507,8 +1507,9 @@ for (const path of [
     copy.hook_retained_lanes = [];
   });
   assert.ok(unretained.missing.includes("meerkat-mcp::lib::meerkat_mcp"), "a lib binary that neither runs is a gap");
-  // A retained lane exempts lib binaries only: leaving the integration lane to
-  // the hook exempts none of its tests, and the lib binaries lose their lane.
+  // A retained lane exempts lib binaries only: leaving the integration lane
+  // without rows exempts none of its tests, and the lib binaries lose their
+  // lane.
   const integrationKept = mutate((copy) => {
     copy.hook_retained_lanes = ["workspace integration lane"];
     copy.closure_test_rows = copy.closure_test_rows.filter((row) => !row.binaries.includes("meerkat-mcp::form_elicitation"));
@@ -1519,8 +1520,8 @@ for (const path of [
     copy.hook_retained_lanes = ["workspace lib lane"];
   });
   assert.ok(
-    unknownLane.errors.some((error) => error.includes("leaves \"workspace lib lane\" to the hook, which has no such workspace lane")),
-    "a lane the hook does not have is refused",
+    unknownLane.errors.some((error) => error.includes("leaves \"workspace lib lane\" without a row, but the lane script has no such workspace lane")),
+    "a lane the lane script does not have is refused",
   );
   assert.ok(unknownLane.missing.includes("meerkat-mcp::lib::meerkat_mcp"), "and exempts nothing");
   const elsewhere = mutate((copy) => {

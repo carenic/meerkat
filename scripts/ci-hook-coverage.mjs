@@ -517,10 +517,10 @@ export function checkHookCoverage(plan, { metadata = readMetadata(), nextestText
     if (!byName.has(name)) errors.push(`test scope names unknown package ${name}`);
   }
 
-  // The hook's workspace binaries for the scope, keyed package::kind::binary:
-  // built by the workspace inventory, run by at least one of its lanes. A lib
-  // binary that a lane the plan leaves to the hook runs is the hook's; every
-  // other one needs a row.
+  // The lane script's workspace binaries for the scope, keyed
+  // package::kind::binary: built by the workspace inventory, run by at least
+  // one of its lanes. A lib binary of a lane the plan leaves without a row
+  // runs in the unit lanes; every other one needs a row.
   const builtFilter = parseFilter(hook.buildFilter);
   const lanes = hook.lanes.map((lane) => ({
     label: lane.label,
@@ -529,7 +529,7 @@ export function checkHookCoverage(plan, { metadata = readMetadata(), nextestText
   }));
   const retainedLabels = [...new Set(plan.hook_retained_lanes ?? [])].sort();
   for (const label of retainedLabels) {
-    if (!lanes.some((lane) => lane.label === label)) errors.push(`the plan leaves "${label}" to the hook, which has no such workspace lane`);
+    if (!lanes.some((lane) => lane.label === label)) errors.push(`the plan leaves "${label}" without a row, but the lane script has no such workspace lane`);
   }
   const expected = new Map();
   const retained = new Map();
