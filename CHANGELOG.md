@@ -65,13 +65,6 @@ them.
 
 ### Changed
 
-- `meerkat-mcp`: a stdio MCP server's stderr is now piped and drained by its
-  process custody. Before, it was inherited on a trusted-host launch and
-  discarded under confinement. A trusted-host server's stderr is still
-  written to the host's own stderr; a confined server's never is. The drain
-  never blocks the server on a full pipe and stops shortly after the process
-  is gone.
-
 - The release workflow's `Build Web SDK package` job runs beside the release
   validation and the semver gate once `Require green CI` passes, instead of
   after them. Its Cargo build runs four jobs instead of one: the release
@@ -81,6 +74,12 @@ them.
   plain jobs; a tree without a wrapper that matches its crates builds at one
   job. Locally, on four vCPUs, the Cargo phase took about 11 minutes instead
   of 24 at one job (33m43s in the v0.9.1 tag run).
+- `meerkat-mcp`: a stdio MCP server's stderr is now piped and drained by its
+  process custody. Before, it was inherited on a trusted-host launch and
+  discarded under confinement. A trusted-host server's stderr is still
+  written to the host's own stderr; a confined server's never is. The drain
+  never blocks the server on a full pipe and stops shortly after the process
+  is gone.
 - `Publish Web SDK package` also requires the release validation gate and
   `Breaks declared and notes stamped` (both skipped only on Web-only
   recovery). It publishes only a package whose source stamp (commit, package
