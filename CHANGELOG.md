@@ -1236,6 +1236,11 @@ them.
   and the bridge outcome is attributed to the original the run resumes
   (its requester, represented subject, logical executor and realm), where
   it was unavailable before.
+- Live e2e scenario S101 reads the voice model's committed speech from the
+  history rows' `transcript` blocks (and any display `text`). It read only
+  `text` blocks, which a GPT Live session never commits for speech, so it
+  reported every heard response as not committed. Its history line now
+  prints each assistant row's block types and text.
 
 ### Known limitations
 
