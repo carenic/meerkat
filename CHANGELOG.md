@@ -60,8 +60,11 @@ them.
     them, resolved secrets and the connector binding first; each line of a
     multi-line value is also tracked.
   - A private key cut at the tail's edge is redacted up to its END marker.
-  - Control characters other than line feed and tab are removed, so the
-    tail carries no terminal escape sequences.
+  - Control characters other than line feed and tab are removed, and so
+    are the bidirectional and zero-width format characters, so the tail
+    carries no terminal escape sequences and cannot reorder or hide its
+    text. Launch values are matched after that strip, so bytes the strip
+    removes cannot split one past the redaction.
   - Redaction is defence in depth only. The tail never reaches the model,
     lifecycle notices, events or errors.
   - The model's setup-failure notice is unchanged and carries no class.
