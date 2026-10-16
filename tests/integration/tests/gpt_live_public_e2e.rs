@@ -7829,6 +7829,28 @@ fn assistant_row_text(row: &Value) -> String {
         .unwrap_or_default()
 }
 
+/// The assistant speech of one `block_assistant` history row: the text of its
+/// `transcript` and `text` blocks, joined in block order. The runtime commits
+/// what a voice model says as `AssistantBlock::Transcript` (block type
+/// `transcript`, source `spoken`, or `spoken_unmeasured` without playback
+/// evidence) and display output as `text`; [`assistant_row_text`] reads only
+/// the latter, so it finds no voice-model speech.
+fn assistant_speech_text(row: &Value) -> String {
+    row["blocks"]
+        .as_array()
+        .map(|blocks| {
+            blocks
+                .iter()
+                .filter(|block| {
+                    block["block_type"] == "transcript" || block["block_type"] == "text"
+                })
+                .filter_map(|block| block["data"]["text"].as_str())
+                .collect::<Vec<_>>()
+                .join("")
+        })
+        .unwrap_or_default()
+}
+
 /// Whether a voiced row's content carries `probe`: the mirror sends a
 /// canonical row as JSON (`{"role":"assistant","text":...}`), so its string
 /// values are compared, not its escaped bytes.
@@ -10420,7 +10442,9 @@ fn s101_compact(text: &str) -> String {
 /// heard response matched: each response consumes its own committed
 /// occurrence, so one committed text cannot satisfy two heard responses.
 /// Assistant and user rows need not alternate; the model may answer two
-/// utterances in one later response.
+/// utterances in one later response. A row's text is its assistant speech
+/// ([`assistant_speech_text`]): the voice model's spoken `transcript` blocks
+/// as well as any display `text`.
 fn s101_committed_responses(
     messages: &[Value],
     spoken_at: &[usize],
@@ -10436,7 +10460,7 @@ fn s101_committed_responses(
             .as_str()
             .is_some_and(|role| role.contains("assistant"))
         {
-            assistant.push_str(&s101_compact(&assistant_row_text(row)));
+            assistant.push_str(&s101_compact(&assistant_speech_text(row)));
         }
     }
     row_start.push(assistant.len());
@@ -11058,10 +11082,12 @@ async fn run_s101_busy_backend(evidence: Journal) -> Result<(), Box<dyn std::err
         // model's spoken responses. Deterministic: the three spoken user rows
         // are committed, and every response the browser heard (a
         // `response_end` with its final transcript) is committed as its own
-        // assistant text, in heard order, after the user rows whose input
-        // final preceded it. Whether the model answers between two utterances
-        // is its own turn-taking: job 2 starts on the quick question's
-        // delegation, and the model may answer both in one later response
+        // assistant text (the rows' spoken `transcript` blocks, or display
+        // `text`), in heard order, after the user rows whose input final
+        // preceded it.
+        // Whether the model answers between two utterances is its own
+        // turn-taking: job 2 starts on the quick question's delegation, and
+        // the model may answer both in one later response
         // (Live gate run 38410526290 on eee388c2).
         let rows = s100_user_rows(&history);
         let messages = history["messages"].as_array().cloned().unwrap_or_default();
@@ -11134,8 +11160,31 @@ async fn run_s101_busy_backend(evidence: Journal) -> Result<(), Box<dyn std::err
                     .to_owned(),
             );
         }
+        // Each assistant row's block types and speech, so a failed check
+        // shows what was committed beside what was heard.
+        let assistant_rows: Vec<(usize, Vec<&str>, String)> = messages
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| {
+                row["role"]
+                    .as_str()
+                    .is_some_and(|role| role.contains("assistant"))
+            })
+            .map(|(index, row)| {
+                let blocks = row["blocks"]
+                    .as_array()
+                    .map(|blocks| {
+                        blocks
+                            .iter()
+                            .filter_map(|block| block["block_type"].as_str())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                (index, blocks, assistant_speech_text(row))
+            })
+            .collect();
         println!(
-            "GPT_LIVE_S101_HISTORY spoken_rows={} responses(index, after_inputs, committed)={responses:?} executor_inputs={:?} user_rows={:?} roles={roles:?}",
+            "GPT_LIVE_S101_HISTORY spoken_rows={} responses(index, after_inputs, committed)={responses:?} executor_inputs={:?} user_rows={:?} roles={roles:?} assistant_rows(index, blocks, speech)={assistant_rows:?}",
             spoken_at.len(),
             rows.executor_inputs,
             rows.spoken
@@ -14080,7 +14129,7 @@ mod config_tests {
     #[test]
     fn s101_one_committed_response_does_not_satisfy_two_heard_ones() {
         let user = |text: &str| serde_json::json!({"role": "user", "content": text});
-        let assistant = |text: &str| serde_json::json!({"role": "block_assistant", "blocks": [{"block_type": "text", "data": {"text": text}}]});
+        let assistant = |text: &str| serde_json::json!({"role": "block_assistant", "blocks": [{"block_type": "transcript", "data": {"text": text, "source": {"kind": "spoken"}}}]});
         let heard = [("Okay.", 1), ("Okay.", 2), ("Done.", 3)];
         let lost = [
             user("Start a slow job."),
@@ -14103,6 +14152,173 @@ mod config_tests {
         ];
         assert_eq!(
             super::s101_committed_responses(&kept, &[0, 1, 4], &heard),
+            [true, true, true]
+        );
+    }
+
+    /// The heard S101 responses of the two Live gate runs on the 0.9.2
+    /// release candidate (runs 38852931765 and 38859112351) against their
+    /// history as `session/history` returns it. The runtime commits what the
+    /// voice model speaks as `block_assistant` rows whose blocks are the
+    /// spoken lane's `transcript`, not display `text`; the rows here are built
+    /// from the core message through the wire projection. Both runs committed
+    /// system, user, two assistant rows, user, one, user, five. Their logs
+    /// print roles only, so the rows here split each heard text where its
+    /// segments join; committed rows can split speech anywhere (a local run
+    /// committed " Okay, Got it" and ", working on that now."), and the check
+    /// compares compacted text across rows, so the split does not change the
+    /// verdict. Display `text` rows count as well. A lost row, a response
+    /// committed before the spoken user row of its input, or rows committed
+    /// out of order, still fail.
+    #[test]
+    fn s101_heard_responses_match_committed_spoken_transcript_rows() {
+        use meerkat_core::types::{
+            AssistantBlock, BlockAssistantMessage, Message, StopReason, TranscriptSource,
+        };
+        let row = |block: AssistantBlock| {
+            serde_json::to_value(meerkat_contracts::WireSessionMessage::from(
+                Message::BlockAssistant(BlockAssistantMessage::new(
+                    vec![block],
+                    StopReason::EndTurn,
+                )),
+            ))
+            .unwrap()
+        };
+        let spoken = |text: &str| {
+            row(AssistantBlock::Transcript {
+                text: text.to_owned(),
+                source: TranscriptSource::Spoken,
+                meta: None,
+            })
+        };
+        let display = |text: &str| {
+            row(AssistantBlock::Text {
+                text: text.to_owned(),
+                meta: None,
+            })
+        };
+        // The history and the indexes of its spoken user rows: each group
+        // of assistant rows follows one spoken user row.
+        let history = |groups: [Vec<serde_json::Value>; 3]| {
+            let mut messages = vec![serde_json::json!({"role": "system", "content": "voice"})];
+            let mut spoken_at = Vec::new();
+            for (index, group) in groups.into_iter().enumerate() {
+                spoken_at.push(messages.len());
+                messages.push(
+                    serde_json::json!({"role": "user", "content": format!("utterance {index}")}),
+                );
+                messages.extend(group);
+            }
+            (messages, spoken_at)
+        };
+
+        // Run 38859112351 (f25216be).
+        let heard = [
+            (
+                " Sure,Alright, it's underway now. I'll let you know as soon as it's finished.",
+                1,
+            ),
+            ("Checking", 2),
+            (
+                "Okay,Right, I'll start the second one now, and here\u{2019}s the answer you asked me to read back. There are 0 files.Also, the first slow job just finished: the file marker one dot txt is created.And now the second one is done too: marker two dot txt is created.",
+                3,
+            ),
+        ];
+        let rows = |as_row: &dyn Fn(&str) -> serde_json::Value| {
+            [
+                vec![
+                    as_row("Sure,"),
+                    as_row(
+                        "Alright, it's underway now. I'll let you know as soon as it's finished.",
+                    ),
+                ],
+                vec![as_row("Checking")],
+                vec![
+                    as_row("Okay,"),
+                    as_row(
+                        "Right, I'll start the second one now, and here\u{2019}s the answer you asked me to read back.",
+                    ),
+                    as_row("There are 0 files."),
+                    as_row(
+                        "Also, the first slow job just finished: the file marker one dot txt is created.",
+                    ),
+                    as_row("And now the second one is done too: marker two dot txt is created."),
+                ],
+            ]
+        };
+        let (messages, spoken_at) = history(rows(&spoken));
+        assert_eq!(
+            super::s101_committed_responses(&messages, &spoken_at, &heard),
+            [true, true, true],
+            "every heard response is committed as spoken transcript rows"
+        );
+
+        // Run 38852931765 (33f94f02); the model's dashes are built from the
+        // code point.
+        let dash = char::from_u32(0x2014).unwrap();
+        let first = format!(
+            " On it{dash}starting Okay{dash}I've started that. I'll let you know when it's done."
+        );
+        let third = format!(
+            " Okay{dash}starting on it. There are 0 files. The second one is running; I'll tell you when it's done. The first one is done; `marker1.txt` is created. The second one is done; marker two dot txt is created."
+        );
+        let heard_33f9 = [
+            (first.as_str(), 1),
+            (" [inhale] Checking", 2),
+            (third.as_str(), 3),
+        ];
+        let (messages_33f9, spoken_at_33f9) = history([
+            vec![
+                spoken(&format!("On it{dash}starting")),
+                spoken(&format!(
+                    "Okay{dash}I've started that. I'll let you know when it's done."
+                )),
+            ],
+            vec![spoken("[inhale] Checking")],
+            vec![
+                spoken(&format!("Okay{dash}starting on it.")),
+                spoken("There are 0 files."),
+                spoken("The second one is running; I'll tell you when it's done."),
+                spoken("The first one is done; `marker1.txt` is created."),
+                spoken("The second one is done; marker two dot txt is created."),
+            ],
+        ]);
+        assert_eq!(
+            super::s101_committed_responses(&messages_33f9, &spoken_at_33f9, &heard_33f9),
+            [true, true, true]
+        );
+
+        // A lost row: "Checking" is not committed.
+        let [first_group, _, third_group] = rows(&spoken);
+        let (lost, lost_at) = history([first_group, Vec::new(), third_group]);
+        assert_eq!(
+            super::s101_committed_responses(&lost, &lost_at, &heard),
+            [true, false, true]
+        );
+
+        // Out of place: the third response committed before the spoken user
+        // row of the input it answered.
+        let [first_group, mut second_group, third_group] = rows(&spoken);
+        second_group.extend(third_group);
+        let (early, early_at) = history([first_group, second_group, Vec::new()]);
+        assert_eq!(
+            super::s101_committed_responses(&early, &early_at, &heard),
+            [true, true, false]
+        );
+
+        // Out of order: the first response's two rows committed swapped.
+        let [mut first_group, second_group, third_group] = rows(&spoken);
+        first_group.reverse();
+        let (swapped, swapped_at) = history([first_group, second_group, third_group]);
+        assert_eq!(
+            super::s101_committed_responses(&swapped, &swapped_at, &heard),
+            [false, true, true]
+        );
+
+        // The runtime's display `text` rows are assistant text too.
+        let (shown, shown_at) = history(rows(&display));
+        assert_eq!(
+            super::s101_committed_responses(&shown, &shown_at, &heard),
             [true, true, true]
         );
     }
