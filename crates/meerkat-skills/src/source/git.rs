@@ -191,6 +191,20 @@ impl GitSkillSource {
         // its positionals so a value is never read as one.
         checked_repository_url(&self.config.repo_url)?;
         checked_ref(self.config.git_ref.as_str())?;
+        // A local repository inside a confined write grant is one a confined
+        // process could have planted: clone runs its upload-pack against
+        // that repository's own config.
+        if let Some(local) = local_repository_path(&self.config.repo_url)
+            && self
+                .untrusted
+                .as_ref()
+                .is_some_and(|untrusted| untrusted.0(&local, true))
+        {
+            return Err(SkillError::Load(
+                "git skill repository refused: a local repository a confined process could change"
+                    .into(),
+            ));
+        }
         if self.checkout_dir.join(".git").is_dir() {
             self.run_git(&[
                 "fetch",
@@ -464,19 +478,41 @@ fn checked_repository_url(url: &str) -> Result<(), SkillError> {
     if url.chars().any(|c| c.is_whitespace() || c.is_control()) {
         return refuse("it must not contain whitespace or control characters");
     }
+    // `<helper>::<address>` selects a git remote helper (`ext::` runs a
+    // command); it is never a supported transport.
+    if url.contains("::") {
+        return refuse("a remote-helper address (`::`) is not a supported transport");
+    }
     let known_scheme = ["ssh://", "https://", "http://", "git://", "file://"]
         .iter()
         .any(|scheme| url.starts_with(scheme));
+    // Any other `scheme://` is refused; a scp-like `[user@]host:path` has no
+    // `//` after its colon and no `/` before it.
+    let other_scheme = !known_scheme && url.contains("://");
     let scp_like = || {
-        url.split_once(':')
-            .is_some_and(|(host, _)| !host.is_empty() && !host.contains('/'))
+        url.split_once(':').is_some_and(|(host, rest)| {
+            !host.is_empty() && !host.contains('/') && !rest.starts_with("//")
+        })
     };
     let local_path = Path::new(url).is_absolute();
-    if !(known_scheme || local_path || scp_like()) {
+    if other_scheme || !(known_scheme || local_path || scp_like()) {
         return refuse("its transport is not ssh, https, http, git, file or a local path");
     }
     Ok(())
 }
+
+/// The local path a repository URL names (a `file://` URL or an absolute
+/// path), for judging it against what a confined process could change.
+fn local_repository_path(url: &str) -> Option<PathBuf> {
+    let path = url.strip_prefix("file://").unwrap_or(url);
+    let path = Path::new(path);
+    path.is_absolute().then(|| path.to_path_buf())
+}
+
+/// The transports a Git skill invocation may use: `GIT_ALLOW_PROTOCOL`
+/// overrides every `protocol.*.allow` setting, so host git config such as
+/// `protocol.allow=always` cannot re-enable `ext` or another remote helper.
+const GIT_ALLOWED_PROTOCOLS: &str = "ssh:https:http:git:file";
 
 fn run_git_command(
     args: &[&str],
@@ -496,6 +532,7 @@ fn run_git_command(
     if let Some(git_ssh_command) = git_ssh_command {
         command.env("GIT_SSH_COMMAND", git_ssh_command);
     }
+    command.env("GIT_ALLOW_PROTOCOL", GIT_ALLOWED_PROTOCOLS);
     let output = command.output().map_err(|e| {
         SkillError::Load(format!("git skill source command failed to start: {e}").into())
     })?;
@@ -768,6 +805,39 @@ mod tests {
         );
     }
 
+    /// A real key file whose name contains shell metacharacters is accepted
+    /// and single-quoted, so the shell takes the whole path as one literal
+    /// argument to `ssh -i` and runs nothing it spells out.
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn a_real_metacharacter_key_path_is_quoted_literally() {
+        let temp = tempfile::tempdir().unwrap();
+        let key = temp.path().join("id; touch marker");
+        std::fs::write(&key, "key").unwrap();
+        let key = key.to_string_lossy().to_string();
+        assert_eq!(
+            git_ssh_command(&key).unwrap(),
+            format!("ssh -i '{key}' -o IdentitiesOnly=yes")
+        );
+    }
+
+    /// Only the supported transports resolve a local path; a `file://` URL or
+    /// an absolute path is the one judged against the write grants.
+    #[test]
+    fn local_repository_path_names_only_file_urls_and_absolute_paths() {
+        assert_eq!(
+            local_repository_path("file:///srv/r"),
+            Some(std::path::PathBuf::from("/srv/r"))
+        );
+        assert_eq!(
+            local_repository_path("/srv/r"),
+            Some(std::path::PathBuf::from("/srv/r"))
+        );
+        assert_eq!(local_repository_path("https://h/r.git"), None);
+        assert_eq!(local_repository_path("git@h:owner/r.git"), None);
+    }
+
     /// A ref or URL that reads as an option, or carries whitespace or a
     /// control character, is refused; an ordinary one is accepted.
     #[test]
@@ -778,7 +848,19 @@ mod tests {
         for good in ["main", "v1.2.3", "release/9.0", "0123abcd"] {
             assert!(checked_ref(good).is_ok(), "ref {good:?} must be allowed");
         }
-        for bad in ["-x", "--upload-pack=sh", "https://h/ r", "./rel", "a\tb"] {
+        for bad in [
+            "-x",
+            "--upload-pack=sh",
+            "https://h/ r",
+            "./rel",
+            "a\tb",
+            "ext::sh -c touch% /tmp/x",
+            "ext::/path/in/grant/evil",
+            "fd::3",
+            "foo::x",
+            "ftp://example.com/r.git",
+            "s3://bucket/r",
+        ] {
             assert!(
                 checked_repository_url(bad).is_err(),
                 "url {bad:?} must be refused"

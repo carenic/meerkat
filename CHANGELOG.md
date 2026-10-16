@@ -1171,11 +1171,17 @@ them.
   shell command runs none. The `git_ref` and repository URL are refused when
   they read as an option (a leading `-`) or carry whitespace or control
   characters, the URL's transport must be `ssh`/`https`/`http`/`git`/`file`
-  or a local path, and every `git` invocation passes `--end-of-options`
-  before its refs and URL. Before, a configuration source a confined process
-  could write (or a config-tool client) could run a command on the host
-  through the ssh-key path. The Git skills scan root is also not walked when
-  a link leads it out of the checkout.
+  or a local path (a remote-helper address with `::`, such as `ext::`, and
+  any other `scheme://` are refused), and every `git` invocation passes
+  `--end-of-options` before its refs and URL and runs with
+  `GIT_ALLOW_PROTOCOL=ssh:https:http:git:file`, so host git config such as
+  `protocol.allow=always` cannot re-enable `ext`. A local repository (a
+  `file://` URL or an absolute path) a confined process could change is
+  refused, since clone runs its upload-pack against that repository's own
+  config. Before, a configuration source a confined process could write (or
+  a config-tool client) could run a command on the host through the ssh-key
+  path or a remote-helper URL. The Git skills scan root is also not walked
+  when a link leads it out of the checkout.
 - The governed `rkat-rpc` route builds its controller client and its
   reviewer through the host's confinement, as it already built the
   connection factory, so a credential command either names runs as the host
@@ -1222,10 +1228,14 @@ them.
   backend, so an administered command's token could be resolved for a
   writer-chosen endpoint: the backend a credential is sent to is not yet
   administered like the command itself.
-- The Git skill ssh-key path and `git_ref`/URL are validated and git runs
-  with `--end-of-options`, but the host still trusts the repository content
-  it fetches; a repository is loaded only from a trusted configuration, not
-  made safe by it.
+- A Git skill repository's HTTPS token is still passed on the `git clone`
+  command line (as `https://x-access-token:<token>@...`), where another
+  local process could read it from the process table; prefer an ssh key or
+  a credential helper until this moves off the command line.
+- The Git skill URL/ref validation and `GIT_ALLOW_PROTOCOL` keep a
+  configuration a confined process could write from running a command, but
+  the host still trusts the repository content it fetches; a repository is
+  loaded only from a trusted configuration, not made safe by it.
 
 ## [0.9.1] - 2026-10-15
 
