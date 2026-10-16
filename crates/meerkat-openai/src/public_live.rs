@@ -1549,6 +1549,41 @@ impl PublicLiveBrokerSession {
         Ok(token)
     }
 
+    /// Append text-chat context (rows the user typed and read in the chat
+    /// during the call) through the quiet thinking lane, exactly like
+    /// [`Self::append_thinking_context`] (same token, fragment receipts,
+    /// rejection and close semantics), but never inside a voiced response.
+    /// While the model's response is audible the append is reserved now and
+    /// sent once the response has ended ([`OUTPUT_SILENCE_RELEASE_MS`] of
+    /// output silence on the provider's output audio frames), in append
+    /// order; with the model silent it goes at once. A close before the
+    /// release leaves it unsent and settles it as interrupted by close, like
+    /// held delegation commentary.
+    pub async fn append_text_chat_context(
+        &self,
+        text: impl Into<String>,
+    ) -> Result<GptLiveAppendToken, GptLiveBrokerError> {
+        let text = require_context(text)?;
+        let fragments = context_fragments(&text);
+        let (token, events) = {
+            let mut state = self.state.lock().await;
+            let token = state.reserve_thinking_append(fragments.len())?;
+            let events = fragments
+                .into_iter()
+                .enumerate()
+                .map(|(index, content)| Self::thinking_event(token, index, content.to_owned()))
+                .collect();
+            match state.hold_or_send_text_chat(token, events) {
+                Some(events) => (token, events),
+                None => return Ok(token),
+            }
+        };
+        for event in events {
+            self.deliver_append(token, event).await?;
+        }
+        Ok(token)
+    }
+
     /// Append trusted background knowledge through the native instructions
     /// lane. The provider treats instructions as authoritative context the
     /// model may use to answer; unlike the thinking lane it is not limited to
@@ -2084,6 +2119,34 @@ impl PublicLiveBrokerSession {
                     );
                 }
             }
+            // Text-chat context held while the model's response was audible
+            // goes out, in order, once the response has ended. The state lock
+            // stays held while it is sent, so a later text-chat append cannot
+            // overtake it.
+            let released = state.take_releasable_held_text_chat();
+            if !released.is_empty() {
+                let (sent, failed) = send_released_in_order(released, |event| {
+                    self.instrument_outgoing_append(&event);
+                    let send = self.sender.send(event);
+                    async move { send.await.is_ok() }
+                })
+                .await;
+                for token in sent {
+                    tracing::info!(
+                        token = token.0,
+                        "public Live held text-chat context released"
+                    );
+                }
+                if let Some(token) = failed {
+                    // Nothing after the failed append is tried: the transport
+                    // is gone, and its close settles every reservation left.
+                    state.append_delivery_ambiguous = true;
+                    tracing::warn!(
+                        token = token.0,
+                        "released public Live text-chat context could not be sent; the transport is gone and its close settles the delivery"
+                    );
+                }
+            }
             // A close requested before the session started goes out once
             // `session.started` is applied (#1794), exactly once.
             if state.close_pending_until_started
@@ -2142,12 +2205,14 @@ impl PublicLiveBrokerSession {
             state.close_requested = true;
             state.close_pending_until_started = true;
             state.drop_held_commentary_for_close();
+            state.drop_held_text_chat_for_close();
             tracing::info!("public Live close held until the provider's session.started");
             return Ok(());
         }
         self.send_close_events().await?;
         state.close_requested = true;
         state.drop_held_commentary_for_close();
+        state.drop_held_text_chat_for_close();
         Ok(())
     }
 
@@ -2491,6 +2556,11 @@ struct SessionState {
     /// Delegation commentary appends (narrations and results) held behind an
     /// unanswered utterance, reserved but not yet sent, in append order.
     held_commentary: VecDeque<(GptLiveAppendToken, ClientEvent)>,
+    /// Quiet text-chat appends reserved while the model's response was
+    /// audible ([`PublicLiveBrokerSession::append_text_chat_context`]), each
+    /// with its fragment events, in append order. They go out once the
+    /// response has ended ([`OUTPUT_SILENCE_RELEASE_MS`] of output silence).
+    held_text_chat: VecDeque<(GptLiveAppendToken, Vec<ClientEvent>)>,
     close_requested: bool,
     closed_observed: bool,
     /// The provider's `session.started` was applied on the sideband.
@@ -2548,6 +2618,7 @@ impl Default for SessionState {
             last_output_start_ms: None,
             last_delegation_offset_ms: None,
             held_commentary: VecDeque::new(),
+            held_text_chat: VecDeque::new(),
             close_requested: false,
             session_started_observed: false,
             close_pending_until_started: false,
@@ -2963,6 +3034,58 @@ impl SessionState {
         }
     }
 
+    /// Hold a reserved quiet text-chat append while the model's response is
+    /// audible, or hand its fragment events back to be sent now. A later
+    /// append is also held while earlier ones are, so text-chat rows reach
+    /// the provider in append order. Sent inside a response, quiet context
+    /// is absorbed by it like a result cue (S97 r3), and later answers can
+    /// lack it: S98 recalled a typed update's old value after the update's
+    /// rows landed inside a readout (Live gate run 38859112351, and 1 of 3
+    /// local runs forcing that overlap). Unlike a deferred cue it does not
+    /// wait for the user's floor: context typed in the chat must be in
+    /// place before the model answers the user.
+    fn hold_or_send_text_chat(
+        &mut self,
+        token: GptLiveAppendToken,
+        events: Vec<ClientEvent>,
+    ) -> Option<Vec<ClientEvent>> {
+        if self.close_requested || self.closed_observed {
+            // Never held past a close: sent (or refused) now, and settled
+            // by the close like any in-flight append.
+            return Some(events);
+        }
+        if self.assistant_audible() || !self.held_text_chat.is_empty() {
+            tracing::info!(
+                token = token.0,
+                "public Live text-chat context held: the model's response is audible"
+            );
+            self.held_text_chat.push_back((token, events));
+            return None;
+        }
+        Some(events)
+    }
+
+    /// The held text-chat appends, all of them in order, once the model's
+    /// response has ended.
+    fn take_releasable_held_text_chat(&mut self) -> Vec<(GptLiveAppendToken, Vec<ClientEvent>)> {
+        if self.assistant_audible() || self.close_requested || self.closed_observed {
+            return Vec::new();
+        }
+        self.held_text_chat.drain(..).collect()
+    }
+
+    /// A close leaves held text-chat appends unsent, like held commentary:
+    /// each reservation stays pending, so the owner's close settlement
+    /// resolves it as interrupted by close.
+    fn drop_held_text_chat_for_close(&mut self) {
+        for (token, _) in self.held_text_chat.drain(..) {
+            tracing::info!(
+                token = token.0,
+                "public Live held text-chat context left unsent by the close; settled as interrupted by close"
+            );
+        }
+    }
+
     fn outstanding_receipt_count(&self) -> usize {
         self.pending_appends
             .iter()
@@ -3024,6 +3147,7 @@ impl SessionState {
                 self.closed_observed = true;
                 self.close_pending_until_started = false;
                 self.drop_held_commentary_for_close();
+                self.drop_held_text_chat_for_close();
                 self.finish_open_turn();
                 let observations = &mut self.queued_observations;
                 self.pending_appends.retain(|pending| {
@@ -4179,6 +4303,29 @@ const CONTEXT_FRAGMENT_MAX_BYTES: usize = 500;
 /// a byte split on a UTF-8 character boundary, which the provider still
 /// accepts (the bound is what matters on the wire, the seam only matters for
 /// recall). The result is bounded by the caller's pending-append limit.
+/// Send released appends in order, each one's fragments in order, and stop
+/// at the first failed send: nothing after it is tried. Returns the tokens
+/// sent whole and the token whose send failed.
+async fn send_released_in_order<F, Fut>(
+    released: Vec<(GptLiveAppendToken, Vec<ClientEvent>)>,
+    mut send: F,
+) -> (Vec<GptLiveAppendToken>, Option<GptLiveAppendToken>)
+where
+    F: FnMut(ClientEvent) -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let mut sent = Vec::with_capacity(released.len());
+    for (token, events) in released {
+        for event in events {
+            if !send(event).await {
+                return (sent, Some(token));
+            }
+        }
+        sent.push(token);
+    }
+    (sent, None)
+}
+
 fn context_fragments(mut text: &str) -> Vec<&str> {
     let mut fragments = Vec::new();
     while !text.is_empty() {
@@ -8136,6 +8283,157 @@ mod tests {
             .apply_frame(frame(output_delta_span("sure", 5000.0, 5200.0)))
             .unwrap();
         assert_eq!(released_tokens(&mut state), [first, second]);
+    }
+
+    /// One quiet text-chat append as `append_text_chat_context` reserves it:
+    /// its token and fragment events.
+    fn text_chat_append(
+        state: &mut SessionState,
+        text: &str,
+    ) -> (GptLiveAppendToken, Vec<ClientEvent>) {
+        let fragments = context_fragments(text);
+        let token = state.reserve_thinking_append(fragments.len()).unwrap();
+        let events = fragments
+            .into_iter()
+            .enumerate()
+            .map(|(index, content)| {
+                PublicLiveBrokerSession::thinking_event(token, index, content.to_owned())
+            })
+            .collect();
+        (token, events)
+    }
+
+    fn released_text_chat(state: &mut SessionState) -> Vec<GptLiveAppendToken> {
+        state
+            .take_releasable_held_text_chat()
+            .into_iter()
+            .map(|(token, _)| token)
+            .collect()
+    }
+
+    /// S98: a typed update's quiet rows that land inside a voiced response
+    /// can be absorbed by it, and the later recall answers the old value
+    /// (Live gate run 38859112351; 1 of 3 local runs forcing that overlap).
+    /// Text-chat appends reserved while the model is audible are held, in
+    /// append order, until the response ends (1600 ms of output silence on
+    /// the provider's output audio frames), then released once.
+    #[test]
+    fn text_chat_context_waits_for_the_voiced_response_to_end() {
+        let mut state = state_with_spoken_delegation();
+        model_output(&mut state, true, 3);
+        let (first, events) = text_chat_append(&mut state, "From the text chat: row one");
+        assert!(
+            state.hold_or_send_text_chat(first, events).is_none(),
+            "held while the response is audible"
+        );
+        let (second, events) = text_chat_append(&mut state, "From the text chat: row two");
+        assert!(
+            state.hold_or_send_text_chat(second, events).is_none(),
+            "held behind the first"
+        );
+        model_output(&mut state, true, 2);
+        assert!(released_text_chat(&mut state).is_empty(), "still speaking");
+        model_output(&mut state, false, 7);
+        assert!(
+            released_text_chat(&mut state).is_empty(),
+            "1400 ms of silence is not the end of the response"
+        );
+        model_output(&mut state, false, 1);
+        assert_eq!(released_text_chat(&mut state), [first, second]);
+        assert!(released_text_chat(&mut state).is_empty(), "released once");
+        assert!(state.held_text_chat.is_empty());
+    }
+
+    /// No response in progress, no delay: text-chat context goes at once
+    /// before the model has spoken, after its response has ended, and while
+    /// the user holds the floor (unlike a deferred result cue, it must be in
+    /// place before the model answers the user).
+    #[test]
+    fn text_chat_context_goes_at_once_when_no_response_is_audible() {
+        let mut state = state_with_spoken_delegation();
+        let (token, events) = text_chat_append(&mut state, "typed before any audio");
+        assert_eq!(
+            state
+                .hold_or_send_text_chat(token, events)
+                .map(|events| events.len()),
+            Some(1)
+        );
+        model_output(&mut state, true, 3);
+        model_output(&mut state, false, 8);
+        let (token, events) = text_chat_append(&mut state, "typed after the response");
+        assert!(state.hold_or_send_text_chat(token, events).is_some());
+        state
+            .apply_frame(frame(input_delta_at("what is the code word now", 9000.0)))
+            .unwrap();
+        assert!(state.user_holds_floor());
+        let (token, events) = text_chat_append(&mut state, "typed during the question");
+        assert!(
+            state.hold_or_send_text_chat(token, events).is_some(),
+            "the user's floor does not hold text-chat context"
+        );
+        assert!(state.held_text_chat.is_empty());
+    }
+
+    /// A close leaves held text-chat context unsent, like held commentary:
+    /// its reservation stays pending and the provider's `session.closed`
+    /// settles it as interrupted by close, so nothing is dropped silently.
+    /// An append after the close request is never held.
+    #[test]
+    fn a_close_settles_held_text_chat_context_as_interrupted() {
+        let mut state = state_with_spoken_delegation();
+        model_output(&mut state, true, 3);
+        let (token, events) = text_chat_append(&mut state, "typed row");
+        assert!(state.hold_or_send_text_chat(token, events).is_none());
+        state.close_requested = true;
+        state.drop_held_text_chat_for_close();
+        assert!(state.held_text_chat.is_empty());
+        model_output(&mut state, false, 8);
+        assert!(
+            released_text_chat(&mut state).is_empty(),
+            "never sent after the close"
+        );
+        let (late, events) = text_chat_append(&mut state, "typed after the close request");
+        assert!(
+            state.hold_or_send_text_chat(late, events).is_some(),
+            "never held past a close"
+        );
+        state.apply_frame(frame(session_closed())).unwrap();
+        let interrupted: Vec<GptLiveAppendToken> = drain(&mut state)
+            .into_iter()
+            .filter_map(|observation| match observation {
+                GptLiveBrokerObservation::ThinkingContextAppendInterruptedByClose { token } => {
+                    Some(token)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(interrupted, [token, late]);
+    }
+
+    /// Released text-chat appends go out in order and stop at the first
+    /// failed send: the failed append's later fragments and every later
+    /// append are not tried.
+    #[tokio::test]
+    async fn released_text_chat_stops_at_the_first_failed_send() {
+        let mut state = state_with_spoken_delegation();
+        let (first, one) = text_chat_append(&mut state, "row one");
+        let (second, two) = text_chat_append(&mut state, &"two ".repeat(200));
+        let (third, three) = text_chat_append(&mut state, "row three");
+        assert_eq!(two.len(), 2, "the second append has two fragments");
+        let mut attempts = 0_usize;
+        let (sent, failed) =
+            send_released_in_order(vec![(first, one), (second, two), (third, three)], |_| {
+                attempts += 1;
+                // The first fragment of the second append fails.
+                let ok = attempts != 2;
+                async move { ok }
+            })
+            .await;
+        assert_eq!(sent, [first]);
+        assert_eq!(failed, Some(second));
+        assert_eq!(attempts, 2, "nothing after the failed send is tried");
+        let (sent, failed) = send_released_in_order(Vec::new(), |_| async { true }).await;
+        assert!(sent.is_empty() && failed.is_none());
     }
 
     fn continuation_markers(observations: &[GptLiveBrokerObservation]) -> Vec<(String, String)> {
