@@ -149,7 +149,10 @@ on:
 # every main run starved pull-request CI of runners: in the 02:27-03:50 UTC
 # merge burst of 2026-10-01, 806 of the 1760 main-run job-minutes (46%) ran
 # after a newer main commit had already been pushed. The newest main commit
-# is still fully tested, and its run covers every superseded commit's change.
+# is still fully tested, and its run covers every superseded commit's change:
+# a main push diffs against the last main commit whose run completed green
+# with an attestation (scripts/ci-push-base.mjs), not against the cancelled
+# run's commit.
 #
 # Never superseded, one group per commit (main-<ref>-<sha>):
 #   - a release commit ("chore: release v..." in the head commit message),
@@ -320,8 +323,9 @@ jobs:
     steps:
       # Depth 2 is HEAD and its parents. The classifier diffs a pull
       # request's merge commit against its first parent, or a push against
-      # its before-commit, which ci-cargo-lanes.mjs fetches at depth 1 when
-      # the checkout lacks it; nothing walks history. The full-history fetch
+      # its push base (on main the last green, attested main commit before
+      # HEAD, found through the API), which ci-cargo-lanes.mjs fetches at
+      # depth 1 when the checkout lacks it; nothing walks history. The full-history fetch
       # took 41-63 s, once 242 s, on the path of every lane.
       - name: Checkout
         uses: actions/checkout@v6
@@ -389,13 +393,38 @@ jobs:
                 --base "${classification_base}" --head HEAD --wait-seconds "${EVIDENCE_WAIT_SECONDS}")"; then
             plan_args=(--reuse-release-evidence "${evidence}")
           fi
+          # The ordinary plan's base. A push to main diffs against the newest
+          # commit before HEAD whose main CI run completed green and left its
+          # exact-tree attestation (scripts/ci-push-base.mjs, from HEAD's
+          # first parent's tree so a commit cannot narrow its own push), not
+          # against the payload base: a newer main push cancels the run of an
+          # older one, and a run can fail, so the payload base's changes may
+          # never have run the lanes a pull request leaves to the push.
+          # Without such a commit, or on any lookup failure, the plan is the
+          # whole workspace. A release projection keeps its first parent,
+          # whose workspace-mode run the evidence above verified; a pull
+          # request keeps its merge base and a release-branch push its
+          # payload base.
+          plan_base="${classification_base}"
+          if [[ "${#plan_args[@]}" -eq 0 && "${EVENT_NAME}" == "push" && "${GITHUB_REF}" == "refs/heads/main" ]]; then
+            plan_base=""
+            push_base_tool="${RUNNER_TEMP}/push-base-tools/ci-push-base.mjs"
+            mkdir -p "$(dirname "${push_base_tool}")"
+            if git show "HEAD^1:scripts/ci-push-base.mjs" > "${push_base_tool}" 2>/dev/null \
+              && found_base="$(node "${push_base_tool}" --repository "${GITHUB_REPOSITORY}" --head "$(git rev-parse HEAD)")"; then
+              plan_base="${found_base}"
+              echo "push base: ${plan_base} (payload base ${BASE_SHA})"
+            else
+              echo "::warning title=CI push base::no green, attested main CI run of an ancestor of HEAD was found; planning the whole workspace."
+            fi
+          fi
           # The classifier exits non-zero rather than emit an empty plan for a
           # build-relevant change; a failure here fails the CI gate. The event
           # decides which lanes run here: a pull request leaves the
           # meerkat-mob chain's and the reverse-dependency sweep's lanes to the
           # push (they are named in deferred_to_push).
           node scripts/ci-cargo-lanes.mjs --format github --event "${EVENT_NAME}" \
-            --base "${classification_base}" --head HEAD "${plan_args[@]}" \
+            --base "${plan_base}" --head HEAD "${plan_args[@]}" \
             | tee "${RUNNER_TEMP}/ci-cargo-lanes.txt" >> "${GITHUB_OUTPUT}"
           grep -vE '^(closure_flags|shard_matrix|unit_shard_matrix|main_unit_shard_matrix|main_archive_build_matrix|main_archive_run_matrix|integration_matrix|closure_test_matrix|feature_check_matrix)=' "${RUNNER_TEMP}/ci-cargo-lanes.txt"
 

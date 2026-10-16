@@ -365,6 +365,31 @@ fn pull_requests_leave_the_chain_and_closure_lanes_to_the_push() {
     }
 }
 
+/// A push to main diffs against the last main commit whose CI run completed
+/// green with an attestation (scripts/ci-push-base.mjs, from HEAD's first
+/// parent), and plans the whole workspace without one, so a superseded,
+/// cancelled or failed main run never loses its changes' push-only lanes.
+#[test]
+fn main_pushes_diff_against_the_last_green_attested_main_commit() {
+    let ci_yml = workflow_yml_path("ci.yml");
+    let ci = std::fs::read_to_string(&ci_yml)
+        .unwrap_or_else(|e| panic!("read {}: {e}", ci_yml.display()));
+    for contract in [
+        "git show \"HEAD^1:scripts/ci-push-base.mjs\" > \"${push_base_tool}\"",
+        "--base \"${plan_base}\" --head HEAD \"${plan_args[@]}\"",
+        "no green, attested main CI run of an ancestor of HEAD was found; planning the whole workspace.",
+    ] {
+        assert!(
+            ci.contains(contract),
+            "the change classification must carry `{contract}`"
+        );
+    }
+    assert!(
+        !ci.contains("--base \"${classification_base}\" --head HEAD \"${plan_args[@]}\""),
+        "a push to main must not plan against its payload base"
+    );
+}
+
 #[test]
 fn machine_authority_classifier_protects_required_gate_owners() {
     let classifier_path = repository_path("scripts/machine-authority-changed");

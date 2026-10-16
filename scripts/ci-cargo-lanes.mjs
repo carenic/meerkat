@@ -993,6 +993,8 @@ function isLaneDefinitionPath(path) {
     path === "scripts/ci-non-rust-readers.mjs" ||
     path === "scripts/ci-release-evidence.mjs" ||
     path === "scripts/ci-release-projection-selftest.mjs" ||
+    path === "scripts/ci-push-base.mjs" ||
+    path === "scripts/ci-push-base-selftest.mjs" ||
     path === "scripts/release-projection-only.mjs" ||
     path === "scripts/release-version-pins.mjs"
   );
@@ -1087,6 +1089,8 @@ function isGlobalPath(path) {
     path === "scripts/ci-non-rust-readers.mjs" ||
     path === "scripts/ci-release-evidence.mjs" ||
     path === "scripts/ci-release-projection-selftest.mjs" ||
+    path === "scripts/ci-push-base.mjs" ||
+    path === "scripts/ci-push-base-selftest.mjs" ||
     path === "scripts/release-projection-only.mjs" ||
     path === "scripts/release-version-pins.mjs" ||
     path === "scripts/rust-test-selector.mjs" ||

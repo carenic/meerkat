@@ -515,6 +515,8 @@ for (const path of [
   // They decide when a release projection reuses its parent's evidence.
   "scripts/ci-release-evidence.mjs",
   "scripts/ci-release-projection-selftest.mjs",
+  // It decides what a push to main diffs against.
+  "scripts/ci-push-base.mjs",
   "scripts/release-projection-only.mjs",
   "scripts/release-version-pins.mjs",
   "scripts/ci-clippy-sccache-wrapper",

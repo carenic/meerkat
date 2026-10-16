@@ -68,7 +68,11 @@ them.
   slow harness contracts only when a push changes what they exercise. The
   `CI gate`'s pull-request budgets drop to 1080 s of lane execution and
   1200 s push-to-terminal (runner queue still excluded), from 1500 s and
-  2700 s.
+  2700 s. A push to `main` now diffs against the last main commit whose CI
+  run completed green with its attestation instead of the push's payload
+  base, so the changes of a cancelled, superseded or failed main run still
+  run the push-only lanes; it plans the whole workspace when no such commit
+  is found.
 
 ## [0.9.2] - 2026-10-16
 
