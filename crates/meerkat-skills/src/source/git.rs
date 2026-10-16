@@ -406,7 +406,19 @@ fn discover_skill_directories(base: &Path) -> Vec<PathBuf> {
         if path.file_name().and_then(|name| name.to_str()) == Some(".git") {
             continue;
         }
-        if path.is_dir() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        // A link is a candidate where it is, and the scan judges where it
+        // leads; discovery never descends through one, so a link in a
+        // repository (to `/`, say) cannot walk the host's filesystem.
+        if file_type.is_symlink() {
+            if path.join("SKILL.md").is_file() {
+                out.push(path);
+            }
+            continue;
+        }
+        if file_type.is_dir() {
             if path.join("SKILL.md").is_file() {
                 out.push(path);
             } else {
@@ -575,6 +587,28 @@ mod tests {
             .map(|descriptor| descriptor.key.skill_name.as_str())
             .collect();
         assert_eq!(names, vec!["kept-skill"]);
+    }
+
+    /// Discovery never descends through a link, so a link in a repository
+    /// (to `/`, say) cannot walk the host's filesystem on each refresh; a
+    /// linked skill is judged where it leads by the scan.
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn discovery_does_not_descend_through_a_link() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().canonicalize().unwrap();
+        let outside = base.join("outside");
+        std::fs::create_dir_all(outside.join("deep")).unwrap();
+        std::fs::write(outside.join("deep").join("SKILL.md"), "# Deep").unwrap();
+        let checkout = base.join("checkout");
+        std::fs::create_dir_all(checkout.join("kept-skill")).unwrap();
+        std::fs::write(checkout.join("kept-skill").join("SKILL.md"), "# Kept").unwrap();
+        std::os::unix::fs::symlink(&outside, checkout.join("walk")).unwrap();
+
+        let mut found = discover_skill_directories(&checkout);
+        found.sort();
+        assert_eq!(found, vec![checkout.join("kept-skill")]);
     }
 
     #[test]

@@ -284,8 +284,10 @@ them.
 - A symbolic link no longer carries a confined process past a trusted input:
   a skill linked out of a trusted skills directory to a path a confined
   process could change is not loaded, a skill linked out of a Git checkout
-  is not loaded wherever the link leads, and a start whose realm state or
-  credential store links to such a path is refused.
+  is not loaded wherever the link leads (and finding a repository's skills
+  no longer descends through a link, so a link to `/` cannot walk the
+  host's filesystem), and a start whose realm state or credential store
+  links to such a path is refused.
 - The `rkat` mob deploy RPC host's config store addresses the realm's
   document as the realm config source maps it, so the reserved `global`
   realm's is the user document it composes, not a file under the state
