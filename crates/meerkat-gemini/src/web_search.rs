@@ -179,6 +179,13 @@ fn map_agent_error_to_llm_error(err: meerkat_core::AgentError) -> LlmError {
     use meerkat_core::AgentError;
     use meerkat_core::error::{LlmFailureReason, LlmProviderErrorKind};
 
+    // A required review the helper's model request could not carry settled
+    // at its entry and rides the authority-unavailable class. Keep its typed
+    // settlement so the tool gives the model the same review feedback as any
+    // other tool.
+    if let Some(refusal) = err.operation_review_refusal() {
+        return LlmError::OperationReviewRefused { refusal };
+    }
     match err {
         AgentError::OperationRefused { refusal } => LlmError::from_operation_refused(refusal),
         AgentError::Llm {
@@ -380,6 +387,62 @@ mod tests {
         ));
         assert_eq!(error.failure_reason(), stop.failure_reason());
         assert!(!error.is_retryable());
+    }
+
+    /// A required review the helper's model request could not carry keeps its
+    /// typed settlement through this seam, so the tool gives the model the
+    /// same review feedback as any other tool. It stays non-retryable local
+    /// feedback and never becomes a permission refusal.
+    #[test]
+    fn review_settlement_projection_keeps_its_typed_refusal() {
+        use meerkat_core::{OperationReviewRefusal, ReviewUnavailableKind, ReviewUnsatisfiedKind};
+        for refusal in [
+            OperationReviewRefusal::Unavailable {
+                kind: ReviewUnavailableKind::UnsupportedEntry,
+            },
+            OperationReviewRefusal::Unsatisfied {
+                kind: ReviewUnsatisfiedKind::HumanConsentRequired,
+            },
+        ] {
+            let error = map_agent_error_to_llm_error(
+                LlmError::OperationReviewRefused { refusal }.into_agent_error("gemini"),
+            );
+            assert!(
+                matches!(&error, LlmError::OperationReviewRefused { refusal: kept } if *kept == refusal),
+                "{error:?}"
+            );
+            assert!(!error.is_retryable());
+            assert!(
+                error
+                    .into_agent_error("gemini")
+                    .operation_refusal()
+                    .is_none(),
+                "not a permission refusal"
+            );
+        }
+    }
+
+    /// Authority that cannot be obtained keeps its own class through this
+    /// seam, also when its details carry no typed review settlement.
+    #[test]
+    fn authority_unavailable_projection_keeps_its_class() {
+        use meerkat_core::error::{LlmProviderError, LlmProviderErrorKind};
+        let malformed_review = AgentError::llm(
+            "gemini",
+            LlmFailureReason::ProviderError(LlmProviderError::non_retryable(
+                LlmProviderErrorKind::OperationAuthorizationUnavailable,
+                serde_json::json!({"review": {"review": "not_a_settlement"}}),
+            )),
+            "operation authorization unavailable",
+        );
+        for error in [AgentError::authorization_unavailable(), malformed_review] {
+            let error = map_agent_error_to_llm_error(error);
+            assert!(
+                matches!(error, LlmError::OperationAuthorizationUnavailable),
+                "{error:?}"
+            );
+            assert!(!error.is_retryable());
+        }
     }
 
     /// A fake LLM client that yields one canned outcome per call. The outcome

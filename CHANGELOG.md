@@ -35,6 +35,24 @@ them.
 
 ## [Unreleased]
 
+### Fixed
+
+- A governed web_search helper whose owner rates its model request R2 or R3
+  now gives the model the same typed review feedback as any other tool:
+  `review_unavailable` with kind `unsupported_entry` (R2) or
+  `review_unsatisfied` with kind `human_consent_required` (R3), carrying only
+  that `kind`. The request still settles at its model entry with nothing
+  sent, but the Anthropic, OpenAI and Gemini web_search executors
+  (`AnthropicWebSearchExecutor`, `OpenAiWebSearchExecutor`,
+  `GeminiWebSearchExecutor`) dropped the typed settlement at their provider
+  seam and returned `LlmError::OperationAuthorizationUnavailable`, so the
+  model saw `operation_authorization_unavailable` (as the 0.9.2 notes
+  described). They now return `LlmError::OperationReviewRefused`, which the
+  builtin web_search tool already reports as review feedback. web_search
+  gains no review support: its review entry stays unsupported and the
+  installed reviewer is never asked. An owner that cannot decide the helper
+  still gives `operation_authorization_unavailable`.
+
 ## [0.9.2] - 2026-10-16
 
 ### Breaking

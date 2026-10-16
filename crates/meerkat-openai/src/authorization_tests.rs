@@ -1184,3 +1184,131 @@ async fn helper_revocation_while_credentials_are_awaited_sends_nothing() {
     assert!(server.bodies.lock().unwrap().is_empty());
     assert_eq!(policy.facts().len(), 1);
 }
+
+// The helper's own model request carries no operation review, so a helper
+// its owner rates R2 or R3 settles at its model entry. The executor seam
+// keeps that typed settlement.
+
+/// Decides every helper model operation the same way and counts the
+/// decisions: allowed at `Some(tier)`, or authority unavailable at `None`.
+struct HelperOwner {
+    tier: Option<meerkat_core::authorization::OperationReviewTier>,
+    decisions: AtomicUsize,
+}
+impl HelperOwner {
+    fn new(tier: Option<meerkat_core::authorization::OperationReviewTier>) -> Arc<Self> {
+        Arc::new(Self {
+            tier,
+            decisions: AtomicUsize::new(0),
+        })
+    }
+}
+struct RatedDecision {
+    tier: meerkat_core::authorization::OperationReviewTier,
+    binding: PreparedAuthorizationBinding,
+}
+impl PreparedOperationAuthorization for RatedDecision {
+    fn review_tier(&self) -> meerkat_core::authorization::OperationReviewTier {
+        self.tier
+    }
+
+    fn check_current(
+        &self,
+        binding: &PreparedAuthorizationBinding,
+    ) -> Result<(), meerkat_core::OperationAuthorizationError> {
+        if !self.binding.same_operation(binding) {
+            return Err(OperationRefused::new(OperationRefusalKind::Denied).into());
+        }
+        Ok(())
+    }
+}
+impl WorkAuthorization for HelperOwner {
+    fn prepare(
+        &self,
+        binding: &PreparedAuthorizationBinding,
+    ) -> Result<Arc<dyn PreparedOperationAuthorization>, meerkat_core::OperationAuthorizationError>
+    {
+        self.decisions.fetch_add(1, Ordering::SeqCst);
+        let tier = self
+            .tier
+            .ok_or(meerkat_core::OperationAuthorizationError::Unavailable)?;
+        Ok(Arc::new(RatedDecision {
+            tier,
+            binding: binding.clone(),
+        }))
+    }
+}
+
+/// One governed search through the real OpenAI executor and client.
+async fn search_with(
+    url: &str,
+    owner: Arc<HelperOwner>,
+) -> Result<meerkat_core::web_search::WebSearchResult, LlmError> {
+    use meerkat_llm_core::WebSearchExecutor;
+
+    let work = WorkAuthorizationContext::new(
+        owner,
+        meerkat_core::exact_operation::OperationExecutionScope::Domain,
+    );
+    helper_executor(url, Authorizer::new(false, None))
+        .execute_web_search_authorized(search_request(), helper_authorization(&work))
+        .await
+}
+
+/// A helper rated R2 or R3 settles at its model entry with nothing sent, and
+/// the executor keeps that typed review settlement for its tool: the model
+/// gets the same review feedback as from any other tool, never authorization
+/// unavailable.
+#[tokio::test]
+async fn a_helper_rated_for_review_keeps_its_typed_settlement_through_the_executor() {
+    use meerkat_core::authorization::OperationReviewTier;
+    use meerkat_core::{OperationReviewRefusal, ReviewUnavailableKind, ReviewUnsatisfiedKind};
+
+    for (tier, expected) in [
+        (
+            OperationReviewTier::R2,
+            OperationReviewRefusal::Unavailable {
+                kind: ReviewUnavailableKind::UnsupportedEntry,
+            },
+        ),
+        (
+            OperationReviewTier::R3,
+            OperationReviewRefusal::Unsatisfied {
+                kind: ReviewUnsatisfiedKind::HumanConsentRequired,
+            },
+        ),
+    ] {
+        let server = serve(StatusCode::OK, None, false, None).await;
+        let owner = HelperOwner::new(Some(tier));
+        let error = search_with(&server.url, Arc::clone(&owner))
+            .await
+            .expect_err("a helper rated for review must not search");
+        assert!(
+            matches!(&error, LlmError::OperationReviewRefused { refusal } if *refusal == expected),
+            "{tier:?}: {error:?}"
+        );
+        assert!(!error.is_retryable());
+        assert_eq!(owner.decisions.load(Ordering::SeqCst), 1, "{tier:?}");
+        assert!(
+            server.bodies.lock().unwrap().is_empty(),
+            "{tier:?}: nothing is sent"
+        );
+    }
+}
+
+/// Authority the owner cannot provide for the helper keeps its own
+/// authorization-unavailable class through the executor.
+#[tokio::test]
+async fn an_undecided_helper_stays_authorization_unavailable_through_the_executor() {
+    let server = serve(StatusCode::OK, None, false, None).await;
+    let owner = HelperOwner::new(None);
+    let error = search_with(&server.url, Arc::clone(&owner))
+        .await
+        .expect_err("an undecided helper must not search");
+    assert!(
+        matches!(error, LlmError::OperationAuthorizationUnavailable),
+        "{error:?}"
+    );
+    assert_eq!(owner.decisions.load(Ordering::SeqCst), 1);
+    assert!(server.bodies.lock().unwrap().is_empty(), "nothing is sent");
+}
