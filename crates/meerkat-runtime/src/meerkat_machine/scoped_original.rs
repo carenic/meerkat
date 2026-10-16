@@ -104,6 +104,9 @@ impl std::fmt::Debug for AuthenticatedOriginal {
 /// now. The view is the adapter's own record, so a claim that disagrees with
 /// it on any field is refused.
 pub trait AuthenticatedOriginalSource: Send + Sync {
+    /// Native admission calls this synchronous method while it holds the
+    /// session's mutation gate and driver lock, so it performs no I/O, never
+    /// blocks and takes no native lock its caller may already hold.
     fn authenticated_original(
         &self,
         ingress: &NativeIngressContext,

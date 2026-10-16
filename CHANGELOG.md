@@ -577,6 +577,13 @@ them.
 
 ### Changed
 
+- `meerkat-runtime`: `AuthenticatedOriginalSource::authenticated_original`
+  now documents the contract host adapters must meet, which
+  `retained_original` already stated: native admission calls it
+  synchronously while it holds the session's mutation gate and driver lock,
+  so it performs no I/O, never blocks and takes no native lock its caller
+  may already hold. A read that blocks there holds up that session's other
+  admissions and the start of its admitted runs for as long as it blocks.
 - The release workflow's `Build Web SDK package` job runs beside the release
   validation and the semver gate once `Require green CI` passes, instead of
   after them. Its Cargo build runs four jobs instead of one: the release
