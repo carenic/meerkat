@@ -55,10 +55,15 @@ them.
     completion, removal or connection close, at shutdown, or when the router
     is dropped.
   - The stderr tail is sensitive and host-only. It is redacted for obvious
-    secret shapes and for the attempt's own launch environment values (keyed
-    digests of at most 64 values, no plaintext kept). Redaction is defence in
-    depth only. The tail never reaches the model, lifecycle notices, events
-    or errors.
+    secret shapes and for the attempt's own launch environment values. Those
+    values are kept as keyed digests, never as plaintext, at most 64 of
+    them, resolved secrets and the connector binding first; each line of a
+    multi-line value is also tracked.
+  - A private key cut at the tail's edge is redacted up to its END marker.
+  - Control characters other than line feed and tab are removed, so the
+    tail carries no terminal escape sequences.
+  - Redaction is defence in depth only. The tail never reaches the model,
+    lifecycle notices, events or errors.
   - The model's setup-failure notice is unchanged and carries no class.
   - `meerkat_core::redact::redact_secret_shapes` is the line-preserving
     redaction helper. `panic_safe_detail` output is unchanged.
@@ -76,10 +81,15 @@ them.
   of 24 at one job (33m43s in the v0.9.1 tag run).
 - `meerkat-mcp`: a stdio MCP server's stderr is now piped and drained by its
   process custody. Before, it was inherited on a trusted-host launch and
-  discarded under confinement. A trusted-host server's stderr is still
-  written to the host's own stderr; a confined server's never is. The drain
-  never blocks the server on a full pipe and stops shortly after the process
-  is gone.
+  discarded under confinement.
+  - A trusted-host server's stderr is still written to the host's own
+    stderr; a confined server's never is.
+  - While the process is held, the drain keeps reading, so the server does
+    not block on a full stderr pipe. A blocked host stderr can still hold a
+    trusted-host server, as an inherited stderr did.
+  - Shortly after the process is gone, the drain stops, forwarding
+    included, and closes its end. A descendant still writing to stderr then
+    gets `EPIPE` (or `SIGPIPE`).
 - `Publish Web SDK package` also requires the release validation gate and
   `Breaks declared and notes stamped` (both skipped only on Web-only
   recovery). It publishes only a package whose source stamp (commit, package

@@ -523,10 +523,11 @@ impl StdioChildCustody {
         // process exists. Required isolation has no Command fallback.
         let prepared = profile.prepare(stdio)?;
         // The attempt's diagnostics keep a keyed digest of each launch value
-        // (never the value) to redact it from the server's stderr tail.
+        // (never the value) to redact it from the server's stderr tail:
+        // resolved secrets and the connector binding first.
         let diagnostics = self.diagnostics_record();
         if let Some(record) = &diagnostics {
-            record.track_launch_values(stdio.env.values().map(String::as_str));
+            record.track_launch_values(crate::stdio_diagnostics::launch_values_by_priority(stdio));
         }
         // Physical entry: after custody and launch preparation, before the
         // process exists.
