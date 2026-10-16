@@ -5,7 +5,7 @@
 // BuildBuddy mode violated: a build-relevant change always yields lanes.
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { dirname, join, resolve } from "node:path";
@@ -545,20 +545,42 @@ for (const path of [
 // the push, and is checked against the push's closure rows.
 {
   const names = (rows) => rows.map((row) => row.name).sort();
-  for (const paths of [
-    ["Cargo.toml"],
-    ["crates/meerkat-core/src/lib.rs"],
-    ["crates/meerkat-mob/src/lib.rs"],
-    ["crates/meerkat/src/experimental_gpt_live.rs"],
-    ["crates/meerkat-cli/src/main.rs", "crates/meerkat-session/src/lib.rs"],
-    ["docs/index.mdx"],
+  // Samples beside the source edits: a Cargo.lock-only change, scoped to the
+  // members that resolve a changed entry (a checksum change of cpu-time,
+  // which meerkat-mob's own lock entry lists, so the scope holds the mob
+  // chain); a non-Rust fixture of meerkat-integration-tests, which selects
+  // the mob-chain suite gpt-live-replay by its package and its path; and
+  // that fixture directory's README, which no package owns, so the path
+  // alone selects the suite.
+  const realLock = readFileSync(resolve(root, "Cargo.lock"), "utf8");
+  const mobEntry = /\[\[package\]\]\nname = "meerkat-mob"\n[\s\S]*?(?=\n\n)/.exec(realLock);
+  assert.ok(mobEntry?.[0].includes('\n "cpu-time",\n'), "meerkat-mob's lock entry lists cpu-time");
+  const cpuTime = /\[\[package\]\]\nname = "cpu-time"\nversion = "[^"]+"\nsource = "[^"]+"\nchecksum = "([0-9a-f]+)"/.exec(realLock);
+  assert.ok(cpuTime, "the lock holds cpu-time");
+  const pairDir = mkdtempSync(join(tmpdir(), "ci-lanes-pair-"));
+  const pairBaseLock = join(pairDir, "Cargo.lock.base");
+  writeFileSync(pairBaseLock, realLock.replace(`checksum = "${cpuTime[1]}"`, `checksum = "${"0".repeat(64)}"`));
+  const replayFixture = "tests/integration/fixtures/gpt_live_replay/s104.provider-stream.jsonl";
+  const replayReadme = "tests/integration/fixtures/gpt_live_replay/README.md";
+  for (const sample of [replayFixture, replayReadme]) assert.ok(existsSync(resolve(root, sample)), `${sample} exists`);
+  try {
+  for (const [paths, extra] of [
+    [["Cargo.toml"], []],
+    [["crates/meerkat-core/src/lib.rs"], []],
+    [["crates/meerkat-mob/src/lib.rs"], []],
+    [["crates/meerkat/src/experimental_gpt_live.rs"], []],
+    [["crates/meerkat-cli/src/main.rs", "crates/meerkat-session/src/lib.rs"], []],
+    [["docs/index.mdx"], []],
+    [["Cargo.lock"], ["--base-lock", pairBaseLock]],
+    [[replayFixture], []],
+    [[replayReadme], []],
   ]) {
     const label = paths.join(" ");
-    const push = planFor(paths, ["--event", "push"]);
-    const pr = planFor(paths, ["--event", "pull_request"]);
+    const push = planFor(paths, [...extra, "--event", "push"]);
+    const pr = planFor(paths, [...extra, "--event", "pull_request"]);
     assert.equal(push.event, "push", label);
     assert.equal(pr.event, "pull_request", label);
-    assert.deepEqual(planFor(paths, ["--event", "workflow_dispatch"]).event, "push", `${label}: a dispatch plans the push lanes`);
+    assert.deepEqual(planFor(paths, [...extra, "--event", "workflow_dispatch"]).event, "push", `${label}: a dispatch plans the push lanes`);
     for (const key of ["mode", "packages", "closure", "test_scope", "unit_deferred", "unit_shards", "hook_coverage", "machine_authority", "generated_contract", "bazel_graph"]) {
       assert.deepEqual(pr[key], push[key], `${label}: ${key} does not depend on the event`);
     }
@@ -579,6 +601,27 @@ for (const path of [
       assertLanes(pr, `${label} (pull request)`);
       assertLanes(push, `${label} (push)`);
     }
+  }
+  // What the samples exercise: a scoped lock change that reaches the mob
+  // chain leaves its suites to the push, and so do the fixture and the
+  // path alone.
+  const lockPr = planFor(["Cargo.lock"], ["--base-lock", pairBaseLock, "--event", "pull_request"]);
+  assert.equal(lockPr.mode, "packages", "the lock change is scoped, not the workspace");
+  assert.deepEqual(lockPr.lock_scope.changed.map((entry) => entry.split(" ")[0]), ["cpu-time"]);
+  assert.ok(lockPr.packages.includes("meerkat-mob"), "the scope reaches meerkat-mob");
+  assert.ok(lockPr.deferred_to_push.integration_suites.length > 0, "the pull request leaves mob-chain suites to the push");
+  const replayPr = planFor([replayFixture], ["--event", "pull_request"]);
+  const replayPush = planFor([replayFixture], ["--event", "push"]);
+  assert.deepEqual(replayPr.packages, ["meerkat-integration-tests"], "the fixture belongs to a mob-chain package");
+  assert.deepEqual(replayPr.integration_suites, [], "the pull request runs no suite for it");
+  assert.deepEqual(replayPr.deferred_to_push.integration_suites, ["gpt-live-replay"], "and leaves its suite to the push");
+  assert.deepEqual(names(replayPush.integration_suites), ["gpt-live-replay"], "which runs it");
+  const readmePr = planFor([replayReadme], ["--event", "pull_request"]);
+  assert.equal(readmePr.rust_changed, false, "no package owns the README");
+  assert.deepEqual(readmePr.deferred_to_push.integration_suites, ["gpt-live-replay"], "its path alone leaves the suite to the push");
+  assert.deepEqual(names(planFor([replayReadme], ["--event", "push"]).integration_suites), ["gpt-live-replay"], "which runs it");
+  } finally {
+    rmSync(pairDir, { recursive: true, force: true });
   }
   // The whole workspace: the mob-chain packages lint their lib and bin
   // targets, except the chain heads in MOB_CHAIN_CLIPPY_HEADS, which lint
