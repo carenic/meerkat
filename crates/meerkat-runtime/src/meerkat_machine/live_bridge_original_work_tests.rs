@@ -653,13 +653,32 @@ async fn a_resumed_runs_bridge_outcome_resolves_to_the_original_it_resumes() {
         serde_json::to_string(&changed).expect("identity"),
     )
     .await;
-    assert!(matches!(
+    assert!(
         tampered
             .machine
-            .live_bridge_outcome_authority(&tampered.session_id, &operation)
-            .await,
-        Err(crate::live_execution::LiveBridgeOutcomeBindingError::Unavailable(_))
-    ));
+            .live_bridge_operation_has_original_work(&tampered.session_id, &operation)
+            .await
+            .expect("operation present"),
+        "the changed binding is recorded"
+    );
+    let outcome = tampered
+        .machine
+        .live_bridge_outcome_authority(&tampered.session_id, &operation)
+        .await;
+    assert!(
+        matches!(
+            outcome,
+            Err(
+                crate::live_execution::LiveBridgeOutcomeBindingError::Unavailable(
+                    RuntimeDriverError::RetainedResumeRefused {
+                        reason:
+                            crate::retained_work::RetainedResumeRefusal::NoAdmissibleWorkBinding,
+                    }
+                )
+            )
+        ),
+        "a changed resume row binding is no admissible work binding: {outcome:?}"
+    );
 }
 
 /// An original staged and finished as a run, a completion of that run
