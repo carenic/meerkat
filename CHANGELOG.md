@@ -1208,6 +1208,27 @@ them.
   other guards stop could add `source = { kind = "command", program =
   "/bin/sh", ... }` and have the host run it unconfined, at once through
   `POST /auth/bindings/{id}/test`.
+- `meerkat-runtime`: a retained continuation produced during an already
+  resumed run is admitted to the same original instead of being refused as
+  `no_admissible_work_binding`. The resumed run's identity names the
+  original contributors, but its selected row is the staged resume input,
+  which resolution refused because it is not a contributor. Resolution now
+  accepts such a selected row only from the runtime's own row under that
+  key, which must be the canonical rendering of an input id: an admitted
+  retained resume whose carried originals equal, by full equality (input
+  id, association and replay digest), one contiguous, same-order window of
+  the contributors resolved from their own rows, whose recorded identity
+  names exactly those originals, and whose selected binding and batch key
+  are the ones recomputed from its canonical original. Anything else is
+  still refused, and the host still checks current authorization for every
+  original. As before for the contributors, this proves the rows still exist
+  and are exact; it does not prove that the selected row was staged in that
+  run. The same resolution backs MCP observation of retained work and the
+  outcome of a live bridge operation dispatched from a resumed run
+  (`live_bridge_outcome_authority`): both now resolve for a resumed run,
+  and the bridge outcome is attributed to the original the run resumes
+  (its requester, represented subject, logical executor and realm), where
+  it was unavailable before.
 
 ### Known limitations
 
