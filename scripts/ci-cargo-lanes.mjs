@@ -43,8 +43,9 @@
 // governed JSONL and confinement-positive lanes, the feature suites marked
 // `pullRequest: false`, the test targets of the mob-chain packages (their
 // pull-request Clippy lints lib and bin targets only; their tests run on
-// main), and the wasm lanes that only the reverse-dependency closure
-// selected. On 4-vCPU hosted runners each of those needs 9-30 minutes
+// main), in workspace mode the whole Clippy of the chain heads in
+// WORKSPACE_PR_PUSH_CLIPPY, and the wasm lanes that only the
+// reverse-dependency closure selected. On 4-vCPU hosted runners each of those needs 9-30 minutes
 // (meerkat-mob alone compiles for 5-11 minutes whenever it misses the cache),
 // so no pull request fits the 20-minute cap from the start of the pre-push
 // hook to a green CI gate with them. The plan lists what a pull request left
@@ -493,6 +494,17 @@ export const CLIPPY_HEAD_SHARDS = [
   ["meerkat-rest", "meerkat-mcp-server", "meerkat-web-runtime"],
   ["meerkat-integration-tests", "surface-build-fixtures"],
 ];
+
+// The chain heads whose Clippy a workspace-mode pull request leaves to the
+// push. In that mode meerkat-mob misses the cache, and each of these lanes
+// compiles the whole chain below its package first: on runs 38859112297
+// and 38931641220, every target, rkat took 719-1114 s, meerkat-rpc
+// 745-1158 s and meerkat-integration-tests (with surface-build-fixtures)
+// 945-1057 s, and their lib targets alone sit on the same chain. A
+// packages-mode pull request lints them (lib and bin targets), since the
+// chain below them is cached there. Names are checked against cargo
+// metadata.
+export const WORKSPACE_PR_PUSH_CLIPPY = ["rkat", "meerkat-integration-tests", "meerkat-rpc"];
 export const CLIPPY_PACKED_SHARDS = 5;
 
 function parseBazelFeatureSets(pkg) {
@@ -1727,6 +1739,7 @@ function plan(args) {
     feature_check_jobs: 0,
     integration_suites: [],
     unit_feature_suites: [],
+    clippy_packages: [],
     clippy_test_targets: [],
     governed_jsonl: false,
     mcp_confinement_positive: false,
@@ -1798,21 +1811,29 @@ function plan(args) {
   if (result.rust_changed) {
     const shardCap = result.mode === "workspace" ? args.workspaceShards : args.maxShards;
     // Clippy lanes: every changed package. A pull request lints the
-    // mob-chain packages' lib and bin targets only.
+    // mob-chain packages' lib and bin targets only, and in workspace mode
+    // leaves the Clippy of WORKSPACE_PR_PUSH_CLIPPY to the push.
+    for (const name of WORKSPACE_PR_PUSH_CLIPPY) {
+      if (!byName.has(name)) throw new Error(`workspace pull-request Clippy deferral names unknown package ${name}`);
+    }
+    deferred.clippy_packages = deferToPush && result.mode === "workspace"
+      ? result.packages.filter((name) => WORKSPACE_PR_PUSH_CLIPPY.includes(name))
+      : [];
+    const clippyPackages = result.packages.filter((name) => !deferred.clippy_packages.includes(name));
     result.shards = clippyShards(
-      result.packages,
+      clippyPackages,
       weights,
       result.mode,
       shardCap,
       byName,
       deferToPush ? heavyChain : null,
     );
-    deferred.clippy_test_targets = deferToPush ? result.packages.filter((name) => heavyChain.has(name)) : [];
+    deferred.clippy_test_targets = deferToPush ? clippyPackages.filter((name) => heavyChain.has(name)) : [];
     if (result.shards.length === 0) {
       throw new Error("internal error: Rust-relevant change produced no lanes");
     }
     const covered = new Set(result.shards.flatMap((shard) => shard.packages));
-    for (const name of result.packages) {
+    for (const name of clippyPackages) {
       if (!covered.has(name)) throw new Error(`internal error: package ${name} not covered by any shard`);
     }
     // Pull-request unit lanes: the changed packages outside the heavy chain,
@@ -2168,6 +2189,7 @@ function deferredSummary(deferred) {
   if (deferred.feature_check_jobs > 0) parts.push(`${deferred.feature_check_jobs} feature-combination jobs`);
   if (deferred.integration_suites.length > 0) parts.push(`integration suites ${deferred.integration_suites.join(", ")}`);
   if (deferred.unit_feature_suites.length > 0) parts.push(`feature suites ${deferred.unit_feature_suites.join(", ")}`);
+  if (deferred.clippy_packages.length > 0) parts.push(`the Clippy of ${deferred.clippy_packages.join(", ")}`);
   if (deferred.clippy_test_targets.length > 0) parts.push(`the test targets' Clippy of ${deferred.clippy_test_targets.join(", ")}`);
   if (deferred.governed_jsonl) parts.push("governed JSONL");
   if (deferred.mcp_confinement_positive) parts.push("MCP confinement positive");

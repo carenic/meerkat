@@ -47,8 +47,9 @@ them.
   `mcp-confinement-positive`, the integration suites whose package compiles
   meerkat-mob, the facade's two GPT Live feature suites, the test targets of
   the mob-chain packages' Clippy (a pull request lints their lib and bin
-  targets), and the wasm lanes that only the reverse-dependency closure
-  selected. The plan names what a pull request left to the push
+  targets), in workspace mode the Clippy of rkat, meerkat-integration-tests
+  and meerkat-rpc (a packages-mode pull request lints them), and the wasm
+  lanes that only the reverse-dependency closure selected. The plan names what a pull request left to the push
   (`deferred_to_push`), the gate prints it, and the gate refuses a push plan
   that left anything. meerkat-rpc's default-feature unit row no longer runs
   in the pull request (`PR_UNIT_CHAIN_EXCEPTIONS` is gone; `main-unit` runs

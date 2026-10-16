@@ -20,7 +20,13 @@ import {
   profileFilter,
   workspaceFeatures,
 } from "./ci-hook-coverage.mjs";
-import { GOVERNANCE_DOC_PATTERNS, UNIT_SOLO_PACKAGES, lockScope, parseCargoLock } from "./ci-cargo-lanes.mjs";
+import {
+  GOVERNANCE_DOC_PATTERNS,
+  UNIT_SOLO_PACKAGES,
+  WORKSPACE_PR_PUSH_CLIPPY,
+  lockScope,
+  parseCargoLock,
+} from "./ci-cargo-lanes.mjs";
 import { readMetadata, workspacePackages } from "./rust-test-selector.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -46,9 +52,12 @@ function planFor(paths, extra = []) {
 function assertLanes(plan, label) {
   assert.equal(plan.rust_changed, true, `${label}: rust_changed`);
   assert.ok(plan.shards.length >= 1, `${label}: at least one clippy/unit shard`);
+  // Every changed package lints in a shard, or (a workspace-mode pull
+  // request's chain heads) is named as linting on the push.
   const covered = new Set(plan.shards.flatMap((shard) => shard.packages));
+  const pushClippy = new Set(plan.deferred_to_push?.clippy_packages ?? []);
   for (const name of plan.packages) {
-    assert.ok(covered.has(name), `${label}: ${name} is covered by a shard`);
+    assert.ok(covered.has(name) !== pushClippy.has(name), `${label}: ${name} lints in exactly one of a shard and the push`);
   }
   for (const shard of plan.shards) {
     assert.match(shard.packages_flags ?? shard.package_flags, /^-p \S+( -p \S+)*$/, `${label}: shard flags`);
@@ -142,7 +151,13 @@ function assertEventSplit(plan, label) {
       assert.equal(shard.targets, "--all-targets", `${label}: ${shard.name} lints every target`);
     }
   }
-  assert.deepEqual(deferred.clippy_test_targets, plan.packages.filter(chain), `${label}: the chain's test targets lint on the push`);
+  const pushClippy = plan.mode === "workspace" ? plan.packages.filter((name) => WORKSPACE_PR_PUSH_CLIPPY.includes(name)) : [];
+  assert.deepEqual(deferred.clippy_packages, pushClippy, `${label}: a workspace pull request leaves the chain heads' Clippy to the push`);
+  assert.deepEqual(
+    deferred.clippy_test_targets,
+    plan.packages.filter((name) => chain(name) && !pushClippy.includes(name)),
+    `${label}: the chain's test targets lint on the push`,
+  );
 }
 
 const HOOK_STACK = 32 * 1024 * 1024;
@@ -533,12 +548,12 @@ for (const path of [
     for (const key of ["mode", "packages", "closure", "test_scope", "unit_deferred", "unit_shards", "hook_coverage", "machine_authority", "generated_contract", "bazel_graph"]) {
       assert.deepEqual(pr[key], push[key], `${label}: ${key} does not depend on the event`);
     }
-    assert.deepEqual(
-      pr.shards.flatMap((shard) => shard.packages).sort(),
-      push.shards.flatMap((shard) => shard.packages).sort(),
-      `${label}: a pull request lints every changed package`,
-    );
     const deferred = pr.deferred_to_push;
+    assert.deepEqual(
+      [...pr.shards.flatMap((shard) => shard.packages), ...deferred.clippy_packages].sort(),
+      push.shards.flatMap((shard) => shard.packages).sort(),
+      `${label}: a pull request lints every changed package, or leaves its Clippy to the push`,
+    );
     assert.equal(deferred.closure_test_rows, push.closure_test_rows.length, `${label}: every closure-tests row is the push's`);
     assert.equal(deferred.feature_check_jobs, push.feature_check_jobs.length, `${label}: every feature check is the push's`);
     assert.deepEqual([...names(pr.integration_suites), ...deferred.integration_suites].sort(), names(push.integration_suites), `${label}: integration suites`);
@@ -551,14 +566,18 @@ for (const path of [
       assertLanes(push, `${label} (push)`);
     }
   }
-  // The whole workspace: the mob-chain heads lint their lib and bin targets,
-  // the facade and the packed shards every target; the suites and lanes that
-  // compile the chain, and the facade's GPT Live suites, wait for the push.
+  // The whole workspace: the mob-chain packages lint their lib and bin
+  // targets, except the chain heads in WORKSPACE_PR_PUSH_CLIPPY, which lint
+  // on the push only; the facade and the packed shards lint every target;
+  // the suites and lanes that compile the chain, and the facade's GPT Live
+  // suites, wait for the push.
   const pr = planFor(["Cargo.toml"], ["--event", "pull_request"]);
   const shardOf = (name) => pr.shards.find((shard) => shard.packages.includes(name));
   assert.equal(shardOf("meerkat-mob").targets, "--lib");
-  assert.equal(shardOf("rkat").targets, "--bins", "rkat has no lib target");
-  assert.equal(shardOf("meerkat-rpc").targets, "--lib --bins");
+  for (const name of WORKSPACE_PR_PUSH_CLIPPY) {
+    assert.equal(shardOf(name), undefined, `${name} lints on the push in a workspace-mode pull request`);
+  }
+  assert.deepEqual(pr.deferred_to_push.clippy_packages, ["meerkat-integration-tests", "meerkat-rpc", "rkat"]);
   assert.equal(shardOf("meerkat").targets, "--all-targets", "the facade is not in the chain");
   assert.equal(shardOf("surface-build-fixtures").targets, "--all-targets", "a mixed head group splits");
   assert.ok(!shardOf("surface-build-fixtures").packages.includes("meerkat-integration-tests"));
@@ -574,6 +593,19 @@ for (const path of [
   assert.equal(lines.closure_test_count, "0");
   assert.equal(lines.feature_check_count, "0");
   assert.match(lines.deferred_to_push, /^17 closure-tests rows; the closure check; \d+ feature-combination jobs; /);
+  assert.match(lines.deferred_to_push, /; the Clippy of meerkat-integration-tests, meerkat-rpc, rkat; /);
+  // A packages-mode pull request lints a chain head itself (lib and bin
+  // targets): the chain below it is cached there.
+  for (const [path, name, targets] of [
+    ["crates/meerkat-rpc/src/lib.rs", "meerkat-rpc", "--lib --bins"],
+    ["crates/meerkat-cli/src/main.rs", "rkat", "--bins"],
+    ["tests/integration/src/lib.rs", "meerkat-integration-tests", "--lib --bins"],
+  ]) {
+    const head = planFor([path], ["--event", "pull_request"]);
+    assert.equal(head.mode, "packages", `${path}: packages mode`);
+    assert.deepEqual(head.deferred_to_push.clippy_packages, [], `${path}: no Clippy left to the push`);
+    assert.equal(head.shards.find((shard) => shard.packages.includes(name))?.targets, targets, `${path}: ${name} lints ${targets}`);
+  }
   for (const row of JSON.parse(lines.shard_matrix).include) {
     assert.ok(["--all-targets", "--lib", "--bins", "--lib --bins"].includes(row.targets), `${row.name} carries its targets`);
   }
