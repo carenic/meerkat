@@ -748,6 +748,15 @@ mod tests {
         let (_, foreign_resume, foreign_run) =
             resumed_run(&elsewhere, "caller-a", "fork_off:job-x").await;
 
+        // B's own binding: a resume of B bound exactly as staging binds it, so
+        // only the window check (its carried originals are not the
+        // contributors) refuses it.
+        let (b_binding, b_batch) =
+            crate::input_authority::association_binding(b.association()).expect("binding");
+        let bound_under_b = meerkat_core::retained_work::SelectedInputBinding {
+            binding: b_binding.expect("binding"),
+            batch_key: b_batch.expect("batch key"),
+        };
         let mut changed_binding = resumed.selected_input_bindings()[&r1.to_string()].clone();
         changed_binding.binding = "another-binding".into();
         let mut changed_batch = resumed.selected_input_bindings()[&r1.to_string()].clone();
@@ -782,6 +791,11 @@ mod tests {
                 "a resume of other originals",
                 rekeyed(&resumed, &r1, &rb.to_string(), None),
                 "fork_off:case-other-originals",
+            ),
+            (
+                "a resume of other originals, bound under them",
+                rekeyed(&resumed, &r1, &rb.to_string(), Some(bound_under_b)),
+                "fork_off:case-other-originals-own-binding",
             ),
             (
                 "a changed binding",
