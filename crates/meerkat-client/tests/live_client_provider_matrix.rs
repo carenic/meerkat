@@ -4,6 +4,11 @@
 //! Live integration tests for LLM clients.
 //!
 //! Verifies stream normalization and error handling for all providers.
+//!
+//! No CI lane runs these tests: each live test is ignored and needs the
+//! provider's API key. Run them by hand:
+//! `cargo test -p meerkat-client --features integration-real-tests --test
+//! live_client_provider_matrix -- --ignored`.
 
 use axum::{Router, http::StatusCode, routing::post};
 use futures::StreamExt;
@@ -24,6 +29,7 @@ use meerkat_core::lifecycle::run_primitive::{
     AnthropicProviderTag, GeminiProviderTag, OpaqueProviderBody, OpenAiProviderTag, ProviderTag,
     ReasoningEffort,
 };
+use meerkat_core::model_profile::catalog::ImageGenerationModelRoute;
 use meerkat_core::{Message, StopReason, UserMessage};
 use meerkat_gemini::{GeminiImageOutputOptions, GeminiImageTurnPlan};
 use meerkat_llm_core::{ImageGenerationExecutor, ProviderImageGenerationRequest};
@@ -36,6 +42,16 @@ use serde_json::{Map, Value};
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 use tokio::net::{TcpListener, TcpStream};
+
+/// The text model each provider's tests send: the cheapest current catalog
+/// model of that provider by input and output price when chosen (Claude
+/// Haiku 5.5, GPT-6 Luna, Gemini 3.1 Flash-Lite). The image smokes use the
+/// catalog's image-generation defaults. `provider_matrix_catalog.rs`, a test
+/// that needs no provider keys or features, keeps every model id this file
+/// names in Core's catalog.
+const ANTHROPIC_MODEL: &str = "claude-haiku-5-5";
+const OPENAI_MODEL: &str = "gpt-6-luna";
+const GEMINI_MODEL: &str = "gemini-3.1-flash-lite";
 
 struct AbortOnDrop(tokio::task::JoinHandle<()>);
 
@@ -193,7 +209,7 @@ fn image_capabilities() -> ImageGenerationTargetCapabilities {
 }
 
 #[tokio::test]
-#[ignore = "lane:e2e-live"]
+#[ignore = "live provider matrix: needs provider API keys; run by hand with --ignored"]
 async fn e2e_anthropic_stream() -> Result<(), Box<dyn std::error::Error>> {
     let Some(api_key) = anthropic_api_key() else {
         eprintln!("Skipping: missing ANTHROPIC_API_KEY (or RKAT_ANTHROPIC_API_KEY)");
@@ -201,7 +217,7 @@ async fn e2e_anthropic_stream() -> Result<(), Box<dyn std::error::Error>> {
     };
     let client = AnthropicClient::new(api_key)?;
     let request = LlmRequest::new(
-        "claude-3-haiku-20240307",
+        ANTHROPIC_MODEL,
         vec![Message::User(UserMessage::text("Say 'Hello'".to_string()))],
     );
 
@@ -226,7 +242,7 @@ async fn e2e_anthropic_stream() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[tokio::test]
-#[ignore = "lane:e2e-smoke"]
+#[ignore = "live provider matrix: needs provider API keys; run by hand with --ignored"]
 async fn e2e_smoke_provider_web_search_all_three() -> Result<(), Box<dyn std::error::Error>> {
     let mut ran = 0usize;
     let prompt = "Use the web search tool for this answer. Search for the current title of https://example.com and answer in one short sentence with the source URL.";
@@ -235,7 +251,7 @@ async fn e2e_smoke_provider_web_search_all_three() -> Result<(), Box<dyn std::er
         ran += 1;
         let client = OpenAiClient::new(api_key);
         let request = LlmRequest::new(
-            "gpt-5.4",
+            OPENAI_MODEL,
             vec![Message::User(UserMessage::text(prompt.to_string()))],
         )
         .with_provider_params(ProviderTag::OpenAi(OpenAiProviderTag {
@@ -261,7 +277,7 @@ async fn e2e_smoke_provider_web_search_all_three() -> Result<(), Box<dyn std::er
         ran += 1;
         let client = AnthropicClient::new(api_key)?;
         let request = LlmRequest::new(
-            "claude-sonnet-4-6",
+            ANTHROPIC_MODEL,
             vec![Message::User(UserMessage::text(prompt.to_string()))],
         )
         .with_provider_params(ProviderTag::Anthropic(AnthropicProviderTag {
@@ -288,7 +304,7 @@ async fn e2e_smoke_provider_web_search_all_three() -> Result<(), Box<dyn std::er
         ran += 1;
         let client = GeminiClient::new(api_key);
         let request = LlmRequest::new(
-            "gemini-3.1-flash-lite-preview",
+            GEMINI_MODEL,
             vec![Message::User(UserMessage::text(prompt.to_string()))],
         )
         .with_provider_params(ProviderTag::Gemini(GeminiProviderTag {
@@ -315,14 +331,34 @@ async fn e2e_smoke_provider_web_search_all_three() -> Result<(), Box<dyn std::er
 }
 
 #[tokio::test]
-#[ignore = "lane:e2e-smoke"]
+#[ignore = "live provider matrix: needs provider API keys; run by hand with --ignored"]
 async fn e2e_smoke_openai_live_image_generation() -> Result<(), Box<dyn std::error::Error>> {
     let Some(api_key) = openai_api_key() else {
         eprintln!("Skipping OpenAI image smoke: missing OPENAI_API_KEY (or RKAT_OPENAI_API_KEY)");
         return Ok(());
     };
-    let image_model =
-        std::env::var("RKAT_OPENAI_IMAGE_MODEL").unwrap_or_else(|_| "gpt-image-2".into());
+    let image_model = std::env::var("RKAT_OPENAI_IMAGE_MODEL").unwrap_or_else(|_| {
+        meerkat_models::default_image_generation_model(meerkat_core::Provider::OpenAI)
+            .expect("the catalog has an OpenAI image-generation default")
+            .model_id
+            .into()
+    });
+    // The catalog owns the route: a hosted-tool image model is generated by
+    // its tool model inside a Responses call on the route's call model (the
+    // requested model itself when the route names none).
+    let hosted_route =
+        match meerkat_models::image_generation_model(meerkat_core::Provider::OpenAI, &image_model)
+            .map(|profile| profile.route)
+        {
+            Some(ImageGenerationModelRoute::OpenAiHostedResponsesTool {
+                provider_call_model_id,
+                tool_model_id,
+            }) => Some((
+                provider_call_model_id.map_or_else(|| image_model.clone(), str::to_string),
+                tool_model_id,
+            )),
+            _ => None,
+        };
     let hosted_reasoning_effort = match std::env::var("RKAT_OPENAI_IMAGE_REASONING_EFFORT")
         .as_deref()
     {
@@ -345,9 +381,9 @@ async fn e2e_smoke_openai_live_image_generation() -> Result<(), Box<dyn std::err
         "return_token_budget": "default"
     }));
 
-    let (provider_model, execution_plan) = if image_model == "gpt-image-2" {
+    let (provider_model, execution_plan) = if let Some((call_model, tool_model)) = hosted_route {
         (
-            "gpt-5.4".to_string(),
+            call_model,
             GenerateImageExecutionPlan {
                 provider: ProviderId::new("openai"),
                 backend: ImageGenerationBackendKind::HostedTool,
@@ -356,7 +392,7 @@ async fn e2e_smoke_openai_live_image_generation() -> Result<(), Box<dyn std::err
                 requires_scoped_override: false,
                 provider_plan: serde_json::to_value(OpenAiResponsesImagePlan {
                     tool_name: "image_generation".into(),
-                    model: ModelId::new(image_model.clone()),
+                    model: ModelId::new(tool_model),
                     output: OpenAiImageOutputOptions::default(),
                     provider_params: hosted_provider_params,
                 })?,
@@ -406,7 +442,7 @@ async fn e2e_smoke_openai_live_image_generation() -> Result<(), Box<dyn std::err
 }
 
 #[tokio::test]
-#[ignore = "lane:e2e-smoke"]
+#[ignore = "live provider matrix: needs provider API keys; run by hand with --ignored"]
 async fn e2e_smoke_gemini_live_image_generation() -> Result<(), Box<dyn std::error::Error>> {
     let Some(api_key) = gemini_api_key() else {
         eprintln!(
@@ -414,8 +450,12 @@ async fn e2e_smoke_gemini_live_image_generation() -> Result<(), Box<dyn std::err
         );
         return Ok(());
     };
-    let model = std::env::var("RKAT_GEMINI_IMAGE_MODEL")
-        .unwrap_or_else(|_| "gemini-3.1-flash-image-preview".into());
+    let model = std::env::var("RKAT_GEMINI_IMAGE_MODEL").unwrap_or_else(|_| {
+        meerkat_models::default_image_generation_model(meerkat_core::Provider::Gemini)
+            .expect("the catalog has a Gemini image-generation default")
+            .model_id
+            .into()
+    });
     let client = GeminiClient::new(api_key);
     let request = ProviderImageGenerationRequest {
         operation_id: ImageOperationId::new(uuid::Uuid::new_v4()),
@@ -453,7 +493,7 @@ async fn e2e_smoke_gemini_live_image_generation() -> Result<(), Box<dyn std::err
 }
 
 #[tokio::test]
-#[ignore = "lane:e2e-live"]
+#[ignore = "live provider matrix: needs provider API keys; run by hand with --ignored"]
 async fn e2e_anthropic_tool_use() -> Result<(), Box<dyn std::error::Error>> {
     let Some(api_key) = anthropic_api_key() else {
         eprintln!("Skipping: missing ANTHROPIC_API_KEY (or RKAT_ANTHROPIC_API_KEY)");
@@ -461,7 +501,7 @@ async fn e2e_anthropic_tool_use() -> Result<(), Box<dyn std::error::Error>> {
     };
     let client = AnthropicClient::new(api_key)?;
     let request = LlmRequest::new(
-        "claude-3-haiku-20240307",
+        ANTHROPIC_MODEL,
         vec![Message::User(UserMessage::text(
             "What's the weather in Tokyo?".to_string(),
         ))],
@@ -515,7 +555,7 @@ async fn test_anthropic_auth_error() -> Result<(), Box<dyn std::error::Error>> {
         .build()?;
 
     let request = LlmRequest::new(
-        "claude-3-haiku-20240307",
+        ANTHROPIC_MODEL,
         vec![Message::User(UserMessage::text("test".to_string()))],
     );
 
@@ -556,7 +596,7 @@ async fn test_anthropic_message_stop_without_newline_yields_done()
         .base_url(base_url)
         .build()?;
     let request = LlmRequest::new(
-        "claude-3-haiku-20240307",
+        ANTHROPIC_MODEL,
         vec![Message::User(UserMessage::text("test".to_string()))],
     );
 
@@ -617,7 +657,7 @@ async fn test_anthropic_message_stop_without_space_prefix_yields_done()
         .base_url(base_url)
         .build()?;
     let request = LlmRequest::new(
-        "claude-3-haiku-20240307",
+        ANTHROPIC_MODEL,
         vec![Message::User(UserMessage::text("test".to_string()))],
     );
 
@@ -681,7 +721,7 @@ async fn test_anthropic_stream_end_without_done_yields_incomplete()
         .base_url(base_url)
         .build()?;
     let request = LlmRequest::new(
-        "claude-3-haiku-20240307",
+        ANTHROPIC_MODEL,
         vec![Message::User(UserMessage::text("test".to_string()))],
     );
 
@@ -728,7 +768,7 @@ async fn test_anthropic_stream_end_without_done_yields_incomplete()
 }
 
 #[tokio::test]
-#[ignore = "lane:e2e-live"]
+#[ignore = "live provider matrix: needs provider API keys; run by hand with --ignored"]
 async fn e2e_openai_stream() -> Result<(), Box<dyn std::error::Error>> {
     let Some(api_key) = openai_api_key() else {
         eprintln!("Skipping: missing OPENAI_API_KEY (or RKAT_OPENAI_API_KEY)");
@@ -736,7 +776,7 @@ async fn e2e_openai_stream() -> Result<(), Box<dyn std::error::Error>> {
     };
     let client = OpenAiClient::new(api_key);
     let request = LlmRequest::new(
-        "gpt-5.2",
+        OPENAI_MODEL,
         vec![Message::User(UserMessage::text("Say 'Hello'".to_string()))],
     );
 
@@ -761,7 +801,7 @@ async fn e2e_openai_stream() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[tokio::test]
-#[ignore = "lane:e2e-live"]
+#[ignore = "live provider matrix: needs provider API keys; run by hand with --ignored"]
 async fn e2e_openai_tool_use() -> Result<(), Box<dyn std::error::Error>> {
     let Some(api_key) = openai_api_key() else {
         eprintln!("Skipping: missing OPENAI_API_KEY (or RKAT_OPENAI_API_KEY)");
@@ -769,7 +809,7 @@ async fn e2e_openai_tool_use() -> Result<(), Box<dyn std::error::Error>> {
     };
     let client = OpenAiClient::new(api_key);
     let request = LlmRequest::new(
-        "gpt-5.2",
+        OPENAI_MODEL,
         vec![Message::User(UserMessage::text(
             "What's the weather in Tokyo?".to_string(),
         ))],
@@ -809,7 +849,7 @@ async fn e2e_openai_tool_use() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[tokio::test]
-#[ignore = "lane:e2e-live"]
+#[ignore = "live provider matrix: needs provider API keys; run by hand with --ignored"]
 async fn e2e_gemini_stream() -> Result<(), Box<dyn std::error::Error>> {
     let Some(api_key) = gemini_api_key() else {
         eprintln!("Skipping: missing GOOGLE_API_KEY (or GEMINI_API_KEY/RKAT_GEMINI_API_KEY)");
@@ -817,7 +857,7 @@ async fn e2e_gemini_stream() -> Result<(), Box<dyn std::error::Error>> {
     };
     let client = GeminiClient::new(api_key);
     let request = LlmRequest::new(
-        "gemini-1.5-flash",
+        GEMINI_MODEL,
         vec![Message::User(UserMessage::text("Say 'Hello'".to_string()))],
     );
 
@@ -842,7 +882,7 @@ async fn e2e_gemini_stream() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[tokio::test]
-#[ignore = "lane:e2e-live"]
+#[ignore = "live provider matrix: needs provider API keys; run by hand with --ignored"]
 async fn e2e_gemini_tool_use() -> Result<(), Box<dyn std::error::Error>> {
     let Some(api_key) = gemini_api_key() else {
         eprintln!("Skipping: missing GOOGLE_API_KEY (or GEMINI_API_KEY/RKAT_GEMINI_API_KEY)");
@@ -850,7 +890,7 @@ async fn e2e_gemini_tool_use() -> Result<(), Box<dyn std::error::Error>> {
     };
     let client = GeminiClient::new(api_key);
     let request = LlmRequest::new(
-        "gemini-1.5-flash",
+        GEMINI_MODEL,
         vec![Message::User(UserMessage::text(
             "What's the weather in Tokyo?".to_string(),
         ))],
@@ -907,7 +947,7 @@ async fn test_openai_auth_error() -> Result<(), Box<dyn std::error::Error>> {
     let client = OpenAiClient::new_with_base_url("invalid-key".to_string(), base_url);
 
     let request = LlmRequest::new(
-        "gpt-5.2",
+        OPENAI_MODEL,
         vec![Message::User(UserMessage::text("test".to_string()))],
     );
 
@@ -932,7 +972,8 @@ async fn test_openai_auth_error() -> Result<(), Box<dyn std::error::Error>> {
 // =============================================================================
 //
 // These tests verify structured output works with real API calls.
-// Run with: ANTHROPIC_API_KEY=... cargo test -p meerkat-client structured_output -- --ignored
+// Run with: ANTHROPIC_API_KEY=... cargo test -p meerkat-client --features
+// integration-real-tests --test live_client_provider_matrix structured_output -- --ignored
 
 fn person_schema() -> Value {
     serde_json::json!({
@@ -1025,7 +1066,7 @@ async fn collect_stream_text(
 }
 
 #[tokio::test]
-#[ignore = "lane:e2e-live"]
+#[ignore = "live provider matrix: needs provider API keys; run by hand with --ignored"]
 async fn e2e_anthropic_structured_output() -> Result<(), Box<dyn std::error::Error>> {
     let Some(api_key) = anthropic_api_key() else {
         eprintln!("Skipping: missing ANTHROPIC_API_KEY (or RKAT_ANTHROPIC_API_KEY)");
@@ -1033,7 +1074,7 @@ async fn e2e_anthropic_structured_output() -> Result<(), Box<dyn std::error::Err
     };
     let client = AnthropicClient::new(api_key)?;
     let request = LlmRequest::new(
-        "claude-sonnet-4-5",
+        ANTHROPIC_MODEL,
         vec![Message::User(UserMessage::text(
             "Generate a person named Alice who is 30 years old.".to_string(),
         ))],
@@ -1060,7 +1101,7 @@ async fn e2e_anthropic_structured_output() -> Result<(), Box<dyn std::error::Err
 }
 
 #[tokio::test]
-#[ignore = "lane:e2e-live"]
+#[ignore = "live provider matrix: needs provider API keys; run by hand with --ignored"]
 async fn e2e_openai_structured_output() -> Result<(), Box<dyn std::error::Error>> {
     let Some(api_key) = openai_api_key() else {
         eprintln!("Skipping: missing OPENAI_API_KEY (or RKAT_OPENAI_API_KEY)");
@@ -1068,7 +1109,7 @@ async fn e2e_openai_structured_output() -> Result<(), Box<dyn std::error::Error>
     };
     let client = OpenAiClient::new(api_key);
     let request = LlmRequest::new(
-        "gpt-5.2",
+        OPENAI_MODEL,
         vec![Message::User(UserMessage::text(
             "Generate a person named Bob who is 25 years old.".to_string(),
         ))],
@@ -1093,7 +1134,7 @@ async fn e2e_openai_structured_output() -> Result<(), Box<dyn std::error::Error>
 }
 
 #[tokio::test]
-#[ignore = "lane:e2e-live"]
+#[ignore = "live provider matrix: needs provider API keys; run by hand with --ignored"]
 async fn e2e_gemini_structured_output() -> Result<(), Box<dyn std::error::Error>> {
     let Some(api_key) = gemini_api_key() else {
         eprintln!("Skipping: missing GOOGLE_API_KEY (or GEMINI_API_KEY/RKAT_GEMINI_API_KEY)");
@@ -1101,7 +1142,7 @@ async fn e2e_gemini_structured_output() -> Result<(), Box<dyn std::error::Error>
     };
     let client = GeminiClient::new(api_key);
     let request = LlmRequest::new(
-        "gemini-3.5-flash",
+        GEMINI_MODEL,
         vec![Message::User(UserMessage::text(
             "Generate a person named Carol who is 35 years old.".to_string(),
         ))],
@@ -1126,7 +1167,7 @@ async fn e2e_gemini_structured_output() -> Result<(), Box<dyn std::error::Error>
 }
 
 #[tokio::test]
-#[ignore = "lane:e2e-live"]
+#[ignore = "live provider matrix: needs provider API keys; run by hand with --ignored"]
 async fn e2e_openai_structured_output_strict_nested_schema()
 -> Result<(), Box<dyn std::error::Error>> {
     let Some(api_key) = openai_api_key() else {
@@ -1135,7 +1176,7 @@ async fn e2e_openai_structured_output_strict_nested_schema()
     };
     let client = OpenAiClient::new(api_key);
     let request = LlmRequest::new(
-        "gpt-5.2",
+        OPENAI_MODEL,
         vec![Message::User(UserMessage::text(
             "Return JSON with person={name:'Dina',age:41} and tags=[{label:'runner'}].",
         ))],
@@ -1168,7 +1209,7 @@ async fn e2e_openai_structured_output_strict_nested_schema()
 }
 
 #[tokio::test]
-#[ignore = "lane:e2e-live"]
+#[ignore = "live provider matrix: needs provider API keys; run by hand with --ignored"]
 async fn e2e_anthropic_structured_output_strict_nested_schema()
 -> Result<(), Box<dyn std::error::Error>> {
     let Some(api_key) = anthropic_api_key() else {
@@ -1177,7 +1218,7 @@ async fn e2e_anthropic_structured_output_strict_nested_schema()
     };
     let client = AnthropicClient::new(api_key)?;
     let request = LlmRequest::new(
-        "claude-sonnet-4-5",
+        ANTHROPIC_MODEL,
         vec![Message::User(UserMessage::text(
             "Return JSON with person={name:'Evan',age:29} and tags=[{label:'designer'}].",
         ))],
@@ -1212,7 +1253,7 @@ async fn e2e_anthropic_structured_output_strict_nested_schema()
 }
 
 #[tokio::test]
-#[ignore = "lane:e2e-live"]
+#[ignore = "live provider matrix: needs provider API keys; run by hand with --ignored"]
 async fn e2e_gemini_structured_output_rich_schema_keywords()
 -> Result<(), Box<dyn std::error::Error>> {
     let Some(api_key) = gemini_api_key() else {
@@ -1221,7 +1262,7 @@ async fn e2e_gemini_structured_output_rich_schema_keywords()
     };
     let client = GeminiClient::new(api_key);
     let request = LlmRequest::new(
-        "gemini-3.5-flash",
+        GEMINI_MODEL,
         vec![Message::User(UserMessage::text(
             "Return JSON: status='ok', payload={score:0.6, category:'test'}.".to_string(),
         ))],

@@ -312,8 +312,10 @@ pub struct FinishResult {
 /// Single source of truth for the `adaptive/layer-decision.schema.json`
 /// artifact bundled in adaptive mobpacks: the pack builder emits this schema
 /// when packing an adaptive pack, and pack validation requires the bundled
-/// bytes to match it (structural JSON equality, i.e. byte equality after
-/// canonical serialization), so a stale or hand-rolled schema fails closed.
+/// schema to match it structurally (JSON equality once the `title` and
+/// `description` documentation keywords are removed), so a stale or
+/// hand-rolled schema fails closed while a reworded doc comment does not
+/// invalidate packs built before it.
 #[cfg(feature = "schema")]
 pub fn layer_decision_schema() -> Result<serde_json::Value, serde_json::Error> {
     serde_json::to_value(schemars::schema_for!(LayerDecision))

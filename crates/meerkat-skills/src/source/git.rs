@@ -3,7 +3,6 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime};
 
@@ -80,6 +79,9 @@ pub struct GitSkillSource {
     checkout_dir: PathBuf,
     cache: Arc<RwLock<RemoteCache>>,
     failure_streak: Arc<RwLock<u32>>,
+    // A shared predicate, which a panic cannot leave half-changed, so the
+    // source stays `UnwindSafe` and `RefUnwindSafe`.
+    untrusted: Option<std::panic::AssertUnwindSafe<crate::UntrustedPaths>>,
 }
 
 impl GitSkillSource {
@@ -99,7 +101,19 @@ impl GitSkillSource {
             checkout_dir,
             cache: Arc::new(RwLock::new(RemoteCache::default())),
             failure_streak: Arc::new(RwLock::new(0)),
+            untrusted: None,
         }
+    }
+
+    /// Run `git`, and every program it starts by name (`ssh`, `git-lfs`, a
+    /// credential helper), from a `PATH` without relative directories or the
+    /// directories `untrusted` names
+    /// ([`meerkat_core::HostLaunchExemption::git`]), so none is a program a
+    /// confined process put there.
+    #[must_use]
+    pub fn with_untrusted_paths(mut self, untrusted: crate::UntrustedPaths) -> Self {
+        self.untrusted = Some(std::panic::AssertUnwindSafe(untrusted));
+        self
     }
 
     fn refresh_if_needed(&self) -> Result<(), SkillError> {
@@ -171,9 +185,34 @@ impl GitSkillSource {
                 .into(),
             )
         })?;
+        // The repository URL and the ref come from configuration; a value
+        // that reads as a git option, or carries shell metacharacters, is
+        // refused, and every git invocation passes `--end-of-options` before
+        // its positionals so a value is never read as one.
+        checked_repository_url(&self.config.repo_url)?;
+        checked_ref(self.config.git_ref.as_str())?;
+        // A local repository inside a confined write grant is one a confined
+        // process could have planted: clone runs its upload-pack against
+        // that repository's own config.
+        if let Some(local) = local_repository_path(&self.config.repo_url)
+            && self
+                .untrusted
+                .as_ref()
+                .is_some_and(|untrusted| untrusted.0(&local, true))
+        {
+            return Err(SkillError::Load(
+                "git skill repository refused: a local repository a confined process could change"
+                    .into(),
+            ));
+        }
         if self.checkout_dir.join(".git").is_dir() {
-            self.run_git(&["fetch", "origin", self.config.git_ref.as_str()])?;
-            self.run_git(&["checkout", "FETCH_HEAD"])?;
+            self.run_git(&[
+                "fetch",
+                "--end-of-options",
+                "origin",
+                self.config.git_ref.as_str(),
+            ])?;
+            self.run_git(&["checkout", "--end-of-options", "FETCH_HEAD"])?;
             return Ok(());
         }
 
@@ -192,12 +231,13 @@ impl GitSkillSource {
             }
             GitRef::Commit(_) => {}
         }
+        args.push("--end-of-options");
         args.push(&auth_url);
         let checkout = self.checkout_dir.to_string_lossy().to_string();
         args.push(&checkout);
         self.run_git_at(&args, None)?;
         if matches!(self.config.git_ref, GitRef::Commit(_)) {
-            self.run_git(&["checkout", self.config.git_ref.as_str()])?;
+            self.run_git(&["checkout", "--end-of-options", self.config.git_ref.as_str()])?;
         }
         Ok(())
     }
@@ -207,10 +247,37 @@ impl GitSkillSource {
             Some(skills_root) => self.checkout_dir.join(skills_root),
             None => self.checkout_dir.clone(),
         };
+        // The scan root itself may be a link the repository planted; one that
+        // leads out of the checkout is not walked (the checkout root leads
+        // nowhere, so an unset `skills_root` is always walked).
+        if super::leads_out_of(&self.checkout_dir, &root) {
+            tracing::warn!(
+                dir = %root.display(),
+                "skipping Git skills root: it links out of the checkout"
+            );
+            return Ok(RemoteCache {
+                descriptors: Vec::new(),
+                documents: std::collections::BTreeMap::new(),
+                quarantined: Vec::new(),
+                refreshed_at: Some(SystemTime::now()),
+            });
+        }
         let mut descriptors = Vec::new();
         let mut documents = std::collections::BTreeMap::new();
         let mut quarantined = Vec::new();
         for skill_dir in discover_skill_directories(&root) {
+            // Repository content never reaches into the host's filesystem: a
+            // skill whose directory or SKILL.md a link leads out of the
+            // checkout to is not read, wherever the link leads.
+            if super::leads_out_of(&self.checkout_dir, &skill_dir)
+                || super::leads_out_of(&self.checkout_dir, &skill_dir.join("SKILL.md"))
+            {
+                tracing::warn!(
+                    dir = %skill_dir.display(),
+                    "skipping Git skill: it links out of the checkout"
+                );
+                continue;
+            }
             let Some(file_name) = skill_dir.file_name().and_then(|name| name.to_str()) else {
                 continue;
             };
@@ -272,12 +339,17 @@ impl GitSkillSource {
 
     fn run_git_at(&self, args: &[&str], cwd: Option<&Path>) -> Result<(), SkillError> {
         let ssh_command = match &self.config.auth {
-            Some(GitSkillAuth::SshKey(path)) => {
-                Some(format!("ssh -i {path} -o IdentitiesOnly=yes"))
-            }
+            Some(GitSkillAuth::SshKey(path)) => Some(git_ssh_command(path)?),
             _ => None,
         };
-        run_command("git", args, cwd, ssh_command.as_deref())
+        run_git_command(
+            args,
+            cwd,
+            ssh_command.as_deref(),
+            self.untrusted
+                .as_ref()
+                .map(|untrusted| untrusted.0.as_ref()),
+        )
     }
 
     fn authenticated_url(&self) -> String {
@@ -338,13 +410,121 @@ impl SkillSource for GitSkillSource {
     }
 }
 
-fn run_command(
-    program: &str,
+/// The `GIT_SSH_COMMAND` for the ssh key at `path`. git runs this string
+/// through a shell, so a key path that could carry a shell command is
+/// refused rather than run: it must be absolute, an existing regular file,
+/// free of control characters and of a single quote (which single-quoting
+/// cannot escape), and must not start with `-`. The accepted path is
+/// single-quoted, so the shell takes it as one literal argument to `ssh -i`.
+fn git_ssh_command(path: &str) -> Result<String, SkillError> {
+    let refuse = |why: &str| {
+        Err(SkillError::Load(
+            format!("git skill ssh key path refused: {why}").into(),
+        ))
+    };
+    if path.starts_with('-') {
+        return refuse("it must not start with '-'");
+    }
+    if path.chars().any(|c| c.is_control() || c == '\'') {
+        return refuse("it must not contain control characters or a single quote");
+    }
+    let candidate = Path::new(path);
+    if !candidate.is_absolute() {
+        return refuse("it must be an absolute path");
+    }
+    if !candidate.is_file() {
+        return refuse("it must be an existing regular file");
+    }
+    Ok(format!("ssh -i '{path}' -o IdentitiesOnly=yes"))
+}
+
+/// Refuse a git ref that could be read as an option or carry a shell
+/// metacharacter: one that is empty, starts with `-`, or contains
+/// whitespace or control characters. Every invocation also passes
+/// `--end-of-options` before its refs.
+fn checked_ref(value: &str) -> Result<(), SkillError> {
+    if value.is_empty() {
+        return Err(SkillError::Load(
+            "git skill ref refused: it is empty".into(),
+        ));
+    }
+    if value.starts_with('-') {
+        return Err(SkillError::Load(
+            "git skill ref refused: it must not start with '-'".into(),
+        ));
+    }
+    if value.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err(SkillError::Load(
+            "git skill ref refused: it must not contain whitespace or control characters".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Refuse a repository URL that could be read as an option, carry a shell
+/// metacharacter, or name an unsupported transport: it must not start with
+/// `-` or contain whitespace or control characters, and its scheme must be
+/// one of `ssh`, `https`, `http`, `git` or `file`, a scp-like
+/// `[user@]host:path`, or a local absolute path.
+fn checked_repository_url(url: &str) -> Result<(), SkillError> {
+    let refuse = |why: &str| {
+        Err(SkillError::Load(
+            format!("git skill repository url refused: {why}").into(),
+        ))
+    };
+    if url.starts_with('-') {
+        return refuse("it must not start with '-'");
+    }
+    if url.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return refuse("it must not contain whitespace or control characters");
+    }
+    // `<helper>::<address>` selects a git remote helper (`ext::` runs a
+    // command); it is never a supported transport.
+    if url.contains("::") {
+        return refuse("a remote-helper address (`::`) is not a supported transport");
+    }
+    let known_scheme = ["ssh://", "https://", "http://", "git://", "file://"]
+        .iter()
+        .any(|scheme| url.starts_with(scheme));
+    // Any other `scheme://` is refused; a scp-like `[user@]host:path` has no
+    // `//` after its colon and no `/` before it.
+    let other_scheme = !known_scheme && url.contains("://");
+    let scp_like = || {
+        url.split_once(':').is_some_and(|(host, rest)| {
+            !host.is_empty() && !host.contains('/') && !rest.starts_with("//")
+        })
+    };
+    let local_path = Path::new(url).is_absolute();
+    if other_scheme || !(known_scheme || local_path || scp_like()) {
+        return refuse("its transport is not ssh, https, http, git, file or a local path");
+    }
+    Ok(())
+}
+
+/// The local path a repository URL names (a `file://` URL or an absolute
+/// path), for judging it against what a confined process could change.
+fn local_repository_path(url: &str) -> Option<PathBuf> {
+    let path = url.strip_prefix("file://").unwrap_or(url);
+    let path = Path::new(path);
+    path.is_absolute().then(|| path.to_path_buf())
+}
+
+/// The transports a Git skill invocation may use: `GIT_ALLOW_PROTOCOL`
+/// overrides every `protocol.*.allow` setting, so host git config such as
+/// `protocol.allow=always` cannot re-enable `ext` or another remote helper.
+const GIT_ALLOWED_PROTOCOLS: &str = "ssh:https:http:git:file";
+
+fn run_git_command(
     args: &[&str],
     cwd: Option<&Path>,
     git_ssh_command: Option<&str>,
+    untrusted: Option<&meerkat_core::confinement::UntrustedPathFn>,
 ) -> Result<(), SkillError> {
-    let mut command = Command::new(program);
+    // A host launch exemption: git runs as the host, it and every program it
+    // starts by name from a `PATH` without the directories a confined process
+    // could change. Resolution refuses a repository whose skill cache such a
+    // process could change.
+    let mut command = meerkat_core::HostLaunchExemption::git(untrusted);
     command.args(args);
     if let Some(cwd) = cwd {
         command.current_dir(cwd);
@@ -352,6 +532,7 @@ fn run_command(
     if let Some(git_ssh_command) = git_ssh_command {
         command.env("GIT_SSH_COMMAND", git_ssh_command);
     }
+    command.env("GIT_ALLOW_PROTOCOL", GIT_ALLOWED_PROTOCOLS);
     let output = command.output().map_err(|e| {
         SkillError::Load(format!("git skill source command failed to start: {e}").into())
     })?;
@@ -378,7 +559,19 @@ fn discover_skill_directories(base: &Path) -> Vec<PathBuf> {
         if path.file_name().and_then(|name| name.to_str()) == Some(".git") {
             continue;
         }
-        if path.is_dir() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        // A link is a candidate where it is, and the scan judges where it
+        // leads; discovery never descends through one, so a link in a
+        // repository (to `/`, say) cannot walk the host's filesystem.
+        if file_type.is_symlink() {
+            if path.join("SKILL.md").is_file() {
+                out.push(path);
+            }
+            continue;
+        }
+        if file_type.is_dir() {
             if path.join("SKILL.md").is_file() {
                 out.push(path);
             } else {
@@ -503,6 +696,189 @@ fn is_sensitive_query_key(key: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A skill a Git checkout links to outside the checkout is never read,
+    /// wherever the link leads: repository content cannot reach into the
+    /// host's filesystem.
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn a_skill_linked_out_of_the_checkout_is_not_read() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().canonicalize().unwrap();
+        let outside = base.join("outside").join("linked-skill");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(
+            outside.join("SKILL.md"),
+            "---\nname: linked-skill\ndescription: Outside the checkout\n---\n\n# Linked",
+        )
+        .unwrap();
+        let source = GitSkillSource::new(GitSkillConfig {
+            repo_url: "https://example.invalid/skills.git".into(),
+            git_ref: GitRef::Branch("main".into()),
+            cache_dir: base.join("cache"),
+            skills_root: None,
+            refresh_interval: Duration::from_secs(60),
+            auth: None,
+            depth: None,
+            source_uuid: SourceUuid::builtin(),
+            health_thresholds: SourceHealthThresholds::default(),
+        });
+        let inside = source.checkout_dir.join("kept-skill");
+        std::fs::create_dir_all(&inside).unwrap();
+        std::fs::write(
+            inside.join("SKILL.md"),
+            "---\nname: kept-skill\ndescription: Inside the checkout\n---\n\n# Kept",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&outside, source.checkout_dir.join("linked-skill")).unwrap();
+
+        let cache = source.scan_checkout().unwrap();
+        let names: Vec<&str> = cache
+            .descriptors
+            .iter()
+            .map(|descriptor| descriptor.key.skill_name.as_str())
+            .collect();
+        assert_eq!(names, vec!["kept-skill"]);
+    }
+
+    /// The skill sources keep the auto traits they had before they took a
+    /// host's judgement or runner.
+    #[test]
+    fn skill_sources_stay_unwind_safe() {
+        fn unwind_safe<T: std::panic::UnwindSafe + std::panic::RefUnwindSafe>() {}
+        unwind_safe::<GitSkillSource>();
+        unwind_safe::<crate::source::FilesystemSkillSource>();
+        unwind_safe::<crate::source::StdioExternalClient>();
+    }
+
+    /// Discovery never descends through a link, so a link in a repository
+    /// (to `/`, say) cannot walk the host's filesystem on each refresh; a
+    /// linked skill is judged where it leads by the scan.
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn discovery_does_not_descend_through_a_link() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().canonicalize().unwrap();
+        let outside = base.join("outside");
+        std::fs::create_dir_all(outside.join("deep")).unwrap();
+        std::fs::write(outside.join("deep").join("SKILL.md"), "# Deep").unwrap();
+        let checkout = base.join("checkout");
+        std::fs::create_dir_all(checkout.join("kept-skill")).unwrap();
+        std::fs::write(checkout.join("kept-skill").join("SKILL.md"), "# Kept").unwrap();
+        std::os::unix::fs::symlink(&outside, checkout.join("walk")).unwrap();
+
+        let mut found = discover_skill_directories(&checkout);
+        found.sort();
+        assert_eq!(found, vec![checkout.join("kept-skill")]);
+    }
+
+    /// A crafted ssh key path never produces a `GIT_SSH_COMMAND` a shell
+    /// could read as more than one `ssh -i <path>` argument; a normal
+    /// absolute key file is accepted and single-quoted.
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn the_ssh_key_command_refuses_a_path_that_could_carry_a_command() {
+        let temp = tempfile::tempdir().unwrap();
+        let key = temp.path().join("id_ed25519");
+        std::fs::write(&key, "key").unwrap();
+        let key = key.to_string_lossy().to_string();
+        for crafted in [
+            format!("{key}; touch pwned"),
+            format!("{key} -o ProxyCommand=touch pwned"),
+            format!("{key}\ntouch pwned"),
+            format!("{key}'; touch pwned; '"),
+            "-oProxyCommand=touch pwned".to_string(),
+            "relative/key".to_string(),
+            format!("{}/does-not-exist", temp.path().display()),
+        ] {
+            assert!(
+                git_ssh_command(&crafted).is_err(),
+                "{crafted:?} must be refused"
+            );
+        }
+        assert_eq!(
+            git_ssh_command(&key).unwrap(),
+            format!("ssh -i '{key}' -o IdentitiesOnly=yes")
+        );
+    }
+
+    /// A real key file whose name contains shell metacharacters is accepted
+    /// and single-quoted, so the shell takes the whole path as one literal
+    /// argument to `ssh -i` and runs nothing it spells out.
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn a_real_metacharacter_key_path_is_quoted_literally() {
+        let temp = tempfile::tempdir().unwrap();
+        let key = temp.path().join("id; touch marker");
+        std::fs::write(&key, "key").unwrap();
+        let key = key.to_string_lossy().to_string();
+        assert_eq!(
+            git_ssh_command(&key).unwrap(),
+            format!("ssh -i '{key}' -o IdentitiesOnly=yes")
+        );
+    }
+
+    /// Only the supported transports resolve a local path; a `file://` URL or
+    /// an absolute path is the one judged against the write grants.
+    #[test]
+    fn local_repository_path_names_only_file_urls_and_absolute_paths() {
+        assert_eq!(
+            local_repository_path("file:///srv/r"),
+            Some(std::path::PathBuf::from("/srv/r"))
+        );
+        assert_eq!(
+            local_repository_path("/srv/r"),
+            Some(std::path::PathBuf::from("/srv/r"))
+        );
+        assert_eq!(local_repository_path("https://h/r.git"), None);
+        assert_eq!(local_repository_path("git@h:owner/r.git"), None);
+    }
+
+    /// A ref or URL that reads as an option, or carries whitespace or a
+    /// control character, is refused; an ordinary one is accepted.
+    #[test]
+    fn a_ref_or_url_that_looks_like_an_option_is_refused() {
+        for bad in ["", "-x", "--upload-pack=sh", "a b", "a\tb", "a\0b"] {
+            assert!(checked_ref(bad).is_err(), "ref {bad:?} must be refused");
+        }
+        for good in ["main", "v1.2.3", "release/9.0", "0123abcd"] {
+            assert!(checked_ref(good).is_ok(), "ref {good:?} must be allowed");
+        }
+        for bad in [
+            "-x",
+            "--upload-pack=sh",
+            "https://h/ r",
+            "./rel",
+            "a\tb",
+            "ext::sh -c touch% /tmp/x",
+            "ext::/path/in/grant/evil",
+            "fd::3",
+            "foo::x",
+            "ftp://example.com/r.git",
+            "s3://bucket/r",
+        ] {
+            assert!(
+                checked_repository_url(bad).is_err(),
+                "url {bad:?} must be refused"
+            );
+        }
+        for good in [
+            "https://example.com/r.git",
+            "ssh://git@h/r",
+            "git@h:owner/r.git",
+            "file:///srv/r",
+            "/srv/local/r",
+        ] {
+            assert!(
+                checked_repository_url(good).is_ok(),
+                "url {good:?} must be allowed"
+            );
+        }
+    }
 
     #[test]
     fn redact_url_hides_userinfo_and_sensitive_query_values() {

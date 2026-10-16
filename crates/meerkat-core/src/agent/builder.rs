@@ -92,6 +92,7 @@ pub struct AgentBuilder {
     pub(super) default_event_tx: Option<mpsc::Sender<crate::event::AgentEvent>>,
     pub(super) model_defaults_resolver: Option<Arc<dyn ModelOperationalDefaultsResolver>>,
     pub(super) call_timeout_override: CallTimeoutOverride,
+    pub(super) stream_inactivity_timeout_override: CallTimeoutOverride,
     pub(super) operation_review: Option<Arc<crate::approval::review::BoundOperationReview>>,
     pub(super) tools_config: ToolsConfig,
     pub(super) epoch_cursor_state: Option<Arc<crate::runtime_epoch::EpochCursorState>>,
@@ -264,6 +265,7 @@ impl AgentBuilder {
             default_event_tx: None,
             model_defaults_resolver: None,
             call_timeout_override: CallTimeoutOverride::default(),
+            stream_inactivity_timeout_override: CallTimeoutOverride::default(),
             operation_review: None,
             tools_config: ToolsConfig::default(),
             epoch_cursor_state: None,
@@ -800,6 +802,7 @@ impl AgentBuilder {
             cancel_after_boundary_rx,
             model_defaults_resolver: self.model_defaults_resolver,
             call_timeout_override: self.call_timeout_override,
+            stream_inactivity_timeout_override: self.stream_inactivity_timeout_override,
             extraction_state: super::extraction::ExtractionState::default(),
             last_hidden_deferred_catalog_names: Default::default(),
             last_pending_catalog_sources: Default::default(),
@@ -1283,6 +1286,21 @@ impl AgentBuilder {
     /// - `Value(d)`: explicitly set call timeout to `d`
     pub fn with_call_timeout_override(mut self, override_value: CallTimeoutOverride) -> Self {
         self.call_timeout_override = override_value;
+        self
+    }
+
+    /// Set the explicit stream-inactivity watchdog override from the config
+    /// composition seam (`[retry] stream_inactivity_timeout`).
+    ///
+    /// - `Inherit`: the current model's own window via the model defaults
+    ///   resolver, else the retry policy's window
+    /// - `Disabled`: no watchdog, whatever the model declares
+    /// - `Value(d)`: the window is `d` for every model
+    pub fn with_stream_inactivity_timeout_override(
+        mut self,
+        override_value: CallTimeoutOverride,
+    ) -> Self {
+        self.stream_inactivity_timeout_override = override_value;
         self
     }
 

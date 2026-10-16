@@ -555,6 +555,7 @@ Lifecycle and identity:
 - `mob/ensure_member`, `mob/reconcile`
 - `mob/retire`, `mob/respawn`, `mob/force_cancel`, `mob/stop_member_run` (stop one exact member run)
 - `mob/wire`, `mob/wire_members_batch`, `mob/unwire`, `mob/rotate_supervisor`
+- `mob/claim_callback_route` (bind the mob's member callback route to this connection)
 - `mob/member_tool_declaration`, `mob/apply_member_tool_declaration` (revision-fenced), `mob/adopt_member_identity_declaration`, `mob/resolve_identity_convergence_block` - durable member tool/identity declarations
 
 Member interaction and context:

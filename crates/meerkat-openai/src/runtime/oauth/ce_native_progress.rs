@@ -600,7 +600,10 @@ async fn run_native(
     let prepared = audit.iter().find(|record| matches!(&record.observation.observation, AuditObservation::Prepared { target, .. } if matches!(target.as_ref(), AuditTarget::Tool { call_id, tool_name, .. } if call_id == CALL && tool_name == "read_record"))).unwrap();
     assert!(audit.iter().any(|record| record.observation.operation_id
         == prepared.observation.operation_id
-        && matches!(record.observation.observation, AuditObservation::Entry)));
+        && matches!(
+            record.observation.observation,
+            AuditObservation::Entry { .. }
+        )));
     assert!(audit.iter().any(|record| record.observation.operation_id
         == prepared.observation.operation_id
         && matches!(

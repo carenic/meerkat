@@ -1,10 +1,17 @@
 //! CommsToolSet - groups all comms tools together
 
+// The deprecated set holds the deprecated tools.
+#![allow(deprecated)]
+
 use super::tools::{CommsToolState, PeersTool, SendTool};
 use meerkat_comms::{Router, TrustedPeersView};
 use std::sync::Arc;
 
 /// Collection of all comms tools: `send` and `peers`.
+#[deprecated(
+    since = "0.9.2",
+    note = "use CommsToolSurface: this set holds the deprecated SendTool and PeersTool; removal is planned for 0.9.3"
+)]
 pub struct CommsToolSet {
     pub send: SendTool,
     pub peers: PeersTool,

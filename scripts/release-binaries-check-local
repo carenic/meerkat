@@ -120,11 +120,15 @@ for target in "${targets[@]}"; do
       ! "${checkout}/scripts/check-linux-release-binary-portability.sh" "${src}" >>"${guard_log}" 2>&1; then
       verdict="FAIL"
     fi
-    if ! "${checkout}/scripts/check-release-binary-markers" "${src}" >>"${guard_log}" 2>&1; then
+    # A candidate is no release before 0.9.2, so no VERSION reaches the
+    # guard from the caller's environment.
+    if ! env -u VERSION "${checkout}/scripts/check-release-binary-markers" "${src}" >>"${guard_log}" 2>&1; then
       verdict="FAIL"
     fi
   done
   notes=""
+  # Only a checkout older than 0.9.2 allows a marker (tokio's test-util)
+  # without a VERSION; its own guard reports it.
   if grep -q "carries the allowed marker" "${guard_log}"; then
     notes="; allowed marker present"
   fi

@@ -365,7 +365,8 @@ impl RealmInstalledMcp {
 
     async fn read(paths: &RealmPaths) -> Result<Arc<Self>, meerkat_core::McpRealmPersistError> {
         let state_path = paths.config_path.with_file_name(CONFIG_STATE_FILE);
-        // An absent document reads as one with no servers.
+        // An absent document reads as one with no servers. This store only
+        // reads, so it composes no realm chain: no write goes through it.
         let runtime = ConfigRuntime::new(
             Arc::new(FileConfigStore::new(
                 paths.config_path.clone(),
@@ -818,3 +819,6 @@ mod read_custody_tests;
 
 #[cfg(test)]
 mod review_load_tests;
+
+#[cfg(all(test, feature = "memory-store-session"))]
+mod memory_grant_tests;

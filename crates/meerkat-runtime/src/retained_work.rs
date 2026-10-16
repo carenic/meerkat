@@ -303,6 +303,25 @@ impl std::fmt::Debug for RetainedResumeGrant {
 /// staged order. The passive digests only select and compare: the returned
 /// authorities are the rows' own retained ones, and every selected-row
 /// binding is recomputed from them.
+///
+/// A selected row is a staged row of the identity's run, keyed by its input
+/// id. It is one of the contributors, bound under its own retained
+/// association, or, in a run that resumed retained work, the staged resume
+/// input: such a row carries the originals it resumes instead of an
+/// association of its own, and staging bound it under its canonical
+/// original. A selected key that is not a contributor is accepted only from
+/// this runtime's own row under that key: a runtime-minted retained resume
+/// whose carried originals equal one contiguous, same-order window of the
+/// authorities just resolved from the contributors' own rows, whose recorded
+/// identity names exactly those originals, and whose selected binding and
+/// batch key are the ones recomputed from its canonical original. The key
+/// only looks the row up; acceptance rests on the retained rows, and the
+/// carried originals add no authority beyond the contributors'. Anything
+/// else is [`RetainedResumeRefusal::NoAdmissibleWorkBinding`].
+///
+/// This proves the rows still exist and are exact. It does not prove that
+/// the run was admitted, that a selected row was staged in that run, or that
+/// the contributor set is complete.
 pub(crate) fn resolve_contributors(
     runtime_id: &crate::identifiers::LogicalRuntimeId,
     identity: &RetainedWorkIdentity,
@@ -344,16 +363,76 @@ pub(crate) fn resolve_contributors(
         }
         resolved.push(own.clone());
     }
-    // Every selected row is one of the resolved contributors.
-    if identity.selected_input_bindings().keys().any(|selected| {
-        !identity
+    // Every selected row is one of the resolved contributors, or a verified
+    // resume of a window of them.
+    for (selected_key, selected) in identity.selected_input_bindings() {
+        if identity
             .contributors()
             .iter()
-            .any(|contributor| &contributor.input_id.to_string() == selected)
-    }) {
-        return Err(refused(RetainedResumeRefusal::NoAdmissibleWorkBinding));
+            .any(|contributor| &contributor.input_id.to_string() == selected_key)
+        {
+            continue;
+        }
+        verify_selected_resume(identity, &resolved, selected_key, selected, &mut row)?;
     }
     Ok(resolved)
+}
+
+/// The input id a selected key names, in its canonical rendering only.
+pub(crate) fn selected_input_id(key: &str) -> Option<meerkat_core::lifecycle::InputId> {
+    let input_id = meerkat_core::lifecycle::InputId::from_uuid(uuid::Uuid::parse_str(key).ok()?);
+    (input_id.to_string() == key).then_some(input_id)
+}
+
+/// A selected row that is not a contributor: accepted only as this
+/// runtime's own admitted resume of a window of the contributors (see
+/// [`resolve_contributors`]).
+fn verify_selected_resume(
+    identity: &RetainedWorkIdentity,
+    resolved: &[crate::input_authority::RetainedInputAuthority],
+    selected_key: &str,
+    selected: &SelectedInputBinding,
+    row: &mut impl FnMut(
+        &meerkat_core::lifecycle::InputId,
+    ) -> Result<Option<crate::input_state::InputState>, RuntimeDriverError>,
+) -> Result<(), RuntimeDriverError> {
+    let no_binding = || refused(RetainedResumeRefusal::NoAdmissibleWorkBinding);
+    let input_id = selected_input_id(selected_key).ok_or_else(no_binding)?;
+    let state = row(&input_id)?.ok_or_else(no_binding)?;
+    // Only an admitted retained resume carries originals in place of an
+    // association of its own.
+    let record = state.retained_resume.as_ref().ok_or_else(no_binding)?;
+    let carried = &state.authority_contributors;
+    if carried.is_empty()
+        || !resolved
+            .windows(carried.len())
+            .any(|window| window == carried.as_slice())
+    {
+        return Err(no_binding());
+    }
+    // The resume's recorded identity names exactly those originals.
+    let recorded = record.identity.contributors();
+    if record.identity.runtime_id() != identity.runtime_id() || recorded.len() != carried.len() {
+        return Err(no_binding());
+    }
+    for (reference, original) in recorded.iter().zip(carried) {
+        if &reference.input_id != original.input_id()
+            || retained_association_digest(original.association())? != reference.association_digest
+            || hex(original.replay_digest()) != reference.submission_digest
+        {
+            return Err(no_binding());
+        }
+    }
+    // Bound under its canonical original, as staging bound it.
+    let canonical = carried.first().ok_or_else(no_binding)?;
+    let (binding, batch_key) =
+        crate::input_authority::association_binding(canonical.association())?;
+    if binding.as_deref() != Some(selected.binding.as_str())
+        || batch_key.as_deref() != Some(selected.batch_key.as_str())
+    {
+        return Err(no_binding());
+    }
+    Ok(())
 }
 
 /// The authority an accepted row records: its own retained association and

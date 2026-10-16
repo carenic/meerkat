@@ -33,7 +33,10 @@ fn generated_surface_handle() -> Arc<dyn ExternalToolSurfaceHandle> {
 }
 
 fn generated_router() -> McpRouter {
-    McpRouter::new_with_surface_handle(generated_surface_handle())
+    McpRouter::new_with_surface_handle_and_stdio_profile(
+        generated_surface_handle(),
+        meerkat_mcp::McpStdioLaunchProfile::trusted_host(),
+    )
 }
 
 fn generated_adapter() -> McpRouterAdapter {
@@ -500,8 +503,11 @@ async fn shutdown_releases_a_borrowed_surface_and_closes_an_owned_one() {
     for ownership in [McpSurfaceOwnership::Borrowed, McpSurfaceOwnership::Owned] {
         let surface = generated_surface_handle();
         let adapter = McpRouterAdapter::new(
-            McpRouter::new_with_surface_handle(Arc::clone(&surface))
-                .with_surface_ownership(ownership),
+            McpRouter::new_with_surface_handle_and_stdio_profile(
+                Arc::clone(&surface),
+                meerkat_mcp::McpStdioLaunchProfile::trusted_host(),
+            )
+            .with_surface_ownership(ownership),
         );
         adapter
             .stage_add(test_server_config("held", &server_path))
@@ -527,7 +533,10 @@ async fn shutdown_releases_a_borrowed_surface_and_closes_an_owned_one() {
                 assert_eq!(phase, ExternalToolSurfaceGlobalPhase::Operating);
                 assert_eq!(base, Some(ExternalToolSurfaceBaseState::Removed));
                 // The next holder stages the same server.
-                let mut next = McpRouter::new_with_surface_handle(Arc::clone(&surface));
+                let mut next = McpRouter::new_with_surface_handle_and_stdio_profile(
+                    Arc::clone(&surface),
+                    meerkat_mcp::McpStdioLaunchProfile::trusted_host(),
+                );
                 next.stage_add(test_server_config("held", &server_path))
                     .expect("the next holder stages the released server");
             }
@@ -549,8 +558,11 @@ async fn a_late_bind_onto_a_registration_surface_makes_the_router_borrow_it() {
     let server_path = mcp_test_server::fixture_binary();
     let registration = generated_surface_handle();
     let adapter = McpRouterAdapter::new(
-        McpRouter::new_with_surface_handle(generated_surface_handle())
-            .with_surface_ownership(McpSurfaceOwnership::Owned),
+        McpRouter::new_with_surface_handle_and_stdio_profile(
+            generated_surface_handle(),
+            meerkat_mcp::McpStdioLaunchProfile::trusted_host(),
+        )
+        .with_surface_ownership(McpSurfaceOwnership::Owned),
     );
     adapter.bind_external_tool_surface_handle(Arc::clone(&registration));
     adapter

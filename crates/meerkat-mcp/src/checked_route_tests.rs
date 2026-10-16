@@ -147,9 +147,10 @@ impl Fixture {
         &self,
         provider: Option<Arc<dyn crate::McpCallContextProvider>>,
     ) -> Arc<McpRouterAdapter> {
-        let mut router = McpRouter::new_with_surface_handle(Arc::new(
-            meerkat_runtime::RuntimeExternalToolSurfaceHandle::ephemeral(),
-        ));
+        let mut router = McpRouter::new_with_surface_handle_and_stdio_profile(
+            Arc::new(meerkat_runtime::RuntimeExternalToolSurfaceHandle::ephemeral()),
+            crate::McpStdioLaunchProfile::trusted_host(),
+        );
         if let Some(provider) = provider {
             router = router.with_call_context_provider(provider);
         }
@@ -414,7 +415,9 @@ fn an_incomplete_route_is_refused() {
     ] {
         assert!(matches!(
             CheckedMcpRoute::new(
-                Arc::new(McpRouterAdapter::new(McpRouter::new())),
+                Arc::new(McpRouterAdapter::new(McpRouter::new_with_stdio_profile(
+                    crate::McpStdioLaunchProfile::trusted_host()
+                ))),
                 SessionId::new(),
                 spec,
             ),

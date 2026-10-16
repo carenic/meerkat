@@ -24,7 +24,9 @@ fn invalid_server_config(name: &str) -> McpServerConfig {
 #[tokio::test]
 
 async fn external_tool_integration_red_ok_failed_add_surfaces_typed_notice_update() {
-    let adapter = McpRouterAdapter::new(McpRouter::new());
+    let adapter = McpRouterAdapter::new(McpRouter::new_with_stdio_profile(
+        meerkat_mcp::McpStdioLaunchProfile::trusted_host(),
+    ));
     let surface_handle: Arc<dyn ExternalToolSurfaceHandle> =
         Arc::new(RuntimeExternalToolSurfaceHandle::ephemeral());
     adapter.bind_external_tool_surface_handle(surface_handle);

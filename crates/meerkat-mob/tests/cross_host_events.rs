@@ -114,6 +114,41 @@ async fn durable_cursor_resumes_across_pump_restart() {
     );
     drop(router);
 
+    // The pump writes its durable cursor after it has fanned a page out, and
+    // only while no ACK, obligation or completion waiter holds cursor custody;
+    // a controlling stop aborts a write still in flight, and rows past the
+    // durable cursor are re-read after a restart (losing a cursor only re-reads
+    // events). This row is about resuming FROM the durable record, so restart
+    // only once that record covers every row the first turn consumed.
+    let max_before = before_keys.iter().map(|(_, seq)| *seq).max().unwrap();
+    let before_generations: BTreeSet<u64> = before_keys
+        .iter()
+        .map(|(generation, _)| *generation)
+        .collect();
+    let metadata = Arc::clone(&controlling.storage_metadata);
+    let mob_id = controlling.mob_id.clone();
+    wait_until(
+        "e1's durable event cursor to cover every row the first turn consumed",
+        || {
+            let metadata = Arc::clone(&metadata);
+            let mob_id = mob_id.clone();
+            let before_generations = before_generations.clone();
+            async move {
+                metadata
+                    .list_member_event_cursors(&mob_id)
+                    .await
+                    .is_ok_and(|records| {
+                        records.into_iter().any(|record| {
+                            record.agent_identity == "e1"
+                                && before_generations.contains(&record.generation)
+                                && record.next_seq > max_before
+                        })
+                    })
+            }
+        },
+    )
+    .await;
+
     // Controlling restart: kills the pump; the manager must resume from the
     // DURABLE cursor record, not from Tail and not from seq 1.
     let controlling = controlling.restart().await;
@@ -141,7 +176,6 @@ async fn durable_cursor_resumes_across_pump_restart() {
     );
     // No gap within the resumed window: same generation, strictly advancing
     // seq domain past the pre-restart watermark.
-    let max_before = before_keys.iter().map(|(_, seq)| *seq).max().unwrap();
     let min_after = after_keys.iter().map(|(_, seq)| *seq).min().unwrap();
     assert!(
         min_after > max_before,

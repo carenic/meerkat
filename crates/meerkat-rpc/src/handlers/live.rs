@@ -328,7 +328,7 @@ fn live_open_error_response(id: Option<RpcId>, error: LiveOpenError) -> RpcRespo
         // mapping (never collapsed into not-found).
         LiveOpenError::SessionStateFault(source) => {
             let rpc = crate::session_runtime::session_error_to_rpc(source);
-            RpcResponse::error(id, rpc.code, rpc.message)
+            RpcResponse::from_error(id, rpc)
         }
         LiveOpenError::OpenConfig(source) => RpcResponse::error(
             id,

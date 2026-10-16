@@ -47,6 +47,84 @@ pub async fn resolve_repositories_with_roots(
     user_root: Option<&Path>,
     cache_root: Option<&Path>,
 ) -> Result<Option<CompositeSkillSource>, SkillError> {
+    resolve_repositories_with_roots_trusting(
+        config,
+        context_root,
+        user_root,
+        cache_root,
+        &SkillHostBoundary::trusted_host(),
+    )
+    .await
+}
+
+/// Whether a confined process could change what the host reads at a path
+/// (`true`: anything under it as well).
+pub type UntrustedPaths = Arc<dyn Fn(&Path, bool) -> bool + Send + Sync>;
+
+/// How skill repository resolution meets a host that confines its agents'
+/// launches: the paths its confined processes could change, and how a stdio
+/// skill source's process launches. The default is the trusted host: every
+/// path is trusted and stdio skill sources run as the host.
+#[derive(Clone, Default)]
+pub struct SkillHostBoundary {
+    #[cfg(not(target_arch = "wasm32"))]
+    untrusted: Option<UntrustedPaths>,
+    #[cfg(not(target_arch = "wasm32"))]
+    stdio_runner: Option<Arc<dyn crate::source::StdioSkillRunner>>,
+}
+
+impl SkillHostBoundary {
+    /// The trusted host.
+    #[must_use]
+    pub fn trusted_host() -> Self {
+        Self::default()
+    }
+
+    /// Do not trust the paths `untrusted` names: a skills directory or the
+    /// Git skill cache a confined process could change is refused, a skill
+    /// linked to such a path is not read, and `git` runs from a `PATH`
+    /// without them.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[must_use]
+    pub fn with_untrusted_paths(mut self, untrusted: UntrustedPaths) -> Self {
+        self.untrusted = Some(untrusted);
+        self
+    }
+
+    /// Launch stdio skill sources through `runner` (a host passes one that
+    /// applies its `mcp_stdio` confinement).
+    #[cfg(not(target_arch = "wasm32"))]
+    #[must_use]
+    pub fn with_stdio_runner(mut self, runner: Arc<dyn crate::source::StdioSkillRunner>) -> Self {
+        self.stdio_runner = Some(runner);
+        self
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn untrusted(&self, path: &Path, subtree: bool) -> bool {
+        self.untrusted
+            .as_ref()
+            .is_some_and(|untrusted| untrusted(path, subtree))
+    }
+}
+
+/// [`resolve_repositories_with_roots`] for a host that confines its agents'
+/// launches ([`SkillHostBoundary`]). Each skills directory `host` does not
+/// trust is refused: a filesystem repository's directory, the local cache
+/// Git repositories are fetched into, and the project skills directory
+/// (`<context>/.rkat/skills`). `git`, and every program it starts by name,
+/// runs from a `PATH` without the directories `host` does not trust. A
+/// skill linked out of a trusted directory is judged where the link leads;
+/// one linked out of a Git checkout is not read. Stdio skill sources launch through the host's
+/// runner. Each refusal is logged; the embedded skills and every other
+/// source still load.
+pub async fn resolve_repositories_with_roots_trusting(
+    config: &SkillsConfig,
+    context_root: Option<&Path>,
+    user_root: Option<&Path>,
+    cache_root: Option<&Path>,
+    host: &SkillHostBoundary,
+) -> Result<Option<CompositeSkillSource>, SkillError> {
     if !config.enabled {
         return Ok(None);
     }
@@ -56,7 +134,7 @@ pub async fn resolve_repositories_with_roots(
 
     #[cfg(target_arch = "wasm32")]
     {
-        let _ = (context_root, user_root, cache_root);
+        let _ = (context_root, user_root, cache_root, host);
         if let Some(repo) = config.repositories.first() {
             let error = match &repo.transport {
                 SkillRepoTransport::Filesystem { .. } => unavailable_on_wasm("filesystem"),
@@ -95,13 +173,20 @@ pub async fn resolve_repositories_with_roots(
                     } else {
                         path.into()
                     };
+                    if host.untrusted(&full_path, true) {
+                        refuse_untrusted_skills_directory(&full_path);
+                        continue;
+                    }
                     sources.push(NamedSource::new(
                         source_identity,
-                        SourceNode::Filesystem(FilesystemSkillSource::new_with_identity(
-                            full_path,
-                            SkillScope::Project,
-                            repo.source_uuid.clone(),
-                            config.health_thresholds,
+                        SourceNode::Filesystem(judged_links(
+                            FilesystemSkillSource::new_with_identity(
+                                full_path,
+                                SkillScope::Project,
+                                repo.source_uuid.clone(),
+                                config.health_thresholds,
+                            ),
+                            host,
                         )),
                     ));
                 }
@@ -160,13 +245,16 @@ pub async fn resolve_repositories_with_roots(
                             path.into()
                         }
                     });
-                    let client = StdioExternalClient::new_with_timeout(
+                    let mut client = StdioExternalClient::new_with_timeout(
                         command.clone(),
                         args.clone(),
                         env.clone(),
                         resolved_cwd,
                         Duration::from_secs(*timeout_seconds),
                     );
+                    if let Some(runner) = &host.stdio_runner {
+                        client = client.with_runner(Arc::clone(runner));
+                    }
                     sources.push(NamedSource::new(
                         source_identity,
                         SourceNode::External(ExternalSkillSource::new_with_source_uuid(
@@ -191,6 +279,10 @@ pub async fn resolve_repositories_with_roots(
                         .or(user_root)
                         .unwrap_or_else(|| Path::new("."))
                         .join(".rkat/skill-cache/git");
+                    if host.untrusted(&cache_base, true) {
+                        refuse_untrusted_skills_directory(&cache_base);
+                        continue;
+                    }
                     let git_ref = match ref_type {
                         GitRefType::Branch => GitRef::Branch(git_ref.clone()),
                         GitRefType::Tag => GitRef::Tag(git_ref.clone()),
@@ -202,19 +294,23 @@ pub async fn resolve_repositories_with_roots(
                         }
                         GitSkillRepoAuth::SshKey { path } => GitSkillAuth::SshKey(path.clone()),
                     });
+                    let mut git = GitSkillSource::new(GitSkillConfig {
+                        repo_url: url.clone(),
+                        git_ref,
+                        cache_dir: cache_base,
+                        skills_root: skills_root.clone(),
+                        refresh_interval: Duration::from_secs(*refresh_seconds),
+                        auth,
+                        depth: *depth,
+                        source_uuid: repo.source_uuid.clone(),
+                        health_thresholds: config.health_thresholds,
+                    });
+                    if let Some(untrusted) = &host.untrusted {
+                        git = git.with_untrusted_paths(Arc::clone(untrusted));
+                    }
                     sources.push(NamedSource::new(
                         source_identity,
-                        SourceNode::Git(Box::new(GitSkillSource::new(GitSkillConfig {
-                            repo_url: url.clone(),
-                            git_ref,
-                            cache_dir: cache_base,
-                            skills_root: skills_root.clone(),
-                            refresh_interval: Duration::from_secs(*refresh_seconds),
-                            auth,
-                            depth: *depth,
-                            source_uuid: repo.source_uuid.clone(),
-                            health_thresholds: config.health_thresholds,
-                        }))),
+                        SourceNode::Git(Box::new(git)),
                     ));
                 }
             }
@@ -222,16 +318,21 @@ pub async fn resolve_repositories_with_roots(
 
         if let Some(root) = context_root {
             let default_project_skills = root.join(".rkat/skills");
-            if default_project_skills.is_dir() {
+            if default_project_skills.is_dir() && host.untrusted(&default_project_skills, true) {
+                refuse_untrusted_skills_directory(&default_project_skills);
+            } else if default_project_skills.is_dir() {
                 let project_identity =
                     active_source_identity(&registry, &records, &SourceUuid::project_local())?;
                 sources.push(NamedSource::new(
                     project_identity,
-                    SourceNode::Filesystem(FilesystemSkillSource::new_with_identity(
-                        default_project_skills,
-                        SkillScope::Project,
-                        SourceUuid::project_local(),
-                        config.health_thresholds,
+                    SourceNode::Filesystem(judged_links(
+                        FilesystemSkillSource::new_with_identity(
+                            default_project_skills,
+                            SkillScope::Project,
+                            SourceUuid::project_local(),
+                            config.health_thresholds,
+                        ),
+                        host,
                     )),
                 ));
             }
@@ -241,6 +342,26 @@ pub async fn resolve_repositories_with_roots(
             sources, registry,
         )))
     }
+}
+
+/// `source`, judging each skill a link leads out of its directory by the
+/// paths `host` does not trust.
+#[cfg(not(target_arch = "wasm32"))]
+fn judged_links(source: FilesystemSkillSource, host: &SkillHostBoundary) -> FilesystemSkillSource {
+    match &host.untrusted {
+        Some(untrusted) => source.with_untrusted_targets(Arc::clone(untrusted)),
+        None => source,
+    }
+}
+
+/// Log a skills directory the host does not trust, whose skills are not
+/// loaded.
+#[cfg(not(target_arch = "wasm32"))]
+fn refuse_untrusted_skills_directory(directory: &Path) {
+    tracing::warn!(
+        directory = %directory.display(),
+        "skills directory not trusted: a confined process can write it, so its skills are not loaded"
+    );
 }
 
 fn active_source_identity(

@@ -446,6 +446,79 @@ check_workflow_entrypoints "Cargo subcommand prefix of a word" pass $'run: |\n  
 check_workflow_entrypoints "Cargo after another command" pass $'run: |\n  echo cargo build'
 check_workflow_entrypoints "unlisted Cargo subcommand" pass $'run: |\n  cargo metadata --format-version=1'
 check_workflow_entrypoints "quoted diagnostic" pass 'run: echo "cargo-nextest nextest run"'
+
+# The doctor's shell entrypoint scan. ripgrep exits 0 when it finds a raw
+# Cargo entrypoint and 1 when it finds none; any other status (127 for a
+# missing rg, 2 for an unreadable scan root) means the scan did not run, which
+# must fail the doctor instead of reading as "no bypass".
+SHELL_SCAN_ROOT="${TEST_ROOT}/shell-entrypoints"
+SHELL_SCAN_CHECK="${TEST_ROOT}/doctor-shell-scan-check.sh"
+SHELL_SCAN_PASS='PASS shell build/test entrypoints use the repo Cargo wrapper'
+SHELL_SCAN_BYPASS='FAIL shell build/test entrypoints bypass scripts/repo-cargo'
+SHELL_SCAN_FAILED='FAIL shell build/test entrypoint scan failed'
+cat >"${SHELL_SCAN_CHECK}" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+pass() { printf 'PASS %s\n' "$1"; }
+bad() { printf 'FAIL %s\n' "$1"; }
+EOF
+# Exactly the shell scan: from its first assignment through the `fi` that ends
+# its verdict.
+awk '
+  /^raw_cargo_shell_(scan_status|hits)=/ { selected = 1 }
+  selected { print }
+  selected && /^fi$/ { exit }
+' "$ROOT/scripts/rust-lane-doctor" >>"${SHELL_SCAN_CHECK}"
+if ! grep -Fq "pass \"${SHELL_SCAN_PASS#PASS }\"" "${SHELL_SCAN_CHECK}" ||
+  ! grep -Fq "bad \"${SHELL_SCAN_BYPASS#FAIL }\"" "${SHELL_SCAN_CHECK}" ||
+  [[ "$(tail -n 1 "${SHELL_SCAN_CHECK}")" != 'fi' ]]; then
+  echo "doctor shell scan fixture no longer selects its actual owner" >&2
+  exit 1
+fi
+SHELL_SCAN_NO_RG_BIN="${TEST_ROOT}/shell-scan-no-rg-bin"
+mkdir -p "${SHELL_SCAN_NO_RG_BIN}"
+check_shell_entrypoints() {
+  local description="$1" expected="$2" layout="$3" path_mode="$4" actual output
+  rm -rf -- "${SHELL_SCAN_ROOT}"
+  mkdir -p "${SHELL_SCAN_ROOT}/scripts" "${SHELL_SCAN_ROOT}/specs"
+  printf '#!/usr/bin/env bash\n./scripts/repo-cargo test -p meerkat-core\n' \
+    >"${SHELL_SCAN_ROOT}/scripts/wrapped.sh"
+  case "${layout}" in
+    clean) ;;
+    bypass) printf '#!/usr/bin/env bash\ncargo test -p meerkat-core\n' >"${SHELL_SCAN_ROOT}/specs/raw.sh" ;;
+    missing-root) rm -rf -- "${SHELL_SCAN_ROOT}/specs" ;;
+  esac
+  output="${TEST_ROOT}/shell-scan-check.out"
+  if [[ "${path_mode}" == no-rg ]]; then
+    (cd "${SHELL_SCAN_ROOT}" && PATH="${SHELL_SCAN_NO_RG_BIN}" "${BASH}" "${SHELL_SCAN_CHECK}") \
+      >"${output}" 2>&1 || true
+  else
+    (cd "${SHELL_SCAN_ROOT}" && "${BASH}" "${SHELL_SCAN_CHECK}") >"${output}" 2>&1 || true
+  fi
+  if grep -Fxq -- "${SHELL_SCAN_PASS}" "${output}"; then
+    actual=pass
+  elif grep -Fxq -- "${SHELL_SCAN_BYPASS}" "${output}"; then
+    actual=bypass
+  elif grep -Fq -- "${SHELL_SCAN_FAILED}" "${output}"; then
+    actual=scan-failed
+  else
+    # Exiting without the scan's own verdict is a crash, not a detection.
+    actual=error
+  fi
+  if [[ "${actual}" != "${expected}" ]]; then
+    echo "doctor shell scan ${description}: expected ${expected}, got ${actual}" >&2
+    cat "${output}" >&2
+    exit 1
+  fi
+}
+if command -v rg >/dev/null 2>&1; then
+  check_shell_entrypoints "wrapped entrypoints" pass clean rg
+  check_shell_entrypoints "raw Cargo entrypoint" bypass bypass rg
+  check_shell_entrypoints "unreadable scan root" scan-failed missing-root rg
+else
+  echo "note: ripgrep is not installed; skipped the doctor shell scan probes that need it" >&2
+fi
+check_shell_entrypoints "missing ripgrep" scan-failed clean no-rg
 assert_file_contains "$RELEASE_WORKFLOW" '.schema_version == 4'
 assert_file_contains "$RELEASE_WORKFLOW" '.validation_backend == "github-hosted-cargo"'
 assert_file_contains "$RELEASE_WORKFLOW" '.schema_version == 3'

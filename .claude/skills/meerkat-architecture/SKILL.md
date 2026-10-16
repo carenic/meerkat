@@ -290,10 +290,11 @@ Since 0.8.4 (PR #912, the storage unification arc):
   Previously every schedule-host tick re-parsed machine DSLs per persisted
   row — an idle busy-loop that escalated to restart availability loss.
 - **Stream-inactivity watchdog** — `RetryPolicy::stream_inactivity_timeout`
-  (`[retry] stream_inactivity_timeout`; default ON at 300s, `"disabled"`
-  opts out). A silent provider stream aborts with the retryable
-  `LlmFailureReason::StreamStalled`; stream events re-arm the window, the
-  hard call timeout stays fixed at call start; applies only to
+  (`[retry] stream_inactivity_timeout`; default ON: the model's own window,
+  `ModelProfile::stream_inactivity_timeout_secs`, else 300s, resolved per
+  call; `"disabled"` opts out). A silent provider stream aborts with the
+  retryable `LlmFailureReason::StreamStalled`; stream events re-arm the
+  window, the hard call timeout stays fixed at call start; applies only to
   liveness-reporting clients (`stream_activity_count`).
 - **Force-cancel is legal from `Running`** — MobMachine gained wedge arms
   (`ForceCancelRunningRuntimeNotLive`, `ForceCancelRunningAlreadyRetiring`)

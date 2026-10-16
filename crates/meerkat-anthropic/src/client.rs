@@ -4806,11 +4806,14 @@ mod tests {
         server.abort();
     }
 
-    /// A base URL whose HTTP client could not be built fails each request
-    /// with that error. The client built for the previous base URL is never
-    /// used for the new one: its proxy decision belongs to the old endpoint,
-    /// and the governed-HTTP contract substitutes no other client for one
-    /// that failed to build.
+    /// A base URL whose HTTP client could not be built fails each unchecked
+    /// request (one without an authorization check, as this test sends) with
+    /// that error. The client built for the previous base URL is never used
+    /// for the new one: its proxy decision belongs to the old endpoint, and
+    /// no other client stands in for the one that failed to build. A request
+    /// with an authorization check builds its own checked client for the new
+    /// base URL instead (`authorization_tests.rs`,
+    /// `an_authorized_request_after_a_failed_rebuild_builds_its_checked_client_for_the_new_url`).
     #[tokio::test]
     async fn a_failed_base_url_rebuild_fails_requests_without_a_fallback_client() {
         let payload = [

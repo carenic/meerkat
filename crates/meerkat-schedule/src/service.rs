@@ -217,6 +217,12 @@ impl ScheduleService {
     /// service cannot judge identity deliverability and keeps accepting
     /// identity targets (the fire-time probe and `missing_target_policy`
     /// remain the delivery-time authority).
+    ///
+    /// The probe is never detached: it, and whatever it holds (a surface's
+    /// session and mob hosts), lives as long as any clone of this service. A
+    /// host that tears its surface down while its process keeps running drops
+    /// every clone it still holds once teardown has succeeded, including the
+    /// clone inside agent schedule tools installed on a session builder.
     pub fn attach_identity_target_probe(&self, probe: Arc<dyn ScheduleIdentityTargetProbe>) {
         let _ = self.identity_target_probe.set(probe);
     }

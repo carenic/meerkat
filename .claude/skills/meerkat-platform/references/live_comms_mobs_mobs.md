@@ -120,9 +120,12 @@ and `observer()` are not owners. Use `acquire_owner()` for a temporary lease,
   `mob_member_reload_required`). A member whose session has no committed
   runtime attachment (detached) fails as invalid params with data kind
   `mob_member_runtime_detached` (Rust `MobError::MemberRuntimeDetached`).
-- In `rkat-rpc`, members reach the callback tools of the connection whose
-  `mob/create` created the mob. A mob restored after a restart has no
-  callback route until it is re-created from a live connection.
+- In `rkat-rpc`, members reach the callback tools of the connection that
+  holds the mob's callback route: the one whose `mob/create` created it, or
+  the one that claimed it with `mob/claim_callback_route`. A mob restored
+  after a restart, or whose connection closed, has no route until a
+  connection claims it. A claim while the holding connection is open is
+  refused (`-32002`).
 
 ## Helpers, forks and councils
 

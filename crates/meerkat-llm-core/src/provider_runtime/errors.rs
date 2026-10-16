@@ -42,6 +42,18 @@ pub enum ProviderAuthError {
         expected: meerkat_core::Provider,
         resolved: meerkat_core::Provider,
     },
+    /// The host refused to run a program of its own outside its OS process
+    /// confinement ([`meerkat_core::HostLaunchExemption`]): a confined
+    /// process could change the program, the interpreter it names or its
+    /// working directory. The program did not run, and no other credential
+    /// stands in for it.
+    #[error(
+        "{exemption} refused: a confined process could change its program, its interpreter or its working directory ({refusal})"
+    )]
+    HostLaunchRefused {
+        exemption: meerkat_core::HostLaunchExemption,
+        refusal: meerkat_core::confinement::ConfinementRefusal,
+    },
 }
 
 impl PartialEq for ProviderAuthError {
@@ -60,6 +72,16 @@ impl PartialEq for ProviderAuthError {
                 Self::ResolvedProviderMismatch {
                     expected: be,
                     resolved: br,
+                },
+            ) => ae == be && ar == br,
+            (
+                Self::HostLaunchRefused {
+                    exemption: ae,
+                    refusal: ar,
+                },
+                Self::HostLaunchRefused {
+                    exemption: be,
+                    refusal: br,
                 },
             ) => ae == be && ar == br,
             _ => false,

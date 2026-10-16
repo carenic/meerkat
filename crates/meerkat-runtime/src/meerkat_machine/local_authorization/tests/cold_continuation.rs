@@ -52,6 +52,8 @@ use std::time::Duration;
 const BOUND: Duration = Duration::from_secs(10);
 const DELIVERY: &str = "continuation:auth-complete";
 const CONTINUATION_KEY: &str = "auth:sign-in-1";
+const RESUMED_DELIVERY: &str = "continuation:resumed-auth-complete";
+const RESUMED_CONTINUATION_KEY: &str = "auth:sign-in-2";
 
 struct Applied {
     run: RunId,
@@ -618,12 +620,60 @@ async fn bind_destination(machine: &MeerkatMachine, session: &SessionId, origina
 }
 
 fn continuation() -> Input {
+    keyed_continuation(CONTINUATION_KEY, "sign-in completed")
+}
+
+fn keyed_continuation(admission_key: &str, body: &str) -> Input {
     Input::Prompt(crate::input::PromptInput::continuation(
         InputId::new(),
-        CONTINUATION_KEY,
-        "sign-in completed".into(),
+        admission_key,
+        body.into(),
         meerkat_core::types::HandlingMode::Queue,
     ))
+}
+
+/// Whether `session`'s live driver ledger holds `input_id` (rather than
+/// only the store).
+async fn live_row(machine: &MeerkatMachine, session: &SessionId, input_id: &InputId) -> bool {
+    let driver = Arc::clone(
+        &machine
+            .sessions
+            .read()
+            .await
+            .get(session)
+            .expect("registered session")
+            .driver,
+    );
+    let locked = driver.lock().await;
+    match &*locked {
+        crate::meerkat_machine::driver::DriverEntry::Ephemeral(driver) => {
+            driver.input_state(input_id).is_some()
+        }
+        crate::meerkat_machine::driver::DriverEntry::Persistent(driver) => {
+            driver.inner_ref().input_state(input_id).is_some()
+        }
+    }
+}
+
+/// The retained work in the committed head row `delivery` at `sequence`.
+async fn head_request(
+    store: &InMemoryRuntimeStore,
+    runtime: &LogicalRuntimeId,
+    delivery: &str,
+    sequence: u64,
+) -> crate::retained_work::RetainedResumeRequest {
+    RuntimeDeliveryInbox::new(Arc::new(store.clone()))
+        .retained_resume_request(
+            runtime,
+            &RuntimeDeliveryId::new(delivery).expect("id"),
+            sequence,
+            |row| {
+                serde_json::from_slice::<RetainedWorkIdentity>(row.payload())
+                    .map_err(|error| error.to_string())
+            },
+        )
+        .await
+        .expect("the committed head row")
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -802,6 +852,213 @@ async fn an_undelivered_continuation_resumes_its_original_once_after_a_same_proc
         .expect("original row kept");
     assert_eq!(original.seed.phase, InputLifecycleState::Consumed);
     assert_eq!(original.seed.last_run_id.as_ref(), Some(&original_run));
+}
+
+/// A continuation produced by a resumed run, delivered after another reopen.
+/// The resumed run's identity names the original and selects the resume
+/// input it staged; by the second reopen both rows are terminal and held only
+/// by the store. The selected resume row resolves from the store, and the
+/// continuation resumes the same original again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_resumed_runs_continuation_resolves_its_resume_row_from_the_store_after_a_reopen() {
+    let (configuration, template, _account, _publication) = mutable_controller_configuration(true);
+    let selection = template
+        .header()
+        .authority_association
+        .as_ref()
+        .expect("claims")
+        .candidate()
+        .controller_model
+        .clone()
+        .expect("controller");
+    let claims = template
+        .header()
+        .authority_association
+        .as_ref()
+        .expect("claims")
+        .candidate()
+        .clone();
+    let owners = HostOwners {
+        grants: Arc::clone(&configuration.grants),
+        ingress_domain: claims.ingress_namespace.ingress.clone(),
+        custody: Arc::default(),
+        policy: Arc::new(Policy {
+            requester: claims.requester.clone(),
+            executor: claims.logical_executor.clone(),
+        }),
+        controllers: Arc::default(),
+        operation_owner: Arc::clone(&configuration.operation_owner),
+    };
+    drop(configuration);
+    let store = InMemoryRuntimeStore::new();
+    let blobs = Arc::new(MemoryBlobStore::new());
+    let session = SessionId::new();
+    let runtime = LogicalRuntimeId::for_session(&session);
+    let destination = original_prompt(&template, &runtime);
+
+    // The original runs once; its continuation is committed.
+    let (original_id, identity) = {
+        let machine = open(&store, &blobs, &owners).await;
+        let (_effects, mut applied) = attach(&machine, &session, "waiting for sign-in").await;
+        install_credential(&machine, &EphemeralTokenStore::new(), &selection).await;
+        let original = original_prompt(&template, &runtime);
+        owners.custody.hold(&original);
+        bind_destination(&machine, &session, &original).await;
+        let original_id = original.id().clone();
+        let outcome = machine
+            .ingest(&runtime, original)
+            .await
+            .expect("governed original admitted");
+        assert!(matches!(outcome, AcceptOutcome::Accepted { .. }));
+        let entered = next_apply(&mut applied, "original").await;
+        let identity = entered
+            .context
+            .retained_work()
+            .cloned()
+            .expect("the original run's retained work");
+        assert_eq!(
+            completed_text(&machine, &session, &original_id).await,
+            "waiting for sign-in"
+        );
+        RuntimeDeliveryInbox::new(Arc::new(store.clone()))
+            .submit(
+                &runtime,
+                RuntimeDeliverySubmission::new(
+                    RuntimeDeliveryId::new(DELIVERY).expect("id"),
+                    RuntimeDeliveryKind::Continuation,
+                    "auth",
+                    1,
+                    CONTINUATION_KEY,
+                    serde_json::to_vec(&identity).expect("retained work row"),
+                )
+                .expect("submission"),
+            )
+            .await
+            .expect("continuation committed before the stop");
+        (original_id, identity)
+    };
+
+    // After the first reopen: the continuation resumes the original; the
+    // resumed run retains work, and its own continuation is committed.
+    let (resume_id, resumed_identity) = {
+        let machine = open(&store, &blobs, &owners).await;
+        let (_effects, mut applied) = attach(&machine, &session, "resumed after sign-in").await;
+        bind_destination(&machine, &session, &destination).await;
+        install_credential(&machine, &EphemeralTokenStore::new(), &selection).await;
+        let resume = continuation();
+        let resume_id = resume.id().clone();
+        let (outcome, _) = machine
+            .accept_retained_resume(
+                &session,
+                resume,
+                head_request(&store, &runtime, DELIVERY, 1).await,
+            )
+            .await
+            .expect("resume admitted through the governed host");
+        assert!(matches!(outcome, AcceptOutcome::Accepted { .. }));
+        let entered = next_apply(&mut applied, "resume").await;
+        assert_eq!(entered.ids, vec![resume_id.clone()]);
+        let resumed_identity = entered
+            .context
+            .retained_work()
+            .cloned()
+            .expect("the resumed run's retained work");
+        assert_eq!(
+            resumed_identity.contributors(),
+            identity.contributors(),
+            "the resumed run names the original"
+        );
+        assert!(
+            resumed_identity
+                .selected_input_bindings()
+                .contains_key(&resume_id.to_string()),
+            "the resumed run selects the resume input it staged"
+        );
+        assert_eq!(
+            completed_text(&machine, &session, &resume_id).await,
+            "resumed after sign-in"
+        );
+        let inbox = RuntimeDeliveryInbox::new(Arc::new(store.clone()));
+        inbox
+            .mark_applied(&runtime, &RuntimeDeliveryId::new(DELIVERY).expect("id"), 1)
+            .await
+            .expect("the first continuation is applied");
+        inbox
+            .submit(
+                &runtime,
+                RuntimeDeliverySubmission::new(
+                    RuntimeDeliveryId::new(RESUMED_DELIVERY).expect("id"),
+                    RuntimeDeliveryKind::Continuation,
+                    "auth",
+                    2,
+                    RESUMED_CONTINUATION_KEY,
+                    serde_json::to_vec(&resumed_identity).expect("retained work row"),
+                )
+                .expect("submission"),
+            )
+            .await
+            .expect("the resumed run's continuation committed before the stop");
+        (resume_id, resumed_identity)
+    };
+
+    // After the second reopen: the original and the resume row are terminal
+    // and held only by the store.
+    let machine = open(&store, &blobs, &owners).await;
+    let (_effects, mut applied) = attach(&machine, &session, "resumed again").await;
+    bind_destination(&machine, &session, &destination).await;
+    install_credential(&machine, &EphemeralTokenStore::new(), &selection).await;
+    for (input_id, what) in [
+        (&original_id, "the original"),
+        (&resume_id, "the resume row"),
+    ] {
+        assert!(
+            !live_row(&machine, &session, input_id).await,
+            "{what} is not in the live ledger after the reopen"
+        );
+        assert!(
+            store
+                .load_input_state(&runtime, input_id)
+                .await
+                .expect("store read")
+                .is_some(),
+            "{what} is held by the store"
+        );
+    }
+    let again = keyed_continuation(RESUMED_CONTINUATION_KEY, "signed in again");
+    let again_id = again.id().clone();
+    let (outcome, _) = machine
+        .accept_retained_resume(
+            &session,
+            again,
+            head_request(&store, &runtime, RESUMED_DELIVERY, 2).await,
+        )
+        .await
+        .expect("the resumed run's continuation resumes the original");
+    let AcceptOutcome::Accepted { state, .. } = outcome else {
+        panic!("accepted, got {outcome:?}")
+    };
+    assert_eq!(
+        state
+            .authority_contributors
+            .iter()
+            .map(|original| original.input_id().clone())
+            .collect::<Vec<_>>(),
+        vec![original_id],
+        "the second resume carries exactly the original"
+    );
+    assert_eq!(
+        state
+            .retained_resume
+            .as_ref()
+            .map(|record| &record.identity),
+        Some(&resumed_identity)
+    );
+    let entered = next_apply(&mut applied, "second resume").await;
+    assert_eq!(entered.ids, vec![again_id.clone()]);
+    assert_eq!(
+        completed_text(&machine, &session, &again_id).await,
+        "resumed again"
+    );
 }
 
 /// The source owner's own custody of one original, as a cold consumer keeps

@@ -67,6 +67,21 @@ impl OperationPolicyOwner for McpOperations {
                     operation,
                     ..
                 }) => tuple(operation, &format!("bundle-{bundle}")),
+                // One delivery to one peer: the delivery kind on that peer.
+                Some(ToolOperationTarget::PeerSend { peer, kind }) => {
+                    let action = match kind {
+                        meerkat_core::PeerSendKind::Message => "send-message",
+                        meerkat_core::PeerSendKind::Request => "send-request",
+                        _ => return Err(denied().into()),
+                    };
+                    tuple(action, &format!("peer-{peer}"))
+                }
+                Some(ToolOperationTarget::PeerDirectoryRead) => tuple("read", "peer-directory"),
+                // A read of one session's memory, on that session's memory.
+                Some(ToolOperationTarget::MemoryOperation {
+                    scope: meerkat_core::MemoryScopeRef::Session { session_id },
+                    operation: meerkat_core::MemoryOperation::Read,
+                }) => tuple("memory-read", &format!("memory-{session_id}")),
                 _ => return Err(denied().into()),
             },
             AuthorizationOperation::Source(SourceAuthorizationFacts {
@@ -640,27 +655,23 @@ fn call_with_target(target: ToolOperationTarget) -> PreparedAuthorizationBinding
 #[test]
 fn a_bundle_operation_selects_its_own_exact_target() {
     assert_eq!(
-        operation_grant_target(
-            call_with_target(ToolOperationTarget::RegisteredToolBundleOperation {
+        operation_grant_target(&call_with_target(
+            ToolOperationTarget::RegisteredToolBundleOperation {
                 bundle: "mail".into(),
                 operation: "send_draft".into(),
                 account: std::sync::Arc::new(meerkat_core::OperationAccount::Unavailable),
-            })
-            .facts()
-        ),
+            }
+        )),
         Ok(Some(bundle_operation("mail", "send_draft")))
     );
     assert_eq!(
-        operation_grant_target(
-            call_with_target(ToolOperationTarget::McpServerOperation {
-                server: "alpha".into(),
-                connection_generation: 1,
-                raw_operation: "read".into(),
-                connector: meerkat_core::McpConnectorApproval::NoConnector,
-                account: std::sync::Arc::new(meerkat_core::OperationAccount::Unavailable),
-            })
-            .facts()
-        ),
+        operation_grant_target(&call_with_target(ToolOperationTarget::McpServerOperation {
+            server: "alpha".into(),
+            connection_generation: 1,
+            raw_operation: "read".into(),
+            connector: meerkat_core::McpConnectorApproval::NoConnector,
+            account: std::sync::Arc::new(meerkat_core::OperationAccount::Unavailable),
+        })),
         Ok(Some(server("alpha")))
     );
 }
@@ -852,7 +863,7 @@ fn checked_call(route: &str, server: &str, operation: &str) -> PreparedAuthoriza
 #[test]
 fn a_checked_route_operation_selects_its_own_exact_target() {
     assert_eq!(
-        operation_grant_target(checked_call("checked", "alpha", "install").facts()),
+        operation_grant_target(&checked_call("checked", "alpha", "install")),
         Ok(Some(checked_route("checked", "alpha")))
     );
 }
@@ -927,4 +938,181 @@ fn a_checked_route_operation_resolves_only_its_own_exact_lineage() {
         &checked_call("checked", "alpha", "install")
     )));
     assert!(allowed(&context, &mcp_call(&[("alpha", "read")])));
+}
+
+fn peer_id(value: u128) -> meerkat_core::comms::PeerId {
+    meerkat_core::comms::PeerId::from_uuid(uuid::Uuid::from_u128(value))
+}
+
+/// A dispatched delivery of `kind` to `peer`.
+fn peer_call(
+    peer: meerkat_core::comms::PeerId,
+    kind: meerkat_core::PeerSendKind,
+) -> PreparedAuthorizationBinding {
+    call_with_target(ToolOperationTarget::PeerSend { peer, kind })
+}
+
+fn session_memory(value: u128) -> meerkat_core::MemoryScopeRef {
+    meerkat_core::MemoryScopeRef::Session {
+        session_id: SessionId::from_uuid(uuid::Uuid::from_u128(value)),
+    }
+}
+
+/// A dispatched read of the memory `scope`.
+fn memory_call(scope: meerkat_core::MemoryScopeRef) -> PreparedAuthorizationBinding {
+    call_with_target(ToolOperationTarget::MemoryOperation {
+        scope,
+        operation: meerkat_core::MemoryOperation::Read,
+    })
+}
+
+/// A comms delivery selects exactly the peer it reaches, whatever its kind;
+/// the roster read selects the peer directory; a memory operation selects
+/// exactly its scope. None of them is base work.
+#[test]
+fn peer_and_memory_operations_select_their_own_exact_targets() {
+    use meerkat_core::PeerSendKind;
+    for kind in [
+        PeerSendKind::Message,
+        PeerSendKind::Request,
+        PeerSendKind::Response,
+    ] {
+        assert_eq!(
+            operation_grant_target(&peer_call(peer_id(1), kind)),
+            Ok(Some(GrantTarget::Peer { peer: peer_id(1) }))
+        );
+    }
+    assert_eq!(
+        operation_grant_target(&call_with_target(ToolOperationTarget::PeerDirectoryRead)),
+        Ok(Some(GrantTarget::PeerDirectory))
+    );
+    assert_eq!(
+        operation_grant_target(&memory_call(session_memory(7))),
+        Ok(Some(GrantTarget::Memory {
+            scope: session_memory(7),
+        }))
+    );
+}
+
+/// A delivery resolves only the lineage selected for exactly its peer, the
+/// roster read only the peer directory's and a memory read only its
+/// scope's. A broad base never covers any of them, another peer or scope
+/// has no lineage, the exact grant still bounds the kind of delivery, and
+/// revoking one peer's grant refuses only deliveries to that peer.
+#[test]
+fn peer_and_memory_operations_resolve_only_their_own_exact_lineage() {
+    use meerkat_core::PeerSendKind;
+    let fixture = Fixture::new();
+    let policy = fixture.mcp_policy();
+    let broad = |id_name: &str| {
+        fixture
+            .grants
+            .issue_root(
+                &who("root"),
+                id(id_name),
+                who("executor"),
+                Some(who("subject")),
+                ExecutionRestrictions::unrestricted(),
+            )
+            .expect("broad grant")
+    };
+    let exact = |id_name: &str, operation: &str, namespace: &str| {
+        fixture
+            .grants
+            .issue_root(
+                &who("root"),
+                id(id_name),
+                who("executor"),
+                Some(who("subject")),
+                ExecutionRestrictions {
+                    actions: ExactRestriction::exact([action(operation)]),
+                    resource_domains: ExactRestriction::exact([domain(namespace)]),
+                    ..ExecutionRestrictions::unrestricted()
+                },
+            )
+            .expect("exact grant")
+    };
+    let alice = peer_id(1);
+    let bob = peer_id(2);
+
+    // A broad base alone covers no delivery, roster read or memory read.
+    let base_only = fixture.original_with(
+        "base-only",
+        selecting(Some(vec![broad("base-only-grant")]), vec![]),
+    );
+    let context = fixture.context(&policy, &base_only);
+    assert!(is_denied(&refusal(
+        &context,
+        &peer_call(alice, PeerSendKind::Message)
+    )));
+    assert!(is_denied(&refusal(
+        &context,
+        &call_with_target(ToolOperationTarget::PeerDirectoryRead)
+    )));
+    assert!(is_denied(&refusal(
+        &context,
+        &memory_call(session_memory(7))
+    )));
+
+    let to_alice = exact("alice-message", "send-message", &format!("peer-{alice}"));
+    let association = fixture.original_with(
+        "exact",
+        selecting(
+            Some(vec![broad("base-grant")]),
+            vec![
+                (GrantTarget::Peer { peer: alice }, to_alice.clone()),
+                (
+                    GrantTarget::PeerDirectory,
+                    exact("directory-read", "read", "peer-directory"),
+                ),
+                (
+                    GrantTarget::Memory {
+                        scope: session_memory(7),
+                    },
+                    exact(
+                        "memory-read",
+                        "memory-read",
+                        &format!("memory-{}", SessionId::from_uuid(uuid::Uuid::from_u128(7))),
+                    ),
+                ),
+            ],
+        ),
+    );
+    let context = fixture.context(&policy, &association);
+    assert!(allowed(&context, &peer_call(alice, PeerSendKind::Message)));
+    // The exact grant still bounds the kind of delivery.
+    assert!(is_denied(&refusal(
+        &context,
+        &peer_call(alice, PeerSendKind::Request)
+    )));
+    // Another peer has no lineage; the broad base never stands in.
+    assert!(is_denied(&refusal(
+        &context,
+        &peer_call(bob, PeerSendKind::Message)
+    )));
+    assert!(allowed(
+        &context,
+        &call_with_target(ToolOperationTarget::PeerDirectoryRead)
+    ));
+    assert!(allowed(&context, &memory_call(session_memory(7))));
+    assert!(is_denied(&refusal(
+        &context,
+        &memory_call(session_memory(8))
+    )));
+
+    // Revoking alice's grant refuses only deliveries to alice.
+    fixture
+        .grants
+        .revoke(&who("root"), &to_alice, &mut NoController)
+        .expect("revoke alice");
+    let context = fixture.context(&policy, &association);
+    assert!(is_denied(&refusal(
+        &context,
+        &peer_call(alice, PeerSendKind::Message)
+    )));
+    assert!(allowed(
+        &context,
+        &call_with_target(ToolOperationTarget::PeerDirectoryRead)
+    ));
+    assert!(allowed(&context, &memory_call(session_memory(7))));
 }

@@ -7,8 +7,12 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-TEST_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/meerkat-release-projection.XXXXXX")"
-trap 'rm -rf "$TEST_ROOT"' EXIT
+WORK_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/meerkat-release-projection.XXXXXX")"
+trap 'rm -rf "$WORK_ROOT"' EXIT
+# Two fixture repositories side by side; neither sits in the other's tree.
+TEST_ROOT="$WORK_ROOT/fixture"
+REAL_ROOT="$WORK_ROOT/real-bump"
+mkdir -p "$TEST_ROOT" "$REAL_ROOT/scripts"
 
 git -C "$TEST_ROOT" init -q
 git -C "$TEST_ROOT" config user.name Meerkat
@@ -34,7 +38,7 @@ members = ["crate"]
 version = "1.2.3"
 
 [workspace.dependencies]
-fixture = { version = "1.2.3", path = "crate" }
+fixture = { version = "=1.2.3", path = "crate" }
 EOF
 cat > "$TEST_ROOT/Cargo.lock" <<'EOF'
 [[package]]
@@ -149,6 +153,134 @@ fi
     --base "$base" --head "$projection" --verbose
 )
 
+# The real release shape: this tree's own Cargo.toml (every internal
+# requirement exact, `=X.Y.Z`), Cargo.lock and CHANGELOG.md (over 1 MiB),
+# bumped to the next patch the way cargo-release and the release hook do.
+# The classifier reads every blob through git, so a buffer limit or the
+# exact-requirement form would refuse the real bump here first.
+git -C "$REAL_ROOT" init -q
+git -C "$REAL_ROOT" config user.name Meerkat
+git -C "$REAL_ROOT" config user.email meerkat@example.invalid
+cp "$REPO_ROOT/scripts/stamp-changelog-release.py" "$REAL_ROOT/scripts/"
+cp "$REPO_ROOT/Cargo.toml" "$REPO_ROOT/Cargo.lock" "$REPO_ROOT/CHANGELOG.md" "$REAL_ROOT/"
+real_version="$(
+  awk -F '"' '/^\[workspace\.package\]/ { inside = 1; next } /^\[/ { inside = 0 }
+    inside && /^version = / { print $2; exit }' "$REAL_ROOT/Cargo.toml"
+)"
+IFS=. read -r real_major real_minor real_patch <<<"$real_version"
+next_version="${real_major}.${real_minor}.$((real_patch + 1))"
+real_exact="$(grep -c "version = \"=${real_version}\", path = " "$REAL_ROOT/Cargo.toml" || true)"
+if [[ "$real_exact" -lt 40 ]]; then
+  echo "real-bump: Cargo.toml must pin its internal crates exactly; found ${real_exact} =${real_version} entries" >&2
+  exit 1
+fi
+if [[ "$(wc -c <"$REAL_ROOT/CHANGELOG.md")" -le $((1024 * 1024)) ]]; then
+  echo "real-bump: CHANGELOG.md must exceed 1 MiB" >&2
+  exit 1
+fi
+# Right after a release the pending section is empty, which the stamper
+# refuses; give it one fixture note then.
+python3 - "$REAL_ROOT/CHANGELOG.md" <<'PYEOF'
+import pathlib
+import re
+import sys
+
+path = pathlib.Path(sys.argv[1])
+text = path.read_text()
+pending = re.search(r"^## \[Unreleased\]\n(.*?)^## \[", text, re.M | re.S)
+if pending is None:
+    raise SystemExit("real-bump: CHANGELOG.md has no [Unreleased] section")
+if not re.search(r"^- ", pending.group(1), re.M):
+    text = text.replace(
+        "## [Unreleased]\n", "## [Unreleased]\n\n### Fixed\n\n- Real-bump fixture note.\n", 1
+    )
+    path.write_text(text)
+PYEOF
+git -C "$REAL_ROOT" add .
+git -C "$REAL_ROOT" commit -qm real-base
+real_base="$(git -C "$REAL_ROOT" rev-parse HEAD)"
+bumped_exact="$(
+  python3 - "$REAL_ROOT" "$real_version" "$next_version" <<'PYEOF'
+import pathlib
+import re
+import sys
+
+root, old, new = pathlib.Path(sys.argv[1]), sys.argv[2], sys.argv[3]
+manifest = root / "Cargo.toml"
+section = ""
+lines = []
+exact = 0
+for line in manifest.read_text().split("\n"):
+    header = re.match(r"^\s*\[([^\]]+)\]\s*$", line)
+    if header:
+        section = header.group(1)
+    if section == "workspace.package" and line == f'version = "{old}"':
+        line = f'version = "{new}"'
+    elif section == "workspace.dependencies" and "path =" in line and f'version = "={old}"' in line:
+        line = line.replace(f'version = "={old}"', f'version = "={new}"')
+        exact += 1
+    lines.append(line)
+manifest.write_text("\n".join(lines))
+lock = root / "Cargo.lock"
+blocks = re.split(r"(?=\[\[package\]\]\n)", lock.read_text())
+lock.write_text(
+    "".join(
+        re.sub(rf'^version = "{re.escape(old)}"$', f'version = "{new}"', block, count=1, flags=re.M)
+        if block.startswith("[[package]]\n") and not re.search(r"^source\s*=", block, re.M)
+        else block
+        for block in blocks
+    )
+)
+print(exact)
+PYEOF
+)"
+if [[ "$bumped_exact" -ne "$real_exact" ]]; then
+  echo "real-bump: bumped ${bumped_exact} of ${real_exact} exact internal requirements" >&2
+  exit 1
+fi
+MEERKAT_RELEASE_DATE=2026-08-28 python3 "$REAL_ROOT/scripts/stamp-changelog-release.py" \
+  "$REAL_ROOT/CHANGELOG.md" "$next_version" >/dev/null
+git -C "$REAL_ROOT" add .
+git -C "$REAL_ROOT" commit -qm real-bump
+real_head="$(git -C "$REAL_ROOT" rev-parse HEAD)"
+(
+  cd "$REAL_ROOT"
+  "$REPO_ROOT/scripts/release-projection-only.mjs" \
+    --base "$real_base" --head "$real_head" --verbose
+)
+# The same real bump that drops `=` from one internal requirement is not a
+# projection: it changes what that published crate requires.
+git -C "$REAL_ROOT" checkout -q -b real-dropped-exact "$real_head"
+python3 - "$REAL_ROOT/Cargo.toml" "$next_version" <<'PYEOF'
+import pathlib
+import sys
+
+path, version = pathlib.Path(sys.argv[1]), sys.argv[2]
+exact = f'version = "={version}", path = '
+text = path.read_text()
+if exact not in text:
+    raise SystemExit("real-bump: no exact internal requirement to drop")
+path.write_text(text.replace(exact, f'version = "{version}", path = ', 1))
+PYEOF
+if [[ "$(grep -c "version = \"=${next_version}\", path = " "$REAL_ROOT/Cargo.toml")" -ne $((real_exact - 1)) ]]; then
+  echo "real-bump: the dropped-exact fixture must drop exactly one =${next_version}" >&2
+  exit 1
+fi
+git -C "$REAL_ROOT" add Cargo.toml
+git -C "$REAL_ROOT" commit -qm real-dropped-exact
+set +e
+real_dropped_output="$(
+  cd "$REAL_ROOT" &&
+    "$REPO_ROOT/scripts/release-projection-only.mjs" \
+      --base "$real_base" --head "$(git -C "$REAL_ROOT" rev-parse HEAD)" --verbose 2>&1
+)"
+real_dropped_status=$?
+set -e
+if [[ "$real_dropped_status" -ne 1 || "$real_dropped_output" != *"Cargo.toml contains changes beyond the version projection"* ]]; then
+  echo "real-bump: dropping one exact operator must be refused (status ${real_dropped_status}): ${real_dropped_output}" >&2
+  exit 1
+fi
+
 # Rejected with status 1 and, when given, for the named reason.
 assert_rejected() {
   local label="$1"
@@ -187,6 +319,19 @@ printf '\nserde = "1"\n' >> "$TEST_ROOT/Cargo.toml"
 git -C "$TEST_ROOT" add .
 git -C "$TEST_ROOT" commit -qm semantic-manifest
 assert_rejected semantic-manifest "$(git -C "$TEST_ROOT" rev-parse HEAD)" "Cargo.toml contains changes beyond the version projection"
+
+# Internal requirements publish exact (`=X.Y.Z`); a bump that also drops the
+# `=` changes what every published crate requires, so it is no projection.
+git -C "$TEST_ROOT" checkout -q -B dropped-exact-requirement "$projection"
+sed -i.bak 's/version = "=1\.2\.4", path/version = "1.2.4", path/' "$TEST_ROOT/Cargo.toml"
+rm -f "$TEST_ROOT/Cargo.toml.bak"
+grep -Fq 'fixture = { version = "1.2.4", path = "crate" }' "$TEST_ROOT/Cargo.toml" || {
+  echo "dropped-exact-requirement fixture did not drop the exact operator" >&2
+  exit 1
+}
+git -C "$TEST_ROOT" add Cargo.toml
+git -C "$TEST_ROOT" commit -qm dropped-exact-requirement
+assert_rejected dropped-exact-requirement "$(git -C "$TEST_ROOT" rev-parse HEAD)"
 
 git -C "$TEST_ROOT" checkout -q -B equal-version-external "$base"
 printf '\nexternal = "1.2.3"\n' >> "$TEST_ROOT/Cargo.toml"

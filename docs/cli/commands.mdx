@@ -401,6 +401,10 @@ rkat realm revoke-grant <REALM_ID> [--agent <AGENT>] (--mcp <SERVER> | --catalog
 `realm show` inspect manifests in the active state root. `realm prune` defaults
 to a 24-hour age threshold. `--force` bypasses active-lease safety checks, so
 use it only after confirming that no process still owns the target realm.
+Neither command removes a realm that another realm's own config document
+names as its parent, `--force` included: the refusal (or prune's
+`kept_parents` note) names the child, which would otherwise stop composing
+the parent's `[confinement]` and `[governance]`.
 
 `realm govern` makes an existing realm governed, durably, with the local user
 as operator; every later `rkat` process opens it governed, and no flag selects

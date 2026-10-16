@@ -395,7 +395,7 @@ come from.
 | `managed_store` | Resolve through TokenStore by typed route binding or shared credential-account identity |
 | `platform_default` | Use a supported cloud/platform default credential chain |
 | `external_resolver` | Call a host-registered JavaScript or Rust resolver |
-| `command` | Run an external binary and optionally cache stdout for `refresh_interval_ms` |
+| `command` | Run an external binary and optionally cache stdout for `refresh_interval_ms`; without a `cwd` it runs from the user's home directory. The host adds or changes one by editing the config document: a config write cannot (see [launches outside confinement](/concepts/configuration#launches-outside-confinement)) |
 | `file_descriptor` | Read credentials from a host-supplied descriptor |
 
 <Warning>

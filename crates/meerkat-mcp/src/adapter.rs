@@ -773,6 +773,27 @@ impl McpRouterAdapter {
         Ok(())
     }
 
+    /// Stage the add of a server the host refused before anything in it was
+    /// expanded, authorized, connected or spawned
+    /// ([`McpRouter::stage_add_refused`]): applying it reports the typed
+    /// `refusal` as that server's failed setup, and nothing connects.
+    pub async fn stage_add_refused(
+        &self,
+        config: McpServerConfig,
+        refusal: meerkat_core::confinement::ConfinementRefusal,
+    ) -> Result<(), String> {
+        self.refuse_if_closing()?;
+        let mut router = self.router.write().await;
+        let router = router
+            .as_mut()
+            .ok_or_else(|| "MCP router has been shut down".to_string())?;
+        router
+            .stage_add_refused(config, refusal)
+            .map_err(|error| error.to_string())?;
+        self.sync_router_projection(router);
+        Ok(())
+    }
+
     /// Stage a governed MCP server add under a prepared attachment control.
     ///
     /// The router installs the exact descriptor and its control together,
@@ -1912,7 +1933,10 @@ mod tests {
     }
 
     fn generated_surface_router() -> McpRouter {
-        McpRouter::new_with_surface_handle(generated_surface_handle())
+        McpRouter::new_with_surface_handle_and_stdio_profile(
+            generated_surface_handle(),
+            crate::McpStdioLaunchProfile::trusted_host(),
+        )
     }
 
     struct RejectingExternalToolSurfaceHandle;
@@ -2519,8 +2543,11 @@ mod tests {
         let (private, entered, go) =
             GatedSurface::new(|input| matches!(input, ExternalToolSurfaceInput::Shutdown));
         let adapter = Arc::new(McpRouterAdapter::new(
-            McpRouter::new_with_surface_handle(private.clone())
-                .with_surface_ownership(crate::McpSurfaceOwnership::Owned),
+            McpRouter::new_with_surface_handle_and_stdio_profile(
+                private.clone(),
+                crate::McpStdioLaunchProfile::trusted_host(),
+            )
+            .with_surface_ownership(crate::McpSurfaceOwnership::Owned),
         ));
         let shutting = tokio::spawn({
             let adapter = Arc::clone(&adapter);
@@ -2571,9 +2598,12 @@ mod tests {
     async fn a_bind_racing_a_borrowed_release_waits_for_its_claim() {
         let (claimed, entered, go) =
             GatedSurface::new(|input| matches!(input, ExternalToolSurfaceInput::Release { .. }));
-        let adapter = Arc::new(McpRouterAdapter::new(McpRouter::new_with_surface_handle(
-            claimed.clone(),
-        )));
+        let adapter = Arc::new(McpRouterAdapter::new(
+            McpRouter::new_with_surface_handle_and_stdio_profile(
+                claimed.clone(),
+                crate::McpStdioLaunchProfile::trusted_host(),
+            ),
+        ));
         adapter
             .stage_add(test_server_config(
                 "held",
@@ -2636,8 +2666,11 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_bind_finishing_after_the_router_ended_publishes_nothing() {
         let adapter = Arc::new(McpRouterAdapter::new(
-            McpRouter::new_with_surface_handle(generated_surface_handle())
-                .with_surface_ownership(crate::McpSurfaceOwnership::Owned),
+            McpRouter::new_with_surface_handle_and_stdio_profile(
+                generated_surface_handle(),
+                crate::McpStdioLaunchProfile::trusted_host(),
+            )
+            .with_surface_ownership(crate::McpSurfaceOwnership::Owned),
         ));
         adapter
             .stage_add(test_server_config(
@@ -2680,7 +2713,10 @@ mod tests {
             inner: generated_surface_handle(),
             armed: AtomicBool::new(false),
         });
-        let mut router = McpRouter::new_with_surface_handle(handle.clone());
+        let mut router = McpRouter::new_with_surface_handle_and_stdio_profile(
+            handle.clone(),
+            crate::McpStdioLaunchProfile::trusted_host(),
+        );
         let server = test_server_config("governed", Path::new("/nonexistent/mcp-server"));
         let other = test_server_config("governed", Path::new("/nonexistent/other-server"));
         router
@@ -2959,7 +2995,9 @@ mod tests {
 
     #[tokio::test]
     async fn empty_adapter_reports_exact_catalog_support() {
-        let adapter = McpRouterAdapter::new(McpRouter::new());
+        let adapter = McpRouterAdapter::new(McpRouter::new_with_stdio_profile(
+            crate::McpStdioLaunchProfile::trusted_host(),
+        ));
         assert!(
             adapter.tool_catalog_capabilities().exact_catalog,
             "empty MCP adapters should preserve exact deferred catalogs on other tool planes"
@@ -2969,7 +3007,9 @@ mod tests {
 
     #[test]
     fn adapter_accepts_equivalent_projection_rebuilds_and_rejects_semantic_change() {
-        let adapter = McpRouterAdapter::new(McpRouter::new());
+        let adapter = McpRouterAdapter::new(McpRouter::new_with_stdio_profile(
+            crate::McpStdioLaunchProfile::trusted_host(),
+        ));
         let entry = |description: &str| {
             ToolCatalogEntry::session_inline(
                 Arc::new(ToolDef::new(
@@ -3049,7 +3089,8 @@ mod tests {
 
     #[tokio::test]
     async fn default_router_fails_closed_until_external_surface_handle_is_bound() {
-        let mut router = McpRouter::new();
+        let mut router =
+            McpRouter::new_with_stdio_profile(crate::McpStdioLaunchProfile::trusted_host());
         let error = router
             .stage_add(meerkat_core::McpServerConfig::stdio(
                 "planner",
@@ -3198,7 +3239,8 @@ mod tests {
     #[tokio::test]
     async fn adapter_bind_external_surface_handle_allows_post_bind_pending_state() {
         let server_path = mcp_test_server::fixture_binary();
-        let router = McpRouter::new();
+        let router =
+            McpRouter::new_with_stdio_profile(crate::McpStdioLaunchProfile::trusted_host());
         let adapter = McpRouterAdapter::new(router);
         let handle = generated_surface_handle();
 
@@ -3419,7 +3461,10 @@ mod tests {
                 staged_sequence,
             )
             .expect("seed active surface");
-        let mut router = McpRouter::new_with_surface_handle(handle);
+        let mut router = McpRouter::new_with_surface_handle_and_stdio_profile(
+            handle,
+            crate::McpStdioLaunchProfile::trusted_host(),
+        );
         let cfg = meerkat_core::McpServerConfig::stdio(
             "srv-standalone",
             "/bin/echo",
@@ -3433,7 +3478,9 @@ mod tests {
 
     #[tokio::test]
     async fn pending_empty_adapter_keeps_exact_catalog_support_and_reports_pending_sources() {
-        let adapter = McpRouterAdapter::new(McpRouter::new());
+        let adapter = McpRouterAdapter::new(McpRouter::new_with_stdio_profile(
+            crate::McpStdioLaunchProfile::trusted_host(),
+        ));
         adapter.has_pending.store(true, Ordering::Release);
         adapter.set_pending_sources_cache(Arc::from(["pending-mcp".to_string()]));
 

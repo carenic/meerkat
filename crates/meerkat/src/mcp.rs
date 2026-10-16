@@ -8,11 +8,13 @@
 //! surviving mob member revival via the durable profile).
 //!
 //! For hosts that drive a raw [`McpRouter`] themselves (outside a factory
-//! build), [`standalone_router`] is the supported constructor:
-//! `McpRouter::new()`'s default unbound surface handle deliberately
-//! fail-closes `stage_add`, so standalone use needs an ephemeral runtime
-//! surface authority — previously an incantation that only existed in test
-//! code.
+//! build), [`standalone_router_with_stdio_profile`] is the supported
+//! constructor: an unbound router's surface handle deliberately fail-closes
+//! `stage_add`, so standalone use needs an ephemeral runtime surface
+//! authority. It names the launch profile of the router's local stdio
+//! servers: the host's, canonically
+//! [`crate::AgentFactory::mcp_stdio_launch_profile`], or
+//! [`McpStdioLaunchProfile::trusted_host`] for no OS confinement.
 
 use std::sync::Arc;
 
@@ -29,8 +31,12 @@ use meerkat_runtime::handles::RuntimeExternalToolSurfaceHandle;
 /// prefer the declarative `mcp_servers` build option, which binds the router
 /// to the session's own machine authority instead.
 ///
-/// Local stdio servers launch as the trusted host. A host with a launch
-/// boundary uses [`standalone_router_with_stdio_profile`].
+/// Local stdio servers launch as the trusted host, with no OS confinement,
+/// without the caller naming it.
+#[deprecated(
+    since = "0.9.2",
+    note = "launches local stdio servers as the trusted host without naming it; name the profile with `standalone_router_with_stdio_profile(McpStdioLaunchProfile::trusted_host())`, or pass the host's (canonically `AgentFactory::mcp_stdio_launch_profile`)"
+)]
 #[must_use]
 pub fn standalone_router() -> McpRouter {
     standalone_router_with_stdio_profile(McpStdioLaunchProfile::trusted_host())

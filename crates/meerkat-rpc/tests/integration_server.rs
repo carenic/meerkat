@@ -1607,47 +1607,133 @@ mod tcp_callback_ownership {
         provider: Arc<ScriptedProvider>,
         seen: mpsc::UnboundedReceiver<Seen>,
         servers: Vec<Option<JoinHandle<Result<(), ServerError>>>>,
+        stores: HarnessStores,
+    }
+    /// The durable stores a restarted runtime reopens.
+    #[derive(Clone)]
+    struct HarnessStores {
+        sessions: Arc<dyn meerkat::SessionStore>,
+        runtime: Arc<dyn meerkat_runtime::RuntimeStore>,
+        blobs: Arc<dyn BlobStore>,
     }
     impl Harness {
         fn new() -> Self {
+            Self::with_config(|_| {
+                Arc::new(MemoryConfigStore::new(
+                    Config::default(),
+                    meerkat_models::canonical(),
+                ))
+            })
+        }
+        /// A harness whose mob state persists its mobs under the harness
+        /// root, so [`Self::restart`] restores them.
+        fn new_persistent() -> Self {
+            Self::with_config(|root| {
+                Arc::new(meerkat_core::TaggedConfigStore::new(
+                    Arc::new(MemoryConfigStore::new(
+                        Config::default(),
+                        meerkat_models::canonical(),
+                    )),
+                    meerkat_core::ConfigStoreMetadata {
+                        realm_id: None,
+                        instance_id: None,
+                        backend: None,
+                        resolved_paths: Some(meerkat_core::ConfigResolvedPaths {
+                            root: root.display().to_string(),
+                            manifest_path: root.join("realm.toml").display().to_string(),
+                            config_path: root.join("config.toml").display().to_string(),
+                            sessions_sqlite_path: None,
+                            sessions_jsonl_dir: root.join("sessions").display().to_string(),
+                        }),
+                    },
+                ))
+            })
+        }
+        fn with_config(config: impl FnOnce(&std::path::Path) -> Arc<dyn ConfigStore>) -> Self {
             let temp = tempfile::tempdir().unwrap();
             let (tx, seen) = mpsc::unbounded_channel();
             let provider = Arc::new(ScriptedProvider {
                 plans: Mutex::new(HashMap::new()),
                 seen: tx,
             });
-            let store: Arc<dyn meerkat::SessionStore> = Arc::new(meerkat::MemoryStore::new());
-            let blobs: Arc<dyn BlobStore> = Arc::new(meerkat_store::MemoryBlobStore::new());
+            let stores = HarnessStores {
+                sessions: Arc::new(meerkat::MemoryStore::new()),
+                runtime: Arc::new(meerkat_runtime::InMemoryRuntimeStore::new()),
+                blobs: Arc::new(meerkat_store::MemoryBlobStore::new()),
+            };
+            let config = config(temp.path());
+            let runtime = Self::start_runtime(temp.path(), &stores, &config, &provider);
+            Self {
+                _temp: temp,
+                runtime,
+                config,
+                provider,
+                seen,
+                servers: vec![],
+                stores,
+            }
+        }
+        fn start_runtime(
+            root: &std::path::Path,
+            stores: &HarnessStores,
+            config: &Arc<dyn ConfigStore>,
+            provider: &Arc<ScriptedProvider>,
+        ) -> Arc<SessionRuntime> {
             let runtime = SessionRuntime::new(
-                AgentFactory::new(temp.path().join("sessions")),
+                AgentFactory::new(root.join("sessions")),
                 Config::default(),
                 10,
                 meerkat::PersistenceBundle::new(
-                    store,
-                    Arc::new(meerkat_runtime::InMemoryRuntimeStore::new()),
-                    blobs,
+                    Arc::clone(&stores.sessions),
+                    Arc::clone(&stores.runtime),
+                    Arc::clone(&stores.blobs),
                 )
                 .expect("construct runtime authority"),
                 meerkat_rpc::router::NotificationSink::noop(),
             )
             .expect("compose the RPC session runtime");
-            let config: Arc<dyn ConfigStore> = Arc::new(MemoryConfigStore::new(
-                Config::default(),
-                meerkat_models::canonical(),
-            ));
             runtime.set_default_llm_client(Some(provider.clone()));
             runtime.set_config_runtime(Arc::new(ConfigRuntime::new(
                 config.clone(),
-                temp.path().join("config_state.json"),
+                root.join("config_state.json"),
             )));
-            Self {
-                _temp: temp,
-                runtime: Arc::new(runtime),
-                config,
-                provider,
-                seen,
-                servers: vec![],
+            Arc::new(runtime)
+        }
+        /// Stop every connection and the runtime, then start a new runtime
+        /// over the same stores and config, as a process restart would.
+        async fn restart(&mut self) {
+            for server in &mut self.servers {
+                if let Some(server) = server.take() {
+                    server.abort();
+                    let _ = server.await;
+                }
             }
+            // The old host's mobs release their process-wide supervisor
+            // routes, as the old process's exit would, before the new host
+            // restores them. Their durable state is untouched.
+            #[cfg(feature = "mob")]
+            if let Some(mob_state) = self.runtime.mob_state() {
+                for (mob_id, _) in mob_state.mob_list().await.expect("the old host's mobs") {
+                    let handle = mob_state
+                        .handle_for(&mob_id)
+                        .await
+                        .expect("the old host's mob");
+                    tokio::time::timeout(LIMIT, handle.shutdown())
+                        .await
+                        .expect("bounded mob shutdown before the restart")
+                        .expect("the old host's mob shuts down");
+                }
+            }
+            tokio::time::timeout(LIMIT, self.runtime.try_shutdown())
+                .await
+                .expect("bounded runtime shutdown before the restart")
+                .unwrap();
+            self.runtime = Self::start_runtime(
+                self._temp.path(),
+                &self.stores,
+                &self.config,
+                &self.provider,
+            );
         }
         async fn connect(&mut self) -> (usize, Connection) {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1787,6 +1873,10 @@ mod tcp_callback_ownership {
                 7 => mob_recreated_case(&mut h, true).await,
                 #[cfg(feature = "mob")]
                 8 => mob_recreated_case(&mut h, false).await,
+                #[cfg(feature = "mob")]
+                9 => mob_claim_refused_while_owner_connected_case(&mut h).await,
+                #[cfg(feature = "mob")]
+                10 => mob_claim_after_owner_disconnect_case(&mut h).await,
                 _ => unreachable!(),
             }
             h.exhausted();
@@ -2304,12 +2394,10 @@ mod tcp_callback_ownership {
             .await;
         let initial = h.seen(prompt).await;
         if !over_rpc {
+            // Its route slot is unclaimed: no connection's tools reach it.
             assert!(
-                !initial
-                    .tools
-                    .iter()
-                    .any(|name| name == "tool_catalog_load" || name.ends_with("_lookup")),
-                "a mob no connection created has no callback tools: {initial:?}"
+                !initial.tools.iter().any(|name| name.ends_with("_lookup")),
+                "a mob no connection created or claimed reached callback tools: {initial:?}"
             );
             b.response(9).await;
             return;
@@ -2346,5 +2434,251 @@ mod tcp_callback_ownership {
     #[tokio::test]
     async fn tcp_callback_mob_recreated_in_process_never_reaches_the_old_creator() {
         run_case(8).await;
+    }
+
+    /// The mob definition the claim cases create under `mob_id`.
+    #[cfg(feature = "mob")]
+    fn claim_mob_definition(mob_id: &str) -> Value {
+        json!({"definition":{"id":mob_id,"profiles":{"worker":{"model":"claude-sonnet-4-6","tools":{"comms":true}}}}})
+    }
+
+    #[cfg(feature = "mob")]
+    fn member_turn(id: u64, mob_id: &str, prompt: &str) -> Value {
+        json!({"jsonrpc":"2.0","id":id,"method":"mob/turn_start","params":{"mob_id":mob_id,"agent_identity":"w1","prompt":prompt}})
+    }
+
+    /// A connection cannot take a mob's callback route from an owner whose
+    /// connection is still open: B's claim of A's mob is refused with a typed
+    /// error, while A's own claim of the route it holds is accepted.
+    #[cfg(feature = "mob")]
+    async fn mob_claim_refused_while_owner_connected_case(h: &mut Harness) {
+        let (_, mut a) = h.connect().await;
+        let (_, mut b) = h.connect().await;
+        a.register("a_lookup").await;
+        a.request(5, "mob/create", claim_mob_definition("held_mob"))
+            .await;
+        b.send(json!({"jsonrpc":"2.0","id":6,"method":"mob/claim_callback_route","params":{"mob_id":"held_mob"}}))
+            .await;
+        let refused = b.next_significant().await;
+        assert_eq!(refused["id"], json!(6), "{refused}");
+        assert_eq!(
+            refused["error"]["code"],
+            json!(meerkat_rpc::error::SESSION_BUSY),
+            "a claim of a route its open owner holds is refused: {refused}"
+        );
+        assert_eq!(
+            refused["error"]["data"],
+            json!({"mob_id": "held_mob", "reason": "held_by_open_connection"}),
+            "the refusal carries its typed data: {refused}"
+        );
+        let held = a
+            .request(7, "mob/claim_callback_route", json!({"mob_id":"held_mob"}))
+            .await;
+        assert_eq!(held["mob_id"], "held_mob", "{held}");
+    }
+    #[cfg(feature = "mob")]
+    #[tokio::test]
+    async fn tcp_callback_claim_is_refused_while_the_owner_is_connected() {
+        run_case(9).await;
+    }
+
+    /// When a mob's owning connection closes, its members' callbacks fail
+    /// typed and reach no connection, and another connection may then claim
+    /// the route. A's member calls A's tool; A disconnects; the member's next
+    /// call of that tool fails `tool_unavailable` naming the unclaimed route;
+    /// B claims the route, and the same live member loads and calls B's tool,
+    /// whose call reaches B.
+    #[cfg(feature = "mob")]
+    async fn mob_claim_after_owner_disconnect_case(h: &mut Harness) {
+        h.provider.plan(
+            "handoff-owner",
+            [
+                Step::Load {
+                    tool: "a_lookup",
+                    call_id: "load-owner",
+                },
+                Step::Call {
+                    tool: "a_lookup",
+                    call_id: "call-owner",
+                },
+                finish(),
+            ],
+        );
+        h.provider.plan(
+            "handoff-unclaimed",
+            [
+                Step::Call {
+                    tool: "a_lookup",
+                    call_id: "call-unclaimed",
+                },
+                finish(),
+            ],
+        );
+        h.provider.plan(
+            "handoff-claimed",
+            [
+                Step::Load {
+                    tool: "b_lookup",
+                    call_id: "load-claimer",
+                },
+                Step::Call {
+                    tool: "b_lookup",
+                    call_id: "call-claimer",
+                },
+                finish(),
+            ],
+        );
+        let (a_index, mut a) = h.connect().await;
+        a.register("a_lookup").await;
+        a.request(5, "mob/create", claim_mob_definition("handoff_mob"))
+            .await;
+        a.request(
+            6,
+            "mob/spawn",
+            json!({"mob_id":"handoff_mob","profile":"worker","agent_identity":"w1","runtime_mode":"turn_driven"}),
+        )
+        .await;
+        a.send(member_turn(7, "handoff_mob", "handoff-owner")).await;
+        h.seen("handoff-owner").await;
+        let loaded = h.seen("handoff-owner").await;
+        assert_catalog_load(&loaded, "load-owner", "a_lookup");
+        let callback = a.next_significant().await;
+        assert_eq!(callback["params"]["name"], "a_lookup", "{callback}");
+        a.answer(&callback, "owner-result").await;
+        a.response(7).await;
+        assert_result(&h.seen("handoff-owner").await, "call-owner", "owner-result");
+        drop(a);
+        h.disconnected(a_index).await;
+
+        // No connection holds the route: the member's call fails typed.
+        let (_, mut b) = h.connect().await;
+        b.register("b_lookup").await;
+        b.send(member_turn(8, "handoff_mob", "handoff-unclaimed"))
+            .await;
+        h.seen("handoff-unclaimed").await;
+        let after_call = h.seen("handoff-unclaimed").await;
+        let results: Vec<_> = after_call
+            .results
+            .iter()
+            .filter(|result| result.tool_use_id == "call-unclaimed")
+            .collect();
+        assert_eq!(results.len(), 1, "{after_call:?}");
+        assert!(results[0].is_error, "{after_call:?}");
+        let payload: Value = serde_json::from_str(&results[0].text_content()).unwrap();
+        assert_eq!(payload["error"], "tool_unavailable", "{payload}");
+        assert!(
+            payload["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("no connected client holds")),
+            "the failure names the unclaimed callback route: {payload}"
+        );
+        b.response(8).await;
+
+        // B claims the route; the same live member now reaches B.
+        let claimed = b
+            .request(
+                9,
+                "mob/claim_callback_route",
+                json!({"mob_id":"handoff_mob"}),
+            )
+            .await;
+        assert_eq!(claimed["mob_id"], "handoff_mob", "{claimed}");
+        b.send(member_turn(10, "handoff_mob", "handoff-claimed"))
+            .await;
+        h.seen("handoff-claimed").await;
+        let loaded = h.seen("handoff-claimed").await;
+        assert_catalog_load(&loaded, "load-claimer", "b_lookup");
+        let callback = b.next_significant().await;
+        assert_eq!(callback["params"]["name"], "b_lookup", "{callback}");
+        b.answer(&callback, "claimer-result").await;
+        b.response(10).await;
+        assert_result(
+            &h.seen("handoff-claimed").await,
+            "call-claimer",
+            "claimer-result",
+        );
+    }
+    #[cfg(feature = "mob")]
+    #[tokio::test]
+    async fn tcp_callback_route_is_claimed_after_the_owner_disconnects() {
+        run_case(10).await;
+    }
+
+    /// A mob restored after a restart has no callback route until a
+    /// connection claims it, and the claim reaches its restored member. A
+    /// creates the mob and spawns its member; the runtime restarts over the
+    /// same stores and restores the mob; B registers its tool and claims the
+    /// restored mob's route; the restored member then loads and calls B's
+    /// tool, whose call reaches B.
+    #[cfg(feature = "mob")]
+    #[tokio::test]
+    async fn tcp_callback_restored_mob_member_reaches_the_connection_that_claims_it() {
+        let mut h = Harness::new_persistent();
+        let result = AssertUnwindSafe(tokio::time::timeout(Duration::from_secs(50), async {
+            h.provider.plan(
+                "restored-claimed",
+                [
+                    Step::Load {
+                        tool: "b_lookup",
+                        call_id: "load-restored",
+                    },
+                    Step::Call {
+                        tool: "b_lookup",
+                        call_id: "call-restored",
+                    },
+                    finish(),
+                ],
+            );
+            let (a_index, mut a) = h.connect().await;
+            a.register("a_lookup").await;
+            a.request(5, "mob/create", claim_mob_definition("restored_mob"))
+                .await;
+            a.request(
+                6,
+                "mob/spawn",
+                json!({"mob_id":"restored_mob","profile":"worker","agent_identity":"w1","runtime_mode":"turn_driven"}),
+            )
+            .await;
+            drop(a);
+            h.disconnected(a_index).await;
+            h.restart().await;
+
+            let (_, mut b) = h.connect().await;
+            b.register("b_lookup").await;
+            let claimed = b
+                .request(
+                    7,
+                    "mob/claim_callback_route",
+                    json!({"mob_id":"restored_mob"}),
+                )
+                .await;
+            assert_eq!(claimed["mob_id"], "restored_mob", "{claimed}");
+            b.send(member_turn(8, "restored_mob", "restored-claimed"))
+                .await;
+            let initial = h.seen("restored-claimed").await;
+            assert!(
+                initial.tools.iter().any(|name| name == "tool_catalog_load"),
+                "the restored member has the claimer's deferred callback tools: {initial:?}"
+            );
+            let loaded = h.seen("restored-claimed").await;
+            assert_catalog_load(&loaded, "load-restored", "b_lookup");
+            let callback = b.next_significant().await;
+            assert_eq!(callback["params"]["name"], "b_lookup", "{callback}");
+            b.answer(&callback, "restored-result").await;
+            b.response(8).await;
+            assert_result(
+                &h.seen("restored-claimed").await,
+                "call-restored",
+                "restored-result",
+            );
+            h.exhausted();
+        }))
+        .catch_unwind()
+        .await;
+        h.clean().await;
+        match result {
+            Ok(result) => result.expect("bounded complete scenario"),
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
     }
 }

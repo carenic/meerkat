@@ -252,7 +252,9 @@ mod tool_dispatch {
     #[test]
     fn test_tool_timeout_enforced() {
         // Create dispatcher with router-backed live tool discovery.
-        let router: Arc<dyn AgentToolDispatcher> = Arc::new(McpRouter::new());
+        let router: Arc<dyn AgentToolDispatcher> = Arc::new(McpRouter::new_with_stdio_profile(
+            meerkat_mcp::McpStdioLaunchProfile::trusted_host(),
+        ));
         let timeout = Duration::from_secs(30);
         let dispatcher = ToolDispatcher::new(router).with_timeout(timeout);
 
@@ -914,7 +916,8 @@ mod mcp_protocol {
     #[tokio::test]
     async fn test_mcp_router_creation() {
         // Test router creation
-        let router = McpRouter::new();
+        let router =
+            McpRouter::new_with_stdio_profile(meerkat_mcp::McpStdioLaunchProfile::trusted_host());
 
         // Router should be created successfully
         // list_tools returns empty slice when no servers are connected

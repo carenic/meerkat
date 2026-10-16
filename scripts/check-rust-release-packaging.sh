@@ -129,6 +129,12 @@ while IFS=$'\t' read -r crate expression required_files; do
     done
 done <<< "$license_map"
 
+# Every packaged requirement on a sibling release crate is exact (`=$version`):
+# 0.x patch releases may break API. scripts/check_rust_release_packaging.py
+# holds the manifests to the same rule; this reads what the archives ship.
+"$PYTHON" "$(dirname "${BASH_SOURCE[0]}")/check_packaged_internal_requirements.py" \
+    "$version" "$package_target/package" "${RELEASE_CRATES[@]}"
+
 echo "Running published-style facade link smoke..."
 MEERKAT_PUBLISHED_FACADE_PACKAGE_TARGET="$package_target" \
     "$ROOT/scripts/check-published-facade-link.sh"

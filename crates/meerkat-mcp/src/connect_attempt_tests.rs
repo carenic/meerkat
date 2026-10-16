@@ -650,9 +650,10 @@ async fn a_deletion_answered_without_a_success_status_is_unconfirmed() {
 
 /// A router whose remote servers the close index tests close.
 fn close_index_router() -> crate::McpRouter {
-    crate::McpRouter::new_with_surface_handle(Arc::new(
-        meerkat_runtime::RuntimeExternalToolSurfaceHandle::ephemeral(),
-    ))
+    crate::McpRouter::new_with_surface_handle_and_stdio_profile(
+        Arc::new(meerkat_runtime::RuntimeExternalToolSurfaceHandle::ephemeral()),
+        crate::McpStdioLaunchProfile::trusted_host(),
+    )
 }
 
 /// C8/C9: a remote connection's close is part of the close ticket. The

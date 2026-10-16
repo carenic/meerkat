@@ -176,7 +176,7 @@ impl PreparedOperationAuthorization for Check {
         }
         if let Some(entries) = &self.model_entries {
             match observation {
-                OperationObservation::Entry => {
+                OperationObservation::Entry(_) => {
                     entries.fetch_add(1, Ordering::SeqCst);
                 }
                 OperationObservation::Outcome(outcome) => {

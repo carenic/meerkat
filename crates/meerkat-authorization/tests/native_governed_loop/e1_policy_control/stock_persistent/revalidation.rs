@@ -649,7 +649,7 @@ async fn exercise_revalidated_stock_persistent(server: &Server, cleanup: &Cleanu
         && matches!(
             record.observation.observation,
             AuditObservation::Prepared { .. }
-                | AuditObservation::Entry
+                | AuditObservation::Entry { .. }
                 | AuditObservation::Outcome { .. }
         )));
     let prepared: Vec<_> = audit
@@ -667,7 +667,10 @@ async fn exercise_revalidated_stock_persistent(server: &Server, cleanup: &Cleanu
         audit
             .iter()
             .any(|record| &record.observation.operation_id == read_id
-                && matches!(record.observation.observation, AuditObservation::Entry))
+                && matches!(
+                    record.observation.observation,
+                    AuditObservation::Entry { .. }
+                ))
     );
     assert!(
         audit
@@ -701,7 +704,10 @@ async fn exercise_revalidated_stock_persistent(server: &Server, cleanup: &Cleanu
             audit
                 .iter()
                 .any(|record| &record.observation.operation_id == operation_id
-                    && matches!(record.observation.observation, AuditObservation::Entry))
+                    && matches!(
+                        record.observation.observation,
+                        AuditObservation::Entry { .. }
+                    ))
         );
         assert!(
             audit

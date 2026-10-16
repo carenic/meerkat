@@ -124,6 +124,7 @@ import type {
   MobCancelAllWorkResult,
   MobCancelWorkParams,
   MobCancelWorkResult,
+  MobClaimCallbackRouteResult,
   MobConcludeObjectiveParams,
   MobConcludeObjectiveResult,
   MobCreateParams,
@@ -860,6 +861,10 @@ export interface RpcMethodContracts {
   "mob/rotate_supervisor": {
     params: MobIdParams;
     result: (MobRotateSupervisorResult) & Record<string, unknown>;
+  };
+  "mob/claim_callback_route": {
+    params: MobIdParams;
+    result: (MobClaimCallbackRouteResult) & Record<string, unknown>;
   };
   "mob/submit_work": {
     params: MobSubmitWorkParams;
