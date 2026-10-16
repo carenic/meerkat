@@ -35,7 +35,42 @@ them.
 
 ## [Unreleased]
 
+### Added
+
+- `meerkat-core`, `meerkat-mcp`: typed host diagnostics for a stdio MCP
+  server whose setup failed. They name the exact server and attempt, the
+  phase (`Launch`, `Initialize`, `ToolDiscovery`) and a fixed class that the
+  transport actually established: `SpawnFailed`, `Closed { exit }` (the
+  server's own exit status when its close proved it), `Rejected { code }`
+  (a JSON-RPC error answer, so a missing method is told apart from a crash),
+  `ProtocolError`, `TimedOut` or `Unknown`. They also give the newest 16 KiB
+  of the server's stderr.
+  - Read them through the attempt observer: `McpAttachmentAttempt::setup_failure`
+    and `stderr_tail`, provided methods on `McpAttachmentAttemptObserver`.
+  - For configured servers, read them through the inherent
+    `McpRouterAdapter::stdio_setup_failure` and `stdio_stderr_tail`. These
+    return the latest retained failure.
+  - The router retains at most one failed attempt per server. It releases it
+    when the next attempt for that server is admitted, on its next accepted
+    completion, removal or connection close, at shutdown, or when the router
+    is dropped.
+  - The stderr tail is sensitive and host-only. It is redacted for obvious
+    secret shapes and for the attempt's own launch environment values (keyed
+    digests of at most 64 values, no plaintext kept). Redaction is defence in
+    depth only. The tail never reaches the model, lifecycle notices, events
+    or errors.
+  - The model's setup-failure notice is unchanged and carries no class.
+  - `meerkat_core::redact::redact_secret_shapes` is the line-preserving
+    redaction helper. `panic_safe_detail` output is unchanged.
+
 ### Changed
+
+- `meerkat-mcp`: a stdio MCP server's stderr is now piped and drained by its
+  process custody. Before, it was inherited on a trusted-host launch and
+  discarded under confinement. A trusted-host server's stderr is still
+  written to the host's own stderr; a confined server's never is. The drain
+  never blocks the server on a full pipe and stops shortly after the process
+  is gone.
 
 - The release workflow's `Build Web SDK package` job runs beside the release
   validation and the semver gate once `Require green CI` passes, instead of
