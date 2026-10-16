@@ -240,9 +240,11 @@ pub enum ConfinementRefusal {
 /// runs (and every program it starts by name: an interpreter named through
 /// `env`, `ssh` under Git, the programs a browser opener tries) from a
 /// `PATH` without relative directories or directories a confined process
-/// could change ([`trusted_search_path`]); the host also refuses a Git
-/// skill source or credential command whose cache, program, interpreter or
-/// working directory that process could change.
+/// could change ([`trusted_search_path`]), and with no variable that loads
+/// code from elsewhere or names a path such a process could change
+/// ([`trusted_environment`]); the host also refuses a Git skill source or
+/// credential command whose cache, program, interpreter or working
+/// directory that process could change.
 ///
 /// Every other process a stock host starts runs under its launch kind's
 /// confinement.
@@ -338,29 +340,29 @@ impl HostLaunchExemption {
     #[cfg(not(target_arch = "wasm32"))]
     #[must_use]
     pub fn browser_opener(url: &str, untrusted: Option<&UntrustedPathFn>) -> std::process::Command {
-        Self::browser_opener_in(url, std::env::var_os("PATH").as_deref(), untrusted)
+        Self::browser_opener_in(url, std::env::vars_os(), untrusted)
     }
 
     #[cfg(not(target_arch = "wasm32"))]
     fn browser_opener_in(
         url: &str,
-        search_path: Option<&std::ffi::OsStr>,
+        environment: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
         untrusted: Option<&UntrustedPathFn>,
     ) -> std::process::Command {
         #[cfg(target_os = "macos")]
-        let mut command = Self::BrowserOpener.launch_in("/usr/bin/open", search_path, untrusted);
+        let mut command = Self::BrowserOpener.launch_in("/usr/bin/open", environment, untrusted);
         #[cfg(target_os = "windows")]
         let mut command = {
             let program = std::env::var_os("SystemRoot").map_or_else(
                 || PathBuf::from("rundll32"),
                 |root| PathBuf::from(root).join("System32").join("rundll32.exe"),
             );
-            let mut command = Self::BrowserOpener.launch_in(program, search_path, untrusted);
+            let mut command = Self::BrowserOpener.launch_in(program, environment, untrusted);
             command.arg("url.dll,FileProtocolHandler");
             command
         };
         #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-        let mut command = Self::BrowserOpener.launch_in("xdg-open", search_path, untrusted);
+        let mut command = Self::BrowserOpener.launch_in("xdg-open", environment, untrusted);
         command.arg(url);
         command
     }
@@ -390,25 +392,25 @@ impl HostLaunchExemption {
         program: impl AsRef<std::ffi::OsStr>,
         untrusted: Option<&UntrustedPathFn>,
     ) -> std::process::Command {
-        self.launch_in(program, std::env::var_os("PATH").as_deref(), untrusted)
+        self.launch_in(program, std::env::vars_os(), untrusted)
     }
 
     /// The command of this exemption for `program`, found and running with
-    /// `search_path` as its `PATH`, cleaned by [`trusted_search_path`]: its
-    /// relative directories are always dropped, and the directories
-    /// `untrusted` names when the host names what it does not trust.
+    /// only the variables of `environment` (the host's) that
+    /// [`trusted_environment`] keeps: its `PATH` without relative
+    /// directories, and without the directories `untrusted` names when the
+    /// host names what it does not trust.
     #[cfg(not(target_arch = "wasm32"))]
     fn launch_in(
         self,
         program: impl AsRef<std::ffi::OsStr>,
-        search_path: Option<&std::ffi::OsStr>,
+        environment: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
         untrusted: Option<&UntrustedPathFn>,
     ) -> std::process::Command {
         let _ = self;
         let mut command = std::process::Command::new(program);
-        if let Some(search_path) = search_path {
-            apply_trusted_search_path(&mut command, search_path, untrusted);
-        }
+        command.env_clear();
+        command.envs(trusted_environment(environment, untrusted));
         command
     }
 }
@@ -434,25 +436,121 @@ pub fn trusted_search_path(
     std::env::join_paths(kept).unwrap_or_default()
 }
 
-/// Give `command` the `PATH` `search_path` cleaned by
-/// [`trusted_search_path`] of its relative directories and of the
-/// directories `untrusted` names (none: only relative ones). When no
-/// directory is left `PATH` is removed, so the platform's default system
-/// directories apply: an empty `PATH` reads as the working directory on
-/// some platforms.
+/// The environment a host launch exemption runs with, from `environment`
+/// (the host's own): every variable except one that makes the launched
+/// program, or a program it starts, load code or startup options from
+/// somewhere else ([`is_load_injection_variable`]), which is dropped, with
+/// the paths a confined process could change taken out of the values
+/// ([`trusted_variable_value`]): `PATH` without its relative directories
+/// and the directories `untrusted` names, any other list of absolute paths
+/// likewise, and a value that is one path `untrusted` names dropped. A
+/// variable left without a value is dropped, so the platform's default
+/// applies: an empty `PATH` reads as the working directory on some
+/// platforms.
 #[cfg(not(target_arch = "wasm32"))]
-pub fn apply_trusted_search_path(
+#[must_use]
+pub fn trusted_environment(
+    environment: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+    untrusted: Option<&UntrustedPathFn>,
+) -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+    environment
+        .into_iter()
+        .filter(|(name, _)| !is_load_injection_variable(name))
+        .filter_map(|(name, value)| {
+            let value = trusted_variable_value(&name, &value, untrusted)?;
+            Some((name, value))
+        })
+        .collect()
+}
+
+/// Give `command` the environment an operator configured for it
+/// (`configured`, such as a credential command's `env`), each value without
+/// the paths a confined process could change ([`trusted_variable_value`]):
+/// a configured variable left without a value is not passed on at all. A
+/// configured variable is the operator's own, so no name is refused for
+/// itself.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn apply_configured_environment<'a>(
     command: &mut std::process::Command,
-    search_path: &std::ffi::OsStr,
+    configured: impl IntoIterator<Item = (&'a String, &'a String)>,
     untrusted: Option<&UntrustedPathFn>,
 ) {
-    let trust_all = |_: &Path, _: bool| false;
-    let cleaned = trusted_search_path(search_path, untrusted.unwrap_or(&trust_all));
-    if cleaned.is_empty() {
-        command.env_remove("PATH");
-    } else {
-        command.env("PATH", cleaned);
+    for (name, value) in configured {
+        let name = std::ffi::OsStr::new(name);
+        match trusted_variable_value(name, std::ffi::OsStr::new(value), untrusted) {
+            Some(value) => command.env(name, value),
+            None => command.env_remove(name),
+        };
     }
+}
+
+/// `value` of the variable `name` as a host launch exemption may see it
+/// (`None`: not at all). `PATH`, and any other value that is a list of
+/// absolute paths, keeps only the absolute directories `untrusted` does not
+/// name as a whole ([`trusted_search_path`]); a value that is one absolute
+/// path is dropped when `untrusted` names it; any other value is kept.
+#[cfg(not(target_arch = "wasm32"))]
+fn trusted_variable_value(
+    name: &std::ffi::OsStr,
+    value: &std::ffi::OsStr,
+    untrusted: Option<&UntrustedPathFn>,
+) -> Option<std::ffi::OsString> {
+    let trust_all = |_: &Path, _: bool| false;
+    let untrusted = untrusted.unwrap_or(&trust_all);
+    let entries: Vec<PathBuf> = std::env::split_paths(value).collect();
+    let search_path = name.to_string_lossy().eq_ignore_ascii_case("PATH");
+    let path_list = entries.iter().any(|entry| entry.is_absolute())
+        && entries
+            .iter()
+            .all(|entry| entry.as_os_str().is_empty() || entry.is_absolute());
+    if !search_path && !path_list {
+        return Some(value.to_os_string());
+    }
+    if let [path] = entries.as_slice()
+        && !search_path
+    {
+        return (!untrusted(path, false)).then(|| value.to_os_string());
+    }
+    Some(trusted_search_path(value, untrusted)).filter(|cleaned| !cleaned.is_empty())
+}
+
+/// Whether an environment variable a host launch exemption would inherit
+/// can make the launched program, or a program it starts, load code or
+/// startup options from somewhere else: the dynamic loader's (`LD_*`,
+/// `DYLD_*`, `_RLD_*`, `GLIBC_TUNABLES`), macOS XPC's (`__XPC_*`), a shell's
+/// startup files, functions and options (`ENV`, `BASH_ENV`, `BASH_FUNC_*`,
+/// `SHELLOPTS`, `BASHOPTS`, `ZDOTDIR`), interpreters' module paths and
+/// options (`PYTHON*`, `NODE_OPTIONS`, `NODE_PATH`, `PERL5LIB`, `PERL5OPT`,
+/// `PERLLIB`, `RUBYLIB`, `RUBYOPT`, `JAVA_TOOL_OPTIONS`, `_JAVA_OPTIONS`,
+/// `JDK_JAVA_OPTIONS`), and Git's repository and program locations
+/// (`GIT_DIR`, `GIT_WORK_TREE`, `GIT_EXEC_PATH`). Such a variable is never
+/// inherited, whatever its value.
+#[cfg(not(target_arch = "wasm32"))]
+fn is_load_injection_variable(name: &std::ffi::OsStr) -> bool {
+    const PREFIXES: &[&str] = &["LD_", "DYLD_", "_RLD_", "__XPC_", "BASH_FUNC_", "PYTHON"];
+    const NAMES: &[&str] = &[
+        "ENV",
+        "BASH_ENV",
+        "SHELLOPTS",
+        "BASHOPTS",
+        "ZDOTDIR",
+        "GLIBC_TUNABLES",
+        "NODE_OPTIONS",
+        "NODE_PATH",
+        "PERL5LIB",
+        "PERL5OPT",
+        "PERLLIB",
+        "RUBYLIB",
+        "RUBYOPT",
+        "JAVA_TOOL_OPTIONS",
+        "_JAVA_OPTIONS",
+        "JDK_JAVA_OPTIONS",
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_EXEC_PATH",
+    ];
+    let name = name.to_string_lossy().to_ascii_uppercase();
+    PREFIXES.iter().any(|prefix| name.starts_with(prefix)) || NAMES.contains(&name.as_str())
 }
 
 impl std::fmt::Display for HostLaunchExemption {
@@ -805,9 +903,10 @@ mod tests {
         let search_path = std::env::join_paths([&writable, &trusted]).unwrap();
         let untrusted = move |path: &Path, _: bool| path.starts_with(&writable);
 
+        let environment = || vec![(std::ffi::OsString::from("PATH"), search_path.clone())];
         let status = HostLaunchExemption::browser_opener_in(
             "https://example.invalid/authorize",
-            Some(&search_path),
+            environment(),
             Some(&untrusted),
         )
         .status()
@@ -818,11 +917,90 @@ mod tests {
 
         assert!(
             HostLaunchExemption::GitSkillSource
-                .launch_in("only-planted", Some(&search_path), Some(&untrusted))
+                .launch_in("only-planted", environment(), Some(&untrusted))
                 .status()
                 .is_err(),
             "a program only an untrusted directory holds is not found"
         );
         assert!(!markers[2].exists());
+    }
+
+    /// A host launch exemption inherits no variable that makes a program
+    /// load code or startup options from elsewhere, and no path a confined
+    /// process could change: a list of paths keeps its trusted entries, a
+    /// single untrusted path is dropped, and every other value is kept.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_host_launch_inherits_no_load_path_a_confined_process_could_change() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().canonicalize().unwrap();
+        let writable = base.join("writable");
+        let trusted = base.join("trusted");
+        for dir in [&writable, &trusted] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let seen = base.join("environment-seen");
+        let environment: Vec<(std::ffi::OsString, std::ffi::OsString)> = [
+            ("PATH", "/usr/bin:/bin".to_string()),
+            ("PYTHONPATH", trusted.display().to_string()),
+            (
+                "LD_PRELOAD",
+                writable.join("libplanted.so").display().to_string(),
+            ),
+            ("NODE_OPTIONS", "--require planted".to_string()),
+            ("GIT_DIR", trusted.display().to_string()),
+            (
+                "XDG_DATA_DIRS",
+                format!("{}:/usr/share", writable.display()),
+            ),
+            (
+                "CLOUDSDK_CONFIG",
+                writable.join("gcloud").display().to_string(),
+            ),
+            ("HOME", trusted.display().to_string()),
+            ("LANG", "C.UTF-8".to_string()),
+            ("HTTP_PROXY", "http://proxy.invalid:8080".to_string()),
+            ("DISPLAY", ":0".to_string()),
+        ]
+        .into_iter()
+        .map(|(name, value)| (name.into(), value.into()))
+        .collect();
+        let untrusted = move |path: &Path, _: bool| path.starts_with(&writable);
+
+        let status = HostLaunchExemption::GitSkillSource
+            .launch_in("/bin/sh", environment, Some(&untrusted))
+            .arg("-c")
+            .arg(format!("env > '{}'", seen.display()))
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let seen = std::fs::read_to_string(&seen).unwrap();
+        let variable = |name: &str| {
+            seen.lines()
+                .find_map(|line| line.strip_prefix(&format!("{name}=")))
+                .map(str::to_owned)
+        };
+        for dropped in [
+            "PYTHONPATH",
+            "LD_PRELOAD",
+            "NODE_OPTIONS",
+            "GIT_DIR",
+            "CLOUDSDK_CONFIG",
+        ] {
+            assert_eq!(
+                variable(dropped),
+                None,
+                "{dropped} is not inherited:\n{seen}"
+            );
+        }
+        assert_eq!(variable("XDG_DATA_DIRS").as_deref(), Some("/usr/share"));
+        assert_eq!(variable("PATH").as_deref(), Some("/usr/bin:/bin"));
+        assert_eq!(variable("HOME"), Some(trusted.display().to_string()));
+        assert_eq!(variable("LANG").as_deref(), Some("C.UTF-8"));
+        assert_eq!(
+            variable("HTTP_PROXY").as_deref(),
+            Some("http://proxy.invalid:8080")
+        );
+        assert_eq!(variable("DISPLAY").as_deref(), Some(":0"));
     }
 }

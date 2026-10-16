@@ -290,7 +290,13 @@ Each runs, with every program it starts by name (an interpreter named
 through `env`, `ssh` or `git-lfs` under Git, the programs a browser opener
 tries), from a `PATH` without relative directories and, under a confining
 host, without the directories a confined process could change
-(`meerkat_core::confinement::trusted_search_path`).
+(`meerkat_core::confinement::trusted_search_path`). It inherits no variable
+that makes a program load code or startup options from elsewhere (`LD_*`,
+`DYLD_*`, `PYTHON*`, `NODE_OPTIONS`, `NODE_PATH`, `PERL5LIB`, `PERL5OPT`,
+`RUBYLIB`, `RUBYOPT`, `BASH_ENV`, `ENV`, `GIT_DIR`, `GIT_WORK_TREE`,
+`GIT_EXEC_PATH`, ...), and every other variable loses the paths a confined
+process could change (`trusted_environment`); a credential command's own
+`env` loses them too (`apply_configured_environment`).
 
 A source test fails on any process launch in shipped code that is neither
 confined nor in this list.

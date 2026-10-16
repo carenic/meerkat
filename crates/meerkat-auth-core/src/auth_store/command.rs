@@ -81,7 +81,9 @@ impl CommandCredentialRunner {
     /// Run the command, and every program it starts by name, from a `PATH`
     /// (its configured one, else the host's) without relative directories or
     /// the directories `untrusted` names
-    /// ([`meerkat_core::confinement::trusted_search_path`]).
+    /// ([`meerkat_core::confinement::trusted_search_path`]), and with no
+    /// variable that names a path `untrusted` names
+    /// ([`meerkat_core::confinement::trusted_environment`]).
     #[must_use]
     pub fn with_untrusted_paths(
         mut self,
@@ -119,15 +121,13 @@ impl CommandCredentialRunner {
             &self.spec.program,
             self.untrusted.as_deref(),
         );
-        command.envs(&self.spec.env);
-        // A configured `PATH` is cleaned like the host's.
-        if let Some(search_path) = self.spec.env.get("PATH") {
-            meerkat_core::confinement::apply_trusted_search_path(
-                &mut command,
-                std::ffi::OsStr::new(search_path),
-                self.untrusted.as_deref(),
-            );
-        }
+        // The configured environment is the operator's own; a value naming a
+        // path a confined process could change is still not passed on.
+        meerkat_core::confinement::apply_configured_environment(
+            &mut command,
+            &self.spec.env,
+            self.untrusted.as_deref(),
+        );
         let mut cmd = Command::from(command);
         cmd.args(&self.spec.args)
             .stdin(Stdio::null())

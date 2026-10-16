@@ -89,6 +89,15 @@ them.
   compose a different `[confinement]` or `[governance]` afterwards, such as
   removing or adding `[realm.global]` when the user document states
   `[governance]` (see Fixed).
+- Behaviour-only (not measured by the gate): the programs a host runs as
+  itself (credential commands, `git` for Git skill repositories, the
+  browser opener, `stty`, `wasm-pack`) no longer inherit the variables that
+  make a program load code or startup options from elsewhere (`LD_*`,
+  `DYLD_*`, `PYTHON*`, `NODE_OPTIONS`, `NODE_PATH`, `PERL5LIB`, `PERL5OPT`,
+  `RUBYLIB`, `RUBYOPT`, `BASH_ENV`, `ENV`, `GIT_DIR`, `GIT_WORK_TREE`,
+  `GIT_EXEC_PATH` and the like), and lose the paths a confined process
+  could change from the others. A credential command that needs such a
+  variable states it in its own `env` (see Fixed).
 
 ### Deprecated
 
@@ -144,6 +153,11 @@ them.
   `PATH` cleaned by `meerkat_core::confinement::trusted_search_path`, which
   drops relative directories and the directories an `UntrustedPathFn`
   judgement does not trust.
+- `meerkat_core::confinement::trusted_environment` gives the environment a
+  host launch exemption runs with, and
+  `meerkat_core::confinement::apply_configured_environment` applies an
+  operator's configured environment to one, each without the paths a
+  confined process could change.
 - `meerkat::open_system_browser_trusting` opens a URL with the platform
   browser opener under a host's `UntrustedPathFn`, and
   `CommandCredentialRunner::with_untrusted_paths` runs a credential command
@@ -329,6 +343,14 @@ them.
   refused from an untrusted `mcp.toml` to the model under its plain name or
   a `refused-mcp-server-<n>` placeholder, as sessions on a governed realm
   do. They reported it under its raw name, which a confined process chose.
+- The programs a host runs as itself no longer inherit a module or library
+  path a confined process could change. With `rkat` run from a shell whose
+  `PYTHONPATH` or `LD_LIBRARY_PATH` points into the workspace, a confined
+  process could plant a module or library there that the next credential
+  helper, Git fetch, browser opener or `stty` loaded unconfined. They now
+  run without the loader, interpreter, shell and Git variables that load
+  code from elsewhere, and every other inherited or configured variable
+  loses the paths a confined process could change.
 
 ## [0.9.1] - 2026-10-15
 
