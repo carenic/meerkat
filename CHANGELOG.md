@@ -74,6 +74,13 @@ them.
   `[governance]` on `team`'s chain wherever `team` has no document. A stated
   realm whose chain resolves on no such state root, before or after the
   write, composes nothing there and does not refuse it.
+- `rkat` hides a client secret typed at its terminal where neither
+  `/bin/stty` nor `/usr/bin/stty` exists (NixOS): terminal control
+  (`HostLaunchExemption::terminal_control`) falls back to the `stty` the
+  launch's `PATH` finds, which under a host that confines its launches holds
+  no relative directory and no directory a confined process could change. In
+  0.9.2 it ran `/bin/stty` regardless, so on such a host `rkat` refused to
+  read a secret typed at the terminal (the 0.9.2 known limitation).
 
 ## [0.9.2] - 2026-10-16
 

@@ -2657,8 +2657,8 @@ fn read_connector_client_secret(
     use std::io::IsTerminal;
     let stdin = std::io::stdin();
     let terminal = stdin.is_terminal();
-    // A host launch exemption: `stty`, by absolute path, sets the mode of the
-    // operator's own terminal.
+    // A host launch exemption: `stty` (by absolute path, else from the
+    // trusted `PATH`) sets the mode of the operator's own terminal.
     #[cfg(unix)]
     let echo_off = terminal
         && meerkat_core::HostLaunchExemption::terminal_control(untrusted)

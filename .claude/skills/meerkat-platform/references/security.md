@@ -288,7 +288,8 @@ except these, which it runs as itself (`meerkat_core::HostLaunchExemption`):
   host_confinement.launch_guard().as_deref())`; the unguarded
   `open_system_browser` and `McpOAuthPendingLogin::launch_system_browser`
   are deprecated (0.9.3).
-- `stty` by absolute path (`HostLaunchExemption::terminal_control`): host
+- `stty` (`HostLaunchExemption::terminal_control`: `/bin/stty`, else
+  `/usr/bin/stty`, else the `stty` on the trusted `PATH`, as on NixOS): host
   terminal control (hiding a client secret typed at `rkat`).
 - `wasm-pack` (`HostLaunchExemption::wasm_pack`): developer build tooling
   (`rkat doctor`).
