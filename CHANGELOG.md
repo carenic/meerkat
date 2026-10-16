@@ -216,6 +216,12 @@ them.
   scans every workspace crate under Bazel too (its generated target carries
   every package's sources), and it scans the code after a test-only match
   arm, field or argument, which it skipped.
+- The user document a host creates from its template states
+  `[realm.global]`, so its settings and sign-ins reach every realm from the
+  start, and `rkat auth login`, the startup migration of a legacy sign-in
+  and a connector client for `global` never need to add it. A user document
+  that states `[governance]` but no `[realm.global]` cannot gain the
+  section through a config write: the refusal says to add it by hand.
 - CI's `Closure tests` rows have 60 minutes instead of 40, and the
   `ci-integration` profile gives its four slow nested-Cargo and
   whole-workspace tests 16 slow periods (960 s) instead of 8, so a cold row

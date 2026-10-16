@@ -1955,6 +1955,48 @@ mod tests {
         assert_eq!(tokio::fs::read_to_string(&path).await.unwrap(), HEAD);
     }
 
+    /// A user document that states `[governance]` but no `[realm.global]`
+    /// governs no other realm; a write adding `[realm.global]` (as a sign-in
+    /// that provisions credentials under it does) would put that governance
+    /// on every realm's chain, so it is refused, and the refusal says to add
+    /// the section by hand. The bootstrap template states the section, so a
+    /// user document created from it never meets this.
+    #[tokio::test]
+    async fn adding_the_global_realm_section_is_refused_with_its_remedy() {
+        let user = REVIEW_RULE.to_string();
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("config.toml");
+        tokio::fs::write(&path, &user).await.unwrap();
+        let store = FileConfigStore::new(
+            path.clone(),
+            *crate::model_profile::test_catalog::TEST_CATALOG,
+        )
+        .with_realm_chain(
+            crate::connection::RealmId::global(),
+            Arc::new(MapSource {
+                docs: std::collections::BTreeMap::new(),
+            }),
+        );
+        let refused = store
+            .patch(ConfigDelta(serde_json::json!({"realm": {"global": {}}})))
+            .await
+            .expect_err("adding [realm.global] would spread the user's governance");
+        assert!(
+            refused
+                .to_string()
+                .contains("add [realm.global] to the user document by hand"),
+            "{refused}"
+        );
+        assert_eq!(tokio::fs::read_to_string(&path).await.unwrap(), user);
+        assert!(
+            Config::template()
+                .unwrap()
+                .realm
+                .contains_key(crate::connection::RealmId::global().as_str()),
+            "the bootstrap template states [realm.global]"
+        );
+    }
+
     /// The user document's `[realm.global]` section puts the `global` realm,
     /// and with it the user document's `[governance]`, on the chain of every
     /// realm that states no parent of its own. A write to the user document

@@ -729,7 +729,12 @@ document of its own takes the section the user document states for it. A
 write to the user document is also refused when such a realm would compose
 a different section afterwards. Each refusal names the change and the realm,
 for example
-`removing [realm.global] would change the [governance] section a realm whose own document states no parent and no [realm.global] composes`.
+`removing [realm.global] would change the [governance] section a realm whose own document states no parent and no [realm.global] composes`,
+and says what to do instead. The user document a host creates from its
+template states `[realm.global]`. One that states `[governance]` but no
+`[realm.global]` cannot gain the section through a config write, nor
+through a sign-in that provisions credentials under it: add `[realm.global]`
+to it by hand.
 
 Only a store that declares the realm's chain enforces this, as the stock
 hosts' stores do (`FileConfigStore::with_realm_chain`,

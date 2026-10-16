@@ -3016,6 +3016,18 @@ pub enum AdministeredSection {
     Governance,
 }
 
+/// What the host does instead of a refused write that changes realm
+/// sections ([`ConfigError::CompositionAdministration`]): a missing
+/// `[realm.global]` (as a sign-in that provisions credentials under it
+/// adds) is added to the user document by hand.
+fn composition_remedy(change: &str) -> &'static str {
+    if change.contains("adding [realm.global]") {
+        "add [realm.global] to the user document by hand, as its host"
+    } else {
+        "make the change by editing the document as its host"
+    }
+}
+
 impl std::fmt::Display for AdministeredSection {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
@@ -3090,7 +3102,8 @@ pub enum ConfigError {
     /// administration: the host administers them in the documents
     /// themselves. Nothing is written.
     #[error(
-        "{change} would change the [{administered}] section {composer} composes; the host administers it in the config documents, so a config write cannot change it"
+        "{change} would change the [{administered}] section {composer} composes; the host administers it in the config documents, so a config write cannot change it ({})",
+        composition_remedy(.change)
     )]
     CompositionAdministration {
         /// The section the realm would compose differently.
