@@ -62,6 +62,10 @@ them.
   that workflow declares instead of `secrets: inherit`, and the release
   doctor's token check now fails on `secrets: inherit` in any workflow of
   the repository, not only `release.yml`. CI only.
+- `.github/CODEOWNERS` names the maintainer as the owner of `.github/`,
+  `renovate.json`, `Makefile` and `scripts/` explicitly, so the CI, release
+  and dependency-update configuration keeps that owner if the default
+  owner changes. Repository configuration only.
 
 ## [0.9.2] - 2026-10-16
 
