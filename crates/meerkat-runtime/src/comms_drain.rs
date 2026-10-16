@@ -661,11 +661,13 @@ pub fn spawn_comms_drain(
                                 notify_claim_mechanism_failure(&adapter, &session_id).await;
                                 return;
                             };
+                            // The request records its verified requester, the
+                            // sender ingress admitted for the signed envelope;
+                            // a response to it goes only to that peer.
                             let corr_id =
                                 meerkat_core::PeerCorrelationId::from_uuid(interaction_id.0);
                             if handle.inbound_state(corr_id).is_none()
-                                && let Err(err) = handle
-                                    .request_received(corr_id, candidate.interaction.handling_mode)
+                                && let Err(err) = handle.request_received_from_ingress(&candidate)
                             {
                                 tracing::warn!(
                                     error = %err,
@@ -2810,7 +2812,7 @@ fn record_bridge_inbound_peer_request(
     if handle.inbound_state(corr_id).is_some() {
         return true;
     }
-    if let Err(err) = handle.request_received(corr_id, candidate.interaction.handling_mode) {
+    if let Err(err) = handle.request_received_from_ingress(candidate) {
         tracing::warn!(
             error = %err,
             corr_id = %corr_id,
@@ -8677,6 +8679,7 @@ mod tests {
     struct CountingPeerInteractionHandle {
         inbound: std::sync::Mutex<HashSet<meerkat_core::PeerCorrelationId>>,
         inbound_modes: std::sync::Mutex<HashMap<meerkat_core::PeerCorrelationId, HandlingMode>>,
+        inbound_requesters: std::sync::Mutex<HashMap<meerkat_core::PeerCorrelationId, PeerId>>,
         request_received_count: std::sync::atomic::AtomicUsize,
         response_rejected_count: std::sync::atomic::AtomicUsize,
         response_replied_count: std::sync::atomic::AtomicUsize,
@@ -8723,6 +8726,14 @@ mod tests {
         fn request_received_count(&self) -> usize {
             self.request_received_count
                 .load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn recorded_requester(&self, corr_id: meerkat_core::PeerCorrelationId) -> Option<PeerId> {
+            self.inbound_requesters
+                .lock()
+                .expect("inbound requesters mutex")
+                .get(&corr_id)
+                .copied()
         }
 
         fn response_replied_count(&self) -> usize {
@@ -8815,6 +8826,7 @@ mod tests {
             &self,
             corr_id: meerkat_core::PeerCorrelationId,
             handling_mode: HandlingMode,
+            requester: PeerId,
         ) -> Result<(), meerkat_core::handles::DslTransitionError> {
             if self
                 .reject_request_received
@@ -8836,6 +8848,10 @@ mod tests {
                 .lock()
                 .expect("inbound modes mutex")
                 .insert(corr_id, handling_mode);
+            self.inbound_requesters
+                .lock()
+                .expect("inbound requesters mutex")
+                .insert(corr_id, requester);
             self.request_received_count
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(())
@@ -8856,9 +8872,37 @@ mod tests {
                 .lock()
                 .expect("inbound modes mutex")
                 .remove(&corr_id);
+            self.inbound_requesters
+                .lock()
+                .expect("inbound requesters mutex")
+                .remove(&corr_id);
             self.response_replied_count
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(())
+        }
+
+        fn resolve_response_addressee(
+            &self,
+            corr_id: meerkat_core::PeerCorrelationId,
+            addressee: PeerId,
+        ) -> Result<
+            meerkat_core::PeerResponseAddresseeVerdict,
+            meerkat_core::handles::DslTransitionError,
+        > {
+            Ok(
+                match self
+                    .inbound_requesters
+                    .lock()
+                    .expect("inbound requesters mutex")
+                    .get(&corr_id)
+                {
+                    Some(requester) if *requester == addressee => {
+                        meerkat_core::PeerResponseAddresseeVerdict::Requester
+                    }
+                    Some(_) => meerkat_core::PeerResponseAddresseeVerdict::NotRequester,
+                    None => meerkat_core::PeerResponseAddresseeVerdict::UnknownRequest,
+                },
+            )
         }
 
         fn outbound_state(
@@ -9711,6 +9755,64 @@ mod tests {
                 "rejected {class:?} must use the typed abandonment path"
             );
         }
+    }
+
+    /// The drain records an inbound request's requester from its admitted
+    /// ingress fact, the verified sender of the signed envelope. The display
+    /// label, `from_route` and payload fields that name another peer change
+    /// nothing, so a response can only go back to the sender.
+    #[tokio::test]
+    async fn inbound_request_records_its_ingress_sender_as_requester() {
+        let adapter = Arc::new(MeerkatMachine::ephemeral());
+        let session_id = SessionId::new();
+        adapter
+            .register_session(session_id.clone())
+            .await
+            .expect("register session");
+
+        let mut candidate = inbound_peer_request_candidate(PeerInputClass::ActionableRequest);
+        let sender = candidate
+            .ingress
+            .canonical_peer_id
+            .expect("the helper admits a sender");
+        let claimed = PeerId::new();
+        candidate.interaction.from = "claimed-requester".to_string();
+        candidate.interaction.from_route = Some(claimed);
+        if let InteractionContent::Request { params, .. } = &mut candidate.interaction.content {
+            *params = json!({
+                "requester": claimed.to_string(),
+                "from": claimed.to_string(),
+                "peer_id": claimed.to_string(),
+            });
+        }
+        let corr_id = meerkat_core::PeerCorrelationId::from_uuid(candidate.interaction.id.0);
+
+        let peer_handle = Arc::new(CountingPeerInteractionHandle::default());
+        let peer_authority: Arc<dyn meerkat_core::handles::PeerInteractionHandle> =
+            peer_handle.clone();
+        let runtime = Arc::new(OneShotPeerRequestRuntime::with_complete_authority(
+            candidate,
+            peer_authority,
+        ));
+        let drain = spawn_authorized_test_comms_drain(
+            adapter.clone(),
+            session_id.clone(),
+            runtime.clone(),
+            Duration::from_millis(10),
+        )
+        .await;
+        tokio::time::timeout(Duration::from_secs(1), drain)
+            .await
+            .expect("drain should exit after one candidate")
+            .expect("drain task should not panic");
+
+        assert_eq!(peer_handle.request_received_count(), 1);
+        assert_eq!(
+            peer_handle.recorded_requester(corr_id),
+            Some(sender),
+            "the requester is the ingress-admitted sender"
+        );
+        assert!(runtime.abandonment_reasons().is_empty());
     }
 
     /// #1608: a member-kickoff lifecycle notice is admitted as visible runtime

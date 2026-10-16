@@ -12,7 +12,6 @@
 
 use async_trait::async_trait;
 use meerkat_comms::{CommsRuntime, PeerRequestResponseAuthority};
-use meerkat_core::PeerCorrelationId;
 use meerkat_core::Provider;
 use meerkat_core::agent::CommsRuntime as CoreCommsRuntime;
 use meerkat_core::comms::{
@@ -565,10 +564,7 @@ async fn contract_mob_002_peer_request_response_round_trip() {
     receiver
         .peer_interaction_handle()
         .expect("receiver should have peer interaction authority")
-        .request_received(
-            PeerCorrelationId::from_uuid(request_id.0),
-            request_interaction.handling_mode,
-        )
+        .request_received_from_ingress(&request_candidate)
         .expect("direct comms-drain bypass must seed inbound request state");
 
     // Receiver sends PeerResponse back
@@ -979,7 +975,11 @@ async fn contract_mob_002d_inbound_terminal_reply_closes_lifecycle_via_send() {
     // fire on classified ActionableRequest admission.
     let request_corr_id = meerkat_core::PeerCorrelationId::new();
     handle
-        .request_received(request_corr_id, meerkat_core::types::HandlingMode::Queue)
+        .request_received(
+            request_corr_id,
+            meerkat_core::types::HandlingMode::Queue,
+            originator.public_key().to_peer_id(),
+        )
         .expect("inbound request_received must advance DSL");
     assert_eq!(
         handle.inbound_state(request_corr_id),

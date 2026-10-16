@@ -17,7 +17,7 @@ use meerkat_core::handles::{
 use meerkat_core::interaction::{TerminalDisposition, TerminalityClass};
 use meerkat_core::peer_correlation::{
     InboundPeerRequestState as CoreInboundState, OutboundPeerRequestState as CoreOutboundState,
-    PeerCorrelationId,
+    PeerCorrelationId, PeerResponseAddresseeVerdict,
 };
 use meerkat_core::types::HandlingMode;
 
@@ -192,6 +192,33 @@ fn peer_reply_classified_effect(
         })
 }
 
+/// The machine's key for a canonical peer id. Requesters and response
+/// addressees both go through this one projection, so the machine compares
+/// canonical identities, never caller-supplied strings.
+fn dsl_peer_id(peer_id: meerkat_core::comms::PeerId) -> mm_dsl::PeerId {
+    mm_dsl::PeerId(peer_id.to_string())
+}
+
+fn peer_response_addressee_resolved_effect(
+    effects: Vec<mm_dsl::MeerkatMachineEffect>,
+    context: &'static str,
+) -> Result<PeerResponseAddresseeVerdict, DslTransitionError> {
+    effects
+        .into_iter()
+        .find_map(|effect| match effect {
+            mm_dsl::MeerkatMachineEffect::PeerResponseAddresseeResolved { verdict } => {
+                Some(verdict.into())
+            }
+            _ => None,
+        })
+        .ok_or_else(|| {
+            DslTransitionError::guard_rejected(
+                context,
+                "machine transition did not emit PeerResponseAddresseeResolved",
+            )
+        })
+}
+
 impl PeerInteractionHandle for RuntimePeerInteractionHandle {
     fn request_sent(&self, corr_id: PeerCorrelationId) -> Result<(), DslTransitionError> {
         self.apply_input_and_dispatch_cleanup(
@@ -256,14 +283,32 @@ impl PeerInteractionHandle for RuntimePeerInteractionHandle {
         &self,
         corr_id: PeerCorrelationId,
         handling_mode: HandlingMode,
+        requester: meerkat_core::comms::PeerId,
     ) -> Result<(), DslTransitionError> {
         self.apply_input_and_dispatch_cleanup(
             mm_dsl::MeerkatMachineInput::PeerRequestReceived {
                 corr_id: corr_id.into(),
                 handling_mode: mm_dsl::InputLane::from(handling_mode),
+                requester: dsl_peer_id(requester),
             },
             "PeerInteractionHandle::request_received",
         )
+    }
+
+    fn resolve_response_addressee(
+        &self,
+        corr_id: PeerCorrelationId,
+        addressee: meerkat_core::comms::PeerId,
+    ) -> Result<PeerResponseAddresseeVerdict, DslTransitionError> {
+        let context = "PeerInteractionHandle::resolve_response_addressee";
+        let effects = self.dsl.apply_signal_with_effects(
+            mm_dsl::MeerkatMachineSignal::ResolvePeerResponseAddressee {
+                corr_id: corr_id.into(),
+                addressee: dsl_peer_id(addressee),
+            },
+            context,
+        )?;
+        peer_response_addressee_resolved_effect(effects, context)
     }
 
     fn classify_response_reply(

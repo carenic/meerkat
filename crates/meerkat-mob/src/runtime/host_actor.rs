@@ -11455,7 +11455,7 @@ impl MobHostActor {
         if handle.inbound_state(corr_id).is_some() {
             return true;
         }
-        if let Err(err) = handle.request_received(corr_id, candidate.interaction.handling_mode) {
+        if let Err(err) = handle.request_received_from_ingress(candidate) {
             tracing::warn!(
                 error = %err,
                 corr_id = %corr_id,

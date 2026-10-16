@@ -11,8 +11,12 @@
 
 use std::sync::Arc;
 
+use meerkat_core::comms::PeerId;
 use meerkat_core::handles::{PeerInteractionHandle, PeerTerminalDisposition};
-use meerkat_core::{InboundPeerRequestState, OutboundPeerRequestState, PeerCorrelationId};
+use meerkat_core::{
+    InboundPeerRequestState, OutboundPeerRequestState, PeerCorrelationId,
+    PeerResponseAddresseeVerdict,
+};
 use meerkat_runtime::handles::{HandleDslAuthority, RuntimePeerInteractionHandle};
 use meerkat_runtime::meerkat_machine::dsl as mm_dsl;
 
@@ -21,6 +25,10 @@ use meerkat_runtime::meerkat_machine::dsl as mm_dsl;
 /// bootstrap the authority sits in `Initializing`, where peer-interaction
 /// transitions do not match.
 fn new_handle() -> RuntimePeerInteractionHandle {
+    RuntimePeerInteractionHandle::new(new_registered_authority())
+}
+
+fn new_registered_authority() -> Arc<HandleDslAuthority> {
     let dsl = Arc::new(HandleDslAuthority::ephemeral());
     dsl.apply_signal(mm_dsl::MeerkatMachineSignal::Initialize, "test::initialize")
         .expect("Initialize signal");
@@ -33,7 +41,7 @@ fn new_handle() -> RuntimePeerInteractionHandle {
         "test::register_session",
     )
     .expect("RegisterSession input");
-    RuntimePeerInteractionHandle::new(dsl)
+    dsl
 }
 
 #[test]
@@ -178,7 +186,11 @@ fn inbound_received_then_replied_advances_and_removes() {
     let corr_id = PeerCorrelationId::new();
     assert!(handle.inbound_state(corr_id).is_none());
     handle
-        .request_received(corr_id, meerkat_core::types::HandlingMode::Queue)
+        .request_received(
+            corr_id,
+            meerkat_core::types::HandlingMode::Queue,
+            PeerId::new(),
+        )
         .unwrap();
     assert_eq!(
         handle.inbound_state(corr_id),
@@ -198,10 +210,18 @@ fn inbound_received_rejects_duplicate() {
     let handle = new_handle();
     let corr_id = PeerCorrelationId::new();
     handle
-        .request_received(corr_id, meerkat_core::types::HandlingMode::Queue)
+        .request_received(
+            corr_id,
+            meerkat_core::types::HandlingMode::Queue,
+            PeerId::new(),
+        )
         .unwrap();
     let err = handle
-        .request_received(corr_id, meerkat_core::types::HandlingMode::Queue)
+        .request_received(
+            corr_id,
+            meerkat_core::types::HandlingMode::Queue,
+            PeerId::new(),
+        )
         .expect_err("duplicate inbound receipt must reject");
     assert_eq!(err.context, "PeerInteractionHandle::request_received");
 }
@@ -265,7 +285,7 @@ fn cleanup_observer_fires_on_terminal_transitions() {
     // inbound state-change effect on a different variant).
     let d = PeerCorrelationId::new();
     handle
-        .request_received(d, meerkat_core::types::HandlingMode::Steer)
+        .request_received(d, meerkat_core::types::HandlingMode::Steer, PeerId::new())
         .unwrap();
     assert_eq!(
         handle.inbound_handling_mode(d),
@@ -334,7 +354,11 @@ fn outbound_inbound_are_independent_namespaces() {
     let corr_id = PeerCorrelationId::new();
     handle.request_sent(corr_id).unwrap();
     handle
-        .request_received(corr_id, meerkat_core::types::HandlingMode::Queue)
+        .request_received(
+            corr_id,
+            meerkat_core::types::HandlingMode::Queue,
+            PeerId::new(),
+        )
         .unwrap();
     assert_eq!(
         handle.outbound_state(corr_id),
@@ -352,5 +376,179 @@ fn outbound_inbound_are_independent_namespaces() {
     assert_eq!(
         handle.inbound_state(corr_id),
         Some(InboundPeerRequestState::Received)
+    );
+}
+
+fn resolve(
+    handle: &RuntimePeerInteractionHandle,
+    corr_id: PeerCorrelationId,
+    addressee: PeerId,
+) -> PeerResponseAddresseeVerdict {
+    handle
+        .resolve_response_addressee(corr_id, addressee)
+        .expect("the generated authority judges every addressee")
+}
+
+#[test]
+fn inbound_request_records_its_requester_and_judges_response_addressees() {
+    let handle = new_handle();
+    let corr_id = PeerCorrelationId::new();
+    let requester = PeerId::new();
+    let bystander = PeerId::new();
+
+    assert_eq!(
+        resolve(&handle, corr_id, requester),
+        PeerResponseAddresseeVerdict::UnknownRequest,
+        "no request is recorded yet"
+    );
+
+    handle
+        .request_received(corr_id, meerkat_core::types::HandlingMode::Queue, requester)
+        .unwrap();
+    assert_eq!(
+        resolve(&handle, corr_id, requester),
+        PeerResponseAddresseeVerdict::Requester
+    );
+    assert_eq!(
+        resolve(&handle, corr_id, bystander),
+        PeerResponseAddresseeVerdict::NotRequester
+    );
+    assert_eq!(
+        resolve(&handle, PeerCorrelationId::new(), requester),
+        PeerResponseAddresseeVerdict::UnknownRequest,
+        "a requester answers only for its own request id"
+    );
+    assert_eq!(
+        handle.inbound_state(corr_id),
+        Some(InboundPeerRequestState::Received),
+        "judging an addressee is read-only: the request stays answerable"
+    );
+    assert_eq!(
+        resolve(&handle, corr_id, requester),
+        PeerResponseAddresseeVerdict::Requester,
+        "a refused addressee does not consume the request"
+    );
+
+    handle.response_replied(corr_id).unwrap();
+    assert_eq!(
+        resolve(&handle, corr_id, requester),
+        PeerResponseAddresseeVerdict::UnknownRequest,
+        "the terminal reply removes the requester with the request"
+    );
+}
+
+#[test]
+fn duplicate_inbound_request_keeps_its_first_requester() {
+    let handle = new_handle();
+    let corr_id = PeerCorrelationId::new();
+    let requester = PeerId::new();
+    let reuser = PeerId::new();
+    handle
+        .request_received(corr_id, meerkat_core::types::HandlingMode::Queue, requester)
+        .unwrap();
+    handle
+        .request_received(corr_id, meerkat_core::types::HandlingMode::Queue, reuser)
+        .expect_err("a second receipt of the same id must reject");
+    assert_eq!(
+        resolve(&handle, corr_id, requester),
+        PeerResponseAddresseeVerdict::Requester
+    );
+    assert_eq!(
+        resolve(&handle, corr_id, reuser),
+        PeerResponseAddresseeVerdict::NotRequester,
+        "reusing a request id never rebinds its requester"
+    );
+}
+
+fn assert_requesters_match_requests(dsl: &HandleDslAuthority, step: &str) {
+    let state = dsl.snapshot_state();
+    assert_eq!(
+        state
+            .inbound_peer_request_requesters
+            .keys()
+            .collect::<Vec<_>>(),
+        state.inbound_peer_requests.keys().collect::<Vec<_>>(),
+        "every recorded inbound request has exactly its requester ({step})"
+    );
+}
+
+#[test]
+fn inbound_requesters_share_their_keys_with_inbound_requests() {
+    let dsl = new_registered_authority();
+    let handle = RuntimePeerInteractionHandle::new(Arc::clone(&dsl));
+    let first = PeerCorrelationId::new();
+    let second = PeerCorrelationId::new();
+    assert_requesters_match_requests(&dsl, "registered");
+    handle
+        .request_received(
+            first,
+            meerkat_core::types::HandlingMode::Queue,
+            PeerId::new(),
+        )
+        .unwrap();
+    handle
+        .request_received(
+            second,
+            meerkat_core::types::HandlingMode::Steer,
+            PeerId::new(),
+        )
+        .unwrap();
+    assert_requesters_match_requests(&dsl, "two received");
+    assert_eq!(
+        dsl.snapshot_state().inbound_peer_request_requesters.len(),
+        2
+    );
+    handle.response_replied(first).unwrap();
+    assert_requesters_match_requests(&dsl, "one replied");
+    handle.response_replied(second).unwrap();
+    assert_requesters_match_requests(&dsl, "both replied");
+    assert!(
+        dsl.snapshot_state()
+            .inbound_peer_request_requesters
+            .is_empty()
+    );
+}
+
+/// The keys-equal invariant is generated authority, not a test convention:
+/// recovered state with a request but no requester, or a requester but no
+/// request, is refused.
+#[test]
+fn recovered_state_refuses_an_inbound_request_without_its_requester() {
+    let registered = || mm_dsl::MeerkatMachineState {
+        lifecycle_phase: mm_dsl::MeerkatPhase::Idle,
+        session_id: Some(mm_dsl::SessionId("peer-interaction-test".to_string())),
+        ..Default::default()
+    };
+    let corr_id = mm_dsl::PeerCorrelationId::from(PeerCorrelationId::new());
+    let requester = mm_dsl::PeerId(PeerId::new().to_string());
+
+    let mut without_requester = registered();
+    without_requester
+        .inbound_peer_requests
+        .insert(corr_id.clone(), mm_dsl::InboundPeerRequestState::Received);
+    assert!(
+        mm_dsl::MeerkatMachineAuthority::recover_from_state(without_requester).is_err(),
+        "an inbound request without a requester is not a recoverable state"
+    );
+
+    let mut without_request = registered();
+    without_request
+        .inbound_peer_request_requesters
+        .insert(corr_id.clone(), requester.clone());
+    assert!(
+        mm_dsl::MeerkatMachineAuthority::recover_from_state(without_request).is_err(),
+        "a requester without an inbound request is not a recoverable state"
+    );
+
+    let mut matched = registered();
+    matched
+        .inbound_peer_requests
+        .insert(corr_id.clone(), mm_dsl::InboundPeerRequestState::Received);
+    matched
+        .inbound_peer_request_requesters
+        .insert(corr_id, requester);
+    assert!(
+        mm_dsl::MeerkatMachineAuthority::recover_from_state(matched).is_ok(),
+        "a request with its requester is recoverable"
     );
 }

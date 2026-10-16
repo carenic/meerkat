@@ -542,6 +542,16 @@ pub enum InboundPeerRequestState {
     Replied,
 }
 
+/// Machine-owned verdict on the addressee of a response to an inbound peer
+/// request, mirroring [`meerkat_core::PeerResponseAddresseeVerdict`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum PeerResponseAddresseeVerdict {
+    #[default]
+    UnknownRequest,
+    Requester,
+    NotRequester,
+}
+
 /// Typed terminal disposition carried on `PeerResponseTerminalArrived`.
 /// Mirror of [`meerkat_core::handles::PeerTerminalDisposition`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
@@ -4332,6 +4342,15 @@ macro_rules! meerkat_catalog_machine_dsl {
             // this value when the caller omits an explicit terminal response
             // handling-mode override.
             inbound_peer_request_lanes: Map<PeerCorrelationId, Enum<InputLane>>,
+            // Machine-owned requester of each inbound peer request: the
+            // canonical peer id of the envelope's signing key that ingress
+            // admitted (signature-verified when peer auth is required, the
+            // declared key under open auth), never a field of the request
+            // payload. Recorded at the same generated transition that admits
+            // the request and removed when the reply terminalizes. A response
+            // to the request goes only to this peer
+            // (`ResolvePeerResponseAddressee`).
+            inbound_peer_request_requesters: Map<PeerCorrelationId, PeerId>,
 
             // --- Session-context advancement (W2-E / issue #264) ---
             //
@@ -4898,6 +4917,7 @@ macro_rules! meerkat_catalog_machine_dsl {
             pending_peer_requests = EmptyMap,
             inbound_peer_requests = EmptyMap,
             inbound_peer_request_lanes = EmptyMap,
+            inbound_peer_request_requesters = EmptyMap,
             last_session_context_updated_at_ms = 0,
             reserved_interaction_streams = EmptySet,
             attached_interaction_streams = EmptySet,
@@ -6702,7 +6722,14 @@ macro_rules! meerkat_catalog_machine_dsl {
             // (was previously laundered through `request_timed_out`) so the
             // outbound state advances to the typed `Failed` terminal.
             PeerRequestSendFailed { corr_id: PeerCorrelationId },
-            PeerRequestReceived { corr_id: PeerCorrelationId, handling_mode: Enum<InputLane> },
+            // `requester` is the verified sender ingress admitted for the
+            // request's signed envelope; the shell never reads it from the
+            // payload.
+            PeerRequestReceived {
+                corr_id: PeerCorrelationId,
+                handling_mode: Enum<InputLane>,
+                requester: PeerId,
+            },
             PeerResponseReplied { corr_id: PeerCorrelationId },
             // Session-context advancement input (W2-E). Shell fires this at every
             // site that mutates canonical session truth (ordinary System append,
@@ -7020,6 +7047,10 @@ macro_rules! meerkat_catalog_machine_dsl {
                 in_reply_to: String,
             },
             ClassifyPeerResponseReply { status: Enum<PeerIngressResponseStatus> },
+            // Read-only judgment of an outbound response's addressee against
+            // the verified requester recorded for the inbound request it
+            // answers. The shell asks before any transport.
+            ResolvePeerResponseAddressee { corr_id: PeerCorrelationId, addressee: PeerId },
             ClassifyPlainEvent { source_name: String },
             EnsureDrainRunning,
         }
@@ -8112,6 +8143,9 @@ macro_rules! meerkat_catalog_machine_dsl {
             PeerResponseReplyClassified {
                 response_terminality: Enum<PeerIngressResponseTerminality>,
             },
+            PeerResponseAddresseeResolved {
+                verdict: Enum<PeerResponseAddresseeVerdict>,
+            },
             PeerIngressReceiveResolved {
                 outcome: Enum<PeerIngressReceiveOutcomeClass>,
                 admission_diagnostic: Option<Enum<PeerIngressAdmissionDiagnosticClass>>,
@@ -8537,6 +8571,7 @@ macro_rules! meerkat_catalog_machine_dsl {
         disposition RealtimeTranscriptAppended => local seam SurfaceResultAlignment,
         disposition PeerIngressClassified => local seam NoOwnerRealization,
         disposition PeerResponseReplyClassified => local seam NoOwnerRealization,
+        disposition PeerResponseAddresseeResolved => local seam NoOwnerRealization,
         disposition PeerIngressReceiveResolved => local seam NoOwnerRealization,
         disposition PeerIngressDequeueResolved => local seam NoOwnerRealization,
         disposition SpawnDrainTask => local seam NoOwnerRealization,
@@ -9985,6 +10020,13 @@ macro_rules! meerkat_catalog_machine_dsl {
             || (self.peer_ingress_owner_kind == PeerIngressOwnerKind::MobOwned
                 && self.peer_ingress_comms_runtime_id != None
                 && self.peer_ingress_mob_id != None)
+        }
+
+        // Every admitted inbound peer request records its verified
+        // requester, and a requester exists only for an admitted request, so
+        // `ResolvePeerResponseAddressee` never judges a request without one.
+        invariant inbound_peer_request_requesters_match_requests {
+            self.inbound_peer_request_requesters.keys() == self.inbound_peer_requests.keys()
         }
 
         // Supervisor-binding tagged-union discipline (Wave 3 D Row 21).
@@ -34792,12 +34834,13 @@ macro_rules! meerkat_catalog_machine_dsl {
         // admission still decides which payloads may execute.
         transition PeerRequestReceived {
             per_phase [Idle, Attached, Running, Retired, Stopped, Destroyed]
-            on input PeerRequestReceived { corr_id, handling_mode }
+            on input PeerRequestReceived { corr_id, handling_mode, requester }
             guard "session_registered" { self.session_id != None }
             guard "not_already_inbound" { !self.inbound_peer_requests.contains_key(corr_id) }
             update {
                 self.inbound_peer_requests.insert(corr_id, InboundPeerRequestState::Received);
                 self.inbound_peer_request_lanes.insert(corr_id, handling_mode);
+                self.inbound_peer_request_requesters.insert(corr_id, requester);
             }
             to Idle
             emit InboundPeerInteractionStateChanged { corr_id: corr_id, new_state: InboundPeerRequestState::Received }
@@ -34811,9 +34854,52 @@ macro_rules! meerkat_catalog_machine_dsl {
             update {
                 self.inbound_peer_requests.remove(corr_id);
                 self.inbound_peer_request_lanes.remove(corr_id);
+                self.inbound_peer_request_requesters.remove(corr_id);
             }
             to Idle
             emit InboundPeerInteractionStateChanged { corr_id: corr_id, new_state: InboundPeerRequestState::Replied }
+        }
+
+        // Response addressee authority. A response (progress or terminal) to
+        // an inbound request goes only to the requester recorded when the
+        // request was received. Read-only: the shell asks before any
+        // transport, so a refused response reaches no one and the request
+        // stays answerable. An id with no recorded request is judged
+        // `UnknownRequest`. Same phases as the inbound map it reads.
+        transition ResolvePeerResponseAddresseeRequester {
+            per_phase [Idle, Attached, Running, Retired, Stopped, Destroyed]
+            on signal ResolvePeerResponseAddressee { corr_id, addressee }
+            guard "session_registered" { self.session_id != None }
+            guard "addressee_is_requester" {
+                self.inbound_peer_request_requesters.contains_key(corr_id)
+                && self.inbound_peer_request_requesters.get(corr_id).get("value") == addressee
+            }
+            update {}
+            to Idle
+            emit PeerResponseAddresseeResolved { verdict: PeerResponseAddresseeVerdict::Requester }
+        }
+
+        transition ResolvePeerResponseAddresseeNotRequester {
+            per_phase [Idle, Attached, Running, Retired, Stopped, Destroyed]
+            on signal ResolvePeerResponseAddressee { corr_id, addressee }
+            guard "session_registered" { self.session_id != None }
+            guard "addressee_is_not_requester" {
+                self.inbound_peer_request_requesters.contains_key(corr_id)
+                && self.inbound_peer_request_requesters.get(corr_id).get("value") != addressee
+            }
+            update {}
+            to Idle
+            emit PeerResponseAddresseeResolved { verdict: PeerResponseAddresseeVerdict::NotRequester }
+        }
+
+        transition ResolvePeerResponseAddresseeUnknownRequest {
+            per_phase [Idle, Attached, Running, Retired, Stopped, Destroyed]
+            on signal ResolvePeerResponseAddressee { corr_id, addressee }
+            guard "session_registered" { self.session_id != None }
+            guard "request_unknown" { !self.inbound_peer_request_requesters.contains_key(corr_id) }
+            update {}
+            to Idle
+            emit PeerResponseAddresseeResolved { verdict: PeerResponseAddresseeVerdict::UnknownRequest }
         }
 
         // Session-context advancement transition (W2-E / issue #264).
@@ -35055,7 +35141,7 @@ macro_rules! meerkat_catalog_machine_dsl {
         }
 
         transition PeerRequestReceivedAfterUnregister {
-            on input PeerRequestReceived { corr_id, handling_mode }
+            on input PeerRequestReceived { corr_id, handling_mode, requester }
             guard { self.lifecycle_phase == Phase::Idle }
             guard "session_unregistered" { self.session_id == None }
             update {}

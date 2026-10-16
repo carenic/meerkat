@@ -559,8 +559,8 @@ pub enum ToolOperationTarget {
     /// [`Self::PeerDirectoryRead`] for `peers`): other tools that reach
     /// agents, such as `delegate`, `council`, `mob_spawn_member` and a mob
     /// member's calls up to its mob's operator, carry no peer target. `kind`
-    /// is the delivery the tool makes; a response's addressee is not
-    /// verified against its request (see [`PeerSendKind::Response`]).
+    /// is the delivery the tool makes; a response goes only to the requester
+    /// of the request it answers (see [`PeerSendKind::Response`]).
     PeerSend {
         peer: crate::comms::PeerId,
         kind: PeerSendKind,
@@ -643,12 +643,12 @@ pub enum PeerSendKind {
     Message,
     /// A typed request that expects a correlated response (`send_request`).
     Request,
-    /// A typed response to a request (`send_response`). Its addressee is
-    /// the caller's assertion, not verified against the request: the
-    /// runtime checks that the request id names a request this session
-    /// received and can still answer, but records no requester for it, so
-    /// nothing checks that the addressed peer sent that request. The
-    /// delivery still reaches only the addressed peer.
+    /// A typed response to a request (`send_response`). Its addressee must
+    /// be the request's requester: the runtime records the sender ingress
+    /// admitted for each request this session receives and refuses, before
+    /// any transport, a response (progress or terminal) addressed to any
+    /// other peer, as it refuses one to a request it cannot answer. The
+    /// delivery reaches only the addressed peer.
     Response,
 }
 

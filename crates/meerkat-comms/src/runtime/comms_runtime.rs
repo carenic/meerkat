@@ -1308,6 +1308,34 @@ impl CoreCommsRuntime for CommsRuntime {
                         "PeerResponse requires machine inbound peer request state for corr_id {corr_id}"
                     )));
                 }
+                // A response, progress or terminal, goes only to the request's
+                // verified requester. The generated authority judges the
+                // canonical addressee the transport routes to against the
+                // requester it recorded when the request arrived, before any
+                // transport: a refused response reaches no one and the request
+                // stays answerable.
+                match peer_handle
+                    .resolve_response_addressee(corr_id, to.peer_id)
+                    .map_err(|err| {
+                        SendError::Validation(format!(
+                            "DSL rejected PeerResponse addressee resolution for corr_id {corr_id}: {err}"
+                        ))
+                    })? {
+                    meerkat_core::PeerResponseAddresseeVerdict::Requester => {}
+                    meerkat_core::PeerResponseAddresseeVerdict::NotRequester => {
+                        return Err(SendError::ResponseAddresseeNotRequester {
+                            in_reply_to,
+                            addressee: to.peer_id,
+                        });
+                    }
+                    // No recorded request (or a verdict this shell does not
+                    // know): the unknown-request refusal above.
+                    _ => {
+                        return Err(SendError::Validation(format!(
+                            "PeerResponse requires machine inbound peer request state for corr_id {corr_id}"
+                        )));
+                    }
+                }
                 let reply_terminality =
                     peer_handle
                         .classify_response_reply(core_status)
@@ -5879,6 +5907,8 @@ mod tests {
             Mutex<HashMap<meerkat_core::PeerCorrelationId, meerkat_core::InboundPeerRequestState>>,
         inbound_modes:
             Mutex<HashMap<meerkat_core::PeerCorrelationId, meerkat_core::types::HandlingMode>>,
+        inbound_requesters:
+            Mutex<HashMap<meerkat_core::PeerCorrelationId, meerkat_core::comms::PeerId>>,
         cleanup_observer:
             Mutex<Option<Arc<dyn meerkat_core::handles::PeerInteractionCleanupObserver>>>,
     }
@@ -5996,6 +6026,7 @@ mod tests {
             &self,
             corr_id: meerkat_core::PeerCorrelationId,
             handling_mode: meerkat_core::types::HandlingMode,
+            requester: meerkat_core::comms::PeerId,
         ) -> Result<(), meerkat_core::handles::DslTransitionError> {
             let mut inbound = self.inbound.lock();
             if inbound.contains_key(&corr_id) {
@@ -6006,7 +6037,25 @@ mod tests {
             }
             inbound.insert(corr_id, meerkat_core::InboundPeerRequestState::Received);
             self.inbound_modes.lock().insert(corr_id, handling_mode);
+            self.inbound_requesters.lock().insert(corr_id, requester);
             Ok(())
+        }
+
+        fn resolve_response_addressee(
+            &self,
+            corr_id: meerkat_core::PeerCorrelationId,
+            addressee: meerkat_core::comms::PeerId,
+        ) -> Result<
+            meerkat_core::PeerResponseAddresseeVerdict,
+            meerkat_core::handles::DslTransitionError,
+        > {
+            Ok(match self.inbound_requesters.lock().get(&corr_id) {
+                Some(requester) if *requester == addressee => {
+                    meerkat_core::PeerResponseAddresseeVerdict::Requester
+                }
+                Some(_) => meerkat_core::PeerResponseAddresseeVerdict::NotRequester,
+                None => meerkat_core::PeerResponseAddresseeVerdict::UnknownRequest,
+            })
         }
 
         fn classify_response_reply(
@@ -6031,6 +6080,7 @@ mod tests {
                 ));
             }
             self.inbound_modes.lock().remove(&corr_id);
+            self.inbound_requesters.lock().remove(&corr_id);
             Ok(())
         }
 
@@ -7384,10 +7434,12 @@ mod tests {
 
         let interaction_id = Uuid::new_v4();
         let corr_id = meerkat_core::PeerCorrelationId::from_uuid(interaction_id);
+        let missing_requester = missing_peer_route(&format!("missing-response-peer-{suffix}"));
         meerkat_core::handles::PeerInteractionHandle::request_received(
             peer_handle.as_ref(),
             corr_id,
             meerkat_core::types::HandlingMode::Queue,
+            missing_requester.peer_id,
         )
         .expect("test authority should seed inbound request state");
 
@@ -7396,7 +7448,7 @@ mod tests {
             CommsCommand::PeerResponse {
                 objective_id: None,
                 content_taint: None,
-                to: missing_peer_route(&format!("missing-response-peer-{suffix}")),
+                to: missing_requester,
                 in_reply_to: InteractionId(interaction_id),
                 status: meerkat_core::ResponseStatus::Completed,
                 result: serde_json::json!({"ok": true}),
@@ -7463,6 +7515,7 @@ mod tests {
             peer_handle.as_ref(),
             corr_id,
             meerkat_core::types::HandlingMode::Queue,
+            receiver.public_key().to_peer_id(),
         )
         .expect("machine authority should record inbound request lane");
         assert_eq!(
@@ -7657,6 +7710,7 @@ mod tests {
             peer_handle.as_ref(),
             corr_id,
             meerkat_core::types::HandlingMode::Queue,
+            peer.public_key().to_peer_id(),
         )
         .expect("seed inbound request state");
 
@@ -9078,6 +9132,7 @@ mod tests {
             peer_handle.as_ref(),
             corr_id,
             meerkat_core::types::HandlingMode::Queue,
+            receiver.public_key().to_peer_id(),
         )
         .expect("seed inbound request state");
 

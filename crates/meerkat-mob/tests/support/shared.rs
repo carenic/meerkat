@@ -40,11 +40,11 @@ use super::fixture_mob as meerkat_mob;
 // (`send`, `handoff_volatile_peer_input_candidates`) and on `Arc<MeerkatMachine>`
 // (`list_active_inputs`) — the crates/meerkat-mob/src/runtime/tests.rs and
 // smoke_mob_flow_runtime.rs import discipline.
+use meerkat_core::CommsCommand;
 use meerkat_core::agent::CommsRuntime as _;
 use meerkat_core::comms::TrustedPeerDescriptor;
 use meerkat_core::interaction::InteractionContent;
 use meerkat_core::service::SessionService as _;
-use meerkat_core::{CommsCommand, PeerCorrelationId};
 use meerkat_runtime::SessionServiceRuntimeExt as _;
 use meerkat_runtime::meerkat_machine::MeerkatMachine;
 use meerkat_runtime::meerkat_machine::dsl as machine_dsl;
@@ -3032,10 +3032,7 @@ pub async fn spawn_scripted_host_peer(name: &str) -> ScriptedHostPeer {
                 runtime
                     .peer_interaction_handle()
                     .expect("scripted host peer interaction authority")
-                    .request_received(
-                        PeerCorrelationId::from_uuid(candidate.interaction.id.0),
-                        candidate.interaction.handling_mode,
-                    )
+                    .request_received_from_ingress(&candidate)
                     .expect("record inbound peer request before response");
 
                 let command: Result<BridgeCommand, _> = serde_json::from_value(params.clone());
@@ -5682,10 +5679,7 @@ pub fn spawn_scripted_member_turn_responder(
                 runtime
                     .peer_interaction_handle()
                     .expect("scripted member peer interaction authority")
-                    .request_received(
-                        PeerCorrelationId::from_uuid(candidate.interaction.id.0),
-                        candidate.interaction.handling_mode,
-                    )
+                    .request_received_from_ingress(&candidate)
                     .expect("record inbound peer request before response");
 
                 let command: Result<BridgeCommand, _> = serde_json::from_value(params.clone());

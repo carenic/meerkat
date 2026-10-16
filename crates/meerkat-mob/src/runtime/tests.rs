@@ -8821,10 +8821,7 @@ async fn spawn_live_external_peer_with_transport(
                         responder_runtime
                             .peer_interaction_handle()
                             .expect("live external peer semantic authority")
-                            .request_received(
-                                PeerCorrelationId::from_uuid(candidate.interaction.id.0),
-                                candidate.interaction.handling_mode,
-                            )
+                            .request_received_from_ingress(&candidate)
                             .expect("record inbound peer request before response");
                         let bridge_parse: Result<super::bridge_protocol::BridgeCommand, _> =
                             serde_json::from_value(params.clone());
@@ -85728,10 +85725,7 @@ async fn spawn_host_daemon_stub(label: &str, live_endpoint: Option<String>) -> H
                 responder_runtime
                     .peer_interaction_handle()
                     .expect("host stub semantic authority")
-                    .request_received(
-                        PeerCorrelationId::from_uuid(candidate.interaction.id.0),
-                        candidate.interaction.handling_mode,
-                    )
+                    .request_received_from_ingress(&candidate)
                     .expect("record inbound host stub request before response");
                 let to =
                     trust_candidate_sender_for_reply(responder_runtime.as_ref(), &candidate).await;

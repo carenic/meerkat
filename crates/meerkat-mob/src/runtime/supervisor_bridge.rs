@@ -4081,10 +4081,7 @@ mod tests {
         runtime
             .peer_interaction_handle()
             .expect("remote peer interaction authority")
-            .request_received(
-                meerkat_core::PeerCorrelationId::from_uuid(candidate.interaction.id.0),
-                candidate.interaction.handling_mode,
-            )
+            .request_received_from_ingress(&candidate)
             .expect("record remote request before sending its response");
         runtime
             .send(CommsCommand::PeerResponse {
@@ -4827,10 +4824,7 @@ mod tests {
                 responder_runtime
                     .peer_interaction_handle()
                     .expect("remote peer interaction authority")
-                    .request_received(
-                        meerkat_core::PeerCorrelationId::from_uuid(candidate.interaction.id.0),
-                        candidate.interaction.handling_mode,
-                    )
+                    .request_received_from_ingress(&candidate)
                     .expect("record alternate request before sending its response");
                 responder_runtime
                     .send(CommsCommand::PeerResponse {
@@ -5700,10 +5694,7 @@ mod tests {
         remote_runtime
             .peer_interaction_handle()
             .expect("remote peer interaction authority")
-            .request_received(
-                meerkat_core::PeerCorrelationId::from_uuid(candidate.interaction.id.0),
-                candidate.interaction.handling_mode,
-            )
+            .request_received_from_ingress(&candidate)
             .expect("record inbound request before sending its response");
         remote_runtime
             .send(CommsCommand::PeerResponse {

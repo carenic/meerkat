@@ -23219,7 +23219,11 @@ mod tests {
         sender
             .peer_interaction_handle()
             .expect("sender peer response authority")
-            .request_received(corr_id, meerkat_core::types::HandlingMode::Queue)
+            .request_received(
+                corr_id,
+                meerkat_core::types::HandlingMode::Queue,
+                operator_pubkey.to_peer_id(),
+            )
             .expect("seed inbound request before terminal peer response");
 
         CoreCommsRuntime::send(
