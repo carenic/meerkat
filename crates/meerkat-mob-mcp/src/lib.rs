@@ -3870,14 +3870,14 @@ impl MobMcpState {
     /// Claim the member external tools of an existing mob for a caller (an
     /// RPC connection claiming a mob's callback route).
     ///
-    /// Admitted like a create: the console owner only (`SendCommand`), and
-    /// held by this state's admission while it runs, so a stood-down state
-    /// admits no claim. A restored mob is restored first, so the claim
-    /// reaches the tools its restored members were built with. `claim` is
-    /// the caller's own binding of what it claims; it runs while the managed
-    /// set is read with the mob in it (so after the mob's
-    /// [`MemberExternalTools::on_managed`]), and its answer is returned
-    /// unchanged.
+    /// Needs the console owner (`SendCommand`) and is held by this state's
+    /// admission while it runs, so a stood-down state admits no claim; the
+    /// host's create hook is not asked, since a claim creates nothing. A
+    /// restored mob is restored first, so the claim reaches the tools its
+    /// restored members were built with. `claim` is the caller's own binding
+    /// of what it claims; it runs while the managed set is read with the mob
+    /// in it (so after the mob's [`MemberExternalTools::on_managed`]), and
+    /// its answer is returned unchanged.
     pub async fn mob_claim_member_external_tools<T, F>(
         &self,
         mob_id: &MobId,
