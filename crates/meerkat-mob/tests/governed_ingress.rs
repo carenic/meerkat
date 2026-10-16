@@ -575,20 +575,31 @@ async fn governed_input_shares_the_member_admission_lane() {
     );
     assert!(!retry.is_finished(), "the retry is still held in admission");
 
-    // A's run is unfinished at the provider when its waiter is dropped; the
-    // admitted run still completes, which the retry's replay reports.
-    wait_until("A's run is in flight", || {
-        fixture.provider.requests().len() == 1
-    })
-    .await;
-    drop(first_turn);
-    fixture.provider.release();
+    // B is held inside native admission, which holds the member session's
+    // mutation gate and driver lock. A's run dequeues under that same driver
+    // lock, so it can reach the provider only once B's admission completes:
+    // release the gate first. B is admitted after the work ahead of it, and
+    // the provider still holds A's run unfinished.
     fixture.adapter.gate.release();
     let retry_turn = tokio::time::timeout(WAIT, retry)
         .await
         .expect("the parked governed retry settles")
         .expect("task")
         .expect("the governed retry is admitted after the work ahead of it");
+
+    // A's run is unfinished at the provider when its waiter is dropped; the
+    // admitted run still completes, which the retry's replay reports.
+    wait_until("A's run reaches the provider", || {
+        !fixture.provider.requests().is_empty()
+    })
+    .await;
+    assert_eq!(
+        fixture.provider.requests().len(),
+        1,
+        "A's held run is the only provider request"
+    );
+    drop(first_turn);
+    fixture.provider.release();
     tokio::time::timeout(WAIT, retry_turn.wait())
         .await
         .expect("the replay settles")
