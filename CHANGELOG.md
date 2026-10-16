@@ -44,17 +44,21 @@ them.
   quiet, so an answer that started into the user's speech and never paused
   stayed muted until it ended: in Turbo S S107 the duck ran from 3289 ms to
   19205 ms over a 12.8 s answer, and the user heard none of it. The broker
-  now keys the restore on the response the duck covers, by onset order on
-  the provider audio clock (gpt-live-1 output frames carry no response id):
-  a response that started into or after the user's speech is an answer and
-  restores on the user's quiet, mid-sentence if need be; a response that was
-  already audible when the user started speaking is the one the user
-  interrupted and keeps the 0.8.51 rule (ducked to its next 600 ms output
-  pause or its end, so the stale tail of Turbo S S103 R3 stays silent). The
-  duck still holds while the user speaks, and pauses inside the user's
-  speech (under 1.6 s) never restore it. By design, an answer spoken
-  entirely while the user is still talking stays ducked to its end (Turbo S
-  S106): the user held the floor for all of it.
+  now keys the restore on what the duck covers, by onset order on the
+  provider audio clock (gpt-live-1 output frames carry no response id). A
+  burst the assistant was voicing when the user started speaking is the one
+  the user interrupted: it keeps the 0.8.51 rule (once the user is quiet,
+  ducked to its next 600 ms output pause or its end, so the stale tail of
+  Turbo S S103 R3 stays silent), and it ends at its first 600 ms pause.
+  Audio after that pause, and any response that starts into or after the
+  user's speech, is an answer and restores on the user's quiet, mid-sentence
+  if need be. So does an answer that follows an early yield within the 1.6 s
+  that would end the interrupted response, and one that follows a user onset
+  within 1.6 s of an answer that had already ended. The duck still holds
+  while the user speaks, and pauses inside the user's speech (under 1.6 s)
+  never restore it. By design, an answer spoken entirely while the user is
+  still talking stays ducked to its end (Turbo S S106): the user held the
+  floor for all of it.
 
 ## [0.9.2] - 2026-10-16
 

@@ -2562,15 +2562,17 @@ struct SessionState {
     /// user started speaking while the assistant was audible and neither has
     /// gone quiet for its release length since.
     assistant_playback_ducked: bool,
-    /// The response that was audible when the user's current utterance began
-    /// has not ended: assistant audio now is the response the user
-    /// interrupted, not an answer to them. Set at each utterance onset (a
-    /// voiced input frame after [`USER_FLOOR_SILENCE_RELEASE_MS`] of quiet)
-    /// from [`Self::assistant_audible`], cleared when that response ends
-    /// ([`OUTPUT_SILENCE_RELEASE_MS`] of output silence). Onset ordering on
-    /// the provider audio clock: gpt-live-1 output frames carry no response
-    /// id, so the order of the user's onset and the response's audio is what
-    /// tells the two apart.
+    /// The burst the user's current utterance interrupted has not ended:
+    /// assistant audio now is the response the user talked over, not an
+    /// answer to them. Set at each utterance onset (a voiced input frame
+    /// after [`USER_FLOOR_SILENCE_RELEASE_MS`] of quiet) when the assistant
+    /// is inside a burst, its last voiced frame within
+    /// [`OUTPUT_BURST_GAP_MS`]; cleared at that burst's first output gap of
+    /// [`OUTPUT_BURST_GAP_MS`], so audio after the gap, like any response
+    /// that starts into or after the user's speech, is an answer. Onset
+    /// ordering on the provider audio clock: gpt-live-1 output frames carry
+    /// no response id, so the order of the user's onset and the response's
+    /// audio is what tells the two apart.
     interrupted_response_audible: bool,
     /// Session-timeline start of the last output transcript delta.
     last_output_start_ms: Option<f64>,
@@ -2887,10 +2889,11 @@ impl SessionState {
             return;
         }
         self.output_silence_run_ms = self.output_silence_run_ms.saturating_add(frame_ms);
-        if self.output_silence_run_ms >= OUTPUT_SILENCE_RELEASE_MS {
-            // The response ended. Until the user's next utterance onset,
-            // assistant audio is a later response: it started into or after
-            // the user's speech, an answer to it.
+        if self.output_silence_run_ms >= OUTPUT_BURST_GAP_MS {
+            // The interrupted burst ended (the provider yielded, or paused
+            // for a burst gap). Until the user's next utterance onset,
+            // assistant audio after this gap is an answer to the user, also
+            // when it follows within the 1.6 s that would end the response.
             self.interrupted_response_audible = false;
         }
         if self.output_silence_run_ms >= OUTPUT_SILENCE_RELEASE_MS
@@ -2963,10 +2966,12 @@ impl SessionState {
         let speech = reflected_pcm16_dbfs(audio).is_some_and(|dbfs| dbfs >= USER_FLOOR_SPEECH_DBFS);
         if speech {
             if !self.reflected_input_speaking() {
-                // The user's utterance begins. A response audible now was
+                // The user's utterance begins. A burst under way now was
                 // already audible before the user's speech onset: the user
-                // interrupts it. One that starts later answers the user.
-                self.interrupted_response_audible = self.assistant_audible();
+                // interrupts it. A response that starts later, or after that
+                // burst's gap, answers the user.
+                self.interrupted_response_audible =
+                    self.output_silence_run_ms < OUTPUT_BURST_GAP_MS;
             }
             self.input_silence_run_ms = 0;
             self.reflected_input_speech_seen = true;
@@ -3998,15 +4003,16 @@ const OUTPUT_SILENCE_RELEASE_MS: u64 = 1_600;
 /// `the_duck_release_burst_gap_is_the_peer_end_hysteresis` in the
 /// integration tests, so it is one value, not a tunable).
 ///
-/// A barge-in duck over the response the user interrupted (one already
-/// audible at the user's speech onset) restores on the user's input silence
-/// only once provider output has been silent this long, so playback never
-/// resumes inside its burst. That response can still be talking when the
-/// user stops: Turbo S 7f770753 S103 R3, the provider took 3640 ms to yield,
-/// and a restore on 1.6 s of input silence replayed its stale tail
-/// (talk-over 4102 ms against a 3000 ms bound). A duck over an answer (a
-/// response that started into or after the user's speech) does not wait for
-/// it: it restores as soon as the user is quiet (Turbo S S107).
+/// A barge-in duck over the burst the user interrupted (one under way at the
+/// user's speech onset) restores on the user's input silence only once
+/// provider output has been silent this long, so playback never resumes
+/// inside that burst. It can still be talking when the user stops: Turbo S
+/// 7f770753 S103 R3, the provider took 3640 ms to yield, and a restore on
+/// 1.6 s of input silence replayed its stale tail (talk-over 4102 ms against
+/// a 3000 ms bound). The gap also ends the interrupted burst: audio after it
+/// is an answer, and a duck over an answer (also a response that started
+/// into or after the user's speech) does not wait for a gap: it restores as
+/// soon as the user is quiet (Turbo S S107).
 const OUTPUT_BURST_GAP_MS: u64 = 600;
 
 /// Frame RMS of a reflected PCM16 (little-endian) frame in dBFS, or `None`
@@ -7700,6 +7706,96 @@ mod tests {
             playback_observations(&mut state),
             vec![GptLiveBrokerObservation::AssistantPlaybackRestorable]
         );
+    }
+
+    /// The interrupted response yields early and the answer starts 800 ms
+    /// after its last voiced frame, before 1.6 s of output silence would end
+    /// that response. The interrupted burst ends at its first 600 ms output
+    /// gap, so the audio after the gap is the answer: it restores once the
+    /// user has been quiet 1600 ms, in the middle of its burst.
+    #[test]
+    fn an_answer_after_an_early_yield_restores_once_the_user_is_quiet() {
+        let mut state = SessionState::default();
+        model_output(&mut state, true, 4);
+        // The user interrupts the response.
+        for _ in 0..3 {
+            model_output(&mut state, true, 1);
+            reflect_input(&mut state, true, 1);
+        }
+        assert_eq!(
+            playback_observations(&mut state),
+            vec![GptLiveBrokerObservation::UserSpeechOverAssistant]
+        );
+        // The provider yields as the user goes quiet: 800 ms of silence on
+        // both sides.
+        for _ in 0..4 {
+            model_output(&mut state, false, 1);
+            reflect_input(&mut state, false, 1);
+        }
+        assert!(
+            playback_observations(&mut state).is_empty(),
+            "800 ms of quiet: the user may only be pausing"
+        );
+        // The answer starts and keeps talking.
+        for _ in 0..3 {
+            model_output(&mut state, true, 1);
+            reflect_input(&mut state, false, 1);
+        }
+        assert!(playback_observations(&mut state).is_empty());
+        model_output(&mut state, true, 1);
+        reflect_input(&mut state, false, 1);
+        assert_eq!(
+            playback_observations(&mut state),
+            vec![GptLiveBrokerObservation::AssistantPlaybackRestorable],
+            "the answer restores at 1600 ms of the user's quiet, not at its first pause"
+        );
+        assert!(!state.assistant_playback_ducked);
+    }
+
+    /// The user speaks again 800 ms after an answer ended on its own: inside
+    /// the 1.6 s window the assistant still counts as audible, so the duck
+    /// opens, but that answer was already past its burst gap, not
+    /// interrupted. The next answer starts into the user's speech before the
+    /// 1.6 s release and restores once the user is quiet.
+    #[test]
+    fn an_onset_soon_after_an_answer_ended_leaves_the_next_answer_restorable() {
+        let mut state = SessionState::default();
+        model_output(&mut state, true, 5);
+        model_output(&mut state, false, 4);
+        assert!(playback_observations(&mut state).is_empty());
+        reflect_input(&mut state, true, 1);
+        assert_eq!(
+            playback_observations(&mut state),
+            vec![GptLiveBrokerObservation::UserSpeechOverAssistant]
+        );
+        // 400 ms later, with 1200 ms of output silence, the next answer
+        // starts into the user's speech.
+        for _ in 0..2 {
+            model_output(&mut state, false, 1);
+            reflect_input(&mut state, true, 1);
+        }
+        for _ in 0..3 {
+            model_output(&mut state, true, 1);
+            reflect_input(&mut state, true, 1);
+        }
+        assert!(
+            playback_observations(&mut state).is_empty(),
+            "the duck holds while the user speaks"
+        );
+        // The user stops; the answer keeps talking.
+        for _ in 0..7 {
+            model_output(&mut state, true, 1);
+            reflect_input(&mut state, false, 1);
+        }
+        assert!(playback_observations(&mut state).is_empty());
+        model_output(&mut state, true, 1);
+        reflect_input(&mut state, false, 1);
+        assert_eq!(
+            playback_observations(&mut state),
+            vec![GptLiveBrokerObservation::AssistantPlaybackRestorable],
+            "the next answer restores at 1600 ms of the user's quiet"
+        );
+        assert!(!state.assistant_playback_ducked);
     }
 
     /// S99 pre-merge r3: a cue deferred during the model's response; the
