@@ -54,6 +54,8 @@ struct McpScheduleContext {
     workgraph_service: meerkat::WorkGraphService,
     /// The state's local MCP launch boundary, retained by seeded routers.
     mcp_stdio_launch_profile: meerkat_mcp::McpStdioLaunchProfile,
+    /// The state's MCP attempt guards, installed by seeded routers.
+    mcp_attempt_guards: Option<meerkat_mcp::McpAttemptGuards>,
     #[cfg(test)]
     test_llm_client_override: Option<Arc<dyn meerkat_client::LlmClient>>,
     #[cfg(test)]
@@ -74,6 +76,7 @@ impl McpScheduleContext {
             runtime_registration_locks: Arc::clone(&state.runtime_registration_locks),
             workgraph_service: state.workgraph_service.clone(),
             mcp_stdio_launch_profile: state.mcp_stdio_launch_profile.clone(),
+            mcp_attempt_guards: state.mcp_attempt_guards.clone(),
             #[cfg(test)]
             test_llm_client_override: None,
             #[cfg(test)]
@@ -240,6 +243,7 @@ impl McpScheduleContext {
         } else {
             crate::McpActorMaterializationMode::Fresh
         };
+        let seeded_session = session_id.clone();
         let materialization = crate::materialize_mcp_actor_transaction(
             &self.service,
             &self.runtime_adapter,
@@ -254,6 +258,7 @@ impl McpScheduleContext {
                         .seed_realm_mcp_adapter(
                             Arc::clone(runtime_bindings.external_tool_surface()),
                             runtime_bindings.configured_mcp_attachment().cloned(),
+                            &seeded_session,
                         )
                         .await
                         .map_err(|error| crate::ToolCallError::internal(error.to_string()))?,
@@ -421,15 +426,19 @@ impl McpScheduleContext {
         configured_authority: Option<
             Arc<dyn meerkat_core::mcp_attachment::ConfiguredMcpAttachmentAuthority>,
         >,
+        session_id: &SessionId,
     ) -> Result<Arc<McpRouterAdapter>, ScheduleDomainError> {
         // Scheduled sessions launch local stdio servers inside the host's
-        // own launch boundary, as interactive sessions do.
-        let adapter = Arc::new(McpRouterAdapter::new(
+        // own launch boundary, as interactive sessions do, and begin the
+        // host's attempt guards when given.
+        let adapter = Arc::new(McpRouterAdapter::new(crate::guarded_router(
             McpRouter::new_with_surface_handle_and_stdio_profile(
                 external_tool_surface,
                 self.mcp_stdio_launch_profile.clone(),
             ),
-        ));
+            self.mcp_attempt_guards.as_ref(),
+            session_id,
+        )));
         let server_configs = scheduled_realm_mcp_servers(
             &self.config_runtime,
             &self.realm_config_source,
@@ -474,7 +483,7 @@ pub(crate) async fn seed_realm_mcp_adapter_for_test(
     external_tool_surface: Arc<dyn ExternalToolSurfaceHandle>,
 ) -> Result<Arc<McpRouterAdapter>, ScheduleDomainError> {
     McpScheduleContext::from_state(state)
-        .seed_realm_mcp_adapter(external_tool_surface, None)
+        .seed_realm_mcp_adapter(external_tool_surface, None, &SessionId::new())
         .await
 }
 

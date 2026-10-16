@@ -76,6 +76,8 @@ struct Probe {
     unguarded: StdMutex<HashSet<String>>,
     hold_begins: tokio::sync::watch::Sender<bool>,
     hold_finishes: tokio::sync::watch::Sender<bool>,
+    /// Servers whose finishes are held, each until it leaves the set.
+    hold_servers: tokio::sync::watch::Sender<HashSet<String>>,
     finish: StdMutex<Finish>,
 }
 
@@ -88,6 +90,7 @@ impl Probe {
             unguarded: StdMutex::new(HashSet::new()),
             hold_begins: tokio::sync::watch::channel(false).0,
             hold_finishes: tokio::sync::watch::channel(false).0,
+            hold_servers: tokio::sync::watch::channel(HashSet::new()).0,
             finish: StdMutex::new(Finish::Ok),
         })
     }
@@ -159,6 +162,7 @@ impl ProbeGuard {
         settle: bool,
         disposition: McpAttemptDisposition,
     ) -> Result<(), McpGuardFinishError> {
+        let server = disposition.key.server.clone();
         self.probe.push(if settle {
             Call::Settle(disposition)
         } else {
@@ -166,6 +170,8 @@ impl ProbeGuard {
         });
         let mut held = self.probe.hold_finishes.subscribe();
         let _ = held.wait_for(|held| !*held).await;
+        let mut held = self.probe.hold_servers.subscribe();
+        let _ = held.wait_for(|held| !held.contains(&server)).await;
         let finish = *self.probe.finish.lock().unwrap();
         match finish {
             Finish::Ok => Ok(()),
@@ -280,6 +286,11 @@ async fn add(adapter: &Arc<McpRouterAdapter>, config: McpServerConfig) {
     adapter.apply_staged().await.expect("apply");
 }
 
+async fn remove(adapter: &Arc<McpRouterAdapter>, name: &str) {
+    adapter.stage_remove(name).await.expect("stage remove");
+    adapter.apply_staged().await.expect("apply remove");
+}
+
 async fn until_notice(adapter: &Arc<McpRouterAdapter>, name: &str, phase: ExternalToolDeltaPhase) {
     let mut seen = Vec::new();
     tokio::time::timeout(WAIT, async {
@@ -350,6 +361,17 @@ async fn a_begin_refusal_spawns_nothing_and_finishes_nothing() {
         .expect("the begin is recorded");
     assert_eq!(begin.stage, McpGuardStage::Begin);
     assert_eq!(begin.completion, McpGuardCompletion::Completed);
+    let disposition = begin.disposition.as_ref().expect("the refusal is recorded");
+    assert_eq!(
+        disposition.open,
+        McpAttemptOpenOutcome::Refused {
+            refusal: McpAttemptRefusal::Guard
+        }
+    );
+    assert!(matches!(
+        disposition.process,
+        McpAttemptProcessEnd::NotSpawned
+    ));
 }
 
 /// Ok(None): the attempt proceeds unguarded; no finish, and the begin is
@@ -429,6 +451,10 @@ async fn begin_precedes_the_physical_entry_and_a_control_refusal_cancels_once() 
         unreachable!()
     };
     assert_eq!(request.server, config, "the staged descriptor, as staged");
+    assert!(
+        adapter.stdio_setup_failure("controlled").await.is_none(),
+        "a control refusal leaves no setup failure"
+    );
     adapter.shutdown().await;
 }
 
@@ -847,6 +873,10 @@ async fn a_prior_unsettled_finish_refuses_the_next_begin() {
     // Give the second attempt time to be refused.
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert_eq!(probe.begins("serial").len(), 1, "no second begin");
+    assert!(
+        adapter.stdio_setup_failure("serial").await.is_none(),
+        "the refused attempt leaves no setup failure, and released the first one's"
+    );
     probe.hold_finishes.send_replace(false);
     let report = report_of(adapter.shutdown_with_report().await);
     let refused = report
@@ -1066,9 +1096,18 @@ async fn without_guards_nothing_is_reported() {
     assert!(report.guards_completed());
 }
 
-/// Bounds over the maximum are refused, not clamped.
+/// Bounds over the maximum are refused, not clamped, and so are zero bounds
+/// (a zero begin bound would cancel every stdio attempt).
 #[test]
 fn bounds_over_the_maximum_are_refused() {
+    let second = Duration::from_secs(1);
+    for (begin, cancel, settle) in [
+        (Duration::ZERO, second, second),
+        (second, Duration::ZERO, second),
+        (second, second, Duration::ZERO),
+    ] {
+        assert!(McpAttemptGuardBounds::new(begin, cancel, settle).is_err());
+    }
     assert!(
         McpAttemptGuardBounds::new(
             McpAttemptGuardBounds::MAX + Duration::from_millis(1),
@@ -1085,4 +1124,251 @@ fn bounds_over_the_maximum_are_refused() {
         )
         .is_ok()
     );
+}
+
+/// M1: a close of the installation while an attempt still awaits its prior
+/// guard's finish refuses that attempt's begin: the factory is never asked,
+/// and the close reports the begin `Cancelled{InstallationClosed}`.
+#[tokio::test]
+async fn close_and_join_refuses_a_begin_still_awaiting_its_prior_finish() {
+    let probe = Probe::new();
+    probe.hold_finishes.send_replace(true);
+    let guards = installation(&probe, bounds(5_000, 3_000));
+    let adapter = guarded(&guards, session_owner());
+    add(&adapter, shell("waiting", "exit 3\n")).await;
+    until_notice(&adapter, "waiting", ExternalToolDeltaPhase::Failed).await;
+    probe
+        .until("the first finish starts", |probe| {
+            !probe.finishes("waiting").is_empty()
+        })
+        .await;
+    let first = probe.begins("waiting")[0].clone();
+    // The second attempt awaits the first one's running finish.
+    add(&adapter, shell("waiting", SERVE)).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let closing = {
+        let guards = guards.clone();
+        tokio::spawn(async move {
+            guards
+                .close_and_join(tokio::time::Instant::now() + WAIT)
+                .await
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    probe.hold_finishes.send_replace(false);
+    let records = closing.await.unwrap();
+    // A begin started after the close would show by now.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        probe.begins("waiting"),
+        vec![first.clone()],
+        "no begin after the installation closed"
+    );
+    assert!(
+        records.iter().any(|record| record.key.server == "waiting"
+            && record.key.attempt != first.attempt
+            && record.stage == McpGuardStage::Begin
+            && record.disposition.as_ref().is_some_and(|disposition| {
+                disposition.open
+                    == McpAttemptOpenOutcome::Cancelled {
+                        cause: McpAttemptCancelCause::InstallationClosed,
+                    }
+            })),
+        "the close reports the refused begin: {records:#?}"
+    );
+    assert!(
+        records.iter().any(|record| record.key == first
+            && record.stage == McpGuardStage::Cancel
+            && record.completion == McpGuardCompletion::Completed),
+        "{records:#?}"
+    );
+    adapter.shutdown().await;
+}
+
+/// M1: a finish that starts while `close_and_join` waits for another one is
+/// reported too, and no shutdown reports the guards completed while it runs.
+#[tokio::test]
+async fn close_and_join_reports_a_finish_that_starts_while_it_waits() {
+    let probe = Probe::new();
+    probe.hold_servers.send_modify(|held| {
+        held.insert("first".to_string());
+        held.insert("second".to_string());
+    });
+    let guards = installation(&probe, bounds(5_000, 300));
+    let adapter = guarded(&guards, session_owner());
+    for name in ["first", "second"] {
+        add(&adapter, shell(name, SERVE)).await;
+        until_notice(&adapter, name, ExternalToolDeltaPhase::Applied).await;
+    }
+    remove(&adapter, "first").await;
+    probe
+        .until("the first finish starts", |probe| {
+            !probe.finishes("first").is_empty()
+        })
+        .await;
+    let closing = {
+        let guards = guards.clone();
+        tokio::spawn(async move {
+            guards
+                .close_and_join(tokio::time::Instant::now() + Duration::from_secs(3))
+                .await
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    // This finish starts while the close waits for the first one.
+    remove(&adapter, "second").await;
+    probe
+        .until("the second finish starts", |probe| {
+            !probe.finishes("second").is_empty()
+        })
+        .await;
+    probe.hold_servers.send_modify(|held| {
+        held.remove("first");
+    });
+    let records = closing.await.unwrap();
+    assert!(
+        records
+            .iter()
+            .any(|record| record.key.server == "second" && record.stage == McpGuardStage::Settle),
+        "the finish that started while the close waited is reported: {records:#?}"
+    );
+    let report = report_of(adapter.shutdown_with_report().await);
+    assert!(
+        !report.guards_completed(),
+        "a finish still runs: {:#?}",
+        report.guards()
+    );
+    probe.hold_servers.send_modify(|held| {
+        held.remove("second");
+    });
+    let records = guards
+        .close_and_join(tokio::time::Instant::now() + WAIT)
+        .await;
+    assert!(
+        records.iter().any(|record| record.key.server == "second"
+            && record.stage == McpGuardStage::Settle
+            && record.completion == McpGuardCompletion::Completed),
+        "a later close reports its end: {records:#?}"
+    );
+}
+
+/// L1: the immediate add path keeps a guard refusal typed.
+#[tokio::test]
+async fn add_server_keeps_a_guard_refusal_typed() {
+    let probe = Probe::new();
+    probe.refuse.lock().unwrap().insert("immediate".to_string());
+    let guards = installation(&probe, McpAttemptGuardBounds::DEFAULT);
+    let mut router = surface_router().with_attempt_guards(guards, session_owner());
+    let added = router.add_server(shell("immediate", SERVE)).await;
+    assert!(
+        matches!(
+            added,
+            Err(crate::McpError::AttachmentRefused(
+                McpAttachmentRefusal::Denied
+            ))
+        ),
+        "{added:?}"
+    );
+    assert_eq!(probe.begins("immediate").len(), 1);
+    router.shutdown().await;
+}
+
+/// L3: an attempt dropped while it waits for its begin cancels the guard the
+/// begin returns later as `AttemptDropped`, nothing spawned.
+#[tokio::test]
+async fn a_dropped_attempt_cancels_its_late_guard_as_attempt_dropped() {
+    let probe = Probe::new();
+    probe.hold_begins.send_replace(true);
+    let guards = installation(&probe, McpAttemptGuardBounds::DEFAULT);
+    let mut router = surface_router().with_attempt_guards(guards, session_owner());
+    let added = tokio::time::timeout(
+        Duration::from_millis(300),
+        router.add_server(shell("dropped", SERVE)),
+    )
+    .await;
+    assert!(added.is_err(), "the add still waited for its begin");
+    probe.hold_begins.send_replace(false);
+    let (settled, disposition) = probe.one_finish("dropped").await;
+    assert!(!settled);
+    assert_eq!(
+        disposition.open,
+        McpAttemptOpenOutcome::Cancelled {
+            cause: McpAttemptCancelCause::AttemptDropped
+        }
+    );
+    assert!(matches!(
+        disposition.process,
+        McpAttemptProcessEnd::NotSpawned
+    ));
+    router.shutdown().await;
+}
+
+/// L3: a result the router had not processed when its shutdown began is
+/// cancelled `RouterClosed`, with its process's close.
+#[tokio::test]
+async fn shutdown_cancels_an_unprocessed_result_as_router_closed() {
+    let probe = Probe::new();
+    let guards = installation(&probe, McpAttemptGuardBounds::DEFAULT);
+    let adapter = guarded(&guards, session_owner());
+    let marker = tempfile::tempdir().unwrap();
+    let started = marker.path().join("started");
+    add(
+        &adapter,
+        shell(
+            "unprocessed",
+            &format!("touch '{}'\n{SERVE}", started.display()),
+        ),
+    )
+    .await;
+    tokio::time::timeout(WAIT, async {
+        while !started.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the server process started");
+    // Nothing drives the router: its result waits, unprocessed.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let report = report_of(adapter.shutdown_with_report().await);
+    let (settled, disposition) = probe.one_finish("unprocessed").await;
+    assert!(
+        !settled,
+        "a result first processed by the shutdown is cancelled"
+    );
+    assert_eq!(
+        disposition.open,
+        McpAttemptOpenOutcome::Cancelled {
+            cause: McpAttemptCancelCause::RouterClosed
+        }
+    );
+    closed_receipt(&disposition.process);
+    assert!(report.guards_completed(), "{:#?}", report.guards());
+}
+
+/// N3: a second installation on one router is refused: the first stands.
+#[tokio::test]
+async fn a_second_guard_installation_is_refused() {
+    let first = Probe::new();
+    let second = Probe::new();
+    let router = surface_router()
+        .with_attempt_guards(
+            installation(&first, McpAttemptGuardBounds::DEFAULT),
+            session_owner(),
+        )
+        .with_attempt_guards(
+            installation(&second, McpAttemptGuardBounds::DEFAULT),
+            session_owner(),
+        );
+    let adapter = Arc::new(McpRouterAdapter::new(router));
+    add(&adapter, shell("twice", SERVE)).await;
+    until_notice(&adapter, "twice", ExternalToolDeltaPhase::Applied).await;
+    assert_eq!(
+        first.begins("twice").len(),
+        1,
+        "the first installation stands"
+    );
+    assert!(second.begins("twice").is_empty());
+    adapter.shutdown().await;
+    let (settled, _) = first.one_finish("twice").await;
+    assert!(settled);
 }

@@ -4671,14 +4671,27 @@ impl AgentFactory {
     /// router with the host's installation (see
     /// [`meerkat_mcp::McpAttemptGuards`]), for that construction's session
     /// and mob member. Remote (HTTP and SSE) attempts are neither guarded
-    /// nor refused by it. Routers a host builds itself and passes in as
-    /// external tools are not covered: install the guards on them with
+    /// nor refused by it. The session routers Core's surfaces build
+    /// themselves (a live `mcp/add` target, a restored or resumed session's
+    /// router) install the same installation from
+    /// [`Self::mcp_attempt_guards`]. Routers a host builds itself and passes
+    /// in as external tools are not covered: install the guards on them with
     /// [`meerkat_mcp::McpRouter::with_attempt_guards`].
     #[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
     #[must_use]
     pub fn with_mcp_attempt_guards(mut self, guards: meerkat_mcp::McpAttemptGuards) -> Self {
         self.mcp_attempt_guards = Some(guards);
         self
+    }
+
+    /// The host's MCP attempt guards ([`Self::with_mcp_attempt_guards`]), if
+    /// installed. A surface that builds its own session router installs
+    /// them, with the session (and mob member) it acts for, where it applies
+    /// [`Self::mcp_stdio_launch_profile`]: a guarded host gets no unguarded
+    /// stdio spawn on any surface.
+    #[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
+    pub fn mcp_attempt_guards(&self) -> Option<&meerkat_mcp::McpAttemptGuards> {
+        self.mcp_attempt_guards.as_ref()
     }
 
     /// Advertise standard MCP Apps support when a UI host is attached.

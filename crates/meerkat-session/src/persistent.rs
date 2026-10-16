@@ -9289,6 +9289,13 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
         self.runtime_store.clone()
     }
 
+    /// The builder this service builds its sessions' agents with: for a
+    /// surface's service, the agent factory it was built around, whose
+    /// host-installed settings the surface's own routers read.
+    pub fn builder(&self) -> &B {
+        self.inner.builder()
+    }
+
     /// Observe the exact committed runtime session authority without loading a
     /// Session document or falling back to SessionStore projection state.
     ///

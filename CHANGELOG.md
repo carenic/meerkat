@@ -70,18 +70,36 @@ them.
 - `meerkat-mcp`, `meerkat`: host attempt guards for stdio MCP servers. A
   host builds one `McpAttemptGuards` installation around its
   `McpAttemptGuardFactory` and passes it to the routers it builds
-  (`McpRouter::with_attempt_guards`, or
-  `AgentFactory::with_mcp_attempt_guards` for each construction's own
-  router, owned by its session and mob member).
+  (`McpRouter::with_attempt_guards`; a second call on one router is
+  refused), or installs it on its factory
+  (`AgentFactory::with_mcp_attempt_guards`, read back with
+  `AgentFactory::mcp_attempt_guards`). Each construction's own router is
+  guarded, owned by its session and mob member, and so is every session
+  router Core's surfaces build themselves. The facade re-exports the guard
+  types.
+  - The RPC session runtime's live routers (`mcp/add` and restored
+    attachments), REST session routers and the `rkat run` loader install
+    the guards of the factory their sessions are built with. An embedding
+    host gives REST its guards with
+    `AppState::load_with_bootstrap_options_confinement_and_attempt_guards`,
+    which installs them on REST's own factory (its own routers on a
+    governed runtime included), and gives the MCP server its guards with
+    `MeerkatMcpState::new_with_bootstrap_options_confinement_and_attempt_guards`
+    for its fresh, resumed and scheduled sessions' routers.
+    `PersistentSessionService::builder` and `EphemeralSessionService::builder`
+    return the builder a service builds its agents with.
   - Begin is called only for stdio attempts, before the attempt's secret
     resolution, attachment control entry or spawn. HTTP and SSE attempts
     are neither guarded nor refused by it.
-  - A begin refusal refuses the attempt with nothing spawned; `Ok(None)`
-    lets it proceed unguarded. Both are recorded as a `Begin` completion.
+  - A begin refusal refuses the attempt with nothing spawned, recorded as
+    `Refused{Guard}`; `Ok(None)` lets it proceed unguarded. Both are
+    recorded as a `Begin` completion. `McpRouter::add_server` returns a
+    guard refusal typed (`McpError::AttachmentRefused`).
   - A guard is finished exactly once: `settle` when its attempt's
     connection was installed, `cancel` otherwise, once both the open
-    outcome (`McpAttemptOpenOutcome`) and how the process ended
-    (`McpAttemptProcessEnd`) are known.
+    outcome (`McpAttemptOpenOutcome`, fixed when the router processes the
+    attempt's result) and how the process ended (`McpAttemptProcessEnd`)
+    are known.
   - A begin is never dropped. When its attempt stops waiting (the begin
     bound, a router stop or drop, the attempt dropped, or the installation
     closing), the attempt's `McpAttemptCancellation` is requested with its
@@ -89,16 +107,27 @@ them.
   - Before the next begin for the same owner (mob member, else session) and
     server, the router awaits that pair's running begins and started
     finishes, bounded by the settle bound. It never waits for a live
-    process. A finish still running then refuses the attempt
-    (`PriorGuardUnsettled`).
-  - `McpRouterShutdownReport::guards` reports the router's guard calls;
-    `McpAttemptGuards::close_and_join` joins and reports the rest, those of
-    dropped routers included. Bounds default to 10 s to begin and 5 s to
-    cancel or settle, at most 60 s each.
+    process. A prior begin or finish still running then refuses the
+    attempt (`PriorGuardUnsettled`).
+  - `McpRouterShutdownReport::guards` reports the router's guard calls, and
+    `guards_completed` whether each was seen to end.
+    `McpAttemptGuards::close_and_join` refuses new begins, cancels the
+    waiting ones, and joins and reports the rest: those of dropped routers,
+    and those that start while it waits, included. Run it before the tokio
+    runtime shuts down: a call spawned on a runtime that has shut down never
+    runs.
+  - `McpRouter::construction_id` and `McpRouterAdapter::construction_id`
+    name a router construction (`McpAttemptKey::construction`).
+  - Bounds default to 10 s to begin and 5 s to cancel or settle. A zero
+    bound, or one above 60 s, is refused.
   - Without an installation nothing changes.
 
 ### Changed
 
+- `meerkat-mcp`: `McpRouterAdapter::shutdown_with_report` releases its
+  router lock once it has taken the router, so a reader (an attempt guard's
+  finish among them) no longer waits for the shutdown to finish; it finds
+  the router gone.
 - The release workflow's `Build Web SDK package` job runs beside the release
   validation and the semver gate once `Require green CI` passes, instead of
   after them. Its Cargo build runs four jobs instead of one: the release

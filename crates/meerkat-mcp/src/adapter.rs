@@ -690,14 +690,23 @@ impl McpRouterAdapter {
     /// Takes the router out of the adapter and shuts it down in a task of its
     /// own, so dropping this call stops only the wait: the taken router still
     /// finishes its shutdown, and a later call waits for that same shutdown
-    /// and reads the same report. After this call, tool calls will fail.
+    /// and reads the same report. The router lock is released once the
+    /// router is taken, so a reader (an attempt guard's finish among them)
+    /// never waits for the shutdown: it finds the router gone. After this
+    /// call, tool calls will fail.
     pub async fn shutdown_with_report(&self) -> McpRouterShutdownObservation {
         // Every close starts now, without the router lock: an in-flight call
         // that holds a router guard does not delay it.
         drop(self.begin_close());
-        let mut router = self.router.write().await;
-        if let Some(router) = router.take() {
-            self.execution_binding_epoch.fetch_add(1, Ordering::AcqRel);
+        let taken = {
+            let mut router = self.router.write().await;
+            let taken = router.take();
+            if taken.is_some() {
+                self.execution_binding_epoch.fetch_add(1, Ordering::AcqRel);
+            }
+            taken
+        };
+        if let Some(router) = taken {
             let report = self
                 .shutdown_report
                 .lock()

@@ -4316,6 +4316,11 @@ pub struct EphemeralSessionService<B: SessionAgentBuilder> {
 }
 
 impl<B: SessionAgentBuilder + 'static> EphemeralSessionService<B> {
+    /// The builder this service builds its sessions' agents with.
+    pub fn builder(&self) -> &B {
+        &self.builder
+    }
+
     /// Deliver a hard interrupt to one exact live run.
     ///
     /// The turn-admission slot serializes this comparison with turn

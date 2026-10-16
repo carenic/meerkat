@@ -13129,6 +13129,19 @@ impl SessionRuntime {
             meerkat::McpAuthMode::Interactive,
             self.default_mcp_auth_resolver(),
         );
+        // A guarded host's live router is guarded as its factory's own
+        // routers are: each stdio attempt begins the host's guard first, for
+        // this session and its mob member.
+        let router = match self.factory.mcp_attempt_guards() {
+            Some(guards) => router.with_attempt_guards(
+                guards.clone(),
+                meerkat::McpConstructionOwner::new(
+                    session_id.clone(),
+                    build_config.mob_member_binding.clone(),
+                ),
+            ),
+            None => router,
+        };
         let adapter = Arc::new(McpRouterAdapter::new(router));
         let adapter_dispatcher: Arc<dyn AgentToolDispatcher> = adapter.clone();
         let combined = match build_config.external_tools.clone() {
@@ -32970,6 +32983,87 @@ mod tests {
             "a refused live add never starts the server process"
         );
         adapter.shutdown().await;
+    }
+
+    /// A live `mcp/add` on a guarded host begins the factory's attempt guard
+    /// before anything of the attempt runs, for this session: a refusing
+    /// host refuses the add, and its process never starts.
+    #[cfg(all(feature = "mcp", unix))]
+    #[tokio::test]
+    async fn live_mcp_add_begins_the_factory_attempt_guard() {
+        #[derive(Default)]
+        struct Refusing(std::sync::Mutex<Vec<meerkat::McpAttemptGuardRequest>>);
+        #[async_trait::async_trait]
+        impl meerkat::McpAttemptGuardFactory for Refusing {
+            async fn begin(
+                &self,
+                request: meerkat::McpAttemptGuardRequest,
+                _cancel: meerkat::McpAttemptCancellation,
+            ) -> Result<
+                Option<Box<dyn meerkat::McpAttemptGuard>>,
+                meerkat_core::mcp_attachment::McpAttachmentRefusal,
+            > {
+                self.0.lock().unwrap().push(request);
+                Err(meerkat_core::mcp_attachment::McpAttachmentRefusal::Denied)
+            }
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let marker = temp.path().join("guarded-live-add-marker");
+        let refusing = Arc::new(Refusing::default());
+        let guards = meerkat::McpAttemptGuards::new(
+            Arc::clone(&refusing) as Arc<dyn meerkat::McpAttemptGuardFactory>,
+            meerkat::McpAttemptGuardBounds::DEFAULT,
+        );
+        let factory = temp_factory(&temp).with_mcp_attempt_guards(guards.clone());
+        let runtime = make_runtime(factory, 10);
+        let session_id = runtime
+            .create_session(mock_build_config(), None, None, Vec::new())
+            .await
+            .unwrap();
+        let adapter = runtime
+            .mcp_sessions
+            .read()
+            .await
+            .get(&session_id)
+            .map(|state| Arc::clone(&state.adapter))
+            .expect("the session's live MCP adapter");
+
+        adapter
+            .stage_add(McpServerConfig::stdio(
+                "guarded-live-add",
+                "/bin/sh",
+                vec!["-c".into(), "printf entered > \"$MARKER\"".into()],
+                HashMap::from([("MARKER".into(), marker.display().to_string())]),
+            ))
+            .await
+            .unwrap();
+        adapter.apply_staged().await.unwrap();
+        let deltas = adapter
+            .wait_until_ready(Duration::from_secs(15))
+            .await
+            .unwrap();
+
+        assert!(
+            deltas.iter().any(|delta| {
+                delta.target == "guarded-live-add"
+                    && delta.phase == meerkat_core::ExternalToolDeltaPhase::Failed
+            }),
+            "the host's guard refuses the live add: {deltas:?}"
+        );
+        assert!(
+            !marker.exists(),
+            "a refused live add never starts the server process"
+        );
+        let requests = refusing.0.lock().unwrap().clone();
+        assert_eq!(requests.len(), 1, "the guard began once: {requests:?}");
+        assert_eq!(requests[0].key.server, "guarded-live-add");
+        assert_eq!(requests[0].key.construction, adapter.construction_id());
+        assert_eq!(requests[0].owner.session_id, session_id);
+        adapter.shutdown().await;
+        let _ = guards
+            .close_and_join(tokio::time::Instant::now() + Duration::from_secs(10))
+            .await;
     }
 
     #[cfg(feature = "mcp")]

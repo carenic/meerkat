@@ -2186,12 +2186,21 @@ impl McpRouter {
     /// exactly once, after both the attempt's open outcome and its process
     /// end are known. Only stdio attempts are guarded: remote (HTTP and
     /// SSE) attempts are neither guarded nor refused by it.
+    ///
+    /// A router takes one installation: a second call is refused (it
+    /// changes nothing, and the first installation and owner stand).
     #[must_use]
     pub fn with_attempt_guards(
         mut self,
         guards: crate::McpAttemptGuards,
         owner: crate::McpConstructionOwner,
     ) -> Self {
+        if self.attempt_guards.is_some() {
+            tracing::warn!(
+                "MCP attempt guards are already installed on this router; the first installation stands"
+            );
+            return self;
+        }
         let guards = crate::attempt_guard::RouterGuards::new(&guards, self.construction, owner);
         self.close_index.set_attempt_guards(&guards);
         self.attempt_guards = Some(guards);
@@ -3788,6 +3797,11 @@ impl McpRouter {
             McpError::ServiceSecretRefused { refusal, .. } => Some(refusal.clone()),
             _ => None,
         });
+        // A guard's or the attachment control's refusal stays typed.
+        let attachment_refusal = result.as_ref().err().and_then(|error| match error {
+            McpError::AttachmentRefused(refusal) => Some(refusal.clone()),
+            _ => None,
+        });
         let connect_error = result.as_ref().err().map(ToString::to_string);
         let snapshot_alignment = self.process_pending_result(PendingResult {
             obligation,
@@ -3814,6 +3828,9 @@ impl McpRouter {
                 server: server_name,
                 refusal,
             });
+        }
+        if let Some(refusal) = attachment_refusal {
+            return Err(McpError::AttachmentRefused(refusal));
         }
         if let Some(message) = connect_error {
             return Err(McpError::ProtocolError { message });

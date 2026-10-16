@@ -26,10 +26,10 @@
 //! Before the next begin for the same owner (mob member, else session) and
 //! server, core awaits, bounded, every running begin and every started
 //! finish for that pair; it never waits for a guard whose process is still
-//! alive. A prior finish still running past the settle bound refuses the
-//! new attempt ([`McpAttemptRefusal::PriorGuardUnsettled`]). Router shutdown
-//! awaits the router's own begins and finishes, bounded, and reports them
-//! ([`crate::McpRouterShutdownReport::guards`]); the host's
+//! alive. A prior begin or finish still running past the settle bound
+//! refuses the new attempt ([`McpAttemptRefusal::PriorGuardUnsettled`]).
+//! Router shutdown awaits the router's own begins and finishes, bounded, and
+//! reports them ([`crate::McpRouterShutdownReport::guards`]); the host's
 //! [`McpAttemptGuards::close_and_join`] awaits the rest, those of dropped
 //! routers included, and must run before the tokio runtime shuts down.
 
@@ -190,10 +190,11 @@ impl McpAttemptCancellation {
 }
 
 /// A host's guard factory, asked once per stdio attempt before anything of
-/// it runs. `Err` refuses the attempt with nothing spawned; `Ok(None)` lets
-/// it proceed unguarded (no finish is ever called for it). `cancel` is
-/// requested when the attempt stops waiting; the begin is never dropped,
-/// and a guard it returns after that is cancelled at once.
+/// it runs. `Err` refuses the attempt with nothing spawned (the begin's
+/// record carries [`McpAttemptRefusal::Guard`]); `Ok(None)` lets it proceed
+/// unguarded (no finish is ever called for it). `cancel` is requested while
+/// the attempt waits for this answer, when it stops waiting; the begin is
+/// never dropped, and a guard it returns after that is cancelled at once.
 ///
 /// Begin is called only for stdio attempts: remote (HTTP and SSE) attempts
 /// are neither guarded nor refused by the factory.
@@ -209,7 +210,9 @@ pub trait McpAttemptGuardFactory: Send + Sync {
 /// One begun attempt's guard. Exactly one of its methods is called, exactly
 /// once: `settle` when the attempt's connection was installed, `cancel` for
 /// every other outcome, once both the open outcome and the process end are
-/// known.
+/// known. The open outcome is fixed when the router processes the attempt's
+/// result (its next poll, apply, wait or shutdown), so a failed attempt's
+/// `cancel` follows that processing, not the failure itself.
 #[async_trait::async_trait]
 pub trait McpAttemptGuard: Send {
     async fn settle(
@@ -283,7 +286,7 @@ pub enum McpAttemptNotInstalled {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum McpAttemptRefusal {
-    /// The guard factory.
+    /// The guard factory (recorded on the begin; no guard is finished).
     Guard,
     /// The attachment control at the physical entry.
     Control,
@@ -293,8 +296,8 @@ pub enum McpAttemptRefusal {
     ServiceSecret,
     /// The server's configuration.
     InvalidConfig,
-    /// A prior guard of the same owner and server was still finishing past
-    /// the settle bound.
+    /// A prior begin or finish of the same owner and server was still
+    /// running past the settle bound.
     PriorGuardUnsettled,
 }
 
@@ -333,8 +336,9 @@ pub enum McpGuardCompletion {
     TimedOut,
     /// It panicked.
     Panicked,
-    /// A begin was not called (the installation was closed, or a prior
-    /// guard was unsettled), or it returned after its attempt was cancelled.
+    /// A begin was not called (its router or the installation was closed,
+    /// its attempt stopped waiting, or a prior guard was unsettled), or it
+    /// returned after its attempt was cancelled.
     Cancelled,
     /// The guard's process was still alive, so its finish had not started.
     Held,
@@ -360,14 +364,40 @@ pub struct McpAttemptGuardBounds {
     settle: Duration,
 }
 
+/// One of the three [`McpAttemptGuardBounds`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum McpAttemptGuardBound {
+    Begin,
+    Cancel,
+    Settle,
+}
+
+impl std::fmt::Display for McpAttemptGuardBound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Begin => "begin",
+            Self::Cancel => "cancel",
+            Self::Settle => "settle",
+        })
+    }
+}
+
 /// A refused [`McpAttemptGuardBounds`] value.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("MCP attempt guard {bound} bound of {value:?} exceeds the {max:?} maximum")]
-pub struct McpAttemptGuardBoundsError {
-    /// `"begin"`, `"cancel"` or `"settle"`.
-    pub bound: &'static str,
-    pub value: Duration,
-    pub max: Duration,
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum McpAttemptGuardBoundsError {
+    /// A zero bound: a zero begin bound would cancel every attempt, and a
+    /// zero cancel or settle bound would never wait.
+    #[error("MCP attempt guard {bound} bound must be greater than zero")]
+    Zero { bound: McpAttemptGuardBound },
+    /// A bound above [`McpAttemptGuardBounds::MAX`].
+    #[error("MCP attempt guard {bound} bound of {value:?} exceeds the {max:?} maximum")]
+    TooLong {
+        bound: McpAttemptGuardBound,
+        value: Duration,
+        max: Duration,
+    },
 }
 
 impl McpAttemptGuardBounds {
@@ -380,16 +410,23 @@ impl McpAttemptGuardBounds {
         settle: Duration::from_secs(5),
     };
 
-    /// Bounds with these durations. A bound above [`Self::MAX`] is refused,
-    /// not clamped.
+    /// Bounds with these durations. A zero bound, or one above
+    /// [`Self::MAX`], is refused, not clamped.
     pub fn new(
         begin: Duration,
         cancel: Duration,
         settle: Duration,
     ) -> Result<Self, McpAttemptGuardBoundsError> {
-        for (bound, value) in [("begin", begin), ("cancel", cancel), ("settle", settle)] {
+        for (bound, value) in [
+            (McpAttemptGuardBound::Begin, begin),
+            (McpAttemptGuardBound::Cancel, cancel),
+            (McpAttemptGuardBound::Settle, settle),
+        ] {
+            if value.is_zero() {
+                return Err(McpAttemptGuardBoundsError::Zero { bound });
+            }
             if value > Self::MAX {
-                return Err(McpAttemptGuardBoundsError {
+                return Err(McpAttemptGuardBoundsError::TooLong {
                     bound,
                     value,
                     max: Self::MAX,
@@ -485,41 +522,75 @@ impl McpAttemptGuards {
     }
 
     /// Close the installation and join what it started, by `deadline`: new
-    /// begins are refused, running begins are cancelled
+    /// begins are refused, begins still waiting are cancelled
     /// ([`McpAttemptCancelCause::InstallationClosed`]), and every tracked
-    /// begin and finish (those of dropped routers, and those a router
-    /// shutdown already reported, included) is awaited and reported. A call
-    /// still running at `deadline` is reported
-    /// [`McpGuardCompletion::TimedOut`] (it is not dropped); a guard whose
-    /// process is still alive is reported [`McpGuardCompletion::Held`].
-    /// Completed calls are then forgotten. Run it before the tokio runtime
-    /// shuts down: calls spawned on a runtime that has shut down never run.
+    /// begin and finish is awaited and reported once, those of dropped
+    /// routers and those a router shutdown already reported included. A call
+    /// that starts while it waits (a finish whose process ends meanwhile) is
+    /// joined too. A call still running at `deadline` is reported
+    /// [`McpGuardCompletion::TimedOut`] (it is not dropped, and a later call
+    /// reports its end); a guard whose process is still alive is reported
+    /// [`McpGuardCompletion::Held`]. The calls reported as ended are then
+    /// forgotten. Run it before the tokio runtime shuts down: calls spawned
+    /// on a runtime that has shut down never run.
     pub async fn close_and_join(
         &self,
         deadline: tokio::time::Instant,
     ) -> Vec<McpGuardCompletionRecord> {
         let routers = {
             let mut state = lock(&self.0.state);
+            // Begins are tracked under this lock: every begin is either
+            // tracked by now, and joined below, or refused.
             state.closed = true;
             state.routers.clone()
         };
         for router in routers.iter().filter_map(Weak::upgrade) {
             router.close(McpAttemptCancelCause::InstallationClosed);
         }
-        let mut reported = Vec::new();
-        let begins = self.0.tracked(|task| task.stage == McpGuardStage::Begin);
-        reported.extend(join_tasks(&begins, deadline).await);
-        let finishes = self.0.tracked(|task| task.stage != McpGuardStage::Begin);
-        reported.extend(join_tasks(&finishes, deadline).await);
-        reported.extend(self.0.held(|_| true));
-        self.0.forget_completed();
-        reported
+        let joined = self
+            .0
+            .join(&|_: &McpAttemptKey| true, deadline, JoinBy::At(deadline))
+            .await;
+        self.0.forget(&joined.ended);
+        joined.records
     }
 }
 
+/// When a join stops waiting for finishes.
+#[derive(Clone, Copy)]
+enum JoinBy {
+    /// At this instant.
+    At(tokio::time::Instant),
+    /// This long after the join's first begins were joined.
+    Within(Duration),
+}
+
+/// What one join reported.
+#[derive(Default)]
+struct Joined {
+    records: Vec<McpGuardCompletionRecord>,
+    /// The calls reported as ended (any completion but `TimedOut`).
+    ended: Vec<Arc<GuardTask>>,
+}
+
 impl Installation {
-    fn track(&self, task: &Arc<GuardTask>) {
+    /// Track a begin that is about to wait: refused once the installation
+    /// closed.
+    fn track_begin(&self, task: &Arc<GuardTask>) -> bool {
         let mut state = lock(&self.state);
+        if state.closed {
+            return false;
+        }
+        Self::push(&mut state, task);
+        true
+    }
+
+    /// Track a call: a finish, or a begin already complete.
+    fn track(&self, task: &Arc<GuardTask>) {
+        Self::push(&mut lock(&self.state), task);
+    }
+
+    fn push(state: &mut InstallationState, task: &Arc<GuardTask>) {
         state.tasks.push(Arc::clone(task));
         // Completed calls of dropped routers are kept for close_and_join, up
         // to a bound.
@@ -545,8 +616,8 @@ impl Installation {
         lock(&self.state).closed
     }
 
-    /// Every tracked call that `select`s.
-    fn tracked(&self, select: impl Fn(&GuardTask) -> bool) -> Vec<Arc<GuardTask>> {
+    /// Every tracked call that `select`s, in tracking order.
+    fn tracked(&self, select: impl Fn(&Arc<GuardTask>) -> bool) -> Vec<Arc<GuardTask>> {
         lock(&self.state)
             .tasks
             .iter()
@@ -556,7 +627,10 @@ impl Installation {
     }
 
     /// The guards still held (their finish not started) whose key `select`s.
-    fn held(&self, select: impl Fn(&McpAttemptKey) -> bool) -> Vec<McpGuardCompletionRecord> {
+    fn held(
+        &self,
+        select: &(dyn Fn(&McpAttemptKey) -> bool + Send + Sync),
+    ) -> Vec<McpGuardCompletionRecord> {
         let records: Vec<Arc<AttemptGuardRecord>> = {
             let mut state = lock(&self.state);
             state.records.retain(|record| record.strong_count() > 0);
@@ -569,22 +643,39 @@ impl Installation {
             .collect()
     }
 
-    /// Forget every completed call.
-    fn forget_completed(&self) {
+    /// Forget the calls a join reported as ended.
+    fn forget(&self, ended: &[Arc<GuardTask>]) {
+        if ended.is_empty() {
+            return;
+        }
         lock(&self.state)
             .tasks
-            .retain(|task| task.completion().is_none());
+            .retain(|task| !ended.iter().any(|ended| Arc::ptr_eq(ended, task)));
     }
 
-    /// Wait, at most `bound`, for every running begin and started finish of
-    /// `scope`; `false` if one is still running then.
-    async fn await_prior(&self, scope: &GuardScope, bound: Duration) -> bool {
-        let running: Vec<Arc<GuardTask>> = lock(&self.state)
-            .tasks
-            .iter()
-            .filter(|task| &task.scope == scope && task.completion().is_none())
-            .cloned()
-            .collect();
+    /// Wait, at most `bound`, for the running begins of `scope` tracked
+    /// before `own` (this attempt's begin) and its started finishes; `false`
+    /// if one is still running then. Begins tracked after `own` are not
+    /// awaited, so two waiting attempts never wait for each other.
+    async fn await_prior(&self, scope: &GuardScope, own: &Arc<GuardTask>, bound: Duration) -> bool {
+        let running: Vec<Arc<GuardTask>> = {
+            let state = lock(&self.state);
+            let mut before_own = true;
+            state
+                .tasks
+                .iter()
+                .filter(|task| {
+                    if Arc::ptr_eq(task, own) {
+                        before_own = false;
+                        return false;
+                    }
+                    &task.scope == scope
+                        && task.completion().is_none()
+                        && (before_own || task.stage != McpGuardStage::Begin)
+                })
+                .cloned()
+                .collect()
+        };
         let deadline = tokio::time::Instant::now() + bound;
         for task in running {
             if task.wait_until(deadline).await.is_none() {
@@ -594,22 +685,10 @@ impl Installation {
         true
     }
 
-    /// A call that was never made: its record is kept, completed at once.
-    fn note_not_called(
-        &self,
-        key: McpAttemptKey,
-        scope: GuardScope,
-        disposition: McpAttemptDisposition,
-    ) {
-        let task = GuardTask::new(key, scope, McpGuardStage::Begin, Some(disposition));
-        task.complete(McpGuardCompletion::Cancelled);
-        self.track(&task);
-    }
-
     /// Run one finish of `guard` (settle when the attempt was installed,
-    /// cancel otherwise) on `runtime`, tracked.
+    /// cancel otherwise) on `runtime`, tracked first.
     fn spawn_finish(
-        self: &Arc<Self>,
+        &self,
         runtime: &tokio::runtime::Handle,
         guard: Box<dyn McpAttemptGuard>,
         scope: GuardScope,
@@ -617,11 +696,87 @@ impl Installation {
     ) {
         let task = finish_task(&scope, &disposition);
         self.track(&task);
-        runtime.spawn(async move {
-            let completion = run_finish(guard, disposition).await;
-            task.complete(completion);
-        });
+        spawn_finish_task(runtime, task, guard, disposition);
     }
+
+    /// Await every tracked call `select` picks, begins by `begins_by` and
+    /// finishes by `finishes_by`, and report each once. Calls tracked while
+    /// it waits are joined in later passes; once a pass finds none, the
+    /// guards still held are reported. A finish is tracked before its
+    /// record lets go of the guard, so every guard is either held or
+    /// tracked at that point. Past both deadlines the join ends; a call that
+    /// starts later stays tracked for a later join.
+    async fn join(
+        &self,
+        select: &(dyn Fn(&McpAttemptKey) -> bool + Send + Sync),
+        begins_by: tokio::time::Instant,
+        finishes_by: JoinBy,
+    ) -> Joined {
+        let mut joined = Joined::default();
+        let mut seen: Vec<Arc<GuardTask>> = Vec::new();
+        let mut finishes_at = match finishes_by {
+            JoinBy::At(at) => Some(at),
+            JoinBy::Within(_) => None,
+        };
+        loop {
+            let pending = self.tracked(|task| {
+                select(&task.key) && !seen.iter().any(|done| Arc::ptr_eq(done, task))
+            });
+            let found = !pending.is_empty();
+            let (begins, finishes): (Vec<_>, Vec<_>) = pending
+                .into_iter()
+                .partition(|task| task.stage == McpGuardStage::Begin);
+            for task in begins {
+                report_joined(&mut joined, &task, begins_by).await;
+                seen.push(task);
+            }
+            let finish_deadline = *finishes_at.get_or_insert_with(|| match finishes_by {
+                JoinBy::At(at) => at,
+                JoinBy::Within(bound) => tokio::time::Instant::now() + bound,
+            });
+            for task in finishes {
+                report_joined(&mut joined, &task, finish_deadline).await;
+                seen.push(task);
+            }
+            let past = tokio::time::Instant::now() >= begins_by.max(finish_deadline);
+            if found && !past {
+                continue;
+            }
+            let held = self.held(select);
+            let late = self.tracked(|task| {
+                select(&task.key) && !seen.iter().any(|done| Arc::ptr_eq(done, task))
+            });
+            if late.is_empty() || past {
+                joined.records.extend(held);
+                return joined;
+            }
+        }
+    }
+}
+
+/// Wait for `task` until `by` and report it.
+async fn report_joined(joined: &mut Joined, task: &Arc<GuardTask>, by: tokio::time::Instant) {
+    let completion = task
+        .wait_until(by)
+        .await
+        .unwrap_or(McpGuardCompletion::TimedOut);
+    if completion != McpGuardCompletion::TimedOut {
+        joined.ended.push(Arc::clone(task));
+    }
+    joined.records.push(task.record(completion));
+}
+
+/// Run a tracked finish on `runtime`.
+fn spawn_finish_task(
+    runtime: &tokio::runtime::Handle,
+    task: Arc<GuardTask>,
+    guard: Box<dyn McpAttemptGuard>,
+    disposition: McpAttemptDisposition,
+) {
+    runtime.spawn(async move {
+        let completion = run_finish(guard, disposition).await;
+        task.complete(completion);
+    });
 }
 
 fn finish_task(scope: &GuardScope, disposition: &McpAttemptDisposition) -> Arc<GuardTask> {
@@ -656,21 +811,6 @@ async fn run_finish(
         Ok(Err(_)) => McpGuardCompletion::Failed,
         Err(_) => McpGuardCompletion::Panicked,
     }
-}
-
-/// Await `tasks` until `deadline` and record each: its completion, or
-/// `TimedOut` while it still runs (it is not dropped, and a later join
-/// reports its completion).
-async fn join_tasks(
-    tasks: &[Arc<GuardTask>],
-    deadline: tokio::time::Instant,
-) -> Vec<McpGuardCompletionRecord> {
-    let mut records = Vec::with_capacity(tasks.len());
-    for task in tasks {
-        let completion = task.wait_until(deadline).await;
-        records.push(task.record(completion.unwrap_or(McpGuardCompletion::TimedOut)));
-    }
-    records
 }
 
 /// The owner and server whose guards are awaited before a new begin: the
@@ -712,7 +852,9 @@ struct GuardTask {
     key: McpAttemptKey,
     scope: GuardScope,
     stage: McpGuardStage,
-    disposition: Option<McpAttemptDisposition>,
+    /// A finish's disposition, or a begin's own outcome once it is known (a
+    /// begin not called, or refused by the factory).
+    disposition: OnceLock<McpAttemptDisposition>,
     done: tokio::sync::watch::Sender<Option<McpGuardCompletion>>,
 }
 
@@ -723,17 +865,36 @@ impl GuardTask {
         stage: McpGuardStage,
         disposition: Option<McpAttemptDisposition>,
     ) -> Arc<Self> {
+        let recorded = OnceLock::new();
+        if let Some(disposition) = disposition {
+            let _ = recorded.set(disposition);
+        }
         Arc::new(Self {
             key,
             scope,
             stage,
-            disposition,
+            disposition: recorded,
             done: tokio::sync::watch::channel(None).0,
         })
     }
 
     fn complete(&self, completion: McpGuardCompletion) {
         self.done.send_replace(Some(completion));
+    }
+
+    /// Record a begin's own outcome, nothing spawned.
+    fn begin_outcome(&self, open: McpAttemptOpenOutcome) {
+        let _ = self.disposition.set(McpAttemptDisposition {
+            key: self.key.clone(),
+            open,
+            process: McpAttemptProcessEnd::NotSpawned,
+        });
+    }
+
+    /// A begin that was not called: its outcome, completed `Cancelled`.
+    fn not_called(&self, open: McpAttemptOpenOutcome) {
+        self.begin_outcome(open);
+        self.complete(McpGuardCompletion::Cancelled);
     }
 
     fn completion(&self) -> Option<McpGuardCompletion> {
@@ -752,7 +913,7 @@ impl GuardTask {
         McpGuardCompletionRecord {
             key: self.key.clone(),
             stage: self.stage,
-            disposition: self.disposition.clone(),
+            disposition: self.disposition.get().cloned(),
             completion,
         }
     }
@@ -837,20 +998,14 @@ impl RouterGuards {
     pub(crate) async fn join(&self) -> Vec<McpGuardCompletionRecord> {
         let construction = self.construction;
         let bounds = self.installation.bounds;
-        let mine = |task: &GuardTask| task.key.construction == construction;
-        let begins = self
-            .installation
-            .tracked(|task| mine(task) && task.stage == McpGuardStage::Begin);
-        let mut records = join_tasks(&begins, tokio::time::Instant::now() + bounds.cancel()).await;
-        let finishes = self
-            .installation
-            .tracked(|task| mine(task) && task.stage != McpGuardStage::Begin);
-        records.extend(join_tasks(&finishes, tokio::time::Instant::now() + bounds.settle()).await);
-        records.extend(
-            self.installation
-                .held(|key| key.construction == construction),
-        );
-        records
+        self.installation
+            .join(
+                &move |key: &McpAttemptKey| key.construction == construction,
+                tokio::time::Instant::now() + bounds.cancel(),
+                JoinBy::Within(bounds.settle()),
+            )
+            .await
+            .records
     }
 
     /// Begin the guard of one stdio attempt, before anything of it runs.
@@ -873,34 +1028,54 @@ impl RouterGuards {
         let scope = GuardScope::of(&self.owner, &server.name);
         let installation = &self.installation;
         let bounds = installation.bounds;
-        if let Some(cause) = self.closed_cause() {
-            installation.note_not_called(
-                key.clone(),
-                scope,
-                McpAttemptDisposition {
-                    key,
-                    open: McpAttemptOpenOutcome::Cancelled { cause },
-                    process: McpAttemptProcessEnd::NotSpawned,
-                },
-            );
-            return Err(unavailable());
-        }
-        if !installation.await_prior(&scope, bounds.settle()).await {
-            installation.note_not_called(
-                key.clone(),
-                scope,
-                McpAttemptDisposition {
-                    key,
-                    open: McpAttemptOpenOutcome::Refused {
-                        refusal: McpAttemptRefusal::PriorGuardUnsettled,
-                    },
-                    process: McpAttemptProcessEnd::NotSpawned,
-                },
-            );
+        // The begin is tracked from here, before it waits for prior guards,
+        // so a close that starts meanwhile waits for it and reports it. A
+        // closed installation tracks no new begin.
+        let task = GuardTask::new(key.clone(), scope.clone(), McpGuardStage::Begin, None);
+        if !installation.track_begin(&task) {
+            task.not_called(McpAttemptOpenOutcome::Cancelled {
+                cause: McpAttemptCancelCause::InstallationClosed,
+            });
+            installation.track(&task);
             return Err(unavailable());
         }
         let cancel = McpAttemptCancellation::new();
-        self.register_attempt(&cancel);
+        let pending = PendingBegin {
+            task: Some(Arc::clone(&task)),
+            cancel: cancel.clone(),
+        };
+        // While the attempt waits, its router's close requests the
+        // cancellation (at once when the router is already closed).
+        let _registered = self.register_attempt(&cancel);
+        if let Some(cause) = cancel.cause() {
+            pending.not_called(McpAttemptOpenOutcome::Cancelled { cause });
+            return Err(unavailable());
+        }
+        let prior = tokio::select! {
+            biased;
+            cause = cancel.requested() => Err(cause),
+            settled = installation.await_prior(&scope, &task, bounds.settle()) => Ok(settled),
+        };
+        match prior {
+            Err(cause) => {
+                pending.not_called(McpAttemptOpenOutcome::Cancelled { cause });
+                return Err(unavailable());
+            }
+            Ok(false) => {
+                pending.not_called(McpAttemptOpenOutcome::Refused {
+                    refusal: McpAttemptRefusal::PriorGuardUnsettled,
+                });
+                return Err(unavailable());
+            }
+            Ok(true) => {}
+        }
+        if let Some(cause) = cancel.cause() {
+            pending.not_called(McpAttemptOpenOutcome::Cancelled { cause });
+            return Err(unavailable());
+        }
+        let Some(task) = pending.call() else {
+            return Err(unavailable());
+        };
         let runtime = tokio::runtime::Handle::current();
         let (handoff, delivered) = tokio::sync::oneshot::channel();
         spawn_begin(
@@ -915,6 +1090,7 @@ impl RouterGuards {
             cancel.clone(),
             handoff,
             scope.clone(),
+            task,
         );
         let mut waiting = BeginWait {
             delivered: Some(delivered),
@@ -984,15 +1160,20 @@ impl RouterGuards {
         }
     }
 
-    fn register_attempt(&self, cancel: &McpAttemptCancellation) {
+    fn register_attempt(&self, cancel: &McpAttemptCancellation) -> AttemptRegistration<'_> {
+        let attempt = cancel.downgrade();
         let closed = {
             let mut attempts = lock(&self.attempts);
             attempts.retain(|attempt| attempt.strong_count() > 0);
-            attempts.push(cancel.downgrade());
+            attempts.push(attempt.clone());
             self.closed_cause()
         };
         if let Some(cause) = closed {
             cancel.request(cause);
+        }
+        AttemptRegistration {
+            router: self,
+            attempt,
         }
     }
 
@@ -1010,6 +1191,56 @@ impl RouterGuards {
         }
         if let Some(cause) = closed {
             record.open(McpAttemptOpenOutcome::Cancelled { cause });
+        }
+    }
+}
+
+/// A waiting attempt's cancellation, registered with its router: dropped,
+/// it deregisters, so a later close never requests the token of an attempt
+/// that is no longer waiting for its begin.
+struct AttemptRegistration<'a> {
+    router: &'a RouterGuards,
+    attempt: Weak<CancellationInner>,
+}
+
+impl Drop for AttemptRegistration<'_> {
+    fn drop(&mut self) {
+        lock(&self.router.attempts)
+            .retain(|attempt| !attempt.ptr_eq(&self.attempt) && attempt.strong_count() > 0);
+    }
+}
+
+/// One attempt's tracked begin until it is called. Dropped first (its
+/// attempt's task dropped while it waits for prior guards), it requests the
+/// attempt's cancellation and records the begin not called.
+struct PendingBegin {
+    task: Option<Arc<GuardTask>>,
+    cancel: McpAttemptCancellation,
+}
+
+impl PendingBegin {
+    fn not_called(mut self, open: McpAttemptOpenOutcome) {
+        if let Some(task) = self.task.take() {
+            task.not_called(open);
+        }
+    }
+
+    /// The begin is called: its task is the begin's from here.
+    fn call(mut self) -> Option<Arc<GuardTask>> {
+        self.task.take()
+    }
+}
+
+impl Drop for PendingBegin {
+    fn drop(&mut self) {
+        if let Some(task) = self.task.take() {
+            self.cancel.request(McpAttemptCancelCause::AttemptDropped);
+            task.not_called(McpAttemptOpenOutcome::Cancelled {
+                cause: self
+                    .cancel
+                    .cause()
+                    .unwrap_or(McpAttemptCancelCause::AttemptDropped),
+            });
         }
     }
 }
@@ -1060,9 +1291,10 @@ pub(crate) fn open_for_error(
 
 type BeginAnswer = Result<Option<Box<dyn McpAttemptGuard>>, McpAttachmentRefusal>;
 
-/// Run one begin on `runtime`, tracked and never dropped. Its answer goes to
-/// the waiting attempt; when the attempt is gone, a guard it returns is
-/// cancelled here, in the begin's own task, before the begin is complete.
+/// Run the attempt's tracked begin (`task`) on `runtime`, never dropped. Its
+/// answer goes to the waiting attempt; when the attempt is gone, a guard it
+/// returns is cancelled here, in the begin's own task, before the begin is
+/// complete. A refusal is recorded on the begin as `Refused{Guard}`.
 fn spawn_begin(
     installation: &Arc<Installation>,
     runtime: &tokio::runtime::Handle,
@@ -1070,16 +1302,20 @@ fn spawn_begin(
     cancel: McpAttemptCancellation,
     handoff: tokio::sync::oneshot::Sender<BeginAnswer>,
     scope: GuardScope,
+    task: Arc<GuardTask>,
 ) {
     let key = request.key.clone();
-    let task = GuardTask::new(key.clone(), scope.clone(), McpGuardStage::Begin, None);
-    installation.track(&task);
     let factory = Arc::clone(&installation.factory);
     let installation = Arc::clone(installation);
     runtime.spawn(async move {
         let began = AssertUnwindSafe(factory.begin(request, cancel.clone()))
             .catch_unwind()
             .await;
+        if let Ok(Err(_)) = &began {
+            task.begin_outcome(McpAttemptOpenOutcome::Refused {
+                refusal: McpAttemptRefusal::Guard,
+            });
+        }
         let completion = match began {
             Err(_) => McpGuardCompletion::Panicked,
             Ok(answer) => match handoff.send(answer) {
@@ -1219,17 +1455,17 @@ impl AttemptGuardRecord {
         let Some(guard) = state.guard.take() else {
             return;
         };
+        let disposition = McpAttemptDisposition {
+            key: self.key.clone(),
+            open,
+            process,
+        };
+        // Tracked before the record lets go of its guard: a join sees the
+        // guard either held or tracked, never neither.
+        let task = finish_task(&self.scope, &disposition);
+        self.installation.track(&task);
         drop(state);
-        self.installation.spawn_finish(
-            &self.runtime,
-            guard,
-            self.scope.clone(),
-            McpAttemptDisposition {
-                key: self.key.clone(),
-                open,
-                process,
-            },
-        );
+        spawn_finish_task(&self.runtime, task, guard, disposition);
     }
 
     /// A record of this guard while it is still held (its finish not

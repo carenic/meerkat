@@ -679,6 +679,16 @@ pub use meerkat_mcp::{
     McpLocalTermination, McpReloadTarget, McpRemoteSession, McpRouter, McpRouterAdapter,
     McpServerLifecycleState, McpStdioLaunchProfile, ReleasedCredential,
 };
+// The host's MCP attempt guards ([`AgentFactory::with_mcp_attempt_guards`]).
+#[cfg(feature = "mcp")]
+pub use meerkat_mcp::{
+    McpAttemptCancelCause, McpAttemptCancellation, McpAttemptDisposition, McpAttemptGuard,
+    McpAttemptGuardBound, McpAttemptGuardBounds, McpAttemptGuardBoundsError,
+    McpAttemptGuardFactory, McpAttemptGuardRequest, McpAttemptGuards, McpAttemptKey,
+    McpAttemptNotInstalled, McpAttemptOpenOutcome, McpAttemptOperation, McpAttemptProcessEnd,
+    McpAttemptRefusal, McpConstructionId, McpConstructionOwner, McpGuardCompletion,
+    McpGuardCompletionRecord, McpGuardFinishError, McpGuardStage,
+};
 #[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
 mod connector_mcp;
 #[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
