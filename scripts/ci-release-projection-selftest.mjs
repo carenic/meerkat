@@ -518,6 +518,7 @@ if (args[0] === "api") {
   const gateEnv = {
     CHANGES_RESULT: "success", FMT_GOVERNANCE_RESULT: "success", RATCHETS_RESULT: "success",
     TLC_AUDITS_RESULT: "skipped", MACHINE_AUTHORITY: "false", CLIPPY_RESULT: "skipped",
+    GOVERNANCE_GATES_RESULT: "skipped", GOVERNANCE_GATES: "false",
     UNIT_RESULT: "success", INTEGRATION_RESULT: "skipped", GOVERNED_JSONL_RESULT: "skipped",
     MCP_CONFINEMENT_POSITIVE_RESULT: "skipped", INTEGRATION_COUNT: "0", CLOSURE_TESTS_RESULT: "skipped",
     CLOSURE_TEST_COUNT: "0", TEST_SCOPE_COUNT: "0", HOOK_BINARY_COUNT: "0", HOOK_RETAINED_COUNT: "0",
@@ -543,6 +544,8 @@ if (args[0] === "api") {
   );
   for (const [label, change] of [
     ["a failed ratchet", { RATCHETS_RESULT: "failure" }],
+    ["a failed governance gate", { GOVERNANCE_GATES_RESULT: "failure" }],
+    ["a governance change whose gates did not run", { GOVERNANCE_GATES: "true" }],
     ["a failed Bazel graph check", { BAZEL_GRAPH_RESULT: "failure" }],
     ["a projection plan with Rust lanes", { RUST_CHANGED: "true" }],
     ["a projection plan whose reader rows did not run", { CLOSURE_TEST_COUNT: "2" }],

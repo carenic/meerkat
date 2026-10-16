@@ -1031,6 +1031,23 @@ function isExampleWebPath(path) {
   return EXAMPLE_WEB_DIRS.some((dir) => path.startsWith(dir)) && !/\.(md|mdx)$/.test(path);
 }
 
+// The typed governance gates (effect-authority, ownership-ledger, strict
+// RMAT, strict seam inventory, runtime authority bypass, machine-authority
+// docs) run on the agent gate's governance paths (scripts/cargo-agent-gate,
+// is_governance_path): the machine-authority paths and these dogma
+// documents. The self-test keeps the two lists equal.
+export const GOVERNANCE_DOC_PATTERNS = [
+  ".claude/skills/meerkat-dogma-inquisition/*",
+  "docs/architecture/meerkat-dogma.md",
+  "docs/architecture/meerkat-dogma-commentary.md",
+  "docs/internal/dogma-audits/*",
+];
+function isGovernanceDocPath(path) {
+  return GOVERNANCE_DOC_PATTERNS.some((pattern) =>
+    pattern.endsWith("/*") ? path.startsWith(pattern.slice(0, -1)) : path === pattern,
+  );
+}
+
 // Paths whose change alters the compile graph of every package.
 function isGlobalPath(path) {
   if (
@@ -1499,6 +1516,7 @@ function plan(args) {
     generated_contract: false,
     machine_authority: false,
     machine_posters: false,
+    governance_gates: false,
     wasm: false,
     sdk_host: false,
     bazel_graph: false,
@@ -1580,6 +1598,7 @@ function plan(args) {
     result.generated_contract = true;
     result.machine_authority = false;
     result.machine_posters = false;
+    result.governance_gates = false;
     result.sdk_host = false;
     result.wasm = false;
     result.removed_paths = [];
@@ -1590,6 +1609,7 @@ function plan(args) {
     result.generated_contract = runClassifier("scripts/generated-contract-ratchet-changed", changed);
     result.machine_authority = runClassifier("scripts/machine-authority-changed", changed);
     result.machine_posters = runClassifier("scripts/machine-posters-changed", changed);
+    result.governance_gates = result.machine_authority || changed.some(isGovernanceDocPath);
     result.sdk_host = changed.some(
       (path) =>
         path.startsWith("sdks/python/") ||
@@ -1614,6 +1634,7 @@ function plan(args) {
     result.generated_contract = true;
     result.machine_authority = true;
     result.machine_posters = true;
+    result.governance_gates = true;
     result.sdk_host = true;
     result.wasm = true;
     result.bazel_graph = true;
@@ -2146,6 +2167,7 @@ function githubOutput(result) {
   scalar("generated_contract", String(result.generated_contract));
   scalar("machine_authority", String(result.machine_authority));
   scalar("machine_posters", String(result.machine_posters));
+  scalar("governance_gates", String(result.governance_gates));
   scalar("wasm", String(result.wasm));
   scalar("sdk_host", String(result.sdk_host));
   scalar("bazel_graph", String(result.bazel_graph));

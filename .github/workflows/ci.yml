@@ -18,9 +18,11 @@ name: CI
 #                     ripgrep tombstone scans (legacy surface names,
 #                     session-control routes, deprecated backend)
 #   ratchets        - generated-contract freshness when contract paths
-#                     changed; machine/protocol drift and the typed governance
-#                     gates (rmat-audit, seam-inventory, runtime authority,
-#                     machine-authority docs) when machine authority changed
+#                     changed; machine/protocol drift when machine authority
+#                     changed
+#   governance-gates - the typed governance gates (rmat-audit, seam-inventory,
+#                     runtime authority, machine-authority docs) when machine
+#                     authority or a dogma document changed
 #   tlc-audits      - (x3) the hand-written TLC audit shards on a
 #                     machine-authority change
 #   clippy (xN)     - one lane per shard of directly changed packages:
@@ -275,6 +277,7 @@ jobs:
       generated_contract: ${{ steps.plan.outputs.generated_contract }}
       machine_authority: ${{ steps.plan.outputs.machine_authority }}
       machine_posters: ${{ steps.plan.outputs.machine_posters }}
+      governance_gates: ${{ steps.plan.outputs.governance_gates }}
       wasm: ${{ steps.plan.outputs.wasm }}
       sdk_host: ${{ steps.plan.outputs.sdk_host }}
       bazel_graph: ${{ steps.plan.outputs.bazel_graph }}
@@ -667,16 +670,6 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
-      # The typed governance gates over the live workspace, on a
-      # machine-authority change: the effect-authority, ownership-ledger and
-      # strict RMAT audits, the strict seam inventory, the runtime authority
-      # bypass audit and the machine-authority docs alignment test. The
-      # pre-push hook's changed-path ratchets ran these before every such
-      # push; the hook no longer runs them, and no other per-push lane does.
-      - name: Typed governance gates (machine authority changed)
-        if: ${{ needs.changes.outputs.machine_authority == 'true' }}
-        run: make rmat-audit seam-inventory runtime-authority-bypass machine-authority-docs-gate
-
       # The posters render the canonical machine catalog, TLA specs and
       # contracts. The gate used to run only in cargo.yml, which nothing calls,
       # so the script's paths and the rendered HTML drifted unnoticed. It
@@ -688,6 +681,54 @@ jobs:
       - name: Verify machine poster coverage and freshness
         if: ${{ needs.changes.outputs.machine_authority == 'true' || needs.changes.outputs.machine_posters == 'true' }}
         run: make verify-machine-poster-coverage
+
+  # The typed governance gates over the live workspace: the effect-authority,
+  # ownership-ledger and strict RMAT audits, the strict seam inventory, the
+  # runtime authority bypass audit and the machine-authority docs alignment
+  # test. They run on the agent gate's governance paths (machine authority
+  # or a dogma document; governance_gates in scripts/ci-cargo-lanes.mjs),
+  # where the pre-push hook's changed-path ratchets ran them before every
+  # push; the hook no longer runs them, and no other per-push lane does. A
+  # job of its own, beside `ratchets`: they took 400 s locally, 114 s of it
+  # building xtask, which after the drift checks would hold the ratchets job
+  # past the pull-request lane target.
+  governance-gates:
+    name: Typed governance gates
+    needs: changes
+    if: ${{ needs.changes.outputs.governance_gates == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      RUSTC_WRAPPER: sccache
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Rust
+        uses: ./.github/actions/setup-rust-ci
+
+      - name: Setup sccache
+        uses: ./.github/actions/setup-sccache-ci
+        with:
+          bucket: ${{ env.SCCACHE_GCS_BUCKET_NAME }}
+          workload_identity_provider: ${{ vars.MEERKAT_GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.MEERKAT_GCP_SERVICE_ACCOUNT }}
+          project_id: ${{ vars.MEERKAT_GCP_PROJECT_ID }}
+          key_prefix: sccache/${{ env.RUSTUP_TOOLCHAIN }}/linux-x64
+
+      - name: Setup mold linker
+        uses: rui314/setup-mold@v1
+
+      - name: Cache cargo registry
+        uses: Swatinem/rust-cache@v2
+        with:
+          # Registry only; compiled objects come from sccache (see ratchets).
+          shared-key: ci-registry
+          cache-targets: "false"
+          cache-on-failure: true
+
+      - name: Typed governance gates
+        run: make rmat-audit seam-inventory runtime-authority-bypass machine-authority-docs-gate
 
   # Bounded TLC on machine-authority changes. The hand-written audits model
   # check the generated machines against their invariants and goals (drift
@@ -2123,6 +2164,7 @@ jobs:
       - changes
       - fmt-governance
       - ratchets
+      - governance-gates
       - tlc-audits
       - clippy
       - unit
@@ -2151,6 +2193,8 @@ jobs:
           RATCHETS_RESULT: ${{ needs.ratchets.result }}
           TLC_AUDITS_RESULT: ${{ needs.tlc-audits.result }}
           MACHINE_AUTHORITY: ${{ needs.changes.outputs.machine_authority }}
+          GOVERNANCE_GATES_RESULT: ${{ needs.governance-gates.result }}
+          GOVERNANCE_GATES: ${{ needs.changes.outputs.governance_gates }}
           CLIPPY_RESULT: ${{ needs.clippy.result }}
           UNIT_RESULT: ${{ needs.unit.result }}
           INTEGRATION_RESULT: ${{ needs.integration.result }}
@@ -2222,7 +2266,7 @@ jobs:
           if [[ -n "${DEFERRED_TO_PUSH}" ]]; then
             echo "::notice::left to the push (main or release/**): ${DEFERRED_TO_PUSH}"
           fi
-          echo "changes=${CHANGES_RESULT} fmt-governance=${FMT_GOVERNANCE_RESULT} ratchets=${RATCHETS_RESULT} tlc-audits=${TLC_AUDITS_RESULT}"
+          echo "changes=${CHANGES_RESULT} fmt-governance=${FMT_GOVERNANCE_RESULT} ratchets=${RATCHETS_RESULT} governance-gates=${GOVERNANCE_GATES_RESULT} tlc-audits=${TLC_AUDITS_RESULT}"
           echo "clippy=${CLIPPY_RESULT} unit=${UNIT_RESULT} governed-jsonl=${GOVERNED_JSONL_RESULT} mcp-confinement-positive=${MCP_CONFINEMENT_POSITIVE_RESULT} integration=${INTEGRATION_RESULT} (${INTEGRATION_COUNT} suites) closure-tests=${CLOSURE_TESTS_RESULT} (${CLOSURE_TEST_COUNT} rows, ${HOOK_BINARY_COUNT} hook binaries, ${HOOK_RETAINED_COUNT} of them lib binaries left to the main and nightly unit lanes, ${TEST_SCOPE_COUNT}-package scope) main-unit=${MAIN_UNIT_RESULT} closure-check=${CLOSURE_CHECK_RESULT} feature-check=${FEATURE_CHECK_RESULT} wasm-check=${WASM_CHECK_RESULT} sdk-host=${SDK_HOST_RESULT} example-web=${EXAMPLE_WEB_RESULT} wasm-timers=${WASM_TIMERS_RESULT} bazel-graph=${BAZEL_GRAPH_RESULT}"
           failed=0
           require_success() {
@@ -2284,6 +2328,11 @@ jobs:
             require_ran "Bounded TLC audits" "${TLC_AUDITS_RESULT}"
           else
             forbid_failure "Bounded TLC audits" "${TLC_AUDITS_RESULT}"
+          fi
+          if [[ "${GOVERNANCE_GATES}" == "true" ]]; then
+            require_ran "Typed governance gates" "${GOVERNANCE_GATES_RESULT}"
+          else
+            forbid_failure "Typed governance gates" "${GOVERNANCE_GATES_RESULT}"
           fi
           if [[ "${RUST_CHANGED}" == "true" ]]; then
             if ! [[ "${SHARD_COUNT}" =~ ^[0-9]+$ ]] || (( SHARD_COUNT < 1 )); then

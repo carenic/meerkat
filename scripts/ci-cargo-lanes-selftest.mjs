@@ -20,7 +20,7 @@ import {
   profileFilter,
   workspaceFeatures,
 } from "./ci-hook-coverage.mjs";
-import { lockScope, parseCargoLock } from "./ci-cargo-lanes.mjs";
+import { GOVERNANCE_DOC_PATTERNS, lockScope, parseCargoLock } from "./ci-cargo-lanes.mjs";
 import { readMetadata, workspacePackages } from "./rust-test-selector.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -696,6 +696,37 @@ for (const path of [
   assert.equal(plan.machine_posters, true);
 }
 
+// The typed governance gates run on the agent gate's governance paths: the
+// machine-authority paths and the dogma documents (scripts/cargo-agent-gate,
+// is_governance_path), which ran them in the pre-push hook's ratchets.
+{
+  assert.equal(planFor(["specs/machines/meerkat_machine/model.tla"]).governance_gates, true, "machine authority runs the governance gates");
+  for (const path of [
+    ".claude/skills/meerkat-dogma-inquisition/SKILL.md",
+    "docs/architecture/meerkat-dogma.md",
+    "docs/architecture/meerkat-dogma-commentary.md",
+    "docs/internal/dogma-audits/PR759-final-ledger.md",
+  ]) {
+    const plan = planFor([path]);
+    assert.equal(plan.governance_gates, true, `${path} runs the governance gates`);
+    assert.equal(plan.machine_authority, false, `${path} is not machine authority`);
+  }
+  for (const path of ["docs/architecture/meerkat-dogma-notes.md", ".claude/skills/meerkat-architecture/SKILL.md", "docs/internal/machine-posters/mob_machine.html"]) {
+    assert.equal(planFor([path]).governance_gates, false, `${path} does not run the governance gates`);
+  }
+  const gate = readFileSync(resolve(root, "scripts/cargo-agent-gate"), "utf8");
+  const start = gate.indexOf("is_governance_path() {");
+  assert.ok(start >= 0, "scripts/cargo-agent-gate defines is_governance_path");
+  const body = gate.slice(start, gate.indexOf("\n}\n", start));
+  assert.ok(body.includes("scripts/machine-authority-changed"), "the agent gate's governance paths start from machine authority");
+  const patterns = body
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => /^[^#(]\S*\)$/.test(line))
+    .flatMap((line) => line.slice(0, -1).split("|"));
+  assert.deepEqual(patterns, GOVERNANCE_DOC_PATTERNS, "the classifier's governance documents are the agent gate's");
+}
+
 // A generated machine kernel is both machine authority and a Rust source
 // owned by meerkat-machine-kernels.
 {
@@ -814,6 +845,7 @@ for (const path of [
     "generated_contract",
     "machine_authority",
     "machine_posters",
+    "governance_gates",
     "wasm",
     "sdk_host",
     "bazel_graph",

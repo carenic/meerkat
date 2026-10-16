@@ -55,10 +55,10 @@ them.
   it). A `Cargo.lock` change that is the only global path is scoped to the
   members that resolve a changed lock entry instead of the whole workspace,
   falling back to the workspace on anything the scoping cannot read. The TLC
-  audits run in three shards instead of two, and the `ratchets` job runs the
-  typed governance gates (`rmat-audit`, `seam-inventory`,
-  `runtime-authority-bypass`, `machine-authority-docs-gate`) on a
-  machine-authority change. The pre-push hook no longer runs the
+  audits run in three shards instead of two, and a `governance-gates` job
+  runs the typed governance gates (`rmat-audit`, `seam-inventory`,
+  `runtime-authority-bypass`, `machine-authority-docs-gate`) when machine
+  authority or a dogma document changes. The pre-push hook no longer runs the
   changed-path ratchets, the machine codegen drift check, the canonical TLC
   lane or the deterministic workspace test gate (they are manual hooks; CI
   runs each before merge or before a release tag), skips the release

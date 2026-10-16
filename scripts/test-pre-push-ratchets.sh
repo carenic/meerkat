@@ -10,8 +10,8 @@
 # `clippy --no-deps <targets> --all-features -- -D warnings`, every target
 # except a pull request's meerkat-mob chain shards, which lint their lib and
 # bin targets; and the CI gate requires them whenever Rust changed), and the
-# ratchets job, example-web and wasm-check run the ratchets for the same
-# changed paths. This test pins those facts, checks the package claim on
+# ratchets and governance-gates jobs, example-web and wasm-check run the
+# ratchets for the same changed paths. This test pins those facts, checks the package claim on
 # sample changes against the agent gate's own selection, and checks that the
 # manual hook keeps the agent gate's ratchets and runs no Clippy and no
 # tests.

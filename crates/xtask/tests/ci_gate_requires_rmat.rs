@@ -72,6 +72,7 @@ fn ci_runs_fail_closed_cargo_lanes_on_hosted_runners() {
             "feature-check",
             "fmt-governance",
             "gate",
+            "governance-gates",
             "governed-jsonl",
             "integration",
             "main-unit",
@@ -212,6 +213,7 @@ fn ci_runs_fail_closed_cargo_lanes_on_hosted_runners() {
         "changes",
         "fmt-governance",
         "ratchets",
+        "governance-gates",
         "tlc-audits",
         "clippy",
         "unit",
@@ -235,6 +237,7 @@ fn ci_runs_fail_closed_cargo_lanes_on_hosted_runners() {
     for contract in [
         "require_success \"Change classification\"",
         "require_ran \"Bounded TLC audits\"",
+        "require_ran \"Typed governance gates\"",
         "require_ran \"Clippy\"",
         "require_ran \"Unit tests\"",
         "require_ran \"Main unit tests\"",
@@ -778,4 +781,42 @@ fn ci_runs_the_bounded_tlc_audits_on_machine_authority_changes() {
         ci.contains("require_ran \"Bounded TLC audits\" \"${TLC_AUDITS_RESULT}\""),
         "the CI gate must require the TLC audits on a machine-authority change"
     );
+}
+
+/// The typed governance gates run in CI on the agent gate's governance paths
+/// (machine authority or a dogma document), where the pre-push hook's
+/// changed-path ratchets ran them, in a job of their own, and the CI gate
+/// requires them on such a change.
+#[test]
+fn ci_runs_the_typed_governance_gates_on_governance_changes() {
+    let ci_yml = workflow_yml_path("ci.yml");
+    let doc = read_workflow(&ci_yml);
+    let jobs = doc
+        .get("jobs")
+        .and_then(serde_yaml::Value::as_mapping)
+        .expect("ci workflow jobs mapping");
+    let job = jobs
+        .get(serde_yaml::Value::String("governance-gates".to_string()))
+        .and_then(serde_yaml::Value::as_mapping)
+        .expect("governance-gates job");
+    assert_eq!(
+        job.get("if").and_then(serde_yaml::Value::as_str),
+        Some("${{ needs.changes.outputs.governance_gates == 'true' }}"),
+        "the governance gates run exactly on governance changes"
+    );
+    let job_text = serde_yaml::to_string(job).expect("render governance-gates job");
+    assert!(
+        job_text.contains(
+            "make rmat-audit seam-inventory runtime-authority-bypass machine-authority-docs-gate"
+        ),
+        "governance-gates must run every typed governance gate; job:\n{job_text}"
+    );
+    let ci = std::fs::read_to_string(&ci_yml).expect("read ci.yml");
+    for contract in [
+        "governance_gates: ${{ steps.plan.outputs.governance_gates }}",
+        "GOVERNANCE_GATES: ${{ needs.changes.outputs.governance_gates }}",
+        "require_ran \"Typed governance gates\" \"${GOVERNANCE_GATES_RESULT}\"",
+    ] {
+        assert!(ci.contains(contract), "CI must carry `{contract}`");
+    }
 }
