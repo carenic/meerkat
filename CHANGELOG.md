@@ -35,6 +35,8 @@ them.
 
 ## [Unreleased]
 
+## [0.9.2] - 2026-10-16
+
 ### Breaking
 
 - Per-model stream-inactivity windows (see Added) add the public
@@ -26702,7 +26704,8 @@ tag, so its comparison link uses v0.3.0 as the exact ancestry base.
 
 Initial development release.
 
-[Unreleased]: https://github.com/lukacf/meerkat/compare/v0.9.1...HEAD
+[Unreleased]: https://github.com/lukacf/meerkat/compare/v0.9.2...HEAD
+[0.9.2]: https://github.com/lukacf/meerkat/compare/v0.9.1...v0.9.2
 [0.9.1]: https://github.com/lukacf/meerkat/compare/v0.9.0...v0.9.1
 [0.9.0]: https://github.com/lukacf/meerkat/compare/v0.8.52...v0.9.0
 [0.8.52]: https://github.com/lukacf/meerkat/compare/v0.8.51...v0.8.52
