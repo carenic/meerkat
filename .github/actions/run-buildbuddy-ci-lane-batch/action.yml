@@ -19,6 +19,10 @@ inputs:
     description: Maximum number of local lane submitters to run in parallel.
     required: false
     default: ""
+  repository-cache:
+    description: "Bazel external repository cache: true, restore, or false (see setup-buildbuddy-ci)."
+    required: false
+    default: "true"
 
 runs:
   using: composite
@@ -27,6 +31,7 @@ runs:
       uses: ./.github/actions/setup-buildbuddy-ci
       with:
         profile: ${{ inputs.profile }}
+        repository-cache: ${{ inputs.repository-cache }}
 
     # The self-hosted control plane has no public ingress: submitters reach
     # its gRPCS port through an IAP tunnel on 127.0.0.1 and trust only its

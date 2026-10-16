@@ -320,9 +320,9 @@ else
 fi
 
 if caches_contract="$(workflow_contract release-caches)"; then
-  pass "GitHub Actions caches in release.yml jobs and the local actions they call are never saved on a dispatch and never cache ~/.cargo/bin; token jobs restore none, and OIDC or attesting jobs restore none that a dispatch-like run of any workflow saves (reusable workflows are not read and never run on a dispatch)"
+  pass "GitHub Actions caches in release.yml jobs, the local actions they call and, on a tag, the reusable workflows they call are never saved on a dispatch and never cache ~/.cargo/bin; token jobs restore none, a tag run restores no Bazel repository cache, OIDC or attesting jobs restore none that a dispatch-like run of any workflow saves, and no dispatch-like run saves the Bazel repository cache (reusable workflows never run on a dispatch)"
 else
-  bad "A release cache can be saved on a dispatch, cache ~/.cargo/bin, or reach a token, OIDC or attesting job (${caches_contract//$'\n'/; })"
+  bad "A release cache can be saved on a dispatch, cache ~/.cargo/bin, reach a token, OIDC or attesting job, or a tag run (${caches_contract//$'\n'/; })"
 fi
 
 if tag_validation_contract="$(workflow_contract tag-validation)"; then

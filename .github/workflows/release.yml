@@ -665,6 +665,9 @@ jobs:
     uses: ./.github/workflows/buildbuddy.yml
     with:
       mode: full-fresh
+      # This job mints OIDC tokens: no lane restores a Bazel repository
+      # cache entry another run saved.
+      repository_cache: "false"
     # Only the self-hosted control plane's key: GCP access is the job's OIDC
     # token (workload identity), and no registry or publish secret reaches
     # the called workflow.

@@ -45,6 +45,9 @@ jobs:
       - uses: ./.github/actions/setup-buildbuddy-ci
         with:
           profile: native
+          # A dispatch restores and never saves: a save lands in the default
+          # branch's cache scope, which every tag run would restore.
+          repository-cache: restore
 
       - name: Build release binaries via BuildBuddy
         shell: bash

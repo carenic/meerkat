@@ -28,6 +28,15 @@ on:
         required: false
         default: ""
         type: string
+      repository_cache:
+        description: >-
+          Bazel external repository cache of every lane: 'restore' restores
+          it (this workflow's gcp-buildbuddy backend never saves it); 'false'
+          neither restores nor saves it, which the release tag passes, so a
+          tag run restores no cache entry another run saved.
+        required: false
+        default: restore
+        type: string
     secrets:
       # The self-hosted control plane's own org API key for the CI
       # submitters. This workflow never reads the BuildBuddy Cloud key
@@ -290,6 +299,7 @@ jobs:
 
       - uses: ./.github/actions/run-buildbuddy-ci-lane-batch
         with:
+          repository-cache: ${{ inputs.repository_cache }}
           group: gcp-prebuild
           profile: submitter
           mode: ${{ inputs.mode || 'full-fresh' }}
@@ -316,6 +326,7 @@ jobs:
 
       - uses: ./.github/actions/run-buildbuddy-ci-lane-batch
         with:
+          repository-cache: ${{ inputs.repository_cache }}
           group: gcp-static
           profile: submitter
           mode: ${{ inputs.mode || 'full-fresh' }}
@@ -356,6 +367,7 @@ jobs:
       # test lanes read nothing from it and run in native-cargo-submit.
       - uses: ./.github/actions/run-buildbuddy-ci-lane-batch
         with:
+          repository-cache: ${{ inputs.repository_cache }}
           group: gcp
           profile: submitter
           mode: ${{ inputs.mode || 'full-fresh' }}
@@ -392,6 +404,7 @@ jobs:
 
       - uses: ./.github/actions/run-buildbuddy-ci-lane-batch
         with:
+          repository-cache: ${{ inputs.repository_cache }}
           group: gcp-native-cargo
           profile: submitter
           mode: ${{ inputs.mode || 'full-fresh' }}
@@ -459,6 +472,7 @@ jobs:
       - uses: ./.github/actions/run-buildbuddy-ci-lane-batch
         if: ${{ steps.machine-changes.outputs.changed == 'true' }}
         with:
+          repository-cache: ${{ inputs.repository_cache }}
           group: gcp-governance
           profile: submitter
           mode: ${{ inputs.mode || 'full-fresh' }}
@@ -515,6 +529,7 @@ jobs:
 
       - uses: ./.github/actions/run-buildbuddy-ci-lane-batch
         with:
+          repository-cache: ${{ inputs.repository_cache }}
           group: gcp-sdk-suites
           profile: submitter
           mode: ${{ inputs.mode || 'full-fresh' }}
@@ -541,6 +556,7 @@ jobs:
 
       - uses: ./.github/actions/run-buildbuddy-ci-lane-batch
         with:
+          repository-cache: ${{ inputs.repository_cache }}
           group: gcp-wasm-check
           profile: submitter
           mode: ${{ inputs.mode || 'full-fresh' }}
@@ -567,6 +583,7 @@ jobs:
 
       - uses: ./.github/actions/run-buildbuddy-ci-lane-batch
         with:
+          repository-cache: ${{ inputs.repository_cache }}
           group: gcp-minimal-feature
           profile: submitter
           mode: ${{ inputs.mode || 'full-fresh' }}
@@ -593,6 +610,7 @@ jobs:
 
       - uses: ./.github/actions/run-buildbuddy-ci-lane-batch
         with:
+          repository-cache: ${{ inputs.repository_cache }}
           group: gcp-feature-matrix
           profile: submitter
           mode: ${{ inputs.mode || 'full-fresh' }}
@@ -625,6 +643,7 @@ jobs:
 
       - uses: ./.github/actions/run-buildbuddy-ci-lane-batch
         with:
+          repository-cache: ${{ inputs.repository_cache }}
           group: gcp-security-audit
           profile: submitter
           mode: ${{ inputs.mode || 'full-fresh' }}

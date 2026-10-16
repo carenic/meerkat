@@ -52,6 +52,9 @@ jobs:
         uses: ./.github/actions/setup-buildbuddy-ci
         with:
           profile: submitter
+          # A dispatch restores and never saves: a save lands in the default
+          # branch's cache scope, which every tag run would restore.
+          repository-cache: restore
 
       - name: Run Turbo S on BuildBuddy
         shell: bash

@@ -39,8 +39,8 @@ TRAILING_PASS="PASS Linux and macOS arm64 assets publish without waiting for the
 TRAILING_FAIL="FAIL The trailing Intel macOS and Windows lanes must not gate the critical assets, and no upload may replace a published asset"
 WEB_TOOLS_PASS="PASS The Web SDK release build checks every download's sha256 and wasm-pack installs nothing: wasm-bindgen (Cargo.lock's version) and wasm-opt are pinned"
 TOKEN_PASS="PASS Release workflow token is read-only except for the jobs that attest or publish, which never persist it in a checkout; no reusable workflow inherits every secret"
-CACHES_PASS="PASS GitHub Actions caches in release.yml jobs and the local actions they call are never saved on a dispatch and never cache ~/.cargo/bin; token jobs restore none, and OIDC or attesting jobs restore none that a dispatch-like run of any workflow saves (reusable workflows are not read and never run on a dispatch)"
-CACHES_FAIL="FAIL A release cache can be saved on a dispatch, cache ~/.cargo/bin, or reach a token, OIDC or attesting job"
+CACHES_PASS="PASS GitHub Actions caches in release.yml jobs, the local actions they call and, on a tag, the reusable workflows they call are never saved on a dispatch and never cache ~/.cargo/bin; token jobs restore none, a tag run restores no Bazel repository cache, OIDC or attesting jobs restore none that a dispatch-like run of any workflow saves, and no dispatch-like run saves the Bazel repository cache (reusable workflows never run on a dispatch)"
+CACHES_FAIL="FAIL A release cache can be saved on a dispatch, cache ~/.cargo/bin, reach a token, OIDC or attesting job, or a tag run"
 
 fail() {
   echo "release doctor workflow contract violated: $1" >&2
@@ -588,6 +588,21 @@ elif name == "cache-buildbuddy-repository":
     # The pre-review release binary build restored and saved the Bazel
     # repository cache.
     replace_once('          repository-cache: "false"\n', "")
+elif name == "reusable-tag-repository-restore":
+    # The full-graph call without its repository_cache input: on a tag every
+    # BuildBuddy lane of buildbuddy.yml restores the Bazel repository cache.
+    replace_once(
+        "      # This job mints OIDC tokens: no lane restores a Bazel repository\n"
+        "      # cache entry another run saved.\n"
+        '      repository_cache: "false"\n',
+        "",
+    )
+elif name == "reusable-tag-unreadable":
+    # A reusable workflow the check cannot read, called on a tag.
+    replace_once(
+        "    uses: ./.github/workflows/buildbuddy.yml\n",
+        "    uses: example/workflows/.github/workflows/graph.yml@0123456789abcdef0123456789abcdef01234567 # v1\n",
+    )
 elif name == "reusable-on-dispatch":
     replace_once(
         "    if: ${{ github.event_name != 'workflow_dispatch' && vars.MEERKAT_GCP_BUILDBUDDY_ENABLED == 'true' }}\n",
@@ -685,6 +700,15 @@ elif name == "cache-dispatch-shared-registry":
         "\n"
         "      - name: Lint\n"
         "        run: make lint\n"
+    )
+elif name == "dispatch-saves-repository-cache":
+    # A dispatch-only workflow that saves the Bazel repository cache again.
+    replace_once(
+        ".github/workflows/release-binaries-check.yml",
+        "          # A dispatch restores and never saves: a save lands in the default\n"
+        "          # branch's cache scope, which every tag run would restore.\n"
+        "          repository-cache: restore\n",
+        "",
     )
 elif name == "cache-token-job-action":
     # A cache inside the local action a token job calls.
@@ -952,7 +976,13 @@ mutate cache-buildbuddy-repository "${TEST_ROOT}/cache-buildbuddy-repository.yml
 expect_fail_named cache-buildbuddy-repository "${TEST_ROOT}/cache-buildbuddy-repository.yml" \
   "job \`build_binaries_buildbuddy\` (in \`.github/actions/setup-buildbuddy-ci\`) saves cache \`buildbuddy-bazel-repository-*-*\` on a dispatch" release-caches
 expect_fail_named cache-buildbuddy-repository-restore "${TEST_ROOT}/cache-buildbuddy-repository.yml" \
-  "job \`build_binaries_buildbuddy\` (in \`.github/actions/setup-buildbuddy-ci\`) restores \`buildbuddy-bazel-repository-*-*\`, which release-binaries-check.yml job" release-caches
+  "job \`build_binaries_buildbuddy\` (in \`.github/actions/setup-buildbuddy-ci\`) restores \`buildbuddy-bazel-repository-*-*\` on a tag; a tag run restores no Bazel repository cache" release-caches
+mutate reusable-tag-repository-restore "${TEST_ROOT}/reusable-tag-repository-restore.yml"
+expect_fail_named reusable-tag-repository-restore "${TEST_ROOT}/reusable-tag-repository-restore.yml" \
+  "job \`release_validate_buildbuddy_full\` (through buildbuddy.yml job \`prebuild-submit\` in \`.github/actions/run-buildbuddy-ci-lane-batch\` > \`.github/actions/setup-buildbuddy-ci\`) restores \`buildbuddy-bazel-repository-*-*\` on a tag; a tag run restores no Bazel repository cache" release-caches
+mutate reusable-tag-unreadable "${TEST_ROOT}/reusable-tag-unreadable.yml"
+expect_fail_named reusable-tag-unreadable "${TEST_ROOT}/reusable-tag-unreadable.yml" \
+  "job \`release_validate_buildbuddy_full\` calls a reusable workflow on a tag that this check cannot read" release-caches
 mutate reusable-on-dispatch "${TEST_ROOT}/reusable-on-dispatch.yml"
 expect_fail_named reusable-on-dispatch "${TEST_ROOT}/reusable-on-dispatch.yml" \
   "job \`release_validate_buildbuddy_full\` calls a reusable workflow on a dispatch" release-caches
@@ -965,6 +995,9 @@ expect_tree_fail_named cache-xwin-validate-dispatch-save "${TEST_ROOT}/cache-xwi
 mutate_tree cache-dispatch-shared-registry "${TEST_ROOT}/cache-dispatch-shared-registry"
 expect_tree_fail_named cache-dispatch-shared-registry "${TEST_ROOT}/cache-dispatch-shared-registry" \
   "job \`build_web_sdk_package\` restores \`v0-rust-ci-registry\`, which registry-dispatch.yml job \`lint\` saves on a workflow_dispatch run" release-caches
+mutate_tree dispatch-saves-repository-cache "${TEST_ROOT}/dispatch-saves-repository-cache"
+expect_tree_fail_named dispatch-saves-repository-cache "${TEST_ROOT}/dispatch-saves-repository-cache" \
+  "release-binaries-check.yml job \`build\` (in \`.github/actions/setup-buildbuddy-ci\`) saves \`buildbuddy-bazel-repository-*-*\` on a workflow_dispatch run; such runs only restore the Bazel repository cache" release-caches
 mutate_tree cache-token-job-action "${TEST_ROOT}/cache-token-job-action"
 expect_tree_fail_named cache-token-job-action "${TEST_ROOT}/cache-token-job-action" \
   "job \`update_homebrew\` (in \`.github/actions/update-homebrew\`) holds a registry or publish token and restores a cache" release-caches

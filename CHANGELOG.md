@@ -48,6 +48,15 @@ them.
   an unpinned third-party action, naming its file and line, and on a
   Renovate configuration that could automerge one. The pinned
   `dtolnay/rust-toolchain` now names its toolchain as an input. CI only.
+- **A release tag no longer restores a Bazel repository cache another run
+  could have saved.** The tag's full BuildBuddy graph (`buildbuddy.yml`
+  with `repository_cache: "false"`) restores none, and the dispatch-only
+  release checks (`release-binaries-check.yml`, `release-turbo-s.yml`)
+  restore it without saving, so no dispatch writes the cache scope tags
+  read. The release doctor now reads the reusable workflows a tag run calls,
+  with the caller's inputs, and fails on a call it cannot read, on any tag
+  restore of that cache, and on any dispatch-like run that saves it. CI
+  only.
 
 ## [0.9.2] - 2026-10-16
 
