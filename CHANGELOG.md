@@ -35,6 +35,23 @@ them.
 
 ## [Unreleased]
 
+### Fixed
+
+- A GPT Live barge-in duck (`live/assistant_playback_hint`) now ends once
+  the user has been quiet for 1.6 s, the floor guard's release length, even
+  while the assistant is still talking. Since 0.8.51 that restore also
+  waited for a 600 ms gap in the assistant's output, so an answer that
+  started into the user's speech and never paused stayed muted until it
+  ended: in Turbo S S107 the duck ran from 3289 ms to 19205 ms over a 12.8 s
+  answer, and the user heard none of it. The duck still holds while the
+  user speaks, pauses inside the user's speech (under 1.6 s) never restore
+  it, and a response that ends while the user is still talking still
+  restores at its 1.6 s of output silence. A stale response the provider
+  keeps voicing after the user's correction (0.8.51's Turbo S S103 case) is
+  heard from the same point; the talk-over oracle measures it from what the
+  user hears. The broker's `OUTPUT_BURST_GAP_MS` and its parity test with
+  the browser peer's end hysteresis are removed with that rule.
+
 ## [0.9.2] - 2026-10-16
 
 ### Breaking

@@ -2876,12 +2876,9 @@ impl SessionState {
             return;
         }
         self.output_silence_run_ms = self.output_silence_run_ms.saturating_add(frame_ms);
-        if self.output_silence_run_ms >= OUTPUT_SILENCE_RELEASE_MS
-            || (self.output_silence_run_ms >= OUTPUT_BURST_GAP_MS
-                && !self.reflected_input_speaking())
-        {
-            // The response ended, or the user is quiet and the ducked burst
-            // has ended: playback returns at a burst boundary.
+        if self.output_silence_run_ms >= OUTPUT_SILENCE_RELEASE_MS {
+            // The response ended while the duck was open (the user may still
+            // be talking): nothing is left to silence.
             self.restore_assistant_playback();
         }
         self.release_deferred_result_cues_when_due();
@@ -2964,11 +2961,20 @@ impl SessionState {
         }
         let was_speaking = self.reflected_input_speaking();
         self.input_silence_run_ms = self.input_silence_run_ms.saturating_add(frame_ms);
-        if !self.reflected_input_speaking() && self.output_silence_run_ms >= OUTPUT_BURST_GAP_MS {
-            // The user went quiet (or a noise blip ended) between the
-            // assistant's bursts: playback returns. Mid-burst it waits for
-            // the burst gap on the output side, so a ducked response that is
-            // still talking never resumes audibly.
+        if !self.reflected_input_speaking() {
+            // The user has been quiet for the floor guard's release length:
+            // the duck, which lasts only while the user holds the floor, ends
+            // now, also in the middle of the assistant's burst. A response
+            // that keeps talking after the user stopped is heard (clients
+            // ramp the gain back), never muted to its end: 0.8.51 held this
+            // restore for an output burst gap, and an answer that started
+            // into the user's speech and never paused stayed silent for all
+            // of its 12.8 s (Turbo S S107). The same holds for a stale tail
+            // the provider keeps voicing after the user's correction (Turbo S
+            // 7f770753 S103 R3, 3640 ms to yield): it plays from here, and
+            // the talk-over oracle measures what the user hears. A pause
+            // inside the user's speech is shorter than the release length,
+            // so it never restores.
             self.restore_assistant_playback();
         }
         if was_speaking && !self.reflected_input_speaking() {
@@ -3959,20 +3965,6 @@ const USER_FLOOR_SILENCE_RELEASE_MS: u64 = 1_600;
 /// Frozen like the Turbo S bounds: a response whose own pause exceeds it is
 /// a finding, never a bump.
 const OUTPUT_SILENCE_RELEASE_MS: u64 = 1_600;
-
-/// Audio-clock length of model output silence that ends one burst of speech:
-/// the browser peer's `end_hysteresis_ms`, the gap the Turbo S talk-over
-/// oracle uses to join voiced frames into one burst (pinned to the peer by
-/// `the_duck_release_burst_gap_is_the_peer_end_hysteresis` in the
-/// integration tests, so it is one value, not a tunable).
-///
-/// A barge-in duck restores on the user's input silence only once provider
-/// output has been silent this long, so playback never resumes inside a
-/// burst. The ducked response can still be talking when the user stops:
-/// Turbo S 7f770753 S103 R3, the provider took 3640 ms to yield, and a
-/// restore on 1.6 s of input silence replayed its stale tail (talk-over
-/// 4102 ms against a 3000 ms bound).
-const OUTPUT_BURST_GAP_MS: u64 = 600;
 
 /// Frame RMS of a reflected PCM16 (little-endian) frame in dBFS, or `None`
 /// when it does not decode. Telemetry and floor input only.
@@ -7162,9 +7154,10 @@ mod tests {
     }
 
     /// A false trigger (a cough or a short "mm" over the assistant, the user
-    /// never takes the turn) restores at the assistant's next burst gap once
-    /// the user is quiet, and leaves no stuck mute: the guard re-arms, so a
-    /// later barge-in over the same still-audible assistant ducks again.
+    /// never takes the turn) restores once the user has been quiet for the
+    /// floor guard's release length, while the assistant keeps talking, and
+    /// leaves no stuck mute: the guard re-arms, so a later barge-in over the
+    /// same still-audible assistant ducks again.
     #[test]
     fn a_false_trigger_restores_and_the_next_barge_in_ducks_again() {
         let mut state = SessionState::default();
@@ -7174,23 +7167,24 @@ mod tests {
             playback_observations(&mut state),
             vec![GptLiveBrokerObservation::UserSpeechOverAssistant]
         );
-        // The user goes quiet while the assistant keeps talking: no restore
-        // inside the burst.
-        for _ in 0..8 {
+        // The user goes quiet while the assistant keeps talking: 1400 ms is
+        // not yet the release length.
+        for _ in 0..7 {
             model_output(&mut state, true, 1);
             reflect_input(&mut state, false, 1);
         }
-        assert!(
-            playback_observations(&mut state).is_empty(),
-            "never mid-burst"
-        );
-        // The burst ends (600 ms of output silence): playback returns.
-        model_output(&mut state, false, 3);
+        assert!(playback_observations(&mut state).is_empty());
+        // 1600 ms of the user's quiet: playback returns, mid-burst.
+        model_output(&mut state, true, 1);
+        reflect_input(&mut state, false, 1);
         assert_eq!(
             playback_observations(&mut state),
             vec![GptLiveBrokerObservation::AssistantPlaybackRestorable]
         );
         assert!(!state.assistant_playback_ducked, "no stuck mute");
+        // The burst ends: no second restore.
+        model_output(&mut state, false, 3);
+        assert!(playback_observations(&mut state).is_empty());
         // More assistant audio with the user silent: nothing to say.
         model_output(&mut state, true, 3);
         reflect_input(&mut state, false, 3);
@@ -7270,28 +7264,26 @@ mod tests {
             playback_observations(&mut state),
             vec![GptLiveBrokerObservation::UserSpeechOverAssistant]
         );
-        // The user goes quiet; the readout continues. It stays ducked to the
-        // end of the current burst (the accepted trade-off: playback never
-        // resumes mid-burst) and returns at the readout's next pause.
-        for _ in 0..8 {
+        // The user goes quiet; the readout continues. Playback returns once the
+        // user has been quiet 1600 ms, in the middle of the readout: the
+        // acknowledgement and 1.6 s after it go unheard, no more.
+        for _ in 0..7 {
             model_output(&mut state, true, 1);
             reflect_input(&mut state, false, 1);
         }
-        assert!(
-            playback_observations(&mut state).is_empty(),
-            "never mid-burst"
-        );
-        for _ in 0..3 {
-            model_output(&mut state, false, 1);
-            reflect_input(&mut state, false, 1);
-        }
+        assert!(playback_observations(&mut state).is_empty());
+        model_output(&mut state, true, 1);
+        reflect_input(&mut state, false, 1);
         assert_eq!(
             playback_observations(&mut state),
             vec![GptLiveBrokerObservation::AssistantPlaybackRestorable]
         );
-        // The rest of the readout plays at full gain: no further hint.
-        for _ in 0..10 {
-            model_output(&mut state, true, 1);
+        // The rest of the readout, a pause included, plays at full gain: no
+        // further hint.
+        for voiced in [
+            false, false, false, true, true, true, true, true, true, true, true, true, true,
+        ] {
+            model_output(&mut state, voiced, 1);
             reflect_input(&mut state, false, 1);
         }
         assert!(playback_observations(&mut state).is_empty());
@@ -7300,12 +7292,14 @@ mod tests {
 
     /// Turbo S 7f770753 S103 R3: the user's short correction ducks a response
     /// the provider keeps voicing for seconds (it took 3640 ms to yield, with
-    /// single-frame pauses inside the stale tail). The user going quiet in
-    /// the middle of that burst does not restore; neither do the 200 ms
-    /// pauses inside it. The restore lands once output has been silent for
-    /// one burst gap (600 ms), so the stale tail is never replayed.
+    /// single-frame pauses inside the stale tail). The duck lasts only while
+    /// the user holds the floor: the pauses inside the tail never restore,
+    /// and once the user has been quiet 1600 ms the rest of the tail plays.
+    /// Whether the provider yields in time is what the talk-over oracle
+    /// measures from what the user hears; the duck does not hide a response
+    /// that continues after the user stopped.
     #[test]
-    fn a_duck_over_a_still_talking_response_restores_only_at_its_burst_gap() {
+    fn a_duck_over_a_still_talking_response_restores_once_the_user_is_quiet() {
         let mut state = SessionState::default();
         model_output(&mut state, true, 4);
         // The correction: 1.6 s of speech over the response.
@@ -7317,36 +7311,43 @@ mod tests {
             playback_observations(&mut state),
             vec![GptLiveBrokerObservation::UserSpeechOverAssistant]
         );
-        // The user goes quiet (1.6 s and more) while the stale response keeps
-        // talking, with 200 ms pauses: ".VV.VVV.VVV.VVVV".
-        for voiced in [
+        // The user goes quiet while the stale response keeps talking, with
+        // 200 ms pauses: ".VV.VVV.VVV.VVVV".
+        let tail = [
             false, true, true, false, true, true, true, false, true, true, true, false, true, true,
             true, true,
-        ] {
-            model_output(&mut state, voiced, 1);
+        ];
+        for voiced in &tail[..7] {
+            model_output(&mut state, *voiced, 1);
             reflect_input(&mut state, false, 1);
         }
         assert!(
             playback_observations(&mut state).is_empty(),
-            "no restore inside the stale burst"
+            "1400 ms of quiet: the user may only be pausing"
         );
         assert!(state.assistant_playback_ducked);
-        // 400 ms of output silence: still inside the burst definition.
-        model_output(&mut state, false, 2);
-        assert!(playback_observations(&mut state).is_empty());
-        // The third silent frame completes the 600 ms burst gap.
-        model_output(&mut state, false, 1);
+        model_output(&mut state, tail[7], 1);
+        reflect_input(&mut state, false, 1);
         assert_eq!(
             playback_observations(&mut state),
-            vec![GptLiveBrokerObservation::AssistantPlaybackRestorable]
+            vec![GptLiveBrokerObservation::AssistantPlaybackRestorable],
+            "1600 ms of the user's quiet restores inside the tail"
         );
+        // The rest of the tail and its end add no hint.
+        for voiced in &tail[8..] {
+            model_output(&mut state, *voiced, 1);
+            reflect_input(&mut state, false, 1);
+        }
+        model_output(&mut state, false, 8);
+        assert!(playback_observations(&mut state).is_empty());
+        assert!(!state.assistant_playback_ducked);
     }
 
-    /// The negative: when the assistant was already between bursts (600 ms of
-    /// output silence) as the user went quiet, the input silence restores at
-    /// once, exactly as before.
+    /// When the assistant was paused as the user went quiet, the input
+    /// silence restores at the floor guard's release length, exactly as when
+    /// it keeps talking.
     #[test]
-    fn a_duck_restores_on_input_silence_when_output_already_paused_a_burst_gap() {
+    fn a_duck_restores_on_input_silence_while_the_assistant_pauses() {
         let mut state = SessionState::default();
         model_output(&mut state, true, 3);
         reflect_input(&mut state, true, 1);
@@ -7354,8 +7355,8 @@ mod tests {
             playback_observations(&mut state),
             vec![GptLiveBrokerObservation::UserSpeechOverAssistant]
         );
-        // The user keeps talking while the assistant pauses 800 ms (over the
-        // burst gap, under its 1600 ms response end).
+        // The user keeps talking while the assistant pauses 800 ms (under its
+        // 1600 ms response end).
         for _ in 0..4 {
             model_output(&mut state, false, 1);
             reflect_input(&mut state, true, 1);
@@ -7427,23 +7428,130 @@ mod tests {
             reflect_input(&mut state, true, 1);
         }
         assert!(playback_observations(&mut state).is_empty());
-        // The user stops; the assistant holds the floor. Playback returns at
-        // its first burst gap, never in the middle of the burst it started
-        // into the user's speech.
-        for _ in 0..8 {
+        // The user stops; the assistant holds the floor. Playback returns once
+        // the user has been quiet 1600 ms, in the middle of the burst it
+        // started into the user's speech, so the answer is heard.
+        for _ in 0..7 {
+            model_output(&mut state, true, 1);
+            reflect_input(&mut state, false, 1);
+        }
+        assert!(playback_observations(&mut state).is_empty());
+        model_output(&mut state, true, 1);
+        reflect_input(&mut state, false, 1);
+        assert_eq!(
+            playback_observations(&mut state),
+            vec![GptLiveBrokerObservation::AssistantPlaybackRestorable]
+        );
+        // Its next pause adds no hint.
+        model_output(&mut state, false, 3);
+        assert!(playback_observations(&mut state).is_empty());
+        assert!(!state.assistant_playback_ducked);
+    }
+
+    /// Turbo S S107: the model answered into the user's utterance and kept
+    /// talking for 12.8 s without a pause; the duck held from 3289 ms to the
+    /// answer's end at 19205 ms, and the user heard none of it. The duck
+    /// lasts only while the user holds the floor: once the user has been
+    /// quiet for the floor guard's release length (1600 ms) playback returns,
+    /// in the middle of the answer, and the rest of it plays with no further
+    /// hint.
+    #[test]
+    fn a_duck_restores_once_the_user_is_quiet_while_the_answer_keeps_talking() {
+        let mut state = SessionState::default();
+        reflect_input(&mut state, true, 3);
+        // The answer starts while the user is speaking: it ducks at the
+        // user's next voiced frame.
+        model_output(&mut state, true, 1);
+        reflect_input(&mut state, true, 1);
+        assert_eq!(
+            playback_observations(&mut state),
+            vec![GptLiveBrokerObservation::UserSpeechOverAssistant]
+        );
+        for _ in 0..6 {
+            model_output(&mut state, true, 1);
+            reflect_input(&mut state, true, 1);
+        }
+        // The user stops; the answer keeps talking with no output gap at all.
+        for _ in 0..7 {
             model_output(&mut state, true, 1);
             reflect_input(&mut state, false, 1);
         }
         assert!(
             playback_observations(&mut state).is_empty(),
-            "never mid-burst"
+            "1400 ms of quiet: the user may only be pausing"
         );
-        model_output(&mut state, false, 3);
+        model_output(&mut state, true, 1);
+        reflect_input(&mut state, false, 1);
+        assert_eq!(
+            playback_observations(&mut state),
+            vec![GptLiveBrokerObservation::AssistantPlaybackRestorable],
+            "restored at 1600 ms of the user's quiet, not at the answer's end"
+        );
+        assert!(!state.assistant_playback_ducked);
+        // The rest of the answer plays at full gain, through its end.
+        for _ in 0..50 {
+            model_output(&mut state, true, 1);
+            reflect_input(&mut state, false, 1);
+        }
+        model_output(&mut state, false, 8);
+        assert!(playback_observations(&mut state).is_empty());
+        assert!(!state.assistant_playback_ducked);
+    }
+
+    /// The duck holds while the user holds the floor: the user speaking over
+    /// a talking answer for seconds gives one duck and no restore.
+    #[test]
+    fn a_duck_holds_while_the_user_keeps_speaking_over_a_talking_answer() {
+        let mut state = SessionState::default();
+        model_output(&mut state, true, 2);
+        reflect_input(&mut state, true, 1);
+        assert_eq!(
+            playback_observations(&mut state),
+            vec![GptLiveBrokerObservation::UserSpeechOverAssistant]
+        );
+        for _ in 0..20 {
+            model_output(&mut state, true, 1);
+            reflect_input(&mut state, true, 1);
+        }
+        assert!(
+            playback_observations(&mut state).is_empty(),
+            "still ducked while the user speaks"
+        );
+        assert!(state.assistant_playback_ducked);
+    }
+
+    /// Pauses inside the user's speech are shorter than the floor guard's
+    /// release length (the longest scripted pause is 1020 ms), so they never
+    /// restore and the duck never flaps: one duck while the user speaks with
+    /// pauses over a talking answer, then one restore once the user has been
+    /// quiet 1600 ms.
+    #[test]
+    fn pauses_inside_the_users_speech_never_flap_the_duck() {
+        let mut state = SessionState::default();
+        model_output(&mut state, true, 2);
+        let mut hints = Vec::new();
+        // Speech runs separated by 1000 ms and 1400 ms pauses, the answer
+        // talking throughout.
+        for (voiced, frames) in [(true, 3), (false, 5), (true, 2), (false, 7), (true, 3)] {
+            for _ in 0..frames {
+                model_output(&mut state, true, 1);
+                reflect_input(&mut state, voiced, 1);
+            }
+            hints.extend(playback_observations(&mut state));
+        }
+        assert_eq!(
+            hints,
+            vec![GptLiveBrokerObservation::UserSpeechOverAssistant],
+            "one duck and no restore inside the user's speech"
+        );
+        for _ in 0..8 {
+            model_output(&mut state, true, 1);
+            reflect_input(&mut state, false, 1);
+        }
         assert_eq!(
             playback_observations(&mut state),
             vec![GptLiveBrokerObservation::AssistantPlaybackRestorable]
         );
-        assert!(!state.assistant_playback_ducked);
     }
 
     /// S99 pre-merge r3: a cue deferred during the model's response; the

@@ -1071,22 +1071,6 @@
         ]
       }
     ],
-    "crates/meerkat-openai/src/public_live.rs": [
-      {
-        "package": "meerkat-integration-tests",
-        "target": "test:gpt_live_replay",
-        "scope": "target",
-        "features": [
-          "gpt-live-replay"
-        ],
-        "tests": [
-          "the_duck_release_burst_gap_is_the_peer_end_hysteresis"
-        ],
-        "sources": [
-          "tests/integration/tests/gpt_live_replay.rs"
-        ]
-      }
-    ],
     "crates/meerkat-rpc/": [
       {
         "package": "rkat",
@@ -2179,7 +2163,6 @@
           "gpt-live-replay"
         ],
         "sources": [
-          "tests/integration/tests/gpt_live_replay.rs",
           "tests/integration/tests/support/gpt_live_e2e.rs"
         ]
       }

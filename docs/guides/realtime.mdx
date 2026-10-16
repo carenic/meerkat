@@ -875,8 +875,10 @@ own playback:
 - `live/assistant_playback_hint { channel_id, hint: "restore" }` follows when
   the user's input goes quiet (including a false trigger: the user stops
   without taking the turn) or when the assistant output goes quiet, whichever
-  comes first. A restore follows every duck, so a duck never leaves playback
-  muted for the next turn.
+  comes first. The duck lasts only while the user holds the floor: an answer
+  that keeps talking after the user has been quiet for 1.6 s is restored in
+  the middle of its sentence, never left muted to its end. A restore follows
+  every duck, so a duck never leaves playback muted for the next turn.
 
 The hint is purely additive. It is a notification, not a request: nothing
 waits for it, it changes no channel, transcript, playback or close semantics,
