@@ -67,9 +67,11 @@ impl McpStdioLaunchProfile {
     /// deployment; optional unavailable servers instead fail their own launch.
     /// A required stdio launch's stderr is a fresh pipe its custody drains
     /// continuously and bounds: never a host diagnostic descriptor, never
-    /// forwarded to the host's stderr, never left unread. Only the newest
-    /// bytes are kept, as the attempt's host-only stderr tail. MCP protocol
-    /// stdin and stdout remain piped.
+    /// forwarded to the host's stderr, never left unread while the process
+    /// is held. Only the newest bytes are kept, as the attempt's host-only
+    /// stderr tail. Shortly after the process is gone the drain closes its
+    /// end, so a descendant still writing to stderr then gets `EPIPE` (or
+    /// `SIGPIPE`). MCP protocol stdin and stdout remain piped.
     #[must_use]
     pub fn required(requirement: ExecutionConfinement, working_directory: PathBuf) -> Self {
         let compiled = CompiledConfinement::compile(&requirement).and_then(|compiled| {

@@ -33,15 +33,19 @@ use crate::connection::{
 /// The most stderr bytes one attempt retains: the newest ones.
 pub(crate) const STDERR_TAIL_CAP_BYTES: usize = 16 * 1024;
 
-/// How long the stderr drain keeps reading after the process it captured is
-/// no longer held (its close finished, or its custody dropped it), to collect
-/// the last bytes already in the pipe. It then stops, so a descendant that
-/// keeps the pipe open cannot keep the drain alive.
+/// How long the stderr drain keeps reading (and forwarding) after the
+/// process it captured is no longer held (its close finished, or its custody
+/// dropped it), to collect the last bytes already in the pipe. It then stops
+/// and closes its end, so a descendant that keeps the pipe open cannot keep
+/// the drain alive; such a descendant then gets `EPIPE` (or `SIGPIPE`) when
+/// it writes to stderr.
 pub(crate) const STDERR_DRAIN_GRACE: Duration = Duration::from_millis(200);
 
 /// The most launch environment values one attempt tracks for exact-value
-/// redaction. Values past this cap are not tracked; shape redaction still
-/// applies to them.
+/// redaction (each line of a multi-line value counts as one more). Values
+/// are taken in [`launch_values_by_priority`] order, so resolved secrets and
+/// the connector binding come first; values past this cap are not tracked,
+/// and shape redaction still applies to them.
 pub(crate) const MAX_TRACKED_SECRET_VALUES: usize = 64;
 
 /// Launch environment values shorter than this are not tracked: they are
@@ -195,8 +199,10 @@ impl StdioAttemptRecord {
         }
     }
 
-    /// Track the launch environment values for exact-value redaction: a
-    /// keyed digest of each, never the value itself.
+    /// Track the launch environment values for exact-value redaction, in
+    /// the given order (see [`launch_values_by_priority`]): a keyed digest
+    /// of each, and of each line of a multi-line value, never the value
+    /// itself.
     pub(crate) fn track_launch_values<'a>(&self, values: impl IntoIterator<Item = &'a str>) {
         self.lock().secrets.track(values);
     }
@@ -326,24 +332,40 @@ impl SecretDigests {
 
     fn track<'a>(&mut self, values: impl IntoIterator<Item = &'a str>) {
         for value in values {
-            let bytes = value.as_bytes();
-            // Too short to tell apart, or too long to fit the tail whole.
-            if bytes.len() < MIN_TRACKED_SECRET_BYTES || bytes.len() > STDERR_TAIL_CAP_BYTES {
-                continue;
+            // A multi-line value is also tracked line by line, so a value cut
+            // at the tail's edge does not show its remaining lines.
+            let lines = value
+                .contains('\n')
+                .then(|| value.lines().map(|line| line.trim_end_matches('\r')))
+                .into_iter()
+                .flatten();
+            for candidate in std::iter::once(value).chain(lines) {
+                if !self.track_one(candidate.as_bytes()) {
+                    return;
+                }
             }
-            let tracked = TrackedValue {
-                len: bytes.len(),
-                rolling: rolling_hash(self.base, bytes),
-                keyed: self.keys.hash_one(bytes),
-            };
-            if self.values.contains(&tracked) {
-                continue;
-            }
-            if self.values.len() >= MAX_TRACKED_SECRET_VALUES {
-                break;
-            }
-            self.values.push(tracked);
         }
+    }
+
+    /// Track one value; `false` once the cap is reached.
+    fn track_one(&mut self, bytes: &[u8]) -> bool {
+        // Too short to tell apart, or too long to fit the tail whole.
+        if bytes.len() < MIN_TRACKED_SECRET_BYTES || bytes.len() > STDERR_TAIL_CAP_BYTES {
+            return true;
+        }
+        let tracked = TrackedValue {
+            len: bytes.len(),
+            rolling: rolling_hash(self.base, bytes),
+            keyed: self.keys.hash_one(bytes),
+        };
+        if self.values.contains(&tracked) {
+            return true;
+        }
+        if self.values.len() >= MAX_TRACKED_SECRET_VALUES {
+            return false;
+        }
+        self.values.push(tracked);
+        true
     }
 
     /// The byte ranges of `text` equal to a tracked value. Linear in the
@@ -431,7 +453,68 @@ fn cut_start(bytes: &[u8]) -> usize {
 fn render_tail(bytes: &[u8], truncated: bool, secrets: &SecretDigests) -> String {
     let start = if truncated { cut_start(bytes) } else { 0 };
     let exact = secrets.redact(&bytes[start..]);
-    meerkat_core::redact::redact_secret_shapes(&String::from_utf8_lossy(&exact))
+    let text = strip_controls(&String::from_utf8_lossy(&exact));
+    // A private key cut at the edge starts the tail inside its body: with
+    // no BEGIN marker before its END marker, everything up to that END
+    // marker is redacted.
+    let text = match truncated.then(|| leading_private_key_end(&text)).flatten() {
+        Some(end) => format!("{SECRET_REDACTION_MARKER}{}", &text[end..]),
+        None => text,
+    };
+    meerkat_core::redact::redact_secret_shapes(&text)
+}
+
+/// `text` without control characters (C0, DEL and C1) other than line feed
+/// and tab, so the tail cannot carry terminal escape sequences, carriage
+/// returns or other control codes to whoever prints it.
+fn strip_controls(text: &str) -> String {
+    text.chars()
+        .filter(|character| !character.is_control() || matches!(character, '\n' | '\t'))
+        .collect()
+}
+
+/// The end of the first private-key END marker of `text`, when no BEGIN
+/// marker precedes it.
+fn leading_private_key_end(text: &str) -> Option<usize> {
+    let mut search = 0;
+    while let Some(found) = text[search..].find("-----END ") {
+        let start = search + found;
+        let label_start = start + "-----END ".len();
+        let label_len = text[label_start..].find("-----")?;
+        let label = &text[label_start..label_start + label_len];
+        let end = label_start + label_len + "-----".len();
+        if !label.contains('\n') && label.ends_with("PRIVATE KEY") {
+            return (!text[..start].contains("-----BEGIN ")).then_some(end);
+        }
+        search = end;
+    }
+    None
+}
+
+/// A launch configuration's environment values in tracking order: the
+/// resolved secrets (`secret_env`) first, then the connector binding, then
+/// every other value by name. The cap ([`MAX_TRACKED_SECRET_VALUES`]) is
+/// applied in this order.
+pub(crate) fn launch_values_by_priority(
+    stdio: &meerkat_core::mcp_config::McpStdioConfig,
+) -> Vec<&str> {
+    let binding = meerkat_core::mcp_config::MCP_CONNECTOR_BINDING_ENV;
+    let mut ordered: Vec<&str> = stdio
+        .secret_env
+        .iter()
+        .filter_map(|name| stdio.env.get(name).map(String::as_str))
+        .collect();
+    if let Some(value) = stdio.env.get(binding) {
+        ordered.push(value);
+    }
+    let mut rest: Vec<(&String, &String)> = stdio
+        .env
+        .iter()
+        .filter(|(name, _)| !stdio.secret_env.contains(*name) && name.as_str() != binding)
+        .collect();
+    rest.sort_unstable_by(|left, right| left.0.cmp(right.0));
+    ordered.extend(rest.into_iter().map(|(_, value)| value.as_str()));
+    ordered
 }
 
 /// The server's own exit, when the close receipt proves the process exited
@@ -538,12 +621,13 @@ pub(crate) struct StderrDrain {
 }
 
 /// Drain `stderr` until end of stream on a task of its own, so the server
-/// never blocks on a full pipe: the newest [`STDERR_TAIL_CAP_BYTES`] go to
+/// does not block on a full pipe: the newest [`STDERR_TAIL_CAP_BYTES`] go to
 /// the attempt's record while it exists, everything else is discarded, and
 /// with `forward` every chunk is also written, best effort, to this
-/// process's own stderr (as an inherited stderr showed it). The task holds
-/// the record weakly and stops [`STDERR_DRAIN_GRACE`] after the returned
-/// handle is dropped.
+/// process's own stderr (as an inherited stderr showed it; while the process
+/// is held a blocked host stderr can hold the drain, as it would have held
+/// the server). The task holds the record weakly and stops, forward writes
+/// included, [`STDERR_DRAIN_GRACE`] after the returned handle is dropped.
 pub(crate) fn start_stderr_drain(
     mut stderr: tokio::process::ChildStderr,
     record: Weak<StdioAttemptRecord>,
@@ -582,10 +666,32 @@ pub(crate) fn start_stderr_drain(
                     if let Some(record) = record.upgrade() {
                         record.append_stderr(chunk);
                     }
-                    if let Some(host) = host_stderr.as_mut()
-                        && host.write_all(chunk).await.is_err()
-                    {
-                        host_stderr = None;
+                    if let Some(host) = host_stderr.as_mut() {
+                        // Bounded by the same deadline once the process is
+                        // no longer held.
+                        let write = host.write_all(chunk);
+                        tokio::pin!(write);
+                        let written = match deadline {
+                            Some(deadline) => {
+                                tokio::time::timeout_at(deadline, &mut write).await.ok()
+                            }
+                            None => {
+                                tokio::select! {
+                                    biased;
+                                    written = &mut write => Some(written),
+                                    _ = &mut released => {
+                                        let until = tokio::time::Instant::now() + STDERR_DRAIN_GRACE;
+                                        deadline = Some(until);
+                                        tokio::time::timeout_at(until, &mut write).await.ok()
+                                    }
+                                }
+                            }
+                        };
+                        match written {
+                            Some(Ok(())) => {}
+                            Some(Err(_)) => host_stderr = None,
+                            None => break false,
+                        }
                     }
                 }
             }
@@ -598,7 +704,7 @@ pub(crate) fn start_stderr_drain(
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
 
@@ -727,6 +833,108 @@ mod tests {
             "the value past the cap is not tracked: {:?}",
             tail.text
         );
+    }
+
+    /// The tail's newest bytes: `stream`, cut so that the retained bytes
+    /// start `cut_into` bytes into `marker`.
+    fn cut_inside(marker: &str, stream: &str, cut_into: usize) -> Vec<u8> {
+        let keep_from = stream.find(marker).expect("the marker is in the stream") + cut_into;
+        let mut all = vec![b'p'; STDERR_TAIL_CAP_BYTES];
+        all.extend_from_slice(stream.as_bytes());
+        // Enough after the stream that the retained window (the last cap
+        // bytes) starts exactly at `keep_from`.
+        let suffix = STDERR_TAIL_CAP_BYTES + keep_from - stream.len();
+        all.extend(std::iter::repeat_n(b'f', suffix - 1));
+        all.push(b'\n');
+        all
+    }
+
+    #[test]
+    fn each_line_of_a_multi_line_launch_value_is_tracked() {
+        let value = "first-secret-line-aaaa\nsecond-secret-line-bbbb\nthird-secret-line-cccc";
+        let record = record_with(&[value]);
+        let stream = format!("echoed:\n{value}\nafter the value\n");
+        record.append_stderr(&cut_inside("first-secret-line", &stream, 5));
+        let tail = record.stderr_tail().expect("captured");
+        assert!(tail.truncated);
+        for line in ["first-secret", "second-secret-line", "third-secret-line"] {
+            assert!(
+                !tail.text.contains(line),
+                "{line:?} in {:?}",
+                &tail.text[..200]
+            );
+        }
+        assert!(tail.text.contains("after the value"));
+    }
+
+    #[test]
+    fn a_private_key_cut_at_the_edge_is_redacted_up_to_its_end_marker() {
+        let record = record_with(&[]);
+        let stream = "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASC\nBKcwggSjAgEAAoIBAQC7VJTUt9Us8cKj\n-----END PRIVATE KEY-----\nafter the key\n";
+        record.append_stderr(&cut_inside("MIIEvQIBADANBgkq", stream, 4));
+        let tail = record.stderr_tail().expect("captured");
+        assert!(tail.truncated);
+        assert!(
+            !tail.text.contains("BKcwggSjAgEAAoIBAQC7VJTUt9Us8cKj"),
+            "{:?}",
+            &tail.text[..120]
+        );
+        assert!(!tail.text.contains("-----END"), "{:?}", &tail.text[..120]);
+        assert!(
+            tail.text.starts_with("[REDACTED]\nafter the key\n"),
+            "{:?}",
+            &tail.text[..120]
+        );
+
+        // The same with no line break at all: the whitespace cut.
+        let record = record_with(&[]);
+        let mut line = vec![b'q'; STDERR_TAIL_CAP_BYTES];
+        line.extend_from_slice(
+            b"KEYBODY body-part-two -----END RSA PRIVATE KEY----- trailing words",
+        );
+        record.append_stderr(&line);
+        let tail = record.stderr_tail().expect("captured");
+        assert!(tail.truncated);
+        assert_eq!(tail.text, "[REDACTED] trailing words");
+    }
+
+    #[test]
+    fn resolved_secrets_are_tracked_before_the_cap() {
+        let mut config = meerkat_core::McpServerConfig::stdio(
+            "capped",
+            "/bin/true",
+            vec![],
+            std::collections::HashMap::new(),
+        );
+        let meerkat_core::mcp_config::McpTransportConfig::Stdio(stdio) = &mut config.transport
+        else {
+            panic!("stdio");
+        };
+        for index in 0..MAX_TRACKED_SECRET_VALUES + 6 {
+            stdio.env.insert(
+                format!("ORDINARY_{index:03}"),
+                format!("ordinary-value-{index:03}"),
+            );
+        }
+        stdio.env.insert(
+            "API_SECRET".to_string(),
+            "the-resolved-secret-value".to_string(),
+        );
+        stdio.secret_env.insert("API_SECRET".to_string());
+        let ordered = launch_values_by_priority(stdio);
+        assert_eq!(ordered.first(), Some(&"the-resolved-secret-value"));
+        let record = record_with(&ordered);
+        record.append_stderr(b"the-resolved-secret-value ordinary-value-000 ordinary-value-069\n");
+        let tail = record.stderr_tail().expect("captured");
+        assert_eq!(tail.text, "[REDACTED] [REDACTED] ordinary-value-069\n");
+    }
+
+    #[test]
+    fn control_characters_other_than_line_feed_and_tab_are_removed() {
+        let record = record_with(&[]);
+        record.append_stderr("a\x1b[31mred\x1b[0m\x07 bell\r\n\u{9b}c\u{7f}d\tt\n".as_bytes());
+        let tail = record.stderr_tail().expect("captured");
+        assert_eq!(tail.text, "a[31mred[0m bell\ncd\tt\n");
     }
 
     #[test]

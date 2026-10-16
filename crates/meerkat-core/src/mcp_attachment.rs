@@ -313,10 +313,13 @@ impl McpStdioSetupFailure {
 #[derive(Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct McpStdioStderrTail {
-    /// The newest retained bytes as lossy UTF-8, redacted. When earlier
-    /// bytes were dropped it starts after the first line break past the cut
-    /// (or after the first whitespace when the retained bytes hold no line
-    /// break), so nothing cut at the edge is shown in part.
+    /// The newest retained bytes as lossy UTF-8, redacted, with control
+    /// characters (C0, DEL and C1) other than line feed and tab removed, so
+    /// it carries no terminal escape sequences. When earlier bytes were
+    /// dropped it starts after the first line break past the cut (or after
+    /// the first whitespace when the retained bytes hold no line break), so
+    /// nothing cut at the edge is shown in part, and a private key cut at
+    /// the edge is redacted up to its END marker.
     pub text: String,
     /// The bytes the server wrote to stderr while it was captured.
     pub total_bytes: u64,
