@@ -205,7 +205,8 @@ pushes to `main` and to `release/**` integration branches, and manual
 dispatches (any other branch head runs once, through its pull request), entirely with Cargo on GitHub-hosted `ubuntu-24.04` runners
 (4 vCPU). A pull request runs what fits the owner's cap of 20 minutes from
 the start of the pre-push hook to a green `CI gate`, and the gate also
-enforces a 25-minute lane execution budget on it; the push runs every lane.
+enforces 1080 s of lane execution and a 1200 s push-to-terminal ceiling on
+it, runner queue excluded; the push runs every lane.
 Compiled
 objects are cached by sccache (content-addressed, shared by every lane and
 readable from `main` by every pull request); rust-cache holds only the

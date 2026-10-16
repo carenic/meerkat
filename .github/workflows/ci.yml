@@ -774,8 +774,9 @@ jobs:
     needs: changes
     if: ${{ needs.changes.outputs.machine_authority == 'true' }}
     runs-on: ubuntu-24.04
-    # Past ~24 minutes a shard fails the PR execution budget anyway; 20 leaves
-    # headroom over the expected 5-8 minutes.
+    # On a pull request a shard past about 17.5 minutes fails the execution
+    # budget anyway (CI_MAX_EXEC_SECONDS, 1080 s, less about 30 s of change
+    # classification); 20 leaves headroom over the expected 5-8 minutes.
     timeout-minutes: 20
     strategy:
       fail-fast: false

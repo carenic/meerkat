@@ -59,7 +59,14 @@
 // become the changed packages. A header change, a change to any other lock
 // table, a dependency the lock cannot resolve, an unreadable or unparseable
 // lock, or a diff with no changed entry fails closed into the whole
-// workspace. Measured on this lock, one external entry's change reaches 1
+// workspace. The scope narrows push plans as well as pull requests, and the
+// lock does not record one effect: Cargo's feature unification. A changed
+// entry can turn on a feature of a dependency whose own entry is unchanged;
+// in a build that unifies features across members (a `--workspace` build,
+// such as the hook-parity rows below) that changes the dependency for every
+// member, members that reach no changed entry included. Those members are
+// not replanned; nightly's whole-workspace lanes test them. Measured on
+// this lock, one external entry's change reaches 1
 // to 52 of the 53 members. --base-lock names the base lock file for an
 // explicit path list (self-tests); with --base/--head the base side is read
 // from the base revision.

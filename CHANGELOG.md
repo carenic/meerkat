@@ -65,7 +65,10 @@ them.
   authority or a dogma document changes. The pre-push hook no longer runs the
   changed-path ratchets, the machine codegen drift check, the canonical TLC
   lane or the deterministic workspace test gate (they are manual hooks; CI
-  runs each before merge or before a release tag), skips the release
+  runs each before merge or on the push a release tag requires green,
+  except the gate's lib tests under the workspace's unified features, which
+  only nightly's workspace unit lane runs: the push runs every member's lib
+  tests with that member's own features), skips the release
   contract tests CI already runs on every pull request, and runs its two
   slow harness contracts only when a push changes what they exercise. The
   `CI gate`'s pull-request budgets drop to 1080 s of lane execution and

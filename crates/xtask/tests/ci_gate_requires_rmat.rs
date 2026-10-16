@@ -4,8 +4,9 @@
 //!
 //! Pull-request CI (ci.yml) is Cargo-only on GitHub-hosted runners: the lanes
 //! are selected from the changed paths by scripts/ci-cargo-lanes.mjs, which
-//! fails closed, and the aggregate "CI gate" enforces a 25-minute lane
-//! execution budget and a 45-minute push-to-terminal runaway ceiling. Nightly owns the full workspace test lanes, the
+//! fails closed, and the aggregate "CI gate" enforces, on pull requests, a
+//! 1080-second lane execution budget and a 1200-second push-to-terminal
+//! runaway ceiling, runner queue excluded. Nightly owns the full workspace test lanes, the
 //! dense Mob topology stress, bounded TLC, and the whole BuildBuddy/Bazel
 //! graph; the release workflow re-runs that graph on the tag. The full
 //! GitHub-hosted Cargo workflow (cargo.yml) remains a diagnostic fallback.
@@ -816,7 +817,7 @@ fn ci_runs_the_bounded_tlc_audits_on_machine_authority_changes() {
         job.get("timeout-minutes")
             .and_then(serde_yaml::Value::as_u64),
         Some(20),
-        "a TLC shard times out inside the PR execution budget"
+        "a TLC shard times out at 20 minutes, well over its expected 5-8"
     );
     let job_text = serde_yaml::to_string(job).expect("render tlc-audits job");
     for required in [
