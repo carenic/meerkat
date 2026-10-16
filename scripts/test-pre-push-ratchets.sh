@@ -1,15 +1,20 @@
 #!/usr/bin/env bash
-# Contracts for the pre-push changed-path ratchets hook, which replaced the
-# hook's Clippy body.
+# Contracts for the changed-path ratchets hook, which replaced the hook's
+# Clippy body and is now a manual hook: no push-stage hook runs the ratchets,
+# Clippy, the deterministic test lanes or the machine codegen/TLC lanes.
 #
-# Dropping Clippy from the hook keeps coverage because Clippy is a required
-# CI check: the CI planner (scripts/ci-cargo-lanes.mjs) gives every package
-# the agent gate would lint a Clippy lane, or plans the whole workspace; those
-# lanes run `clippy --no-deps --all-targets --all-features -- -D warnings`;
-# and the CI gate requires them whenever Rust changed. This test pins those
-# facts, checks the package claim on sample changes against the agent gate's
-# own selection, and checks that the hook keeps the agent gate's ratchets and
-# runs no Clippy and no tests.
+# Dropping them from the push keeps coverage because CI runs each before
+# merge: Clippy is a required CI check (the CI planner,
+# scripts/ci-cargo-lanes.mjs, gives every package the agent gate would lint a
+# Clippy lane, or plans the whole workspace; those lanes run
+# `clippy --no-deps <targets> --all-features -- -D warnings`, every target
+# except a pull request's meerkat-mob chain shards, which lint their lib and
+# bin targets; and the CI gate requires them whenever Rust changed), and the
+# ratchets job, example-web and wasm-check run the ratchets for the same
+# changed paths. This test pins those facts, checks the package claim on
+# sample changes against the agent gate's own selection, and checks that the
+# manual hook keeps the agent gate's ratchets and runs no Clippy and no
+# tests.
 set -euo pipefail
 
 REPO_ROOT="${REPO_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}"
@@ -23,12 +28,24 @@ fail() {
 config=.pre-commit-config.yaml
 ci=.github/workflows/ci.yml
 
-# 1. The hook runs the ratchets and never the old Clippy body.
+# 1. The ratchets hook stays as a manual hook, the push stage runs none of
+#    the lanes CI runs, and nothing runs the old Clippy body.
 grep -Fq -- '- id: changed-path-ratchets' "$config" || fail "the changed-path-ratchets hook is missing"
 grep -Fq 'entry: scripts/pre-push-ratchets.sh' "$config" || fail "the ratchets hook does not run scripts/pre-push-ratchets.sh"
 if grep -Eq 'pre-push-clippy|id: cargo-clippy' "$config"; then
   fail "a pre-push hook still runs the Clippy body"
 fi
+python3 - "$config" <<'PY' || fail "a push-stage hook runs a lane CI runs before merge"
+import sys
+
+import yaml
+
+config = yaml.safe_load(open(sys.argv[1]))
+default = config.get("default_stages", ["pre-commit"])
+stages = {hook["id"]: hook.get("stages", default) for repo in config["repos"] for hook in repo["hooks"]}
+for hook_id in ("changed-path-ratchets", "machine-codegen-drift", "machine-codegen-verify", "cargo-test"):
+    assert stages.get(hook_id) == ["manual"], f"{hook_id} runs in {stages.get(hook_id)}, not only manually"
+PY
 [[ ! -e scripts/pre-push-clippy.sh ]] || fail "scripts/pre-push-clippy.sh exists again"
 grep -Fq 'exec "$AGENT_GATE" --committed --ratchets-only --machine-drift-by-hook "$@"' scripts/pre-push-ratchets.sh ||
   fail "pre-push-ratchets.sh does not run the agent gate in ratchets-only mode"

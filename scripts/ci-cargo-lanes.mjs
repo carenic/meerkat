@@ -97,13 +97,15 @@
 // 1226 s, its 54 test targets and lib test most of it) and every target on
 // the push.
 //
-// Hook-parity rows. The pre-push hook's cargo-test body
-// (scripts/pre-push-unit.sh) ran the whole workspace's lib and tests/*.rs
-// binaries, HeadCanonical and e2e-fast before every push. CI runs that
-// coverage as required rows (closure_test_rows, the closure-tests job) on the
-// push for the test scope: the reverse-dependency closure of the changed
-// packages, every member when a global input changed. A pull request runs
-// none of them (deferred_to_push). Every row but HeadCanonical
+// Hook-parity rows. The deterministic workspace lanes of
+// scripts/pre-push-unit.sh (the whole workspace's lib and tests/*.rs
+// binaries, HeadCanonical and e2e-fast) ran in the pre-push hook before
+// every push; the hook now runs them only on demand (its `cargo-test` hook is
+// in the manual stage), and the push runs that coverage as required rows
+// (closure_test_rows, the closure-tests job) for the test scope: the
+// reverse-dependency closure of the changed packages, every member when a
+// global input changed. A pull request runs none of them (deferred_to_push).
+// Every row but HeadCanonical
 // selects the whole workspace (`--workspace`) and names only its targets, so
 // Cargo resolves every crate's features exactly as the hook's single
 // workspace build does and builds only those targets' graphs: the row
@@ -117,9 +119,11 @@
 //              --lib-row-runner, on that runner: a hosted 4-vCPU runner
 //              needs about 64 min to build it (nightly's workspace unit
 //              lane: 4940 s, 1071 s of it running the tests). Without one
-//              the plan leaves the hook's kind(lib) lane to the hook
-//              (hook_retained_lanes), which runs those tests before the
-//              push.
+//              the plan leaves the lane script's kind(lib) lane
+//              (hook_retained_lanes): every member's lib tests run in the
+//              push-to-main unit lanes (package-scoped features) and under
+//              the workspace feature set in nightly's workspace unit lane
+//              (`make test-unit`).
 //   tests      every tests/*.rs target name the hook built, with every
 //              member's target of that name, `--test NAME` by name, with
 //              the hook's fast selection (ci-integration), split by
@@ -127,12 +131,12 @@
 //   HeadCanonical and e2e-fast, from the hook's own lane commands
 // Each row lists and runs one shared selection, and checks that nextest
 // selects exactly the binaries the plan names before it runs.
-// scripts/ci-hook-coverage.mjs reads the hook's lanes from the hook script
+// scripts/ci-hook-coverage.mjs reads the lanes from the lane script
 // and the executing step from ci.yml, credits only whole-workspace rows (and
-// HeadCanonical's own command), and the plan fails when any hook binary in
+// HeadCanonical's own command), and the plan fails when any lane binary in
 // scope has no row and is not a lib binary of a lane the plan leaves to the
-// hook. A pull-request plan is checked the same way, against the rows its
-// push runs.
+// main and nightly unit lanes. A pull-request plan is checked the same way,
+// against the rows its push runs.
 // The test scope also holds the readers of changed non-Rust inputs
 // (scripts/ci-non-rust-readers.json, kept complete by its guard): a test
 // that reads docs/, specs/, sdks/, a fixture outside its crate or the whole
@@ -1926,7 +1930,8 @@ function plan(args) {
   result.test_scope = [...new Set([...result.closure, ...result.reader_packages])].sort();
   const hook = hookModel(hookText);
   // The `--workspace --lib` row runs only on a runner that can build it in
-  // time; without one the plan leaves the hook's kind(lib) lane to the hook.
+  // time; without one the plan leaves the lane script's kind(lib) lane to
+  // the main and nightly unit lanes.
   result.lib_row_runner = args.libRowRunner || null;
   result.hook_retained_lanes = result.lib_row_runner ? [] : [hookLibLane(hook).label];
   const rows = result.test_scope.length > 0
@@ -1956,7 +1961,7 @@ function plan(args) {
   };
   if (coverage.missing.length > 0 || coverage.errors.length > 0) {
     throw new Error(
-      `the plan does not cover the pre-push hook's tests for its scope: missing ${coverage.missing.join(", ") || "none"}; errors ${coverage.errors.join("; ") || "none"}`,
+      `the plan does not cover the workspace test lanes for its scope: missing ${coverage.missing.join(", ") || "none"}; errors ${coverage.errors.join("; ") || "none"}`,
     );
   }
   return result;

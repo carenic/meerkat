@@ -18,8 +18,9 @@ name: CI
 #                     ripgrep tombstone scans (legacy surface names,
 #                     session-control routes, deprecated backend)
 #   ratchets        - generated-contract freshness when contract paths
-#                     changed; machine/protocol drift when machine authority
-#                     changed
+#                     changed; machine/protocol drift and the typed governance
+#                     gates (rmat-audit, seam-inventory, runtime authority,
+#                     machine-authority docs) when machine authority changed
 #   tlc-audits      - (x3) the hand-written TLC audit shards on a
 #                     machine-authority change
 #   clippy (xN)     - one lane per shard of directly changed packages:
@@ -58,7 +59,7 @@ name: CI
 #                     exact-tree attestation on main
 #
 # Push only (no wall-clock budget; a PR names them in deferred_to_push):
-#   closure-tests   - the pre-push hook's cargo-test coverage
+#   closure-tests   - the deterministic workspace test lanes
 #                     (scripts/pre-push-unit.sh) for the test scope
 #   closure-check   - cargo check --all-features (lib and bin targets) over
 #                     the reverse-dependency closure of the changed packages
@@ -666,6 +667,16 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
+      # The typed governance gates over the live workspace, on a
+      # machine-authority change: the effect-authority, ownership-ledger and
+      # strict RMAT audits, the strict seam inventory, the runtime authority
+      # bypass audit and the machine-authority docs alignment test. The
+      # pre-push hook's changed-path ratchets ran these before every such
+      # push; the hook no longer runs them, and no other per-push lane does.
+      - name: Typed governance gates (machine authority changed)
+        if: ${{ needs.changes.outputs.machine_authority == 'true' }}
+        run: make rmat-audit seam-inventory runtime-authority-bypass machine-authority-docs-gate
+
       # The posters render the canonical machine catalog, TLA specs and
       # contracts. The gate used to run only in cargo.yml, which nothing calls,
       # so the script's paths and the rendered HTML drifted unnoticed. It
@@ -1213,20 +1224,23 @@ jobs:
   closure-tests:
     name: Closure tests (${{ matrix.name }})
     needs: changes
-    # The pre-push hook's cargo-test coverage (scripts/pre-push-unit.sh), run
-    # here for the test scope: the reverse-dependency closure of the changed
-    # packages, or every member on a global change. Rows are closure_test_rows
-    # in scripts/ci-cargo-lanes.mjs: every tests/*.rs target the hook built
-    # (by name, fast selection) and e2e-fast, selecting the whole workspace
-    # so they compile the hook's own units, and HeadCanonical with the hook's
-    # own command. The hook keeps its kind(lib) lane: a --workspace --lib row
-    # is planned only with --lib-row-runner, for a runner that builds it in
-    # time (a hosted 4-vCPU runner needs about 64 min).
-    # scripts/ci-hook-coverage.mjs fails the plan when a hook binary in scope
-    # has no row and is not a lib binary the plan leaves to the hook.
-    # Push only: a pull request plans no rows (its plan counts them in
-    # deferred_to_push; on run 38859112297 the 17 rows took 315-1779 s).
-    # Selected by the row count alone.
+    # The deterministic workspace test lanes (scripts/pre-push-unit.sh, which
+    # the pre-push hook now runs only on demand), run here for the test
+    # scope: the reverse-dependency closure of the changed packages, or every
+    # member on a global change. Rows are closure_test_rows in
+    # scripts/ci-cargo-lanes.mjs: every tests/*.rs target the lane script
+    # builds (by name, fast selection) and e2e-fast, selecting the whole
+    # workspace so they compile the lane script's own units, and HeadCanonical
+    # with its own command. Its kind(lib) lane gets no row: a --workspace
+    # --lib row is planned only with --lib-row-runner, for a runner that
+    # builds it in time (a hosted 4-vCPU runner needs about 64 min); every
+    # member's lib tests run in main-unit and, under the workspace feature
+    # set, in nightly's workspace unit lane.
+    # scripts/ci-hook-coverage.mjs fails the plan when a lane binary in scope
+    # has no row and is not such a lib binary. Push only: a pull request
+    # plans no rows (its plan counts them in deferred_to_push; on run
+    # 38859112297 the 17 rows took 315-1779 s). Selected by the row count
+    # alone.
     if: ${{ needs.changes.result == 'success' && needs.changes.outputs.closure_test_count != '0' }}
     runs-on: ubuntu-24.04
     # A cold row (no reusable units, as after a release version bump) builds
@@ -2209,7 +2223,7 @@ jobs:
             echo "::notice::left to the push (main or release/**): ${DEFERRED_TO_PUSH}"
           fi
           echo "changes=${CHANGES_RESULT} fmt-governance=${FMT_GOVERNANCE_RESULT} ratchets=${RATCHETS_RESULT} tlc-audits=${TLC_AUDITS_RESULT}"
-          echo "clippy=${CLIPPY_RESULT} unit=${UNIT_RESULT} governed-jsonl=${GOVERNED_JSONL_RESULT} mcp-confinement-positive=${MCP_CONFINEMENT_POSITIVE_RESULT} integration=${INTEGRATION_RESULT} (${INTEGRATION_COUNT} suites) closure-tests=${CLOSURE_TESTS_RESULT} (${CLOSURE_TEST_COUNT} rows, ${HOOK_BINARY_COUNT} hook binaries, ${HOOK_RETAINED_COUNT} of them left to the hook, ${TEST_SCOPE_COUNT}-package scope) main-unit=${MAIN_UNIT_RESULT} closure-check=${CLOSURE_CHECK_RESULT} feature-check=${FEATURE_CHECK_RESULT} wasm-check=${WASM_CHECK_RESULT} sdk-host=${SDK_HOST_RESULT} example-web=${EXAMPLE_WEB_RESULT} wasm-timers=${WASM_TIMERS_RESULT} bazel-graph=${BAZEL_GRAPH_RESULT}"
+          echo "clippy=${CLIPPY_RESULT} unit=${UNIT_RESULT} governed-jsonl=${GOVERNED_JSONL_RESULT} mcp-confinement-positive=${MCP_CONFINEMENT_POSITIVE_RESULT} integration=${INTEGRATION_RESULT} (${INTEGRATION_COUNT} suites) closure-tests=${CLOSURE_TESTS_RESULT} (${CLOSURE_TEST_COUNT} rows, ${HOOK_BINARY_COUNT} hook binaries, ${HOOK_RETAINED_COUNT} of them lib binaries left to the main and nightly unit lanes, ${TEST_SCOPE_COUNT}-package scope) main-unit=${MAIN_UNIT_RESULT} closure-check=${CLOSURE_CHECK_RESULT} feature-check=${FEATURE_CHECK_RESULT} wasm-check=${WASM_CHECK_RESULT} sdk-host=${SDK_HOST_RESULT} example-web=${EXAMPLE_WEB_RESULT} wasm-timers=${WASM_TIMERS_RESULT} bazel-graph=${BAZEL_GRAPH_RESULT}"
           failed=0
           require_success() {
             local lane="$1" result="$2"

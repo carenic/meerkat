@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 // Hook coverage equivalence: does a CI lane plan run every test binary that
-// the pre-push hook's cargo-test body (scripts/pre-push-unit.sh) runs, under
-// the feature set the hook builds it with? The push runs these rows; a
+// the deterministic workspace lanes (scripts/pre-push-unit.sh, the hook's
+// cargo-test body, which the pre-push hook now runs only on demand) run,
+// under the feature set they build it with? The push runs these rows; a
 // pull-request plan runs none and is checked against its push's rows.
 //
 // The hook builds every workspace test binary in one invocation,
@@ -37,19 +38,21 @@
 // selection are credited together, and only when they hold every partition
 // 1..N exactly once.
 //
-// A plan may leave hook lanes to the hook (hook_retained_lanes, by the
-// lane's label in the hook script): the lib binaries such a lane runs need
-// no row, because the hook runs them before the push. Only lib binaries:
-// whatever else a retained lane runs still needs a row, as does
-// HeadCanonical. The planner leaves the hook's kind(lib) lane there when no
-// runner can build the `--workspace --lib` row in time (--lib-row-runner).
-// A row that names a runner must run exactly where its bound job runs.
+// A plan may leave lanes of the hook script without a row
+// (hook_retained_lanes, by the lane's label in the hook script): the lib
+// binaries such a lane runs need no row, because the push-to-main unit lanes
+// run every member's lib tests and nightly's workspace unit lane runs them
+// under the workspace feature set. Only lib binaries: whatever else a
+// retained lane runs still needs a row, as does HeadCanonical. The planner
+// leaves the hook's kind(lib) lane there when no runner can build the
+// `--workspace --lib` row in time (--lib-row-runner). A row that names a
+// runner must run exactly where its bound job runs.
 //
 // usage: ci-hook-coverage.mjs [--plan <file>|-] [--map]
 //   Reads a plan (ci-cargo-lanes.mjs --format json) and prints the coverage
 //   summary; exits 1 on a gap. --map prints every hook binary with the CI row
-//   that runs it, or the hook lane the plan leaves it to. A pull-request plan
-//   holds no rows: check its push plan instead.
+//   that runs it, or the hook lane the plan leaves to the unit lanes. A
+//   pull-request plan holds no rows: check its push plan instead.
 
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
@@ -651,7 +654,7 @@ export function checkHookCoverage(plan, { metadata = readMetadata(), nextestText
     map: Object.fromEntries([
       ...[...expected.keys(), ...retained.keys()].sort().map((key) => [
         key,
-        covered.get(key) ?? (retained.has(key) ? `hook: ${retained.get(key).lane}` : null),
+        covered.get(key) ?? (retained.has(key) ? `unit lanes (main, nightly): ${retained.get(key).lane}` : null),
       ]),
       ...(headCanonicalExpected ? [[headKey, headCanonical]] : []),
     ]),

@@ -1322,9 +1322,9 @@ for (const path of [
 // Hook parity: workspace-unified features. meerkat-mcp's form_elicitation
 // and lifecycle_contract require test-support, which only the workspace's
 // feature unification enables (a package-scoped build has none), so their
-// row must carry it. The mob chain's lib tests run before the merge, never
-// only on main: in the hook's kind(lib) lane without a lib-row runner, in the
-// pull request's lib row with one.
+// row must carry it. Without a lib-row runner the lib tests of the scope run
+// in the push-to-main unit lanes (and nightly under the workspace feature
+// set); with one, in the push's lib row.
 {
   const plan = planFor(["crates/meerkat-mcp/src/lib.rs"]);
   assertLanes(plan, "mcp touch");
@@ -1334,14 +1334,19 @@ for (const path of [
   assert.equal(row.package_flags, "--workspace", "under the workspace's resolution, which enables test-support");
   assert.equal(
     checkHookCoverage(plan).map["meerkat-mob::lib::meerkat_mob"],
-    "hook: workspace unit lane",
-    "without a lib-row runner, the hook runs meerkat-mob's lib tests",
+    "unit lanes (main, nightly): workspace unit lane",
+    "without a lib-row runner, the unit lanes run meerkat-mob's lib tests",
+  );
+  assert.ok(
+    plan.main_unit_shards.some((shard) => shard.packages.includes("meerkat-mcp")) &&
+      plan.main_archive_builds.some((build) => build.package_flags === "-p meerkat-mob"),
+    "the push-to-main unit lanes hold the scope's lib tests",
   );
   const withRunner = planFor(["crates/meerkat-mcp/src/lib.rs"], ["--lib-row-runner", "ubuntu-24.04"]);
   assertLanes(withRunner, "mcp touch, lib-row runner");
   assert.ok(
     withRunner.closure_test_rows.some((candidate) => candidate.lane === "lib" && candidate.packages.includes("meerkat-mob")),
-    "with one, meerkat-mob's lib tests run in the pull request",
+    "with one, meerkat-mob's lib tests run in the push's lib row",
   );
 }
 
