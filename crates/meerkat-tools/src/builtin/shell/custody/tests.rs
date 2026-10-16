@@ -1469,6 +1469,29 @@ const UNSHARE_SCOPE_ENV: &str = "MEERKAT_TEST_CUSTODY_UNSHARE_SCOPE";
 const UNSHARE_CHILD_TEST: &str =
     "builtin::shell::custody::tests::custody_foreign_namespace_host_role";
 
+/// Why an unshare(1) run ended before the host it started became ready.
+#[cfg(target_os = "linux")]
+#[derive(Debug, PartialEq, Eq)]
+enum UnshareFailure {
+    /// unshare(1) could not set up the namespaces here: there is nothing to
+    /// exercise.
+    NamespacesUnavailable,
+    /// Anything else: a test failure.
+    HostFailed,
+}
+
+/// Classify unshare(1)'s stderr after it failed.
+#[cfg(target_os = "linux")]
+fn classify_unshare_failure(stderr: &str) -> UnshareFailure {
+    // Only unshare's own setup failure, before it execs the host, means the
+    // namespaces are unavailable here.
+    if stderr.starts_with("unshare:") {
+        UnshareFailure::NamespacesUnavailable
+    } else {
+        UnshareFailure::HostFailed
+    }
+}
+
 /// Host role run inside a new pid namespace by
 /// [`a_host_in_another_pid_namespace_is_proven_ended_by_its_lock`]: open
 /// custody (taking the incarnation lock), run a tool in custody, report
@@ -1584,9 +1607,7 @@ async fn a_host_in_another_pid_namespace_is_proven_ended_by_its_lock() {
         exited = host.wait() => {
             let status = exited.unwrap();
             let stderr = collect_stderr(stderr_task).await;
-            // Only unshare's own setup failure, before it execs the host,
-            // means the namespaces are unavailable here.
-            if stderr.starts_with("unshare:") {
+            if classify_unshare_failure(&stderr) == UnshareFailure::NamespacesUnavailable {
                 eprintln!(
                     "skipped: user+pid+mount namespaces unavailable: unshare failed before the host started ({status}): {}",
                     stderr.trim()
