@@ -437,13 +437,16 @@ pub use meerkat_providers::connector_login::{
     clear_connector_client_secret, load_connector_client_secret, save_connector_client_secret,
 };
 #[cfg(not(target_arch = "wasm32"))]
+#[allow(deprecated)]
+pub use meerkat_providers::mcp_oauth::open_system_browser;
+#[cfg(not(target_arch = "wasm32"))]
 pub use meerkat_providers::mcp_oauth::{
     MCP_INTERACTIVE_LOGIN_TIMEOUT, MCP_OAUTH_CALLBACK_PATH, McpAuthMode, McpOAuthAccountStrategy,
     McpOAuthAttemptCleanup, McpOAuthAuthority, McpOAuthBrowserLaunch, McpOAuthCallback,
     McpOAuthCancelHandle, McpOAuthCeremonyContext, McpOAuthError, McpOAuthListenerCleanup,
     McpOAuthLoginComplete, McpOAuthLoginDisposition, McpOAuthLoginStart, McpOAuthLoopbackBegin,
     McpOAuthPendingAttempt, McpOAuthPendingClose, McpOAuthPendingLogin, McpServerIdentity,
-    OidcUserInfoAccountStrategy, open_system_browser, open_system_browser_trusting,
+    OidcUserInfoAccountStrategy, open_system_browser_guarded, open_system_browser_trusting,
 };
 
 pub mod help;

@@ -531,11 +531,7 @@ fn open_html_artifact_in_browser(
     // cannot reach. Under confinement the opener, and every program it
     // starts by name, come from a `PATH` without the directories a confined
     // process could change.
-    match untrusted {
-        Some(untrusted) => meerkat::open_system_browser_trusting(&url, untrusted),
-        None => meerkat::open_system_browser(&url),
-    }
-    .map_err(|e| e.to_string())
+    meerkat::open_system_browser_guarded(&url, untrusted).map_err(|e| e.to_string())
 }
 
 async fn print_completed_run_result(
@@ -8676,11 +8672,9 @@ async fn interactive_login(
     // The opener, and every program it starts by name, come from a `PATH`
     // without the directories this host's confined processes could change.
     let untrusted = cli_scope_launch_guard(scope).await;
-    let browser_ok =
-        launch_provider_authorize_url(&login_start.authorize_url, |url| match &untrusted {
-            Some(untrusted) => meerkat::open_system_browser_trusting(url, untrusted.as_ref()),
-            None => meerkat::open_system_browser(url),
-        });
+    let browser_ok = launch_provider_authorize_url(&login_start.authorize_url, |url| {
+        meerkat::open_system_browser_guarded(url, untrusted.as_deref())
+    });
     if browser_ok {
         print_ok("Browser launched. Complete the sign-in there.");
     } else {
@@ -11282,22 +11276,17 @@ async fn cli_mcp_browser_login(
     www_authenticate: Option<&str>,
     untrusted: Option<Arc<meerkat_core::confinement::UntrustedPathFn>>,
 ) -> Result<meerkat::McpOAuthLoginComplete, meerkat::HostAuthError> {
-    cli_mcp_browser_login_with(
-        service,
-        target,
-        www_authenticate,
-        move |url| match &untrusted {
-            Some(untrusted) => meerkat::open_system_browser_trusting(&url, untrusted.as_ref()),
-            None => meerkat::open_system_browser(&url),
-        },
-    )
+    cli_mcp_browser_login_with(service, target, www_authenticate, move |url| {
+        meerkat::open_system_browser_guarded(&url, untrusted.as_deref())
+    })
     .await
 }
 
 /// Open a provider's authorize URL in the user's browser through `launch`.
-/// Production passes [`meerkat::open_system_browser_trusting`], which never
-/// logs: the URL carries the one-time `state` and the PKCE challenge, and
-/// `webbrowser::open` logged the spawned command (URL included) at debug.
+/// Production passes [`meerkat::open_system_browser_guarded`] with the host's
+/// launch guard, which never logs: the URL carries the one-time `state` and
+/// the PKCE challenge, and `webbrowser::open` logged the spawned command (URL
+/// included) at debug.
 /// The launcher runs on the caller's thread, so a test capturing this
 /// thread's logs sees everything it emits.
 #[cfg(any(
@@ -29197,7 +29186,7 @@ default_model = "gemma"
     /// it, its `state` or its PKCE challenge to any log. Positive control: a
     /// launcher that logs the URL, as `webbrowser::open` did with the spawned
     /// command, is caught by the same capture. The production launcher is
-    /// `meerkat::open_system_browser_trusting`, a plain
+    /// `meerkat::open_system_browser_guarded`, a plain
     /// `std::process::Command` with null stdio and no logging, so no
     /// `log`-crate record exists to bridge.
     #[test]

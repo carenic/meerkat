@@ -42,6 +42,25 @@ them.
   compose a different `[confinement]` or `[governance]` on a state root that
   holds no document of its own for that realm (see Fixed).
 
+### Added
+
+- `meerkat::open_system_browser_guarded`
+  (`meerkat_auth_core::mcp_oauth::open_system_browser_guarded`) opens a URL
+  with the platform browser opener under the host's launch guard
+  (`HostConfinement::launch_guard`), `None` for a host that confines no launch
+  kind. `rkat` opens every browser with it.
+
+### Deprecated
+
+- `meerkat::open_system_browser`
+  (`meerkat_auth_core::mcp_oauth::open_system_browser`) and
+  `McpOAuthPendingLogin::launch_system_browser`, which name no host judgement:
+  a host that confines its agents' launches and called them would run a
+  browser opener a confined process planted on `PATH`. Use
+  `open_system_browser_guarded` with the host's launch guard, or
+  `open_system_browser_trusting`, and pass it to
+  `McpOAuthPendingLogin::launch_browser`. Their behaviour is unchanged.
+
 ### Fixed
 
 - A write to the user document checks each realm the user document states a

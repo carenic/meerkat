@@ -284,6 +284,10 @@ except these, which it runs as itself (`meerkat_core::HostLaunchExemption`):
 - Browser opener (`HostLaunchExemption::browser_opener`: `/usr/bin/open`,
   `xdg-open`, the system `rundll32.exe`; OAuth logins and the CLI's HTML
   artifact): must reach the user's desktop session; the URL is one argument.
+  Embedders open with `meerkat::open_system_browser_guarded(url,
+  host_confinement.launch_guard().as_deref())`; the unguarded
+  `open_system_browser` and `McpOAuthPendingLogin::launch_system_browser`
+  are deprecated (0.9.3).
 - `stty` by absolute path (`HostLaunchExemption::terminal_control`): host
   terminal control (hiding a client secret typed at `rkat`).
 - `wasm-pack` (`HostLaunchExemption::wasm_pack`): developer build tooling

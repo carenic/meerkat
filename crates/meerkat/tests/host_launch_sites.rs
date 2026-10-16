@@ -70,7 +70,7 @@ const SITES: &[(&str, &str, usize, Launch)] = &[
     (
         "crates/meerkat-auth-core/src/mcp_oauth.rs",
         "HostLaunchExemption::browser_opener(",
-        2,
+        1,
         Launch::Exempt(HostLaunchExemption::BrowserOpener),
     ),
     (
