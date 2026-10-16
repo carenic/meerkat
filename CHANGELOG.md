@@ -1275,6 +1275,13 @@ them.
   typed rows, causal replays, voiced conversational rows) wait for it too,
   in order: up to the rest of the model's response plus 1.6 seconds. A held
   row keeps its fragments' receipt slots until it is sent.
+- GPT Live: releasing held delegation commentary (background-work results
+  held behind an unanswered utterance) now stops at the first failed send,
+  as releasing held text-chat context does. It went on to send the next
+  held result, so a later result could reach the provider ahead of an
+  earlier one whose delivery failed. Nothing after the failed send is
+  tried; the session is marked ambiguous, and the results left settle when
+  the transport closes.
 
 ### Known limitations
 
