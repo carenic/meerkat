@@ -7697,6 +7697,62 @@ impl std::fmt::Display for PeerIngressResponseTerminality {
     serde::Serialize,
     serde::Deserialize,
 )]
+pub enum PeerResponseAddresseeVerdict {
+    #[default]
+    #[serde(rename = "UnknownRequest")]
+    UnknownRequest,
+    #[serde(rename = "Requester")]
+    Requester,
+    #[serde(rename = "NotRequester")]
+    NotRequester,
+}
+impl PeerResponseAddresseeVerdict {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::UnknownRequest => "UnknownRequest",
+            Self::Requester => "Requester",
+            Self::NotRequester => "NotRequester",
+        }
+    }
+}
+impl std::convert::TryFrom<&str> for PeerResponseAddresseeVerdict {
+    type Error = String;
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "UnknownRequest" => Ok(Self::UnknownRequest),
+            "Requester" => Ok(Self::Requester),
+            "NotRequester" => Ok(Self::NotRequester),
+            other => Err(format!(
+                "invalid PeerResponseAddresseeVerdict value `{other}`"
+            )),
+        }
+    }
+}
+impl std::convert::TryFrom<String> for PeerResponseAddresseeVerdict {
+    type Error = String;
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::try_from(value.as_str())
+    }
+}
+impl std::fmt::Display for PeerResponseAddresseeVerdict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+#[allow(non_camel_case_types)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 pub enum PeerResponseTerminalObservedStatus {
     #[default]
     #[serde(rename = "NotPeerTerminal")]
@@ -14109,6 +14165,7 @@ pub struct State {
     pub inbound_peer_requests:
         std::collections::BTreeMap<PeerCorrelationId, InboundPeerRequestState>,
     pub inbound_peer_request_lanes: std::collections::BTreeMap<PeerCorrelationId, InputLane>,
+    pub inbound_peer_request_requesters: std::collections::BTreeMap<PeerCorrelationId, PeerId>,
     pub last_session_context_updated_at_ms: u64,
     pub reserved_interaction_streams: std::collections::BTreeSet<PeerCorrelationId>,
     pub attached_interaction_streams: std::collections::BTreeSet<PeerCorrelationId>,
@@ -15527,6 +15584,10 @@ impl std::fmt::Debug for State {
             .field(
                 "inbound_peer_request_lanes",
                 &self.inbound_peer_request_lanes,
+            )
+            .field(
+                "inbound_peer_request_requesters",
+                &self.inbound_peer_request_requesters,
             )
             .field(
                 "last_session_context_updated_at_ms",
@@ -18167,6 +18228,7 @@ pub mod inputs {
     pub struct PeerRequestReceived {
         pub corr_id: PeerCorrelationId,
         pub handling_mode: InputLane,
+        pub requester: PeerId,
     }
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct PeerResponseReplied {
@@ -19884,6 +19946,11 @@ pub mod signals {
         pub status: PeerIngressResponseStatus,
     }
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct ResolvePeerResponseAddressee {
+        pub corr_id: PeerCorrelationId,
+        pub addressee: PeerId,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct ClassifyPlainEvent {
         pub source_name: String,
     }
@@ -19898,6 +19965,7 @@ pub enum Signal {
     DrainQueuedRun(signals::DrainQueuedRun),
     ClassifyExternalEnvelope(signals::ClassifyExternalEnvelope),
     ClassifyPeerResponseReply(signals::ClassifyPeerResponseReply),
+    ResolvePeerResponseAddressee(signals::ResolvePeerResponseAddressee),
     ClassifyPlainEvent(signals::ClassifyPlainEvent),
     EnsureDrainRunning(signals::EnsureDrainRunning),
 }
@@ -19909,6 +19977,7 @@ impl Signal {
             Self::DrainQueuedRun(_) => SignalKind::DrainQueuedRun,
             Self::ClassifyExternalEnvelope(_) => SignalKind::ClassifyExternalEnvelope,
             Self::ClassifyPeerResponseReply(_) => SignalKind::ClassifyPeerResponseReply,
+            Self::ResolvePeerResponseAddressee(_) => SignalKind::ResolvePeerResponseAddressee,
             Self::ClassifyPlainEvent(_) => SignalKind::ClassifyPlainEvent,
             Self::EnsureDrainRunning(_) => SignalKind::EnsureDrainRunning,
         }
@@ -19921,6 +19990,7 @@ pub enum SignalKind {
     DrainQueuedRun,
     ClassifyExternalEnvelope,
     ClassifyPeerResponseReply,
+    ResolvePeerResponseAddressee,
     ClassifyPlainEvent,
     EnsureDrainRunning,
 }
@@ -21317,6 +21387,10 @@ pub mod effects {
         pub response_terminality: PeerIngressResponseTerminality,
     }
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct PeerResponseAddresseeResolved {
+        pub verdict: PeerResponseAddresseeVerdict,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct PeerIngressReceiveResolved {
         pub outcome: PeerIngressReceiveOutcomeClass,
         pub admission_diagnostic: Option<PeerIngressAdmissionDiagnosticClass>,
@@ -21790,6 +21864,7 @@ pub enum Effect {
     RealtimeTranscriptAppended(effects::RealtimeTranscriptAppended),
     PeerIngressClassified(effects::PeerIngressClassified),
     PeerResponseReplyClassified(effects::PeerResponseReplyClassified),
+    PeerResponseAddresseeResolved(effects::PeerResponseAddresseeResolved),
     PeerIngressReceiveResolved(effects::PeerIngressReceiveResolved),
     PeerIngressDequeueResolved(effects::PeerIngressDequeueResolved),
     SpawnDrainTask(effects::SpawnDrainTask),
@@ -22050,6 +22125,7 @@ pub enum EffectKind {
     RealtimeTranscriptAppended,
     PeerIngressClassified,
     PeerResponseReplyClassified,
+    PeerResponseAddresseeResolved,
     PeerIngressReceiveResolved,
     PeerIngressDequeueResolved,
     SpawnDrainTask,
@@ -24580,6 +24656,24 @@ pub enum TransitionId {
     PeerResponseRepliedRetired,
     PeerResponseRepliedStopped,
     PeerResponseRepliedDestroyed,
+    ResolvePeerResponseAddresseeRequesterIdle,
+    ResolvePeerResponseAddresseeRequesterAttached,
+    ResolvePeerResponseAddresseeRequesterRunning,
+    ResolvePeerResponseAddresseeRequesterRetired,
+    ResolvePeerResponseAddresseeRequesterStopped,
+    ResolvePeerResponseAddresseeRequesterDestroyed,
+    ResolvePeerResponseAddresseeNotRequesterIdle,
+    ResolvePeerResponseAddresseeNotRequesterAttached,
+    ResolvePeerResponseAddresseeNotRequesterRunning,
+    ResolvePeerResponseAddresseeNotRequesterRetired,
+    ResolvePeerResponseAddresseeNotRequesterStopped,
+    ResolvePeerResponseAddresseeNotRequesterDestroyed,
+    ResolvePeerResponseAddresseeUnknownRequestIdle,
+    ResolvePeerResponseAddresseeUnknownRequestAttached,
+    ResolvePeerResponseAddresseeUnknownRequestRunning,
+    ResolvePeerResponseAddresseeUnknownRequestRetired,
+    ResolvePeerResponseAddresseeUnknownRequestStopped,
+    ResolvePeerResponseAddresseeUnknownRequestDestroyed,
     AdvanceSessionContextIdle,
     AdvanceSessionContextAttached,
     AdvanceSessionContextRunning,
@@ -25570,6 +25664,7 @@ pub fn initial_state() -> State {
         pending_peer_requests: Default::default(),
         inbound_peer_requests: Default::default(),
         inbound_peer_request_lanes: Default::default(),
+        inbound_peer_request_requesters: Default::default(),
         last_session_context_updated_at_ms: 0,
         reserved_interaction_streams: Default::default(),
         attached_interaction_streams: Default::default(),

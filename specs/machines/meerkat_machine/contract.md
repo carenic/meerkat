@@ -416,6 +416,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `pending_peer_requests`: `Map<PeerCorrelationId, OutboundPeerRequestState>`
 - `inbound_peer_requests`: `Map<PeerCorrelationId, InboundPeerRequestState>`
 - `inbound_peer_request_lanes`: `Map<PeerCorrelationId, InputLane>`
+- `inbound_peer_request_requesters`: `Map<PeerCorrelationId, PeerId>`
 - `last_session_context_updated_at_ms`: `u64`
 - `reserved_interaction_streams`: `Set<PeerCorrelationId>`
 - `attached_interaction_streams`: `Set<PeerCorrelationId>`
@@ -845,7 +846,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `PeerResponseRejected`(corr_id: PeerCorrelationId)
 - `PeerRequestTimedOut`(corr_id: PeerCorrelationId)
 - `PeerRequestSendFailed`(corr_id: PeerCorrelationId)
-- `PeerRequestReceived`(corr_id: PeerCorrelationId, handling_mode: InputLane)
+- `PeerRequestReceived`(corr_id: PeerCorrelationId, handling_mode: InputLane, requester: PeerId)
 - `PeerResponseReplied`(corr_id: PeerCorrelationId)
 - `AdvanceSessionContext`(updated_at_ms: u64)
 - `InteractionStreamReserved`(corr_id: PeerCorrelationId)
@@ -897,6 +898,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `DrainQueuedRun`(run_id: RunId)
 - `ClassifyExternalEnvelope`(item_id: String, from_peer: String, from_peer_id: PeerId, envelope_kind: PeerIngressEnvelopeClass, request_intent: String, request_intent_class: PeerIngressRequestClass, lifecycle_kind: PeerIngressLifecycleClass, lifecycle_peer_param: Option<String>, response_status: PeerIngressResponseStatus, in_reply_to: String)
 - `ClassifyPeerResponseReply`(status: PeerIngressResponseStatus)
+- `ResolvePeerResponseAddressee`(corr_id: PeerCorrelationId, addressee: PeerId)
 - `ClassifyPlainEvent`(source_name: String)
 - `EnsureDrainRunning`
 
@@ -1113,6 +1115,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `RealtimeTranscriptAppended`(channel_id: String, item_id: String, text: String, role: RealtimeTranscriptRoleKind, lane: RealtimeTranscriptLaneKind, sequence: u64)
 - `PeerIngressClassified`(class: PeerIngressInputClass, actionable: Bool, kind: PeerIngressAdmittedKind, auth: PeerIngressAuthClass, from_peer_id: Option<PeerId>, lifecycle_kind: Option<PeerIngressLifecycleClass>, lifecycle_peer: Option<String>, request_id: Option<String>, response_terminality: Option<PeerIngressResponseTerminality>)
 - `PeerResponseReplyClassified`(response_terminality: PeerIngressResponseTerminality)
+- `PeerResponseAddresseeResolved`(verdict: PeerResponseAddresseeVerdict)
 - `PeerIngressReceiveResolved`(outcome: PeerIngressReceiveOutcomeClass, admission_diagnostic: Option<PeerIngressAdmissionDiagnosticClass>, phase: PeerIngressAuthorityPhaseClass)
 - `PeerIngressDequeueResolved`(phase: PeerIngressAuthorityPhaseClass)
 - `SpawnDrainTask`
@@ -1460,6 +1463,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `staged_surface_ops_are_known_and_sequenced`
 - `staged_reload_surfaces_are_active`
 - `peer_ingress_owner_consistency`
+- `inbound_peer_request_requesters_match_requests`
 - `supervisor_binding_consistency`
 - `supervisor_revoke_pending_consistency`
 - `supervisor_revoked_receipt_consistency`
@@ -22674,7 +22678,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `PeerRequestReceivedIdle`
 - From: `Idle`
-- On: `PeerRequestReceived`(corr_id, handling_mode)
+- On: `PeerRequestReceived`(corr_id, handling_mode, requester)
 - Guards:
   - `session_registered`
   - `not_already_inbound`
@@ -22683,7 +22687,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `PeerRequestReceivedAttached`
 - From: `Attached`
-- On: `PeerRequestReceived`(corr_id, handling_mode)
+- On: `PeerRequestReceived`(corr_id, handling_mode, requester)
 - Guards:
   - `session_registered`
   - `not_already_inbound`
@@ -22692,7 +22696,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `PeerRequestReceivedRunning`
 - From: `Running`
-- On: `PeerRequestReceived`(corr_id, handling_mode)
+- On: `PeerRequestReceived`(corr_id, handling_mode, requester)
 - Guards:
   - `session_registered`
   - `not_already_inbound`
@@ -22701,7 +22705,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `PeerRequestReceivedRetired`
 - From: `Retired`
-- On: `PeerRequestReceived`(corr_id, handling_mode)
+- On: `PeerRequestReceived`(corr_id, handling_mode, requester)
 - Guards:
   - `session_registered`
   - `not_already_inbound`
@@ -22710,7 +22714,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `PeerRequestReceivedStopped`
 - From: `Stopped`
-- On: `PeerRequestReceived`(corr_id, handling_mode)
+- On: `PeerRequestReceived`(corr_id, handling_mode, requester)
 - Guards:
   - `session_registered`
   - `not_already_inbound`
@@ -22719,7 +22723,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `PeerRequestReceivedDestroyed`
 - From: `Destroyed`
-- On: `PeerRequestReceived`(corr_id, handling_mode)
+- On: `PeerRequestReceived`(corr_id, handling_mode, requester)
 - Guards:
   - `session_registered`
   - `not_already_inbound`
@@ -22778,6 +22782,168 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `session_registered`
   - `inbound_exists`
 - Emits: `InboundPeerInteractionStateChanged`
+- To: `Destroyed`
+
+### `ResolvePeerResponseAddresseeRequesterIdle`
+- From: `Idle`
+- On: `ResolvePeerResponseAddressee`(corr_id, addressee)
+- Guards:
+  - `session_registered`
+  - `addressee_is_requester`
+- Emits: `PeerResponseAddresseeResolved`
+- To: `Idle`
+
+### `ResolvePeerResponseAddresseeRequesterAttached`
+- From: `Attached`
+- On: `ResolvePeerResponseAddressee`(corr_id, addressee)
+- Guards:
+  - `session_registered`
+  - `addressee_is_requester`
+- Emits: `PeerResponseAddresseeResolved`
+- To: `Attached`
+
+### `ResolvePeerResponseAddresseeRequesterRunning`
+- From: `Running`
+- On: `ResolvePeerResponseAddressee`(corr_id, addressee)
+- Guards:
+  - `session_registered`
+  - `addressee_is_requester`
+- Emits: `PeerResponseAddresseeResolved`
+- To: `Running`
+
+### `ResolvePeerResponseAddresseeRequesterRetired`
+- From: `Retired`
+- On: `ResolvePeerResponseAddressee`(corr_id, addressee)
+- Guards:
+  - `session_registered`
+  - `addressee_is_requester`
+- Emits: `PeerResponseAddresseeResolved`
+- To: `Retired`
+
+### `ResolvePeerResponseAddresseeRequesterStopped`
+- From: `Stopped`
+- On: `ResolvePeerResponseAddressee`(corr_id, addressee)
+- Guards:
+  - `session_registered`
+  - `addressee_is_requester`
+- Emits: `PeerResponseAddresseeResolved`
+- To: `Stopped`
+
+### `ResolvePeerResponseAddresseeRequesterDestroyed`
+- From: `Destroyed`
+- On: `ResolvePeerResponseAddressee`(corr_id, addressee)
+- Guards:
+  - `session_registered`
+  - `addressee_is_requester`
+- Emits: `PeerResponseAddresseeResolved`
+- To: `Destroyed`
+
+### `ResolvePeerResponseAddresseeNotRequesterIdle`
+- From: `Idle`
+- On: `ResolvePeerResponseAddressee`(corr_id, addressee)
+- Guards:
+  - `session_registered`
+  - `addressee_is_not_requester`
+- Emits: `PeerResponseAddresseeResolved`
+- To: `Idle`
+
+### `ResolvePeerResponseAddresseeNotRequesterAttached`
+- From: `Attached`
+- On: `ResolvePeerResponseAddressee`(corr_id, addressee)
+- Guards:
+  - `session_registered`
+  - `addressee_is_not_requester`
+- Emits: `PeerResponseAddresseeResolved`
+- To: `Attached`
+
+### `ResolvePeerResponseAddresseeNotRequesterRunning`
+- From: `Running`
+- On: `ResolvePeerResponseAddressee`(corr_id, addressee)
+- Guards:
+  - `session_registered`
+  - `addressee_is_not_requester`
+- Emits: `PeerResponseAddresseeResolved`
+- To: `Running`
+
+### `ResolvePeerResponseAddresseeNotRequesterRetired`
+- From: `Retired`
+- On: `ResolvePeerResponseAddressee`(corr_id, addressee)
+- Guards:
+  - `session_registered`
+  - `addressee_is_not_requester`
+- Emits: `PeerResponseAddresseeResolved`
+- To: `Retired`
+
+### `ResolvePeerResponseAddresseeNotRequesterStopped`
+- From: `Stopped`
+- On: `ResolvePeerResponseAddressee`(corr_id, addressee)
+- Guards:
+  - `session_registered`
+  - `addressee_is_not_requester`
+- Emits: `PeerResponseAddresseeResolved`
+- To: `Stopped`
+
+### `ResolvePeerResponseAddresseeNotRequesterDestroyed`
+- From: `Destroyed`
+- On: `ResolvePeerResponseAddressee`(corr_id, addressee)
+- Guards:
+  - `session_registered`
+  - `addressee_is_not_requester`
+- Emits: `PeerResponseAddresseeResolved`
+- To: `Destroyed`
+
+### `ResolvePeerResponseAddresseeUnknownRequestIdle`
+- From: `Idle`
+- On: `ResolvePeerResponseAddressee`(corr_id, addressee)
+- Guards:
+  - `session_registered`
+  - `request_unknown`
+- Emits: `PeerResponseAddresseeResolved`
+- To: `Idle`
+
+### `ResolvePeerResponseAddresseeUnknownRequestAttached`
+- From: `Attached`
+- On: `ResolvePeerResponseAddressee`(corr_id, addressee)
+- Guards:
+  - `session_registered`
+  - `request_unknown`
+- Emits: `PeerResponseAddresseeResolved`
+- To: `Attached`
+
+### `ResolvePeerResponseAddresseeUnknownRequestRunning`
+- From: `Running`
+- On: `ResolvePeerResponseAddressee`(corr_id, addressee)
+- Guards:
+  - `session_registered`
+  - `request_unknown`
+- Emits: `PeerResponseAddresseeResolved`
+- To: `Running`
+
+### `ResolvePeerResponseAddresseeUnknownRequestRetired`
+- From: `Retired`
+- On: `ResolvePeerResponseAddressee`(corr_id, addressee)
+- Guards:
+  - `session_registered`
+  - `request_unknown`
+- Emits: `PeerResponseAddresseeResolved`
+- To: `Retired`
+
+### `ResolvePeerResponseAddresseeUnknownRequestStopped`
+- From: `Stopped`
+- On: `ResolvePeerResponseAddressee`(corr_id, addressee)
+- Guards:
+  - `session_registered`
+  - `request_unknown`
+- Emits: `PeerResponseAddresseeResolved`
+- To: `Stopped`
+
+### `ResolvePeerResponseAddresseeUnknownRequestDestroyed`
+- From: `Destroyed`
+- On: `ResolvePeerResponseAddressee`(corr_id, addressee)
+- Guards:
+  - `session_registered`
+  - `request_unknown`
+- Emits: `PeerResponseAddresseeResolved`
 - To: `Destroyed`
 
 ### `AdvanceSessionContextIdle`
@@ -23181,7 +23347,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `PeerRequestReceivedAfterUnregister`
 - From: `Idle`
-- On: `PeerRequestReceived`(corr_id, handling_mode)
+- On: `PeerRequestReceived`(corr_id, handling_mode, requester)
 - Guards:
   - `session_unregistered`
 - To: `Idle`
