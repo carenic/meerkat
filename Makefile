@@ -339,6 +339,7 @@ path-classifier-selftest:
 	@bash scripts/tests/require_python_test.sh
 	@bash scripts/tests/require_bash_test.sh
 	@bash scripts/tests/live_gate_selftest.sh
+	@node scripts/ci-action-pins-selftest.mjs
 
 cargo-agent-gate: rust-lane-doctor
 	@echo "$(GREEN)Running Cargo agent changed-path gate...$(NC)"

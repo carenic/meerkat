@@ -1,6 +1,6 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
-  "extends": ["config:recommended"],
+  "extends": ["config:recommended", "helpers:pinGitHubActionDigests"],
   "schedule": ["before 9am on Monday"],
   "branchConcurrentLimit": 1,
   "prConcurrentLimit": 1,
@@ -17,8 +17,12 @@
       "automerge": true
     },
     {
+      "description": "GitHub Actions run with the workflow token, OIDC and release secrets: pinned to commit SHAs (helpers:pinGitHubActionDigests, checked by scripts/ci-action-pins.mjs), proposed a week after release, in a group of their own, and never automerged. Keep this rule last.",
       "matchManagers": ["github-actions"],
-      "automerge": true
+      "groupName": "github actions",
+      "groupSlug": "github-actions",
+      "minimumReleaseAge": "7 days",
+      "automerge": false
     }
   ]
 }

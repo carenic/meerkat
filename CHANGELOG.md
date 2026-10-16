@@ -35,6 +35,20 @@ them.
 
 ## [Unreleased]
 
+### Changed
+
+- **Every third-party GitHub Action is pinned to a commit SHA, and Renovate
+  no longer automerges action updates.** Each `uses:` in `.github/`
+  workflows and composite actions (release and reusable workflows included)
+  names the full commit its tag or branch resolved to, with the ref in a
+  trailing comment; Renovate keeps them current
+  (`helpers:pinGitHubActionDigests`) and proposes action updates in a group
+  of their own, a week after release, without automerge.
+  `scripts/ci-action-pins.mjs` (in `make path-classifier-selftest`) fails on
+  an unpinned third-party action, naming its file and line, and on a
+  Renovate configuration that could automerge one. The pinned
+  `dtolnay/rust-toolchain` now names its toolchain as an input. CI only.
+
 ## [0.9.2] - 2026-10-16
 
 ### Breaking
