@@ -476,10 +476,15 @@ restored binary can shadow a tool on `PATH`; the jobs that hold registry or
 publish tokens restore no cache at all; and the jobs that mint OIDC tokens or
 attest artifacts restore only caches that no workflow in the repository saves
 on a dispatch-like run (any trigger but `push`, `pull_request`, `schedule`
-and `merge_group`). The BuildBuddy release binary build passes
-`repository-cache: "false"`. The doctor reads release.yml and its local
-actions, not the reusable `buildbuddy.yml`, which the full-graph validation
-calls only on tag pushes, and it does not cover the BuildBuddy remote cache.
+and `merge_group`). A tag run restores no Bazel repository cache: the
+BuildBuddy release binary build passes `repository-cache: "false"` and the
+full-graph validation passes `buildbuddy.yml` `repository_cache: "false"`.
+No workflow saves that cache on a dispatch-like run either
+(`release-binaries-check.yml` and `release-turbo-s.yml` only restore it).
+The doctor reads release.yml, the local actions it calls and, with the
+caller's inputs, the reusable `buildbuddy.yml` that the full-graph
+validation calls only on tag pushes; it does not cover the BuildBuddy remote
+cache.
 The macOS checks call the Apple tools by absolute path. The Web SDK package
 job installs wasm-pack, wasm-bindgen (the version Cargo.lock locks) and
 wasm-opt pinned by sha256 and runs wasm-pack with `--mode no-install`
