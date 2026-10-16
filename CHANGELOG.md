@@ -37,20 +37,24 @@ them.
 
 ### Fixed
 
-- A GPT Live barge-in duck (`live/assistant_playback_hint`) now ends once
-  the user has been quiet for 1.6 s, the floor guard's release length, even
-  while the assistant is still talking. Since 0.8.51 that restore also
-  waited for a 600 ms gap in the assistant's output, so an answer that
-  started into the user's speech and never paused stayed muted until it
-  ended: in Turbo S S107 the duck ran from 3289 ms to 19205 ms over a 12.8 s
-  answer, and the user heard none of it. The duck still holds while the
-  user speaks, pauses inside the user's speech (under 1.6 s) never restore
-  it, and a response that ends while the user is still talking still
-  restores at its 1.6 s of output silence. A stale response the provider
-  keeps voicing after the user's correction (0.8.51's Turbo S S103 case) is
-  heard from the same point; the talk-over oracle measures it from what the
-  user hears. The broker's `OUTPUT_BURST_GAP_MS` and its parity test with
-  the browser peer's end hysteresis are removed with that rule.
+- A GPT Live barge-in duck (`live/assistant_playback_hint`) over an answer
+  now ends once the user has been quiet for 1.6 s, the floor guard's release
+  length, even while the answer is still talking. Since 0.8.51 every duck
+  waited for a 600 ms gap in the assistant's output after the user went
+  quiet, so an answer that started into the user's speech and never paused
+  stayed muted until it ended: in Turbo S S107 the duck ran from 3289 ms to
+  19205 ms over a 12.8 s answer, and the user heard none of it. The broker
+  now keys the restore on the response the duck covers, by onset order on
+  the provider audio clock (gpt-live-1 output frames carry no response id):
+  a response that started into or after the user's speech is an answer and
+  restores on the user's quiet, mid-sentence if need be; a response that was
+  already audible when the user started speaking is the one the user
+  interrupted and keeps the 0.8.51 rule (ducked to its next 600 ms output
+  pause or its end, so the stale tail of Turbo S S103 R3 stays silent). The
+  duck still holds while the user speaks, and pauses inside the user's
+  speech (under 1.6 s) never restore it. By design, an answer spoken
+  entirely while the user is still talking stays ducked to its end (Turbo S
+  S106): the user held the floor for all of it.
 
 ## [0.9.2] - 2026-10-16
 

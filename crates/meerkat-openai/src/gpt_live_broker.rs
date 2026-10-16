@@ -171,9 +171,12 @@ pub enum GptLiveBrokerObservation {
     /// ducks assistant playback on it, so the user's floor wins at the
     /// overlap instead of when the provider yields.
     UserSpeechOverAssistant,
-    /// Ends a [`Self::UserSpeechOverAssistant`]: the user's speech or the
-    /// assistant's output has gone quiet for its release length on the
-    /// provider audio clock. A client restores assistant playback.
+    /// Ends a [`Self::UserSpeechOverAssistant`] on the provider audio clock:
+    /// the assistant's response ended, or the user's speech went quiet for
+    /// its release length. Over an answer (a response that started into or
+    /// after the user's speech) the user's quiet restores at once; over the
+    /// response the user interrupted, at its next output burst gap. A client
+    /// restores assistant playback.
     AssistantPlaybackRestorable,
     SessionContextAppendAcknowledged {
         token: GptLiveAppendToken,

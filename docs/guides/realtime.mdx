@@ -874,11 +874,19 @@ own playback:
   reply that starts after the user has stopped is never ducked.
 - `live/assistant_playback_hint { channel_id, hint: "restore" }` follows when
   the user's input goes quiet (including a false trigger: the user stops
-  without taking the turn) or when the assistant output goes quiet, whichever
-  comes first. The duck lasts only while the user holds the floor: an answer
-  that keeps talking after the user has been quiet for 1.6 s is restored in
-  the middle of its sentence, never left muted to its end. A restore follows
-  every duck, so a duck never leaves playback muted for the next turn.
+  without taking the turn) or when the assistant output goes quiet (the
+  response ended), whichever comes first. When the user goes quiet (1.6 s
+  without speech), the restore depends on the response the duck covers. An
+  answer, a response that started into or after the user's speech, is
+  restored at once, also in the middle of a sentence, so the answer is heard;
+  an answer spoken entirely while the user is still talking stays ducked to
+  its end, because the user held the floor for all of it. The response the
+  user interrupted, one already audible when the user started speaking, is
+  restored at its next pause (600 ms of output silence) or at its end, so the
+  stale tail the provider voices before it yields is not replayed. Meerkat
+  tells the two apart by onset order on the provider audio clock (gpt-live-1
+  output frames carry no response id). A restore follows every duck, so a
+  duck never leaves playback muted for the next turn.
 
 The hint is purely additive. It is a notification, not a request: nothing
 waits for it, it changes no channel, transcript, playback or close semantics,
