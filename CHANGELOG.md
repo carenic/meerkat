@@ -162,6 +162,15 @@ them.
   strict UTF-8, both sides of every change must be regular non-executable
   files, only a forward patch release qualifies, and a CHANGELOG over 1 MiB
   no longer makes classification fail.
+- CI's nested-Cargo canaries (the `downstream-cargo-canary` test group, the
+  three `downstream_*` tests of `meerkat::agent_builder_policy_canary`) no
+  longer run one after another in a packed `Closure tests` row: their
+  binary gets rows of its own, one `--partition count:K/N` per canary, so
+  they run side by side on separate runners (in run 38859112297 they took
+  447, 80 and 376 s in a row, 903 s of a 1760 s row). The coverage check
+  credits a partitioned binary only when every partition of one selection
+  is planned, and `scripts/ci-verify-row-binaries.mjs` accepts tests left to
+  sibling partitions only for a row that names its partition.
 
 ## [0.9.1] - 2026-10-15
 

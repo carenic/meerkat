@@ -182,6 +182,19 @@ const HEAVY_ANCHOR = "meerkat-mob";
 // stack: scripts/pre-push-unit.sh exports 32 MiB for all of its lanes.
 export const HOOK_TEST_STACK = 32 * 1024 * 1024;
 export const CLOSURE_TESTS_PER_ROW = 12;
+// Nested-Cargo canaries: the tests .config/nextest.toml puts in this test
+// group each build a fixture crate with a nested `cargo` and run one at a time
+// (max-threads = 1). In run 38859112297 the three of
+// meerkat::agent_builder_policy_canary took 446.6, 79.7 and 376.3 s one after
+// another: 903 s of the 1760 s row that held them. Their binary leaves the
+// packed rows for rows of its own: one selection, run as count partitions,
+// one per canary. A count partition deals a binary's tests round-robin in name
+// order, and the canaries share a name prefix, so they are adjacent and each
+// lands in its own partition, on its own runner. A miscount changes only how
+// the canaries spread, never what runs: the partitions together run every
+// test, and the coverage check credits the binary only when every partition
+// is planned.
+export const CANARY_TEST_GROUP = "downstream-cargo-canary";
 const CLOSURE_TEST_PROFILE = "ci-integration";
 const CLOSURE_LIB_PROFILE = "ci-unit";
 // Compile and link of one tests/*.rs binary, in cost units. Uncalibrated:
@@ -939,6 +952,47 @@ function hookLibLane(hook) {
   return lanes[0];
 }
 
+// The canary test group's binary and test-name prefix, from the one
+// `[[profile.default.overrides]]` entry that assigns CANARY_TEST_GROUP (the
+// default profile's overrides apply to every profile). Its filter must be
+// `binary(NAME) and test(/^PREFIX/)`; any other shape fails the plan rather
+// than splitting the wrong tests. No such entry: no canary rows.
+function canaryGroup(nextestText) {
+  const entries = [];
+  let section = null;
+  let entry = null;
+  for (const raw of nextestText.split("\n")) {
+    const line = raw.trim();
+    const header = /^\[\[?([^\]]+)\]\]?$/.exec(line);
+    if (header) {
+      section = header[1];
+      entry = section === "profile.default.overrides" ? {} : null;
+      if (entry) entries.push(entry);
+      continue;
+    }
+    const pair = /^(filter|test-group)\s*=\s*'([^']*)'\s*(#.*)?$/.exec(line);
+    if (entry && pair) entry[pair[1]] = pair[2];
+  }
+  const assigned = entries.filter((candidate) => candidate["test-group"] === CANARY_TEST_GROUP);
+  if (assigned.length === 0) return null;
+  if (assigned.length > 1) throw new Error(`${assigned.length} default overrides assign test group ${CANARY_TEST_GROUP}; expected one`);
+  const shape = /^binary\(([A-Za-z0-9_]+)\) and test\(\/\^([A-Za-z0-9_]+)\/\)$/.exec(assigned[0].filter ?? "");
+  if (!shape) {
+    throw new Error(`test group ${CANARY_TEST_GROUP} filter ${JSON.stringify(assigned[0].filter)} is not binary(NAME) and test(/^PREFIX/)`);
+  }
+  return { binary: shape[1], prefix: shape[2] };
+}
+
+// The number of #[test] / #[tokio::test] functions in a test source whose
+// names start with `prefix`.
+function countCanaryTests(source, prefix) {
+  const pattern = new RegExp(
+    `#\\[(?:tokio::)?test(?:\\([^)]*\\))?\\]\\s*(?:#\\[[^\\]]*\\]\\s*)*(?:async\\s+)?fn\\s+${prefix}[A-Za-z0-9_]*\\s*\\(`,
+    "g",
+  );
+  return (source.match(pattern) ?? []).length;
+}
+
 // The hook-parity rows for the test scope (see the header). Every row but
 // HeadCanonical selects the whole workspace (`--workspace`) and names only
 // its own targets: Cargo then resolves features exactly as the hook's single
@@ -1006,6 +1060,21 @@ function hookParityRows({ scope, byName, unified, model, maxTestRows, nextestTex
   }).map((name) => `${name}::${test}`);
   const byHome = new Map();
   for (const [test, name] of home) byHome.set(name, [...(byHome.get(name) ?? []), test]);
+  // The nested-Cargo canaries' binary (CANARY_TEST_GROUP) leaves the packed
+  // units for count-partitioned rows of its own, one per canary.
+  const canary = canaryGroup(nextestText);
+  let canaryRows = null;
+  if (canary && home.has(canary.binary)) {
+    const owner = home.get(canary.binary);
+    const target = testTargets(owner).find((candidate) => candidate.name === canary.binary);
+    const source = target?.src_path && existsSync(target.src_path) ? readFileSync(target.src_path, "utf8") : "";
+    const count = countCanaryTests(source, canary.prefix);
+    if (count >= 2) {
+      byHome.set(owner, byHome.get(owner).filter((test) => test !== canary.binary));
+      if (byHome.get(owner).length === 0) byHome.delete(owner);
+      canaryRows = { owner, test: canary.binary, count };
+    }
+  }
   const units = [];
   for (const [name, tests] of [...byHome].sort(([a], [b]) => a.localeCompare(b))) {
     tests.sort();
@@ -1063,6 +1132,33 @@ function hookParityRows({ scope, byName, unified, model, maxTestRows, nextestTex
       rust_min_stack: HOOK_TEST_STACK,
       estimated_minutes: estimatedMinutes(lines + LINK_COST_PER_DEP * union.size + TEST_TARGET_COST * binaries.length),
     });
+  }
+  if (canaryRows) {
+    const binaries = binariesOf(canaryRows.test);
+    const packages = [...new Set(binaries.map((binary) => binary.split("::")[0]))].sort();
+    const union = new Set();
+    let lines = 0;
+    for (const name of packages) {
+      lines += model.lines.get(name);
+      for (const dep of model.closures.get(name)) union.add(dep);
+    }
+    for (let index = 1; index <= canaryRows.count; index += 1) {
+      rows.push({
+        name: `tests ${shortName(canaryRows.owner)} canaries ${index}/${canaryRows.count}`,
+        lane: "tests",
+        packages,
+        package_flags: "--workspace",
+        test_flags: `--test ${canaryRows.test}`,
+        profile: CLOSURE_TEST_PROFILE,
+        binaries,
+        // Every partition of a binary with more tests than canaries holds
+        // tests; an empty one means the binary lost its tests.
+        no_tests: "fail",
+        rust_min_stack: HOOK_TEST_STACK,
+        partition: `count:${index}/${canaryRows.count}`,
+        estimated_minutes: estimatedMinutes(lines + LINK_COST_PER_DEP * union.size + TEST_TARGET_COST * binaries.length),
+      });
+    }
   }
 
   // The hook's two named lanes: HeadCanonical with the hook's own
@@ -1727,6 +1823,7 @@ function closureMatrixOf(rows) {
     binaries: row.binaries.join(" "),
     no_tests: row.no_tests,
     rust_min_stack: String(row.rust_min_stack),
+    partition: row.partition ?? "",
   }));
   if (include.length === 0) include.push({ name: "none", packages: "" });
   return JSON.stringify({ include });

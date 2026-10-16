@@ -1194,7 +1194,9 @@ jobs:
     if: ${{ needs.changes.result == 'success' && needs.changes.outputs.closure_test_count != '0' }}
     runs-on: ubuntu-24.04
     # A cold row (no reusable units, as after a release version bump) builds
-    # for about 22 min and then runs the nested-Cargo canaries one at a time.
+    # for about 22 min before its tests run. The nested-Cargo canaries'
+    # binary has rows of its own, one count partition per canary, so the
+    # canaries run side by side on separate runners instead of one at a time.
     timeout-minutes: 60
     strategy:
       fail-fast: false
@@ -1243,6 +1245,7 @@ jobs:
           BINARIES: ${{ matrix.binaries }}
           NO_TESTS: ${{ matrix.no_tests }}
           MIN_STACK: ${{ matrix.rust_min_stack }}
+          PARTITION: ${{ matrix.partition }}
         run: |
           set -euo pipefail
           if [[ -z "${PACKAGES}" || -z "${TESTS}" || -z "${PROFILE}" || -z "${BINARIES}" || -z "${NO_TESTS}" ]]; then
@@ -1252,6 +1255,10 @@ jobs:
           read -r -a test_flags <<<"${TESTS}"
           filter_args=()
           if [[ -n "${FILTER}" ]]; then filter_args=(-E "${FILTER}"); fi
+          # A partitioned row (the nested-Cargo canaries' binary) runs one
+          # count partition; the plan holds every sibling partition.
+          partition_args=()
+          if [[ -n "${PARTITION}" ]]; then partition_args=(--partition "${PARTITION}"); fi
           # One selection for the list and the run: the binaries nextest
           # lists, and the check below accepts, are the ones that run.
           # scripts/ci-hook-coverage.mjs pins every line of this step that
@@ -1259,7 +1266,7 @@ jobs:
           # nextest or the binary check, so no line can reassign an input or
           # the test-thread stack.
           # shellcheck disable=SC2206
-          selection=(${PACKAGES} "${test_flags[@]}" --profile "${PROFILE}" "${filter_args[@]}")
+          selection=(${PACKAGES} "${test_flags[@]}" --profile "${PROFILE}" "${filter_args[@]}" "${partition_args[@]}")
           # The hook ran every lane on a 32 MiB test-thread stack.
           if [[ -n "${MIN_STACK}" ]]; then export RUST_MIN_STACK="${MIN_STACK}"; fi
           # Tests of crates that dev-depend on mcp-test-server spawn this exact
@@ -1275,7 +1282,7 @@ jobs:
           # profile, before anything runs. The run reuses the same build.
           ./scripts/repo-cargo nextest list "${selection[@]}" --message-format json >"${RUNNER_TEMP}/closure-test-list.json"
           # shellcheck disable=SC2086
-          node scripts/ci-verify-row-binaries.mjs "${RUNNER_TEMP}/closure-test-list.json" ${BINARIES}
+          node scripts/ci-verify-row-binaries.mjs "${RUNNER_TEMP}/closure-test-list.json" "${partition_args[@]}" ${BINARIES}
           ./scripts/repo-cargo nextest run "${selection[@]}" --no-tests="${NO_TESTS}" --no-fail-fast --status-level slow --final-status-level slow
 
       - name: Upload sccache server log
