@@ -42,7 +42,8 @@ them.
   keep a closed live channel's generated assistant outputs addressable while
   its deferred close settlement replays rows that need them. A retirement
   requested meanwhile runs when the last hold ends; a held output never
-  becomes reservable. (#1821)
+  becomes reservable. Additive public API: the semver gate lists the new type
+  and method as additions. (#1821)
 
 ### Fixed
 
@@ -72,6 +73,10 @@ them.
   voice-delegated work in the existing member), later rows wait behind it, so
   the persisted transcript can lag the conversation by up to that turn's
   length (see `docs/guides/realtime.mdx`). (#1821)
+- When the member turn's boundary frees while a channel close is still
+  settling, a later live row can commit ahead of an earlier row the close
+  holds for its settlement. No row is lost; only their order in the
+  transcript can differ from the conversation. (#1821)
 - Rows a channel close holds for replay after its deferred settlement gave up
   are held in memory only: they are lost if the process exits before the next
   boundary lets them land. Durable staging is planned. (#1821)
