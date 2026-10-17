@@ -35,6 +35,19 @@ them.
 
 ## [Unreleased]
 
+### Fixed
+
+- A read of runtime delivery state no longer creates the state directory or
+  an empty runtime store. The SQLite runtime store's delivery reads (delivery
+  authorities and inbox records, continuation key bindings and admissions,
+  and the delivery generation) opened a create-capable connection, so a read
+  over a store whose file or directory was gone (a released, moved or removed
+  state directory, read by a delivery owner or a health tick that outlived
+  it) re-created the directory and an empty `runtime.sqlite`. They now open
+  an existing file without create and answer "not provisioned" when it is
+  missing; only a delivery write creates the store. Behaviour only: no API
+  or schema change.
+
 ## [0.9.2] - 2026-10-16
 
 ### Breaking

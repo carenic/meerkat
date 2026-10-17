@@ -4655,20 +4655,33 @@ END";
         Ok(RuntimeDeliveryAuthorityCasOutcome::Applied(replacement))
     }
 
+    /// Delivery-read connection. A read never creates the store: a database
+    /// file that is not there, or whose directory is not, never used durable
+    /// delivery, so it reads as unprovisioned and nothing is created (no
+    /// directory, no file, no fence sidecar). An existing file is opened with
+    /// the store's ordinary read-write policy, without create. Only
+    /// [`open_runtime_delivery_write_connection`] creates the store.
     fn open_runtime_delivery_read_connection(
         path: &Path,
     ) -> Result<Option<RuntimeConn>, RuntimeStoreError> {
+        if runtime_database_absent(path) {
+            return Ok(None);
+        }
         let guard =
             meerkat_sqlite::OperationGuard::for_database(path).map_err(map_shared_sqlite_error)?;
-        let conn = meerkat_sqlite::open_with(
+        let conn = match meerkat_sqlite::open_with(
             path,
-            meerkat_sqlite::ConnectionProfile::PRIMARY,
+            meerkat_sqlite::ConnectionProfile::Primary { create: false },
             meerkat_sqlite::OpenOptions {
                 schema_preflight: &[&RUNTIME_DELIVERY_DOMAIN],
                 ..meerkat_sqlite::OpenOptions::default()
             },
-        )
-        .map_err(map_shared_sqlite_error)?;
+        ) {
+            Ok(conn) => conn,
+            // Removed between the check and the open: still unprovisioned.
+            Err(_) if runtime_database_absent(path) => return Ok(None),
+            Err(error) => return Err(map_shared_sqlite_error(error)),
+        };
         let provisioned = meerkat_sqlite::domain_version(&conn, RUNTIME_DELIVERY_DOMAIN.name)
             .map_err(map_shared_sqlite_error)?
             .is_some();
@@ -4676,6 +4689,16 @@ END";
             conn,
             _guard: guard,
         }))
+    }
+
+    /// Whether nothing is at `path`, a missing directory included. Anything
+    /// there, even a file of the wrong kind, is not absent: opening it
+    /// reports why it is refused.
+    fn runtime_database_absent(path: &Path) -> bool {
+        matches!(
+            std::fs::symlink_metadata(path),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound
+        )
     }
 
     /// Delivery-write connection: provisions the delivery domain on first
@@ -25332,6 +25355,165 @@ ORDER BY runtime_id";
             );
             drop(reopened);
             drop(dir);
+        }
+
+        /// A read of runtime delivery state never creates the store. Over a
+        /// state directory that never existed, a directory removed after the
+        /// store opened (before or after a provisioned delivery write), or a
+        /// removed database file, every delivery read answers unprovisioned
+        /// and creates nothing: no directory, no database, no sidecar.
+        #[tokio::test]
+        async fn delivery_reads_never_create_a_missing_store() {
+            #[derive(Debug, Clone, Copy)]
+            enum Read {
+                Authority,
+                Record,
+                KeyBinding,
+                Admission,
+                Generation,
+                Authorities,
+                Records,
+            }
+            #[derive(Debug, Clone, Copy)]
+            enum Gone {
+                /// The state directory, before any delivery use.
+                Directory,
+                /// The state directory, after a provisioned delivery write.
+                ProvisionedDirectory,
+                /// Only the database file; its directory stays.
+                DatabaseFile,
+            }
+            const DELIVERY: &str = "job:job_1:terminal:1";
+            fn entries(dir: &Path) -> Vec<std::ffi::OsString> {
+                let mut names = std::fs::read_dir(dir)
+                    .unwrap()
+                    .map(|entry| entry.unwrap().file_name())
+                    .collect::<Vec<_>>();
+                names.sort();
+                names
+            }
+
+            let mut created = Vec::new();
+            let root = TempDir::new().unwrap();
+            let never = root.path().join("never");
+            assert!(
+                open_runtime_delivery_read_connection(&never.join("runtime.sqlite"))
+                    .unwrap()
+                    .is_none(),
+                "a store whose directory never existed reads unprovisioned"
+            );
+            if never.exists() {
+                created.push(
+                    "shared read connection: created a directory that never existed".to_string(),
+                );
+            }
+
+            let rid = runtime_id();
+            for gone in [
+                Gone::Directory,
+                Gone::ProvisionedDirectory,
+                Gone::DatabaseFile,
+            ] {
+                for read in [
+                    Read::Authority,
+                    Read::Record,
+                    Read::KeyBinding,
+                    Read::Admission,
+                    Read::Generation,
+                    Read::Authorities,
+                    Read::Records,
+                ] {
+                    let root = TempDir::new().unwrap();
+                    let state = root.path().join("state");
+                    let database = state.join("runtime.sqlite");
+                    let store = SqliteRuntimeStore::new(&database).unwrap();
+                    if matches!(gone, Gone::ProvisionedDirectory) {
+                        let outcome = store
+                            .compare_and_swap_runtime_delivery_authority(
+                                &rid,
+                                None,
+                                RuntimeDeliveryAuthorityRecord::from_parts(1, b"state".to_vec()),
+                                Some(RuntimeDeliveryStoreRecord::from_parts(
+                                    DELIVERY,
+                                    1,
+                                    b"payload".to_vec(),
+                                )),
+                            )
+                            .await
+                            .unwrap();
+                        assert!(matches!(
+                            outcome,
+                            RuntimeDeliveryAuthorityCasOutcome::Applied(_)
+                        ));
+                        assert_eq!(store.load_delivery_generation().await.unwrap(), 1);
+                    }
+                    let left = match gone {
+                        Gone::Directory | Gone::ProvisionedDirectory => {
+                            std::fs::remove_dir_all(&state).unwrap();
+                            None
+                        }
+                        Gone::DatabaseFile => {
+                            std::fs::remove_file(&database).unwrap();
+                            Some(entries(&state))
+                        }
+                    };
+                    let unprovisioned = match read {
+                        Read::Authority => store
+                            .load_runtime_delivery_authority(&rid)
+                            .await
+                            .unwrap()
+                            .is_none(),
+                        Read::Record => store
+                            .load_runtime_delivery_record(&rid, DELIVERY)
+                            .await
+                            .unwrap()
+                            .is_none(),
+                        Read::KeyBinding => store
+                            .load_continuation_key_binding("owner", "key")
+                            .await
+                            .unwrap()
+                            .is_none(),
+                        Read::Admission => store
+                            .load_continuation_admission(&rid, DELIVERY)
+                            .await
+                            .unwrap()
+                            .is_none(),
+                        Read::Generation => store.load_delivery_generation().await.unwrap() == 0,
+                        Read::Authorities => store
+                            .list_runtime_delivery_authorities()
+                            .await
+                            .unwrap()
+                            .is_empty(),
+                        Read::Records => store
+                            .list_runtime_delivery_records(&rid, 0, 16)
+                            .await
+                            .unwrap()
+                            .is_empty(),
+                    };
+                    assert!(
+                        unprovisioned,
+                        "{read:?} over a missing store ({gone:?}) reads unprovisioned"
+                    );
+                    match left {
+                        None if state.exists() => created.push(format!(
+                            "{read:?} ({gone:?}): re-created the removed state directory"
+                        )),
+                        Some(left) if entries(&state) != left => created.push(format!(
+                            "{read:?} ({gone:?}): created {:?} beside the removed database",
+                            entries(&state)
+                                .into_iter()
+                                .filter(|name| !left.contains(name))
+                                .collect::<Vec<_>>()
+                        )),
+                        _ => {}
+                    }
+                }
+            }
+            assert!(
+                created.is_empty(),
+                "delivery reads created store files:\n{}",
+                created.join("\n")
+            );
         }
 
         #[tokio::test]
