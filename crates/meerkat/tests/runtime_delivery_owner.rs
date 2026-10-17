@@ -1696,3 +1696,113 @@ async fn a_bundles_job_store_records_the_submitting_members_address() {
         Some("worker-7".to_string())
     );
 }
+
+/// Reports `current` as the current session of the member at `address`;
+/// the test moves the member by replacing `current`.
+struct RepointableMember {
+    current: std::sync::Mutex<SessionId>,
+    address: meerkat_runtime::LogicalRuntimeId,
+}
+
+#[async_trait::async_trait]
+impl meerkat::ContinuationAddressResolver for RepointableMember {
+    async fn current_address(
+        &self,
+        _owner: &ContinuationOwner,
+    ) -> Result<Option<meerkat_runtime::LogicalRuntimeId>, String> {
+        Ok(None)
+    }
+
+    async fn resolve_address(
+        &self,
+        _address: &meerkat_runtime::LogicalRuntimeId,
+    ) -> Result<meerkat::AddressResolution, String> {
+        Ok(meerkat::AddressResolution::NotServed)
+    }
+
+    async fn member_address_of_session(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Option<meerkat_runtime::LogicalRuntimeId>, String> {
+        let current = self.current.lock().expect("current session lock").clone();
+        Ok((session_id == &current).then(|| self.address.clone()))
+    }
+}
+
+/// #1790: a replay through the producer job store keeps what its admitted
+/// job recorded as its origin member, in either direction. A job admitted
+/// without one (submitted before 0.9.3, through the host's own store, or
+/// while the resolver could not tell) is joined by a replay from the
+/// member's current session; a job admitted with one is joined by a replay
+/// from a session the member has since left.
+#[cfg(feature = "session-store")]
+#[tokio::test]
+async fn a_replay_through_the_producer_store_keeps_its_admitted_origin_member() {
+    let bundle = meerkat::PersistenceBundle::new(
+        Arc::new(meerkat_store::MemoryStore::new()) as Arc<dyn meerkat::SessionStore>,
+        Arc::new(InMemoryRuntimeStore::new()) as Arc<dyn meerkat_runtime::RuntimeStore>,
+        Arc::new(meerkat::MemoryBlobStore::new()),
+    )
+    .expect("persistence bundle");
+    let member_session = SessionId::new();
+    let member = meerkat::member_delivery_address("team", "worker", 1).expect("member address");
+    let resolver = Arc::new(RepointableMember {
+        current: std::sync::Mutex::new(member_session.clone()),
+        address: member.clone(),
+    });
+    let _binding = bundle
+        .continuation_bindings()
+        .bind(resolver.clone(), Arc::new(NoRetainedJobs))
+        .expect("bind the host's resolver");
+    let host_jobs = DetachedJobService::new(bundle.job_store());
+    let producer_jobs = DetachedJobService::new(bundle.producer_job_store());
+    let origin_member = |job: Option<meerkat_jobs::StoredJob>| {
+        job.expect("job")
+            .spec
+            .origin_member_id
+            .map(|id| id.as_str().to_string())
+    };
+
+    // Admitted without an origin member, then replayed from the member's
+    // current session.
+    let plain = spec("default", "admitted-plain", member_session.clone());
+    let admitted = host_jobs.submit(plain.clone()).await.expect("submit");
+    let replay = producer_jobs
+        .submit(plain)
+        .await
+        .expect("the replay joins the job admitted without an origin member");
+    assert_eq!(replay.job_id, admitted.job_id);
+    assert!(replay.deduplicated);
+    assert_eq!(
+        origin_member(
+            bundle
+                .job_store()
+                .get(&admitted.job_id)
+                .await
+                .expect("read")
+        ),
+        None
+    );
+
+    // Admitted with the member's address, then replayed after the member
+    // moved to a successor session.
+    let stamped = spec("default", "admitted-stamped", member_session.clone());
+    let admitted = producer_jobs.submit(stamped.clone()).await.expect("submit");
+    *resolver.current.lock().expect("current session lock") = SessionId::new();
+    let replay = producer_jobs
+        .submit(stamped)
+        .await
+        .expect("the replay joins the job admitted with an origin member");
+    assert_eq!(replay.job_id, admitted.job_id);
+    assert!(replay.deduplicated);
+    assert_eq!(
+        origin_member(
+            bundle
+                .job_store()
+                .get(&admitted.job_id)
+                .await
+                .expect("read")
+        ),
+        Some(member.0)
+    );
+}

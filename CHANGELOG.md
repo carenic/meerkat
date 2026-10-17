@@ -66,8 +66,18 @@ them.
   member respawned under its identity is a new generation that never receives
   an earlier generation's rows, which stay pending. Jobs submitted before
   0.9.3, and jobs of sessions no member serves, keep their session's
-  address. Not yet covered: the terminal a background shell job applies
-  itself, in the session that ran it.
+  address; a replay keeps what its admitted job recorded. A host that builds
+  its own job producers from `PersistenceBundle::job_store()` keeps session
+  addressing; give them `producer_job_store()` for member addressing. Not
+  yet covered: the terminal a background shell job applies itself, in the
+  session that ran it.
+
+### Known limitations
+
+- A mob member repointed between applying a job delivery row in one session
+  and acknowledging it can see the row applied again in the successor
+  session: each session keeps its own idempotency ledger. Continuation rows
+  already have the same window.
 
 ## [0.9.2] - 2026-10-16
 

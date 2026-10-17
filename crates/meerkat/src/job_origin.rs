@@ -25,8 +25,13 @@ use meerkat_jobs::{
 /// stamps only while the submitting session is the member's current one, so
 /// the address is that of the incarnation the job was started by. A
 /// submission that already names an origin member, a session no member
-/// serves, and a host with no bound resolver are stored as given. Every
-/// other operation is the inner store's.
+/// serves, and a host with no bound resolver are stored as given.
+///
+/// A replay is transparent: a submission whose key already admitted a job
+/// takes that job's origin member, whatever it recorded (none, for a job
+/// submitted before 0.9.3, through the host's own store or while the
+/// resolver could not tell), and the inner store's equivalence check decides
+/// the rest as before. Every other operation is the inner store's.
 pub(crate) struct MemberOriginJobStore {
     inner: Arc<dyn DetachedJobStore>,
     continuations: Arc<crate::ContinuationHostBindings>,
@@ -50,13 +55,33 @@ impl DetachedJobStore for MemberOriginJobStore {
         &self,
         mut job: StoredJob,
     ) -> Result<InsertJobOutcome, DetachedJobError> {
-        if job.spec.origin_member_id.is_none()
-            && let Some(address) = self
-                .continuations
-                .member_address_of_session(&job.spec.origin_session_id)
+        if job.spec.origin_member_id.is_none() {
+            match self
+                .inner
+                .get_by_submission_key(&job.spec.realm_id, &job.spec.submission_key)
                 .await
-        {
-            job.spec.origin_member_id = Some(OriginMemberId::new(address.0)?);
+            {
+                Ok(Some(admitted)) => {
+                    job.spec.origin_member_id = admitted.spec.origin_member_id;
+                }
+                Ok(None) => {
+                    if let Some(address) = self
+                        .continuations
+                        .member_address_of_session(&job.spec.origin_session_id)
+                        .await
+                    {
+                        job.spec.origin_member_id = Some(OriginMemberId::new(address.0)?);
+                    }
+                }
+                // A store that cannot read its submission index stamps
+                // nothing: its jobs keep their session's address.
+                Err(error) => {
+                    tracing::debug!(
+                        %error,
+                        "the submission index is unreadable; the job keeps its session's address"
+                    );
+                }
+            }
         }
         self.inner.insert_deduplicated(job).await
     }
