@@ -825,12 +825,6 @@ pub fn builtin_tool_visibility_witness() -> meerkat_core::ToolVisibilityWitness 
 // the gate names that feature too instead of leaving an unused import in the
 // default-feature lib test build.
 #[cfg(all(
-    feature = "session-store",
-    feature = "live",
-    not(target_arch = "wasm32")
-))]
-pub(crate) use orchestrator::unrecorded_live_row_identity;
-#[cfg(all(
     test,
     feature = "session-store",
     feature = "live",
@@ -842,6 +836,18 @@ pub(crate) use orchestrator::{
     DeferredCloseSettlementGiveUp, DeferredCloseSettlementOutcome,
     settle_live_close_playback_deferred,
 };
+
+// The GPT Live transport names a row it cannot hand to a closing channel the
+// way the close's settlement does. That transport is compiled only with
+// `openai-live`, so the gate names the feature too: without it nothing imports
+// this and the build would warn.
+#[cfg(all(
+    feature = "session-store",
+    feature = "live",
+    feature = "openai-live",
+    not(target_arch = "wasm32")
+))]
+pub(crate) use orchestrator::unrecorded_live_row_identity;
 /// Phase 4 R1: surface-agnostic [`LiveOrchestrator`] that owns the
 /// load-bearing live-channel methods previously stranded on
 /// `meerkat-rpc::SessionRuntime`.
