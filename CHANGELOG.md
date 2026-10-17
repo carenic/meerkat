@@ -87,11 +87,15 @@ them.
   drops the other scope held for the old one. An agent's `mob_create`
   grants the incarnation its own create started; `delegate` grants the
   incarnation its session's implicit mob runs at, and only when the mob's
-  owner-bridge record marks it as that session's implicit mob. Incarnations
-  are never decoded from input: `Deserialize` always refuses and `Debug`
-  and `Serialize` render them redacted. Grants are still not persisted, so
-  no grant survives a restart; a member's operator facts re-bind to the
-  incarnation of the mob that holds them on each upcall.
+  owner-bridge record marks it as that session's implicit mob. Every agent
+  mob tool acts through the mob it was admitted against and never resolves
+  the id again, so a mob destroyed and created again under the id while a
+  call is in flight is never touched by that call (a destroy re-checks the
+  admitted incarnation and refuses with the ordinary access denial).
+  Incarnations are never decoded from input: `Deserialize` always refuses
+  and `Debug` and `Serialize` render them redacted. Grants are still not
+  persisted, so no grant survives a restart; a member's operator facts
+  re-bind to the incarnation of the mob that holds them on each upcall.
 
 ### Added
 

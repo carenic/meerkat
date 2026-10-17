@@ -1209,16 +1209,19 @@ impl std::fmt::Display for OpaquePrincipalToken {
 /// process, is a new incarnation.
 ///
 /// Mob operator grants name the incarnation they were minted for, so a grant
-/// never reaches a later mob under the same id. Only the mob runtime mints
-/// one, when it starts (UUID v4, 122 random bits). The value is opaque and
-/// is never decoded: deserialization always refuses, and `Debug` and
+/// never reaches a later mob under the same id. The mob runtime mints one
+/// with [`Self::mint`] when it starts (UUID v4, 122 random bits) and hands it
+/// out through its handles; a value minted anywhere else names no running
+/// mob, so a grant naming it reaches nothing. The value is opaque and is
+/// never decoded: deserialization always refuses, and `Debug` and
 /// `Serialize` render it redacted. It is not a credential; the authority is
 /// the sealed [`MobToolAuthorityContext`] that names it.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct MobIncarnationId(uuid::Uuid);
 
 impl MobIncarnationId {
-    /// A fresh incarnation, never handed out before.
+    /// A fresh incarnation, never handed out before. The mob runtime calls
+    /// this when a mob starts; any other caller gets a value no mob runs at.
     pub fn mint() -> Self {
         Self(uuid::Uuid::new_v4())
     }

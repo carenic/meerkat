@@ -1028,6 +1028,10 @@ pub struct MobMcpState {
     /// and before the managed-set registration.
     #[cfg(test)]
     resume_insert_hold: std::sync::Mutex<Option<Arc<InsertHold>>>,
+    /// Test seam: when set, the next agent mob tool call parks once between
+    /// its admission and its action (see [`Self::pause_agent_call`]).
+    #[cfg(test)]
+    agent_call_hold: std::sync::Mutex<Option<Arc<InsertHold>>>,
     /// Stable per-process coordinator identity. It is the council claim id, so
     /// a later in-process recovery sweep RENEWS the claim this process already
     /// holds instead of colliding with itself, while a genuinely different
@@ -1192,6 +1196,8 @@ impl MobMcpState {
             create_insert_hold: std::sync::Mutex::new(None),
             #[cfg(test)]
             resume_insert_hold: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            agent_call_hold: std::sync::Mutex::new(None),
             coordinator_id: uuid::Uuid::new_v4().simple().to_string(),
             temporary_council_clock_offset_ms: std::sync::atomic::AtomicI64::new(0),
             temporary_council_clock_changes: tokio::sync::watch::channel(0).0,
@@ -3524,7 +3530,7 @@ impl MobMcpState {
         // flight; once it is dropped, on any path, the actor's own retry
         // recovers whatever cleanup remains.
         let result = meerkat_runtime::stack_relief::box_in_own_frame(|| {
-            self.mob_destroy_unchecked_loaded(&mob_id, MobDestroyCaller::Console)
+            self.mob_destroy_unchecked_loaded(&mob_id, MobDestroyCaller::Console, None)
         })
         .await;
         drop(custody);
@@ -4521,15 +4527,20 @@ impl MobMcpState {
         &self,
         mob_id: &MobId,
     ) -> Result<meerkat_mob::MobDestroyReport, MobMcpDestroyError> {
-        self.mob_destroy_for(mob_id, MobDestroyCaller::Console)
+        self.mob_destroy_for(mob_id, MobDestroyCaller::Console, None)
             .await
     }
 
     /// [`Self::mob_destroy`] for `caller`, which the destroy records.
+    /// `admitted_incarnation` names the mob the caller was admitted to
+    /// destroy, when it was admitted against a resolved mob: the destroy is
+    /// refused unless the mob it is about to destroy is that incarnation, so
+    /// a mob created under the id since is never destroyed by it.
     pub(crate) async fn mob_destroy_for(
         &self,
         mob_id: &MobId,
         caller: MobDestroyCaller,
+        admitted_incarnation: Option<meerkat_core::service::MobIncarnationId>,
     ) -> Result<meerkat_mob::MobDestroyReport, MobMcpDestroyError> {
         // A destroy this state already admitted and natively completed is
         // continued for its own caller before the actor-routed admission
@@ -4563,7 +4574,17 @@ impl MobMcpState {
             )));
         }
         self.ensure_restored().await?;
-        self.mob_destroy_unchecked_loaded(mob_id, caller).await
+        self.mob_destroy_unchecked_loaded(mob_id, caller, admitted_incarnation)
+            .await
+    }
+
+    /// The refusal of a destroy whose mob is not the incarnation it was
+    /// admitted against: the caller holds no scope over the mob under the id.
+    fn destroy_not_admitted() -> MobMcpDestroyError {
+        MobMcpDestroyError::Mob(MobError::ScopeDenied(ScopeDenial {
+            required: ControlScope::Retire,
+            presented: BTreeSet::new(),
+        }))
     }
 
     /// Destroy a mob without the implicit-mob guard.
@@ -4574,7 +4595,7 @@ impl MobMcpState {
         mob_id: &MobId,
     ) -> Result<meerkat_mob::MobDestroyReport, MobMcpDestroyError> {
         self.ensure_restored().await?;
-        self.mob_destroy_unchecked_loaded(mob_id, MobDestroyCaller::Console)
+        self.mob_destroy_unchecked_loaded(mob_id, MobDestroyCaller::Console, None)
             .await
     }
 
@@ -4618,7 +4639,21 @@ impl MobMcpState {
         &self,
         mob_id: &MobId,
         caller: MobDestroyCaller,
+        admitted_incarnation: Option<meerkat_core::service::MobIncarnationId>,
     ) -> Result<meerkat_mob::MobDestroyReport, MobMcpDestroyError> {
+        // A destroy admitted against one incarnation never reaches another,
+        // not even through the preflight's report of its bindings.
+        if let Some(admitted) = admitted_incarnation {
+            let current = self
+                .mobs
+                .read()
+                .await
+                .get(mob_id)
+                .map(|managed| managed.handle.incarnation());
+            if current != Some(admitted) {
+                return Err(Self::destroy_not_admitted());
+            }
+        }
         self.workgraph_destroy_preflight(mob_id)
             .await
             .map_err(MobMcpDestroyError::Mob)?;
@@ -4628,6 +4663,9 @@ impl MobMcpState {
                 .cloned()
                 .ok_or_else(|| MobMcpDestroyError::Mob(MobError::MobNotFound(mob_id.clone())))?
         };
+        if admitted_incarnation.is_some_and(|admitted| managed.handle.incarnation() != admitted) {
+            return Err(Self::destroy_not_admitted());
+        }
 
         // What the destroy will owe the mob's database, taken before it
         // starts: what the path holds, and the actor task whose stores drop
@@ -4739,12 +4777,21 @@ impl MobMcpState {
         mob_id: &MobId,
         identity: AgentIdentity,
     ) -> Result<(), MobError> {
+        let handle = self.handle_for(mob_id).await?;
+        Self::mob_retire_on(&handle, identity).await
+    }
+
+    /// [`Self::mob_retire`] on the mob `handle` serves, which the caller
+    /// already resolved and admitted against: it never resolves the id
+    /// again.
+    pub(crate) async fn mob_retire_on(
+        handle: &MobHandle,
+        identity: AgentIdentity,
+    ) -> Result<(), MobError> {
         // Retirement follows process-tree semantics: members this one
         // spawned (e.g. its fork_off children) are retired with it.
-        self.admitted_handle_for(mob_id, ControlScope::Retire)
-            .await?
-            .retire_with_descendants(identity)
-            .await
+        handle.admit_control_scope(ControlScope::Retire).await?;
+        handle.retire_with_descendants(identity).await
     }
 
     pub async fn mob_identity_intent(
@@ -5041,9 +5088,18 @@ impl MobMcpState {
         mob_id: &MobId,
     ) -> Result<Vec<meerkat_mob::runtime::MobMemberListEntry>, MobError> {
         let handle = self.handle_for(mob_id).await?;
+        self.mob_list_members_on(&handle).await
+    }
+
+    /// [`Self::mob_list_members`] on the mob `handle` serves, which the
+    /// caller already resolved and admitted against.
+    pub(crate) async fn mob_list_members_on(
+        &self,
+        handle: &MobHandle,
+    ) -> Result<Vec<meerkat_mob::runtime::MobMemberListEntry>, MobError> {
         // (b) resolver: the member list is a watch-read projection that
         // never enters the actor queue (FLAG-W-E-1 in scope_gate.rs).
-        self.require_console_scope(&handle, ControlScope::List)?;
+        self.require_console_scope(handle, ControlScope::List)?;
         handle.list_members_including_retiring().await.pipe(Ok)
     }
 
@@ -5343,6 +5399,15 @@ impl MobMcpState {
         bridge_session_id: &SessionId,
     ) -> Result<meerkat_mob::AgentIdentity, MobError> {
         let handle = self.handle_for(mob_id).await?;
+        Self::objective_principal_on(&handle, bridge_session_id).await
+    }
+
+    /// [`Self::objective_principal_for_mob_owner_session`] in the mob
+    /// `handle` serves, which the caller already resolved.
+    pub(crate) async fn objective_principal_on(
+        handle: &MobHandle,
+        bridge_session_id: &SessionId,
+    ) -> Result<meerkat_mob::AgentIdentity, MobError> {
         let roster = handle.roster().await;
         if let Some(entry) = roster.find_by_bridge_session_id(bridge_session_id) {
             return Ok(entry.agent_identity.clone());
@@ -5354,7 +5419,8 @@ impl MobMcpState {
             ));
         }
         Err(MobError::Internal(format!(
-            "bridge session {bridge_session_id} is not an objective lead for mob {mob_id}"
+            "bridge session {bridge_session_id} is not an objective lead for mob {}",
+            handle.mob_id()
         )))
     }
 
@@ -5684,13 +5750,21 @@ impl MobMcpState {
         mob_id: &MobId,
         identity: &AgentIdentity,
     ) -> Result<meerkat_mob::MobMemberSnapshot, MobError> {
+        let handle = self.handle_for(mob_id).await?;
+        Self::mob_member_status_on(&handle, identity).await
+    }
+
+    /// [`Self::mob_member_status`] on the mob `handle` serves, which the
+    /// caller already resolved and admitted against.
+    pub(crate) async fn mob_member_status_on(
+        handle: &MobHandle,
+        identity: &AgentIdentity,
+    ) -> Result<meerkat_mob::MobMemberSnapshot, MobError> {
         // The retiring-member fast path reads a machine watch and can return
         // before ProjectMemberStatus reaches the actor gate.  Admit first so
         // every lifecycle phase has identical denial precedence.
-        self.admitted_handle_for(mob_id, ControlScope::List)
-            .await?
-            .member_status(identity)
-            .await
+        handle.admit_control_scope(ControlScope::List).await?;
+        handle.member_status(identity).await
     }
 
     pub async fn realtime_validate_session_target(
@@ -6196,7 +6270,7 @@ impl MobMcpState {
             };
             if owner_archived {
                 if let Err(error) = meerkat_runtime::stack_relief::box_in_own_frame(|| {
-                    self.mob_destroy_unchecked_loaded(&mob_id, MobDestroyCaller::Console)
+                    self.mob_destroy_unchecked_loaded(&mob_id, MobDestroyCaller::Console, None)
                 })
                 .await
                 {
@@ -6259,6 +6333,25 @@ impl MobMcpState {
         let handle = self.handle_for(mob_id).await?;
         handle.admit_control_scope(required).await?;
         Ok(handle)
+    }
+
+    /// Test seam: an agent mob tool call parks here, once, between its
+    /// admission against a mob and its action, so a test can replace the
+    /// mob under the id in between. A no-op outside tests.
+    pub(crate) async fn pause_agent_call(&self) {
+        #[cfg(test)]
+        {
+            let hold = self
+                .agent_call_hold
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            if let Some(hold) = hold {
+                hold.reached
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                hold.release.notified().await;
+            }
+        }
     }
 
     /// Chokepoint (b) gate for verbs that never send a MobCommand
@@ -17679,6 +17772,212 @@ mod tests {
             !managing_authority(&mob_id, before_incarnation)
                 .can_manage_mob(mob_id.as_str(), restored.incarnation())
         );
+    }
+
+    /// Park the next agent mob tool call on `state` between its admission
+    /// and its action; the hold reports the park and releases it.
+    fn hold_next_agent_call(state: &MobMcpState) -> Arc<InsertHold> {
+        let hold = Arc::new(InsertHold::default());
+        *state
+            .agent_call_hold
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::clone(&hold));
+        hold
+    }
+
+    async fn wait_parked(hold: &InsertHold) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !hold.reached.load(std::sync::atomic::Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the call parks between its admission and its action");
+    }
+
+    /// Run `operator`'s call of `tool` on the mob `mob_id` and, while it is
+    /// parked after its admission, let the console destroy that mob and
+    /// `recreator` create one under the same id with a member `b-member`.
+    async fn race_call_against_recreate(
+        state: &Arc<MobMcpState>,
+        operator: &OperatorSession,
+        recreator: &OperatorSession,
+        mob_id: &str,
+        tool: &str,
+        args: serde_json::Value,
+    ) -> Result<meerkat_core::ToolDispatchOutcome, ToolError> {
+        let hold = hold_next_agent_call(state);
+        let call = operator.call(tool, args);
+        let race = async {
+            wait_parked(&hold).await;
+            state
+                .mob_destroy(&MobId::from(mob_id))
+                .await
+                .expect("the console destroys the admitted mob");
+            recreator.create(mob_id).await;
+            recreator
+                .call(
+                    "mob_spawn_member",
+                    json!({ "mob_id": mob_id, "profile": "worker", "member_id": "b-member" }),
+                )
+                .await
+                .expect("the new creator spawns into its mob");
+            hold.release.notify_one();
+        };
+        let (outcome, ()) = tokio::join!(call, race);
+        outcome
+    }
+
+    async fn member_ids(state: &MobMcpState, mob_id: &str) -> Vec<String> {
+        state
+            .handle_for(&MobId::from(mob_id))
+            .await
+            .expect("the mob under the id")
+            .list_members_including_retiring()
+            .await
+            .into_iter()
+            .map(|member| member.agent_identity.to_string())
+            .collect()
+    }
+
+    /// A spawn admitted against a mob lands in that mob or nowhere: when the
+    /// mob is destroyed and another session creates one under the same id
+    /// between the call's admission and its action, the spawn fails and the
+    /// new mob gains no member.
+    #[tokio::test]
+    async fn an_admitted_spawn_never_lands_in_a_mob_recreated_under_its_id() {
+        let state = MobMcpState::new_in_memory();
+        let first = OperatorSession::new(&state);
+        let second = OperatorSession::new(&state);
+        let mob_id = "raced-spawn-mob";
+        first.create(mob_id).await;
+
+        let outcome = race_call_against_recreate(
+            &state,
+            &first,
+            &second,
+            mob_id,
+            "mob_spawn_member",
+            json!({ "mob_id": mob_id, "profile": "worker", "member_id": "intruder" }),
+        )
+        .await;
+
+        assert!(outcome.is_err(), "{outcome:?}");
+        assert_eq!(
+            member_ids(&state, mob_id).await,
+            vec!["b-member".to_string()]
+        );
+    }
+
+    /// A destroy admitted against a mob destroys that mob or nothing: the
+    /// mob another session created under the id in between stays.
+    #[tokio::test]
+    async fn an_admitted_destroy_never_destroys_a_mob_recreated_under_its_id() {
+        let state = MobMcpState::new_in_memory();
+        let first = OperatorSession::new(&state);
+        let second = OperatorSession::new(&state);
+        let mob_id = "raced-destroy-mob";
+        first.create(mob_id).await;
+
+        let outcome = race_call_against_recreate(
+            &state,
+            &first,
+            &second,
+            mob_id,
+            "mob_destroy",
+            json!({ "mob_id": mob_id }),
+        )
+        .await;
+
+        let refused = outcome.expect_err("the destroy is refused");
+        assert!(
+            matches!(refused, ToolError::AccessDenied { .. }),
+            "{refused:?}"
+        );
+        assert_eq!(
+            member_ids(&state, mob_id).await,
+            vec!["b-member".to_string()]
+        );
+    }
+
+    /// A member list admitted against a mob never reads the mob another
+    /// session created under the id in between.
+    #[tokio::test]
+    async fn an_admitted_member_list_never_reads_a_mob_recreated_under_its_id() {
+        let state = MobMcpState::new_in_memory();
+        let first = OperatorSession::new(&state);
+        let second = OperatorSession::new(&state);
+        let mob_id = "raced-list-mob";
+        first.create(mob_id).await;
+
+        let outcome = race_call_against_recreate(
+            &state,
+            &first,
+            &second,
+            mob_id,
+            "mob_list_members",
+            json!({ "mob_id": mob_id }),
+        )
+        .await;
+
+        if let Ok(listed) = outcome {
+            assert!(
+                !listed.result.text_content().contains("b-member"),
+                "the list read the recreated mob: {}",
+                listed.result.text_content()
+            );
+        }
+    }
+
+    /// A delegate that found its session's implicit mob acts on it only: when
+    /// that mob is destroyed and another session creates a mob under the
+    /// implicit id between finding the mob and acting on it, the delegate is
+    /// refused with the ordinary access denial and grants nothing.
+    #[tokio::test]
+    async fn a_delegate_never_acts_on_a_mob_that_took_its_implicit_id_mid_call() {
+        let state = MobMcpState::new_in_memory();
+        let owner = OperatorSession::new(&state);
+        let squatter = OperatorSession::new(&state);
+        let (implicit_id, created) = state
+            .ensure_implicit_mob_for_model(&owner.session_id.to_string(), "claude-sonnet-4-5", None)
+            .await
+            .expect("the owner's implicit mob");
+        assert!(created);
+
+        let hold = hold_next_agent_call(&state);
+        let delegate = owner.call(
+            "delegate",
+            json!({
+                "task": "say hi",
+                "member_id": "helper",
+                "result_label": "delegate_result",
+                "max_text_bytes": 4096
+            }),
+        );
+        let race = async {
+            wait_parked(&hold).await;
+            state
+                .mob_destroy_unchecked(&implicit_id)
+                .await
+                .expect("the console destroys the implicit mob");
+            squatter.create(implicit_id.as_str()).await;
+            hold.release.notify_one();
+        };
+        let (outcome, ()) = tokio::join!(delegate, race);
+
+        let refused = outcome.expect_err("the delegate is refused");
+        assert!(
+            matches!(refused, ToolError::AccessDenied { .. }),
+            "{refused:?}"
+        );
+        {
+            let authority = owner
+                .authority
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert!(authority.managed_mob_scope().is_empty());
+        }
+        assert!(member_ids(&state, implicit_id.as_str()).await.is_empty());
     }
 
     /// While a destroyed mob's storage cleanup is owed, its id is not
