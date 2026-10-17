@@ -3241,6 +3241,25 @@ impl SessionRuntime {
         Ok(metadata.keep_alive)
     }
 
+    /// The keep-alive policy of a session that work reaches outside
+    /// `turn/start`, without a request override: a staged session
+    /// (materialized, no first turn yet, #1225) carries it in its staged
+    /// build config, any other session in its persisted metadata. This is
+    /// `start_turn`'s precedence after the override. `live/open` needs no
+    /// such fallback: it promotes a staged session
+    /// (`materialize_staged_session_for_realtime_open`) before it reconciles
+    /// peer ingress.
+    #[cfg(feature = "comms")]
+    async fn staged_or_persisted_keep_alive(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<bool, RpcError> {
+        if let Some(keep_alive) = self.staged_sessions.keep_alive(session_id).await {
+            return Ok(keep_alive);
+        }
+        self.persisted_keep_alive(session_id).await
+    }
+
     async fn live_session_is_stale(
         &self,
         session_id: &SessionId,
@@ -23567,6 +23586,209 @@ mod tests {
              schedule tools bind to this runtime's store, so an in-process \
              firing authority is mandatory even when the embedder never \
              constructs the RPC router"
+        );
+    }
+
+    /// Fire one materialize-on-demand schedule through the runtime's schedule
+    /// host and return its terminal occurrence. The first fire stages its
+    /// session (#1225): until its first turn the session has no durable
+    /// document.
+    async fn fire_scheduled_action_on_a_new_session(
+        runtime: &Arc<SessionRuntime>,
+        action: meerkat::ScheduledSessionAction,
+        keep_alive: bool,
+        comms_name: Option<&str>,
+    ) -> meerkat::Occurrence {
+        let schedule = runtime
+            .schedule_service()
+            .create(meerkat::CreateScheduleRequest {
+                name: Some("scheduled-delivery".to_string()),
+                description: None,
+                trigger: meerkat::TriggerSpec::Once {
+                    due_at_utc: chrono::Utc::now() - chrono::Duration::seconds(1),
+                },
+                target: meerkat::TargetBinding::session(
+                    meerkat::SessionTargetBinding::materialize_on_demand(
+                        meerkat::SessionMaterializationSpec {
+                            model: "claude-sonnet-4-5".to_string(),
+                            system_prompt: None,
+                            max_tokens: None,
+                            provider: None,
+                            output_schema: None,
+                            structured_output_retries: None,
+                            provider_params: None,
+                            comms_name: comms_name.map(str::to_string),
+                            peer_meta: None,
+                            labels: Default::default(),
+                            preload_skills: Vec::new(),
+                            additional_instructions: Vec::new(),
+                            realm_id: None,
+                            instance_id: None,
+                            backend: None,
+                            config_generation: None,
+                            keep_alive,
+                            app_context: None,
+                        },
+                        action,
+                    ),
+                ),
+                misfire_policy: meerkat::MisfirePolicy::Skip,
+                overlap_policy: meerkat::OverlapPolicy::AllowConcurrent,
+                missing_target_policy: meerkat::MissingTargetPolicy::Skip,
+                labels: Default::default(),
+                planning_horizon_days: Some(1),
+                planning_horizon_occurrences: Some(1),
+            })
+            .await
+            .expect("create the schedule");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        loop {
+            let occurrence = runtime
+                .schedule_service()
+                .list_occurrences(&schedule.schedule_id)
+                .await
+                .expect("occurrences")
+                .into_iter()
+                .next()
+                .expect("the planned occurrence");
+            if !matches!(
+                occurrence.phase,
+                meerkat::OccurrencePhase::Pending
+                    | meerkat::OccurrencePhase::Claimed
+                    | meerkat::OccurrencePhase::Dispatching
+                    | meerkat::OccurrencePhase::AwaitingCompletion
+            ) {
+                return occurrence;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the fire never terminalized: {occurrence:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// An RPC runtime over an ordinary sqlite realm, with a test LLM and its
+    /// schedule host started.
+    async fn scheduled_delivery_runtime() -> (tempfile::TempDir, Arc<SessionRuntime>) {
+        let temp = tempfile::tempdir().unwrap();
+        let (_, persistence) = meerkat::open_realm_persistence_in(
+            temp.path(),
+            "scheduled-delivery",
+            Some(meerkat_store::RealmBackend::Sqlite),
+            None,
+        )
+        .await
+        .unwrap();
+        let runtime = Arc::new(
+            SessionRuntime::new(
+                temp_factory(&temp),
+                Config::default(),
+                4,
+                persistence,
+                crate::router::NotificationSink::noop(),
+            )
+            .expect("compose the RPC session runtime"),
+        );
+        runtime.set_default_llm_client(Some(Arc::new(MockLlmClient)));
+        runtime.ensure_schedule_host_started().await.unwrap();
+        (temp, runtime)
+    }
+
+    fn scheduled_prompt() -> meerkat::ScheduledSessionAction {
+        meerkat::ScheduledSessionAction::Prompt {
+            prompt: meerkat_core::ContentInput::Text("scheduled check".to_string()),
+            system_prompt: None,
+            render_metadata: None,
+            skill_refs: Vec::new(),
+            additional_instructions: Vec::new(),
+        }
+    }
+
+    /// A scheduled prompt and a scheduled event each reach Completed on the
+    /// session their fire materialized, in an ordinary sqlite realm.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_scheduled_fire_runs_on_its_freshly_materialized_session() {
+        let (_temp, runtime) = scheduled_delivery_runtime().await;
+
+        for action in [
+            scheduled_prompt(),
+            meerkat::ScheduledSessionAction::Event {
+                event_type: "scheduled.check".to_string(),
+                payload: serde_json::json!({ "check": true }),
+                render_metadata: None,
+            },
+        ] {
+            let kind = match &action {
+                meerkat::ScheduledSessionAction::Prompt { .. } => "prompt",
+                meerkat::ScheduledSessionAction::Event { .. } => "event",
+            };
+            let occurrence =
+                fire_scheduled_action_on_a_new_session(&runtime, action, false, None).await;
+            let session_id = occurrence.materialized_session_id();
+            if occurrence.phase != meerkat::OccurrencePhase::Completed {
+                eprintln!(
+                    "scheduled {kind} on {session_id}: staged={} persisted={}",
+                    runtime.staged_sessions.contains(&session_id).await,
+                    runtime
+                        .load_persisted_session(&session_id)
+                        .await
+                        .expect("load persisted session")
+                        .is_some(),
+                );
+            }
+            assert_eq!(
+                occurrence.phase,
+                meerkat::OccurrencePhase::Completed,
+                "the scheduled {kind} must complete on its new session: {occurrence:?}"
+            );
+        }
+    }
+
+    /// The fire's turn honours the materialized session's own keep-alive
+    /// policy, read from its staged build config before the first turn: a
+    /// keep-alive session with a comms name keeps session-owned peer ingress
+    /// after the scheduled turn, and its persisted metadata records the
+    /// policy.
+    #[cfg(feature = "comms")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_scheduled_fire_honours_its_sessions_keep_alive() {
+        let (_temp, runtime) = scheduled_delivery_runtime().await;
+        let occurrence = fire_scheduled_action_on_a_new_session(
+            &runtime,
+            scheduled_prompt(),
+            true,
+            Some("scheduled-keep-alive"),
+        )
+        .await;
+        assert_eq!(
+            occurrence.phase,
+            meerkat::OccurrencePhase::Completed,
+            "the scheduled prompt must complete on its keep-alive session: {occurrence:?}"
+        );
+        let session_id = occurrence.materialized_session_id();
+        let persisted = runtime
+            .load_persisted_session(&session_id)
+            .await
+            .expect("load persisted session")
+            .expect("the first turn persisted the session");
+        assert!(
+            persisted
+                .session_metadata()
+                .expect("session metadata")
+                .keep_alive,
+            "the materialized session keeps its keep-alive policy"
+        );
+        let owner = runtime
+            .runtime_adapter
+            .peer_ingress_owner(&session_id)
+            .await;
+        assert!(
+            matches!(
+                owner,
+                meerkat_runtime::PeerIngressOwner::SessionOwned { .. }
+            ),
+            "a keep-alive session keeps session-owned peer ingress: {owner:?}"
         );
     }
 

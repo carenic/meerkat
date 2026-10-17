@@ -45,6 +45,12 @@ them.
   and was retried after each lease expiry. A dispatching occurrence now
   records the session its dispatch materialized, once; rebinding it stays
   refused.
+- `rkat-rpc`'s schedule host delivers a scheduled prompt or event to the
+  session its fire has just materialized. That session is staged until its
+  first turn, and the delivery read its keep-alive policy from the persisted
+  session, so every materialize-on-demand fire failed as `transport_error`
+  ("session not found"). The policy now comes from the staged session, as it
+  does for `turn/start`.
 
 ## [0.9.2] - 2026-10-16
 
