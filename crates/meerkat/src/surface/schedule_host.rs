@@ -543,13 +543,16 @@ impl SharedScheduleTargetAdapter {
     /// [`spawn_schedule_host`] for what an embedder clears after teardown.
     ///
     /// A host over a stock-governed realm passes the realm's commissioned
-    /// service ([`crate::PersistenceBundle::schedule_service`]) and, to fire,
-    /// composes [`crate::PersistenceBundle::scheduled_session_agent_binding`]
-    /// with [`Self::with_session_agent_binding`]; without the binding it
-    /// refuses every fire as `schedule_mandate_unavailable` before any
-    /// delivery. A service from [`ScheduleService::new`] over a governed
-    /// realm's store commissions no agent, so this adapter fires its
-    /// schedules unchecked and each fire fails later, at runtime admission.
+    /// service ([`crate::PersistenceBundle::schedule_service`]) and composes
+    /// [`crate::PersistenceBundle::scheduled_session_agent_binding`] with
+    /// [`Self::with_session_agent_binding`] once its session host binds
+    /// scheduled sessions. Without the binding the adapter refuses each
+    /// occurrence as `schedule_mandate_unavailable` when it is delivered,
+    /// after the driver's target probe, before the target is resolved for
+    /// delivery or a session is materialized. A service from
+    /// [`ScheduleService::new`] over a governed realm's store commissions no
+    /// agent, so the adapter fires its schedules unchecked and each fire fails
+    /// later, at runtime admission.
     pub fn new(
         schedule_service: ScheduleService,
         session_host: Arc<dyn SurfaceScheduleSessionHost>,

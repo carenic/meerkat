@@ -18424,4 +18424,68 @@ matching the required schema. Output ONLY the JSON, no additional text or markdo
             assert_config_fault_endpoint("/models/catalog").await;
         }
     }
+
+    /// rkat-rest never hosts a stock-governed realm's schedules: it opens its
+    /// realm only through the ordinary open, so its startup refuses a governed
+    /// realm with `PersistenceError::RealmGoverned`. The control starts an
+    /// ungoverned realm through the same constructor.
+    #[tokio::test]
+    async fn rest_startup_refuses_a_governed_realm() {
+        let temp = TempDir::new().unwrap();
+        let realms_root = temp.path().join("realms");
+        let bootstrap = |realm_id: &str| {
+            let mut bootstrap = RuntimeBootstrap::default();
+            bootstrap.realm.selection = RealmSelection::Explicit {
+                realm_id: realm_id.to_string(),
+            };
+            bootstrap.realm.backend_hint = Some("sqlite".to_string());
+            bootstrap.realm.state_root = Some(realms_root.clone());
+            bootstrap.context.context_root = Some(temp.path().to_path_buf());
+            bootstrap.context.user_config_root = Some(temp.path().join("user"));
+            bootstrap
+        };
+        meerkat_store::ensure_realm_manifest_in(
+            &realms_root,
+            "governed-rest",
+            Some(meerkat_store::RealmBackend::Sqlite),
+            None,
+        )
+        .await
+        .expect("materialize the realm");
+        meerkat_store::govern_realm_in(&realms_root, "governed-rest")
+            .await
+            .expect("govern the realm");
+
+        let control = AppState::load_from_with_bootstrap_and_confinement(
+            temp.path().to_path_buf(),
+            bootstrap("ordinary-rest"),
+            false,
+            test_credential_store(temp.path()),
+            None,
+        )
+        .await;
+        assert!(
+            control.is_ok(),
+            "an ungoverned realm starts: {:?}",
+            control.err().map(|error| error.to_string())
+        );
+
+        let refused = AppState::load_from_with_bootstrap_and_confinement(
+            temp.path().to_path_buf(),
+            bootstrap("governed-rest"),
+            false,
+            test_credential_store(temp.path()),
+            None,
+        )
+        .await
+        .err()
+        .expect("a governed realm is refused at startup");
+        assert!(
+            matches!(
+                refused.downcast_ref::<meerkat::PersistenceError>(),
+                Some(meerkat::PersistenceError::RealmGoverned { .. })
+            ),
+            "{refused}"
+        );
+    }
 }
