@@ -93,7 +93,8 @@ fn procfs() -> io::Result<Procfs<'static>> {
 ///
 /// `NSpid` (Linux 4.1 and later) lists the host's pid in every pid namespace
 /// from the procfs's down to the host's own, so the procfs is the host's
-/// own exactly when it lists one pid, the host's. Without `NSpid` (earlier
+/// own exactly when it lists one pid, the host's, and its `Tgid` (the pid
+/// the procfs shows the host as) is the host's too. Without `NSpid` (earlier
 /// kernels, or gVisor, which prints `Tgid` in the procfs's namespace) the
 /// host's own pid as `Tgid` is the only evidence: an ancestor namespace's
 /// procfs in which the host's pid happens to be the same number passes,
@@ -119,10 +120,11 @@ fn foreign_view(status: Option<&str>, host_pid: i32) -> io::Result<Option<Foreig
                 .collect::<io::Result<Vec<_>>>()
         })
         .transpose()?;
-    let own = match &levels {
-        Some(pids) => matches!(pids.as_slice(), [pid] if *pid == host_pid),
-        None => procfs_pid == host_pid,
-    };
+    // A record whose `Tgid` and one `NSpid` level disagree is not the host's.
+    let own = procfs_pid == host_pid
+        && levels
+            .as_deref()
+            .is_none_or(|pids| matches!(pids, [pid] if *pid == host_pid));
     if own {
         return Ok(None);
     }
@@ -800,6 +802,8 @@ mod tests {
             vec![self_status(OUTER, None)],
             // A record that contradicts itself.
             vec![self_status(OUTER, Some(&[OUTER]))],
+            // One `NSpid` level naming the host, but another `Tgid`.
+            vec![self_status(OUTER, Some(&[HOST]))],
             // A procfs that does not show the host at all.
             Vec::new(),
         ];
@@ -850,6 +854,10 @@ mod tests {
         );
         assert_eq!(
             view(vec![self_status(OUTER, Some(&[OUTER]))]),
+            expected(Some(OUTER), None)
+        );
+        assert_eq!(
+            view(vec![self_status(OUTER, Some(&[HOST]))]),
             expected(Some(OUTER), None)
         );
         assert_eq!(view(Vec::new()), expected(None, None));

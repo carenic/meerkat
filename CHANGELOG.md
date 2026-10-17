@@ -60,9 +60,9 @@ them.
   start stamps of other processes, and pin and SIGKILL pids taken from the
   procfs's numbering. Every custody read of `/proc/<pid>` now goes through a
   procfs proven, at the start of each operation, to show the host's own pid
-  namespace: the host's own status record there lists exactly its pid in
-  `NSpid`, or, on kernels without `NSpid` (before Linux 4.1, and gVisor),
-  shows its pid as `Tgid`. Any other procfs fails closed before a lock,
+  namespace: the host's own status record there shows its pid as `Tgid` and,
+  where the kernel lists `NSpid` (Linux 4.1 and later; not gVisor), lists
+  exactly that pid in `NSpid`. Any other procfs fails closed before a lock,
   record or spawn gate is touched, with the new
   `ProcessCustodyError::ForeignProcfs { context, view: ForeignProcfsView }`
   (the host's pid, the pid the procfs shows it as, and the pid namespace

@@ -1533,8 +1533,14 @@ async fn start_unshared_host(
 ) -> Option<UnsharedHost> {
     // Unprivileged user and pid namespaces (and a procfs mount in them) may
     // be unavailable, for example restricted by AppArmor; the test then has
-    // nothing to exercise, and says why.
-    match Command::new("unshare").args(args).arg("true").output() {
+    // nothing to exercise, and says why. util-linux translates its messages,
+    // so both unshare runs use the C locale the refusal list is written in.
+    match Command::new("unshare")
+        .env("LC_ALL", "C")
+        .args(args)
+        .arg("true")
+        .output()
+    {
         Ok(output) if output.status.success() => {}
         Ok(output) => {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1568,6 +1574,7 @@ async fn start_unshared_host(
         .open_receiver(&fifo_path)
         .unwrap();
     let mut host = tokio::process::Command::new("unshare")
+        .env("LC_ALL", "C")
         .args(args)
         .arg(std::env::current_exe().unwrap())
         .args([
@@ -1753,11 +1760,16 @@ async fn custody_foreign_procfs_host_role() {
     ) else {
         return;
     };
+    // A kernel without `NSpid` (gVisor) reports no namespace levels; any
+    // refusal of the outer procfs is then the expected outcome.
+    let nspid_listed = std::fs::read_to_string("/proc/self/status")
+        .is_ok_and(|status| status.lines().any(|line| line.starts_with("NSpid:")));
     let outcome = match ProcessCustody::recover_and_open(&root, ProcessCustodyScope(scope)).await {
         Err(ProcessCustodyError::ForeignProcfs { view, .. })
-            if view
-                .namespace_levels_above
-                .is_some_and(|levels| levels >= 1) =>
+            if !nspid_listed
+                || view
+                    .namespace_levels_above
+                    .is_some_and(|levels| levels >= 1) =>
         {
             "refused".to_owned()
         }
