@@ -1138,6 +1138,29 @@ machine! {
             to Claimed
         }
 
+        // A dispatch that materialized its session target records that
+        // session, once: only while the occurrence is still unbound, or as an
+        // exact replay of the recorded binding. Rebinding a dispatching
+        // occurrence is refused. The shell builds the recorded snapshot from
+        // the occurrence's own target, so a dispatch never retargets.
+        transition SyncTargetSnapshotDispatching {
+            on input SyncTargetSnapshot { target_binding_key, target_materialized_session_id }
+            guard { self.lifecycle_phase == Phase::Dispatching }
+            guard "binds_a_materialized_session" { target_materialized_session_id != None }
+            guard "records_once_or_replays" {
+                self.target_materialized_session_id == None
+                || (
+                    self.target_materialized_session_id == target_materialized_session_id
+                    && self.target_binding_key == target_binding_key
+                )
+            }
+            update {
+                self.target_binding_key = target_binding_key;
+                self.target_materialized_session_id = target_materialized_session_id;
+            }
+            to Dispatching
+        }
+
         // --- Receipt/result projection ---
 
         transition RecordReceiptPending {

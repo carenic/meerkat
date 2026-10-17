@@ -1294,6 +1294,14 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - On: `SyncTargetSnapshot`(target_binding_key, target_materialized_session_id)
 - To: `Claimed`
 
+### `SyncTargetSnapshotDispatching`
+- From: `Dispatching`
+- On: `SyncTargetSnapshot`(target_binding_key, target_materialized_session_id)
+- Guards:
+  - `binds_a_materialized_session`
+  - `records_once_or_replays`
+- To: `Dispatching`
+
 ### `RecordReceiptPending`
 - From: `Pending`
 - On: `RecordReceipt`(correlation_id, detail, materialized_session_id, runtime_outcome_key)

@@ -714,7 +714,7 @@ impl ScheduleDriver {
                 .await?;
             dispatching = self
                 .service
-                .sync_occurrence_target_with_schedule(dispatching)
+                .record_dispatch_materialization(dispatching, &materialized_session_id)
                 .await?;
         }
 
@@ -1849,6 +1849,92 @@ mod tests {
                 completion: Box::pin(async { Ok(DeliveryTerminal::completed(None)) }),
             })
         }
+    }
+
+    /// A delivery that materializes the occurrence's deterministic session, as
+    /// the surface adapter does for a materialize-on-demand target, and
+    /// completes at once.
+    #[derive(Default)]
+    struct MaterializingDelivery;
+
+    #[async_trait]
+    impl ScheduleTargetDelivery for MaterializingDelivery {
+        async fn deliver_occurrence(
+            &self,
+            occurrence: &Occurrence,
+            identity: &ScheduleDeliveryIdentity,
+        ) -> Result<DeliveryDispatch, ScheduleDomainError> {
+            let session_id = occurrence.materialized_session_id();
+            let mut receipt = DeliveryReceipt::new(
+                occurrence.occurrence_id.clone(),
+                occurrence.attempt_count,
+                DeliveryReceiptStage::DispatchAccepted,
+            );
+            receipt.correlation_id = Some(identity.correlation_id.clone());
+            receipt.materialized_session_id = Some(session_id.clone());
+            receipt.runtime_outcome = Some(RuntimeDeliveryOutcome::AdmissionAccepted);
+            Ok(DeliveryDispatch {
+                receipt,
+                correlation_id: Some(identity.correlation_id.clone()),
+                materialized_session_id: Some(session_id),
+                completion: Box::pin(async { Ok(DeliveryTerminal::completed(None)) }),
+            })
+        }
+    }
+
+    /// The first fire of a materialize-on-demand schedule binds the session it
+    /// materialized and completes.
+    #[tokio::test]
+    async fn a_materializing_first_fire_binds_its_session_and_completes() {
+        let store = Arc::new(MemoryScheduleStore::new());
+        let shared_store: Arc<dyn ScheduleStore> = store.clone();
+        let service = ScheduleService::new(Arc::clone(&shared_store));
+        let schedule = service
+            .create(CreateScheduleRequest {
+                name: Some("materializing".into()),
+                description: None,
+                trigger: TriggerSpec::Once {
+                    due_at_utc: Utc::now() - Duration::seconds(1),
+                },
+                target: materialize_on_demand_target("scheduled prompt"),
+                misfire_policy: MisfirePolicy::Skip,
+                overlap_policy: OverlapPolicy::AllowConcurrent,
+                missing_target_policy: MissingTargetPolicy::Skip,
+                labels: BTreeMap::new(),
+                planning_horizon_days: Some(1),
+                planning_horizon_occurrences: Some(1),
+            })
+            .await
+            .expect("create schedule");
+        let driver = ScheduleDriver::new(
+            service.clone(),
+            shared_store,
+            Arc::new(ReadyProbe),
+            Arc::new(MaterializingDelivery),
+            "driver-owner",
+            ScheduleDriverConfig {
+                claim_limit: 8,
+                lease_duration: Duration::seconds(30),
+            },
+        );
+        let tick = driver.tick_once().await;
+        assert!(tick.is_ok(), "the tick must succeed: {tick:?}");
+        let occurrence =
+            wait_for_occurrence_phase(&service, &schedule.schedule_id, OccurrencePhase::Completed)
+                .await
+                .expect("the first fire completes");
+        let materialized = occurrence.materialized_session_id();
+        assert_eq!(
+            crate::types::target_materialized_session_id(&occurrence.target_snapshot),
+            Some(materialized.clone()),
+            "the occurrence records the session its dispatch materialized"
+        );
+        let schedule = service.get(&schedule.schedule_id).await.expect("schedule");
+        assert_eq!(
+            crate::types::target_materialized_session_id(&schedule.target),
+            Some(materialized),
+            "later fires reuse the materialized session"
+        );
     }
 
     #[tokio::test]

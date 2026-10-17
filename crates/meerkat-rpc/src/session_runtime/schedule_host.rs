@@ -331,7 +331,7 @@ impl SessionRuntime {
         #[cfg(feature = "comms")]
         let peer_ingress_enabled = {
             let keep_alive = self
-                .persisted_keep_alive(session_id)
+                .staged_or_persisted_keep_alive(session_id)
                 .await
                 .map_err(rpc_to_schedule)?;
             self.preserve_existing_peer_ingress(session_id, keep_alive)
@@ -435,7 +435,7 @@ impl SessionRuntime {
         #[cfg(feature = "comms")]
         let peer_ingress_enabled = {
             let keep_alive = self
-                .persisted_keep_alive(session_id)
+                .staged_or_persisted_keep_alive(session_id)
                 .await
                 .map_err(rpc_to_schedule)?;
             self.preserve_existing_peer_ingress(session_id, keep_alive)

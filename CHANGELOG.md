@@ -426,6 +426,13 @@ them.
   pinned digest is deleted and refused with `BinaryIntegrityError` (it used to
   run as found), an integrity failure no longer falls back to a legacy `rkat`
   on `PATH`, and the download no longer follows a redirect to a non-HTTPS URL.
+- `meerkat-machine-kernels`: the generated occurrence lifecycle's
+  `TransitionId` (`generated::occurrence_lifecycle::TransitionId`) gains
+  `SyncTargetSnapshotDispatching` (a dispatching occurrence records the
+  session its dispatch materialized; see Fixed). An exhaustive match needs an
+  arm for it, and the implicit discriminants of the variants after it change
+  (`TransitionId::*`); match them by variant name, not by numeric cast or
+  position.
 
 ### Security
 
@@ -1436,6 +1443,20 @@ them.
   off now ends the Anthropic stream with that stop reason instead of a stream
   parse error. Under any other stop reason a tool input that does not parse
   still fails the response as before.
+- The first fire of a materialize-on-demand schedule completes, in every
+  schedule host. After the dispatch materialized its session, the schedule
+  driver synced the in-flight occurrence's target to the newly bound session,
+  and generated occurrence authority refused that sync while the occurrence
+  was dispatching: the driver tick failed, and the occurrence never completed
+  and was retried after each lease expiry. A dispatching occurrence now
+  records the session its dispatch materialized, once; rebinding it stays
+  refused.
+- `rkat-rpc`'s schedule host delivers a scheduled prompt or event to the
+  session its fire has just materialized. That session is staged until its
+  first turn, and the delivery read its keep-alive policy from the persisted
+  session, so every materialize-on-demand fire failed as `transport_error`
+  ("session not found"). The policy now comes from the staged session, as it
+  does for `turn/start`.
 
 ### Known issues
 

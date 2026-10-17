@@ -728,6 +728,42 @@ impl ScheduleService {
         Ok(())
     }
 
+    /// Record the session a dispatching occurrence materialized: its own
+    /// target snapshot with exactly `materialized_session_id` bound. Generated
+    /// occurrence authority accepts this once, while the occurrence is still
+    /// unbound (a replay of the same binding is a no-op here), and refuses a
+    /// rebinding; building the snapshot from the occurrence's own target means
+    /// a dispatch never retargets.
+    pub async fn record_dispatch_materialization(
+        &self,
+        occurrence: Occurrence,
+        materialized_session_id: &SessionId,
+    ) -> Result<Occurrence, ScheduleDomainError> {
+        if crate::types::target_materialized_session_id(&occurrence.target_snapshot).as_ref()
+            == Some(materialized_session_id)
+        {
+            return Ok(occurrence);
+        }
+        let mut target_snapshot = occurrence.target_snapshot.clone();
+        if !target_snapshot.bind_materialized_session(materialized_session_id) {
+            return Err(ScheduleDomainError::Internal(format!(
+                "occurrence {} cannot record materialized session {materialized_session_id}: \
+                 its target is not an unbound materialize-on-demand session",
+                occurrence.occurrence_id
+            )));
+        }
+        let mutator = occurrence
+            .apply(crate::OccurrenceLifecycleInput::SyncTargetSnapshot { target_snapshot })
+            .map_err(|error| ScheduleDomainError::Internal(error.to_string()))?;
+        let commit = self
+            .store
+            .commit_occurrence_write(mutator.into_authorized_write())
+            .await?;
+        let occurrence = Self::observe_effectless_occurrence_commit(commit)?;
+        self.notify_mutation();
+        Ok(occurrence)
+    }
+
     async fn plan_schedule_occurrences(
         &self,
         schedule: &Schedule,
