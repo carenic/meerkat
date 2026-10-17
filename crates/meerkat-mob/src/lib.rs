@@ -363,6 +363,12 @@ pub use runtime::{
 pub use runtime::{MobBeforeActivation, MobReadHandle};
 pub use runtime::{MobpackCallableConfig, MobpackRunOutcome, MobpackRunSpec};
 pub use runtime::{SpawnBasePromptSource, StaticSpawnBasePromptSource};
+#[cfg(all(any(test, feature = "test-support"), feature = "runtime-adapter"))]
+#[doc(hidden)]
+pub use runtime::{
+    arm_owned_actor_cleanup_released_boundary_pause_for_test,
+    arm_owned_actor_cleanup_rollback_pause_for_test,
+};
 pub use runtime_mode::MobRuntimeMode;
 pub use spec::SpecValidator;
 pub use store::{

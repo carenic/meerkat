@@ -414,6 +414,10 @@ pub struct HostFixtureOptions {
     /// different SessionId from the live session the service actually built.
     /// Exercises the materializer's two-identity rollback fence.
     pub corrupt_first_create_session_result_identity: bool,
+    /// Corrupt one selected one-based `create_session` result the same way,
+    /// for example a later revival's create. Overrides the first-call
+    /// shorthand above.
+    pub corrupt_create_session_result_identity_call: Option<u64>,
     /// Fail this many initial mob-authorized archive calls before delegating.
     /// Used with a corrupted create result to exercise retryable and sticky
     /// unrecorded-session cleanup failures.
@@ -471,6 +475,7 @@ impl HostFixtureOptions {
             failing_first_create_session: false,
             failing_create_session_call: None,
             corrupt_first_create_session_result_identity: false,
+            corrupt_create_session_result_identity_call: None,
             failing_archive_with_mob_lifecycle_authority_calls: 0,
             failing_first_projection_drain: false,
             stop_first_executor_after_ensure: false,
@@ -2135,9 +2140,10 @@ pub async fn spawn_host_daemon_fixture(
             let fail_create_call = opts
                 .failing_create_session_call
                 .or(opts.failing_first_create_session.then_some(1));
-            let corrupt_create_result_call = opts
-                .corrupt_first_create_session_result_identity
-                .then_some(1);
+            let corrupt_create_result_call =
+                opts.corrupt_create_session_result_identity_call.or(opts
+                    .corrupt_first_create_session_result_identity
+                    .then_some(1));
             let mob_service: Arc<dyn meerkat_mob::MobSessionService> = if fail_create_call.is_some()
                 || corrupt_create_result_call.is_some()
                 || opts.failing_archive_with_mob_lifecycle_authority_calls > 0

@@ -595,17 +595,13 @@ async fn run_runtime_backed_initial_turn_with_machine_boundary_mode<
 
 async fn rollback_prepared_runtime_registration(
     prepared: &mut meerkat_runtime::PreparedSessionMaterialization,
-    turn_boundary_already_held: bool,
 ) {
     let session_id = prepared.session_id().clone();
-    let result = if turn_boundary_already_held {
-        prepared
-            .rollback_now_under_turn_finalization_boundary()
-            .await
-    } else {
-        prepared.rollback_now().await
-    };
-    if let Err(error) = result {
+    // Never under the turn-finalization boundary B: a rollback that holds B
+    // while it takes the live lifecycle lease can deadlock with a concurrent
+    // raw unregister whose saga holds that lease into its B-taking surface
+    // cleanup (#1814). A boundary-owning caller releases B first.
+    if let Err(error) = prepared.rollback_now().await {
         tracing::warn!(
             %session_id,
             %error,
@@ -977,7 +973,7 @@ pub async fn materialize_prepared_session_actor_unattached_with_actor_slot<
         .witness()
         .is_some_and(|witness| witness.session_id() == &result.session_id && witness.is_live());
     if !actor_witness_is_exact {
-        rollback_prepared_runtime_registration(prepared, false).await;
+        rollback_prepared_runtime_registration(prepared).await;
         return Err(SurfaceRuntimeMaterializeError::RuntimeDriver(
             RuntimeDriverError::ValidationFailed {
                 reason: format!(
@@ -1134,7 +1130,7 @@ where
     {
         Ok(EnsureRuntimeExecutorAttachment::Pending(pending)) => pending,
         Ok(EnsureRuntimeExecutorAttachment::Existing(witness)) => {
-            rollback_prepared_runtime_registration(&mut prepared, false).await;
+            rollback_prepared_runtime_registration(&mut prepared).await;
             return Err(SurfaceRuntimeMaterializeError::RuntimeDriver(
                 RuntimeDriverError::ValidationFailed {
                     reason: format!(
@@ -1144,7 +1140,7 @@ where
             ));
         }
         Err(error) => {
-            rollback_prepared_runtime_registration(&mut prepared, false).await;
+            rollback_prepared_runtime_registration(&mut prepared).await;
             return Err(SurfaceRuntimeMaterializeError::RuntimeDriver(error));
         }
     };
@@ -1211,7 +1207,7 @@ async fn materialize_prepared_session_actor_transaction_with_admission<
     )
     .await
     {
-        rollback_prepared_runtime_registration(prepared, false).await;
+        rollback_prepared_runtime_registration(prepared).await;
         return Err(SurfaceRuntimeMaterializeError::RuntimeDriver(error));
     }
 
@@ -1232,7 +1228,7 @@ async fn materialize_prepared_session_actor_transaction_with_admission<
     let result = match create_result {
         Ok(result) => result,
         Err(error) => {
-            rollback_prepared_runtime_registration(prepared, false).await;
+            rollback_prepared_runtime_registration(prepared).await;
             return Err(SurfaceRuntimeMaterializeError::Session(error));
         }
     };
@@ -1240,7 +1236,7 @@ async fn materialize_prepared_session_actor_transaction_with_admission<
     if let Err(error) =
         ensure_materialized_session_id_matches(&prepared_session_id, &result.session_id)
     {
-        rollback_prepared_runtime_registration(prepared, false).await;
+        rollback_prepared_runtime_registration(prepared).await;
         return Err(error);
     }
 
@@ -1268,7 +1264,7 @@ async fn materialize_prepared_session_actor_transaction_with_admission<
                         .await
                         .map_err(SurfaceRuntimeMaterializeError::RuntimeDriver)?;
                 } else {
-                    rollback_prepared_runtime_registration(prepared, false).await;
+                    rollback_prepared_runtime_registration(prepared).await;
                 }
                 return Err(error);
             }
@@ -1279,7 +1275,7 @@ async fn materialize_prepared_session_actor_transaction_with_admission<
     if let Err(error) =
         ensure_materialized_session_id_matches(&prepared_session_id, &result.session_id)
     {
-        rollback_prepared_runtime_registration(prepared, false).await;
+        rollback_prepared_runtime_registration(prepared).await;
         return Err(error);
     }
 

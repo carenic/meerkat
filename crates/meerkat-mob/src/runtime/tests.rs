@@ -89672,6 +89672,10 @@ mod owned_retirement;
 #[cfg(all(feature = "runtime-adapter", not(target_arch = "wasm32")))]
 mod resume_bind_custody;
 mod retirement_isolation;
+/// #1814 owned rollbacks release the turn-finalization boundary before they
+/// take the lease a concurrent raw unregister holds into its cleanup.
+#[cfg(all(feature = "runtime-adapter", not(target_arch = "wasm32")))]
+mod rollback_boundary_order;
 /// #1105 spawn-activation isolation: a parked activation must not stall the
 /// loop, a failed one must compensate exactly, and a stale one must be
 /// declined instead of touching its successor.

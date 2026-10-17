@@ -5162,6 +5162,12 @@ impl PreparedSessionMaterialization {
 
     /// Exact rollback for a caller that already owns the persistent service's
     /// turn-finalization boundary.
+    ///
+    /// This takes the session's live lifecycle lease while the caller holds
+    /// that boundary. A concurrent raw unregister's saga holds the lease
+    /// into a surface cleanup that may take the boundary, so a caller whose
+    /// cleanup handle can do that (one with a published actor) must release
+    /// the boundary and call [`Self::rollback_now`] instead.
     pub async fn rollback_now_under_turn_finalization_boundary(
         &mut self,
     ) -> Result<bool, RuntimeDriverError> {
@@ -9827,6 +9833,11 @@ pub struct MeerkatMachineShared {
     #[cfg(feature = "test-support")]
     test_unregister_wait_witness:
         StdMutex<Option<crate::tokio::sync::oneshot::Sender<UnregisterTeardownWaitWitness>>>,
+    /// One-shot signal armed by a test: the next unregister teardown saga
+    /// reports once it holds its session's live lifecycle lease.
+    #[cfg(feature = "test-support")]
+    test_unregister_saga_live_lease_signal:
+        StdMutex<Option<crate::tokio::sync::oneshot::Sender<()>>>,
     /// This machine's user-interrupt acknowledgement bound. Tests scope it
     /// per machine: a short bound would make every success-path interrupt
     /// race the process-global cleanup dispatcher that all in-process tests
@@ -11719,6 +11730,8 @@ impl MeerkatMachine {
                 #[cfg(feature = "test-support")]
                 test_unregister_wait_witness: StdMutex::new(None),
                 #[cfg(feature = "test-support")]
+                test_unregister_saga_live_lease_signal: StdMutex::new(None),
+                #[cfg(feature = "test-support")]
                 test_unregister_caller_wait_grace: StdMutex::new(None),
                 #[cfg(any(test, feature = "test-support"))]
                 test_user_interrupt_ack_timeout: StdMutex::new(USER_INTERRUPT_ACK_TIMEOUT),
@@ -11935,6 +11948,8 @@ impl MeerkatMachine {
                 test_unregister_saga_hold: StdMutex::new(None),
                 #[cfg(feature = "test-support")]
                 test_unregister_wait_witness: StdMutex::new(None),
+                #[cfg(feature = "test-support")]
+                test_unregister_saga_live_lease_signal: StdMutex::new(None),
                 #[cfg(feature = "test-support")]
                 test_unregister_caller_wait_grace: StdMutex::new(None),
                 #[cfg(any(test, feature = "test-support"))]

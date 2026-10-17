@@ -251,6 +251,12 @@ pub use identity_recovery_test_support::{
 pub use member_status_test_support::{
     MemberStatusDeadlineTestObservation, member_status_deadline_after_snapshot_wait_for_test,
 };
+#[cfg(all(any(test, feature = "test-support"), feature = "runtime-adapter"))]
+#[doc(hidden)]
+pub use provisioner::{
+    arm_owned_actor_cleanup_released_boundary_pause_for_test,
+    arm_owned_actor_cleanup_rollback_pause_for_test,
+};
 
 /// Test-support seam: the operator tool definitions a mob member receives
 /// from `MobOperatorToolDispatcher` (local flavor), so the provider schema

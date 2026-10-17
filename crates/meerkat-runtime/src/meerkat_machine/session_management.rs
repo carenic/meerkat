@@ -10116,6 +10116,8 @@ impl MeerkatMachine {
             Some(lease) => lease,
             None => return Ok(ControlFlow::Break(())),
         };
+        #[cfg(all(feature = "live", feature = "test-support"))]
+        self.report_unregister_saga_live_lease_test_signal();
         #[cfg(feature = "live")]
         let Some(gate_guard) = crate::stack_relief::box_in_own_frame(|| {
             self.lock_exact_unregister_mutation_gate(
@@ -11944,6 +11946,40 @@ Ok::<(), RuntimeDriverError>(())
             .take();
         if let Some(witness_tx) = witness_tx {
             let _ = witness_tx.send(witness);
+        }
+    }
+
+    /// Report once the next unregister teardown saga this machine runs holds
+    /// its session's live lifecycle lease. The saga keeps that lease through
+    /// its surface cleanup, so a lock-order test can start a competing owner
+    /// only while the saga provably holds it, without relying on scheduling.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn test_signal_next_unregister_saga_live_lease(
+        &self,
+    ) -> crate::tokio::sync::oneshot::Receiver<()> {
+        let (held_tx, held_rx) = crate::tokio::sync::oneshot::channel();
+        let replaced = self
+            .test_unregister_saga_live_lease_signal
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .replace(held_tx);
+        assert!(
+            replaced.is_none(),
+            "unregister saga live-lease test signal already armed"
+        );
+        held_rx
+    }
+
+    #[cfg(all(feature = "test-support", feature = "live"))]
+    fn report_unregister_saga_live_lease_test_signal(&self) {
+        let held_tx = self
+            .test_unregister_saga_live_lease_signal
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(held_tx) = held_tx {
+            let _ = held_tx.send(());
         }
     }
 
