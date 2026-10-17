@@ -7097,6 +7097,11 @@ mod tests {
         let peer_id = "550e8400-e29b-41d4-a716-446655440000";
         let request_uuid = uuid::Uuid::parse_str("018f6f79-7a82-7c4e-a552-a3b86f9630f1").unwrap();
         let request_id = meerkat_core::PeerCorrelationId::from_uuid(request_uuid);
+        // Without a registered session the machine records no request, and
+        // the cleanup assertion below would hold whatever the rejection did.
+        driver
+            .ensure_contract_session_authority()
+            .expect("generated session registration");
         driver
             .dsl_apply(
                 mm_dsl::MeerkatMachineInput::PeerRequestSent {
@@ -7106,6 +7111,14 @@ mod tests {
                 "PeerRequestSent(test)",
             )
             .unwrap();
+        driver.with_dsl_state(|state| {
+            assert!(
+                state
+                    .pending_peer_requests
+                    .contains_key(&mm_dsl::PeerCorrelationId::from(request_uuid)),
+                "the request is pending before the invalid terminal observation"
+            );
+        });
 
         let input = Input::Peer(PeerInput {
             directed_interaction_id: None,
