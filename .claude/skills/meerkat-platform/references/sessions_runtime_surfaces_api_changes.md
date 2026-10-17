@@ -89,8 +89,9 @@ reports); a failure with no typed owner exits 1.
   realm's local refusal ("the governed realm refused this prompt"), and a
   typed error whose owner has no public code.
 - 2: usage errors (argument parsing, storage verbs given `--isolated` or
-  `--default-model`, an invalid `RKAT_WORKER_STACK_BYTES`) and a typed
-  config error.
+  `--default-model`, an invalid `RKAT_WORKER_STACK_BYTES`,
+  `RKAT_WORKER_THREADS` or `TOKIO_WORKER_THREADS`), a typed config error, and
+  a host whose main thread the OS refused at startup (a thread limit).
 - 10 `SESSION_NOT_FOUND`: `run --resume <exact id>` or `session show <id>`
   for a session the realm does not hold.
 - 11 `SESSION_BUSY`: a busy session, one served by another process, or a
@@ -227,7 +228,9 @@ CARGO_BUILD_JOBS=2 CARGO_PROFILE_RELEASE_OPT_LEVEL=1 cargo install rkat --locked
   `session-store,comms,mcp,workgraph` compiling; leaving out the mob graph
   means omitting `mob`, `rpc-surface` and `openai-live`.
 - Host binaries run their workers on an 8 MiB stack; `RKAT_WORKER_STACK_BYTES`
-  overrides it for diagnosis only.
+  overrides it for diagnosis only. They start one worker per available CPU;
+  `RKAT_WORKER_THREADS` (then Tokio's `TOKIO_WORKER_THREADS`) sets the count,
+  which a container whose pids limit is below its CPU count needs.
 
 ## Embedding the Rust crates
 

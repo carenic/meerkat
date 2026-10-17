@@ -18,7 +18,9 @@ behind CLI, REST, JSON-RPC, MCP, SDK, and browser/WASM surfaces.
 - Environment variables: provider secrets use `RKAT_*` and provider-native keys;
   ordinary configuration stays declarative. Explicit operational/diagnostic
   overrides also exist, such as `RKAT_WORKER_STACK_BYTES` for
-  [worker-stack diagnosis](docs/guides/deploying.mdx#worker-stack-budget).
+  [worker-stack diagnosis](docs/guides/deploying.mdx#worker-stack-budget) and
+  `RKAT_WORKER_THREADS` for the
+  [worker count](docs/guides/deploying.mdx#worker-threads).
 
 ## Build and Test Commands
 

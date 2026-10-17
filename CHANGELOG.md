@@ -452,6 +452,30 @@ them.
   deprecated in 0.9.2, are removed. Use `CommsToolSurface`: it dispatches the
   comms tools with the dispatch context and a typed operation target, which
   the removed tools did not carry.
+- `meerkat_runtime::host_stack::HostStackError` is now `#[non_exhaustive]`
+  and has two new variants, `InvalidWorkerThreads { name, raw }` and
+  `ThreadLimit { name, workers, workers_set_by, stack_bytes,
+  stack_overridden_by, observed_limit, source }` (see Added and Fixed); an
+  exhaustive match must add a wildcard arm. Both new variants are
+  `#[non_exhaustive]` themselves, so a pattern on either needs `..`.
+- Not measured by the gate (cargo-semver-checks does not compare a trait
+  object's lifetime bound): `meerkat::surface::FatalErrorReport::new` and
+  `meerkat::surface::report_fatal_error` take `&(dyn Error + 'static)`
+  instead of `&dyn Error`, so the report can look for an `std::io::Error` in
+  the chain (see Fixed). A `Box<dyn Error>`'s `as_ref()` still fits.
+- Behaviour-only (not measured by the gate): `TOKIO_WORKER_THREADS` set to 0
+  or to anything that is not a whole number stops a host binary with exit
+  code 2 and a message, instead of Tokio's panic (exit code 101); a valid
+  value works as before. A worker-stack or worker-count variable whose value
+  is not valid UTF-8 is refused like any other value that is not a number,
+  instead of being ignored.
+- Behaviour-only (not measured by the gate): `rkat-mob-mcp` runs on the
+  shared host budget (`meerkat_runtime::host_stack::run_host`) instead of
+  `#[tokio::main]`. Its workers get the 8 MiB worker stack instead of Tokio's
+  2 MiB default, its main future runs on a budgeted `rkat-mob-mcp-main`
+  thread, `RKAT_WORKER_STACK_BYTES` and `RKAT_WORKER_THREADS` apply to it, and
+  a fatal error prints its `Display` chain prefixed with `rkat-mob-mcp:`
+  (exit code 1) instead of `Error:` and its `Debug` form.
 
 ### Security
 
@@ -820,6 +844,16 @@ them.
   file holds no fence) and fails with `SqliteStoreError::MaintenanceFenceHeld`
   under another holder's exclusive fence, as `OperationGuard::for_database`
   does.
+- `RKAT_WORKER_THREADS=<n>` sets the Tokio worker count of `rkat`,
+  `rkat-rpc`, `rkat-rest`, `rkat-mcp` and `rkat-mob-mcp` (#1799). Unset, the
+  runtime still starts one worker per available CPU, and Tokio's own
+  `TOKIO_WORKER_THREADS` is read in its place, through the same validation.
+  Rust hosts that build their own runtime read the validated count with
+  `meerkat_runtime::host_stack::worker_threads_from_env()`;
+  `HostStackBudget::worker_threads()` and `worker_threads_set_by()` report
+  the resolved one. The deployment guide's Worker Threads section and its
+  container thread-limit notes describe the default and how to size a pids
+  limit.
 
 ### Changed
 
@@ -1537,6 +1571,19 @@ them.
   queues its job. A turn that merges inputs of several interactions, or
   whose input names none (for example a flow step without a correlation
   id), still refuses typed, and the refusal now says so.
+- A host started where its thread limit (a container pids limit,
+  `RLIMIT_NPROC`) is below its CPU count failed with only "failed to spawn
+  the rkat-rpc main thread: Resource temporarily unavailable (os error 11)"
+  (#1799). Tokio launches one worker per CPU and silently queues the ones it
+  cannot spawn, so the main thread was the first refusal anyone saw. The
+  error now names the worker count and where it came from, the cgroup
+  `pids.max` and `RLIMIT_NPROC` that Linux reports, the variable to lower
+  (the one that set the count, else `RKAT_WORKER_THREADS`), and, when
+  `RKAT_WORKER_STACK_BYTES` overrode the stack, its size, since mapping an
+  oversized stack fails with the same EAGAIN. A fatal error whose chain holds
+  an `std::io::Error` of kind `WouldBlock` (EAGAIN) now ends with a `hint:`
+  line naming the usual causes and the variable that set the worker count,
+  in `rkat`, `rkat-rpc`, `rkat-rest`, `rkat-mcp` and `rkat-mob-mcp`.
 
 ### Known issues
 
