@@ -164,10 +164,13 @@ them.
   themselves. The test also fails when anything turns the lint off in bulk:
   a second Clippy configuration file (a crate's own `clippy.toml` or
   `.clippy.toml` would replace the root one for that crate), a `warnings`,
-  `clippy::all` or `clippy::style` allow or expect in shipped code, or a
-  Cargo manifest entry for the lint or an allow of its group. A Clippy run
-  with `CLIPPY_CONF_DIR` set reads another configuration; the repository's
-  lanes and CI never set it.
+  `clippy::all` or `clippy::style` allow or expect in shipped code, a Cargo
+  manifest entry for the lint or an allow of its group, or a Cargo
+  configuration file in the tree (`.cargo/config.toml`) whose `rustflags`
+  allow the lint, its groups or `warnings` or cap lint levels, or whose
+  `[env]` sets `CLIPPY_CONF_DIR` or `CLIPPY_ARGS`. A run whose environment
+  sets those variables or such `RUSTFLAGS`, or a Cargo configuration outside
+  the checkout, is outside the test; the repository's lanes and CI set none.
 
 ### Deprecated
 

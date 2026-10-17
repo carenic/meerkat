@@ -173,36 +173,60 @@ fn walk_rust_sources(root: &Path) -> Vec<PathBuf> {
     walk_files(root, |name| name.ends_with(".rs"))
 }
 
-/// Every file under `root` whose name `keep` accepts, skipping build output
-/// and VCS metadata.
-fn walk_files(root: &Path, keep: impl Fn(&str) -> bool) -> Vec<PathBuf> {
+/// Every directory under `root`, `root` included, skipping build output,
+/// VCS metadata and Cargo's own directories.
+fn walk_directories(root: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let mut pending = vec![root.to_path_buf()];
     while let Some(dir) = pending.pop() {
-        let Ok(entries) = fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            let Ok(file_type) = entry.file_type() else {
-                continue;
-            };
-            if file_type.is_dir() {
-                if !matches!(
-                    name.as_ref(),
-                    "target" | ".git" | "node_modules" | ".cargo" | "dist"
-                ) && !name.starts_with("bazel-")
+        if let Ok(entries) = fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if entry.file_type().is_ok_and(|file_type| file_type.is_dir())
+                    && !matches!(
+                        name.as_ref(),
+                        "target" | ".git" | "node_modules" | ".cargo" | "dist"
+                    )
+                    && !name.starts_with("bazel-")
                 {
-                    pending.push(path);
+                    pending.push(entry.path());
                 }
-            } else if keep(&name) {
-                out.push(path);
             }
         }
+        out.push(dir);
     }
     out
+}
+
+/// Every file under `root` whose name `keep` accepts, skipping build output
+/// and VCS metadata.
+fn walk_files(root: &Path, keep: impl Fn(&str) -> bool) -> Vec<PathBuf> {
+    walk_directories(root)
+        .into_iter()
+        .filter_map(|dir| fs::read_dir(dir).ok())
+        .flat_map(|entries| entries.flatten())
+        .filter(|entry| {
+            entry.file_type().is_ok_and(|file_type| !file_type.is_dir())
+                && keep(&entry.file_name().to_string_lossy())
+        })
+        .map(|entry| entry.path())
+        .collect()
+}
+
+/// Every Cargo configuration file in the tree: a `.cargo/config.toml`, or
+/// the older `.cargo/config`, in any directory the walk reaches. Cargo reads
+/// the one of each directory from where it runs up to the filesystem root,
+/// so a crate's own applies to a build run in that crate.
+fn cargo_config_files(root: &Path) -> Vec<PathBuf> {
+    walk_directories(root)
+        .into_iter()
+        .flat_map(|dir| {
+            let cargo = dir.join(".cargo");
+            [cargo.join("config.toml"), cargo.join("config")]
+        })
+        .filter(|path| path.is_file())
+        .collect()
 }
 
 /// Whether a repository-relative source path is shipped library or binary
@@ -654,6 +678,98 @@ fn wholesale_lint_allows(code: &str) -> Vec<String> {
     found
 }
 
+/// The lints whose allow silences the launch lint: the lints themselves,
+/// the `clippy::style` and `clippy::all` groups they belong to, and
+/// `warnings`.
+const LAUNCH_LINT_SILENCERS: [&str; 5] = [
+    "clippy::disallowed_methods",
+    "clippy::disallowed_types",
+    "clippy::style",
+    "clippy::all",
+    "warnings",
+];
+
+/// The flags of a rustc flag list that turn the launch lint off: an allow
+/// (`-A`, `--allow`, with the lint attached or as the next flag) of one of
+/// [`LAUNCH_LINT_SILENCERS`], and any `--cap-lints`.
+fn lint_off_flags(flags: &[String]) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut flags = flags.iter().map(String::as_str);
+    while let Some(flag) = flags.next() {
+        let allowed = match flag {
+            "-A" | "--allow" => flags.next(),
+            "--cap-lints" => {
+                found.push(format!("--cap-lints {}", flags.next().unwrap_or_default()));
+                continue;
+            }
+            _ if flag.starts_with("--cap-lints=") => {
+                found.push(flag.to_owned());
+                continue;
+            }
+            _ => flag
+                .strip_prefix("--allow=")
+                .or_else(|| flag.strip_prefix("-A")),
+        };
+        for lint in allowed.into_iter().flat_map(|allowed| allowed.split(',')) {
+            if LAUNCH_LINT_SILENCERS.contains(&lint.trim().replace('-', "_").as_str()) {
+                found.push(format!("allows {lint}"));
+            }
+        }
+    }
+    found
+}
+
+/// What a Cargo configuration file states that turns the launch lint off
+/// for the builds it applies to: such a flag in a `rustflags` list (of
+/// `[build]`, `[host]`, a `[target.<triple>]` or `[target.'cfg(..)']`
+/// table, or a profile), and an `[env]` entry that points Clippy at another
+/// configuration (`CLIPPY_CONF_DIR`) or passes it other arguments
+/// (`CLIPPY_ARGS`).
+fn cargo_config_lint_overrides(config: &toml::Table) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut pending: Vec<(String, &toml::Value)> = config
+        .iter()
+        .map(|(key, value)| (key.clone(), value))
+        .collect();
+    while let Some((key, value)) = pending.pop() {
+        match value {
+            toml::Value::Table(table) => pending.extend(
+                table
+                    .iter()
+                    .map(|(name, value)| (format!("{key}.{name}"), value)),
+            ),
+            _ if key == "rustflags" || key.ends_with(".rustflags") => {
+                let flags: Vec<String> = match value {
+                    toml::Value::String(text) => {
+                        text.split_whitespace().map(str::to_owned).collect()
+                    }
+                    toml::Value::Array(items) => items
+                        .iter()
+                        .filter_map(toml::Value::as_str)
+                        .map(str::to_owned)
+                        .collect(),
+                    _ => Vec::new(),
+                };
+                found.extend(
+                    lint_off_flags(&flags)
+                        .into_iter()
+                        .map(|flag| format!("{key}: {flag}")),
+                );
+            }
+            _ => {}
+        }
+    }
+    if let Some(env) = config.get("env").and_then(toml::Value::as_table) {
+        found.extend(
+            ["CLIPPY_CONF_DIR", "CLIPPY_ARGS"]
+                .into_iter()
+                .filter(|name| env.contains_key(*name))
+                .map(|name| format!("env.{name}")),
+        );
+    }
+    found
+}
+
 /// The entries of a Cargo manifest's `[lints.clippy]` or
 /// `[workspace.lints.clippy]` that would turn the launch lint off: any entry
 /// for `disallowed_methods` or `disallowed_types`, and an `allow` of the
@@ -697,10 +813,14 @@ fn manifest_launch_lint_entries(manifest: &toml::Table) -> Vec<String> {
 /// configuration file (a crate's own `clippy.toml` or `.clippy.toml` would
 /// replace the root one, and its disallowed list, for that crate), shipped
 /// code allows neither `warnings` nor the `clippy::all` or `clippy::style`
-/// group, and no Cargo manifest configures the lint or allows its group.
-/// Clippy also reads its configuration from `CLIPPY_CONF_DIR` when that is
-/// set, which no file in the tree can show: the repository's build lanes and
-/// CI never set it, and a run that does lints against another file.
+/// group, no Cargo manifest configures the lint or allows its group, and no
+/// Cargo configuration file in the tree passes rustc such an allow or a
+/// `--cap-lints`, or sets `CLIPPY_CONF_DIR` (another configuration) or
+/// `CLIPPY_ARGS` for the builds it applies to. What no file in the tree can
+/// show is outside the check: those variables or `RUSTFLAGS` in a run's
+/// environment, and Cargo configuration files above the checkout or in
+/// Cargo's home. The repository's build lanes and CI set none that turns
+/// the lint off.
 #[test]
 fn the_launch_lint_is_allowed_only_at_the_listed_launch_sites() {
     let root = repo_root();
@@ -757,6 +877,17 @@ fn the_launch_lint_is_allowed_only_at_the_listed_launch_sites() {
         ["clippy.toml"],
         "the workspace has one Clippy configuration, at its root"
     );
+    for config in cargo_config_files(&root) {
+        let text = fs::read_to_string(&config)
+            .unwrap_or_else(|error| panic!("read {}: {error}", config.display()));
+        let table: toml::Table = text
+            .parse()
+            .unwrap_or_else(|error| panic!("parse {}: {error}", config.display()));
+        let overrides = cargo_config_lint_overrides(&table);
+        if !overrides.is_empty() {
+            bulk.push(format!("{}: {overrides:?}", relative(&config)));
+        }
+    }
     for manifest in walk_files(&root, |name| name == "Cargo.toml") {
         let text = fs::read_to_string(&manifest)
             .unwrap_or_else(|error| panic!("read {}: {error}", manifest.display()));
@@ -803,8 +934,9 @@ fn every_host_launch_exemption_is_in_use_and_named_where_it_launches() {
 }
 
 /// The bulk checks see what they look for: a `warnings` or group allow in
-/// an `allow` or `expect` list, and a manifest entry for the lint or an
-/// allow of its group, but not a lint or level that leaves it on.
+/// an `allow` or `expect` list, a manifest entry for the lint or an allow of
+/// its group, and a Cargo configuration's rustc allow, `--cap-lints` or
+/// Clippy variable, but not a lint, level or flag that leaves it on.
 #[test]
 fn the_bulk_lint_checks_see_what_turns_the_lint_off() {
     assert_eq!(
@@ -834,6 +966,37 @@ fn the_bulk_lint_checks_see_what_turns_the_lint_off() {
         manifest(
             "[workspace.lints.clippy]\nall = { level = \"warn\", priority = -1 }\npanic = \"deny\"\n\
              [lints]\nworkspace = true\n"
+        )
+        .is_empty()
+    );
+    let cargo_config = |text: &str| -> Vec<String> {
+        let mut found = cargo_config_lint_overrides(&text.parse::<toml::Table>().unwrap());
+        found.sort();
+        found
+    };
+    assert_eq!(
+        cargo_config(
+            "[build]\nrustflags = [\"-A\", \"clippy::disallowed_methods\", \"--cfg\", \"tokio_unstable\"]\n\
+             [target.'cfg(unix)']\nrustflags = \"-Aclippy::style --allow=warnings -Dclippy::pedantic\"\n\
+             [target.x86_64-unknown-linux-gnu]\n\
+             rustflags = [\"--cap-lints\", \"warn\", \"--allow\", \"clippy::disallowed-types\"]\n\
+             [profile.dev]\nrustflags = [\"-A\", \"clippy::all\"]\n\
+             [env]\nCLIPPY_CONF_DIR = \"elsewhere\"\nRUST_MIN_STACK = \"8388608\"\n"
+        ),
+        [
+            "build.rustflags: allows clippy::disallowed_methods",
+            "env.CLIPPY_CONF_DIR",
+            "profile.dev.rustflags: allows clippy::all",
+            "target.cfg(unix).rustflags: allows clippy::style",
+            "target.cfg(unix).rustflags: allows warnings",
+            "target.x86_64-unknown-linux-gnu.rustflags: --cap-lints warn",
+            "target.x86_64-unknown-linux-gnu.rustflags: allows clippy::disallowed-types",
+        ]
+    );
+    assert!(
+        cargo_config(
+            "[build]\nrustflags = [\"-D\", \"warnings\", \"-A\", \"clippy::pedantic\", \"-Wclippy::style\"]\n\
+             [env]\nRUST_MIN_STACK = \"8388608\"\n[alias]\nfast = [\"nextest\", \"run\"]\n"
         )
         .is_empty()
     );
