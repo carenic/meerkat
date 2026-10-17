@@ -35,6 +35,35 @@ them.
 
 ## [Unreleased]
 
+### Added
+
+- `meerkat_authorization::publication::LocalAuthorizationPublication::poison`
+  permanently poisons a publication without taking its writer, so an owner
+  that shares the publication can call it from a callback that runs under a
+  held reservation. Every retained stamp, prepared final entry and grant check
+  then answers `Unavailable`, retained consent eligibility is no longer
+  current, and no new observation or owner change is admitted until the
+  owners are reconstructed under a new publication. Effects that already
+  passed their final entry keep their outcomes. A revocation refused while the
+  publication is poisoned did not happen; retry it after reconstruction.
+- `LocalAuthorizationPublication::poison_on_unwind` returns an
+  `OwnerPoisonSentinel` that poisons the publication when it is dropped during
+  an unwind. An owner creates it right after acquiring its own entry lock, in
+  the same scope, and holds it as long as that lock, reads included: the panic
+  that poisons the lock then poisons the publication before any outer
+  `catch_unwind` can swallow it.
+
+### Fixed
+
+- Guard writes no longer overwrite a poisoned authorization publication. A
+  poison that lands while an owner change holds the publication's writer
+  stands when that change publishes or completes, instead of becoming current
+  again. `begin_owner_change` and `try_begin_owner_change` return
+  `Unavailable` when the publication was poisoned before the change published,
+  and `LocalGrantAuthority::reconstruct` returns
+  `ReplacementPublicationUnavailable`, installing nothing, when its
+  replacement publication is poisoned during the reconstruction.
+
 ## [0.9.2] - 2026-10-16
 
 ### Breaking

@@ -495,3 +495,142 @@ fn an_expected_revoke_with_a_current_stamp_revokes_exactly_once() {
     assert_eq!(revision(&owner), before + 1);
     assert_eq!(after.check_current(), Ok(()), "nothing published again");
 }
+
+fn open() -> ChildGrantValidity {
+    ChildGrantValidity {
+        not_before_ms: 0,
+        expires_at_ms: u64::MAX,
+        deadline: Instant::now() + Duration::from_secs(3600),
+    }
+}
+fn child_intent(parent: &GrantLineageRef, name: &str) -> ChildGrantIntent {
+    ChildGrantIntent {
+        issuer: who("holder"),
+        parent_lineage: vec![parent.clone()],
+        id: id(name),
+        grantee: who("helper"),
+        represented_subject: None,
+        requested: ExecutionRestrictions::unrestricted(),
+    }
+}
+/// A host owner sharing `publication` panics inside its own entry lock while
+/// holding the sentinel, and catches its own panic.
+#[allow(clippy::panic)] // Deliberately poison the host owner's own lock.
+fn caught_host_poison(publication: &LocalAuthorizationPublication, host: &Mutex<()>) {
+    let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _entry = host.lock().expect("host entry");
+        let _sentinel = publication.poison_on_unwind();
+        panic!("simulated host owner panic");
+    }));
+    assert!(caught.is_err());
+    assert!(host.is_poisoned());
+}
+
+#[test]
+fn a_caught_owner_poison_inside_an_excluded_operation_stays_poisoned() {
+    let owner = authority(Arc::new(Clock));
+    let before = stamp(&owner);
+    let publication = owner.publication.clone();
+    let host = Mutex::new(());
+    owner
+        .try_with_owner_changes_excluded(|| caught_host_poison(&publication, &host))
+        .expect("the operation ran under the exclusion");
+    assert_eq!(before.check_current(), Err(PublicationError::Unavailable));
+    assert!(matches!(
+        owner.publication.observe(|| ()),
+        Err(PublicationError::Unavailable)
+    ));
+    assert!(matches!(
+        owner.try_with_owner_changes_excluded(|| ()),
+        Err(PublicationError::Unavailable)
+    ));
+}
+
+/// The append reserved before the poison still lands, but its publication
+/// never overwrites the poison: the child stays unusable until
+/// reconstruction, and the same intent then recovers it.
+#[test]
+fn a_caught_owner_poison_inside_a_child_issuance_is_never_overwritten() {
+    let mut owner = authority(Arc::new(Clock));
+    let parent = issue(&owner, "parent");
+    let before = stamp(&owner);
+    let publication = owner.publication.clone();
+    let host = Mutex::new(());
+    let intent = child_intent(&parent, "child");
+    let issued = owner
+        .issue_or_recover_child_under_exclusion(&intent, || {
+            caught_host_poison(&publication, &host);
+            Ok(open())
+        })
+        .expect("the append reserved before the poison lands");
+    assert!(
+        matches!(issued, ChildGrantOutcome::Issued { .. }),
+        "{issued:?}"
+    );
+    let lineage = issued.lineage().to_vec();
+    assert_eq!(
+        before.check_current(),
+        Err(PublicationError::Unavailable),
+        "the issuance's publication must not overwrite the poison"
+    );
+    assert!(matches!(
+        owner.publication.observe(|| ()),
+        Err(PublicationError::Unavailable)
+    ));
+    assert!(matches!(
+        owner.resolve_controller_lineage(&lineage, &who("helper"), None),
+        Err(GrantRefusal::Unavailable)
+    ));
+    assert_eq!(
+        owner.issue_or_recover_child_under_exclusion(&intent, || Ok(open())),
+        Err(ChildGrantRefusal::Unavailable)
+    );
+
+    Arc::get_mut(&mut owner)
+        .expect("the only reference to the owner")
+        .reconstruct(LocalAuthorizationPublication::new())
+        .expect("reconstructed under a new publication");
+    assert_eq!(
+        owner.issue_or_recover_child_under_exclusion(&intent, || Ok(open())),
+        Ok(ChildGrantOutcome::Recovered {
+            lineage: lineage.clone()
+        })
+    );
+    owner
+        .resolve_controller_lineage(&lineage, &who("helper"), None)
+        .expect("the recovered child is usable again");
+}
+
+/// A child issued and published before a poison keeps its outcome: it is
+/// unusable while poisoned and recovered by the same intent after
+/// reconstruction.
+#[test]
+fn a_child_issued_before_an_owner_poison_is_recovered_after_reconstruction() {
+    let mut owner = authority(Arc::new(Clock));
+    let parent = issue(&owner, "parent");
+    let intent = child_intent(&parent, "child");
+    let issued = owner
+        .issue_or_recover_child_under_exclusion(&intent, || Ok(open()))
+        .expect("issued before the poison");
+    let lineage = issued.lineage().to_vec();
+    let resolved = owner
+        .resolve_controller_lineage(&lineage, &who("helper"), None)
+        .expect("usable before the poison");
+    assert_eq!(resolved.check_current(), Ok(()));
+
+    owner.publication.poison();
+    assert_eq!(resolved.check_current(), Err(PublicationError::Unavailable));
+    assert!(matches!(
+        owner.resolve_controller_lineage(&lineage, &who("helper"), None),
+        Err(GrantRefusal::Unavailable)
+    ));
+
+    Arc::get_mut(&mut owner)
+        .expect("the only reference to the owner")
+        .reconstruct(LocalAuthorizationPublication::new())
+        .expect("reconstructed under a new publication");
+    assert_eq!(
+        owner.issue_or_recover_child_under_exclusion(&intent, || Ok(open())),
+        Ok(ChildGrantOutcome::Recovered { lineage })
+    );
+}
