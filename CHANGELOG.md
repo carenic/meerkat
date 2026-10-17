@@ -49,38 +49,47 @@ them.
   because the model context window filled (Anthropic
   `model_context_window_exceeded`) no longer commits as an end of turn.
   Nothing of the turn is committed and its tool calls never run; the run fails
-  as context exceeded (`LlmFailureReason::ContextExceeded`, terminal cause
-  `llm_failure`, where `max` is the model's context window and `requested` the
-  call's reported tokens). The next run compacts at its boundary as before. A
-  compaction summary call that stops this way takes the mechanical capacity
-  fallback, charged with the call's usage, instead of committing a truncated
-  summary.
+  as context exceeded (`LlmFailureReason::ContextExceeded`, error reason
+  `llm_context_exceeded`, terminal cause `llm_failure`). There `max` is the
+  model's context window and `requested` the call's reported tokens, which can
+  be at or below `max` (the provider decided the window was full), so a host
+  must not compute an overflow from the two. The next run compacts at its
+  boundary as before. A compaction summary call that stops this way takes the
+  mechanical capacity fallback, charged with the call's usage, instead of
+  committing a truncated summary.
 - Behaviour-only (not measured by the gate): a refused turn (Anthropic
   `refusal`) and a content-filtered turn (`content_filter` from any provider)
   fail the run with `AgentError::ContentFiltered` (`run_failed` class
   `content_filtered`) instead of committing. Nothing of the turn is committed
   and none of its tool calls run, including a call the refusal cut mid-input.
-  In a structured-output extraction turn either stop fails the extraction
-  instead of the run. A compaction summary the provider refuses or filters
-  fails that compaction (`compaction_failed`, `llm_failed`): the history stays
-  as it was and the run goes on, so a refusal never becomes the session
-  summary.
+  For hook authors: `PostLlmResponse` hooks no longer run for a refused,
+  content-filtered or context-window-stopped response, because the turn fails
+  before that hook point. In a structured-output extraction turn either stop
+  fails the extraction instead of the run. A compaction summary the provider
+  refuses or filters fails that compaction (`compaction_failed`,
+  `llm_failed`): the history stays as it was and the run goes on, so a refusal
+  never becomes the session summary.
 - Behaviour-only (not measured by the gate): an Anthropic stop reason the
   adapter does not know is no longer read as `end_turn`. The response fails
   with the retryable `LlmError::IncompleteResponse` naming the raw reason: it
   is retried within the retry policy with nothing committed, then fails the run
-  as `ProviderError(IncompleteResponse)`.
+  as `ProviderError(IncompleteResponse)`. A model fallback policy reads that
+  failure as empty output, so a run whose policy lists the `empty_output`
+  trigger may switch to a fallback model after `trigger_after_attempts`
+  attempts before it fails.
 - Behaviour-only (not measured by the gate): the same holds for a Chat
   Completions `finish_reason` and a Gemini `finishReason` the adapter does not
   know. Chat Completions knows `stop`, `length`, `tool_calls`, `function_call`
   and `content_filter`, plus the natural-stop names `eos`, `eos_token` and
-  `stop_sequence` some self-hosted servers send. Gemini maps its whole safety
-  family (`SAFETY`, `RECITATION`, `LANGUAGE`, `BLOCKLIST`,
-  `PROHIBITED_CONTENT`, `SPII`, `IMAGE_SAFETY`, `IMAGE_PROHIBITED_CONTENT`,
-  `IMAGE_RECITATION`) to `content_filter`, which fails the run as above; a
-  malformed or unexpected tool call (`MALFORMED_FUNCTION_CALL`,
-  `UNEXPECTED_TOOL_CALL`, `TOO_MANY_TOOL_CALLS`), `OTHER` and any other reason
-  fail the response as incomplete. The OpenAI realtime text-turn adapter
+  `stop_sequence` some self-hosted servers send. Gemini maps its safety family
+  (`SAFETY`, `RECITATION`, `BLOCKLIST`, `PROHIBITED_CONTENT`, `SPII`,
+  `IMAGE_SAFETY`, `IMAGE_PROHIBITED_CONTENT`, `IMAGE_RECITATION`) to
+  `content_filter`, which fails the run as above. `LANGUAGE` (the candidate was
+  flagged for an unsupported language, not for safety) maps there too, so it
+  also fails the run instead of being retried. A malformed or unexpected tool
+  call (`MALFORMED_FUNCTION_CALL`, `UNEXPECTED_TOOL_CALL`,
+  `TOO_MANY_TOOL_CALLS`), `OTHER` and any other reason fail the response as
+  incomplete. The OpenAI realtime text-turn adapter
   (realtime models running agent-loop turns) now reads the status of
   `response.done` the same way: a failed response, an incomplete one with an
   unknown or missing reason, or one still in progress fails as incomplete,
@@ -92,7 +101,12 @@ them.
 - An Anthropic `pause_turn` stop (a server-tool loop reached its iteration
   limit) is reported as `pause_turn` instead of `end_turn`. The paused turn
   commits like an end of turn, even when it holds only server-tool blocks, and
-  the next request replays its `server_tool_use` blocks.
+  its `server_tool_use` blocks go back to the provider as history with the
+  next request. That replay has been checked against a stub server only, not
+  against the live API (#1881). Recovery of a durable tail left by a shutdown
+  race classifies a tail that ends in a `pause_turn` turn as `Ambiguous` and
+  holds it, as it does a `max_tokens` tail. Before, such a tail read as
+  `end_turn` and could be recovered as a completed run.
 - A tool call whose streamed input a refusal or a filled context window cut
   off now ends the Anthropic stream with that stop reason instead of a stream
   parse error. Under any other stop reason a tool input that does not parse
@@ -106,8 +120,18 @@ them.
   turn (#1882).
 - An Anthropic stream that carries no stop reason at all (a proxy may omit it)
   still ends as `end_turn`: a missing reason is not an unknown one.
+- A Chat Completions stream that ends without a `finish_reason` also still ends
+  as `end_turn`, and a tool call it streamed without a `tool_calls` (or
+  `function_call`) finish is dropped, not run.
 - The OpenAI realtime session adapter (live channels) still reports a failed
   response, or an incomplete one with an unknown reason, as `end_turn` (#1883).
+- The `web_search` tool's native search call does not read its stop reason: a
+  search the provider refused or filtered comes back as `completed` (or
+  `unavailable`) with the refusal text as its answer (#1887).
+- A Gemini prompt blocked before any candidate (`promptFeedback.blockReason`,
+  no `finishReason`) still fails as an incomplete response, retried and then
+  failing the run as `ProviderError(IncompleteResponse)`, instead of as
+  `content_filtered` (#1888).
 
 ## [0.9.2] - 2026-10-16
 

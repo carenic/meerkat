@@ -23,6 +23,13 @@ pub enum LlmFailureReason {
     RateLimited {
         retry_after: Option<std::time::Duration>,
     },
+    /// The request did not fit the model's context. Both counts are tokens as
+    /// the failure reported them: a refusal before dispatch names the
+    /// request's estimate and the limit it exceeds; a response the provider
+    /// stopped because the window filled names the call's reported tokens,
+    /// which can be at or below `max`; a provider rejection names the counts
+    /// its error carried, or placeholders when it carried none. They are
+    /// evidence, not an overflow to compute.
     ContextExceeded {
         max: u32,
         requested: u32,
@@ -1026,7 +1033,11 @@ impl AgentError {
     /// `requested` is the call's reported token count (presented input plus
     /// output). `max` is the model's declared context window; a model that
     /// declares none reports the count the provider stopped at, which is
-    /// where its window was reached.
+    /// where its window was reached. The provider, not this count, decided
+    /// that the window was full, so `requested` can be at or below `max` (the
+    /// provider counts differently, or the call reported no usage and
+    /// `requested` falls back to the window): never derive an overflow from
+    /// the two.
     pub fn llm_context_window_stop(
         provider: &'static str,
         context_window_tokens: Option<u32>,

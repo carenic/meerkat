@@ -2379,8 +2379,11 @@ impl GeminiClient {
 
 /// Map one Gemini `finishReason`.
 ///
-/// The safety family (the candidate was blocked or flagged) is a content
-/// filter. A malformed or unexpected tool call, `OTHER`, and any reason this
+/// The safety family (the candidate was blocked or flagged for safety,
+/// recitation, a blocklisted term or sensitive data) is a content filter.
+/// `LANGUAGE` (the candidate was flagged for an unsupported language) is not
+/// a safety stop, but it is as terminal as one, so it fails the turn the same
+/// way. A malformed or unexpected tool call, `OTHER`, and any reason this
 /// adapter does not know refuse the response instead of reading it as a
 /// natural end of turn: `IncompleteResponse` is retried with nothing committed.
 fn gemini_finish_reason_stop(reason: &str) -> Result<StopReason, LlmError> {
@@ -2389,13 +2392,14 @@ fn gemini_finish_reason_stop(reason: &str) -> Result<StopReason, LlmError> {
         "MAX_TOKENS" => Ok(StopReason::MaxTokens),
         "SAFETY"
         | "RECITATION"
-        | "LANGUAGE"
         | "BLOCKLIST"
         | "PROHIBITED_CONTENT"
         | "SPII"
         | "IMAGE_SAFETY"
         | "IMAGE_PROHIBITED_CONTENT"
         | "IMAGE_RECITATION" => Ok(StopReason::ContentFilter),
+        // Not safety: an unsupported language. Terminal all the same.
+        "LANGUAGE" => Ok(StopReason::ContentFilter),
         // Legacy tool-call names some Gemini-shaped endpoints send.
         "TOOL_CALL" | "FUNCTION_CALL" => Ok(StopReason::ToolUse),
         other => Err(LlmError::IncompleteResponse {
@@ -4363,13 +4367,13 @@ mod tests {
     }
 
     /// Regression: every Gemini safety-family finish reason (the candidate
-    /// was blocked or flagged) maps to ContentFilter.
+    /// was blocked or flagged for safety) maps to ContentFilter, and so does
+    /// `LANGUAGE`, which is not safety but just as terminal.
     #[test]
     fn test_regression_gemini_safety_family_maps_to_content_filter() {
         for reason in [
             "SAFETY",
             "RECITATION",
-            "LANGUAGE",
             "BLOCKLIST",
             "PROHIBITED_CONTENT",
             "SPII",
@@ -4383,6 +4387,11 @@ mod tests {
                 "{reason}"
             );
         }
+        assert_eq!(
+            gemini_finish_reason_stop("LANGUAGE").expect("LANGUAGE"),
+            StopReason::ContentFilter,
+            "an unsupported language fails the turn instead of being retried"
+        );
         assert_eq!(
             gemini_finish_reason_stop("STOP").expect("STOP"),
             StopReason::EndTurn
