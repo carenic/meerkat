@@ -46,8 +46,9 @@ pub use custody::{
     ProcessIdentity, ProcessStartStamp, sweep_process_custody_once, track_owned_process_group,
 };
 pub use custody_types::{
-    ProcessCustodyError, ProcessCustodyRecoveryReport, ProcessCustodySweepReport,
-    RecoveredToolProcess, ScopeSweep, ToolProcessCessation, ToolProcessSpawner,
+    ForeignProcfsView, ProcessCustodyError, ProcessCustodyRecoveryReport,
+    ProcessCustodySweepReport, RecoveredToolProcess, ScopeSweep, ToolProcessCessation,
+    ToolProcessSpawner,
 };
 pub use job_cancel_tool::ShellJobCancelTool;
 pub use job_manager::{

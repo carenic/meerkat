@@ -76,6 +76,42 @@ impl std::fmt::Display for ForeignIncarnationLiveness {
     }
 }
 
+/// What a Linux host's `/proc` shows of the host when it is not a procfs of
+/// the host's own pid namespace (see [`ProcessCustodyError::ForeignProcfs`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ForeignProcfsView {
+    /// The host's pid in its own pid namespace.
+    pub host_pid: i32,
+    /// The host's pid as the procfs shows it (the `Tgid` of the host's own
+    /// status record there); `None` when the procfs does not show the host
+    /// at all: a procfs of a pid namespace that does not contain the host,
+    /// or none mounted.
+    pub procfs_pid: Option<i32>,
+    /// How many pid namespace levels the procfs's namespace lies above the
+    /// host's, when the kernel lists them (`NSpid`, Linux 4.1 and later).
+    pub namespace_levels_above: Option<u32>,
+}
+
+impl std::fmt::Display for ForeignProcfsView {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Some(procfs_pid) = self.procfs_pid else {
+            return write!(f, "/proc does not show this host (pid {})", self.host_pid);
+        };
+        write!(
+            f,
+            "/proc shows this host (pid {}) as pid {procfs_pid}",
+            self.host_pid
+        )?;
+        match self.namespace_levels_above {
+            Some(levels) => write!(f, ", {levels} pid namespace level(s) up"),
+            None => Ok(()),
+        }
+    }
+}
+
+impl std::error::Error for ForeignProcfsView {}
+
 /// Errors establishing or recovering process custody.
 ///
 /// Every error fails closed: no custody handle is produced, so no new work
@@ -166,11 +202,38 @@ pub enum ProcessCustodyError {
         pgid: i32,
         live_members: usize,
     },
+    /// This Linux host's `/proc` is not a procfs of its own pid namespace
+    /// (for example a host started in a new pid namespace, as by
+    /// `unshare --pid --fork`, without a procfs mounted for it), so a pid
+    /// read there names another process than the same pid passed to the
+    /// host's own syscalls. Custody captured, compared and signalled
+    /// nothing, and no tool or hook ran. Operator action: give the host a
+    /// procfs of its own pid namespace (`unshare --pid --fork --mount-proc`,
+    /// or the container runtime's own `/proc`), then retry.
+    #[error(
+        "process custody refused ({context}): {view}; custody needs a procfs of this host's own pid namespace"
+    )]
+    ForeignProcfs {
+        context: &'static str,
+        view: ForeignProcfsView,
+    },
 }
 
 impl ProcessCustodyError {
+    /// An I/O failure of `context`. A procfs of another pid namespace, which
+    /// the platform layer reports through its I/O results, surfaces as
+    /// [`Self::ForeignProcfs`].
     #[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
     pub(super) fn io(context: &'static str, source: std::io::Error) -> Self {
-        Self::Io { context, source }
+        match source
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<ForeignProcfsView>())
+        {
+            Some(view) => Self::ForeignProcfs {
+                context,
+                view: *view,
+            },
+            None => Self::Io { context, source },
+        }
     }
 }
