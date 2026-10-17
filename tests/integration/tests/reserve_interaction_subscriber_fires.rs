@@ -108,6 +108,7 @@ async fn reserve_interaction_subscriber_fires_on_matching_response() {
         .request_received(
             PeerCorrelationId::from_uuid(envelope_id),
             HandlingMode::Queue,
+            a.public_key().to_peer_id(),
         )
         .expect("direct comms-drain bypass must seed inbound request state");
 
