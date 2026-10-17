@@ -28,6 +28,8 @@ use meerkat_machine_schema::{
 };
 use quote::ToTokens;
 use serde::Serialize;
+
+pub use crate::authority_language::collect_authority_language_mismatches;
 use syn::spanned::Spanned;
 use syn::visit::Visit;
 
@@ -958,33 +960,6 @@ pub fn collect_drift_mismatches(root: &Path, selection: &Selection) -> Result<Ve
                 &driver_code,
                 &mut mismatches,
             )?;
-        }
-    }
-
-    Ok(mismatches)
-}
-
-/// Deliberately text-level tombstone gate: these are retired
-/// authority-language names banned from *documentation prose*
-/// (`docs/` + spec READMEs — see `authority_language_paths`), where the
-/// stale word itself is the violation regardless of context. This is not a
-/// Rust-source structure check; structural source-shape governance lives in
-/// the syn-AST gates in this file and `rmat_audit`/`effect_authority`.
-pub fn collect_authority_language_mismatches(root: &Path) -> Result<Vec<String>> {
-    let mut mismatches = Vec::new();
-    let banned = ["schema.yaml", "PureHandKernel", "PureHand"];
-
-    for path in authority_language_paths(root)? {
-        let contents = fs::read_to_string(&path)
-            .with_context(|| format!("read authority-language file {}", path.display()))?;
-
-        for token in banned {
-            if contents.contains(token) {
-                mismatches.push(format!(
-                    "stale authority language `{token}` present in {}",
-                    path.display()
-                ));
-            }
         }
     }
 
@@ -3507,23 +3482,6 @@ fn parse_markdown_table_rows(contents: &str, heading: &str) -> Result<Vec<Vec<St
     Ok(rows)
 }
 
-fn authority_language_paths(root: &Path) -> Result<Vec<PathBuf>> {
-    let mut paths = Vec::new();
-
-    collect_text_paths(&root.join("docs"), &mut paths)?;
-
-    for path in [
-        root.join("specs/machines/README.md"),
-        root.join("specs/compositions/README.md"),
-    ] {
-        if path.exists() {
-            paths.push(path);
-        }
-    }
-
-    Ok(paths)
-}
-
 pub fn owner_module_dir(root: &Path, crate_name: &str, module: &str) -> PathBuf {
     let mut path = root.join("crates").join(crate_name).join("src");
     let mut segments = module.split("::").peekable();
@@ -3544,35 +3502,6 @@ pub fn owner_module_file(root: &Path, crate_name: &str, module: &str) -> Result<
         .ok_or_else(|| anyhow!("Rust module path always has a leaf segment"))?;
     path.push(format!("{leaf}.rs"));
     Ok(path)
-}
-
-fn collect_text_paths(dir: &Path, paths: &mut Vec<PathBuf>) -> Result<()> {
-    if !dir.exists() {
-        return Ok(());
-    }
-
-    for entry in fs::read_dir(dir).with_context(|| format!("read {}", dir.display()))? {
-        let entry = entry.with_context(|| format!("iterate {}", dir.display()))?;
-        let path = entry.path();
-        let file_type = entry
-            .file_type()
-            .with_context(|| format!("read file type {}", path.display()))?;
-
-        if file_type.is_dir() {
-            collect_text_paths(&path, paths)?;
-            continue;
-        }
-
-        let is_text = matches!(
-            path.extension().and_then(|ext| ext.to_str()),
-            Some("md" | "mdx" | "yaml" | "yml" | "txt")
-        );
-        if is_text {
-            paths.push(path);
-        }
-    }
-
-    Ok(())
 }
 
 fn production_rust_source_paths(root: &Path) -> Result<Vec<PathBuf>> {

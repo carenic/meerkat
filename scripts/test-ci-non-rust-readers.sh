@@ -5,7 +5,9 @@
 #
 # GREEN: the committed inventory matches the scan of this checkout.
 # RED:   an inventory with one reader row deleted fails, naming the reader's
-#        file and line; an inventory with an invented row fails as stale. In
+#        file and line, also for an in-crate doc the crate compiles in; an
+#        inventory with an invented row fails as stale; a row whose named
+#        test its features compile out fails, naming the cfg gate. In
 #        a scratch copy of the checkout, each from the clean tree: a new,
 #        unlisted reader target fails, naming its file and line; so does a
 #        reader in a support file a test target reaches only through
@@ -57,6 +59,21 @@ expect_red "deleted inventory row" "${TEST_ROOT}/deleted.log" \
   "missing reader: crates/meerkat-cli/tests/help_mobpack_contract.rs:5 reads docs/docs.json" \
   node "$GUARD" --inventory "${TEST_ROOT}/deleted.json"
 
+# RED: delete the row of an in-crate doc its crate compiles in
+# (include_str! of a skill body): the planner selects the crate from it.
+node - "$INVENTORY" "${TEST_ROOT}/compiled-in.json" <<'NODE'
+const fs = require("node:fs");
+const [from, to] = process.argv.slice(2);
+const doc = JSON.parse(fs.readFileSync(from, "utf8"));
+const key = "crates/meerkat-hooks/skills/hook-authoring/SKILL.md";
+if (!doc.paths[key]) throw new Error(`fixture: no ${key} row`);
+delete doc.paths[key];
+fs.writeFileSync(to, JSON.stringify(doc, null, 2));
+NODE
+expect_red "deleted compiled-in doc row" "${TEST_ROOT}/compiled-in.log" \
+  "missing reader: crates/meerkat-hooks/src/lib.rs:27 reads crates/meerkat-hooks/skills/hook-authoring/SKILL.md (meerkat-hooks lib, scope package)" \
+  node "$GUARD" --inventory "${TEST_ROOT}/compiled-in.json"
+
 # RED: an invented row no source produces.
 node - "$INVENTORY" "${TEST_ROOT}/stale.json" <<'NODE'
 const fs = require("node:fs");
@@ -71,6 +88,23 @@ NODE
 expect_red "stale inventory row" "${TEST_ROOT}/stale.log" \
   'stale inventory entry: "docs/index.mdx" lists rkat test:help_mobpack_contract' \
   node "$GUARD" --inventory "${TEST_ROOT}/stale.json"
+
+# RED: a row whose named test its build compiles out. meerkat-store's
+# release-corpus test sits in the sqlite module (cfg(feature = "sqlite"),
+# not a default feature); without the feature its row runs no test.
+node - "$INVENTORY" "${TEST_ROOT}/compiled-out.json" <<'NODE'
+const fs = require("node:fs");
+const [from, to] = process.argv.slice(2);
+const doc = JSON.parse(fs.readFileSync(from, "utf8"));
+const rows = doc.paths["crates/meerkat-runtime/tests/fixtures/v0_8_10_released_realm/corpus/realm/sessions.sqlite3"] ?? [];
+const row = rows.find((candidate) => candidate.package === "meerkat-store" && candidate.target === "lib");
+if (!row?.features?.includes("sqlite")) throw new Error("fixture: no meerkat-store lib row with the sqlite feature");
+delete row.features;
+fs.writeFileSync(to, JSON.stringify(doc, null, 2));
+NODE
+expect_red "named test compiled out by the row's features" "${TEST_ROOT}/compiled-out.log" \
+  'names test exact_released_0810_corpus_imports_and_fully_loads_current_session, which its build (default features) compiles out: cfg(all(feature = "sqlite"' \
+  node "$GUARD" --inventory "${TEST_ROOT}/compiled-out.json"
 
 # RED: a new reader in a scratch copy. Clone the committed tree, overlay this
 # checkout's guard files (so an uncommitted guard is what runs), and add a

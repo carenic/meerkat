@@ -32,6 +32,8 @@ import {
   lockScope,
   parseCargoLock,
   readRowDurations,
+  compiledInDocKeys,
+  readerRows,
 } from "./ci-cargo-lanes.mjs";
 import { readMetadata, workspacePackages } from "./rust-test-selector.mjs";
 import { durationsOf, rowOf } from "./ci-row-durations.mjs";
@@ -1367,6 +1369,88 @@ for (const path of [
   }
 }
 
+// The nested-Cargo canaries outlast a reader row's hung-test kill: a
+// reader row of their binary runs its other named tests, and a pull request
+// names the canaries as left to the push's closure-tests rows (one count
+// partition each).
+{
+  const canaryRows = (tests) => {
+    const deferred = { reader_rows: [] };
+    const rows = readerRows({
+      selections: [{ package: "facade", target: "test:canarybin", scope: "target", tests, features: [], paths: ["scripts/x"], reads: ["scripts/x"] }],
+      result: { main_unit_shards: [], unit_packages: [], unit_shards: [], integration_suites: [] },
+      byName: new Map([["facade", { name: "facade", targets: [{ name: "facade", kind: ["lib"] }, { name: "canarybin", kind: ["test"] }] }]]),
+      heavyChain: new Set(),
+      deferToPush: true,
+      deferred,
+      compiledInDocs: new Set(),
+      unified: new Map([["facade", new Set()]]),
+      canary: { binary: "canarybin", prefix: "downstream_" },
+    });
+    return [rows.map((row) => row.test_flags), deferred.reader_rows];
+  };
+  assert.deepEqual(canaryRows(["downstream_builds", "static_check"]), [
+    ["--test canarybin -E test(/(^|::)(static_check)$/)"],
+    ["facade:test:canarybin canaries"],
+  ]);
+  assert.deepEqual(canaryRows(["downstream_builds"]), [[], ["facade:test:canarybin canaries"]]);
+  assert.deepEqual(canaryRows(null), [[], ["facade:test:canarybin canaries"]], "the whole canary binary is the push's");
+  assert.deepEqual(canaryRows(["static_check"]), [["--test canarybin -E test(/(^|::)(static_check)$/)"], []]);
+}
+
+// Compiled-in documentation is a crate's reader of a doc in its own
+// directory: another crate's reader of that doc, a test-only reader and a
+// reader of a doc outside every crate are ordinary readers.
+{
+  const owners = { "crates/a/skills/x/SKILL.md": "a", "crates/a/README.md": "a" };
+  const keys = compiledInDocKeys(
+    [
+      { path: "crates/a/skills/x/SKILL.md", package: "a", scope: "package" },
+      { path: "crates/a/skills/x/SKILL.md", package: "b", scope: "package" },
+      { path: "crates/a/README.md", package: "a", scope: "target" },
+      { path: "docs/x.mdx", package: "a", scope: "package" },
+    ],
+    (path) => owners[path],
+  );
+  assert.deepEqual([...keys], ["crates/a/skills/x/SKILL.md\0a"]);
+}
+
+// A reader in library, binary or build-script code of a binary-only
+// package (the class rkat's main unit row hit): its row names only the
+// target kinds the package has.
+{
+  const byName = new Map([["binonly", { name: "binonly", targets: [{ name: "binonly", kind: ["bin"] }, { name: "it", kind: ["test"] }] }]]);
+  const rowsFor = (deferToPush) =>
+    readerRows({
+      selections: [{ package: "binonly", target: "bin:binonly", scope: "package", tests: null, features: [], paths: ["docs/x.mdx"], reads: ["docs/"] }],
+      result: { main_unit_shards: [], unit_packages: [], unit_shards: [], integration_suites: [] },
+      byName,
+      heavyChain: new Set(),
+      deferToPush,
+      deferred: { reader_rows: [] },
+      compiledInDocs: new Set(),
+      unified: new Map([["binonly", new Set()]]),
+    }).map((row) => `${row.package_flags} | ${row.test_flags}`);
+  assert.deepEqual(rowsFor(false), ["-p binonly | --bins"], "a push with no main unit lane runs its bins, not --lib");
+  assert.deepEqual(rowsFor(true), ["-p binonly | --bins"], "a pull request runs its bins and leaves its test targets to the push");
+  // A library reader of a package without a library is an inventory error,
+  // never a --lib row.
+  assert.throws(
+    () =>
+      readerRows({
+        selections: [{ package: "binonly", target: "lib", scope: "target", tests: null, features: [], paths: ["docs/x.mdx"], reads: ["docs/"] }],
+        result: { main_unit_shards: [], unit_packages: [], unit_shards: [], integration_suites: [] },
+        byName,
+        heavyChain: new Set(),
+        deferToPush: false,
+        deferred: { reader_rows: [] },
+        compiledInDocs: new Set(),
+        unified: new Map([["binonly", new Set()]]),
+      }),
+    /names the library of binonly, which has none/,
+  );
+}
+
 // The two-wave lanes in ci.yml: each lane's rest wave is a copy of its job
 // that differs only in its key, its needs (the stagger job), its row count
 // and its matrix; the stagger job waits on a push only; the short lanes queue
@@ -1588,8 +1672,13 @@ for (const path of [
   const authorizationGithub = run(["--format", "github", "--", "crates/meerkat-authorization/tests/native_governed_loop.rs"]);
   assert.equal(authorizationGithub.status, 0, authorizationGithub.stderr);
   const authorizationLines = Object.fromEntries(authorizationGithub.stdout.trim().split("\n").map((line) => [line.slice(0, line.indexOf("=")), line.slice(line.indexOf("=") + 1)]));
-  assert.equal(authorizationLines.integration_count, "1");
-  assert.deepEqual(JSON.parse(authorizationLines.integration_matrix).include.map((row) => row.packages), ["-p meerkat-authorization"]);
+  // The suite, then the push's whole-checkout reader row (xtask's
+  // machine-authority contracts, which the closure-tests rows do not build).
+  assert.equal(authorizationLines.integration_count, "2");
+  assert.deepEqual(JSON.parse(authorizationLines.integration_matrix).include.map((row) => row.packages), [
+    "-p meerkat-authorization",
+    "-p xtask --features machine-authority",
+  ]);
   // xtask's integration tests pin the workflows: an xtask change or a
   // workflow-only edit (a plan with no Rust change) runs them, with the
   // feature its machines_contracts target requires.
@@ -1606,8 +1695,11 @@ for (const path of [
   const github = run(["--format", "github", "--", "crates/meerkat-runtime/src/lib.rs"]);
   assert.equal(github.status, 0, github.stderr);
   const lines = Object.fromEntries(github.stdout.trim().split("\n").map((line) => [line.slice(0, line.indexOf("=")), line.slice(line.indexOf("=") + 1)]));
-  const rows = JSON.parse(lines.integration_matrix).include;
-  assert.equal(Number(lines.integration_count), 6);
+  // The suites, then the push's whole-checkout reader row.
+  const allRows = JSON.parse(lines.integration_matrix).include;
+  assert.equal(Number(lines.integration_count), 7);
+  assert.deepEqual(allRows.slice(6).map((row) => row.name), ["reader xtask:test:machines_contracts"]);
+  const rows = allRows.slice(0, 6);
   assert.deepEqual(rows.map((row) => row.packages.split(" --features")[0]), [
     "-p meerkat-runtime",
     "-p meerkat-machine-codegen",
@@ -1626,10 +1718,20 @@ for (const path of [
     "--test gpt_live_replay",
     undefined,
   ]);
+  // A docs edit selects no suite: its integration rows are its reader rows.
   const docsGithub = run(["--format", "github", "--", "docs/index.mdx"]);
   const docsLines = Object.fromEntries(docsGithub.stdout.trim().split("\n").map((line) => [line.slice(0, line.indexOf("=")), line.slice(line.indexOf("=") + 1)]));
-  assert.equal(docsLines.integration_count, "0");
-  assert.deepEqual(JSON.parse(docsLines.integration_matrix).include, [{ name: "none", packages: "" }]);
+  assert.equal(docsLines.integration_count, "3");
+  assert.deepEqual(JSON.parse(docsLines.integration_matrix).include.map((row) => row.name), [
+    "reader rkat:bin:rkat",
+    "reader xtask:package",
+    "reader xtask:test:machines_contracts",
+  ]);
+  // With neither, the matrix keeps its placeholder.
+  const noneGithub = run(["--format", "github", "--event", "pull_request", "--", "LICENSE-MIT"]);
+  const noneLines = Object.fromEntries(noneGithub.stdout.trim().split("\n").map((line) => [line.slice(0, line.indexOf("=")), line.slice(line.indexOf("=") + 1)]));
+  assert.equal(noneLines.integration_count, "0");
+  assert.deepEqual(JSON.parse(noneLines.integration_matrix).include, [{ name: "none", packages: "" }]);
 }
 
 // Bazel graph check selection: Bazel-relevant paths, any Cargo manifest, and
@@ -1931,6 +2033,125 @@ for (const path of [
   assert.equal(Number(lines.closure_test_first_count) + Number(lines.closure_test_rest_count), plan.closure_test_rows.length);
   assert.equal(lines.hook_retained_lanes, "workspace unit lane", "the plan log names the lane it leaves without a row");
   assert.equal(lines.hook_retained_count, String(plan.hook_coverage.hook_retained));
+}
+
+// Reader rows: the exact targets that read a changed non-Rust input, where
+// no other lane of the plan runs them.
+{
+  const outputs = (args) => {
+    const result = run(["--format", "github", ...args]);
+    assert.equal(result.status, 0, result.stderr);
+    return Object.fromEntries(result.stdout.trim().split("\n").map((line) => [line.slice(0, line.indexOf("=")), line.slice(line.indexOf("=") + 1)]));
+  };
+  const rowsOf = (plan) => plan.reader_rows.map((row) => `${row.name} | ${row.package_flags} | ${row.test_flags}`);
+  // A docs edit on a pull request: the machine-authority docs alignment
+  // test and xtask's static lanes, filtered to the tests that read docs/,
+  // and xtask's lib and bins (its library reads docs/: the
+  // authority-language gate, whose live-docs test is a library test). The
+  // package's test targets, like every test target a pull request's unit
+  // lanes leave, are the push's closure-tests rows' and named; so is rkat's
+  // doc-example test, which compiles meerkat-mob.
+  const staticLanes =
+    "reader xtask:test:buildbuddy_static_lanes | -p xtask | --test buildbuddy_static_lanes -E test(/(^|::)(deprecated_backend_references_stay_rejected_only|generated_header_truthfulness_is_clean|retired_public_surface_tokens_stay_out_of_unowned_paths|retired_session_control_names_are_absent)$/)";
+  const pullRequest = planFor(["docs/index.mdx"], ["--event", "pull_request"]);
+  assert.deepEqual(rowsOf(pullRequest), [
+    "reader machine-schema:test:docs_machine_authority_alignment | -p meerkat-machine-schema | --test docs_machine_authority_alignment -E test(/(^|::)(doctrine_count_claims_match_canonical_registry)$/)",
+    "reader xtask:package | -p xtask | --lib --bins",
+    staticLanes,
+  ]);
+  assert.deepEqual(pullRequest.reader_rows.map((row) => row.reads), [["docs/index.mdx"], ["docs/index.mdx"], ["docs/index.mdx"]]);
+  assert.deepEqual(pullRequest.deferred_to_push.reader_rows, ["rkat:bin:rkat", "xtask:package test targets"]);
+  const prLines = outputs(["--event", "pull_request", "--", "docs/index.mdx"]);
+  assert.equal(prLines.integration_count, "3", "the integration lane runs the reader rows");
+  assert.deepEqual(JSON.parse(prLines.integration_matrix).include.map((row) => [row.name, row.packages, row.tests]), [
+    [
+      "reader machine-schema:test:docs_machine_authority_alignment",
+      "-p meerkat-machine-schema",
+      "--test docs_machine_authority_alignment -E test(/(^|::)(doctrine_count_claims_match_canonical_registry)$/)",
+    ],
+    ["reader xtask:package", "-p xtask", "--lib --bins"],
+    staticLanes.split(" | "),
+  ]);
+  assert.match(prLines.deferred_to_push, /(^|; )reader rows rkat:bin:rkat, xtask:package test targets($|;)/, "the gate prints the readers left to the push");
+  // Every push plans xtask's machine-authority contracts, a whole-checkout
+  // audit whose test target needs a feature the closure-tests rows do not
+  // build, unless an xtask integration suite with that feature runs.
+  const machineContracts = "reader xtask:test:machines_contracts | -p xtask --features machine-authority | --test machines_contracts -E test(/(^|::)(canonical_machine_inventory_matches_docs_and_artifact_bundle|live_flow_runtime_reducer_transitions_are_mob_machine_command_gated|live_mob_runtime_catalog_commands_fail_close_on_matching_machine_inputs)$/)";
+  // The docs-only push: its closure-tests rows run the readers' test
+  // targets they build; with no main unit lane, reader rows run the lib and
+  // bin targets, the meerkat-mob chain's included.
+  assert.deepEqual(rowsOf(planFor(["docs/index.mdx"])), [
+    "reader rkat:bin:rkat | -p rkat | --bin rkat -E test(/(^|::)(fenced_rkat_doc_examples_parse_against_clap)$/)",
+    "reader xtask:package | -p xtask | --lib --bins",
+    machineContracts,
+  ]);
+  // A Rust-relevant push runs every package's lib and bins in main unit.
+  assert.deepEqual(rowsOf(planFor(["docs/index.mdx", "crates/meerkat-core/src/lib.rs"])), [machineContracts]);
+  assert.deepEqual(planFor(["crates/xtask/src/lib.rs"]).reader_rows, [], "xtask's own suite runs its contracts");
+  // A pull request that runs xtask's unit lane and integration suite plans
+  // no xtask row; one whose suite runs xtask's test targets keeps the lib
+  // and bins.
+  assert.ok(
+    !planFor(["docs/index.mdx", "crates/xtask/src/lib.rs"], ["--event", "pull_request"]).reader_rows.some((row) => row.packages[0] === "xtask"),
+    "xtask's own lanes run its readers",
+  );
+  const sdk = planFor(["sdks/python/meerkat/generated/types.py"], ["--event", "pull_request"]);
+  assert.deepEqual(rowsOf(sdk), ["reader xtask:package | -p xtask | --lib --bins"]);
+  assert.deepEqual(sdk.deferred_to_push.reader_rows, ["integration-tests:package"]);
+  // A CHANGELOG edit runs xtask's static lanes, filtered to their readers.
+  assert.deepEqual(rowsOf(planFor(["CHANGELOG.md"], ["--event", "pull_request"])), [
+    "reader xtask:test:buildbuddy_static_lanes | -p xtask | --test buildbuddy_static_lanes -E test(/(^|::)(deprecated_backend_references_stay_rejected_only|generated_header_truthfulness_is_clean|retired_public_surface_tokens_stay_out_of_unowned_paths)$/)",
+  ]);
+  // A path only the whole-checkout readers select (live audits): a pull
+  // request leaves them to the push, whose closure-tests rows run the test
+  // targets they build, and a reader row the one they do not.
+  const license = planFor(["LICENSE-MIT"], ["--event", "pull_request"]);
+  assert.deepEqual([license.reader_rows, license.deferred_to_push.reader_rows], [[], []]);
+  assert.deepEqual(rowsOf(planFor(["LICENSE-MIT"])), [machineContracts]);
+  // That row runs in the integration lane, which waits for the stagger job
+  // (the rest wave), and in no first-wave matrix: it never takes a runner
+  // before the push's long rows.
+  const licenseLines = outputs(["--", "LICENSE-MIT"]);
+  assert.deepEqual(JSON.parse(licenseLines.integration_matrix).include.map((row) => row.name), ["reader xtask:test:machines_contracts"]);
+  for (const key of ["shard_matrix", "main_unit_shard_matrix", "closure_test_matrix", "feature_check_matrix"]) {
+    assert.doesNotMatch(licenseLines[key], /machines_contracts/, `${key} holds no reader row`);
+  }
+  assert.ok(
+    jobLines(readFileSync(resolve(root, ".github/workflows/ci.yml"), "utf8"), "integration").includes("    needs: [changes, stagger]"),
+    "the integration lane waits for the stagger job",
+  );
+  // A test target whose required features the closure-tests rows do not
+  // build runs with them on the push; one that needs live-provider
+  // credentials runs in no CI lane and is named, not deferred.
+  const browser = "tests/live_smoke/browser/harness/gpt-live-peer-e2e.mjs";
+  const browserPush = planFor([browser]);
+  assert.deepEqual(rowsOf(browserPush), [
+    "reader integration-tests:package | -p meerkat-integration-tests | --lib --bins",
+    "reader integration-tests:test:gpt_live_replay | -p meerkat-integration-tests --features gpt-live-replay | --test gpt_live_replay",
+    machineContracts,
+  ]);
+  assert.deepEqual(browserPush.reader_not_run, ["integration-tests:test:gpt_live_public_e2e"]);
+  const browserPr = planFor([browser], ["--event", "pull_request"]);
+  assert.deepEqual(
+    [browserPr.reader_rows, browserPr.deferred_to_push.reader_rows, browserPr.reader_not_run],
+    [[], ["integration-tests:package", "integration-tests:test:gpt_live_replay"], ["integration-tests:test:gpt_live_public_e2e"]],
+  );
+  const browserLines = outputs(["--event", "pull_request", "--", browser]);
+  assert.equal(browserLines.reader_not_run, "integration-tests:test:gpt_live_public_e2e", "the gate names the readers no lane runs");
+  assert.doesNotMatch(browserLines.deferred_to_push, /gpt_live_public_e2e/, "and does not call them deferred");
+  // An in-crate doc the crate compiles in selects the crate like its code
+  // (no reader row: the crate's own lanes run); other in-crate docs select
+  // nothing.
+  for (const event of ["pull_request", "push"]) {
+    // Only the push's whole-checkout reader row (above) remains.
+    const wholeCheckout = event === "push" ? [machineContracts] : [];
+    const skill = planFor(["crates/meerkat-hooks/skills/hook-authoring/SKILL.md"], ["--event", event]);
+    assert.deepEqual([skill.mode, skill.packages, rowsOf(skill)], ["packages", ["meerkat-hooks"], wholeCheckout], `${event}: a compiled-in skill`);
+    for (const doc of ["crates/meerkat-core/README.md", "crates/meerkat-mob-mcp/LIVE_DELEGATION.md"]) {
+      const plan = planFor([doc], ["--event", event]);
+      assert.deepEqual([plan.mode, rowsOf(plan)], ["none", wholeCheckout], `${event}: ${doc}`);
+    }
+  }
 }
 
 // The coverage checker on mutated plans: each mutation is a way a row change

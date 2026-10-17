@@ -470,7 +470,23 @@ and its CI must be green before a release tag (`require_ci_green`):
   xtask with machine-authority, also on any `.github/workflows/` or `sdks/`
   edit, because its tests pin the workflows and read the SDK manifests and
   generated types), on main pushes, and on PRs for the suites whose package
-  does not compile meerkat-mob.
+  does not compile meerkat-mob. The lane also runs the reader rows: the
+  exact target that reads a changed non-Rust input
+  (`scripts/ci-non-rust-readers.json`: docs, skills, CHANGELOG, specs,
+  fixtures), with the inventory's features and a filter on the reading
+  tests, where no other lane of the plan runs it (`reader_rows`; a reader
+  in library code runs its lib and bins there, its test targets in the
+  push's `closure-tests`, which alone run the nested-Cargo canaries). A pull
+  request leaves the readers that compile meerkat-mob and the readers
+  keyed only by the whole checkout to the push; the push's `closure-tests`
+  run test targets with the features a workspace build resolves, so a test
+  target that needs others (xtask's `machine-authority` contracts) gets a
+  reader row there, and a push with no `main-unit` gets reader rows for
+  lib, bin and example targets. A reader that needs live-provider
+  credentials (`integration-real-tests`, `openai-live-e2e`) runs in no CI
+  lane (`reader_not_run`, printed by the gate). In-crate documentation the
+  crate compiles in (`include_str!` of
+  its `skills/*/SKILL.md`) is a build input of that crate.
   The unit lanes run `--lib --bins` only; `closure-tests` runs the
   integration tests of every package in its test scope.
 - `closure-tests` (push only): the deterministic workspace lanes of
@@ -479,7 +495,8 @@ and its CI must be green before a release tag (`require_ci_green`):
   for the test scope: the reverse-dependency closure of the changed packages
   (every member on a global change) plus the packages whose tests read a
   changed non-Rust input (`scripts/ci-non-rust-readers.json`, kept complete
-  by `scripts/ci-non-rust-readers-guard.mjs` in `make ci-lanes-selftest`).
+  by `scripts/ci-non-rust-readers-guard.mjs` in `make ci-lanes-selftest`,
+  which also fails a reader whose named test its features compile out).
   Rows (`closure_test_rows` in `scripts/ci-cargo-lanes.mjs`) select the whole
   workspace and name only their targets, so they compile the hook's own
   units: every `tests/*.rs` target the hook builds (by name, `ci-integration`
