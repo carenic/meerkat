@@ -45,8 +45,10 @@ them.
   state directory, read by a delivery owner or a health tick that outlived
   it) re-created the directory and an empty `runtime.sqlite`. They now open
   an existing file without create and answer "not provisioned" when it is
-  missing; only a delivery write creates the store. Behaviour only: no API
-  or schema change.
+  missing, unless another holder's maintenance fence covers the missing file
+  (an archive by rename), which still fails typed; among delivery
+  operations, only a write creates the store. Behaviour only: no API or
+  schema change.
 
 ## [0.9.2] - 2026-10-16
 

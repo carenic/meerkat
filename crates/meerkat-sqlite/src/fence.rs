@@ -172,6 +172,35 @@ impl OperationGuard {
             Err(_) => Ok(Self { _lock: None }),
         }
     }
+
+    /// Admit an operation that finds `db_path` missing and answers without
+    /// touching it. The fence covers its database file whether or not the
+    /// file exists (an archive by rename removes the file while the fence is
+    /// held), so a missing database under the exclusive fence of another
+    /// holder fails typed with [`SqliteStoreError::MaintenanceFenceHeld`],
+    /// as [`Self::for_database`] does. Nothing is created: the lock file is
+    /// opened only if it exists, and an absent lock file holds no fence. The
+    /// in-process fence holder is admitted, as by [`Self::for_database`].
+    pub fn admit_missing_database(db_path: &Path) -> Result<(), SqliteStoreError> {
+        if db_path.file_name().is_none() || db_path.as_os_str() == ":memory:" {
+            return Ok(());
+        }
+        let lock_path = fence_lock_path(db_path);
+        if process_holds_exclusive(&lock_path) {
+            return Ok(());
+        }
+        let Ok(file) = OpenOptions::new().read(true).write(true).open(&lock_path) else {
+            return Ok(());
+        };
+        match file.try_lock_shared() {
+            Err(err) if is_would_block(&err) => Err(SqliteStoreError::MaintenanceFenceHeld {
+                path: db_path.to_path_buf(),
+            }),
+            // Admitted, or a filesystem without lock support (fail open, as
+            // `for_database`). Dropping the file releases the shared lock.
+            Ok(()) | Err(_) => Ok(()),
+        }
+    }
 }
 
 /// The exclusive side of the maintenance fence for one database file.
@@ -280,6 +309,42 @@ mod tests {
         assert!(matches!(err, SqliteStoreError::MaintenanceFenceHeld { .. }));
         drop(foreign);
         OperationGuard::for_database(&db).expect("released after drop");
+    }
+
+    /// A missing database is refused typed while another holder holds its
+    /// fence, admitted otherwise (no lock file, a released fence, or this
+    /// process's own fence), and nothing is ever created for it.
+    #[test]
+    fn a_missing_database_honours_a_held_fence_and_creates_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("db.sqlite3");
+        OperationGuard::admit_missing_database(&db).expect("no lock file: no fence");
+        assert!(
+            !fence_lock_path(&db).exists(),
+            "admission creates no lock file"
+        );
+
+        let lock_path = fence_lock_path(&db);
+        let foreign = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .expect("open lock file");
+        foreign.try_lock().expect("foreign exclusive lock");
+        let err = OperationGuard::admit_missing_database(&db)
+            .expect_err("a foreign fence covers the missing database");
+        assert!(matches!(err, SqliteStoreError::MaintenanceFenceHeld { .. }));
+        drop(foreign);
+        OperationGuard::admit_missing_database(&db).expect("released after drop");
+
+        let own = ExclusiveFence::try_acquire(&db)
+            .expect("io")
+            .expect("own fence");
+        OperationGuard::admit_missing_database(&db).expect("the fence holder is admitted");
+        drop(own);
+        assert!(!db.exists(), "nothing created the database");
     }
 
     #[test]

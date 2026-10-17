@@ -4658,13 +4658,17 @@ END";
     /// Delivery-read connection. A read never creates the store: a database
     /// file that is not there, or whose directory is not, never used durable
     /// delivery, so it reads as unprovisioned and nothing is created (no
-    /// directory, no file, no fence sidecar). An existing file is opened with
-    /// the store's ordinary read-write policy, without create. Only
-    /// [`open_runtime_delivery_write_connection`] creates the store.
+    /// directory, no file, no fence sidecar), unless another holder's
+    /// maintenance fence covers the missing file, which fails typed as any
+    /// guarded operation does. An existing file is opened with the store's
+    /// ordinary read-write policy, without create. Among delivery operations,
+    /// only [`open_runtime_delivery_write_connection`] creates the store.
     fn open_runtime_delivery_read_connection(
         path: &Path,
     ) -> Result<Option<RuntimeConn>, RuntimeStoreError> {
         if runtime_database_absent(path) {
+            meerkat_sqlite::OperationGuard::admit_missing_database(path)
+                .map_err(map_shared_sqlite_error)?;
             return Ok(None);
         }
         let guard =
@@ -25514,6 +25518,84 @@ ORDER BY runtime_id";
                 "delivery reads created store files:\n{}",
                 created.join("\n")
             );
+        }
+
+        /// A database removed under another holder's maintenance fence (an
+        /// archive by rename) is under maintenance, not unprovisioned: every
+        /// delivery read fails typed while the fence is held and creates
+        /// nothing, and reads unprovisioned once the fence is released.
+        #[tokio::test]
+        async fn delivery_reads_of_a_fenced_missing_store_fail_typed() {
+            fn fenced<T: std::fmt::Debug>(read: &str, result: Result<T, RuntimeStoreError>) {
+                assert!(
+                    matches!(result, Err(RuntimeStoreError::MaintenanceFenceHeld { .. })),
+                    "{read} over a fenced missing store: {result:?}"
+                );
+            }
+            const DELIVERY: &str = "job:job_1:terminal:1";
+            let root = TempDir::new().unwrap();
+            let state = root.path().join("state");
+            let database = state.join("runtime.sqlite");
+            let store = SqliteRuntimeStore::new(&database).unwrap();
+            std::fs::remove_file(&database).unwrap();
+            // Another holder's exclusive fence: a raw lock on the fence file,
+            // without this process's holder registry entry.
+            let fence = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(meerkat_sqlite::fence_lock_path(&database))
+                .unwrap();
+            fence.try_lock().unwrap();
+            let before = std::fs::read_dir(&state).unwrap().count();
+
+            let rid = runtime_id();
+            fenced(
+                "load_runtime_delivery_authority",
+                store.load_runtime_delivery_authority(&rid).await,
+            );
+            fenced(
+                "load_runtime_delivery_record",
+                store.load_runtime_delivery_record(&rid, DELIVERY).await,
+            );
+            fenced(
+                "load_continuation_key_binding",
+                store.load_continuation_key_binding("owner", "key").await,
+            );
+            fenced(
+                "load_continuation_admission",
+                store.load_continuation_admission(&rid, DELIVERY).await,
+            );
+            fenced(
+                "load_delivery_generation",
+                store.load_delivery_generation().await,
+            );
+            fenced(
+                "list_runtime_delivery_authorities",
+                store.list_runtime_delivery_authorities().await,
+            );
+            fenced(
+                "list_runtime_delivery_records",
+                store.list_runtime_delivery_records(&rid, 0, 16).await,
+            );
+            assert_eq!(
+                std::fs::read_dir(&state).unwrap().count(),
+                before,
+                "a fenced read created nothing"
+            );
+            assert!(!database.exists());
+
+            drop(fence);
+            assert_eq!(store.load_delivery_generation().await.unwrap(), 0);
+            assert!(
+                store
+                    .list_runtime_delivery_authorities()
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(!database.exists(), "a released read still creates nothing");
         }
 
         #[tokio::test]
