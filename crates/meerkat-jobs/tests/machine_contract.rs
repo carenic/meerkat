@@ -298,22 +298,25 @@ fn recovery_refuses_a_notification_sequenced_at_or_after_the_terminal_delivery()
     DetachedJobMachineAuthority::recover_from_state(committed.clone())
         .expect("a committed terminal state recovers");
 
-    let mut reordered = committed;
-    let terminal_sequence = reordered.terminal_delivery_sequence;
-    reordered
-        .notification_sequences
-        .insert("terminal".into(), terminal_sequence);
-    let refused = DetachedJobMachineAuthority::recover_from_state(reordered).map(|_| ());
-    assert!(
-        matches!(
-            refused,
-            Err(
-                DetachedJobMachineTransitionError::RecoveredStateInvariantRejected {
-                    invariant: "terminal_delivery_follows_every_notification",
-                    ..
-                }
-            )
-        ),
-        "a notification at the terminal delivery's sequence must be refused: {refused:?}"
-    );
+    let terminal_sequence = committed.terminal_delivery_sequence;
+    for (position, sequence) in [("at", terminal_sequence), ("after", terminal_sequence + 1)] {
+        let mut reordered = committed.clone();
+        reordered
+            .notification_sequences
+            .insert("terminal".into(), sequence);
+        let refused = DetachedJobMachineAuthority::recover_from_state(reordered).map(|_| ());
+        assert!(
+            matches!(
+                refused,
+                Err(
+                    DetachedJobMachineTransitionError::RecoveredStateInvariantRejected {
+                        invariant: "terminal_delivery_follows_every_notification",
+                        ..
+                    }
+                )
+            ),
+            "a notification {position} the terminal delivery's sequence must be refused: \
+             {refused:?}"
+        );
+    }
 }

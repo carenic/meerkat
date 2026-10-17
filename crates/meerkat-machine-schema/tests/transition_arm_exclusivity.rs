@@ -35,13 +35,20 @@
 //!
 //! The contract fails on a new unrefuted pair, on a stale entry (now
 //! refutable, or its arms are gone), and on an invariant reason the machine
-//! does not declare. The baseline therefore only shrinks. After a reviewed
-//! machine change, `cargo test --test transition_arm_exclusivity --
-//! --ignored print_exclusivity_baseline --nocapture` prints the current set.
-//! It keeps each listed reason and prints a new pair as `unproven-1811`:
-//! replace [`BASELINE`] with its output, then review every new pair into a
-//! refutable guard, an `invariant:<name>` the machine declares, or a kept
-//! `unproven-1811` the reviewer accepts.
+//! does not declare. The baseline therefore only shrinks.
+//!
+//! To update it after a reviewed machine change, run `cargo test --test
+//! transition_arm_exclusivity -- --ignored print_exclusivity_baseline
+//! --nocapture`. It prints the current unrefuted pairs on stdout (the census
+//! summary goes to stderr), keeping each listed reason and printing a new
+//! pair as `unproven-1811`. Replace [`BASELINE`] with those lines. The review
+//! list is then the `git diff` of [`BASELINE`], and every `+` line needs a
+//! decision: a guard that makes the pair refutable, an `invariant:<name>` the
+//! machine declares, or an `unproven-1811` the reviewer accepts. A renamed
+//! arm reprints as a new `unproven-1811` pair and loses its reason, so
+//! re-attach the `invariant:` reasons of renamed arms. The contract checks
+//! only that an `invariant:<name>` is declared, not that it separates the
+//! pair; that argument belongs to the review.
 //!
 //! At introduction (base `d7916d84`) there were 1,045 groups with more than
 //! one arm in 15 of the 17 canonical machines, and 10,548 arm pairs, of which
@@ -782,7 +789,10 @@ fn print_exclusivity_baseline() {
     let census = census(&machines);
     let reasons: std::collections::BTreeMap<ArmPair, String> =
         parse_baseline(BASELINE).into_iter().collect();
-    println!(
+    // Under `--nocapture` libtest has already printed `test <name> ... `
+    // without a newline: start the pairs on a line of their own.
+    println!();
+    eprintln!(
         "# {} groups with more than one arm, {} pairs, {} unrefuted",
         census.groups,
         census.pairs,
