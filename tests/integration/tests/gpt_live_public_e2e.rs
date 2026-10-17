@@ -7874,12 +7874,11 @@ async fn wait_typed_turn_mirrored(
         if Instant::now() >= deadline {
             // Journal what the quiet lane and the provider's output did
             // before failing, so a red says which side stalled.
-            match quiet_lane_timeout(&lines, channel, &probes, wait_started_ms) {
-                Ok(timeout) => println!("{}", timeout.evidence_line(scenario, channel)),
-                Err(error) => println!(
-                    "GPT_LIVE_PUBLIC_QUIET_LANE_TIMEOUT scenario={scenario} channel={channel} evidence_error={error:?}"
-                ),
-            }
+            println!(
+                "{}",
+                quiet_lane_timeout(&lines, channel, &probes, wait_started_ms)
+                    .evidence_line(scenario, channel)
+            );
             return Err(format!(
                 "{scenario}: the typed turn's rows were not acknowledged on the quiet lane within 60 s: {pending:?}"
             )
@@ -7953,12 +7952,17 @@ fn thinking_tokens(lines: &[provider_recording::Line], channel: u32) -> Vec<Thin
 }
 
 /// The product's floor for an audible model (dBFS, frame RMS of PCM16):
-/// `meerkat-openai`'s public Live holds text-chat context while a provider
-/// output frame at or above it arrived within the last 1600 ms, and releases
-/// it after 1600 ms of output below it (`USER_FLOOR_SPEECH_DBFS`,
+/// `meerkat-openai`'s public Live holds text-chat context while fewer than
+/// 1600 ms of provider output audio have followed the last frame at or above
+/// it, and releases it once 1600 ms have (`USER_FLOOR_SPEECH_DBFS`,
 /// `OUTPUT_SILENCE_RELEASE_MS`). Evidence only; the test's own voiced
 /// threshold is [`VOICED_FRAME_RMS`].
 const PRODUCT_OUTPUT_FLOOR_DBFS: f64 = -50.0;
+
+/// Output audio below [`PRODUCT_OUTPUT_FLOOR_DBFS`] after which the product
+/// releases held text-chat context, and its below-floor run when a channel
+/// opens: the model starts silent (`OUTPUT_SILENCE_RELEASE_MS`).
+const PRODUCT_OUTPUT_SILENCE_RELEASE_MS: i64 = 1600;
 
 /// Characters of the voice's output transcript a quiet-lane timeout
 /// journals, from its end.
@@ -7966,14 +7970,22 @@ const QUIET_LANE_TRANSCRIPT_TAIL_CHARS: usize = 200;
 
 /// What a typed turn's quiet-lane wait saw when it timed out, read from the
 /// journal for its channel. Times are journal milliseconds after the wait
-/// started, just after the typed turn committed (negative before it). It
-/// tells the causes apart: no row sent and no 1600 ms run below the product
-/// floor means the provider's output never went quiet long enough for the
-/// product to release held text-chat context (a response still audible, or
-/// energy at the floor that the voiced threshold calls silence); no row sent
-/// with such a run means the hold did not release; a row sent but not
-/// acknowledged is a provider acknowledgement stall. S98 on Live gate run
-/// 39043475436 timed out with neither row sent.
+/// started, just after the typed turn committed (negative before it); runs
+/// are provider output audio time, counted as the product counts its own.
+///
+/// The outbox sends a typed turn's rows one at a time, and its admission can
+/// defer the head row (an open provider user turn, the row's own pending
+/// append, a late summary), so read the first row not sent: later rows queue
+/// behind it. That row at (0, 0) with no below-floor run of 1600 ms since the
+/// wait started is explained by the audible hold: the provider's output never
+/// went quiet long enough to release it. At (0, 0) with such a run, something
+/// other than an audible response held it: either the hold did not release
+/// or the row never reached it, and the product's `text-chat context held
+/// ... token=N` log line tells which. A row sent but not acknowledged is a
+/// provider acknowledgement stall. With no output frame since the wait
+/// started, provider audio stopped, so the product's clock stopped and the
+/// hold cannot release. S98 on Live gate run 39043475436 timed out with
+/// neither row sent.
 #[derive(Debug)]
 struct QuietLaneTimeout {
     /// Per probe, in order: the thinking tokens carrying it, and how many of
@@ -7981,14 +7993,20 @@ struct QuietLaneTimeout {
     rows_sent_acked: Vec<(usize, usize)>,
     /// Provider output audio frames since the wait started.
     output_frames: usize,
-    /// The last of them at or above [`PRODUCT_OUTPUT_FLOOR_DBFS`].
+    /// The below-floor run when the wait started.
+    below_floor_at_wait_start_ms: i64,
+    /// The last frame since the wait started at or above
+    /// [`PRODUCT_OUTPUT_FLOOR_DBFS`].
     last_at_floor_ms: Option<i64>,
-    /// The last of them above [`VOICED_FRAME_RMS`].
+    /// The last frame since the wait started above [`VOICED_FRAME_RMS`].
     last_voiced_ms: Option<i64>,
-    /// Longest run of them below the floor, in frame audio time.
+    /// The longest the below-floor run was at a frame since the wait
+    /// started.
     longest_below_floor_ms: i64,
-    /// Longest run of them at or below the voiced threshold.
+    /// The same for the run at or below the voiced threshold.
     longest_below_voiced_ms: i64,
+    /// The below-floor run at the timeout, after the last frame.
+    below_floor_at_timeout_ms: i64,
     /// Characters of the channel's whole output transcript.
     transcript_chars: usize,
     /// Characters of it that arrived since the wait started.
@@ -8003,19 +8021,35 @@ impl QuietLaneTimeout {
     /// One `GPT_LIVE_PUBLIC_QUIET_LANE_TIMEOUT` evidence line.
     fn evidence_line(&self, scenario: &str, channel: u32) -> String {
         format!(
-            "GPT_LIVE_PUBLIC_QUIET_LANE_TIMEOUT scenario={scenario} channel={channel} rows_sent_acked={:?} output_frames={} last_at_floor_ms={:?} last_voiced_ms={:?} longest_below_floor_ms={} longest_below_voiced_ms={} transcript_chars={} transcript_chars_since_wait={} last_transcript_ms={:?} transcript_tail={:?}",
+            "GPT_LIVE_PUBLIC_QUIET_LANE_TIMEOUT scenario={scenario} channel={channel} rows_sent_acked={:?} output_frames={} below_floor_at_wait_start_ms={} last_at_floor_ms={:?} last_voiced_ms={:?} longest_below_floor_ms={} longest_below_voiced_ms={} below_floor_at_timeout_ms={} transcript_chars={} transcript_chars_since_wait={} last_transcript_ms={:?} transcript_tail={:?}",
             self.rows_sent_acked,
             self.output_frames,
+            self.below_floor_at_wait_start_ms,
             self.last_at_floor_ms,
             self.last_voiced_ms,
             self.longest_below_floor_ms,
             self.longest_below_voiced_ms,
+            self.below_floor_at_timeout_ms,
             self.transcript_chars,
             self.transcript_chars_since_wait,
             self.last_transcript_ms,
             self.transcript_tail,
         )
     }
+}
+
+/// Audio time of one provider output frame as the product reads it: PCM16
+/// samples at 24 kHz counted from the base64 payload's length, decodable or
+/// not (`reflected_pcm16_samples` in `meerkat-openai`'s public Live).
+fn product_frame_ms(audio: &str) -> i64 {
+    let encoded = audio.trim_end_matches('=').len() as i64;
+    let bytes = encoded / 4 * 3
+        + match encoded % 4 {
+            2 => 1,
+            3 => 2,
+            _ => 0,
+        };
+    bytes / 2 * 1000 / PROVIDER_PCM_RATE_HZ as i64
 }
 
 /// Summarise a timed-out quiet-lane wait on `channel` (see
@@ -8026,7 +8060,7 @@ fn quiet_lane_timeout(
     channel: u32,
     probes: &[String],
     wait_started_ms: u64,
-) -> Result<QuietLaneTimeout, String> {
+) -> QuietLaneTimeout {
     let tokens = thinking_tokens(lines, channel);
     let rows_sent_acked = probes
         .iter()
@@ -8043,38 +8077,60 @@ fn quiet_lane_timeout(
     let mut summary = QuietLaneTimeout {
         rows_sent_acked,
         output_frames: 0,
+        below_floor_at_wait_start_ms: PRODUCT_OUTPUT_SILENCE_RELEASE_MS,
         last_at_floor_ms: None,
         last_voiced_ms: None,
         longest_below_floor_ms: 0,
         longest_below_voiced_ms: 0,
+        below_floor_at_timeout_ms: 0,
         transcript_chars: 0,
         transcript_chars_since_wait: 0,
         last_transcript_ms: None,
         transcript_tail: String::new(),
     };
-    let (mut below_floor_ms, mut below_voiced_ms) = (0, 0);
-    for (elapsed_ms, raw) in sideband_server_frames(lines, channel, "session.output_audio.delta")
-        .filter(|(elapsed_ms, _)| *elapsed_ms >= wait_started_ms)
-    {
-        let (rms, duration_ms) = pcm16_frame(&raw["delta"])?;
+    // Both runs are counted as the product counts its own: over the
+    // channel's output frames from the first, starting at 1600 ms (the model
+    // starts silent), growing by each frame's audio time and reset by a frame
+    // at or above the threshold. Frames before the wait started only carry
+    // the run into it.
+    let (mut below_floor_ms, mut below_voiced_ms) = (
+        PRODUCT_OUTPUT_SILENCE_RELEASE_MS,
+        PRODUCT_OUTPUT_SILENCE_RELEASE_MS,
+    );
+    for (elapsed_ms, raw) in sideband_server_frames(lines, channel, "session.output_audio.delta") {
+        // An undecodable frame is below every threshold, as the product
+        // reads it, for its length's audio time.
+        let rms = pcm16_frame(&raw["delta"]).ok().map(|(rms, _)| rms);
+        let at_floor = rms.is_some_and(|rms| {
+            rms > 0.0 && 20.0 * (rms / 32768.0).log10() >= PRODUCT_OUTPUT_FLOOR_DBFS
+        });
+        let voiced = rms.is_some_and(|rms| rms > VOICED_FRAME_RMS);
+        let frame_ms = product_frame_ms(raw["delta"].as_str().unwrap_or_default());
+        below_floor_ms = if at_floor {
+            0
+        } else {
+            below_floor_ms + frame_ms
+        };
+        below_voiced_ms = if voiced {
+            0
+        } else {
+            below_voiced_ms + frame_ms
+        };
+        if elapsed_ms < wait_started_ms {
+            summary.below_floor_at_wait_start_ms = below_floor_ms;
+            continue;
+        }
         summary.output_frames += 1;
-        // The product's frame level, 20 log10(RMS / full scale); digital
-        // silence is below any floor.
-        if rms > 0.0 && 20.0 * (rms / 32768.0).log10() >= PRODUCT_OUTPUT_FLOOR_DBFS {
+        if at_floor {
             summary.last_at_floor_ms = Some(after_wait_start(elapsed_ms));
-            below_floor_ms = 0;
-        } else {
-            below_floor_ms += duration_ms;
-            summary.longest_below_floor_ms = summary.longest_below_floor_ms.max(below_floor_ms);
         }
-        if rms > VOICED_FRAME_RMS {
+        if voiced {
             summary.last_voiced_ms = Some(after_wait_start(elapsed_ms));
-            below_voiced_ms = 0;
-        } else {
-            below_voiced_ms += duration_ms;
-            summary.longest_below_voiced_ms = summary.longest_below_voiced_ms.max(below_voiced_ms);
         }
+        summary.longest_below_floor_ms = summary.longest_below_floor_ms.max(below_floor_ms);
+        summary.longest_below_voiced_ms = summary.longest_below_voiced_ms.max(below_voiced_ms);
     }
+    summary.below_floor_at_timeout_ms = below_floor_ms;
     let mut transcript = String::new();
     for (elapsed_ms, raw) in
         sideband_server_frames(lines, channel, "session.output_transcript.delta")
@@ -8098,7 +8154,7 @@ fn quiet_lane_timeout(
                 .saturating_sub(QUIET_LANE_TRANSCRIPT_TAIL_CHARS),
         )
         .collect();
-    Ok(summary)
+    summary
 }
 
 /// Waits until the assistant has said "done" in output that started (provider
@@ -14177,7 +14233,7 @@ mod config_tests {
             super::typed_row_probe("A delayed background update changes the code word."),
             super::typed_row_probe("Okay, Violet."),
         ];
-        let unsent = super::quiet_lane_timeout(&[], 1, &probes, 0).unwrap();
+        let unsent = super::quiet_lane_timeout(&[], 1, &probes, 0);
         assert_eq!(unsent.rows_sent_acked, vec![(0, 0), (0, 0)]);
         let lines = vec![
             append(
@@ -14193,7 +14249,7 @@ mod config_tests {
             ),
             ack(4, 2, "meerkat-thinking-5-0"),
         ];
-        let timeout = super::quiet_lane_timeout(&lines, 1, &probes, 0).unwrap();
+        let timeout = super::quiet_lane_timeout(&lines, 1, &probes, 0);
         assert_eq!(timeout.rows_sent_acked, vec![(1, 1), (1, 0)]);
         let evidence = timeout.evidence_line("S98", 1);
         assert!(
@@ -14234,11 +14290,14 @@ mod config_tests {
                     .enumerate()
                     .map(|(i, amplitude)| frame(10 + i as u64, 1000 + 200 * i as u64, *amplitude)),
             );
-            super::quiet_lane_timeout(&lines, 1, &[], 1000).unwrap()
+            super::quiet_lane_timeout(&lines, 1, &[], 1000)
         };
         // RMS 150 is at the floor (-46.8 dBFS) and below the voiced RMS 300.
         let floor_level = summary(&[1500, 5, 5, 5, 5, 5, 5, 5, 150, 5, 5, 5, 5, 5, 5, 5, 150]);
         assert_eq!(floor_level.output_frames, 17);
+        // The frame at 800 carried the run from 1600 to 1800 into the wait.
+        assert_eq!(floor_level.below_floor_at_wait_start_ms, 1800);
+        assert_eq!(floor_level.below_floor_at_timeout_ms, 0);
         assert_eq!(floor_level.longest_below_floor_ms, 1400);
         assert_eq!(floor_level.longest_below_voiced_ms, 3200);
         assert_eq!(floor_level.last_at_floor_ms, Some(3200));
@@ -14248,6 +14307,45 @@ mod config_tests {
         assert_eq!(silent_run.longest_below_floor_ms, 1600);
         assert_eq!(silent_run.longest_below_voiced_ms, 1600);
         assert_eq!(silent_run.last_voiced_ms, Some(1800));
+    }
+
+    /// A timed-out quiet-lane wait counts the below-floor run as the product
+    /// does: from the channel's first output frame, starting at 1600 ms (the
+    /// model starts silent) and carried across the wait start; an undecodable
+    /// frame is below the floor for its length's audio time.
+    #[test]
+    fn a_quiet_lane_timeout_counts_the_floor_run_as_the_product_does() {
+        let frame = |seq: u64, elapsed_ms: u64, delta: String| {
+            server_frame(
+                seq,
+                elapsed_ms,
+                serde_json::json!({"type": "session.output_audio.delta", "delta": delta}),
+            )
+        };
+        // At the floor at 0, then 200 ms frames below it: five before the
+        // wait starts at 1200 and three after, so the run reaches 1600 ms.
+        let mut carried = vec![frame(1, 0, pcm(1500))];
+        carried.extend((1..=8).map(|i| frame(1 + i, 200 * i, pcm(5))));
+        let timeout = super::quiet_lane_timeout(&carried, 1, &[], 1200);
+        assert_eq!(timeout.longest_below_floor_ms, 1600);
+        assert_eq!(timeout.output_frames, 3);
+        assert_eq!(timeout.below_floor_at_wait_start_ms, 1000);
+        assert_eq!(timeout.below_floor_at_timeout_ms, 1600);
+        assert_eq!(timeout.last_at_floor_ms, None);
+        // No frame before the wait: the run starts at 1600 ms.
+        let seeded: Vec<_> = (0..3)
+            .map(|i| frame(1 + i, 1000 + 200 * i, pcm(5)))
+            .collect();
+        let timeout = super::quiet_lane_timeout(&seeded, 1, &[], 1000);
+        assert_eq!(timeout.below_floor_at_wait_start_ms, 1600);
+        assert_eq!(timeout.longest_below_floor_ms, 2200);
+        // Not base64: 6400 characters read as 100 ms below every threshold.
+        let undecodable = vec![frame(1, 0, pcm(1500)), frame(2, 200, "*".repeat(6400))];
+        let timeout = super::quiet_lane_timeout(&undecodable, 1, &[], 0);
+        assert_eq!(timeout.output_frames, 2);
+        assert_eq!(timeout.last_at_floor_ms, Some(0));
+        assert_eq!(timeout.longest_below_floor_ms, 100);
+        assert_eq!(timeout.longest_below_voiced_ms, 100);
     }
 
     /// The voice's output transcript a timed-out quiet-lane wait journals:
@@ -14272,14 +14370,14 @@ mod config_tests {
             },
             delta(3, 2500, late.as_str()),
         ];
-        let timeout = super::quiet_lane_timeout(&lines, 1, &[], 1000).unwrap();
+        let timeout = super::quiet_lane_timeout(&lines, 1, &[], 1000);
         let whole = format!("{early}{late}");
         assert_eq!(timeout.transcript_chars, whole.chars().count());
         assert_eq!(timeout.transcript_chars_since_wait, late.chars().count());
         assert_eq!(timeout.last_transcript_ms, Some(1500));
         assert_eq!(timeout.transcript_tail.chars().count(), 200);
         assert!(whole.ends_with(&timeout.transcript_tail));
-        let before_wait = super::quiet_lane_timeout(&lines[..1], 1, &[], 1000).unwrap();
+        let before_wait = super::quiet_lane_timeout(&lines[..1], 1, &[], 1000);
         assert_eq!(before_wait.transcript_chars_since_wait, 0);
         assert_eq!(before_wait.last_transcript_ms, Some(-500));
         assert_eq!(before_wait.transcript_tail, early);
