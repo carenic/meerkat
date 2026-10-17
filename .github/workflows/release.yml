@@ -539,6 +539,9 @@ jobs:
       - uses: ./.github/actions/setup-rust-ci
 
       - name: Cache cargo registry
+        # A tag run uses no cache: only a re-run of the same tag ever saved
+        # one of these keys, so a tag restores nothing it can trust.
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           # Release caches never come from a dispatch: a dispatch runs on main
@@ -1111,6 +1114,9 @@ jobs:
         run: rustup target add ${{ matrix.platform.target }}
 
       - name: Cache cargo registry
+        # A tag run uses no cache: only a re-run of the same tag ever saved
+        # one of these keys, so a tag restores nothing it can trust.
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           key: release-${{ matrix.platform.target }}
@@ -1373,6 +1379,9 @@ jobs:
       - uses: ./.github/actions/setup-rust-ci
 
       - name: Cache cargo registry
+        # A tag run uses no cache: only a re-run of the same tag ever saved
+        # one of these keys, so a tag restores nothing it can trust.
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           key: release-x86_64-pc-windows-msvc-cross
@@ -1551,6 +1560,9 @@ jobs:
         run: rustup target add x86_64-apple-darwin
 
       - name: Cache cargo registry
+        # A tag run uses no cache: only a re-run of the same tag ever saved
+        # one of these keys, so a tag restores nothing it can trust.
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           key: release-x86_64-apple-darwin-cross
@@ -2116,6 +2128,9 @@ jobs:
       - uses: ./.github/actions/setup-rust-ci
 
       - name: Cache cargo registry
+        # A tag run uses no cache: only a re-run of the same tag ever saved
+        # one of these keys, so a tag restores nothing it can trust.
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           # Release caches never come from a dispatch: a dispatch runs on main
@@ -2783,6 +2798,9 @@ jobs:
       - uses: ./.github/actions/setup-rust-ci
 
       - name: Cache cargo
+        # A tag run uses no cache: only a re-run of the same tag ever saved
+        # one of these keys, so a tag restores nothing it can trust.
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           shared-key: release-semver-rustdoc

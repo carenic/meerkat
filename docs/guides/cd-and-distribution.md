@@ -482,9 +482,11 @@ and `merge_group`). The workflows whose runs a tag trusts (`ci.yml`, which
 writes the exact-tree attestation, and `release-semver-readiness.yml`,
 which writes the semver attestation) and any workflow that checks out a
 ref its inputs choose save no cache on a dispatch-like run either. A tag
-run restores no Bazel repository cache: the
-BuildBuddy release binary build passes `repository-cache: "false"` and the
-full-graph validation passes `buildbuddy.yml` `repository_cache: "false"`.
+run restores no cache at all: the cache steps of the release jobs and the
+Windows SDK cache of `build-windows-cross` skip tag runs (only a re-run of
+the same tag ever saved one of their keys), the BuildBuddy release binary
+build passes `repository-cache: "false"` and the full-graph validation
+passes `buildbuddy.yml` `repository_cache: "false"`.
 No workflow saves that cache on a dispatch-like run either
 (`release-binaries-check.yml` and `release-turbo-s.yml` only restore it).
 The doctor reads release.yml, the local actions it calls and, with the

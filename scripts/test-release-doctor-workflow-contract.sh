@@ -39,7 +39,7 @@ TRAILING_PASS="PASS Linux and macOS arm64 assets publish without waiting for the
 TRAILING_FAIL="FAIL The trailing Intel macOS and Windows lanes must not gate the critical assets, and no upload may replace a published asset"
 WEB_TOOLS_PASS="PASS The Web SDK release build checks every download's sha256 and wasm-pack installs nothing: wasm-bindgen (Cargo.lock's version) and wasm-opt are pinned"
 TOKEN_PASS="PASS Release workflow token is read-only except for the jobs that attest or publish, which never persist it in a checkout; no workflow passes every secret to a reusable workflow"
-CACHES_PASS="PASS GitHub Actions caches in release.yml jobs, the local actions they call and, on a tag, the reusable workflows they call are never saved on a dispatch and never cache ~/.cargo/bin; token jobs restore none, a tag run restores no Bazel repository cache, OIDC or attesting jobs restore none that a dispatch-like run of any workflow saves, and no dispatch-like run saves the Bazel repository cache (reusable workflows never run on a dispatch); a workflow that produces what a tag trusts or checks out a ref its inputs choose saves no cache on a dispatch-like run"
+CACHES_PASS="PASS GitHub Actions caches in release.yml jobs, the local actions they call and, on a tag, the reusable workflows they call are never saved on a dispatch and never cache ~/.cargo/bin; token jobs restore none, a tag run restores no cache, OIDC or attesting jobs restore none that a dispatch-like run of any workflow saves, and no dispatch-like run saves the Bazel repository cache (reusable workflows never run on a dispatch); a workflow that produces what a tag trusts or checks out a ref its inputs choose saves no cache on a dispatch-like run"
 CACHES_FAIL="FAIL A release cache can be saved on a dispatch, cache ~/.cargo/bin, reach a token, OIDC or attesting job, or a tag run, or a workflow a tag trusts saves a cache on a dispatch-like run"
 
 fail() {
@@ -542,6 +542,12 @@ elif name == "secrets-inherit":
         "    secrets:\n      MEERKAT_GCP_BUILDBUDDY_API_KEY: ${{ secrets.MEERKAT_GCP_BUILDBUDDY_API_KEY }}\n",
         "    secrets: inherit\n",
     )
+elif name == "cache-tag-restore":
+    # The pre-review build job restored its rust-cache on a tag.
+    job = text.index("  build_binaries:\n")
+    needle = "        if: ${{ !startsWith(github.ref, 'refs/tags/') }}\n"
+    at = text.index(needle, job)
+    text = text[:at] + text[at + len(needle):]
 elif name == "cache-registry-restore":
     # The pre-review registry publisher restored a cache with its tokens.
     job = text.index("  publish_registries:\n")
@@ -653,7 +659,7 @@ if name == "cache-xwin-save-ungated":
     # The pre-review action saved the Windows SDK cache from any run.
     replace_once(
         ".github/actions/build-windows-cross/action.yml",
-        "      if: ${{ inputs.save-sdk-cache == 'true' && steps.sdk-cache.outputs.cache-hit != 'true' }}\n",
+        "      if: ${{ inputs.save-sdk-cache == 'true' && !startsWith(github.ref, 'refs/tags/') && steps.sdk-cache.outputs.cache-hit != 'true' }}\n",
         "      if: ${{ steps.sdk-cache.outputs.cache-hit != 'true' }}\n",
     )
 elif name == "cache-xwin-validate-dispatch-save":
@@ -709,6 +715,13 @@ elif name == "dispatch-saves-repository-cache":
         "          # branch's cache scope, which every tag run would restore.\n"
         "          repository-cache: restore\n",
         "",
+    )
+elif name == "xwin-tag-restore":
+    # The pre-review action restored the Windows SDK cache on a tag.
+    replace_once(
+        ".github/actions/build-windows-cross/action.yml",
+        "      id: sdk-cache\n      if: ${{ !startsWith(github.ref, 'refs/tags/') }}\n",
+        "      id: sdk-cache\n",
     )
 elif name == "semver-readiness-dispatch-save":
     # The pre-review semver measurement saved its rust-cache on a dispatch.
@@ -1025,6 +1038,9 @@ mutate web-sdk-unchecked-download "${TEST_ROOT}/web-sdk-unchecked-download.yml"
 expect_fail_named web-sdk-unchecked-download "${TEST_ROOT}/web-sdk-unchecked-download.yml" \
   "step \`Install pinned wasm-bindgen and wasm-opt\` downloads 2 file(s) but checks 1 sha256" web-sdk-tools
 
+mutate cache-tag-restore "${TEST_ROOT}/cache-tag-restore.yml"
+expect_fail_named cache-tag-restore "${TEST_ROOT}/cache-tag-restore.yml" \
+  "job \`build_binaries\` restores \`v0-rust-release-*-build_binaries\` on a tag; a tag run restores no cache" release-caches
 mutate cache-registry-restore "${TEST_ROOT}/cache-registry-restore.yml"
 expect_fail_named cache-registry-restore "${TEST_ROOT}/cache-registry-restore.yml" \
   "job \`publish_registries\` holds a registry or publish token and restores a cache" release-caches
@@ -1038,10 +1054,10 @@ mutate cache-buildbuddy-repository "${TEST_ROOT}/cache-buildbuddy-repository.yml
 expect_fail_named cache-buildbuddy-repository "${TEST_ROOT}/cache-buildbuddy-repository.yml" \
   "job \`build_binaries_buildbuddy\` (in \`.github/actions/setup-buildbuddy-ci\`) saves cache \`buildbuddy-bazel-repository-*-*\` on a dispatch" release-caches
 expect_fail_named cache-buildbuddy-repository-restore "${TEST_ROOT}/cache-buildbuddy-repository.yml" \
-  "job \`build_binaries_buildbuddy\` (in \`.github/actions/setup-buildbuddy-ci\`) restores \`buildbuddy-bazel-repository-*-*\` on a tag; a tag run restores no Bazel repository cache" release-caches
+  "job \`build_binaries_buildbuddy\` (in \`.github/actions/setup-buildbuddy-ci\`) restores \`buildbuddy-bazel-repository-*-*\` on a tag; a tag run restores no cache" release-caches
 mutate reusable-tag-repository-restore "${TEST_ROOT}/reusable-tag-repository-restore.yml"
 expect_fail_named reusable-tag-repository-restore "${TEST_ROOT}/reusable-tag-repository-restore.yml" \
-  "job \`release_validate_buildbuddy_full\` (through buildbuddy.yml job \`prebuild-submit\` in \`.github/actions/run-buildbuddy-ci-lane-batch\` > \`.github/actions/setup-buildbuddy-ci\`) restores \`buildbuddy-bazel-repository-*-*\` on a tag; a tag run restores no Bazel repository cache" release-caches
+  "job \`release_validate_buildbuddy_full\` (through buildbuddy.yml job \`prebuild-submit\` in \`.github/actions/run-buildbuddy-ci-lane-batch\` > \`.github/actions/setup-buildbuddy-ci\`) restores \`buildbuddy-bazel-repository-*-*\` on a tag; a tag run restores no cache" release-caches
 mutate reusable-tag-unreadable "${TEST_ROOT}/reusable-tag-unreadable.yml"
 expect_fail_named reusable-tag-unreadable "${TEST_ROOT}/reusable-tag-unreadable.yml" \
   "job \`release_validate_buildbuddy_full\` calls a reusable workflow on a tag that this check cannot read" release-caches
@@ -1060,6 +1076,9 @@ expect_tree_fail_named cache-dispatch-shared-registry "${TEST_ROOT}/cache-dispat
 mutate_tree dispatch-saves-repository-cache "${TEST_ROOT}/dispatch-saves-repository-cache"
 expect_tree_fail_named dispatch-saves-repository-cache "${TEST_ROOT}/dispatch-saves-repository-cache" \
   "release-binaries-check.yml job \`build\` (in \`.github/actions/setup-buildbuddy-ci\`) saves \`buildbuddy-bazel-repository-*-*\` on a workflow_dispatch run; such runs only restore the Bazel repository cache" release-caches
+mutate_tree xwin-tag-restore "${TEST_ROOT}/xwin-tag-restore"
+expect_tree_fail_named xwin-tag-restore "${TEST_ROOT}/xwin-tag-restore" \
+  "job \`build_binaries_windows_cross\` (in \`.github/actions/build-windows-cross\`) restores \`xwin-sdk-*-cargo-xwin-0.23.1\` on a tag; a tag run restores no cache" release-caches
 mutate_tree semver-readiness-dispatch-save "${TEST_ROOT}/semver-readiness-dispatch-save"
 expect_tree_fail_named semver-readiness-dispatch-save "${TEST_ROOT}/semver-readiness-dispatch-save" \
   "release-semver-readiness.yml job \`semver\` saves a cache on a workflow_dispatch run" release-caches

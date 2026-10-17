@@ -73,6 +73,12 @@ them.
   dispatch-like run that saves a cache in any workflow whose runs a tag
   trusts or that checks out a ref its inputs choose. The semver readiness
   and release binaries checks no longer cache `~/.cargo/bin`. CI only.
+- **A release tag run restores no GitHub Actions cache.** The cache steps
+  of the release validation, binary, Web SDK and semver baseline jobs, and
+  the Windows SDK cache of `build-windows-cross`, skip tag runs; only a
+  re-run of the same tag loses a warm cache. The release doctor fails on
+  any cache a tag run would restore, not only the Bazel repository cache.
+  CI only.
 
 ## [0.9.2] - 2026-10-16
 

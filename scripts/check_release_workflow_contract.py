@@ -2576,8 +2576,8 @@ def check_release_caches(text: str) -> list[str]:
     cache scope, which every tag run restores, so no cache step saves on a
     dispatch; no rust-cache caches ~/.cargo/bin, so a restored binary cannot
     shadow a tool on PATH; a job holding a registry or publish token (or
-    `contents: write`) runs no cache step; a tag run restores no Bazel
-    repository cache; and a job that mints OIDC tokens or attests artifacts
+    `contents: write`) runs no cache step; a tag run restores no cache at
+    all; and a job that mints OIDC tokens or attests artifacts
     (`id-token` or `attestations: write`) restores only caches that no
     workflow in the repository saves on a dispatch-like run (any trigger but
     push, pull_request, schedule and merge_group), through the same local
@@ -2620,8 +2620,7 @@ def check_release_caches(text: str) -> list[str]:
                 report(f"{use.where} saves cache {saved} on a dispatch (`{use.uses}`)")
         if frame is tag and use.may_restore():
             for spec in use.key_specs()[0]:
-                if _specs_overlap(spec, BAZEL_REPOSITORY_CACHE):
-                    report(f"{use.where} restores `{spec[1]}` on a tag; a tag run restores no Bazel repository cache")
+                report(f"{use.where} restores `{spec[1]}` on a tag; a tag run restores no cache")
         if sensitive_job and use.may_restore():
             restored.extend((use, spec) for spec in use.key_specs()[0])
 
