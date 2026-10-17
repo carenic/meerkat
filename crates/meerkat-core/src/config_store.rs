@@ -1469,8 +1469,21 @@ impl RealmChainGuard {
             let after = over(written, without).administered(&realm).await;
             match (before, after) {
                 (Ok(before), Ok(after)) => keep_composition(change, &composer, &before, &after)?,
+                // A stated realm whose chain resolves on no state root
+                // without its own document, before or after, composes
+                // nothing there: chain discovery follows no user-document
+                // edge for a realm without its own document.
                 (Err(ConfigError::RealmChain(_)), Err(ConfigError::RealmChain(_)))
                     if without_document => {}
+                // The user document states a section for the realm that
+                // does not compose where the realm has no document, and the
+                // write would make it compose: what it would compose there
+                // cannot be checked against what it composed before.
+                (Err(error), _) if without_document => {
+                    return Err(ConfigError::Validation(format!(
+                        "the realm sections do not compose for {composer} before this write ({error}), so {change} cannot be checked against what it composes there; the host edits the user document instead"
+                    )));
+                }
                 (Err(error), _) => return Err(error),
                 (Ok(_), Err(error)) => {
                     return Err(ConfigError::Validation(format!(
@@ -2306,6 +2319,167 @@ mod tests {
             .patch(ConfigDelta(serde_json::json!({"realm": {"other": {}}})))
             .await
             .expect("no realm composes differently");
+    }
+
+    /// A user document section for a realm that does not compose where the
+    /// realm has no document of its own (its edge names a realm with no
+    /// document) cannot be checked against what a write would make it
+    /// compose there: removing it is refused, and the refusal names the
+    /// composition it could not check (the realm on a state root without
+    /// its own document, not this host's) with the chain error. Nothing is
+    /// written; the host edits the user document instead.
+    #[tokio::test]
+    async fn removing_a_user_section_that_composes_nowhere_names_the_state_root_it_is_about() {
+        use crate::connection::RealmId;
+
+        let team_document = confinement_document("[realm.team]\n\n[realm.global]\n");
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("config.toml");
+        let store = FileConfigStore::new(
+            path.clone(),
+            *crate::model_profile::test_catalog::TEST_CATALOG,
+        )
+        .with_realm_chain(
+            RealmId::global(),
+            Arc::new(MapSource {
+                docs: std::iter::once(("team".to_string(), team_document)).collect(),
+            }),
+        );
+
+        let user = format!("[realm.team]\nparent = \"org\"\n\n{REVIEW_RULE}");
+        tokio::fs::write(&path, &user).await.unwrap();
+        let refused = store
+            .patch(ConfigDelta(serde_json::json!({"realm": {"team": null}})))
+            .await
+            .expect_err("what team would compose without its document cannot be checked");
+        let message = refused.to_string();
+        assert!(
+            matches!(refused, ConfigError::Validation(_))
+                && message.contains("removing [realm.team]")
+                && message.contains("realm 'team' (on a state root without its own document)")
+                && message.contains("org"),
+            "{message}"
+        );
+        assert_eq!(tokio::fs::read_to_string(&path).await.unwrap(), user);
+    }
+
+    /// The view a user document write checks a stated realm in (as if the
+    /// realm had no document of its own) is what a host on another state
+    /// root that shares the user document, and holds no document for the
+    /// realm, composes at run time. Chain discovery follows no user document
+    /// edge for a realm without its own document, so an edge to a realm
+    /// that has a document on that root does not compose there either: the
+    /// guard may skip a stated realm whose chain resolves neither before nor
+    /// after a write.
+    #[tokio::test]
+    async fn the_as_if_view_is_what_another_state_root_composes() {
+        use crate::connection::RealmId;
+
+        /// A state root's documents, as the filesystem source maps them:
+        /// `global` to the user document, every other realm to
+        /// `<root>/<realm>/config.toml`.
+        struct StateRoot {
+            root: PathBuf,
+            user: PathBuf,
+        }
+
+        #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+        #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+        impl RealmConfigSource for StateRoot {
+            async fn config_for_realm(
+                &self,
+                realm: &crate::connection::RealmId,
+            ) -> Result<Option<Config>, ConfigError> {
+                let path = if realm.is_global() {
+                    self.user.clone()
+                } else {
+                    self.root.join(realm.as_str()).join("config.toml")
+                };
+                if !tokio::fs::try_exists(&path).await? {
+                    return Ok(None);
+                }
+                FileConfigStore::new(path, *crate::model_profile::test_catalog::TEST_CATALOG)
+                    .get()
+                    .await
+                    .map(Some)
+            }
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let user = temp.path().join("user.toml");
+        // Root A, where a user document write is checked, holds `team`'s
+        // document; root B holds none for `team`, and one for `org` that
+        // states governance.
+        let write = |relative: &str, text: String| {
+            let path = temp.path().join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        };
+        write(
+            "a/team/config.toml",
+            "[realm.team]\n\n[realm.global]\n".to_owned(),
+        );
+        write("b/org/config.toml", format!("[realm.org]\n\n{REVIEW_RULE}"));
+        let root_a = Arc::new(StateRoot {
+            root: temp.path().join("a"),
+            user: user.clone(),
+        });
+        let root_b = Arc::new(StateRoot {
+            root: temp.path().join("b"),
+            user: user.clone(),
+        });
+        let team = RealmId::parse("team").unwrap();
+
+        for (stated, composes) in [
+            (
+                format!("[realm.team]\nparent = \"global\"\n\n{REVIEW_RULE}"),
+                true,
+            ),
+            ("[realm.team]\nparent = \"org\"\n".to_owned(), false),
+        ] {
+            std::fs::write(&user, &stated).unwrap();
+            let run_time =
+                EffectiveConfigReader::new(Arc::clone(&root_b) as Arc<dyn RealmConfigSource>)
+                    .administered(&team)
+                    .await;
+            let user_config = FileConfigStore::new(
+                user.clone(),
+                *crate::model_profile::test_catalog::TEST_CATALOG,
+            )
+            .get()
+            .await
+            .unwrap();
+            let as_if = EffectiveConfigReader::new(Arc::new(WithUserDocument {
+                documents: Arc::clone(&root_a) as Arc<dyn RealmConfigSource>,
+                user: administration_document(
+                    &realm_edges(&user_config),
+                    &user_config.confinement,
+                    &user_config.governance,
+                ),
+                without: Some(team.clone()),
+            }))
+            .administered(&team)
+            .await;
+            match (&run_time, &as_if) {
+                (Ok(run_time), Ok(as_if)) => assert!(
+                    composes
+                        && run_time.1 == as_if.1
+                        && run_time.1.is_some()
+                        && composes_the_same(&run_time.0, &as_if.0),
+                    "{stated}"
+                ),
+                (Err(ConfigError::RealmChain(_)), Err(ConfigError::RealmChain(_))) => {
+                    assert!(!composes, "{stated}");
+                }
+                other => panic!(
+                    "{stated}: root B at run time and root A's as-if view differ: {:?}",
+                    (
+                        other.0.as_ref().map(|composed| composed.1.is_some()),
+                        other.1.as_ref().map(|composed| composed.1.is_some())
+                    )
+                ),
+            }
+        }
     }
 
     /// A store keeps the auto traits it had before it could declare a realm

@@ -771,6 +771,15 @@ template states `[realm.global]`. One that states `[governance]` but no
 through a sign-in that provisions credentials under it: add `[realm.global]`
 to it by hand.
 
+A section the user document states for a realm whose chain does not
+resolve where the realm has no document of its own (say, an edge to a realm
+with no document there) cannot be removed or changed by a config write
+either. Hosts on such state roots refuse to compose the realm, and a write
+that would have them compose it from the user document alone, possibly
+with weaker requirements than intended, is refused, naming the realm on a
+state root without its own document. Edit the user document by hand as its
+host.
+
 Only a store that declares the realm's chain enforces this, as the stock
 hosts' stores do (`FileConfigStore::with_realm_chain`,
 `SdkConfigStore::with_realm_document`). A store built with

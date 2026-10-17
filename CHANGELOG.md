@@ -173,7 +173,13 @@ them.
   `parent = "global"` edge of `[realm.team]` that put the user document's
   `[governance]` on `team`'s chain wherever `team` has no document. A stated
   realm whose chain resolves on no such state root, before or after the
-  write, composes nothing there and does not refuse it.
+  write, composes nothing there and does not refuse it. One whose chain
+  resolves there only after the write (removing a stale `[realm.team]
+  parent = "org"` where `org` has no document, say) is refused with an
+  error naming the realm on a state root without its own document and the
+  remedy, editing the user document by hand: such roots refuse to compose
+  the realm before the write, and would compose it from the user document
+  alone after it.
 - `rkat` hides a client secret typed at its terminal where neither
   `/bin/stty` nor `/usr/bin/stty` exists (NixOS): terminal control
   (`HostLaunchExemption::terminal_control`) falls back to the `stty` the
