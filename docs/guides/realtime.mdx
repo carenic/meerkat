@@ -844,14 +844,17 @@ transcript then carries a `RuntimeNotice` system notice with category
 `live_transcript_row_unrecorded` whose payload names the channel, the row kind,
 its provider item id, its position among the rows the close held and the
 refusal class; it never carries the row's content. A refused assistant output
-start is not reported on its own while a later row that settles the same
-provider item's speech is still to be applied: a playback terminal (such as a
-segment's release), a playback completion or truncation, or the item's final
-transcript. The session applies that row by its usual rules, or refuses it too,
-and then that row is reported itself. Transcript deltas only buffer text until
-such a row arrives, so a start followed only by deltas is still reported. The
-notice is recorded the same way as other transcript writes, so a session that
-refuses every write refuses it too, and only a warning remains.
+start is not reported on its own while later rows that settle the same
+provider item's speech are still to be applied: a playback terminal (such as a
+segment's release), a playback completion or truncation, or text the item
+stages (its final transcript or spoken transcript deltas) followed by the
+completion of the same response. The session applies those rows by its usual
+rules, or refuses one, and then that row is reported itself. Staged text is
+recorded only when its response completes, and a closed channel completes
+nothing on its own, so a start followed only by text whose response never
+completes is still reported. The notice is recorded the same way as other
+transcript writes, so a session that refuses every write refuses it too, and
+only a warning remains.
 
 ### Continuous media without fabricated playback completion
 

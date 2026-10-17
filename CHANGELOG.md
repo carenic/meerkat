@@ -74,12 +74,14 @@ them.
 - Live channels: a closed channel that replays two spoken segments of one
   provider turn, both of whose output starts waited behind a member turn, no
   longer reports the second segment's output start as unrecorded while its
-  release commits that speech. A refused output start is not reported while a
-  later row among the rows the close held settles its provider item's speech
-  (a playback terminal such as that release, a playback completion or
-  truncation, or the item's final transcript): the session applies that row
-  by its usual rules, or refuses it and it is reported itself. A start
-  followed only by transcript deltas is still reported. (#1821)
+  release commits that speech. A refused output start is not reported while
+  later rows among the rows the close held settle its provider item's speech:
+  a playback terminal such as that release, a playback completion or
+  truncation, or the item's final transcript or spoken transcript deltas
+  followed by the completion of their response. The session applies those
+  rows by its usual rules, or refuses one and it is reported itself. Text
+  whose response never completes among those rows stays staged and does not
+  count, so the start is still reported. (#1821)
 - GPT Live: speech whose output start waited behind a running member turn
   when the channel closed is committed under its generated output instead of
   being abandoned with its captions retracted. The segment's release follows

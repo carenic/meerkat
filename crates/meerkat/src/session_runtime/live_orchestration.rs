@@ -1480,16 +1480,15 @@ mod orchestrator {
     /// The last resort for a deferred row the session refused for a reason
     /// other than a held boundary: see [`record_unrecorded_live_row`].
     /// `later_rows` are the rows of the same list still to be applied after
-    /// it. A refused output start is not reported while a later row settles
-    /// the speech of its provider item (see [`settles_item_speech`]): the
-    /// session applies that row by its usual rules, or refuses it and it is
-    /// reported itself, so no notice names speech that lands. Transcript
-    /// deltas only buffer text until such a row arrives, so a start followed
-    /// only by deltas is still reported. A second spoken segment of a
-    /// provider turn whose output starts both waited behind the member turn
-    /// is replayed that way: its start finds the turn's output still bound to
-    /// the first segment, while its release commits under the target the
-    /// start admitted.
+    /// it. A refused output start is not reported while those rows settle
+    /// the speech of its provider item (see
+    /// [`later_rows_settle_item_speech`]): the session applies them by its
+    /// usual rules, or refuses one and it is reported itself, so no notice
+    /// names speech that lands. A second spoken segment of a provider turn
+    /// whose output starts both waited behind the member turn is replayed
+    /// that way: its start finds the turn's output still bound to the first
+    /// segment, while its release commits under the target the start
+    /// admitted.
     fn report_unrecorded_live_row<'a, B, L>(
         service: &Arc<PersistentSessionService<B>>,
         session_id: &SessionId,
@@ -1504,9 +1503,7 @@ mod orchestrator {
     {
         let refusal = unrecorded_live_row_refusal(error);
         if let Some(item) = output_start_item(observation)
-            && later_rows
-                .into_iter()
-                .any(|later| settles_item_speech(later, item))
+            && later_rows_settle_item_speech(later_rows, item)
         {
             tracing::info!(
                 target: meerkat_live::LIVE_CLOSE_TRACE_TARGET,
@@ -1515,7 +1512,7 @@ mod orchestrator {
                 provider_item_id = item,
                 row_index,
                 refusal,
-                "a refused live output start is left to the later row that settles its provider item's speech"
+                "a refused live output start is left to the later rows that settle its provider item's speech"
             );
             return;
         }
@@ -1543,34 +1540,55 @@ mod orchestrator {
         }
     }
 
-    /// Whether a deferred row settles the speech of provider item `item`: a
+    /// Whether `later_rows` settle the speech of provider item `item`. A
     /// playback terminal (an unmeasured segment's release among them), a
-    /// playback completion or truncation, or the item's final transcript.
-    /// Transcript deltas only buffer text until one of these lands, so they
-    /// do not count.
-    fn settles_item_speech(
-        observation: &meerkat_core::live_adapter::LiveAdapterObservation,
-        item: &str,
-    ) -> bool {
+    /// playback completion or a truncation of the item settles it.
+    /// Text the item stages (its final transcript or its spoken transcript
+    /// deltas) settles it only when a completion of the same response
+    /// follows it: the session stages such text until its response
+    /// completes, and a closed channel completes nothing on its own.
+    fn later_rows_settle_item_speech<'a, L>(later_rows: L, item: &str) -> bool
+    where
+        L: IntoIterator<Item = &'a meerkat_core::live_adapter::LiveAdapterObservation>,
+    {
         use meerkat_core::live_adapter::LiveAdapterObservation as Row;
-        match observation {
-            Row::WithContextObservation { observation, .. } => {
-                settles_item_speech(observation, item)
+        let mut staged_responses: Vec<&str> = Vec::new();
+        for later in later_rows {
+            let mut row = later;
+            while let Row::WithContextObservation { observation, .. } = row {
+                row = observation;
             }
-            Row::AssistantPlaybackTerminalObserved {
-                provider_item_id, ..
+            let staged_response = match row {
+                Row::AssistantPlaybackTerminalObserved {
+                    provider_item_id, ..
+                }
+                | Row::AssistantPlaybackCompleted {
+                    provider_item_id, ..
+                } if provider_item_id == item => return true,
+                Row::AssistantTranscriptTruncated {
+                    provider_item_id, ..
+                } if provider_item_id.as_deref() == Some(item) => return true,
+                Row::TurnCompleted {
+                    response_id: Some(response_id),
+                    ..
+                } if staged_responses.contains(&response_id.as_str()) => return true,
+                Row::AssistantTranscriptFinal {
+                    provider_item_id,
+                    response_id,
+                    ..
+                } if provider_item_id == item => response_id,
+                Row::AssistantTranscriptDelta {
+                    provider_item_id,
+                    response_id,
+                    ..
+                } if provider_item_id.as_deref() == Some(item) => response_id,
+                _ => continue,
+            };
+            if let Some(response_id) = staged_response.as_deref().filter(|id| !id.is_empty()) {
+                staged_responses.push(response_id);
             }
-            | Row::AssistantPlaybackCompleted {
-                provider_item_id, ..
-            }
-            | Row::AssistantTranscriptFinal {
-                provider_item_id, ..
-            } => provider_item_id == item,
-            Row::AssistantTranscriptTruncated {
-                provider_item_id, ..
-            } => provider_item_id.as_deref() == Some(item),
-            _ => false,
         }
+        false
     }
 
     /// A live row that is not recorded: a typed warning and a typed runtime

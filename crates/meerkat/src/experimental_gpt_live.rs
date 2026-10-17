@@ -15737,6 +15737,155 @@ mod tests {
         );
     }
 
+    /// The final transcript of [`output_start_without_custody`]'s item.
+    fn final_without_custody(text: &str) -> meerkat_core::live_adapter::LiveAdapterObservation {
+        meerkat_core::live_adapter::LiveAdapterObservation::AssistantTranscriptFinal {
+            provider_item_id: "item-without-custody".to_string(),
+            previous_item_id: None,
+            content_index: Some(0),
+            response_id: Some("response-without-custody".to_string()),
+            text: text.to_string(),
+            stop_reason: StopReason::EndTurn,
+            usage: Usage::default(),
+        }
+    }
+
+    /// The completion of [`output_start_without_custody`]'s response.
+    fn completion_without_custody() -> meerkat_core::live_adapter::LiveAdapterObservation {
+        meerkat_core::live_adapter::LiveAdapterObservation::TurnCompleted {
+            response_id: Some("response-without-custody".to_string()),
+            stop_reason: StopReason::EndTurn,
+            usage: TurnUsage::host_declared(
+                Provider::OpenAI,
+                "gpt-live-1-codex".to_string(),
+                Usage::default(),
+            ),
+        }
+    }
+
+    /// The text of each spoken assistant transcript row, in order.
+    fn spoken_rows(session: &meerkat_core::Session) -> Vec<String> {
+        session
+            .messages()
+            .iter()
+            .filter_map(|message| match message {
+                meerkat_core::Message::BlockAssistant(assistant) => Some(assistant),
+                _ => None,
+            })
+            .filter_map(|assistant| {
+                let text: String = assistant
+                    .blocks
+                    .iter()
+                    .filter_map(|block| match block {
+                        meerkat_core::AssistantBlock::Transcript {
+                            text,
+                            source: meerkat_core::types::TranscriptSource::Spoken,
+                            ..
+                        } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                (!text.is_empty()).then_some(text)
+            })
+            .collect()
+    }
+
+    /// Settle `rows` as the rows a closed channel held, then read the spoken
+    /// assistant rows the persisted transcript holds and its unrecorded-row
+    /// notice payloads.
+    async fn settle_held_rows(
+        rows: Vec<meerkat_core::live_adapter::LiveAdapterObservation>,
+    ) -> (Vec<String>, Vec<serde_json::Value>) {
+        let (service, runtime, host, session_id, channel_id, _temp) = deferred_rows_fixture().await;
+        assert_eq!(
+            crate::session_runtime::live_orchestration::settle_live_close_playback_deferred(
+                Arc::clone(&service),
+                Arc::clone(&runtime),
+                host.owned_handle(),
+                rows,
+                session_id.clone(),
+                channel_id.clone(),
+                None,
+            )
+            .await,
+            crate::session_runtime::live_orchestration::DeferredCloseSettlementOutcome::Settled,
+        );
+        wait_for_resolved_close_settlement(&runtime, &session_id).await;
+        let session = service
+            .load_authoritative_session(&session_id)
+            .await
+            .expect("read the persisted transcript")
+            .expect("session");
+        (
+            spoken_rows(&session),
+            unrecorded_row_notices_now(&service, &session_id).await,
+        )
+    }
+
+    const HELD_SPEECH: &str = "Speech the close held.";
+
+    /// #1821: a final transcript only stages its item's text until its
+    /// response completes, and a closed channel completes nothing on its
+    /// own. A refused output start followed by its item's final and no
+    /// completion of that response is reported: one notice, for the start.
+    #[tokio::test]
+    async fn a_refused_start_followed_by_its_uncompleted_final_is_reported() {
+        let (spoken, notices) = settle_held_rows(vec![
+            output_start_without_custody(),
+            final_without_custody(HELD_SPEECH),
+        ])
+        .await;
+        assert_eq!(
+            (spoken, notice_rows(&notices)),
+            (
+                Vec::<String>::new(),
+                vec![(
+                    Some("assistant_output_started"),
+                    Some("item-without-custody"),
+                    Some(0),
+                )],
+            ),
+            "the staged final records nothing, and the refused start is reported: {notices:?}"
+        );
+    }
+
+    /// #1821 control: the final's response completes among the rows the
+    /// close held, so the final's text is recorded and the refused start is
+    /// not reported.
+    #[tokio::test]
+    async fn a_refused_start_is_left_to_its_completed_final() {
+        let (spoken, notices) = settle_held_rows(vec![
+            output_start_without_custody(),
+            final_without_custody(HELD_SPEECH),
+            completion_without_custody(),
+        ])
+        .await;
+        assert_eq!(
+            (spoken, notice_rows(&notices)),
+            (vec![HELD_SPEECH.to_string()], Vec::new()),
+            "the completed final is recorded, and its refused start is not reported: {notices:?}"
+        );
+    }
+
+    /// #1821: transcript deltas stage their item's text the same way, so a
+    /// completion of their response records it and the refused start is not
+    /// reported.
+    #[tokio::test]
+    async fn a_refused_start_is_left_to_its_completed_deltas() {
+        let (spoken, notices) = settle_held_rows(vec![
+            output_start_without_custody(),
+            delta_without_custody("delta-1", "Speech the close"),
+            delta_without_custody("delta-2", " held."),
+            completion_without_custody(),
+        ])
+        .await;
+        assert_eq!(
+            (spoken, notice_rows(&notices)),
+            (vec![HELD_SPEECH.to_string()], Vec::new()),
+            "the completed deltas are recorded, and their refused start is not reported: {notices:?}"
+        );
+    }
+
     /// #1821 (F1 last resort): the same notice when the row is refused by the
     /// replay that follows a given-up settlement.
     #[tokio::test]
