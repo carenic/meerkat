@@ -35,6 +35,13 @@ them.
 
 ## [Unreleased]
 
+### Breaking
+
+- `meerkat_tools::builtin::comms::{CommsToolSet, SendTool, PeersTool}`,
+  deprecated in 0.9.2, are removed. Use `CommsToolSurface`: it dispatches the
+  comms tools with the dispatch context and a typed operation target, which
+  the removed tools did not carry.
+
 ## [0.9.2] - 2026-10-16
 
 ### Breaking

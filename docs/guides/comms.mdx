@@ -80,7 +80,7 @@ graph TD
 | Crate | Role |
 |-------|------|
 | `meerkat-comms` | Core comms: identity, trust, transport, router, inbox, runtime, MCP tools, agent integration |
-| `meerkat-tools` (`builtin::comms`) | `CommsToolSurface`, `CommsToolSet`, individual `BuiltinTool` implementations |
+| `meerkat-tools` (`builtin::comms`) | `CommsToolSurface`, the comms tools' dispatcher |
 | `meerkat-core` | `CommsRuntime` trait, `CommsRuntimeConfig`, `CommsRuntimeMode` enum, substrate integration points |
 | `meerkat` (facade) | `build_comms_runtime_from_config()`, `compose_tools_with_comms()`, factory wiring |
 
