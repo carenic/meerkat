@@ -728,6 +728,61 @@ impl PublicLiveHarness {
         Ok(())
     }
 
+    /// Play `fixture` directly as exchange `label`, which then awaits its
+    /// input final (provider health evidence). Returns the browser's play
+    /// result and the timeline length before the play, for
+    /// [`Self::settle_direct_play`].
+    async fn play_direct(
+        &mut self,
+        label: &str,
+        fixture: &str,
+    ) -> Result<(Value, usize), Box<dyn std::error::Error>> {
+        let timeline_before = self.peer.timeline().await?.len();
+        self.exchange_started(label)?;
+        let sent = self
+            .peer
+            .call(json!({"type": "play", "name": fixture}))
+            .await?;
+        Ok((sent, timeline_before))
+    }
+
+    /// Settle a direct-play exchange's provider health evidence after its
+    /// wait, as [`Self::settle_exchange_evidence`] settles a scheduled one:
+    /// the lag when the input final arrived, otherwise a timeout carrying the
+    /// provider input latency read now, so a provider stall scores the run
+    /// void instead of red. A failed wait also prints the uplink evidence.
+    async fn settle_direct_play(
+        &mut self,
+        scenario: &str,
+        label: &str,
+        fixture: &str,
+        timeline_before: usize,
+        wait_failed: bool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let timeline = self.peer.timeline().await?;
+        let reading = direct_play_reading(&timeline, fixture, timeline_before);
+        if let Some(journal) = self.evidence.clone() {
+            match reading.and_then(|(_, lag_ms)| lag_ms) {
+                Some(lag_ms) => journal.exchange_heard(label, lag_ms)?,
+                None => {
+                    let latency = self.provider_input_latency().await;
+                    journal.exchange_timed_out(latency)?;
+                }
+            }
+        }
+        if wait_failed {
+            match reading {
+                Some((fixture_start_ms, _)) => {
+                    print_no_audio_evidence(self, scenario, label, fixture_start_ms).await;
+                }
+                None => {
+                    println!("GPT_LIVE_{scenario}_NO_FIXTURE_START label={label} fixture={fixture}")
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn shared(
         &mut self,
     ) -> Result<&mut (SharedPublicLive, ExactChannel), Box<dyn std::error::Error>> {
@@ -5968,6 +6023,49 @@ fn timeline_find(
         .find(|entry| entry.kind == kind && entry.t_ms >= not_before_ms)
 }
 
+/// One direct `play` exchange read off the browser timeline: the start of
+/// the first `fixture` play after the first `timeline_before` entries, and
+/// its speech end to input final lag when the final arrived. A direct play
+/// carries no schedule id, so it is found by name; the lag is read as
+/// [`SpokenTurn::from_timeline`] reads a scheduled turn's.
+fn direct_play_reading(
+    timeline: &[TimelineEntry],
+    fixture: &str,
+    timeline_before: usize,
+) -> Option<(u64, Option<i64>)> {
+    let start = timeline.iter().skip(timeline_before).find(|entry| {
+        entry.kind == TimelineKind::FixtureStart && entry.detail_str("name") == Some(fixture)
+    })?;
+    let speech_end_ms = start.t_ms + start.detail_u64("speech_ms").unwrap_or(0);
+    let lag_ms = timeline
+        .iter()
+        .find(|entry| entry.kind == TimelineKind::InputFinal && entry.t_ms > start.t_ms)
+        .map(|entry| entry.detail_u64("t_ms").unwrap_or(entry.t_ms) as i64 - speech_end_ms as i64);
+    Some((start.t_ms, lag_ms))
+}
+
+/// The rows a session history holds after its first `skip` messages, as
+/// `role: text` with the text cut to 400 characters (diagnostics only).
+fn history_rows_after(history: &Value, skip: usize) -> Vec<String> {
+    history["messages"]
+        .as_array()
+        .map(|messages| {
+            messages
+                .iter()
+                .skip(skip)
+                .map(|message| {
+                    let text = history_text(&json!({ "messages": [message] }));
+                    format!(
+                        "{}: {}",
+                        message["role"].as_str().unwrap_or("?"),
+                        text.chars().take(400).collect::<String>()
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn fixture_start_entry(timeline: &[TimelineEntry], schedule_id: u64) -> Option<&TimelineEntry> {
     timeline.iter().find(|entry| {
         entry.kind == TimelineKind::FixtureStart && entry.schedule_id() == Some(schedule_id)
@@ -9394,6 +9492,12 @@ async fn run_s104_handoff_voice_typed_voice(
             late_channels.push(channel2);
         }
         evidence.stage(EvidenceStage::HandoffBack)?;
+        let messages_before_back = live
+            .rpc
+            .session_history(json!(live.session_id), 30)
+            .await?["messages"]
+            .as_array()
+            .map_or(0, Vec::len);
         let events_before_back = live.peer.events().await?.len();
         let (back, answer_back, _, back_start) = native_question(
             &mut live,
@@ -9499,6 +9603,29 @@ async fn run_s104_handoff_voice_typed_voice(
             "S104",
             "post_reopen_answer",
             format!("token={S104_RESULT_TOKEN:?} answer={:?}", answer_back.trim()),
+        )?;
+        // The delegated result as the session committed it: the rows added
+        // since the reopen question (the executor's input and reply, the
+        // spoken rows). A spoken answer without the token then reads as
+        // never delivered (absent from these rows) or delivered but not said.
+        let rows_after_back = history_rows_after(
+            &live
+                .rpc
+                .session_history(json!(live.session_id), 30)
+                .await?,
+            messages_before_back,
+        );
+        record_metric(
+            &evidence,
+            channel2,
+            "S104",
+            "post_reopen_rows",
+            format!(
+                "token={S104_RESULT_TOKEN:?} rows_have_token={} rows={rows_after_back:?}",
+                rows_after_back
+                    .iter()
+                    .any(|row| row.to_lowercase().contains(S104_RESULT_TOKEN))
+            ),
         )?;
         // The typed note was committed while the call was closed, so by the
         // reopen contract it rides the reopen's startup input verbatim. That
@@ -11768,12 +11895,21 @@ async fn run_s98_real_audio_and_context(
     live.assert_existing_text_identity().await?;
 
     // Phase A: tell the model a code word and confirm playback of its reply.
+    // Each spoken exchange records provider health evidence, so a provider
+    // stall scores the run void (provider-degraded) instead of red.
     let before = live.peer.events().await?.len();
     let audio_baseline = live.peer.audio_evidence().await?;
-    live.peer
-        .call(json!({"type":"play","name":"remember"}))
-        .await?;
-    let first_output = live.output().await?;
+    let (_, timeline_before) = live.play_direct("remember", "remember").await?;
+    let first_output = live.output().await;
+    live.settle_direct_play(
+        "S98",
+        "remember",
+        "remember",
+        timeline_before,
+        first_output.is_err(),
+    )
+    .await?;
+    let first_output = first_output?;
     assert_eq!(first_output["channel_id"], live.channel_id);
     let remember_audio = wait_for_spoken_output(&mut live.peer, audio_baseline, 45).await?;
     println!("GPT_LIVE_PUBLIC_AUDIO phase=remember evidence={remember_audio:?}");
@@ -11837,10 +11973,17 @@ async fn run_s98_real_audio_and_context(
     // Phase B: later output in the same interaction gets a fresh handle.
     let before_second = events.len();
     let audio_baseline = live.peer.audio_evidence().await?;
-    live.peer
-        .call(json!({"type":"play","name":"greeting"}))
-        .await?;
-    let second_output = live.output().await?;
+    let (_, timeline_before) = live.play_direct("greeting", "greeting").await?;
+    let second_output = live.output().await;
+    live.settle_direct_play(
+        "S98",
+        "greeting",
+        "greeting",
+        timeline_before,
+        second_output.is_err(),
+    )
+    .await?;
+    let second_output = second_output?;
     assert_eq!(second_output["channel_id"], live.channel_id);
     assert_ne!(
         second_output["output_id"], first_output["output_id"],
@@ -11875,10 +12018,17 @@ async fn run_s98_real_audio_and_context(
     live.assert_existing_text_identity().await?;
     let before_recall = live.peer.events().await?.len();
     let audio_baseline = live.peer.audio_evidence().await?;
-    live.peer
-        .call(json!({"type":"play","name":"recall"}))
-        .await?;
-    let recall_output = live.output().await?;
+    let (_, timeline_before) = live.play_direct("recall", "recall").await?;
+    let recall_output = live.output().await;
+    live.settle_direct_play(
+        "S98",
+        "recall",
+        "recall",
+        timeline_before,
+        recall_output.is_err(),
+    )
+    .await?;
+    let recall_output = recall_output?;
     assert_eq!(recall_output["channel_id"], live.channel_id);
     let recalled = wait_for_events(&mut live.peer, 60, |events| {
         output_transcript_text(events, before_recall)
@@ -11928,10 +12078,7 @@ async fn run_s98_real_audio_and_context(
         .len();
     let before_work = live.peer.events().await?.len();
     let audio_baseline = live.peer.audio_evidence().await?;
-    let sent = live
-        .peer
-        .call(json!({"type":"play","name":"delegation"}))
-        .await?;
+    let (sent, timeline_before) = live.play_direct("delegation", "delegation").await?;
     assert!(
         sent["input"]["bytes_sent"]
             .as_u64()
@@ -11941,10 +12088,19 @@ async fn run_s98_real_audio_and_context(
         "GPT_LIVE_PUBLIC_INPUT phase=existing_member evidence={}",
         sent["input"]
     );
-    wait_for_events(&mut live.peer, 120, |events| {
+    let delegated = wait_for_events(&mut live.peer, 120, |events| {
         events[before_work..].iter().any(is_client_delegation)
     })
+    .await;
+    live.settle_direct_play(
+        "S98",
+        "delegation",
+        "delegation",
+        timeline_before,
+        delegated.is_err(),
+    )
     .await?;
+    delegated?;
     let deadline = Instant::now() + Duration::from_secs(300);
     let operation = loop {
         if let Some(output) = live.poll_output(Duration::from_millis(500)).await? {
@@ -12045,16 +12201,22 @@ async fn run_s98_real_audio_and_context(
     let audio_baseline = live.peer.audio_evidence().await?;
     // `recall` asks for the word the user asked to remember, which stays
     // Tangerine after the update; `recall_now` asks for the current word.
-    live.peer
-        .call(json!({"type":"play","name":"recall_now"}))
-        .await?;
+    let (_, timeline_before) = live.play_direct("recall_now", "recall_now").await?;
     let recalled_update = wait_for_events(&mut live.peer, 90, |events| {
         output_transcript_text(events, before_updated_recall)
             .to_lowercase()
             .contains("violet")
     })
-    .await
-    .map_err(|error| {
+    .await;
+    live.settle_direct_play(
+        "S98",
+        "recall_now",
+        "recall_now",
+        timeline_before,
+        recalled_update.is_err(),
+    )
+    .await?;
+    let recalled_update = recalled_update.map_err(|error| {
         format!("Live did not recall the later canonical background update: {error}")
     })?;
     let update_audio = wait_for_spoken_output(&mut live.peer, audio_baseline, 45).await?;
@@ -12121,6 +12283,60 @@ fn delegated_worker_lifecycle(events: &Value) -> DelegatedWorkerLifecycle {
 mod config_tests {
     use super::{API_KEY_ENV, BINDING, REALM, scenario_config};
     use meerkat_core::CredentialSourceSpec;
+
+    /// A direct `play` carries no schedule id: its exchange reading is the
+    /// first start of the fixture after the baseline, and its lag runs from
+    /// that play's speech end to the next input final's own arrival time. A
+    /// start with no later final reads as no lag (the exchange timed out).
+    #[test]
+    fn direct_play_reading_takes_the_play_after_the_baseline() {
+        use super::support::{TimelineEntry, TimelineKind};
+        let entry = |t_ms: u64, kind: TimelineKind, detail: serde_json::Value| TimelineEntry {
+            t_ms,
+            kind,
+            detail,
+        };
+        let timeline = vec![
+            entry(
+                100,
+                TimelineKind::FixtureStart,
+                serde_json::json!({"id": "play-1", "name": "remember", "speech_ms": 1500}),
+            ),
+            entry(
+                1800,
+                TimelineKind::InputFinal,
+                serde_json::json!({"t_ms": 1750}),
+            ),
+            entry(
+                5000,
+                TimelineKind::FixtureStart,
+                serde_json::json!({"id": "play-2", "name": "remember", "speech_ms": 1500}),
+            ),
+            entry(
+                6900,
+                TimelineKind::InputFinal,
+                serde_json::json!({"t_ms": 6850}),
+            ),
+            entry(
+                9000,
+                TimelineKind::FixtureStart,
+                serde_json::json!({"id": "play-3", "name": "greeting", "speech_ms": 900}),
+            ),
+        ];
+        assert_eq!(
+            super::direct_play_reading(&timeline, "remember", 0),
+            Some((100, Some(150)))
+        );
+        assert_eq!(
+            super::direct_play_reading(&timeline, "remember", 2),
+            Some((5000, Some(350)))
+        );
+        assert_eq!(
+            super::direct_play_reading(&timeline, "greeting", 4),
+            Some((9000, None))
+        );
+        assert_eq!(super::direct_play_reading(&timeline, "recall", 0), None);
+    }
 
     fn strings(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_owned()).collect()
