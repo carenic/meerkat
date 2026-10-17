@@ -95,8 +95,11 @@ them.
   show (an explicit `?` key, an alias, an escape in a quoted key), naming
   its file and line, and on a Renovate configuration that could automerge
   an action update, including automerge set outside packageRules
-  (`vulnerabilityAlerts`, an update type's settings), or release its
-  digest updates from approval. The pinned
+  (`vulnerabilityAlerts`, an update type's settings), release its digest
+  updates from approval, or automerge what a regex manager
+  (`customManagers`) pins: the container digests and the sccache release,
+  which Renovate proposes a week after their release, in a group of their
+  own, and never automerges. The pinned
   `dtolnay/rust-toolchain` commit is that of its `1.94.1` branch, which
   installs that toolchain; the trailing comment names it. The release jobs
   whose checkout can be an older tag (a recovery dispatch) run their setup

@@ -19,7 +19,8 @@
 //   minimumReleaseAge (new versions), hold their digest updates (a tag
 //   that moved, which the age does not hold back) for dependency dashboard
 //   approval, and end with a github-actions rule that turns automerge off,
-//   after every rule that could turn it on for them; nothing outside
+//   after every rule that could turn it on for them; a custom.regex rule
+//   does the same for what its customManagers pin; nothing outside
 //   packageRules may turn automerge on (vulnerabilityAlerts, an update
 //   type's settings). A `docker://` action, a `container:` or `image:`
 //   value in .github, and a `docker://` reference in the Bazel files under
@@ -65,6 +66,8 @@ const BLOCK_SCALAR = /^(\s*)(-\s+)?[^\s#-][^#]*?:\s*[|>][-+0-9]*\s*$/;
 const PINNED = /^[^@\s]+\/[^@\s]+@[0-9a-f]{40}$/;
 const REF_COMMENT = /^\s+#\s+\S+\s*$/;
 const MANAGER = "github-actions";
+// The manager Renovate runs renovate.json's customManagers as.
+const CUSTOM_MANAGER = "custom.regex";
 const PIN_PRESET = "helpers:pinGitHubActionDigests";
 const MINIMUM_RELEASE_AGE = "7 days";
 
@@ -181,12 +184,12 @@ export function usesProblems(root) {
   return problems;
 }
 
-// Does a package rule apply to github-actions updates, for at least some
-// of them (true), and to all of them (all)? A rule with any criterion other
+// Does a package rule apply to a manager's updates, for at least some of
+// them (true), and to all of them (all)? A rule with any criterion other
 // than matchManagers applies to some updates only.
-function ruleScope(rule) {
+function ruleScope(rule, manager = MANAGER) {
   const managers = rule.matchManagers;
-  if (Array.isArray(managers) && !managers.includes(MANAGER)) return { some: false, all: false };
+  if (Array.isArray(managers) && !managers.includes(manager)) return { some: false, all: false };
   const criteria = Object.keys(rule).filter((key) => key.startsWith("match") || key.startsWith("exclude"));
   const onlyManager = criteria.every((key) => key === "matchManagers");
   return { some: true, all: onlyManager && Array.isArray(managers) && managers.length === 1 };
@@ -282,6 +285,30 @@ function coversAllDigests(rule) {
   );
 }
 
+// A manager's updates are never automerged: a rule for all of them turns
+// automerge off after every rule that could turn it on for some, and one
+// for all of them sets the release age.
+function managerRuleProblems(rules, manager) {
+  const problems = [];
+  let lastOff = -1;
+  let lastOn = -1;
+  let age = false;
+  rules.forEach((rule, index) => {
+    const scope = ruleScope(rule, manager);
+    if (!scope.some) return;
+    if (rule.automerge === true) lastOn = index;
+    if (rule.automerge === false && scope.all) lastOff = index;
+    if (scope.all && rule.minimumReleaseAge === MINIMUM_RELEASE_AGE) age = true;
+  });
+  if (lastOff < 0) {
+    problems.push(`renovate.json: no packageRule turns automerge off for every ${manager} update`);
+  } else if (lastOn > lastOff) {
+    problems.push(`renovate.json: packageRules[${lastOn}] can turn automerge on for ${manager} after the rule that turns it off`);
+  }
+  if (!age) problems.push(`renovate.json: ${manager} updates lack a minimumReleaseAge of "${MINIMUM_RELEASE_AGE}"`);
+  return problems;
+}
+
 export function renovateProblems(config) {
   const problems = [];
   if (!(config.extends ?? []).includes(PIN_PRESET)) {
@@ -296,26 +323,17 @@ export function renovateProblems(config) {
     problems.push(`renovate.json: ${path} turns automerge on outside packageRules`);
   }
   const rules = config.packageRules ?? [];
-  let lastOff = -1;
-  let lastOn = -1;
-  let age = false;
+  problems.push(...managerRuleProblems(rules, MANAGER));
+  // What the customManagers pin (container digests, a tool release) is
+  // never automerged either.
+  if ((config.customManagers ?? []).length > 0) problems.push(...managerRuleProblems(rules, CUSTOM_MANAGER));
   let digestHeld = -1;
   let digestReleased = -1;
   rules.forEach((rule, index) => {
-    const scope = ruleScope(rule);
-    if (!scope.some) return;
-    if (rule.automerge === true) lastOn = index;
-    if (rule.automerge === false && scope.all) lastOff = index;
-    if (scope.all && rule.minimumReleaseAge === MINIMUM_RELEASE_AGE) age = true;
+    if (!ruleScope(rule).some) return;
     if (rule.dependencyDashboardApproval === false) digestReleased = index;
     if (rule.dependencyDashboardApproval === true && coversAllDigests(rule)) digestHeld = index;
   });
-  if (lastOff < 0) {
-    problems.push(`renovate.json: no packageRule turns automerge off for every ${MANAGER} update`);
-  } else if (lastOn > lastOff) {
-    problems.push(`renovate.json: packageRules[${lastOn}] can turn automerge on for ${MANAGER} after the rule that turns it off`);
-  }
-  if (!age) problems.push(`renovate.json: ${MANAGER} updates lack a minimumReleaseAge of "${MINIMUM_RELEASE_AGE}"`);
   if (digestHeld < 0) {
     problems.push(`renovate.json: no packageRule holds every ${MANAGER} digest update for dependency dashboard approval`);
   } else if (digestReleased > digestHeld) {
@@ -350,7 +368,7 @@ function main(argv) {
     return 1;
   }
   process.stdout.write(
-    "ci-action-pins: every third-party action is SHA-pinned, every container image digest-pinned, every sccache-action step names an exact release, and Renovate never automerges an action\n",
+    "ci-action-pins: every third-party action is SHA-pinned, every container image digest-pinned, every sccache-action step names an exact release, and Renovate never automerges an action or what a customManager pins\n",
   );
   return 0;
 }

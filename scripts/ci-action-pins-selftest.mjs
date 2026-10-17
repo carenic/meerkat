@@ -285,6 +285,27 @@ try {
     const problems = renovateProblems(config);
     assert.ok(problems.some((problem) => problem.includes(message)), `${label}: ${problems.join("; ")}`);
   }
+  // What customManagers pin is never automerged: a rule for every
+  // custom.regex update turns automerge off after the patch automerge, with
+  // the release age.
+  {
+    const custom = {
+      ...goodRenovate,
+      customManagers: [{ customType: "regex", managerFilePatterns: ["/x/"], matchStrings: ["(?<currentValue>v\\S+)"], datasourceTemplate: "github-releases" }],
+    };
+    const off = { matchManagers: ["custom.regex"], automerge: false, minimumReleaseAge: "7 days" };
+    const [patch, ...rest] = goodRenovate.packageRules;
+    assert.deepEqual(renovateProblems({ ...custom, packageRules: [patch, off, ...rest] }), []);
+    for (const [label, packageRules, message] of [
+      ["no custom.regex rule", goodRenovate.packageRules, "no packageRule turns automerge off for every custom.regex update"],
+      ["a patch automerge after it", [off, patch, ...rest], "can turn automerge on for custom.regex"],
+      ["a rule for one dependency only", [patch, { ...off, matchDepNames: ["mozilla/sccache"] }, ...rest], "no packageRule turns automerge off for every custom.regex update"],
+      ["no release age", [patch, { matchManagers: ["custom.regex"], automerge: false }, ...rest], "custom.regex updates lack a minimumReleaseAge"],
+    ]) {
+      const problems = renovateProblems({ ...custom, packageRules });
+      assert.ok(problems.some((problem) => problem.includes(message)), `${label}: ${problems.join("; ")}`);
+    }
+  }
   // A rule for other managers may automerge after the github-actions rule.
   assert.deepEqual(
     renovateProblems({ ...goodRenovate, packageRules: [...goodRenovate.packageRules, { matchManagers: ["cargo"], automerge: true }] }),

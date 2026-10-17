@@ -44,6 +44,14 @@
       "dependencyDashboardApproval": true
     },
     {
+      "description": "What the customManagers above pin (container digests, the sccache release) builds CI and the release: proposed a week after its release, in a group of its own, and never automerged.",
+      "matchManagers": ["custom.regex"],
+      "groupName": "pinned images and tools",
+      "groupSlug": "pinned-images-and-tools",
+      "minimumReleaseAge": "7 days",
+      "automerge": false
+    },
+    {
       "description": "GitHub Actions run with the workflow token, OIDC and release secrets: pinned to commit SHAs (helpers:pinGitHubActionDigests, checked by scripts/ci-action-pins.mjs), new versions proposed a week after their release, in a group of their own, and never automerged. Keep this rule last.",
       "matchManagers": ["github-actions"],
       "groupName": "github actions",
