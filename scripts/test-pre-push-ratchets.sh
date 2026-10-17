@@ -80,10 +80,13 @@ import re
 import sys
 
 text = open(sys.argv[1]).read()
-job = re.search(r"\n  clippy:\n(.*?)\n  [a-z][a-z0-9-]*:\n", text, re.S)
-assert job, "no clippy job"
-assert "    if: ${{ needs.changes.outputs.rust_changed == 'true' }}\n" in job.group(1), "clippy job condition"
-assert "      matrix: ${{ fromJSON(needs.changes.outputs.shard_matrix) }}\n" in job.group(1), "clippy matrix"
+# The lanes run in two waves (long rows first): clippy holds the first,
+# clippy-rest the rest, each on a Rust change when its wave holds rows.
+for name, count, matrix in (("clippy", "shard_first_count", "shard_matrix"), ("clippy-rest", "shard_rest_count", "shard_rest_matrix")):
+    job = re.search(rf"\n  {name}:\n(.*?)\n  [a-z][a-z0-9-]*:\n", text, re.S)
+    assert job, f"no {name} job"
+    assert f"    if: ${{{{ needs.changes.outputs.rust_changed == 'true' && needs.changes.outputs.{count} != '0' }}}}\n" in job.group(1), f"{name} job condition"
+    assert f"      matrix: ${{{{ fromJSON(needs.changes.outputs.{matrix}) }}}}\n" in job.group(1), f"{name} matrix"
 required = (
     '          if [[ "${RUST_CHANGED}" == "true" ]]; then\n'
     '            if ! [[ "${SHARD_COUNT}" =~ ^[0-9]+$ ]] || (( SHARD_COUNT < 1 )); then\n'
