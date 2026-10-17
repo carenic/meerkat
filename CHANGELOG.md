@@ -119,8 +119,8 @@ them.
   completion's own notice names no item or response, so the text it would
   have recorded cannot be attributed from the notice. Staged text is also
   recorded only after the item before it in the transcript, so text whose
-  earlier item never lands keeps waiting while its start is not reported.
-  (#1821)
+  earlier item has not landed waits while its start is not reported; if that
+  item never lands, the text is lost without a notice. (#1821)
 
 ## [0.9.2] - 2026-10-16
 

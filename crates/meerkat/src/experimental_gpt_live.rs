@@ -15980,6 +15980,42 @@ mod tests {
         .await;
     }
 
+    /// #1821: a barge-in interrupt discards the text its response staged, so
+    /// a normal completion of that response after the interrupt records
+    /// nothing and the refused start is reported.
+    #[tokio::test]
+    async fn a_refused_start_whose_interrupted_deltas_complete_normally_is_reported() {
+        assert_only_the_refused_start_is_reported(
+            vec![
+                output_start_without_custody(),
+                delta_without_custody("delta-1", "Speech the close"),
+                delta_without_custody("delta-2", " held."),
+                interrupt_without_custody(),
+                completion_without_custody(StopReason::EndTurn),
+            ],
+            "deltas, an interrupt, then a normal completion",
+        )
+        .await;
+    }
+
+    /// #1821: the session ignores text and completions of a response that
+    /// arrive after an interrupt named it, so text staged after the
+    /// interrupt does not count either.
+    #[tokio::test]
+    async fn a_refused_start_whose_deltas_follow_an_interrupt_of_their_response_is_reported() {
+        assert_only_the_refused_start_is_reported(
+            vec![
+                output_start_without_custody(),
+                interrupt_without_custody(),
+                delta_without_custody("delta-1", "Speech the close"),
+                delta_without_custody("delta-2", " held."),
+                completion_without_custody(StopReason::EndTurn),
+            ],
+            "an interrupt, then deltas and a normal completion",
+        )
+        .await;
+    }
+
     /// #1821 (F1 last resort): the same notice when the row is refused by the
     /// replay that follows a given-up settlement.
     #[tokio::test]

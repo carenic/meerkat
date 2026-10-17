@@ -2793,6 +2793,7 @@ fn resolve_assistant_turn_completed(
 /// completion of a response that was not discarded: the response is marked
 /// ready only for a completion that is neither cancelled (which discards the
 /// response) nor a tool call (which removes the completion).
+#[doc(hidden)]
 #[must_use]
 pub fn realtime_completion_records_staged_text(stop_reason: StopReason) -> bool {
     resolve_assistant_turn_completed(true, false, stop_reason)
