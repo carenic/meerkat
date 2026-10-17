@@ -274,7 +274,8 @@ fn ci_runs_fail_closed_cargo_lanes_on_hosted_runners() {
     for lane in [
         "--no-deps ${TARGETS} --all-features -- -D warnings",
         "\"--all-targets\"|\"--lib\"|\"--bins\"|\"--lib --bins\") ;;",
-        "--lib --bins --profile ci-pr",
+        "nextest run ${PACKAGES} ${TARGETS} --profile ci-pr",
+        "\"--lib\"|\"--bins\"|\"--lib --bins\") ;;",
         "unit_shard_matrix",
         "main_unit_shard_matrix",
         "CLOSURE_CHECK_TARGETS: lib",

@@ -1049,12 +1049,17 @@ jobs:
         shell: bash
         env:
           PACKAGES: ${{ matrix.packages }}
+          TARGETS: ${{ matrix.targets }}
           # Set only on feature-suite rows whose tests need a deeper test-thread
           # stack than the 8 MiB .cargo/config.toml default (see FEATURE_UNIT_SUITES).
           MIN_STACK: ${{ matrix.rust_min_stack }}
         run: |
           set -euo pipefail
           [[ -n "${PACKAGES}" ]] || { echo "::error::empty package list in a unit lane"; exit 1; }
+          case "${TARGETS}" in
+            "--lib"|"--bins"|"--lib --bins") ;;
+            *) echo "::error::unexpected unit targets '${TARGETS}'"; exit 1 ;;
+          esac
           # An empty RUST_MIN_STACK would drop tests to Rust's 2 MiB default, so it
           # is exported only when the row sets one.
           if [[ -n "${MIN_STACK}" ]]; then export RUST_MIN_STACK="${MIN_STACK}"; fi
@@ -1067,7 +1072,7 @@ jobs:
             echo "mcp-test-server fixture: ${MEERKAT_MCP_TEST_SERVER}"
           fi
           # shellcheck disable=SC2086
-          ./scripts/repo-cargo nextest run ${PACKAGES} --lib --bins --profile ci-pr \
+          ./scripts/repo-cargo nextest run ${PACKAGES} ${TARGETS} --profile ci-pr \
             --no-tests=pass --no-fail-fast --status-level fail --final-status-level fail
 
       - name: Upload sccache server log
@@ -1684,12 +1689,17 @@ jobs:
         shell: bash
         env:
           PACKAGES: ${{ matrix.packages }}
+          TARGETS: ${{ matrix.targets }}
           # Set only on feature-suite rows whose tests need a deeper test-thread
           # stack than the 8 MiB .cargo/config.toml default (see FEATURE_UNIT_SUITES).
           MIN_STACK: ${{ matrix.rust_min_stack }}
         run: |
           set -euo pipefail
           [[ -n "${PACKAGES}" ]] || { echo "::error::empty package list in a main unit lane"; exit 1; }
+          case "${TARGETS}" in
+            "--lib"|"--bins"|"--lib --bins") ;;
+            *) echo "::error::unexpected unit targets '${TARGETS}'"; exit 1 ;;
+          esac
           # An empty RUST_MIN_STACK would drop tests to Rust's 2 MiB default, so it
           # is exported only when the row sets one.
           if [[ -n "${MIN_STACK}" ]]; then export RUST_MIN_STACK="${MIN_STACK}"; fi
@@ -1702,7 +1712,7 @@ jobs:
             echo "mcp-test-server fixture: ${MEERKAT_MCP_TEST_SERVER}"
           fi
           # shellcheck disable=SC2086
-          ./scripts/repo-cargo nextest run ${PACKAGES} --lib --bins --profile ci-pr \
+          ./scripts/repo-cargo nextest run ${PACKAGES} ${TARGETS} --profile ci-pr \
             --no-tests=pass --no-fail-fast --status-level fail --final-status-level fail
 
       - name: Upload sccache server log
@@ -1765,10 +1775,15 @@ jobs:
         shell: bash
         env:
           PACKAGES: ${{ matrix.packages }}
+          TARGETS: ${{ matrix.targets }}
           MIN_STACK: ${{ matrix.rust_min_stack }}
         run: |
           set -euo pipefail
           [[ -n "${PACKAGES}" ]] || { echo "::error::empty package list in a main unit lane"; exit 1; }
+          case "${TARGETS}" in
+            "--lib"|"--bins"|"--lib --bins") ;;
+            *) echo "::error::unexpected unit targets '${TARGETS}'"; exit 1 ;;
+          esac
           if [[ -n "${MIN_STACK}" ]]; then export RUST_MIN_STACK="${MIN_STACK}"; fi
           # shellcheck disable=SC2086
           fixture="$(scripts/mcp-test-server-fixture --if-needed ${PACKAGES})"
@@ -1777,7 +1792,7 @@ jobs:
             echo "mcp-test-server fixture: ${MEERKAT_MCP_TEST_SERVER}"
           fi
           # shellcheck disable=SC2086
-          ./scripts/repo-cargo nextest run ${PACKAGES} --lib --bins --profile ci-pr \
+          ./scripts/repo-cargo nextest run ${PACKAGES} ${TARGETS} --profile ci-pr \
             --no-tests=pass --no-fail-fast --status-level fail --final-status-level fail
 
       - name: Upload sccache server log
