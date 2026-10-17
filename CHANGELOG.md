@@ -1273,6 +1273,27 @@ them.
   no relative directory and no directory a confined process could change. In
   0.9.2 it ran `/bin/stty` regardless, so on such a host `rkat` refused to
   read a secret typed at the terminal (the 0.9.2 known limitation).
+- A mob Stop no longer holds up every later mob command for one session wait
+  per member. It cancelled every member session's checkpoint gate, then held
+  every member's run starts, one member after another, and each of those
+  steps can wait on that member's session: an in-flight checkpoint save holds
+  its gate, and a running turn's commit holds the session's mutation gate. A
+  Stop of a large busy mob blocked its actor for seconds. Both phases now run
+  concurrently per member (run-start holds 32 at a time) and keep their order
+  (every hold before any interrupt); a failed Stop still reports its first
+  failure in roster order. Every member that can be held is now held even
+  when another member's hold fails (before, the members after the first
+  failure were not held), and a failed Stop now releases every member's
+  hold again (before, they stayed held), except while the actor is
+  fail-stopping for cold recovery, where cold replay decides. After a
+  failed Stop the mob stays Running and input queued before the Stop runs,
+  but the Stop's lifecycle intent stays pending: new member input is
+  refused with `LifecycleOperationPending { intent: "stop" }` until a
+  retried Stop completes and the mob is resumed, or a Reset takes the
+  intent over (Resume alone does not clear it: it resumes only a Stopped
+  mob). The actor's inline-step watchdog now names each Stop stage
+  (`stop_checkpointer_cancel`, `stop_run_start_holds`, and so on) in its
+  `stage_timings_ms`.
 
 ### Known issues
 

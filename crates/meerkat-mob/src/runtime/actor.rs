@@ -3150,6 +3150,48 @@ impl SpawnInlineStage {
     }
 }
 
+/// Typed stages of the inline `Stop` command step. A Stop's inline work grows
+/// with the mob's member count, so the watchdog names the running stage and,
+/// for a Stop that exceeds its budget, reports every stage's elapsed time: a
+/// slow Stop names its slow phase.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum StopInlineStage {
+    /// Placed completion lifecycle quiesce and cancellation requests.
+    PlacedCompletionCleanup,
+    /// Pending spawns failed with the stop reason.
+    PendingSpawns,
+    /// Pending peer deliveries cancelled.
+    PeerDeliveries,
+    /// Every member session's checkpoint gate cancelled.
+    CheckpointerCancel,
+    /// Every member's run starts held (#1500).
+    RunStartHolds,
+    /// Autonomous members' kickoff stops and interrupt dispatch.
+    AutonomousStops,
+    /// The orchestrator transition and the durable `MobStopped` commit.
+    StoppedCommit,
+}
+
+impl StopInlineStage {
+    pub(super) const fn as_str(self) -> &'static str {
+        match self {
+            Self::PlacedCompletionCleanup => "stop_placed_completion_cleanup",
+            Self::PendingSpawns => "stop_pending_spawns",
+            Self::PeerDeliveries => "stop_peer_deliveries",
+            Self::CheckpointerCancel => "stop_checkpointer_cancel",
+            Self::RunStartHolds => "stop_run_start_holds",
+            Self::AutonomousStops => "stop_autonomous_stops",
+            Self::StoppedCommit => "stop_stopped_commit",
+        }
+    }
+}
+
+/// Run-start holds a Stop keeps in flight at once. Each waits on its own
+/// member's runtime, so a Stop holds its members concurrently, bounded so a
+/// large mob does not contend every session gate (or, for placed members,
+/// every host) at the same moment.
+pub(super) const STOP_RUN_START_HOLD_CONCURRENCY: usize = 32;
+
 /// Inline-step watchdog (#1102 observability). The loop marks the start of
 /// every command dispatch and the arms refine the current step name; a
 /// checker task warns once when the running step exceeds
@@ -3236,6 +3278,11 @@ impl ActorInlineStepWatchdog {
 
     /// Enter one typed `Spawn` stage (#1249).
     pub(super) fn set_spawn_stage(&self, stage: SpawnInlineStage) {
+        self.set_step(stage.as_str());
+    }
+
+    /// Enter one typed `Stop` stage.
+    pub(super) fn set_stop_stage(&self, stage: StopInlineStage) {
         self.set_step(stage.as_str());
     }
 
@@ -18072,12 +18119,12 @@ impl MobActor {
         }
     }
 
-    /// Hold roster members' run starts (#1500), returning each member's
-    /// outcome. Shared by Stop, which holds every member and records the
-    /// outcomes in its report, and Shutdown, which holds only the
-    /// members whose runtime this mob hosts (`local_only`): a remote member's
-    /// host is not contacted during Shutdown, which never probes a placed
-    /// member it has no live channel to.
+    /// Hold roster members' run starts (#1500) for a Shutdown, returning each
+    /// member's outcome: it holds only the members whose runtime this mob
+    /// hosts (`local_only`), one after another. A remote member's host is not
+    /// contacted during Shutdown, which never probes a placed member it has no
+    /// live channel to. A Stop holds every member concurrently instead
+    /// ([`Self::hold_every_member_run_starts_concurrently`]).
     async fn hold_all_member_run_starts(
         &mut self,
         local_only: bool,
@@ -18128,7 +18175,7 @@ impl MobActor {
     /// before the stop. Each autonomous member is held again with its exact
     /// cancel by its interrupt task, whose outcome then replaces this one.
     async fn hold_all_member_run_starts_for_stop(&mut self) -> Result<(), MobError> {
-        let mut outcomes = self.hold_all_member_run_starts(false).await?;
+        let mut outcomes = self.hold_every_member_run_starts_concurrently().await?;
         // A retried Stop keeps the outcomes of interrupts that already
         // completed for the same incarnation.
         for (identity, completed) in &self.autonomous_stop_interrupted {
@@ -18136,6 +18183,88 @@ impl MobActor {
         }
         self.stop_member_outcomes = outcomes;
         Ok(())
+    }
+
+    /// Hold every roster member's run starts for a Stop (#1500), the holds
+    /// running concurrently. Each hold waits on its own member's runtime (its
+    /// session's mutation gate, which a running turn's commit holds, or its
+    /// host for a placed member), so one busy member does not delay the
+    /// others, and the inline Stop lasts about one hold rather than all of
+    /// them in turn. The per-member decisions stay synchronous and in roster
+    /// order. Every member that can be held is held, and the first failure in
+    /// roster order is returned; holds are idempotent per reason, so a retried
+    /// Stop holds again.
+    async fn hold_every_member_run_starts_concurrently(
+        &mut self,
+    ) -> Result<BTreeMap<AgentIdentity, super::stop_report::MemberStopOutcome>, MobError> {
+        let entries = {
+            let roster = self.roster.read().await;
+            roster.list().cloned().collect::<Vec<_>>()
+        };
+        let mut outcomes = BTreeMap::new();
+        let mut first_error: Option<(usize, MobError)> = None;
+        let mut holds = Vec::with_capacity(entries.len());
+        for (position, entry) in entries.iter().enumerate() {
+            if self.placed_member_carrier_dormant(&entry.agent_identity) {
+                outcomes.insert(
+                    entry.agent_identity.clone(),
+                    super::stop_report::MemberStopOutcome {
+                        run: super::stop_report::MemberStopRun::NoRun,
+                        starts: super::stop_report::MemberRunStarts::NotBound,
+                    },
+                );
+                continue;
+            }
+            match self.autonomous_stop_interrupt_incarnation(entry) {
+                Ok(incarnation) => {
+                    holds.push((position, entry.agent_identity.clone(), incarnation));
+                }
+                Err(error) => {
+                    if first_error.is_none() {
+                        first_error = Some((position, error));
+                    }
+                }
+            }
+        }
+        let provisioner = Arc::clone(&self.provisioner);
+        let held =
+            futures::stream::iter(holds.into_iter().map(|(position, identity, incarnation)| {
+                let provisioner = Arc::clone(&provisioner);
+                async move {
+                    let result = converge_autonomous_stop_member_result(
+                        provisioner
+                            .stop_member_runtime(
+                                &incarnation.member_ref,
+                                incarnation.expected_member.as_ref(),
+                                false,
+                            )
+                            .await,
+                    );
+                    (position, identity, result)
+                }
+            }))
+            .buffer_unordered(STOP_RUN_START_HOLD_CONCURRENCY)
+            .collect::<Vec<_>>()
+            .await;
+        for (position, identity, result) in held {
+            match result {
+                Ok(outcome) => {
+                    outcomes.insert(identity, outcome);
+                }
+                Err(error) => {
+                    if first_error
+                        .as_ref()
+                        .is_none_or(|(first, _)| position < *first)
+                    {
+                        first_error = Some((position, error));
+                    }
+                }
+            }
+        }
+        match first_error {
+            Some((_, error)) => Err(error),
+            None => Ok(outcomes),
+        }
     }
 
     async fn prepare_all_autonomous_member_stops(
@@ -18767,6 +18896,21 @@ impl MobActor {
         }
         if stop_result.is_err() {
             self.provisioner.rearm_all_checkpointers().await;
+            // A Stop that did not happen leaves the mob running (#1500: Stop
+            // is a pause), so it releases the holds it took: a member left
+            // held would keep its queued input waiting while the mob runs.
+            // The Stop's error stays the reported one. An actor
+            // fail-stopping for cold recovery releases none: cold replay
+            // alone decides whether work can start.
+            if !self.durable_uncertainty_fail_stop
+                && let Err(error) = self.release_all_member_run_starts().await
+            {
+                tracing::warn!(
+                    mob_id = %self.definition.id,
+                    error = %error,
+                    "a failed stop could not release every member's run-start hold"
+                );
+            }
         }
         stop_result
     }
@@ -27607,6 +27751,8 @@ impl MobActor {
                         reply_tx.send(Ok(self.machine_projection_for_identity(&agent_identity)));
                 }
                 MobCommand::Stop { reply_tx } => {
+                    self.inline_step_watchdog
+                        .set_stop_stage(StopInlineStage::PlacedCompletionCleanup);
                     let result = if self.state() == MobState::Destroyed {
                         Err(self.invalid_transition_to(MobState::Stopped))
                     } else if let Err(error) = self
@@ -27625,9 +27771,13 @@ impl MobActor {
                             "stop_command_admission",
                         ) {
                             Ok(()) => {
+                                self.inline_step_watchdog
+                                    .set_stop_stage(StopInlineStage::PendingSpawns);
                                 let mut stop_result =
                                     self.fail_all_pending_spawns("mob is stopping").await;
                                 if stop_result.is_ok() {
+                                    self.inline_step_watchdog
+                                        .set_stop_stage(StopInlineStage::PeerDeliveries);
                                     if let Err(error) =
                                         self.cancel_pending_peer_deliveries("mob is stopping").await
                                     {
@@ -27642,19 +27792,26 @@ impl MobActor {
                                     // in-flight saves that complete after the loop stops don't
                                     // race with subsequent external cleanup (e.g. DML deletes).
                                     if stop_result.is_ok() {
+                                        self.inline_step_watchdog
+                                            .set_stop_stage(StopInlineStage::CheckpointerCancel);
                                         self.provisioner.cancel_all_checkpointers().await;
                                     }
                                 }
                                 // Hold every member's run starts before any
                                 // interrupt (#1500): input admitted before the
                                 // stop runs only after Resume.
-                                if stop_result.is_ok()
-                                    && let Err(error) =
+                                if stop_result.is_ok() {
+                                    self.inline_step_watchdog
+                                        .set_stop_stage(StopInlineStage::RunStartHolds);
+                                    if let Err(error) =
                                         self.hold_all_member_run_starts_for_stop().await
-                                {
-                                    stop_result = Err(error);
+                                    {
+                                        stop_result = Err(error);
+                                    }
                                 }
                                 if stop_result.is_ok() {
+                                    self.inline_step_watchdog
+                                        .set_stop_stage(StopInlineStage::AutonomousStops);
                                     match Box::pin(self.prepare_all_autonomous_member_stops(
                                         PendingAutonomousStopKind::Stop,
                                     ))
@@ -27696,6 +27853,8 @@ impl MobActor {
                                         }
                                     }
                                 }
+                                self.inline_step_watchdog
+                                    .set_stop_stage(StopInlineStage::StoppedCommit);
                                 Box::pin(self.complete_stop_after_member_stops(stop_result))
                                     .await
                             }

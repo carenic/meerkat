@@ -12310,6 +12310,8 @@ Ok::<(), RuntimeDriverError>(())
         session_id: &SessionId,
         reason: super::RunStartHoldReason,
     ) -> Result<super::RunStartsHold, RuntimeDriverError> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _in_flight = self.enter_hold_run_starts_for_test(session_id).await?;
         let _gate = self
             .lock_current_durability_ready_session_mutation_gate(session_id)
             .await?;
