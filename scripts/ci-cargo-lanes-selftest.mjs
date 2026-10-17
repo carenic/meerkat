@@ -11,6 +11,7 @@ import { fileURLToPath } from "node:url";
 import { dirname, join, resolve } from "node:path";
 import {
   CI_ROW_STEPS,
+  rowStepBindings,
   HOOK_SCRIPT,
   bindRowSteps,
   checkHookCoverage,
@@ -24,11 +25,16 @@ import {
   GOVERNANCE_DOC_PATTERNS,
   MOB_CHAIN_CLIPPY_HEADS,
   MOB_CHAIN_INVALIDATED,
+  ROW_DURATIONS,
   UNIT_SOLO_PACKAGES,
+  WAVE_FIRST_SECONDS,
+  WAVE_LANES,
   lockScope,
   parseCargoLock,
+  readRowDurations,
 } from "./ci-cargo-lanes.mjs";
 import { readMetadata, workspacePackages } from "./rust-test-selector.mjs";
+import { durationsOf, rowOf } from "./ci-row-durations.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const classifier = resolve(here, "ci-cargo-lanes.mjs");
@@ -501,10 +507,13 @@ function assertArchivedLanes(plan, label) {
   }
   const workspaceGithub = run(["--format", "github", "--", "Cargo.lock"]);
   assert.equal(workspaceGithub.status, 0, workspaceGithub.stderr);
-  const closureMatrixLine = workspaceGithub.stdout.split("\n").find((line) => line.startsWith("closure_test_matrix="));
-  const closureInclude = JSON.parse(closureMatrixLine.slice("closure_test_matrix=".length)).include;
+  // The rows of both waves (long rows first): the first wave's matrix and the rest's.
+  const closureInclude = ["closure_test_matrix", "closure_test_rest_matrix"].flatMap((key) => {
+    const line = workspaceGithub.stdout.split("\n").find((candidate) => candidate.startsWith(`${key}=`));
+    return JSON.parse(line.slice(key.length + 1)).include.filter((row) => row.name !== "none");
+  });
   assert.deepEqual(
-    closureInclude.filter((row) => row.partition !== "").map((row) => [row.name, row.partition]),
+    closureInclude.filter((row) => row.partition !== "").map((row) => [row.name, row.partition]).sort(),
     [["tests meerkat canaries 1/3", "count:1/3"], ["tests meerkat canaries 2/3", "count:2/3"], ["tests meerkat canaries 3/3", "count:3/3"]],
     "the matrix carries each canary row's partition, and only theirs",
   );
@@ -1203,6 +1212,150 @@ for (const path of [
   assertUnitJobsMatch(readFileSync(resolve(root, ".github/workflows/ci.yml"), "utf8"), "ci.yml");
 }
 
+// Long rows first: each two-wave lane's rows split by their measured
+// duration (ROW_DURATIONS, or --row-durations): rows at WAVE_FIRST_SECONDS
+// or more, and rows never measured, start first; a main unit row may carry
+// a unit row's measurement; every row is in exactly one wave; and the
+// GitHub outputs split each lane's matrix and count the same way.
+{
+  const scratch = mkdtempSync(join(tmpdir(), "ci-lanes-waves-"));
+  try {
+    const table = (rows, extra = {}) => {
+      const file = join(scratch, `table-${Object.keys(rows).length}-${Math.random().toString(36).slice(2)}.json`);
+      writeFileSync(file, JSON.stringify({ schema_version: 1, rows, ...extra }));
+      return file;
+    };
+    const wavesFor = (rows, paths = ["crates/meerkat-core/src/lib.rs"]) => planFor(paths, ["--event", "push", "--row-durations", table(rows)]).waves;
+    const below = WAVE_FIRST_SECONDS - 1;
+    let waves = wavesFor({ "clippy:core": below, "main-unit:core": WAVE_FIRST_SECONDS });
+    assert.deepEqual(waves.clippy, { first: [], rest: ["core"] }, "a short Clippy row waits");
+    assert.ok(waves.main_unit.first.includes("core"), "a row measured at the threshold starts first");
+    waves = wavesFor({ "unit:core": below });
+    assert.ok(waves.main_unit.rest.includes("core"), "a main unit row carries its unit row's measurement");
+    assert.ok(!waves.main_unit.first.includes("core"));
+    waves = wavesFor({ "main-unit:core": WAVE_FIRST_SECONDS, "unit:core": below });
+    assert.ok(waves.main_unit.first.includes("core"), "its own measurement comes before the unit row's");
+    // Rows never measured start first: an empty table plans every row first.
+    const workspace = planFor(["Cargo.toml"], ["--event", "push", "--row-durations", table({})]);
+    for (const [lane, rows] of [
+      ["clippy", workspace.shards],
+      ["main_unit", [...workspace.main_unit_shards, ...workspace.main_feature_unit_shards]],
+      ["closure_tests", workspace.closure_test_rows],
+      ["feature_check", workspace.feature_check_jobs],
+    ]) {
+      assert.deepEqual(workspace.waves[lane], { first: rows.map((row) => row.name), rest: [] }, `${lane}: an unmeasured row starts first`);
+    }
+    // The real table splits a whole-workspace push into both waves, each row in one.
+    const real = planFor(["Cargo.toml"], ["--event", "push"]);
+    for (const [lane, rows] of [
+      ["clippy", real.shards],
+      ["main_unit", [...real.main_unit_shards, ...real.main_feature_unit_shards]],
+      ["closure_tests", real.closure_test_rows],
+      ["feature_check", real.feature_check_jobs],
+    ]) {
+      const { first, rest } = real.waves[lane];
+      assert.ok(first.length > 0 && rest.length > 0, `${lane}: the measured table splits a workspace push`);
+      assert.deepEqual([...first, ...rest].sort(), rows.map((row) => row.name).sort(), `${lane}: every row is in exactly one wave`);
+    }
+    const github = run(["--format", "github", "--event", "push", "--", "Cargo.toml"]);
+    assert.equal(github.status, 0, github.stderr);
+    const lines = Object.fromEntries(github.stdout.trim().split("\n").map((line) => [line.slice(0, line.indexOf("=")), line.slice(line.indexOf("=") + 1)]));
+    const names = (key) => JSON.parse(lines[key]).include.map((row) => row.name).filter((name) => name !== "none");
+    for (const [lane, first, rest, firstCount, restCount, total] of [
+      ["clippy", "shard_matrix", "shard_rest_matrix", "shard_first_count", "shard_rest_count", "shard_count"],
+      ["main_unit", "main_unit_shard_matrix", "main_unit_rest_shard_matrix", "main_unit_first_count", "main_unit_rest_count", "main_unit_shard_count"],
+      ["closure_tests", "closure_test_matrix", "closure_test_rest_matrix", "closure_test_first_count", "closure_test_rest_count", "closure_test_count"],
+      ["feature_check", "feature_check_matrix", "feature_check_rest_matrix", "feature_check_first_count", "feature_check_rest_count", "feature_check_count"],
+    ]) {
+      assert.deepEqual(names(first), real.waves[lane].first, `${lane}: the first-wave matrix holds the first wave`);
+      assert.deepEqual(names(rest), real.waves[lane].rest, `${lane}: the rest matrix holds the rest`);
+      assert.equal(Number(lines[firstCount]), real.waves[lane].first.length, `${lane}: first count`);
+      assert.equal(Number(lines[restCount]), real.waves[lane].rest.length, `${lane}: rest count`);
+      assert.equal(Number(lines[total]), real.waves[lane].first.length + real.waves[lane].rest.length, `${lane}: the count is the lane's whole`);
+    }
+    // A table the planner cannot read stops the plan.
+    for (const [label, file] of [
+      ["another schema", table({ "clippy:core": 600 }, { schema_version: 2 })],
+      ["an unknown lane", table({ "integration:core": 600 })],
+      ["zero seconds", table({ "clippy:core": 0 })],
+      ["fractional seconds", table({ "clippy:core": 600.5 })],
+      ["seconds as text", table({ "clippy:core": "600" })],
+    ]) {
+      const result = run(["--format", "json", "--row-durations", file, "--", "crates/meerkat-core/src/lib.rs"]);
+      assert.equal(result.status, 1, `${label}: the plan stops`);
+    }
+    // The table's generator: a row is its lane and its matrix name, and keeps
+    // the longest successful job.
+    assert.equal(rowOf("Clippy (mob)"), "clippy:mob");
+    assert.equal(rowOf("Main unit tests (meerkat[openai-live])"), "main-unit:meerkat[openai-live]");
+    assert.equal(rowOf("Closure tests (tests mob 1/4+3)"), "closure-tests:tests mob 1/4+3");
+    assert.equal(rowOf("Feature combinations (mob+4 bazel set)"), "feature-check:mob+4 bazel set");
+    assert.equal(rowOf("Unit tests (core+4)"), "unit:core+4");
+    assert.equal(rowOf("CI gate"), null);
+    assert.equal(rowOf("Integration tests (runtime)"), null);
+    const job = (name, conclusion, seconds) => ({ name, conclusion, started_at: "2026-01-01T00:00:00Z", completed_at: new Date(Date.parse("2026-01-01T00:00:00Z") + seconds * 1000).toISOString() });
+    assert.deepEqual(
+      durationsOf([job("Clippy (mob)", "success", 600), job("Clippy (mob)", "success", 700), job("Clippy (mob)", "failure", 900), job("Clippy (rpc)", "cancelled", 800), job("CI gate", "success", 30)]),
+      { "clippy:mob": 700 },
+      "the longest successful job of each row",
+    );
+    // The checked-in table is readable and measures only the planned lanes.
+    const durations = readRowDurations(resolve(root, ROW_DURATIONS));
+    assert.ok(Object.keys(durations).length > 0, "the checked-in table measures rows");
+    for (const key of Object.keys(durations)) {
+      assert.ok(["unit", ...WAVE_LANES].includes(key.slice(0, key.indexOf(":"))), `${key} names a measured lane`);
+    }
+  } finally {
+    rmSync(scratch, { recursive: true, force: true });
+  }
+}
+
+// The two-wave lanes in ci.yml: each lane's rest wave is a copy of its job
+// that differs only in its key, its needs (the stagger job), its row count
+// and its matrix; the stagger job waits on a push only; the short lanes queue
+// behind it, the long single lanes do not; and the gate waits for every wave.
+{
+  const workflow = readFileSync(resolve(root, ".github/workflows/ci.yml"), "utf8");
+  for (const [job, firstCount, restCount, matrix, restMatrix] of [
+    ["clippy", "shard_first_count", "shard_rest_count", "shard_matrix", "shard_rest_matrix"],
+    ["main-unit", "main_unit_first_count", "main_unit_rest_count", "main_unit_shard_matrix", "main_unit_rest_shard_matrix"],
+    ["closure-tests", "closure_test_first_count", "closure_test_rest_count", "closure_test_matrix", "closure_test_rest_matrix"],
+    ["feature-check", "feature_check_first_count", "feature_check_rest_count", "feature_check_matrix", "feature_check_rest_matrix"],
+  ]) {
+    const first = jobLines(workflow, job);
+    const rest = jobLines(workflow, `${job}-rest`);
+    assert.equal(first.length, rest.length, `${job}: the rest wave has the job's lines`);
+    first.forEach((line, index) => {
+      const twin = rest[index];
+      if (line === twin) return;
+      if (line === "    needs: changes") return assert.equal(twin, "    needs: [changes, stagger]", `${job}: the rest wave waits for the stagger job`);
+      if (line.startsWith("    if: ")) {
+        assert.ok(line.includes(`needs.changes.outputs.${firstCount} != '0'`), `${job}: the first wave runs when it holds rows`);
+        return assert.equal(twin, line.replace(firstCount, restCount), `${job}: the rest wave runs when it holds rows, on the job's condition`);
+      }
+      if (line.startsWith("      matrix: ")) {
+        assert.equal(line, `      matrix: \${{ fromJSON(needs.changes.outputs.${matrix}) }}`, `${job}: first-wave matrix`);
+        return assert.equal(twin, `      matrix: \${{ fromJSON(needs.changes.outputs.${restMatrix}) }}`, `${job}: rest matrix`);
+      }
+      assert.fail(`${job}: the rest wave differs from the job in ${JSON.stringify(line)} / ${JSON.stringify(twin)}`);
+    });
+  }
+  const stagger = jobLines(workflow, "stagger").join("\n");
+  assert.match(stagger, /^    needs: changes$/m, "the stagger job follows the classification");
+  assert.match(stagger, /STAGGER_SECONDS: \$\{\{ github\.event_name == 'pull_request' && '0' \|\| '30' \}\}/, "it waits on a push only");
+  assert.match(stagger, /run: sleep "\$\{STAGGER_SECONDS\}"$/m);
+  for (const job of ["ratchets", "integration", "governed-jsonl", "closure-check", "sdk-host", "example-web", "wasm-timers", "bazel-graph"]) {
+    assert.ok(jobLines(workflow, job).includes("    needs: [changes, stagger]"), `${job} is a short lane: it waits for the stagger job`);
+  }
+  for (const job of ["wasm-check", "governance-gates", "mcp-confinement-positive", "tlc-audits", "main-unit-archive-build", "clippy", "main-unit", "closure-tests", "feature-check"]) {
+    assert.ok(jobLines(workflow, job).includes("    needs: changes"), `${job} starts with the first wave`);
+  }
+  const gate = jobLines(workflow, "gate");
+  for (const job of ["stagger", "clippy-rest", "main-unit-rest", "closure-tests-rest", "feature-check-rest"]) {
+    assert.ok(gate.includes(`      - ${job}`), `the gate waits for ${job}`);
+  }
+}
+
 // Feature-gated unit suites: the default-feature unit lanes cannot run a
 // test behind a non-default feature, so every Rust-relevant push to main
 // carries every suite as an extra main unit row, and a pull request carries
@@ -1237,8 +1390,13 @@ for (const path of [
   assert.equal(github.status, 0, github.stderr);
   const lines = Object.fromEntries(github.stdout.trim().split("\n").map((line) => [line.slice(0, line.indexOf("=")), line.slice(line.indexOf("=") + 1)]));
   const unitRows = JSON.parse(lines.unit_shard_matrix).include;
-  const mainRows = JSON.parse(lines.main_unit_shard_matrix).include;
+  // The main unit rows of both waves (long rows first).
+  const mainRows = [
+    ...JSON.parse(lines.main_unit_shard_matrix).include,
+    ...JSON.parse(lines.main_unit_rest_shard_matrix).include,
+  ];
   assert.equal(Number(lines.main_unit_shard_count), mainRows.length);
+  assert.equal(Number(lines.main_unit_first_count) + Number(lines.main_unit_rest_count), mainRows.length);
   // A push's unit matrix holds only the placeholder row; its unit rows are
   // main matrix rows.
   assert.equal(Number(lines.unit_shard_count), 0);
@@ -1710,7 +1868,10 @@ for (const path of [
   assert.equal(github.status, 0, github.stderr);
   const lines = Object.fromEntries(github.stdout.trim().split("\n").map((line) => [line.slice(0, line.indexOf("=")), line.slice(line.indexOf("=") + 1)]));
   assert.equal(lines.closure_test_count, String(plan.closure_test_rows.length));
-  assert.equal(JSON.parse(lines.closure_test_matrix).include.length, plan.closure_test_rows.length);
+  // The rows of both waves (long rows first).
+  const rowsOf = (key) => JSON.parse(lines[key]).include.filter((row) => row.name !== "none");
+  assert.equal(rowsOf("closure_test_matrix").length + rowsOf("closure_test_rest_matrix").length, plan.closure_test_rows.length);
+  assert.equal(Number(lines.closure_test_first_count) + Number(lines.closure_test_rest_count), plan.closure_test_rows.length);
   assert.equal(lines.hook_retained_lanes, "workspace unit lane", "the plan log names the lane it leaves without a row");
   assert.equal(lines.hook_retained_count, String(plan.hook_coverage.hook_retained));
 }
@@ -1775,7 +1936,8 @@ for (const path of [
   assert.throws(() => assertHookParity({ ...plan, test_scope: plan.packages }, "narrowed scope"));
   // Every row-executing step is bound: with no workflow, each one is missing.
   const unbound = checkHookCoverage(plan, { workflowText: "" });
-  assert.equal(unbound.errors.length, CI_ROW_STEPS.length, "every row-executing step is bound");
+  assert.equal(unbound.errors.length, rowStepBindings().length, "every row-executing step is bound");
+  assert.deepEqual(rowStepBindings().map((spec) => spec.job), ["closure-tests", "closure-tests-rest"], "both closure-tests waves are bound");
 }
 
 // What a plan may leave without a row: the lib binaries of a lane of the
@@ -1834,9 +1996,20 @@ for (const path of [
 {
   const workflow = readFileSync(resolve(root, ".github/workflows/ci.yml"), "utf8");
   assert.deepEqual(bindRowSteps(workflow), [], "the real workflow binds");
+  // closure-tests and its rest-wave copy (long rows first) are bound the
+  // same way: an anchor in their shared text occurs once in each, the
+  // first in closure-tests, and the same mutation of the copy is refused too.
+  const jobs = rowStepBindings().map((spec) => spec.job);
   const mutated = (from, to) => {
-    assert.equal(workflow.split(from).length, 2, `mutation anchor is unique: ${from}`);
-    return bindRowSteps(workflow.replace(from, to));
+    const parts = workflow.split(from);
+    assert.ok(parts.length === 2 || parts.length === jobs.length + 1, `mutation anchor is unique or once per bound job: ${from}`);
+    const mutate = (index) => bindRowSteps(parts.slice(0, index + 1).join(from) + to + parts.slice(index + 1).join(from));
+    if (parts.length === jobs.length + 1) {
+      for (let index = 1; index < jobs.length; index += 1) {
+        assert.ok(mutate(index).some((error) => error.includes(`job ${jobs[index]}:`)), `the same mutation of ${jobs[index]} is refused: ${from}`);
+      }
+    }
+    return mutate(0);
   };
   const run = '          ./scripts/repo-cargo nextest run "${selection[@]}" --no-tests="${NO_TESTS}" --no-fail-fast --status-level slow --final-status-level slow\n';
   const runOnly = mutated(run, run.replace('"${selection[@]}"', `"\${selection[@]}" -E 'none()'`));
@@ -1894,9 +2067,14 @@ for (const path of [
     "      matrix: ${{ fromJSON(needs.changes.outputs.integration_matrix) }}\n",
   );
   assert.ok(wrongMatrix.some((error) => error.includes("its matrix is not")), "the closure-tests job runs the closure matrix");
+  const wrongRestMatrix = mutated(
+    "      matrix: ${{ fromJSON(needs.changes.outputs.closure_test_rest_matrix) }}\n",
+    "      matrix: ${{ fromJSON(needs.changes.outputs.closure_test_matrix) }}\n",
+  );
+  assert.ok(wrongRestMatrix.some((error) => error.includes("job closure-tests-rest: its matrix is not")), "the rest wave runs the rest matrix");
   const otherRunner = mutated(
-    "    if: ${{ needs.changes.result == 'success' && needs.changes.outputs.closure_test_count != '0' }}\n    runs-on: ubuntu-24.04\n",
-    "    if: ${{ needs.changes.result == 'success' && needs.changes.outputs.closure_test_count != '0' }}\n    runs-on: ubuntu-22.04\n",
+    "    if: ${{ needs.changes.result == 'success' && needs.changes.outputs.closure_test_first_count != '0' }}\n    runs-on: ubuntu-24.04\n",
+    "    if: ${{ needs.changes.result == 'success' && needs.changes.outputs.closure_test_first_count != '0' }}\n    runs-on: ubuntu-22.04\n",
   );
   assert.ok(otherRunner.some((error) => error.includes("job closure-tests: it does not run on ubuntu-24.04")), "the job's runner is bound");
   const rewired = mutated(
@@ -1961,15 +2139,18 @@ for (const path of [
   );
 }
 
-// The matrix the closure-tests job runs is the plan's rows, field by field.
+// The matrices the closure-tests job and its rest wave run are the plan's
+// rows, field by field, each row in its wave.
 {
   const plan = planFor(["crates/meerkat-mob/src/lib.rs"]);
   const github = run(["--format", "github", "--", "crates/meerkat-mob/src/lib.rs"]);
   assert.equal(github.status, 0, github.stderr);
   const lines = Object.fromEntries(github.stdout.trim().split("\n").map((line) => [line.slice(0, line.indexOf("=")), line.slice(line.indexOf("=") + 1)]));
+  const inWave = (names) => plan.closure_test_rows.filter((row) => names.includes(row.name));
+  const rowsOf = (key) => JSON.parse(lines[key]).include.filter((row) => row.name !== "none");
   assert.deepEqual(
-    JSON.parse(lines.closure_test_matrix).include,
-    plan.closure_test_rows.map((row) => ({
+    [...rowsOf("closure_test_matrix"), ...rowsOf("closure_test_rest_matrix")],
+    [...inWave(plan.waves.closure_tests.first), ...inWave(plan.waves.closure_tests.rest)].map((row) => ({
       name: row.name,
       packages: row.package_flags,
       tests: row.test_flags,

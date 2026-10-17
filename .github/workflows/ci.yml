@@ -307,7 +307,10 @@ jobs:
       mcp_confinement_positive: ${{ steps.plan.outputs.mcp_confinement_positive }}
       deferred_to_push: ${{ steps.plan.outputs.deferred_to_push }}
       shard_count: ${{ steps.plan.outputs.shard_count }}
+      shard_first_count: ${{ steps.plan.outputs.shard_first_count }}
+      shard_rest_count: ${{ steps.plan.outputs.shard_rest_count }}
       shard_matrix: ${{ steps.plan.outputs.shard_matrix }}
+      shard_rest_matrix: ${{ steps.plan.outputs.shard_rest_matrix }}
       unit_shard_count: ${{ steps.plan.outputs.unit_shard_count }}
       unit_shard_matrix: ${{ steps.plan.outputs.unit_shard_matrix }}
       unit_deferred: ${{ steps.plan.outputs.unit_deferred }}
@@ -315,7 +318,10 @@ jobs:
       unit_rows_on_main: ${{ steps.plan.outputs.unit_rows_on_main }}
       unit_rows_on_main_count: ${{ steps.plan.outputs.unit_rows_on_main_count }}
       main_unit_shard_count: ${{ steps.plan.outputs.main_unit_shard_count }}
+      main_unit_first_count: ${{ steps.plan.outputs.main_unit_first_count }}
+      main_unit_rest_count: ${{ steps.plan.outputs.main_unit_rest_count }}
       main_unit_shard_matrix: ${{ steps.plan.outputs.main_unit_shard_matrix }}
+      main_unit_rest_shard_matrix: ${{ steps.plan.outputs.main_unit_rest_shard_matrix }}
       main_archive_build_count: ${{ steps.plan.outputs.main_archive_build_count }}
       main_archive_build_matrix: ${{ steps.plan.outputs.main_archive_build_matrix }}
       main_archive_run_count: ${{ steps.plan.outputs.main_archive_run_count }}
@@ -326,9 +332,15 @@ jobs:
       hook_binary_count: ${{ steps.plan.outputs.hook_binary_count }}
       hook_retained_count: ${{ steps.plan.outputs.hook_retained_count }}
       closure_test_count: ${{ steps.plan.outputs.closure_test_count }}
+      closure_test_first_count: ${{ steps.plan.outputs.closure_test_first_count }}
+      closure_test_rest_count: ${{ steps.plan.outputs.closure_test_rest_count }}
       closure_test_matrix: ${{ steps.plan.outputs.closure_test_matrix }}
+      closure_test_rest_matrix: ${{ steps.plan.outputs.closure_test_rest_matrix }}
       feature_check_count: ${{ steps.plan.outputs.feature_check_count }}
+      feature_check_first_count: ${{ steps.plan.outputs.feature_check_first_count }}
+      feature_check_rest_count: ${{ steps.plan.outputs.feature_check_rest_count }}
       feature_check_matrix: ${{ steps.plan.outputs.feature_check_matrix }}
+      feature_check_rest_matrix: ${{ steps.plan.outputs.feature_check_rest_matrix }}
     steps:
       # Depth 2 is HEAD and its parents. The classifier diffs a pull
       # request's merge commit against its first parent, or a push against
@@ -440,7 +452,22 @@ jobs:
           node scripts/ci-cargo-lanes.mjs --format github --event "${EVENT_NAME}" \
             --base "${plan_base}" --head HEAD "${plan_args[@]}" \
             | tee "${RUNNER_TEMP}/ci-cargo-lanes.txt" >> "${GITHUB_OUTPUT}"
-          grep -vE '^(closure_flags|shard_matrix|unit_shard_matrix|main_unit_shard_matrix|main_archive_build_matrix|main_archive_run_matrix|integration_matrix|closure_test_matrix|feature_check_matrix)=' "${RUNNER_TEMP}/ci-cargo-lanes.txt"
+          grep -vE '^(closure_flags|shard_matrix|shard_rest_matrix|unit_shard_matrix|main_unit_shard_matrix|main_unit_rest_shard_matrix|closure_test_rest_matrix|feature_check_rest_matrix|main_archive_build_matrix|main_archive_run_matrix|integration_matrix|closure_test_matrix|feature_check_matrix)=' "${RUNNER_TEMP}/ci-cargo-lanes.txt"
+
+  stagger:
+    name: Stagger the short rows
+    needs: changes
+    # Long rows first (scripts/ci-cargo-lanes.mjs): the rest wave of each
+    # two-wave lane and the short lanes need this job, so they queue after
+    # the long rows; on a push it also waits 30 s while those take runners
+    # from the account's pool. A pull request does not wait.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Let the long rows take runners first
+        env:
+          STAGGER_SECONDS: ${{ github.event_name == 'pull_request' && '0' || '30' }}
+        run: sleep "${STAGGER_SECONDS}"
 
   fmt-governance:
     name: Format + governance
@@ -580,7 +607,7 @@ jobs:
 
   ratchets:
     name: Generation ratchets
-    needs: changes
+    needs: [changes, stagger]
     runs-on: ubuntu-24.04
     timeout-minutes: 40
     env:
@@ -822,7 +849,7 @@ jobs:
   clippy:
     name: Clippy (${{ matrix.name }})
     needs: changes
-    if: ${{ needs.changes.outputs.rust_changed == 'true' }}
+    if: ${{ needs.changes.outputs.rust_changed == 'true' && needs.changes.outputs.shard_first_count != '0' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 40
     strategy:
@@ -891,6 +918,70 @@ jobs:
       - name: Upload sccache server log
         if: ${{ always() }}
         # Diagnostics can never fail a lane.
+        continue-on-error: true
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: sccache-log-clippy-${{ matrix.name }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: /home/runner/work/_temp/sccache.log
+          if-no-files-found: ignore
+          retention-days: 3
+
+  clippy-rest:
+    name: Clippy (${{ matrix.name }})
+    needs: [changes, stagger]
+    # The rest wave of `clippy` (long rows first, scripts/ci-cargo-lanes.mjs):
+    # a copy of that job, which scripts/ci-cargo-lanes-selftest.mjs checks.
+    if: ${{ needs.changes.outputs.rust_changed == 'true' && needs.changes.outputs.shard_rest_count != '0' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.changes.outputs.shard_rest_matrix) }}
+    env:
+      RUSTC_WRAPPER: ${{ github.workspace }}/scripts/ci-clippy-sccache-wrapper
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Setup Rust
+        uses: ./.github/actions/setup-rust-ci
+
+      - name: Setup sccache
+        uses: ./.github/actions/setup-sccache-ci
+        with:
+          bucket: ${{ env.SCCACHE_GCS_BUCKET_NAME }}
+          workload_identity_provider: ${{ vars.MEERKAT_GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.MEERKAT_GCP_SERVICE_ACCOUNT }}
+          project_id: ${{ vars.MEERKAT_GCP_PROJECT_ID }}
+          key_prefix: sccache/${{ env.RUSTUP_TOOLCHAIN }}/linux-x64
+
+      - name: Setup mold linker
+        uses: rui314/setup-mold@339e96b4ff1f3bd865856ba4cbbe8818a7acb038 # v1
+
+      - name: Cache cargo registry
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          save-if: ${{ github.event_name != 'workflow_dispatch' }}
+          shared-key: ci-registry
+          cache-targets: "false"
+          cache-on-failure: true
+
+      - name: Clippy (changed packages, the shard's targets, all features)
+        shell: bash
+        env:
+          PACKAGES: ${{ matrix.packages }}
+          TARGETS: ${{ matrix.targets }}
+        run: |
+          set -euo pipefail
+          [[ -n "${PACKAGES}" ]] || { echo "::error::empty package list in a clippy lane"; exit 1; }
+          case "${TARGETS}" in
+            "--all-targets"|"--lib"|"--bins"|"--lib --bins") ;;
+            *) echo "::error::unexpected clippy targets '${TARGETS}'"; exit 1 ;;
+          esac
+          ./scripts/repo-cargo clippy ${PACKAGES} --no-deps ${TARGETS} --all-features -- -D warnings
+
+      - name: Upload sccache server log
+        if: ${{ always() }}
         continue-on-error: true
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
@@ -988,7 +1079,7 @@ jobs:
 
   governed-jsonl:
     name: Governed JSONL
-    needs: changes
+    needs: [changes, stagger]
     # Default RPC features enable MCP and compile these three cases away.
     # Native dependency changes must retain this positive non-MCP profile.
     # The push runs it on every Rust change; a pull request leaves it there
@@ -1223,7 +1314,7 @@ jobs:
 
   integration:
     name: Integration tests (${{ matrix.name }})
-    needs: changes
+    needs: [changes, stagger]
     # A crate's tests/*.rs binaries run in no unit lane (those run --lib
     # --bins). Each row is an integration suite whose trigger packages
     # changed (INTEGRATION_SUITES in scripts/ci-cargo-lanes.mjs); measured on
@@ -1335,7 +1426,7 @@ jobs:
     # plans no rows (its plan counts them in deferred_to_push; on run
     # 38859112297 the 17 rows took 315-1779 s). Selected by the row count
     # alone.
-    if: ${{ needs.changes.result == 'success' && needs.changes.outputs.closure_test_count != '0' }}
+    if: ${{ needs.changes.result == 'success' && needs.changes.outputs.closure_test_first_count != '0' }}
     runs-on: ubuntu-24.04
     # A cold row (no reusable units, as after a release version bump) builds
     # for about 22 min before its tests run. The nested-Cargo canaries'
@@ -1441,6 +1532,94 @@ jobs:
           if-no-files-found: ignore
           retention-days: 3
 
+  closure-tests-rest:
+    name: Closure tests (${{ matrix.name }})
+    needs: [changes, stagger]
+    # The rest wave of `closure-tests` (long rows first, scripts/ci-cargo-lanes.mjs):
+    # a copy of that job, which scripts/ci-cargo-lanes-selftest.mjs checks.
+    if: ${{ needs.changes.result == 'success' && needs.changes.outputs.closure_test_rest_count != '0' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.changes.outputs.closure_test_rest_matrix) }}
+    env:
+      RUSTC_WRAPPER: sccache
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Setup Rust
+        uses: ./.github/actions/setup-rust-ci
+
+      - name: Setup sccache
+        uses: ./.github/actions/setup-sccache-ci
+        with:
+          bucket: ${{ env.SCCACHE_GCS_BUCKET_NAME }}
+          workload_identity_provider: ${{ vars.MEERKAT_GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.MEERKAT_GCP_SERVICE_ACCOUNT }}
+          project_id: ${{ vars.MEERKAT_GCP_PROJECT_ID }}
+          key_prefix: sccache/${{ env.RUSTUP_TOOLCHAIN }}/linux-x64
+
+      - name: Setup mold linker
+        uses: rui314/setup-mold@339e96b4ff1f3bd865856ba4cbbe8818a7acb038 # v1
+
+      - name: Cache cargo registry
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          save-if: ${{ github.event_name != 'workflow_dispatch' }}
+          shared-key: ci-registry
+          cache-targets: "false"
+          cache-on-failure: true
+
+      - name: Install nextest
+        uses: taiki-e/install-action@9252097d36d2d3618ad98f5d873696a962b6897c # nextest
+        env:
+          HOME: ${{ runner.temp }}/install-action-home-${{ github.job }}
+
+      - name: Closure tests (the row's targets, workspace feature set)
+        shell: bash
+        env:
+          PACKAGES: ${{ matrix.packages }}
+          TESTS: ${{ matrix.tests }}
+          PROFILE: ${{ matrix.profile }}
+          FILTER: ${{ matrix.filter }}
+          BINARIES: ${{ matrix.binaries }}
+          NO_TESTS: ${{ matrix.no_tests }}
+          MIN_STACK: ${{ matrix.rust_min_stack }}
+          PARTITION: ${{ matrix.partition }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${PACKAGES}" || -z "${TESTS}" || -z "${PROFILE}" || -z "${BINARIES}" || -z "${NO_TESTS}" ]]; then
+            echo "::error::incomplete closure test row"
+            exit 1
+          fi
+          read -r -a test_flags <<<"${TESTS}"
+          filter_args=()
+          if [[ -n "${FILTER}" ]]; then filter_args=(-E "${FILTER}"); fi
+          partition_args=()
+          if [[ -n "${PARTITION}" ]]; then partition_args=(--partition "${PARTITION}"); fi
+          selection=(${PACKAGES} "${test_flags[@]}" --profile "${PROFILE}" "${filter_args[@]}" "${partition_args[@]}")
+          if [[ -n "${MIN_STACK}" ]]; then export RUST_MIN_STACK="${MIN_STACK}"; fi
+          fixture="$(scripts/mcp-test-server-fixture --if-needed ${PACKAGES})"
+          if [[ -n "${fixture}" ]]; then
+            export MEERKAT_MCP_TEST_SERVER="${fixture}"
+            echo "mcp-test-server fixture: ${MEERKAT_MCP_TEST_SERVER}"
+          fi
+          ./scripts/repo-cargo nextest list "${selection[@]}" --message-format json >"${RUNNER_TEMP}/closure-test-list.json"
+          node scripts/ci-verify-row-binaries.mjs "${RUNNER_TEMP}/closure-test-list.json" "${partition_args[@]}" ${BINARIES}
+          ./scripts/repo-cargo nextest run "${selection[@]}" --no-tests="${NO_TESTS}" --no-fail-fast --status-level slow --final-status-level slow
+
+      - name: Upload sccache server log
+        if: ${{ always() }}
+        continue-on-error: true
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: sccache-log-closure-tests-${{ matrix.name }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: /home/runner/work/_temp/sccache.log
+          if-no-files-found: ignore
+          retention-days: 3
+
   main-unit:
     name: Main unit tests (${{ matrix.name }})
     needs: changes
@@ -1449,7 +1628,7 @@ jobs:
     # push with no Rust-relevant change (a docs-only merge) has no unit lanes,
     # exactly as on a pull request. A manual dispatch runs them too, so a
     # branch can measure the main lanes before it merges.
-    if: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && needs.changes.outputs.rust_changed == 'true' }}
+    if: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && needs.changes.outputs.rust_changed == 'true' && needs.changes.outputs.main_unit_first_count != '0' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     strategy:
@@ -1517,6 +1696,78 @@ jobs:
       - name: Upload sccache server log
         if: ${{ always() }}
         # Diagnostics can never fail a lane.
+        continue-on-error: true
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: sccache-log-main-unit-${{ matrix.name }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: /home/runner/work/_temp/sccache.log
+          if-no-files-found: ignore
+          retention-days: 3
+
+  main-unit-rest:
+    name: Main unit tests (${{ matrix.name }})
+    needs: [changes, stagger]
+    # The rest wave of `main-unit` (long rows first, scripts/ci-cargo-lanes.mjs):
+    # a copy of that job, which scripts/ci-cargo-lanes-selftest.mjs checks.
+    if: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && needs.changes.outputs.rust_changed == 'true' && needs.changes.outputs.main_unit_rest_count != '0' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.changes.outputs.main_unit_rest_shard_matrix) }}
+    env:
+      RUSTC_WRAPPER: sccache
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Setup Rust
+        uses: ./.github/actions/setup-rust-ci
+
+      - name: Setup sccache
+        uses: ./.github/actions/setup-sccache-ci
+        with:
+          bucket: ${{ env.SCCACHE_GCS_BUCKET_NAME }}
+          workload_identity_provider: ${{ vars.MEERKAT_GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.MEERKAT_GCP_SERVICE_ACCOUNT }}
+          project_id: ${{ vars.MEERKAT_GCP_PROJECT_ID }}
+          key_prefix: sccache/${{ env.RUSTUP_TOOLCHAIN }}/linux-x64
+
+      - name: Setup mold linker
+        uses: rui314/setup-mold@339e96b4ff1f3bd865856ba4cbbe8818a7acb038 # v1
+
+      - name: Cache cargo registry
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          save-if: ${{ github.event_name != 'workflow_dispatch' }}
+          shared-key: ci-registry
+          cache-targets: "false"
+          cache-on-failure: true
+
+      - name: Install nextest
+        uses: taiki-e/install-action@9252097d36d2d3618ad98f5d873696a962b6897c # nextest
+        env:
+          HOME: ${{ runner.temp }}/install-action-home-${{ github.job }}
+
+      - name: Unit tests (workspace shard, lib and bin targets)
+        shell: bash
+        env:
+          PACKAGES: ${{ matrix.packages }}
+          MIN_STACK: ${{ matrix.rust_min_stack }}
+        run: |
+          set -euo pipefail
+          [[ -n "${PACKAGES}" ]] || { echo "::error::empty package list in a main unit lane"; exit 1; }
+          if [[ -n "${MIN_STACK}" ]]; then export RUST_MIN_STACK="${MIN_STACK}"; fi
+          fixture="$(scripts/mcp-test-server-fixture --if-needed ${PACKAGES})"
+          if [[ -n "${fixture}" ]]; then
+            export MEERKAT_MCP_TEST_SERVER="${fixture}"
+            echo "mcp-test-server fixture: ${MEERKAT_MCP_TEST_SERVER}"
+          fi
+          ./scripts/repo-cargo nextest run ${PACKAGES} --lib --bins --profile ci-pr \
+            --no-tests=pass --no-fail-fast --status-level fail --final-status-level fail
+
+      - name: Upload sccache server log
+        if: ${{ always() }}
         continue-on-error: true
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
@@ -1689,7 +1940,7 @@ jobs:
 
   closure-check:
     name: Closure check (${{ needs.changes.outputs.closure_count }} crates)
-    needs: changes
+    needs: [changes, stagger]
     # Push only: a pull request's Clippy lanes compile its changed packages
     # under every feature (a whole-workspace plan lints every package, a
     # superset of this check), and the dependents compile here on the push.
@@ -1775,7 +2026,7 @@ jobs:
     # check, and the other rows (one job reached 1568 s cold on #1763).
     # Push only: a pull request plans no rows (on run 38859112297 the 16 jobs
     # of a whole-workspace plan took 119-1303 s).
-    if: ${{ needs.changes.outputs.rust_changed == 'true' && needs.changes.outputs.feature_check_count != '0' }}
+    if: ${{ needs.changes.outputs.rust_changed == 'true' && needs.changes.outputs.feature_check_first_count != '0' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     strategy:
@@ -1843,6 +2094,75 @@ jobs:
           if-no-files-found: ignore
           retention-days: 3
 
+  feature-check-rest:
+    name: Feature combinations (${{ matrix.name }})
+    needs: [changes, stagger]
+    # The rest wave of `feature-check` (long rows first, scripts/ci-cargo-lanes.mjs):
+    # a copy of that job, which scripts/ci-cargo-lanes-selftest.mjs checks.
+    if: ${{ needs.changes.outputs.rust_changed == 'true' && needs.changes.outputs.feature_check_rest_count != '0' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.changes.outputs.feature_check_rest_matrix) }}
+    env:
+      RUSTC_WRAPPER: sccache
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Setup Rust
+        uses: ./.github/actions/setup-rust-ci
+
+      - name: Setup sccache
+        uses: ./.github/actions/setup-sccache-ci
+        with:
+          bucket: ${{ env.SCCACHE_GCS_BUCKET_NAME }}
+          workload_identity_provider: ${{ vars.MEERKAT_GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.MEERKAT_GCP_SERVICE_ACCOUNT }}
+          project_id: ${{ vars.MEERKAT_GCP_PROJECT_ID }}
+          key_prefix: sccache/${{ env.RUSTUP_TOOLCHAIN }}/linux-x64
+
+      - name: Setup mold linker
+        uses: rui314/setup-mold@339e96b4ff1f3bd865856ba4cbbe8818a7acb038 # v1
+
+      - name: Cache cargo registry
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          save-if: ${{ github.event_name != 'workflow_dispatch' }}
+          shared-key: ci-registry
+          cache-targets: "false"
+          cache-on-failure: true
+
+      - name: Check each feature combination
+        shell: bash
+        env:
+          COMMANDS: ${{ matrix.commands }}
+        run: |
+          set -euo pipefail
+          [[ -n "${COMMANDS}" ]] || { echo "::error::empty feature-combination row"; exit 1; }
+          failed=0
+          while IFS= read -r args; do
+            [[ -n "${args}" ]] || continue
+            echo "::group::cargo check ${args}"
+            if ! ./scripts/repo-cargo check ${args}; then
+              echo "::error::cargo check ${args} failed"
+              failed=1
+            fi
+            echo "::endgroup::"
+          done <<< "${COMMANDS}"
+          exit "${failed}"
+
+      - name: Upload sccache server log
+        if: ${{ always() }}
+        continue-on-error: true
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: sccache-log-feature-check-${{ strategy.job-index }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: /home/runner/work/_temp/sccache.log
+          if-no-files-found: ignore
+          retention-days: 3
+
   wasm-check:
     name: wasm32 check
     needs: changes
@@ -1895,7 +2215,7 @@ jobs:
 
   sdk-host:
     name: Python + TypeScript SDK suites
-    needs: changes
+    needs: [changes, stagger]
     # The Python + TypeScript SDK suites are post-merge only (13 min
     # measured); pull requests defer them. The Node example suites
     # (examples/037-live-webrtc-web in Playwright Chromium and the examples
@@ -1988,7 +2308,7 @@ jobs:
 
   example-web:
     name: Example web suites
-    needs: changes
+    needs: [changes, stagger]
     # Examples 031, 032 and 033 execute the sdks/web wasm runtime in
     # Playwright Chromium. Every main push runs them (a release projection
     # reuses its parent's run); pull requests run them when the runtime, its
@@ -2118,7 +2438,7 @@ jobs:
 
   wasm-timers:
     name: WASM timer ownership
-    needs: changes
+    needs: [changes, stagger]
     # Compile the Rust regression binaries independently of the example build
     # so both lanes retain the pull-request wall-clock budget. Selected with
     # the example web suites.
@@ -2184,7 +2504,7 @@ jobs:
 
   bazel-graph:
     name: Bazel graph check
-    needs: changes
+    needs: [changes, stagger]
     # Proves the Bazel graph loads and analyses (plain local Bazel, no
     # remote execution, nothing is compiled). Pull requests run it when the
     # classifier sees a Bazel-relevant path: BUILD/Starlark/module inputs,
@@ -2230,17 +2550,22 @@ jobs:
       - ratchets
       - governance-gates
       - tlc-audits
+      - stagger
       - clippy
+      - clippy-rest
       - unit
       - integration
       - closure-tests
+      - closure-tests-rest
       - governed-jsonl
       - mcp-confinement-positive
       - main-unit
+      - main-unit-rest
       - main-unit-archive-build
       - main-unit-archive-run
       - closure-check
       - feature-check
+      - feature-check-rest
       - wasm-check
       - sdk-host
       - example-web
@@ -2259,22 +2584,35 @@ jobs:
           MACHINE_AUTHORITY: ${{ needs.changes.outputs.machine_authority }}
           GOVERNANCE_GATES_RESULT: ${{ needs.governance-gates.result }}
           GOVERNANCE_GATES: ${{ needs.changes.outputs.governance_gates }}
-          CLIPPY_RESULT: ${{ needs.clippy.result }}
+          STAGGER_RESULT: ${{ needs.stagger.result }}
+          CLIPPY_FIRST_RESULT: ${{ needs.clippy.result }}
+          CLIPPY_REST_RESULT: ${{ needs.clippy-rest.result }}
+          SHARD_FIRST_COUNT: ${{ needs.changes.outputs.shard_first_count }}
+          SHARD_REST_COUNT: ${{ needs.changes.outputs.shard_rest_count }}
           UNIT_RESULT: ${{ needs.unit.result }}
           INTEGRATION_RESULT: ${{ needs.integration.result }}
           GOVERNED_JSONL_RESULT: ${{ needs.governed-jsonl.result }}
           MCP_CONFINEMENT_POSITIVE_RESULT: ${{ needs.mcp-confinement-positive.result }}
           INTEGRATION_COUNT: ${{ needs.changes.outputs.integration_count }}
-          CLOSURE_TESTS_RESULT: ${{ needs.closure-tests.result }}
+          CLOSURE_TESTS_FIRST_RESULT: ${{ needs.closure-tests.result }}
+          CLOSURE_TESTS_REST_RESULT: ${{ needs.closure-tests-rest.result }}
+          CLOSURE_TEST_FIRST_COUNT: ${{ needs.changes.outputs.closure_test_first_count }}
+          CLOSURE_TEST_REST_COUNT: ${{ needs.changes.outputs.closure_test_rest_count }}
           CLOSURE_TEST_COUNT: ${{ needs.changes.outputs.closure_test_count }}
           TEST_SCOPE_COUNT: ${{ needs.changes.outputs.test_scope_count }}
           HOOK_BINARY_COUNT: ${{ needs.changes.outputs.hook_binary_count }}
           HOOK_RETAINED_COUNT: ${{ needs.changes.outputs.hook_retained_count }}
-          MAIN_UNIT_PACKED_RESULT: ${{ needs.main-unit.result }}
+          MAIN_UNIT_FIRST_RESULT: ${{ needs.main-unit.result }}
+          MAIN_UNIT_REST_RESULT: ${{ needs.main-unit-rest.result }}
+          MAIN_UNIT_FIRST_COUNT: ${{ needs.changes.outputs.main_unit_first_count }}
+          MAIN_UNIT_REST_COUNT: ${{ needs.changes.outputs.main_unit_rest_count }}
           MAIN_UNIT_ARCHIVE_BUILD_RESULT: ${{ needs.main-unit-archive-build.result }}
           MAIN_UNIT_ARCHIVE_RUN_RESULT: ${{ needs.main-unit-archive-run.result }}
           CLOSURE_CHECK_RESULT: ${{ needs.closure-check.result }}
-          FEATURE_CHECK_RESULT: ${{ needs.feature-check.result }}
+          FEATURE_CHECK_FIRST_RESULT: ${{ needs.feature-check.result }}
+          FEATURE_CHECK_REST_RESULT: ${{ needs.feature-check-rest.result }}
+          FEATURE_CHECK_FIRST_COUNT: ${{ needs.changes.outputs.feature_check_first_count }}
+          FEATURE_CHECK_REST_COUNT: ${{ needs.changes.outputs.feature_check_rest_count }}
           FEATURE_CHECK_COUNT: ${{ needs.changes.outputs.feature_check_count }}
           WASM: ${{ needs.changes.outputs.wasm }}
           WASM_CHECK_RESULT: ${{ needs.wasm-check.result }}
@@ -2311,6 +2649,37 @@ jobs:
           RELEASE_EVIDENCE_RUN_ATTEMPT: ${{ needs.changes.outputs.release_evidence_run_attempt }}
         run: |
           set -euo pipefail
+          # A two-wave lane (long rows first, the rest after the stagger job)
+          # ran when every wave that holds rows succeeded: a failure or
+          # cancellation of either fails it, a wave with rows that did not
+          # run leaves it unrun, and it counts as skipped only when neither
+          # wave holds a row. The attestation step reads the same results.
+          combine_waves() {
+            local first="$1" first_count="$2" rest="$3" rest_count="$4" any_rows=0 result count wave
+            for result in "${first}" "${rest}"; do
+              case "${result}" in failure|cancelled) echo "${result}"; return ;; esac
+            done
+            for wave in "${first}:${first_count}" "${rest}:${rest_count}"; do
+              result="${wave%%:*}"
+              count="${wave##*:}"
+              if ! [[ "${count}" =~ ^[0-9]+$ ]]; then echo "unplanned"; return; fi
+              if (( count > 0 )); then
+                any_rows=1
+                if [[ "${result}" != "success" ]]; then echo "${result}"; return; fi
+              fi
+            done
+            if (( any_rows )); then echo success; else echo skipped; fi
+          }
+          CLIPPY_RESULT="$(combine_waves "${CLIPPY_FIRST_RESULT}" "${SHARD_FIRST_COUNT}" "${CLIPPY_REST_RESULT}" "${SHARD_REST_COUNT}")"
+          CLOSURE_TESTS_RESULT="$(combine_waves "${CLOSURE_TESTS_FIRST_RESULT}" "${CLOSURE_TEST_FIRST_COUNT}" "${CLOSURE_TESTS_REST_RESULT}" "${CLOSURE_TEST_REST_COUNT}")"
+          MAIN_UNIT_PACKED_RESULT="$(combine_waves "${MAIN_UNIT_FIRST_RESULT}" "${MAIN_UNIT_FIRST_COUNT}" "${MAIN_UNIT_REST_RESULT}" "${MAIN_UNIT_REST_COUNT}")"
+          FEATURE_CHECK_RESULT="$(combine_waves "${FEATURE_CHECK_FIRST_RESULT}" "${FEATURE_CHECK_FIRST_COUNT}" "${FEATURE_CHECK_REST_RESULT}" "${FEATURE_CHECK_REST_COUNT}")"
+          {
+            echo "CLIPPY_RESULT=${CLIPPY_RESULT}"
+            echo "CLOSURE_TESTS_RESULT=${CLOSURE_TESTS_RESULT}"
+            echo "MAIN_UNIT_PACKED_RESULT=${MAIN_UNIT_PACKED_RESULT}"
+            echo "FEATURE_CHECK_RESULT=${FEATURE_CHECK_RESULT}"
+          } >> "${GITHUB_ENV:-/dev/null}"
           # Main unit coverage is the packed shards plus the archived lanes
           # (build once, partitioned runs): one failure or cancellation fails
           # it, and it counts as skipped only when all three were skipped.
@@ -2364,6 +2733,8 @@ jobs:
           require_success "Change classification" "${CHANGES_RESULT}"
           require_success "Format + governance" "${FMT_GOVERNANCE_RESULT}"
           require_success "Generation ratchets" "${RATCHETS_RESULT}"
+          # The rest waves and the short lanes wait for the stagger job.
+          require_success "Stagger the short rows" "${STAGGER_RESULT}"
           # A release-projection plan runs no Clippy, unit, check, wasm, SDK or
           # example lane: it reuses the parent's workspace-mode exact-main run,
           # which the next step verifies. The readers of the changed files
@@ -2604,7 +2975,8 @@ jobs:
         #             the lane ran in
         # The execution path of a lane is its own run time plus the change
         # classification's (every lane but classification and format +
-        # governance waits for the plan). The budgets:
+        # governance waits for the plan) and, for a lane that waits for the
+        # stagger job, the stagger job's. The budgets:
         #   - execution path <= CI_MAX_EXEC_SECONDS: fails (exec_over_budget)
         #   - terminal minus path queue <= CI_MAX_TERMINAL_SECONDS: fails
         #     (runaway); runner queue never counts toward a failure
@@ -2625,6 +2997,7 @@ jobs:
           GATE_JOB_NAME: CI gate
           CLASSIFICATION_JOB_NAME: Change classification
           ROOT_JOB_NAMES: Change classification,Format + governance
+          STAGGER_JOB_NAME: Stagger the short rows
         run: |
           set -euo pipefail
           python3 - <<'PY'
@@ -2659,6 +3032,7 @@ jobs:
           gate_name = os.environ["GATE_JOB_NAME"]
           classification_name = os.environ["CLASSIFICATION_JOB_NAME"]
           root_names = set(os.environ["ROOT_JOB_NAMES"].split(","))
+          stagger_name = os.environ["STAGGER_JOB_NAME"]
 
           def collect_lanes():
               # Start of every attempt so far; a carried-over job belongs to the
@@ -2693,6 +3067,8 @@ jobs:
                       {
                           "name": job["name"],
                           "attempt": ran_in,
+                          "created": created,
+                          "completed": completed,
                           "queued": max(0, int((started - created).total_seconds())),
                           "duration": int((completed - started).total_seconds()),
                           "terminal": int((completed - clock).total_seconds()),
@@ -2722,18 +3098,33 @@ jobs:
 
           # Every lane except the roots waits for the change classification,
           # so its execution path starts with the classification's run time
-          # and its queue includes the classification's queue.
+          # and its queue includes the classification's queue. The rest wave
+          # of a two-wave lane and the short lanes also wait for the stagger
+          # job. The jobs API does not list a job's needs, but it creates a
+          # job when they complete: a lane created no earlier than the
+          # stagger job completed, in the same attempt, waited for it (the
+          # other lanes are created with the stagger job itself, when the
+          # classification completes).
           classification = next((lane for lane in lanes if lane["name"] == classification_name), None)
+          stagger = next((lane for lane in lanes if lane["name"] == stagger_name), None)
           if classification is None and enforce:
               print(f"::error::no completed {classification_name} job: the execution path is unmeasurable.")
               sys.exit(1)
           for lane in lanes:
-              upstream = classification if lane["name"] not in root_names and classification else None
-              lane["exec_path"] = lane["duration"] + (upstream["duration"] if upstream else 0)
+              upstream = [classification] if lane["name"] not in root_names and classification else []
+              if (
+                  stagger is not None
+                  and lane is not stagger
+                  and lane["attempt"] == stagger["attempt"]
+                  and lane["created"] >= stagger["completed"]
+              ):
+                  upstream.append(stagger)
+              lane["exec_path"] = lane["duration"] + sum(job["duration"] for job in upstream)
               # A lane re-run in a later attempt did not wait for the
-              # carried-over classification's runner.
-              same_attempt = upstream is not None and upstream["attempt"] == lane["attempt"]
-              lane["path_queued"] = lane["queued"] + (upstream["queued"] if same_attempt else 0)
+              # carried-over upstream jobs' runners.
+              lane["path_queued"] = lane["queued"] + sum(
+                  job["queued"] for job in upstream if job["attempt"] == lane["attempt"]
+              )
               # The runaway ceiling is measured without runner queue: the
               # 40-job account cap is shared, so queue is reported, never
               # budgeted.
@@ -2823,17 +3214,16 @@ jobs:
         if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
         id: attestation
         shell: bash
+        # CLIPPY_RESULT, CLOSURE_TESTS_RESULT and MAIN_UNIT_PACKED_RESULT come
+        # from the check step: each combines its lane's two waves.
         env:
           CHANGES_RESULT: ${{ needs.changes.result }}
           FMT_GOVERNANCE_RESULT: ${{ needs.fmt-governance.result }}
           RATCHETS_RESULT: ${{ needs.ratchets.result }}
-          CLIPPY_RESULT: ${{ needs.clippy.result }}
           UNIT_RESULT: ${{ needs.unit.result }}
           INTEGRATION_RESULT: ${{ needs.integration.result }}
-          CLOSURE_TESTS_RESULT: ${{ needs.closure-tests.result }}
           GOVERNED_JSONL_RESULT: ${{ needs.governed-jsonl.result }}
           MCP_CONFINEMENT_POSITIVE_RESULT: ${{ needs.mcp-confinement-positive.result }}
-          MAIN_UNIT_PACKED_RESULT: ${{ needs.main-unit.result }}
           MAIN_UNIT_ARCHIVE_BUILD_RESULT: ${{ needs.main-unit-archive-build.result }}
           MAIN_UNIT_ARCHIVE_RUN_RESULT: ${{ needs.main-unit-archive-run.result }}
           CLOSURE_CHECK_RESULT: ${{ needs.closure-check.result }}

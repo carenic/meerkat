@@ -37,6 +37,21 @@ them.
 
 ### Changed
 
+- **CI starts its long rows first.** The Clippy, main unit, closure-tests
+  and feature-check lanes run in two waves: the rows that took 8 minutes or
+  more on a green run (`scripts/ci-row-durations.json`, regenerated with
+  `scripts/ci-row-durations.mjs`), and rows never measured, start right
+  after the change classification; the shorter rows, and the short lanes,
+  wait for a `stagger` job (30 seconds on a push, none on a pull request).
+  The account's hosted runners take about 40 jobs at a time and pick queued
+  jobs in no reliable order, so a long row picked late set the run's wall
+  time; a simulation of the two whole-workspace main pushes before this
+  change puts such a push at about 18 minutes instead of about 24, with no
+  other run on the account. The `CI gate` counts a two-wave lane as run
+  when every wave that holds rows succeeded, and requires the `stagger` job;
+  the pull-request lane budget adds the stagger job's run time to the lanes
+  that wait for it and leaves its runner queue out, as for every lane. CI
+  only.
 - A push to `main` or a `release/**` branch runs no separate unit lane. The
   rows a pull request's unit lane would run for the same change (its
   shards, with the same `-p` sets, and its feature suites) run verbatim in

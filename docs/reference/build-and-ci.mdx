@@ -242,6 +242,24 @@ the exact-tree attestation; nightly and the release tag carry the rest):
 | dense Mob topology, feature matrices, minimal builds, audit, `e2e-system`, release packaging | - | - | yes | BuildBuddy `full-fresh` graph |
 | `gate` (`CI gate`): fail-closed aggregate; on pull requests a 1080-second lane execution budget and a 1200-second push-to-terminal runaway ceiling, both excluding runner queue, which is reported as a warning; it prints what the pull request left to the push and refuses a push plan that left anything; schema-4 attestation on `main` | yes | yes (no budget) | - | consumed by `require_ci_green` |
 
+Long rows first. `clippy`, `main-unit`, `closure-tests` and `feature-check`
+run in two waves, each wave a job of its own (`<lane>` and `<lane>-rest`).
+The rows that took 8 minutes or more on a green run, and rows never
+measured, start right after `changes`; the shorter rows, and the short
+lanes (`ratchets`, `integration`, `governed-jsonl`, `closure-check`,
+`sdk-host`, `example-web`, `wasm-timers`, `bazel-graph`), wait for the
+`stagger` job, which sleeps 30 seconds on a push and not at all on a pull
+request. The account's hosted runners take about 40 jobs at a time and pick
+queued jobs in no reliable order, so on a push of about a hundred jobs a
+long row picked late set the wall time. The measurements are
+`scripts/ci-row-durations.json`, regenerated from green runs with
+`scripts/ci-row-durations.mjs --repository OWNER/REPO --output
+scripts/ci-row-durations.json RUN_ID...`; a stale entry only moves a row
+between waves. The `CI gate` counts a two-wave lane as run when every wave
+that holds rows succeeded. Other runs on the account (pull-request CI,
+nightly, dispatches) take runners from the same pool: keep them off while a
+release commit's main run is in progress.
+
 "Deferred" lanes run on the push of the merge to `main` (or a `release/**`
 branch), whose CI must be green before a release tag. A pull request's plan
 names them (`deferred_to_push`) and the gate prints them. They are deferred
@@ -256,14 +274,17 @@ Actions jobs API and splits its time into runner queue (`created_at` to
 it enforces two limits:
 
 - **Lane execution, 1080 s** (`CI_MAX_EXEC_SECONDS`): each lane's own run time
-  plus the run time of the change classification it waits for, over the
-  slowest lane. This is the part the code controls: a lane that grows or an
+  plus the run time of the change classification it waits for (and of the
+  `stagger` job, for a lane that waits for it), over the slowest lane. This is the part the code controls: a lane that grows or an
   aggregate that drifts fails here. Run times belong to the job, so
   re-running only the gate cannot turn an overrun green.
 - **Push-to-terminal excluding runner queue, 1200 s**
   (`CI_MAX_TERMINAL_SECONDS`): the runaway backstop on the latest lane
   terminal minus the runner queue on that lane's path (its own queue plus the
-  change classification's, in the same attempt). Each lane is timed from the
+  change classification's, and the `stagger` job's for a lane that waits for
+  it, in the same attempt; the jobs API creates a job when its needs
+  complete, so a lane created after the `stagger` job completed waited for
+  it). Each lane is timed from the
   start of the run attempt it ran in: a re-run lane gets a fresh clock, and a
   carried-over lane keeps its attempt's clock. Past the ceiling a run's jobs
   are stuck. Waiting for runners alone never fails it.

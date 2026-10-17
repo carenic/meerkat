@@ -528,11 +528,17 @@ and its CI must be green before a release tag (`require_ci_green`):
   tests over the generated events, node unit suites).
 - `push: main` only (no budget): `main-unit` over the whole workspace (the
   unit lane's rows verbatim, then the rest of the workspace in packed
-  shards), `sdk-host`, and the push-only lanes above. A red main run is
+  shards), `sdk-host`, and the push-only lanes above.
+- Long rows first: `clippy`, `main-unit`, `closure-tests` and
+  `feature-check` run in two waves (`<lane>` and `<lane>-rest`, a copy the
+  lanes self-test checks); rows measured at 8 minutes or more
+  (`scripts/ci-row-durations.json`), or never measured, start first, and the
+  rest and the short lanes wait for the `stagger` job. A red main run is
   a failed `CI gate` on the main commit and blocks `require_ci_green`.
 - `gate` (`CI gate`, the only required context): fail-closed aggregate; on
-  pull requests a 1080-second lane execution budget (classification plus
-  each lane's own run time, runner queue excluded) and a 1200-second
+  pull requests a 1080-second lane execution budget (classification, the
+  stagger job for the lanes that wait for it, and each lane's own run time,
+  runner queue excluded) and a 1200-second
   push-to-terminal runaway ceiling (the owner's cap is 20 minutes from the
   start of the pre-push hook, which takes about a minute) (each lane timed from the start of the
   run attempt it ran in, runner queue on its path excluded); runner queue

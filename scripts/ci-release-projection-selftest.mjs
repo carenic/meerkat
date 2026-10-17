@@ -14,7 +14,7 @@
 // checks out depth 2).
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { chmodSync, existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -533,7 +533,7 @@ if (args[0] === "api") {
   const workflow = readFileSync(resolve(root, ".github/workflows/ci.yml"), "utf8");
   const gateCheck = extractStepRun(workflow, "Check lane results");
   const gateEnv = {
-    CHANGES_RESULT: "success", FMT_GOVERNANCE_RESULT: "success", RATCHETS_RESULT: "success",
+    CHANGES_RESULT: "success", FMT_GOVERNANCE_RESULT: "success", RATCHETS_RESULT: "success", STAGGER_RESULT: "success",
     TLC_AUDITS_RESULT: "skipped", MACHINE_AUTHORITY: "false", CLIPPY_RESULT: "skipped",
     GOVERNANCE_GATES_RESULT: "skipped", GOVERNANCE_GATES: "false",
     UNIT_RESULT: "success", INTEGRATION_RESULT: "skipped", GOVERNED_JSONL_RESULT: "skipped",
@@ -551,7 +551,29 @@ if (args[0] === "api") {
     GENERATED_CONTRACT: "true", RELEASE_PROJECTION: "true",
     RELEASE_EVIDENCE_COMMIT: BUMP_PARENT, RELEASE_EVIDENCE_RUN_ID: String(RUN_ID), RELEASE_EVIDENCE_RUN_ATTEMPT: "1",
   };
-  const gate = (change) => spawnSync("bash", ["-c", gateCheck], { env: { ...process.env, ...gateEnv, ...change }, encoding: "utf8" });
+  // The gate reads each two-wave lane (long rows first) as two jobs and their
+  // row counts. The cases below name a lane's result and count once: all its
+  // rows in the first wave, none in the rest.
+  const waveEnv = (env) => {
+    const out = { ...env };
+    for (const [lane, prefix, count] of [
+      ["CLIPPY", "SHARD", "SHARD_COUNT"],
+      ["CLOSURE_TESTS", "CLOSURE_TEST", "CLOSURE_TEST_COUNT"],
+      ["FEATURE_CHECK", "FEATURE_CHECK", "FEATURE_CHECK_COUNT"],
+      ["MAIN_UNIT", "MAIN_UNIT", null],
+    ]) {
+      const key = lane === "MAIN_UNIT" ? "MAIN_UNIT_PACKED_RESULT" : `${lane}_RESULT`;
+      if (!(key in out)) continue;
+      const rows = count ? out[count] : out[key] === "skipped" ? "0" : "1";
+      out[`${lane}_FIRST_RESULT`] = out[key];
+      out[`${lane}_REST_RESULT`] = "skipped";
+      out[`${prefix}_FIRST_COUNT`] = rows;
+      out[`${prefix}_REST_COUNT`] = "0";
+      delete out[key];
+    }
+    return out;
+  };
+  const gate = (change) => spawnSync("bash", ["-c", gateCheck], { env: { ...process.env, ...waveEnv({ ...gateEnv, ...change }) }, encoding: "utf8" });
   assert.equal(gate({}).status, 0, `the gate accepts a release-projection main push: ${gate({}).stdout}`);
   assert.equal(gate({ IS_MAIN_PUSH: "false", IS_PULL_REQUEST: "true" }).status, 0, "and a release-projection pull request");
   assert.equal(
@@ -561,6 +583,7 @@ if (args[0] === "api") {
   );
   for (const [label, change] of [
     ["a failed ratchet", { RATCHETS_RESULT: "failure" }],
+    ["a failed stagger job", { STAGGER_RESULT: "failure" }],
     ["a failed governance gate", { GOVERNANCE_GATES_RESULT: "failure" }],
     ["a governance change whose gates did not run", { GOVERNANCE_GATES: "true" }],
     ["a failed Bazel graph check", { BAZEL_GRAPH_RESULT: "failure" }],
@@ -598,7 +621,7 @@ if (args[0] === "api") {
     WASM_CHECK_RESULT: "success", SDK_HOST_RESULT: "success", EXAMPLE_WEB_RESULT: "success",
     WASM_TIMERS_RESULT: "success", BAZEL_GRAPH_RESULT: "success",
   };
-  const runGate = (env) => spawnSync("bash", ["-c", gateCheck], { env: { ...process.env, ...env }, encoding: "utf8" });
+  const runGate = (env) => spawnSync("bash", ["-c", gateCheck], { env: { ...process.env, ...waveEnv(env) }, encoding: "utf8" });
   const pullRequestRun = runGate(pullRequestGate);
   assert.equal(pullRequestRun.status, 0, `the gate accepts a pull request without the lanes it left to the push: ${pullRequestRun.stdout}`);
   assert.match(pullRequestRun.stdout, /left to the push \(main or release\/\*\*\): 17 closure-tests rows/);
@@ -627,6 +650,116 @@ if (args[0] === "api") {
   ]) {
     assert.equal(runGate(env).status, 1, `the gate refuses ${label}`);
   }
+  // A two-wave lane ran when every wave that holds rows succeeded.
+  const waved = { ...waveEnv(pushGate), SHARD_COUNT: "5", SHARD_FIRST_COUNT: "2", SHARD_REST_COUNT: "3", CLIPPY_REST_RESULT: "success" };
+  const rawGate = (env) => spawnSync("bash", ["-c", gateCheck], { env: { ...process.env, ...env }, encoding: "utf8" });
+  assert.equal(rawGate(waved).status, 0, `the gate accepts both waves of a lane: ${rawGate(waved).stdout}`);
+  const restOnly = { ...waved, SHARD_FIRST_COUNT: "0", CLIPPY_FIRST_RESULT: "skipped" };
+  assert.equal(rawGate(restOnly).status, 0, `and a lane whose rows are all in the rest wave: ${rawGate(restOnly).stdout}`);
+  for (const [label, change] of [
+    ["a rest wave with rows that did not run", { CLIPPY_REST_RESULT: "skipped" }],
+    ["a failed rest wave", { CLIPPY_REST_RESULT: "failure" }],
+    ["a cancelled first wave", { CLIPPY_FIRST_RESULT: "cancelled" }],
+    ["a first wave with rows that did not run", { CLIPPY_FIRST_RESULT: "skipped" }],
+    ["a lane whose wave counts are missing", { SHARD_REST_COUNT: "" }],
+    ["a main unit rest wave that failed", { MAIN_UNIT_REST_COUNT: "4", MAIN_UNIT_REST_RESULT: "failure" }],
+    ["a closure-tests rest wave with rows that did not run", { CLOSURE_TEST_COUNT: "20", CLOSURE_TEST_REST_COUNT: "3", CLOSURE_TESTS_REST_RESULT: "skipped" }],
+  ]) {
+    assert.equal(rawGate({ ...waved, ...change }).status, 1, `the gate refuses ${label}`);
+  }
+
+  // The lane execution budget, read from ci.yml and run against a fake gh.
+  // A lane that waited for the stagger job (the rest wave of a two-wave lane,
+  // the short lanes) counts the stagger's run time in its execution path and
+  // its runner queue in its path queue, so waiting for runners alone never
+  // fails the runaway ceiling.
+  const budgetStep = extractStepRun(workflow, "Enforce lane execution budget");
+  const budgetEnv = extractStepLiteralEnv(workflow, "Enforce lane execution budget");
+  const jobName = (id) => workflow.match(new RegExp(`\\n  ${id}:\\n    name: (.+)\\n`))?.[1];
+  assert.equal(budgetEnv.STAGGER_JOB_NAME, jobName("stagger"), "the budget names the stagger job");
+  assert.equal(budgetEnv.CLASSIFICATION_JOB_NAME, jobName("changes"), "and the change classification");
+  const workflowSeconds = (name) => {
+    const value = workflow.match(new RegExp(`^  ${name}: "(\\d+)"$`, "m"))?.[1];
+    assert.ok(value, `ci.yml sets ${name}`);
+    return value;
+  };
+  const budgetBin = join(scratch, "budget-bin");
+  mkdirSync(budgetBin);
+  const budgetFixture = join(scratch, "budget-fixture.json");
+  writeFileSync(
+    join(budgetBin, "gh"),
+    `#!/usr/bin/env node
+const fs = require("node:fs");
+const fixture = JSON.parse(fs.readFileSync(${JSON.stringify(budgetFixture)}, "utf8"));
+const path = process.argv[process.argv.length - 1];
+if (!(path in fixture)) { process.stderr.write("gh: Not Found (HTTP 404)\\n"); process.exit(1); }
+process.stdout.write(JSON.stringify(fixture[path]));
+`,
+  );
+  chmodSync(join(budgetBin, "gh"), 0o755);
+  const at = (seconds) => new Date(Date.UTC(2026, 9, 17) + seconds * 1000).toISOString().replace(".000Z", "Z");
+  const job = (name, created, started, completed) => ({
+    name, created_at: at(created), started_at: at(started), completed_at: at(completed), conclusion: "success",
+  });
+  const runBudget = (attemptStarts, jobs) => {
+    const run = `/repos/${REPOSITORY}/actions/runs/${RUN_ID}`;
+    const pages = { [`${run}/attempts/${attemptStarts.length}/jobs?per_page=100`]: [{ jobs }] };
+    attemptStarts.forEach((start, index) => {
+      pages[`${run}/attempts/${index + 1}`] = [{ run_started_at: at(start) }];
+    });
+    writeFileSync(budgetFixture, JSON.stringify(pages));
+    const outputFile = join(scratch, "budget-output");
+    writeFileSync(outputFile, "");
+    const result = spawnSync("bash", ["-c", budgetStep], {
+      env: {
+        ...process.env, ...budgetEnv, PATH: `${budgetBin}:${process.env.PATH}`,
+        GITHUB_REPOSITORY: REPOSITORY, GITHUB_RUN_ID: String(RUN_ID), GITHUB_RUN_ATTEMPT: String(attemptStarts.length),
+        MAX_EXEC_SECONDS: workflowSeconds("CI_MAX_EXEC_SECONDS"), MAX_TERMINAL_SECONDS: workflowSeconds("CI_MAX_TERMINAL_SECONDS"),
+        QUEUE_WARN_SECONDS: workflowSeconds("CI_QUEUE_WARN_SECONDS"), ENFORCE_BUDGET: "true",
+        GITHUB_OUTPUT: outputFile, GITHUB_STEP_SUMMARY: "",
+      },
+      encoding: "utf8",
+    });
+    const outputs = Object.fromEntries(
+      readFileSync(outputFile, "utf8").split("\n").filter(Boolean).map((line) => line.split("=")),
+    );
+    return { ...result, outputs };
+  };
+  // A pull request on a busy account: the stagger job waited 700 s for a
+  // runner, the long first-wave row ran 900 s, the rest-wave row 470 s.
+  const stagger = job(budgetEnv.STAGGER_JOB_NAME, 36, 736, 740);
+  const busy = [
+    job(budgetEnv.CLASSIFICATION_JOB_NAME, 0, 5, 35),
+    job("Format + governance", 0, 5, 400),
+    stagger,
+    job("Clippy (mob)", 36, 46, 946),
+    job("Clippy (core+12)", 741, 745, 1215),
+    { ...job("Unit tests (xtask)", 36, 36, 36), conclusion: "skipped" },
+    { name: budgetEnv.GATE_JOB_NAME, created_at: at(1216), started_at: at(1220), completed_at: null, conclusion: null },
+  ];
+  let budget = runBudget([0], busy);
+  assert.equal(budget.status, 0, `the stagger job's runner queue never fails a pull request: ${budget.stdout}${budget.stderr}`);
+  assert.deepEqual(
+    budget.outputs,
+    {
+      exec_path_seconds: "930", terminal_seconds: "1215", terminal_excluding_queue_seconds: "931",
+      queue_seconds: "709", budget_verdict: "queue_delayed",
+    },
+    `the rest-wave row's path holds the stagger job's queue: ${budget.stdout}`,
+  );
+  assert.match(budget.stdout, /^\| Clippy \(core\+12\) \| 1 \| 4 \| 470 \| 504 \| 1215 \| 506 \| success \|$/m, "a rest-wave row waits for the stagger job");
+  assert.match(budget.stdout, /^\| Clippy \(mob\) \| 1 \| 10 \| 900 \| 930 \| 946 \| 931 \| success \|$/m, "a first-wave row does not");
+  assert.match(budget.stdout, /::warning title=CI runner queue wait::Clippy \(core\+12\) waited 709 s/);
+  // A row re-run in a later attempt did not wait for the carried-over
+  // stagger job.
+  budget = runBudget([0, 2000], [...busy.slice(0, 4), job("Clippy (core+12)", 2000, 2003, 2473)]);
+  assert.equal(budget.status, 0, `a re-run rest-wave row: ${budget.stdout}${budget.stderr}`);
+  assert.match(budget.stdout, /^\| Clippy \(core\+12\) \| 2 \| 3 \| 470 \| 500 \| 473 \| 470 \| success \|$/m, "a re-run row is not behind the stagger job");
+  // The execution overrun still fails: the stagger job's run time counts.
+  budget = runBudget([0], [...busy.slice(0, 2), { ...stagger, completed_at: at(741) }, job("Clippy (core+12)", 741, 745, 1791)]);
+  assert.equal(budget.status, 1, `a rest-wave row over the execution budget fails: ${budget.stdout}`);
+  assert.equal(budget.outputs.exec_path_seconds, "1081", "1046 s of the row, 30 s of classification, 5 s of stagger");
+  assert.equal(budget.outputs.budget_verdict, "exec_over_budget");
 
   // The gate verifies the evidence after the lanes and records it.
   const verifyStep = extractStepRun(workflow, "Verify reused release-projection evidence");
@@ -650,6 +783,29 @@ if (args[0] === "api") {
   assert.match(release, /node "\$\{tools\}\/ci-release-evidence\.mjs" verify --repository "\$\{GITHUB_REPOSITORY\}"/, "require_ci_green re-verifies the reused run");
 } finally {
   rmSync(scratch, { recursive: true, force: true });
+}
+
+// The literal `env:` entries of the named step (no expressions).
+function extractStepLiteralEnv(text, name) {
+  const lines = text.split("\n");
+  const at = lines.findIndex((line) => line.trim() === `- name: ${name}`);
+  assert.ok(at >= 0, `ci.yml has a step named ${name}`);
+  const stepIndent = lines[at].indexOf("-");
+  const env = {};
+  let envIndent = -1;
+  for (let index = at + 1; index < lines.length; index += 1) {
+    const indent = lines[index].search(/\S/);
+    if (indent >= 0 && indent <= stepIndent) break;
+    if (envIndent < 0) {
+      if (/^\s+env:\s*$/.test(lines[index])) envIndent = indent;
+      continue;
+    }
+    if (indent >= 0 && indent <= envIndent) break;
+    const entry = lines[index].match(/^\s+([A-Z_]+): (.+)$/);
+    if (entry && !entry[2].includes("${{")) env[entry[1]] = entry[2];
+  }
+  assert.ok(Object.keys(env).length > 0, `step ${name} has literal env entries`);
+  return env;
 }
 
 // The `run: |` body of the named step: the indented block under it.
