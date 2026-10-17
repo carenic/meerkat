@@ -717,6 +717,7 @@ test_suite(
         "//crates/meerkat-machine-schema:grant_tlc_model_test",
         "//crates/meerkat-machine-schema:identity_roundtrip_test",
         "//crates/meerkat-machine-schema:input_field_domains_test",
+        "//crates/meerkat-machine-schema:live_context_readiness_guard_contract_test",
         "//crates/meerkat-machine-schema:meerkat_machine_schema_unit_test",
         "//crates/meerkat-machine-schema:model_routing_handoff_lifecycle_test",
         "//crates/meerkat-machine-schema:named_type_binding_covers_catalog_test",
