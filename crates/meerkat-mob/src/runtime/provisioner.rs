@@ -2355,6 +2355,79 @@ pub(super) fn arm_owned_create_abort_failure_for_test(session_id: SessionId) {
     );
 }
 
+/// Where a test pauses an owned actor transaction's cleanup.
+#[cfg(all(any(test, feature = "test-support"), feature = "runtime-adapter"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum OwnedCleanupPause {
+    /// Right after the exact live actor discard, still holding the
+    /// turn-finalization boundary.
+    ActorDiscardedUnderBoundary,
+    /// Right after the boundary was released, before the prepared
+    /// materialization is rolled back.
+    BoundaryReleased,
+}
+
+/// Test seam: pauses an owned actor transaction's cleanup at one point
+/// (entered, release). Inert unless armed for the session and point.
+#[cfg(all(any(test, feature = "test-support"), feature = "runtime-adapter"))]
+static OWNED_CLEANUP_PAUSES: std::sync::LazyLock<
+    StdMutex<HashMap<(SessionId, OwnedCleanupPause), (oneshot::Sender<()>, oneshot::Receiver<()>)>>,
+> = std::sync::LazyLock::new(|| StdMutex::new(HashMap::new()));
+
+#[cfg(all(any(test, feature = "test-support"), feature = "runtime-adapter"))]
+fn arm_owned_cleanup_pause(
+    session_id: SessionId,
+    point: OwnedCleanupPause,
+) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+    let (paused_tx, paused_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
+    let replaced = OWNED_CLEANUP_PAUSES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert((session_id, point), (paused_tx, release_rx));
+    assert!(
+        replaced.is_none(),
+        "owned actor cleanup pause already armed"
+    );
+    (paused_rx, release_tx)
+}
+
+/// Pause the next owned actor cleanup of `session_id` after its actor
+/// discard, while it still holds the turn-finalization boundary. Returns the
+/// paused signal and the release sender; sending on or dropping it lets the
+/// cleanup go on.
+#[cfg(all(any(test, feature = "test-support"), feature = "runtime-adapter"))]
+#[doc(hidden)]
+pub fn arm_owned_actor_cleanup_rollback_pause_for_test(
+    session_id: SessionId,
+) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+    arm_owned_cleanup_pause(session_id, OwnedCleanupPause::ActorDiscardedUnderBoundary)
+}
+
+/// Pause the next owned actor cleanup of `session_id` after it released the
+/// turn-finalization boundary, before it rolls back its prepared
+/// materialization. Same signals as
+/// [`arm_owned_actor_cleanup_rollback_pause_for_test`].
+#[cfg(all(any(test, feature = "test-support"), feature = "runtime-adapter"))]
+#[doc(hidden)]
+pub fn arm_owned_actor_cleanup_released_boundary_pause_for_test(
+    session_id: SessionId,
+) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+    arm_owned_cleanup_pause(session_id, OwnedCleanupPause::BoundaryReleased)
+}
+
+#[cfg(all(any(test, feature = "test-support"), feature = "runtime-adapter"))]
+async fn run_owned_cleanup_pause(session_id: &SessionId, point: OwnedCleanupPause) {
+    let pause = OWNED_CLEANUP_PAUSES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(&(session_id.clone(), point));
+    if let Some((paused_tx, release_rx)) = pause {
+        let _ = paused_tx.send(());
+        let _ = release_rx.await;
+    }
+}
+
 /// Fault seam: runs in a held member's final serving commit, right after its
 /// actor's liveness was read, so a test can complete a competing service
 /// discard inside that interval.
@@ -8350,7 +8423,6 @@ impl PreparedServiceActorTransaction {
             .as_ref()
             .expect("boundary inserted above")
             .require_session(&session_id)?;
-        let mut errors = Vec::new();
         if let Some((adapter, state)) = committed_runtime_attachment {
             let attachment_witness = state.witness().clone();
             // Every failure below leaves this exact attachment retained. Hand
@@ -8449,6 +8521,47 @@ impl PreparedServiceActorTransaction {
                 }
             }
         }
+        let errors = Self::discard_actor_then_roll_back_after_boundary(
+            &session_id,
+            session_service.as_ref(),
+            &actor_witness_slot,
+            boundary.take(),
+            prepared.as_mut(),
+        )
+        .await;
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(MobError::Internal(format!(
+                "actor transaction cleanup for '{session_id}' failed: {}",
+                errors.join("; ")
+            )))
+        }
+    }
+
+    /// Settle the transaction's exact live actor and prepared materialization
+    /// in the lock order a concurrent raw unregister also takes: discard the
+    /// actor while still holding the turn-finalization boundary (B), release
+    /// B, then roll back through the ordinary rollback. That rollback takes
+    /// the session's live lifecycle lease and mutation gate, and its
+    /// canonical unregister saga takes B in its surface cleanup.
+    ///
+    /// Rolling back while still holding B would wait for that lease while a
+    /// raw unregister's saga holds it into its own surface cleanup, waiting
+    /// for B. Between the release and the rollback the prepared claim is
+    /// still the session's current claim, so no other materialization is
+    /// admitted. A raw unregister that removed the registration meanwhile,
+    /// or a re-registration after it, is not this claim's: the rollback then
+    /// answers `Ok(false)`, which is no rollback effect, not a failure.
+    #[cfg_attr(not(any(test, feature = "test-support")), allow(unused_variables))]
+    async fn discard_actor_then_roll_back_after_boundary(
+        session_id: &SessionId,
+        session_service: &dyn MobSessionService,
+        actor_witness_slot: &meerkat_session::LiveSessionActorWitnessSlot,
+        boundary: Option<RuntimeTurnFinalizationBoundaryLease>,
+        prepared: Option<&mut PreparedSessionMaterialization>,
+    ) -> Vec<String> {
+        let mut errors = Vec::new();
         if let Some(actor_witness) = actor_witness_slot.witness() {
             match session_service
                 .discard_live_session_actor_under_runtime_turn_boundary(&actor_witness)
@@ -8458,22 +8571,17 @@ impl PreparedServiceActorTransaction {
                 Err(error) => errors.push(format!("exact live actor discard: {error}")),
             }
         }
-        if let Some(prepared) = prepared.as_mut()
-            && let Err(error) = prepared
-                .rollback_now_under_turn_finalization_boundary()
-                .await
+        #[cfg(any(test, feature = "test-support"))]
+        run_owned_cleanup_pause(session_id, OwnedCleanupPause::ActorDiscardedUnderBoundary).await;
+        drop(boundary);
+        #[cfg(any(test, feature = "test-support"))]
+        run_owned_cleanup_pause(session_id, OwnedCleanupPause::BoundaryReleased).await;
+        if let Some(prepared) = prepared
+            && let Err(error) = prepared.rollback_now().await
         {
             errors.push(format!("prepared materialization rollback: {error}"));
         }
-        drop(boundary.take());
-        if errors.is_empty() {
-            Ok(())
-        } else {
-            Err(MobError::Internal(format!(
-                "actor transaction cleanup for '{session_id}' failed: {}",
-                errors.join("; ")
-            )))
-        }
+        errors
     }
 
     /// Await the exact owner-side cleanup of every part this transaction still

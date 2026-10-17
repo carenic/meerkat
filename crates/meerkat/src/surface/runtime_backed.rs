@@ -598,6 +598,10 @@ async fn rollback_prepared_runtime_registration(
     turn_boundary_already_held: bool,
 ) {
     let session_id = prepared.session_id().clone();
+    // Every caller passes `false`. A rollback that holds B while it takes
+    // the live lifecycle lease can deadlock with a concurrent raw unregister
+    // whose saga holds that lease into its B-taking surface cleanup (#1814);
+    // a boundary-owning caller releases B first.
     let result = if turn_boundary_already_held {
         prepared
             .rollback_now_under_turn_finalization_boundary()

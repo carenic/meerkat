@@ -1974,6 +1974,112 @@ async fn materialize_identity_mismatch_rollback_joins_a_slow_unregister_saga() {
     fixture.shutdown().await;
 }
 
+/// A revival whose actor create fails after it published its actor cleans
+/// up the actor and its prepared registration under the turn-finalization
+/// boundary (B) the revival took. That rollback must not wait for the live
+/// lifecycle lease while it holds B: a concurrent raw unregister's saga holds
+/// that lease into its surface cleanup, which takes B. The cleanup is paused
+/// with B held until the saga holds the lease, so no scheduling decides the
+/// outcome.
+#[tokio::test(flavor = "multi_thread")]
+async fn revival_cleanup_rollback_does_not_deadlock_with_a_raw_unregister_saga() {
+    const DEADLOCK_BOUND: Duration = Duration::from_secs(10);
+    let _guard = REAL_COMMS_TEST_LOCK.lock().await;
+    let fixture = spawn_host_daemon_fixture(HostFixtureOptions {
+        // Create 1 materializes the member; create 2 is the revival's, whose
+        // result is corrupted after the service published its actor.
+        corrupt_create_session_result_identity_call: Some(2),
+        ..HostFixtureOptions::named("mat-revival-rollback-order-host").with_member_build()
+    })
+    .await
+    .expect("revival rollback-order fixture");
+    let probe =
+        spawn_peer_comms_endpoint("mat-revival-rollback-order-supervisor", true, None).await;
+    probe.trust(fixture.host_peer_descriptor()).await;
+    let mob_id = "mob-revival-rollback-order";
+    let ack = bind_then_materialize(&probe, &fixture, mob_id, "b2").await;
+    let session_id =
+        meerkat_core::SessionId::parse(&ack.session_id).expect("materialized session id parses");
+    let adapter = std::sync::Arc::clone(
+        fixture
+            .member_runtime_adapter
+            .as_ref()
+            .expect("member runtime adapter"),
+    );
+
+    // Stop the serving incarnation, so the exact replay below revives it.
+    let registration = adapter
+        .current_session_registration_witness(&session_id)
+        .await
+        .expect("materialized runtime must expose an exact registration");
+    assert!(
+        adapter
+            .stop_runtime_executor_until_terminal_if_current(
+                &registration,
+                "revival rollback-order regression",
+            )
+            .await
+            .expect("stop materialized runtime executor"),
+        "the materialized registration must still be current when stopped"
+    );
+
+    let (cleanup_paused, release_cleanup) =
+        meerkat_mob::arm_owned_actor_cleanup_rollback_pause_for_test(session_id.clone());
+    let command = BridgeCommand::MaterializeMember(sample_materialize_payload(
+        &probe,
+        1,
+        sample_portable_member_spec(mob_id, "b2", "worker"),
+        1,
+        1,
+        MaterializeLaunchMode::Fresh {},
+    ));
+    let host = fixture.host_peer_descriptor();
+    let replay = probe.send_bridge_command_raw(&host, &command, REPLY_TIMEOUT);
+    tokio::pin!(replay);
+    tokio::select! {
+        reply = &mut replay => {
+            panic!("the revival replied before its owned cleanup paused: {reply:?}");
+        }
+        paused = cleanup_paused => {
+            paused.expect("the revival's owned cleanup paused with B held");
+        }
+    }
+
+    // A raw unregister of the revived session: its saga takes the live
+    // lifecycle lease, then its surface cleanup waits for B.
+    adapter.test_set_unregister_caller_wait_grace(Duration::from_secs(60));
+    let saga_holds_lease = adapter.test_signal_next_unregister_saga_live_lease();
+    let unregister = tokio::spawn({
+        let adapter = std::sync::Arc::clone(&adapter);
+        let session_id = session_id.clone();
+        async move { adapter.unregister_session(&session_id).await }
+    });
+    tokio::time::timeout(DEADLOCK_BOUND, saga_holds_lease)
+        .await
+        .expect("the raw unregister saga took the live lifecycle lease")
+        .expect("lease signal");
+
+    // Resume the revival's rollback while the saga holds the lease.
+    let _ = release_cleanup.send(());
+    let reply = tokio::time::timeout(DEADLOCK_BOUND, &mut replay)
+        .await
+        .expect(
+            "the revival's cleanup finished: it must not wait for the saga's lease while holding B",
+        )
+        .expect("revival reply");
+    assert!(
+        matches!(reply, BridgeReply::Rejected { .. }),
+        "the corrupted revival create is rejected, got {reply:?}"
+    );
+    tokio::time::timeout(DEADLOCK_BOUND, unregister)
+        .await
+        .expect("the raw unregister saga finished")
+        .expect("unregister task")
+        .expect("raw unregister");
+
+    fixture.shutdown().await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn executor_stop_between_ensure_and_attach_return_cleans_preinstalled_sidecar() {
     let _guard = REAL_COMMS_TEST_LOCK.lock().await;

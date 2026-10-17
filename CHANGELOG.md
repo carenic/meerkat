@@ -35,6 +35,25 @@ them.
 
 ## [Unreleased]
 
+### Fixed
+
+- A mob member's failed provisioning cleanup no longer deadlocks with a
+  concurrent raw unregister of the same session (`meerkat-mob`). An owned
+  actor transaction (a member create or revival whose create failed after
+  the session service published its actor, or one cancelled after that)
+  rolled its prepared materialization back while still holding the
+  session's turn-finalization boundary. That rollback takes the session's
+  live lifecycle lease, which a concurrent
+  `MeerkatMachine::unregister_session` saga holds into its surface cleanup,
+  and that cleanup waits for the boundary. The cleanup now discards the
+  exact live actor under the boundary, releases it, and then rolls back
+  through the ordinary path, in the saga's own lock order. If a raw
+  unregister removes the registration while the boundary is released, or
+  the session id is registered again, the rollback leaves it alone. The
+  host materializer's rollbacks before any actor is published keep the
+  boundary, since no surface cleanup waits on it there; debug builds assert
+  that no actor is published at those points.
+
 ## [0.9.2] - 2026-10-16
 
 ### Breaking

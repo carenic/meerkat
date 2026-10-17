@@ -206,6 +206,10 @@ async fn materialize_ephemeral_runtime_session_inner<B: SessionAgentBuilder + 's
     let (created, attachment) = match materialized {
         Ok(result) => result,
         Err(error) => {
+            // This rollback keeps B while it takes the live lifecycle lease,
+            // the order a concurrent raw unregister's saga reverses (#1814).
+            // That saga cannot exist here: the session id was minted above
+            // and no caller can name it before this function returns.
             prepared
                 .rollback_now_under_turn_finalization_boundary()
                 .await?;
