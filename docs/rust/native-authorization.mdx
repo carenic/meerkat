@@ -334,13 +334,15 @@ recorded under its own operation, also when it is refused before its
 provider send. A helper the owner rates R2 or R3 settles at its model entry
 as `unsupported_entry` (R2) or `human_consent_required` (R3), whether or not
 a reviewer exists, because a model request carries no operation review, and
-nothing is sent. Through the web_search executor the model sees that as
-`operation_authorization_unavailable` feedback (the review settlement stays
-in the provider error's details). No audit row records that review refusal
-(a limit of every model request, not only this helper), so the audit shows
-only its preparation. One attribution can prepare helper requests until its
-run ends, and each request is its own operation that needs its own current
-lineage.
+nothing is sent. The web_search executor of every provider keeps that typed
+settlement, so the model sees the same `review_unavailable` (R2) or
+`review_unsatisfied` (R3) tool feedback, carrying only its `kind`, as for
+any other tool's review refusal; an owner that cannot decide the helper now
+still gives `operation_authorization_unavailable`. No audit row records that
+review refusal (a limit of every model request, not only this helper), so
+the audit shows only its preparation. One attribution can prepare helper
+requests until its run ends, and each request is its own operation that
+needs its own current lineage.
 
 Behaviour contract for a call that already entered: revoking the call's own
 lineage refuses later calls, but it does not cancel an invocation that

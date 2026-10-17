@@ -42,6 +42,31 @@ them.
   outlives the server and still writes to stderr then gets `EPIPE` (or
   `SIGPIPE`); on a trusted-host launch it used to inherit the host's stderr
   and could keep writing there (see Changed).
+- Behaviour-only (not measured by the gate): for a governed web_search
+  helper whose owner rates its model request R2 or R3, the tool error code
+  changes from `operation_authorization_unavailable` to `review_unavailable`
+  (R2) or `review_unsatisfied` (R3), and the Anthropic, OpenAI and Gemini
+  web_search executors return `LlmError::OperationReviewRefused` instead of
+  `LlmError::OperationAuthorizationUnavailable` for them (see Fixed). A host
+  that branched on the old code or variant for these settlements must branch
+  on the review ones.
+- Behaviour-only (not measured by the gate): a live tool call that its
+  session fails with a model request's settled review now reaches the live
+  model as `review_unavailable` (R2) or `review_unsatisfied` (R3) instead of
+  `operation_authorization_unavailable`, and
+  `LiveToolDispatchError::from_session_error` classifies it as
+  `LiveToolDispatchError::Tool` with `ToolError::ReviewUnavailable` or
+  `ToolError::ReviewUnsatisfied` (see Fixed).
+- Behaviour-only (not measured by the gate): a live tool call that its
+  session fails with a model request's settled review, authority
+  unavailability or observation unavailability together with settlement
+  diagnostics is classified like the same failure without them:
+  `LiveToolDispatchError::Tool` instead of `LiveToolDispatchError::Session`
+  with code `AGENT_ERROR` (see Fixed). Through `LiveAdapterHost`, the review
+  and authority cases now reach the live model as typed tool feedback instead
+  of a prose tool error, and in the observation case `apply_observation`
+  returns `LiveAdapterHostError::OperationObservationUnavailable` instead of
+  submitting a prose tool error.
 
 ### Added
 
@@ -153,6 +178,52 @@ them.
   - Shortly after the process is gone, the drain stops, forwarding
     included, and closes its end. A descendant still writing to stderr then
     gets `EPIPE` (or `SIGPIPE`).
+
+### Fixed
+
+- A governed web_search helper whose owner rates its model request R2 or R3
+  now gives the model the same typed review feedback as any other tool:
+  `review_unavailable` with kind `unsupported_entry` (R2) or
+  `review_unsatisfied` with kind `human_consent_required` (R3), carrying only
+  that `kind`. The request still settles at its model entry with nothing
+  sent, but the Anthropic, OpenAI and Gemini web_search executors
+  (`AnthropicWebSearchExecutor`, `OpenAiWebSearchExecutor`,
+  `GeminiWebSearchExecutor`) dropped the typed settlement at their provider
+  seam and returned `LlmError::OperationAuthorizationUnavailable`, so the
+  model saw `operation_authorization_unavailable` (as the 0.9.2 notes
+  described). They now return `LlmError::OperationReviewRefused`, which the
+  builtin web_search tool already reports as review feedback. web_search
+  gains no review support: its review entry stays unsupported and the
+  installed reviewer is never asked. An owner that cannot decide the helper
+  still gives `operation_authorization_unavailable`.
+- The live host gives the live model the same typed review feedback when a
+  session fails a live tool call with a model request's settled review (R2
+  `unsupported_entry`, R3 `human_consent_required`, carried in the
+  authority-unavailable model error's details).
+  `LiveToolDispatchError::from_session_error` classified every such error as
+  `ToolError::OperationAuthorizationUnavailable`; it now decodes the
+  settlement with core's `AgentError::operation_review_refusal` and gives
+  `ToolError::ReviewUnavailable` or `ToolError::ReviewUnsatisfied`. Plain
+  authority unavailability, and a review detail that does not decode, still
+  give `operation_authorization_unavailable`.
+- `LiveToolDispatchError::from_session_error` now also classifies a model
+  failure that its session reports with settlement diagnostics. Core keeps
+  such a failure inside `AgentError::WithSettlementFailures`, and the
+  classifier matched only an unwrapped model error, so a settled review,
+  authority unavailability or observation unavailability with diagnostics
+  fell through to `LiveToolDispatchError::Session` (code `AGENT_ERROR`) and
+  reached the live model as a prose tool error. The classifier now reads the
+  primary error: a settled review and authority unavailability give the same
+  typed tool feedback as without diagnostics, and the diagnostics travel in
+  the live tool result's `settlement_failures`; observation unavailability
+  leaves the tool feedback path as
+  `LiveAdapterHostError::OperationObservationUnavailable` carrying them. An
+  operation refusal keeps its classification and is never read as review
+  feedback, also when its details carry a review.
+- `meerkat` built without its `session-store` feature (its default feature
+  set included) no longer warns that `ConsentAwareJobSource` is never
+  constructed. The crate-private consent-aware job source is now compiled
+  only with the session-store runtime delivery host that builds it.
 
 ## [0.9.2] - 2026-10-16
 
