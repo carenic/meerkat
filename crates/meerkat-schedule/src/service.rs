@@ -1899,6 +1899,22 @@ mod tests {
             Some(agent("agent-b"))
         );
 
+        // A writer that commissions no agent records none on its
+        // redefinition: the schedule's agent is cleared, not kept.
+        let cleared = ScheduleService::new(Arc::clone(&store))
+            .update(
+                &created.schedule_id,
+                UpdateScheduleRequest {
+                    name: Some("rewritten".into()),
+                    ..UpdateScheduleRequest::default()
+                },
+            )
+            .await
+            .expect("update");
+        assert_eq!(cleared.config.commissioning_agent, None);
+        let stored = agent_a.get(&created.schedule_id).await.expect("get");
+        assert_eq!(stored.config.commissioning_agent, None);
+
         let ungoverned = ScheduleService::new(store)
             .create(identity_create_request("domain:ops", plain_prompt_action()))
             .await

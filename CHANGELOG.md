@@ -65,23 +65,31 @@ them.
   (`ScheduleService::commissioning_agent` is set, as
   `PersistenceBundle::schedule_service` builds it in a stock-governed realm)
   and composed without a session agent binding fires no occurrence: each
-  fails as `schedule_mandate_unavailable` before any delivery. rkat's
-  schedule host composes no binding, so in a stock-governed realm every
-  fire now fails this way before a session is materialized. Such a fire used
-  to materialize its session and then fail as `transport_error`: the realm's
-  runtime refused its input at admission (see Known issues).
+  fails as `schedule_mandate_unavailable` when it is delivered, before a
+  session is materialized. rkat's and rkat-rpc's schedule hosts compose no
+  binding, so in a stock-governed realm every fire now fails this way. Such
+  a fire used to materialize its session and then fail late, as
+  `transport_error` (see Known issues).
 
 ### Security
 
-- A schedule host no longer runs a governed realm's schedule outside the
-  mandate of the agent that commissioned it. A host whose delivery adapter
-  is bound to an agent fires a schedule only when its recorded commissioning
-  agent is that agent, and a host whose schedule service commissions
-  schedules for an agent but has no binding fires none. Every refused
-  occurrence, including each schedule recorded before commissioning agents
-  existed, fails closed with the typed failure class
-  `schedule_mandate_unavailable` before its target is resolved or a session
-  is materialized, and the occurrence and its terminal receipt show it.
+- A stock-governed realm's schedules no longer fire outside the mandate of
+  the agent that commissioned them. Every fire there, including each
+  schedule recorded before commissioning agents existed, fails closed with
+  the typed failure class `schedule_mandate_unavailable` when it is
+  delivered, before a session is materialized or an input admitted (a fire
+  whose target the driver's probe finds missing still misfires or fails as
+  `target_missing`); the occurrence and its terminal receipt show it. This
+  holds for every host that can open such a realm: `rkat` (its schedule
+  hosts, `rkat mob` hosts included) and `rkat-rpc`, whose schedule services
+  commission each schedule for the realm's opened agent and which compose no
+  session agent binding in this release. `rkat-rest` and `rkat-mcp` never
+  open a governed realm: their startup refuses it ("realm '<id>' is governed
+  and cannot be opened as an ordinary realm"). A Rust host that opens one
+  (`open_stock_realm_persistence*`) refuses early only when its schedule
+  service comes from `PersistenceBundle::schedule_service()`; one built with
+  `ScheduleService::new` over the realm's store is not gated: it fires, and
+  the fire fails later, after materializing its session (see Known issues).
   Ungoverned realms are unchanged.
 
 ### Added
@@ -107,14 +115,20 @@ them.
   recorded `commissioning_agent` is the binding's agent.
   `PersistenceBundle::scheduled_session_agent_binding` returns a
   stock-governed realm's binding (`StockGovernance` implements the trait for
-  the realm's opened agent) and `None` for every other realm.
+  the realm's opened agent) and `None` for every other realm. The adapter
+  only gates: no session host in this release (rkat's, rkat-rpc's, the MCP
+  server's or the facade's runtime-backed host) calls
+  `bind_scheduled_session` yet, so a host composing a binding must bind its
+  own scheduled sessions, or they run unbound.
 
 ### Known issues
 
-- A stock-governed realm does not run scheduled agent work yet. Its runtime
+- A stock-governed realm does not run scheduled agent work yet: its runtime
   admits only work bound to an authenticated original, and a schedule fire
-  carries none, so rkat refuses every fire there with
-  `schedule_mandate_unavailable` (it never materializes a session for one).
+  carries none. rkat and rkat-rpc refuse every such fire as
+  `schedule_mandate_unavailable` without materializing a session. A Rust
+  host whose schedule service is an uncommissioned `ScheduleService::new`
+  still materializes the fire's session and then fails the fire late.
 
 ## [0.9.2] - 2026-10-16
 

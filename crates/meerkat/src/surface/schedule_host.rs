@@ -461,10 +461,13 @@ impl SurfaceScheduleMobHost for NoopScheduleMobHost {
 /// schedule only when its recorded commissioning agent
 /// ([`meerkat_schedule::ScheduleConfig::commissioning_agent`]) is
 /// [`Self::agent`]; every other occurrence, a schedule recorded with no agent
-/// included, fails as `schedule_mandate_unavailable` before any delivery. A
-/// session the host materializes or revives for a firing schedule is bound
-/// with [`Self::bind_scheduled_session`] after its registration and before
-/// its agent is built, as an interactive session is.
+/// included, fails as `schedule_mandate_unavailable` when it is delivered
+/// (after the driver's target probe, before the target is resolved for
+/// delivery). A session the host materializes or revives for a firing
+/// schedule must be bound with [`Self::bind_scheduled_session`] after its
+/// registration and before its agent is built, as an interactive session is.
+/// The adapter only gates: the session host binds, and no session host in
+/// this crate does yet.
 #[async_trait]
 pub trait ScheduledSessionAgentBinding: Send + Sync {
     /// The agent whose mandate this host's scheduled sessions act under.
@@ -573,10 +576,17 @@ impl SharedScheduleTargetAdapter {
     /// composition supplies it (a stock-governed realm's opened agent, see
     /// [`crate::PersistenceBundle::scheduled_session_agent_binding`]). Each
     /// occurrence whose schedule records another commissioning agent, or
-    /// none, fails as `schedule_mandate_unavailable` before any delivery, and
-    /// the surface's session host binds the agent onto each session it
-    /// materializes or revives for a fire
-    /// ([`ScheduledSessionAgentBinding::bind_scheduled_session`]).
+    /// none, fails as `schedule_mandate_unavailable` when it is delivered:
+    /// after the driver's target probe (a target the probe finds missing
+    /// still misfires or fails as `target_missing`), before the target is
+    /// resolved for delivery or a session is materialized.
+    ///
+    /// This only gates. The surface's session host must itself bind the
+    /// agent onto each session it materializes or revives for a fire
+    /// ([`ScheduledSessionAgentBinding::bind_scheduled_session`]); no session
+    /// host in this crate (nor rkat's, rkat-rpc's or the MCP server's) does
+    /// yet, so a binding composed with one of them passes the gate and the
+    /// fire's session still runs unbound.
     ///
     /// Without a binding, a schedule service that commissions schedules for
     /// an agent ([`ScheduleService::commissioning_agent`]) fires none of them:
@@ -1061,7 +1071,8 @@ impl ScheduleTargetDelivery for SharedScheduleTargetAdapter {
         identity: &ScheduleDeliveryIdentity,
     ) -> Result<DeliveryDispatch, ScheduleDomainError> {
         // A governed host fires a schedule only under the agent whose mandate
-        // commissioned it, before any target is resolved or materialized.
+        // commissioned it: refused here, after the driver's target probe and
+        // before the target is resolved for delivery or materialized.
         if let Some(refused) = self.refuse_foreign_mandate(occurrence, identity).await? {
             return Ok(refused);
         }
@@ -5229,5 +5240,54 @@ mod tests {
             invocations.lock().expect("invocation lock").is_empty(),
             "a refused fire never runs its target"
         );
+    }
+
+    /// An update by a writer that commissions no agent clears the schedule's
+    /// agent (a redefinition is commissioned by its writer), and a gated host
+    /// then refuses the schedule's fire.
+    #[tokio::test]
+    async fn an_uncommissioned_update_clears_the_agent_and_a_gated_host_refuses() {
+        let store =
+            Arc::new(meerkat_schedule::MemoryScheduleStore::new()) as Arc<dyn ScheduleStore>;
+        let host_service =
+            ScheduleService::new_commissioned(Arc::clone(&store), mandate_agent("agent-a"));
+        let commissioned = planned_commissioned_occurrence(&host_service).await;
+
+        let updated = ScheduleService::new(Arc::clone(&store))
+            .update(
+                &commissioned.schedule_id,
+                meerkat_schedule::UpdateScheduleRequest {
+                    name: Some("rewritten".to_string()),
+                    ..meerkat_schedule::UpdateScheduleRequest::default()
+                },
+            )
+            .await
+            .expect("update");
+        assert_eq!(updated.config.commissioning_agent, None);
+        let occurrence = host_service
+            .list_occurrences(&commissioned.schedule_id)
+            .await
+            .expect("list occurrences")
+            .into_iter()
+            .rev()
+            .find(|occurrence| occurrence.phase == OccurrencePhase::Pending)
+            .unwrap_or(commissioned);
+
+        let (phase, reason, detail, materialized) =
+            deliver_under_host_agent(host_service, Some(mandate_agent("agent-a")), &occurrence)
+                .await;
+
+        assert_eq!(phase, OccurrencePhase::DeliveryFailed);
+        assert_eq!(
+            reason,
+            Some(DeliveryFailureReason::ScheduleMandateUnavailable)
+        );
+        assert!(
+            detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("records no commissioning agent")),
+            "the refusal says the schedule records no agent: {detail:?}"
+        );
+        assert_eq!(materialized, 0);
     }
 }
