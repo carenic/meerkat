@@ -37,6 +37,18 @@ them.
 
 ### Changed
 
+- **CI runs the tests that read a changed doc.** A change to a file that
+  belongs to no crate (docs, skills, `CHANGELOG.md`, specs, fixtures) now
+  adds the exact targets that read it to the integration lane, as listed
+  in `scripts/ci-non-rust-readers.json`: on a pull request, unless the
+  reader compiles meerkat-mob (then on the push, named in the plan); on a
+  push without a main unit lane, for the lib, bin and example targets.
+  Before, a docs-only pull request ran none of them and a docs-only push
+  never ran rkat's doc-example test. A crate's in-crate documentation that
+  it compiles in (the `skills/*/SKILL.md` files) is now a build input of
+  that crate, and the authority-language check of
+  `xtask machine-check-drift` runs on the live docs in an xtask test, so a
+  docs change runs it too. CI only.
 - **CI starts its long rows first.** The Clippy, main unit, closure-tests
   and feature-check lanes run in two waves: the rows that took 8 minutes or
   more on a green run (`scripts/ci-row-durations.json`, regenerated with

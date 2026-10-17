@@ -231,7 +231,7 @@ the exact-tree attestation; nightly and the release tag carry the rest):
 | `clippy` per shard of every changed package: `--no-deps --all-features -D warnings` over every target; a pull request lints the meerkat-mob chain's lib and bin targets only, and one that invalidates meerkat-mob's build (workspace mode, or a change to meerkat-mob or a crate its library compiles) leaves the Clippy of rkat, meerkat-integration-tests and meerkat-rpc to the push | yes | yes | whole workspace (`make lint`) | Bazel clippy lanes |
 | `unit` per shard: `nextest --lib --bins --profile ci-pr` for changed packages outside the meerkat-mob compile chain, plus their feature-gated suites (`FEATURE_UNIT_SUITES`; a pull request skips those marked `pullRequest: false`); a push runs these rows in `main-unit`, verbatim (`unit_rows_on_main`) | yes | in `main-unit` | `make test-unit` | Bazel unit lanes |
 | `main-unit` per shard: `nextest --lib --bins` over the whole workspace, including the meerkat-mob chain (mob, mob-adaptive, mob-mcp, mob-pack, rpc, rest, mcp-server, rkat, web-runtime, integration-tests, machine-codegen: the crates whose unit-lane build graph contains mob); the `unit` rows a push would have run are its first rows, the same shards (Cargo unifies features across the packages of one run) and suites, and the rest of the workspace is packed around them | deferred | yes | `make test-unit` | Bazel unit lanes |
-| `integration` per suite: `nextest -p <package> --test '*'` for each `INTEGRATION_SUITES` entry in `scripts/ci-cargo-lanes.mjs` whose trigger packages or paths changed | the suites whose package does not compile meerkat-mob | every selected suite | `make test-int` | Bazel integration lanes |
+| `integration` per suite: `nextest -p <package> --test '*'` for each `INTEGRATION_SUITES` entry in `scripts/ci-cargo-lanes.mjs` whose trigger packages or paths changed; plus the reader rows (below) | the suites whose package does not compile meerkat-mob, and the reader rows outside that chain | every selected suite, and reader rows for lib, bin and example targets when the push has no `main-unit` | `make test-int` | Bazel integration lanes |
 | `closure-tests`: the deterministic workspace test lanes (`scripts/pre-push-unit.sh`) for the test scope: integration-fast, HeadCanonical and `e2e-fast` rows | deferred | yes | `make test-int`, `make e2e-fast` | Bazel integration lanes |
 | `closure-check`: `cargo check --all-features` (lib and bin targets) over the reverse-dependency closure | deferred | yes | - | - |
 | `feature-check`: the changed packages' Bazel feature sets and the Make feature-matrix check rows | deferred | yes | feature matrix | Bazel graph |
@@ -241,6 +241,27 @@ the exact-tree attestation; nightly and the release tag carry the rest):
 | `example-web`: build the `sdks/web` wasm runtime once (wasm-pack 0.13.1, no wasm-opt), then run examples 031, 032 and 033 in Playwright Chromium | when `sdks/web/`, `crates/meerkat-web-runtime/`, `crates/meerkat-contracts/` or those examples change | yes | - | - |
 | dense Mob topology, feature matrices, minimal builds, audit, `e2e-system`, release packaging | - | - | yes | BuildBuddy `full-fresh` graph |
 | `gate` (`CI gate`): fail-closed aggregate; on pull requests a 1080-second lane execution budget and a 1200-second push-to-terminal runaway ceiling, both excluding runner queue, which is reported as a warning; it prints what the pull request left to the push and refuses a push plan that left anything; schema-4 attestation on `main` | yes | yes (no budget) | - | consumed by `require_ci_green` |
+
+Reader rows. Some tests read files that belong to no crate: the rkat
+doc-example test walks `docs/`, the machine-authority docs alignment test
+reads `docs/` and `.claude/skills/`, xtask's static lanes read
+`CHANGELOG.md`, and so on. `scripts/ci-non-rust-readers.json` lists every
+such input and its reader (`scripts/ci-non-rust-readers-guard.mjs` keeps it
+complete), and a change to one adds the exact target that reads it to the
+`integration` lane: `-p` the reader with the inventory's features, its
+lib, bin, test or example target (every target for a reader in library or
+build-script code) and a filter on the reading tests, where no other lane
+of the plan runs it. A pull request leaves the readers that compile
+meerkat-mob to the push and names them; readers keyed only by the whole
+checkout (live audits that every path selects) run in the push's
+`closure-tests` rows. A push runs its readers' test targets in
+`closure-tests` and every package's lib and bins in `main-unit`; a push
+with no `main-unit` (no Rust-relevant path, such as a docs-only push) gets
+reader rows for the lib, bin and example targets. Documentation inside a
+crate is no build input unless the crate compiles it in
+(`include_str!`/`include_bytes!` in library, binary or build-script code,
+such as the crates' `skills/*/SKILL.md`); that selects the crate like a
+change to its code.
 
 Long rows first. `clippy`, `main-unit`, `closure-tests` and `feature-check`
 run in two waves, each wave a job of its own (`<lane>` and `<lane>-rest`).

@@ -14,7 +14,9 @@
 // examples/*-rs files that meerkat and meerkat-mob compile as [[example]]
 // targets, and #[path] modules shared across crates, are scanned under the
 // package that compiles them), lexes each file (comments are not code), and
-// collects references to repository paths outside the referencing crate.
+// collects references to repository paths outside the referencing crate,
+// and to in-crate documentation (.md, .mdx) that include_str!/include_bytes!
+// compiles in (the planner otherwise treats in-crate docs as no build input).
 // The walk follows `mod`, #[path] modules and include!() of a literal or of
 // concat!(env!("CARGO_MANIFEST_DIR"), "<literal>"). Any other include!()
 // form, an include!() whose file does not exist, and an
@@ -869,6 +871,9 @@ function inRepoPathArray(tokens, k, index) {
   return false;
 }
 
+// The macros that compile a file into the crate.
+const COMPILED_IN = new Set(["include_str", "include_bytes"]);
+
 export function scanReferences(model, index) {
   const refs = [];
   for (const [file, byPkg] of model.files) {
@@ -883,7 +888,12 @@ export function scanReferences(model, index) {
       const push = (k, kind, abs, literal) => {
         const path = repoPathOf(abs);
         if (path === null) return;
-        if (path !== "" && (path === pkgDir || path.startsWith(`${pkgDir}/`))) return;
+        // The crate's own files select it, except its documentation (.md,
+        // .mdx), which the planner treats as no build input: an in-crate doc
+        // that include_str!/include_bytes! compiles in is listed like an
+        // outside input.
+        const inCrate = path !== "" && (path === pkgDir || path.startsWith(`${pkgDir}/`));
+        if (inCrate && !(COMPILED_IN.has(kind) && /\.mdx?$/.test(path))) return;
         if (!existsInCheckout(path, index)) return;
         const isDir = path === "" || !index.files.has(path);
         // The #[test] function that holds the reference, if any.

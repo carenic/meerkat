@@ -631,6 +631,21 @@ fn rpc_catalog_router_docs_and_sdk_wrappers_are_aligned() {
     );
 }
 
+/// The authority-language tombstone gate of `xtask machine-check-drift` on
+/// the live documentation (docs/ and the spec READMEs). It needs no
+/// machine-authority feature, so the reader rows CI plans for a docs change
+/// run it.
+#[test]
+fn live_docs_carry_no_stale_authority_language() {
+    let root = repo_root();
+    let mismatches = xtask::authority_language::collect_authority_language_mismatches(&root)
+        .expect("scan the authority-language paths");
+    assert!(
+        mismatches.is_empty(),
+        "stale authority language in the live docs: {mismatches:#?}"
+    );
+}
+
 #[test]
 fn retired_public_surface_tokens_stay_out_of_unowned_paths() {
     let root = repo_root();

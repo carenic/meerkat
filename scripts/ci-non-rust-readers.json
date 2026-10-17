@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "description": [
-    "Repository paths outside a crate that Rust code reads, and their readers.",
+    "Repository paths outside a crate that Rust code reads, and in-crate documentation (.md, .mdx) that include_str!/include_bytes! compiles in, and their readers.",
     "Keys are exact repository paths, directory prefixes ending in '/', or './' for a reader of the whole checkout.",
     "Each reader names the package and target holding the reference, its scope (target: test-only code; package: library, binary or build-script code any test of the package can reach), optional nextest test names, and the source files.",
     "scripts/ci-non-rust-readers-guard.mjs regenerates the facts from the sources and fails on any difference; scripts/ci-non-rust-readers.mjs maps changed paths onto readers."
@@ -610,6 +610,26 @@
         ]
       }
     ],
+    "crates/meerkat-comms/skills/mob-communication/SKILL.md": [
+      {
+        "package": "meerkat-comms",
+        "target": "lib",
+        "scope": "package",
+        "sources": [
+          "crates/meerkat-comms/src/lib.rs"
+        ]
+      }
+    ],
+    "crates/meerkat-comms/skills/multi-agent-comms/SKILL.md": [
+      {
+        "package": "meerkat-comms",
+        "target": "lib",
+        "scope": "package",
+        "sources": [
+          "crates/meerkat-comms/src/lib.rs"
+        ]
+      }
+    ],
     "crates/meerkat-contracts/src/": [
       {
         "package": "xtask",
@@ -888,6 +908,16 @@
         ]
       }
     ],
+    "crates/meerkat-hooks/skills/hook-authoring/SKILL.md": [
+      {
+        "package": "meerkat-hooks",
+        "target": "lib",
+        "scope": "package",
+        "sources": [
+          "crates/meerkat-hooks/src/lib.rs"
+        ]
+      }
+    ],
     "crates/meerkat-machine-kernels/src/generated/meerkat.rs": [
       {
         "package": "meerkat-machine-codegen",
@@ -985,6 +1015,27 @@
         ],
         "sources": [
           "crates/meerkat-runtime/tests/core_apply_terminal_truth.rs"
+        ]
+      }
+    ],
+    "crates/meerkat-mcp/skills/mcp-server-setup/SKILL.md": [
+      {
+        "package": "meerkat-mcp",
+        "target": "lib",
+        "scope": "package",
+        "sources": [
+          "crates/meerkat-mcp/src/lib.rs"
+        ]
+      }
+    ],
+    "crates/meerkat-memory/skills/memory-retrieval/SKILL.md": [
+      {
+        "package": "meerkat-memory",
+        "target": "lib",
+        "scope": "package",
+        "sources": [
+          "crates/meerkat-memory/src/lib.rs",
+          "crates/meerkat-memory/src/tool.rs"
         ]
       }
     ],
@@ -1199,6 +1250,26 @@
         ]
       }
     ],
+    "crates/meerkat-schedule/skills/schedule-workflow/SKILL.md": [
+      {
+        "package": "meerkat-schedule",
+        "target": "lib",
+        "scope": "package",
+        "sources": [
+          "crates/meerkat-schedule/src/lib.rs"
+        ]
+      }
+    ],
+    "crates/meerkat-session/skills/session-management/SKILL.md": [
+      {
+        "package": "meerkat-session",
+        "target": "lib",
+        "scope": "package",
+        "sources": [
+          "crates/meerkat-session/src/lib.rs"
+        ]
+      }
+    ],
     "crates/meerkat-session/src/generated/session_turn_admission.rs": [
       {
         "package": "xtask",
@@ -1217,6 +1288,56 @@
         ],
         "sources": [
           "crates/xtask/tests/protocol_codegen_drift.rs"
+        ]
+      }
+    ],
+    "crates/meerkat-tools/skills/builtin-utilities-workflow/SKILL.md": [
+      {
+        "package": "meerkat-tools",
+        "target": "lib",
+        "scope": "package",
+        "sources": [
+          "crates/meerkat-tools/src/lib.rs"
+        ]
+      }
+    ],
+    "crates/meerkat-tools/skills/shell-patterns/SKILL.md": [
+      {
+        "package": "meerkat-tools",
+        "target": "lib",
+        "scope": "package",
+        "sources": [
+          "crates/meerkat-tools/src/lib.rs"
+        ]
+      }
+    ],
+    "crates/meerkat-tools/skills/skill-discovery-workflow/SKILL.md": [
+      {
+        "package": "meerkat-tools",
+        "target": "lib",
+        "scope": "package",
+        "sources": [
+          "crates/meerkat-tools/src/lib.rs"
+        ]
+      }
+    ],
+    "crates/meerkat-tools/skills/task-workflow/SKILL.md": [
+      {
+        "package": "meerkat-tools",
+        "target": "lib",
+        "scope": "package",
+        "sources": [
+          "crates/meerkat-tools/src/lib.rs"
+        ]
+      }
+    ],
+    "crates/meerkat-workgraph/skills/workgraph-workflow/SKILL.md": [
+      {
+        "package": "meerkat-workgraph",
+        "target": "lib",
+        "scope": "package",
+        "sources": [
+          "crates/meerkat-workgraph/src/lib.rs"
         ]
       }
     ],
@@ -1287,7 +1408,7 @@
         "target": "lib",
         "scope": "package",
         "sources": [
-          "crates/xtask/src/machines.rs"
+          "crates/xtask/src/authority_language.rs"
         ]
       },
       {
@@ -1930,7 +2051,7 @@
         "target": "lib",
         "scope": "package",
         "sources": [
-          "crates/xtask/src/machines.rs"
+          "crates/xtask/src/authority_language.rs"
         ]
       }
     ],
@@ -1964,7 +2085,7 @@
         "target": "lib",
         "scope": "package",
         "sources": [
-          "crates/xtask/src/machines.rs"
+          "crates/xtask/src/authority_language.rs"
         ]
       }
     ],

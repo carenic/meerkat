@@ -468,7 +468,16 @@ and its CI must be green before a release tag (`require_ci_green`):
   xtask with machine-authority, also on any `.github/workflows/` or `sdks/`
   edit, because its tests pin the workflows and read the SDK manifests and
   generated types), on main pushes, and on PRs for the suites whose package
-  does not compile meerkat-mob.
+  does not compile meerkat-mob. The lane also runs the reader rows: the
+  exact target that reads a changed non-Rust input
+  (`scripts/ci-non-rust-readers.json`: docs, skills, CHANGELOG, specs,
+  fixtures), with the inventory's features and a filter on the reading
+  tests, where no other lane of the plan runs it (`reader_rows`). A pull
+  request leaves the readers that compile meerkat-mob to the push and the
+  readers keyed only by the whole checkout to the push's `closure-tests`; a
+  push with no `main-unit` gets reader rows for lib, bin and example
+  targets. In-crate documentation the crate compiles in (`include_str!` of
+  its `skills/*/SKILL.md`) is a build input of that crate.
   The unit lanes run `--lib --bins` only; `closure-tests` runs the
   integration tests of every package in its test scope.
 - `closure-tests` (push only): the deterministic workspace lanes of
