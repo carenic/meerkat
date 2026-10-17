@@ -466,11 +466,13 @@ fn post_unregister_observation_inputs_are_accepted_noops() {
         &mut authority,
         MeerkatMachineInput::PeerRequestSent {
             corr_id: mm_dsl::PeerCorrelationId::from("late-corr"),
+            addressee: mm_dsl::PeerId("late-peer".to_string()),
         },
     )
     .expect("post-unregister PeerRequestSent must be an accepted no-op");
     assert!(
-        authority.state().pending_peer_requests.is_empty(),
+        authority.state().pending_peer_requests.is_empty()
+            && authority.state().pending_peer_request_addressees.is_empty(),
         "post-unregister peer observations must not seed orphan pending entries"
     );
 
@@ -479,6 +481,7 @@ fn post_unregister_observation_inputs_are_accepted_noops() {
         MeerkatMachineInput::PeerResponseTerminalArrived {
             corr_id: mm_dsl::PeerCorrelationId::from("late-corr"),
             disposition: mm_dsl::PeerTerminalDisposition::Completed,
+            responder: mm_dsl::PeerId("late-peer".to_string()),
         },
     )
     .expect("post-unregister PeerResponseTerminalArrived must be an accepted no-op");

@@ -329,6 +329,8 @@ trap 'rm -rf "$tlc_env_tmp"' EXIT
 # be reported violated.
 # live_context_result_barrier_audit.sh with --mutants requires its
 # summary-dropped mutant to violate AuditResultFollowsSummary.
+# peer_request_maps_audit.sh requires its six witnesses reported violated,
+# and with --mutants each seeded defect's property or invariant violated.
 printf '%s\n' \
   '#!/bin/sh' \
   'printf "%s\n" "$JAVA_TOOL_OPTIONS" > "$TLC_JAVA_OPTIONS_CAPTURE"' \
@@ -379,6 +381,17 @@ printf '%s\n' \
   'echo "Error: Action property NeverSilentReopenRunning is violated."' \
   'echo "Error: Action property NeverSilentExhaustedAttached is violated."' \
   'echo "Error: Action property NeverSilentExhaustedRunning is violated."' \
+  'echo "Error: Invariant NotAuditWitnessAnswered is violated."' \
+  'echo "Error: Invariant NotAuditWitnessProgressThenAnswered is violated."' \
+  'echo "Error: Invariant NotAuditWitnessNotAddressee is violated."' \
+  'echo "Error: Invariant NotAuditWitnessUnknownAfterAnswer is violated."' \
+  'echo "Error: Invariant NotAuditWitnessReplied is violated."' \
+  'echo "Error: Invariant NotAuditWitnessNotRequester is violated."' \
+  'echo "Error: Action property AuditResponsesOnlyFromAddressee is violated."' \
+  'echo "Error: Action property AuditSenderVerdictExact is violated."' \
+  'echo "Error: Action property AuditAddresseeVerdictExact is violated."' \
+  'echo "Error: Invariant pending_peer_request_addressees_match_requests is violated."' \
+  'echo "Error: Invariant inbound_peer_request_requesters_match_requests is violated."' \
   'echo "State 1: <Initial predicate>"' \
   > "$tlc_env_tmp/tlc"
 chmod +x "$tlc_env_tmp/tlc"

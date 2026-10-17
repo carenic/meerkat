@@ -7753,6 +7753,60 @@ impl std::fmt::Display for PeerResponseAddresseeVerdict {
     serde::Serialize,
     serde::Deserialize,
 )]
+pub enum PeerResponseSenderVerdict {
+    #[default]
+    #[serde(rename = "UnknownRequest")]
+    UnknownRequest,
+    #[serde(rename = "Addressee")]
+    Addressee,
+    #[serde(rename = "NotAddressee")]
+    NotAddressee,
+}
+impl PeerResponseSenderVerdict {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::UnknownRequest => "UnknownRequest",
+            Self::Addressee => "Addressee",
+            Self::NotAddressee => "NotAddressee",
+        }
+    }
+}
+impl std::convert::TryFrom<&str> for PeerResponseSenderVerdict {
+    type Error = String;
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "UnknownRequest" => Ok(Self::UnknownRequest),
+            "Addressee" => Ok(Self::Addressee),
+            "NotAddressee" => Ok(Self::NotAddressee),
+            other => Err(format!("invalid PeerResponseSenderVerdict value `{other}`")),
+        }
+    }
+}
+impl std::convert::TryFrom<String> for PeerResponseSenderVerdict {
+    type Error = String;
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::try_from(value.as_str())
+    }
+}
+impl std::fmt::Display for PeerResponseSenderVerdict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+#[allow(non_camel_case_types)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 pub enum PeerResponseTerminalObservedStatus {
     #[default]
     #[serde(rename = "NotPeerTerminal")]
@@ -14162,6 +14216,7 @@ pub struct State {
     pub mcp_server_states: std::collections::BTreeMap<McpServerId, McpServerState>,
     pub pending_peer_requests:
         std::collections::BTreeMap<PeerCorrelationId, OutboundPeerRequestState>,
+    pub pending_peer_request_addressees: std::collections::BTreeMap<PeerCorrelationId, PeerId>,
     pub inbound_peer_requests:
         std::collections::BTreeMap<PeerCorrelationId, InboundPeerRequestState>,
     pub inbound_peer_request_lanes: std::collections::BTreeMap<PeerCorrelationId, InputLane>,
@@ -15580,6 +15635,10 @@ impl std::fmt::Debug for State {
             .field("removal_timeout_ms", &self.removal_timeout_ms)
             .field("mcp_server_states", &self.mcp_server_states)
             .field("pending_peer_requests", &self.pending_peer_requests)
+            .field(
+                "pending_peer_request_addressees",
+                &self.pending_peer_request_addressees,
+            )
             .field("inbound_peer_requests", &self.inbound_peer_requests)
             .field(
                 "inbound_peer_request_lanes",
@@ -18202,19 +18261,23 @@ pub mod inputs {
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct PeerRequestSent {
         pub corr_id: PeerCorrelationId,
+        pub addressee: PeerId,
     }
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct PeerResponseProgressArrived {
         pub corr_id: PeerCorrelationId,
+        pub responder: PeerId,
     }
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct PeerResponseTerminalArrived {
         pub corr_id: PeerCorrelationId,
         pub disposition: PeerTerminalDisposition,
+        pub responder: PeerId,
     }
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct PeerResponseRejected {
         pub corr_id: PeerCorrelationId,
+        pub responder: PeerId,
     }
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct PeerRequestTimedOut {
@@ -19951,6 +20014,11 @@ pub mod signals {
         pub addressee: PeerId,
     }
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct ResolvePeerResponseSender {
+        pub corr_id: PeerCorrelationId,
+        pub responder: PeerId,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct ClassifyPlainEvent {
         pub source_name: String,
     }
@@ -19966,6 +20034,7 @@ pub enum Signal {
     ClassifyExternalEnvelope(signals::ClassifyExternalEnvelope),
     ClassifyPeerResponseReply(signals::ClassifyPeerResponseReply),
     ResolvePeerResponseAddressee(signals::ResolvePeerResponseAddressee),
+    ResolvePeerResponseSender(signals::ResolvePeerResponseSender),
     ClassifyPlainEvent(signals::ClassifyPlainEvent),
     EnsureDrainRunning(signals::EnsureDrainRunning),
 }
@@ -19978,6 +20047,7 @@ impl Signal {
             Self::ClassifyExternalEnvelope(_) => SignalKind::ClassifyExternalEnvelope,
             Self::ClassifyPeerResponseReply(_) => SignalKind::ClassifyPeerResponseReply,
             Self::ResolvePeerResponseAddressee(_) => SignalKind::ResolvePeerResponseAddressee,
+            Self::ResolvePeerResponseSender(_) => SignalKind::ResolvePeerResponseSender,
             Self::ClassifyPlainEvent(_) => SignalKind::ClassifyPlainEvent,
             Self::EnsureDrainRunning(_) => SignalKind::EnsureDrainRunning,
         }
@@ -19991,6 +20061,7 @@ pub enum SignalKind {
     ClassifyExternalEnvelope,
     ClassifyPeerResponseReply,
     ResolvePeerResponseAddressee,
+    ResolvePeerResponseSender,
     ClassifyPlainEvent,
     EnsureDrainRunning,
 }
@@ -21391,6 +21462,10 @@ pub mod effects {
         pub verdict: PeerResponseAddresseeVerdict,
     }
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct PeerResponseSenderResolved {
+        pub verdict: PeerResponseSenderVerdict,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct PeerIngressReceiveResolved {
         pub outcome: PeerIngressReceiveOutcomeClass,
         pub admission_diagnostic: Option<PeerIngressAdmissionDiagnosticClass>,
@@ -21865,6 +21940,7 @@ pub enum Effect {
     PeerIngressClassified(effects::PeerIngressClassified),
     PeerResponseReplyClassified(effects::PeerResponseReplyClassified),
     PeerResponseAddresseeResolved(effects::PeerResponseAddresseeResolved),
+    PeerResponseSenderResolved(effects::PeerResponseSenderResolved),
     PeerIngressReceiveResolved(effects::PeerIngressReceiveResolved),
     PeerIngressDequeueResolved(effects::PeerIngressDequeueResolved),
     SpawnDrainTask(effects::SpawnDrainTask),
@@ -22126,6 +22202,7 @@ pub enum EffectKind {
     PeerIngressClassified,
     PeerResponseReplyClassified,
     PeerResponseAddresseeResolved,
+    PeerResponseSenderResolved,
     PeerIngressReceiveResolved,
     PeerIngressDequeueResolved,
     SpawnDrainTask,
@@ -24644,6 +24721,24 @@ pub enum TransitionId {
     PeerRequestSendFailedRunning,
     PeerRequestSendFailedRetired,
     PeerRequestSendFailedStopped,
+    ResolvePeerResponseSenderAddresseeIdle,
+    ResolvePeerResponseSenderAddresseeAttached,
+    ResolvePeerResponseSenderAddresseeRunning,
+    ResolvePeerResponseSenderAddresseeRetired,
+    ResolvePeerResponseSenderAddresseeStopped,
+    ResolvePeerResponseSenderAddresseeDestroyed,
+    ResolvePeerResponseSenderNotAddresseeIdle,
+    ResolvePeerResponseSenderNotAddresseeAttached,
+    ResolvePeerResponseSenderNotAddresseeRunning,
+    ResolvePeerResponseSenderNotAddresseeRetired,
+    ResolvePeerResponseSenderNotAddresseeStopped,
+    ResolvePeerResponseSenderNotAddresseeDestroyed,
+    ResolvePeerResponseSenderUnknownRequestIdle,
+    ResolvePeerResponseSenderUnknownRequestAttached,
+    ResolvePeerResponseSenderUnknownRequestRunning,
+    ResolvePeerResponseSenderUnknownRequestRetired,
+    ResolvePeerResponseSenderUnknownRequestStopped,
+    ResolvePeerResponseSenderUnknownRequestDestroyed,
     PeerRequestReceivedIdle,
     PeerRequestReceivedAttached,
     PeerRequestReceivedRunning,
@@ -25662,6 +25757,7 @@ pub fn initial_state() -> State {
         removal_timeout_ms: 30000,
         mcp_server_states: Default::default(),
         pending_peer_requests: Default::default(),
+        pending_peer_request_addressees: Default::default(),
         inbound_peer_requests: Default::default(),
         inbound_peer_request_lanes: Default::default(),
         inbound_peer_request_requesters: Default::default(),

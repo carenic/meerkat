@@ -611,6 +611,35 @@ impl PeerCommsHandle for RuntimePeerCommsHandle {
         })
     }
 
+    fn resolve_peer_response_sender(
+        &self,
+        corr_id: meerkat_core::PeerCorrelationId,
+        responder: meerkat_core::comms::PeerId,
+    ) -> Result<meerkat_core::PeerResponseSenderVerdict, DslTransitionError> {
+        let context = "PeerCommsHandle::resolve_peer_response_sender";
+        let effects = self.dsl.apply_signal_with_effects(
+            mm_dsl::MeerkatMachineSignal::ResolvePeerResponseSender {
+                corr_id: corr_id.into(),
+                responder: super::peer_interaction::dsl_peer_id(responder),
+            },
+            context,
+        )?;
+        effects
+            .into_iter()
+            .find_map(|effect| match effect {
+                mm_dsl::MeerkatMachineEffect::PeerResponseSenderResolved { verdict } => {
+                    Some(verdict.into())
+                }
+                _ => None,
+            })
+            .ok_or_else(|| {
+                DslTransitionError::guard_rejected(
+                    context,
+                    "machine transition did not emit PeerResponseSenderResolved",
+                )
+            })
+    }
+
     fn authorize_peer_ingress_claim_commit(
         &self,
         facts: PeerIngressClaimCommitFacts,

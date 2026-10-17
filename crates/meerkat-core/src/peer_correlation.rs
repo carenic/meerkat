@@ -165,6 +165,30 @@ pub enum PeerResponseAddresseeVerdict {
     NotRequester,
 }
 
+/// Machine-owned verdict on the sender of a response to an outbound peer
+/// request (local is requester).
+///
+/// A response frame, progress or terminal, is accepted only from the peer the
+/// request was sent to: the addressee recorded when the request was sent
+/// ([`crate::handles::PeerInteractionHandle::request_sent`]). Ingress asks
+/// the generated authority
+/// ([`crate::handles::PeerCommsHandle::resolve_peer_response_sender`]) with
+/// the canonical peer id of the frame's verified signer before the frame is
+/// queued, so a frame from any other peer is dropped and the request stays
+/// open for its addressee.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum PeerResponseSenderVerdict {
+    /// No outbound request with this id is pending: never sent, already
+    /// answered, timed out, or sent before this session's authority was
+    /// created.
+    UnknownRequest,
+    /// The signer is the peer the request was sent to.
+    Addressee,
+    /// The signer is not the peer the request was sent to.
+    NotAddressee,
+}
+
 /// Typed lifecycle state of an interaction stream reservation (U6 / dogma #5).
 ///
 /// Authoritative truth for whether a reserved stream channel is still

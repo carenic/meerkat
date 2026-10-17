@@ -1526,6 +1526,12 @@ Use `send_message` for normal agent collaboration. Use `send_request` only when 
 { "status": "sent", "kind": "peer_request", "receipt": { ... } }
 ```
 
+Only the peer the request was sent to can answer it: the runtime records the
+addressee's canonical peer ID before the request leaves, and drops at ingress
+any response, progress or terminal, signed by another peer's key (under open
+auth, `require_peer_auth = false`, the key the envelope declares). The
+request stays open for its addressee.
+
 **Source:** `crates/meerkat-comms/src/mcp/tools.rs`
 </Accordion>
 

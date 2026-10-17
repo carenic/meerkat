@@ -192,10 +192,11 @@ fn peer_reply_classified_effect(
         })
 }
 
-/// The machine's key for a canonical peer id. Requesters and response
-/// addressees both go through this one projection, so the machine compares
-/// canonical identities, never caller-supplied strings.
-fn dsl_peer_id(peer_id: meerkat_core::comms::PeerId) -> mm_dsl::PeerId {
+/// The machine's key for a canonical peer id. Requesters, request and
+/// response addressees, and response signers all go through this one
+/// projection, so the machine compares canonical identities, never
+/// caller-supplied strings.
+pub(crate) fn dsl_peer_id(peer_id: meerkat_core::comms::PeerId) -> mm_dsl::PeerId {
     mm_dsl::PeerId(peer_id.to_string())
 }
 
@@ -220,19 +221,29 @@ fn peer_response_addressee_resolved_effect(
 }
 
 impl PeerInteractionHandle for RuntimePeerInteractionHandle {
-    fn request_sent(&self, corr_id: PeerCorrelationId) -> Result<(), DslTransitionError> {
+    fn request_sent(
+        &self,
+        corr_id: PeerCorrelationId,
+        addressee: meerkat_core::comms::PeerId,
+    ) -> Result<(), DslTransitionError> {
         self.apply_input_and_dispatch_cleanup(
             mm_dsl::MeerkatMachineInput::PeerRequestSent {
                 corr_id: corr_id.into(),
+                addressee: dsl_peer_id(addressee),
             },
             "PeerInteractionHandle::request_sent",
         )
     }
 
-    fn response_progress(&self, corr_id: PeerCorrelationId) -> Result<(), DslTransitionError> {
+    fn response_progress(
+        &self,
+        corr_id: PeerCorrelationId,
+        responder: meerkat_core::comms::PeerId,
+    ) -> Result<(), DslTransitionError> {
         self.apply_input_and_dispatch_cleanup(
             mm_dsl::MeerkatMachineInput::PeerResponseProgressArrived {
                 corr_id: corr_id.into(),
+                responder: dsl_peer_id(responder),
             },
             "PeerInteractionHandle::response_progress",
         )
@@ -242,20 +253,27 @@ impl PeerInteractionHandle for RuntimePeerInteractionHandle {
         &self,
         corr_id: PeerCorrelationId,
         disposition: CorePeerDisposition,
+        responder: meerkat_core::comms::PeerId,
     ) -> Result<(), DslTransitionError> {
         self.apply_input_and_dispatch_cleanup(
             mm_dsl::MeerkatMachineInput::PeerResponseTerminalArrived {
                 corr_id: corr_id.into(),
                 disposition: disposition.into(),
+                responder: dsl_peer_id(responder),
             },
             "PeerInteractionHandle::response_terminal",
         )
     }
 
-    fn response_rejected(&self, corr_id: PeerCorrelationId) -> Result<(), DslTransitionError> {
+    fn response_rejected(
+        &self,
+        corr_id: PeerCorrelationId,
+        responder: meerkat_core::comms::PeerId,
+    ) -> Result<(), DslTransitionError> {
         self.apply_input_and_dispatch_cleanup(
             mm_dsl::MeerkatMachineInput::PeerResponseRejected {
                 corr_id: corr_id.into(),
+                responder: dsl_peer_id(responder),
             },
             "PeerInteractionHandle::response_rejected",
         )

@@ -141,14 +141,22 @@ impl TestPeerInteractionHandle {
 }
 
 impl meerkat_core::handles::PeerInteractionHandle for TestPeerInteractionHandle {
-    fn request_sent(&self, corr_id: PeerCorrelationId) -> Result<(), DslTransitionError> {
+    fn request_sent(
+        &self,
+        corr_id: PeerCorrelationId,
+        _addressee: meerkat_core::comms::PeerId,
+    ) -> Result<(), DslTransitionError> {
         self.outbound
             .lock()
             .insert(corr_id, OutboundPeerRequestState::Sent);
         Ok(())
     }
 
-    fn response_progress(&self, corr_id: PeerCorrelationId) -> Result<(), DslTransitionError> {
+    fn response_progress(
+        &self,
+        corr_id: PeerCorrelationId,
+        _responder: meerkat_core::comms::PeerId,
+    ) -> Result<(), DslTransitionError> {
         if !self.outbound.lock().contains_key(&corr_id) {
             return Err(Self::rejection(
                 "PeerInteractionHandle::response_progress",
@@ -165,6 +173,7 @@ impl meerkat_core::handles::PeerInteractionHandle for TestPeerInteractionHandle 
         &self,
         corr_id: PeerCorrelationId,
         _disposition: meerkat_core::handles::PeerTerminalDisposition,
+        _responder: meerkat_core::comms::PeerId,
     ) -> Result<(), DslTransitionError> {
         if self.outbound.lock().remove(&corr_id).is_none() {
             return Err(Self::rejection(
@@ -175,7 +184,11 @@ impl meerkat_core::handles::PeerInteractionHandle for TestPeerInteractionHandle 
         Ok(())
     }
 
-    fn response_rejected(&self, corr_id: PeerCorrelationId) -> Result<(), DslTransitionError> {
+    fn response_rejected(
+        &self,
+        corr_id: PeerCorrelationId,
+        _responder: meerkat_core::comms::PeerId,
+    ) -> Result<(), DslTransitionError> {
         if self.outbound.lock().remove(&corr_id).is_none() {
             return Err(Self::rejection(
                 "PeerInteractionHandle::response_rejected",
@@ -408,7 +421,7 @@ async fn e2e_smoke_mcp_multimodal_blob_response_transport() {
     let ctx_b = tool_context(&runtime_b);
     let request_id = meerkat_core::InteractionId(Uuid::new_v4());
     peer_a
-        .request_sent(PeerCorrelationId::from_uuid(request_id.0))
+        .request_sent(PeerCorrelationId::from_uuid(request_id.0), peer_b_id)
         .expect("seed A outbound request authority");
     peer_b
         .request_received(

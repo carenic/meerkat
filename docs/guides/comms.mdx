@@ -473,6 +473,24 @@ Send a structured ask to a peer when you want explicit `intent + params` and a c
 
 **Response**: `{"status": "sent", "kind": "peer_request", "receipt": {...}}`
 
+Only the peer the request was sent to can answer it. Before the request
+leaves, the runtime's machine authority records its addressee: the canonical
+peer ID of the trusted peer it is routed to. A response, progress or terminal,
+is accepted only when the key that signed its envelope is that peer's. A
+response signed by any other peer, even one that knows the request ID, is
+dropped at ingress before it is queued: nothing reaches the session, a
+pending stream or a waiting tool, and the request stays open for its
+addressee's answer. A response to a request ID this session never sent, has
+already completed or timed out, or sent before a restart is refused as
+before. Under open auth (`require_peer_auth = false`), ingress does not verify
+signatures, so the check compares the key the response envelope declares.
+A sender whose response is dropped learns little: over TCP no response frame
+is acknowledged, so its send succeeds as for an accepted response; in process
+its send fails with `AdmissionDropped`, which tells a sender holding the
+request ID that this session holds the request for another peer. The ID is
+only ever sent to the addressee, so a sender that holds it already sees the
+exchange.
+
 <Note>
 Use `send_message` by default for ordinary collaboration. `send_request` is for structured ask/reply semantics only. It is not task tracking, a stronger delivery mode, or a reserved response channel.
 </Note>

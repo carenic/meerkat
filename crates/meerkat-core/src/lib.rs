@@ -432,6 +432,7 @@ pub use ops_lifecycle::{
 pub use peer_correlation::{
     InboundPeerRequestState, InteractionStreamAbandonReason, InteractionStreamState,
     OutboundPeerRequestState, PeerCorrelationId, PeerResponseAddresseeVerdict,
+    PeerResponseSenderVerdict,
 };
 pub use peer_meta::PeerMeta;
 pub use persistence_contract::{

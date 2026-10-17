@@ -3122,11 +3122,20 @@ impl MobSupervisorBridge {
                 Some(SupervisorResponseOutcome::Terminal { value, disposition })
                     if matched.is_none() =>
                 {
-                    Self::record_response_terminal(runtime, request_envelope_id, disposition)?;
+                    Self::record_response_terminal(
+                        runtime,
+                        request_envelope_id,
+                        disposition,
+                        expected_responder,
+                    )?;
                     matched = Some(value);
                 }
                 Some(SupervisorResponseOutcome::Progress) => {
-                    Self::record_response_progress(runtime, request_envelope_id)?;
+                    Self::record_response_progress(
+                        runtime,
+                        request_envelope_id,
+                        expected_responder,
+                    )?;
                 }
                 Some(SupervisorResponseOutcome::Terminal { .. }) => {}
                 None => retained.push_back(candidate),
@@ -3166,11 +3175,20 @@ impl MobSupervisorBridge {
                 Some(SupervisorResponseOutcome::Terminal { value, disposition })
                     if matched.is_none() =>
                 {
-                    Self::record_response_terminal(runtime, request_envelope_id, disposition)?;
+                    Self::record_response_terminal(
+                        runtime,
+                        request_envelope_id,
+                        disposition,
+                        expected_responder,
+                    )?;
                     matched = Some(value);
                 }
                 Some(SupervisorResponseOutcome::Progress) => {
-                    Self::record_response_progress(runtime, request_envelope_id)?;
+                    Self::record_response_progress(
+                        runtime,
+                        request_envelope_id,
+                        expected_responder,
+                    )?;
                 }
                 Some(SupervisorResponseOutcome::Terminal { .. }) => {}
                 None => {
@@ -3286,27 +3304,37 @@ impl MobSupervisorBridge {
         })
     }
 
+    /// Record the responder's progress on the awaited request. `responder`
+    /// is the canonical sender identity the caller already matched against
+    /// the request's recipient (`responder_identity_matches`); the generated
+    /// transition checks it against the recorded addressee again.
     fn record_response_progress(
         runtime: &Arc<meerkat_comms::CommsRuntime>,
         request_envelope_id: uuid::Uuid,
+        responder: PeerId,
     ) -> Result<(), MobError> {
         let corr_id = meerkat_core::PeerCorrelationId::from_uuid(request_envelope_id);
         let handle = Self::peer_interaction_handle(runtime, request_envelope_id)?;
-        handle.response_progress(corr_id).map_err(|error| {
+        handle.response_progress(corr_id, responder).map_err(|error| {
             MobError::Internal(format!(
                 "supervisor request '{request_envelope_id}' progress rejected by machine authority: {error}"
             ))
         })
     }
 
+    /// Record the responder's terminal response on the awaited request;
+    /// `responder` as for [`Self::record_response_progress`].
     fn record_response_terminal(
         runtime: &Arc<meerkat_comms::CommsRuntime>,
         request_envelope_id: uuid::Uuid,
         disposition: meerkat_core::handles::PeerTerminalDisposition,
+        responder: PeerId,
     ) -> Result<(), MobError> {
         let corr_id = meerkat_core::PeerCorrelationId::from_uuid(request_envelope_id);
         let handle = Self::peer_interaction_handle(runtime, request_envelope_id)?;
-        handle.response_terminal(corr_id, disposition).map_err(|error| {
+        handle
+            .response_terminal(corr_id, disposition, responder)
+            .map_err(|error| {
             MobError::Internal(format!(
                 "supervisor request '{request_envelope_id}' terminal response rejected by machine authority: {error}"
             ))
@@ -6254,14 +6282,16 @@ mod tests {
         let handle = runtime
             .peer_interaction_handle()
             .expect("supervisor runtime installs peer interaction authority");
+        let member = PeerId::new();
         handle
-            .request_sent(corr_id)
+            .request_sent(corr_id, member)
             .expect("request should be recorded by generated authority");
 
         MobSupervisorBridge::record_response_terminal(
             &runtime,
             request_envelope_id,
             meerkat_core::handles::PeerTerminalDisposition::Completed,
+            member,
         )
         .expect("terminal response should be recorded by generated authority");
 
@@ -6291,7 +6321,7 @@ mod tests {
             .peer_interaction_handle()
             .expect("supervisor runtime installs peer interaction authority");
         handle
-            .request_sent(corr_id)
+            .request_sent(corr_id, PeerId::new())
             .expect("request should be recorded by generated authority");
 
         MobSupervisorBridge::record_request_timed_out(&runtime, request_envelope_id)

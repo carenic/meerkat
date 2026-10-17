@@ -3268,7 +3268,10 @@ impl CommsRuntime {
             self.require_peer_request_response_authority("PeerRequest")?;
         let stream_handle = stream_reserved.then_some(stream_authority);
 
-        if let Err(err) = peer_handle.request_sent(corr_id) {
+        // The machine records the addressee before the request frame can
+        // leave, so every response to it finds the peer it was sent to
+        // recorded: only that peer's verified signer may answer it.
+        if let Err(err) = peer_handle.request_sent(corr_id, to.peer_id) {
             tracing::warn!(
                 error = %err,
                 corr_id = %corr_id,
@@ -5938,6 +5941,7 @@ mod tests {
         fn request_sent(
             &self,
             corr_id: meerkat_core::PeerCorrelationId,
+            _addressee: meerkat_core::comms::PeerId,
         ) -> Result<(), meerkat_core::handles::DslTransitionError> {
             let mut outbound = self.outbound.lock();
             if outbound.contains_key(&corr_id) {
@@ -5953,6 +5957,7 @@ mod tests {
         fn response_progress(
             &self,
             corr_id: meerkat_core::PeerCorrelationId,
+            _responder: meerkat_core::comms::PeerId,
         ) -> Result<(), meerkat_core::handles::DslTransitionError> {
             let mut outbound = self.outbound.lock();
             if !outbound.contains_key(&corr_id) {
@@ -5972,6 +5977,7 @@ mod tests {
             &self,
             corr_id: meerkat_core::PeerCorrelationId,
             _disposition: meerkat_core::handles::PeerTerminalDisposition,
+            _responder: meerkat_core::comms::PeerId,
         ) -> Result<(), meerkat_core::handles::DslTransitionError> {
             if self.outbound.lock().remove(&corr_id).is_none() {
                 return Err(Self::guard_rejected(
@@ -5986,6 +5992,7 @@ mod tests {
         fn response_rejected(
             &self,
             corr_id: meerkat_core::PeerCorrelationId,
+            _responder: meerkat_core::comms::PeerId,
         ) -> Result<(), meerkat_core::handles::DslTransitionError> {
             if self.outbound.lock().remove(&corr_id).is_none() {
                 return Err(Self::guard_rejected(
@@ -7531,6 +7538,7 @@ mod tests {
         meerkat_core::handles::PeerInteractionHandle::request_sent(
             receiver_peer_handle.as_ref(),
             corr_id,
+            sender.public_key().to_peer_id(),
         )
         .expect("receiver machine authority should expect the response");
 
@@ -10614,8 +10622,13 @@ mod tests {
 
         let interaction_id = meerkat_core::InteractionId(Uuid::new_v4());
         let corr_id = meerkat_core::PeerCorrelationId::from_uuid(interaction_id.0);
-        meerkat_core::handles::PeerInteractionHandle::request_sent(peer_handle.as_ref(), corr_id)
-            .unwrap();
+        let addressee = meerkat_core::comms::PeerId::new();
+        meerkat_core::handles::PeerInteractionHandle::request_sent(
+            peer_handle.as_ref(),
+            corr_id,
+            addressee,
+        )
+        .unwrap();
         runtime
             .reserve_interaction_stream_channels(
                 corr_id,
@@ -10680,8 +10693,13 @@ mod tests {
         ));
         let interaction_id = meerkat_core::InteractionId(Uuid::new_v4());
         let corr_id = meerkat_core::PeerCorrelationId::from_uuid(interaction_id.0);
-        meerkat_core::handles::PeerInteractionHandle::request_sent(peer_handle.as_ref(), corr_id)
-            .unwrap();
+        let addressee = meerkat_core::comms::PeerId::new();
+        meerkat_core::handles::PeerInteractionHandle::request_sent(
+            peer_handle.as_ref(),
+            corr_id,
+            addressee,
+        )
+        .unwrap();
         runtime
             .reserve_interaction_stream_channels(
                 corr_id,
@@ -10696,6 +10714,7 @@ mod tests {
             peer_handle.as_ref(),
             corr_id,
             meerkat_core::handles::PeerTerminalDisposition::Completed,
+            addressee,
         )
         .unwrap();
         sender
@@ -10786,8 +10805,13 @@ mod tests {
 
         let interaction_id = meerkat_core::InteractionId(Uuid::new_v4());
         let corr_id = meerkat_core::PeerCorrelationId::from_uuid(interaction_id.0);
-        meerkat_core::handles::PeerInteractionHandle::request_sent(peer_handle.as_ref(), corr_id)
-            .unwrap();
+        let addressee = meerkat_core::comms::PeerId::new();
+        meerkat_core::handles::PeerInteractionHandle::request_sent(
+            peer_handle.as_ref(),
+            corr_id,
+            addressee,
+        )
+        .unwrap();
         runtime
             .reserve_interaction_stream_channels(
                 corr_id,
@@ -11749,6 +11773,383 @@ mod tests {
         assert!(
             !CoreCommsRuntime::has_bridge_reply_waiter(sender.as_ref(), &interaction_id),
             "take must consume the waiter entry"
+        );
+    }
+
+    /// What the requester's machine held for one request frame when the
+    /// transport handed it over.
+    #[derive(Debug, PartialEq)]
+    struct SendMoment {
+        corr_id: meerkat_core::PeerCorrelationId,
+        outbound: Option<meerkat_core::OutboundPeerRequestState>,
+        addressee_verdict: Result<meerkat_core::PeerResponseSenderVerdict, String>,
+    }
+
+    /// Classifies like the receiver's runtime handle and, for each request
+    /// frame, records what the requester's machine holds for it. In process,
+    /// the receiver classifies in the requester's sending task while the
+    /// transport hands the frame over, so this sees the requester as the
+    /// frame leaves.
+    struct SendMomentObserver {
+        delegate: Arc<dyn meerkat_core::handles::PeerCommsHandle>,
+        requester_interaction: Arc<dyn meerkat_core::handles::PeerInteractionHandle>,
+        requester_comms: Arc<dyn meerkat_core::handles::PeerCommsHandle>,
+        addressee: PeerId,
+        seen: Mutex<Vec<SendMoment>>,
+    }
+
+    impl meerkat_core::handles::PeerCommsHandle for SendMomentObserver {
+        fn classify_external_envelope(
+            &self,
+            facts: meerkat_core::PeerIngressEnvelopeFacts,
+        ) -> Result<meerkat_core::PeerIngressAdmission, meerkat_core::handles::DslTransitionError>
+        {
+            if matches!(
+                facts.kind,
+                meerkat_core::PeerIngressEnvelopeKind::Request { .. }
+            ) && let Ok(id) = Uuid::parse_str(&facts.item_id)
+            {
+                let corr_id = meerkat_core::PeerCorrelationId::from_uuid(id);
+                self.seen.lock().push(SendMoment {
+                    corr_id,
+                    outbound: self.requester_interaction.outbound_state(corr_id),
+                    addressee_verdict: self
+                        .requester_comms
+                        .resolve_peer_response_sender(corr_id, self.addressee)
+                        .map_err(|error| error.to_string()),
+                });
+            }
+            self.delegate.classify_external_envelope(facts)
+        }
+
+        fn classify_plain_event(
+            &self,
+            facts: meerkat_core::PeerIngressPlainEventFacts,
+        ) -> Result<meerkat_core::PeerIngressAdmission, meerkat_core::handles::DslTransitionError>
+        {
+            self.delegate.classify_plain_event(facts)
+        }
+
+        fn resolve_peer_ingress_receive(
+            &self,
+            facts: meerkat_core::PeerIngressReceiveFacts,
+        ) -> Result<
+            meerkat_core::PeerIngressReceiveAuthority,
+            meerkat_core::handles::DslTransitionError,
+        > {
+            self.delegate.resolve_peer_ingress_receive(facts)
+        }
+
+        fn resolve_peer_ingress_dequeue(
+            &self,
+            facts: meerkat_core::PeerIngressDequeueFacts,
+        ) -> Result<
+            meerkat_core::PeerIngressDequeueAuthority,
+            meerkat_core::handles::DslTransitionError,
+        > {
+            self.delegate.resolve_peer_ingress_dequeue(facts)
+        }
+
+        fn resolve_peer_response_sender(
+            &self,
+            corr_id: meerkat_core::PeerCorrelationId,
+            responder: PeerId,
+        ) -> Result<
+            meerkat_core::PeerResponseSenderVerdict,
+            meerkat_core::handles::DslTransitionError,
+        > {
+            self.delegate
+                .resolve_peer_response_sender(corr_id, responder)
+        }
+
+        fn authorize_peer_ingress_claim_commit(
+            &self,
+            facts: meerkat_core::interaction::PeerIngressClaimCommitFacts,
+            receipt: &(dyn std::any::Any + Send + Sync),
+        ) -> Result<
+            meerkat_core::interaction::PeerIngressClaimTerminalOutcome,
+            meerkat_core::handles::DslTransitionError,
+        > {
+            self.delegate
+                .authorize_peer_ingress_claim_commit(facts, receipt)
+        }
+
+        fn set_peer_ingress_context(
+            &self,
+            keep_alive: bool,
+        ) -> Result<(), meerkat_core::handles::DslTransitionError> {
+            self.delegate.set_peer_ingress_context(keep_alive)
+        }
+
+        fn install_generated_peer_comms_on_target(
+            &self,
+            expected_owner: &meerkat_core::comms::GeneratedPeerCommsOwnerToken,
+            target: &(dyn meerkat_core::handles::PeerCommsInstallTarget + '_),
+        ) -> Result<(), String> {
+            self.delegate
+                .install_generated_peer_comms_on_target(expected_owner, target)
+        }
+    }
+
+    /// The requester's machine records a request, with the peer it is sent
+    /// to, before the request frame leaves: when the transport hands the
+    /// frame to the addressee, the request is `Sent` and the machine accepts
+    /// responses to it from the addressee.
+    #[tokio::test]
+    async fn the_addressee_is_recorded_before_the_request_frame_leaves() {
+        let suffix = Uuid::new_v4().simple().to_string();
+        let sender_name = format!("send-moment-sender-{suffix}");
+        let receiver_name = format!("send-moment-receiver-{suffix}");
+        let sender = Arc::new(CommsRuntime::inproc_only(&sender_name).unwrap());
+        let receiver = Arc::new(CommsRuntime::inproc_only(&receiver_name).unwrap());
+        let machine = meerkat_runtime::MeerkatMachine::ephemeral();
+        let bindings = machine
+            .prepare_bindings(SessionId::new())
+            .await
+            .expect("the requester's machine prepares its bindings");
+        sender.install_peer_request_response_authority(PeerRequestResponseAuthority::new(
+            Arc::clone(bindings.peer_interaction()),
+            Arc::clone(bindings.interaction_stream()),
+        ));
+        let (receiver_handle, finalizer) =
+            meerkat_runtime::test_peer_comms_handle_and_runtime_finalizer();
+        let observer = Arc::new(SendMomentObserver {
+            delegate: receiver_handle,
+            requester_interaction: Arc::clone(bindings.peer_interaction()),
+            requester_comms: Arc::clone(bindings.peer_comms()),
+            addressee: crate::router::peer_id_from_pubkey(&receiver.public_key()),
+            seen: Mutex::new(Vec::new()),
+        });
+        add_trusted_peer_with_generated_authority(
+            sender.as_ref(),
+            trusted_descriptor(
+                &receiver_name,
+                receiver.public_key(),
+                &format!("inproc://{receiver_name}"),
+            ),
+        )
+        .await;
+        add_trusted_peer_with_generated_authority(
+            receiver.as_ref(),
+            trusted_descriptor(
+                &sender_name,
+                sender.public_key(),
+                &format!("inproc://{sender_name}"),
+            ),
+        )
+        .await;
+        // After trust: adding a trusted peer installs its own classification
+        // handle.
+        receiver.install_peer_comms_handle(observer.clone());
+
+        let finalize = spawn_runtime_finalization(Arc::clone(&receiver), Arc::new(finalizer));
+        let receipt = CoreCommsRuntime::send(
+            sender.as_ref(),
+            meerkat_core::comms::CommsCommand::PeerRequest {
+                to: peer_route(&receiver_name, receiver.public_key()),
+                intent: "test.send_moment".to_string(),
+                params: serde_json::json!({}),
+                blocks: None,
+                content_taint: None,
+                handling_mode: meerkat_core::types::HandlingMode::Queue,
+                stream: InputStreamMode::None,
+                objective_id: None,
+            },
+        )
+        .await
+        .expect("the request reaches the receiver");
+        let meerkat_core::comms::SendReceipt::PeerRequestSent { envelope_id, .. } = receipt else {
+            panic!("expected a peer request receipt, got {receipt:?}");
+        };
+        finalize.await.expect("the receiver admits the request");
+        assert_eq!(
+            *observer.seen.lock(),
+            vec![SendMoment {
+                corr_id: meerkat_core::PeerCorrelationId::from_uuid(envelope_id),
+                outbound: Some(meerkat_core::OutboundPeerRequestState::Sent),
+                addressee_verdict: Ok(meerkat_core::PeerResponseSenderVerdict::Addressee),
+            }],
+            "when the request frame leaves, the request is sent and its addressee recorded"
+        );
+    }
+
+    /// Send one signed response frame to `listener` on its own TCP
+    /// connection and return every frame the connection carried back before
+    /// it closed. The listener closes a connection once it has handled its
+    /// frame, so on return the frame has been admitted or dropped.
+    async fn send_response_frame_over_tcp(
+        listener: std::net::SocketAddr,
+        from: &Keypair,
+        to: PubKey,
+        in_reply_to: Uuid,
+        status: Status,
+    ) -> Vec<Envelope> {
+        use futures::SinkExt;
+        let stream = TcpStream::connect(listener)
+            .await
+            .expect("connect to the requester's listener");
+        let mut framed = tokio_util::codec::Framed::new(
+            stream,
+            crate::transport::codec::TransportCodec::default(),
+        );
+        let mut envelope = Envelope {
+            id: Uuid::new_v4(),
+            from: from.public_key(),
+            to,
+            kind: MessageKind::Response {
+                objective_id: None,
+                in_reply_to,
+                status,
+                result: serde_json::json!({}),
+                blocks: None,
+                content_taint: None,
+                handling_mode: None,
+            },
+            sig: Signature::new([0u8; 64]),
+        };
+        envelope.sign(from);
+        framed
+            .send(crate::transport::codec::EnvelopeFrame::from_envelope(
+                envelope,
+            ))
+            .await
+            .expect("write the response frame");
+        let mut replies = Vec::new();
+        while let Some(Ok(frame)) = framed.next().await {
+            replies.push(frame.envelope);
+        }
+        replies
+    }
+
+    async fn queued_response_count(runtime: &CommsRuntime) -> usize {
+        CoreCommsRuntime::peer_ingress_queue_snapshot(runtime)
+            .await
+            .expect("classified queue snapshot")
+            .response_count
+    }
+
+    /// Over TCP, as in process, a response frame signed by a peer the
+    /// request was not sent to is dropped at the requester's listener before
+    /// it is queued, so the drain never sees it and the request stays open.
+    /// TCP carries no reply to a response frame, admitted or dropped: the
+    /// sender sees its connection close with nothing sent back, as for an
+    /// admitted response, so its send succeeds. The same sender's response
+    /// to a request id the requester does not hold, and the addressee's
+    /// response, are queued as before.
+    #[tokio::test]
+    async fn a_tcp_response_from_a_peer_the_request_was_not_sent_to_is_never_queued() {
+        let suffix = Uuid::new_v4().simple().to_string();
+        let mut requester =
+            CommsRuntime::inproc_only(&format!("tcp-response-requester-{suffix}")).unwrap();
+        requester
+            .set_listen_tcp_for_unstarted_runtime(std::net::SocketAddr::from(([127, 0, 0, 1], 0)))
+            .expect("configure the requester's TCP listener");
+        requester
+            .start_listeners()
+            .await
+            .expect("start the requester's TCP listener");
+        let requester = Arc::new(requester);
+        let listener = requester
+            .bound_tcp_listener_address()
+            .expect("the requester's TCP listener is bound");
+        let machine = meerkat_runtime::MeerkatMachine::ephemeral();
+        let bindings = machine
+            .prepare_bindings(SessionId::new())
+            .await
+            .expect("the requester's machine prepares its bindings");
+        let addressee = Keypair::generate();
+        let impostor = Keypair::generate();
+        let addressee_descriptor = trusted_descriptor(
+            "tcp-response-addressee",
+            addressee.public_key(),
+            &format!("inproc://tcp-response-addressee-{suffix}"),
+        );
+        let impostor_descriptor = trusted_descriptor(
+            "tcp-response-impostor",
+            impostor.public_key(),
+            &format!("inproc://tcp-response-impostor-{suffix}"),
+        );
+        let trust =
+            add_trusted_peer_with_generated_authority(requester.as_ref(), addressee_descriptor)
+                .await;
+        let impostor_trust = test_projection_add_authority_with_dsl(trust, &impostor_descriptor);
+        CoreCommsRuntime::apply_trust_mutation(
+            requester.as_ref(),
+            CommsTrustMutation::AddTrustedPeer {
+                authority: impostor_trust.authority,
+                peer: impostor_descriptor,
+            },
+        )
+        .await
+        .expect("the requester trusts the impostor");
+        // After trust: adding a trusted peer installs its own classification
+        // handle. The requester classifies with the machine that records its
+        // requests.
+        requester.install_peer_comms_handle(Arc::clone(bindings.peer_comms()));
+        let request_id = Uuid::new_v4();
+        let corr_id = meerkat_core::PeerCorrelationId::from_uuid(request_id);
+        bindings
+            .peer_interaction()
+            .request_sent(
+                corr_id,
+                crate::router::peer_id_from_pubkey(&addressee.public_key()),
+            )
+            .expect("the requester's machine records the request to the addressee");
+
+        for status in [Status::Accepted, Status::Completed] {
+            let replies = send_response_frame_over_tcp(
+                listener,
+                &impostor,
+                requester.public_key(),
+                request_id,
+                status,
+            )
+            .await;
+            assert!(
+                replies.is_empty(),
+                "a response frame gets nothing back: {replies:?}"
+            );
+            assert_eq!(
+                queued_response_count(requester.as_ref()).await,
+                0,
+                "the impostor's {status:?} response is never queued"
+            );
+            assert_eq!(
+                bindings.peer_interaction().outbound_state(corr_id),
+                Some(meerkat_core::OutboundPeerRequestState::Sent),
+                "the request stays open for its addressee"
+            );
+        }
+
+        let unknown = Uuid::new_v4();
+        let replies = send_response_frame_over_tcp(
+            listener,
+            &impostor,
+            requester.public_key(),
+            unknown,
+            Status::Completed,
+        )
+        .await;
+        assert!(replies.is_empty(), "{replies:?}");
+        assert_eq!(
+            queued_response_count(requester.as_ref()).await,
+            1,
+            "a response to an id the requester does not hold is queued as before"
+        );
+
+        let replies = send_response_frame_over_tcp(
+            listener,
+            &addressee,
+            requester.public_key(),
+            request_id,
+            Status::Completed,
+        )
+        .await;
+        assert!(replies.is_empty(), "{replies:?}");
+        assert_eq!(
+            queued_response_count(requester.as_ref()).await,
+            2,
+            "the addressee's response is queued"
         );
     }
 
