@@ -135,6 +135,8 @@ pub struct AddServerRequest {
     pub positional_url: Option<String>,
     pub headers: Vec<String>,
     pub oauth_account: Option<String>,
+    /// The account binding of a server that names no `oauth_account`.
+    pub oauth_account_selection: Option<McpOAuthAccountSelection>,
     pub command: Vec<String>,
     pub env: Vec<String>,
     /// The only raw operations the server may be called with; empty leaves
@@ -155,11 +157,12 @@ fn server_from_request(request: AddServerRequest) -> anyhow::Result<McpServerCon
         request.command,
         request.env,
     )?;
-    if let Some(account) = request.oauth_account {
+    if request.oauth_account.is_some() || request.oauth_account_selection.is_some() {
         let McpTransportConfig::Http(http) = &mut server.transport else {
             return Err(meerkat_auth_core::McpOAuthError::UnsupportedAccountSelection.into());
         };
-        http.oauth_account = Some(account);
+        http.oauth_account = request.oauth_account;
+        http.oauth_account_selection = request.oauth_account_selection;
         meerkat_auth_core::McpServerIdentity::from_config(&server)?;
     }
     if !request.allowed_operations.is_empty() {
@@ -210,7 +213,50 @@ pub async fn add_server(
         scope,
         path.display()
     );
+    print_oauth_account_note(&server);
     Ok(())
+}
+
+/// What `rkat mcp add` says about a server's OAuth account: its selection,
+/// or, for a streamable HTTP server that could use OAuth sign-in (no
+/// selection and no static `Authorization` header), the choices
+/// `rkat mcp login` needs. Nothing for any other server.
+fn oauth_account_note(server: &McpServerConfig) -> Option<String> {
+    let McpTransportConfig::Http(http) = &server.transport else {
+        return None;
+    };
+    if let Some(account) = &http.oauth_account {
+        return Some(format!(
+            "OAuth account: {account} (each login must prove this provider subject)"
+        ));
+    }
+    match http.oauth_account_selection {
+        Some(McpOAuthAccountSelection::Discover) => {
+            Some("OAuth account: discovered at the first login (provider-verified)".to_owned())
+        }
+        Some(McpOAuthAccountSelection::Unverified) => Some(
+            "OAuth account: not verified (resource-bound access, no account evidence)".to_owned(),
+        ),
+        None => {
+            let static_authorization = http
+                .headers
+                .keys()
+                .any(|name| name.eq_ignore_ascii_case("authorization"));
+            (server.transport_kind() == McpTransportKind::StreamableHttp && !static_authorization)
+                .then(|| {
+                    format!(
+                        "If '{}' uses OAuth sign-in, `rkat mcp login` needs an account selection: re-add it with --oauth-account-selection discover | unverified, or --oauth-account <SUBJECT_ID>.",
+                        server.name
+                    )
+                })
+        }
+    }
+}
+
+fn print_oauth_account_note(server: &McpServerConfig) {
+    if let Some(note) = oauth_account_note(server) {
+        println!("{note}");
+    }
 }
 
 /// Add an MCP server to the selected realm's own config, under the
@@ -232,6 +278,7 @@ pub async fn add_realm_server(
         realm_name,
         snapshot.generation
     );
+    print_oauth_account_note(&server);
     Ok(())
 }
 
@@ -604,6 +651,7 @@ mod tests {
                     positional_url: None,
                     headers,
                     oauth_account: Some(account.into()),
+                    oauth_account_selection: None,
                     command: Vec::new(),
                     env: Vec::new(),
                     allowed_operations: Vec::new(),
@@ -627,6 +675,158 @@ mod tests {
         assert_eq!(target.expected_account(), Some("provider-subject-a"));
     }
 
+    /// `--oauth-account-selection` writes `oauth_account_selection` under the
+    /// same validation as `--oauth-account`: a streamable HTTP server without
+    /// a static `Authorization` header, and never beside an account. A
+    /// refused request writes nothing.
+    #[tokio::test]
+    async fn oauth_account_selection_is_persisted_and_conflicts_do_not_write() {
+        use meerkat_auth_core::McpAccountSelection;
+        let temp = TempDir::new().unwrap();
+        for (name, transport, headers, account, selection, accepted) in [
+            (
+                "discover",
+                McpTransportKind::StreamableHttp,
+                vec![],
+                None,
+                McpOAuthAccountSelection::Discover,
+                true,
+            ),
+            (
+                "unverified",
+                McpTransportKind::StreamableHttp,
+                vec![],
+                None,
+                McpOAuthAccountSelection::Unverified,
+                true,
+            ),
+            (
+                "static",
+                McpTransportKind::StreamableHttp,
+                vec!["Authorization: Bearer fixture".to_owned()],
+                None,
+                McpOAuthAccountSelection::Discover,
+                false,
+            ),
+            (
+                "sse",
+                McpTransportKind::Sse,
+                vec![],
+                None,
+                McpOAuthAccountSelection::Unverified,
+                false,
+            ),
+            (
+                "both",
+                McpTransportKind::StreamableHttp,
+                vec![],
+                Some("provider-subject-a".to_owned()),
+                McpOAuthAccountSelection::Discover,
+                false,
+            ),
+        ] {
+            let result = add_server(
+                AddServerRequest {
+                    name: name.into(),
+                    transport: Some(transport),
+                    url: Some("https://fixture.example/mcp".into()),
+                    positional_url: None,
+                    headers,
+                    oauth_account: account,
+                    oauth_account_selection: Some(selection),
+                    command: Vec::new(),
+                    env: Vec::new(),
+                    allowed_operations: Vec::new(),
+                    project_scope: false,
+                },
+                None,
+                Some(temp.path()),
+            )
+            .await;
+            assert_eq!(
+                result.is_ok(),
+                accepted,
+                "unexpected config admission for {name}: {result:?}"
+            );
+        }
+        let stored = McpConfig::load_scope_from_roots(McpScope::User, None, Some(temp.path()))
+            .await
+            .unwrap();
+        let selections: Vec<(&str, McpAccountSelection)> = stored
+            .servers
+            .iter()
+            .map(|server| {
+                let target = meerkat_auth_core::McpServerIdentity::from_config(server).unwrap();
+                (server.name.as_str(), target.selection().clone())
+            })
+            .collect();
+        assert_eq!(
+            selections,
+            vec![
+                ("discover", McpAccountSelection::Discover),
+                ("unverified", McpAccountSelection::Unverified),
+            ]
+        );
+    }
+
+    /// The add output names the selection, labels unverified access, and
+    /// names the account choices only for a streamable HTTP server that
+    /// could use OAuth sign-in.
+    #[test]
+    fn add_output_names_the_oauth_account_choice() {
+        let server_with = |headers: &[(&str, &str)], selection, account: Option<&str>| {
+            let mut server = McpServerConfig::streamable_http(
+                "tracker",
+                "https://fixture.example/mcp",
+                headers
+                    .iter()
+                    .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+                    .collect(),
+            );
+            if let McpTransportConfig::Http(http) = &mut server.transport {
+                http.oauth_account_selection = selection;
+                http.oauth_account = account.map(str::to_owned);
+            }
+            server
+        };
+        assert_eq!(
+            oauth_account_note(&server_with(
+                &[],
+                Some(McpOAuthAccountSelection::Unverified),
+                None
+            ))
+            .as_deref(),
+            Some("OAuth account: not verified (resource-bound access, no account evidence)")
+        );
+        assert_eq!(
+            oauth_account_note(&server_with(
+                &[],
+                Some(McpOAuthAccountSelection::Discover),
+                None
+            ))
+            .as_deref(),
+            Some("OAuth account: discovered at the first login (provider-verified)")
+        );
+        assert_eq!(
+            oauth_account_note(&server_with(&[], None, Some("subject-7"))).as_deref(),
+            Some("OAuth account: subject-7 (each login must prove this provider subject)")
+        );
+        let hint = oauth_account_note(&server_with(&[], None, None)).expect("the account choices");
+        for choice in [
+            "--oauth-account-selection discover | unverified",
+            "--oauth-account <SUBJECT_ID>",
+        ] {
+            assert!(hint.contains(choice), "{hint}");
+        }
+        for silent in [
+            server_with(&[("Authorization", "Bearer fixture")], None, None),
+            McpServerConfig::sse("tracker", "https://fixture.example/sse", HashMap::new()),
+            McpServerConfig::stdio("tracker", "tracker-mcp", Vec::new(), HashMap::new()),
+        ] {
+            assert_eq!(oauth_account_note(&silent), None, "{silent:?}");
+        }
+    }
+
     #[tokio::test]
     async fn test_offline_mutations_use_explicit_convention_roots() {
         let temp = TempDir::new().unwrap();
@@ -641,6 +841,7 @@ mod tests {
                 positional_url: None,
                 headers: Vec::new(),
                 oauth_account: None,
+                oauth_account_selection: None,
                 command: vec!["echo".to_string(), "hello".to_string()],
                 env: Vec::new(),
                 allowed_operations: Vec::new(),
@@ -699,6 +900,7 @@ mod tests {
                 positional_url: None,
                 headers: Vec::new(),
                 oauth_account: None,
+                oauth_account_selection: None,
                 command: vec!["realm-tools".to_string(), "--stdio".to_string()],
                 env: Vec::new(),
                 allowed_operations: Vec::new(),
@@ -779,6 +981,7 @@ future_server_key = "preserve-too"
                 positional_url: None,
                 headers: Vec::new(),
                 oauth_account: None,
+                oauth_account_selection: None,
                 command: vec!["echo".to_string()],
                 env: Vec::new(),
                 allowed_operations: Vec::new(),

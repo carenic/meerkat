@@ -368,6 +368,19 @@ them.
   so the layer is never written there.
   `meerkat_rpc::session_runtime::SessionRuntime::set_realm_config_source_with_host_layer`
   installs one on an RPC host.
+- `rkat mcp add --oauth-account-selection discover|unverified` writes the
+  OAuth account selection of a streamable HTTP server that names no
+  `--oauth-account` (it conflicts with that flag and has the same checks:
+  streamable HTTP, no static `Authorization` header). `discover` binds the
+  account the provider verifies at the first login; `unverified` is the
+  explicit opt-in to resource-bound access with no account evidence. Before,
+  `oauth_account_selection` could only be set by editing `mcp.toml`, so
+  `rkat mcp add <name> --url <url>` followed by `rkat mcp login <name>`
+  could not log in without a manual edit. `rkat mcp add` now prints the
+  selection it wrote, and for a streamable HTTP server without a selection
+  or a static `Authorization` header one line naming the three choices.
+  `rkat mcp login` itself never sets or changes a selection, and no default
+  changed.
 
 ### Changed
 
@@ -655,6 +668,44 @@ them.
   still read and write the realm's own document. The host now also refuses
   to start when the realm declares multi-process hosting its stores cannot
   provide, as the `cli` surface already did (see Breaking).
+- `rkat mcp login` refusals now name the server and the remedy. A server
+  without an account selection is refused before any credential store or
+  network effect, with the server's scope and the `rkat mcp remove` and
+  `rkat mcp add` commands for each choice. A `discover` (or
+  `--oauth-account`) server whose authorization server publishes no usable
+  OpenID Connect UserInfo is still refused before client registration with
+  nothing stored, and the refusal now says so, says to retry first when the
+  issuer could not be reached (one typed reason covers both), and names
+  `unverified` as the deliberate alternative and what it means; it never
+  switches the server to `unverified`. An account other than the selected
+  one is refused naming the server, and for a `discover` server how to bind
+  another account. A slot holding a credential the login may not replace is
+  refused with the real way to disconnect it (RPC `auth/logout` with the MCP
+  target, or the SDK `auth_mcp_logout` / `authMcpLogout` helpers; `rkat` has
+  no disconnect command). The printed commands single-quote the server name
+  and URL, so a URL with `?` or `&` pastes as shown. A successful login says
+  whether the account was bound by discovery, and an unverified login says
+  it carries no account verification.
+- `rkat run --mcp-auth interactive` logs in to `discover` and `unverified`
+  servers when they first require OAuth. The CLI's in-session login refused
+  every server without an `oauth_account`, unlike `rkat mcp login`; only a
+  server without any account selection is refused now. An in-session login
+  prints the same one-line outcome as `rkat mcp login` on stderr, including
+  that an unverified credential carries no account verification.
+- The `McpOAuthError::AccountSelectionRequired` text (shown by RPC and REST
+  for the `account_selection_required` reason) now names both ways to
+  select: "MCP OAuth interactive login requires an account selection:
+  oauth_account (a provider subject ID) or oauth_account_selection (discover
+  or unverified)". It said an explicit expected account was required.
+- The quickstart, the MCP examples and the embedded `mcp-server-setup` skill
+  showed `rkat mcp add <name> --url <url>` followed by `rkat mcp login
+  <name>`, which that refusal stops; they now pass
+  `--oauth-account-selection discover`.
+- The MCP reference said MCP OAuth credentials are stored per installation,
+  not per realm. Since 0.9 each realm has its own credential slot in the
+  host's token store (the slot key includes the realm the host serves), as
+  the CLI reference and the 0.9 migration notes say; the reference now says
+  so.
 
 ## [0.9.2] - 2026-10-16
 
