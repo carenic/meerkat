@@ -3532,6 +3532,18 @@ enum McpCommands {
         #[arg(long, value_name = "ACCOUNT_ID")]
         oauth_account: Option<String>,
 
+        /// OAuth account binding without an --oauth-account (streamable HTTP
+        /// only): discover binds the account the provider verifies at the
+        /// first login, unverified is resource-bound access with no account
+        /// evidence
+        #[arg(
+            long,
+            value_enum,
+            value_name = "MODE",
+            conflicts_with = "oauth_account"
+        )]
+        oauth_account_selection: Option<CliOAuthAccountSelection>,
+
         /// Environment variable (KEY=VALUE). Can be repeated. (for stdio transport)
         #[arg(short = 'e', long = "env", value_name = "KEY=VALUE")]
         env: Vec<String>,
@@ -4217,6 +4229,26 @@ impl From<CliMcpScope> for meerkat_core::McpServerSource {
             CliMcpScope::User => Self::File(McpScope::User),
             CliMcpScope::Project | CliMcpScope::Local => Self::File(McpScope::Project),
             CliMcpScope::Realm => Self::Realm,
+        }
+    }
+}
+
+/// `rkat mcp add --oauth-account-selection` (maps to McpOAuthAccountSelection)
+#[cfg(feature = "mcp")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum CliOAuthAccountSelection {
+    /// Bind the account the provider verifies at the first login
+    Discover,
+    /// Resource-bound access with no account evidence; no account is verified
+    Unverified,
+}
+
+#[cfg(feature = "mcp")]
+impl From<CliOAuthAccountSelection> for meerkat_core::mcp_config::McpOAuthAccountSelection {
+    fn from(selection: CliOAuthAccountSelection) -> Self {
+        match selection {
+            CliOAuthAccountSelection::Discover => Self::Discover,
+            CliOAuthAccountSelection::Unverified => Self::Unverified,
         }
     }
 }
@@ -11222,7 +11254,9 @@ impl meerkat_mcp::McpAuthResolver for CliMcpHostAuthResolver {
         www_authenticate: Option<&str>,
     ) -> Result<String, meerkat::McpOAuthError> {
         use std::io::IsTerminal;
-        if target.expected_account().is_none() {
+        // Any selection (Known, Discover or Unverified) logs in, exactly as
+        // `rkat mcp login` does; only an unselected server is refused.
+        if !target.is_selected() {
             return Err(meerkat::McpOAuthError::AccountSelectionRequired);
         }
         if self.mode != CliMcpAuthMode::Interactive || !std::io::stderr().is_terminal() {
@@ -18429,6 +18463,7 @@ async fn handle_mcp_command(command: McpCommands, cli_scope: &RuntimeScope) -> a
             url,
             headers,
             oauth_account,
+            oauth_account_selection,
             env,
             expected_generation,
             allowed_operations,
@@ -18446,6 +18481,7 @@ async fn handle_mcp_command(command: McpCommands, cli_scope: &RuntimeScope) -> a
                 positional_url,
                 headers,
                 oauth_account,
+                oauth_account_selection: oauth_account_selection.map(Into::into),
                 command,
                 env,
                 allowed_operations,
@@ -18727,6 +18763,112 @@ fn require_mcp_login_terminal(allow_headless: bool, is_terminal: bool) -> anyhow
     )
 }
 
+/// What a refused `rkat mcp login` names: the server, the scope that
+/// configures it and its URL, so each remedy is a command to run as shown.
+#[cfg(feature = "mcp")]
+struct McpLoginRemedy<'a> {
+    server: &'a str,
+    scope: meerkat_core::McpServerSource,
+    url: &'a str,
+}
+
+#[cfg(feature = "mcp")]
+impl McpLoginRemedy<'_> {
+    fn remove(&self) -> String {
+        format!("rkat mcp remove {} --scope {}", self.server, self.scope)
+    }
+
+    fn add(&self, selection: &str) -> String {
+        format!(
+            "rkat mcp add {} --scope {} --url {} {selection}",
+            self.server, self.scope, self.url
+        )
+    }
+
+    /// The server names no account selection, so no login can bind its
+    /// credential to an account.
+    fn missing_selection(&self) -> String {
+        format!(
+            "MCP server '{server}' has no OAuth account selection, so `rkat mcp login` cannot bind its credential to an account. Add it again with one (`{remove}` first; repeat any other options):\n  --oauth-account-selection discover    bind the account the provider verifies at the first login (needs OpenID Connect UserInfo)\n  --oauth-account <SUBJECT_ID>          the provider subject ID the login must prove (not an email or display name)\n  --oauth-account-selection unverified  resource-bound access with no account evidence\nFor example: {example}",
+            server = self.server,
+            remove = self.remove(),
+            example = self.add("--oauth-account-selection discover"),
+        )
+    }
+
+    /// A Known or Discover selection found no account evidence it can
+    /// verify. Unverified is named as the deliberate alternative, never
+    /// taken.
+    fn no_account_evidence(&self, known: bool) -> String {
+        let outcome = if known {
+            "Its --oauth-account subject cannot be verified; no credential was stored."
+        } else {
+            "Its `discover` selection cannot bind an account; no credential was stored."
+        };
+        format!(
+            "MCP server '{server}' gave no account evidence this host can verify: its authorization server publishes no usable OpenID Connect UserInfo endpoint, or it could not be reached.\n{outcome}\nIf resource-bound access without account evidence is acceptable for this server, select it deliberately:\n  {remove}\n  {add}\nAn unverified credential is bound to the server, issuer and client only: no account is verified, stored or reported, and it acts as whichever account signs in.",
+            server = self.server,
+            remove = self.remove(),
+            add = self.add("--oauth-account-selection unverified"),
+        )
+    }
+
+    /// The signed-in account is not the one the selection requires.
+    fn account_mismatch(&self, known: bool) -> String {
+        if known {
+            format!(
+                "The account signed in for MCP server '{}' is not the subject its --oauth-account names; no credential was stored. Sign in with that account, or add the server again with the right subject ID.",
+                self.server
+            )
+        } else {
+            format!(
+                "The account signed in for MCP server '{}' is not the account its credential is bound to; no credential was stored. Sign in with that account.",
+                self.server
+            )
+        }
+    }
+
+    /// `error` as the operator sees it: a refusal they can act on names
+    /// this server and its remedy, with the typed error kept in the chain;
+    /// anything else keeps its own text.
+    fn failure(
+        &self,
+        target: &meerkat::McpServerIdentity,
+        error: meerkat::HostAuthError,
+    ) -> anyhow::Error {
+        use meerkat_auth_core::McpAccountSelection;
+        use meerkat_auth_core::connector_oauth::ConnectorOAuthRefusal;
+        let known = match target.selection() {
+            McpAccountSelection::Known(_) => Some(true),
+            McpAccountSelection::Discover => Some(false),
+            McpAccountSelection::Legacy | McpAccountSelection::Unverified => None,
+        };
+        let message = match (&error, known) {
+            (
+                meerkat::HostAuthError::McpOAuth(meerkat::McpOAuthError::AccountSelectionRequired),
+                _,
+            ) => Some(self.missing_selection()),
+            (
+                meerkat::HostAuthError::McpOAuth(meerkat::McpOAuthError::Verification(
+                    ConnectorOAuthRefusal::VerificationUnavailable,
+                )),
+                Some(known),
+            ) => Some(self.no_account_evidence(known)),
+            (
+                meerkat::HostAuthError::McpOAuth(meerkat::McpOAuthError::Verification(
+                    ConnectorOAuthRefusal::AccountMismatch,
+                )),
+                Some(known),
+            ) => Some(self.account_mismatch(known)),
+            _ => None,
+        };
+        match message {
+            Some(message) => exit_status::typed_failure(error, |_| message),
+            None => anyhow::anyhow!("{error}"),
+        }
+    }
+}
+
 #[cfg(feature = "mcp")]
 async fn login_mcp_server(
     name: String,
@@ -18747,11 +18889,8 @@ async fn login_mcp_server(
             "MCP server '{name}' exists in multiple scopes. Specify --scope user, --scope project or --scope realm."
         );
     }
-    let server = servers
-        .into_iter()
-        .next()
-        .expect("non-empty checked")
-        .server;
+    let meerkat_core::McpServerWithSource { server, source } =
+        servers.into_iter().next().expect("non-empty checked");
     let McpTransportConfig::Http(http) = &server.transport else {
         anyhow::bail!("MCP OAuth login supports streamable HTTP servers only");
     };
@@ -18769,8 +18908,21 @@ async fn login_mcp_server(
         );
     }
 
-    let service = open_cli_mcp_host_auth_service(cli_scope)?;
+    let remedy = McpLoginRemedy {
+        server: &server.name,
+        scope: source,
+        url: &http.url,
+    };
     let target = meerkat::McpServerIdentity::from_config(&server)?;
+    // Refused before any credential store or network effect: only host
+    // configuration selects the account binding.
+    if !target.is_selected() {
+        return Err(exit_status::typed_failure(
+            meerkat::McpOAuthError::AccountSelectionRequired,
+            |_| remedy.missing_selection(),
+        ));
+    }
+    let service = open_cli_mcp_host_auth_service(cli_scope)?;
     service
         .mcp_oauth_authority()?
         .validate_interactive_selection(&target)?;
@@ -18782,8 +18934,19 @@ async fn login_mcp_server(
         cli_scope_launch_guard(cli_scope).await,
     )
     .await
-    .map_err(|error| anyhow::anyhow!("{error}"))?;
+    .map_err(|error| remedy.failure(&target, error))?;
+    let unverified = completed.account_verification
+        == meerkat_auth_core::connector_oauth::AccountVerification::Unverified;
+    let discovered = *target.selection() == meerkat_auth_core::McpAccountSelection::Discover;
     match completed.account_id.as_deref() {
+        _ if unverified => println!(
+            "Logged in MCP server '{}' ({}) without account verification (unverified, resource-bound access)",
+            server.name, http.url
+        ),
+        Some(account) if discovered => println!(
+            "Logged in MCP server '{}' ({}) as {account} (bound by discovery)",
+            server.name, http.url
+        ),
         Some(account) => println!(
             "Logged in MCP server '{}' ({}) as {account}",
             server.name, http.url
@@ -29065,6 +29228,114 @@ default_model = "gemma"
                 }
             })
         ));
+    }
+
+    /// `--oauth-account-selection` takes `discover` or `unverified` and
+    /// conflicts with `--oauth-account`: a server names one selection.
+    #[cfg(feature = "mcp")]
+    #[test]
+    fn mcp_add_oauth_account_selection_parses_and_conflicts_with_oauth_account() {
+        let add = |extra: &[&str]| {
+            let mut args = vec![
+                "rkat",
+                "mcp",
+                "add",
+                "remote",
+                "--url",
+                "https://mcp.example.com/api",
+            ];
+            args.extend_from_slice(extra);
+            Cli::try_parse_from(args)
+        };
+        for mode in ["discover", "unverified"] {
+            if let Err(error) = add(&["--oauth-account-selection", mode]) {
+                panic!("--oauth-account-selection {mode} should parse: {error}");
+            }
+        }
+        for (extra, kind) in [
+            (
+                &[
+                    "--oauth-account",
+                    "subject-7",
+                    "--oauth-account-selection",
+                    "discover",
+                ][..],
+                clap::error::ErrorKind::ArgumentConflict,
+            ),
+            (
+                &["--oauth-account-selection", "anonymous"][..],
+                clap::error::ErrorKind::InvalidValue,
+            ),
+        ] {
+            match add(extra) {
+                Ok(_) => panic!("{extra:?} must not parse"),
+                Err(error) => assert_eq!(error.kind(), kind, "{extra:?}: {error}"),
+            }
+        }
+    }
+
+    /// The CLI's in-session login (`rkat run --mcp-auth interactive`) admits
+    /// every selected server, as `rkat mcp login` does: a discover or
+    /// unverified server is never refused for lacking a selection. Stored
+    /// mode answers the typed human-authorization status here, so no
+    /// terminal or browser is involved; only a server without a selection
+    /// is refused for it.
+    #[cfg(feature = "mcp")]
+    #[tokio::test]
+    async fn cli_session_login_admits_discover_and_unverified_selections() {
+        use meerkat_core::mcp_config::McpOAuthAccountSelection;
+        let runtime = meerkat_runtime::MeerkatMachine::ephemeral();
+        let service = meerkat::HostAuthService::new(
+            meerkat_providers::auth_store::ProviderAuthPersistence::new(
+                Arc::new(meerkat_providers::auth_store::EphemeralTokenStore::new()),
+                Arc::new(meerkat_providers::auth_store::InMemoryCoordinator::new()),
+            ),
+            runtime.provider_auth_runtime_authority(),
+        );
+        let resolver = CliMcpHostAuthResolver {
+            authority: service.mcp_oauth_authority().unwrap(),
+            service: service.clone(),
+            mode: CliMcpAuthMode::Stored,
+            untrusted: None,
+        };
+        let target = |selection: Option<McpOAuthAccountSelection>| {
+            let mut server = meerkat_core::McpServerConfig::streamable_http(
+                "tracker",
+                "https://mcp.example.test/mcp",
+                HashMap::new(),
+            );
+            if let McpTransportConfig::Http(http) = &mut server.transport {
+                http.oauth_account_selection = selection;
+            }
+            meerkat::McpServerIdentity::from_config(&server).expect("the server's OAuth target")
+        };
+        for selection in [
+            McpOAuthAccountSelection::Discover,
+            McpOAuthAccountSelection::Unverified,
+        ] {
+            let outcome = meerkat_mcp::McpAuthResolver::interactive_login(
+                &resolver,
+                &target(Some(selection)),
+                None,
+            )
+            .await;
+            assert!(
+                matches!(
+                    outcome,
+                    Err(meerkat::McpOAuthError::HumanAuthorizationRequired { .. })
+                ),
+                "{selection:?}: {outcome:?}"
+            );
+        }
+        let legacy =
+            meerkat_mcp::McpAuthResolver::interactive_login(&resolver, &target(None), None).await;
+        assert!(
+            matches!(
+                legacy,
+                Err(meerkat::McpOAuthError::AccountSelectionRequired)
+            ),
+            "{legacy:?}"
+        );
     }
 
     #[derive(Clone, Default)]

@@ -177,8 +177,9 @@ rkat mcp add api --url https://mcp.example.com/api
 # Add a streamable HTTP server with Claude-compatible positional URL syntax
 rkat mcp add --transport http remote https://mcp.example.com/api
 
-# Log in when the HTTP server requires OAuth
-rkat mcp login remote
+# An OAuth-protected server: choose its account binding when adding it, then log in
+rkat mcp add tracker --url https://tracker.example.com/mcp --oauth-account-selection discover
+rkat mcp login tracker
 
 # List servers
 rkat mcp list
@@ -255,10 +256,15 @@ sessions treated as expired and must be fixed to answer `405`.
 
 <Note>
 For OAuth-protected streamable HTTP servers, keep config simple. Add the URL
-with `rkat mcp add`, set `oauth_account` to the account the login must prove,
-then run `rkat mcp login <name>` for an explicit browser login, or
+with `rkat mcp add` and an account selection: `--oauth-account <SUBJECT_ID>`
+(the account the login must prove), `--oauth-account-selection discover`
+(bind the account the provider verifies at the first login) or
+`--oauth-account-selection unverified` (resource-bound access with no account
+evidence). Then run `rkat mcp login <name>` for an explicit browser login, or
 `rkat run "..." --mcp-auth interactive` to allow first-use browser auth during
-an interactive TTY run. Normal runs default to `--mcp-auth stored`.
+an interactive TTY run. Normal runs default to `--mcp-auth stored`. A server
+added without a selection is refused by `rkat mcp login` before any network
+request, with the commands for each choice.
 </Note>
 
 ### The account an operation acts with
@@ -316,7 +322,8 @@ ask its user.
     and a re-login over an existing credential needs `auth/logout` first.
 
   Whoever administers the host's configuration sets these keys: the
-  project or user `mcp.toml`, or the host's RPC and REST `mcp/add`. The
+  project or user `mcp.toml` (`rkat mcp add --oauth-account` or
+  `--oauth-account-selection`), or the host's RPC and REST `mcp/add`. The
   `meerkat_mcp_add` management tool refuses both keys, because a host may
   expose that tool to an agent. The two keys conflict. Each selection has
   its own credential slot: changing it never reuses or migrates another
@@ -340,7 +347,12 @@ ask its user.
   proven: for the default strategy, the issuer's OpenID Connect discovery
   must name the exact issuer and an https (or loopback) `userinfo_endpoint`.
   An issuer that cannot is refused before client registration and before any
-  browser opens.
+  browser opens. Hosts see these refusals as the typed auth reasons
+  `account_selection_required` (no selection) and `verification_unavailable`
+  (no account evidence); neither ever switches the server to `unverified`, so
+  a host offers that mode only as the operator's explicit choice. `rkat mcp
+  login` prints the exact `rkat mcp remove` and `rkat mcp add` commands for
+  each.
 - **Discovery, registration and scopes.** The authorization server's metadata
   is read from RFC 8414 discovery, falling back to OpenID Connect discovery.
   Dynamic client registration declares `application_type: "native"`. The

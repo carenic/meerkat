@@ -16,7 +16,9 @@ Rust-embedder-only APIs. Built-in tools, tool policy and callback tools are in
 - Local (stdio) server for this project:
   `rkat mcp add fs -- npx -y @modelcontextprotocol/server-filesystem .`
 - Remote server: `rkat mcp add tracker https://mcp.example.com/mcp`. With
-  OAuth: add `--oauth-account <provider-subject>`, then `rkat mcp login tracker`.
+  OAuth: add an account selection (`--oauth-account-selection discover`,
+  `--oauth-account <provider-subject>`, or `--oauth-account-selection
+  unverified`), then `rkat mcp login tracker`.
 - Configured servers start in `rkat run` / `rkat run --resume`, governed
   `rkat-rpc` sessions, and `rkat-mcp` sessions a schedule creates (the realm's
   servers). Other `rkat-rpc`, `rkat-rest` and `rkat-mcp` sessions need live
@@ -140,7 +142,7 @@ env var names, must not repeat an `env` key, and cannot be
 ## rkat mcp commands
 
 ```bash
-rkat mcp add <NAME> [-t|--transport stdio|http|sse] [--scope project|user|local|realm] [--expected-generation <N>] [-H|--header KEY:VALUE...] [-e|--env KEY=VALUE...] [--oauth-account <ACCOUNT_ID>] [--allow-operation <OPERATION>...] [-u|--url <URL> | <URL> | -- <CMD> [ARGS...]]
+rkat mcp add <NAME> [-t|--transport stdio|http|sse] [--scope project|user|local|realm] [--expected-generation <N>] [-H|--header KEY:VALUE...] [-e|--env KEY=VALUE...] [--oauth-account <ACCOUNT_ID> | --oauth-account-selection discover|unverified] [--allow-operation <OPERATION>...] [-u|--url <URL> | <URL> | -- <CMD> [ARGS...]]
 rkat mcp login <NAME> [--scope project|user|local|realm] [--allow-headless]
 rkat mcp remove <NAME> [--scope project|user|local|realm] [--expected-generation <N>]
 rkat mcp list [--scope project|user|local|realm] [--json]
@@ -151,8 +153,10 @@ rkat mcp get <NAME> [--scope project|user|local|realm] [--json]
   server unless `--transport sse`. Do not combine `--url` with a positional
   URL, or a URL with a command.
 - `-H KEY:VALUE` sets HTTP headers; `-e KEY=VALUE` sets stdio environment.
-- `--oauth-account` needs streamable HTTP without a static `Authorization`
-  header. `oauth_account_selection` has no flag: edit the file.
+- `--oauth-account` and `--oauth-account-selection` need streamable HTTP
+  without a static `Authorization` header, and conflict. `add` prints the
+  selection it wrote; for a streamable HTTP server without a selection or a
+  static `Authorization` header it names the three choices.
 - `--allow-operation` (repeatable) writes `access = { allowed_operations = [...] }`.
 - `--scope realm` edits the realm chosen by `--realm`; `--expected-generation`
   is accepted only with `--scope realm`.
@@ -178,14 +182,20 @@ stored before 0.9 is left unused, and another realm's target is refused
 
 Account selection on the server entry:
 
-- `oauth_account = "<subject>"`: the login must prove this subject (by default
-  the issuer's OpenID UserInfo `sub`; issuers without UserInfo refuse).
-- `oauth_account_selection = "discover"`: binds the account verified at the
-  first login; later logins must prove the same one.
-- `oauth_account_selection = "unverified"`: resource-bound access with no
-  account evidence.
-- None of these: login fails with `MCP OAuth interactive login requires an
-  explicit expected account`.
+- `oauth_account = "<subject>"` (`--oauth-account`): the login must prove this
+  subject (by default the issuer's OpenID UserInfo `sub`; issuers without
+  UserInfo refuse).
+- `oauth_account_selection = "discover"` (`--oauth-account-selection
+  discover`): binds the account verified at the first login; later logins
+  must prove the same one.
+- `oauth_account_selection = "unverified"` (`--oauth-account-selection
+  unverified`): resource-bound access with no account evidence. Only the
+  operator chooses it; a failed verification never falls back to it.
+- None of these: `rkat mcp login` refuses before any network request
+  (`MCP server '<name>' has no OAuth account selection...`) and prints the
+  `rkat mcp remove`/`rkat mcp add` commands for each choice. Hosts get the
+  auth reason `account_selection_required` ("MCP OAuth interactive login
+  requires an account selection: ...").
 
 CLI:
 
@@ -194,13 +204,14 @@ CLI:
   which may print the authorize URL to stderr), a streamable HTTP server
   without a static `Authorization` header, and one matching entry (pass
   `--scope` if the name exists in several). Ctrl-C closes the attempt.
-  Success prints `Logged in MCP server '<name>' (<url>) as <account>`.
+  Success prints `Logged in MCP server '<name>' (<url>) as <account>`
+  (`... (bound by discovery)` for discover), or `... without account
+  verification (unverified, resource-bound access)`.
 - `rkat run --mcp-auth stored` (default) uses stored tokens only; a missing
   one reports `MCP OAuth token not found for '<name>'. Run: rkat mcp login
   <name>` or that the server is awaiting human authorization.
 - `rkat run --mcp-auth interactive` lets a terminal run log in on first use
-  and continue. It needs `oauth_account`; for `discover` or `unverified`
-  servers run `rkat mcp login` first.
+  and continue, for any server with an account selection.
 
 Hosts (they never open a browser):
 
@@ -359,7 +370,10 @@ normal tool policy: visibility is not authorization.
 | `confinement_refused` | Host launch confinement refused the process |
 | "MCP server 'X' is awaiting human authorization" | No usable OAuth credential: log in |
 | "... already has a credential this login cannot replace; disconnect it first" | Slot holds another account: `auth/logout` first |
-| "MCP OAuth account selection requires its OAuth resolver and streamable HTTP without static Authorization" | `oauth_account` on stdio, SSE or with an `Authorization` header |
+| "MCP OAuth account selection requires its OAuth resolver and streamable HTTP without static Authorization" | `oauth_account` or `oauth_account_selection` on stdio, SSE or with an `Authorization` header |
+| "MCP server 'X' has no OAuth account selection, so `rkat mcp login` cannot bind its credential to an account" | Add it again with `--oauth-account-selection discover`, `--oauth-account <SUBJECT_ID>` or `--oauth-account-selection unverified` |
+| "MCP server 'X' gave no account evidence this host can verify" | Issuer has no usable OpenID Connect UserInfo; nothing stored. Re-add with `--oauth-account-selection unverified` only if resource-bound access is acceptable |
+| "The account signed in for MCP server 'X' is not the subject its --oauth-account names" | Another account signed in; nothing stored |
 | "MCP server 'X' has an invalid access policy: ..." | Empty or malformed `access` |
 | "MCP attachment refused: ..." | Governed attachment decision refused |
 | "Invalid tool name mapping for server 'X', operation 'Y': ..." | Bad `tool_names` entry; nothing was started |

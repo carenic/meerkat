@@ -629,7 +629,7 @@ confused with `rkat realm prune`, which deletes whole realm directories.
 the project and user `mcp.toml` files.
 
 ```bash
-rkat mcp add <NAME> [--transport stdio|http|sse] [--scope project|user|local|realm] [--expected-generation <N>] [-H KEY:VALUE...] [-e KEY=VALUE...] [--oauth-account <ACCOUNT_ID>] [--allow-operation <OPERATION>...] [--url <URL> | <URL> | -- <CMD...>]
+rkat mcp add <NAME> [--transport stdio|http|sse] [--scope project|user|local|realm] [--expected-generation <N>] [-H KEY:VALUE...] [-e KEY=VALUE...] [--oauth-account <ACCOUNT_ID> | --oauth-account-selection discover|unverified] [--allow-operation <OPERATION>...] [--url <URL> | <URL> | -- <CMD...>]
 rkat mcp login <NAME> [--scope project|user|local|realm] [--allow-headless]
 rkat mcp remove <NAME> [--scope project|user|local|realm] [--expected-generation <N>]
 rkat mcp list [--scope project|user|local|realm] [--json]
@@ -647,14 +647,20 @@ literal: `--scope realm` refuses a `${VAR}` reference in the command, args,
 `--allow-operation <OPERATION>` (repeatable) allows only the named raw MCP
 operations on the server; every other operation is refused and not offered.
 `--oauth-account` sets the OAuth account a streamable HTTP server's login
-must prove.
+must prove (the provider subject ID, not an email or display name).
+`--oauth-account-selection discover` binds the account the provider verifies
+at the first login instead, and `--oauth-account-selection unverified` is an
+explicit opt-in to resource-bound access with no account evidence; the two
+flags conflict. `add` prints the selection it wrote, and for a streamable
+HTTP server without either flag (and without a static `Authorization`
+header) it names these choices in case the server uses OAuth sign-in.
 
 Examples:
 
 ```bash
 rkat mcp add filesystem -- npx -y @modelcontextprotocol/server-filesystem .
 rkat mcp add api --url https://mcp.example.com/api
-rkat mcp add --transport http remote https://mcp.example.com/api
+rkat mcp add --transport http remote https://mcp.example.com/api --oauth-account-selection discover
 rkat mcp login remote
 rkat mcp list
 rkat mcp get filesystem --scope project
@@ -669,16 +675,26 @@ Interactive login requires an account selection on the server entry: its
 for the default strategy), or `oauth_account_selection = "discover"` (bind
 the account verified at the first login) or `"unverified"` (an explicit
 opt-in for servers that cannot prove an account; no account is verified).
-Set these in `mcp.toml`; `rkat mcp get` shows them.
+`rkat mcp add` writes them (`--oauth-account`, `--oauth-account-selection`);
+`rkat mcp get` shows them. `rkat mcp login` never sets or changes a
+selection. Without one it refuses before any network request and prints the
+`rkat mcp remove` and `rkat mcp add` commands for each choice. `discover`
+and `--oauth-account` need account evidence: the default strategy reads the
+issuer's OpenID Connect UserInfo endpoint, and an issuer without one is
+refused before client registration, with no credential stored and the
+selection unchanged; the refusal names `unverified` as the deliberate
+alternative. A login reports the account it bound, or that the credential is
+unverified.
 Use `rkat mcp login <NAME>` to open the browser flow ahead of time
 (`--allow-headless` permits it without an interactive terminal and prints the
 authorize URL to stderr if no browser opens, so avoid it where output is
 captured or logged), or
 `rkat run "..." --mcp-auth interactive` to allow a TTY run to authenticate
-when an HTTP MCP server first requires it. The CLI owns the loopback callback
-and your browser; agents never see the authorize URL or callback data. The
-default `--mcp-auth stored` uses persisted tokens only, and a server without
-a usable credential is reported as awaiting human authorization.
+when an HTTP MCP server with an account selection first requires it. The CLI
+owns the loopback callback and your browser; agents never see the authorize
+URL or callback data. The default `--mcp-auth stored` uses persisted tokens
+only, and a server without a usable credential is reported as awaiting human
+authorization.
 
 ## mob
 

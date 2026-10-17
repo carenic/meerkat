@@ -1268,7 +1268,9 @@ pub enum McpOAuthError {
     /// never share or reach each other's MCP credentials.
     #[error("MCP server '{server_name}' belongs to another realm than this host serves")]
     RealmMismatch { server_name: String },
-    #[error("MCP OAuth interactive login requires an explicit expected account")]
+    #[error(
+        "MCP OAuth interactive login requires an account selection: oauth_account (a provider subject ID) or oauth_account_selection (discover or unverified)"
+    )]
     AccountSelectionRequired,
     #[error(
         "MCP OAuth account selection requires its OAuth resolver and streamable HTTP without static Authorization"

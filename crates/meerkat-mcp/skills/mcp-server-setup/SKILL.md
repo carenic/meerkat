@@ -18,6 +18,13 @@ ownership away from the server or Meerkat runtime.
 - Use `rkat mcp list` and `rkat mcp get` to inspect configured servers.
 - Use `rkat mcp login <name>` for OAuth-protected HTTP servers. Do not paste
   bearer tokens into prompts or command arguments.
+- Login needs an account selection, written by `rkat mcp add`:
+  `--oauth-account-selection discover` (bind the account the provider verifies
+  at the first login), `--oauth-account <SUBJECT_ID>` (a known provider
+  subject ID, not an email) or `--oauth-account-selection unverified`
+  (resource-bound access with no account evidence). Never pick `unverified`
+  for the user: it is their explicit choice, for example after `discover` is
+  refused because the server publishes no account evidence.
 - Project configuration wins when the same server name exists in both scopes.
   Specify `--scope` when removing an ambiguous name.
 - Start or resume a session to load configured MCP tools into the agent.
@@ -32,7 +39,7 @@ ownership away from the server or Meerkat runtime.
 
 ```bash
 rkat mcp add files -- npx -y @modelcontextprotocol/server-filesystem .
-rkat mcp add issue-api --url https://mcp.example.com
+rkat mcp add issue-api --url https://mcp.example.com --oauth-account-selection discover
 rkat mcp login issue-api
 rkat mcp list
 ```
