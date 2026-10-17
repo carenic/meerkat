@@ -656,12 +656,14 @@ impl SharedScheduleTargetAdapter {
                 }
             }
         };
+        // The driver requires every dispatch for the occurrence, a refusal
+        // included, to name the session an earlier fire bound to its target.
         Ok(Some(immediate_delivery_failure(
             occurrence,
             detail,
             DeliveryFailureReason::ScheduleMandateUnavailable,
             Some(identity.correlation_id.clone()),
-            None,
+            bound_target_session_id(&occurrence.target_snapshot),
         )))
     }
 
@@ -2130,6 +2132,20 @@ pub fn async_completion_dispatch_with_admission_outcome(
         correlation_id,
         materialized_session_id: None,
         completion,
+    }
+}
+
+/// The session an earlier fire bound to a materialize-on-demand target.
+fn bound_target_session_id(target: &TargetBinding) -> Option<SessionId> {
+    let TargetBinding::Session(binding) = target else {
+        return None;
+    };
+    match binding.as_ref() {
+        SessionTargetBinding::MaterializeOnDemandSession {
+            bound_session_id, ..
+        } => bound_session_id.clone(),
+        SessionTargetBinding::ExactSession { .. }
+        | SessionTargetBinding::ResumableSession { .. } => None,
     }
 }
 
@@ -5336,13 +5352,23 @@ mod tests {
     /// The planned occurrence of one due materialize-on-demand schedule
     /// created through `service` (so with `service`'s commissioning agent).
     async fn planned_commissioned_occurrence(service: &ScheduleService) -> Occurrence {
+        planned_commissioned_occurrence_due_at(
+            service,
+            chrono::Utc::now() - ChronoDuration::seconds(1),
+        )
+        .await
+    }
+
+    /// As [`planned_commissioned_occurrence`], due at `due_at_utc`.
+    async fn planned_commissioned_occurrence_due_at(
+        service: &ScheduleService,
+        due_at_utc: chrono::DateTime<chrono::Utc>,
+    ) -> Occurrence {
         let schedule = service
             .create(meerkat_schedule::CreateScheduleRequest {
                 name: Some("commissioned".to_string()),
                 description: None,
-                trigger: meerkat_schedule::TriggerSpec::Once {
-                    due_at_utc: chrono::Utc::now() - ChronoDuration::seconds(1),
-                },
+                trigger: meerkat_schedule::TriggerSpec::Once { due_at_utc },
                 target: materialize_on_demand_target(),
                 misfire_policy: meerkat_schedule::MisfirePolicy::Skip,
                 overlap_policy: meerkat_schedule::OverlapPolicy::AllowConcurrent,
@@ -5564,6 +5590,145 @@ mod tests {
             invocations.lock().expect("invocation lock").is_empty(),
             "a refused fire never runs its target"
         );
+    }
+
+    /// Bind `occurrence`'s materialize-on-demand target to a session, as an
+    /// earlier fire does: the pending occurrence carries the bound session.
+    async fn bind_pending_target(service: &ScheduleService, occurrence: &Occurrence) {
+        service
+            .bind_materialized_session_for_occurrence(occurrence, &SessionId::new())
+            .await
+            .expect("bind the materialized session");
+        let pending = service
+            .list_occurrences(&occurrence.schedule_id)
+            .await
+            .expect("list occurrences")
+            .into_iter()
+            .find(|candidate| candidate.occurrence_id == occurrence.occurrence_id)
+            .expect("pending occurrence");
+        let TargetBinding::Session(binding) = &pending.target_snapshot else {
+            panic!("expected a session target binding");
+        };
+        assert!(
+            binding.resolved_session_id().is_some(),
+            "the pending occurrence carries the bound session"
+        );
+    }
+
+    /// An adapter over `host_service` for a governed host acting as `agent`,
+    /// whose session host counts materializations into `materialize_calls`.
+    fn governed_counting_adapter(
+        host_service: ScheduleService,
+        agent: &str,
+        materialize_calls: &Arc<AtomicUsize>,
+    ) -> Arc<SharedScheduleTargetAdapter> {
+        let session_host: Arc<dyn SurfaceScheduleSessionHost> = Arc::new(CountingMaterializeHost {
+            materialize_calls: Arc::clone(materialize_calls),
+        });
+        let mob_host: Arc<dyn SurfaceScheduleMobHost> = Arc::new(NoopScheduleMobHost::new(
+            "mob targets unsupported in this test",
+        ));
+        Arc::new(
+            SharedScheduleTargetAdapter::new(host_service, session_host, mob_host)
+                .with_session_agent_binding(Arc::new(FixedAgentBinding(mandate_agent(agent)))),
+        )
+    }
+
+    /// A governed host refuses a fire whose materialize-on-demand target an
+    /// earlier fire bound. The refusal names that bound session, as every
+    /// dispatch for the occurrence must, so the driver records it: the
+    /// occurrence ends `DeliveryFailed` with `schedule_mandate_unavailable` in
+    /// one tick, and the tick does not fail.
+    #[tokio::test]
+    async fn refused_mandate_on_a_bound_target_ends_the_occurrence_in_one_tick() {
+        let store =
+            Arc::new(meerkat_schedule::MemoryScheduleStore::new()) as Arc<dyn ScheduleStore>;
+        let commissioning =
+            ScheduleService::new_commissioned(Arc::clone(&store), mandate_agent("agent-b"));
+        let planned = planned_commissioned_occurrence(&commissioning).await;
+        bind_pending_target(&commissioning, &planned).await;
+
+        let host_service =
+            ScheduleService::new_commissioned(Arc::clone(&store), mandate_agent("agent-a"));
+        let materialize_calls = Arc::new(AtomicUsize::new(0));
+        let adapter =
+            governed_counting_adapter(host_service.clone(), "agent-a", &materialize_calls);
+        let driver = host_runnable_driver(host_service.clone(), Arc::clone(&store), adapter);
+
+        driver
+            .tick_once()
+            .await
+            .expect("a refused fire is not a driver fault");
+
+        let occurrence = wait_for_occurrence_phase(
+            &host_service,
+            &planned.schedule_id,
+            OccurrencePhase::DeliveryFailed,
+        )
+        .await;
+        assert_eq!(
+            occurrence.failure_class,
+            Some(OccurrenceFailureClass::ScheduleMandateUnavailable)
+        );
+        let receipts = store
+            .list_receipts(&occurrence.occurrence_id)
+            .await
+            .expect("receipts");
+        let last_receipt = receipts.last().expect("terminal receipt");
+        assert_eq!(last_receipt.stage, DeliveryReceiptStage::DeliveryFailed);
+        assert_eq!(
+            last_receipt.failure_class,
+            Some(OccurrenceFailureClass::ScheduleMandateUnavailable)
+        );
+        assert_eq!(
+            materialize_calls.load(Ordering::SeqCst),
+            0,
+            "a refused fire materializes no session"
+        );
+    }
+
+    /// One refused fire does not hold back the rest of the tick. A schedule
+    /// recorded without a commissioning agent, whose target an earlier fire
+    /// bound, is claimed first and refused; the host agent's own schedule,
+    /// claimed in the same tick, still fires.
+    #[tokio::test]
+    async fn a_refused_bound_target_does_not_hold_back_the_rest_of_the_tick() {
+        let store =
+            Arc::new(meerkat_schedule::MemoryScheduleStore::new()) as Arc<dyn ScheduleStore>;
+        let unrecorded = ScheduleService::new(Arc::clone(&store));
+        // Due first, so claimed first.
+        let legacy = planned_commissioned_occurrence_due_at(
+            &unrecorded,
+            chrono::Utc::now() - ChronoDuration::seconds(10),
+        )
+        .await;
+        bind_pending_target(&unrecorded, &legacy).await;
+        let host_service =
+            ScheduleService::new_commissioned(Arc::clone(&store), mandate_agent("agent-a"));
+        let own = planned_commissioned_occurrence(&host_service).await;
+
+        let materialize_calls = Arc::new(AtomicUsize::new(0));
+        let adapter =
+            governed_counting_adapter(host_service.clone(), "agent-a", &materialize_calls);
+        let driver = host_runnable_driver(host_service.clone(), Arc::clone(&store), adapter);
+
+        let tick = driver.tick_once().await;
+
+        wait_for_occurrence_phase(&host_service, &own.schedule_id, OccurrencePhase::Completed)
+            .await;
+        assert_eq!(materialize_calls.load(Ordering::SeqCst), 1);
+        let refused = wait_for_occurrence_phase(
+            &host_service,
+            &legacy.schedule_id,
+            OccurrencePhase::DeliveryFailed,
+        )
+        .await;
+        assert_eq!(
+            refused.failure_class,
+            Some(OccurrenceFailureClass::ScheduleMandateUnavailable)
+        );
+        let report = tick.expect("a refused fire is not a driver fault");
+        assert_eq!(report.claimed_occurrences, 2);
     }
 
     /// An update by a writer that commissions no agent clears the schedule's
