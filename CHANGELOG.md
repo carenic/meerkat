@@ -83,10 +83,11 @@ them.
 
 - A stock-governed realm's schedules no longer fire outside the mandate of
   the agent that commissioned them. Every fire there, including each
-  schedule recorded before commissioning agents existed, fails closed with
-  the typed failure class `schedule_mandate_unavailable` when it is
-  delivered, before a session is materialized or an input admitted (a fire
-  whose target the driver's probe finds missing still misfires or fails as
+  schedule recorded before commissioning agents existed or bound to a
+  session an earlier fire materialized, fails closed with the typed failure
+  class `schedule_mandate_unavailable` when it is delivered, before a
+  session is materialized or an input admitted (a fire whose target the
+  driver's probe finds missing still misfires or fails as
   `target_missing`); the occurrence and its terminal receipt show it. This
   holds for every host that can open such a realm: `rkat` (its schedule
   hosts, `rkat mob` hosts included) and `rkat-rpc`, whose schedule services
@@ -128,6 +129,18 @@ them.
   server's or the facade's runtime-backed host) calls
   `bind_scheduled_session` yet, so a host composing a binding must bind its
   own scheduled sessions, or they run unbound.
+
+### Fixed
+
+- One failing delivery no longer holds back the rest of a schedule driver
+  tick. When handling one claimed occurrence failed with an error (for
+  example, a delivery adapter returned a dispatch inconsistent with its
+  occurrence), a `ScheduleDriver` tick returned that error at once. Every
+  occurrence the tick had claimed after it stayed claimed and undelivered
+  until its lease expired (60 seconds in the schedule host), then fired late
+  or misfired. The tick now handles every occurrence it claimed, logs each
+  later error, and then returns the first, so the schedule host still
+  records the failed tick.
 
 ### Known issues
 
