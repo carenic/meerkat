@@ -80,7 +80,12 @@ them.
   `IMAGE_RECITATION`) to `content_filter`, which fails the run as above; a
   malformed or unexpected tool call (`MALFORMED_FUNCTION_CALL`,
   `UNEXPECTED_TOOL_CALL`, `TOO_MANY_TOOL_CALLS`), `OTHER` and any other reason
-  fail the response as incomplete.
+  fail the response as incomplete. The OpenAI realtime text-turn adapter
+  (realtime models running agent-loop turns) now reads the status of
+  `response.done` the same way: a failed response, an incomplete one with an
+  unknown or missing reason, or one still in progress fails as incomplete,
+  while `max_output_tokens`, `content_filter` and `cancelled` keep their typed
+  stops. All of these ended as `end_turn` before.
 
 ### Fixed
 
@@ -101,8 +106,8 @@ them.
   turn (#1882).
 - An Anthropic stream that carries no stop reason at all (a proxy may omit it)
   still ends as `end_turn`: a missing reason is not an unknown one.
-- The OpenAI realtime adapter still reports a failed response, or an
-  incomplete one with an unknown reason, as `end_turn` (#1883).
+- The OpenAI realtime session adapter (live channels) still reports a failed
+  response, or an incomplete one with an unknown reason, as `end_turn` (#1883).
 
 ## [0.9.2] - 2026-10-16
 
