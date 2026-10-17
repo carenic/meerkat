@@ -84,6 +84,15 @@ them.
   `/schedules` endpoints as 503 `SERVICE_UNAVAILABLE`, as for an
   unsupported schedule backend. A service that never had a
   probe attached still accepts identity targets unjudged.
+- Behaviour-only (not measured by the gate): Linux shell process custody
+  refuses a host whose `/proc` is not a procfs of its own pid namespace (see
+  Fixed). A host started in a new pid namespace without a procfs mounted for
+  it (for example under `unshare --pid --fork` without `--mount-proc`), whose
+  own pid number named a process of the same user in the outer procfs
+  (typically a host running as root), used to run custody on the identities
+  of other processes. Its session builds under a realm runtime root now fail
+  with `ProcessCustodyError::ForeignProcfs` until it has a procfs of its own
+  pid namespace.
 
 ### Added
 
@@ -354,6 +363,37 @@ them.
   teardown for the same service judges identity targets itself instead of
   being ignored because the first attach won, and store-only schedule tool
   calls (get, list, pause and the rest) keep working after teardown.
+- Linux shell process custody (`meerkat-tools`) no longer captures, compares
+  or signals processes through a procfs of another pid namespace. Custody
+  records pids from the host's own syscalls, but `/proc` numbers processes in
+  the pid namespace it was mounted for, so a host in a new pid namespace
+  without a procfs of its own read other processes' entries. Capturing the
+  host's or a tool leader's identity then failed (`Io { context: "capture
+  tool leader identity", .. }` with `NotFound`), or captured a process of the
+  same user that held that number there; recovery could then compare the
+  start stamps of other processes, and pin and SIGKILL pids taken from the
+  procfs's numbering. Every custody read of `/proc/<pid>` now goes through a
+  procfs proven, at the start of each operation, to show the host's own pid
+  namespace: the host's own status record there shows its pid as `Tgid` and,
+  where the kernel lists `NSpid` (Linux 4.1 and later; not gVisor), lists
+  exactly that pid in `NSpid`. Any other procfs fails closed before a lock,
+  record or spawn gate is touched, with the new
+  `ProcessCustodyError::ForeignProcfs { context, view: ForeignProcfsView }`
+  (the host's pid, the pid the procfs shows it as, and the pid namespace
+  levels between them); a session build under a realm runtime root reports
+  it as `CompositeDispatcherError::ProcessCustody`. Operator action: give the
+  host a procfs of its own pid namespace (`unshare --pid --fork --mount-proc`,
+  or the container runtime's own `/proc`). Residuals: on kernels without
+  `NSpid`, an ancestor namespace's procfs in which the host's pid happens to
+  be the same number is not detected. Custody records written before this
+  fix by a host whose procfs was not its own can carry another process's
+  start stamp. Such a host now refuses before recovery, and a reboot or a
+  host in a new pid namespace settles them, but a host later given its own
+  procfs in the same pid namespace reads them as written and may settle one
+  as `GroupReassigned` while its tool group still runs. The custody namespace
+  tests now also run a host that keeps its parent's procfs wherever
+  unprivileged user and pid namespaces exist, and skip only on unshare(1)'s
+  own namespace setup refusals: a failure to execute the host fails them.
 
 ## [0.9.2] - 2026-10-16
 
