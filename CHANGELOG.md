@@ -50,7 +50,8 @@ them.
   it as `CAPABILITY_UNAVAILABLE` (-32001), and `ScheduleToolDispatcher` and
   `ScheduleToolSurface` return `ToolError::Unavailable` with
   `ToolUnavailableReason::TemporarilyUnavailable`. The RPC `schedule/*`
-  methods return it as capability unavailable (-32020), as for an
+  methods return it as capability unavailable (-32020), and the REST
+  `/schedules` endpoints as 503 `SERVICE_UNAVAILABLE`, as for an
   unsupported schedule backend. A service that never had a
   probe attached still accepts identity targets unjudged.
 

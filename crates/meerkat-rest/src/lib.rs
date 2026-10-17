@@ -5121,9 +5121,15 @@ fn schedule_error_to_api(error: meerkat::ScheduleDomainError) -> ApiError {
         meerkat::ScheduleDomainError::Store(meerkat::ScheduleStoreError::ScheduleNotFound {
             schedule_id,
         }) => ApiError::NotFound(format!("Schedule not found: {schedule_id}")),
+        // No schedule capability here: the backend lacks it, or the schedule
+        // host that judged identity targets has stopped (as the schedule
+        // tools report it).
         meerkat::ScheduleDomainError::Store(meerkat::ScheduleStoreError::UnsupportedBackend {
             ..
-        }) => ApiError::ServiceUnavailable(error.to_string()),
+        })
+        | meerkat::ScheduleDomainError::DriverStopped => {
+            ApiError::ServiceUnavailable(error.to_string())
+        }
         meerkat::ScheduleDomainError::InvalidSchedule(_)
         | meerkat::ScheduleDomainError::InvalidTrigger(_)
         | meerkat::ScheduleDomainError::InvalidCron(_) => ApiError::BadRequest(error.to_string()),
@@ -12810,6 +12816,54 @@ mod tests {
             .await
             .expect("schedule/call should start the host and service due work");
         assert_eq!(occurrence.phase, OccurrencePhase::Misfired);
+    }
+
+    /// A schedule host shutdown that lands after a handler's host start
+    /// leaves no live host to judge identity targets: the direct create maps
+    /// to the same 503 the schedule tools return.
+    #[tokio::test]
+    async fn schedule_create_after_its_host_stopped_is_service_unavailable() {
+        let temp = TempDir::new().unwrap();
+        let state = AppState::load_from(temp.path().to_path_buf())
+            .await
+            .unwrap();
+        state
+            .ensure_schedule_host_started()
+            .await
+            .expect("start the schedule host");
+        state.shutdown_schedule_host().await;
+        let request: meerkat::CreateScheduleRequest = serde_json::from_value(json!({
+            "name": "after-shutdown",
+            "trigger": {
+                "type": "once",
+                "due_at_utc": (Utc::now() + Duration::days(1)).to_rfc3339(),
+            },
+            "target": {
+                "target_kind": "identity",
+                "type": "resumable_identity",
+                "identity": "domain:ops",
+                "action": { "type": "prompt", "prompt": "check in" }
+            },
+            "missing_target_policy": "mark_misfired",
+            "planning_horizon_days": 1,
+            "planning_horizon_occurrences": 1
+        }))
+        .expect("identity schedule request");
+
+        let error = state
+            .schedule_service
+            .create(request)
+            .await
+            .expect_err("no stopped host judges an identity target");
+        let api_error = schedule_error_to_api(error);
+        assert!(
+            matches!(api_error, ApiError::ServiceUnavailable(_)),
+            "expected the tools' 503, found {api_error:?}"
+        );
+        assert_eq!(
+            api_error.into_response().status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
     }
 
     #[tokio::test]
