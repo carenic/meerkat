@@ -476,6 +476,11 @@ them.
   thread, `RKAT_WORKER_STACK_BYTES` and `RKAT_WORKER_THREADS` apply to it, and
   a fatal error prints its `Display` chain prefixed with `rkat-mob-mcp:`
   (exit code 1) instead of `Error:` and its `Debug` form.
+- `meerkat_mob_mcp::fork_relink`: `ForkRelinkReport` gains the field
+  `child_retirement` (a new `ChildRetirement`: `NotRequired`, `Retired`,
+  `InProgress`, or `Failed` with the error); `relink_child` and
+  `relink_child_within` return the new `ForkRelinkOutcome` (`action` and
+  `child_retirement`) instead of a `ForkRelinkAction`.
 
 ### Security
 
@@ -1584,6 +1589,13 @@ them.
   an `std::io::Error` of kind `WouldBlock` (EAGAIN) now ends with a `hint:`
   line naming the usual causes and the variable that set the worker count,
   in `rkat`, `rkat-rpc`, `rkat-rest`, `rkat-mcp` and `rkat-mob-mcp`.
+- The fork_off re-link after a restart no longer only logs a failed
+  retirement of a child whose settled outcome retires it (its own turn
+  failed, or it ran past its `max_run`). It retries the retirement for up to
+  about ten seconds, in that child's own settlement, and reports the result
+  typed (`ChildRetirement`) in each report and outcome; a child whose
+  retirement still fails is reported `Failed`, logged, and retired by the
+  next pass (a restart, or `MobMcpState::relink_restored_fork_children`).
 
 ### Known issues
 
