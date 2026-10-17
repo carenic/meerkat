@@ -4,8 +4,9 @@
 //!
 //! Pull-request CI (ci.yml) is Cargo-only on GitHub-hosted runners: the lanes
 //! are selected from the changed paths by scripts/ci-cargo-lanes.mjs, which
-//! fails closed, and the aggregate "CI gate" enforces a 25-minute lane
-//! execution budget and a 45-minute push-to-terminal runaway ceiling. Nightly owns the full workspace test lanes, the
+//! fails closed, and the aggregate "CI gate" enforces, on pull requests, a
+//! 1080-second lane execution budget and a 1200-second push-to-terminal
+//! runaway ceiling, runner queue excluded. Nightly owns the full workspace test lanes, the
 //! dense Mob topology stress, bounded TLC, and the whole BuildBuddy/Bazel
 //! graph; the release workflow re-runs that graph on the tag. The full
 //! GitHub-hosted Cargo workflow (cargo.yml) remains a diagnostic fallback.
@@ -72,6 +73,7 @@ fn ci_runs_fail_closed_cargo_lanes_on_hosted_runners() {
             "feature-check",
             "fmt-governance",
             "gate",
+            "governance-gates",
             "governed-jsonl",
             "integration",
             "main-unit",
@@ -125,13 +127,15 @@ fn ci_runs_fail_closed_cargo_lanes_on_hosted_runners() {
     // The budget measures what the code controls: lane execution (started to
     // completed) plus the classification it waits for. Runner queue wait is a
     // warning, and a generous push-to-terminal ceiling still fails a stuck CI.
+    // The owner's cap is 20 minutes from the start of the pre-push hook to a
+    // green gate, and the hook takes about a minute.
     assert!(
-        ci.contains("CI_MAX_EXEC_SECONDS: \"1500\""),
-        "the lane execution budget is 1500 seconds"
+        ci.contains("CI_MAX_EXEC_SECONDS: \"1080\""),
+        "the lane execution budget is 1080 seconds"
     );
     assert!(
-        ci.contains("CI_MAX_TERMINAL_SECONDS: \"2700\""),
-        "the push-to-terminal runaway ceiling is 2700 seconds"
+        ci.contains("CI_MAX_TERMINAL_SECONDS: \"1200\""),
+        "the push-to-terminal runaway ceiling is 1200 seconds"
     );
     assert!(
         ci.contains("title=CI runner queue wait") && ci.contains("budget_verdict="),
@@ -212,6 +216,7 @@ fn ci_runs_fail_closed_cargo_lanes_on_hosted_runners() {
         "changes",
         "fmt-governance",
         "ratchets",
+        "governance-gates",
         "tlc-audits",
         "clippy",
         "unit",
@@ -235,6 +240,7 @@ fn ci_runs_fail_closed_cargo_lanes_on_hosted_runners() {
     for contract in [
         "require_success \"Change classification\"",
         "require_ran \"Bounded TLC audits\"",
+        "require_ran \"Typed governance gates\"",
         "require_ran \"Clippy\"",
         "require_ran \"Unit tests\"",
         "require_ran \"Main unit tests\"",
@@ -261,7 +267,8 @@ fn ci_runs_fail_closed_cargo_lanes_on_hosted_runners() {
         assert!(ci.contains(contract), "CI gate must enforce `{contract}`");
     }
     for lane in [
-        "--no-deps --all-targets --all-features -- -D warnings",
+        "--no-deps ${TARGETS} --all-features -- -D warnings",
+        "\"--all-targets\"|\"--lib\"|\"--bins\"|\"--lib --bins\") ;;",
         "--lib --bins --profile ci-pr",
         "unit_shard_matrix",
         "main_unit_shard_matrix",
@@ -299,6 +306,118 @@ fn ci_runs_fail_closed_cargo_lanes_on_hosted_runners() {
     assert!(
         fmt_governance.get("if").is_none(),
         "docs-only changes must not skip the always-run format and governance lane"
+    );
+}
+
+/// A pull request runs what fits the cap from the start of the pre-push hook
+/// to a green CI gate and leaves the lanes that compile the meerkat-mob chain
+/// or sweep the reverse-dependency closure to the push, whose CI must be
+/// green before a release tag. The classifier is told the event, the
+/// push-only lanes follow its flags, and the gate refuses a push plan that
+/// left anything to a later push.
+#[test]
+fn pull_requests_leave_the_chain_and_closure_lanes_to_the_push() {
+    let ci_yml = workflow_yml_path("ci.yml");
+    let ci = std::fs::read_to_string(&ci_yml)
+        .unwrap_or_else(|e| panic!("read {}: {e}", ci_yml.display()));
+    let doc = read_workflow(&ci_yml);
+    let jobs = doc
+        .get("jobs")
+        .and_then(serde_yaml::Value::as_mapping)
+        .expect("ci workflow jobs mapping");
+    let job_if = |job: &str| -> String {
+        jobs.get(serde_yaml::Value::String(job.to_string()))
+            .and_then(|job| job.get("if"))
+            .and_then(serde_yaml::Value::as_str)
+            .unwrap_or_default()
+            .to_owned()
+    };
+    assert!(
+        ci.contains("node scripts/ci-cargo-lanes.mjs --format github --event \"${EVENT_NAME}\""),
+        "the change classification must plan for the event it runs in"
+    );
+    for (job, flag) in [
+        ("closure-check", "closure_check"),
+        ("governed-jsonl", "governed_jsonl"),
+        ("mcp-confinement-positive", "mcp_confinement_positive"),
+    ] {
+        assert_eq!(
+            job_if(job),
+            format!("${{{{ needs.changes.outputs.{flag} == 'true' }}}}"),
+            "{job} runs exactly when the plan selects it"
+        );
+    }
+    assert!(
+        job_if("closure-tests").contains("needs.changes.outputs.closure_test_count != '0'"),
+        "closure-tests runs the rows the plan names"
+    );
+    assert!(
+        job_if("feature-check").contains("needs.changes.outputs.feature_check_count != '0'"),
+        "feature-check runs the rows the plan names"
+    );
+    // The push lints every target of every changed package, the chain heads
+    // a pull request left to it included, and a Clippy failure is a red CI
+    // gate: neither the job nor its lint step may soft-fail.
+    let clippy = jobs
+        .get(serde_yaml::Value::String("clippy".to_string()))
+        .and_then(serde_yaml::Value::as_mapping)
+        .expect("clippy job");
+    assert!(
+        clippy.get("continue-on-error").is_none(),
+        "the Clippy job never soft-fails"
+    );
+    let lint_step = clippy
+        .get("steps")
+        .and_then(serde_yaml::Value::as_sequence)
+        .expect("clippy steps")
+        .iter()
+        .find(|step| {
+            step.get("run")
+                .and_then(serde_yaml::Value::as_str)
+                .is_some_and(|run| run.contains("./scripts/repo-cargo clippy"))
+        })
+        .expect("the Clippy lint step");
+    assert!(
+        lint_step.get("continue-on-error").is_none(),
+        "the Clippy lint step never soft-fails"
+    );
+    for contract in [
+        "a push plan left lanes to a later push",
+        "forbid_failure \"Closure check\" \"${CLOSURE_CHECK_RESULT}\"",
+        "forbid_failure \"Governed JSONL\" \"${GOVERNED_JSONL_RESULT}\"",
+        "forbid_failure \"MCP confinement positive\" \"${MCP_CONFINEMENT_POSITIVE_RESULT}\"",
+        "left to the push (main or release/**): ${DEFERRED_TO_PUSH}",
+    ] {
+        assert!(ci.contains(contract), "CI gate must enforce `{contract}`");
+    }
+}
+
+/// A push to main diffs against the last main commit whose CI run completed
+/// green with an attestation (scripts/ci-push-base.mjs, from HEAD's first
+/// parent), and plans the whole workspace without one, so a superseded,
+/// cancelled or failed main run never loses its changes' push-only lanes.
+#[test]
+fn main_pushes_diff_against_the_last_green_attested_main_commit() {
+    let ci_yml = workflow_yml_path("ci.yml");
+    let ci = std::fs::read_to_string(&ci_yml)
+        .unwrap_or_else(|e| panic!("read {}: {e}", ci_yml.display()));
+    for contract in [
+        "if found_base=\"$(node scripts/ci-push-plan-base.mjs --repository \"${GITHUB_REPOSITORY}\" --payload-base \"${BASE_SHA}\")\"; then",
+        "--base \"${plan_base}\" --head HEAD \"${plan_args[@]}\"",
+        "no qualifying green, attested main CI run before HEAD (reason above); planning the whole workspace.",
+    ] {
+        assert!(
+            ci.contains(contract),
+            "the change classification must carry `{contract}`"
+        );
+    }
+    assert!(
+        !ci.contains("--base \"${classification_base}\" --head HEAD \"${plan_args[@]}\""),
+        "a push to main must not plan against its payload base"
+    );
+    assert!(
+        !ci.contains("HEAD^1:scripts/ci-push-base.mjs"),
+        "ci.yml must run the parent's finder only through scripts/ci-push-plan-base.mjs"
     );
 }
 
@@ -663,7 +782,7 @@ fn buildbuddy_workflow_is_called_only_by_nightly_and_release() {
 /// Bounded TLC runs on pull requests that touch machine authority: the
 /// hand-written audits model check the generated machines against their
 /// invariants and goals, which the drift ratchet alone does not. The lane
-/// runs both audit shards of the canonical TLC lane on a machine-authority
+/// runs every audit shard of the canonical TLC lane on a machine-authority
 /// change, inside the PR budget, with TLC from the shared setup-tlc-ci action
 /// (its contents are pinned by scripts/tests/xtask_scripts_dogma_gates.sh),
 /// and the CI gate requires it on such a change.
@@ -693,12 +812,16 @@ fn ci_runs_the_bounded_tlc_audits_on_machine_authority_changes() {
         .iter()
         .filter_map(serde_yaml::Value::as_str)
         .collect();
-    assert_eq!(parts, ["audits-a", "audits-b"], "both audit shards run");
+    assert_eq!(
+        parts,
+        ["audits-a", "audits-b", "audits-c"],
+        "every audit shard runs"
+    );
     assert_eq!(
         job.get("timeout-minutes")
             .and_then(serde_yaml::Value::as_u64),
         Some(20),
-        "a TLC shard times out inside the PR execution budget"
+        "a TLC shard times out at 20 minutes, well over its expected 5-8"
     );
     let job_text = serde_yaml::to_string(job).expect("render tlc-audits job");
     for required in [
@@ -716,4 +839,42 @@ fn ci_runs_the_bounded_tlc_audits_on_machine_authority_changes() {
         ci.contains("require_ran \"Bounded TLC audits\" \"${TLC_AUDITS_RESULT}\""),
         "the CI gate must require the TLC audits on a machine-authority change"
     );
+}
+
+/// The typed governance gates run in CI on the agent gate's governance paths
+/// (machine authority or a dogma document), where the pre-push hook's
+/// changed-path ratchets ran them, in a job of their own, and the CI gate
+/// requires them on such a change.
+#[test]
+fn ci_runs_the_typed_governance_gates_on_governance_changes() {
+    let ci_yml = workflow_yml_path("ci.yml");
+    let doc = read_workflow(&ci_yml);
+    let jobs = doc
+        .get("jobs")
+        .and_then(serde_yaml::Value::as_mapping)
+        .expect("ci workflow jobs mapping");
+    let job = jobs
+        .get(serde_yaml::Value::String("governance-gates".to_string()))
+        .and_then(serde_yaml::Value::as_mapping)
+        .expect("governance-gates job");
+    assert_eq!(
+        job.get("if").and_then(serde_yaml::Value::as_str),
+        Some("${{ needs.changes.outputs.governance_gates == 'true' }}"),
+        "the governance gates run exactly on governance changes"
+    );
+    let job_text = serde_yaml::to_string(job).expect("render governance-gates job");
+    assert!(
+        job_text.contains(
+            "make rmat-audit seam-inventory runtime-authority-bypass machine-authority-docs-gate"
+        ),
+        "governance-gates must run every typed governance gate; job:\n{job_text}"
+    );
+    let ci = std::fs::read_to_string(&ci_yml).expect("read ci.yml");
+    for contract in [
+        "governance_gates: ${{ steps.plan.outputs.governance_gates }}",
+        "GOVERNANCE_GATES: ${{ needs.changes.outputs.governance_gates }}",
+        "require_ran \"Typed governance gates\" \"${GOVERNANCE_GATES_RESULT}\"",
+    ] {
+        assert!(ci.contains(contract), "CI must carry `{contract}`");
+    }
 }
