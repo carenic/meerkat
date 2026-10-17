@@ -1480,12 +1480,14 @@ mod orchestrator {
     /// The last resort for a deferred row the session refused for a reason
     /// other than a held boundary: see [`record_unrecorded_live_row`].
     /// `later_rows` are the rows of the same list still to be applied after
-    /// it. A refused output start is not reported while a later row of its
-    /// provider item follows (its segment's release): that row records the
-    /// speech, or is reported itself if the session refuses it too, so no
-    /// notice names speech that lands. A second spoken segment of a provider
-    /// turn whose output starts both waited behind the member turn is
-    /// replayed that way: its start finds the turn's output still bound to
+    /// it. A refused output start is not reported while a later row settles
+    /// the speech of its provider item (see [`settles_item_speech`]): the
+    /// session applies that row by its usual rules, or refuses it and it is
+    /// reported itself, so no notice names speech that lands. Transcript
+    /// deltas only buffer text until such a row arrives, so a start followed
+    /// only by deltas is still reported. A second spoken segment of a
+    /// provider turn whose output starts both waited behind the member turn
+    /// is replayed that way: its start finds the turn's output still bound to
     /// the first segment, while its release commits under the target the
     /// start admitted.
     fn report_unrecorded_live_row<'a, B, L>(
@@ -1504,7 +1506,7 @@ mod orchestrator {
         if let Some(item) = output_start_item(observation)
             && later_rows
                 .into_iter()
-                .any(|later| unrecorded_live_row_identity(later).1 == Some(item))
+                .any(|later| settles_item_speech(later, item))
         {
             tracing::info!(
                 target: meerkat_live::LIVE_CLOSE_TRACE_TARGET,
@@ -1513,7 +1515,7 @@ mod orchestrator {
                 provider_item_id = item,
                 row_index,
                 refusal,
-                "a refused live output start is left to the later row of its provider item"
+                "a refused live output start is left to the later row that settles its provider item's speech"
             );
             return;
         }
@@ -1538,6 +1540,36 @@ mod orchestrator {
                 provider_item_id, ..
             } => Some(provider_item_id),
             _ => None,
+        }
+    }
+
+    /// Whether a deferred row settles the speech of provider item `item`: a
+    /// playback terminal (an unmeasured segment's release among them), a
+    /// playback completion or truncation, or the item's final transcript.
+    /// Transcript deltas only buffer text until one of these lands, so they
+    /// do not count.
+    fn settles_item_speech(
+        observation: &meerkat_core::live_adapter::LiveAdapterObservation,
+        item: &str,
+    ) -> bool {
+        use meerkat_core::live_adapter::LiveAdapterObservation as Row;
+        match observation {
+            Row::WithContextObservation { observation, .. } => {
+                settles_item_speech(observation, item)
+            }
+            Row::AssistantPlaybackTerminalObserved {
+                provider_item_id, ..
+            }
+            | Row::AssistantPlaybackCompleted {
+                provider_item_id, ..
+            }
+            | Row::AssistantTranscriptFinal {
+                provider_item_id, ..
+            } => provider_item_id == item,
+            Row::AssistantTranscriptTruncated {
+                provider_item_id, ..
+            } => provider_item_id.as_deref() == Some(item),
+            _ => false,
         }
     }
 

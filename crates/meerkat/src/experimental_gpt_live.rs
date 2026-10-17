@@ -15658,20 +15658,82 @@ mod tests {
         wait_for_resolved_close_settlement(&runtime, &session_id).await;
         let notices = unrecorded_row_notices_now(&service, &session_id).await;
         assert_eq!(
-            notices
-                .iter()
-                .map(|notice| (
-                    notice["row"].as_str(),
-                    notice["provider_item_id"].as_str(),
-                    notice["row_index"].as_u64(),
-                ))
-                .collect::<Vec<_>>(),
+            notice_rows(&notices),
             vec![(
                 Some("assistant_playback_terminal"),
                 Some("item-without-custody"),
                 Some(1),
             )],
             "the refused release is reported once, and its refused start is not: {notices:?}"
+        );
+    }
+
+    /// The row kind, provider item id and row index of each unrecorded-row
+    /// notice payload.
+    fn notice_rows(
+        notices: &[serde_json::Value],
+    ) -> Vec<(Option<&str>, Option<&str>, Option<u64>)> {
+        notices
+            .iter()
+            .map(|notice| {
+                (
+                    notice["row"].as_str(),
+                    notice["provider_item_id"].as_str(),
+                    notice["row_index"].as_u64(),
+                )
+            })
+            .collect()
+    }
+
+    /// A spoken transcript delta of [`output_start_without_custody`]'s item.
+    fn delta_without_custody(
+        delta_id: &str,
+        delta: &str,
+    ) -> meerkat_core::live_adapter::LiveAdapterObservation {
+        meerkat_core::live_adapter::LiveAdapterObservation::AssistantTranscriptDelta {
+            provider_item_id: Some("item-without-custody".to_string()),
+            previous_item_id: None,
+            content_index: Some(0),
+            response_id: Some("response-without-custody".to_string()),
+            delta_id: Some(delta_id.to_string()),
+            delta: delta.to_string(),
+        }
+    }
+
+    /// #1821 (L-1): transcript deltas only buffer an item's text until a row
+    /// settles its speech. A refused output start followed by deltas of its
+    /// item and by nothing that settles them is reported: one notice, for
+    /// the start.
+    #[tokio::test]
+    async fn a_refused_start_followed_only_by_its_deltas_is_reported() {
+        let (service, runtime, host, session_id, channel_id, _temp) = deferred_rows_fixture().await;
+        assert_eq!(
+            crate::session_runtime::live_orchestration::settle_live_close_playback_deferred(
+                Arc::clone(&service),
+                Arc::clone(&runtime),
+                host.owned_handle(),
+                vec![
+                    output_start_without_custody(),
+                    delta_without_custody("delta-1", "Speech the close"),
+                    delta_without_custody("delta-2", " held."),
+                ],
+                session_id.clone(),
+                channel_id.clone(),
+                None,
+            )
+            .await,
+            crate::session_runtime::live_orchestration::DeferredCloseSettlementOutcome::Settled,
+        );
+        wait_for_resolved_close_settlement(&runtime, &session_id).await;
+        let notices = unrecorded_row_notices_now(&service, &session_id).await;
+        assert_eq!(
+            notice_rows(&notices),
+            vec![(
+                Some("assistant_output_started"),
+                Some("item-without-custody"),
+                Some(0),
+            )],
+            "the refused start is reported once, and its buffered deltas are not refused: {notices:?}"
         );
     }
 
@@ -20505,9 +20567,9 @@ mod tests {
                             format!("private-parked-segments-delegation-{ordinal}"),
                         )
                         .expect("fixture delegation identity"),
-                        final_transcript: format!("matrix user {ordinal}"),
-                        request_transcript: format!("matrix user {ordinal}"),
-                        assistant_context: "First spoken checkpoint.".to_string(),
+                        final_transcript: format!("parked segments request {ordinal}"),
+                        request_transcript: format!("parked segments request {ordinal}"),
+                        assistant_context: format!("parked segments context {ordinal}"),
                         represented_user_rows: Vec::new(),
                     },
                     LiveSidebandObservationKind::TurnSnapshotDelta {
