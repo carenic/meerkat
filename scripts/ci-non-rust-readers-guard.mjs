@@ -288,6 +288,143 @@ export function lexRust(text) {
   return tokens;
 }
 
+// The index of the bracket that closes the one at `open`.
+function closingBracket(tokens, open) {
+  const [left, right] = tokens[open].v === "(" ? ["(", ")"] : tokens[open].v === "{" ? ["{", "}"] : ["[", "]"];
+  let level = 0;
+  for (let k = open; k < tokens.length; k += 1) {
+    if (tokens[k].t !== "p") continue;
+    if (tokens[k].v === left) level += 1;
+    else if (tokens[k].v === right && --level === 0) return k;
+  }
+  return tokens.length - 1;
+}
+
+// The predicate of a `cfg(...)` whose `(` is at `open`: { op: all|any|not,
+// args }, { key, value } (`feature = "x"`), { flag } (`test`), or
+// { unknown } for a shape this parser does not read.
+export function parseCfg(tokens, open) {
+  const close = closingBracket(tokens, open);
+  let k = open + 1;
+  const predicate = () => {
+    const head = tokens[k];
+    if (head?.t !== "id") return { unknown: true };
+    k += 1;
+    if (tokens[k]?.v === "=" && tokens[k + 1]?.t === "str") {
+      k += 2;
+      return { key: head.v, value: tokens[k - 1].v };
+    }
+    if (tokens[k]?.v !== "(") return { flag: head.v };
+    const end = closingBracket(tokens, k);
+    k += 1;
+    const args = [];
+    while (k < end) {
+      const before = k;
+      args.push(predicate());
+      if (tokens[k]?.v === ",") k += 1;
+      if (k === before) return { unknown: true };
+    }
+    k = end + 1;
+    return { op: head.v, args };
+  };
+  const expr = predicate();
+  return k === close ? expr : { unknown: true };
+}
+
+// The cfg values of the CI runners (x86_64 Linux, debug test builds).
+const CFG_FLAGS = { test: true, unix: true, windows: false, debug_assertions: true, miri: false, doc: false, doctest: false };
+const CFG_KEYS = { target_arch: "x86_64", target_os: "linux", target_family: "unix", target_pointer_width: "64", target_endian: "little", target_env: "gnu", panic: "unwind" };
+
+// true, false, or null for a cfg this guard does not model (never a
+// refusal: only a predicate known false compiles a test out).
+export function evalCfg(expr, features) {
+  if (expr.op === "all" || expr.op === "any" || expr.op === "not") {
+    const values = expr.args.map((arg) => evalCfg(arg, features));
+    if (expr.op === "not") return values.length === 1 && values[0] !== null ? !values[0] : null;
+    if (expr.op === "all") return values.includes(false) ? false : values.includes(null) ? null : true;
+    return values.includes(true) ? true : values.includes(null) ? null : false;
+  }
+  if (expr.key === "feature") return features.has(expr.value);
+  if (expr.key !== undefined) return Object.hasOwn(CFG_KEYS, expr.key) ? CFG_KEYS[expr.key] === expr.value : null;
+  if (expr.flag !== undefined) return Object.hasOwn(CFG_FLAGS, expr.flag) ? CFG_FLAGS[expr.flag] : null;
+  return null;
+}
+
+export function cfgText(expr) {
+  if (expr.op) return `${expr.op}(${expr.args.map(cfgText).join(", ")})`;
+  if (expr.key !== undefined) return `${expr.key} = "${expr.value}"`;
+  return expr.flag ?? "?";
+}
+
+// The features `-p <package> --features <listed>` enables for the
+// package's own test build: the listed ones, the defaults and those a
+// dev-dependency of the package on itself requests (the repository's way
+// to give package-scoped test lanes their features), closed over the
+// package's feature table (an optional dependency is a feature of its own
+// name).
+export function enabledFeatures(pkg, listed) {
+  const enabled = new Set();
+  const queue = ["default", ...listed];
+  for (const dep of pkg.dependencies ?? []) {
+    if (dep.kind !== "dev" || dep.name !== pkg.name || !dep.path) continue;
+    queue.push(...dep.features);
+    if (dep.uses_default_features) queue.push("default");
+  }
+  while (queue.length) {
+    const name = queue.pop();
+    if (enabled.has(name) || !Object.hasOwn(pkg.features, name)) continue;
+    enabled.add(name);
+    for (const item of pkg.features[name]) {
+      if (item.startsWith("dep:")) continue;
+      const slash = item.indexOf("/");
+      if (slash < 0) queue.push(item);
+      else if (item[slash - 1] !== "?") queue.push(item.slice(0, slash));
+    }
+  }
+  return enabled;
+}
+
+// The cfg predicates over each definition of `fn <name>` in a file: the
+// file's inner #![cfg(...)], those on every enclosing item, and the fn's
+// own. One list per definition.
+export function fnCfgs(tokens, name) {
+  const sites = [];
+  const inner = [];
+  const stack = [];
+  let pending = [];
+  let depth = 0;
+  for (let k = 0; k < tokens.length; k += 1) {
+    const tok = tokens[k];
+    if (tok.t === "p" && tok.v === "#" && (tokens[k + 1]?.v === "[" || (tokens[k + 1]?.v === "!" && tokens[k + 2]?.v === "["))) {
+      const isInner = tokens[k + 1].v === "!";
+      const open = isInner ? k + 2 : k + 1;
+      if (tokens[open + 1]?.v === "cfg" && tokens[open + 2]?.v === "(") {
+        const expr = parseCfg(tokens, open + 2);
+        if (!isInner) pending.push(expr);
+        else if (depth === 0) inner.push(expr);
+        else if (stack.length && stack[stack.length - 1].depth === depth) stack[stack.length - 1].cfgs.push(expr);
+        else stack.push({ depth, cfgs: [expr] });
+      }
+      k = closingBracket(tokens, open);
+      continue;
+    }
+    if (tok.t === "p" && tok.v === "{") {
+      depth += 1;
+      if (pending.length) stack.push({ depth, cfgs: pending });
+      pending = [];
+    } else if (tok.t === "p" && tok.v === "}") {
+      if (stack.length && stack[stack.length - 1].depth === depth) stack.pop();
+      depth -= 1;
+      pending = [];
+    } else if (tok.t === "p" && tok.v === ";") {
+      pending = [];
+    } else if (tok.t === "id" && tok.v === "fn" && tokens[k + 1]?.v === name) {
+      sites.push([...inner, ...stack.flatMap((entry) => entry.cfgs), ...pending]);
+    }
+  }
+  return sites;
+}
+
 // Test-only code: the bodies of items marked #[test], #[tokio::test],
 // #[cfg(test)] (and cfg(all(test, ...)), not cfg(not(test))), and the `mod`
 // declarations so marked. Returns { inTest: Uint8Array per token,
@@ -373,8 +510,9 @@ export function includeArgument(tokens, open, match) {
 }
 
 // The `mod` declarations, #[path] modules and include!() files of one file,
-// each with the candidate paths it may resolve to and whether the
-// declaration is test-only; an include!() the walk cannot follow is a child
+// each with the candidate paths it may resolve to, whether the declaration
+// is test-only and the cfg predicates over it (its own and those of the
+// inline modules around it); an include!() the walk cannot follow is a child
 // with `unresolved` set. Inline `mod name { ... }` blocks nest the
 // directory. A file reached through include!() gets `modDir`, the
 // directory the including file's `mod` items resolve against at the
@@ -385,20 +523,41 @@ function moduleChildren(file, tokens, regions, index, isRoot, crateDir, modDir =
   const children = [];
   const inline = [];
   const inlineDepths = [];
+  const inlineCfgs = [];
+  const fileCfgs = [];
+  let pendingCfgs = [];
   let depth = 0;
   let pendingPath = null;
   for (let k = 0; k < tokens.length; k += 1) {
     const tok = tokens[k];
     if (tok.t === "p" && tok.v === "{") {
       depth += 1;
+      pendingCfgs = [];
       continue;
     }
     if (tok.t === "p" && tok.v === "}") {
       depth -= 1;
+      pendingCfgs = [];
       if (inlineDepths.length && inlineDepths[inlineDepths.length - 1] === depth) {
         inlineDepths.pop();
         inline.pop();
+        inlineCfgs.pop();
       }
+      continue;
+    }
+    if (tok.t === "p" && tok.v === ";") {
+      pendingCfgs = [];
+      continue;
+    }
+    // An inner #![cfg(...)] of the file gates every module it declares.
+    if (tok.v === "#" && depth === 0 && tokens[k + 1]?.v === "!" && tokens[k + 2]?.v === "[" && tokens[k + 3]?.v === "cfg" && tokens[k + 4]?.v === "(") {
+      fileCfgs.push(parseCfg(tokens, k + 4));
+      k = closingBracket(tokens, k + 2);
+      continue;
+    }
+    if (tok.v === "#" && tokens[k + 1]?.v === "[" && tokens[k + 2]?.v === "cfg" && tokens[k + 3]?.v === "(") {
+      pendingCfgs.push(parseCfg(tokens, k + 3));
+      k = closingBracket(tokens, k + 1);
       continue;
     }
     if (tok.v === "#" && tokens[k + 1]?.v === "[" && tokens[k + 2]?.v === "path" && tokens[k + 3]?.v === "=" && tokens[k + 4]?.t === "str") {
@@ -410,18 +569,21 @@ function moduleChildren(file, tokens, regions, index, isRoot, crateDir, modDir =
       const name = tokens[k + 1].v;
       const after = tokens[k + 2];
       const testOnly = regions.testMods.has(k) || regions.inTest[k] === 1;
+      const cfgs = [...fileCfgs, ...inlineCfgs.flat(), ...pendingCfgs];
+      pendingCfgs = [];
       if (after?.v === ";") {
         const dir = resolve(stem, ...inline);
         if (pendingPath) {
-          children.push({ candidates: [resolve(inline.length ? dir : base, pendingPath.value)], testOnly, pathLiteral: pendingPath.index });
+          children.push({ candidates: [resolve(inline.length ? dir : base, pendingPath.value)], testOnly, cfgs, pathLiteral: pendingPath.index });
         } else {
           const dirs = modDir ? [resolve(modDir, ...inline), resolve(base, ...inline), dir] : [dir];
           const candidates = [...new Set(dirs.flatMap((candidate) => [resolve(candidate, `${name}.rs`), resolve(candidate, name, "mod.rs")]))];
-          children.push({ candidates, testOnly });
+          children.push({ candidates, testOnly, cfgs });
         }
         pendingPath = null;
       } else if (after?.v === "{") {
         inline.push(pendingPath?.value ?? name);
+        inlineCfgs.push(cfgs.slice(fileCfgs.length + inlineCfgs.flat().length));
         pendingPath = null;
         inlineDepths.push(depth);
         depth += 1;
@@ -433,10 +595,11 @@ function moduleChildren(file, tokens, regions, index, isRoot, crateDir, modDir =
       const arg = includeArgument(tokens, k + 2, index.match);
       const testOnly = regions.inTest[k] === 1;
       const includeDir = resolve(stem, ...inline);
+      const cfgs = [...fileCfgs, ...inlineCfgs.flat()];
       if (arg.kind === "literal") {
-        children.push({ candidates: [resolve(base, arg.value)], testOnly, include: { line: tok.line, form: arg.form, modDir: includeDir } });
+        children.push({ candidates: [resolve(base, arg.value)], testOnly, cfgs, include: { line: tok.line, form: arg.form, modDir: includeDir } });
       } else if (arg.kind === "manifest") {
-        children.push({ candidates: [resolve(crateDir, arg.value.replace(/^\//, ""))], testOnly, include: { line: tok.line, form: arg.form, modDir: includeDir } });
+        children.push({ candidates: [resolve(crateDir, arg.value.replace(/^\//, ""))], testOnly, cfgs, include: { line: tok.line, form: arg.form, modDir: includeDir } });
       } else {
         children.push({ unresolved: { line: tok.line, form: `include!(${arg.form})`, why: "the walk follows include!() of a literal or of concat!(env!(\"CARGO_MANIFEST_DIR\"), \"<literal>\") only" } });
       }
@@ -459,7 +622,8 @@ function targetId(target) {
 export function workspaceModel() {
   const metadata = readMetadata();
   const packages = workspacePackages(metadata);
-  // abs file -> Map<package name, { pkg, targets: Map<target id, testOnly> }>
+  // abs file -> Map<package name, { pkg, targets: Map<target id, testOnly>,
+  // gates: Map<target id, cfg predicate lists, one per module path> }>
   const files = new Map();
   const cache = new Map();
   const parse = (file) => {
@@ -484,19 +648,20 @@ export function workspaceModel() {
       const id = targetId(target);
       const rootTestOnly = id.startsWith("test:") || id.startsWith("bench:");
       const visited = new Map(); // file -> testOnly
-      const queue = [[target.src_path, true, rootTestOnly, null]];
+      const queue = [[target.src_path, true, rootTestOnly, null, []]];
       while (queue.length) {
-        const [file, isRoot, testOnly, modDir] = queue.pop();
+        const [file, isRoot, testOnly, modDir, gates] = queue.pop();
         if (!existsSync(file)) continue;
+        const byPkg = files.get(file) ?? new Map();
+        const entry = byPkg.get(pkg.name) ?? { pkg, targets: new Map(), gates: new Map() };
+        entry.gates.set(id, [...(entry.gates.get(id) ?? []), gates]);
+        byPkg.set(pkg.name, entry);
+        files.set(file, byPkg);
         // Re-walk a file first reached through test-only code when a
         // non-test path reaches it too.
         if (visited.has(file) && (visited.get(file) === false || testOnly)) continue;
         visited.set(file, testOnly);
-        const byPkg = files.get(file) ?? new Map();
-        const entry = byPkg.get(pkg.name) ?? { pkg, targets: new Map() };
         entry.targets.set(id, entry.targets.has(id) ? entry.targets.get(id) && testOnly : testOnly);
-        byPkg.set(pkg.name, entry);
-        files.set(file, byPkg);
         const { tokens, regions, index } = parse(file);
         for (const child of moduleChildren(file, tokens, regions, index, isRoot, crateDir, modDir)) {
           if (child.unresolved) {
@@ -505,7 +670,7 @@ export function workspaceModel() {
           }
           const found = child.candidates.find((candidate) => existsSync(candidate));
           if (found) {
-            queue.push([found, false, testOnly || child.testOnly, child.include ? child.include.modDir : null]);
+            queue.push([found, false, testOnly || child.testOnly, child.include ? child.include.modDir : null, [...gates, ...child.cfgs]]);
           } else if (child.include) {
             refuse(file, { ...child.include, why: `its file ${normalizePath(relative(root, child.candidates[0]))} does not exist` }, pkg, id);
           }
@@ -1168,11 +1333,22 @@ export function checkInventory(refs, inventory, model) {
     }
     for (const test of row.tests ?? []) {
       const files = targetFiles.get(`${row.package}\0${row.target}`) ?? [];
-      const found = files.some((file) => {
-        const { tokens } = model.parse(file);
-        return tokens.some((tok, k) => tok.v === "fn" && tokens[k + 1]?.v === test);
+      const sites = files.flatMap((file) => {
+        const chains = model.files.get(file).get(row.package).gates.get(row.target) ?? [[]];
+        return fnCfgs(model.parse(file).tokens, test).flatMap((site) => chains.map((chain) => [...chain, ...site]));
       });
-      if (!found) problems.push(`inventory row "${row.path}" (${row.package} ${row.target}) names test ${test}, which no file of that target defines`);
+      if (sites.length === 0) {
+        problems.push(`inventory row "${row.path}" (${row.package} ${row.target}) names test ${test}, which no file of that target defines`);
+        continue;
+      }
+      // A test the row's build compiles out runs in no lane, and the row's
+      // `--no-tests=fail` fails when it names no other test.
+      const enabled = enabledFeatures(pkg, row.features);
+      if (!sites.some((site) => site.every((cfg) => evalCfg(cfg, enabled) !== false))) {
+        const gates = [...new Set(sites.flatMap((site) => site.filter((cfg) => evalCfg(cfg, enabled) === false).map(cfgText)))];
+        const build = row.features.length ? `--features ${row.features.join(",")}` : "default features";
+        problems.push(`inventory row "${row.path}" (${row.package} ${row.target}) names test ${test}, which its build (${build}) compiles out: cfg(${gates.join("), cfg(")})`);
+      }
     }
   }
   return problems;

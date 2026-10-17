@@ -495,7 +495,8 @@ and its CI must be green before a release tag (`require_ci_green`):
   for the test scope: the reverse-dependency closure of the changed packages
   (every member on a global change) plus the packages whose tests read a
   changed non-Rust input (`scripts/ci-non-rust-readers.json`, kept complete
-  by `scripts/ci-non-rust-readers-guard.mjs` in `make ci-lanes-selftest`).
+  by `scripts/ci-non-rust-readers-guard.mjs` in `make ci-lanes-selftest`,
+  which also fails a reader whose named test its features compile out).
   Rows (`closure_test_rows` in `scripts/ci-cargo-lanes.mjs`) select the whole
   workspace and name only their targets, so they compile the hook's own
   units: every `tests/*.rs` target the hook builds (by name, `ci-integration`

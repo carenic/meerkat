@@ -247,7 +247,8 @@ doc-example test walks `docs/`, the machine-authority docs alignment test
 reads `docs/` and `.claude/skills/`, xtask's static lanes read
 `CHANGELOG.md`, and so on. `scripts/ci-non-rust-readers.json` lists every
 such input and its reader (`scripts/ci-non-rust-readers-guard.mjs` keeps it
-complete), and a change to one adds the exact target that reads it to the
+complete, and fails a reader whose named test its features compile out),
+and a change to one adds the exact target that reads it to the
 `integration` lane: `-p` the reader with the inventory's features, its
 lib, bin, test or example target (the lib and bins for a reader in
 library or build-script code: its test targets, like those of a pull

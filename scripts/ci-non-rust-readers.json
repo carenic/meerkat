@@ -1243,6 +1243,9 @@
         "package": "meerkat-store",
         "target": "lib",
         "scope": "target",
+        "features": [
+          "sqlite"
+        ],
         "tests": [
           "exact_released_0810_corpus_imports_and_fully_loads_current_session"
         ],

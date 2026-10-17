@@ -55,8 +55,10 @@ them.
   crate's in-crate documentation that it compiles in (the
   `skills/*/SKILL.md` files) is now a build input of that crate, and the
   authority-language check of `xtask machine-check-drift` runs on the live
-  docs in an xtask library test, so a docs pull request runs it too. CI
-  only.
+  docs in an xtask library test, so a docs pull request runs it too. The
+  inventory's guard fails a reader whose named test the reader's features
+  compile out (meerkat-store's 0.8.10 corpus test needs `sqlite`, not a
+  default feature of the crate). CI only.
 - **CI starts its long rows first.** The Clippy, main unit, closure-tests
   and feature-check lanes run in two waves: the rows that took 8 minutes or
   more on a green run (`scripts/ci-row-durations.json`, regenerated with
