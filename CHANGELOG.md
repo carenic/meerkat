@@ -49,7 +49,9 @@ them.
   `ScheduleDomainError::DriverStopped`; `handle_schedule_tools_call` returns
   it as `CAPABILITY_UNAVAILABLE` (-32001), and `ScheduleToolDispatcher` and
   `ScheduleToolSurface` return `ToolError::Unavailable` with
-  `ToolUnavailableReason::TemporarilyUnavailable`. A service that never had a
+  `ToolUnavailableReason::TemporarilyUnavailable`. The RPC `schedule/*`
+  methods return it as capability unavailable (-32020), as for an
+  unsupported schedule backend. A service that never had a
   probe attached still accepts identity targets unjudged.
 
 ### Fixed

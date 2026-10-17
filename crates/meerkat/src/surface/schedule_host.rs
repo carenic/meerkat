@@ -5070,4 +5070,68 @@ mod tests {
             .expect("pause keeps working after teardown");
         assert_eq!(paused["phase"].as_str(), Some("paused"));
     }
+
+    /// Two real hosts over one shared service: the earlier one judges
+    /// identity targets while it runs, the later one judges once the earlier
+    /// one has stopped, and with both stopped identity targets are refused as
+    /// stopped.
+    #[tokio::test]
+    async fn two_hosts_over_one_service_judge_in_attach_order_and_hand_off() {
+        let service = memory_schedule_service();
+        let adapter = |identity: TargetProbeOutcome| {
+            let session_host: Arc<dyn SurfaceScheduleSessionHost> = Arc::new(FixedIdentityHost {
+                _alive: Arc::new(()),
+                identity,
+            });
+            let mob_host: Arc<dyn SurfaceScheduleMobHost> = Arc::new(NoopScheduleMobHost::new(
+                "mob targets unsupported in this test",
+            ));
+            Arc::new(SharedScheduleTargetAdapter::new(
+                service.clone(),
+                session_host,
+                mob_host,
+            ))
+        };
+        let first = spawn_schedule_host(
+            service.clone(),
+            adapter(TargetProbeOutcome::Missing {
+                detail: Some("unknown to the first host".to_string()),
+            }),
+            "first-host",
+        );
+        let second = spawn_schedule_host(
+            service.clone(),
+            adapter(TargetProbeOutcome::Ready),
+            "second-host",
+        );
+
+        let refused = service
+            .create(identity_create_request("domain:ops"))
+            .await
+            .expect_err("the first host judges while it runs");
+        assert!(
+            matches!(
+                &refused,
+                ScheduleDomainError::InvalidSchedule(reason)
+                    if reason.contains("unknown to the first host")
+            ),
+            "expected the first host's refusal, found {refused:?}"
+        );
+
+        first.shutdown().await;
+        service
+            .create(identity_create_request("domain:ops"))
+            .await
+            .expect("the second host judges once the first has stopped");
+
+        second.shutdown().await;
+        let stopped = service
+            .create(identity_create_request("domain:ops"))
+            .await
+            .expect_err("no running host is left to judge");
+        assert!(
+            matches!(stopped, ScheduleDomainError::DriverStopped),
+            "expected DriverStopped, found {stopped:?}"
+        );
+    }
 }
