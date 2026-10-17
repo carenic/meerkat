@@ -810,6 +810,12 @@ them.
   flowmaster's inline layer profiles until pack schemas are versioned; a
   layer decision that carries it anyway is honoured as `Disabled`, and
   refused with the same typed error where the model refuses it.
+- `meerkat-sqlite`: `OperationGuard::admit_missing_database`, the
+  maintenance-fence admission for an operation that finds its database file
+  missing and answers without touching it. It creates nothing (an absent lock
+  file holds no fence) and fails with `SqliteStoreError::MaintenanceFenceHeld`
+  under another holder's exclusive fence, as `OperationGuard::for_database`
+  does.
 
 ### Changed
 
@@ -1490,6 +1496,17 @@ them.
   session, so every materialize-on-demand fire failed as `transport_error`
   ("session not found"). The policy now comes from the staged session, as it
   does for `turn/start`.
+- A read of runtime delivery state no longer creates the state directory or
+  an empty runtime store. The SQLite runtime store's delivery reads (delivery
+  authorities and inbox records, continuation key bindings and admissions,
+  and the delivery generation) opened a create-capable connection, so a read
+  over a store whose file or directory was gone (a released, moved or removed
+  state directory, read by a delivery owner or a health tick that outlived
+  it) re-created the directory and an empty `runtime.sqlite`. They now open
+  an existing file without create and answer "not provisioned" when it is
+  missing, unless another holder's maintenance fence covers the missing file
+  (an archive by rename), which still fails typed; among delivery
+  operations, only a write creates the store. No schema change.
 
 ### Known issues
 
