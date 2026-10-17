@@ -1203,6 +1203,49 @@ impl std::fmt::Display for OpaquePrincipalToken {
     }
 }
 
+/// One incarnation of a mob: a mob runtime from the moment it starts (a
+/// create, or a resume by a later process) until it stops for good. A mob
+/// destroyed and created again under the same id, or resumed by a later
+/// process, is a new incarnation.
+///
+/// Mob operator grants name the incarnation they were minted for, so a grant
+/// never reaches a later mob under the same id. Only the mob runtime mints
+/// one, when it starts (UUID v4, 122 random bits). The value is opaque and
+/// is never decoded: deserialization always refuses, and `Debug` and
+/// `Serialize` render it redacted. It is not a credential; the authority is
+/// the sealed [`MobToolAuthorityContext`] that names it.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct MobIncarnationId(uuid::Uuid);
+
+impl MobIncarnationId {
+    /// A fresh incarnation, never handed out before.
+    pub fn mint() -> Self {
+        Self(uuid::Uuid::new_v4())
+    }
+}
+
+const REDACTED_MOB_INCARNATION: &str = "[redacted mob incarnation]";
+
+impl std::fmt::Debug for MobIncarnationId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(REDACTED_MOB_INCARNATION)
+    }
+}
+
+impl Serialize for MobIncarnationId {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(REDACTED_MOB_INCARNATION)
+    }
+}
+
+impl<'de> Deserialize<'de> for MobIncarnationId {
+    fn deserialize<D: serde::Deserializer<'de>>(_deserializer: D) -> Result<Self, D::Error> {
+        Err(serde::de::Error::custom(
+            "a mob incarnation is minted by the mob runtime and never decoded",
+        ))
+    }
+}
+
 /// Runtime-supplied caller provenance carried alongside mob tool authority.
 ///
 /// This is informational/projection-only data. It is not a second authority

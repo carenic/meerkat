@@ -3784,6 +3784,11 @@ macro_rules! meerkat_catalog_machine_dsl {
             mob_operator_can_mutate_profiles: bool,
             mob_operator_managed_mob_scope: Set<String>,
             mob_operator_spawn_profile_scope: Map<String, Set<String>>,
+            // The mob incarnation each scoped mob id is bound to. A grant
+            // names the incarnation the mob runtime minted when it started,
+            // so it never reaches a later mob created under the same id.
+            #[redacted]
+            mob_operator_mob_incarnations: Map<String, MobIncarnationId>,
             mob_operator_caller_provenance: Option<MobToolCallerProvenance>,
             mob_operator_audit_invocation_id: Option<String>,
 
@@ -4582,6 +4587,7 @@ macro_rules! meerkat_catalog_machine_dsl {
             mob_operator_can_mutate_profiles = false,
             mob_operator_managed_mob_scope = EmptySet,
             mob_operator_spawn_profile_scope = EmptyMap,
+            mob_operator_mob_incarnations = EmptyMap,
             mob_operator_caller_provenance = None,
             mob_operator_audit_invocation_id = None,
             // Comms drain substate
@@ -5197,6 +5203,8 @@ macro_rules! meerkat_catalog_machine_dsl {
                 can_mutate_profiles: bool,
                 managed_mob_scope: Set<String>,
                 spawn_profile_scope: Map<String, Set<String>>,
+                #[redacted]
+                mob_incarnations: Map<String, MobIncarnationId>,
                 caller_provenance: Option<MobToolCallerProvenance>,
                 audit_invocation_id: Option<String>,
             },
@@ -5208,9 +5216,13 @@ macro_rules! meerkat_catalog_machine_dsl {
             },
             GrantMobOperatorManageMob {
                 mob_id: String,
+                #[redacted]
+                mob_incarnation: MobIncarnationId,
             },
             SetMobOperatorSpawnProfilesInMob {
                 mob_id: String,
+                #[redacted]
+                mob_incarnation: MobIncarnationId,
                 profiles: Set<String>,
             },
             Reset,
@@ -9152,6 +9164,13 @@ macro_rules! meerkat_catalog_machine_dsl {
             self.active_runtime_generation == None || self.active_runtime_id != None
         }
 
+        invariant mob_operator_scopes_are_bound_to_an_incarnation {
+            for_all(mob_id in self.mob_operator_managed_mob_scope,
+                self.mob_operator_mob_incarnations.contains_key(mob_id))
+            && for_all(mob_id in self.mob_operator_spawn_profile_scope.keys(),
+                self.mob_operator_mob_incarnations.contains_key(mob_id))
+        }
+
         invariant live_execution_binding_is_complete_and_channel_scoped {
             self.live_execution_runtime_id_by_channel.keys()
                 == self.live_execution_fence_by_channel.keys()
@@ -11100,6 +11119,7 @@ macro_rules! meerkat_catalog_machine_dsl {
                 self.mob_operator_can_mutate_profiles = true;
                 self.mob_operator_managed_mob_scope = EmptySet;
                 self.mob_operator_spawn_profile_scope = EmptyMap;
+                self.mob_operator_mob_incarnations = EmptyMap;
                 self.mob_operator_caller_provenance = caller_provenance;
                 self.mob_operator_audit_invocation_id = audit_invocation_id;
             }
@@ -11119,6 +11139,7 @@ macro_rules! meerkat_catalog_machine_dsl {
                 self.mob_operator_can_mutate_profiles = false;
                 self.mob_operator_managed_mob_scope = EmptySet;
                 self.mob_operator_spawn_profile_scope = EmptyMap;
+                self.mob_operator_mob_incarnations = EmptyMap;
                 self.mob_operator_caller_provenance = None;
                 self.mob_operator_audit_invocation_id = None;
             }
@@ -11128,10 +11149,15 @@ macro_rules! meerkat_catalog_machine_dsl {
         transition RestoreMobOperatorAuthority {
             on input RestoreMobOperatorAuthority {
                 principal_token, can_create_mobs, can_mutate_profiles,
-                managed_mob_scope, spawn_profile_scope, caller_provenance,
-                audit_invocation_id
+                managed_mob_scope, spawn_profile_scope, mob_incarnations,
+                caller_provenance, audit_invocation_id
             }
             guard { self.lifecycle_phase == Phase::Initializing }
+            guard "scoped_mobs_are_bound" {
+                for_all(mob_id in managed_mob_scope, mob_incarnations.contains_key(mob_id))
+                && for_all(mob_id in spawn_profile_scope.keys(),
+                    mob_incarnations.contains_key(mob_id))
+            }
             update {
                 self.mob_operator_authority_present = true;
                 self.mob_operator_principal_token = Some(principal_token);
@@ -11139,6 +11165,7 @@ macro_rules! meerkat_catalog_machine_dsl {
                 self.mob_operator_can_mutate_profiles = can_mutate_profiles;
                 self.mob_operator_managed_mob_scope = managed_mob_scope;
                 self.mob_operator_spawn_profile_scope = spawn_profile_scope;
+                self.mob_operator_mob_incarnations = mob_incarnations;
                 self.mob_operator_caller_provenance = caller_provenance;
                 self.mob_operator_audit_invocation_id = audit_invocation_id;
             }
@@ -11165,22 +11192,73 @@ macro_rules! meerkat_catalog_machine_dsl {
             to Initializing
         }
 
+        // A grant names one incarnation of the mob: the one the mob runtime
+        // minted when it started. Scope held for an earlier incarnation of
+        // the same id never reaches a later one.
         transition GrantMobOperatorManageMob {
-            on input GrantMobOperatorManageMob { mob_id }
+            on input GrantMobOperatorManageMob { mob_id, mob_incarnation }
             guard { self.lifecycle_phase == Phase::Initializing }
             guard "authority_present" { self.mob_operator_authority_present }
+            guard "mob_unbound_or_same_incarnation" {
+                !self.mob_operator_mob_incarnations.contains_key(mob_id)
+                || self.mob_operator_mob_incarnations.get_cloned(mob_id) == Some(mob_incarnation)
+            }
             update {
                 self.mob_operator_managed_mob_scope.insert(mob_id);
+                self.mob_operator_mob_incarnations.insert(mob_id, mob_incarnation);
+            }
+            to Initializing
+        }
+
+        // A manage grant for a new incarnation of a mob id replaces the old
+        // binding. Spawn-profile scope held for the old incarnation is
+        // dropped: it never carries over to the new mob.
+        transition RebindMobOperatorManageMob {
+            on input GrantMobOperatorManageMob { mob_id, mob_incarnation }
+            guard { self.lifecycle_phase == Phase::Initializing }
+            guard "authority_present" { self.mob_operator_authority_present }
+            guard "mob_bound_to_another_incarnation" {
+                self.mob_operator_mob_incarnations.contains_key(mob_id)
+                && self.mob_operator_mob_incarnations.get_cloned(mob_id) != Some(mob_incarnation)
+            }
+            update {
+                self.mob_operator_managed_mob_scope.insert(mob_id);
+                self.mob_operator_spawn_profile_scope.remove(mob_id);
+                self.mob_operator_mob_incarnations.insert(mob_id, mob_incarnation);
             }
             to Initializing
         }
 
         transition SetMobOperatorSpawnProfilesInMob {
-            on input SetMobOperatorSpawnProfilesInMob { mob_id, profiles }
+            on input SetMobOperatorSpawnProfilesInMob { mob_id, mob_incarnation, profiles }
             guard { self.lifecycle_phase == Phase::Initializing }
             guard "authority_present" { self.mob_operator_authority_present }
+            guard "mob_unbound_or_same_incarnation" {
+                !self.mob_operator_mob_incarnations.contains_key(mob_id)
+                || self.mob_operator_mob_incarnations.get_cloned(mob_id) == Some(mob_incarnation)
+            }
             update {
                 self.mob_operator_spawn_profile_scope.insert(mob_id, profiles);
+                self.mob_operator_mob_incarnations.insert(mob_id, mob_incarnation);
+            }
+            to Initializing
+        }
+
+        // A spawn-profile grant for a new incarnation of a mob id replaces
+        // the old binding. Manage scope held for the old incarnation is
+        // dropped: a spawn grant for the new mob never revives it.
+        transition RebindMobOperatorSpawnProfilesInMob {
+            on input SetMobOperatorSpawnProfilesInMob { mob_id, mob_incarnation, profiles }
+            guard { self.lifecycle_phase == Phase::Initializing }
+            guard "authority_present" { self.mob_operator_authority_present }
+            guard "mob_bound_to_another_incarnation" {
+                self.mob_operator_mob_incarnations.contains_key(mob_id)
+                && self.mob_operator_mob_incarnations.get_cloned(mob_id) != Some(mob_incarnation)
+            }
+            update {
+                self.mob_operator_managed_mob_scope.remove(mob_id);
+                self.mob_operator_spawn_profile_scope.insert(mob_id, profiles);
+                self.mob_operator_mob_incarnations.insert(mob_id, mob_incarnation);
             }
             to Initializing
         }
@@ -38370,6 +38448,7 @@ macro_rules! meerkat_catalog_machine_dsl {
 
 crate::meerkat_catalog_machine_dsl!("self", "catalog::dsl::meerkat_machine");
 
+pub type MobIncarnationId = meerkat_core::service::MobIncarnationId;
 pub type MobToolCallerProvenance = meerkat_core::service::MobToolCallerProvenance;
 pub type OpaquePrincipalToken = meerkat_core::service::OpaquePrincipalToken;
 
