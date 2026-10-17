@@ -1023,6 +1023,54 @@ async fn exhausted_extraction_reports_unchanged_attempts() {
     );
 }
 
+/// A refused or window-stopped extraction reply fails the extraction, not the
+/// completed main run: the run's answer stands, nothing of the reply is used,
+/// and the stop is not retried as another extraction attempt.
+#[tokio::test]
+async fn refusing_stop_in_extraction_fails_the_extraction_not_the_run() {
+    for stop_reason in [StopReason::Refusal, StopReason::ContextWindowExceeded] {
+        let stopped = LlmStreamResult::new(
+            vec![AssistantBlock::Text {
+                text: r#"{"verdict":"appr"#.to_string(),
+                meta: None,
+            }],
+            stop_reason,
+            Usage::default(),
+        );
+        let client = Arc::new(RecordingSchemaClient::new(
+            Provider::OpenAI,
+            vec![text("prose"), stopped],
+        ));
+        let mut agent = build(
+            &client,
+            base_builder()
+                .output_schema(review_schema())
+                .structured_output_retries(1),
+        )
+        .await;
+        let (result, events) = run_collecting(&mut agent, "q").await;
+        let result = result.unwrap_or_else(|error| {
+            panic!("{stop_reason:?}: a stopped extraction still completes the main run: {error}")
+        });
+
+        assert_eq!(
+            client.call_count(),
+            2,
+            "{stop_reason:?}: main + one extraction"
+        );
+        assert!(result.structured_output.is_none(), "{stop_reason:?}");
+        let error = result.extraction_error.expect("extraction error");
+        assert_eq!(error.last_output, "prose", "{stop_reason:?}");
+        assert_eq!(result.text, "prose", "{stop_reason:?}");
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::ExtractionFailed { .. })),
+            "{stop_reason:?}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn validator_fault_falls_through_to_the_unchanged_extraction_failure() {
     let client = Arc::new(
