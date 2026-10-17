@@ -1074,8 +1074,10 @@ mod orchestrator {
     /// settlement has found the session consistent at the boundary: the
     /// channel's projections wait for the boundary again from here on, and
     /// the host keeps the closed channel reachable through `retention` until
-    /// they have landed. An assistant output whose handle the close already
-    /// retired is refused by the projection and reported, not retried.
+    /// they have landed. `output_hold` keeps the closed channel's generated
+    /// assistant outputs addressable until then, so an output start the
+    /// member turn's boundary parked until after the close still finds its
+    /// handle; the close's retirement of those outputs runs when it ends.
     ///
     /// A settlement that gives up (the member turn ended with an error, or the
     /// hang guard) never drops the rows it still holds: they are applied in
@@ -1098,6 +1100,7 @@ mod orchestrator {
         deferred_projections: Vec<meerkat_core::live_adapter::LiveAdapterObservation>,
         session_id: SessionId,
         channel_id: LiveChannelId,
+        output_hold: Option<meerkat_runtime::meerkat_machine::LiveAssistantOutputRetirementHold>,
     ) -> DeferredCloseSettlementOutcome {
         let retention = host
             .retain_channel_close_projection(&session_id, &channel_id)
@@ -1207,6 +1210,7 @@ mod orchestrator {
                 host,
                 DeferredRowsCustody {
                     _retention: retention,
+                    _output_hold: output_hold,
                 },
                 rows,
                 session_id,
@@ -1260,6 +1264,7 @@ mod orchestrator {
                             host,
                             DeferredRowsCustody {
                                 _retention: retention,
+                                _output_hold: output_hold,
                             },
                             deferred_projections.into(),
                             session_id.clone(),
@@ -1304,6 +1309,7 @@ mod orchestrator {
             }
         }
         drop(retention);
+        drop(output_hold);
         if let Err(error) = runtime
             .resolve_live_close_settlement(&session_id, &channel_id)
             .await
@@ -1335,9 +1341,10 @@ mod orchestrator {
     }
 
     /// What keeps a closed channel's deferred rows applicable: the host's
-    /// close-projection retention.
+    /// close-projection retention and the hold on its generated outputs.
     struct DeferredRowsCustody {
         _retention: Option<meerkat_live::LiveChannelCloseProjectionLease>,
+        _output_hold: Option<meerkat_runtime::meerkat_machine::LiveAssistantOutputRetirementHold>,
     }
 
     /// Apply the rows a given-up close settlement still held, in arrival
@@ -5149,8 +5156,15 @@ mod orchestrator {
                     .map_err(|error| LiveChannelVerbError::HostCommit {
                         message: error.to_string(),
                     })?;
+                    // A deferred settlement may replay an output start the
+                    // member turn's boundary parked; the channel's generated
+                    // outputs stay addressable until it is done, and their
+                    // retirement runs then.
+                    let settles_deferred = settlement_deferred || !deferred_projections.is_empty();
+                    let output_hold = settles_deferred
+                        .then(|| runtime.hold_live_assistant_output_handles(&session_id, &channel));
                     runtime.retire_live_assistant_output_handles(&session_id, &channel);
-                    if settlement_deferred || !deferred_projections.is_empty() {
+                    if settles_deferred {
                         match meerkat_live::traced_live_close_step(
                             Some(&channel),
                             "defer_settlement",
@@ -5166,9 +5180,11 @@ mod orchestrator {
                                     deferred_projections,
                                     session_id.clone(),
                                     channel.clone(),
+                                    output_hold,
                                 ));
                             }
                             Err(error) => {
+                                drop(output_hold);
                                 service.restore_live_projection_turn_boundary_wait(
                                     &session_id,
                                     &channel,

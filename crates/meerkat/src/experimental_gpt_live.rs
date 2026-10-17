@@ -4421,6 +4421,10 @@ struct PendingExperimentalGptLivePlayback {
     /// Generated output admitted for this segment, recorded by the pump from
     /// the host's output address. Unmeasured policy only.
     output_id: Option<String>,
+    /// The segment's output start was handed to the channel's close because
+    /// the member turn held the session boundary, so `output_id` was never
+    /// recorded. Unmeasured policy only.
+    output_start_deferred: bool,
     /// Local segment number within the provider turn. Unmeasured policy only;
     /// generated authority advances its own counter on each release and the
     /// release verifies they agree.
@@ -4448,6 +4452,9 @@ struct UnmeasuredSegmentSeal {
     /// The release committed canonically; only consuming the generated
     /// output may remain. Its speech is never retracted or re-applied.
     applied: bool,
+    /// The segment's output start went to the channel's close; its release
+    /// follows it there.
+    start_deferred: bool,
 }
 
 impl UnmeasuredSegmentSeal {
@@ -4467,6 +4474,7 @@ impl UnmeasuredSegmentSeal {
             usage: pending.usage.clone(),
             continues_turn,
             applied: false,
+            start_deferred: pending.output_start_deferred,
         }
     }
 
@@ -4981,6 +4989,35 @@ impl ExperimentalGptLiveDeferredAdapter {
         Ok(())
     }
 
+    /// An output start the channel's close took behind the member turn's
+    /// held session boundary: its segment never records a generated output,
+    /// so its release must follow the start to the close instead of being
+    /// abandoned.
+    fn note_deferred_output_start(&self, observation: &LiveAdapterObservation) {
+        let (response_id, item_id) = match observation {
+            LiveAdapterObservation::WithContextObservation { observation, .. } => {
+                self.note_deferred_output_start(observation);
+                return;
+            }
+            LiveAdapterObservation::AssistantOutputStarted {
+                response_id,
+                provider_item_id,
+                ..
+            } => (response_id, provider_item_id),
+            _ => return,
+        };
+        if !self.provider_managed_unmeasured() {
+            return;
+        }
+        if let Ok(mut playback) = self.playback_by_item.lock()
+            && let Some(pending) = playback.get_mut(item_id).filter(|pending| {
+                &pending.response_id == response_id && pending.output_started_forwarded
+            })
+        {
+            pending.output_start_deferred = true;
+        }
+    }
+
     /// A typed between-speech boundary: every open unmeasured segment that
     /// observed speech seals now, so it is released before any later row,
     /// and its provider turn continues in a new segment. The next delta of
@@ -5013,6 +5050,7 @@ impl ExperimentalGptLiveDeferredAdapter {
             pending.response_id = response_id;
             pending.output_started_forwarded = false;
             pending.output_id = None;
+            pending.output_start_deferred = false;
             pending.segment = segment;
             pending.context_observation_id = None;
             playback.insert(next_item, pending);
@@ -5430,6 +5468,7 @@ impl ExperimentalGptLiveDeferredAdapter {
                     cut_captured: false,
                     next_segment: None,
                     output_id: None,
+                    output_start_deferred: false,
                     segment: 0,
                     boundary_pending: false,
                 };
@@ -7485,14 +7524,35 @@ async fn release_unmeasured_segments(
     Ok(())
 }
 
+/// The generated output of a sealed segment whose output start went to the
+/// channel's close: its provider turn's current output, still bound to no
+/// target because the start has not been applied.
+fn deferred_start_output(
+    runtime: &meerkat_runtime::MeerkatMachine,
+    binding: &ProviderWebrtcBinding,
+    seal: &UnmeasuredSegmentSeal,
+) -> Option<meerkat_runtime::meerkat_machine::LiveAssistantOutputHandle> {
+    if !seal.start_deferred {
+        return None;
+    }
+    runtime
+        .live_assistant_output_handle_for_turn(
+            binding.session_id(),
+            binding.channel_id(),
+            &seal.provider_turn_ref,
+        )
+        .filter(|handle| handle.__target().is_none())
+}
+
 /// How one sealed segment left the release queue.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UnmeasuredSegmentRelease {
     /// Committed canonically and its generated output consumed.
     Committed,
-    /// Handed to the close: the member's turn holds the session boundary, so
-    /// the close's deferred settlement applies the release once the boundary
-    /// frees, before it settles leftover playback.
+    /// Handed to the close: the member's turn holds the session boundary (or
+    /// the segment's output start already went to the close), so the close's
+    /// deferred settlement applies the release once the boundary frees, after
+    /// the start and before it settles leftover playback.
     Deferred,
     /// No generated custody remains to commit it against.
     Abandoned,
@@ -7519,9 +7579,22 @@ async fn release_unmeasured_segment(
             // meanwhile (a close, a rebinding). Nothing is left to do.
             return Ok(UnmeasuredSegmentRelease::Committed);
         }
-        // The segment's output was never admitted (its start was deferred
-        // behind a member turn while the channel closed, and the close
-        // retires that custody), so no canonical target can hold its speech.
+        if let Some(handle) = deferred_start_output(runtime, binding, seal) {
+            // The segment's output start went to the close behind the member
+            // turn's boundary, so its generated output is still unbound. The
+            // release follows the start there, never ahead of it; the close
+            // keeps the channel's outputs until its deferred settlement has
+            // replayed both.
+            return Ok(defer_unmeasured_release(
+                activation,
+                binding,
+                seal.release_observation(handle.interaction_id()),
+            )
+            .await);
+        }
+        // No generated output custody exists for the segment (its provider
+        // turn never reached the machine), so no canonical target can hold
+        // its speech.
         tracing::warn!(
             channel = %binding.channel_id(),
             "unmeasured segment has no generated output custody; its speech has no canonical target"
@@ -7735,7 +7808,8 @@ async fn release_unmeasured_segments_before_terminal(
         let handle = seal
             .output_id
             .as_deref()
-            .and_then(|output_id| activation.runtime.live_assistant_output_handle(output_id));
+            .and_then(|output_id| activation.runtime.live_assistant_output_handle(output_id))
+            .or_else(|| deferred_start_output(&activation.runtime, binding, &seal));
         let release = match handle {
             Some(handle) => {
                 defer_unmeasured_release(
@@ -8465,13 +8539,16 @@ fn spawn_sideband_actors(
                     .defer_projection_after_close(pump_binding.channel_id(), deferred)
                     .await
                 {
-                    Ok(()) => tracing::info!(
-                        target: meerkat_live::LIVE_CLOSE_TRACE_TARGET,
-                        channel = %pump_binding.channel_id(),
-                        observation = ?observation,
-                        close_requested,
-                        "live projection parked behind the member turn boundary was deferred to the boundary by the close"
-                    ),
+                    Ok(()) => {
+                        pump_adapter.note_deferred_output_start(observation);
+                        tracing::info!(
+                            target: meerkat_live::LIVE_CLOSE_TRACE_TARGET,
+                            channel = %pump_binding.channel_id(),
+                            observation = ?observation,
+                            close_requested,
+                            "live projection parked behind the member turn boundary was deferred to the boundary by the close"
+                        );
+                    }
                     Err(error) => tracing::warn!(
                         target: meerkat_live::LIVE_CLOSE_TRACE_TARGET,
                         channel = %pump_binding.channel_id(),
@@ -15338,6 +15415,7 @@ mod tests {
                 vec![deferred_user_row("item:r1", ROW)],
                 session_id.clone(),
                 channel_id.clone(),
+                None,
             )
             .await,
             crate::session_runtime::live_orchestration::DeferredCloseSettlementOutcome::GaveUp(
@@ -15387,6 +15465,7 @@ mod tests {
                 vec![deferred_user_row("item:r2", ROW)],
                 session_id.clone(),
                 channel_id.clone(),
+                None,
             )
             .await,
             crate::session_runtime::live_orchestration::DeferredCloseSettlementOutcome::GaveUp(
@@ -15446,6 +15525,7 @@ mod tests {
             Vec::new(),
             session_id.clone(),
             channel_id.clone(),
+            None,
         )
     }
 
@@ -15641,6 +15721,7 @@ mod tests {
                 Vec::new(),
                 session_id.clone(),
                 channel_id.clone(),
+                None,
             ),
         );
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
@@ -15853,6 +15934,7 @@ mod tests {
                 deferred,
                 session_id.clone(),
                 channel_id.clone(),
+                None,
             ),
         );
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
@@ -18783,7 +18865,7 @@ mod tests {
     ))]
     #[tokio::test]
     async fn shipping_close_matrix_preserves_history_or_retains_failed_custody() {
-        run_shipping_close_matrix(None).await;
+        run_shipping_close_matrix(MatrixSelection::Shipping).await;
     }
 
     #[cfg(all(
@@ -18794,7 +18876,7 @@ mod tests {
     ))]
     #[tokio::test]
     async fn shipping_context_first_typed_speech_continues_and_reopens_without_native_user() {
-        run_shipping_close_matrix(Some(false)).await;
+        run_shipping_close_matrix(MatrixSelection::ContextFirst { peer: false }).await;
     }
 
     #[cfg(all(
@@ -18805,7 +18887,38 @@ mod tests {
     ))]
     #[tokio::test]
     async fn shipping_context_first_peer_speech_continues_and_reopens_without_native_user() {
-        run_shipping_close_matrix(Some(true)).await;
+        run_shipping_close_matrix(MatrixSelection::ContextFirst { peer: true }).await;
+    }
+
+    /// #1821 (R3): the member turn already holds the session boundary when
+    /// the provider speaks, so the assistant output's start parks behind it
+    /// with the user's row and the speech. The close does not wait for the
+    /// turn; once the turn ends, the user's row and the spoken segment both
+    /// reach the transcript and no caption is retracted.
+    #[cfg(all(
+        feature = "session-store",
+        feature = "memory-store",
+        feature = "test-realtime-fixtures",
+        not(target_arch = "wasm32")
+    ))]
+    #[tokio::test]
+    async fn speech_whose_start_parked_behind_the_member_turn_survives_the_close() {
+        run_shipping_close_matrix(MatrixSelection::ParkedStartBehindMemberTurn).await;
+    }
+
+    /// #1821 (R4, R6): rows parked behind a running member turn when the
+    /// channel closes. The close drains the transport before it commits, so
+    /// nothing is left unapplied in the adapter and nothing is deferred to
+    /// the channel after the close has taken its deferred rows.
+    #[cfg(all(
+        feature = "session-store",
+        feature = "memory-store",
+        feature = "test-realtime-fixtures",
+        not(target_arch = "wasm32")
+    ))]
+    #[tokio::test]
+    async fn rows_parked_behind_the_member_turn_are_all_handed_to_the_close() {
+        run_shipping_close_matrix(MatrixSelection::ParkedRowsBehindMemberTurn).await;
     }
 
     #[cfg(all(
@@ -19078,7 +19191,21 @@ mod tests {
         feature = "test-realtime-fixtures",
         not(target_arch = "wasm32")
     ))]
-    async fn run_shipping_close_matrix(context_first_peer: Option<bool>) {
+    #[derive(Clone, Copy)]
+    enum MatrixSelection {
+        Shipping,
+        ContextFirst { peer: bool },
+        ParkedStartBehindMemberTurn,
+        ParkedRowsBehindMemberTurn,
+    }
+
+    #[cfg(all(
+        feature = "session-store",
+        feature = "memory-store",
+        feature = "test-realtime-fixtures",
+        not(target_arch = "wasm32")
+    ))]
+    async fn run_shipping_close_matrix(selection: MatrixSelection) {
         use meerkat_contracts::{LiveOpenTransport, WireLiveTransportBootstrap};
         use meerkat_core::service::{DeferredPromptPolicy, InitialTurnPolicy, SessionBuildOptions};
 
@@ -19095,6 +19222,8 @@ mod tests {
             UnmeasuredEofReleaseFailure,
             UnmeasuredMemberTurnEndsMidClose,
             UnmeasuredEofDuringMemberTurn,
+            UnmeasuredStartParkedBehindMemberTurn,
+            RowsParkedBehindMemberTurn,
             SnapshotCut,
             PrefixCut,
             UnmeasuredCut,
@@ -19130,6 +19259,8 @@ mod tests {
             ExitKind::UnmeasuredEofReleaseFailure,
             ExitKind::UnmeasuredMemberTurnEndsMidClose,
             ExitKind::UnmeasuredEofDuringMemberTurn,
+            ExitKind::UnmeasuredStartParkedBehindMemberTurn,
+            ExitKind::RowsParkedBehindMemberTurn,
             ExitKind::SnapshotCut,
             ExitKind::PrefixCut,
             ExitKind::UnmeasuredCut,
@@ -19154,12 +19285,25 @@ mod tests {
         ]
         .into_iter()
         .enumerate()
-        .filter(|(_, exit)| match context_first_peer {
-            Some(false) => matches!(exit, ExitKind::ContextFirstTyped),
-            Some(true) => matches!(exit, ExitKind::ContextFirstPeer),
-            None => !matches!(
+        .filter(|(_, exit)| match selection {
+            MatrixSelection::ContextFirst { peer: false } => {
+                matches!(exit, ExitKind::ContextFirstTyped)
+            }
+            MatrixSelection::ContextFirst { peer: true } => {
+                matches!(exit, ExitKind::ContextFirstPeer)
+            }
+            MatrixSelection::ParkedStartBehindMemberTurn => {
+                matches!(exit, ExitKind::UnmeasuredStartParkedBehindMemberTurn)
+            }
+            MatrixSelection::ParkedRowsBehindMemberTurn => {
+                matches!(exit, ExitKind::RowsParkedBehindMemberTurn)
+            }
+            MatrixSelection::Shipping => !matches!(
                 exit,
-                ExitKind::ContextFirstTyped | ExitKind::ContextFirstPeer
+                ExitKind::ContextFirstTyped
+                    | ExitKind::ContextFirstPeer
+                    | ExitKind::UnmeasuredStartParkedBehindMemberTurn
+                    | ExitKind::RowsParkedBehindMemberTurn
             ),
         }) {
             let persistence = crate::PersistenceBundle::new(
@@ -19289,6 +19433,7 @@ mod tests {
                     | ExitKind::UnmeasuredEofReleaseFailure
                     | ExitKind::UnmeasuredMemberTurnEndsMidClose
                     | ExitKind::UnmeasuredEofDuringMemberTurn
+                    | ExitKind::UnmeasuredStartParkedBehindMemberTurn
                     | ExitKind::PrefixCut
                     | ExitKind::UnmeasuredCut
                     | ExitKind::UnmeasuredRetry
@@ -19302,6 +19447,7 @@ mod tests {
                     | ExitKind::UnmeasuredEofReleaseFailure
                     | ExitKind::UnmeasuredMemberTurnEndsMidClose
                     | ExitKind::UnmeasuredEofDuringMemberTurn
+                    | ExitKind::UnmeasuredStartParkedBehindMemberTurn
                     | ExitKind::ContextFirstTyped
                     | ExitKind::ContextFirstPeer
             ) {
@@ -19939,6 +20085,21 @@ mod tests {
             } else {
                 None
             };
+            // #1821: the member turn already holds the session boundary when
+            // the provider speaks, so every projection below parks behind it.
+            let early_boundary = if matches!(
+                exit,
+                ExitKind::UnmeasuredStartParkedBehindMemberTurn
+                    | ExitKind::RowsParkedBehindMemberTurn
+            ) {
+                Some(
+                    service
+                        .acquire_runtime_turn_finalization_guard(&session_id)
+                        .await,
+                )
+            } else {
+                None
+            };
             let user_turn = LiveSidebandTurnRef::__from_provider_observation(
                 binding.channel_id(),
                 format!("matrix-user-{ordinal}"),
@@ -19989,6 +20150,7 @@ mod tests {
                     | ExitKind::UnmeasuredEofReleaseFailure
                     | ExitKind::UnmeasuredMemberTurnEndsMidClose
                     | ExitKind::UnmeasuredEofDuringMemberTurn
+                    | ExitKind::UnmeasuredStartParkedBehindMemberTurn
                     | ExitKind::PrefixCut
                     | ExitKind::UnmeasuredCut
                     | ExitKind::UnmeasuredRetry
@@ -20513,6 +20675,72 @@ mod tests {
                     .close_live_channel(Some(authority.as_ref()), reopened.channel_id())
                     .await
                     .expect("close pending replacement");
+                continue;
+            }
+            if matches!(
+                exit,
+                ExitKind::UnmeasuredStartParkedBehindMemberTurn
+                    | ExitKind::RowsParkedBehindMemberTurn
+            ) {
+                let boundary =
+                    early_boundary.expect("the member turn holds the boundary before speech");
+                // The pump is parked on the first projection; the speech is
+                // lowered (and captioned) while the close drains it.
+                // The close releases the channel's projections from the
+                // member turn's boundary and does not wait for the turn.
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    member_host.close_live_channel(Some(authority.as_ref()), &channel_id),
+                )
+                .await
+                .expect("the close converges while the member turn runs")
+                .expect("the close commits while the member turn runs");
+                // R4: the close drained the transport; nothing it lowered is
+                // left unapplied for a retirement to drop.
+                let (unmeasured_seals, unread_ingress) = adapter.unapplied_backlog();
+                assert_eq!(unmeasured_seals, Some(0), "no sealed speech is left behind");
+                assert_eq!(
+                    unread_ingress,
+                    Some(0),
+                    "no lowered observation is left unread"
+                );
+                drop(boundary);
+                assert_eventually_user_row(
+                    &service,
+                    &session_id,
+                    &format!("matrix user {ordinal}"),
+                )
+                .await;
+                if matches!(exit, ExitKind::UnmeasuredStartParkedBehindMemberTurn) {
+                    assert!(
+                        !captions.captions().is_empty(),
+                        "the speech was observed and captioned during the close"
+                    );
+                    assert!(
+                        captions.retractions().is_empty(),
+                        "speech whose output start was parked is never retracted"
+                    );
+                    assert_eventually_one_unmeasured_row(
+                        &service,
+                        &session_id,
+                        "First spoken checkpoint.",
+                    )
+                    .await;
+                } else {
+                    // R6: every row the transport deferred reached the close's
+                    // settlement; none was deferred after the close took them.
+                    live_adapter_host
+                        .retain_channel_close_projection(&session_id, &channel_id)
+                        .await
+                        .expect("the closed channel stays reachable on the host");
+                    assert!(
+                        live_adapter_host
+                            .take_deferred_projections(&channel_id)
+                            .await
+                            .is_empty(),
+                        "no row was deferred to the channel after the close took its deferred rows"
+                    );
+                }
                 continue;
             }
             if matches!(
@@ -21606,6 +21834,8 @@ mod tests {
                 | ExitKind::UnmeasuredEofReleaseFailure
                 | ExitKind::UnmeasuredMemberTurnEndsMidClose
                 | ExitKind::UnmeasuredEofDuringMemberTurn
+                | ExitKind::UnmeasuredStartParkedBehindMemberTurn
+                | ExitKind::RowsParkedBehindMemberTurn
                 | ExitKind::PrefixCut
                 | ExitKind::UnmeasuredCut
                 | ExitKind::UnmeasuredRetry

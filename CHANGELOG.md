@@ -54,6 +54,11 @@ them.
   further deadline; the settlement's outcome and its recorded deferral are
   unchanged. A row the session refuses for any other reason is reported with
   a warning. (#1821)
+- GPT Live: speech whose output start waited behind a running member turn
+  when the channel closed is committed under its generated output instead of
+  being abandoned with its captions retracted. The segment's release follows
+  its start to the close, and the close keeps the channel's generated outputs
+  addressable until its deferred settlement has replayed both. (#1821)
 
 ### Known limitations
 
