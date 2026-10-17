@@ -35,6 +35,15 @@ them.
 
 ## [Unreleased]
 
+### Added
+
+- `meerkat-sqlite`: `OperationGuard::admit_missing_database`, the
+  maintenance-fence admission for an operation that finds its database file
+  missing and answers without touching it. It creates nothing (an absent lock
+  file holds no fence) and fails with `SqliteStoreError::MaintenanceFenceHeld`
+  under another holder's exclusive fence, as `OperationGuard::for_database`
+  does.
+
 ### Fixed
 
 - A read of runtime delivery state no longer creates the state directory or
@@ -47,8 +56,7 @@ them.
   an existing file without create and answer "not provisioned" when it is
   missing, unless another holder's maintenance fence covers the missing file
   (an archive by rename), which still fails typed; among delivery
-  operations, only a write creates the store. Behaviour only: no API or
-  schema change.
+  operations, only a write creates the store. No schema change.
 
 ## [0.9.2] - 2026-10-16
 
