@@ -702,30 +702,76 @@ impl PublicLiveHarness {
         Ok(())
     }
 
-    /// Settle one exchange's provider health evidence after its waits: the
-    /// speech end to input final lag when the final arrived, otherwise a
-    /// timeout carrying the provider input latency read now.
-    async fn settle_exchange_evidence(
+    /// Settle one scheduled exchange's provider health evidence after its
+    /// wait (see [`Self::journal_exchange_evidence`]). A failed wait's own
+    /// error stays primary ([`settle_after_wait`]).
+    async fn settle_exchange_evidence<T, E>(
         &mut self,
+        scenario: &str,
         label: &str,
         schedule_id: u64,
+        waited: &Result<T, E>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let settled = self
+            .journal_exchange_evidence(label, waited.is_err(), |timeline| {
+                SpokenTurn::from_timeline(timeline, schedule_id).and_then(|turn| {
+                    turn.input_final_ms
+                        .map(|final_ms| final_ms as i64 - turn.speech_end_ms as i64)
+                })
+            })
+            .await;
+        settle_after_wait(scenario, label, waited, settled)
+    }
+
+    /// Record one exchange's provider health evidence once its wait is over,
+    /// from `lag` read off the timeline ([`exchange_evidence`]): the speech
+    /// end to input final lag when the final arrived, a timeout carrying the
+    /// provider input latency read now only when the wait itself failed, and
+    /// nothing otherwise. After a good wait the input final gets
+    /// [`INPUT_FINAL_GRACE`] to reach the browser.
+    async fn journal_exchange_evidence(
+        &mut self,
+        label: &str,
+        wait_failed: bool,
+        lag: impl Fn(&[TimelineEntry]) -> Option<i64>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let Some(journal) = self.evidence.clone() else {
             return Ok(());
         };
-        let timeline = self.peer.timeline().await?;
-        let heard = SpokenTurn::from_timeline(&timeline, schedule_id).and_then(|turn| {
-            turn.input_final_ms
-                .map(|final_ms| final_ms as i64 - turn.speech_end_ms as i64)
-        });
-        match heard {
-            Some(lag_ms) => journal.exchange_heard(label, lag_ms)?,
-            None => {
+        let lag_ms = if wait_failed {
+            lag(&self.peer.timeline().await?)
+        } else {
+            self.poll_timeline(INPUT_FINAL_GRACE, &lag).await?
+        };
+        match exchange_evidence(lag_ms, wait_failed) {
+            ExchangeEvidence::Heard(lag_ms) => journal.exchange_heard(label, lag_ms)?,
+            ExchangeEvidence::TimedOut => {
                 let latency = self.provider_input_latency().await;
                 journal.exchange_timed_out(latency)?;
             }
+            ExchangeEvidence::Unrecorded => {}
         }
         Ok(())
+    }
+
+    /// Poll the timeline for `predicate` for at most `bound`, `None` once it
+    /// passes. Not a failure bound: it lets evidence that trails a good wait
+    /// arrive.
+    async fn poll_timeline<T>(
+        &mut self,
+        bound: Duration,
+        predicate: impl Fn(&[TimelineEntry]) -> Option<T>,
+    ) -> Result<Option<T>, Box<dyn std::error::Error>> {
+        let deadline = Instant::now() + bound;
+        loop {
+            if let Some(value) = predicate(&self.peer.timeline().await?) {
+                return Ok(Some(value));
+            }
+            if Instant::now() >= deadline {
+                return Ok(None);
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
     }
 
     /// Play `fixture` directly as exchange `label`, which then awaits its
@@ -747,11 +793,24 @@ impl PublicLiveHarness {
     }
 
     /// Settle a direct-play exchange's provider health evidence after its
-    /// wait, as [`Self::settle_exchange_evidence`] settles a scheduled one:
-    /// the lag when the input final arrived, otherwise a timeout carrying the
-    /// provider input latency read now, so a provider stall scores the run
-    /// void instead of red. A failed wait also prints the uplink evidence.
-    async fn settle_direct_play(
+    /// wait, as [`Self::settle_exchange_evidence`] settles a scheduled one,
+    /// so a provider stall scores the run void instead of red. A failed wait
+    /// also prints the uplink evidence, and its own error stays primary.
+    async fn settle_direct_play<T, E>(
+        &mut self,
+        scenario: &str,
+        label: &str,
+        fixture: &str,
+        timeline_before: usize,
+        waited: &Result<T, E>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let settled = self
+            .direct_play_evidence(scenario, label, fixture, timeline_before, waited.is_err())
+            .await;
+        settle_after_wait(scenario, label, waited, settled)
+    }
+
+    async fn direct_play_evidence(
         &mut self,
         scenario: &str,
         label: &str,
@@ -759,19 +818,13 @@ impl PublicLiveHarness {
         timeline_before: usize,
         wait_failed: bool,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let timeline = self.peer.timeline().await?;
-        let reading = direct_play_reading(&timeline, fixture, timeline_before);
-        if let Some(journal) = self.evidence.clone() {
-            match reading.and_then(|(_, lag_ms)| lag_ms) {
-                Some(lag_ms) => journal.exchange_heard(label, lag_ms)?,
-                None => {
-                    let latency = self.provider_input_latency().await;
-                    journal.exchange_timed_out(latency)?;
-                }
-            }
-        }
+        self.journal_exchange_evidence(label, wait_failed, |timeline| {
+            direct_play_reading(timeline, fixture, timeline_before).and_then(|(_, lag_ms)| lag_ms)
+        })
+        .await?;
         if wait_failed {
-            match reading {
+            let timeline = self.peer.timeline().await?;
+            match direct_play_reading(&timeline, fixture, timeline_before) {
                 Some((fixture_start_ms, _)) => {
                     print_no_audio_evidence(self, scenario, label, fixture_start_ms).await;
                 }
@@ -4321,7 +4374,8 @@ async fn native_question_once(
             },
         )
         .await;
-    live.settle_exchange_evidence(label, schedule_id).await?;
+    live.settle_exchange_evidence(scenario, label, schedule_id, &waited)
+        .await?;
     if waited.is_err() {
         print_no_audio_evidence(live, scenario, label, fixture_start_ms).await;
     }
@@ -6044,6 +6098,50 @@ fn direct_play_reading(
     Some((start.t_ms, lag_ms))
 }
 
+/// How long a good wait gives its exchange's input final to reach the
+/// browser before the exchange settles without a lag (never as a timeout).
+const INPUT_FINAL_GRACE: Duration = Duration::from_secs(5);
+
+/// What one exchange's provider health evidence records once its wait is
+/// over.
+#[derive(Debug, PartialEq, Eq)]
+enum ExchangeEvidence {
+    /// The input final arrived: the speech end to input final lag.
+    Heard(i64),
+    /// The wait failed with no input final: a timeout, scored against the
+    /// provider input latency read then.
+    TimedOut,
+    /// The wait succeeded but its input final did not show: a healthy
+    /// exchange is no timeout, so nothing is recorded.
+    Unrecorded,
+}
+
+fn exchange_evidence(lag_ms: Option<i64>, wait_failed: bool) -> ExchangeEvidence {
+    match (lag_ms, wait_failed) {
+        (Some(lag_ms), _) => ExchangeEvidence::Heard(lag_ms),
+        (None, true) => ExchangeEvidence::TimedOut,
+        (None, false) => ExchangeEvidence::Unrecorded,
+    }
+}
+
+/// Keep a failed wait's own error primary: a settle error after it is
+/// printed and dropped, so the caller returns the wait's error; after a good
+/// wait the settle error is returned.
+fn settle_after_wait<T, E>(
+    scenario: &str,
+    label: &str,
+    waited: &Result<T, E>,
+    settled: Result<(), Box<dyn std::error::Error>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match settled {
+        Err(error) if waited.is_err() => {
+            println!("GPT_LIVE_{scenario}_SETTLE_ERROR label={label} error={error}");
+            Ok(())
+        }
+        settled => settled,
+    }
+}
+
 /// The rows a session history holds after its first `skip` messages, as
 /// `role: text` with the text cut to 400 characters (diagnostics only).
 fn history_rows_after(history: &Value, skip: usize) -> Vec<String> {
@@ -6539,7 +6637,8 @@ async fn delegated_request(
             |t| timeline_find(t, TimelineKind::DelegationCreated, fixture_start_ms).map(|e| e.t_ms),
         )
         .await;
-    live.settle_exchange_evidence(label, schedule_id).await?;
+    live.settle_exchange_evidence(scenario, label, schedule_id, &delegation_wait)
+        .await?;
     let delegation_created_ms = match delegation_wait {
         Ok(ms) => ms,
         Err(error) => {
@@ -9620,12 +9719,7 @@ async fn run_s104_handoff_voice_typed_voice(
             channel2,
             "S104",
             "post_reopen_rows",
-            format!(
-                "token={S104_RESULT_TOKEN:?} rows_have_token={} rows={rows_after_back:?}",
-                rows_after_back
-                    .iter()
-                    .any(|row| row.to_lowercase().contains(S104_RESULT_TOKEN))
-            ),
+            format!("token={S104_RESULT_TOKEN:?} rows={rows_after_back:?}"),
         )?;
         // The typed note was committed while the call was closed, so by the
         // reopen contract it rides the reopen's startup input verbatim. That
@@ -11835,6 +11929,13 @@ const S98_TYPED_UPDATE: &str = "A delayed background update changes the code wor
 ///    told to it before the close.
 /// 5. Spoken delegation executes real tools on the existing ordinary text
 ///    member and returns a completed generated operation without a fork.
+///
+/// Each spoken exchange records provider health evidence, so a provider
+/// stall scores the run void (provider-degraded) instead of red. The lag
+/// rules read the lag end to end in the browser, so a stall on Meerkat's own
+/// uplink would read as provider-degraded too; only a timeout is
+/// corroborated, by the provider's measured input backlog. With at most five
+/// measured exchanges the p90 rule does not apply here.
 #[tokio::test]
 #[ignore = "lane:e2e-smoke"]
 async fn e2e_scenario_98_gpt_live_public_playback_settlement_and_reopen()
@@ -11906,7 +12007,7 @@ async fn run_s98_real_audio_and_context(
         "remember",
         "remember",
         timeline_before,
-        first_output.is_err(),
+        &first_output,
     )
     .await?;
     let first_output = first_output?;
@@ -11980,7 +12081,7 @@ async fn run_s98_real_audio_and_context(
         "greeting",
         "greeting",
         timeline_before,
-        second_output.is_err(),
+        &second_output,
     )
     .await?;
     let second_output = second_output?;
@@ -12020,14 +12121,8 @@ async fn run_s98_real_audio_and_context(
     let audio_baseline = live.peer.audio_evidence().await?;
     let (_, timeline_before) = live.play_direct("recall", "recall").await?;
     let recall_output = live.output().await;
-    live.settle_direct_play(
-        "S98",
-        "recall",
-        "recall",
-        timeline_before,
-        recall_output.is_err(),
-    )
-    .await?;
+    live.settle_direct_play("S98", "recall", "recall", timeline_before, &recall_output)
+        .await?;
     let recall_output = recall_output?;
     assert_eq!(recall_output["channel_id"], live.channel_id);
     let recalled = wait_for_events(&mut live.peer, 60, |events| {
@@ -12097,7 +12192,7 @@ async fn run_s98_real_audio_and_context(
         "delegation",
         "delegation",
         timeline_before,
-        delegated.is_err(),
+        &delegated,
     )
     .await?;
     delegated?;
@@ -12213,7 +12308,7 @@ async fn run_s98_real_audio_and_context(
         "recall_now",
         "recall_now",
         timeline_before,
-        recalled_update.is_err(),
+        &recalled_update,
     )
     .await?;
     let recalled_update = recalled_update.map_err(|error| {
@@ -12287,7 +12382,7 @@ mod config_tests {
     /// A direct `play` carries no schedule id: its exchange reading is the
     /// first start of the fixture after the baseline, and its lag runs from
     /// that play's speech end to the next input final's own arrival time. A
-    /// start with no later final reads as no lag (the exchange timed out).
+    /// start with no later final reads as no lag.
     #[test]
     fn direct_play_reading_takes_the_play_after_the_baseline() {
         use super::support::{TimelineEntry, TimelineKind};
@@ -12336,6 +12431,47 @@ mod config_tests {
             Some((9000, None))
         );
         assert_eq!(super::direct_play_reading(&timeline, "recall", 0), None);
+    }
+
+    /// An exchange with no input final is a timeout only when its wait
+    /// failed. A good wait whose final has not shown records nothing, so a
+    /// healthy exchange never journals a timeout.
+    #[test]
+    fn exchange_evidence_times_out_only_a_failed_wait() {
+        use super::{ExchangeEvidence, exchange_evidence};
+        assert_eq!(
+            exchange_evidence(Some(900), false),
+            ExchangeEvidence::Heard(900)
+        );
+        assert_eq!(
+            exchange_evidence(Some(900), true),
+            ExchangeEvidence::Heard(900)
+        );
+        assert_eq!(exchange_evidence(None, true), ExchangeEvidence::TimedOut);
+        assert_eq!(exchange_evidence(None, false), ExchangeEvidence::Unrecorded);
+    }
+
+    /// A failed wait's own error stays primary: a settle error after it is
+    /// not returned (the caller returns the wait's error), while after a
+    /// good wait the settle error is the error.
+    #[test]
+    fn settle_error_never_replaces_a_failed_wait_error() {
+        let failed: Result<(), &str> = Err("timed out waiting for the reply");
+        assert!(
+            super::settle_after_wait(
+                "S98",
+                "remember",
+                &failed,
+                Err("timeline unreadable".into())
+            )
+            .is_ok()
+        );
+        let good: Result<(), &str> = Ok(());
+        let error =
+            super::settle_after_wait("S98", "remember", &good, Err("timeline unreadable".into()))
+                .expect_err("a settle error after a good wait is the error");
+        assert_eq!(error.to_string(), "timeline unreadable");
+        assert!(super::settle_after_wait("S98", "remember", &failed, Ok(())).is_ok());
     }
 
     fn strings(values: &[&str]) -> Vec<String> {
