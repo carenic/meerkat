@@ -7800,6 +7800,12 @@ mod tests {
     struct TestPeerIngressQueue {
         candidates: std::sync::Mutex<VecDeque<PeerInputCandidate>>,
         outstanding: std::sync::Mutex<Option<(PeerIngressClaimId, InteractionId)>>,
+        committed: std::sync::Mutex<
+            Vec<(
+                PeerIngressClaimCommitFacts,
+                Arc<dyn std::any::Any + Send + Sync>,
+            )>,
+        >,
     }
 
     impl TestPeerIngressQueue {
@@ -7807,11 +7813,30 @@ mod tests {
             Arc::new(Self {
                 candidates: std::sync::Mutex::new(candidates.into_iter().collect()),
                 outstanding: std::sync::Mutex::new(None),
+                committed: std::sync::Mutex::new(Vec::new()),
             })
         }
 
         fn remaining(&self) -> usize {
             self.candidates.lock().expect("candidate mutex").len()
+        }
+
+        /// The terminal outcome the runtime receipt of each durable commit
+        /// carries, in commit order.
+        fn committed_outcomes(
+            &self,
+        ) -> Vec<Option<meerkat_core::interaction::PeerIngressClaimTerminalOutcome>> {
+            self.committed
+                .lock()
+                .expect("committed mutex")
+                .iter()
+                .map(|(facts, receipt)| {
+                    receipt
+                        .downcast_ref::<crate::meerkat_machine::DurablePeerIngressAdmissionReceipt>(
+                        )
+                        .and_then(|receipt| receipt.validate(*facts))
+                })
+                .collect()
         }
 
         fn claim(self: &Arc<Self>) -> Option<PeerIngressQueueClaim> {
@@ -7854,7 +7879,7 @@ mod tests {
         fn commit(
             &self,
             claim_id: PeerIngressClaimId,
-            _receipt: Arc<dyn std::any::Any + Send + Sync>,
+            receipt: Arc<dyn std::any::Any + Send + Sync>,
         ) -> Result<(), PeerIngressClaimCommitError> {
             let mut outstanding = self.outstanding.lock().expect("outstanding claim mutex");
             let Some((current_claim_id, raw_item_id)) = *outstanding else {
@@ -7867,7 +7892,16 @@ mod tests {
             if candidates.front().map(|candidate| candidate.interaction.id) != Some(raw_item_id) {
                 return Err(PeerIngressClaimCommitError::HeadMismatch);
             }
-            candidates.pop_front();
+            if let Some(committed) = candidates.pop_front() {
+                self.committed.lock().expect("committed mutex").push((
+                    PeerIngressClaimCommitFacts {
+                        claim_id,
+                        raw_item_id,
+                        class: committed.ingress.class,
+                    },
+                    receipt,
+                ));
+            }
             *outstanding = None;
             Ok(())
         }
@@ -9297,6 +9331,35 @@ mod tests {
         }
     }
 
+    /// A plain event a host injected under `id`: it has no peer sender.
+    fn host_event_candidate(id: InteractionId) -> PeerInputCandidate {
+        PeerInputCandidate {
+            interaction: InboxInteraction {
+                objective_id: None,
+                sender_taint: None,
+                id,
+                from_route: None,
+                from: "event:webhook".to_string(),
+                content: InteractionContent::Message {
+                    body: "build failed".to_string(),
+                    blocks: None,
+                },
+                rendered_text: "External event via webhook: build failed".to_string(),
+                handling_mode: HandlingMode::Queue,
+                render_metadata: None,
+            },
+            ingress: PeerIngressFact::plain_event(
+                id,
+                "webhook",
+                PeerInputClass::PlainEvent,
+                meerkat_core::PeerIngressKind::PlainEvent,
+                None,
+            ),
+            lifecycle_peer: None,
+            response_terminality: None,
+        }
+    }
+
     fn actionable_message_candidate(index: usize) -> PeerInputCandidate {
         let id = InteractionId(Uuid::new_v4());
         let peer_id = PeerId::new();
@@ -10035,6 +10098,89 @@ mod tests {
                 peer_handle.request_received_count(),
                 usize::from(held_by_another)
             );
+            assert!(runtime.abandonment_reasons().is_empty());
+        }
+    }
+
+    /// A host event, which has no peer sender, under the id of a request the
+    /// session has not answered is refused before admission: its durable
+    /// claim ends `Rejected`, nothing reaches the session, and the open
+    /// request keeps its requester. The same event under an id no request
+    /// holds is admitted.
+    #[tokio::test]
+    async fn host_event_under_an_outstanding_request_id_is_refused_before_admission() {
+        use meerkat_core::interaction::PeerIngressClaimTerminalOutcome;
+        for held in [true, false] {
+            let adapter = Arc::new(MeerkatMachine::ephemeral());
+            let session_id = SessionId::new();
+            adapter
+                .register_session(session_id.clone())
+                .await
+                .expect("register session");
+
+            let candidate = host_event_candidate(InteractionId(Uuid::new_v4()));
+            assert_eq!(candidate.from_peer_id(), None);
+            let peer_handle = Arc::new(CountingPeerInteractionHandle::default());
+            let requester = PeerId::new();
+            let corr_id =
+                held.then(|| record_outstanding_request(&peer_handle, &candidate, requester));
+            let peer_authority: Arc<dyn meerkat_core::handles::PeerInteractionHandle> =
+                peer_handle.clone();
+            let runtime = Arc::new(OneShotPeerRequestRuntime::with_complete_authority(
+                candidate,
+                peer_authority,
+            ));
+            let drain = spawn_authorized_test_comms_drain(
+                adapter.clone(),
+                session_id.clone(),
+                runtime.clone(),
+                Duration::from_millis(10),
+            )
+            .await;
+
+            tokio::time::timeout(Duration::from_secs(1), drain)
+                .await
+                .expect("drain should exit after one candidate")
+                .expect("drain task should not panic");
+
+            let snapshot = adapter
+                .meerkat_machine_spine_snapshot(&session_id)
+                .await
+                .expect("registered session snapshot");
+            let outcomes = runtime.queue.committed_outcomes();
+            if let Some(corr_id) = corr_id {
+                assert_eq!(
+                    snapshot.ledger.input_count, 0,
+                    "a host event under an open request's id must not enter the session's work"
+                );
+                assert!(
+                    matches!(
+                        outcomes.as_slice(),
+                        [Some(
+                            PeerIngressClaimTerminalOutcome::RuntimeRejected { .. }
+                        )]
+                    ),
+                    "the event's durable claim ends Rejected: {outcomes:?}"
+                );
+                assert_eq!(peer_handle.recorded_requester(corr_id), Some(requester));
+                assert_eq!(runtime.completed_count(), 0);
+            } else {
+                assert_eq!(
+                    snapshot.ledger.input_count, 1,
+                    "a host event under an id no request holds is admitted"
+                );
+                assert!(
+                    matches!(
+                        outcomes.as_slice(),
+                        [Some(
+                            PeerIngressClaimTerminalOutcome::RuntimeAccepted { .. }
+                        )]
+                    ),
+                    "the event's durable claim ends Accepted: {outcomes:?}"
+                );
+            }
+            assert_eq!(runtime.queue.remaining(), 0);
+            assert_eq!(peer_handle.request_received_count(), usize::from(held));
             assert!(runtime.abandonment_reasons().is_empty());
         }
     }

@@ -530,13 +530,15 @@ recorded requester is the key the envelope declares: the same identity that
 trust and routing use in that mode.
 
 A request ID belongs to one request while that request is open. A request,
-message or event from another peer that reuses the ID of a request the
-session has not yet answered is refused before the session sees it: a
-durable delivery's sender gets a rejection (`DurableAdmissionRejected`), a
-volatile delivery is dropped without a signal, and the open request keeps
-its requester. The request that first used an ID keeps it; the request IDs
-Meerkat generates are random UUIDs, so another peer can only reuse one it
-has learned. The requester record lasts for the responder process: after a
+message or event from another peer (a host event, which has no peer sender,
+too) that reuses the ID of a request the session has not yet answered is
+refused before the session sees it, and the open request keeps its
+requester. A durable peer delivery's sender gets a rejection
+(`DurableAdmissionRejected`); a volatile delivery is dropped without a
+signal, and so is a host event, whose injecting call returned when the
+event was queued. The request that first used an ID keeps it; the request
+IDs Meerkat generates are random UUIDs, so another peer can only reuse one
+it has learned. The requester record lasts for the responder process: after a
 restart, an ID whose request is still queued can be claimed by another peer
 until it is answered. A host that mints its own request IDs
 (`send_peer_request_with_id`, `Router::send_with_id`) must keep them
