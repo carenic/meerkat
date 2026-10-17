@@ -48147,15 +48147,169 @@ impl MobActor {
     async fn handle_destroy(
         &mut self,
     ) -> Result<super::handle::MobDestroyReport, super::handle::MobDestroyError> {
+        // A member whose runtime requires a durability reload would hold the
+        // destroy in its ingress detach forever. Reload each such member
+        // before any destroy write, so a reload that fails leaves nothing to
+        // undo and the destroy can simply be retried.
+        let reloaded =
+            boxed_arm_future(|| self.reload_durability_degraded_members_for_destroy()).await?;
         // Both phases are built in their own frames: at opt-level 0 each
         // awaited future reserved twice its size in this poll frame, beneath
         // the whole destroy.
-        boxed_arm_future(|| self.destroy_preflight_and_quiesce()).await?;
+        if let Err(error) = boxed_arm_future(|| self.destroy_preflight_and_quiesce()).await {
+            return Self::with_destroy_reloaded_members(Err(error), reloaded);
+        }
         let was_active = self.destroy_cleanup_active;
         self.destroy_cleanup_active = true;
         let result = boxed_arm_future(|| self.handle_destroy_inner()).await;
         self.destroy_cleanup_active = was_active;
-        result
+        Self::with_destroy_reloaded_members(result, reloaded)
+    }
+
+    /// Report the members the destroy reloaded before it started (`reloaded`,
+    /// first) together with any it reloaded later, before their ingress
+    /// detach, on the report `result` carries.
+    fn with_destroy_reloaded_members(
+        result: Result<super::handle::MobDestroyReport, super::handle::MobDestroyError>,
+        reloaded: Vec<AgentIdentity>,
+    ) -> Result<super::handle::MobDestroyReport, super::handle::MobDestroyError> {
+        let merge = |report: &mut super::handle::MobDestroyReport| {
+            let later = std::mem::replace(&mut report.reloaded_members, reloaded);
+            for identity in later {
+                if !report.reloaded_members.contains(&identity) {
+                    report.reloaded_members.push(identity);
+                }
+            }
+        };
+        match result {
+            Ok(mut report) => {
+                merge(&mut report);
+                Ok(report)
+            }
+            Err(super::handle::MobDestroyError::Incomplete { mut report }) => {
+                merge(&mut report);
+                Err(super::handle::MobDestroyError::Incomplete { report })
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Reload every local member whose runtime requires a durability reload
+    /// (see [`Self::reload_member_if_durability_degraded`]) before the
+    /// destroy writes anything. A reload that fails stops the destroy with a
+    /// typed incomplete report naming the member; the mob is unchanged.
+    #[cfg(feature = "runtime-adapter")]
+    async fn reload_durability_degraded_members_for_destroy(
+        &self,
+    ) -> Result<Vec<AgentIdentity>, super::handle::MobDestroyError> {
+        let entries = {
+            let roster = self.roster.read().await;
+            roster.list_all().cloned().collect::<Vec<_>>()
+        };
+        let mut reloaded = Vec::new();
+        for entry in &entries {
+            match boxed_arm_future(|| self.reload_member_if_durability_degraded(entry)).await {
+                Ok(true) => reloaded.push(entry.agent_identity.clone()),
+                Ok(false) => {}
+                Err(error) => {
+                    let mut report = super::handle::MobDestroyReport {
+                        reloaded_members: reloaded,
+                        ..Default::default()
+                    };
+                    report.push_error(error);
+                    return Err(super::handle::MobDestroyError::Incomplete { report });
+                }
+            }
+        }
+        Ok(reloaded)
+    }
+
+    #[cfg(not(feature = "runtime-adapter"))]
+    async fn reload_durability_degraded_members_for_destroy(
+        &self,
+    ) -> Result<Vec<AgentIdentity>, super::handle::MobDestroyError> {
+        Ok(Vec::new())
+    }
+
+    /// Reload `entry`'s runtime from its durable store when its persistent
+    /// shell is durability-degraded: a boundary commit failed after its run
+    /// consumed its input in memory.
+    ///
+    /// Until that reload, the member's exited runtime loop keeps the
+    /// session's mutation gate, so the destroy's ingress detach would wait on
+    /// it forever. The reload is the one retirement already performs: the
+    /// degraded shell is replaced by a cold successor recovered from the
+    /// durable store, where the consumed input is pending again, and the
+    /// member's retirement then records what became of it. Bounded by the
+    /// member retire budget. Returns whether the member was reloaded; `Err`
+    /// is the destroy report's entry for a reload that failed, or for a
+    /// member still degraded after it.
+    #[cfg(feature = "runtime-adapter")]
+    async fn reload_member_if_durability_degraded(
+        &self,
+        entry: &RosterEntry,
+    ) -> Result<bool, String> {
+        let Some(adapter) = self.runtime_adapter.as_ref() else {
+            return Ok(false);
+        };
+        if Self::runtime_binding_for_entry(entry).is_some()
+            || super::member_runtime_is_host_owned(
+                self.dsl_authority.state(),
+                &entry.agent_identity,
+            )
+        {
+            return Ok(false);
+        }
+        let Some(session_id) = entry.member_ref.bridge_session_id() else {
+            return Ok(false);
+        };
+        let Some(required) = adapter.durability_reload_required(session_id).await else {
+            return Ok(false);
+        };
+        let Some(registration) = adapter
+            .current_session_registration_witness(session_id)
+            .await
+        else {
+            return Err(format!(
+                "{}: {required}; the runtime has no current registration the destroy can reload",
+                entry.agent_identity
+            ));
+        };
+        tracing::warn!(
+            mob_id = %self.definition.id,
+            agent_identity = %entry.agent_identity,
+            session_id = %session_id,
+            operation = %required.operation,
+            "destroy reloads a member runtime that requires a durability reload before retiring it"
+        );
+        let disposition =
+            super::provisioner::MemberSessionDisposalArc::reload_durability_degraded_registration_until(
+                adapter,
+                Some(&self.session_ops_adapter),
+                &registration,
+                session_id,
+                Instant::now() + super::provisioner::MEMBER_RETIRE_TOTAL_TIMEOUT,
+            )
+            .await
+            .map_err(|error| {
+                format!(
+                    "{}: {required}; reloading it before the destroy failed: {error}",
+                    entry.agent_identity
+                )
+            })?;
+        if matches!(
+            disposition,
+            meerkat_runtime::ReloadRequiredRegistrationDisposition::Discarded
+        ) {
+            return Ok(true);
+        }
+        match adapter.durability_reload_required(session_id).await {
+            None => Ok(false),
+            Some(still) => Err(format!(
+                "{}: {still}; the runtime still requires a durability reload after the destroy's reload attempt",
+                entry.agent_identity
+            )),
+        }
     }
 
     /// Admit this mob's destroy before the actor starts any work, for a host
@@ -48410,6 +48564,19 @@ impl MobActor {
         }
         if destroy_input_needed {
             for entry in &entries {
+                // A member can lose a boundary commit after the destroy's
+                // reload pass (a turn it was already running). Its ingress
+                // detach would then wait on the mutation gate its exited
+                // runtime loop keeps, so reload it here too.
+                #[cfg(feature = "runtime-adapter")]
+                match boxed_arm_future(|| self.reload_member_if_durability_degraded(entry)).await {
+                    Ok(true) => report.reloaded_members.push(entry.agent_identity.clone()),
+                    Ok(false) => {}
+                    Err(error) => {
+                        report.push_error(error);
+                        return Err(MobDestroyError::Incomplete { report });
+                    }
+                }
                 if let Err(error) =
                     boxed_arm_future(|| self.admit_member_retire_for_destroy(entry)).await
                 {
