@@ -813,6 +813,9 @@ where
         // A summary the provider stopped because the model context window
         // filled is truncated. It joins the capacity fallback below instead
         // of being committed, and the provider work it was stays charged.
+        // A refused or content-filtered summary fails this compaction: its
+        // text must never become the session summary, so the history stays
+        // as it is and the run goes on.
         let mut stopped_call_usage = None;
         let llm_result = match llm_result {
             Ok(result) if result.stop_reason() == StopReason::ContextWindowExceeded => {
@@ -828,6 +831,23 @@ where
                     stopped_call_usage
                         .as_ref()
                         .map(|(usage, _)| usage.normalized_total_tokens()),
+                ))
+            }
+            Ok(result)
+                if matches!(
+                    result.stop_reason(),
+                    StopReason::Refusal | StopReason::ContentFilter
+                ) =>
+            {
+                Err(crate::error::AgentError::llm(
+                    client.provider().as_str(),
+                    crate::error::LlmFailureReason::ProviderError(
+                        crate::error::LlmProviderError::non_retryable(
+                            crate::error::LlmProviderErrorKind::ContentFiltered,
+                            serde_json::json!({ "stop_reason": result.stop_reason() }),
+                        ),
+                    ),
+                    "the provider refused the compaction summary",
                 ))
             }
             other => other,
@@ -1539,6 +1559,77 @@ mod tests {
             }))
         ));
         assert_eq!(serde_json::to_vec(&session).unwrap(), before);
+    }
+
+    /// A summary call that stopped with a refusal or a content filter.
+    struct RefusedSummaryClient {
+        stop_reason: StopReason,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::agent::AgentLlmClient for RefusedSummaryClient {
+        async fn stream_response(
+            &self,
+            _: &[Message],
+            _: &[Arc<crate::ToolDef>],
+            _: u32,
+            _: Option<f32>,
+            _: Option<&crate::ProviderParamsOverride>,
+        ) -> Result<crate::LlmStreamResult, crate::error::AgentError> {
+            Ok(crate::LlmStreamResult::new(
+                vec![AssistantBlock::Text {
+                    text: "I can't help with summarizing this conversation.".into(),
+                    meta: None,
+                }],
+                self.stop_reason,
+                Usage {
+                    input_tokens: 10,
+                    output_tokens: 3,
+                    provider_accounting: Some(crate::ProviderTokenAccounting::openai(
+                        "test-observation-summary",
+                        10,
+                    )),
+                    ..Usage::default()
+                },
+            ))
+        }
+        fn provider(&self) -> crate::Provider {
+            crate::Provider::OpenAI
+        }
+        fn model(&self) -> &'static str {
+            "test-observation-summary"
+        }
+    }
+
+    /// The refusal text never becomes the session summary: the compaction
+    /// fails as a content-filtered LLM failure and the history is untouched.
+    #[tokio::test]
+    async fn refused_summary_fails_the_compaction_and_keeps_the_history() {
+        for stop_reason in [StopReason::Refusal, StopReason::ContentFilter] {
+            let mut session = Session::new();
+            session.push(Message::User(UserMessage::text("One")));
+            session.push(Message::User(UserMessage::text("Two")));
+            let before = serde_json::to_vec(&session).unwrap();
+            let outcome =
+                compact_observed_source(&session, &RefusedSummaryClient { stop_reason }).await;
+            assert!(
+                matches!(
+                    &outcome,
+                    Err(CompactionError::LlmFailed(crate::error::AgentError::Llm {
+                        reason: crate::error::LlmFailureReason::ProviderError(provider_error),
+                        ..
+                    })) if provider_error.kind
+                        == crate::error::LlmProviderErrorKind::ContentFiltered
+                ),
+                "{stop_reason:?}: {:?}",
+                outcome.as_ref().err()
+            );
+            assert_eq!(
+                serde_json::to_vec(&session).unwrap(),
+                before,
+                "{stop_reason:?}"
+            );
+        }
     }
 
     #[tokio::test]

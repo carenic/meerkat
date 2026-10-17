@@ -61,13 +61,15 @@ them.
   `content_filtered`) instead of committing. Nothing of the turn is committed
   and none of its tool calls run, including a call the refusal cut mid-input.
   In a structured-output extraction turn either stop fails the extraction
-  instead of the run.
+  instead of the run. A compaction summary the provider refuses or filters
+  fails that compaction (`compaction_failed`, `llm_failed`): the history stays
+  as it was and the run goes on, so a refusal never becomes the session
+  summary.
 - Behaviour-only (not measured by the gate): an Anthropic stop reason the
   adapter does not know is no longer read as `end_turn`. The response fails
   with the retryable `LlmError::IncompleteResponse` naming the raw reason: it
   is retried within the retry policy with nothing committed, then fails the run
   as `ProviderError(IncompleteResponse)`.
-
 - Behaviour-only (not measured by the gate): the same holds for a Chat
   Completions `finish_reason` and a Gemini `finishReason` the adapter does not
   know. Chat Completions knows `stop`, `length`, `tool_calls`, `function_call`
