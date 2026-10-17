@@ -2023,11 +2023,11 @@ TAG_TRUSTED_WORKFLOWS = ("ci.yml", "release-semver-readiness.yml", "release.yml"
 RELEASE_RESTORE_JOBS = ("release_semver_gate",)
 # The sccache setup every CI lane runs: the GCS objects it writes are what
 # the push to main compiles from before it attests, so only push and
-# schedule runs set the sccache client to write them, and the run steps
-# after the sccache action do not inherit the Actions cache token it
-# exports. Both are client-side settings: a later step can still read the
-# job's GCS credentials file (SCCACHE_GCS_KEY_PATH), whose identity can
-# write, and the job's actions still receive the token.
+# schedule runs set the sccache client to write them (a client-side
+# setting: a later step can still read the job's GCS credentials file,
+# SCCACHE_GCS_KEY_PATH, whose identity can write). It installs a release
+# checked against a pinned sha256 itself, not through sccache-action, which
+# would export the job's Actions cache token to the run steps after it.
 SCCACHE_ACTION = "./.github/actions/setup-sccache-ci"
 SCCACHE_WRITERS = ("push", "schedule")
 SCCACHE_READERS = ("pull_request", "pull_request_target", "workflow_dispatch", "merge_group", "workflow_run")
@@ -2574,9 +2574,8 @@ def _reusable_cache_uses(
 
 
 def _sccache_problems(root: Path) -> list[str]:
-    """Which runs set the sccache client to write, and whether the run steps
-    after the sccache action inherit the Actions cache token (both
-    client-side settings, see SCCACHE_ACTION)."""
+    """Which runs set the sccache client to write, and how the setup installs
+    sccache (see SCCACHE_ACTION)."""
     where = SCCACHE_ACTION[2:]
     try:
         action = _local_action(SCCACHE_ACTION, root)
@@ -2586,15 +2585,22 @@ def _sccache_problems(root: Path) -> list[str]:
         return [f"{where} is not a local action"]
     problems: list[str] = []
     steps = list(action.steps)
-    installs = [i for i, step in enumerate(steps) if "mozilla-actions/sccache-action" in step.fields.get("uses", "")]
-    withdrawals = [
-        i
-        for i, step in enumerate(steps)
-        if re.search(r'^echo "ACTIONS_RUNTIME_TOKEN=" >> "\$\{GITHUB_ENV\}"$', step.run, re.M)
-    ]
-    if installs and not any(i > max(installs) for i in withdrawals):
+    if any("mozilla-actions/sccache-action" in step.fields.get("uses", "") for step in steps):
         problems.append(
-            f"{where} leaves the Actions cache token sccache-action exports to the run steps after it"
+            f"{where} installs sccache through sccache-action, which exports the job's Actions cache token"
+            " to the run steps after it"
+        )
+    pinned = [
+        step
+        for step in steps
+        if re.fullmatch(r"v\d+\.\d+\.\d+", step.env.get("SCCACHE_VERSION", ""))
+        and re.fullmatch(r"[0-9a-f]{64}", step.env.get("SCCACHE_SHA256", ""))
+        and re.search(r'^\s*echo "\$\{SCCACHE_SHA256\}  .*" \| sha256sum --check --strict$', step.run, re.M)
+    ]
+    if not pinned:
+        problems.append(
+            f"{where} installs no sccache release checked against a pinned sha256"
+            " (SCCACHE_VERSION, SCCACHE_SHA256, sha256sum --check --strict)"
         )
     writes = [step for step in steps if "SCCACHE_GCS_RW_MODE=" in step.run]
     if not writes:
@@ -2647,9 +2653,10 @@ def check_release_caches(text: str) -> list[str]:
     workflow that produces what a tag run trusts (TAG_TRUSTED_WORKFLOWS),
     or that checks out a ref its inputs choose, saves no cache at all on a
     dispatch-like run. Only push and schedule runs set the CI lanes' sccache
-    client to write its bucket, and the run steps after the sccache action
-    do not inherit the Actions cache token it exports (_sccache_problems);
-    both are client-side settings, not credentials.
+    client to write its bucket (a client-side setting, not a credential),
+    and the lanes install a sha256-pinned sccache release themselves, so no
+    step exports the Actions cache token to their run steps
+    (_sccache_problems).
     """
     root = REPO_ROOT
     violations: list[str] = []

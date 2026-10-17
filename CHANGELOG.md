@@ -146,22 +146,27 @@ them.
   restore, on any event. CI only.
 - **Only push and schedule runs set the CI sccache client to write its
   bucket.** Every other run, pull requests from this repository included,
-  runs it read-only (`SCCACHE_GCS_RW_MODE=READ_ONLY`), and the Actions
-  cache token the sccache action exports is removed from the environment
-  of the run steps after it. Both are client-side settings, not
-  credentials: any later step of such a run can read the credentials file
-  `SCCACHE_GCS_KEY_PATH` names, which carries a bearer token for the same
-  identity the push runs write with, and the job's actions still receive
-  the Actions cache token. The release doctor checks both settings. CI
-  only.
-- **CI installs a pinned sccache release.** Every
-  `mozilla-actions/sccache-action` step names the sccache release it
-  installs (`version: v0.18.0`) instead of taking the newest one when the
-  job runs. The action checks a download only against the `.sha256` file
-  of the same release and takes no checksum input, so the exact version
-  is the pin. Renovate proposes new releases through a regex manager, and
-  `scripts/ci-action-pins.mjs` fails on a step that does not name an
-  exact release. CI only.
+  runs it read-only (`SCCACHE_GCS_RW_MODE=READ_ONLY`), and the lanes no
+  longer install sccache through sccache-action, so no step exports the
+  job's Actions cache token to their run steps. The read-only mode is a
+  client-side setting, not a credential: any later step of such a run can
+  read the credentials file `SCCACHE_GCS_KEY_PATH` names, which carries a
+  bearer token for the same identity the push runs write with. The release
+  doctor checks the mode and the install. CI only.
+- **CI installs a pinned sccache release.** The CI lanes' setup
+  (`.github/actions/setup-sccache-ci`) downloads the sccache v0.18.0
+  tarball itself and checks it against a pinned sha256, instead of
+  installing through `mozilla-actions/sccache-action`, which checks a
+  download only against the `.sha256` file of the same release. Every
+  remaining sccache-action step (nightly, `cargo.yml` and the dense Mob
+  topology workflow, which use the GitHub Actions cache backend the action
+  sets up) names the release it installs (`version: v0.18.0`) instead of
+  taking the newest one when the job runs. Renovate proposes new releases
+  through a regex manager; the setup's sha256 must change with the
+  version, or its install fails. `scripts/ci-action-pins.mjs` fails on an
+  sccache-action step without an exact release, and the release doctor on
+  a CI setup that installs through the action or skips the sha256 check.
+  CI only.
 - **The Linux release build image is pinned by digest.**
   `buildpack-deps:bullseye` (the release workflow's Linux build container
   and the Bazel x86_64 and arm64 execution platforms) is named by its

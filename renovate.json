@@ -17,10 +17,11 @@
     },
     {
       "customType": "regex",
-      "description": "The sccache release every sccache-action step installs (the action would otherwise take the newest at run time).",
+      "description": "The sccache release every sccache-action step installs (the action would otherwise take the newest at run time), and the one setup-sccache-ci downloads, whose pinned SCCACHE_SHA256 an update must change too: its install fails until it matches.",
       "managerFilePatterns": ["/^\\.github/.+\\.ya?ml$/"],
       "matchStrings": [
-        "mozilla-actions/sccache-action@[0-9a-f]{40} # \\S+\\n\\s+with:\\n(?:\\s+#[^\\n]*\\n)*\\s+version: (?<currentValue>v[0-9]+\\.[0-9]+\\.[0-9]+)"
+        "mozilla-actions/sccache-action@[0-9a-f]{40} # \\S+\\n\\s+with:\\n(?:\\s+#[^\\n]*\\n)*\\s+version: (?<currentValue>v[0-9]+\\.[0-9]+\\.[0-9]+)",
+        "SCCACHE_VERSION: (?<currentValue>v[0-9]+\\.[0-9]+\\.[0-9]+)"
       ],
       "depNameTemplate": "mozilla/sccache",
       "datasourceTemplate": "github-releases"

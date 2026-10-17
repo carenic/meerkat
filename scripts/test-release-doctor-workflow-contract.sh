@@ -39,8 +39,8 @@ TRAILING_PASS="PASS Linux and macOS arm64 assets publish without waiting for the
 TRAILING_FAIL="FAIL The trailing Intel macOS and Windows lanes must not gate the critical assets, and no upload may replace a published asset"
 WEB_TOOLS_PASS="PASS The Web SDK release build checks every download's sha256 and wasm-pack installs nothing: wasm-bindgen (Cargo.lock's version) and wasm-opt are pinned"
 TOKEN_PASS="PASS Release workflow token is read-only except for the jobs that attest or publish, which never persist it in a checkout; no workflow passes every secret to a reusable workflow"
-CACHES_PASS="PASS GitHub Actions caches in release.yml jobs, the local actions they call and, on a tag, the reusable workflows they call are never saved on a dispatch and never cache ~/.cargo/bin; token jobs restore none, no release job restores a cache on any event but the semver gate's measurement, OIDC or attesting jobs restore none that a dispatch-like run of any workflow saves, and no dispatch-like run saves the Bazel repository cache (reusable workflows never run on a dispatch); a workflow that produces what a tag trusts or checks out a ref its inputs choose saves no cache on a dispatch-like run; only push and schedule runs set CI's sccache client to write its bucket, and no run step after the sccache action inherits the Actions cache token (client-side settings)"
-CACHES_FAIL="FAIL A release cache can be saved on a dispatch, cache ~/.cargo/bin, reach a token, OIDC or attesting job, or be restored by a release job, or a workflow a tag trusts saves a cache on a dispatch-like run, or a run other than a push or schedule sets CI's sccache client to write, or a run step after the sccache action inherits the Actions cache token"
+CACHES_PASS="PASS GitHub Actions caches in release.yml jobs, the local actions they call and, on a tag, the reusable workflows they call are never saved on a dispatch and never cache ~/.cargo/bin; token jobs restore none, no release job restores a cache on any event but the semver gate's measurement, OIDC or attesting jobs restore none that a dispatch-like run of any workflow saves, and no dispatch-like run saves the Bazel repository cache (reusable workflows never run on a dispatch); a workflow that produces what a tag trusts or checks out a ref its inputs choose saves no cache on a dispatch-like run; only push and schedule runs set CI's sccache client to write its bucket (a client-side setting), and CI installs a sha256-pinned sccache release without sccache-action, so its run steps never get the Actions cache token"
+CACHES_FAIL="FAIL A release cache can be saved on a dispatch, cache ~/.cargo/bin, reach a token, OIDC or attesting job, or be restored by a release job, or a workflow a tag trusts saves a cache on a dispatch-like run, or a run other than a push or schedule sets CI's sccache client to write, or CI installs sccache through sccache-action or without a pinned sha256"
 
 fail() {
   echo "release doctor workflow contract violated: $1" >&2
@@ -761,12 +761,23 @@ elif name == "sccache-pull-request-writes":
         + "        RW_MODE: ${{ github.event_name != 'workflow_dispatch' && 'READ_WRITE' || 'READ_ONLY' }}\n"
         + text[at + len(needle):]
     )
-elif name == "sccache-token-kept":
-    # The pre-review sccache setup left the Actions cache token to run steps.
+elif name == "sccache-action-install":
+    # The pre-review sccache setup installed through sccache-action, which
+    # exports the job's Actions cache token to the run steps after it.
     replace_once(
         ".github/actions/setup-sccache-ci/action.yml",
-        "      run: echo \"ACTIONS_RUNTIME_TOKEN=\" >> \"${GITHUB_ENV}\"\n",
-        "      run: echo \"sccache installed\"\n",
+        "  steps:\n",
+        "  steps:\n"
+        "    - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11\n"
+        "      with:\n"
+        "        version: v0.18.0\n",
+    )
+elif name == "sccache-unchecked-install":
+    # An install that never checks the tarball against the pinned sha256.
+    replace_once(
+        ".github/actions/setup-sccache-ci/action.yml",
+        '        echo "${SCCACHE_SHA256}  ${archive}" | sha256sum --check --strict\n',
+        "",
     )
 elif name == "semver-readiness-dispatch-save":
     # The pre-review semver measurement saved its rust-cache on a dispatch.
@@ -1127,9 +1138,12 @@ expect_tree_fail_named xwin-tag-restore "${TEST_ROOT}/xwin-tag-restore" \
 mutate_tree sccache-pull-request-writes "${TEST_ROOT}/sccache-pull-request-writes"
 expect_tree_fail_named sccache-pull-request-writes "${TEST_ROOT}/sccache-pull-request-writes" \
   ".github/actions/setup-sccache-ci gives a pull_request run sccache mode READ_WRITE, not READ_ONLY" release-caches
-mutate_tree sccache-token-kept "${TEST_ROOT}/sccache-token-kept"
-expect_tree_fail_named sccache-token-kept "${TEST_ROOT}/sccache-token-kept" \
-  ".github/actions/setup-sccache-ci leaves the Actions cache token sccache-action exports to the run steps after it" release-caches
+mutate_tree sccache-action-install "${TEST_ROOT}/sccache-action-install"
+expect_tree_fail_named sccache-action-install "${TEST_ROOT}/sccache-action-install" \
+  ".github/actions/setup-sccache-ci installs sccache through sccache-action, which exports the job's Actions cache token to the run steps after it" release-caches
+mutate_tree sccache-unchecked-install "${TEST_ROOT}/sccache-unchecked-install"
+expect_tree_fail_named sccache-unchecked-install "${TEST_ROOT}/sccache-unchecked-install" \
+  ".github/actions/setup-sccache-ci installs no sccache release checked against a pinned sha256 (SCCACHE_VERSION, SCCACHE_SHA256, sha256sum --check --strict)" release-caches
 mutate_tree semver-readiness-dispatch-save "${TEST_ROOT}/semver-readiness-dispatch-save"
 expect_tree_fail_named semver-readiness-dispatch-save "${TEST_ROOT}/semver-readiness-dispatch-save" \
   "release-semver-readiness.yml job \`semver\` saves a cache on a workflow_dispatch run" release-caches

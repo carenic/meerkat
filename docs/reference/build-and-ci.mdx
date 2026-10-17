@@ -208,11 +208,10 @@ the start of the pre-push hook to a green `CI gate`, and the gate also
 enforces 1080 s of lane execution and a 1200 s push-to-terminal ceiling on
 it, runner queue excluded; the push runs every lane.
 Compiled
-objects are cached by sccache (a pinned release, content-addressed and
-shared by every lane; push and schedule runs set the client to write it,
-every other run, a pull request included, to only read it, and the run
-steps after the sccache action do not inherit the Actions cache token it
-exports: client-side settings, see [Known limits](#known-limits));
+objects are cached by sccache (a release pinned by sha256, content-addressed
+and shared by every lane; push and schedule runs set the client to write it,
+every other run, a pull request included, to only read it, a client-side
+setting, see [Known limits](#known-limits));
 rust-cache holds only the
 registry, because per-lane target caches exceeded the repository's 10 GB
 cache limit in one pull request:
@@ -337,14 +336,12 @@ graph.
 
 ### Known limits
 
-- The sccache read-only mode and the withdrawn Actions cache token are
-  client-side settings. A run that only reads the bucket (a pull request
-  from this repository, a dispatch) still authenticates as the identity
-  push runs write with: any of its steps can read the credentials file
-  `SCCACHE_GCS_KEY_PATH` names, and its JavaScript and container actions
-  still receive the Actions cache token. Only a separate read-only
-  identity for those runs, an IAM change outside this repository, closes
-  that.
+- The sccache read-only mode is a client-side setting. A run that only
+  reads the bucket (a pull request from this repository, a dispatch) still
+  authenticates as the identity push runs write with: any of its steps can
+  read the credentials file `SCCACHE_GCS_KEY_PATH` names. Only a separate
+  read-only identity for those runs, an IAM change outside this
+  repository, closes that.
 - A release job whose checkout can be an older tag runs its setup action
   from `.release-tooling`, a sparse checkout of the workflow's own commit,
   but a local action that action calls in turn (`uses: ./.github/actions/...`)
