@@ -774,6 +774,15 @@ jobs:
       - name: Checkout workflow helpers
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
+      - name: Require a GitHub-hosted attesting runner
+        # build_binaries_buildbuddy attests the release archives on
+        # MEERKAT_CI_RUNNER, and the SDK digest stamp refuses attestations from
+        # self-hosted runners: fail here, before any crate publishes, when it
+        # names a label that is not a GitHub-hosted Ubuntu label.
+        env:
+          MEERKAT_CI_RUNNER: ${{ vars.MEERKAT_CI_RUNNER }}
+        run: python3 -I scripts/release-stamp-sdk-binary-digests require-hosted-runner
+
       - name: Setup Node
         uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
@@ -2894,7 +2903,16 @@ jobs:
        github.event.inputs.publish_web_sdk_only != 'true'))
     needs: [require_ci_green, release_validate_gate, release_semver_gate, registry_credentials_preflight]
     runs-on: ubuntu-24.04
-    timeout-minutes: 180
+    # The SDK packages can wait up to 150 minutes for the release's binary
+    # manifest (Stamp the SDK binary digests) after the crates publish; the
+    # SLO step after them must still run.
+    timeout-minutes: 240
+    # Read-only. The SDK digest stamp lists this run's jobs, downloads the
+    # release manifest and verifies the archives' build attestations.
+    permissions:
+      actions: read
+      attestations: read
+      contents: read
     steps:
       - name: Checkout
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -2968,6 +2986,46 @@ jobs:
             --readback-only \
             --observations-out "${RUNNER_TEMP}/rust-crates-public.json"
 
+      - name: Stamp the SDK binary digests
+        # The Python and TypeScript SDKs download rkat-rpc only against
+        # digests they carry (#1739), so pin this release's into both before
+        # either package builds. They come from the release's own manifest,
+        # which publish_github_release writes once from the published archives
+        # after every platform lane: a tag run waits for it (with a prebuild
+        # it is usually there already) and fails at once if that job fails; a
+        # package recovery needs it present. The stamp refuses an incomplete
+        # manifest, an archive that does not re-hash or carries no build
+        # attestation from this repository's release workflow, and pins the
+        # binary inside each verified archive. A tag tree whose SDKs predate
+        # pinned digests has nothing to stamp.
+        if: >-
+          ${{
+            github.event_name != 'workflow_dispatch' ||
+            (github.event.inputs.publish_web_sdk_only != 'true' &&
+             github.event.inputs.alpha_crates_only != 'true')
+          }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag || github.ref_name }}
+          WAIT_FOR_MANIFEST: ${{ github.event_name != 'workflow_dispatch' }}
+        run: |
+          set -euo pipefail
+          if [[ ! -f sdks/python/meerkat/_rkat_rpc_digests.py ]]; then
+            echo "${RELEASE_TAG}'s SDKs pin no rkat-rpc digests; nothing to stamp"
+            exit 0
+          fi
+          scripts/release-await-binary-manifest "${RELEASE_TAG}"
+          release_dir="${RUNNER_TEMP}/sdk-binary-digests-release"
+          mkdir -p "${release_dir}"
+          gh release download "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" --dir "${release_dir}" \
+            --pattern checksums.sha256 --pattern index.json --pattern 'rkat-rpc-*'
+          python3 scripts/release-stamp-sdk-binary-digests stamp \
+            --release-dir "${release_dir}" \
+            --release-tag "${RELEASE_TAG}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --table-out "${RUNNER_TEMP}/sdk-binary-digests.json"
+
       - name: Publish Python SDK
         if: >-
           ${{
@@ -2978,6 +3036,7 @@ jobs:
         env:
           TWINE_USERNAME: __token__
           TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
+          RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag || github.ref_name }}
         working-directory: sdks/python
         run: |
           set -euo pipefail
@@ -2991,6 +3050,25 @@ jobs:
           "$VENV_DIR/bin/python" -m pip install --upgrade pip
           "$VENV_DIR/bin/python" -m pip install dist/*.whl
           "$VENV_DIR/bin/python" -c "from meerkat import CONTRACT_VERSION, MeerkatClient; print(CONTRACT_VERSION); print(MeerkatClient.__name__)"
+          # The wheel must pin exactly the stamped digests for its version
+          # (#1739): read them from the installed package (-I keeps the source
+          # tree off sys.path), let its own lookup accept every entry, and
+          # refuse an unstamped or wrong-version table.
+          if [[ -f meerkat/_rkat_rpc_digests.py ]]; then
+            "$VENV_DIR/bin/python" -I -c '
+          import json, sys, meerkat
+          from meerkat import _rkat_rpc_digests
+          from meerkat.client import MeerkatClient
+          table = _rkat_rpc_digests.RKAT_RPC_DIGESTS
+          for target, entry in table["archives"].items():
+              MeerkatClient._pinned_rkat_rpc_archive(meerkat.CONTRACT_VERSION, target, entry["asset"])
+          json.dump({"contract_version": meerkat.CONTRACT_VERSION, "digests": table}, sys.stdout)
+          ' > "${RUNNER_TEMP}/python-sdk-binary-digests.json"
+            python3 ../../scripts/release-stamp-sdk-binary-digests verify \
+              --release-tag "${RELEASE_TAG}" \
+              --expected "${RUNNER_TEMP}/sdk-binary-digests.json" \
+              --actual "${RUNNER_TEMP}/python-sdk-binary-digests.json"
+          fi
           rm -rf "$VENV_DIR"
           if [[ "$DRY_RUN" == "true" ]]; then
             echo "Python SDK dry-run: skipping upload"
@@ -3007,6 +3085,7 @@ jobs:
           }}
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag || github.ref_name }}
         working-directory: sdks/typescript
         run: |
           set -euo pipefail
@@ -3025,6 +3104,26 @@ jobs:
           npm init -y >/dev/null 2>&1
           npm install "${GITHUB_WORKSPACE}/sdks/typescript/${PACKFILE}" >/dev/null 2>&1
           node --input-type=module -e "const sdk = await import('@rkat/sdk'); if (!sdk.MeerkatClient || !sdk.CONTRACT_VERSION) throw new Error('missing expected exports');"
+          # The packed package must pin exactly the stamped digests for its
+          # version (#1739): read them from the installed package, let its
+          # own lookup accept every entry, and refuse an unstamped or
+          # wrong-version table.
+          if [[ -f "${GITHUB_WORKSPACE}/sdks/typescript/src/rkat-rpc-digests.ts" ]]; then
+            node --input-type=module -e "
+              const { pathToFileURL } = await import('node:url');
+              const sdk = await import('@rkat/sdk');
+              const pinned = pathToFileURL(process.cwd() + '/node_modules/@rkat/sdk/dist/rkat-rpc-digests.js');
+              const { RKAT_RPC_DIGESTS: table } = await import(pinned.href);
+              for (const [target, entry] of Object.entries(table.archives)) {
+                sdk.MeerkatClient.pinnedArchive(sdk.CONTRACT_VERSION, target, entry.asset);
+              }
+              process.stdout.write(JSON.stringify({ contract_version: sdk.CONTRACT_VERSION, digests: table }));
+            " > "${RUNNER_TEMP}/typescript-sdk-binary-digests.json"
+            python3 "${GITHUB_WORKSPACE}/scripts/release-stamp-sdk-binary-digests" verify \
+              --release-tag "${RELEASE_TAG}" \
+              --expected "${RUNNER_TEMP}/sdk-binary-digests.json" \
+              --actual "${RUNNER_TEMP}/typescript-sdk-binary-digests.json"
+          fi
           cd "${GITHUB_WORKSPACE}/sdks/typescript"
           rm -rf "$SMOKE_DIR" "$PACKFILE"
           if [[ "$DRY_RUN" == "true" ]]; then

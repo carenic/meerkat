@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+# Wait until a release carries its complete binary manifest: the
+# checksums.sha256 and index.json that publish_github_release writes once
+# every platform archive is published. The SDK binary digest stamp
+# (scripts/release-stamp-sdk-binary-digests) reads that manifest.
+#
+# usage: release-await-binary-manifest <release-tag>
+#
+# GITHUB_REPOSITORY names the repository. With WAIT_FOR_MANIFEST=true (a tag
+# run) it polls every RELEASE_MANIFEST_POLL_SECONDS (60) until the manifest is
+# there, fails at once when this run's "Publish GitHub release assets" job
+# (GITHUB_RUN_ID, GITHUB_RUN_ATTEMPT) ends without success, and fails after
+# RELEASE_MANIFEST_DEADLINE_SECONDS (9000). Otherwise (a package recovery) the
+# manifest must already be there. A failed API call while polling counts as
+# "not yet", never as an answer.
+
+set -euo pipefail
+
+release_tag="${1:?usage: release-await-binary-manifest <release-tag>}"
+repository="${GITHUB_REPOSITORY:?GITHUB_REPOSITORY is required}"
+wait_for_manifest="${WAIT_FOR_MANIFEST:-false}"
+deadline_seconds="${RELEASE_MANIFEST_DEADLINE_SECONDS:-9000}"
+poll_seconds="${RELEASE_MANIFEST_POLL_SECONDS:-60}"
+deadline=$(($(date +%s) + deadline_seconds))
+
+while true; do
+  assets="$(gh release view "${release_tag}" --repo "${repository}" \
+    --json assets --jq '.assets[].name' 2>/dev/null)" || assets=""
+  if grep -Fxq checksums.sha256 <<<"${assets}" && grep -Fxq index.json <<<"${assets}"; then
+    echo "${release_tag} carries its complete binary manifest"
+    exit 0
+  fi
+  if [[ "${wait_for_manifest}" != "true" ]]; then
+    echo "::error::${release_tag} has no complete manifest (checksums.sha256 + index.json) to stamp the SDK digests from; publish its assets first (make release-assets)"
+    exit 1
+  fi
+  publisher="$(gh api --paginate \
+    "repos/${repository}/actions/runs/${GITHUB_RUN_ID:?}/attempts/${GITHUB_RUN_ATTEMPT:?}/jobs?per_page=100" \
+    --jq '.jobs[] | select(.name == "Publish GitHub release assets") | (.conclusion // "pending")' \
+    2>/dev/null)" || publisher=pending
+  case "${publisher:-pending}" in
+    pending | success) ;;
+    *)
+      echo "::error::Publish GitHub release assets ${publisher}: no complete ${release_tag} manifest to stamp the SDK digests from; after an asset recovery, publish the SDKs with a package recovery (make release-packages)"
+      exit 1
+      ;;
+  esac
+  if (($(date +%s) >= deadline)); then
+    echo "::error::no complete ${release_tag} manifest after $((deadline_seconds / 60)) minutes"
+    exit 1
+  fi
+  sleep "${poll_seconds}"
+done

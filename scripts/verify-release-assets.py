@@ -116,6 +116,24 @@ def verify_assets(assets_dir, release_tag):
         )
 
     checksum_path = assets_dir / CHECKSUMS_NAME
+    checksums = read_checksums(checksum_path)
+
+    if set(checksums) != expected_archives:
+        raise ReleaseAssetError(
+            describe_set_mismatch(
+                "checksum entries", expected_archives, set(checksums)
+            )
+        )
+    for name in sorted(expected_archives):
+        actual_digest = sha256(assets_dir / name)
+        if checksums[name] != actual_digest:
+            raise ReleaseAssetError(f"checksum mismatch for {name}")
+
+    print(f"verified {len(expected_archives)} flat release archives for {tag}")
+
+
+def read_checksums(checksum_path):
+    """Parse a release `checksums.sha256` strictly: name -> lowercase hex digest."""
     checksums = {}
     try:
         checksum_lines = checksum_path.read_text(encoding="utf-8").splitlines()
@@ -142,19 +160,7 @@ def verify_assets(assets_dir, release_tag):
         if name in checksums:
             raise ReleaseAssetError(f"duplicate checksum entry for {name}")
         checksums[name] = digest
-
-    if set(checksums) != expected_archives:
-        raise ReleaseAssetError(
-            describe_set_mismatch(
-                "checksum entries", expected_archives, set(checksums)
-            )
-        )
-    for name in sorted(expected_archives):
-        actual_digest = sha256(assets_dir / name)
-        if checksums[name] != actual_digest:
-            raise ReleaseAssetError(f"checksum mismatch for {name}")
-
-    print(f"verified {len(expected_archives)} flat release archives for {tag}")
+    return checksums
 
 
 def prepare_assets(source_dir, output_dir, release_tag):

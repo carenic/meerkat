@@ -324,6 +324,14 @@ repos:
         always_run: true
         stages: [manual]
 
+      - id: sdk-binary-digest-stamp-contract
+        name: SDK binary digest stamp refuses incomplete releases and unstamped packages
+        entry: scripts/test_release_stamp_sdk_binary_digests.py
+        language: script
+        pass_filenames: false
+        files: ^(scripts/(release-stamp-sdk-binary-digests|release-await-binary-manifest|test_release_stamp_sdk_binary_digests\.py|verify-release-assets\.py)|sdks/python/meerkat/(_rkat_rpc_digests|client)\.py|sdks/typescript/src/(rkat-rpc-digests|client)\.ts)$
+        stages: [pre-push]
+
       - id: gcp-buildbuddy-workflow-gate-contract
         name: self-hosted GCP graph stays default-off and tags validate on exact-tree CI while it is off
         entry: scripts/test-gcp-buildbuddy-workflow-gate.sh

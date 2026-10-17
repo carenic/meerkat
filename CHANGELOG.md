@@ -414,6 +414,18 @@ them.
   know at all (it does not parse) now fails as incomplete at once, naming the
   status; before, it was skipped and the turn failed later as a stalled or
   reset stream.
+- Behaviour-only (not measured by the gate): the Python and TypeScript SDKs
+  refuse to auto-download `rkat-rpc` when the package pins no digest for its
+  version and platform, raising `MeerkatError` with code
+  `BINARY_DIGEST_UNAVAILABLE` instead (see Security). Only packages the
+  release workflow builds pin digests; a source or git install pins none.
+  Install `rkat-rpc` yourself and put it on `PATH`, or set `MEERKAT_BIN_PATH`
+  or the client's binary path (`rkat_path`, `new MeerkatClient(path)`); a
+  legacy `rkat` on `PATH` is still used through its `rpc` subcommand.
+- Behaviour-only: a cached auto-downloaded `rkat-rpc` that does not match its
+  pinned digest is deleted and refused with `BinaryIntegrityError` (it used to
+  run as found), an integrity failure no longer falls back to a legacy `rkat`
+  on `PATH`, and the download no longer follows a redirect to a non-HTTPS URL.
 
 ### Security
 
@@ -518,6 +530,42 @@ them.
   and `Debug` and `Serialize` render them redacted. Grants are still not
   persisted, so no grant survives a restart; a member's operator facts
   re-bind to the incarnation of the mob that holds them on each upcall.
+- The Python and TypeScript SDKs verify the `rkat-rpc` binary they
+  auto-download (#1739). Each published package pins the sha256 of every
+  release archive it may download and of the `rkat-rpc` inside it: pinned
+  when the package is built, from the release's manifest, with each archive's
+  build attestation verified; never fetched at download time. Before stamping
+  (`scripts/release-stamp-sdk-binary-digests`), the release workflow
+  re-hashes each archive against the release's `checksums.sha256` and
+  verifies its build attestation (`gh attestation verify`: signed by this
+  repository's `release.yml` run from `main` or the release tag, in a job on
+  a GitHub-hosted runner, with a verified subject that names the exact asset,
+  version included, with the archive's sha256; up to three attempts). Before
+  any crate publishes, the release preflight fails when `MEERKAT_CI_RUNNER`
+  names a label that is not a GitHub-hosted Ubuntu label; it checks the
+  label, not where the runner is hosted, so the stamp's
+  `--deny-self-hosted-runners` stays the enforcement. If any check fails
+  nothing is stamped and neither SDK package publishes. The download uses HTTPS only,
+  redirects
+  included, and refuses an archive over 256 MiB. The archive is checked
+  before anything is written or extracted, the binary before it is
+  installed, and the cached binary every time it is reused. A mismatch
+  raises `BinaryIntegrityError` (code `BINARY_INTEGRITY_MISMATCH`, naming the
+  asset and the expected and actual digests): the SDK deletes what failed,
+  runs nothing and does not fall back to another binary. A transport fault,
+  a detected cut-off body included, is `BINARY_DOWNLOAD_FAILED`: a transport
+  fault the SDK can detect is never reported as tamper. `MEERKAT_BIN_PATH`,
+  an explicit binary path and `rkat-rpc` on
+  `PATH` still run as given: they are the user's own trust decision.
+  Residual: the pins are only as trustworthy as the release that produced
+  them. The attested identity names the workflow and its ref, and `main`
+  names no commit: the release version is bound by the attested subject
+  name. The GitHub-hosted runner is the job that attested; on a BuildBuddy
+  release the Linux (x86_64 and arm64) and macOS arm64 binaries are compiled
+  by BuildBuddy remote execution, so BuildBuddy's executors and cache are part
+  of what the pins trust. Anyone able to run this repository's release workflow can
+  produce attested archives, and a package whose own files were replaced
+  after it was built pins whatever digests it then carries.
 
 ### Added
 
@@ -715,6 +763,13 @@ them.
 - `meerkat_core::service::MobIncarnationId`, `meerkat_mob::MobHandle::incarnation`
   and `meerkat_core::service::MobToolAuthorityContext::mob_incarnations` (see
   Security).
+- `BinaryIntegrityError`, a `MeerkatError` subclass exported by both SDKs
+  (`meerkat.BinaryIntegrityError` with `asset`, `path`, `expected_sha256` and
+  `actual_sha256`; `BinaryIntegrityError` from `@rkat/sdk` with `asset`,
+  `path`, `expectedSha256` and `actualSha256`), and the SDK error codes
+  `BINARY_INTEGRITY_MISMATCH`, `BINARY_DIGEST_UNAVAILABLE` (whose message
+  names the exact release asset URL for a manual install) and
+  `BINARY_DOWNLOAD_TOO_LARGE` (an auto-download archive over 256 MiB).
 
 ### Changed
 
@@ -961,6 +1016,16 @@ them.
   longer counts a change under `crates/xtask/` as live-relevant: no live
   gate target compiles or runs xtask, so a pull request that changes only
   xtask passes the gate without running the GPT Live scenarios. CI only.
+- Release: before it builds the Python and TypeScript SDK packages,
+  `publish_registries` waits for the release's complete binary manifest
+  (`scripts/release-await-binary-manifest`: up to 150 minutes on a tag run,
+  usually no time with a prebuild, a failed API call counting as "not yet";
+  a package recovery needs the manifest already published), verifies each
+  `rkat-rpc` archive's build attestation, stamps the pinned digests into both
+  SDKs and refuses to publish a package that does not pin exactly them for
+  its version. The job's token gains `attestations: read`, and its timeout is
+  240 minutes, up from 180. Crate publication and the publication SLO do not
+  wait for it.
 
 ### Deprecated
 

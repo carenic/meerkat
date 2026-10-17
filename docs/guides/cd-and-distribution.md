@@ -233,11 +233,47 @@ Python and TypeScript SDK users should not need a local Rust toolchain.
 
 | SDK | Install | Runtime resolution |
 |-----|---------|--------------------|
-| Python | `pip install meerkat-sdk` | Uses `MEERKAT_BIN_PATH` when set; otherwise resolves a matching `rkat-rpc` release binary |
-| TypeScript | `npm install @rkat/sdk` | Uses an explicit binary path when configured; otherwise resolves a matching `rkat-rpc` release binary |
+| Python | `pip install meerkat-sdk` | Runs `MEERKAT_BIN_PATH`, an explicit `rkat_path` or `rkat-rpc` on `PATH` as given; otherwise downloads the matching `rkat-rpc` release binary and verifies it against the digests the package pins |
+| TypeScript | `npm install @rkat/sdk` | Runs `MEERKAT_BIN_PATH`, an explicit `rkatPath` or `rkat-rpc` on `PATH` as given; otherwise downloads the matching `rkat-rpc` release binary and verifies it against the digests the package pins |
 
 The SDKs are clients. They start or connect to the JSON-RPC surface rather than
 embedding a separate runtime implementation.
+
+The digests are pinned when the package is built, from the release's
+manifest, with each archive's build attestation verified; they are never
+fetched at download time. Before either
+SDK package builds, `publish_registries` waits for the release's complete
+manifest (`checksums.sha256` and `index.json`;
+`scripts/release-await-binary-manifest`), and
+`scripts/release-stamp-sdk-binary-digests` re-hashes the five `rkat-rpc`
+archives against it, verifies each archive's build attestation
+(`gh attestation verify` with `--cert-identity-regex` for the repository's
+`release.yml` run from `main` or the release tag,
+`--deny-self-hosted-runners` and `--format json`, requiring a verified
+subject that names the exact asset, version included, with the archive's
+sha256; up to three attempts per archive), takes the digest of the binary
+inside each verified archive, and stamps both SDKs. It refuses an incomplete
+manifest, an archive that does not re-hash, carries no attestation that
+passes or exceeds the SDKs' 256 MiB download cap, and SDK packages of
+another version; nothing is stamped then and neither package publishes.
+Before any crate publishes, the release preflight fails when
+`MEERKAT_CI_RUNNER` (the runner the BuildBuddy build job attests on) names a
+label that is not a GitHub-hosted Ubuntu label. It checks the label, not
+where the runner is hosted: the stamp's `--deny-self-hosted-runners` stays
+the enforcement. Each publish step then refuses a built package that does not pin
+exactly those digests for its version. A source or git install pins nothing
+and refuses to download (`BINARY_DIGEST_UNAVAILABLE`).
+
+The residual: the pins are only as trustworthy as the release that produced
+them. The attested identity names the workflow and its ref, and `main` names
+no commit: the release version is bound by the attested subject name. The
+GitHub-hosted runner is the job that attested; on a BuildBuddy release the
+Linux (x86_64 and arm64) and macOS arm64 binaries are compiled by BuildBuddy
+remote execution, so BuildBuddy's executors and cache are part of what the
+pins trust. Anyone
+able to run this repository's release workflow can produce attested
+archives, and a package whose own files were replaced after it was built
+pins whatever digests it then carries.
 
 ## Release Workflow
 
@@ -291,7 +327,12 @@ embedding a separate runtime implementation.
    canonical order in `scripts/release-rust-crates.sh` and `cargo metadata`:
    a level's crates upload concurrently and the next level starts once all of
    them are in the crates.io index. The SDK publish jobs build and smoke-test
-   their package artifacts before upload.
+   their package artifacts before upload. Before they build, the job stamps
+   the release's `rkat-rpc` digests into both SDKs (see
+   [SDK Bootstrap](#sdk-bootstrap)): a tag run waits for the complete manifest
+   (up to 150 minutes; with a prebuild it is usually there already) and fails
+   at once if `publish_github_release` fails, and a package recovery needs the
+   manifest already published. Crate publication never waits for it.
 8. Publish the prebuilt Web SDK artifact on a GitHub-hosted runner.
 9. Off the publication path, build the rustdoc JSON baseline the next
    release's semver gate compares against (`publish_semver_baseline`, which
