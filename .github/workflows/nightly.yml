@@ -149,9 +149,17 @@ jobs:
     needs: feature-matrix
     if: ${{ !cancelled() && !inputs.graph_only }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 120
+    # Two Cargo jobs build for up to about twice as long as four.
+    timeout-minutes: 180
     env:
       RUSTC_WRAPPER: sccache
+      # At four Cargo jobs the 16 GB runner lost this job mid-build (exit 143
+      # after the log went silent, 2026-10-14 and 10-16). A cold `make
+      # test-int` reached 15.0 GiB of rustc memory within two minutes (the
+      # schema catalog's library and test harness beside the kernels and
+      # contracts), and single meerkat-core and meerkat-runtime rustc
+      # processes reach 6-7 GiB. Two jobs keep at most two rustc alive.
+      CARGO_BUILD_JOBS: "2"
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -694,6 +702,13 @@ jobs:
     runs-on: ubuntu-24.04
     env:
       RUSTC_WRAPPER: sccache
+      # Four slots of four Cargo jobs ran up to 16 rustc processes, each slot
+      # building its own copy of the heavy crates in its own target
+      # directory, and the 16 GB runner lost the job every night from
+      # 2026-10-05 (at about 70 minutes from 10-13, when the mob-family
+      # slots overlapped). Two slots of two jobs keep at most four alive.
+      MEERKAT_RELEASE_PACKAGING_JOBS: "2"
+      CARGO_BUILD_JOBS: "2"
     steps:
       - name: Checkout
         uses: actions/checkout@v6
