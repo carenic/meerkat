@@ -170,7 +170,11 @@ them.
 - The BuildBuddy edge-lane detector (`scripts/buildbuddy-edge-changes`)
   matched crate paths without their `crates/` prefix, so a crate change
   selected none of the WASM, SDK, minimal or feature-matrix edge lanes it
-  should; it now does. `make buildbuddy-doctor` reads the mixed
+  should; it now does, and its WASM list gains the five crates the web
+  runtime's dependencies reach that it lacked (authorization contracts,
+  capabilities, jobs, models, workgraph). A self-test in
+  `make path-classifier-selftest` fails when that list drifts from cargo
+  metadata. `make buildbuddy-doctor` reads the mixed
   fast/non-fast routing and the `oai-rt-rs` pin without pinning a target
   list or a crate version. CI only.
 
