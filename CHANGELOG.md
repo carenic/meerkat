@@ -869,8 +869,6 @@ them.
   `MaterializeServeError::UnrecordedSessionCleanup`, which fail-stops the
   serving actor, instead of risking the deadlock.
 
-### Fixed
-
 - A member force cancel (`MobHandle::force_cancel_member`, `mob/force_cancel`,
   the `force_cancel_member` tool) and `mob/cancel_all_work` no longer fail
   with an internal error ("cancelling the current run of '...' failed:
