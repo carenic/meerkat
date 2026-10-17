@@ -1077,6 +1077,11 @@ mod orchestrator {
     /// they have landed. An assistant output whose handle the close already
     /// retired is refused by the projection and reported, not retried.
     ///
+    /// A settlement that gives up (the member turn ended with an error, or the
+    /// hang guard) never drops the rows it still holds: they are applied in
+    /// arrival order at the next point each can land
+    /// ([`replay_deferred_rows_after_give_up`]).
+    ///
     /// A settlement that wins the boundary while the member turn's boundary
     /// commit is still landing in the store is `Busy` (see
     /// `PersistentSessionService::resolve_live_assistant_playback_on_channel_close_within`).
@@ -1187,11 +1192,25 @@ mod orchestrator {
             }
         }
         if let Some(reason) = give_up {
+            let rows: std::collections::VecDeque<_> = transcript_first
+                .into_iter()
+                .chain(deferred_projections)
+                .collect();
             tracing::warn!(
                 %channel_id,
                 ?reason,
-                deferred_projections = transcript_first.len(),
-                "deferred live transcript projections gave up waiting for the member turn boundary; the deferral stays recorded"
+                deferred_projections = rows.len(),
+                "deferred live transcript projections gave up waiting for the member turn boundary; the deferral stays recorded and the rows land at the next boundary"
+            );
+            replay_deferred_rows_after_give_up(
+                service,
+                host,
+                DeferredRowsCustody {
+                    _retention: retention,
+                },
+                rows,
+                session_id,
+                channel_id,
             );
             return DeferredCloseSettlementOutcome::GaveUp(reason);
         }
@@ -1234,7 +1253,17 @@ mod orchestrator {
                             %channel_id,
                             ?reason,
                             deferred_projections = deferred_projections.len(),
-                            "deferred live close settlement gave up waiting for the member turn boundary; the deferral stays recorded"
+                            "deferred live close settlement gave up waiting for the member turn boundary; the deferral stays recorded and the rows land at the next boundary"
+                        );
+                        replay_deferred_rows_after_give_up(
+                            Arc::clone(&service),
+                            host,
+                            DeferredRowsCustody {
+                                _retention: retention,
+                            },
+                            deferred_projections.into(),
+                            session_id.clone(),
+                            channel_id.clone(),
                         );
                         return DeferredCloseSettlementOutcome::GaveUp(reason);
                     }
@@ -1303,6 +1332,93 @@ mod orchestrator {
         BoundaryNotCommitted,
         /// No signal arrived within [`super::LIVE_CLOSE_DEFERRED_SETTLEMENT_BOUND`].
         HangGuard,
+    }
+
+    /// What keeps a closed channel's deferred rows applicable: the host's
+    /// close-projection retention.
+    struct DeferredRowsCustody {
+        _retention: Option<meerkat_live::LiveChannelCloseProjectionLease>,
+    }
+
+    /// Apply the rows a given-up close settlement still held, in arrival
+    /// order, each at the next point it can land: once the member turn
+    /// releases the session boundary (the channel's projections wait for it
+    /// again). After a member turn that ended with an error that is at once:
+    /// the ordinary projection resynchronizes the live transcript the turn
+    /// left ahead of the store, as the member's next turn would. A projection
+    /// refused as busy waits for live authority to advance. Nothing bounds
+    /// the wait, so a row is never dropped for taking long; the rows are held
+    /// in memory only and are lost if the process exits first. A row the
+    /// session refuses for any other reason is reported and the rest
+    /// continue. The GaveUp outcome and the recorded deferral are unchanged.
+    fn replay_deferred_rows_after_give_up<B: SessionAgentBuilder + 'static>(
+        service: Arc<PersistentSessionService<B>>,
+        host: LiveAdapterHost,
+        custody: DeferredRowsCustody,
+        mut rows: std::collections::VecDeque<meerkat_core::live_adapter::LiveAdapterObservation>,
+        session_id: SessionId,
+        channel_id: LiveChannelId,
+    ) {
+        if rows.is_empty() {
+            return;
+        }
+        tokio::spawn(async move {
+            while let Some(observation) = rows.front() {
+                let advanced = service.live_authority_advanced();
+                tokio::pin!(advanced);
+                advanced.as_mut().enable();
+                match host.apply_observation(&channel_id, observation).await {
+                    Ok(outcome) => {
+                        tracing::info!(
+                            target: meerkat_live::LIVE_CLOSE_TRACE_TARGET,
+                            channel = %channel_id,
+                            ?observation,
+                            ?outcome,
+                            "deferred live projection applied at the boundary after its close settlement gave up"
+                        );
+                        rows.pop_front();
+                    }
+                    Err(meerkat_live::LiveAdapterHostError::ProjectionError(
+                        meerkat_live::LiveProjectionError::SessionBusy(_),
+                    )) => {
+                        if service.live_projection_turn_boundary_released(&session_id, &channel_id)
+                        {
+                            // A later close released the channel again: the
+                            // rows wait on the boundary itself.
+                            service.restore_live_projection_turn_boundary_wait(
+                                &session_id,
+                                &channel_id,
+                            );
+                            continue;
+                        }
+                        advanced.await;
+                    }
+                    Err(error) => {
+                        report_unrecorded_live_row(&session_id, &channel_id, observation, &error);
+                        rows.pop_front();
+                    }
+                }
+            }
+            drop(custody);
+        });
+    }
+
+    /// The last resort for a deferred row the session refused for a reason
+    /// other than a held boundary: it is not recorded, so say so, typed.
+    fn report_unrecorded_live_row(
+        session_id: &SessionId,
+        channel_id: &LiveChannelId,
+        observation: &meerkat_core::live_adapter::LiveAdapterObservation,
+        error: &meerkat_live::LiveAdapterHostError,
+    ) {
+        tracing::warn!(
+            target: meerkat_live::LIVE_CLOSE_TRACE_TARGET,
+            %session_id,
+            channel = %channel_id,
+            ?observation,
+            %error,
+            "deferred live transcript row was refused after the close; it is not recorded"
+        );
     }
 
     fn is_unmeasured_playback_release(

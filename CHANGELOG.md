@@ -44,6 +44,23 @@ them.
   requested meanwhile runs when the last hold ends; a held output never
   becomes reservable. (#1821)
 
+### Fixed
+
+- Live channels: rows a close took behind a running member turn (the user's
+  finalized speech, the assistant's spoken segments) are no longer dropped
+  when the close's deferred settlement gives up because the member turn ended
+  with an error or its ten-minute hang guard elapsed. The rows it still holds
+  are applied in arrival order at the next point each can land, with no
+  further deadline; the settlement's outcome and its recorded deferral are
+  unchanged. A row the session refuses for any other reason is reported with
+  a warning. (#1821)
+
+### Known limitations
+
+- Rows a channel close holds for replay after its deferred settlement gave up
+  are held in memory only: they are lost if the process exits before the next
+  boundary lets them land. Durable staging is planned. (#1821)
+
 ## [0.9.2] - 2026-10-16
 
 ### Breaking
