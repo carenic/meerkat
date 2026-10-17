@@ -778,6 +778,17 @@ hosts' stores do (`FileConfigStore::with_realm_chain`,
 in-memory store, keep the document's own `[confinement]` and `[governance]`
 sections but not the realm sections that compose an ancestor's.
 
+Such writes over one state root take turns: each store holds an exclusive
+advisory lock on `<state_root>/.realm-config.lock` from before it reads its
+own document, through its composition check, to after its write, in one
+process and across processes, so no check reads a document another writer
+is about to replace. A `RealmConfigSource` names the file with
+`composition_lock_path`; one that names none (the default) leaves such
+writes unserialized. Hosts on different state roots take different locks;
+the user document's own check composes each realm it states as if that
+realm had no document, so it depends on no document only another state
+root holds.
+
 A realm composes only from the documents on its chain, each from its own:
 an ancestor whose own document is missing fails the composition (a missing
 parent) instead of composing as if it required nothing, and `rkat realm

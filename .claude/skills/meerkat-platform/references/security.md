@@ -143,7 +143,11 @@ requirement = { baseline = "command_runtime_v1", read = { kind = "paths", paths 
   stores, `FileConfigStore::with_realm_chain` and
   `SdkConfigStore::with_realm_document`; a `FileConfigStore::new`,
   `SdkConfigStore::with_path` or in-memory store keeps only the document's
-  own sections. Each ancestor composes from its own document alone, so a
+  own sections. Such writes over one state root take turns: each holds an
+  exclusive lock on `<state_root>/.realm-config.lock` from before its read
+  to after its write (`RealmConfigSource::composition_lock_path`; a source
+  that names none leaves them unserialized). Each ancestor composes from
+  its own document alone, so a
   chain through a missing ancestor fails (a missing parent), and `rkat realm
   delete` and `rkat realm prune` keep a realm another realm names as its
   parent.

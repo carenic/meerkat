@@ -142,6 +142,20 @@ pub trait RealmConfigSource: Send + Sync {
     ) -> Result<Option<toml::Value>, ConfigError> {
         Ok(None)
     }
+
+    /// The file a store that guards its writes against these documents
+    /// ([`FileConfigStore::with_realm_chain`]) holds an exclusive advisory
+    /// lock on from before it reads its own document, through its
+    /// composition check, to after its write. Writers of documents one host
+    /// composes then take turns, in one process and across processes, so no
+    /// check reads a document another writer is about to replace.
+    ///
+    /// Default: `None`, and such writes stay unserialized. The filesystem
+    /// source returns one file under its state root, which every guarded
+    /// store over that root locks (the user document's included).
+    fn composition_lock_path(&self) -> Option<PathBuf> {
+        None
+    }
 }
 
 /// Read-only reader that composes a realm's parent chain into the effective
@@ -699,6 +713,22 @@ impl FileConfigStore {
         &self.path
     }
 
+    /// The composition lock a store declared with a realm chain holds
+    /// across a write ([`RealmConfigSource::composition_lock_path`]), or
+    /// `None` when there is no chain or its documents name no lock. Lock
+    /// order: a caller's own lock first (such as `ConfigRuntime`'s), then
+    /// this one; nothing takes them the other way round.
+    async fn composition_lock(&self) -> Result<Option<CompositionLock>, ConfigError> {
+        match self
+            .realm_chain
+            .as_ref()
+            .and_then(|chain| chain.documents.composition_lock_path())
+        {
+            Some(path) => CompositionLock::acquire(path).await.map(Some),
+            None => Ok(None),
+        }
+    }
+
     /// The document text as persisted; empty when the file does not exist.
     async fn read_content(&self) -> Result<String, ConfigError> {
         if self.create_if_missing {
@@ -801,6 +831,8 @@ impl ConfigStore for FileConfigStore {
         &self,
         delta: ConfigDelta,
     ) -> Result<(Config, Vec<ConfigWarning>), ConfigError> {
+        // Held from before the read to after the write.
+        let _composition = self.composition_lock().await?;
         let content = self.read_content().await?;
         let patched = PersistedConfigDocument::patch_content(&content, delta.0)?;
         // The patch already parsed this content strictly, so this parse
@@ -832,6 +864,8 @@ impl ConfigStore for FileConfigStore {
     /// document each one then overrides the parent realm, so callers that
     /// change individual keys of a realm document patch it instead.
     async fn set(&self, config: Config) -> Result<(), ConfigError> {
+        // Held from before the read to after the write.
+        let _composition = self.composition_lock().await?;
         let content = self.read_content().await?;
         let governance = persisted_governance(&content)?;
         keep_governance(&governance, &config.governance)?;
@@ -857,6 +891,56 @@ impl ConfigStore for FileConfigStore {
         let (updated, warnings) = self.patch_with_warnings(delta).await?;
         report_config_load_warnings_once(&self.path, &warnings);
         Ok(updated)
+    }
+}
+
+/// An exclusive advisory lock on a realm config root's composition lock
+/// file ([`RealmConfigSource::composition_lock_path`]), released when
+/// dropped. The lock is taken on the blocking pool and waits for the
+/// writer that holds it.
+struct CompositionLock {
+    #[cfg(not(target_arch = "wasm32"))]
+    file: std::fs::File,
+}
+
+impl CompositionLock {
+    #[cfg(not(target_arch = "wasm32"))]
+    async fn acquire(path: PathBuf) -> Result<Self, ConfigError> {
+        tokio::task::spawn_blocking(move || -> Result<Self, ConfigError> {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .open(&path)?;
+            fs4::fs_std::FileExt::lock_exclusive(&file)?;
+            Ok(Self { file })
+        })
+        .await
+        .map_err(|error| {
+            ConfigError::InternalError(format!(
+                "realm config composition lock task failed: {error}"
+            ))
+        })?
+    }
+
+    /// wasm32 has no advisory file lock, and no source there names a lock
+    /// file.
+    #[cfg(target_arch = "wasm32")]
+    async fn acquire(_path: PathBuf) -> Result<Self, ConfigError> {
+        Ok(Self {})
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Drop for CompositionLock {
+    fn drop(&mut self) {
+        // An explicit unlock, so a copy of the descriptor a concurrently
+        // spawned process holds until its exec cannot keep the lock.
+        let _ = fs4::fs_std::FileExt::unlock(&self.file);
     }
 }
 
@@ -1206,6 +1290,10 @@ impl RealmConfigSource for WithUserDocument {
             return Ok(None);
         }
         self.documents.raw_config_for_realm(realm).await
+    }
+
+    fn composition_lock_path(&self) -> Option<PathBuf> {
+        self.documents.composition_lock_path()
     }
 }
 

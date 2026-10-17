@@ -110,6 +110,12 @@ them.
 
 ### Added
 
+- `meerkat_core::RealmConfigSource::composition_lock_path` (provided,
+  default `None`): the file a store declared with
+  `FileConfigStore::with_realm_chain` locks across its read, its
+  composition check and its write. `meerkat_store::FilesystemRealmConfigSource`
+  returns `<state_root>/.realm-config.lock` (see Fixed); a source that
+  wraps it forwards it.
 - `meerkat::open_system_browser_guarded`
   (`meerkat_auth_core::mcp_oauth::open_system_browser_guarded`) opens a URL
   with the platform browser opener under the host's launch guard
@@ -144,6 +150,19 @@ them.
 
 ### Fixed
 
+- Guarded config writes over one state root take turns. Every store
+  declared with its realm chain (`FileConfigStore::with_realm_chain`, as the
+  stock hosts' stores are, and `SdkConfigStore::with_realm_document`) holds
+  an exclusive advisory lock on the state root's composition lock file from
+  before it reads its own document, through its composition check, to after
+  its write, in one process and across processes. A check that reads
+  another document can then never read one another writer is about to
+  replace, so two writes that each pass alone cannot combine into a
+  composition neither checked. In 0.9.2 each write was checked alone (the
+  0.9.2 known limitation). A host on another state root takes another
+  lock; a write to the user document also composes each realm it states as
+  if that realm had no document (below), so none of its checks depends on a
+  document only another state root holds.
 - A write to the user document checks each realm the user document states a
   section for both with that realm's own document from the writing host's
   state root and as if the realm had none. Several state roots can share one
