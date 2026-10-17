@@ -35,6 +35,13 @@ them.
 
 ## [Unreleased]
 
+### Added
+
+- `meerkat_core::ToolBindingDigest` and `ToolBindingDigestParseError`: a
+  durable SHA-256 digest of what a tool catalog entry declares (never its
+  live authorities or current callability), with the text form
+  `sha256:<64 hex digits>`.
+
 ## [0.9.2] - 2026-10-16
 
 ### Breaking
