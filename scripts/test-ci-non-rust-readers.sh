@@ -59,7 +59,7 @@ else delete doc.paths["docs/docs.json"];
 fs.writeFileSync(to, JSON.stringify(doc, null, 2));
 NODE
 expect_red "deleted inventory row" "${TEST_ROOT}/deleted.log" \
-  "missing reader: crates/meerkat-cli/tests/help_mobpack_contract.rs:5 reads docs/docs.json" \
+  "missing reader: crates/meerkat-cli/tests/help_mobpack_contract.rs:6 reads docs/docs.json" \
   node "$GUARD" --inventory "${TEST_ROOT}/deleted.json"
 
 # RED: delete the row of an in-crate doc its crate compiles in
