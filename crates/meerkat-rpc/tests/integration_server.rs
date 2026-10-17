@@ -2176,7 +2176,7 @@ mod tcp_callback_ownership {
     /// The `durable` detached callback tool as a connection registers it:
     /// one runner and contract, and the description that tells two
     /// declarations apart.
-    fn detached_tool(description: &str) -> Value {
+    fn durable_tool(description: &str) -> Value {
         json!([{
             "name": "durable",
             "description": description,
@@ -2195,7 +2195,11 @@ mod tcp_callback_ownership {
         /// Register `tools`. A registration reconciles the detached callback
         /// jobs its tools serve concurrently with its response: the server
         /// requests that arrive before the response are returned.
-        async fn register_tools(&mut self, id: u64, tools: Value) -> Vec<Value> {
+        async fn register_tools_and_collect_requests(
+            &mut self,
+            id: u64,
+            tools: Value,
+        ) -> Vec<Value> {
             self.send(
                 json!({"jsonrpc":"2.0","id":id,"method":"tools/register","params":{"tools":tools}}),
             )
@@ -2273,7 +2277,7 @@ mod tcp_callback_ownership {
             );
             let (creator_index, mut creator) = h.connect().await;
             let offered = creator
-                .register_tools(2, detached_tool("the creator's durable tool"))
+                .register_tools_and_collect_requests(2, durable_tool("the creator's durable tool"))
                 .await;
             assert!(offered.is_empty(), "{offered:?}");
             let session = creator.create().await;
@@ -2325,7 +2329,7 @@ mod tcp_callback_ownership {
             // offered to it and keeps running once reported live.
             let (unchanged_index, mut unchanged) = h.connect().await;
             let mut offered = unchanged
-                .register_tools(2, detached_tool("the creator's durable tool"))
+                .register_tools_and_collect_requests(2, durable_tool("the creator's durable tool"))
                 .await;
             if offered.is_empty() {
                 offered.push(unchanged.next_significant().await);
@@ -2354,7 +2358,7 @@ mod tcp_callback_ownership {
             // The same name and runner under another description.
             let (_, mut changed) = h.connect().await;
             let offered = changed
-                .register_tools(2, detached_tool("another connection's durable tool"))
+                .register_tools_and_collect_requests(2, durable_tool("another connection's durable tool"))
                 .await;
             assert!(
                 offered.is_empty(),
