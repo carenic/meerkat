@@ -543,6 +543,35 @@ fn assistant_blocks_have_user_visible_output(blocks: &[crate::types::AssistantBl
     })
 }
 
+/// Whether the empty-output gates refuse a provider response.
+///
+/// A response whose stop reason refuses it (a refusal, a content filter, a
+/// filled context window) is decided by that stop reason, never retried as
+/// empty output. A paused turn's server-tool blocks are the work the next
+/// request resumes from (`pause_turn`), so they count as output even with no
+/// text yet.
+fn response_reads_as_empty_output(
+    blocks: &[crate::types::AssistantBlock],
+    stop_reason: StopReason,
+) -> bool {
+    match stop_reason {
+        StopReason::Refusal | StopReason::ContentFilter | StopReason::ContextWindowExceeded => {
+            false
+        }
+        StopReason::PauseTurn
+            if blocks.iter().any(|block| {
+                matches!(
+                    block,
+                    crate::types::AssistantBlock::ServerToolContent { .. }
+                )
+            }) =>
+        {
+            false
+        }
+        _ => !crate::types::assistant_blocks_have_visible_or_actionable_output(blocks),
+    }
+}
+
 fn validate_turn_input_failure_reason(input: &TurnExecutionInput) -> Result<(), AgentError> {
     if let Some(failure) = turn_input_failure_source(input)
         && !failure.source_kind.is_known()
@@ -2761,9 +2790,7 @@ where
             // 5. Handle call result
             match call_result {
                 Ok(result) => {
-                    if !crate::types::assistant_blocks_have_visible_or_actionable_output(
-                        result.blocks(),
-                    ) {
+                    if response_reads_as_empty_output(result.blocks(), result.stop_reason()) {
                         if allow_empty_success {
                             return Ok(LlmRetryOutcome::Completed(
                                 result,
@@ -6791,11 +6818,11 @@ where
     /// Pre-dispatch refusals and post-dispatch retry exhaustion share this
     /// path so a committed terminal can never escape as the raw LLM error that
     /// preceded it.
-    async fn complete_calling_llm_failure(
+    async fn complete_calling_llm_failure<Gate>(
         &mut self,
         ctx: &CallingLlmTurnCtx<'_>,
         error: &AgentError,
-    ) -> Result<CallingLlmGate<LlmStreamResult>, AgentError> {
+    ) -> Result<CallingLlmGate<Gate>, AgentError> {
         // Recoverable LLM failures reaching this point have exhausted retry
         // authority; non-recoverable LLM failures keep their typed LLM cause.
         let retry_failure = crate::retry::LlmRetryFailure::from_agent_error(error);
@@ -7286,6 +7313,46 @@ where
                 .await?;
             return Err(error);
         }
+        // Stop reasons that refuse the whole response. It has already
+        // streamed, but none of it is committed and none of its tool calls
+        // run: a refusal or content filter can cut a tool call mid-input, and
+        // a filled context window truncated the turn. Usage above is retained,
+        // as for thinking exhaustion.
+        let refused_response = match stop_reason {
+            StopReason::ContextWindowExceeded => Some(AgentError::llm_context_window_stop(
+                response_provider.as_str(),
+                self.request_model_profile(*ctx.controller_feedback)
+                    .and_then(|profile| profile.context_window()),
+                turn_usage.as_ref().map(TurnUsage::normalized_total_tokens),
+            )),
+            StopReason::Refusal | StopReason::ContentFilter => Some(AgentError::ContentFiltered {
+                turn: ctx.turn_count,
+            }),
+            _ => None,
+        };
+        if let Some(error) = refused_response {
+            if in_extraction {
+                return Ok(CallingLlmGate::Done(
+                    self.complete_extraction_failed(
+                        ctx.run_id,
+                        ctx.turn_count,
+                        ctx.tool_call_count,
+                        error.to_string(),
+                        ctx.event_tx,
+                    )
+                    .await,
+                ));
+            }
+            if matches!(error, AgentError::Llm { .. }) {
+                // A typed LLM failure: it terminalizes on the same generated
+                // path as the pre-dispatch context refusal, so the committed
+                // terminal never escapes as the raw error.
+                return self.complete_calling_llm_failure(ctx, &error).await;
+            }
+            self.terminalize_fatal_error(ctx.run_id, ctx.turn_count, ctx.event_tx, &error)
+                .await?;
+            return Err(error);
+        }
         let assistant_msg = self.stamp_assistant_message_identity(
             BlockAssistantMessage::new(blocks, stop_reason),
             ctx.run_id,
@@ -7297,7 +7364,8 @@ where
         // turn's output OR any prior visible/actionable output in the
         // run) and MeerkatMachine owns the empty-output terminal
         // verdict. The loop mirrors `empty_response_terminal`.
-        let turn_has_visible_or_actionable = assistant_msg.has_visible_or_actionable_output();
+        let turn_has_visible_or_actionable =
+            !response_reads_as_empty_output(&assistant_msg.blocks, stop_reason);
         let has_visible_or_actionable =
             turn_has_visible_or_actionable || *ctx.run_has_visible_or_actionable_output;
         if self.classify_assistant_output_terminal(has_visible_or_actionable)? {
@@ -22545,6 +22613,292 @@ mod tests {
         assert_eq!(
             snapshot.terminal_cause_kind,
             Some(crate::TurnTerminalCauseKind::FatalFailure)
+        );
+    }
+
+    /// One scripted provider turn: these blocks under this stop reason,
+    /// measured at 11 presented input and 7 output tokens. Every call returns
+    /// it again and is counted.
+    struct ScriptedStopLlmClient {
+        blocks: Vec<AssistantBlock>,
+        stop_reason: StopReason,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+    #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+    impl AgentLlmClient for ScriptedStopLlmClient {
+        async fn stream_response(
+            &self,
+            _messages: &[Message],
+            _tools: &[Arc<ToolDef>],
+            _max_tokens: u32,
+            _temperature: Option<f32>,
+            _provider_params: Option<&crate::lifecycle::run_primitive::ProviderParamsOverride>,
+        ) -> Result<super::LlmStreamResult, AgentError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(super::LlmStreamResult::new(
+                self.blocks.clone(),
+                self.stop_reason,
+                normalized_test_usage(
+                    self,
+                    Usage {
+                        input_tokens: 11,
+                        output_tokens: 7,
+                        ..Usage::default()
+                    },
+                ),
+            ))
+        }
+
+        fn provider(&self) -> crate::provider::Provider {
+            crate::provider::Provider::OpenAI
+        }
+
+        fn model(&self) -> &'static str {
+            "primary"
+        }
+    }
+
+    /// Text and a complete call of the visible `probe` tool.
+    fn text_and_probe_call() -> Vec<AssistantBlock> {
+        vec![
+            AssistantBlock::Text {
+                text: "Reading the file now.".to_string(),
+                meta: None,
+            },
+            AssistantBlock::ToolUse {
+                id: "call-probe".to_string(),
+                name: "probe".into(),
+                args: serde_json::value::RawValue::from_string(r#"{"path":"/etc"}"#.to_string())
+                    .expect("static raw value should parse"),
+                meta: None,
+            },
+        ]
+    }
+
+    struct ScriptedStopRun {
+        result: Result<crate::types::RunResult, AgentError>,
+        events: Vec<crate::event::AgentEvent>,
+        provider_calls: usize,
+        dispatched: Vec<String>,
+        assistant_rows: Vec<crate::types::BlockAssistantMessage>,
+        metadata: Option<crate::TurnErrorMetadata>,
+    }
+
+    /// Run one prompt against a scripted stop on the `primary` model, whose
+    /// registry entry declares a 128K context window.
+    async fn run_scripted_stop(
+        stop_reason: StopReason,
+        blocks: Vec<AssistantBlock>,
+    ) -> ScriptedStopRun {
+        let tools = Arc::new(FullToolDispatcher::new(&["probe"]));
+        let client = Arc::new(ScriptedStopLlmClient {
+            blocks,
+            stop_reason,
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let mut agent = with_test_turn_state_handle_for_session(
+            AgentBuilder::new()
+                .model("primary")
+                .max_tokens_per_turn(8_192)
+                .retry_policy(crate::retry::RetryPolicy {
+                    max_retries: 2,
+                    initial_delay: std::time::Duration::from_millis(1),
+                    max_delay: std::time::Duration::from_millis(5),
+                    ..crate::retry::RetryPolicy::default()
+                })
+                .with_effective_model_registry(fallback_activation_test_registry()),
+            explicit_hot_swap_session("primary"),
+        )
+        .with_tool_visibility_owner(explicit_test_visibility_owner())
+        .build_standalone(Arc::clone(&client), Arc::clone(&tools), Arc::new(NoopStore))
+        .await;
+        agent.config.max_turns = Some(2);
+
+        let (tx, mut rx) = mpsc::channel(1024);
+        let result = agent
+            .run_with_events("Read /etc".to_string().into(), tx)
+            .await;
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        ScriptedStopRun {
+            result,
+            events,
+            provider_calls: client.calls.load(std::sync::atomic::Ordering::SeqCst),
+            dispatched: tools.dispatched(),
+            assistant_rows: agent
+                .session
+                .messages()
+                .iter()
+                .filter_map(|message| match message {
+                    Message::BlockAssistant(assistant) => Some(assistant.clone()),
+                    _ => None,
+                })
+                .collect(),
+            metadata: agent.terminal_error_metadata.clone(),
+        }
+    }
+
+    #[tokio::test]
+    async fn context_window_stop_fails_typed_and_commits_nothing() {
+        let run = run_scripted_stop(StopReason::ContextWindowExceeded, text_and_probe_call()).await;
+
+        assert!(
+            matches!(
+                run.result,
+                Err(AgentError::TerminalFailure {
+                    cause_kind: crate::TurnTerminalCauseKind::LlmFailure,
+                    ..
+                })
+            ),
+            "a context-window stop is a typed LLM terminal: {:?}",
+            run.result
+        );
+        // max is the model's declared window, requested the call's reported
+        // tokens (11 presented input + 7 output).
+        assert_eq!(
+            run.metadata
+                .as_ref()
+                .and_then(|metadata| metadata.reason.clone()),
+            Some(crate::event::AgentErrorReason::LlmContextExceeded {
+                max: 128_000,
+                requested: 18,
+            })
+        );
+        assert_eq!(
+            run.provider_calls, 1,
+            "a context-window stop is not retried"
+        );
+        assert!(run.dispatched.is_empty(), "{:?}", run.dispatched);
+        assert!(run.assistant_rows.is_empty(), "{:?}", run.assistant_rows);
+        assert!(
+            run.events.iter().any(|event| matches!(
+                event,
+                crate::event::AgentEvent::RunFailed { error_report, .. }
+                    if error_report.class == AgentErrorClass::Llm
+            )),
+            "{:?}",
+            run.events
+        );
+        assert!(
+            !run.events
+                .iter()
+                .any(|event| matches!(event, crate::event::AgentEvent::TurnCompleted { .. })),
+            "{:?}",
+            run.events
+        );
+    }
+
+    /// A refusal can arrive with a tool call already streamed. The call
+    /// never runs and nothing of the turn is committed; content_filter (any
+    /// provider) ends the same way.
+    #[tokio::test]
+    async fn refused_or_filtered_turn_fails_content_filtered_and_dispatches_nothing() {
+        for stop_reason in [StopReason::Refusal, StopReason::ContentFilter] {
+            let run = run_scripted_stop(stop_reason, text_and_probe_call()).await;
+
+            assert!(
+                matches!(run.result, Err(AgentError::ContentFiltered { .. })),
+                "{stop_reason:?}: {:?}",
+                run.result
+            );
+            assert_eq!(run.provider_calls, 1, "{stop_reason:?} is not retried");
+            assert!(
+                run.dispatched.is_empty(),
+                "{stop_reason:?}: {:?}",
+                run.dispatched
+            );
+            assert!(
+                run.assistant_rows.is_empty(),
+                "{stop_reason:?}: {:?}",
+                run.assistant_rows
+            );
+            assert!(
+                run.events.iter().any(|event| matches!(
+                    event,
+                    crate::event::AgentEvent::RunFailed { error_report, .. }
+                        if error_report.class == AgentErrorClass::ContentFiltered
+                )),
+                "{stop_reason:?}: {:?}",
+                run.events
+            );
+        }
+    }
+
+    /// A refused, filtered or window-stopped response with nothing in it is
+    /// decided by its stop reason: never retried as empty output, never
+    /// failed as an empty response.
+    #[tokio::test]
+    async fn empty_response_with_a_refusing_stop_is_not_retried_as_empty_output() {
+        for stop_reason in [
+            StopReason::Refusal,
+            StopReason::ContentFilter,
+            StopReason::ContextWindowExceeded,
+        ] {
+            let run = run_scripted_stop(stop_reason, Vec::new()).await;
+
+            assert_eq!(run.provider_calls, 1, "{stop_reason:?} is not retried");
+            assert!(
+                run.assistant_rows.is_empty(),
+                "{stop_reason:?}: {:?}",
+                run.assistant_rows
+            );
+            match stop_reason {
+                StopReason::ContextWindowExceeded => assert!(
+                    matches!(
+                        run.metadata
+                            .as_ref()
+                            .and_then(|metadata| metadata.reason.clone()),
+                        Some(crate::event::AgentErrorReason::LlmContextExceeded { .. })
+                    ),
+                    "{stop_reason:?}: {:?}",
+                    run.metadata
+                ),
+                _ => assert!(
+                    matches!(run.result, Err(AgentError::ContentFiltered { .. })),
+                    "{stop_reason:?}: {:?}",
+                    run.result
+                ),
+            }
+        }
+    }
+
+    /// A paused server-tool turn is committed as it stands, even with no
+    /// text yet: its server-tool blocks are what the next request resumes.
+    #[tokio::test]
+    async fn paused_server_tool_turn_commits_with_its_stop_reason() {
+        let paused = vec![AssistantBlock::ServerToolContent {
+            id: Some("srvtoolu_paused".to_string()),
+            kind: crate::types::ServerToolKind::WebSearch,
+            content: serde_json::json!({
+                "type": "server_tool_use",
+                "input": { "query": "meerkat release notes" }
+            }),
+            meta: None,
+        }];
+        let run = run_scripted_stop(StopReason::PauseTurn, paused.clone()).await;
+
+        assert!(run.result.is_ok(), "{:?}", run.result);
+        assert_eq!(run.provider_calls, 1, "a paused turn is not retried");
+        assert_eq!(run.assistant_rows.len(), 1, "{:?}", run.assistant_rows);
+        assert_eq!(
+            run.assistant_rows[0].stop_reason,
+            Some(StopReason::PauseTurn)
+        );
+        assert_eq!(run.assistant_rows[0].blocks, paused);
+        assert!(
+            run.events.iter().any(|event| matches!(
+                event,
+                crate::event::AgentEvent::TurnCompleted {
+                    stop_reason: StopReason::PauseTurn,
+                    ..
+                }
+            )),
+            "{:?}",
+            run.events
         );
     }
 

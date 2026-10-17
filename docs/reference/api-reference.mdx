@@ -72,7 +72,7 @@ capabilities, config, auth, realms, and usage.
 | `ToolCallView` | `meerkat_core` | Zero-allocation borrowed view of a tool call |
 | `ToolResult` | `meerkat_core` | Tool execution result |
 | `Usage` | `meerkat_core` | Token usage tracking |
-| `StopReason` | `meerkat_core` | Why the LLM stopped (`EndTurn`, `ToolUse`, `MaxTokens`, `StopSequence`, `ContentFilter`, `Cancelled`) |
+| `StopReason` | `meerkat_core` | Why the LLM stopped (`EndTurn`, `ToolUse`, `MaxTokens`, `StopSequence`, `ContentFilter`, `Cancelled`, `Refusal`, `PauseTurn`, `ContextWindowExceeded`) |
 | `RunResult` | `meerkat_core` | Agent execution result (text, session ID, usage, structured output) |
 | `AgentEvent` | `meerkat_core` | Streaming events during execution |
 | `AgentError` | `meerkat_core` | Error types (LLM, tool, budget, hook, cancellation) |

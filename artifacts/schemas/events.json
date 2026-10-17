@@ -4093,6 +4093,21 @@
             "const": "cancelled",
             "description": "Request was cancelled",
             "type": "string"
+          },
+          {
+            "const": "refusal",
+            "description": "The model declined the response (Anthropic `refusal`). The agent loop\ncommits nothing of a refused turn and never runs its tool calls.",
+            "type": "string"
+          },
+          {
+            "const": "pause_turn",
+            "description": "The provider paused a long-running server-tool turn (Anthropic\n`pause_turn`). The turn is committed as it stands; sending it back\nlets the model continue.",
+            "type": "string"
+          },
+          {
+            "const": "context_window_exceeded",
+            "description": "Generation stopped because the model's context window filled\n(Anthropic `model_context_window_exceeded`). The agent loop commits\nnothing of the turn and fails the run as context exceeded.",
+            "type": "string"
           }
         ]
       },
@@ -12805,6 +12820,21 @@
           {
             "const": "cancelled",
             "description": "Request was cancelled",
+            "type": "string"
+          },
+          {
+            "const": "refusal",
+            "description": "The model declined the response (Anthropic `refusal`). The agent loop\ncommits nothing of a refused turn and never runs its tool calls.",
+            "type": "string"
+          },
+          {
+            "const": "pause_turn",
+            "description": "The provider paused a long-running server-tool turn (Anthropic\n`pause_turn`). The turn is committed as it stands; sending it back\nlets the model continue.",
+            "type": "string"
+          },
+          {
+            "const": "context_window_exceeded",
+            "description": "Generation stopped because the model's context window filled\n(Anthropic `model_context_window_exceeded`). The agent loop commits\nnothing of the turn and fails the run as context exceeded.",
             "type": "string"
           }
         ]

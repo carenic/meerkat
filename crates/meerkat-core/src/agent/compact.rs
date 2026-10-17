@@ -12,7 +12,7 @@ use crate::compact::{
 use crate::event::AgentEvent;
 #[cfg(target_arch = "wasm32")]
 use crate::tokio;
-use crate::types::{AssistantBlock, Message, TurnUsage, Usage};
+use crate::types::{AssistantBlock, Message, StopReason, TurnUsage, Usage};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -810,6 +810,29 @@ where
             )
             .await;
 
+        // A summary the provider stopped because the model context window
+        // filled is truncated. It joins the capacity fallback below instead
+        // of being committed, and the provider work it was stays charged.
+        let mut stopped_call_usage = None;
+        let llm_result = match llm_result {
+            Ok(result) if result.stop_reason() == StopReason::ContextWindowExceeded => {
+                stopped_call_usage = validated_compaction_summary_usage(
+                    result.usage().clone(),
+                    client.provider(),
+                    client.model(),
+                )
+                .ok();
+                Err(crate::error::AgentError::llm_context_window_stop(
+                    client.provider().as_str(),
+                    None,
+                    stopped_call_usage
+                        .as_ref()
+                        .map(|(usage, _)| usage.normalized_total_tokens()),
+                ))
+            }
+            other => other,
+        };
+
         match llm_result {
             Ok(result) => {
                 // Extract summary text from response blocks
@@ -851,13 +874,20 @@ where
                     estimated_history_tokens = estimated,
                     "compaction summary request exceeded provider capacity; using mechanical progress fallback"
                 );
-                (
-                    MECHANICAL_CAPACITY_SUMMARY.to_string(),
-                    TurnUsage::host_declared(
+                let usage = match stopped_call_usage.take() {
+                    Some((usage, dispute)) => {
+                        summary_usage_identity_dispute = dispute;
+                        usage
+                    }
+                    None => TurnUsage::host_declared(
                         crate::Provider::Other,
                         "mechanical-compaction-fallback",
                         Usage::default(),
                     ),
+                };
+                (
+                    MECHANICAL_CAPACITY_SUMMARY.to_string(),
+                    usage,
                     CompactionSummarySource::MechanicalFallback,
                 )
             }
@@ -1056,7 +1086,9 @@ pub enum CompactionSummarySource {
     ProviderCall,
     /// A configured host curator; no provider request was made.
     HostCurator,
-    /// The mechanical capacity fallback; no provider request was made.
+    /// The mechanical capacity fallback: the summary request was refused for
+    /// capacity (zero usage), or the provider answered and stopped at the
+    /// model context window (that call's usage).
     MechanicalFallback,
 }
 
@@ -1069,7 +1101,9 @@ pub struct CompactionOutcome {
     /// Usage from the summary LLM call.
     pub summary_usage: TurnUsage,
     /// Who produced the summary. Only [`CompactionSummarySource::ProviderCall`]
-    /// is backed by a provider request; the others carry zero usage.
+    /// is a provider-written summary; a curator carries zero usage, and the
+    /// mechanical fallback carries the usage of a summary call the provider
+    /// stopped at the context window, else zero.
     pub summary_source: CompactionSummarySource,
     /// Set when the summary call's accounting named a provider/model other
     /// than the one requested. The usage above is charged exactly as reported;
@@ -1312,9 +1346,9 @@ mod tests {
         }
     }
 
-    async fn compact_observed_source(
+    async fn compact_observed_source<C: crate::agent::AgentLlmClient>(
         session: &Session,
-        client: &ObservationSummaryClient,
+        client: &C,
     ) -> Result<CompactionOutcome, CompactionError> {
         let model_messages = session.messages_for_model_boundary();
         let compactor: Arc<dyn Compactor> = Arc::new(ObservationCompactor);
@@ -1434,6 +1468,77 @@ mod tests {
         .expect("ordinary mechanical capacity fallback remains available");
         assert!(matches!(&outcome.new_messages[0], Message::User(user)
                 if user.text_content().contains(MECHANICAL_CAPACITY_SUMMARY)));
+    }
+
+    /// A summary call the provider stopped because the model context window
+    /// filled.
+    struct ContextWindowStoppedSummaryClient;
+
+    #[async_trait::async_trait]
+    impl crate::agent::AgentLlmClient for ContextWindowStoppedSummaryClient {
+        async fn stream_response(
+            &self,
+            _: &[Message],
+            tools: &[Arc<crate::ToolDef>],
+            _: u32,
+            _: Option<f32>,
+            _: Option<&crate::ProviderParamsOverride>,
+        ) -> Result<crate::LlmStreamResult, crate::error::AgentError> {
+            assert!(tools.is_empty());
+            Ok(crate::LlmStreamResult::new(
+                vec![AssistantBlock::Text {
+                    text: "Blueprint review was discussed and the".into(),
+                    meta: None,
+                }],
+                StopReason::ContextWindowExceeded,
+                Usage {
+                    input_tokens: 10,
+                    output_tokens: 3,
+                    provider_accounting: Some(crate::ProviderTokenAccounting::openai(
+                        "test-observation-summary",
+                        10,
+                    )),
+                    ..Usage::default()
+                },
+            ))
+        }
+        fn provider(&self) -> crate::Provider {
+            crate::Provider::OpenAI
+        }
+        fn model(&self) -> &'static str {
+            "test-observation-summary"
+        }
+    }
+
+    #[tokio::test]
+    async fn context_window_stopped_summary_joins_the_capacity_fallback() {
+        let mut ordinary = Session::new();
+        ordinary.push(Message::User(UserMessage::text("One")));
+        ordinary.push(Message::User(UserMessage::text("Two")));
+        let outcome = compact_observed_source(&ordinary, &ContextWindowStoppedSummaryClient)
+            .await
+            .expect("a truncated summary takes the mechanical capacity fallback");
+        assert!(matches!(&outcome.new_messages[0], Message::User(user)
+                if user.text_content().contains(MECHANICAL_CAPACITY_SUMMARY)));
+        assert_eq!(
+            outcome.summary_source,
+            CompactionSummarySource::MechanicalFallback
+        );
+        // The provider answered, so its work stays charged.
+        assert_eq!(outcome.summary_usage.output_tokens, 3);
+
+        // With unsummarized voice observations the fallback is closed, as for
+        // a refused summary request: the source is preserved.
+        let session = session_with_unmeasured_voice();
+        let before = serde_json::to_vec(&session).unwrap();
+        assert!(matches!(
+            compact_observed_source(&session, &ContextWindowStoppedSummaryClient).await,
+            Err(CompactionError::LlmFailed(crate::error::AgentError::Llm {
+                reason: crate::error::LlmFailureReason::ContextExceeded { .. },
+                ..
+            }))
+        ));
+        assert_eq!(serde_json::to_vec(&session).unwrap(), before);
     }
 
     #[tokio::test]

@@ -2730,6 +2730,39 @@ def test_parse_turn_completed_with_no_usage_at_all_is_a_completed_turn():
     assert event.stop_reason == "end_turn"
 
 
+_WIRE_STOP_REASONS = (
+    "end_turn",
+    "tool_use",
+    "max_tokens",
+    "stop_sequence",
+    "content_filter",
+    "cancelled",
+    "refusal",
+    "pause_turn",
+    "context_window_exceeded",
+)
+
+
+def test_parse_turn_completed_accepts_every_wire_stop_reason():
+    for stop_reason in _WIRE_STOP_REASONS:
+        event = parse_event({"type": "turn_completed", "stop_reason": stop_reason})
+        assert isinstance(event, TurnCompleted), stop_reason
+        assert event.stop_reason == stop_reason
+
+
+def test_parse_session_history_accepts_every_wire_stop_reason():
+    for stop_reason in _WIRE_STOP_REASONS:
+        message = MeerkatClient._parse_session_message(
+            {
+                "role": "block_assistant",
+                "created_at": "2026-10-17T10:00:00Z",
+                "blocks": [{"block_type": "text", "data": {"text": "partial"}}],
+                "stop_reason": stop_reason,
+            }
+        )
+        assert message.role == "block_assistant", stop_reason
+
+
 def test_parse_interaction_complete_structured_output():
     raw = {
         "type": "interaction_complete",

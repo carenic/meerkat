@@ -815,6 +815,9 @@ fn test_stop_reason_mapping() {
         (StopReason::StopSequence, "stop_sequence"),
         (StopReason::ContentFilter, "content_filter"),
         (StopReason::Cancelled, "cancelled"),
+        (StopReason::Refusal, "refusal"),
+        (StopReason::PauseTurn, "pause_turn"),
+        (StopReason::ContextWindowExceeded, "context_window_exceeded"),
     ];
 
     for (reason, expected_str) in reasons {

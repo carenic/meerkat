@@ -6721,6 +6721,9 @@ class MeerkatClient:
                 "stop_sequence",
                 "content_filter",
                 "cancelled",
+                "refusal",
+                "pause_turn",
+                "context_window_exceeded",
             }:
                 raise MeerkatError(
                     "INVALID_RESPONSE",

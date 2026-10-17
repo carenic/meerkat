@@ -35,6 +35,59 @@ them.
 
 ## [Unreleased]
 
+### Breaking
+
+- `meerkat_core::types::StopReason` (re-exported as `meerkat_core::StopReason`)
+  and `meerkat_contracts::WireStopReason` (`meerkat_contracts::wire::WireStopReason`)
+  gain the variants `Refusal`, `PauseTurn` and `ContextWindowExceeded` (wire
+  `refusal`, `pause_turn`, `context_window_exceeded`; see Fixed). Neither enum
+  is `#[non_exhaustive]`, so a `match` over one must handle the three new
+  variants. The generated schemas and the Python, TypeScript and Web SDK types
+  carry them; an older SDK refuses a `turn_completed` event or a history row
+  that names one, so update the SDKs together with the server.
+- Behaviour-only (not measured by the gate): a turn the provider stopped
+  because the model context window filled (Anthropic
+  `model_context_window_exceeded`) no longer commits as an end of turn.
+  Nothing of the turn is committed and its tool calls never run; the run fails
+  as context exceeded (`LlmFailureReason::ContextExceeded`, terminal cause
+  `llm_failure`, where `max` is the model's context window and `requested` the
+  call's reported tokens). The next run compacts at its boundary as before. A
+  compaction summary call that stops this way takes the mechanical capacity
+  fallback, charged with the call's usage, instead of committing a truncated
+  summary.
+- Behaviour-only (not measured by the gate): a refused turn (Anthropic
+  `refusal`) and a content-filtered turn (`content_filter` from any provider)
+  fail the run with `AgentError::ContentFiltered` (`run_failed` class
+  `content_filtered`) instead of committing. Nothing of the turn is committed
+  and none of its tool calls run, including a call the refusal cut mid-input.
+  In a structured-output extraction turn either stop fails the extraction
+  instead of the run.
+- Behaviour-only (not measured by the gate): an Anthropic stop reason the
+  adapter does not know is no longer read as `end_turn`. The response fails
+  with the retryable `LlmError::IncompleteResponse` naming the raw reason: it
+  is retried within the retry policy with nothing committed, then fails the run
+  as `ProviderError(IncompleteResponse)`.
+
+### Fixed
+
+- An Anthropic `pause_turn` stop (a server-tool loop reached its iteration
+  limit) is reported as `pause_turn` instead of `end_turn`. The paused turn
+  commits like an end of turn, even when it holds only server-tool blocks, and
+  the next request replays its `server_tool_use` blocks.
+- A tool call whose streamed input a refusal or a filled context window cut
+  off now ends the Anthropic stream with that stop reason instead of a stream
+  parse error. Under any other stop reason a tool input that does not parse
+  still fails the response as before.
+
+### Known limitations
+
+- A run that stops with `pause_turn` ends there: Meerkat does not yet continue
+  a paused turn automatically (#1881).
+- A context-window stop fails the run; the loop does not compact and retry the
+  turn (#1882).
+- An Anthropic stream that carries no stop reason at all (a proxy may omit it)
+  still ends as `end_turn`: a missing reason is not an unknown one.
+
 ## [0.9.2] - 2026-10-16
 
 ### Breaking

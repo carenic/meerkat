@@ -4430,7 +4430,7 @@ export type RuntimeAcceptOutcomeType = "accepted" | "deduplicated" | "rejected";
 
 export type WireInputLifecycleState = "accepted" | "queued" | "staged" | "applied" | "applied_pending_consumption" | "consumed" | "superseded" | "coalesced" | "abandoned";
 
-export type WireStopReason = "end_turn" | "tool_use" | "max_tokens" | "stop_sequence" | "content_filter" | "cancelled";
+export type WireStopReason = "end_turn" | "tool_use" | "max_tokens" | "stop_sequence" | "content_filter" | "cancelled" | "refusal" | "pause_turn" | "context_window_exceeded";
 
 export type WireToolResultContent = string | WireContentBlock[];
 
@@ -5849,7 +5849,7 @@ export interface RealtimeTranscriptEventAssistantTranscriptFinalText {
 
 export interface RealtimeTranscriptEventAssistantTurnCompleted {
   response_id: string;
-  stop_reason: "end_turn" | "tool_use" | "max_tokens" | "stop_sequence" | "content_filter" | "cancelled";
+  stop_reason: "end_turn" | "tool_use" | "max_tokens" | "stop_sequence" | "content_filter" | "cancelled" | "refusal" | "pause_turn" | "context_window_exceeded";
   type: "assistant_turn_completed";
   usage: Record<string, unknown>;
 }

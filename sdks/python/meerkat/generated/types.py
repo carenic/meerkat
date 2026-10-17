@@ -5669,7 +5669,7 @@ class RealtimeTranscriptEventAssistantTranscriptFinalText(TypedDict, total=False
 
 class RealtimeTranscriptEventAssistantTurnCompleted(TypedDict, total=False):
     response_id: Required[str]
-    stop_reason: Required[Literal['end_turn', 'tool_use', 'max_tokens', 'stop_sequence', 'content_filter', 'cancelled']]
+    stop_reason: Required[Literal['end_turn', 'tool_use', 'max_tokens', 'stop_sequence', 'content_filter', 'cancelled', 'refusal', 'pause_turn', 'context_window_exceeded']]
     type: Required[Literal['assistant_turn_completed']]
     usage: Required[dict[str, Any]]
 
@@ -5954,7 +5954,7 @@ class WireLiveAdapterObservationAssistantTranscriptFinal(TypedDict, total=False)
     previous_item_id: NotRequired[Optional[str]]
     provider_item_id: Required[str]
     response_id: NotRequired[Optional[str]]
-    stop_reason: Required[Literal['end_turn', 'tool_use', 'max_tokens', 'stop_sequence', 'content_filter', 'cancelled']]
+    stop_reason: Required[Literal['end_turn', 'tool_use', 'max_tokens', 'stop_sequence', 'content_filter', 'cancelled', 'refusal', 'pause_turn', 'context_window_exceeded']]
     text: Required[str]
     usage: Required[WireUsage]
 
@@ -5992,7 +5992,7 @@ class WireLiveAdapterObservationTurnInterrupted(TypedDict, total=False):
 class WireLiveAdapterObservationTurnCompleted(TypedDict, total=False):
     observation: Required[Literal['turn_completed']]
     response_id: NotRequired[Optional[str]]
-    stop_reason: Required[Literal['end_turn', 'tool_use', 'max_tokens', 'stop_sequence', 'content_filter', 'cancelled']]
+    stop_reason: Required[Literal['end_turn', 'tool_use', 'max_tokens', 'stop_sequence', 'content_filter', 'cancelled', 'refusal', 'pause_turn', 'context_window_exceeded']]
     usage: Required[dict[str, Any]]
 
 class WireLiveAdapterObservationStatusChanged(TypedDict, total=False):
@@ -7524,7 +7524,7 @@ RuntimeAcceptOutcomeType = Literal['accepted', 'deduplicated', 'rejected']
 WireInputLifecycleState = Literal['accepted', 'queued', 'staged', 'applied', 'applied_pending_consumption', 'consumed', 'superseded', 'coalesced', 'abandoned']
 
 # Canonical stop reason for transcript messages.
-WireStopReason = Literal['end_turn', 'tool_use', 'max_tokens', 'stop_sequence', 'content_filter', 'cancelled']
+WireStopReason = Literal['end_turn', 'tool_use', 'max_tokens', 'stop_sequence', 'content_filter', 'cancelled', 'refusal', 'pause_turn', 'context_window_exceeded']
 
 # Wire-safe tool result content that handles both legacy string and array formats.
 WireToolResultContent = str | list[WireContentBlock]

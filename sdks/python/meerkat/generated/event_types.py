@@ -1408,7 +1408,7 @@ SkillResolutionFailureReason = SkillResolutionFailureReasonNotFound | SkillResol
 
 
 # Why the model stopped generating
-StopReason = Literal['end_turn', 'tool_use', 'max_tokens', 'stop_sequence', 'content_filter', 'cancelled']
+StopReason = Literal['end_turn', 'tool_use', 'max_tokens', 'stop_sequence', 'content_filter', 'cancelled', 'refusal', 'pause_turn', 'context_window_exceeded']
 
 
 class StreamTruncationReasonChannelFull(TypedDict, total=False):

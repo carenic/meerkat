@@ -5683,6 +5683,9 @@ export class MeerkatClient {
           "stop_sequence",
           "content_filter",
           "cancelled",
+          "refusal",
+          "pause_turn",
+          "context_window_exceeded",
         ].includes(stopReason)
       ) {
         throw new MeerkatError(

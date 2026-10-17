@@ -100,6 +100,9 @@ fn syntactically_complete_allow_does_not_hide_truncation_or_cancellation() {
         StopReason::StopSequence,
         StopReason::ContentFilter,
         StopReason::Cancelled,
+        StopReason::Refusal,
+        StopReason::PauseTurn,
+        StopReason::ContextWindowExceeded,
     ] {
         let mut response = ReviewResponse::default();
         response.push_text(r#"{"verdict":"allow"}"#).unwrap();

@@ -1020,6 +1020,33 @@ impl AgentError {
         )
     }
 
+    /// The provider stopped a response because the model's context window
+    /// filled ([`crate::types::StopReason::ContextWindowExceeded`]).
+    ///
+    /// `requested` is the call's reported token count (presented input plus
+    /// output). `max` is the model's declared context window; a model that
+    /// declares none reports the count the provider stopped at, which is
+    /// where its window was reached.
+    pub fn llm_context_window_stop(
+        provider: &'static str,
+        context_window_tokens: Option<u32>,
+        reported_tokens: Option<u64>,
+    ) -> Self {
+        let requested = reported_tokens
+            .map(|tokens| u32::try_from(tokens).unwrap_or(u32::MAX))
+            .or(context_window_tokens)
+            .unwrap_or(0);
+        let max = context_window_tokens.unwrap_or(requested);
+        Self::llm(
+            provider,
+            LlmFailureReason::ContextExceeded { max, requested },
+            format!(
+                "the provider stopped the response because the model context window filled \
+                 ({requested} tokens reported, {max}-token window)"
+            ),
+        )
+    }
+
     pub fn is_graceful(&self) -> bool {
         matches!(
             self.primary_error(),

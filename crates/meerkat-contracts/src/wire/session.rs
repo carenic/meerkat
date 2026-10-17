@@ -1180,6 +1180,9 @@ pub enum WireStopReason {
     StopSequence,
     ContentFilter,
     Cancelled,
+    Refusal,
+    PauseTurn,
+    ContextWindowExceeded,
 }
 
 impl From<StopReason> for WireStopReason {
@@ -1191,6 +1194,9 @@ impl From<StopReason> for WireStopReason {
             StopReason::StopSequence => Self::StopSequence,
             StopReason::ContentFilter => Self::ContentFilter,
             StopReason::Cancelled => Self::Cancelled,
+            StopReason::Refusal => Self::Refusal,
+            StopReason::PauseTurn => Self::PauseTurn,
+            StopReason::ContextWindowExceeded => Self::ContextWindowExceeded,
         }
     }
 }
@@ -1204,6 +1210,9 @@ impl From<WireStopReason> for StopReason {
             WireStopReason::StopSequence => Self::StopSequence,
             WireStopReason::ContentFilter => Self::ContentFilter,
             WireStopReason::Cancelled => Self::Cancelled,
+            WireStopReason::Refusal => Self::Refusal,
+            WireStopReason::PauseTurn => Self::PauseTurn,
+            WireStopReason::ContextWindowExceeded => Self::ContextWindowExceeded,
         }
     }
 }

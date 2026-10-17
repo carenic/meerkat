@@ -1090,7 +1090,7 @@ export type SkillResolutionFailureReason = {
 /**
  * Why the model stopped generating
  */
-export type StopReason = "end_turn" | "tool_use" | "max_tokens" | "stop_sequence" | "content_filter" | "cancelled";
+export type StopReason = "end_turn" | "tool_use" | "max_tokens" | "stop_sequence" | "content_filter" | "cancelled" | "refusal" | "pause_turn" | "context_window_exceeded";
 
 /**
  * Typed reason a best-effort event stream dropped frames.

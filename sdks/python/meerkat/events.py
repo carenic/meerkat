@@ -777,6 +777,9 @@ _STOP_REASONS = frozenset({
     "stop_sequence",
     "content_filter",
     "cancelled",
+    "refusal",
+    "pause_turn",
+    "context_window_exceeded",
 })
 
 _TOOL_CONFIG_OPERATIONS = frozenset({"add", "remove", "reload"})
@@ -1582,6 +1585,9 @@ def _validate_known_event(event_type: str, raw: dict[str, Any]) -> None:
             "stop_sequence",
             "content_filter",
             "cancelled",
+            "refusal",
+            "pause_turn",
+            "context_window_exceeded",
         }:
             raise ValueError("stop_reason must be known")
     if event_type == "budget_warning" and raw.get("budget_type") not in {
