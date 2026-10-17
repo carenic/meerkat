@@ -29742,7 +29742,7 @@ url = "https://user.example/mcp"
             model: "claude-sonnet-4-5".to_string(),
             max_tokens: 4096,
             structured_output_retries: 2,
-            provider: Provider::Anthropic,
+            provider: meerkat_core::Provider::Anthropic,
             self_hosted_server_id: None,
             provider_params: None,
             tooling: meerkat_core::SessionTooling::default(),
