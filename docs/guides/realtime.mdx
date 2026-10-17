@@ -816,13 +816,14 @@ context-mirror/activation host as the default coordinator.
 ### Transcript rows while the member's turn runs
 
 A live channel commits its transcript rows (the user's finalized speech, the
-assistant's spoken segments) one at a time, in arrival order, and each row
-waits for the session's turn boundary: the same boundary a running turn of the
+assistant's spoken segments) one at a time, in their order on that channel, and
+each row waits for the session's turn boundary: the same boundary a running turn of the
 member holds until that turn's own rows commit. While such a turn runs (for
 example voice-delegated work in the existing member, above), later live rows
 wait behind it, so the persisted transcript can lag the conversation by up to
 that turn's length. Once the turn's boundary commits, the waiting rows commit
-in their original order.
+in their original order. These ordering guarantees hold per channel, not
+across channels of the same session.
 
 A channel that closes while the member's turn runs does not wait for the turn.
 The rows still waiting are handed to the close, which commits them once the
@@ -831,14 +832,20 @@ it keeps the boundary past the close settlement's ten-minute hang guard, they
 still commit once it frees it, with no further deadline. Rows handed to a close
 this way are held in memory only, so they are lost if the process exits before
 they commit. If the turn's boundary frees while the close is still settling, a
-later row can commit ahead of a row the close holds, so the transcript order can
-differ from the conversation; no row is lost.
+later row can commit ahead of a row the close holds, and a channel reopened on
+the same session can commit its rows ahead of rows a closed channel still
+replays, so the transcript order can differ from the conversation; no row is
+lost. A close that fails before it commits leaves the rows it found deferred on
+the channel for its retry.
 
 A row the session refuses for any other reason (for example an assistant output
 whose provider turn never reached the runtime) is not recorded. The session's
 transcript then carries a `RuntimeNotice` system notice with category
 `live_transcript_row_unrecorded` whose payload names the channel, the row kind,
-its provider item id and the refusal class; it never carries the row's content.
+its provider item id, its position among the rows the close held and the
+refusal class; it never carries the row's content. The notice is recorded the
+same way as other transcript writes, so a session that refuses every write
+refuses it too, and only a warning remains.
 
 ### Continuous media without fabricated playback completion
 
