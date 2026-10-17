@@ -32,6 +32,7 @@ import {
   lockScope,
   parseCargoLock,
   readRowDurations,
+  readerRows,
 } from "./ci-cargo-lanes.mjs";
 import { readMetadata, workspacePackages } from "./rust-test-selector.mjs";
 import { durationsOf, rowOf } from "./ci-row-durations.mjs";
@@ -1365,6 +1366,26 @@ for (const path of [
     assert.match(text, /nextest run \$\{PACKAGES\} \$\{TARGETS\} --profile ci-pr/, `${job} runs them`);
     assert.doesNotMatch(text, /nextest run \$\{PACKAGES\} --lib --bins/, `${job} names no fixed targets`);
   }
+}
+
+// A reader in library, binary or build-script code of a binary-only
+// package (the class rkat's main unit row hit): its row names only the
+// target kinds the package has.
+{
+  const byName = new Map([["binonly", { name: "binonly", targets: [{ name: "binonly", kind: ["bin"] }, { name: "it", kind: ["test"] }] }]]);
+  const rowsFor = (deferToPush) =>
+    readerRows({
+      selections: [{ package: "binonly", target: "bin:binonly", scope: "package", tests: null, features: [], paths: ["docs/x.mdx"], reads: ["docs/"] }],
+      result: { main_unit_shards: [], unit_packages: [], unit_shards: [], integration_suites: [] },
+      byName,
+      heavyChain: new Set(),
+      deferToPush,
+      deferred: { reader_rows: [] },
+      compiledInDocs: new Set(),
+      unified: new Map([["binonly", new Set()]]),
+    }).map((row) => `${row.package_flags} | ${row.test_flags}`);
+  assert.deepEqual(rowsFor(false), ["-p binonly | --bins"], "a push with no main unit lane runs its bins, not --lib");
+  assert.deepEqual(rowsFor(true), ["-p binonly | --tests"], "a pull request runs every test target");
 }
 
 // The two-wave lanes in ci.yml: each lane's rest wave is a copy of its job

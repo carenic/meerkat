@@ -1261,7 +1261,7 @@ export const LIVE_ONLY_FEATURES = ["integration-real-tests", "openai-live-e2e"];
 // (scripts/ci-non-rust-readers.mjs) the targets no other lane of the plan
 // runs, as one integration-lane row. A pull request leaves the readers that
 // compile meerkat-mob to the push (named in `deferred.reader_rows`).
-function readerRows({ selections, result, byName, heavyChain, deferToPush, deferred, compiledInDocs, unified }) {
+export function readerRows({ selections, result, byName, heavyChain, deferToPush, deferred, compiledInDocs, unified }) {
   const mainUnit = result.main_unit_shards.length > 0;
   // The unit lane of this plan runs the package's lib and bins (default
   // features): a pull request's unit lane, a push's main unit lane (every
@@ -1321,7 +1321,9 @@ function readerRows({ selections, result, byName, heavyChain, deferToPush, defer
       // which skips a target whose required features are off (a
       // `--test '*'` glob refuses it) and also runs the lib and bins.
       const testsRun = suiteRuns(selection.package, null, selection.features) || (!deferToPush && closureBuilds(selection));
-      targets = testsRun ? (unitCovered ? [] : ["--lib", "--bins"]) : ["--tests"];
+      // Only the kinds the package has: Cargo refuses --lib for a package
+      // without a library.
+      targets = testsRun ? (unitCovered ? [] : targetFlags([pkg], { tests: false })) : ["--tests"];
     } else if (kind === "lib") {
       targets = unitCovered ? [] : ["--lib"];
     } else if (kind === "bin") {
