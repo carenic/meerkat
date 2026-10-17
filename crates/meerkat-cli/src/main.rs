@@ -4248,6 +4248,16 @@ fn main() -> anyhow::Result<ExitCode> {
     // future runs on a budgeted thread too, not the platform main thread
     // (1 MiB on Windows).
     match meerkat_runtime::host_stack::run_host("rkat", cli_main) {
+        // A refused thread or process spawn: the report a returned error
+        // gets (`Error: {:?}`, status 1), then what usually causes it.
+        Ok(Err(err)) => match meerkat_runtime::host_stack::thread_limit_hint(err.chain()) {
+            Some(hint) => {
+                eprintln!("Error: {err:?}");
+                eprintln!("rkat: {hint}");
+                Ok(ExitCode::FAILURE)
+            }
+            None => Err(err),
+        },
         Ok(result) => result,
         Err(err) => {
             eprintln!("rkat: {err}");

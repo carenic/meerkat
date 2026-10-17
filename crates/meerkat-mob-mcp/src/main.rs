@@ -109,9 +109,22 @@ mod app {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    app::run().await
+fn main() -> std::process::ExitCode {
+    // One documented worker-stack budget and worker-count knob for every host
+    // binary (`meerkat_runtime::host_stack`); the main future runs on a
+    // budgeted thread too, not the platform main thread.
+    match meerkat_runtime::host_stack::run_host("rkat-mob-mcp", || async {
+        match app::run().await {
+            Ok(()) => std::process::ExitCode::SUCCESS,
+            Err(err) => meerkat::surface::report_fatal_error("rkat-mob-mcp", err.as_ref()),
+        }
+    }) {
+        Ok(code) => code,
+        Err(err) => {
+            eprintln!("rkat-mob-mcp: {err}");
+            std::process::ExitCode::from(2)
+        }
+    }
 }
 
 #[cfg(target_arch = "wasm32")]

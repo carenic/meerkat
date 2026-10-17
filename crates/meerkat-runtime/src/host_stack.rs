@@ -1,9 +1,11 @@
-//! One worker-stack budget for every shipping Meerkat host process.
+//! One worker-stack budget and worker count for every shipping Meerkat host
+//! process.
 //!
-//! `rkat`, `rkat-rpc`, `rkat-rest` and `rkat-mcp` all run the same runtime
-//! machinery, so they run it on the same stack budget, from one constant, and
-//! the main future runs on a budgeted thread as well rather than on the
-//! platform main thread (8 MiB on Linux and macOS, 1 MiB on Windows).
+//! `rkat`, `rkat-rpc`, `rkat-rest`, `rkat-mcp` and `rkat-mob-mcp` all run the
+//! same runtime machinery, so they run it on the same stack budget, from one
+//! constant, and the main future runs on a budgeted thread as well rather
+//! than on the platform main thread (8 MiB on Linux and macOS, 1 MiB on
+//! Windows).
 //!
 //! Why 8 MiB. Measured on the meerkat-rpc router harness (session/create,
 //! turn/start, session/archive through the real `MethodRouter`) on x86_64
@@ -25,8 +27,20 @@
 //! diagnosis: sweeping it tells a bounded large frame from unbounded recursion.
 //! A value that is not a byte count of at least [`HOST_WORKER_STACK_FLOOR`] is
 //! refused rather than guessed at.
+//!
+//! Worker count. The runtime starts one worker per available CPU
+//! (`std::thread::available_parallelism`: cpusets and cgroup CPU quotas
+//! shrink it, a pids limit does not). `RKAT_WORKER_THREADS` sets the count,
+//! and Tokio's own `TOKIO_WORKER_THREADS` is read after it through the same
+//! validation, so a bad value is refused here instead of panicking in Tokio.
+//! A host whose CPU count exceeds its thread limit (a container pids limit,
+//! `RLIMIT_NPROC`) cannot start every worker. Tokio queues the workers it
+//! could not spawn without reporting them, so the first refusal anyone sees
+//! is the `{name}-main` thread; [`HostStackError::ThreadLimit`] reports it
+//! with the worker count, the limits Linux exposes, and the knob.
 
 use std::future::Future;
+use std::num::NonZeroUsize;
 
 /// Worker and main-future stack budget for every Meerkat host binary.
 pub const HOST_WORKER_STACK_BUDGET: usize = 8 * 1024 * 1024;
@@ -37,8 +51,15 @@ pub const HOST_WORKER_STACK_ENV: &str = "RKAT_WORKER_STACK_BYTES";
 /// Smallest override accepted; anything below cannot run a Tokio worker.
 pub const HOST_WORKER_STACK_FLOOR: usize = 64 * 1024;
 
+/// Environment variable that sets the Tokio worker count of a host runtime.
+pub const HOST_WORKER_THREADS_ENV: &str = "RKAT_WORKER_THREADS";
+
+/// Tokio's own worker-count variable, read after [`HOST_WORKER_THREADS_ENV`].
+const TOKIO_WORKER_THREADS_ENV: &str = "TOKIO_WORKER_THREADS";
+
 /// A host failed before its main future could run.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum HostStackError {
     /// The override variable holds something other than a byte count of at
     /// least [`HOST_WORKER_STACK_FLOOR`].
@@ -66,6 +87,46 @@ pub enum HostStackError {
         #[source]
         source: std::io::Error,
     },
+    /// A worker-count variable holds something other than a whole number of
+    /// at least 1.
+    #[error(
+        "{name}={raw:?} is not a worker thread count >= 1; refusing to guess. \
+         Unset it to start one worker per available CPU."
+    )]
+    InvalidWorkerThreads { name: String, raw: String },
+    /// The OS refused the main thread with EAGAIN after the runtime launched
+    /// its workers: the process is, almost always, at its thread limit.
+    #[error(
+        "failed to spawn the {name} main thread: {source}. The OS refuses new \
+         threads, usually because the process is at its thread limit; the \
+         runtime asks for {workers} worker threads ({workers_from}). {} Set {} \
+         to fewer workers, or raise the limit.",
+        limit_sentence(.observed_limit.as_deref()),
+        HOST_WORKER_THREADS_ENV
+    )]
+    ThreadLimit {
+        name: String,
+        /// Workers the runtime was built with (not all of them may run).
+        workers: usize,
+        /// Where the count came from: one per available CPU, or the variable
+        /// that set it.
+        workers_from: String,
+        /// The limits Linux exposes (cgroup `pids.max`, `RLIMIT_NPROC`), when
+        /// readable and finite.
+        observed_limit: Option<String>,
+        #[source]
+        source: std::io::Error,
+    },
+}
+
+/// The limit sentence of [`HostStackError::ThreadLimit`]'s message.
+fn limit_sentence(observed: Option<&str>) -> String {
+    match observed {
+        Some(limits) => format!("Observed limits: {limits}."),
+        None => {
+            "The likely limit is a container pids limit or RLIMIT_NPROC (`ulimit -u`).".to_string()
+        }
+    }
 }
 
 /// The resolved stack budget for one host process.
@@ -73,6 +134,14 @@ pub enum HostStackError {
 pub struct HostStackBudget {
     bytes: usize,
     overridden_by: Option<String>,
+    worker_threads: Option<WorkerThreads>,
+}
+
+/// A worker count and the variable that set it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WorkerThreads {
+    count: NonZeroUsize,
+    set_by: &'static str,
 }
 
 impl HostStackBudget {
@@ -82,15 +151,18 @@ impl HostStackBudget {
         Self {
             bytes: HOST_WORKER_STACK_BUDGET,
             overridden_by: None,
+            worker_threads: None,
         }
     }
 
     /// Resolve from the process environment. `names` are consulted in order
     /// and the first one that is set decides; hosts that once had their own
     /// variable pass it after [`HOST_WORKER_STACK_ENV`] so old invocations
-    /// keep working.
+    /// keep working. The worker count comes from [`HOST_WORKER_THREADS_ENV`],
+    /// then `TOKIO_WORKER_THREADS`. A value that is not valid UTF-8 is
+    /// refused like any other value that is not a number.
     pub fn from_env(names: &[&str]) -> Result<Self, HostStackError> {
-        Self::from_lookup(names, |name| std::env::var(name).ok())
+        Self::from_lookup(names, env_lookup)
     }
 
     /// [`Self::from_env`] with an injected environment, for tests.
@@ -98,24 +170,28 @@ impl HostStackBudget {
         names: &[&str],
         lookup: impl Fn(&str) -> Option<String>,
     ) -> Result<Self, HostStackError> {
-        for name in names {
-            let Some(raw) = lookup(name) else {
-                continue;
-            };
-            return match raw.trim().parse::<usize>() {
-                Ok(bytes) if bytes >= HOST_WORKER_STACK_FLOOR => Ok(Self {
-                    bytes,
-                    overridden_by: Some((*name).to_string()),
-                }),
-                _ => Err(HostStackError::InvalidOverride {
-                    name: (*name).to_string(),
-                    raw,
-                    floor: HOST_WORKER_STACK_FLOOR,
-                    default: HOST_WORKER_STACK_BUDGET,
-                }),
-            };
+        let mut budget = Self::default_budget();
+        if let Some((name, raw)) = names
+            .iter()
+            .find_map(|name| lookup(name).map(|raw| (*name, raw)))
+        {
+            match raw.trim().parse::<usize>() {
+                Ok(bytes) if bytes >= HOST_WORKER_STACK_FLOOR => {
+                    budget.bytes = bytes;
+                    budget.overridden_by = Some(name.to_string());
+                }
+                _ => {
+                    return Err(HostStackError::InvalidOverride {
+                        name: name.to_string(),
+                        raw,
+                        floor: HOST_WORKER_STACK_FLOOR,
+                        default: HOST_WORKER_STACK_BUDGET,
+                    });
+                }
+            }
         }
-        Ok(Self::default_budget())
+        budget.worker_threads = resolve_worker_threads(&lookup)?;
+        Ok(budget)
     }
 
     /// Stack bytes per worker thread and for the main future's thread.
@@ -130,17 +206,31 @@ impl HostStackBudget {
         self.overridden_by.as_deref()
     }
 
+    /// The worker count [`HOST_WORKER_THREADS_ENV`] or `TOKIO_WORKER_THREADS`
+    /// set; `None` starts one worker per available CPU.
+    #[must_use]
+    pub fn worker_threads(&self) -> Option<NonZeroUsize> {
+        self.worker_threads.map(|workers| workers.count)
+    }
+
+    /// The variable that set the worker count, if any.
+    #[must_use]
+    pub fn worker_threads_set_by(&self) -> Option<&'static str> {
+        self.worker_threads.map(|workers| workers.set_by)
+    }
+
     /// Build a multi-thread Tokio runtime whose workers and blocking threads
-    /// all get this budget.
+    /// all get this budget, with the configured worker count.
     pub fn build_runtime(&self, name: &str) -> Result<tokio::runtime::Runtime, HostStackError> {
-        tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .thread_stack_size(self.bytes)
-            .build()
-            .map_err(|source| HostStackError::Runtime {
-                name: name.to_string(),
-                source,
-            })
+        let mut builder = tokio::runtime::Builder::new_multi_thread();
+        builder.enable_all().thread_stack_size(self.bytes);
+        if let Some(workers) = self.worker_threads {
+            builder.worker_threads(workers.count.get());
+        }
+        builder.build().map_err(|source| HostStackError::Runtime {
+            name: name.to_string(),
+            source,
+        })
     }
 
     /// Run a host's main future to completion on this budget.
@@ -157,6 +247,26 @@ impl HostStackBudget {
         Fut: Future<Output = T>,
         T: Send + 'static,
     {
+        self.run_with_spawn(name, make, |builder, main| builder.spawn(main))
+    }
+
+    /// [`Self::run`] with the `{name}-main` thread spawn injected, so tests
+    /// can make the OS refuse it.
+    fn run_with_spawn<T, F, Fut, S>(
+        &self,
+        name: &str,
+        make: F,
+        spawn: S,
+    ) -> Result<T, HostStackError>
+    where
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: Future<Output = T>,
+        T: Send + 'static,
+        S: FnOnce(
+            std::thread::Builder,
+            Box<dyn FnOnce() -> T + Send>,
+        ) -> std::io::Result<std::thread::JoinHandle<T>>,
+    {
         if let Some(variable) = self.overridden_by() {
             eprintln!(
                 "{name}: worker stack overridden to {} bytes by {variable}",
@@ -164,27 +274,184 @@ impl HostStackBudget {
             );
         }
         let runtime = self.build_runtime(name)?;
-        let handle = std::thread::Builder::new()
+        let workers = runtime.metrics().num_workers();
+        let builder = std::thread::Builder::new()
             .name(format!("{name}-main"))
-            .stack_size(self.bytes)
-            .spawn(move || {
+            .stack_size(self.bytes);
+        let handle = spawn(
+            builder,
+            Box::new(move || {
                 let output = runtime.block_on(make());
                 drop(runtime);
                 output
-            })
-            .map_err(|source| HostStackError::Thread {
-                name: name.to_string(),
-                source,
-            })?;
+            }),
+        )
+        .map_err(|source| self.main_thread_spawn_error(name, workers, source))?;
         match handle.join() {
             Ok(output) => Ok(output),
             Err(panic) => std::panic::resume_unwind(panic),
         }
     }
+
+    /// A refused `{name}-main` thread. EAGAIN (`WouldBlock`) after the
+    /// workers launched means a thread limit, so it is reported with what the
+    /// runtime asked for and the limits Linux exposes.
+    fn main_thread_spawn_error(
+        &self,
+        name: &str,
+        workers: usize,
+        source: std::io::Error,
+    ) -> HostStackError {
+        if source.kind() != std::io::ErrorKind::WouldBlock {
+            return HostStackError::Thread {
+                name: name.to_string(),
+                source,
+            };
+        }
+        HostStackError::ThreadLimit {
+            name: name.to_string(),
+            workers,
+            workers_from: match self.worker_threads {
+                Some(workers) => format!("set by {}", workers.set_by),
+                None => "one per available CPU".to_string(),
+            },
+            observed_limit: observed_thread_limits(),
+            source,
+        }
+    }
+}
+
+/// The process environment as [`HostStackBudget::from_lookup`] reads it: a
+/// value that is not valid UTF-8 is passed on (lossily) to be refused, not
+/// treated as unset.
+fn env_lookup(name: &str) -> Option<String> {
+    std::env::var_os(name).map(|value| value.to_string_lossy().into_owned())
+}
+
+/// [`HOST_WORKER_THREADS_ENV`], then `TOKIO_WORKER_THREADS`: the first one
+/// set decides, and it must be a whole number of at least 1.
+fn resolve_worker_threads(
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Result<Option<WorkerThreads>, HostStackError> {
+    let Some((set_by, raw)) = [HOST_WORKER_THREADS_ENV, TOKIO_WORKER_THREADS_ENV]
+        .into_iter()
+        .find_map(|name| lookup(name).map(|raw| (name, raw)))
+    else {
+        return Ok(None);
+    };
+    match raw.trim().parse::<NonZeroUsize>() {
+        Ok(count) => Ok(Some(WorkerThreads { count, set_by })),
+        Err(_) => Err(HostStackError::InvalidWorkerThreads {
+            name: set_by.to_string(),
+            raw,
+        }),
+    }
+}
+
+/// The worker count for a host that builds its own Tokio runtime:
+/// [`HOST_WORKER_THREADS_ENV`], then `TOKIO_WORKER_THREADS`, validated as
+/// [`HostStackBudget::from_env`] does. `None` keeps Tokio's default of one
+/// worker per available CPU; apply `Some` with `Builder::worker_threads`.
+pub fn worker_threads_from_env() -> Result<Option<NonZeroUsize>, HostStackError> {
+    Ok(resolve_worker_threads(env_lookup)?.map(|workers| workers.count))
+}
+
+/// The hint a host adds to a fatal error caused by a refused thread or
+/// process spawn: an [`std::io::Error`] of kind `WouldBlock` (EAGAIN)
+/// anywhere in `chain`, the error followed by its sources. `None` for any
+/// other error.
+pub fn thread_limit_hint<'e>(
+    mut chain: impl Iterator<Item = &'e (dyn std::error::Error + 'static)>,
+) -> Option<&'static str> {
+    chain
+        .any(|link| {
+            link.downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::WouldBlock)
+        })
+        .then_some(
+            "hint: the OS refused a new thread or process (EAGAIN), usually because \
+             the process is at its thread limit (a container pids limit or \
+             RLIMIT_NPROC). The runtime starts one worker thread per available CPU \
+             unless RKAT_WORKER_THREADS sets fewer; lower it, or raise the limit.",
+        )
+}
+
+/// The limits a refused thread spawn usually hits, as Linux exposes them:
+/// the tightest cgroup `pids.max` on the process's cgroup path and the
+/// `RLIMIT_NPROC` soft limit. Best effort: `None` when neither is readable
+/// and finite. No usage figure: by the time the refusal is reported the
+/// runtime that held the threads has shut down.
+#[cfg(target_os = "linux")]
+fn observed_thread_limits() -> Option<String> {
+    observed_thread_limits_from(|path| std::fs::read_to_string(path).ok())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn observed_thread_limits() -> Option<String> {
+    None
+}
+
+/// [`observed_thread_limits`] over an injected file reader, for tests.
+#[cfg(any(target_os = "linux", test))]
+fn observed_thread_limits_from(read: impl Fn(&str) -> Option<String>) -> Option<String> {
+    let cgroup = cgroup_pids_limit(&read).map(|max| format!("cgroup pids.max {max}"));
+    let nproc = rlimit_nproc(&read).map(|soft| format!("RLIMIT_NPROC {soft}"));
+    match (cgroup, nproc) {
+        (Some(cgroup), Some(nproc)) => Some(format!("{cgroup}, {nproc}")),
+        (cgroup, nproc) => cgroup.or(nproc),
+    }
+}
+
+/// The tightest finite `pids.max` from the process's cgroup up to the root:
+/// cgroup v2 (`0::<path>`) or the v1 `pids` hierarchy.
+#[cfg(any(target_os = "linux", test))]
+fn cgroup_pids_limit(read: &impl Fn(&str) -> Option<String>) -> Option<u64> {
+    let cgroups = read("/proc/self/cgroup")?;
+    let (root, path) = cgroups.lines().find_map(|line| {
+        let mut fields = line.splitn(3, ':');
+        let (_, controllers, path) = (fields.next()?, fields.next()?, fields.next()?);
+        if controllers.is_empty() {
+            Some(("/sys/fs/cgroup".to_string(), path))
+        } else if controllers
+            .split(',')
+            .any(|controller| controller == "pids")
+        {
+            Some((format!("/sys/fs/cgroup/{controllers}"), path))
+        } else {
+            None
+        }
+    })?;
+    let mut tightest: Option<u64> = None;
+    let mut dir = path.trim_end_matches('/');
+    loop {
+        if let Some(max) =
+            read(&format!("{root}{dir}/pids.max")).and_then(|value| value.trim().parse().ok())
+        {
+            tightest = Some(tightest.map_or(max, |seen: u64| seen.min(max)));
+        }
+        if dir.is_empty() {
+            return tightest;
+        }
+        dir = dir.rfind('/').map_or("", |cut| &dir[..cut]);
+    }
+}
+
+/// The `RLIMIT_NPROC` soft limit from `/proc/self/limits`, when finite.
+#[cfg(any(target_os = "linux", test))]
+fn rlimit_nproc(read: &impl Fn(&str) -> Option<String>) -> Option<u64> {
+    let limits = read("/proc/self/limits")?;
+    let line = limits
+        .lines()
+        .find(|line| line.starts_with("Max processes"))?;
+    line.trim_start_matches("Max processes")
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()
 }
 
 /// Run a host's main future on the documented budget, honouring
-/// [`HOST_WORKER_STACK_ENV`].
+/// [`HOST_WORKER_STACK_ENV`] and [`HOST_WORKER_THREADS_ENV`].
 pub fn run_host<T, F, Fut>(name: &str, make: F) -> Result<T, HostStackError>
 where
     F: FnOnce() -> Fut + Send + 'static,
@@ -291,5 +558,273 @@ mod tests {
             })
         });
         assert!(outcome.is_err(), "the panic must reach the caller");
+    }
+
+    #[test]
+    fn worker_threads_come_from_the_knob_then_tokio_and_are_named() {
+        let budget = HostStackBudget::from_lookup(&[HOST_WORKER_STACK_ENV], env(&[])).unwrap();
+        assert_eq!(budget.worker_threads(), None);
+        assert_eq!(budget.worker_threads_set_by(), None);
+
+        let cases: [(&[(&str, &str)], usize, &str); 3] = [
+            (
+                &[(HOST_WORKER_THREADS_ENV, " 3 ")],
+                3,
+                HOST_WORKER_THREADS_ENV,
+            ),
+            (&[("TOKIO_WORKER_THREADS", "5")], 5, "TOKIO_WORKER_THREADS"),
+            (
+                &[
+                    (HOST_WORKER_THREADS_ENV, "2"),
+                    ("TOKIO_WORKER_THREADS", "0"),
+                ],
+                2,
+                HOST_WORKER_THREADS_ENV,
+            ),
+        ];
+        for (pairs, count, set_by) in cases {
+            let budget = HostStackBudget::from_lookup(&[HOST_WORKER_STACK_ENV], env(pairs))
+                .unwrap_or_else(|error| panic!("{pairs:?} must resolve: {error}"));
+            assert_eq!(
+                budget.worker_threads(),
+                NonZeroUsize::new(count),
+                "{pairs:?}"
+            );
+            assert_eq!(budget.worker_threads_set_by(), Some(set_by), "{pairs:?}");
+            assert_eq!(budget.bytes(), HOST_WORKER_STACK_BUDGET, "{pairs:?}");
+        }
+    }
+
+    #[test]
+    fn worker_thread_counts_that_are_not_whole_numbers_above_zero_are_refused() {
+        for name in [HOST_WORKER_THREADS_ENV, "TOKIO_WORKER_THREADS"] {
+            for raw in ["0", "-1", "two", "", "1.5"] {
+                let error =
+                    HostStackBudget::from_lookup(&[HOST_WORKER_STACK_ENV], env(&[(name, raw)]))
+                        .unwrap_err();
+                let message = error.to_string();
+                match error {
+                    HostStackError::InvalidWorkerThreads {
+                        name: seen,
+                        raw: value,
+                    } => {
+                        assert_eq!(seen, name);
+                        assert_eq!(value, raw);
+                    }
+                    other => panic!("expected InvalidWorkerThreads, got {other:?}"),
+                }
+                assert!(
+                    message.starts_with(&format!("{name}={raw:?} is not a worker thread count")),
+                    "{message}"
+                );
+            }
+        }
+    }
+
+    /// A worker count the host would not pick on its own, so a runtime that
+    /// ignores the knob is caught.
+    fn worker_count_unlike_the_default() -> usize {
+        let default = std::thread::available_parallelism().map_or(1, NonZeroUsize::get);
+        if default == 3 { 2 } else { 3 }
+    }
+
+    #[test]
+    fn build_runtime_starts_the_configured_worker_count() {
+        let wanted = worker_count_unlike_the_default();
+        let budget = HostStackBudget::from_lookup(
+            &[HOST_WORKER_STACK_ENV],
+            env(&[(HOST_WORKER_THREADS_ENV, &wanted.to_string())]),
+        )
+        .unwrap();
+        let runtime = budget.build_runtime("rkat-test").unwrap();
+        assert_eq!(runtime.metrics().num_workers(), wanted);
+
+        // Unset, the runtime keeps Tokio's default: one worker per CPU.
+        if std::env::var_os("TOKIO_WORKER_THREADS").is_none() {
+            let runtime = HostStackBudget::default_budget()
+                .build_runtime("rkat-test")
+                .unwrap();
+            assert_eq!(
+                runtime.metrics().num_workers(),
+                std::thread::available_parallelism().map_or(1, NonZeroUsize::get)
+            );
+        }
+    }
+
+    fn refuse_main_thread(
+        error: std::io::Error,
+    ) -> impl FnOnce(
+        std::thread::Builder,
+        Box<dyn FnOnce() + Send>,
+    ) -> std::io::Result<std::thread::JoinHandle<()>> {
+        move |_, _| Err(error)
+    }
+
+    #[test]
+    fn a_main_thread_refused_with_eagain_reports_the_thread_limit_and_the_knob() {
+        let wanted = worker_count_unlike_the_default();
+        let budget = HostStackBudget::from_lookup(
+            &[HOST_WORKER_STACK_ENV],
+            env(&[(HOST_WORKER_THREADS_ENV, &wanted.to_string())]),
+        )
+        .unwrap();
+        let error = budget
+            .run_with_spawn(
+                "rkat-test",
+                || async {},
+                refuse_main_thread(std::io::Error::from(std::io::ErrorKind::WouldBlock)),
+            )
+            .unwrap_err();
+        let message = error.to_string();
+        match error {
+            HostStackError::ThreadLimit {
+                name,
+                workers,
+                workers_from,
+                ..
+            } => {
+                assert_eq!(name, "rkat-test");
+                assert_eq!(workers, wanted);
+                assert_eq!(workers_from, "set by RKAT_WORKER_THREADS");
+            }
+            other => panic!("expected ThreadLimit, got {other:?}"),
+        }
+        assert!(
+            message.starts_with("failed to spawn the rkat-test main thread: "),
+            "{message}"
+        );
+        assert!(
+            message.contains(&format!(
+                "the runtime asks for {wanted} worker threads (set by RKAT_WORKER_THREADS)"
+            )),
+            "{message}"
+        );
+        assert!(
+            message.contains("Set RKAT_WORKER_THREADS to fewer workers, or raise the limit."),
+            "{message}"
+        );
+
+        // Without the knob the count is the runtime's own default, and the
+        // OS's own EAGAIN is the same refusal.
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            let eagain = std::io::Error::from_raw_os_error(nix::errno::Errno::EAGAIN as i32);
+            let error = HostStackBudget::default_budget()
+                .run_with_spawn("rkat-test", || async {}, refuse_main_thread(eagain))
+                .unwrap_err();
+            match error {
+                HostStackError::ThreadLimit { workers_from, .. } => {
+                    assert_eq!(workers_from, "one per available CPU");
+                }
+                other => panic!("expected ThreadLimit, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_main_thread_refused_for_another_reason_stays_a_spawn_error() {
+        let error = HostStackBudget::default_budget()
+            .run_with_spawn(
+                "rkat-test",
+                || async {},
+                refuse_main_thread(std::io::Error::other("no")),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(error, HostStackError::Thread { ref name, .. } if name == "rkat-test"),
+            "{error:?}"
+        );
+        assert_eq!(
+            error.to_string(),
+            "failed to spawn the rkat-test main thread: no"
+        );
+    }
+
+    fn files<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        env(pairs)
+    }
+
+    const LIMITS: &str = "Limit                     Soft Limit           Hard Limit           Units     \n\
+                          Max processes             4096                 8192                 processes \n";
+
+    #[test]
+    fn observed_limits_name_the_tightest_cgroup_pids_max_and_rlimit_nproc() {
+        let scope = "/sys/fs/cgroup/user.slice/app.slice/run-1.scope";
+        let observed = observed_thread_limits_from(files(&[
+            (
+                "/proc/self/cgroup",
+                "0::/user.slice/app.slice/run-1.scope\n",
+            ),
+            (&format!("{scope}/pids.max"), "128\n"),
+            ("/sys/fs/cgroup/user.slice/app.slice/pids.max", "4096\n"),
+            ("/sys/fs/cgroup/user.slice/pids.max", "max\n"),
+            ("/proc/self/limits", LIMITS),
+        ]));
+        assert_eq!(
+            observed.as_deref(),
+            Some("cgroup pids.max 128, RLIMIT_NPROC 4096")
+        );
+
+        // An ancestor's tighter limit is the one that applies.
+        let observed = observed_thread_limits_from(files(&[
+            ("/proc/self/cgroup", "0::/kubepods/pod-1/ctr\n"),
+            ("/sys/fs/cgroup/kubepods/pod-1/ctr/pids.max", "max\n"),
+            ("/sys/fs/cgroup/kubepods/pod-1/pids.max", "64\n"),
+        ]));
+        assert_eq!(observed.as_deref(), Some("cgroup pids.max 64"));
+
+        // cgroup v1 keeps pids in its own hierarchy.
+        let observed = observed_thread_limits_from(files(&[
+            (
+                "/proc/self/cgroup",
+                "12:pids:/docker/abc\n1:name=systemd:/docker/abc\n0::/\n",
+            ),
+            ("/sys/fs/cgroup/pids/docker/abc/pids.max", "100\n"),
+        ]));
+        assert_eq!(observed.as_deref(), Some("cgroup pids.max 100"));
+    }
+
+    #[test]
+    fn observed_limits_are_none_when_nothing_is_finite_or_readable() {
+        assert_eq!(observed_thread_limits_from(files(&[])), None);
+        let unlimited =
+            "Max processes             unlimited            unlimited            processes \n";
+        assert_eq!(
+            observed_thread_limits_from(files(&[
+                ("/proc/self/cgroup", "0::/\n"),
+                ("/sys/fs/cgroup/pids.max", "max\n"),
+                ("/proc/self/limits", unlimited),
+            ])),
+            None
+        );
+        assert_eq!(
+            observed_thread_limits_from(files(&[("/proc/self/limits", LIMITS)])).as_deref(),
+            Some("RLIMIT_NPROC 4096")
+        );
+    }
+
+    #[derive(Debug, thiserror::Error)]
+    #[error("I/O error: {0}")]
+    struct Wrapped(#[source] std::io::Error);
+
+    fn hint_for(error: &(dyn std::error::Error + 'static)) -> Option<&'static str> {
+        thread_limit_hint(std::iter::successors(Some(error), |&link| link.source()))
+    }
+
+    #[test]
+    fn the_thread_limit_hint_needs_a_would_block_io_error_in_the_chain() {
+        let wrapped = Wrapped(std::io::Error::from(std::io::ErrorKind::WouldBlock));
+        let hint = hint_for(&wrapped).unwrap();
+        assert!(
+            hint.starts_with("hint: the OS refused a new thread"),
+            "{hint}"
+        );
+        assert!(hint.contains(HOST_WORKER_THREADS_ENV), "{hint}");
+
+        let bare = std::io::Error::from(std::io::ErrorKind::WouldBlock);
+        assert_eq!(hint_for(&bare), Some(hint));
+
+        assert_eq!(hint_for(&Wrapped(std::io::Error::other("disk full"))), None);
+        assert_eq!(hint_for(&std::fmt::Error), None);
     }
 }
