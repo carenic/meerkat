@@ -394,7 +394,8 @@ fn combine_prepared_session_unregister_result(
 /// A rollback that keeps the turn-finalization boundary must run before any
 /// actor is published (see `rollback_prepared_session_after_failure`). Debug
 /// builds fail here, instead of risking a deadlock, if a change publishes
-/// the actor earlier.
+/// the actor earlier; [`published_actor_rollback_refusal`] is the release
+/// build's check.
 fn debug_assert_no_published_actor(
     actor_witness_slot: &meerkat_session::LiveSessionActorWitnessSlot,
 ) {
@@ -402,6 +403,29 @@ fn debug_assert_no_published_actor(
         actor_witness_slot.witness().is_none(),
         "a rollback that keeps the turn-finalization boundary ran after actor publication"
     );
+}
+
+/// The release-build check before a rollback that keeps the
+/// turn-finalization boundary: one read of the witness slot. With an actor
+/// published, that rollback could wait forever on a concurrent raw
+/// unregister (#1814), so the caller skips it and returns this typed error
+/// instead. The error fail-stops the serving actor, and the prepared
+/// registration is left to its drop-time abort, which never holds B.
+pub(super) fn published_actor_rollback_refusal(
+    session_id: &SessionId,
+    actor_witness_slot: &meerkat_session::LiveSessionActorWitnessSlot,
+    original: impl std::fmt::Display,
+) -> Option<MaterializeServeError> {
+    if actor_witness_slot.witness().is_none() {
+        return None;
+    }
+    Some(MaterializeServeError::UnrecordedSessionCleanup {
+        session_id: session_id.to_string(),
+        original: original.to_string(),
+        cleanup: "rollback refused: an actor was published before a rollback that keeps the \
+                  turn-finalization boundary"
+            .to_string(),
+    })
 }
 
 /// Validate every deterministic conversion in a portable member spec without
@@ -1711,6 +1735,11 @@ impl HostMemberMaterializer {
     ) -> MaterializeServeError {
         debug_assert_no_published_actor(actor_witness_slot);
         let session_id = prepared.session_id().clone();
+        if let Some(refusal) =
+            published_actor_rollback_refusal(&session_id, actor_witness_slot, &original)
+        {
+            return refusal;
+        }
         let rollback_result = prepared
             .rollback_now_under_turn_finalization_boundary()
             .await;
@@ -1895,6 +1924,14 @@ impl HostMemberMaterializer {
             // Pre-actor: keeping B is safe (see
             // `rollback_prepared_session_after_failure`).
             debug_assert_no_published_actor(&actor_witness_slot);
+            let refusal = published_actor_rollback_refusal(
+                &session_id,
+                &actor_witness_slot,
+                format_args!("failed to install prepared session handles: {error}"),
+            );
+            if let Some(refusal) = refusal {
+                return Err(refusal);
+            }
             let rollback_error = prepared
                 .rollback_now_under_turn_finalization_boundary()
                 .await
@@ -2475,6 +2512,17 @@ impl HostMemberMaterializer {
             // Pre-actor: keeping B is safe (see
             // `rollback_prepared_session_after_failure`).
             debug_assert_no_published_actor(&actor_witness_slot);
+            let refusal = published_actor_rollback_refusal(
+                &session_id,
+                &actor_witness_slot,
+                format_args!("failed to install prepared session handles: {error}"),
+            );
+            if let Some(refusal) = refusal {
+                drop(materialization_boundary.take());
+                return Err(self
+                    .preserve_snapshot_after_revival_failure(&session_id, refusal)
+                    .await);
+            }
             let rollback_error = prepared
                 .rollback_now_under_turn_finalization_boundary()
                 .await

@@ -4,6 +4,7 @@
 //! B: a rollback that still held B there would close the cycle.
 
 use super::*;
+use crate::runtime::host_materialize::{MaterializeServeError, published_actor_rollback_refusal};
 use crate::runtime::provisioner::{
     PreparedServiceActorTransaction, RuntimeTurnFinalizationBoundaryLease,
     arm_owned_actor_cleanup_released_boundary_pause_for_test,
@@ -176,4 +177,42 @@ async fn a_re_registration_in_the_released_boundary_window_is_left_alone() {
         "the successor still owns its current claim"
     );
     assert!(!machine.contains_session(&session_id).await);
+}
+
+/// The release-build check behind the boundary-held rollbacks in
+/// `host_materialize`: an empty witness slot lets the rollback run, and a
+/// published actor turns it into a typed refusal that fail-stops the serving
+/// actor. Those rollbacks all run before their own create publishes into
+/// their fresh slot, so no existing hook reaches the refusal there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_boundary_held_rollback_after_actor_publication_is_refused_with_a_typed_error() {
+    let empty = meerkat_session::LiveSessionActorWitnessSlot::default();
+    assert!(
+        published_actor_rollback_refusal(&SessionId::new(), &empty, "install failed").is_none(),
+        "an empty slot keeps the boundary-held rollback"
+    );
+
+    let (_machine, session_id, transaction) = prepared_actor_transaction().await;
+    let refusal = published_actor_rollback_refusal(
+        &session_id,
+        transaction.actor_witness_slot(),
+        "install failed",
+    )
+    .expect("a published actor refuses the boundary-held rollback");
+    assert!(refusal.requires_actor_fail_stop(), "{refusal}");
+    assert!(
+        matches!(
+            &refusal,
+            MaterializeServeError::UnrecordedSessionCleanup {
+                session_id: refused,
+                original,
+                ..
+            } if *refused == session_id.to_string() && original == "install failed"
+        ),
+        "{refusal:?}"
+    );
+    tokio::time::timeout(DEADLOCK_BOUND, transaction.abort())
+        .await
+        .expect("the owned cleanup finished")
+        .expect("exact owned cleanup");
 }

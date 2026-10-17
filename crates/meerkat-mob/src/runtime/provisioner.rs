@@ -8553,7 +8553,6 @@ impl PreparedServiceActorTransaction {
     /// admitted. A raw unregister that removed the registration meanwhile,
     /// or a re-registration after it, is not this claim's: the rollback then
     /// answers `Ok(false)`, which is no rollback effect, not a failure.
-    #[cfg_attr(not(any(test, feature = "test-support")), allow(unused_variables))]
     async fn discard_actor_then_roll_back_after_boundary(
         session_id: &SessionId,
         session_service: &dyn MobSessionService,
@@ -8576,10 +8575,15 @@ impl PreparedServiceActorTransaction {
         drop(boundary);
         #[cfg(any(test, feature = "test-support"))]
         run_owned_cleanup_pause(session_id, OwnedCleanupPause::BoundaryReleased).await;
-        if let Some(prepared) = prepared
-            && let Err(error) = prepared.rollback_now().await
-        {
-            errors.push(format!("prepared materialization rollback: {error}"));
+        if let Some(prepared) = prepared {
+            match prepared.rollback_now().await {
+                Ok(true) => {}
+                Ok(false) => tracing::debug!(
+                    %session_id,
+                    "no current claim: raw unregister or re-registration in the released window"
+                ),
+                Err(error) => errors.push(format!("prepared materialization rollback: {error}")),
+            }
         }
         errors
     }

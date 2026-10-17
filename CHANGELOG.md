@@ -51,8 +51,11 @@ them.
   unregister removes the registration while the boundary is released, or
   the session id is registered again, the rollback leaves it alone. The
   host materializer's rollbacks before any actor is published keep the
-  boundary, since no surface cleanup waits on it there; debug builds assert
-  that no actor is published at those points.
+  boundary, since no surface cleanup waits on it there. Debug builds assert
+  that no actor is published at those points; release builds check it too,
+  and refuse such a rollback with a typed
+  `MaterializeServeError::UnrecordedSessionCleanup`, which fail-stops the
+  serving actor, instead of risking the deadlock.
 
 ## [0.9.2] - 2026-10-16
 
