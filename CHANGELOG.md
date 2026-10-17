@@ -932,6 +932,14 @@ them.
   and `mint_callback_claim_token`, and
   `meerkat_mob_mcp::CallbackRouteClaimTokenRefused`.
 - `meerkat_contracts::MobClaimCallbackRouteParams`.
+- `MeerkatMachine::hold_live_assistant_output_handles` and
+  `LiveAssistantOutputRetirementHold` (`meerkat-runtime`, `live` feature):
+  keep a closed live channel's generated assistant outputs addressable while
+  its deferred close settlement replays rows that need them. A retirement
+  requested meanwhile runs when the last hold ends; a held output never
+  becomes reservable. Both are additive public API.
+  `retire_live_assistant_output_handles` keeps its signature but now defers
+  the retirement while a hold exists. (#1821)
 
 ### Changed
 
@@ -1763,6 +1771,46 @@ them.
   It returns the first handling error, or that contract violation, and logs
   every error it does not return, so the schedule host still records the
   failed tick.
+- Live channels: rows a close took behind a running member turn (the user's
+  finalized speech, the assistant's spoken segments) are no longer dropped
+  when the close's deferred settlement gives up because the member turn ended
+  with an error or its ten-minute hang guard elapsed. The rows it still holds
+  are applied in arrival order at the next point each can land, with no
+  further deadline; the settlement's outcome and its recorded deferral are
+  unchanged. (#1821)
+- Live channels: a row deferred to a close that the session then refuses for
+  a reason other than a held turn boundary is no longer dropped silently. A
+  warning and a `live_transcript_row_unrecorded` runtime notice in the
+  session's transcript record that it was not recorded, naming the channel,
+  the row kind, its provider item id, its position among the rows the close
+  held and the refusal class, never the row's content. (#1821)
+- Live channels: a close takes the rows the transport deferred to it only once
+  it has committed, so a close that fails before that leaves them deferred on
+  the channel for its retry; a close that cannot record its deferred
+  settlement still applies its rows at the boundary; and a row its settlement
+  applies after settling playback, finding the channel released again while a
+  member turn holds the boundary, waits for the boundary instead of being
+  reported as unrecorded. (#1821)
+- A deferred playback release replayed after its channel closed no longer
+  fails on the closed channel's playback segment: its speech commits and the
+  release succeeds (it was reported as refused although recorded). (#1821)
+- Live channels: a closed channel that replays two spoken segments of one
+  provider turn, both of whose output starts waited behind a member turn, no
+  longer reports the second segment's output start as unrecorded while its
+  release commits that speech. A refused output start is not reported while
+  later rows among the rows the close held settle its provider item's speech:
+  a playback terminal such as that release, a playback completion or
+  truncation, or the item's final transcript or spoken transcript deltas
+  whose response then completes normally (not cancelled, not a tool call)
+  with no barge-in interrupt discarding them first. The session applies those
+  rows by its usual rules, or refuses one and it is reported itself. Text
+  whose response does not complete that way among those rows is not
+  recorded, so the start is still reported. (#1821)
+- GPT Live: speech whose output start waited behind a running member turn
+  when the channel closed is committed under its generated output instead of
+  being abandoned with its captions retracted. The segment's release follows
+  its start to the close, and the close keeps the channel's generated outputs
+  addressable until its deferred settlement has replayed both. (#1821)
 
 ### Known issues
 
@@ -1818,6 +1866,36 @@ them.
   and acknowledging it can see the row applied again in the successor
   session: each session keeps its own idempotency ledger. Continuation rows
   already have the same window.
+- Live transcript rows commit one at a time, in arrival order, and each waits
+  for the session's turn boundary. While a member turn runs (for example
+  voice-delegated work in the existing member), later rows wait behind it, so
+  the persisted transcript can lag the conversation by up to that turn's
+  length (see `docs/guides/realtime.mdx`). (#1821)
+- When the member turn's boundary frees while a channel close is still
+  settling, a later live row can commit ahead of an earlier row the close
+  holds for its settlement. No row is lost; only their order in the
+  transcript can differ from the conversation. (#1821)
+- Rows a channel close holds for replay after its deferred settlement gave up
+  are held in memory only: they are lost if the process exits before the next
+  boundary lets them land. Durable staging is planned. (#1821)
+- A row the transport cannot hand to its closing channel because the channel
+  is already gone from the host is dropped with a warning only. The shipped
+  close order keeps the channel reachable until the close has taken its rows,
+  so this needs a close out of that order. (#1821)
+- A member turn that ends with an error after it staged its final checkpoint
+  leaves that checkpoint staged until the runtime recovers it, and while it is
+  staged the store can refuse ordinary live writes to the session. A row a
+  channel close replays in that window can then go unrecorded: it is reported
+  with a warning, and its `live_transcript_row_unrecorded` notice can be
+  refused the same way. (#1821)
+- For a refused live output start a channel close replays: text of its item
+  that arrives after its response's completion is recorded at once, yet the
+  start is still reported, so that notice over-reports. A refused
+  completion's own notice names no item or response, so the text it would
+  have recorded cannot be attributed from the notice. Staged text is also
+  recorded only after the item before it in the transcript, so text whose
+  earlier item never lands keeps waiting while its start is not reported.
+  (#1821)
 
 ## [0.9.2] - 2026-10-16
 

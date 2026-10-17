@@ -8993,6 +8993,50 @@ pub struct LiveAssistantOutputTerminalReservation {
     _lifecycle_lease: crate::member_live::MemberLiveLifecycleLease,
 }
 
+/// Keeps one closed channel's generated assistant-output handles addressable
+/// while the close's deferred settlement replays rows that need them: an
+/// output start that the member turn's held session boundary parked until
+/// after the close still finds its generated handle.
+///
+/// A retirement requested while a hold exists
+/// ([`MeerkatMachine::retire_live_assistant_output_handles`]) runs when the
+/// last hold ends. A held handle never becomes reservable: reservation still
+/// requires the channel's current generated binding, which the close removed.
+#[cfg(feature = "live")]
+#[must_use = "dropping the hold ends it at once"]
+pub struct LiveAssistantOutputRetirementHold {
+    machine: MeerkatMachine,
+    session_id: SessionId,
+    channel_id: meerkat_core::LiveChannelId,
+}
+
+#[cfg(feature = "live")]
+impl std::fmt::Debug for LiveAssistantOutputRetirementHold {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LiveAssistantOutputRetirementHold")
+            .field("session_id", &self.session_id)
+            .field("channel_id", &self.channel_id)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(feature = "live")]
+impl Drop for LiveAssistantOutputRetirementHold {
+    fn drop(&mut self) {
+        self.machine
+            .end_live_assistant_output_retirement_hold(&self.session_id, &self.channel_id);
+    }
+}
+
+/// The holds on one channel's output handles, and whether a retirement waits
+/// for the last of them to end.
+#[cfg(feature = "live")]
+#[derive(Debug, Default)]
+struct LiveAssistantOutputRetirementHolds {
+    holds: usize,
+    retirement_requested: bool,
+}
+
 /// Opaque custody proving one exact provider binding is still current while
 /// its public observation is written and flushed.
 ///
@@ -9867,6 +9911,12 @@ pub struct MeerkatMachineShared {
     >,
     #[cfg(feature = "live")]
     live_assistant_output_by_id: StdMutex<HashMap<String, LiveAssistantOutputHandle>>,
+    /// Channels whose output handles a deferred close settlement still
+    /// replays rows against; see [`LiveAssistantOutputRetirementHold`].
+    #[cfg(feature = "live")]
+    live_assistant_output_retirement_holds: StdMutex<
+        HashMap<(SessionId, meerkat_core::LiveChannelId), LiveAssistantOutputRetirementHolds>,
+    >,
     /// Count of live bridge commands that reached this member's drain arms
     /// (ADJ-P6B seam S3b). Deterministic lanes pin zero-bridge-traffic
     /// gates against it; mechanical observability, not machine state.
@@ -10007,6 +10057,10 @@ pub struct MeerkatMachineShared {
     /// as owned by the recorded cancel too.
     #[cfg(test)]
     test_fail_next_boundary_cancel_dispatch_abort: std::sync::atomic::AtomicBool,
+    /// Fail the next record of a deferred close-time playback settlement
+    /// after its machine transition, as a failed recovery-state persist does.
+    #[cfg(any(test, feature = "test-support"))]
+    test_fail_next_live_close_settlement_deferral: std::sync::atomic::AtomicBool,
     /// One-shot deterministic gate before the runtime loop's terminal run
     /// commit takes the session driver. The turn is terminal in its live
     /// agent while its run input is still applied and unconsumed, and the
@@ -11828,6 +11882,8 @@ impl MeerkatMachine {
                 live_assistant_output_by_turn: StdMutex::new(HashMap::new()),
                 #[cfg(feature = "live")]
                 live_assistant_output_by_id: StdMutex::new(HashMap::new()),
+                #[cfg(feature = "live")]
+                live_assistant_output_retirement_holds: StdMutex::new(HashMap::new()),
                 live_commands_served: std::sync::atomic::AtomicU64::new(0),
                 member_incarnation_slots: StdRwLock::new(HashMap::new()),
                 auth_lease: StdRwLock::new(auth_lease),
@@ -11875,6 +11931,10 @@ impl MeerkatMachine {
                     std::sync::atomic::AtomicBool::new(false),
                 #[cfg(test)]
                 test_fail_next_boundary_cancel_dispatch_abort: std::sync::atomic::AtomicBool::new(
+                    false,
+                ),
+                #[cfg(any(test, feature = "test-support"))]
+                test_fail_next_live_close_settlement_deferral: std::sync::atomic::AtomicBool::new(
                     false,
                 ),
                 #[cfg(any(test, feature = "test-support"))]
@@ -12056,6 +12116,8 @@ impl MeerkatMachine {
                 live_assistant_output_by_turn: StdMutex::new(HashMap::new()),
                 #[cfg(feature = "live")]
                 live_assistant_output_by_id: StdMutex::new(HashMap::new()),
+                #[cfg(feature = "live")]
+                live_assistant_output_retirement_holds: StdMutex::new(HashMap::new()),
                 live_commands_served: std::sync::atomic::AtomicU64::new(0),
                 member_incarnation_slots: StdRwLock::new(HashMap::new()),
                 auth_lease: StdRwLock::new(auth_lease),
@@ -12103,6 +12165,10 @@ impl MeerkatMachine {
                     std::sync::atomic::AtomicBool::new(false),
                 #[cfg(test)]
                 test_fail_next_boundary_cancel_dispatch_abort: std::sync::atomic::AtomicBool::new(
+                    false,
+                ),
+                #[cfg(any(test, feature = "test-support"))]
+                test_fail_next_live_close_settlement_deferral: std::sync::atomic::AtomicBool::new(
                     false,
                 ),
                 #[cfg(any(test, feature = "test-support"))]

@@ -3475,6 +3475,22 @@ impl LiveAdapterHost {
         Ok(())
     }
 
+    /// Whether any projection deferred by [`Self::defer_projection_after_close`]
+    /// for this channel satisfies `predicate`, without taking it. An unknown
+    /// channel has none.
+    pub async fn any_deferred_projection(
+        &self,
+        channel_id: &LiveChannelId,
+        predicate: impl Fn(&LiveAdapterObservation) -> bool,
+    ) -> bool {
+        self.inner
+            .lock()
+            .await
+            .channels
+            .get(channel_id)
+            .is_some_and(|channel| channel.deferred_projections.iter().any(predicate))
+    }
+
     /// Take every projection deferred by [`Self::defer_projection_after_close`]
     /// for this channel, in arrival order. An unknown channel has none.
     pub async fn take_deferred_projections(

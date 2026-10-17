@@ -8762,15 +8762,27 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
         }
         if let crate::LiveAssistantPlaybackObservationResult::Resolved(receipt) = &outcome
             && receipt.continues_provider_group()
-        {
-            machine
+            && let Err(error) = machine
                 .advance_live_assistant_playback_segment(receipt)
                 .await
-                .map_err(|error| {
-                    SessionError::Agent(meerkat_core::error::AgentError::InternalError(
-                        error.to_string(),
-                    ))
-                })?;
+        {
+            // A release a closed channel's deferred settlement replays commits
+            // its speech above; the closed channel has no next segment to
+            // advance to, so that is not a refusal of the release.
+            if machine
+                .live_channel_is_active_for_session(id, receipt.channel_id())
+                .await
+            {
+                return Err(SessionError::Agent(
+                    meerkat_core::error::AgentError::InternalError(error.to_string()),
+                ));
+            }
+            tracing::debug!(
+                session_id = %id,
+                channel_id = %receipt.channel_id(),
+                %error,
+                "a playback release committed after its channel closed advances no segment"
+            );
         }
         Ok(outcome)
     }

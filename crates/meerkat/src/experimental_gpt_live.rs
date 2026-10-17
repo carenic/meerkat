@@ -4421,6 +4421,10 @@ struct PendingExperimentalGptLivePlayback {
     /// Generated output admitted for this segment, recorded by the pump from
     /// the host's output address. Unmeasured policy only.
     output_id: Option<String>,
+    /// The segment's output start was handed to the channel's close because
+    /// the member turn held the session boundary, so `output_id` was never
+    /// recorded. Unmeasured policy only.
+    output_start_deferred: bool,
     /// Local segment number within the provider turn. Unmeasured policy only;
     /// generated authority advances its own counter on each release and the
     /// release verifies they agree.
@@ -4448,6 +4452,9 @@ struct UnmeasuredSegmentSeal {
     /// The release committed canonically; only consuming the generated
     /// output may remain. Its speech is never retracted or re-applied.
     applied: bool,
+    /// The segment's output start went to the channel's close; its release
+    /// follows it there.
+    start_deferred: bool,
 }
 
 impl UnmeasuredSegmentSeal {
@@ -4467,6 +4474,7 @@ impl UnmeasuredSegmentSeal {
             usage: pending.usage.clone(),
             continues_turn,
             applied: false,
+            start_deferred: pending.output_start_deferred,
         }
     }
 
@@ -4981,6 +4989,35 @@ impl ExperimentalGptLiveDeferredAdapter {
         Ok(())
     }
 
+    /// An output start the channel's close took behind the member turn's
+    /// held session boundary: its segment never records a generated output,
+    /// so its release must follow the start to the close instead of being
+    /// abandoned.
+    fn note_deferred_output_start(&self, observation: &LiveAdapterObservation) {
+        let (response_id, item_id) = match observation {
+            LiveAdapterObservation::WithContextObservation { observation, .. } => {
+                self.note_deferred_output_start(observation);
+                return;
+            }
+            LiveAdapterObservation::AssistantOutputStarted {
+                response_id,
+                provider_item_id,
+                ..
+            } => (response_id, provider_item_id),
+            _ => return,
+        };
+        if !self.provider_managed_unmeasured() {
+            return;
+        }
+        if let Ok(mut playback) = self.playback_by_item.lock()
+            && let Some(pending) = playback.get_mut(item_id).filter(|pending| {
+                &pending.response_id == response_id && pending.output_started_forwarded
+            })
+        {
+            pending.output_start_deferred = true;
+        }
+    }
+
     /// A typed between-speech boundary: every open unmeasured segment that
     /// observed speech seals now, so it is released before any later row,
     /// and its provider turn continues in a new segment. The next delta of
@@ -5013,6 +5050,7 @@ impl ExperimentalGptLiveDeferredAdapter {
             pending.response_id = response_id;
             pending.output_started_forwarded = false;
             pending.output_id = None;
+            pending.output_start_deferred = false;
             pending.segment = segment;
             pending.context_observation_id = None;
             playback.insert(next_item, pending);
@@ -5430,6 +5468,7 @@ impl ExperimentalGptLiveDeferredAdapter {
                     cut_captured: false,
                     next_segment: None,
                     output_id: None,
+                    output_start_deferred: false,
                     segment: 0,
                     boundary_pending: false,
                 };
@@ -7485,14 +7524,35 @@ async fn release_unmeasured_segments(
     Ok(())
 }
 
+/// The generated output of a sealed segment whose output start went to the
+/// channel's close: its provider turn's current output, still bound to no
+/// target because the start has not been applied.
+fn deferred_start_output(
+    runtime: &meerkat_runtime::MeerkatMachine,
+    binding: &ProviderWebrtcBinding,
+    seal: &UnmeasuredSegmentSeal,
+) -> Option<meerkat_runtime::meerkat_machine::LiveAssistantOutputHandle> {
+    if !seal.start_deferred {
+        return None;
+    }
+    runtime
+        .live_assistant_output_handle_for_turn(
+            binding.session_id(),
+            binding.channel_id(),
+            &seal.provider_turn_ref,
+        )
+        .filter(|handle| handle.__target().is_none())
+}
+
 /// How one sealed segment left the release queue.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UnmeasuredSegmentRelease {
     /// Committed canonically and its generated output consumed.
     Committed,
-    /// Handed to the close: the member's turn holds the session boundary, so
-    /// the close's deferred settlement applies the release once the boundary
-    /// frees, before it settles leftover playback.
+    /// Handed to the close: the member's turn holds the session boundary (or
+    /// the segment's output start already went to the close), so the close's
+    /// deferred settlement applies the release once the boundary frees, after
+    /// the start and before it settles leftover playback.
     Deferred,
     /// No generated custody remains to commit it against.
     Abandoned,
@@ -7519,9 +7579,22 @@ async fn release_unmeasured_segment(
             // meanwhile (a close, a rebinding). Nothing is left to do.
             return Ok(UnmeasuredSegmentRelease::Committed);
         }
-        // The segment's output was never admitted (its start was deferred
-        // behind a member turn while the channel closed, and the close
-        // retires that custody), so no canonical target can hold its speech.
+        if let Some(handle) = deferred_start_output(runtime, binding, seal) {
+            // The segment's output start went to the close behind the member
+            // turn's boundary, so its generated output is still unbound. The
+            // release follows the start there, never ahead of it; the close
+            // keeps the channel's outputs until its deferred settlement has
+            // replayed both.
+            return Ok(defer_unmeasured_release(
+                activation,
+                binding,
+                seal.release_observation(handle.interaction_id()),
+            )
+            .await);
+        }
+        // No generated output custody exists for the segment (its provider
+        // turn never reached the machine), so no canonical target can hold
+        // its speech.
         tracing::warn!(
             channel = %binding.channel_id(),
             "unmeasured segment has no generated output custody; its speech has no canonical target"
@@ -7687,8 +7760,9 @@ async fn defer_unmeasured_release(
             tracing::warn!(
                 target: meerkat_live::LIVE_CLOSE_TRACE_TARGET,
                 channel = %binding.channel_id(),
+                row = "assistant_playback_terminal",
                 %error,
-                "unmeasured segment release could not be deferred to the close; it is dropped"
+                "unmeasured segment release could not be deferred to the close; it is dropped and its captions are retracted"
             );
             UnmeasuredSegmentRelease::Abandoned
         }
@@ -7735,7 +7809,8 @@ async fn release_unmeasured_segments_before_terminal(
         let handle = seal
             .output_id
             .as_deref()
-            .and_then(|output_id| activation.runtime.live_assistant_output_handle(output_id));
+            .and_then(|output_id| activation.runtime.live_assistant_output_handle(output_id))
+            .or_else(|| deferred_start_output(&activation.runtime, binding, &seal));
         let release = match handle {
             Some(handle) => {
                 defer_unmeasured_release(
@@ -8465,20 +8540,30 @@ fn spawn_sideband_actors(
                     .defer_projection_after_close(pump_binding.channel_id(), deferred)
                     .await
                 {
-                    Ok(()) => tracing::info!(
-                        target: meerkat_live::LIVE_CLOSE_TRACE_TARGET,
-                        channel = %pump_binding.channel_id(),
-                        observation = ?observation,
-                        close_requested,
-                        "live projection parked behind the member turn boundary was deferred to the boundary by the close"
-                    ),
-                    Err(error) => tracing::warn!(
-                        target: meerkat_live::LIVE_CLOSE_TRACE_TARGET,
-                        channel = %pump_binding.channel_id(),
-                        observation = ?observation,
-                        %error,
-                        "live projection parked behind the member turn boundary could not be deferred; it is dropped by the close"
-                    ),
+                    Ok(()) => {
+                        pump_adapter.note_deferred_output_start(observation);
+                        tracing::info!(
+                            target: meerkat_live::LIVE_CLOSE_TRACE_TARGET,
+                            channel = %pump_binding.channel_id(),
+                            observation = ?observation,
+                            close_requested,
+                            "live projection parked behind the member turn boundary was deferred to the boundary by the close"
+                        );
+                    }
+                    Err(error) => {
+                        let (row, provider_item_id) =
+                            crate::session_runtime::live_orchestration::unrecorded_live_row_identity(
+                                observation,
+                            );
+                        tracing::warn!(
+                            target: meerkat_live::LIVE_CLOSE_TRACE_TARGET,
+                            channel = %pump_binding.channel_id(),
+                            row,
+                            provider_item_id,
+                            %error,
+                            "live projection parked behind the member turn boundary could not be deferred; it is dropped by the close"
+                        );
+                    }
                 }
                 pending_projection = None;
                 unapplied.pending_projection.store(false, Ordering::Release);
@@ -15129,13 +15214,11 @@ mod tests {
         retire_sideband_actors(active, SidebandActorRetirement::Graceful).await;
     }
 
-    /// A runtime-backed member session with a closed channel whose playback
-    /// settlement is deferred, as a close during the member turn leaves it.
-    async fn deferred_settlement_fixture() -> (
+    /// A runtime-backed member session, materialized and idle.
+    async fn materialized_member_session() -> (
         Arc<crate::PersistentSessionService<crate::FactoryAgentBuilder>>,
         Arc<meerkat_runtime::MeerkatMachine>,
         meerkat_core::SessionId,
-        meerkat_live::LiveChannelId,
         tempfile::TempDir,
     ) {
         use meerkat_core::service::{DeferredPromptPolicy, InitialTurnPolicy, SessionBuildOptions};
@@ -15184,19 +15267,32 @@ mod tests {
         ))
         .await
         .expect("materialize deferred-settlement fixture session");
+        (service, runtime, session_id, temp)
+    }
+
+    fn deferred_settlement_identity() -> meerkat_core::SessionLlmIdentity {
+        meerkat_core::SessionLlmIdentity {
+            model: "gpt-realtime-2".to_string(),
+            provider: meerkat_core::Provider::OpenAI,
+            self_hosted_server_id: None,
+            provider_params: None,
+            auth_binding: None,
+        }
+    }
+
+    /// A runtime-backed member session with a closed channel whose playback
+    /// settlement is deferred, as a close during the member turn leaves it.
+    async fn deferred_settlement_fixture() -> (
+        Arc<crate::PersistentSessionService<crate::FactoryAgentBuilder>>,
+        Arc<meerkat_runtime::MeerkatMachine>,
+        meerkat_core::SessionId,
+        meerkat_live::LiveChannelId,
+        tempfile::TempDir,
+    ) {
+        let (service, runtime, session_id, temp) = materialized_member_session().await;
         let channel_id = meerkat_live::LiveChannelId::new("deferred-close-settlement");
         runtime
-            .resolve_live_open_admission(
-                &session_id,
-                &channel_id,
-                &meerkat_core::SessionLlmIdentity {
-                    model: "gpt-realtime-2".to_string(),
-                    provider: meerkat_core::Provider::OpenAI,
-                    self_hosted_server_id: None,
-                    provider_params: None,
-                    auth_binding: None,
-                },
-            )
+            .resolve_live_open_admission(&session_id, &channel_id, &deferred_settlement_identity())
             .await
             .expect("channel admitted");
         runtime
@@ -15208,6 +15304,754 @@ mod tests {
             .await
             .expect("deferral recorded on the closed channel");
         (service, runtime, session_id, channel_id, temp)
+    }
+
+    /// [`deferred_settlement_fixture`] with the channel also open on a host
+    /// whose projections reach the session through the real
+    /// [`crate::surface::ServiceLiveProjection`], so a row the deferred
+    /// settlement applies lands in the persisted transcript (#1821).
+    async fn deferred_rows_fixture() -> (
+        Arc<crate::PersistentSessionService<crate::FactoryAgentBuilder>>,
+        Arc<meerkat_runtime::MeerkatMachine>,
+        meerkat_live::LiveAdapterHost,
+        meerkat_core::SessionId,
+        meerkat_live::LiveChannelId,
+        tempfile::TempDir,
+    ) {
+        let (service, runtime, session_id, temp) = materialized_member_session().await;
+        let channel_id = meerkat_live::LiveChannelId::new("deferred-close-rows");
+        let admission = runtime
+            .resolve_live_open_admission(&session_id, &channel_id, &deferred_settlement_identity())
+            .await
+            .expect("channel admitted");
+        let host = meerkat_live::LiveAdapterHost::new(Arc::new(
+            crate::surface::ServiceLiveProjection::new(Arc::clone(&service), Arc::clone(&runtime)),
+        ));
+        host.open_channel_with_authority(
+            admission
+                .channel_open_authority()
+                .expect("admission carries host open authority"),
+        )
+        .await
+        .expect("host channel opened");
+        runtime
+            .abandon_live_open_admission(&session_id, &channel_id)
+            .await
+            .expect("channel closed");
+        runtime
+            .defer_live_close_settlement(&session_id, &channel_id)
+            .await
+            .expect("deferral recorded on the closed channel");
+        (service, runtime, host, session_id, channel_id, temp)
+    }
+
+    /// A user row the transport deferred to the close.
+    fn deferred_user_row(
+        item_id: &str,
+        text: &str,
+    ) -> meerkat_core::live_adapter::LiveAdapterObservation {
+        meerkat_core::live_adapter::LiveAdapterObservation::UserTranscriptFinal {
+            provider_item_id: Some(item_id.to_string()),
+            previous_item_id: None,
+            content_index: Some(0),
+            text: text.to_string(),
+        }
+    }
+
+    /// Wait (bounded) until the persisted transcript holds a user row with
+    /// exactly `expected`.
+    async fn assert_eventually_user_row(
+        service: &crate::PersistentSessionService<crate::FactoryAgentBuilder>,
+        session_id: &meerkat_core::SessionId,
+        expected: &str,
+    ) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let session = service
+                    .load_authoritative_session(session_id)
+                    .await
+                    .expect("read the persisted transcript")
+                    .expect("session");
+                if session.messages().iter().any(|message| {
+                    matches!(message, meerkat_core::Message::User(user) if user.text_content() == expected)
+                }) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!("the deferred row {expected:?} never reached the persisted transcript")
+        });
+    }
+
+    /// #1821 (R1): a member turn that ends with an error gives the close
+    /// settlement no boundary commit to wait for, so the settlement gives
+    /// up. The rows the transport deferred to it must still reach the
+    /// transcript.
+    #[tokio::test]
+    async fn deferred_rows_reach_the_transcript_after_an_errored_member_turn() {
+        let (service, runtime, host, session_id, channel_id, _temp) = deferred_rows_fixture().await;
+        // The member turn's rows reach the live transcript and the turn ends
+        // with an error before it staged a checkpoint: the live transcript is
+        // ahead of the store and no boundary commit is coming for it.
+        run_uncommitted_member_turn(&service, &session_id).await;
+        discard_staged_member_turn_checkpoint(&service, &session_id).await;
+        service
+            .apply_runtime_turn(
+                &session_id,
+                meerkat_core::lifecycle::RunId::new(),
+                meerkat_core::StartTurnRequest {
+                    injected_context: Vec::new(),
+                    prompt: String::new().into(),
+                    system_prompt: None,
+                    event_tx: None,
+                    runtime: meerkat_core::service::StartTurnRuntimeSemantics::default(),
+                },
+                meerkat_core::lifecycle::run_primitive::RunApplyBoundary::RunStart,
+                vec![meerkat_core::lifecycle::InputId::new()],
+            )
+            .await
+            .expect_err("a runtime turn without an execution kind ends with an error");
+        const ROW: &str = "A row spoken while the member turn ran.";
+        assert_eq!(
+            crate::session_runtime::live_orchestration::settle_live_close_playback_deferred(
+                Arc::clone(&service),
+                Arc::clone(&runtime),
+                host.owned_handle(),
+                vec![deferred_user_row("item:r1", ROW)],
+                session_id.clone(),
+                channel_id.clone(),
+                None,
+            )
+            .await,
+            crate::session_runtime::live_orchestration::DeferredCloseSettlementOutcome::GaveUp(
+                crate::session_runtime::live_orchestration::DeferredCloseSettlementGiveUp::BoundaryNotCommitted
+            ),
+        );
+        assert_eventually_user_row(&service, &session_id, ROW).await;
+    }
+
+    /// Drop the provisional checkpoint [`run_uncommitted_member_turn`]
+    /// staged, as a turn that fails before its checkpoint leaves none.
+    async fn discard_staged_member_turn_checkpoint(
+        service: &crate::PersistentSessionService<crate::FactoryAgentBuilder>,
+        session_id: &meerkat_core::SessionId,
+    ) {
+        let store = service.runtime_store();
+        let runtime_id = meerkat_runtime::LogicalRuntimeId::for_session(session_id);
+        let staged = store
+            .load_whole_blob_provisional_tail(&runtime_id)
+            .await
+            .expect("read the staged checkpoint")
+            .expect("the uncommitted member turn staged a checkpoint");
+        assert!(
+            store
+                .discard_whole_blob_provisional_tail(&runtime_id, staged.authority())
+                .await
+                .expect("discard the staged checkpoint")
+        );
+    }
+
+    /// The `live_transcript_row_unrecorded` runtime notice payloads the
+    /// persisted transcript holds now.
+    async fn unrecorded_row_notices_now(
+        service: &crate::PersistentSessionService<crate::FactoryAgentBuilder>,
+        session_id: &meerkat_core::SessionId,
+    ) -> Vec<serde_json::Value> {
+        service
+            .load_authoritative_session(session_id)
+            .await
+            .expect("read the persisted transcript")
+            .expect("session")
+            .messages()
+            .iter()
+            .filter_map(|message| match message {
+                meerkat_core::Message::SystemNotice(notice) => Some(notice),
+                _ => None,
+            })
+            .flat_map(|notice| notice.blocks.iter())
+            .filter_map(|block| match block {
+                meerkat_core::types::SystemNoticeBlock::RuntimeNotice {
+                    category, payload, ..
+                } if category == "live_transcript_row_unrecorded" => payload.clone(),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The `live_transcript_row_unrecorded` runtime notice payloads in the
+    /// persisted transcript, waiting (bounded) for at least one.
+    async fn eventually_unrecorded_row_notices(
+        service: &crate::PersistentSessionService<crate::FactoryAgentBuilder>,
+        session_id: &meerkat_core::SessionId,
+    ) -> Vec<serde_json::Value> {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let payloads = unrecorded_row_notices_now(service, session_id).await;
+                if !payloads.is_empty() {
+                    break payloads;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the unrecorded row leaves a typed runtime notice")
+    }
+
+    /// Wait (bounded) until no close settlement of the session is still
+    /// deferred, then give any notice it reported time to land.
+    async fn wait_for_resolved_close_settlement(
+        runtime: &meerkat_runtime::MeerkatMachine,
+        session_id: &meerkat_core::SessionId,
+    ) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !runtime
+                .live_close_settlement_deferred_channels(session_id)
+                .await
+                .is_empty()
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the deferred close settlement resolves");
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+
+    /// #1821 (L2): a row the close settlement applies after it settled
+    /// playback finds its channel released again while the member's next
+    /// turn holds the boundary (a later close of the channel). The row waits
+    /// for the boundary instead of being reported as unrecorded.
+    #[tokio::test]
+    async fn rows_after_the_settlement_wait_out_a_re_released_channel() {
+        let (service, runtime, host, session_id, channel_id, _temp) = deferred_rows_fixture().await;
+        const ROW: &str = "A row the settlement applies after a re-release.";
+        let boundary = service
+            .acquire_runtime_turn_finalization_guard(&session_id)
+            .await;
+        let settlement = tokio::spawn(
+            crate::session_runtime::live_orchestration::settle_live_close_playback_deferred(
+                Arc::clone(&service),
+                Arc::clone(&runtime),
+                host.owned_handle(),
+                vec![deferred_user_row("item:l2", ROW)],
+                session_id.clone(),
+                channel_id.clone(),
+                None,
+            ),
+        );
+        // The settlement queues on the boundary the member turn holds.
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+        }
+        drop(boundary);
+        // The member's next turn queues right behind it and takes the
+        // boundary as soon as the settlement has settled playback; a later
+        // close of the channel then releases its projections again.
+        let next_turn = service
+            .acquire_runtime_turn_finalization_guard(&session_id)
+            .await;
+        service.release_live_projection_turn_boundary_waiters(&session_id, &channel_id);
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+        }
+        drop(next_turn);
+        assert_eq!(
+            settlement.await.expect("settlement task"),
+            crate::session_runtime::live_orchestration::DeferredCloseSettlementOutcome::Settled,
+        );
+        assert_eventually_user_row(&service, &session_id, ROW).await;
+        assert_eq!(
+            unrecorded_row_notices_now(&service, &session_id).await,
+            Vec::<serde_json::Value>::new(),
+            "a row that waited out the boundary is never reported as unrecorded"
+        );
+    }
+
+    /// An output start whose provider turn never reached the machine: no
+    /// generated custody can admit it, so the session refuses it.
+    fn output_start_without_custody() -> meerkat_core::live_adapter::LiveAdapterObservation {
+        meerkat_core::live_adapter::LiveAdapterObservation::AssistantOutputStarted {
+            provider_turn_ref: "turn-without-custody".to_string(),
+            response_id: "response-without-custody".to_string(),
+            provider_item_id: "item-without-custody".to_string(),
+            content_index: 0,
+        }
+    }
+
+    fn unrecorded_output_start_notice() -> serde_json::Value {
+        serde_json::json!({
+            "channel_id": "deferred-close-rows",
+            "row": "assistant_output_started",
+            "provider_item_id": "item-without-custody",
+            "row_index": 0,
+            "refusal": "rejected",
+        })
+    }
+
+    /// #1821 (F1 last resort): a deferred row the session refuses after the
+    /// close for a reason other than a held boundary is not recorded. A typed
+    /// runtime notice in the transcript says so, without the row's content.
+    #[tokio::test]
+    async fn an_unrecordable_deferred_row_leaves_a_typed_runtime_notice() {
+        let (service, runtime, host, session_id, channel_id, _temp) = deferred_rows_fixture().await;
+        assert_eq!(
+            crate::session_runtime::live_orchestration::settle_live_close_playback_deferred(
+                Arc::clone(&service),
+                Arc::clone(&runtime),
+                host.owned_handle(),
+                vec![output_start_without_custody()],
+                session_id.clone(),
+                channel_id.clone(),
+                None,
+            )
+            .await,
+            crate::session_runtime::live_orchestration::DeferredCloseSettlementOutcome::Settled,
+        );
+        assert_eq!(
+            eventually_unrecorded_row_notices(&service, &session_id).await,
+            vec![unrecorded_output_start_notice()]
+        );
+    }
+
+    /// The release of [`output_start_without_custody`]'s segment.
+    fn release_without_custody() -> meerkat_core::live_adapter::LiveAdapterObservation {
+        meerkat_core::live_adapter::LiveAdapterObservation::AssistantPlaybackTerminalObserved {
+            interaction_id: meerkat_core::InteractionId::new(),
+            provider_item_id: "item-without-custody".to_string(),
+            content_index: 0,
+            response_id: "response-without-custody".to_string(),
+            evidence: meerkat_core::LiveAssistantPlaybackEvidence::ProviderManagedUnmeasured(
+                "Speech without custody.".to_string(),
+            ),
+            stop_reason: StopReason::EndTurn,
+            usage: TurnUsage::host_declared(
+                Provider::OpenAI,
+                "gpt-live-1-codex".to_string(),
+                Usage::default(),
+            ),
+        }
+    }
+
+    /// #1821: a refused output start is left to the later row of its
+    /// provider item. When the session refuses that row (the segment's
+    /// release) too, the release is reported: one notice, never a second one
+    /// for the start.
+    #[tokio::test]
+    async fn a_refused_start_is_reported_through_its_refused_release() {
+        let (service, runtime, host, session_id, channel_id, _temp) = deferred_rows_fixture().await;
+        assert_eq!(
+            crate::session_runtime::live_orchestration::settle_live_close_playback_deferred(
+                Arc::clone(&service),
+                Arc::clone(&runtime),
+                host.owned_handle(),
+                vec![output_start_without_custody(), release_without_custody()],
+                session_id.clone(),
+                channel_id.clone(),
+                None,
+            )
+            .await,
+            crate::session_runtime::live_orchestration::DeferredCloseSettlementOutcome::Settled,
+        );
+        wait_for_resolved_close_settlement(&runtime, &session_id).await;
+        let notices = unrecorded_row_notices_now(&service, &session_id).await;
+        assert_eq!(
+            notice_rows(&notices),
+            vec![(
+                Some("assistant_playback_terminal"),
+                Some("item-without-custody"),
+                Some(1),
+            )],
+            "the refused release is reported once, and its refused start is not: {notices:?}"
+        );
+    }
+
+    /// The row kind, provider item id and row index of each unrecorded-row
+    /// notice payload.
+    fn notice_rows(
+        notices: &[serde_json::Value],
+    ) -> Vec<(Option<&str>, Option<&str>, Option<u64>)> {
+        notices
+            .iter()
+            .map(|notice| {
+                (
+                    notice["row"].as_str(),
+                    notice["provider_item_id"].as_str(),
+                    notice["row_index"].as_u64(),
+                )
+            })
+            .collect()
+    }
+
+    /// A spoken transcript delta of [`output_start_without_custody`]'s item.
+    fn delta_without_custody(
+        delta_id: &str,
+        delta: &str,
+    ) -> meerkat_core::live_adapter::LiveAdapterObservation {
+        meerkat_core::live_adapter::LiveAdapterObservation::AssistantTranscriptDelta {
+            provider_item_id: Some("item-without-custody".to_string()),
+            previous_item_id: None,
+            content_index: Some(0),
+            response_id: Some("response-without-custody".to_string()),
+            delta_id: Some(delta_id.to_string()),
+            delta: delta.to_string(),
+        }
+    }
+
+    /// #1821 (L-1): transcript deltas only buffer an item's text until a row
+    /// settles its speech. A refused output start followed by deltas of its
+    /// item and by nothing that settles them is reported: one notice, for
+    /// the start.
+    #[tokio::test]
+    async fn a_refused_start_followed_only_by_its_deltas_is_reported() {
+        let (service, runtime, host, session_id, channel_id, _temp) = deferred_rows_fixture().await;
+        assert_eq!(
+            crate::session_runtime::live_orchestration::settle_live_close_playback_deferred(
+                Arc::clone(&service),
+                Arc::clone(&runtime),
+                host.owned_handle(),
+                vec![
+                    output_start_without_custody(),
+                    delta_without_custody("delta-1", "Speech the close"),
+                    delta_without_custody("delta-2", " held."),
+                ],
+                session_id.clone(),
+                channel_id.clone(),
+                None,
+            )
+            .await,
+            crate::session_runtime::live_orchestration::DeferredCloseSettlementOutcome::Settled,
+        );
+        wait_for_resolved_close_settlement(&runtime, &session_id).await;
+        let notices = unrecorded_row_notices_now(&service, &session_id).await;
+        assert_eq!(
+            notice_rows(&notices),
+            vec![(
+                Some("assistant_output_started"),
+                Some("item-without-custody"),
+                Some(0),
+            )],
+            "the refused start is reported once, and its buffered deltas are not refused: {notices:?}"
+        );
+    }
+
+    /// The final transcript of [`output_start_without_custody`]'s item.
+    fn final_without_custody(text: &str) -> meerkat_core::live_adapter::LiveAdapterObservation {
+        meerkat_core::live_adapter::LiveAdapterObservation::AssistantTranscriptFinal {
+            provider_item_id: "item-without-custody".to_string(),
+            previous_item_id: None,
+            content_index: Some(0),
+            response_id: Some("response-without-custody".to_string()),
+            text: text.to_string(),
+            stop_reason: StopReason::EndTurn,
+            usage: Usage::default(),
+        }
+    }
+
+    /// The completion of [`output_start_without_custody`]'s response.
+    fn completion_without_custody(
+        stop_reason: StopReason,
+    ) -> meerkat_core::live_adapter::LiveAdapterObservation {
+        meerkat_core::live_adapter::LiveAdapterObservation::TurnCompleted {
+            response_id: Some("response-without-custody".to_string()),
+            stop_reason,
+            usage: TurnUsage::host_declared(
+                Provider::OpenAI,
+                "gpt-live-1-codex".to_string(),
+                Usage::default(),
+            ),
+        }
+    }
+
+    /// The text of each spoken assistant transcript row, in order.
+    fn spoken_rows(session: &meerkat_core::Session) -> Vec<String> {
+        session
+            .messages()
+            .iter()
+            .filter_map(|message| match message {
+                meerkat_core::Message::BlockAssistant(assistant) => Some(assistant),
+                _ => None,
+            })
+            .filter_map(|assistant| {
+                let text: String = assistant
+                    .blocks
+                    .iter()
+                    .filter_map(|block| match block {
+                        meerkat_core::AssistantBlock::Transcript {
+                            text,
+                            source: meerkat_core::types::TranscriptSource::Spoken,
+                            ..
+                        } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                (!text.is_empty()).then_some(text)
+            })
+            .collect()
+    }
+
+    /// Settle `rows` as the rows a closed channel held, then read the spoken
+    /// assistant rows the persisted transcript holds and its unrecorded-row
+    /// notice payloads.
+    async fn settle_held_rows(
+        rows: Vec<meerkat_core::live_adapter::LiveAdapterObservation>,
+    ) -> (Vec<String>, Vec<serde_json::Value>) {
+        let (service, runtime, host, session_id, channel_id, _temp) = deferred_rows_fixture().await;
+        assert_eq!(
+            crate::session_runtime::live_orchestration::settle_live_close_playback_deferred(
+                Arc::clone(&service),
+                Arc::clone(&runtime),
+                host.owned_handle(),
+                rows,
+                session_id.clone(),
+                channel_id.clone(),
+                None,
+            )
+            .await,
+            crate::session_runtime::live_orchestration::DeferredCloseSettlementOutcome::Settled,
+        );
+        wait_for_resolved_close_settlement(&runtime, &session_id).await;
+        let session = service
+            .load_authoritative_session(&session_id)
+            .await
+            .expect("read the persisted transcript")
+            .expect("session");
+        (
+            spoken_rows(&session),
+            unrecorded_row_notices_now(&service, &session_id).await,
+        )
+    }
+
+    const HELD_SPEECH: &str = "Speech the close held.";
+
+    /// #1821: a final transcript only stages its item's text until its
+    /// response completes, and a closed channel completes nothing on its
+    /// own. A refused output start followed by its item's final and no
+    /// completion of that response is reported: one notice, for the start.
+    #[tokio::test]
+    async fn a_refused_start_followed_by_its_uncompleted_final_is_reported() {
+        let (spoken, notices) = settle_held_rows(vec![
+            output_start_without_custody(),
+            final_without_custody(HELD_SPEECH),
+        ])
+        .await;
+        assert_eq!(
+            (spoken, notice_rows(&notices)),
+            (
+                Vec::<String>::new(),
+                vec![(
+                    Some("assistant_output_started"),
+                    Some("item-without-custody"),
+                    Some(0),
+                )],
+            ),
+            "the staged final records nothing, and the refused start is reported: {notices:?}"
+        );
+    }
+
+    /// #1821 control: the final's response completes among the rows the
+    /// close held, so the final's text is recorded and the refused start is
+    /// not reported.
+    #[tokio::test]
+    async fn a_refused_start_is_left_to_its_completed_final() {
+        let (spoken, notices) = settle_held_rows(vec![
+            output_start_without_custody(),
+            final_without_custody(HELD_SPEECH),
+            completion_without_custody(StopReason::EndTurn),
+        ])
+        .await;
+        assert_eq!(
+            (spoken, notice_rows(&notices)),
+            (vec![HELD_SPEECH.to_string()], Vec::new()),
+            "the completed final is recorded, and its refused start is not reported: {notices:?}"
+        );
+    }
+
+    /// #1821: transcript deltas stage their item's text the same way, so a
+    /// completion of their response records it and the refused start is not
+    /// reported.
+    #[tokio::test]
+    async fn a_refused_start_is_left_to_its_completed_deltas() {
+        let (spoken, notices) = settle_held_rows(vec![
+            output_start_without_custody(),
+            delta_without_custody("delta-1", "Speech the close"),
+            delta_without_custody("delta-2", " held."),
+            completion_without_custody(StopReason::EndTurn),
+        ])
+        .await;
+        assert_eq!(
+            (spoken, notice_rows(&notices)),
+            (vec![HELD_SPEECH.to_string()], Vec::new()),
+            "the completed deltas are recorded, and their refused start is not reported: {notices:?}"
+        );
+    }
+
+    /// A barge-in interrupt of [`output_start_without_custody`]'s response.
+    fn interrupt_without_custody() -> meerkat_core::live_adapter::LiveAdapterObservation {
+        meerkat_core::live_adapter::LiveAdapterObservation::TurnInterrupted {
+            response_id: Some("response-without-custody".to_string()),
+        }
+    }
+
+    /// Settle `rows`, then assert that none of the item's text is recorded
+    /// and that the refused start at row 0 is the one row reported.
+    async fn assert_only_the_refused_start_is_reported(
+        rows: Vec<meerkat_core::live_adapter::LiveAdapterObservation>,
+        case: &str,
+    ) {
+        let (spoken, notices) = settle_held_rows(rows).await;
+        assert_eq!(
+            (spoken, notice_rows(&notices)),
+            (
+                Vec::<String>::new(),
+                vec![(
+                    Some("assistant_output_started"),
+                    Some("item-without-custody"),
+                    Some(0),
+                )],
+            ),
+            "{case}: nothing is recorded, and the refused start is reported: {notices:?}"
+        );
+    }
+
+    /// #1821 (M1): a tool-call completion removes its response's completion
+    /// and records none of the text it staged, so a refused start whose
+    /// deltas end in a tool call is reported.
+    #[tokio::test]
+    async fn a_refused_start_whose_deltas_end_in_a_tool_call_is_reported() {
+        assert_only_the_refused_start_is_reported(
+            vec![
+                output_start_without_custody(),
+                delta_without_custody("delta-1", "Speech the close"),
+                delta_without_custody("delta-2", " held."),
+                completion_without_custody(StopReason::ToolUse),
+            ],
+            "deltas, then a tool-call completion",
+        )
+        .await;
+    }
+
+    /// #1821 (M1): the same for a final that ends in a tool call.
+    #[tokio::test]
+    async fn a_refused_start_whose_final_ends_in_a_tool_call_is_reported() {
+        assert_only_the_refused_start_is_reported(
+            vec![
+                output_start_without_custody(),
+                final_without_custody(HELD_SPEECH),
+                completion_without_custody(StopReason::ToolUse),
+            ],
+            "a final, then a tool-call completion",
+        )
+        .await;
+    }
+
+    /// #1821 (M1): a barge-in interrupt discards the text every in-flight
+    /// response staged, and the response's cancelled completion records
+    /// nothing, so a refused start whose deltas were interrupted is reported.
+    #[tokio::test]
+    async fn a_refused_start_whose_deltas_were_interrupted_is_reported() {
+        assert_only_the_refused_start_is_reported(
+            vec![
+                output_start_without_custody(),
+                delta_without_custody("delta-1", "Speech the close"),
+                delta_without_custody("delta-2", " held."),
+                interrupt_without_custody(),
+                completion_without_custody(StopReason::Cancelled),
+            ],
+            "deltas, an interrupt, then a cancelled completion",
+        )
+        .await;
+    }
+
+    /// #1821 (M1): the same for an interrupted final.
+    #[tokio::test]
+    async fn a_refused_start_whose_final_was_interrupted_is_reported() {
+        assert_only_the_refused_start_is_reported(
+            vec![
+                output_start_without_custody(),
+                final_without_custody(HELD_SPEECH),
+                interrupt_without_custody(),
+                completion_without_custody(StopReason::Cancelled),
+            ],
+            "a final, an interrupt, then a cancelled completion",
+        )
+        .await;
+    }
+
+    /// #1821 (F1 last resort): the same notice when the row is refused by the
+    /// replay that follows a given-up settlement.
+    #[tokio::test]
+    async fn an_unrecordable_row_replayed_after_a_give_up_leaves_a_typed_runtime_notice() {
+        let (service, runtime, host, session_id, channel_id, _temp) = deferred_rows_fixture().await;
+        run_uncommitted_member_turn(&service, &session_id).await;
+        discard_staged_member_turn_checkpoint(&service, &session_id).await;
+        service
+            .apply_runtime_turn(
+                &session_id,
+                meerkat_core::lifecycle::RunId::new(),
+                meerkat_core::StartTurnRequest {
+                    injected_context: Vec::new(),
+                    prompt: String::new().into(),
+                    system_prompt: None,
+                    event_tx: None,
+                    runtime: meerkat_core::service::StartTurnRuntimeSemantics::default(),
+                },
+                meerkat_core::lifecycle::run_primitive::RunApplyBoundary::RunStart,
+                vec![meerkat_core::lifecycle::InputId::new()],
+            )
+            .await
+            .expect_err("a runtime turn without an execution kind ends with an error");
+        assert_eq!(
+            crate::session_runtime::live_orchestration::settle_live_close_playback_deferred(
+                Arc::clone(&service),
+                Arc::clone(&runtime),
+                host.owned_handle(),
+                vec![output_start_without_custody()],
+                session_id.clone(),
+                channel_id.clone(),
+                None,
+            )
+            .await,
+            crate::session_runtime::live_orchestration::DeferredCloseSettlementOutcome::GaveUp(
+                crate::session_runtime::live_orchestration::DeferredCloseSettlementGiveUp::BoundaryNotCommitted
+            ),
+        );
+        assert_eq!(
+            eventually_unrecorded_row_notices(&service, &session_id).await,
+            vec![unrecorded_output_start_notice()]
+        );
+    }
+
+    /// #1821 (R2): a member turn that holds the boundary past the documented
+    /// hang guard ends the close settlement. The rows the transport deferred
+    /// to it must still reach the transcript once the turn releases the
+    /// boundary.
+    #[tokio::test(start_paused = true)]
+    async fn deferred_rows_reach_the_transcript_after_the_hang_guard() {
+        let (service, runtime, host, session_id, channel_id, _temp) = deferred_rows_fixture().await;
+        let boundary = service
+            .acquire_runtime_turn_finalization_guard(&session_id)
+            .await;
+        const ROW: &str = "A row spoken during a long member turn.";
+        assert_eq!(
+            crate::session_runtime::live_orchestration::settle_live_close_playback_deferred(
+                Arc::clone(&service),
+                Arc::clone(&runtime),
+                host.owned_handle(),
+                vec![deferred_user_row("item:r2", ROW)],
+                session_id.clone(),
+                channel_id.clone(),
+                None,
+            )
+            .await,
+            crate::session_runtime::live_orchestration::DeferredCloseSettlementOutcome::GaveUp(
+                crate::session_runtime::live_orchestration::DeferredCloseSettlementGiveUp::HangGuard
+            ),
+        );
+        drop(boundary);
+        assert_eventually_user_row(&service, &session_id, ROW).await;
     }
 
     /// Drive one runtime content turn on the member session without the
@@ -15259,6 +16103,7 @@ mod tests {
             Vec::new(),
             session_id.clone(),
             channel_id.clone(),
+            None,
         )
     }
 
@@ -15454,6 +16299,7 @@ mod tests {
                 Vec::new(),
                 session_id.clone(),
                 channel_id.clone(),
+                None,
             ),
         );
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
@@ -15666,6 +16512,7 @@ mod tests {
                 deferred,
                 session_id.clone(),
                 channel_id.clone(),
+                None,
             ),
         );
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
@@ -18596,7 +19443,7 @@ mod tests {
     ))]
     #[tokio::test]
     async fn shipping_close_matrix_preserves_history_or_retains_failed_custody() {
-        run_shipping_close_matrix(None).await;
+        run_shipping_close_matrix(MatrixSelection::Shipping).await;
     }
 
     #[cfg(all(
@@ -18607,7 +19454,7 @@ mod tests {
     ))]
     #[tokio::test]
     async fn shipping_context_first_typed_speech_continues_and_reopens_without_native_user() {
-        run_shipping_close_matrix(Some(false)).await;
+        run_shipping_close_matrix(MatrixSelection::ContextFirst { peer: false }).await;
     }
 
     #[cfg(all(
@@ -18618,7 +19465,75 @@ mod tests {
     ))]
     #[tokio::test]
     async fn shipping_context_first_peer_speech_continues_and_reopens_without_native_user() {
-        run_shipping_close_matrix(Some(true)).await;
+        run_shipping_close_matrix(MatrixSelection::ContextFirst { peer: true }).await;
+    }
+
+    /// #1821 (R3): the member turn already holds the session boundary when
+    /// the provider speaks, so the assistant output's start parks behind it
+    /// with the user's row and the speech. The close does not wait for the
+    /// turn; once the turn ends, the user's row and the spoken segment both
+    /// reach the transcript and no caption is retracted.
+    #[cfg(all(
+        feature = "session-store",
+        feature = "memory-store",
+        feature = "test-realtime-fixtures",
+        not(target_arch = "wasm32")
+    ))]
+    #[tokio::test]
+    async fn speech_whose_start_parked_behind_the_member_turn_survives_the_close() {
+        run_shipping_close_matrix(MatrixSelection::ParkedStartBehindMemberTurn).await;
+    }
+
+    /// #1821: a delegation seals one provider turn's speech between two
+    /// segments while the member turn holds the session boundary, so both
+    /// segment output starts park behind it on the closing channel. Once the
+    /// turn ends, both segments reach the transcript in order, no caption is
+    /// retracted, and no row is reported as unrecorded.
+    #[cfg(all(
+        feature = "session-store",
+        feature = "memory-store",
+        feature = "test-realtime-fixtures",
+        not(target_arch = "wasm32")
+    ))]
+    #[tokio::test]
+    async fn speech_segments_whose_starts_parked_behind_the_member_turn_survive_the_close() {
+        run_shipping_close_matrix(MatrixSelection::ParkedSegmentsBehindMemberTurn).await;
+    }
+
+    /// #1821 (R4, R6): rows parked behind a running member turn when the
+    /// channel closes. The close drains the transport before it commits, so
+    /// nothing is left unapplied in the adapter and nothing is deferred to
+    /// the channel after the close has taken its deferred rows.
+    #[cfg(all(
+        feature = "session-store",
+        feature = "memory-store",
+        feature = "test-realtime-fixtures",
+        not(target_arch = "wasm32")
+    ))]
+    #[tokio::test]
+    async fn rows_parked_behind_the_member_turn_are_all_handed_to_the_close() {
+        run_shipping_close_matrix(MatrixSelection::ParkedRowsBehindMemberTurn {
+            deferral_fails: false,
+        })
+        .await;
+    }
+
+    /// #1821 (L1): rows parked behind the member turn when the channel
+    /// closes, and the close cannot record its deferred settlement (the
+    /// recovery-state persist fails). The rows it took still reach the
+    /// transcript once the turn releases the boundary.
+    #[cfg(all(
+        feature = "session-store",
+        feature = "memory-store",
+        feature = "test-realtime-fixtures",
+        not(target_arch = "wasm32")
+    ))]
+    #[tokio::test]
+    async fn rows_parked_behind_the_member_turn_survive_a_failed_deferral_record() {
+        run_shipping_close_matrix(MatrixSelection::ParkedRowsBehindMemberTurn {
+            deferral_fails: true,
+        })
+        .await;
     }
 
     #[cfg(all(
@@ -18891,7 +19806,22 @@ mod tests {
         feature = "test-realtime-fixtures",
         not(target_arch = "wasm32")
     ))]
-    async fn run_shipping_close_matrix(context_first_peer: Option<bool>) {
+    #[derive(Clone, Copy)]
+    enum MatrixSelection {
+        Shipping,
+        ContextFirst { peer: bool },
+        ParkedStartBehindMemberTurn,
+        ParkedSegmentsBehindMemberTurn,
+        ParkedRowsBehindMemberTurn { deferral_fails: bool },
+    }
+
+    #[cfg(all(
+        feature = "session-store",
+        feature = "memory-store",
+        feature = "test-realtime-fixtures",
+        not(target_arch = "wasm32")
+    ))]
+    async fn run_shipping_close_matrix(selection: MatrixSelection) {
         use meerkat_contracts::{LiveOpenTransport, WireLiveTransportBootstrap};
         use meerkat_core::service::{DeferredPromptPolicy, InitialTurnPolicy, SessionBuildOptions};
 
@@ -18908,6 +19838,9 @@ mod tests {
             UnmeasuredEofReleaseFailure,
             UnmeasuredMemberTurnEndsMidClose,
             UnmeasuredEofDuringMemberTurn,
+            UnmeasuredStartParkedBehindMemberTurn,
+            UnmeasuredSegmentsParkedBehindMemberTurn,
+            RowsParkedBehindMemberTurn,
             SnapshotCut,
             PrefixCut,
             UnmeasuredCut,
@@ -18943,6 +19876,9 @@ mod tests {
             ExitKind::UnmeasuredEofReleaseFailure,
             ExitKind::UnmeasuredMemberTurnEndsMidClose,
             ExitKind::UnmeasuredEofDuringMemberTurn,
+            ExitKind::UnmeasuredStartParkedBehindMemberTurn,
+            ExitKind::UnmeasuredSegmentsParkedBehindMemberTurn,
+            ExitKind::RowsParkedBehindMemberTurn,
             ExitKind::SnapshotCut,
             ExitKind::PrefixCut,
             ExitKind::UnmeasuredCut,
@@ -18967,12 +19903,29 @@ mod tests {
         ]
         .into_iter()
         .enumerate()
-        .filter(|(_, exit)| match context_first_peer {
-            Some(false) => matches!(exit, ExitKind::ContextFirstTyped),
-            Some(true) => matches!(exit, ExitKind::ContextFirstPeer),
-            None => !matches!(
+        .filter(|(_, exit)| match selection {
+            MatrixSelection::ContextFirst { peer: false } => {
+                matches!(exit, ExitKind::ContextFirstTyped)
+            }
+            MatrixSelection::ContextFirst { peer: true } => {
+                matches!(exit, ExitKind::ContextFirstPeer)
+            }
+            MatrixSelection::ParkedStartBehindMemberTurn => {
+                matches!(exit, ExitKind::UnmeasuredStartParkedBehindMemberTurn)
+            }
+            MatrixSelection::ParkedSegmentsBehindMemberTurn => {
+                matches!(exit, ExitKind::UnmeasuredSegmentsParkedBehindMemberTurn)
+            }
+            MatrixSelection::ParkedRowsBehindMemberTurn { .. } => {
+                matches!(exit, ExitKind::RowsParkedBehindMemberTurn)
+            }
+            MatrixSelection::Shipping => !matches!(
                 exit,
-                ExitKind::ContextFirstTyped | ExitKind::ContextFirstPeer
+                ExitKind::ContextFirstTyped
+                    | ExitKind::ContextFirstPeer
+                    | ExitKind::UnmeasuredStartParkedBehindMemberTurn
+                    | ExitKind::UnmeasuredSegmentsParkedBehindMemberTurn
+                    | ExitKind::RowsParkedBehindMemberTurn
             ),
         }) {
             let persistence = crate::PersistenceBundle::new(
@@ -19102,6 +20055,8 @@ mod tests {
                     | ExitKind::UnmeasuredEofReleaseFailure
                     | ExitKind::UnmeasuredMemberTurnEndsMidClose
                     | ExitKind::UnmeasuredEofDuringMemberTurn
+                    | ExitKind::UnmeasuredStartParkedBehindMemberTurn
+                    | ExitKind::UnmeasuredSegmentsParkedBehindMemberTurn
                     | ExitKind::PrefixCut
                     | ExitKind::UnmeasuredCut
                     | ExitKind::UnmeasuredRetry
@@ -19115,6 +20070,8 @@ mod tests {
                     | ExitKind::UnmeasuredEofReleaseFailure
                     | ExitKind::UnmeasuredMemberTurnEndsMidClose
                     | ExitKind::UnmeasuredEofDuringMemberTurn
+                    | ExitKind::UnmeasuredStartParkedBehindMemberTurn
+                    | ExitKind::UnmeasuredSegmentsParkedBehindMemberTurn
                     | ExitKind::ContextFirstTyped
                     | ExitKind::ContextFirstPeer
             ) {
@@ -19752,6 +20709,22 @@ mod tests {
             } else {
                 None
             };
+            // #1821: the member turn already holds the session boundary when
+            // the provider speaks, so every projection below parks behind it.
+            let early_boundary = if matches!(
+                exit,
+                ExitKind::UnmeasuredStartParkedBehindMemberTurn
+                    | ExitKind::UnmeasuredSegmentsParkedBehindMemberTurn
+                    | ExitKind::RowsParkedBehindMemberTurn
+            ) {
+                Some(
+                    service
+                        .acquire_runtime_turn_finalization_guard(&session_id)
+                        .await,
+                )
+            } else {
+                None
+            };
             let user_turn = LiveSidebandTurnRef::__from_provider_observation(
                 binding.channel_id(),
                 format!("matrix-user-{ordinal}"),
@@ -19802,6 +20775,8 @@ mod tests {
                     | ExitKind::UnmeasuredEofReleaseFailure
                     | ExitKind::UnmeasuredMemberTurnEndsMidClose
                     | ExitKind::UnmeasuredEofDuringMemberTurn
+                    | ExitKind::UnmeasuredStartParkedBehindMemberTurn
+                    | ExitKind::UnmeasuredSegmentsParkedBehindMemberTurn
                     | ExitKind::PrefixCut
                     | ExitKind::UnmeasuredCut
                     | ExitKind::UnmeasuredRetry
@@ -19814,6 +20789,39 @@ mod tests {
                         delta: "First spoken checkpoint.".to_string(),
                     },
                 ));
+            }
+            if matches!(exit, ExitKind::UnmeasuredSegmentsParkedBehindMemberTurn) {
+                // A delegation is a typed between-speech boundary: the open
+                // segment seals and the provider turn continues in a second
+                // segment, whose output start parks behind the member turn
+                // too. The matrix activator acts on no delegation, so the
+                // request has no effect beyond the seal.
+                let delegating_user = LiveSidebandTurnRef::__from_provider_observation(
+                    binding.channel_id(),
+                    format!("parked-segments-user-{ordinal}"),
+                    format!("private-parked-segments-user-{ordinal}"),
+                )
+                .expect("delegating user turn");
+                for kind in [
+                    LiveSidebandObservationKind::DelegationRequested {
+                        turn: delegating_user,
+                        delegation: LiveSidebandDelegationRef::__from_provider_observation(
+                            format!("parked-segments-delegation-{ordinal}"),
+                            format!("private-parked-segments-delegation-{ordinal}"),
+                        )
+                        .expect("fixture delegation identity"),
+                        final_transcript: format!("parked segments request {ordinal}"),
+                        request_transcript: format!("parked segments request {ordinal}"),
+                        assistant_context: format!("parked segments context {ordinal}"),
+                        represented_user_rows: Vec::new(),
+                    },
+                    LiveSidebandObservationKind::TurnSnapshotDelta {
+                        turn: assistant_turn.clone(),
+                        delta: "Second spoken checkpoint.".to_string(),
+                    },
+                ] {
+                    sideband.push(LiveSidebandObservation::new(binding.clone(), kind));
+                }
             }
             if matches!(exit, ExitKind::ProviderManaged) {
                 use futures::{FutureExt as _, StreamExt as _};
@@ -20326,6 +21334,117 @@ mod tests {
                     .close_live_channel(Some(authority.as_ref()), reopened.channel_id())
                     .await
                     .expect("close pending replacement");
+                continue;
+            }
+            if matches!(
+                exit,
+                ExitKind::UnmeasuredStartParkedBehindMemberTurn
+                    | ExitKind::UnmeasuredSegmentsParkedBehindMemberTurn
+                    | ExitKind::RowsParkedBehindMemberTurn
+            ) {
+                let boundary =
+                    early_boundary.expect("the member turn holds the boundary before speech");
+                if matches!(
+                    selection,
+                    MatrixSelection::ParkedRowsBehindMemberTurn {
+                        deferral_fails: true
+                    }
+                ) {
+                    runtime.__fail_next_live_close_settlement_deferral_for_test();
+                }
+                // The pump is parked on the first projection; the speech is
+                // lowered (and captioned) while the close drains it.
+                // The close releases the channel's projections from the
+                // member turn's boundary and does not wait for the turn.
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    member_host.close_live_channel(Some(authority.as_ref()), &channel_id),
+                )
+                .await
+                .expect("the close converges while the member turn runs")
+                .expect("the close commits while the member turn runs");
+                // R4: the close drained the transport; nothing it lowered is
+                // left unapplied for a retirement to drop.
+                let (unmeasured_seals, unread_ingress) = adapter.unapplied_backlog();
+                assert_eq!(unmeasured_seals, Some(0), "no sealed speech is left behind");
+                assert_eq!(
+                    unread_ingress,
+                    Some(0),
+                    "no lowered observation is left unread"
+                );
+                drop(boundary);
+                assert_eventually_user_row(
+                    &service,
+                    &session_id,
+                    &format!("matrix user {ordinal}"),
+                )
+                .await;
+                if matches!(exit, ExitKind::UnmeasuredStartParkedBehindMemberTurn) {
+                    assert!(
+                        !captions.captions().is_empty(),
+                        "the speech was observed and captioned during the close"
+                    );
+                    assert!(
+                        captions.retractions().is_empty(),
+                        "speech whose output start was parked is never retracted"
+                    );
+                    assert_eventually_one_unmeasured_row(
+                        &service,
+                        &session_id,
+                        "First spoken checkpoint.",
+                    )
+                    .await;
+                    wait_for_resolved_close_settlement(&runtime, &session_id).await;
+                    assert_eq!(
+                        unrecorded_row_notices_now(&service, &session_id).await,
+                        Vec::<serde_json::Value>::new(),
+                        "speech that committed is never reported as unrecorded"
+                    );
+                } else if matches!(exit, ExitKind::UnmeasuredSegmentsParkedBehindMemberTurn) {
+                    assert!(
+                        captions.retractions().is_empty(),
+                        "speech whose output starts were parked is never retracted"
+                    );
+                    wait_for_resolved_close_settlement(&runtime, &session_id).await;
+                    let rows: Vec<String> = unmeasured_rows(
+                        &service
+                            .load_authoritative_session(&session_id)
+                            .await
+                            .expect("read committed speech")
+                            .expect("session"),
+                    )
+                    .into_iter()
+                    .map(|(text, _)| text)
+                    .collect();
+                    assert_eq!(
+                        (
+                            rows,
+                            unrecorded_row_notices_now(&service, &session_id).await
+                        ),
+                        (
+                            vec![
+                                "First spoken checkpoint.".to_string(),
+                                "Second spoken checkpoint.".to_string(),
+                            ],
+                            Vec::<serde_json::Value>::new(),
+                        ),
+                        "both parked segments commit in order, and speech that committed is never reported as unrecorded"
+                    );
+                } else {
+                    // R6: every row the transport deferred reached the close's
+                    // settlement; none was deferred after the close took them.
+                    live_adapter_host
+                        .retain_channel_close_projection(&session_id, &channel_id)
+                        .await
+                        .expect("the closed channel stays reachable on the host");
+                    assert!(
+                        live_adapter_host
+                            .take_deferred_projections(&channel_id)
+                            .await
+                            .is_empty(),
+                        "no row was deferred to the channel after the close took its deferred rows"
+                    );
+                }
                 continue;
             }
             if matches!(
@@ -21419,6 +22538,9 @@ mod tests {
                 | ExitKind::UnmeasuredEofReleaseFailure
                 | ExitKind::UnmeasuredMemberTurnEndsMidClose
                 | ExitKind::UnmeasuredEofDuringMemberTurn
+                | ExitKind::UnmeasuredStartParkedBehindMemberTurn
+                | ExitKind::UnmeasuredSegmentsParkedBehindMemberTurn
+                | ExitKind::RowsParkedBehindMemberTurn
                 | ExitKind::PrefixCut
                 | ExitKind::UnmeasuredCut
                 | ExitKind::UnmeasuredRetry
