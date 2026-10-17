@@ -84,6 +84,113 @@ them.
   is found, when the push carries more than one commit (the finder runs from
   HEAD's first parent only when that parent is the push's payload base), or
   when the finder's answer is not a full sha of an ancestor of HEAD.
+- **Every third-party GitHub Action is pinned to a commit SHA, and Renovate
+  no longer automerges action updates.** Each `uses:` in `.github/`
+  workflows and composite actions (release and reusable workflows included)
+  names the full commit its tag or branch resolved to, with the ref in a
+  trailing comment; Renovate keeps them current
+  (`helpers:pinGitHubActionDigests`), proposes new action versions in a
+  group of their own a week after their release, holds a digest update (a
+  tag that now names another commit) for approval on the dependency
+  dashboard, and never automerges one. `scripts/ci-action-pins.mjs` (in
+  `make path-classifier-selftest`) fails on an unpinned third-party action
+  and on any spelling of a `uses` key it cannot read (quoted, in a flow
+  mapping, its value on the next line) or any key whose name a line cannot
+  show (an explicit `?` key, an alias, an escape in a quoted key), naming
+  its file and line, and on a Renovate configuration that could automerge
+  an action update, including automerge set outside packageRules
+  (`vulnerabilityAlerts`, an update type's settings), release its digest
+  updates from approval, or automerge what a regex manager
+  (`customManagers`) pins: the container digests and the sccache release,
+  which Renovate proposes a week after their release, in a group of their
+  own, and never automerges. The pinned
+  `dtolnay/rust-toolchain` commit is that of its `1.94.1` branch, which
+  installs that toolchain; the trailing comment names it. The release jobs
+  whose checkout can be an older tag (a recovery dispatch) run their setup
+  action, Rust or BuildBuddy, and the scripts it runs from a checkout of
+  the workflow's own commit, so an older tag's setup action never runs,
+  and the Rust setup installs the channel the checked-out tree names when
+  it differs. The BuildBuddy release validation, which runs the actions of
+  the tree it checks out, refuses a release tag; the github-hosted backend
+  validates one. CI only.
+- **A release tag no longer restores a Bazel repository cache another run
+  could have saved.** The tag's full BuildBuddy graph (`buildbuddy.yml`
+  with `repository_cache: "false"`) restores none, and the dispatch-only
+  release checks (`release-binaries-check.yml`, `release-turbo-s.yml`)
+  restore it without saving, so no dispatch writes the cache scope tags
+  read. The release doctor now reads the reusable workflows a tag run calls,
+  with the caller's inputs, and fails on a call it cannot read, on any tag
+  restore of that cache, and on any dispatch-like run that saves it. CI
+  only.
+- **The nightly full BuildBuddy graph no longer passes every repository
+  secret.** `nightly.yml` calls `buildbuddy.yml` with exactly the secrets
+  that workflow declares instead of `secrets: inherit`, and the release
+  doctor's token check now fails on `secrets: inherit` in any workflow of
+  the repository, not only `release.yml`. CI only.
+- `.github/CODEOWNERS` names the maintainer as the owner of `.github/`,
+  `renovate.json`, `Makefile` and `scripts/` explicitly, so the CI, release
+  and dependency-update configuration keeps that owner if the default
+  owner changes. Repository configuration only.
+- **A dispatch saves no cache that a tag-trusted run restores.** `ci.yml`
+  (which writes the exact-tree attestation), `release-semver-readiness.yml`
+  (the semver attestation) and `release-binaries-check.yml` save no cache
+  on a `workflow_dispatch` run, and the release doctor fails on a
+  dispatch-like run that saves a cache in any workflow whose runs a tag
+  trusts or that checks out a ref its inputs choose. The semver readiness
+  and release binaries checks no longer cache `~/.cargo/bin`. CI only.
+- **Release runs restore no GitHub Actions cache.** The release
+  validation, binary, Web SDK and semver baseline jobs run no rust-cache
+  step, on a tag or on a dispatch (a prebuild or a recovery): nothing on
+  main saves their keys. `build-windows-cross` restores the Windows SDK
+  cache only for a caller that saves it, which release.yml does not, and
+  the BuildBuddy release jobs pass `repository-cache: "false"`. The
+  semver gate's dispatch measurement keeps its cache, which the readiness
+  workflow's push to main saves. Only a re-run of the same tag loses a
+  warm cache. The release doctor fails on any cache a release job would
+  restore, on any event. CI only.
+- **Only push and schedule runs set the CI sccache client to write its
+  bucket.** Every other run, pull requests from this repository included,
+  runs it read-only (`SCCACHE_GCS_RW_MODE=READ_ONLY`), and the lanes no
+  longer install sccache through sccache-action, so no step exports the
+  job's Actions cache token to their run steps. Both stop short of a
+  credential: the read-only mode is a client-side setting, and any later
+  step of a lane that authenticated to GCS can read the credentials file
+  `SCCACHE_GCS_KEY_PATH` names, whose bearer is the job's Actions runtime
+  token (the runner sets `ACTIONS_ID_TOKEN_REQUEST_TOKEN` to the same
+  token). That token reaches the Actions caches, which no release job
+  restores. The release doctor checks the mode and the install. CI only.
+- **CI installs a pinned sccache release.** The CI lanes' setup
+  (`.github/actions/setup-sccache-ci`) downloads the sccache v0.18.0
+  tarball itself and checks it against a pinned sha256, instead of
+  installing through `mozilla-actions/sccache-action`, which checks a
+  download only against the `.sha256` file of the same release. Every
+  remaining sccache-action step (nightly, `cargo.yml` and the dense Mob
+  topology workflow, which use the GitHub Actions cache backend the action
+  sets up) names the release it installs (`version: v0.18.0`) instead of
+  taking the newest one when the job runs. Renovate proposes new releases
+  through a regex manager; the setup's sha256 must change with the
+  version, or its install fails. `scripts/ci-action-pins.mjs` fails on an
+  sccache-action step without an exact release, and the release doctor on
+  a CI setup that installs through the action or skips the sha256 check.
+  CI only.
+- **The Linux release build image is pinned by digest.**
+  `buildpack-deps:bullseye` (the release workflow's Linux build container
+  and the Bazel x86_64 and arm64 execution platforms) is named by its
+  multi-arch index digest, which a Renovate regex manager keeps current.
+  `scripts/ci-action-pins.mjs` refuses a `docker://` action, a
+  `container:` or `image:` value, or a Bazel `docker://` reference without
+  a digest, with one named exception: the self-hosted CI image, whose
+  registry is private. CI and release builds only.
+- The BuildBuddy edge-lane detector (`scripts/buildbuddy-edge-changes`)
+  matched crate paths without their `crates/` prefix, so a crate change
+  selected none of the WASM, SDK, minimal or feature-matrix edge lanes it
+  should; it now does, and its WASM list gains the five crates the web
+  runtime's dependencies reach that it lacked (authorization contracts,
+  capabilities, jobs, models, workgraph). A self-test in
+  `make path-classifier-selftest` fails when that list drifts from cargo
+  metadata. `make buildbuddy-doctor` reads the mixed
+  fast/non-fast routing and the `oai-rt-rs` pin without pinning a target
+  list or a crate version. CI only.
 
 ## [0.9.2] - 2026-10-16
 

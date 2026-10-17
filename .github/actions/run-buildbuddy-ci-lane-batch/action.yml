@@ -19,6 +19,10 @@ inputs:
     description: Maximum number of local lane submitters to run in parallel.
     required: false
     default: ""
+  repository-cache:
+    description: "Bazel external repository cache: true, restore, or false (see setup-buildbuddy-ci)."
+    required: false
+    default: "true"
 
 runs:
   using: composite
@@ -27,13 +31,14 @@ runs:
       uses: ./.github/actions/setup-buildbuddy-ci
       with:
         profile: ${{ inputs.profile }}
+        repository-cache: ${{ inputs.repository-cache }}
 
     # The self-hosted control plane has no public ingress: submitters reach
     # its gRPCS port through an IAP tunnel on 127.0.0.1 and trust only its
     # per-boot CA (BUILDBUDDY_TLS_CA_B64 from control-plane-up).
     - name: Authenticate to GCP for the control-plane tunnel
       if: ${{ env.MEERKAT_BAZEL_BACKEND == 'gcp-buildbuddy' && env.MEERKAT_GCP_WORKLOAD_IDENTITY_PROVIDER != '' && env.MEERKAT_GCP_SERVICE_ACCOUNT != '' }}
-      uses: google-github-actions/auth@v3
+      uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
       with:
         workload_identity_provider: ${{ env.MEERKAT_GCP_WORKLOAD_IDENTITY_PROVIDER }}
         service_account: ${{ env.MEERKAT_GCP_SERVICE_ACCOUNT }}
@@ -41,7 +46,7 @@ runs:
 
     - name: Setup gcloud for the control-plane tunnel
       if: ${{ env.MEERKAT_BAZEL_BACKEND == 'gcp-buildbuddy' }}
-      uses: google-github-actions/setup-gcloud@v3
+      uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3
 
     - name: Authenticate to GCP with JSON fallback
       if: ${{ env.MEERKAT_BAZEL_BACKEND == 'gcp-buildbuddy' }}
@@ -88,7 +93,7 @@ runs:
 
     - name: Upload BuildBuddy logs
       if: always()
-      uses: actions/upload-artifact@v7
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
       with:
         name: buildbuddy-${{ inputs.group }}-${{ github.run_id }}-${{ github.run_attempt }}
         path: ${{ runner.temp }}/buildbuddy-logs

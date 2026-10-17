@@ -1,10 +1,32 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
-  "extends": ["config:recommended"],
+  "extends": ["config:recommended", "helpers:pinGitHubActionDigests"],
   "schedule": ["before 9am on Monday"],
   "branchConcurrentLimit": 1,
   "prConcurrentLimit": 1,
   "prHourlyLimit": 1,
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "Container images pinned by digest where no built-in manager reads them: the release workflow's build container expression and the Bazel execution platforms.",
+      "managerFilePatterns": ["/^\\.github/workflows/release\\.yml$/", "/^tools/bazel/platforms/BUILD\\.bazel$/"],
+      "matchStrings": [
+        "(?:docker://)?(?<depName>docker\\.io/[a-z0-9._/-]+):(?<currentValue>[A-Za-z0-9._-]+)@(?<currentDigest>sha256:[a-f0-9]{64})"
+      ],
+      "datasourceTemplate": "docker"
+    },
+    {
+      "customType": "regex",
+      "description": "The sccache release every sccache-action step installs (the action would otherwise take the newest at run time), and the one setup-sccache-ci downloads, whose pinned SCCACHE_SHA256 an update must change too: its install fails until it matches.",
+      "managerFilePatterns": ["/^\\.github/.+\\.ya?ml$/"],
+      "matchStrings": [
+        "mozilla-actions/sccache-action@[0-9a-f]{40} # \\S+\\n\\s+with:\\n(?:\\s+#[^\\n]*\\n)*\\s+version: (?<currentValue>v[0-9]+\\.[0-9]+\\.[0-9]+)",
+        "SCCACHE_VERSION: (?<currentValue>v[0-9]+\\.[0-9]+\\.[0-9]+)"
+      ],
+      "depNameTemplate": "mozilla/sccache",
+      "datasourceTemplate": "github-releases"
+    }
+  ],
   "packageRules": [
     {
       "description": "Keep routine dependency updates in one validation train",
@@ -17,8 +39,26 @@
       "automerge": true
     },
     {
+      "description": "A digest update of a pinned action (its tag now names another commit) waits for approval on the dependency dashboard: minimumReleaseAge holds back new versions only, and a moved tag keeps its original date.",
       "matchManagers": ["github-actions"],
-      "automerge": true
+      "matchUpdateTypes": ["digest"],
+      "dependencyDashboardApproval": true
+    },
+    {
+      "description": "What the customManagers above pin (container digests, the sccache release) builds CI and the release: proposed a week after its release, in a group of its own, and never automerged.",
+      "matchManagers": ["custom.regex"],
+      "groupName": "pinned images and tools",
+      "groupSlug": "pinned-images-and-tools",
+      "minimumReleaseAge": "7 days",
+      "automerge": false
+    },
+    {
+      "description": "GitHub Actions run with the workflow token, OIDC and release secrets: pinned to commit SHAs (helpers:pinGitHubActionDigests, checked by scripts/ci-action-pins.mjs), new versions proposed a week after their release, in a group of their own, and never automerged. Keep this rule last.",
+      "matchManagers": ["github-actions"],
+      "groupName": "github actions",
+      "groupSlug": "github-actions",
+      "minimumReleaseAge": "7 days",
+      "automerge": false
     }
   ]
 }

@@ -19,6 +19,13 @@ if ! command -v rustup >/dev/null 2>&1; then
   exit 1
 fi
 
+# The setup action installs the pinned channel; a checkout whose
+# rust-toolchain.toml names another one (a recovery of an older release
+# tag) gets that channel here, from rustup's own verified channel data.
+if ! rustup which --toolchain "${toolchain}" cargo >/dev/null 2>&1; then
+  rustup toolchain install "${toolchain}" --profile minimal --no-self-update
+fi
+
 if [[ "${GITHUB_ACTIONS:-}" == "true" ]]; then
   # Hosted runners give every job a fresh VM, so a STABLE Cargo home is
   # required: rust-cache/sccache reuse depends on registry source paths that

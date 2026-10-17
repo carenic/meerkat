@@ -1,1 +1,12 @@
+# The maintainer owns every path.
 * @lukacf
+
+# CI, release and dependency-update configuration, and the scripts and make
+# targets CI and the release run. The default above names the same owner;
+# these entries keep it on these paths if the default changes (the last
+# matching pattern wins). Whether a pull request needs a code owner's review
+# is a repository rule, not this file.
+/.github/ @lukacf
+/renovate.json @lukacf
+/Makefile @lukacf
+/scripts/ @lukacf

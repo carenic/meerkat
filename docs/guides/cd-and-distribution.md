@@ -466,8 +466,10 @@ The release workflow's own `GITHUB_TOKEN` is read-only by default: only the
 build jobs may mint OIDC tokens and write build attestations, only the
 release publishers may write the GitHub release, and neither the build nor
 the publisher checkouts persist the token. The full-graph validation passes
-`buildbuddy.yml` only the `MEERKAT_GCP_BUILDBUDDY_API_KEY` secret, never
-`secrets: inherit` (`scripts/release-doctor` checks all of this). No GitHub
+`buildbuddy.yml` only the `MEERKAT_GCP_BUILDBUDDY_API_KEY` secret, and no
+workflow in the repository uses `secrets: inherit`: the nightly full graph
+lists the secrets `buildbuddy.yml` declares (`scripts/release-doctor` checks
+all of this). No GitHub
 Actions cache step in its jobs, or in the local actions they call (the
 Windows SDK cache of `build-windows-cross`, the Bazel repository cache of
 `setup-buildbuddy-ci`), is saved by a dispatch, which would write the `main`
@@ -476,10 +478,23 @@ restored binary can shadow a tool on `PATH`; the jobs that hold registry or
 publish tokens restore no cache at all; and the jobs that mint OIDC tokens or
 attest artifacts restore only caches that no workflow in the repository saves
 on a dispatch-like run (any trigger but `push`, `pull_request`, `schedule`
-and `merge_group`). The BuildBuddy release binary build passes
-`repository-cache: "false"`. The doctor reads release.yml and its local
-actions, not the reusable `buildbuddy.yml`, which the full-graph validation
-calls only on tag pushes, and it does not cover the BuildBuddy remote cache.
+and `merge_group`). The workflows whose runs a tag trusts (`ci.yml`, which
+writes the exact-tree attestation, and `release-semver-readiness.yml`,
+which writes the semver attestation) and any workflow that checks out a
+ref its inputs choose save no cache on a dispatch-like run either. No
+release job restores a cache, on a tag or on a dispatch (a prebuild or a
+recovery), but the semver gate's dispatch measurement, whose cache only
+the readiness workflow's push to main saves: the release jobs run no
+rust-cache step, `build-windows-cross` restores the Windows SDK cache only
+for a caller that saves it (release.yml does not), the BuildBuddy release
+jobs pass `repository-cache: "false"` and the full-graph validation
+passes `buildbuddy.yml` `repository_cache: "false"`.
+No workflow saves that cache on a dispatch-like run either
+(`release-binaries-check.yml` and `release-turbo-s.yml` only restore it).
+The doctor reads release.yml, the local actions it calls and, with the
+caller's inputs, the reusable `buildbuddy.yml` that the full-graph
+validation calls only on tag pushes; it does not cover the BuildBuddy remote
+cache.
 The macOS checks call the Apple tools by absolute path. The Web SDK package
 job installs wasm-pack, wasm-bindgen (the version Cargo.lock locks) and
 wasm-opt pinned by sha256 and runs wasm-pack with `--mode no-install`
