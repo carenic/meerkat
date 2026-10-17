@@ -2941,6 +2941,9 @@ async fn resubmit_under_recorded_specification(
     let mut replay = spec;
     replay.canonical_arguments_hash = admitted.spec.canonical_arguments_hash;
     replay.runner_specification_ref = Some(recorded_ref);
+    // The admitted job's origin member: a replay from a session its member
+    // has since left no longer derives it (#1790).
+    replay.origin_member_id = admitted.spec.origin_member_id;
     service.submit(replay).await.map_err(shell_job_error)
 }
 
@@ -5126,6 +5129,92 @@ mod durable_tests {
                 .len(),
             1
         );
+    }
+
+    /// #1790: a shell job admitted with the delivery address of the mob
+    /// member whose session ran it is the job a replay of the same call
+    /// joins after that member moved to a successor session, when the replay
+    /// no longer derives the address: the store refuses the replay without it
+    /// as another submission, and the conflict path adopts the admitted
+    /// job's origin member along with its recorded specification.
+    #[tokio::test]
+    async fn a_replay_without_the_origin_member_joins_the_admitted_shell_job() {
+        let temp = TempDir::new().expect("tempdir");
+        let session_id = SessionId::new();
+        let tool_call_id = "member-completed-call";
+        let command = "printf member-shell";
+        let (_, job_store, config) = strict_durable_fixture(&temp, session_id.clone());
+        let runner_spec = shell_call_runner_spec(&config, command).await;
+        let spec_blob = plant_shell_artifact(
+            &temp,
+            SHELL_RUNNER_MEDIA_TYPE,
+            &runner_spec,
+            PlantedEncoding::Base64,
+        )
+        .await;
+        let result_blob = plant_shell_artifact(
+            &temp,
+            SHELL_RESULT_MEDIA_TYPE,
+            &ShellResultRecord {
+                exit_code: Some(0),
+                stdout: "member-shell".to_string(),
+                stderr: String::new(),
+                duration_secs: 0.5,
+            },
+            PlantedEncoding::Base64,
+        )
+        .await;
+        let member =
+            meerkat_jobs::OriginMemberId::new("rt:member:team:worker:1").expect("member id");
+        let service = DetachedJobService::new(job_store.clone());
+        let committed = service
+            .submit(
+                shell_call_job_spec(&session_id, tool_call_id, &spec_blob)
+                    .with_origin_member_id(member.clone()),
+            )
+            .await
+            .expect("member submission");
+        let claim = service
+            .claim_attempt(
+                &committed.job_id,
+                AttemptClaim::new(
+                    WorkerId::new("member-worker").expect("worker"),
+                    1,
+                    60_000,
+                    RunnerHandleRef::new("member-handle").expect("handle"),
+                ),
+            )
+            .await
+            .expect("member claim");
+        service
+            .complete_attempt(
+                &committed.job_id,
+                AttemptWriteAuthority::from(&claim),
+                2,
+                Some(JobResultRef::new(result_blob.blob_id.to_string()).expect("result ref")),
+            )
+            .await
+            .expect("member completion");
+
+        let (runtime, job_store, config) = strict_durable_fixture(&temp, session_id.clone());
+        let manager = JobManager::new(config)
+            .bind_canonical_async_ops(
+                session_id.clone(),
+                Arc::new(RuntimeOpsLifecycleRegistry::new()),
+            )
+            .with_durable_job_runtime(runtime);
+        let replayed = manager
+            .spawn_job_for_call(command, None, 5, tool_call_id)
+            .await
+            .expect("the replay joins the admitted job");
+        assert_eq!(replayed.to_string(), committed.job_id.as_str());
+        let jobs = job_store
+            .list_for_origin("test-realm", &session_id, 10)
+            .await
+            .expect("list");
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].spec.origin_member_id, Some(member));
+        assert_eq!(jobs[0].machine_state.attempt_count, 1);
     }
 
     #[tokio::test]

@@ -397,7 +397,7 @@ pub fn build_runtime_backed_service_with_capacities(
         .manifest()
         .map(|manifest| manifest.realm.clone());
     #[cfg(not(target_arch = "wasm32"))]
-    let detached_job_store = persistence.job_store();
+    let detached_job_store = persistence.producer_job_store();
     #[cfg(not(target_arch = "wasm32"))]
     let runtime_delivery_inbox = persistence.runtime_delivery_inbox();
     #[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]

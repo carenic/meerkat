@@ -3423,7 +3423,7 @@ impl SessionRuntime {
         persistence: PersistenceBundle,
         notification_sink: crate::router::NotificationSink,
     ) -> Result<Self, meerkat::surface::RuntimeBackedCompositionError> {
-        let job_store = persistence.job_store();
+        let job_store = persistence.producer_job_store();
         let runtime_delivery_inbox = persistence.runtime_delivery_inbox();
         let continuation_bindings = persistence.continuation_bindings();
         let schedule_service = persistence.schedule_service();
@@ -3595,7 +3595,7 @@ impl SessionRuntime {
         persistence: PersistenceBundle,
         notification_sink: crate::router::NotificationSink,
     ) -> Result<Self, meerkat::surface::RuntimeBackedCompositionError> {
-        let job_store = persistence.job_store();
+        let job_store = persistence.producer_job_store();
         let runtime_delivery_inbox = persistence.runtime_delivery_inbox();
         let continuation_bindings = persistence.continuation_bindings();
         let schedule_service = persistence.schedule_service();

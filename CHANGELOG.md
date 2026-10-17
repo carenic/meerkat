@@ -864,6 +864,15 @@ them.
   durable store before retiring them. The field is left out of the
   serialized report when it is empty, so the `mob/destroy` result of any
   other destroy is unchanged.
+- `meerkat::ContinuationAddressResolver::member_address_of_session` and
+  `meerkat_mob::continuation::MobHandleLookup::mob_handles`, provided
+  methods (the defaults know of no members and hold no mobs): a host that
+  resolves member delivery addresses reports the mob member a session serves
+  now. `meerkat::ContinuationHostBindings::member_address_of_session` asks
+  the bound resolver. `meerkat::JobRuntimeDeliveryApplier::with_address_session`
+  names the session serving a drained member address.
+  `meerkat::PersistenceBundle::producer_job_store` is the bundle's job store
+  as job producers use it (see Fixed); `job_store` stays the host's own store.
 
 ### Changed
 
@@ -1616,6 +1625,28 @@ them.
   budget makes the destroy a typed `MobDestroyError::Incomplete` whose report
   names the member and the reload error; when that happens before the destroy
   started, the mob is left as it was, and the destroy can be retried.
+- A detached job a mob member's session submitted delivered its
+  notifications and terminal to that session's runtime, and an
+  explicit-resume repoint moves the member to a successor session without
+  migrating delivery rows, so after a repoint they stranded on the
+  superseded session (#1790). The job store the persistence bundle hands
+  producers (`PersistenceBundle::producer_job_store`, which the RPC host and
+  the runtime-backed surfaces use) now records the delivery address of the
+  member whose current session submits a job
+  (`rt:member:{mob}:{identity}:{generation}`, as the host's continuation
+  resolver reports it) as the job's origin member (`JobSpec::origin_member_id`),
+  and the delivery owner applies such a job's rows in the session serving the
+  member when they are delivered; other sessions' subscriptions are
+  unchanged. A replay of the same call from the superseded session joins the
+  admitted job: the callback and shell producers adopt its origin member. A
+  member respawned under its identity is a new generation that never receives
+  an earlier generation's rows, which stay pending. Jobs submitted before
+  0.9.3, and jobs of sessions no member serves, keep their session's
+  address; a replay keeps what its admitted job recorded. A host that builds
+  its own job producers from `PersistenceBundle::job_store()` keeps session
+  addressing; give them `producer_job_store()` for member addressing. Not
+  yet covered: the terminal a background shell job applies itself, in the
+  session that ran it.
 
 ### Known issues
 
@@ -1667,6 +1698,10 @@ them.
 - `MobHandle::force_cancel_member` cannot cancel a member whose runtime
   requires a durability reload: it fails with the runtime's repair-blocked
   error. Retiring the member, or destroying the mob, reloads it first.
+- A mob member repointed between applying a job delivery row in one session
+  and acknowledging it can see the row applied again in the successor
+  session: each session keeps its own idempotency ledger. Continuation rows
+  already have the same window.
 
 ## [0.9.2] - 2026-10-16
 

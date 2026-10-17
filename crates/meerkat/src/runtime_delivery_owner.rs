@@ -1054,6 +1054,9 @@ async fn run_pass(
             Arc::clone(&owner.router),
             owner.cold.applies_cold_deliveries(),
         );
+        if via_address {
+            applier = applier.with_address_session(session_id.clone());
+        }
         if let Some(continuations) = owner.host.continuation_sink(&session_id).await {
             applier = applier.with_continuations(
                 continuations,
@@ -1119,8 +1122,8 @@ async fn run_pass(
 enum ServingSession {
     /// A job row's provenance session.
     Session(SessionId),
-    /// The session serving a continuation address now, from the host's
-    /// address resolution.
+    /// The session serving a continuation address, or a member's address,
+    /// now, from the host's address resolution.
     Address(SessionId),
     /// A live owner no session serves at the moment: retried on the next
     /// attachment commit, run settlement or source change.
@@ -1130,9 +1133,12 @@ enum ServingSession {
     NothingToDrain,
 }
 
-/// The session that drains `runtime_id` now, decided by its first pending
-/// row: a job row by its provenance, a continuation row by the host's address
-/// resolution.
+/// The session that drains `runtime_id` now: a member's delivery address and
+/// a continuation row by the host's address resolution, any other job row by
+/// its provenance. A member's address carries its continuations and, since
+/// #1790, the rows of the jobs its sessions submitted; a retired incarnation
+/// (its identity respawned under a new generation, or its mob gone) is
+/// served by no session, so its rows are never applied.
 async fn serving_session(
     owner: &OwnerLoop,
     runtime_id: &LogicalRuntimeId,
@@ -1148,7 +1154,9 @@ async fn serving_session(
     else {
         return Ok(ServingSession::NothingToDrain);
     };
-    if first.submission.kind() == RuntimeDeliveryKind::Continuation {
+    if first.submission.kind() == RuntimeDeliveryKind::Continuation
+        || matches!(runtime_id.member_address(), Ok(Some(_)))
+    {
         return Ok(match owner.host.resolve_address(runtime_id).await {
             crate::AddressResolution::Session(session_id) => ServingSession::Address(session_id),
             crate::AddressResolution::NotServed => ServingSession::NotServed,
