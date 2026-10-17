@@ -871,6 +871,32 @@ them.
   `[env]` sets `CLIPPY_CONF_DIR` or `CLIPPY_ARGS`. A run whose environment
   sets those variables or such `RUSTFLAGS`, or a Cargo configuration outside
   the checkout, is outside the test; the repository's lanes and CI set none.
+- **CI runs the tests that read a changed doc.** A change to a file that
+  belongs to no crate (docs, skills, `CHANGELOG.md`, specs, fixtures) now
+  adds the exact targets that read it to the integration lane, as listed
+  in `scripts/ci-non-rust-readers.json`: on a pull request, unless the
+  reader compiles meerkat-mob (then on the push, named in the plan); on a
+  push without a main unit lane, for the lib, bin and example targets; and
+  on every push for a test target that needs features the push's
+  closure-tests rows do not build (xtask's machine-authority contracts,
+  the GPT Live replay suite). For a reader in library code a pull request
+  runs the lib and bins and leaves its test targets to the push's
+  closure-tests rows, as for a code change; the nested-Cargo canary tests
+  run only there. The plan names what a pull request leaves to the push.
+  A reader that needs live-provider credentials runs in no CI lane, and
+  the plan and the `CI gate` name it. Before, a docs-only pull request ran
+  none of them and a docs-only push never ran rkat's doc-example test. A
+  crate's in-crate documentation that it compiles in (the
+  `skills/*/SKILL.md` files) is now a build input of that crate, and the
+  authority-language check of `xtask machine-check-drift` runs on the live
+  docs in an xtask library test, so a docs pull request runs it too. The
+  inventory's guard fails a reader whose named test the reader's features
+  compile out (meerkat-store's 0.8.10 corpus test needs `sqlite`, not a
+  default feature of the crate). CI only.
+- **The live gate skips xtask changes.** `scripts/live-gate-changed` no
+  longer counts a change under `crates/xtask/` as live-relevant: no live
+  gate target compiles or runs xtask, so a pull request that changes only
+  xtask passes the gate without running the GPT Live scenarios. CI only.
 
 ### Deprecated
 

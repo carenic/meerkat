@@ -545,7 +545,7 @@ if (args[0] === "api") {
     WASM: "false", WASM_CHECK_RESULT: "skipped", SDK_HOST_RESULT: "skipped", EXAMPLE_WEB_RESULT: "skipped",
     WASM_TIMERS_RESULT: "skipped", BAZEL_GRAPH_RESULT: "success", RUST_CHANGED: "false", IS_MAIN_PUSH: "true",
     IS_PULL_REQUEST: "false", PLAN_EVENT: "push", CLOSURE_CHECK: "false", GOVERNED_JSONL: "false",
-    MCP_CONFINEMENT_POSITIVE: "false", DEFERRED_TO_PUSH: "",
+    MCP_CONFINEMENT_POSITIVE: "false", DEFERRED_TO_PUSH: "", READER_NOT_RUN: "",
     SDK_HOST: "false", BAZEL_GRAPH: "true", EXAMPLES_BROWSER: "false", EXAMPLE_WEB: "false",
     MODE: "release-projection", REASON: "release projection", SHARD_COUNT: "0", UNIT_SHARD_COUNT: "6",
     UNIT_DEFERRED: "", UNIT_DEFERRED_COUNT: "0", PACKAGE_COUNT: "0", CLOSURE_COUNT: "0",
@@ -626,6 +626,11 @@ if (args[0] === "api") {
   const pullRequestRun = runGate(pullRequestGate);
   assert.equal(pullRequestRun.status, 0, `the gate accepts a pull request without the lanes it left to the push: ${pullRequestRun.stdout}`);
   assert.match(pullRequestRun.stdout, /left to the push \(main or release\/\*\*\): 17 closure-tests rows/);
+  // The readers no CI lane runs (live-provider credentials) are named, and
+  // pass.
+  const notRunRun = runGate({ ...pullRequestGate, READER_NOT_RUN: "integration-tests:test:gpt_live_public_e2e" });
+  assert.equal(notRunRun.status, 0, notRunRun.stdout);
+  assert.match(notRunRun.stdout, /::notice::readers of changed files that need live-provider credentials run in no CI lane: integration-tests:test:gpt_live_public_e2e/);
   assert.equal(runGate(pushGate).status, 0, `the gate accepts a push that ran them: ${runGate(pushGate).stdout}`);
   // A push runs its unit rows in the packed main unit lane, not in a unit
   // lane of its own: the gate requires that lane instead.

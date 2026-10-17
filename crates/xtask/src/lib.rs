@@ -2,6 +2,7 @@
 #![allow(clippy::disallowed_methods)]
 
 pub mod audit_generated_headers;
+pub mod authority_language;
 pub mod bridge_classifier;
 pub mod effect_authority;
 pub mod generated_files;

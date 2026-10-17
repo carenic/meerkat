@@ -596,8 +596,10 @@ mobpack-docs-contract-gate:
 	$(CARGO) test -p rkat --features mob --test help_mobpack_contract -- --quiet
 
 # Docs are load-bearing inputs to validation scripts and compiled integration
-# tests. Code changes cover these through the ratchet and integration lanes;
-# docs-only CI invokes this exact complement from the governance job.
+# tests. CI runs docs-check in its Format + governance job and, for a changed
+# doc, the tests that read it (reader rows from scripts/ci-non-rust-readers.json;
+# the readers that compile meerkat-mob run on the push). This target is the
+# local check for a docs-only change.
 docs-only-contract-gate: docs-check verify-rpc-surface-alignment mobpack-docs-contract-gate
 
 runtime-authority-bypass:
