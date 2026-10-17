@@ -550,11 +550,23 @@ own repeated claim succeeds. Once the holder has closed, the first claim
 presenting the token
 wins, including the pending detached callback jobs the closed connection's
 tools started: a claimer that registers tools of the same name and runner
-reconciles and cancels them. Pending detached jobs queued for the mob's
-callback tools run on the claiming connection's tool of the same name and
-runner: jobs are matched by tool name and runner, not re-checked against the
-connection that queued them. A detached callback call made while no open
-connection holds the route is refused before anything durable is written.
+reconciles and cancels them, and runs the queued ones, but only where its
+tool declares exactly what the job recorded when it was submitted (the
+tool's description, schema, provenance, audience and execution contract,
+runner included). Every route other than the connection that submitted a
+job, and every route after a restart, is held to that declaration. A
+running job whose recorded declaration differs goes to `needs_attention`
+with the reason `callback_binding_changed` instead of being reconciled or
+cancelled through that route; a queued job is not that route's to start
+and stays queued, unchanged, for a route that declares what it recorded or
+for the connection that submitted it, until one of them starts it or
+`jobs/cancel` cancels it. A job submitted before 0.9.3 recorded no
+declaration and goes to `needs_attention` (`callback_binding_changed`) at
+its first start, reconcile or cancel. A job whose recorded specification
+no longer decodes goes to `needs_attention` with the reason
+`callback_specification_unreadable`. A detached callback call made while no
+open connection holds the route is refused before anything durable is
+written.
 
 ## Session methods
 

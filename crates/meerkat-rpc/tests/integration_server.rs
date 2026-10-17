@@ -2173,6 +2173,225 @@ mod tcp_callback_ownership {
         run_case(3).await;
     }
 
+    /// The `durable` detached callback tool as a connection registers it:
+    /// one runner and contract, and the description that tells two
+    /// declarations apart.
+    fn detached_tool(description: &str) -> Value {
+        json!([{
+            "name": "durable",
+            "description": description,
+            "input_schema": {"type": "object", "properties": {}},
+            "execution": {
+                "mode": "detached",
+                "runner": {"name": "host.durable", "version": "v1"},
+                "restart_class": "adoptable",
+                "idempotency_scope": "tool_call",
+                "submission_timeout_ms": 5000
+            }
+        }])
+    }
+
+    impl Connection {
+        /// Register `tools`. A registration reconciles the detached callback
+        /// jobs its tools serve concurrently with its response: the server
+        /// requests that arrive before the response are returned.
+        async fn register_tools(&mut self, id: u64, tools: Value) -> Vec<Value> {
+            self.send(
+                json!({"jsonrpc":"2.0","id":id,"method":"tools/register","params":{"tools":tools}}),
+            )
+            .await;
+            let mut requests = Vec::new();
+            loop {
+                let frame = self.next_significant().await;
+                if frame["method"].is_string() {
+                    requests.push(frame);
+                    continue;
+                }
+                assert_eq!(frame["id"], json!(id), "{frame}");
+                assert!(frame["error"].is_null(), "RPC error: {frame}");
+                assert!(
+                    frame["result"]["registered"].as_u64().unwrap() > 0,
+                    "{frame}"
+                );
+                return requests;
+            }
+        }
+
+        /// The job's `jobs/get` summary, or the server request that arrived
+        /// before the response.
+        async fn get_job(&mut self, id: u64, job_id: &str) -> Result<Value, Value> {
+            self.send(
+                json!({"jsonrpc":"2.0","id":id,"method":"jobs/get","params":{"job_id":job_id}}),
+            )
+            .await;
+            let frame = self.next_significant().await;
+            if frame["method"].is_string() {
+                return Err(frame);
+            }
+            assert_eq!(frame["id"], json!(id), "{frame}");
+            assert!(frame["error"].is_null(), "RPC error: {frame}");
+            Ok(frame["result"]["job"].clone())
+        }
+    }
+
+    /// RED 5 (#222) over real connections: a detached callback job whose
+    /// submitting connection closed is reconciled only by a connection whose
+    /// tool declares what the job recorded. The creator's second turn calls
+    /// its detached `durable` tool (the turn's caller context gives it the
+    /// runtime-owned interaction lineage a detached call records); the
+    /// creator takes the attempt's start and closes without answering it,
+    /// and the attempt was claimed (with a 120 s lease) before its start was
+    /// sent, so the job stays running until a
+    /// connection serving the tool reconciles it. A connection registering
+    /// the creator's declaration is offered the job, and it keeps running
+    /// once reported live; one registering the same name and runner with
+    /// another description is offered nothing, and the job goes to
+    /// needs_attention (`callback_binding_changed`).
+    #[tokio::test]
+    async fn tcp_detached_callback_job_is_reconciled_only_under_the_declaration_it_recorded() {
+        let mut h = Harness::new();
+        h.runtime.set_realm_context(
+            Some(meerkat_core::connection::RealmId::global()),
+            None,
+            None,
+        );
+        let result = AssertUnwindSafe(tokio::time::timeout(Duration::from_secs(50), async {
+            h.provider.plan("warm-durable", [finish()]);
+            h.provider.plan(
+                "submit-durable",
+                [
+                    Step::Load {
+                        tool: "durable",
+                        call_id: "load-durable",
+                    },
+                    Step::Call {
+                        tool: "durable",
+                        call_id: "call-durable",
+                    },
+                    finish(),
+                ],
+            );
+            let (creator_index, mut creator) = h.connect().await;
+            let offered = creator
+                .register_tools(2, detached_tool("the creator's durable tool"))
+                .await;
+            assert!(offered.is_empty(), "{offered:?}");
+            let session = creator.create().await;
+            creator.start(&session, "warm-durable").await;
+            creator.response(4).await;
+            h.seen("warm-durable").await;
+            creator
+                .send(json!({"jsonrpc":"2.0","id":5,"method":"turn/start","params":{"session_id":session,"prompt":"submit-durable","transient_turn_context":"submit-durable"}}))
+                .await;
+            h.seen("submit-durable").await;
+            assert_catalog_load(
+                &h.seen("submit-durable").await,
+                "load-durable",
+                "durable",
+            );
+            let submitted = h.seen("submit-durable").await;
+            let results: Vec<_> = submitted
+                .results
+                .iter()
+                .filter(|result| result.tool_use_id == "call-durable")
+                .collect();
+            assert_eq!(results.len(), 1, "{submitted:?}");
+            assert!(!results[0].is_error, "{submitted:?}");
+            let receipt: Value = serde_json::from_str(&results[0].text_content()).unwrap();
+            let job_id = receipt["job_id"].as_str().unwrap().to_owned();
+            let mut start = None;
+            let mut turn_done = false;
+            while start.is_none() || !turn_done {
+                let frame = creator.next_significant().await;
+                if frame["method"] == "callback/job/start" {
+                    assert!(start.is_none(), "a second attempt start: {frame}");
+                    start = Some(frame);
+                } else {
+                    assert_eq!(frame["id"], json!(5), "{frame}");
+                    assert!(frame["error"].is_null(), "RPC error: {frame}");
+                    turn_done = true;
+                }
+            }
+            let start = start.unwrap();
+            assert_eq!(
+                start["params"]["authority"]["job_id"],
+                json!(job_id),
+                "{start}"
+            );
+            drop(creator);
+            h.disconnected(creator_index).await;
+
+            // The creator's declaration on another connection: the job is
+            // offered to it and keeps running once reported live.
+            let (unchanged_index, mut unchanged) = h.connect().await;
+            let mut offered = unchanged
+                .register_tools(2, detached_tool("the creator's durable tool"))
+                .await;
+            if offered.is_empty() {
+                offered.push(unchanged.next_significant().await);
+            }
+            assert_eq!(offered.len(), 1, "{offered:?}");
+            let reconcile = &offered[0];
+            assert_eq!(reconcile["method"], "callback/job/reconcile", "{reconcile}");
+            let attempts = reconcile["params"]["attempts"].as_array().unwrap();
+            assert_eq!(attempts.len(), 1, "{reconcile}");
+            assert_eq!(
+                attempts[0]["authority"],
+                start["params"]["authority"],
+                "{reconcile}"
+            );
+            unchanged
+                .send(json!({"jsonrpc":"2.0","id":reconcile["id"],"result":{"live_attempts":[attempts[0]["authority"]]}}))
+                .await;
+            let job = unchanged
+                .get_job(3, &job_id)
+                .await
+                .unwrap_or_else(|request| panic!("a second request: {request}"));
+            assert_eq!(job["phase"], "running", "{job}");
+            drop(unchanged);
+            h.disconnected(unchanged_index).await;
+
+            // The same name and runner under another description.
+            let (_, mut changed) = h.connect().await;
+            let offered = changed
+                .register_tools(2, detached_tool("another connection's durable tool"))
+                .await;
+            assert!(
+                offered.is_empty(),
+                "the job is offered to a connection declaring another tool: {offered:?}"
+            );
+            let job = tokio::time::timeout(LIMIT, async {
+                let mut id = 2;
+                loop {
+                    id += 1;
+                    let job = changed.get_job(id, &job_id).await.unwrap_or_else(|request| {
+                        panic!("the job is offered to a connection declaring another tool: {request}")
+                    });
+                    if job["phase"] != "running" {
+                        break job;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .expect("the job leaves running");
+            assert_eq!(job["phase"], "needs_attention", "{job}");
+            assert_eq!(
+                job["terminal_result"],
+                json!({"kind": "needs_attention", "reason": "callback_binding_changed"}),
+                "{job}"
+            );
+            h.exhausted();
+        }))
+        .catch_unwind()
+        .await;
+        h.clean().await;
+        match result {
+            Ok(result) => result.expect("bounded complete scenario"),
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
+    }
+
     /// A mob member's callback tools are the tools registered on the
     /// connection that created its mob: the member sees the tool, loads it
     /// and its call reaches that connection, whether the tool was registered
