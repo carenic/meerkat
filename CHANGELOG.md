@@ -54,11 +54,18 @@ them.
   user's speech, is an answer and restores on the user's quiet, mid-sentence
   if need be. So does an answer that follows an early yield within the 1.6 s
   that would end the interrupted response, and one that follows a user onset
-  within 1.6 s of an answer that had already ended. The duck still holds
+  within 1.6 s of an answer that had ended at least 600 ms before. The duck
+  still holds
   while the user speaks, and pauses inside the user's speech (under 1.6 s)
   never restore it. By design, an answer spoken entirely while the user is
   still talking stays ducked to its end (Turbo S S106): the user held the
-  floor for all of it.
+  floor for all of it. Known limitation: without a response id the broker
+  cannot tell a resumed interrupted response from a new answer. If the
+  interrupted response pauses for 600 ms or more while the user is still
+  talking and then resumes, or the user starts speaking inside a 600 ms to
+  1.6 s pause of a response that then resumes, the resumed audio counts as
+  an answer: it stays ducked while the user speaks and is restored once the
+  user has been quiet for 1.6 s, mid-sentence if need be.
 
 ## [0.9.2] - 2026-10-16
 

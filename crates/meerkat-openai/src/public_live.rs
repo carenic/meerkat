@@ -7798,6 +7798,98 @@ mod tests {
         assert!(!state.assistant_playback_ducked);
     }
 
+    /// Trade-off pin (gpt-live-1 output frames carry no response id): the
+    /// interrupted response pauses for a burst gap of 600 ms or more while
+    /// the user is still talking, then resumes its stale tail. The gap ended
+    /// the interrupted burst, so the resumed audio counts as an answer: it
+    /// stays ducked while the user speaks and is restored once the user has
+    /// been quiet 1600 ms, in the middle of its burst.
+    #[test]
+    fn an_interrupted_response_resumed_after_a_burst_gap_restores_at_the_users_quiet() {
+        let mut state = SessionState::default();
+        model_output(&mut state, true, 3);
+        // The user interrupts the response.
+        reflect_input(&mut state, true, 1);
+        assert_eq!(
+            playback_observations(&mut state),
+            vec![GptLiveBrokerObservation::UserSpeechOverAssistant]
+        );
+        // It pauses for 600 ms while the user keeps talking, then its stale
+        // tail resumes into the user's speech.
+        for _ in 0..3 {
+            model_output(&mut state, false, 1);
+            reflect_input(&mut state, true, 1);
+        }
+        for _ in 0..2 {
+            model_output(&mut state, true, 1);
+            reflect_input(&mut state, true, 1);
+        }
+        assert!(
+            playback_observations(&mut state).is_empty(),
+            "the duck holds while the user speaks"
+        );
+        // The user stops; the tail keeps talking.
+        for _ in 0..7 {
+            model_output(&mut state, true, 1);
+            reflect_input(&mut state, false, 1);
+        }
+        assert!(playback_observations(&mut state).is_empty());
+        model_output(&mut state, true, 1);
+        reflect_input(&mut state, false, 1);
+        assert_eq!(
+            playback_observations(&mut state),
+            vec![GptLiveBrokerObservation::AssistantPlaybackRestorable],
+            "the resumed tail counts as an answer: restored mid-burst at 1600 ms of the user's quiet"
+        );
+        assert!(!state.assistant_playback_ducked);
+    }
+
+    /// Trade-off pin (gpt-live-1 output frames carry no response id): the
+    /// user starts speaking inside a 600 ms to 1.6 s output pause of a
+    /// response, which then resumes. The pause already ended the response's
+    /// burst, so the onset does not mark it interrupted: the resumed audio
+    /// counts as an answer, ducked while the user speaks and restored once
+    /// the user has been quiet 1600 ms, in the middle of its burst.
+    #[test]
+    fn a_duck_over_a_response_resumed_after_an_onset_in_its_burst_gap_restores_at_the_users_quiet()
+    {
+        let mut state = SessionState::default();
+        model_output(&mut state, true, 3);
+        // An 800 ms output pause.
+        model_output(&mut state, false, 4);
+        assert!(playback_observations(&mut state).is_empty());
+        // The user starts speaking inside the pause: under 1.6 s of output
+        // silence the assistant still counts as audible, so the duck opens.
+        reflect_input(&mut state, true, 1);
+        assert_eq!(
+            playback_observations(&mut state),
+            vec![GptLiveBrokerObservation::UserSpeechOverAssistant]
+        );
+        // The response resumes into the user's speech.
+        for _ in 0..3 {
+            model_output(&mut state, true, 1);
+            reflect_input(&mut state, true, 1);
+        }
+        assert!(
+            playback_observations(&mut state).is_empty(),
+            "the duck holds while the user speaks"
+        );
+        // The user stops; the response keeps talking.
+        for _ in 0..7 {
+            model_output(&mut state, true, 1);
+            reflect_input(&mut state, false, 1);
+        }
+        assert!(playback_observations(&mut state).is_empty());
+        model_output(&mut state, true, 1);
+        reflect_input(&mut state, false, 1);
+        assert_eq!(
+            playback_observations(&mut state),
+            vec![GptLiveBrokerObservation::AssistantPlaybackRestorable],
+            "the resumed response counts as an answer: restored mid-burst at 1600 ms of the user's quiet"
+        );
+        assert!(!state.assistant_playback_ducked);
+    }
+
     /// S99 pre-merge r3: a cue deferred during the model's response; the
     /// response ends and the user starts a question. The model's output is
     /// silent while the user speaks, so output silence alone released the
