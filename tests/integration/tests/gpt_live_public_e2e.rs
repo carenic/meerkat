@@ -7976,15 +7976,18 @@ const QUIET_LANE_TRANSCRIPT_TAIL_CHARS: usize = 200;
 /// The outbox sends a typed turn's rows one at a time, and its admission can
 /// defer the head row (an open provider user turn, the row's own pending
 /// append, a late summary), so read the first row not sent: later rows queue
-/// behind it. That row at (0, 0) with no below-floor run of 1600 ms since the
-/// wait started is explained by the audible hold: the provider's output never
-/// went quiet long enough to release it. At (0, 0) with such a run, something
-/// other than an audible response held it: either the hold did not release
-/// or the row never reached it, and the product's `text-chat context held
-/// ... token=N` log line tells which. A row sent but not acknowledged is a
-/// provider acknowledgement stall. With no output frame since the wait
+/// behind it. A 1600 ms below-floor run counts when a frame since the wait
+/// started reached it, or when the run was already there as the wait started
+/// (`below_floor_at_wait_start_ms` of 1600 or more: the product was not
+/// holding then, whatever frames followed). That row at (0, 0) with no such
+/// run is explained by the audible hold: the provider's output never went
+/// quiet long enough to release it, and with no output frame since the wait
 /// started, provider audio stopped, so the product's clock stopped and the
-/// hold cannot release. S98 on Live gate run 39043475436 timed out with
+/// hold cannot release. At (0, 0) with such a run, something other than an
+/// audible response held it: either the hold did not release or the row
+/// never reached it, and the product's `text-chat context held ... token=N`
+/// log line tells which. A row sent but not acknowledged is a provider
+/// acknowledgement stall. S98 on Live gate run 39043475436 timed out with
 /// neither row sent.
 #[derive(Debug)]
 struct QuietLaneTimeout {
