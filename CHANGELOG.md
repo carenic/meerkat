@@ -74,6 +74,15 @@ them.
   layer decision that carries it anyway is honoured as `Disabled`, and
   refused with the same typed error where the model refuses it.
 
+### Known limitations
+
+- Disabled Anthropic thinking is not live-verified in this release: which
+  models accept it comes from Anthropic's per-model thinking table. Claude
+  Opus 5 and Haiku 5.5 accept it only at `high` effort or below, and a
+  request that sets no effort relies on their documented default efforts
+  (`high` and `medium`); set the effort explicitly at `high` or below on
+  those two models to be certain.
+
 ## [0.9.2] - 2026-10-16
 
 ### Breaking
