@@ -79,6 +79,10 @@ them.
   re-run of the same tag loses a warm cache. The release doctor fails on
   any cache a tag run would restore, not only the Bazel repository cache.
   CI only.
+- **Only push and schedule runs write the CI sccache bucket.** Every other
+  run, pull requests from this repository included, uses it read-only, and
+  the run steps after the sccache action no longer see the Actions cache
+  token it exports. The release doctor checks both. CI only.
 
 ## [0.9.2] - 2026-10-16
 

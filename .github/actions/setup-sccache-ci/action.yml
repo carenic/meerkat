@@ -1,9 +1,11 @@
 name: Setup sccache for CI
 description: >-
   Install sccache and point it at the GCS object cache through the repository's
-  GCP workload identity. When that identity is unavailable (pull requests from
-  forks have no id-token, or the variables are unset) run with a local disk
-  cache only, with no remote cache, instead of failing the lane.
+  GCP workload identity: read-write for push and schedule runs, read-only for
+  every other run (pull requests from this repository included). When that
+  identity is unavailable (pull requests from forks have no id-token, or the
+  variables are unset) run with a local disk cache only, with no remote cache,
+  instead of failing the lane.
 
 inputs:
   bucket:
@@ -41,6 +43,15 @@ runs:
       # statistics in its post step. The backend is selected below.
       uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
 
+    # The action exports the job's Actions cache token for its GitHub
+    # Actions cache backend, which neither backend below uses, and has no
+    # input to keep it. The runner hands JavaScript and container actions
+    # the token itself, so blanking it here takes it only from the run
+    # steps that follow (builds, build scripts, tests).
+    - name: Withdraw the Actions cache token from later run steps
+      shell: bash
+      run: echo "ACTIONS_RUNTIME_TOKEN=" >> "${GITHUB_ENV}"
+
     - name: Authenticate to GCP with workload identity
       id: gcp
       if: ${{ inputs.bucket != '' && inputs.workload_identity_provider != '' && inputs.service_account != '' }}
@@ -64,17 +75,21 @@ runs:
         KEY_PREFIX: ${{ inputs.key_prefix }}
         GCP_OUTCOME: ${{ steps.gcp.outcome }}
         CREDENTIALS_FILE: ${{ steps.gcp.outputs.credentials_file_path }}
+        # Only a push (main or a release branch) or a schedule writes the
+        # bucket, whose objects the push to main compiles from before it
+        # attests; every other run, a pull request included, only reads it.
+        RW_MODE: ${{ (github.event_name == 'push' || github.event_name == 'schedule') && 'READ_WRITE' || 'READ_ONLY' }}
       run: |
         set -euo pipefail
         if [[ -n "${BUCKET}" && "${GCP_OUTCOME}" == "success" && -n "${CREDENTIALS_FILE}" && -s "${CREDENTIALS_FILE}" ]]; then
           {
             echo "SCCACHE_GCS_BUCKET=${BUCKET}"
-            echo "SCCACHE_GCS_RW_MODE=READ_WRITE"
+            echo "SCCACHE_GCS_RW_MODE=${RW_MODE}"
             echo "SCCACHE_GCS_KEY_PREFIX=${KEY_PREFIX}"
             echo "SCCACHE_GCS_KEY_PATH=${CREDENTIALS_FILE}"
           } >> "${GITHUB_ENV}"
           echo "backend=gcs" >> "${GITHUB_OUTPUT}"
-          echo "sccache backend: gcs://${BUCKET}/${KEY_PREFIX} (read-write)"
+          echo "sccache backend: gcs://${BUCKET}/${KEY_PREFIX} (${RW_MODE})"
         else
           # No remote cache: a fresh runner's local disk cache, so the lane
           # compiles cold and still counts against the same budget.
@@ -83,10 +98,11 @@ runs:
           echo "sccache backend: local disk only (GCS identity unavailable: bucket='${BUCKET}', auth outcome='${GCP_OUTCOME}')"
         fi
 
-    - name: Start the sccache server read-write
+    - name: Start the sccache server
       shell: bash
       env:
         BACKEND: ${{ steps.select.outputs.backend }}
+        RW_MODE: ${{ (github.event_name == 'push' || github.event_name == 'schedule') && 'READ_WRITE' || 'READ_ONLY' }}
       run: |
         set -euo pipefail
         # sccache probes the bucket with one shared object (.sccache_check)
@@ -94,13 +110,14 @@ runs:
         # second, GCS's per-object mutation rate limit (429) fails the probe
         # for some of them and that server silently runs ReadOnly for the
         # whole lane. Stagger the start and restart until the server reports
-        # ReadWrite (the GCS backend only; the local fallback has no probe).
+        # ReadWrite (a read-write GCS backend only; a read-only one is meant
+        # to come up ReadOnly, and the local fallback has no probe).
         for attempt in 1 2 3 4 5 6; do
           sccache --stop-server >/dev/null 2>&1 || true
           if [[ -n "${SCCACHE_ERROR_LOG:-}" ]]; then : > "${SCCACHE_ERROR_LOG}"; fi
           sleep "$((RANDOM % 10 + attempt))"
           sccache --start-server
-          if [[ "${BACKEND}" == "gcs" && -n "${SCCACHE_ERROR_LOG:-}" ]] && grep -q 'server has setup with ReadOnly' "${SCCACHE_ERROR_LOG}"; then
+          if [[ "${BACKEND}" == "gcs" && "${RW_MODE}" == "READ_WRITE" && -n "${SCCACHE_ERROR_LOG:-}" ]] && grep -q 'server has setup with ReadOnly' "${SCCACHE_ERROR_LOG}"; then
             echo "sccache server came up ReadOnly (bucket write probe rate-limited); restarting (attempt ${attempt})"
             continue
           fi

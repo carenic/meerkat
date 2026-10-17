@@ -2015,6 +2015,13 @@ BAZEL_REPOSITORY_CACHE = ("key", "buildbuddy-bazel-repository-*")
 # its inputs choose, saves no cache: it would save into the scope the next
 # trusted run restores from.
 TAG_TRUSTED_WORKFLOWS = ("ci.yml", "release-semver-readiness.yml", "release.yml")
+# The sccache setup every CI lane runs: the GCS objects it writes are what
+# the push to main compiles from before it attests, so only push and
+# schedule runs write them, and no run step keeps the Actions cache token
+# the sccache action exports.
+SCCACHE_ACTION = "./.github/actions/setup-sccache-ci"
+SCCACHE_WRITERS = ("push", "schedule")
+SCCACHE_READERS = ("pull_request", "pull_request_target", "workflow_dispatch", "merge_group", "workflow_run")
 
 
 @dataclass(frozen=True)
@@ -2557,6 +2564,47 @@ def _reusable_cache_uses(
     return found
 
 
+def _sccache_problems(root: Path) -> list[str]:
+    """Who writes the sccache bucket, and who keeps the Actions cache token."""
+    where = SCCACHE_ACTION[2:]
+    try:
+        action = _local_action(SCCACHE_ACTION, root)
+    except ContractError as error:
+        return [f"{where}: {error}"]
+    if action is None:
+        return [f"{where} is not a local action"]
+    problems: list[str] = []
+    steps = list(action.steps)
+    installs = [i for i, step in enumerate(steps) if "mozilla-actions/sccache-action" in step.fields.get("uses", "")]
+    withdrawals = [
+        i
+        for i, step in enumerate(steps)
+        if re.search(r'^echo "ACTIONS_RUNTIME_TOKEN=" >> "\$\{GITHUB_ENV\}"$', step.run, re.M)
+    ]
+    if installs and not any(i > max(installs) for i in withdrawals):
+        problems.append(
+            f"{where} leaves the Actions cache token sccache-action exports to the run steps after it"
+        )
+    writes = [step for step in steps if "SCCACHE_GCS_RW_MODE=" in step.run]
+    if not writes:
+        problems.append(f"{where} sets no SCCACHE_GCS_RW_MODE")
+    for step in writes:
+        if "SCCACHE_GCS_RW_MODE=${RW_MODE}" not in step.run or step.run.count("SCCACHE_GCS_RW_MODE=") != 1:
+            problems.append(f"{where} step `{step.name}` sets SCCACHE_GCS_RW_MODE other than from RW_MODE")
+            continue
+        mode = step.env.get("RW_MODE")
+        if mode is None:
+            problems.append(f"{where} step `{step.name}` has no RW_MODE")
+            continue
+        for event in (*SCCACHE_WRITERS, *SCCACHE_READERS):
+            got = _open_evaluate(mode, OpenFrame(label=f"a {event} run", event_name=event))
+            wanted = "READ_WRITE" if event in SCCACHE_WRITERS else "READ_ONLY"
+            if got != wanted:
+                shown = "unknown" if isinstance(got, _Unknown) else got
+                problems.append(f"{where} gives a {event} run sccache mode {shown}, not {wanted}")
+    return problems
+
+
 def _checks_out_input_ref(text: str) -> bool:
     """Does any job check out a ref that the run's inputs choose?"""
     for job in _job_names(text):
@@ -2585,7 +2633,9 @@ def check_release_caches(text: str) -> list[str]:
     cache on a dispatch-like run at all: such runs only restore it. A
     workflow that produces what a tag run trusts (TAG_TRUSTED_WORKFLOWS),
     or that checks out a ref its inputs choose, saves no cache at all on a
-    dispatch-like run.
+    dispatch-like run. The CI lanes' sccache bucket is written only by push
+    and schedule runs, and no run step after the sccache action keeps the
+    Actions cache token it exports (_sccache_problems).
     """
     root = REPO_ROOT
     violations: list[str] = []
@@ -2651,6 +2701,8 @@ def check_release_caches(text: str) -> list[str]:
     sources = {path.name: path.read_text(encoding="utf-8") for path in workflows}
     # The workflow under check, which may be a mutated copy.
     sources[DEFAULT_WORKFLOW.name] = text
+    for problem in _sccache_problems(root):
+        report(problem)
     for trusted in TAG_TRUSTED_WORKFLOWS:
         if trusted not in sources:
             report(f"{trusted}, a workflow whose runs a tag trusts, is missing; update TAG_TRUSTED_WORKFLOWS")

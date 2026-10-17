@@ -39,8 +39,8 @@ TRAILING_PASS="PASS Linux and macOS arm64 assets publish without waiting for the
 TRAILING_FAIL="FAIL The trailing Intel macOS and Windows lanes must not gate the critical assets, and no upload may replace a published asset"
 WEB_TOOLS_PASS="PASS The Web SDK release build checks every download's sha256 and wasm-pack installs nothing: wasm-bindgen (Cargo.lock's version) and wasm-opt are pinned"
 TOKEN_PASS="PASS Release workflow token is read-only except for the jobs that attest or publish, which never persist it in a checkout; no workflow passes every secret to a reusable workflow"
-CACHES_PASS="PASS GitHub Actions caches in release.yml jobs, the local actions they call and, on a tag, the reusable workflows they call are never saved on a dispatch and never cache ~/.cargo/bin; token jobs restore none, a tag run restores no cache, OIDC or attesting jobs restore none that a dispatch-like run of any workflow saves, and no dispatch-like run saves the Bazel repository cache (reusable workflows never run on a dispatch); a workflow that produces what a tag trusts or checks out a ref its inputs choose saves no cache on a dispatch-like run"
-CACHES_FAIL="FAIL A release cache can be saved on a dispatch, cache ~/.cargo/bin, reach a token, OIDC or attesting job, or a tag run, or a workflow a tag trusts saves a cache on a dispatch-like run"
+CACHES_PASS="PASS GitHub Actions caches in release.yml jobs, the local actions they call and, on a tag, the reusable workflows they call are never saved on a dispatch and never cache ~/.cargo/bin; token jobs restore none, a tag run restores no cache, OIDC or attesting jobs restore none that a dispatch-like run of any workflow saves, and no dispatch-like run saves the Bazel repository cache (reusable workflows never run on a dispatch); a workflow that produces what a tag trusts or checks out a ref its inputs choose saves no cache on a dispatch-like run; only push and schedule runs write CI's sccache bucket, and no run step keeps the Actions cache token"
+CACHES_FAIL="FAIL A release cache can be saved on a dispatch, cache ~/.cargo/bin, reach a token, OIDC or attesting job, or a tag run, or a workflow a tag trusts saves a cache on a dispatch-like run, or CI's sccache bucket or the Actions cache token reaches other runs"
 
 fail() {
   echo "release doctor workflow contract violated: $1" >&2
@@ -723,6 +723,25 @@ elif name == "xwin-tag-restore":
         "      id: sdk-cache\n      if: ${{ !startsWith(github.ref, 'refs/tags/') }}\n",
         "      id: sdk-cache\n",
     )
+elif name == "sccache-pull-request-writes":
+    # The pre-review sccache setup wrote the bucket from pull requests.
+    path = root / ".github/actions/setup-sccache-ci/action.yml"
+    text = path.read_text()
+    step = text.index("    - name: Select the sccache backend\n")
+    needle = "        RW_MODE: ${{ (github.event_name == 'push' || github.event_name == 'schedule') && 'READ_WRITE' || 'READ_ONLY' }}\n"
+    at = text.index(needle, step)
+    path.write_text(
+        text[:at]
+        + "        RW_MODE: ${{ github.event_name != 'workflow_dispatch' && 'READ_WRITE' || 'READ_ONLY' }}\n"
+        + text[at + len(needle):]
+    )
+elif name == "sccache-token-kept":
+    # The pre-review sccache setup left the Actions cache token to run steps.
+    replace_once(
+        ".github/actions/setup-sccache-ci/action.yml",
+        "      run: echo \"ACTIONS_RUNTIME_TOKEN=\" >> \"${GITHUB_ENV}\"\n",
+        "      run: echo \"sccache installed\"\n",
+    )
 elif name == "semver-readiness-dispatch-save":
     # The pre-review semver measurement saved its rust-cache on a dispatch.
     replace_once(
@@ -1079,6 +1098,12 @@ expect_tree_fail_named dispatch-saves-repository-cache "${TEST_ROOT}/dispatch-sa
 mutate_tree xwin-tag-restore "${TEST_ROOT}/xwin-tag-restore"
 expect_tree_fail_named xwin-tag-restore "${TEST_ROOT}/xwin-tag-restore" \
   "job \`build_binaries_windows_cross\` (in \`.github/actions/build-windows-cross\`) restores \`xwin-sdk-*-cargo-xwin-0.23.1\` on a tag; a tag run restores no cache" release-caches
+mutate_tree sccache-pull-request-writes "${TEST_ROOT}/sccache-pull-request-writes"
+expect_tree_fail_named sccache-pull-request-writes "${TEST_ROOT}/sccache-pull-request-writes" \
+  ".github/actions/setup-sccache-ci gives a pull_request run sccache mode READ_WRITE, not READ_ONLY" release-caches
+mutate_tree sccache-token-kept "${TEST_ROOT}/sccache-token-kept"
+expect_tree_fail_named sccache-token-kept "${TEST_ROOT}/sccache-token-kept" \
+  ".github/actions/setup-sccache-ci leaves the Actions cache token sccache-action exports to the run steps after it" release-caches
 mutate_tree semver-readiness-dispatch-save "${TEST_ROOT}/semver-readiness-dispatch-save"
 expect_tree_fail_named semver-readiness-dispatch-save "${TEST_ROOT}/semver-readiness-dispatch-save" \
   "release-semver-readiness.yml job \`semver\` saves a cache on a workflow_dispatch run" release-caches

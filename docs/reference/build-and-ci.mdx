@@ -204,8 +204,10 @@ Pull-request CI is `.github/workflows/ci.yml`. It runs on pull requests,
 pushes to `main` and to `release/**` integration branches, and manual
 dispatches (any other branch head runs once, through its pull request), entirely with Cargo on GitHub-hosted `ubuntu-24.04` runners
 (4 vCPU), and it is sized to a 25-minute lane execution budget. Compiled
-objects are cached by sccache (content-addressed, shared by every lane and
-readable from `main` by every pull request); rust-cache holds only the
+objects are cached by sccache (content-addressed and shared by every lane;
+push and schedule runs write it, every other run, a pull request included,
+only reads it, and no run step keeps the Actions cache token the sccache
+action exports); rust-cache holds only the
 registry, because per-lane target caches exceeded the repository's 10 GB
 cache limit in one pull request:
 
