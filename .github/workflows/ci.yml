@@ -2615,6 +2615,8 @@ jobs:
           MAIN_UNIT_REST_COUNT: ${{ needs.changes.outputs.main_unit_rest_count }}
           MAIN_UNIT_ARCHIVE_BUILD_RESULT: ${{ needs.main-unit-archive-build.result }}
           MAIN_UNIT_ARCHIVE_RUN_RESULT: ${{ needs.main-unit-archive-run.result }}
+          MAIN_ARCHIVE_BUILD_COUNT: ${{ needs.changes.outputs.main_archive_build_count }}
+          MAIN_ARCHIVE_RUN_COUNT: ${{ needs.changes.outputs.main_archive_run_count }}
           CLOSURE_CHECK_RESULT: ${{ needs.closure-check.result }}
           FEATURE_CHECK_FIRST_RESULT: ${{ needs.feature-check.result }}
           FEATURE_CHECK_REST_RESULT: ${{ needs.feature-check-rest.result }}
@@ -2687,20 +2689,33 @@ jobs:
             echo "MAIN_UNIT_PACKED_RESULT=${MAIN_UNIT_PACKED_RESULT}"
             echo "FEATURE_CHECK_RESULT=${FEATURE_CHECK_RESULT}"
           } >> "${GITHUB_ENV:-/dev/null}"
-          # Main unit coverage is the packed shards plus the archived lanes
-          # (build once, partitioned runs): one failure or cancellation fails
-          # it, and it counts as skipped only when all three were skipped.
+          # Main unit coverage is the packed waves plus the archived lanes
+          # (build once, partitioned runs), each given as result:row count:
+          # one failure or cancellation fails it, a lane that has rows and did
+          # not succeed leaves it unrun (the others' success never stands in
+          # for its rows), and it counts as skipped only when no lane has rows.
           combine_main_unit() {
-            local result any_ran=0
-            for result in "$@"; do
-              case "${result}" in
-                failure|cancelled) echo "${result}"; return ;;
-                success) any_ran=1 ;;
-              esac
+            local lane result count any_rows=0
+            for lane in "$@"; do
+              case "${lane%%:*}" in failure|cancelled) echo "${lane%%:*}"; return ;; esac
             done
-            if (( any_ran )); then echo success; else echo skipped; fi
+            for lane in "$@"; do
+              result="${lane%%:*}"
+              count="${lane##*:}"
+              if ! [[ "${count}" =~ ^[0-9]+$ ]]; then echo "unplanned"; return; fi
+              if (( count > 0 )); then
+                any_rows=1
+                if [[ "${result}" != "success" ]]; then echo "${result:-missing}"; return; fi
+              fi
+            done
+            if (( any_rows )); then echo success; else echo skipped; fi
           }
-          MAIN_UNIT_RESULT="$(combine_main_unit "${MAIN_UNIT_PACKED_RESULT}" "${MAIN_UNIT_ARCHIVE_BUILD_RESULT}" "${MAIN_UNIT_ARCHIVE_RUN_RESULT}")"
+          main_unit_rows=unplanned
+          if [[ "${MAIN_UNIT_FIRST_COUNT}" =~ ^[0-9]+$ && "${MAIN_UNIT_REST_COUNT}" =~ ^[0-9]+$ ]]; then
+            main_unit_rows=$(( MAIN_UNIT_FIRST_COUNT + MAIN_UNIT_REST_COUNT ))
+          fi
+          MAIN_UNIT_RESULT="$(combine_main_unit "${MAIN_UNIT_PACKED_RESULT}:${main_unit_rows}" "${MAIN_UNIT_ARCHIVE_BUILD_RESULT}:${MAIN_ARCHIVE_BUILD_COUNT}" "${MAIN_UNIT_ARCHIVE_RUN_RESULT}:${MAIN_ARCHIVE_RUN_COUNT}")"
+          echo "MAIN_UNIT_RESULT=${MAIN_UNIT_RESULT}" >> "${GITHUB_ENV:-/dev/null}"
           echo "plan: mode=${MODE} packages=${PACKAGE_COUNT} closure=${CLOSURE_COUNT} clippy_shards=${SHARD_COUNT} unit_shards=${UNIT_SHARD_COUNT} (${REASON})"
           if [[ -n "${UNIT_DEFERRED}" ]]; then
             echo "::notice::unit tests deferred to the push-to-main run (meerkat-mob compile chain): ${UNIT_DEFERRED}"
@@ -3222,7 +3237,8 @@ jobs:
         id: attestation
         shell: bash
         # CLIPPY_RESULT, CLOSURE_TESTS_RESULT and MAIN_UNIT_PACKED_RESULT come
-        # from the check step: each combines its lane's two waves.
+        # from the check step: each combines its lane's two waves. So does
+        # MAIN_UNIT_RESULT, the packed waves plus the archived lanes.
         env:
           CHANGES_RESULT: ${{ needs.changes.result }}
           FMT_GOVERNANCE_RESULT: ${{ needs.fmt-governance.result }}
@@ -3231,8 +3247,6 @@ jobs:
           INTEGRATION_RESULT: ${{ needs.integration.result }}
           GOVERNED_JSONL_RESULT: ${{ needs.governed-jsonl.result }}
           MCP_CONFINEMENT_POSITIVE_RESULT: ${{ needs.mcp-confinement-positive.result }}
-          MAIN_UNIT_ARCHIVE_BUILD_RESULT: ${{ needs.main-unit-archive-build.result }}
-          MAIN_UNIT_ARCHIVE_RUN_RESULT: ${{ needs.main-unit-archive-run.result }}
           CLOSURE_CHECK_RESULT: ${{ needs.closure-check.result }}
           WASM_CHECK_RESULT: ${{ needs.wasm-check.result }}
           SDK_HOST_RESULT: ${{ needs.sdk-host.result }}
@@ -3261,20 +3275,6 @@ jobs:
           REUSED_TO_VERSION: ${{ steps.release_evidence.outputs.to_version }}
         run: |
           set -euo pipefail
-          # Main unit coverage is the packed shards plus the archived lanes
-          # (build once, partitioned runs): one failure or cancellation fails
-          # it, and it counts as skipped only when all three were skipped.
-          combine_main_unit() {
-            local result any_ran=0
-            for result in "$@"; do
-              case "${result}" in
-                failure|cancelled) echo "${result}"; return ;;
-                success) any_ran=1 ;;
-              esac
-            done
-            if (( any_ran )); then echo success; else echo skipped; fi
-          }
-          MAIN_UNIT_RESULT="$(combine_main_unit "${MAIN_UNIT_PACKED_RESULT}" "${MAIN_UNIT_ARCHIVE_BUILD_RESULT}" "${MAIN_UNIT_ARCHIVE_RUN_RESULT}")"
           destination="${RUNNER_TEMP}/meerkat-ci-attestation"
           mkdir -p "${destination}"
           tree_sha="$(git rev-parse 'HEAD^{tree}')"

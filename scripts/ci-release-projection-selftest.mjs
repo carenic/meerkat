@@ -540,6 +540,7 @@ if (args[0] === "api") {
     MCP_CONFINEMENT_POSITIVE_RESULT: "skipped", INTEGRATION_COUNT: "0", CLOSURE_TESTS_RESULT: "skipped",
     CLOSURE_TEST_COUNT: "0", TEST_SCOPE_COUNT: "0", HOOK_BINARY_COUNT: "0", HOOK_RETAINED_COUNT: "0",
     MAIN_UNIT_PACKED_RESULT: "skipped", MAIN_UNIT_ARCHIVE_BUILD_RESULT: "skipped", MAIN_UNIT_ARCHIVE_RUN_RESULT: "skipped",
+    MAIN_ARCHIVE_BUILD_COUNT: "0", MAIN_ARCHIVE_RUN_COUNT: "0",
     CLOSURE_CHECK_RESULT: "skipped", FEATURE_CHECK_RESULT: "skipped", FEATURE_CHECK_COUNT: "0",
     WASM: "false", WASM_CHECK_RESULT: "skipped", SDK_HOST_RESULT: "skipped", EXAMPLE_WEB_RESULT: "skipped",
     WASM_TIMERS_RESULT: "skipped", BAZEL_GRAPH_RESULT: "success", RUST_CHANGED: "false", IS_MAIN_PUSH: "true",
@@ -666,6 +667,24 @@ if (args[0] === "api") {
     ["a closure-tests rest wave with rows that did not run", { CLOSURE_TEST_COUNT: "20", CLOSURE_TEST_REST_COUNT: "3", CLOSURE_TESTS_REST_RESULT: "skipped" }],
   ]) {
     assert.equal(rawGate({ ...waved, ...change }).status, 1, `the gate refuses ${label}`);
+  }
+  // Main unit coverage is the packed waves plus the archived lanes: each that
+  // has rows must succeed, and the others' success never stands in for it.
+  const archived = {
+    ...waved, MAIN_ARCHIVE_BUILD_COUNT: "1", MAIN_UNIT_ARCHIVE_BUILD_RESULT: "success",
+    MAIN_ARCHIVE_RUN_COUNT: "2", MAIN_UNIT_ARCHIVE_RUN_RESULT: "success",
+  };
+  assert.equal(rawGate(archived).status, 0, `the gate accepts the packed and archived main unit lanes: ${rawGate(archived).stdout}`);
+  for (const [label, change] of [
+    ["a packed main unit wave with rows that did not run, beside green archived lanes", { MAIN_UNIT_REST_COUNT: "4", MAIN_UNIT_REST_RESULT: "skipped" }],
+    ["a packed main unit wave with rows and no result, beside green archived lanes", { MAIN_UNIT_FIRST_RESULT: "" }],
+    ["archived lanes with rows that did not run, beside a green packed lane", { MAIN_UNIT_ARCHIVE_BUILD_RESULT: "skipped", MAIN_UNIT_ARCHIVE_RUN_RESULT: "skipped" }],
+    ["an archived run with rows that did not run", { MAIN_UNIT_ARCHIVE_RUN_RESULT: "skipped" }],
+    ["archived lanes without a row count", { MAIN_ARCHIVE_BUILD_COUNT: "" }],
+  ]) {
+    const run = rawGate({ ...archived, ...change });
+    assert.equal(run.status, 1, `the gate refuses ${label}: ${run.stdout}`);
+    assert.match(run.stdout, /::error::Main unit tests must run and succeed/, `main unit coverage refuses ${label}`);
   }
 
   // The lane execution budget, read from ci.yml and run against a fake gh.

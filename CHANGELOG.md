@@ -48,10 +48,11 @@ them.
   time; a simulation of the two whole-workspace main pushes before this
   change puts such a push at about 18 minutes instead of about 24, with no
   other run on the account. The `CI gate` counts a two-wave lane as run
-  when every wave that holds rows succeeded, and requires the `stagger` job;
-  the pull-request lane budget adds the stagger job's run time to the lanes
-  that wait for it and leaves its runner queue out, as for every lane. CI
-  only.
+  when every wave that holds rows succeeded (and main unit coverage when
+  each of its packed waves and archived lanes that holds rows succeeded),
+  and requires the `stagger` job; the pull-request lane budget adds the
+  stagger job's run time to the lanes that wait for it and leaves its
+  runner queue out, as for every lane. CI only.
 - A push to `main` or a `release/**` branch runs no separate unit lane. The
   rows a pull request's unit lane would run for the same change (its
   shards, with the same `-p` sets, and its feature suites) run verbatim in
