@@ -50,7 +50,7 @@ describe("@rkat/sdk package", () => {
 
   it(
     "loads through require() as well as import",
-    { skip: !nodeWithinEnginesFloor() && "this Node is below the engines floor" },
+    { skip: !nodeWithinEnginesFloor() && "this Node is outside engines.node" },
     () => {
       const load = spawnSync(
         process.execPath,
