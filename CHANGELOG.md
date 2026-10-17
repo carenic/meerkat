@@ -35,6 +35,32 @@ them.
 
 ## [Unreleased]
 
+### Breaking
+
+- Behaviour-only (not measured by the gate): a detached callback job
+  submitted before 0.9.3 recorded neither its tool's declaration nor the
+  route that submitted it, so its first start, reconcile or cancel moves it
+  to `needs_attention` with the reason `callback_binding_changed` instead of
+  running it through the route that serves the tool (see Security). Remedy:
+  resolve each such job from `needs_attention`, and submit the call again
+  once the upgraded server serves the tool; jobs 0.9.3 submits keep running
+  on the connection that submitted them, and on any other route while its
+  tool declares what they recorded.
+
+### Security
+
+- A detached callback job records the declaration of the tool that took it
+  (`meerkat_core::ToolBindingDigest`: its description, input schema,
+  provenance, audience, plane, deferred eligibility and execution contract,
+  runner included) and the route that submitted it. Any other route that
+  starts, reconciles or cancels it (one that took over the mob's callback
+  route or registered a tool of the same name and runner, and every route
+  after a restart) must register a tool that declares exactly that, compared
+  on every use, before any attempt is claimed or any callback is sent;
+  otherwise the job goes to `needs_attention` (`callback_binding_changed`).
+  The submitting connection itself is not checked. In 0.9.2 any route that
+  registered a tool of the same name and runner took the job.
+
 ### Added
 
 - `meerkat_core::ToolBindingDigest` and `ToolBindingDigestParseError`: a

@@ -2591,8 +2591,9 @@ pub struct SessionRuntime {
     /// connection holding it closes, the first connection to claim it
     /// (`mob/claim_callback_route`) takes over the mob's member callbacks,
     /// including the pending detached callback jobs the closed connection's
-    /// tools started, when it registers tools of the same name and runner:
-    /// it then reconciles and cancels those jobs.
+    /// tools started, when it registers tools of the same name and runner
+    /// whose declaration each job recorded: it then reconciles and cancels
+    /// those jobs.
     default_callback_route: StdRwLock<Option<crate::callback_dispatcher::CallbackRoute>>,
     /// The callback route each session was created on. Recovery and live
     /// orchestration rebuild a session's callback tools from its own route;

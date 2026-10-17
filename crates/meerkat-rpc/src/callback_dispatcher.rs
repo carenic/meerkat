@@ -201,6 +201,28 @@ pub struct CallbackRoute {
     tx: mpsc::Sender<CallbackRequestEnvelope>,
     id_counter: Arc<AtomicU64>,
     registry: Arc<CallbackToolRegistry>,
+    route_id: CallbackRouteId,
+}
+
+/// The identity of one callback route: unique to this process and to the
+/// route, kept by the route's clones. A detached callback job records its
+/// submitting route's identity, so a route that acts on the job later can
+/// tell whether it is that route; no route of another process (one after a
+/// restart included) ever is.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CallbackRouteId(Arc<str>);
+
+impl CallbackRouteId {
+    fn mint() -> Self {
+        static PROCESS: OnceLock<String> = OnceLock::new();
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let process = PROCESS.get_or_init(|| uuid::Uuid::new_v4().to_string());
+        Self(format!("{process}:{}", NEXT.fetch_add(1, Ordering::Relaxed)).into())
+    }
+
+    fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 impl CallbackRoute {
@@ -223,6 +245,7 @@ impl CallbackRoute {
             tx,
             id_counter,
             registry,
+            route_id: CallbackRouteId::mint(),
         }
     }
 
@@ -246,6 +269,11 @@ impl CallbackRoute {
     /// Whether `other` is the same connection's route.
     pub fn same_connection(&self, other: &Self) -> bool {
         self.tx.same_channel(&other.tx)
+    }
+
+    /// This route's identity.
+    pub(crate) fn route_id(&self) -> &CallbackRouteId {
+        &self.route_id
     }
 }
 
@@ -599,12 +627,7 @@ impl CallbackToolDispatcher {
 
     /// Create a callback dispatcher bound to one connection's route.
     pub fn from_route(route: &CallbackRoute, inline_tools: Vec<ToolDef>) -> Self {
-        Self::from_registry(
-            route.registry(),
-            route.sender(),
-            route.id_counter(),
-            inline_tools,
-        )
+        Self::from_source(CallbackRouteSource::Fixed(route.clone()), inline_tools)
     }
 
     /// Create a route-bound dispatcher that can also own detached callback jobs.
@@ -615,15 +638,11 @@ impl CallbackToolDispatcher {
         job_store: Arc<dyn meerkat::DetachedJobStore>,
         blob_store: Arc<dyn meerkat_core::BlobStore>,
     ) -> Self {
-        Self::from_registry_with_job_runtime(
-            route.registry(),
-            route.sender(),
-            route.id_counter(),
-            inline_tools,
-            realm_id,
-            job_store,
-            blob_store,
-        )
+        let mut dispatcher = Self::from_route(route, inline_tools);
+        dispatcher.detached_jobs = Some(DetachedCallbackJobRuntime::new(
+            realm_id, job_store, blob_store,
+        ));
+        dispatcher
     }
 
     pub fn from_registry_with_job_runtime(
@@ -700,14 +719,34 @@ impl CallbackToolDispatcher {
         // The route first: a call no open connection can take writes nothing
         // durable, so no later holder of the route can run it.
         let route = self.call_route(call.name)?;
+        // The job records the route it is submitted on and the declaration
+        // of the tool that route registers: the route that runs it.
+        let tool_binding =
+            registered_tool_binding_in(&route.registry(), call.name).ok_or_else(|| {
+                ToolError::unavailable(
+                    call.name,
+                    meerkat_core::ToolUnavailableReason::ExecutionOwnerChanged,
+                )
+            })?;
         let (spec, arguments) = detached_callback_job_spec(&runtime.realm_id, call, context, plan)?;
         // The blob contract carries base64-encoded bytes: store the base64 of
-        // the exact argument bytes the call carried.
+        // the specification record, which keeps the exact argument bytes the
+        // call carried and the declaration of the tool that took it.
+        let record = serde_json::to_vec(&CallbackSpecification {
+            arguments: call.args.to_owned(),
+            tool_binding_sha256: tool_binding,
+            submitted_route: route.route_id().as_str().to_string(),
+        })
+        .map_err(|error| {
+            ToolError::execution_failed(format!(
+                "failed to encode detached callback specification: {error}"
+            ))
+        })?;
         let specification = runtime
             .blob_store
             .put_artifact(
-                CALLBACK_ARGUMENTS_MEDIA_TYPE,
-                &base64::engine::general_purpose::STANDARD.encode(call.args.get().as_bytes()),
+                CALLBACK_SPECIFICATION_MEDIA_TYPE,
+                &base64::engine::general_purpose::STANDARD.encode(record),
             )
             .await
             .map_err(|error| {
@@ -730,10 +769,19 @@ impl CallbackToolDispatcher {
 
         let callback_tx = route.sender();
         let id_counter = route.id_counter();
+        let acting_route = route.route_id().clone();
         tokio::spawn(async move {
-            if let Err(error) =
-                start_detached_callback_attempt(runtime, callback_tx, id_counter, receipt.job_id)
-                    .await
+            if let Err(error) = start_detached_callback_attempt(
+                runtime,
+                callback_tx,
+                id_counter,
+                receipt.job_id,
+                ActingRoute {
+                    route_id: acting_route,
+                    tool_binding: Some(tool_binding),
+                },
+            )
+            .await
             {
                 tracing::warn!(%error, "detached callback attempt start did not complete");
             }
@@ -761,6 +809,21 @@ impl CallbackToolDispatcher {
             match job.machine_state.lifecycle_phase {
                 meerkat::JobPhase::Queued | meerkat::JobPhase::RetryScheduled => {}
                 meerkat::JobPhase::Running | meerkat::JobPhase::WaitingExternal => {
+                    match self.keeps_its_tool_binding(&runtime, &job.spec).await {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            mark_callback_binding_changed(&runtime, &job.job_id).await?;
+                            continue;
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                job_id = %job.job_id,
+                                %error,
+                                "active detached callback left unreconciled"
+                            );
+                            continue;
+                        }
+                    }
                     let Some(attempt_id) = job.machine_state.current_attempt_id.as_deref() else {
                         return Err(format!(
                             "active detached callback {} has no committed attempt id",
@@ -912,10 +975,19 @@ impl CallbackToolDispatcher {
             let route = self.job_route()?;
             let callback_tx = route.sender();
             let id_counter = route.id_counter();
+            let acting = ActingRoute {
+                route_id: route.route_id().clone(),
+                tool_binding: registered_tool_binding_in(&route.registry(), job.spec.tool.name()),
+            };
             tokio::spawn(async move {
-                if let Err(error) =
-                    start_detached_callback_attempt(runtime, callback_tx, id_counter, job.job_id)
-                        .await
+                if let Err(error) = start_detached_callback_attempt(
+                    runtime,
+                    callback_tx,
+                    id_counter,
+                    job.job_id,
+                    acting,
+                )
+                .await
                 {
                     tracing::warn!(%error, "runnable detached callback start did not complete");
                 }
@@ -946,6 +1018,27 @@ impl CallbackToolDispatcher {
             .unwrap_or(false)
     }
 
+    /// Whether the route this dispatcher acts through may act on the job
+    /// `spec` describes ([`RetainedCallbackSpecification::admits`]): it is
+    /// the route that submitted the job, or its tool declares what the job
+    /// recorded. A job whose specification recorded neither (written before
+    /// 0.9.3) is never admitted. `Err` when its specification cannot be read.
+    async fn keeps_its_tool_binding(
+        &self,
+        runtime: &DetachedCallbackJobRuntime,
+        spec: &meerkat::JobSpec,
+    ) -> Result<bool, String> {
+        let Some(reference) = spec.runner_specification_ref.as_ref() else {
+            return Ok(false);
+        };
+        let specification = read_callback_specification(runtime, reference).await?;
+        let route = self.job_route()?;
+        Ok(specification.admits(&ActingRoute {
+            route_id: route.route_id().clone(),
+            tool_binding: registered_tool_binding_in(&route.registry(), spec.tool.name()),
+        }))
+    }
+
     /// Deliver a committed cancellation request to the host using the exact
     /// current attempt authority. This never claims work or advances a fence.
     pub async fn cancel_detached_job(&self, job_id: &meerkat::JobId) -> Result<(), String> {
@@ -969,6 +1062,9 @@ impl CallbackToolDispatcher {
             || !job.machine_state.cancel_requested
         {
             return Ok(());
+        }
+        if !self.keeps_its_tool_binding(runtime, &job.spec).await? {
+            return mark_callback_binding_changed(runtime, job_id).await;
         }
         let attempt_id = job
             .machine_state
@@ -1376,6 +1472,103 @@ fn format_sha256(digest: [u8; 32]) -> String {
 
 const CALLBACK_ARGUMENTS_MEDIA_TYPE: &str = "application/vnd.meerkat.callback-arguments+json";
 
+/// The media type of a detached callback job's runner specification since
+/// 0.9.3: a [`CallbackSpecification`] record. Jobs submitted before kept only
+/// their arguments, under [`CALLBACK_ARGUMENTS_MEDIA_TYPE`].
+const CALLBACK_SPECIFICATION_MEDIA_TYPE: &str =
+    "application/vnd.meerkat.callback-specification.v2+json";
+
+/// What a detached callback job keeps for its runner: the exact argument
+/// text of the call, the declaration of the callback tool that took it
+/// ([`meerkat_core::ToolBindingDigest`]), and the route that submitted it
+/// ([`CallbackRouteId`]). Any later start, reconcile or cancel through
+/// another route (one that took over the mob's callbacks, or registered a
+/// tool of the same name and runner, or any route after a restart) compares
+/// that declaration with the tool the acting route registers then, so such a
+/// route never runs or reaches the job under another declaration.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CallbackSpecification {
+    arguments: Box<RawValue>,
+    tool_binding_sha256: meerkat_core::ToolBindingDigest,
+    submitted_route: String,
+}
+
+/// A detached callback job's retained specification, read back.
+struct RetainedCallbackSpecification {
+    arguments: serde_json::Value,
+    /// The declaration it recorded; `None` for one written before 0.9.3.
+    tool_binding: Option<meerkat_core::ToolBindingDigest>,
+    /// The route that submitted it; `None` for one written before 0.9.3.
+    submitted_route: Option<String>,
+}
+
+/// The route a start, reconcile or cancel of a detached callback job acts
+/// through, and the declaration of the job's tool it registers now (`None`
+/// when it registers none).
+struct ActingRoute {
+    route_id: CallbackRouteId,
+    tool_binding: Option<meerkat_core::ToolBindingDigest>,
+}
+
+impl RetainedCallbackSpecification {
+    /// Whether `acting` may start, reconcile or cancel the job: it is the
+    /// route that submitted the job (whatever it registers now), or it
+    /// registers exactly the declaration the job recorded.
+    fn admits(&self, acting: &ActingRoute) -> bool {
+        if self.submitted_route.as_deref() == Some(acting.route_id.as_str()) {
+            return true;
+        }
+        matches!(
+            (self.tool_binding.as_ref(), acting.tool_binding.as_ref()),
+            (Some(recorded), Some(current)) if recorded == current
+        )
+    }
+}
+
+/// The declaration of the callback tool `tool_name` that `registry`
+/// registers now ([`meerkat_core::ToolBindingDigest`]), `None` when it
+/// registers none.
+fn registered_tool_binding_in(
+    registry: &CallbackToolRegistry,
+    tool_name: &str,
+) -> Option<meerkat_core::ToolBindingDigest> {
+    let state = registry.state.read().ok()?;
+    state
+        .tools
+        .iter()
+        .find(|registered| registered.tool.name == tool_name)
+        .map(|registered| {
+            meerkat_core::ToolBindingDigest::of_catalog_entry(&callback_catalog_entry(
+                registered.tool.clone(),
+                registered.execution.clone(),
+            ))
+        })
+}
+
+/// Move a detached callback job that the acting route may not act on
+/// ([`RetainedCallbackSpecification::admits`]) to NeedsAttention
+/// (`callback_binding_changed`) instead of starting, reconciling or
+/// cancelling it through that route. A job another writer moved first is
+/// left as it is.
+async fn mark_callback_binding_changed(
+    runtime: &DetachedCallbackJobRuntime,
+    job_id: &meerkat::JobId,
+) -> Result<(), String> {
+    let reason = meerkat::JobFailureCode::new("callback_binding_changed")
+        .map_err(|error| error.to_string())?;
+    match runtime
+        .service
+        .mark_needs_attention(job_id, unix_time_ms()?, reason)
+        .await
+    {
+        Ok(_)
+        | Err(meerkat::DetachedJobError::StaleRevision { .. })
+        | Err(meerkat::DetachedJobError::InvalidTransition { .. }) => Ok(()),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
 /// The job a detached callback call submits, without its runner
 /// specification reference, and the call's parsed arguments.
 fn detached_callback_job_spec(
@@ -1505,13 +1698,51 @@ async fn read_callback_arguments(
     runtime: &DetachedCallbackJobRuntime,
     reference: &meerkat::RunnerSpecificationRef,
 ) -> Result<serde_json::Value, String> {
+    read_callback_specification(runtime, reference)
+        .await
+        .map(|specification| specification.arguments)
+}
+
+/// Read the retained specification of a detached callback job, of either
+/// version.
+async fn read_callback_specification(
+    runtime: &DetachedCallbackJobRuntime,
+    reference: &meerkat::RunnerSpecificationRef,
+) -> Result<RetainedCallbackSpecification, String> {
     let payload = runtime
         .blob_store
         .get(&meerkat_core::BlobId::new(reference.as_str()))
         .await
         .map_err(|error| error.to_string())?;
-    decode_callback_arguments(&payload)
-        .map_err(|error| format!("detached callback arguments are corrupt: {error}"))
+    decode_callback_specification(&payload)
+        .map_err(|error| format!("detached callback specification is corrupt: {error}"))
+}
+
+/// Decode a retained specification: a [`CallbackSpecification`] record
+/// under [`CALLBACK_SPECIFICATION_MEDIA_TYPE`] (the base64 of its JSON), or
+/// the arguments alone under [`CALLBACK_ARGUMENTS_MEDIA_TYPE`], which
+/// recorded no declaration.
+fn decode_callback_specification(
+    payload: &meerkat_core::BlobPayload,
+) -> Result<RetainedCallbackSpecification, String> {
+    if payload.media_type != CALLBACK_SPECIFICATION_MEDIA_TYPE {
+        return decode_callback_arguments(payload).map(|arguments| RetainedCallbackSpecification {
+            arguments,
+            tool_binding: None,
+            submitted_route: None,
+        });
+    }
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(payload.data.as_bytes())
+        .map_err(|error| format!("invalid base64: {error}"))?;
+    let record: CallbackSpecification =
+        serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+    Ok(RetainedCallbackSpecification {
+        arguments: serde_json::from_str(record.arguments.get())
+            .map_err(|error| error.to_string())?,
+        tool_binding: Some(record.tool_binding_sha256),
+        submitted_route: Some(record.submitted_route),
+    })
 }
 
 /// Decode retained callback arguments stored under exactly the callback
@@ -1606,11 +1837,16 @@ fn wire_restart_class(class: meerkat::RestartClass) -> meerkat_contracts::JobRes
     }
 }
 
+/// Start the next attempt of a runnable detached callback job through the
+/// `acting` route. A job that route may not act on
+/// ([`RetainedCallbackSpecification::admits`]) goes to NeedsAttention
+/// instead, unclaimed.
 async fn start_detached_callback_attempt(
     runtime: DetachedCallbackJobRuntime,
     callback_tx: mpsc::Sender<CallbackRequestEnvelope>,
     id_counter: Arc<AtomicU64>,
     job_id: meerkat::JobId,
+    acting: ActingRoute,
 ) -> Result<(), String> {
     let stored = runtime
         .store
@@ -1627,6 +1863,15 @@ async fn start_detached_callback_attempt(
                 .is_some_and(|due_at_ms| claimed_at_ms >= due_at_ms));
     if !runnable {
         return Ok(());
+    }
+    let specification_ref = stored
+        .spec
+        .runner_specification_ref
+        .clone()
+        .ok_or_else(|| format!("detached callback job {job_id} has no runner specification"))?;
+    let specification = read_callback_specification(&runtime, &specification_ref).await?;
+    if !specification.admits(&acting) {
+        return mark_callback_binding_changed(&runtime, &job_id).await;
     }
 
     let lease_expires_at_ms = claimed_at_ms
@@ -1656,12 +1901,7 @@ async fn start_detached_callback_attempt(
         | Err(meerkat::DetachedJobError::InvalidTransition { .. }) => return Ok(()),
         Err(error) => return Err(error.to_string()),
     };
-    let specification_ref = stored
-        .spec
-        .runner_specification_ref
-        .as_ref()
-        .ok_or_else(|| format!("detached callback job {job_id} has no runner specification"))?;
-    let arguments = read_callback_arguments(&runtime, specification_ref).await?;
+    let arguments = specification.arguments;
     let credential_scopes = stored
         .spec
         .credential_context_refs
@@ -2321,6 +2561,16 @@ mod tests {
         Arc<dyn AgentToolDispatcher>,
         mpsc::Receiver<CallbackRequestEnvelope>,
     ) {
+        let (dispatcher, callback_rx) = detached_callback_dispatcher_registering(
+            job_store,
+            blob_store,
+            make_provenanced_tool_def("durable"),
+        );
+        (dispatcher, callback_rx)
+    }
+
+    /// The detached contract of the fixture's `durable` tool.
+    fn durable_detached_contract() -> meerkat_core::ToolExecutionContract {
         let policy = meerkat_core::DetachedToolExecutionPolicy::new(
             meerkat_core::RunnerIdentity::new("meta.callback", "v1").unwrap(),
             meerkat_core::RestartClass::CheckpointResumable,
@@ -2328,29 +2578,66 @@ mod tests {
             std::time::Duration::from_secs(5),
         )
         .unwrap();
-        let contract = meerkat_core::ToolExecutionContract::new(
+        meerkat_core::ToolExecutionContract::new(
             std::collections::BTreeSet::from([meerkat_core::ToolExecutionMode::Detached]),
             meerkat_core::ToolExecutionMode::Detached,
             None,
             Some(policy),
         )
-        .unwrap();
+        .unwrap()
+    }
+
+    /// [`detached_callback_dispatcher`] whose route registers `tool` (under
+    /// the fixture's detached contract) as its `durable` tool.
+    fn detached_callback_dispatcher_registering(
+        job_store: Arc<dyn meerkat::DetachedJobStore>,
+        blob_store: Arc<dyn meerkat_core::BlobStore>,
+        tool: ToolDef,
+    ) -> (
+        Arc<CallbackToolDispatcher>,
+        mpsc::Receiver<CallbackRequestEnvelope>,
+    ) {
         let registry = Arc::new(CallbackToolRegistry::default());
         registry
-            .replace_or_add_with_contracts(vec![(make_provenanced_tool_def("durable"), contract)])
+            .replace_or_add_with_contracts(vec![(tool, durable_detached_contract())])
             .unwrap();
         let (callback_tx, callback_rx) = mpsc::channel(2);
-        let dispatcher: Arc<dyn AgentToolDispatcher> =
-            Arc::new(CallbackToolDispatcher::from_registry_with_job_runtime(
-                registry,
-                callback_tx,
-                Arc::new(AtomicU64::new(0)),
-                vec![],
-                "realm-a",
-                job_store,
-                blob_store,
-            ));
+        let dispatcher = Arc::new(CallbackToolDispatcher::from_registry_with_job_runtime(
+            registry,
+            callback_tx,
+            Arc::new(AtomicU64::new(0)),
+            vec![],
+            "realm-a",
+            job_store,
+            blob_store,
+        ));
         (dispatcher, callback_rx)
+    }
+
+    /// Wait until the job is in `needs_attention` for a changed callback
+    /// binding.
+    async fn await_binding_changed(
+        job_store: &Arc<dyn meerkat::DetachedJobStore>,
+        job_id: &meerkat::JobId,
+    ) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let job = job_store.get(job_id).await.unwrap().expect("job");
+                if job.machine_state.lifecycle_phase == meerkat::JobPhase::NeedsAttention {
+                    assert_eq!(
+                        job.terminal_result,
+                        Some(meerkat::JobTerminalResult::NeedsAttention {
+                            reason: meerkat::JobFailureCode::new("callback_binding_changed")
+                                .unwrap(),
+                        })
+                    );
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the job moves to needs_attention");
     }
 
     fn detached_callback_context() -> meerkat_core::ToolDispatchContext {
@@ -2458,16 +2745,26 @@ mod tests {
                 Some(reference.as_str())
             );
             assert_eq!(admitted.machine_state.attempt_count, 1);
-            // The record holds the base64 of exactly the argument bytes the
-            // call carried.
+            // The record (stored as base64) holds exactly the argument bytes
+            // the call carried, and the declaration of the tool that took it.
             let stored = verbatim
                 .get(&meerkat_core::BlobId::new(reference.as_str()))
                 .await
                 .unwrap();
-            assert_eq!(stored.media_type, CALLBACK_ARGUMENTS_MEDIA_TYPE);
+            assert_eq!(stored.media_type, CALLBACK_SPECIFICATION_MEDIA_TYPE);
+            let record: CallbackSpecification = serde_json::from_slice(
+                &base64::engine::general_purpose::STANDARD
+                    .decode(stored.data.as_bytes())
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(record.arguments.get(), args.get());
             assert_eq!(
-                base64::engine::general_purpose::STANDARD.decode(stored.data.as_bytes()),
-                Ok(args.get().as_bytes().to_vec())
+                record.tool_binding_sha256,
+                meerkat_core::ToolBindingDigest::of_catalog_entry(&callback_catalog_entry(
+                    make_provenanced_tool_def("durable"),
+                    durable_detached_contract(),
+                ))
             );
             (receipt, reference)
         };
@@ -2527,25 +2824,20 @@ mod tests {
             let replay = submit_detached_callback(&dispatcher, call).await.unwrap();
             assert_eq!(replay.job_id, legacy_job.job_id.to_string(), "{literal}");
             assert!(replay.deduplicated, "{literal}");
-            // The admitted job was still queued: its first attempt reads the
-            // literal record.
-            let start = accept_detached_callback_start(&mut callback_rx).await;
-            assert_eq!(
-                start.arguments,
-                serde_json::from_str::<serde_json::Value>(literal).unwrap(),
-                "{literal}"
-            );
-            assert_eq!(
-                start.runner_specification_ref.as_deref(),
-                Some(legacy_reference.as_str()),
-                "{literal}"
+            // The admitted job was still queued, and its record names no
+            // tool declaration (it was written before 0.9.3): its first start
+            // moves it to needs_attention instead of offering it.
+            await_binding_changed(&job_store, &legacy_job.job_id).await;
+            assert!(
+                callback_rx.try_recv().is_err(),
+                "the legacy job is never offered: {literal}"
             );
             let admitted = job_store
                 .get(&legacy_job.job_id)
                 .await
                 .unwrap()
                 .expect("admitted job");
-            assert_eq!(admitted.machine_state.attempt_count, 1, "{literal}");
+            assert_eq!(admitted.machine_state.attempt_count, 0, "{literal}");
 
             let again = submit_detached_callback(&dispatcher, call).await.unwrap();
             assert_eq!(again.job_id, replay.job_id, "{literal}");
@@ -2580,8 +2872,355 @@ mod tests {
                 "{literal}"
             );
             assert_eq!(jobs[0].revision, admitted.revision, "{literal}");
-            assert_eq!(jobs[0].machine_state.attempt_count, 1, "{literal}");
+            assert_eq!(jobs[0].machine_state.attempt_count, 0, "{literal}");
         }
+    }
+
+    /// Queue `call` as the creator's route would have: a v2 record holding
+    /// its arguments and the declaration `tool` has under the fixture's
+    /// contract, and the job admitted under it, unstarted.
+    async fn queue_detached_callback(
+        job_store: &Arc<dyn meerkat::DetachedJobStore>,
+        blob_store: &Arc<dyn meerkat_core::BlobStore>,
+        call: ToolCallView<'_>,
+        tool: ToolDef,
+    ) -> meerkat::JobId {
+        let declaration = meerkat_core::ToolBindingDigest::of_catalog_entry(
+            &callback_catalog_entry(tool.clone(), durable_detached_contract()),
+        );
+        let (planner, _callback_rx) =
+            detached_callback_dispatcher_registering(job_store.clone(), blob_store.clone(), tool);
+        let planner: Arc<dyn AgentToolDispatcher> = planner;
+        let context = detached_callback_context();
+        let plan = resolve_detached_callback_plan(&planner, call, &context);
+        let (spec, _) = detached_callback_job_spec("realm-a", call, &context, &plan).unwrap();
+        let record = serde_json::to_vec(&CallbackSpecification {
+            arguments: call.args.to_owned(),
+            tool_binding_sha256: declaration,
+            submitted_route: CallbackRouteId::mint().as_str().to_string(),
+        })
+        .unwrap();
+        let stored = blob_store
+            .put_artifact(
+                CALLBACK_SPECIFICATION_MEDIA_TYPE,
+                &base64::engine::general_purpose::STANDARD.encode(record),
+            )
+            .await
+            .unwrap();
+        meerkat::DetachedJobService::new(job_store.clone())
+            .submit(spec.with_runner_specification_ref(
+                meerkat::RunnerSpecificationRef::new(stored.blob_id.to_string()).unwrap(),
+            ))
+            .await
+            .unwrap()
+            .job_id
+    }
+
+    /// A queued detached callback job starts only through a route whose
+    /// tool declares exactly what the job recorded when it was submitted. A
+    /// route registering the same name and runner with another declaration
+    /// (another connection that took over the mob's callback route) moves
+    /// the job to needs_attention without offering it; a route declaring
+    /// what the job recorded (its creator reconnecting with the same tools)
+    /// starts it.
+    #[tokio::test]
+    async fn a_queued_callback_job_starts_only_under_the_declaration_it_recorded() {
+        let root = tempfile::tempdir().unwrap();
+        let (job_store, _verbatim, strict) = open_detached_callback_stores(root.path());
+        let args = RawValue::from_string(r#"{"target": "lan"}"#.to_string()).unwrap();
+        let changed_job = queue_detached_callback(
+            &job_store,
+            &strict,
+            ToolCallView {
+                id: "tc-changed",
+                name: "durable",
+                args: &args,
+            },
+            make_provenanced_tool_def("durable"),
+        )
+        .await;
+
+        let mut other = make_provenanced_tool_def("durable");
+        other.description = "another connection's durable tool".to_string();
+        let (claimer, mut claimer_rx) =
+            detached_callback_dispatcher_registering(job_store.clone(), strict.clone(), other);
+        claimer.start_due_detached_jobs().await.unwrap();
+        await_binding_changed(&job_store, &changed_job).await;
+        assert!(
+            claimer_rx.try_recv().is_err(),
+            "the job is never offered to a route declaring another tool"
+        );
+        assert_eq!(
+            job_store
+                .get(&changed_job)
+                .await
+                .unwrap()
+                .expect("job")
+                .machine_state
+                .attempt_count,
+            0
+        );
+
+        let kept_job = queue_detached_callback(
+            &job_store,
+            &strict,
+            ToolCallView {
+                id: "tc-kept",
+                name: "durable",
+                args: &args,
+            },
+            make_provenanced_tool_def("durable"),
+        )
+        .await;
+        let (creator, mut creator_rx) = detached_callback_dispatcher_registering(
+            job_store.clone(),
+            strict.clone(),
+            make_provenanced_tool_def("durable"),
+        );
+        creator.start_due_detached_jobs().await.unwrap();
+        let start = accept_detached_callback_start(&mut creator_rx).await;
+        assert_eq!(start.authority.job_id, kept_job.to_string());
+        assert_eq!(start.arguments, serde_json::json!({"target": "lan"}));
+    }
+
+    /// Submit a call of the fixture's `durable` tool through a route that
+    /// registers it, and abandon the attempt the route is offered: the
+    /// route's connection closes with the job running (its claim is
+    /// committed before the start is sent).
+    async fn submit_and_abandon_detached_callback(
+        job_store: &Arc<dyn meerkat::DetachedJobStore>,
+        blob_store: &Arc<dyn meerkat_core::BlobStore>,
+        call_id: &str,
+        args: &RawValue,
+    ) -> meerkat::JobId {
+        let (creator, mut creator_rx) = detached_callback_dispatcher_registering(
+            job_store.clone(),
+            blob_store.clone(),
+            make_provenanced_tool_def("durable"),
+        );
+        let creator: Arc<dyn AgentToolDispatcher> = creator;
+        let receipt = submit_detached_callback(
+            &creator,
+            ToolCallView {
+                id: call_id,
+                name: "durable",
+                args,
+            },
+        )
+        .await
+        .unwrap();
+        let envelope = tokio::time::timeout(std::time::Duration::from_secs(5), creator_rx.recv())
+            .await
+            .expect("the attempt start is offered")
+            .expect("callback channel");
+        let (request, _response_tx, _permit) = envelope.into_parts();
+        assert_eq!(request.method, "callback/job/start");
+        drop(creator_rx);
+        let job_id = meerkat::JobId::new(receipt.job_id).unwrap();
+        assert_eq!(
+            job_store
+                .get(&job_id)
+                .await
+                .unwrap()
+                .expect("job")
+                .machine_state
+                .lifecycle_phase,
+            meerkat::JobPhase::Running
+        );
+        job_id
+    }
+
+    /// RED 5 (#222): an active detached callback job is reconciled only
+    /// through a route whose tool declares what the job recorded when it was
+    /// submitted. Its creator's connection closes with the attempt in
+    /// flight. A connection that then serves the tool's name and runner with
+    /// another declaration (another description) moves the job to
+    /// needs_attention without being offered it; one serving the same
+    /// declaration (the creator reconnecting with the same tools) is offered
+    /// it, and the job keeps running.
+    #[tokio::test]
+    async fn an_active_callback_job_is_reconciled_only_under_the_declaration_it_recorded() {
+        let root = tempfile::tempdir().unwrap();
+        let (job_store, _verbatim, strict) = open_detached_callback_stores(root.path());
+        let args = RawValue::from_string(r#"{"target": "lan"}"#.to_string()).unwrap();
+
+        let changed_job =
+            submit_and_abandon_detached_callback(&job_store, &strict, "tc-changed", &args).await;
+        let mut other = make_provenanced_tool_def("durable");
+        other.description = "another connection's durable tool".to_string();
+        let (claimer, mut claimer_rx) =
+            detached_callback_dispatcher_registering(job_store.clone(), strict.clone(), other);
+        let reconcile = tokio::spawn(async move { claimer.reconcile_detached_jobs().await });
+        // Nothing is offered: no request arrives before the claimer's
+        // channel closes or the wait ends.
+        let offered =
+            match tokio::time::timeout(std::time::Duration::from_millis(500), claimer_rx.recv())
+                .await
+            {
+                Ok(Some(envelope)) => Some(envelope.into_parts().0.method),
+                Ok(None) | Err(_) => None,
+            };
+        assert_eq!(
+            offered, None,
+            "the job is offered to a route declaring another tool"
+        );
+        reconcile.await.unwrap().unwrap();
+        await_binding_changed(&job_store, &changed_job).await;
+
+        let kept_job =
+            submit_and_abandon_detached_callback(&job_store, &strict, "tc-kept", &args).await;
+        let (creator, mut creator_rx) = detached_callback_dispatcher_registering(
+            job_store.clone(),
+            strict.clone(),
+            make_provenanced_tool_def("durable"),
+        );
+        let reconcile = tokio::spawn(async move { creator.reconcile_detached_jobs().await });
+        let envelope = tokio::time::timeout(std::time::Duration::from_secs(5), creator_rx.recv())
+            .await
+            .expect("the job is offered to its declaration's route")
+            .expect("callback channel");
+        let (request, response_tx, _permit) = envelope.into_parts();
+        assert_eq!(request.method, "callback/job/reconcile");
+        let params: meerkat_contracts::CallbackJobReconcileParams =
+            serde_json::from_str(request.params.as_deref().unwrap().get()).unwrap();
+        assert_eq!(
+            params
+                .attempts
+                .iter()
+                .map(|attempt| attempt.authority.job_id.clone())
+                .collect::<Vec<_>>(),
+            vec![kept_job.to_string()]
+        );
+        assert!(
+            response_tx
+                .send(CallbackResponseHandoff::unmetered_for_test(
+                    RpcResponse::success(
+                        request.id,
+                        meerkat_contracts::CallbackJobReconcileResult {
+                            live_attempts: params
+                                .attempts
+                                .iter()
+                                .map(|attempt| attempt.authority.clone())
+                                .collect(),
+                        },
+                    ),
+                ))
+                .is_ok()
+        );
+        reconcile.await.unwrap().unwrap();
+        assert_eq!(
+            job_store
+                .get(&kept_job)
+                .await
+                .unwrap()
+                .expect("job")
+                .machine_state
+                .lifecycle_phase,
+            meerkat::JobPhase::Running
+        );
+    }
+
+    /// The route that submitted a detached callback job keeps acting on it
+    /// whatever it registers since: its own redefinition of the tool is not
+    /// checked. Only another route, and every route after a restart, is held
+    /// to the declaration the job recorded.
+    #[tokio::test]
+    async fn the_submitting_route_reconciles_its_job_after_redefining_its_tool() {
+        let root = tempfile::tempdir().unwrap();
+        let (job_store, _verbatim, strict) = open_detached_callback_stores(root.path());
+        let args = RawValue::from_string(r#"{"target": "lan"}"#.to_string()).unwrap();
+        let registry = Arc::new(CallbackToolRegistry::default());
+        registry
+            .replace_or_add_with_contracts(vec![(
+                make_provenanced_tool_def("durable"),
+                durable_detached_contract(),
+            )])
+            .unwrap();
+        let (callback_tx, mut callback_rx) = mpsc::channel(2);
+        let route =
+            CallbackRoute::from_parts(callback_tx, Arc::new(AtomicU64::new(0)), registry.clone());
+        let submitter: Arc<dyn AgentToolDispatcher> =
+            Arc::new(CallbackToolDispatcher::from_route_with_job_runtime(
+                &route,
+                vec![],
+                "realm-a",
+                job_store.clone(),
+                strict.clone(),
+            ));
+        let receipt = submit_detached_callback(
+            &submitter,
+            ToolCallView {
+                id: "tc-own",
+                name: "durable",
+                args: &args,
+            },
+        )
+        .await
+        .unwrap();
+        // The attempt stays in flight: its start is taken and never answered.
+        let envelope = tokio::time::timeout(std::time::Duration::from_secs(5), callback_rx.recv())
+            .await
+            .expect("the attempt start is offered")
+            .expect("callback channel");
+        let (request, _unanswered, _permit) = envelope.into_parts();
+        assert_eq!(request.method, "callback/job/start");
+
+        // The same connection redefines its tool, then reconciles.
+        let mut redefined = make_provenanced_tool_def("durable");
+        redefined.description = "the same connection's redefined tool".to_string();
+        registry
+            .replace_or_add_with_contracts(vec![(redefined, durable_detached_contract())])
+            .unwrap();
+        let reconciler = Arc::new(CallbackToolDispatcher::from_route_with_job_runtime(
+            &route,
+            vec![],
+            "realm-a",
+            job_store.clone(),
+            strict.clone(),
+        ));
+        let reconcile = tokio::spawn(async move { reconciler.reconcile_detached_jobs().await });
+        let envelope = tokio::time::timeout(std::time::Duration::from_secs(5), callback_rx.recv())
+            .await
+            .expect("the job is offered to the route that submitted it")
+            .expect("callback channel");
+        let (request, response_tx, _permit) = envelope.into_parts();
+        assert_eq!(request.method, "callback/job/reconcile");
+        let params: meerkat_contracts::CallbackJobReconcileParams =
+            serde_json::from_str(request.params.as_deref().unwrap().get()).unwrap();
+        assert_eq!(
+            params
+                .attempts
+                .iter()
+                .map(|attempt| attempt.authority.job_id.clone())
+                .collect::<Vec<_>>(),
+            vec![receipt.job_id.clone()]
+        );
+        assert!(
+            response_tx
+                .send(CallbackResponseHandoff::unmetered_for_test(
+                    RpcResponse::success(
+                        request.id,
+                        meerkat_contracts::CallbackJobReconcileResult {
+                            live_attempts: params
+                                .attempts
+                                .iter()
+                                .map(|attempt| attempt.authority.clone())
+                                .collect(),
+                        },
+                    ),
+                ))
+                .is_ok()
+        );
+        reconcile.await.unwrap().unwrap();
+        let job = job_store
+            .get(&meerkat::JobId::new(receipt.job_id).unwrap())
+            .await
+            .unwrap()
+            .expect("job");
+        assert_eq!(
+            job.machine_state.lifecycle_phase,
+            meerkat::JobPhase::Running
+        );
     }
 
     #[tokio::test]
@@ -2657,11 +3296,43 @@ mod tests {
         assert!(stored.machine_state.terminal_kind.is_none());
     }
 
+    /// Retain the specification a submission of `arguments` through a route
+    /// registering the `durable` tool under [`detached_execution_contract`]
+    /// keeps: the record of its arguments and that tool's declaration.
+    async fn retain_durable_callback_specification(
+        blob_store: &dyn meerkat_core::BlobStore,
+        arguments: &str,
+    ) -> meerkat::RunnerSpecificationRef {
+        let record = serde_json::to_vec(&CallbackSpecification {
+            arguments: RawValue::from_string(arguments.to_string()).unwrap(),
+            tool_binding_sha256: meerkat_core::ToolBindingDigest::of_catalog_entry(
+                &callback_catalog_entry(
+                    make_provenanced_tool_def("durable"),
+                    detached_execution_contract(),
+                ),
+            ),
+            // Another route submitted it.
+            submitted_route: CallbackRouteId::mint().as_str().to_string(),
+        })
+        .unwrap();
+        let stored = blob_store
+            .put_artifact(
+                CALLBACK_SPECIFICATION_MEDIA_TYPE,
+                &base64::engine::general_purpose::STANDARD.encode(record),
+            )
+            .await
+            .unwrap();
+        meerkat::RunnerSpecificationRef::new(stored.blob_id.to_string()).unwrap()
+    }
+
     #[tokio::test]
     async fn reconcile_reuses_committed_attempt_fence_lease_checkpoint_and_handle() {
         let job_store = Arc::new(meerkat::MemoryDetachedJobStore::new());
         let service = meerkat::DetachedJobService::new(job_store.clone());
         let session_id = meerkat_core::SessionId::new();
+        let blob_store = Arc::new(meerkat::MemoryBlobStore::new());
+        let specification =
+            retain_durable_callback_specification(&*blob_store, r#"{"target":"lan"}"#).await;
         let receipt = service
             .submit(
                 meerkat::JobSpec::new(
@@ -2675,9 +3346,7 @@ mod tests {
                     meerkat::CanonicalArgumentsHash::new("sha256:args").unwrap(),
                     meerkat::JobSubmissionKey::new("reconcile-same-authority").unwrap(),
                 )
-                .with_runner_specification_ref(
-                    meerkat::RunnerSpecificationRef::new("sha256:spec").unwrap(),
-                ),
+                .with_runner_specification_ref(specification),
             )
             .await
             .unwrap();
@@ -2719,7 +3388,7 @@ mod tests {
             vec![],
             "realm-a",
             job_store,
-            Arc::new(meerkat::MemoryBlobStore::new()),
+            blob_store,
         ));
         let reconcile = tokio::spawn({
             let dispatcher = Arc::clone(&dispatcher);
@@ -2767,18 +3436,24 @@ mod tests {
     async fn cancel_uses_committed_attempt_authority_without_advancing_fence() {
         let job_store = Arc::new(meerkat::MemoryDetachedJobStore::new());
         let service = meerkat::DetachedJobService::new(job_store.clone());
+        let blob_store = Arc::new(meerkat::MemoryBlobStore::new());
+        let specification =
+            retain_durable_callback_specification(&*blob_store, r#"{"target":"lan"}"#).await;
         let receipt = service
-            .submit(meerkat::JobSpec::new(
-                "realm-a",
-                meerkat_core::SessionId::new(),
-                meerkat::ExecutionIntentId::from_string("intent-cancel").unwrap(),
-                meerkat::InteractionLineageId::from_string("lineage-cancel").unwrap(),
-                meerkat::ToolIdentity::new("durable", "v1").unwrap(),
-                meerkat::RunnerIdentity::new("meta.callback", "v1").unwrap(),
-                meerkat::RestartClass::Adoptable,
-                meerkat::CanonicalArgumentsHash::new("sha256:args").unwrap(),
-                meerkat::JobSubmissionKey::new("cancel-same-authority").unwrap(),
-            ))
+            .submit(
+                meerkat::JobSpec::new(
+                    "realm-a",
+                    meerkat_core::SessionId::new(),
+                    meerkat::ExecutionIntentId::from_string("intent-cancel").unwrap(),
+                    meerkat::InteractionLineageId::from_string("lineage-cancel").unwrap(),
+                    meerkat::ToolIdentity::new("durable", "v1").unwrap(),
+                    meerkat::RunnerIdentity::new("meta.callback", "v1").unwrap(),
+                    meerkat::RestartClass::Adoptable,
+                    meerkat::CanonicalArgumentsHash::new("sha256:args").unwrap(),
+                    meerkat::JobSubmissionKey::new("cancel-same-authority").unwrap(),
+                )
+                .with_runner_specification_ref(specification),
+            )
             .await
             .unwrap();
         let claim = service
@@ -2811,7 +3486,7 @@ mod tests {
             vec![],
             "realm-a",
             job_store,
-            Arc::new(meerkat::MemoryBlobStore::new()),
+            blob_store,
         ));
         let cancelling = tokio::spawn({
             let dispatcher = Arc::clone(&dispatcher);
@@ -2849,18 +3524,24 @@ mod tests {
     async fn expired_omitted_non_resumable_attempt_becomes_worker_lost_without_new_fence() {
         let job_store = Arc::new(meerkat::MemoryDetachedJobStore::new());
         let service = meerkat::DetachedJobService::new(job_store.clone());
+        let blob_store = Arc::new(meerkat::MemoryBlobStore::new());
+        let specification =
+            retain_durable_callback_specification(&*blob_store, r#"{"target":"lan"}"#).await;
         let receipt = service
-            .submit(meerkat::JobSpec::new(
-                "realm-a",
-                meerkat_core::SessionId::new(),
-                meerkat::ExecutionIntentId::from_string("intent-lost").unwrap(),
-                meerkat::InteractionLineageId::from_string("lineage-lost").unwrap(),
-                meerkat::ToolIdentity::new("durable", "v1").unwrap(),
-                meerkat::RunnerIdentity::new("meta.callback", "v1").unwrap(),
-                meerkat::RestartClass::NonResumable,
-                meerkat::CanonicalArgumentsHash::new("sha256:args").unwrap(),
-                meerkat::JobSubmissionKey::new("lost-no-replay").unwrap(),
-            ))
+            .submit(
+                meerkat::JobSpec::new(
+                    "realm-a",
+                    meerkat_core::SessionId::new(),
+                    meerkat::ExecutionIntentId::from_string("intent-lost").unwrap(),
+                    meerkat::InteractionLineageId::from_string("lineage-lost").unwrap(),
+                    meerkat::ToolIdentity::new("durable", "v1").unwrap(),
+                    meerkat::RunnerIdentity::new("meta.callback", "v1").unwrap(),
+                    meerkat::RestartClass::NonResumable,
+                    meerkat::CanonicalArgumentsHash::new("sha256:args").unwrap(),
+                    meerkat::JobSubmissionKey::new("lost-no-replay").unwrap(),
+                )
+                .with_runner_specification_ref(specification),
+            )
             .await
             .unwrap();
         let claim = service
@@ -2890,7 +3571,7 @@ mod tests {
             vec![],
             "realm-a",
             job_store,
-            Arc::new(meerkat::MemoryBlobStore::new()),
+            blob_store,
         ));
         let reconciling = tokio::spawn({
             let dispatcher = Arc::clone(&dispatcher);
