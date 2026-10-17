@@ -41,7 +41,8 @@ them.
   and has two new variants, `InvalidWorkerThreads { name, raw }` and
   `ThreadLimit { name, workers, workers_set_by, stack_bytes,
   stack_overridden_by, observed_limit, source }` (see Added and Fixed); an
-  exhaustive match must add a wildcard arm.
+  exhaustive match must add a wildcard arm. Both new variants are
+  `#[non_exhaustive]` themselves, so a pattern on either needs `..`.
 - Not measured by the gate (cargo-semver-checks does not compare a trait
   object's lifetime bound): `meerkat::surface::FatalErrorReport::new` and
   `meerkat::surface::report_fatal_error` take `&(dyn Error + 'static)`
