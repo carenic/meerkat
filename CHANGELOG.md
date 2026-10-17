@@ -55,8 +55,7 @@ them.
   be at or below `max` (the provider decided the window was full), so a host
   must not compute an overflow from the two. The next run compacts at its
   boundary as before. A compaction summary call that stops this way takes the
-  mechanical capacity fallback, charged with the call's usage, instead of
-  committing a truncated summary.
+  mechanical capacity fallback instead of committing a truncated summary.
 - Behaviour-only (not measured by the gate): a refused turn (Anthropic
   `refusal`) and a content-filtered turn (`content_filter` from any provider)
   fail the run with `AgentError::ContentFiltered` (`run_failed` class
@@ -68,7 +67,11 @@ them.
   fails the extraction instead of the run. A compaction summary the provider
   refuses or filters fails that compaction (`compaction_failed`,
   `llm_failed`): the history stays as it was and the run goes on, so a refusal
-  never becomes the session summary.
+  never becomes the session summary. A summary call that comes back refused,
+  filtered or stopped at the context window is still charged to the session,
+  the budget and the run's `request_usage` rows, whether the compaction then
+  fails or takes the mechanical fallback (whose own summary carries no
+  usage).
 - Behaviour-only (not measured by the gate): an Anthropic stop reason the
   adapter does not know is no longer read as `end_turn`. The response fails
   with the retryable `LlmError::IncompleteResponse` naming the raw reason: it
@@ -89,12 +92,15 @@ them.
   also fails the run instead of being retried. A malformed or unexpected tool
   call (`MALFORMED_FUNCTION_CALL`, `UNEXPECTED_TOOL_CALL`,
   `TOO_MANY_TOOL_CALLS`), `OTHER` and any other reason fail the response as
-  incomplete. The OpenAI realtime text-turn adapter
-  (realtime models running agent-loop turns) now reads the status of
-  `response.done` the same way: a failed response, an incomplete one with an
-  unknown or missing reason, or one still in progress fails as incomplete,
-  while `max_output_tokens`, `content_filter` and `cancelled` keep their typed
-  stops. All of these ended as `end_turn` before.
+  incomplete. The OpenAI realtime text-turn adapter (realtime models running
+  agent-loop turns) now reads the status of `response.done` the same way: a
+  failed response, an incomplete one with an unknown or missing reason, or one
+  still in progress fails as incomplete, while `max_output_tokens`,
+  `content_filter` and `cancelled` keep their typed stops. All of these ended
+  as `end_turn` before. A `response.done` whose status the protocol does not
+  know at all (it does not parse) now fails as incomplete at once, naming the
+  status; before, it was skipped and the turn failed later as a stalled or
+  reset stream.
 
 ### Fixed
 

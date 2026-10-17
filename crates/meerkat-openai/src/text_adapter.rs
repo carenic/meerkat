@@ -290,6 +290,16 @@ impl LlmClient for OpenAiRealtimeTextAdapter {
                     ServerEvent::Error { error, .. } => {
                         Err(map_server_error(error))?;
                     }
+                    // A response.done this client cannot read (a status the
+                    // protocol does not know) arrives as Unknown. It still
+                    // ends the turn: fail it now instead of waiting for the
+                    // stream to stall.
+                    ServerEvent::Unknown(event) => {
+                        if let Some(outcome) = unreadable_response_done(&event) {
+                            yield LlmEvent::Done { outcome };
+                            break;
+                        }
+                    }
                     _ => {
                         // Other event types (session.*, conversation.item.*,
                         // rate_limits.updated, etc.) are informational for the
@@ -523,6 +533,26 @@ fn text_turn_done_outcome(response: &Response, completed_stop: StopReason) -> Ll
     LlmDoneOutcome::Success { stop_reason }
 }
 
+/// The outcome of a `response.done` that did not parse, usually because its
+/// status is one this client does not know: the turn fails with the
+/// retryable `IncompleteResponse` naming that status. `None` for any other
+/// unparsed event, which stays informational.
+fn unreadable_response_done(event: &serde_json::Value) -> Option<LlmDoneOutcome> {
+    if event.get("type").and_then(serde_json::Value::as_str) != Some("response.done") {
+        return None;
+    }
+    let status = match event.pointer("/response/status") {
+        Some(serde_json::Value::String(status)) => status.clone(),
+        Some(other) => other.to_string(),
+        None => "missing".to_string(),
+    };
+    Some(LlmDoneOutcome::Error {
+        error: LlmError::IncompleteResponse {
+            message: format!("OpenAI realtime response.done did not parse (status '{status}')"),
+        },
+    })
+}
+
 fn map_usage(u: &OaiUsage, model: &str) -> Usage {
     let cache_read_tokens = u
         .input_token_details
@@ -717,6 +747,41 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A `response.done` with a status this client does not know does not
+    /// parse as `ResponseDone`. It still ends the turn, as a typed failure
+    /// naming the status, instead of being ignored until the stream stalls.
+    #[test]
+    fn unreadable_response_done_fails_the_turn() {
+        let event: ServerEvent = serde_json::from_value(serde_json::json!({
+            "type": "response.done",
+            "event_id": "event_1",
+            "response": {
+                "id": "resp_text_turn",
+                "object": "realtime.response",
+                "status": "paused",
+                "output": []
+            }
+        }))
+        .expect("an unparsed server event still deserializes, as Unknown");
+        let event = match event {
+            ServerEvent::Unknown(event) => event,
+            other => {
+                panic!("a response.done with an unknown status is not a ResponseDone: {other:?}")
+            }
+        };
+        match unreadable_response_done(&event) {
+            Some(LlmDoneOutcome::Error {
+                error: LlmError::IncompleteResponse { message },
+            }) => assert!(message.contains("'paused'"), "{message}"),
+            other => panic!("expected an IncompleteResponse failure, got {other:?}"),
+        }
+        assert!(
+            unreadable_response_done(&serde_json::json!({ "type": "response.unheard_of" }))
+                .is_none(),
+            "any other unparsed event stays informational"
+        );
     }
 
     #[test]

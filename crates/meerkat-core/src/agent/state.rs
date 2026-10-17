@@ -3396,6 +3396,46 @@ where
         })
     }
 
+    /// Charge one compaction summary call to the session and the budget, and
+    /// to the run's request rows when a provider request backs it. Its
+    /// accounting identity is routed, not repaired: the counters are charged
+    /// as reported and the disagreement is published.
+    async fn charge_compaction_summary_call(
+        &mut self,
+        usage: &TurnUsage,
+        provider_request: bool,
+        identity_dispute: Option<crate::provider_evidence::DisputedTurnUsageAccountingIdentity>,
+        event_tx: &Option<mpsc::Sender<AgentEvent>>,
+    ) {
+        self.session.record_turn_usage(usage);
+        self.budget.record_turn_usage(usage);
+        if provider_request {
+            self.run_request_usage.push(usage.clone());
+        }
+        if let Some(dispute) = identity_dispute {
+            tracing::warn!(
+                session_id = %self.session.id(),
+                marker = dispute.marker(),
+                dispute = %dispute,
+                "compaction summary usage accounting identity is disputed; counters are charged exactly as reported"
+            );
+            if !crate::event_tap::tap_emit(
+                &self.event_tap,
+                event_tx.as_ref(),
+                AgentEvent::TurnUsageAccountingIdentityDisputed {
+                    session_id: self.session.id().clone(),
+                    dispute,
+                },
+            )
+            .await
+            {
+                tracing::warn!(
+                    "compaction event stream receiver dropped before TurnUsageAccountingIdentityDisputed"
+                );
+            }
+        }
+    }
+
     /// Execute side effects from a transition. Handles CheckCompaction
     /// effects emitted on CallingLlm entry.
     ///
@@ -3557,7 +3597,7 @@ where
                                 // retained controller client (still authorized
                                 // per request as Compaction). Any other
                                 // compactor route keeps the session client.
-                                match self.bound_controller_client() {
+                                let attempt = match self.bound_controller_client() {
                                     Some(controller) => {
                                         crate::agent::compact::run_compaction(
                                             controller.as_ref(),
@@ -3582,7 +3622,21 @@ where
                                         .instrument(span)
                                         .await
                                     }
+                                };
+                                // A summary call that came back refused,
+                                // filtered or stopped at the context window is
+                                // not committed, but it was real provider
+                                // work: charge it whatever the result.
+                                if let Some(call) = attempt.uncommitted_call {
+                                    self.charge_compaction_summary_call(
+                                        &call.usage,
+                                        true,
+                                        call.identity_dispute,
+                                        event_tx,
+                                    )
+                                    .await;
                                 }
+                                attempt.result
                             }
                             Err(error) => {
                                 tracing::warn!(
@@ -3652,38 +3706,14 @@ where
                             // projection is later rejected. Charge it before
                             // any rewrite/projection branch so no failure path
                             // can silently refund usage.
-                            self.session.record_turn_usage(&outcome.summary_usage);
-                            self.budget.record_turn_usage(&outcome.summary_usage);
-                            if outcome.summary_source
-                                == crate::agent::compact::CompactionSummarySource::ProviderCall
-                            {
-                                self.run_request_usage.push(outcome.summary_usage.clone());
-                            }
-                            // The summary call's accounting identity is routed,
-                            // not repaired: the counters above are charged as
-                            // reported and the disagreement is published.
-                            if let Some(dispute) = outcome.summary_usage_identity_dispute.clone() {
-                                tracing::warn!(
-                                    session_id = %self.session.id(),
-                                    marker = dispute.marker(),
-                                    dispute = %dispute,
-                                    "compaction summary usage accounting identity is disputed; counters are charged exactly as reported"
-                                );
-                                if !crate::event_tap::tap_emit(
-                                    &self.event_tap,
-                                    event_tx.as_ref(),
-                                    AgentEvent::TurnUsageAccountingIdentityDisputed {
-                                        session_id: self.session.id().clone(),
-                                        dispute,
-                                    },
-                                )
-                                .await
-                                {
-                                    tracing::warn!(
-                                        "compaction event stream receiver dropped before TurnUsageAccountingIdentityDisputed"
-                                    );
-                                }
-                            }
+                            self.charge_compaction_summary_call(
+                                &outcome.summary_usage,
+                                outcome.summary_source
+                                    == crate::agent::compact::CompactionSummarySource::ProviderCall,
+                                outcome.summary_usage_identity_dispute.clone(),
+                                event_tx,
+                            )
+                            .await;
                             // Prepare the transcript rewrite on an isolated
                             // session value. Its exact TranscriptRewriteCommit
                             // becomes the identity of any paired memory stage.
@@ -10672,6 +10702,68 @@ mod tests {
         }
     }
 
+    /// Answers every turn, and answers the compaction summary call with text
+    /// that stops for `summary_stop` (a refusal, a content filter or a filled
+    /// context window).
+    struct StoppedSummaryLlmClient {
+        summary_stop: StopReason,
+    }
+
+    #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+    #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+    impl AgentLlmClient for StoppedSummaryLlmClient {
+        async fn stream_response(
+            &self,
+            messages: &[Message],
+            _tools: &[Arc<ToolDef>],
+            _max_tokens: u32,
+            _temperature: Option<f32>,
+            _provider_params: Option<&crate::lifecycle::run_primitive::ProviderParamsOverride>,
+        ) -> Result<super::LlmStreamResult, AgentError> {
+            let summary_call = messages.iter().rev().find_map(|message| match message {
+                Message::User(user) => Some(user.text_content()),
+                _ => None,
+            }) == Some("COMPACT NOW".to_string());
+            let (text, stop_reason, usage) = if summary_call {
+                (
+                    "I can't summarize this conversation.",
+                    self.summary_stop,
+                    Usage {
+                        input_tokens: 7,
+                        output_tokens: 3,
+                        ..Usage::default()
+                    },
+                )
+            } else {
+                (
+                    "ok",
+                    StopReason::EndTurn,
+                    Usage {
+                        input_tokens: 20,
+                        output_tokens: 5,
+                        ..Usage::default()
+                    },
+                )
+            };
+            Ok(super::LlmStreamResult::new(
+                vec![AssistantBlock::Text {
+                    text: text.to_string(),
+                    meta: None,
+                }],
+                stop_reason,
+                normalized_test_usage(self, usage),
+            ))
+        }
+
+        fn provider(&self) -> crate::provider::Provider {
+            crate::provider::Provider::Other
+        }
+
+        fn model(&self) -> &'static str {
+            "mock-model"
+        }
+    }
+
     struct DiscardingCompactor {
         compact_on_boundary: u64,
     }
@@ -13468,6 +13560,77 @@ mod tests {
             ],
             "the failed summary request must be followed by the rebuilt ordinary turn"
         );
+    }
+
+    /// A summary call the provider refused, filtered or stopped at the
+    /// context window did real work. Nothing of it is committed, but the
+    /// session, the budget and the run's request rows all charge it.
+    #[tokio::test]
+    async fn uncommitted_compaction_summary_call_is_charged() {
+        for summary_stop in [
+            StopReason::Refusal,
+            StopReason::ContentFilter,
+            StopReason::ContextWindowExceeded,
+        ] {
+            let client = Arc::new(StoppedSummaryLlmClient { summary_stop });
+            let mut agent = with_test_turn_state_handle(AgentBuilder::new())
+                .budget(BudgetLimits::unlimited().with_max_tokens(1_000_000))
+                .compactor(Arc::new(DiscardingCompactor::new(1)))
+                .build_standalone(client, Arc::new(NoTools), Arc::new(NoopStore))
+                .await;
+
+            agent.run("first".into()).await.unwrap();
+            let usage_before = agent.session().total_usage();
+            let budget_before = agent.budget.token_usage().unwrap().0;
+            let second = agent
+                .run("second".into())
+                .await
+                .unwrap_or_else(|error| panic!("{summary_stop:?}: the run goes on: {error}"));
+
+            let summary_usage = Usage {
+                input_tokens: 7,
+                output_tokens: 3,
+                ..Usage::default()
+            };
+            let turn_usage = Usage {
+                input_tokens: 20,
+                output_tokens: 5,
+                ..Usage::default()
+            };
+            let mut expected_usage = usage_before;
+            expected_usage.add(&summary_usage);
+            expected_usage.add(&turn_usage);
+            assert_eq!(
+                agent.session().total_usage(),
+                expected_usage,
+                "{summary_stop:?}"
+            );
+            assert_eq!(
+                agent.budget.token_usage(),
+                Some((
+                    budget_before + summary_usage.total_tokens() + turn_usage.total_tokens(),
+                    1_000_000
+                )),
+                "{summary_stop:?}"
+            );
+            assert_eq!(
+                second
+                    .request_usage
+                    .iter()
+                    .map(|row| row.output_tokens)
+                    .collect::<Vec<_>>(),
+                vec![3, 5],
+                "{summary_stop:?}: the summary call is one request row of the run"
+            );
+            assert!(
+                !agent.session().messages().iter().any(|message| {
+                    message
+                        .as_indexable_text()
+                        .contains("I can't summarize this conversation.")
+                }),
+                "{summary_stop:?}: nothing of the call is committed"
+            );
+        }
     }
 
     #[tokio::test]
