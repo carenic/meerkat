@@ -62,6 +62,11 @@ them.
 
 ### Known limitations
 
+- Live transcript rows commit one at a time, in arrival order, and each waits
+  for the session's turn boundary. While a member turn runs (for example
+  voice-delegated work in the existing member), later rows wait behind it, so
+  the persisted transcript can lag the conversation by up to that turn's
+  length (see `docs/guides/realtime.mdx`). (#1821)
 - Rows a channel close holds for replay after its deferred settlement gave up
   are held in memory only: they are lost if the process exits before the next
   boundary lets them land. Durable staging is planned. (#1821)
