@@ -402,6 +402,15 @@ impl TemporaryCouncilAdmittedSources {
     }
 }
 
+/// What belongs to one attempt to run a council rather than to its
+/// identity: never fingerprinted or persisted, and ignored by a replay or a
+/// joined caller, which use the owning run's.
+#[derive(Debug, Clone, Default)]
+struct TemporaryCouncilAttempt {
+    host_bootstrap: TemporaryCouncilHostBootstrap,
+    admitted_sources: TemporaryCouncilAdmittedSources,
+}
+
 /// The typed contract a `StructuredResult` merge must satisfy.
 ///
 /// A council does not accept "any syntactically valid JSON" as a structured
@@ -1214,13 +1223,8 @@ impl TemporaryCouncilCoordinator {
         &self,
         request: TemporaryCouncilRequest,
     ) -> Result<TemporaryCouncilOutcome, TemporaryCouncilError> {
-        self.run_with_host_bootstrap(
-            request,
-            TemporaryCouncilHostBootstrap::none(),
-            None,
-            TemporaryCouncilAdmittedSources::default(),
-        )
-        .await
+        self.run_with_host_bootstrap(request, TemporaryCouncilAttempt::default(), None)
+            .await
     }
 
     /// [`Self::run`] for a convener admitted to each participant's source
@@ -1233,9 +1237,11 @@ impl TemporaryCouncilCoordinator {
     ) -> Result<TemporaryCouncilOutcome, TemporaryCouncilError> {
         self.run_with_host_bootstrap(
             request,
-            TemporaryCouncilHostBootstrap::none(),
+            TemporaryCouncilAttempt {
+                host_bootstrap: TemporaryCouncilHostBootstrap::none(),
+                admitted_sources: sources,
+            },
             None,
-            sources,
         )
         .await
     }
@@ -1252,13 +1258,8 @@ impl TemporaryCouncilCoordinator {
         request: TemporaryCouncilRequest,
         job: TemporaryCouncilJobBinding,
     ) -> Result<TemporaryCouncilOutcome, TemporaryCouncilError> {
-        self.run_with_host_bootstrap(
-            request,
-            TemporaryCouncilHostBootstrap::none(),
-            Some(job),
-            TemporaryCouncilAdmittedSources::default(),
-        )
-        .await
+        self.run_with_host_bootstrap(request, TemporaryCouncilAttempt::default(), Some(job))
+            .await
     }
 
     /// [`Self::run_detached`] for a convener admitted to each participant's
@@ -1271,25 +1272,27 @@ impl TemporaryCouncilCoordinator {
     ) -> Result<TemporaryCouncilOutcome, TemporaryCouncilError> {
         self.run_with_host_bootstrap(
             request,
-            TemporaryCouncilHostBootstrap::none(),
+            TemporaryCouncilAttempt {
+                host_bootstrap: TemporaryCouncilHostBootstrap::none(),
+                admitted_sources: sources,
+            },
             Some(job),
-            sources,
         )
         .await
     }
 
-    /// [`Self::run`] with the one-time host bootstrap a council needs to seat
-    /// HOST-owned participants.
+    /// [`Self::run`] with what belongs to this attempt: the one-time host
+    /// bootstrap a council needs to seat HOST-owned participants, and the
+    /// incarnations its convener was admitted to the source mobs at.
     ///
-    /// The bootstrap belongs to the ATTEMPT, not to the council identity: a
-    /// replay or a joined caller reuses the owning task's bootstrap and this
-    /// one is ignored, and nothing from it is fingerprinted or persisted.
+    /// Both belong to the ATTEMPT, not to the council identity: a replay or a
+    /// joined caller reuses the owning task's and this one is ignored, and
+    /// nothing from it is fingerprinted or persisted.
     async fn run_with_host_bootstrap(
         &self,
         request: TemporaryCouncilRequest,
-        host_bootstrap: TemporaryCouncilHostBootstrap,
+        attempt: TemporaryCouncilAttempt,
         detached_job: Option<TemporaryCouncilJobBinding>,
-        admitted_sources: TemporaryCouncilAdmittedSources,
     ) -> Result<TemporaryCouncilOutcome, TemporaryCouncilError> {
         // Shape validation only. Deadline resolution is deliberately NOT done
         // here: a replay of a lost response may legitimately arrive after the
@@ -1325,8 +1328,7 @@ impl TemporaryCouncilCoordinator {
             match self
                 .admit_owned(
                     &validated,
-                    host_bootstrap,
-                    admitted_sources,
+                    attempt,
                     detached_job,
                     key,
                     owner_tx.clone(),
@@ -1375,8 +1377,7 @@ impl TemporaryCouncilCoordinator {
     async fn admit_owned(
         &self,
         validated: &ValidatedRequest,
-        host_bootstrap: TemporaryCouncilHostBootstrap,
-        admitted_sources: TemporaryCouncilAdmittedSources,
+        attempt: TemporaryCouncilAttempt,
         detached_job: Option<TemporaryCouncilJobBinding>,
         key: String,
         tx: tokio::sync::watch::Sender<Option<CouncilPublish>>,
@@ -1551,8 +1552,8 @@ impl TemporaryCouncilCoordinator {
                         state: state.clone(),
                         validated,
                         record,
-                        host_bootstrap,
-                        admitted_sources,
+                        host_bootstrap: attempt.host_bootstrap,
+                        admitted_sources: attempt.admitted_sources,
                         claim: claim.clone(),
                     };
                     // A panic inside execution must not be a silent hang: it is
