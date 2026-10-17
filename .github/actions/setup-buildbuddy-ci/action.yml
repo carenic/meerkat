@@ -23,10 +23,6 @@ runs:
     - name: Install Rust
       if: ${{ inputs.profile == 'submitter' || inputs.profile == 'doctor' || inputs.profile == 'lint' || inputs.profile == 'sdk' || inputs.profile == 'rust' || inputs.profile == 'wasm' || inputs.profile == 'audit' || inputs.profile == 'native' || inputs.profile == 'full' }}
       uses: dtolnay/rust-toolchain@ee868d7805ade43a1b47dd054727ab76c9108b4f # 1.94.1
-      with:
-        # Pinned to a commit, the action cannot read the toolchain from its
-        # ref name, so it is named here (rust-toolchain.toml's channel).
-        toolchain: 1.94.1
 
     - name: Pin Rust toolchain binaries
       if: ${{ inputs.profile == 'submitter' || inputs.profile == 'doctor' || inputs.profile == 'lint' || inputs.profile == 'sdk' || inputs.profile == 'rust' || inputs.profile == 'wasm' || inputs.profile == 'audit' || inputs.profile == 'native' || inputs.profile == 'full' }}

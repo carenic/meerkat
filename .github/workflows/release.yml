@@ -536,7 +536,22 @@ jobs:
           ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag != '' && github.event.inputs.release_tag || github.ref }}
           fetch-depth: 0
 
-      - uses: ./.github/actions/setup-rust-ci
+      # A recovery of an older tag checks that tag out, and its local
+      # actions would be the tag's own: the setup action comes from the
+      # workflow's commit instead, whose third-party actions are pinned.
+      # Sparse, so the checkout adds no Cargo or Bazel package to the build.
+      - name: Checkout release tooling
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.sha }}
+          path: .release-tooling
+          persist-credentials: false
+          sparse-checkout: |
+            .github/actions/setup-rust-ci/action.yml
+            scripts/ci-pin-rust-toolchain-env
+          sparse-checkout-cone-mode: false
+
+      - uses: ./.release-tooling/.github/actions/setup-rust-ci
 
       - name: Cache cargo registry
         # A tag run uses no cache: only a re-run of the same tag ever saved
@@ -1108,7 +1123,24 @@ jobs:
         shell: bash
         run: git config --global --add safe.directory "${GITHUB_WORKSPACE}"
 
-      - uses: ./.github/actions/setup-rust-ci
+      # A recovery of an older tag checks that tag out: its local actions
+      # would be the tag's own, and its tree can predate the test-code
+      # marker guard. The setup action and the guard come from the
+      # workflow's commit instead, whose third-party actions are pinned.
+      # Sparse, so the checkout adds no Cargo or Bazel package to the build.
+      - name: Checkout release tooling
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.sha }}
+          path: .release-tooling
+          persist-credentials: false
+          sparse-checkout: |
+            .github/actions/setup-rust-ci/action.yml
+            scripts/ci-pin-rust-toolchain-env
+            scripts/check-release-binary-markers
+          sparse-checkout-cone-mode: false
+
+      - uses: ./.release-tooling/.github/actions/setup-rust-ci
 
       - name: Add release target
         run: rustup target add ${{ matrix.platform.target }}
@@ -1217,19 +1249,6 @@ jobs:
         run: |
           set -euo pipefail
           /usr/bin/codesign --force --sign - "target/${{ matrix.platform.target }}/release/${{ matrix.surface.bin }}"
-
-      # The test-code marker guard comes from the workflow ref: an asset
-      # recovery of an older tag builds a tree that predates it. Sparse, so
-      # the checkout adds no Cargo or Bazel package to the build.
-      - name: Checkout release binary guard
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-        with:
-          ref: ${{ github.sha }}
-          path: .release-tooling
-          persist-credentials: false
-          sparse-checkout: |
-            scripts/check-release-binary-markers
-          sparse-checkout-cone-mode: false
 
       - name: Package artifacts
         shell: bash
@@ -1376,7 +1395,7 @@ jobs:
           ref: ${{ github.sha }}
           path: .release-tooling
           persist-credentials: false
-      - uses: ./.github/actions/setup-rust-ci
+      - uses: ./.release-tooling/.github/actions/setup-rust-ci
 
       - name: Cache cargo registry
         # A tag run uses no cache: only a re-run of the same tag ever saved
@@ -1554,7 +1573,25 @@ jobs:
           ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.prebuild_release_artifacts == 'true' && github.sha || github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag != '' && github.event.inputs.release_tag || github.ref }}
           persist-credentials: false
 
-      - uses: ./.github/actions/setup-rust-ci
+      # A recovery of an older tag checks that tag out: its local actions
+      # would be the tag's own, and its tree can predate the test-code
+      # marker guard. The setup action and the guard come from the
+      # workflow's commit instead, whose third-party actions are pinned.
+      # Sparse, so the checkout adds no Cargo or Bazel package to the build.
+      - name: Checkout release tooling
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.sha }}
+          path: .release-tooling
+          persist-credentials: false
+          sparse-checkout: |
+            .github/actions/setup-rust-ci/action.yml
+            scripts/ci-pin-rust-toolchain-env
+            scripts/check-release-binary-markers
+            scripts/check-macos-x86-release-binary
+          sparse-checkout-cone-mode: false
+
+      - uses: ./.release-tooling/.github/actions/setup-rust-ci
 
       - name: Add the Intel macOS target
         run: rustup target add x86_64-apple-darwin
@@ -1584,20 +1621,6 @@ jobs:
       - name: Ad-hoc codesign the binary
         shell: bash
         run: /usr/bin/codesign --force --sign - "target/x86_64-apple-darwin/release/${{ matrix.surface.bin }}"
-
-      # The test-code marker guard comes from the workflow ref: an asset
-      # recovery of an older tag builds a tree that predates it. Sparse, so
-      # the checkout adds no Cargo or Bazel package to the build.
-      - name: Checkout release binary guard
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-        with:
-          ref: ${{ github.sha }}
-          path: .release-tooling
-          persist-credentials: false
-          sparse-checkout: |
-            scripts/check-release-binary-markers
-            scripts/check-macos-x86-release-binary
-          sparse-checkout-cone-mode: false
 
       - name: Package artifacts
         shell: bash
@@ -2125,7 +2148,22 @@ jobs:
           ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.prebuild_release_artifacts == 'true' && github.sha || github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag != '' && github.event.inputs.release_tag || github.ref }}
           persist-credentials: false
 
-      - uses: ./.github/actions/setup-rust-ci
+      # A recovery of an older tag checks that tag out, and its local
+      # actions would be the tag's own: the setup action comes from the
+      # workflow's commit instead, whose third-party actions are pinned.
+      # Sparse, so the checkout adds no Cargo or Bazel package to the build.
+      - name: Checkout release tooling
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.sha }}
+          path: .release-tooling
+          persist-credentials: false
+          sparse-checkout: |
+            .github/actions/setup-rust-ci/action.yml
+            scripts/ci-pin-rust-toolchain-env
+          sparse-checkout-cone-mode: false
+
+      - uses: ./.release-tooling/.github/actions/setup-rust-ci
 
       - name: Cache cargo registry
         # A tag run uses no cache: only a re-run of the same tag ever saved
@@ -2795,7 +2833,22 @@ jobs:
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag || github.ref_name }}
 
-      - uses: ./.github/actions/setup-rust-ci
+      # A recovery of an older tag checks that tag out, and its local
+      # actions would be the tag's own: the setup action comes from the
+      # workflow's commit instead, whose third-party actions are pinned.
+      # Sparse, so the checkout adds no Cargo or Bazel package to the build.
+      - name: Checkout release tooling
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.sha }}
+          path: .release-tooling
+          persist-credentials: false
+          sparse-checkout: |
+            .github/actions/setup-rust-ci/action.yml
+            scripts/ci-pin-rust-toolchain-env
+          sparse-checkout-cone-mode: false
+
+      - uses: ./.release-tooling/.github/actions/setup-rust-ci
 
       - name: Cache cargo
         # A tag run uses no cache: only a re-run of the same tag ever saved
@@ -2914,7 +2967,22 @@ jobs:
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag != '' && github.event.inputs.release_tag || github.ref }}
 
-      - uses: ./.github/actions/setup-rust-ci
+      # A recovery of an older tag checks that tag out, and its local
+      # actions would be the tag's own: the setup action comes from the
+      # workflow's commit instead, whose third-party actions are pinned.
+      # Sparse, so the checkout adds no Cargo or Bazel package to the build.
+      - name: Checkout release tooling
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.sha }}
+          path: .release-tooling
+          persist-credentials: false
+          sparse-checkout: |
+            .github/actions/setup-rust-ci/action.yml
+            scripts/ci-pin-rust-toolchain-env
+          sparse-checkout-cone-mode: false
+
+      - uses: ./.release-tooling/.github/actions/setup-rust-ci
 
       # No cache: this job holds the crates.io, PyPI and npm tokens, and a
       # restored cache (written by any earlier run on main, a dispatch

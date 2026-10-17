@@ -62,10 +62,23 @@ fn release_workflows_use_the_repository_pinned_rust_toolchain() {
         "publish_semver_baseline",
         "publish_registries",
     ];
+    // The jobs whose checkout can be an older release tag (a recovery
+    // dispatch) run the setup action from their checkout of the workflow's
+    // own commit, so an older tag's local action never runs.
+    let tooling_jobs = [
+        "release_validate_cargo",
+        "build_binaries",
+        "build_binaries_windows_cross",
+        "build_binaries_macos_x86_cross",
+        "build_web_sdk_package",
+        "publish_semver_baseline",
+        "publish_registries",
+    ];
+    const LOCAL_SETUP: &str = "./.github/actions/setup-rust-ci";
+    const TOOLING_SETUP: &str = "./.release-tooling/.github/actions/setup-rust-ci";
     assert_eq!(
-        release
-            .matches("uses: ./.github/actions/setup-rust-ci")
-            .count(),
+        release.matches(&format!("uses: {LOCAL_SETUP}")).count()
+            + release.matches(&format!("uses: {TOOLING_SETUP}")).count(),
         rust_jobs.len(),
         "all Rust-using release jobs, including the semver gate and the Windows and Intel macOS cross-builds, must use the pinned setup action"
     );
@@ -74,14 +87,40 @@ fn release_workflows_use_the_repository_pinned_rust_toolchain() {
         let steps = workflow["jobs"][job]["steps"]
             .as_sequence()
             .unwrap_or_else(|| panic!("release job {job} must contain steps"));
+        let expected = if tooling_jobs.contains(&job) {
+            TOOLING_SETUP
+        } else {
+            LOCAL_SETUP
+        };
+        let setups: Vec<usize> = steps
+            .iter()
+            .enumerate()
+            .filter(|(_, step)| {
+                step["uses"]
+                    .as_str()
+                    .is_some_and(|uses| uses.ends_with(".github/actions/setup-rust-ci"))
+            })
+            .map(|(index, _)| index)
+            .collect();
         assert_eq!(
-            steps
-                .iter()
-                .filter(|step| step["uses"].as_str() == Some("./.github/actions/setup-rust-ci"))
-                .count(),
+            setups.len(),
             1,
             "release job {job} must use the pinned setup action exactly once"
         );
+        assert_eq!(
+            steps[setups[0]]["uses"].as_str(),
+            Some(expected),
+            "release job {job} must run the setup action as {expected}"
+        );
+        if expected == TOOLING_SETUP {
+            assert!(
+                steps[..setups[0]].iter().any(|step| {
+                    step["with"]["path"].as_str() == Some(".release-tooling")
+                        && step["with"]["ref"].as_str() == Some("${{ github.sha }}")
+                }),
+                "release job {job} must check out the workflow's own commit as .release-tooling before its setup action"
+            );
+        }
     }
 
     let semver_path = release_path.with_file_name("release-semver-readiness.yml");
