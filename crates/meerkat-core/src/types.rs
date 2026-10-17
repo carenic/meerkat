@@ -4016,6 +4016,12 @@ pub enum ToolSourceKind {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolProvenance {
     pub kind: ToolSourceKind,
+    /// The source instance: an MCP server name, a bundle name, a host's
+    /// callback surface. Visibility witnesses (an inherited tool ceiling, a
+    /// filter) match a tool by `kind` and this id, so a host that rebuilds an
+    /// agent must give one surface the same id in every build. An id minted
+    /// per build makes every witness recorded against an earlier build miss
+    /// the rebuilt tool.
     pub source_id: ToolSourceId,
     /// The installed artifact this tool's implementation came from, set only
     /// after its host verified the reference against the artifacts it
