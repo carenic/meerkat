@@ -109,10 +109,10 @@ them.
   trusted composition, never from a request. `ScheduleService::new` records
   none, and `ScheduleService::commissioning_agent` reads the service's agent.
   `PersistenceBundle::schedule_service` builds a stock-governed realm's
-  service commissioned for the realm's opened agent (`rkat` uses it for its
-  schedule tools and hosts) and an ordinary realm's service with none. The
-  wire `Schedule` and the generated SDK types carry `commissioning_agent`
-  when it is set.
+  service commissioned for the realm's opened agent (`rkat` and `rkat-rpc`
+  use it for their schedule tools and hosts) and an ordinary realm's
+  service with none. The wire `Schedule` and the generated SDK types carry
+  `commissioning_agent` when it is set.
 - Governed schedule hosts. `meerkat::surface::ScheduledSessionAgentBinding`
   is the agent a governed host's scheduled sessions act as (`agent`) and its
   binding onto a session the host materializes or revives for a fire
