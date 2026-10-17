@@ -481,11 +481,13 @@ on a dispatch-like run (any trigger but `push`, `pull_request`, `schedule`
 and `merge_group`). The workflows whose runs a tag trusts (`ci.yml`, which
 writes the exact-tree attestation, and `release-semver-readiness.yml`,
 which writes the semver attestation) and any workflow that checks out a
-ref its inputs choose save no cache on a dispatch-like run either. A tag
-run restores no cache at all: the cache steps of the release jobs and the
-Windows SDK cache of `build-windows-cross` skip tag runs (only a re-run of
-the same tag ever saved one of their keys), the BuildBuddy release binary
-build passes `repository-cache: "false"` and the full-graph validation
+ref its inputs choose save no cache on a dispatch-like run either. No
+release job restores a cache, on a tag or on a dispatch (a prebuild or a
+recovery), but the semver gate's dispatch measurement, whose cache only
+the readiness workflow's push to main saves: the release jobs run no
+rust-cache step, `build-windows-cross` restores the Windows SDK cache only
+for a caller that saves it (release.yml does not), the BuildBuddy release
+jobs pass `repository-cache: "false"` and the full-graph validation
 passes `buildbuddy.yml` `repository_cache: "false"`.
 No workflow saves that cache on a dispatch-like run either
 (`release-binaries-check.yml` and `release-turbo-s.yml` only restore it).

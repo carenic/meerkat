@@ -553,19 +553,6 @@ jobs:
 
       - uses: ./.release-tooling/.github/actions/setup-rust-ci
 
-      - name: Cache cargo registry
-        # A tag run uses no cache: only a re-run of the same tag ever saved
-        # one of these keys, so a tag restores nothing it can trust.
-        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-        with:
-          # Release caches never come from a dispatch: a dispatch runs on main
-          # and would save into the default branch's scope, which every later
-          # tag run restores from. ~/.cargo/bin is never cached, so no restored
-          # binary can shadow cargo, git or the platform tools on PATH.
-          save-if: ${{ github.event_name != 'workflow_dispatch' }}
-          cache-bin: "false"
-
       - name: Setup Python
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
@@ -648,9 +635,9 @@ jobs:
           lane: release-validate
           profile: native
           mode: release-validate
-          # Dispatch-only: restore, never save into the default branch's
-          # cache scope, which every tag run restores.
-          repository-cache: restore
+          # No release job restores a cache: nothing on main saves this
+          # one either (the self-hosted graph's backend never does).
+          repository-cache: "false"
 
       - name: Setup Python
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
@@ -1145,20 +1132,6 @@ jobs:
       - name: Add release target
         run: rustup target add ${{ matrix.platform.target }}
 
-      - name: Cache cargo registry
-        # A tag run uses no cache: only a re-run of the same tag ever saved
-        # one of these keys, so a tag restores nothing it can trust.
-        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-        with:
-          key: release-${{ matrix.platform.target }}
-          # Release caches never come from a dispatch: a dispatch runs on main
-          # and would save into the default branch's scope, which every later
-          # tag run restores from. ~/.cargo/bin is never cached, so no restored
-          # binary can shadow cargo, git or the platform tools on PATH.
-          save-if: ${{ github.event_name != 'workflow_dispatch' }}
-          cache-bin: "false"
-
       # The workspace is trusted for Git in the step after Checkout (see
       # there). audiopus-sys falls back to building bundled Opus and requires
       # CMake 3.x (bundled
@@ -1397,20 +1370,6 @@ jobs:
           persist-credentials: false
       - uses: ./.release-tooling/.github/actions/setup-rust-ci
 
-      - name: Cache cargo registry
-        # A tag run uses no cache: only a re-run of the same tag ever saved
-        # one of these keys, so a tag restores nothing it can trust.
-        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-        with:
-          key: release-x86_64-pc-windows-msvc-cross
-          # Release caches never come from a dispatch: a dispatch runs on main
-          # and would save into the default branch's scope, which every later
-          # tag run restores from. ~/.cargo/bin is never cached, so no restored
-          # binary can shadow cargo, git or the platform tools on PATH.
-          save-if: ${{ github.event_name != 'workflow_dispatch' }}
-          cache-bin: "false"
-
       - name: Resolve release version
         id: version
         shell: bash
@@ -1428,7 +1387,8 @@ jobs:
           version: ${{ steps.version.outputs.version }}
           # The SDK cache is linked into attested binaries: a dispatch on main
           # would save it into the scope every tag run restores.
-          save-sdk-cache: ${{ github.event_name != 'workflow_dispatch' }}
+          # No release job restores or saves a cache.
+          save-sdk-cache: "false"
 
       # An asset recovery runs this workflow from main against the tag, so
       # its attestations name main's commit, not the tag. Each archive
@@ -1595,20 +1555,6 @@ jobs:
 
       - name: Add the Intel macOS target
         run: rustup target add x86_64-apple-darwin
-
-      - name: Cache cargo registry
-        # A tag run uses no cache: only a re-run of the same tag ever saved
-        # one of these keys, so a tag restores nothing it can trust.
-        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-        with:
-          key: release-x86_64-apple-darwin-cross
-          # Release caches never come from a dispatch: a dispatch runs on main
-          # and would save into the default branch's scope, which every later
-          # tag run restores from. ~/.cargo/bin is never cached, so no restored
-          # binary can shadow cargo, git or the platform tools on PATH.
-          save-if: ${{ github.event_name != 'workflow_dispatch' }}
-          cache-bin: "false"
 
       - name: Cross-compile the surface binary
         shell: bash
@@ -2164,19 +2110,6 @@ jobs:
           sparse-checkout-cone-mode: false
 
       - uses: ./.release-tooling/.github/actions/setup-rust-ci
-
-      - name: Cache cargo registry
-        # A tag run uses no cache: only a re-run of the same tag ever saved
-        # one of these keys, so a tag restores nothing it can trust.
-        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-        with:
-          # Release caches never come from a dispatch: a dispatch runs on main
-          # and would save into the default branch's scope, which every later
-          # tag run restores from. ~/.cargo/bin is never cached, so no restored
-          # binary can shadow cargo, git or the platform tools on PATH.
-          save-if: ${{ github.event_name != 'workflow_dispatch' }}
-          cache-bin: "false"
 
       - name: Install Python + Node tooling
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
@@ -2849,20 +2782,6 @@ jobs:
           sparse-checkout-cone-mode: false
 
       - uses: ./.release-tooling/.github/actions/setup-rust-ci
-
-      - name: Cache cargo
-        # A tag run uses no cache: only a re-run of the same tag ever saved
-        # one of these keys, so a tag restores nothing it can trust.
-        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-        with:
-          shared-key: release-semver-rustdoc
-          # Release caches never come from a dispatch: a dispatch runs on main
-          # and would save into the default branch's scope, which every later
-          # tag run restores from. ~/.cargo/bin is never cached, so no restored
-          # binary can shadow cargo, git or the platform tools on PATH.
-          save-if: ${{ github.event_name != 'workflow_dispatch' }}
-          cache-bin: "false"
 
       - name: Generate rustdoc JSON for every publishable library crate
         shell: bash

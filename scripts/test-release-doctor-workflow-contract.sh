@@ -39,8 +39,8 @@ TRAILING_PASS="PASS Linux and macOS arm64 assets publish without waiting for the
 TRAILING_FAIL="FAIL The trailing Intel macOS and Windows lanes must not gate the critical assets, and no upload may replace a published asset"
 WEB_TOOLS_PASS="PASS The Web SDK release build checks every download's sha256 and wasm-pack installs nothing: wasm-bindgen (Cargo.lock's version) and wasm-opt are pinned"
 TOKEN_PASS="PASS Release workflow token is read-only except for the jobs that attest or publish, which never persist it in a checkout; no workflow passes every secret to a reusable workflow"
-CACHES_PASS="PASS GitHub Actions caches in release.yml jobs, the local actions they call and, on a tag, the reusable workflows they call are never saved on a dispatch and never cache ~/.cargo/bin; token jobs restore none, a tag run restores no cache, OIDC or attesting jobs restore none that a dispatch-like run of any workflow saves, and no dispatch-like run saves the Bazel repository cache (reusable workflows never run on a dispatch); a workflow that produces what a tag trusts or checks out a ref its inputs choose saves no cache on a dispatch-like run; only push and schedule runs write CI's sccache bucket, and no run step keeps the Actions cache token"
-CACHES_FAIL="FAIL A release cache can be saved on a dispatch, cache ~/.cargo/bin, reach a token, OIDC or attesting job, or a tag run, or a workflow a tag trusts saves a cache on a dispatch-like run, or CI's sccache bucket or the Actions cache token reaches other runs"
+CACHES_PASS="PASS GitHub Actions caches in release.yml jobs, the local actions they call and, on a tag, the reusable workflows they call are never saved on a dispatch and never cache ~/.cargo/bin; token jobs restore none, no release job restores a cache on any event but the semver gate's measurement, OIDC or attesting jobs restore none that a dispatch-like run of any workflow saves, and no dispatch-like run saves the Bazel repository cache (reusable workflows never run on a dispatch); a workflow that produces what a tag trusts or checks out a ref its inputs choose saves no cache on a dispatch-like run; only push and schedule runs write CI's sccache bucket, and no run step keeps the Actions cache token"
+CACHES_FAIL="FAIL A release cache can be saved on a dispatch, cache ~/.cargo/bin, reach a token, OIDC or attesting job, or be restored by a release job, or a workflow a tag trusts saves a cache on a dispatch-like run, or CI's sccache bucket or the Actions cache token reaches other runs"
 
 fail() {
   echo "release doctor workflow contract violated: $1" >&2
@@ -542,12 +542,18 @@ elif name == "secrets-inherit":
         "    secrets:\n      MEERKAT_GCP_BUILDBUDDY_API_KEY: ${{ secrets.MEERKAT_GCP_BUILDBUDDY_API_KEY }}\n",
         "    secrets: inherit\n",
     )
-elif name == "cache-tag-restore":
-    # The pre-review build job restored its rust-cache on a tag.
+elif name == "release-job-cache":
+    # The pre-review build job restored a rust-cache, which on a dispatch
+    # (a prebuild) reads main's scope, where no release run saves it.
     job = text.index("  build_binaries:\n")
-    needle = "        if: ${{ !startsWith(github.ref, 'refs/tags/') }}\n"
+    needle = "      - name: Add release target\n"
     at = text.index(needle, job)
-    text = text[:at] + text[at + len(needle):]
+    text = (
+        text[:at]
+        + "      - name: Cache cargo registry\n        uses: Swatinem/rust-cache@v2\n        with:\n"
+        + "          save-if: ${{ github.event_name != 'workflow_dispatch' }}\n          cache-bin: \"false\"\n\n"
+        + text[at:]
+    )
 elif name == "cache-registry-restore":
     # The pre-review registry publisher restored a cache with its tokens.
     job = text.index("  publish_registries:\n")
@@ -557,9 +563,14 @@ elif name == "cache-registry-restore":
 elif name == "cache-dispatch-save":
     # A build cache saved by dispatch runs, which tag runs restore.
     job = text.index("  build_binaries_windows_cross:\n")
-    needle = "          save-if: ${{ github.event_name != 'workflow_dispatch' }}\n"
+    needle = "      - name: Resolve release version\n"
     at = text.index(needle, job)
-    text = text[:at] + text[at + len(needle):]
+    text = (
+        text[:at]
+        + "      - name: Cache cargo registry\n        uses: Swatinem/rust-cache@v2\n        with:\n"
+        + "          cache-bin: \"false\"\n\n"
+        + text[at:]
+    )
 elif name == "semver-baseline-clobber":
     # The pre-review attach replaced a baseline already on the release.
     replace_once(
@@ -587,13 +598,16 @@ elif name == "web-sdk-unchecked-download":
 elif name == "cache-xwin-dispatch-save":
     # The Windows SDK cache saved by dispatch runs too.
     replace_once(
-        "          save-sdk-cache: ${{ github.event_name != 'workflow_dispatch' }}\n",
+        "          # No release job restores or saves a cache.\n          save-sdk-cache: \"false\"\n",
         "          save-sdk-cache: \"true\"\n",
     )
 elif name == "cache-buildbuddy-repository":
     # The pre-review release binary build restored and saved the Bazel
     # repository cache.
-    replace_once('          repository-cache: "false"\n', "")
+    job = text.index("  build_binaries_buildbuddy:\n")
+    needle = '          repository-cache: "false"\n'
+    at = text.index(needle, job)
+    text = text[:at] + text[at + len(needle):]
 elif name == "reusable-tag-repository-restore":
     # The full-graph call without its repository_cache input: on a tag every
     # BuildBuddy lane of buildbuddy.yml restores the Bazel repository cache.
@@ -663,11 +677,17 @@ if name == "cache-xwin-save-ungated":
         "      if: ${{ steps.sdk-cache.outputs.cache-hit != 'true' }}\n",
     )
 elif name == "cache-xwin-validate-dispatch-save":
-    # Another workflow's dispatch saves the cache the release build restores.
+    # Another workflow's dispatch saves the cache that the release build
+    # restores once the action restores it whatever its caller saves.
     replace_once(
         ".github/workflows/windows-cross-validate.yml",
         "          save-sdk-cache: ${{ github.event_name != 'workflow_dispatch' }}\n",
         '          save-sdk-cache: "true"\n',
+    )
+    replace_once(
+        ".github/actions/build-windows-cross/action.yml",
+        "      if: ${{ inputs.save-sdk-cache == 'true' && !startsWith(github.ref, 'refs/tags/') }}\n",
+        "      if: ${{ !startsWith(github.ref, 'refs/tags/') }}\n",
     )
 elif name == "cache-dispatch-shared-registry":
     # An attesting job shares a rust-cache key with a workflow whose trigger
@@ -676,9 +696,15 @@ elif name == "cache-dispatch-shared-registry":
     release = root / ".github/workflows/release.yml"
     text = release.read_text()
     job = text.index("  build_web_sdk_package:\n")
-    needle = "          save-if: ${{ github.event_name != 'workflow_dispatch' }}\n"
-    at = text.index(needle, job)
-    release.write_text(text[:at] + "          shared-key: ci-registry\n" + text[at:])
+    needle = "      - uses: ./.release-tooling/.github/actions/setup-rust-ci\n\n"
+    at = text.index(needle, job) + len(needle)
+    release.write_text(
+        text[:at]
+        + "      - name: Cache cargo registry\n        uses: Swatinem/rust-cache@v2\n        with:\n"
+        + "          shared-key: ci-registry\n"
+        + "          save-if: ${{ github.event_name != 'workflow_dispatch' }}\n          cache-bin: \"false\"\n\n"
+        + text[at:]
+    )
     (root / ".github/workflows/registry-dispatch.yml").write_text(
         "name: Registry cache on dispatch\n"
         "\n"
@@ -717,10 +743,10 @@ elif name == "dispatch-saves-repository-cache":
         "",
     )
 elif name == "xwin-tag-restore":
-    # The pre-review action restored the Windows SDK cache on a tag.
+    # The pre-review action restored the Windows SDK cache on every run.
     replace_once(
         ".github/actions/build-windows-cross/action.yml",
-        "      id: sdk-cache\n      if: ${{ !startsWith(github.ref, 'refs/tags/') }}\n",
+        "      id: sdk-cache\n      if: ${{ inputs.save-sdk-cache == 'true' && !startsWith(github.ref, 'refs/tags/') }}\n",
         "      id: sdk-cache\n",
     )
 elif name == "sccache-pull-request-writes":
@@ -1057,9 +1083,9 @@ mutate web-sdk-unchecked-download "${TEST_ROOT}/web-sdk-unchecked-download.yml"
 expect_fail_named web-sdk-unchecked-download "${TEST_ROOT}/web-sdk-unchecked-download.yml" \
   "step \`Install pinned wasm-bindgen and wasm-opt\` downloads 2 file(s) but checks 1 sha256" web-sdk-tools
 
-mutate cache-tag-restore "${TEST_ROOT}/cache-tag-restore.yml"
-expect_fail_named cache-tag-restore "${TEST_ROOT}/cache-tag-restore.yml" \
-  "job \`build_binaries\` restores \`v0-rust-release-*-build_binaries\` on a tag; a tag run restores no cache" release-caches
+mutate release-job-cache "${TEST_ROOT}/release-job-cache.yml"
+expect_fail_named release-job-cache "${TEST_ROOT}/release-job-cache.yml" \
+  "job \`build_binaries\` restores \`v0-rust-build_binaries\` on a dispatch; a release job restores no cache" release-caches
 mutate cache-registry-restore "${TEST_ROOT}/cache-registry-restore.yml"
 expect_fail_named cache-registry-restore "${TEST_ROOT}/cache-registry-restore.yml" \
   "job \`publish_registries\` holds a registry or publish token and restores a cache" release-caches
@@ -1073,10 +1099,10 @@ mutate cache-buildbuddy-repository "${TEST_ROOT}/cache-buildbuddy-repository.yml
 expect_fail_named cache-buildbuddy-repository "${TEST_ROOT}/cache-buildbuddy-repository.yml" \
   "job \`build_binaries_buildbuddy\` (in \`.github/actions/setup-buildbuddy-ci\`) saves cache \`buildbuddy-bazel-repository-*-*\` on a dispatch" release-caches
 expect_fail_named cache-buildbuddy-repository-restore "${TEST_ROOT}/cache-buildbuddy-repository.yml" \
-  "job \`build_binaries_buildbuddy\` (in \`.github/actions/setup-buildbuddy-ci\`) restores \`buildbuddy-bazel-repository-*-*\` on a tag; a tag run restores no cache" release-caches
+  "job \`build_binaries_buildbuddy\` (in \`.github/actions/setup-buildbuddy-ci\`) restores \`buildbuddy-bazel-repository-*-*\` on a tag push; a release job restores no cache" release-caches
 mutate reusable-tag-repository-restore "${TEST_ROOT}/reusable-tag-repository-restore.yml"
 expect_fail_named reusable-tag-repository-restore "${TEST_ROOT}/reusable-tag-repository-restore.yml" \
-  "job \`release_validate_buildbuddy_full\` (through buildbuddy.yml job \`prebuild-submit\` in \`.github/actions/run-buildbuddy-ci-lane-batch\` > \`.github/actions/setup-buildbuddy-ci\`) restores \`buildbuddy-bazel-repository-*-*\` on a tag; a tag run restores no cache" release-caches
+  "job \`release_validate_buildbuddy_full\` (through buildbuddy.yml job \`prebuild-submit\` in \`.github/actions/run-buildbuddy-ci-lane-batch\` > \`.github/actions/setup-buildbuddy-ci\`) restores \`buildbuddy-bazel-repository-*-*\` on a tag push; a release job restores no cache" release-caches
 mutate reusable-tag-unreadable "${TEST_ROOT}/reusable-tag-unreadable.yml"
 expect_fail_named reusable-tag-unreadable "${TEST_ROOT}/reusable-tag-unreadable.yml" \
   "job \`release_validate_buildbuddy_full\` calls a reusable workflow on a tag that this check cannot read" release-caches
@@ -1097,7 +1123,7 @@ expect_tree_fail_named dispatch-saves-repository-cache "${TEST_ROOT}/dispatch-sa
   "release-binaries-check.yml job \`build\` (in \`.github/actions/setup-buildbuddy-ci\`) saves \`buildbuddy-bazel-repository-*-*\` on a workflow_dispatch run; such runs only restore the Bazel repository cache" release-caches
 mutate_tree xwin-tag-restore "${TEST_ROOT}/xwin-tag-restore"
 expect_tree_fail_named xwin-tag-restore "${TEST_ROOT}/xwin-tag-restore" \
-  "job \`build_binaries_windows_cross\` (in \`.github/actions/build-windows-cross\`) restores \`xwin-sdk-*-cargo-xwin-0.23.1\` on a tag; a tag run restores no cache" release-caches
+  "job \`build_binaries_windows_cross\` (in \`.github/actions/build-windows-cross\`) restores \`xwin-sdk-*-cargo-xwin-0.23.1\` on a tag push; a release job restores no cache" release-caches
 mutate_tree sccache-pull-request-writes "${TEST_ROOT}/sccache-pull-request-writes"
 expect_tree_fail_named sccache-pull-request-writes "${TEST_ROOT}/sccache-pull-request-writes" \
   ".github/actions/setup-sccache-ci gives a pull_request run sccache mode READ_WRITE, not READ_ONLY" release-caches

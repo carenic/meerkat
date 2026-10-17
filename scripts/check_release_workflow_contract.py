@@ -2015,6 +2015,12 @@ BAZEL_REPOSITORY_CACHE = ("key", "buildbuddy-bazel-repository-*")
 # its inputs choose, saves no cache: it would save into the scope the next
 # trusted run restores from.
 TAG_TRUSTED_WORKFLOWS = ("ci.yml", "release-semver-readiness.yml", "release.yml")
+# The one release.yml job that restores a cache: the semver gate's dispatch
+# measurement, whose family release-semver-readiness.yml's push to main
+# writes. Every other release job restores none, on a tag or a dispatch
+# (a prebuild or a recovery): nothing on main saves their keys, so a
+# restore could only return an entry some other run wrote.
+RELEASE_RESTORE_JOBS = ("release_semver_gate",)
 # The sccache setup every CI lane runs: the GCS objects it writes are what
 # the push to main compiles from before it attests, so only push and
 # schedule runs write them, and no run step keeps the Actions cache token
@@ -2624,8 +2630,10 @@ def check_release_caches(text: str) -> list[str]:
     cache scope, which every tag run restores, so no cache step saves on a
     dispatch; no rust-cache caches ~/.cargo/bin, so a restored binary cannot
     shadow a tool on PATH; a job holding a registry or publish token (or
-    `contents: write`) runs no cache step; a tag run restores no cache at
-    all; and a job that mints OIDC tokens or attests artifacts
+    `contents: write`) runs no cache step; no release job restores a cache,
+    on a tag or a dispatch, but the semver gate's dispatch measurement
+    (RELEASE_RESTORE_JOBS); and a job that mints OIDC tokens or attests
+    artifacts
     (`id-token` or `attestations: write`) restores only caches that no
     workflow in the repository saves on a dispatch-like run (any trigger but
     push, pull_request, schedule and merge_group), through the same local
@@ -2668,9 +2676,9 @@ def check_release_caches(text: str) -> list[str]:
             else:
                 saved = ", ".join(f"`{pattern}`" for _, pattern in use.key_specs()[1])
                 report(f"{use.where} saves cache {saved} on a dispatch (`{use.uses}`)")
-        if frame is tag and use.may_restore():
+        if use.may_restore() and (frame is tag or use.job not in RELEASE_RESTORE_JOBS):
             for spec in use.key_specs()[0]:
-                report(f"{use.where} restores `{spec[1]}` on a tag; a tag run restores no cache")
+                report(f"{use.where} restores `{spec[1]}` on {frame.label}; a release job restores no cache")
         if sensitive_job and use.may_restore():
             restored.extend((use, spec) for spec in use.key_specs()[0])
 

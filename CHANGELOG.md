@@ -126,12 +126,16 @@ them.
   dispatch-like run that saves a cache in any workflow whose runs a tag
   trusts or that checks out a ref its inputs choose. The semver readiness
   and release binaries checks no longer cache `~/.cargo/bin`. CI only.
-- **A release tag run restores no GitHub Actions cache.** The cache steps
-  of the release validation, binary, Web SDK and semver baseline jobs, and
-  the Windows SDK cache of `build-windows-cross`, skip tag runs; only a
-  re-run of the same tag loses a warm cache. The release doctor fails on
-  any cache a tag run would restore, not only the Bazel repository cache.
-  CI only.
+- **Release runs restore no GitHub Actions cache.** The release
+  validation, binary, Web SDK and semver baseline jobs run no rust-cache
+  step, on a tag or on a dispatch (a prebuild or a recovery): nothing on
+  main saves their keys. `build-windows-cross` restores the Windows SDK
+  cache only for a caller that saves it, which release.yml does not, and
+  the BuildBuddy release jobs pass `repository-cache: "false"`. The
+  semver gate's dispatch measurement keeps its cache, which the readiness
+  workflow's push to main saves. Only a re-run of the same tag loses a
+  warm cache. The release doctor fails on any cache a release job would
+  restore, on any event. CI only.
 - **Only push and schedule runs write the CI sccache bucket.** Every other
   run, pull requests from this repository included, uses it read-only, and
   the run steps after the sccache action no longer see the Actions cache
