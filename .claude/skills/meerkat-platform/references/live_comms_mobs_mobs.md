@@ -122,10 +122,12 @@ and `observer()` are not owners. Use `acquire_owner()` for a temporary lease,
   `mob_member_runtime_detached` (Rust `MobError::MemberRuntimeDetached`).
 - In `rkat-rpc`, members reach the callback tools of the connection that
   holds the mob's callback route: the one whose `mob/create` created it, or
-  the one that claimed it with `mob/claim_callback_route`. A mob restored
-  after a restart, or whose connection closed, has no route until a
-  connection claims it. A claim while the holding connection is open is
-  refused (`-32002`).
+  the one that claimed it with `mob/claim_callback_route` and the mob's claim
+  token (`mob/create` returns it once, to the creator). A mob restored after
+  a restart, or whose connection closed, has no route until a connection
+  claims it. A claim with another token (`claim_token_mismatch`), for a mob
+  created without one (`not_claimable`), or while the holding connection is
+  open (`held_by_open_connection`) is refused (`-32002`).
 
 ## Helpers, forks and councils
 

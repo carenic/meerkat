@@ -5215,7 +5215,7 @@ async def test_client_mob_lifecycle_and_send_methods_use_explicit_rpc_methods():
     async def fake_request(method, params):
         calls.append((method, params))
         if method == "mob/create":
-            return {"mob_id": "mob-1"}
+            return {"mob_id": "mob-1", "claim_token": "mct_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}
         if method == "mob/list":
             return {"mobs": [{"mob_id": "mob-1"}]}
         if method == "mob/status":

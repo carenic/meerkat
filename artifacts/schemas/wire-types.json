@@ -114764,6 +114764,26 @@
     "title": "MobCancelWorkResult",
     "type": "object"
   },
+  "MobClaimCallbackRouteParams": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "description": "Request payload for `mob/claim_callback_route`.",
+    "properties": {
+      "claim_token": {
+        "description": "The claim token `mob/create` returned to the mob's creator.",
+        "type": "string"
+      },
+      "mob_id": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "mob_id",
+      "claim_token"
+    ],
+    "title": "MobClaimCallbackRouteParams",
+    "type": "object"
+  },
   "MobClaimCallbackRouteResult": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "description": "Response payload for `mob/claim_callback_route`: the calling connection\nnow holds the mob's member callback route.",
@@ -114809,12 +114829,17 @@
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "description": "Response payload for `mob/create`.",
     "properties": {
+      "claim_token": {
+        "description": "The mob's callback claim token, returned once, to the mob's creator:\nanother connection takes the mob's callback route\n(`mob/claim_callback_route`) only by presenting it, and the mob keeps\nonly its SHA-256. Bearer authority: keep it secret and never log it.",
+        "type": "string"
+      },
       "mob_id": {
         "type": "string"
       }
     },
     "required": [
-      "mob_id"
+      "mob_id",
+      "claim_token"
     ],
     "title": "MobCreateResult",
     "type": "object"

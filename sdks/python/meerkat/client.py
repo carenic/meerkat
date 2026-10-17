@@ -2738,6 +2738,9 @@ class MeerkatClient:
         return Mob(
             self,
             self._require_string_field(result, "mob_id", "Invalid mob/create response"),
+            claim_token=self._require_string_field(
+                result, "claim_token", "Invalid mob/create response"
+            ),
         )
 
     def mob(self, mob_id: str) -> Mob:
@@ -4089,20 +4092,25 @@ class MeerkatClient:
         return await self._request("mob/rotate_supervisor", {"mob_id": mob_id})
 
     async def mob_claim_callback_route(
-        self, mob_id: str
+        self, mob_id: str, claim_token: str
     ) -> MobClaimCallbackRouteResult:
         """Claim a mob's member callback route for this connection.
 
         Wraps the ``mob/claim_callback_route`` RPC. A mob restored after a
         restart, or one whose owning connection closed, has no callback
         route: its members' callback tools fail ``tool_unavailable`` until a
-        connection claims it. After the claim, its live and future members
-        call the tools this connection registered. A claim while the
-        connection that holds the route is still open is refused with
-        ``-32002``.
+        connection claims it with the mob's claim token, the one
+        ``create_mob`` returned to its creator (``Mob.claim_token``). After
+        the claim, its live and future members call the tools this
+        connection registered. A claim is refused with ``-32002``, its reason
+        in ``data.reason``: ``claim_token_mismatch`` for another token,
+        ``not_claimable`` for a mob created without one, and
+        ``held_by_open_connection`` while the connection that holds the
+        route is still open.
         """
         return await self._request(
-            "mob/claim_callback_route", {"mob_id": mob_id}
+            "mob/claim_callback_route",
+            {"mob_id": mob_id, "claim_token": claim_token},
         )
 
     async def mob_submit_work(

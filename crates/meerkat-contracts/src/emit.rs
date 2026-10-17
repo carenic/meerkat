@@ -194,6 +194,7 @@ pub fn emit_all_schemas(output_dir: &std::path::Path) -> Result<(), Box<dyn std:
         "MobSnapshotResult": schema_for!(crate::wire::MobSnapshotResult),
         "MobDestroyResult": schema_for!(crate::wire::MobDestroyResult),
         "MobRotateSupervisorResult": schema_for!(crate::wire::MobRotateSupervisorResult),
+        "MobClaimCallbackRouteParams": schema_for!(crate::wire::MobClaimCallbackRouteParams),
         "MobClaimCallbackRouteResult": schema_for!(crate::wire::MobClaimCallbackRouteResult),
         "SupervisorRotationReportWire": schema_for!(crate::wire::SupervisorRotationReportWire),
         "SupervisorRotationIncompleteDataWire": schema_for!(crate::wire::SupervisorRotationIncompleteDataWire),

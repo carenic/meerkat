@@ -327,11 +327,21 @@ class Member:
 
 
 class Mob:
-    """First-class mob handle backed by explicit RPC methods."""
+    """First-class mob handle backed by explicit RPC methods.
 
-    def __init__(self, client: Any, mob_id: str):
+    ``claim_token`` is the mob's callback claim token when this handle came
+    from ``create_mob`` (``None`` otherwise): bearer authority over the mob's
+    callback route (see ``MeerkatClient.mob_claim_callback_route``). Keep it
+    secret and never log it.
+    """
+
+    def __init__(self, client: Any, mob_id: str, *, claim_token: str | None = None):
         self._client = client
         self.id = mob_id
+        self.claim_token = claim_token
+
+    def __repr__(self) -> str:
+        return f"Mob(id={self.id!r})"
 
     async def status(self) -> dict[str, Any]:
         return await self._client.mob_status(self.id)

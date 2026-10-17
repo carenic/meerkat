@@ -2206,6 +2206,7 @@ class MobCreateParams:
 @dataclass
 class MobCreateResult:
     """Response payload for `mob/create`."""
+    claim_token: str
     mob_id: str
 
 
@@ -2986,6 +2987,13 @@ class MobRotateSupervisorResult:
     mob_id: str
     ok: bool
     report: SupervisorRotationReportWire
+
+
+@dataclass
+class MobClaimCallbackRouteParams:
+    """Request payload for `mob/claim_callback_route`."""
+    claim_token: str
+    mob_id: str
 
 
 @dataclass

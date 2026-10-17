@@ -239,9 +239,11 @@ RPC (the client answers inline):
   `session/create` also takes `external_tools`.
 - Mob members use the callbacks of the connection that holds the mob's
   callback route: its `mob/create` connection, or the one that claimed it
-  with `mob/claim_callback_route`. A restored mob, or one not made by
-  `mob/create`, has no route until a connection claims it; until then a
-  member's callback fails `tool_unavailable`.
+  with `mob/claim_callback_route` and the claim token `mob/create` returned
+  to the creator. A restored mob has no route until a connection claims it;
+  until then a member's callback fails `tool_unavailable`. A mob not made by
+  `mob/create` has no claim token, so no connection claims its route unless
+  its host mints one.
 - Give input schemas an object root; a root that declares another `type` is
   refused with an error naming the tool. For Anthropic, a root `oneOf`,
   `anyOf` or `allOf` of plain object schemas is folded into one object.

@@ -186,6 +186,7 @@ MOB_RPC_CONTRACT_TYPES = [
     "MobDestroyResult",
     "SupervisorRotationReportWire",
     "MobRotateSupervisorResult",
+    "MobClaimCallbackRouteParams",
     "MobClaimCallbackRouteResult",
     "MobSubmitWorkParams",
     "MobSubmitWorkResult",

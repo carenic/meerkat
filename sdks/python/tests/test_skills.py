@@ -246,7 +246,7 @@ async def test_client_create_mob_uses_typed_route():
     async def fake_request(method, params):
         calls.append((method, params))
         if method == "mob/create":
-            return {"ok": True, "mob_id": "m1"}
+            return {"ok": True, "mob_id": "m1", "claim_token": "mct_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}
         return {}
 
     client._request = fake_request  # type: ignore[attr-defined]
@@ -257,6 +257,8 @@ async def test_client_create_mob_uses_typed_route():
         definition={"id": "mob-1", "profiles": {"worker": {"model": "claude-sonnet-4-6"}}},
     )
     assert mob.id == "m1"
+    assert mob.claim_token == "mct_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    assert "mct_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" not in repr(mob)
     assert calls == [
         ("mob/create", {"definition": {"id": "mob-1", "profiles": {"worker": {"model": "claude-sonnet-4-6"}}}}),
     ]

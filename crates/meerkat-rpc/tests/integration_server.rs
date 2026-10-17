@@ -1877,6 +1877,14 @@ mod tcp_callback_ownership {
                 9 => mob_claim_refused_while_owner_connected_case(&mut h).await,
                 #[cfg(feature = "mob")]
                 10 => mob_claim_after_owner_disconnect_case(&mut h).await,
+                #[cfg(feature = "mob")]
+                11 => mob_claim_needs_the_creators_token_case(&mut h).await,
+                #[cfg(feature = "mob")]
+                12 => mob_claim_token_of_a_destroyed_mob_is_refused_case(&mut h).await,
+                #[cfg(feature = "mob")]
+                13 => mob_created_in_process_is_not_claimable_case(&mut h).await,
+                #[cfg(feature = "mob")]
+                14 => host_mints_a_claim_token_for_a_tokenless_mob_case(&mut h).await,
                 _ => unreachable!(),
             }
             h.exhausted();
@@ -2447,17 +2455,47 @@ mod tcp_callback_ownership {
         json!({"jsonrpc":"2.0","id":id,"method":"mob/turn_start","params":{"mob_id":mob_id,"agent_identity":"w1","prompt":prompt}})
     }
 
+    /// The claim token `mob/create` returned for a mob.
+    #[cfg(feature = "mob")]
+    fn claim_token(created: &Value) -> Value {
+        created["claim_token"].clone()
+    }
+
+    #[cfg(feature = "mob")]
+    fn claim_params(mob_id: &str, token: &Value) -> Value {
+        json!({"mob_id": mob_id, "claim_token": token})
+    }
+
+    /// A claim refused with `-32002` for `reason`.
+    #[cfg(feature = "mob")]
+    fn assert_claim_refused(refused: &Value, id: u64, mob_id: &str, reason: &str) {
+        assert_eq!(refused["id"], json!(id), "{refused}");
+        assert_eq!(
+            refused["error"]["code"],
+            json!(meerkat_rpc::error::SESSION_BUSY),
+            "the claim is refused: {refused}"
+        );
+        assert_eq!(
+            refused["error"]["data"],
+            json!({"mob_id": mob_id, "reason": reason}),
+            "the refusal carries its typed data: {refused}"
+        );
+    }
+
     /// A connection cannot take a mob's callback route from an owner whose
-    /// connection is still open: B's claim of A's mob is refused with a typed
-    /// error, while A's own claim of the route it holds is accepted.
+    /// connection is still open, even with the mob's claim token: B's claim
+    /// of A's mob is refused with a typed error, while A's own claim of the
+    /// route it holds is accepted.
     #[cfg(feature = "mob")]
     async fn mob_claim_refused_while_owner_connected_case(h: &mut Harness) {
         let (_, mut a) = h.connect().await;
         let (_, mut b) = h.connect().await;
         a.register("a_lookup").await;
-        a.request(5, "mob/create", claim_mob_definition("held_mob"))
+        let created = a
+            .request(5, "mob/create", claim_mob_definition("held_mob"))
             .await;
-        b.send(json!({"jsonrpc":"2.0","id":6,"method":"mob/claim_callback_route","params":{"mob_id":"held_mob"}}))
+        let token = claim_token(&created);
+        b.send(json!({"jsonrpc":"2.0","id":6,"method":"mob/claim_callback_route","params":claim_params("held_mob", &token)}))
             .await;
         let refused = b.next_significant().await;
         assert_eq!(refused["id"], json!(6), "{refused}");
@@ -2472,7 +2510,11 @@ mod tcp_callback_ownership {
             "the refusal carries its typed data: {refused}"
         );
         let held = a
-            .request(7, "mob/claim_callback_route", json!({"mob_id":"held_mob"}))
+            .request(
+                7,
+                "mob/claim_callback_route",
+                claim_params("held_mob", &token),
+            )
             .await;
         assert_eq!(held["mob_id"], "held_mob", "{held}");
     }
@@ -2530,8 +2572,10 @@ mod tcp_callback_ownership {
         );
         let (a_index, mut a) = h.connect().await;
         a.register("a_lookup").await;
-        a.request(5, "mob/create", claim_mob_definition("handoff_mob"))
-            .await;
+        let token = claim_token(
+            &a.request(5, "mob/create", claim_mob_definition("handoff_mob"))
+                .await,
+        );
         a.request(
             6,
             "mob/spawn",
@@ -2574,12 +2618,13 @@ mod tcp_callback_ownership {
         );
         b.response(8).await;
 
-        // B claims the route; the same live member now reaches B.
+        // B claims the route with the mob's claim token; the same live
+        // member now reaches B.
         let claimed = b
             .request(
                 9,
                 "mob/claim_callback_route",
-                json!({"mob_id":"handoff_mob"}),
+                claim_params("handoff_mob", &token),
             )
             .await;
         assert_eq!(claimed["mob_id"], "handoff_mob", "{claimed}");
@@ -2604,12 +2649,211 @@ mod tcp_callback_ownership {
         run_case(10).await;
     }
 
+    /// Once a mob's creator has closed its connection, only a connection
+    /// presenting the mob's claim token takes the mob's callback route: a
+    /// claim without a token or with a malformed one is invalid, and one
+    /// with another well-formed token is refused, typed; the creator's token
+    /// claims it.
+    #[cfg(feature = "mob")]
+    async fn mob_claim_needs_the_creators_token_case(h: &mut Harness) {
+        let (a_index, mut a) = h.connect().await;
+        a.register("a_lookup").await;
+        let token = claim_token(
+            &a.request(5, "mob/create", claim_mob_definition("token_mob"))
+                .await,
+        );
+        drop(a);
+        h.disconnected(a_index).await;
+
+        let (_, mut b) = h.connect().await;
+        b.register("b_lookup").await;
+        let presented = token
+            .as_str()
+            .expect("mob/create returns the mob's claim token")
+            .to_owned();
+        for (id, params) in [
+            (6, json!({"mob_id": "token_mob"})),
+            (7, claim_params("token_mob", &json!("not-a-token"))),
+            // The creator's token with a stray character.
+            (
+                10,
+                claim_params("token_mob", &json!(format!("{presented} "))),
+            ),
+        ] {
+            b.send(json!({"jsonrpc":"2.0","id":id,"method":"mob/claim_callback_route","params":params}))
+                .await;
+            let refused = b.next_significant().await;
+            assert!(
+                !refused.to_string().contains(&presented),
+                "an invalid claim never echoes the token it was given (id {id})"
+            );
+            assert_eq!(refused["id"], json!(id), "{refused}");
+            assert_eq!(
+                refused["error"]["code"],
+                json!(-32602),
+                "a claim needs a well-formed claim token: {refused}"
+            );
+        }
+        assert!(
+            token
+                .as_str()
+                .is_some_and(|token| token.starts_with("mct_") && token.len() == 47),
+            "mob/create returns the mob's claim token: {token}"
+        );
+        b.send(json!({"jsonrpc":"2.0","id":8,"method":"mob/claim_callback_route","params":claim_params("token_mob", &json!(format!("mct_{}", "A".repeat(43))))}))
+            .await;
+        assert_claim_refused(
+            &b.next_significant().await,
+            8,
+            "token_mob",
+            "claim_token_mismatch",
+        );
+        let claimed = b
+            .request(
+                9,
+                "mob/claim_callback_route",
+                claim_params("token_mob", &token),
+            )
+            .await;
+        assert_eq!(claimed["mob_id"], "token_mob", "{claimed}");
+    }
+    #[cfg(feature = "mob")]
+    #[tokio::test]
+    async fn tcp_callback_route_claim_needs_the_creators_token() {
+        run_case(11).await;
+    }
+
+    /// A mob destroyed and created again under its id gets a new claim
+    /// token, and the destroyed mob's token claims nothing.
+    #[cfg(feature = "mob")]
+    async fn mob_claim_token_of_a_destroyed_mob_is_refused_case(h: &mut Harness) {
+        let (a_index, mut a) = h.connect().await;
+        a.register("a_lookup").await;
+        let destroyed = claim_token(
+            &a.request(5, "mob/create", claim_mob_definition("recreated_mob"))
+                .await,
+        );
+        a.request(6, "mob/destroy", json!({"mob_id": "recreated_mob"}))
+            .await;
+        let current = claim_token(
+            &a.request(7, "mob/create", claim_mob_definition("recreated_mob"))
+                .await,
+        );
+        assert_ne!(destroyed, current, "a new mob gets a new claim token");
+        drop(a);
+        h.disconnected(a_index).await;
+
+        let (_, mut b) = h.connect().await;
+        b.register("b_lookup").await;
+        b.send(json!({"jsonrpc":"2.0","id":8,"method":"mob/claim_callback_route","params":claim_params("recreated_mob", &destroyed)}))
+            .await;
+        assert_claim_refused(
+            &b.next_significant().await,
+            8,
+            "recreated_mob",
+            "claim_token_mismatch",
+        );
+        let claimed = b
+            .request(
+                9,
+                "mob/claim_callback_route",
+                claim_params("recreated_mob", &current),
+            )
+            .await;
+        assert_eq!(claimed["mob_id"], "recreated_mob", "{claimed}");
+    }
+    #[cfg(feature = "mob")]
+    #[tokio::test]
+    async fn tcp_callback_route_claim_refuses_a_destroyed_mobs_token() {
+        run_case(12).await;
+    }
+
+    /// A mob created other than by `mob/create` has no claim token, so no
+    /// token claims its callback route: the claim is refused as
+    /// `not_claimable`.
+    #[cfg(feature = "mob")]
+    async fn mob_created_in_process_is_not_claimable_case(h: &mut Harness) {
+        // The router composes the runtime's mob state when it serves its
+        // first connection.
+        let (_, mut b) = h.connect().await;
+        b.register("b_lookup").await;
+        h.runtime
+            .mob_state()
+            .expect("the RPC mob state")
+            .mob_create_definition(meerkat_mob::MobDefinition::implicit(
+                "tokenless",
+                "claude-sonnet-4-6",
+            ))
+            .await
+            .expect("created in-process");
+        b.send(json!({"jsonrpc":"2.0","id":6,"method":"mob/claim_callback_route","params":claim_params("implicit-tokenless", &json!(format!("mct_{}", "A".repeat(43))))}))
+            .await;
+        assert_claim_refused(
+            &b.next_significant().await,
+            6,
+            "implicit-tokenless",
+            "not_claimable",
+        );
+    }
+    #[cfg(feature = "mob")]
+    #[tokio::test]
+    async fn tcp_callback_route_of_a_mob_created_in_process_is_not_claimable() {
+        run_case(13).await;
+    }
+
+    /// The host mints a claim token for a mob that has none, once, through
+    /// its Rust API (no wire method mints one): the connection it hands the
+    /// token to claims the route, and a second mint yields nothing, keeping
+    /// the first token.
+    #[cfg(feature = "mob")]
+    async fn host_mints_a_claim_token_for_a_tokenless_mob_case(h: &mut Harness) {
+        // The router composes the runtime's mob state when it serves its
+        // first connection.
+        let (_, mut b) = h.connect().await;
+        b.register("b_lookup").await;
+        let state = h.runtime.mob_state().expect("the RPC mob state");
+        let mob_id = state
+            .mob_create_definition(meerkat_mob::MobDefinition::implicit(
+                "minted",
+                "claude-sonnet-4-6",
+            ))
+            .await
+            .expect("created in-process");
+        let token = state
+            .mint_callback_claim_token(&mob_id)
+            .await
+            .expect("mint")
+            .expect("a mob without a claim token takes one");
+        assert!(
+            state
+                .mint_callback_claim_token(&mob_id)
+                .await
+                .expect("mint")
+                .is_none(),
+            "a mob's claim token is minted once"
+        );
+        let claimed = b
+            .request(
+                6,
+                "mob/claim_callback_route",
+                claim_params(mob_id.as_str(), &json!(token.expose_secret())),
+            )
+            .await;
+        assert_eq!(claimed["mob_id"], json!(mob_id.as_str()), "{claimed}");
+    }
+    #[cfg(feature = "mob")]
+    #[tokio::test]
+    async fn tcp_callback_route_takes_a_claim_token_the_host_minted() {
+        run_case(14).await;
+    }
+
     /// A mob restored after a restart has no callback route until a
-    /// connection claims it, and the claim reaches its restored member. A
-    /// creates the mob and spawns its member; the runtime restarts over the
-    /// same stores and restores the mob; B registers its tool and claims the
-    /// restored mob's route; the restored member then loads and calls B's
-    /// tool, whose call reaches B.
+    /// connection claims it with the claim token its creator received before
+    /// the restart, and the claim reaches its restored member. A creates the
+    /// mob and spawns its member; the runtime restarts over the same stores
+    /// and restores the mob; B registers its tool, is refused with another
+    /// token, and claims the restored mob's route with A's; the restored
+    /// member then loads and calls B's tool, whose call reaches B.
     #[cfg(feature = "mob")]
     #[tokio::test]
     async fn tcp_callback_restored_mob_member_reaches_the_connection_that_claims_it() {
@@ -2631,8 +2875,10 @@ mod tcp_callback_ownership {
             );
             let (a_index, mut a) = h.connect().await;
             a.register("a_lookup").await;
-            a.request(5, "mob/create", claim_mob_definition("restored_mob"))
-                .await;
+            let token = claim_token(
+                &a.request(5, "mob/create", claim_mob_definition("restored_mob"))
+                    .await,
+            );
             a.request(
                 6,
                 "mob/spawn",
@@ -2645,11 +2891,19 @@ mod tcp_callback_ownership {
 
             let (_, mut b) = h.connect().await;
             b.register("b_lookup").await;
+            b.send(json!({"jsonrpc":"2.0","id":17,"method":"mob/claim_callback_route","params":claim_params("restored_mob", &json!(format!("mct_{}", "A".repeat(43))))}))
+                .await;
+            assert_claim_refused(
+                &b.next_significant().await,
+                17,
+                "restored_mob",
+                "claim_token_mismatch",
+            );
             let claimed = b
                 .request(
                     7,
                     "mob/claim_callback_route",
-                    json!({"mob_id":"restored_mob"}),
+                    claim_params("restored_mob", &token),
                 )
                 .await;
             assert_eq!(claimed["mob_id"], "restored_mob", "{claimed}");

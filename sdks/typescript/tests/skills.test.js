@@ -675,7 +675,7 @@ describe("Skills v2.1", () => {
     client.request = async (method, params) => {
       calls.push({ method, params });
       if (method === "mob/create") {
-        return { ok: true, mob_id: "m1" };
+        return { ok: true, mob_id: "m1", claim_token: "mct_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" };
       }
       return {};
     };
@@ -687,6 +687,7 @@ describe("Skills v2.1", () => {
     });
 
     assert.equal(mob.mobId, "m1");
+    assert.equal(mob.claimToken, "mct_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
     assert.deepEqual(calls, [
       {
         method: "mob/create",

@@ -253,11 +253,19 @@ export class Member {
 export class Mob {
   private readonly client: MeerkatClient;
   readonly mobId: string;
+  /**
+   * The mob's callback claim token when this handle came from `createMob`
+   * (`undefined` otherwise): bearer authority over the mob's callback route
+   * (see `MeerkatClient.mobClaimCallbackRoute`). Keep it secret and never
+   * log it.
+   */
+  readonly claimToken: string | undefined;
 
   /** @internal */
-  constructor(client: MeerkatClient, mobId: string) {
+  constructor(client: MeerkatClient, mobId: string, claimToken?: string) {
     this.client = client;
     this.mobId = mobId;
+    this.claimToken = claimToken;
   }
 
   async status(): Promise<MobStatus> {

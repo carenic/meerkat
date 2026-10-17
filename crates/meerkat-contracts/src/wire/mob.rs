@@ -1063,10 +1063,25 @@ pub struct MobCreateParams {
 }
 
 /// Response payload for `mob/create`.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct MobCreateResult {
     pub mob_id: String,
+    /// The mob's callback claim token, returned once, to the mob's creator:
+    /// another connection takes the mob's callback route
+    /// (`mob/claim_callback_route`) only by presenting it, and the mob keeps
+    /// only its SHA-256. Bearer authority: keep it secret and never log it.
+    pub claim_token: String,
+}
+
+impl std::fmt::Debug for MobCreateResult {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("MobCreateResult")
+            .field("mob_id", &self.mob_id)
+            .field("claim_token", &"[REDACTED]")
+            .finish()
+    }
 }
 
 /// Shared request payload for mob methods that address a mob by id.
@@ -2915,6 +2930,26 @@ pub struct MobDestroyResult {
     pub mob_id: String,
     pub ok: bool,
     pub destroy_report: Value,
+}
+
+/// Request payload for `mob/claim_callback_route`.
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct MobClaimCallbackRouteParams {
+    pub mob_id: String,
+    /// The claim token `mob/create` returned to the mob's creator.
+    pub claim_token: String,
+}
+
+impl std::fmt::Debug for MobClaimCallbackRouteParams {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("MobClaimCallbackRouteParams")
+            .field("mob_id", &self.mob_id)
+            .field("claim_token", &"[REDACTED]")
+            .finish()
+    }
 }
 
 /// Response payload for `mob/claim_callback_route`: the calling connection

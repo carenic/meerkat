@@ -179,7 +179,8 @@ under `### Breaking`. The common ones:
 - `rkat-rpc`: a mob's members reach callback tools only through the
   connection that holds the mob's callback route (its creator, or the
   connection that claimed it). A restored mob has no route until a
-  connection calls `mob/claim_callback_route`.
+  connection calls `mob/claim_callback_route` with the mob's claim token
+  (0.9.3: `mob/create` returns it).
 
 ## Checklist
 

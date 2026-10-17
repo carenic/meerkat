@@ -132,6 +132,7 @@ from .types import (
     MobCancelAllWorkResult,
     MobCancelWorkParams,
     MobCancelWorkResult,
+    MobClaimCallbackRouteParams,
     MobClaimCallbackRouteResult,
     MobConcludeObjectiveParams,
     MobConcludeObjectiveResult,
@@ -1447,7 +1448,7 @@ class RpcRequest(Protocol):
     def __call__(
         self,
         method: Literal["mob/claim_callback_route"],
-        params: MobIdParams,
+        params: MobClaimCallbackRouteParams,
         /,
     ) -> Awaitable[MobClaimCallbackRouteResult]: ...
 

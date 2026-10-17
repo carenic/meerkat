@@ -1697,6 +1697,7 @@ export interface MobCreateParams {
 }
 
 export interface MobCreateResult {
+  claim_token: string;
   mob_id: string;
 }
 
@@ -2275,6 +2276,11 @@ export interface MobRotateSupervisorResult {
   mob_id: string;
   ok: boolean;
   report: SupervisorRotationReportWire;
+}
+
+export interface MobClaimCallbackRouteParams {
+  claim_token: string;
+  mob_id: string;
 }
 
 export interface MobClaimCallbackRouteResult {

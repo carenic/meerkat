@@ -218,7 +218,7 @@ of this full catalog.
 | `mob/snapshot` | Mob | `MobIdParams` | `MobSnapshotResult` | Point-in-time aggregate of mob status plus member list (mob feature) |
 | `mob/destroy` | Mob | `MobIdParams` | `MobDestroyResult` | Destroy a mob and surface the structured MobDestroyReport (mob feature) |
 | `mob/rotate_supervisor` | Mob | `MobIdParams` | `MobRotateSupervisorResult` | Rotate the supervisor bridge for all members of a mob (mob feature) |
-| `mob/claim_callback_route` | Mob | `MobIdParams` | `MobClaimCallbackRouteResult` | Bind a mob's member callback route to this connection (mob feature) |
+| `mob/claim_callback_route` | Mob | `MobClaimCallbackRouteParams` | `MobClaimCallbackRouteResult` | Bind a mob's member callback route to this connection with the mob's claim token (mob feature) |
 | `mob/submit_work` | Mob | `MobSubmitWorkParams` | `MobSubmitWorkResult` | Submit a unit of work to a mob member through the work lane (mob feature) |
 | `mob/conclude_objective` | Mob | `MobConcludeObjectiveParams` | `MobConcludeObjectiveResult` | Explicitly conclude a durable kickoff objective (mob feature) |
 | `mob/cancel_work` | Mob | `MobCancelWorkParams` | `MobCancelWorkResult` | Cancel a previously submitted unit of work (mob feature) |
@@ -495,7 +495,13 @@ client-callable catalog method.
 
 A mob's members call the callback tools of the connection that holds the
 mob's callback route. `mob/create` gives the route to the creating
-connection. Where a restored mob's route starts depends on the server:
+connection, and returns the mob's claim token once, to that connection
+(`{"mob_id":"team","claim_token":"mct_..."}`): only a connection that
+presents it can take the route later. The mob keeps only the token's
+SHA-256, in its own store, so the token survives restarts but is never
+read back; a mob destroyed and created again under its id gets a new one.
+The token is bearer authority over the mob's callbacks: keep it secret and
+never log it. Where a restored mob's route starts depends on the server:
 
 - On a connection-owned server, where every connection owns its own route
   (`rkat-rpc` over stdio or TCP), a mob restored after a restart starts
@@ -514,17 +520,25 @@ advertised to the mob's members until the next claim. A connection claims
 the route with:
 
 ```json
-{"jsonrpc":"2.0","id":13,"method":"mob/claim_callback_route","params":{"mob_id":"team"}}
+{"jsonrpc":"2.0","id":13,"method":"mob/claim_callback_route","params":{"mob_id":"team","claim_token":"mct_..."}}
 ```
 
 The claim needs the console owner and the mob state's admission; it does not
-ask the host's create hook, since a claim creates nothing. It returns
-`{"mob_id":"team"}` and reaches the mob's live members and the ones it spawns
-later, which then call the tools this connection registered. While the
-connection that holds the route is open, another connection's claim is
-refused with `-32002` and `data`
-`{"mob_id":"team","reason":"held_by_open_connection"}`; the holder's own
-repeated claim succeeds. Once the holder has closed, the first claim
+ask the host's create hook, since a claim creates nothing. The token is
+checked first: a claim without one, or with one that is not a claim token,
+is invalid (`-32602`); a token that is not the mob's is refused with
+`-32002` and `data` `{"mob_id":"team","reason":"claim_token_mismatch"}`; and
+a mob created without one (by an agent's `mob_create`, implicitly, by a
+host's Rust create, or before 0.9.3) is refused with
+`{"mob_id":"team","reason":"not_claimable"}`, unless its host minted it a
+token (`MobMcpState::mint_callback_claim_token`, a Rust API with no wire
+method). With the mob's token, the claim returns `{"mob_id":"team"}` and
+reaches the mob's live members and the ones it spawns later, which then call
+the tools this connection registered. While the connection that holds the
+route is open, another connection's claim is refused with `-32002` and
+`data` `{"mob_id":"team","reason":"held_by_open_connection"}`; the holder's
+own repeated claim succeeds. Once the holder has closed, the first claim
+presenting the token
 wins, including the pending detached callback jobs the closed connection's
 tools started: a claimer that registers tools of the same name and runner
 reconciles and cancels them. Pending detached jobs queued for the mob's
@@ -3199,7 +3213,7 @@ and `data`, never on the message text.
 | -32602 | Invalid params | Missing or invalid parameters. An input idempotency conflict names the input the key is bound to in `data.existing_id` |
 | -32603 | Internal error | Server error |
 | -32001 | Session not found | Session ID does not exist |
-| -32002 | Session busy | The session cannot take this request now, for example a `turn/interrupt` while a deferred session is being materialized, a session hosted by another process, or a runtime teardown still in progress. A `turn/start` on a session with a running turn is queued, not refused. Also a `mob/claim_callback_route` while another open connection holds the mob's callback route, with `data` `{"mob_id", "reason": "held_by_open_connection"}`; once that connection closes, the first claim wins |
+| -32002 | Session busy | The session cannot take this request now, for example a `turn/interrupt` while a deferred session is being materialized, a session hosted by another process, or a runtime teardown still in progress. A `turn/start` on a session with a running turn is queued, not refused. Also a refused `mob/claim_callback_route`, with `data` `{"mob_id", "reason"}`: `claim_token_mismatch` (the token is not the mob's), `not_claimable` (the mob has no claim token), or `held_by_open_connection` (another open connection holds the mob's callback route; once that connection closes, the first claim presenting the token wins) |
 | -32003 | Session not running | Session not in running state |
 | -32004 | Duplicate input | The request or input was already admitted; a deduplicated runtime input carries `data.existing_id` |
 | -32005 | Request cancelled | Cancelled before the response was published (see above) |

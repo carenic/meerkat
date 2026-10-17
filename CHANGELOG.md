@@ -37,12 +37,43 @@ them.
 
 ### Breaking
 
+- `meerkat-contracts`: `MobCreateResult` (the `mob/create` result) gains the
+  public field `claim_token` (constructible struct adds field); struct
+  literals must set it. Its `Debug` redacts the token.
+- `meerkat-mob-mcp`: `MobMcpState::mob_claim_member_external_tools` takes
+  the presented `&MobClaimToken` and answers
+  `Result<Result<T, CallbackRouteClaimTokenRefused>, MobError>`.
+- Behaviour-only (not measured by the gate): `mob/claim_callback_route` takes
+  `MobClaimCallbackRouteParams { mob_id, claim_token }` (unknown fields
+  refused) instead of `MobIdParams`, and refuses a claim without the claim
+  token its `mob/create` returned (see Security). SDKs: Python
+  `MeerkatClient.mob_claim_callback_route(mob_id, claim_token)` and
+  `Mob.claim_token`; TypeScript
+  `MeerkatClient.mobClaimCallbackRoute(mobId, claimToken)` and
+  `Mob.claimToken`.
 - Behaviour-only (not measured by the gate): 0.9.3 migrates a mob's SQLite
   store to schema version 11 (a table for the mob's callback claim
   verifier) when it opens it, and 0.9.2 refuses a store at version 11 with
   its typed future-schema error. Downgrading after the migration is not
   supported: keep a copy of the mob stores from before the upgrade to roll
   back.
+
+### Security
+
+- A mob's callback route is handed over only to a connection presenting the
+  mob's claim token. `mob/create` returns the token (`mct_` and the
+  unpadded base64url of 32 bytes of OS entropy) once, to the creating
+  connection, and the mob keeps only its SHA-256, in its own store, written
+  before the mob is managed. `mob/claim_callback_route` compares the
+  presented token in constant time before anything else: another token is
+  refused (`-32002`, `claim_token_mismatch`), and a mob created without one
+  (by an agent's `mob_create`, implicitly, by a host's Rust create, or
+  before 0.9.3) is not claimable (`not_claimable`) unless its host mints it
+  one (`MobMcpState::mint_callback_claim_token`, a Rust API with no wire
+  method). A mob destroyed and created again under its id gets a new token.
+  In 0.9.2 the first connection to ask took a mob's route once its holder
+  had closed, with every member callback and the mob's pending detached
+  callback jobs.
 
 ### Added
 
@@ -57,6 +88,10 @@ them.
   `MobRuntimeMetadataStore::put_callback_claim_verifier_if_absent` and
   `load_callback_claim_verifier`, provided methods that refuse by default
   (the in-memory and SQLite stores implement them).
+- `meerkat_mob_mcp::MobMcpState::mob_create_definition_with_claim_verifier`
+  and `mint_callback_claim_token`, and
+  `meerkat_mob_mcp::CallbackRouteClaimTokenRefused`.
+- `meerkat_contracts::MobClaimCallbackRouteParams`.
 
 ## [0.9.2] - 2026-10-16
 
