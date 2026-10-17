@@ -309,6 +309,7 @@ jobs:
       governed_jsonl: ${{ steps.plan.outputs.governed_jsonl }}
       mcp_confinement_positive: ${{ steps.plan.outputs.mcp_confinement_positive }}
       deferred_to_push: ${{ steps.plan.outputs.deferred_to_push }}
+      reader_not_run: ${{ steps.plan.outputs.reader_not_run }}
       shard_count: ${{ steps.plan.outputs.shard_count }}
       shard_first_count: ${{ steps.plan.outputs.shard_first_count }}
       shard_rest_count: ${{ steps.plan.outputs.shard_rest_count }}
@@ -2660,6 +2661,7 @@ jobs:
           GOVERNED_JSONL: ${{ needs.changes.outputs.governed_jsonl }}
           MCP_CONFINEMENT_POSITIVE: ${{ needs.changes.outputs.mcp_confinement_positive }}
           DEFERRED_TO_PUSH: ${{ needs.changes.outputs.deferred_to_push }}
+          READER_NOT_RUN: ${{ needs.changes.outputs.reader_not_run }}
           SDK_HOST: ${{ needs.changes.outputs.sdk_host }}
           BAZEL_GRAPH: ${{ needs.changes.outputs.bazel_graph }}
           EXAMPLES_BROWSER: ${{ needs.changes.outputs.examples_browser }}
@@ -2745,6 +2747,9 @@ jobs:
           fi
           if [[ -n "${DEFERRED_TO_PUSH}" ]]; then
             echo "::notice::left to the push (main or release/**): ${DEFERRED_TO_PUSH}"
+          fi
+          if [[ -n "${READER_NOT_RUN}" ]]; then
+            echo "::notice::readers of changed files that need live-provider credentials run in no CI lane: ${READER_NOT_RUN}"
           fi
           echo "changes=${CHANGES_RESULT} fmt-governance=${FMT_GOVERNANCE_RESULT} ratchets=${RATCHETS_RESULT} governance-gates=${GOVERNANCE_GATES_RESULT} tlc-audits=${TLC_AUDITS_RESULT}"
           echo "clippy=${CLIPPY_RESULT} unit=${UNIT_RESULT} governed-jsonl=${GOVERNED_JSONL_RESULT} mcp-confinement-positive=${MCP_CONFINEMENT_POSITIVE_RESULT} integration=${INTEGRATION_RESULT} (${INTEGRATION_COUNT} suites) closure-tests=${CLOSURE_TESTS_RESULT} (${CLOSURE_TEST_COUNT} rows, ${HOOK_BINARY_COUNT} hook binaries, ${HOOK_RETAINED_COUNT} of them lib binaries left to the main and nightly unit lanes, ${TEST_SCOPE_COUNT}-package scope) main-unit=${MAIN_UNIT_RESULT} closure-check=${CLOSURE_CHECK_RESULT} feature-check=${FEATURE_CHECK_RESULT} wasm-check=${WASM_CHECK_RESULT} sdk-host=${SDK_HOST_RESULT} example-web=${EXAMPLE_WEB_RESULT} wasm-timers=${WASM_TIMERS_RESULT} bazel-graph=${BAZEL_GRAPH_RESULT}"

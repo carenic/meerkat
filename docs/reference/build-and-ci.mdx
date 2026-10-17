@@ -252,12 +252,17 @@ complete), and a change to one adds the exact target that reads it to the
 lib, bin, test or example target (every target for a reader in library or
 build-script code) and a filter on the reading tests, where no other lane
 of the plan runs it. A pull request leaves the readers that compile
-meerkat-mob to the push and names them; readers keyed only by the whole
-checkout (live audits that every path selects) run in the push's
-`closure-tests` rows. A push runs its readers' test targets in
-`closure-tests` and every package's lib and bins in `main-unit`; a push
-with no `main-unit` (no Rust-relevant path, such as a docs-only push) gets
-reader rows for the lib, bin and example targets. Documentation inside a
+meerkat-mob (named) and the readers keyed only by the whole checkout (live
+audits that every path selects) to the push. A push runs its readers'
+test targets in `closure-tests`, which build each package with the
+features a whole-workspace build resolves, and every package's lib and
+bins in `main-unit`; a test target that needs other features (such as
+xtask's `machine-authority` contracts or the `gpt-live-replay` suite) gets
+a reader row with them, and a push with no `main-unit` (no Rust-relevant
+path, such as a docs-only push) gets reader rows for the lib, bin and
+example targets. A reader whose features need live-provider credentials
+(`integration-real-tests`, `openai-live-e2e`) runs in no CI lane: the plan
+names it (`reader_not_run`) and the `CI gate` prints it. Documentation inside a
 crate is no build input unless the crate compiles it in
 (`include_str!`/`include_bytes!` in library, binary or build-script code,
 such as the crates' `skills/*/SKILL.md`); that selects the crate like a

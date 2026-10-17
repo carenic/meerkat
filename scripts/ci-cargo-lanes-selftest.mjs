@@ -1588,8 +1588,13 @@ for (const path of [
   const authorizationGithub = run(["--format", "github", "--", "crates/meerkat-authorization/tests/native_governed_loop.rs"]);
   assert.equal(authorizationGithub.status, 0, authorizationGithub.stderr);
   const authorizationLines = Object.fromEntries(authorizationGithub.stdout.trim().split("\n").map((line) => [line.slice(0, line.indexOf("=")), line.slice(line.indexOf("=") + 1)]));
-  assert.equal(authorizationLines.integration_count, "1");
-  assert.deepEqual(JSON.parse(authorizationLines.integration_matrix).include.map((row) => row.packages), ["-p meerkat-authorization"]);
+  // The suite, then the push's whole-checkout reader row (xtask's
+  // machine-authority contracts, which the closure-tests rows do not build).
+  assert.equal(authorizationLines.integration_count, "2");
+  assert.deepEqual(JSON.parse(authorizationLines.integration_matrix).include.map((row) => row.packages), [
+    "-p meerkat-authorization",
+    "-p xtask --features machine-authority",
+  ]);
   // xtask's integration tests pin the workflows: an xtask change or a
   // workflow-only edit (a plan with no Rust change) runs them, with the
   // feature its machines_contracts target requires.
@@ -1606,8 +1611,11 @@ for (const path of [
   const github = run(["--format", "github", "--", "crates/meerkat-runtime/src/lib.rs"]);
   assert.equal(github.status, 0, github.stderr);
   const lines = Object.fromEntries(github.stdout.trim().split("\n").map((line) => [line.slice(0, line.indexOf("=")), line.slice(line.indexOf("=") + 1)]));
-  const rows = JSON.parse(lines.integration_matrix).include;
-  assert.equal(Number(lines.integration_count), 6);
+  // The suites, then the push's whole-checkout reader row.
+  const allRows = JSON.parse(lines.integration_matrix).include;
+  assert.equal(Number(lines.integration_count), 7);
+  assert.deepEqual(allRows.slice(6).map((row) => row.name), ["reader xtask:test:machines_contracts"]);
+  const rows = allRows.slice(0, 6);
   assert.deepEqual(rows.map((row) => row.packages.split(" --features")[0]), [
     "-p meerkat-runtime",
     "-p meerkat-machine-codegen",
@@ -1629,10 +1637,14 @@ for (const path of [
   // A docs edit selects no suite: its integration rows are its reader rows.
   const docsGithub = run(["--format", "github", "--", "docs/index.mdx"]);
   const docsLines = Object.fromEntries(docsGithub.stdout.trim().split("\n").map((line) => [line.slice(0, line.indexOf("=")), line.slice(line.indexOf("=") + 1)]));
-  assert.equal(docsLines.integration_count, "2");
-  assert.deepEqual(JSON.parse(docsLines.integration_matrix).include.map((row) => row.name), ["reader rkat:bin:rkat", "reader xtask:package"]);
+  assert.equal(docsLines.integration_count, "3");
+  assert.deepEqual(JSON.parse(docsLines.integration_matrix).include.map((row) => row.name), [
+    "reader rkat:bin:rkat",
+    "reader xtask:package",
+    "reader xtask:test:machines_contracts",
+  ]);
   // With neither, the matrix keeps its placeholder.
-  const noneGithub = run(["--format", "github", "--", "LICENSE-MIT"]);
+  const noneGithub = run(["--format", "github", "--event", "pull_request", "--", "LICENSE-MIT"]);
   const noneLines = Object.fromEntries(noneGithub.stdout.trim().split("\n").map((line) => [line.slice(0, line.indexOf("=")), line.slice(line.indexOf("=") + 1)]));
   assert.equal(noneLines.integration_count, "0");
   assert.deepEqual(JSON.parse(noneLines.integration_matrix).include, [{ name: "none", packages: "" }]);
@@ -1972,15 +1984,21 @@ for (const path of [
     { name: "reader xtask:package", packages: "-p xtask", tests: "--tests" },
   ]);
   assert.match(prLines.deferred_to_push, /(^|; )reader rows rkat:bin:rkat($|;)/, "the gate prints the readers left to the push");
+  // Every push plans xtask's machine-authority contracts, a whole-checkout
+  // audit whose test target needs a feature the closure-tests rows do not
+  // build, unless an xtask integration suite with that feature runs.
+  const machineContracts = "reader xtask:test:machines_contracts | -p xtask --features machine-authority | --test machines_contracts -E test(/(^|::)(canonical_machine_inventory_matches_docs_and_artifact_bundle|live_flow_runtime_reducer_transitions_are_mob_machine_command_gated|live_mob_runtime_catalog_commands_fail_close_on_matching_machine_inputs)$/)";
   // The docs-only push: its closure-tests rows run the readers' test
-  // targets; with no main unit lane, reader rows run the lib and bin
-  // targets, the meerkat-mob chain's included.
+  // targets they build; with no main unit lane, reader rows run the lib and
+  // bin targets, the meerkat-mob chain's included.
   assert.deepEqual(rowsOf(planFor(["docs/index.mdx"])), [
     "reader rkat:bin:rkat | -p rkat | --bin rkat -E test(/(^|::)(fenced_rkat_doc_examples_parse_against_clap)$/)",
     "reader xtask:package | -p xtask | --lib --bins",
+    machineContracts,
   ]);
   // A Rust-relevant push runs every package's lib and bins in main unit.
-  assert.deepEqual(planFor(["docs/index.mdx", "crates/meerkat-core/src/lib.rs"]).reader_rows, []);
+  assert.deepEqual(rowsOf(planFor(["docs/index.mdx", "crates/meerkat-core/src/lib.rs"])), [machineContracts]);
+  assert.deepEqual(planFor(["crates/xtask/src/lib.rs"]).reader_rows, [], "xtask's own suite runs its contracts");
   // A pull request that runs xtask's unit lane and integration suite plans
   // no xtask row; one whose suite runs xtask's test targets keeps the lib
   // and bins.
@@ -1995,19 +2013,42 @@ for (const path of [
   assert.deepEqual(rowsOf(planFor(["CHANGELOG.md"], ["--event", "pull_request"])), [
     "reader xtask:test:buildbuddy_static_lanes | -p xtask | --test buildbuddy_static_lanes -E test(/(^|::)(deprecated_backend_references_stay_rejected_only|generated_header_truthfulness_is_clean|retired_public_surface_tokens_stay_out_of_unowned_paths)$/)",
   ]);
-  // A path only the whole-checkout readers select (live audits) plans no
-  // reader row: the push's closure-tests rows run those.
+  // A path only the whole-checkout readers select (live audits): a pull
+  // request leaves them to the push, whose closure-tests rows run the test
+  // targets they build, and a reader row the one they do not.
   const license = planFor(["LICENSE-MIT"], ["--event", "pull_request"]);
   assert.deepEqual([license.reader_rows, license.deferred_to_push.reader_rows], [[], []]);
+  assert.deepEqual(rowsOf(planFor(["LICENSE-MIT"])), [machineContracts]);
+  // A test target whose required features the closure-tests rows do not
+  // build runs with them on the push; one that needs live-provider
+  // credentials runs in no CI lane and is named, not deferred.
+  const browser = "tests/live_smoke/browser/harness/gpt-live-peer-e2e.mjs";
+  const browserPush = planFor([browser]);
+  assert.deepEqual(rowsOf(browserPush), [
+    "reader integration-tests:package | -p meerkat-integration-tests | --lib --bins",
+    "reader integration-tests:test:gpt_live_replay | -p meerkat-integration-tests --features gpt-live-replay | --test gpt_live_replay",
+    machineContracts,
+  ]);
+  assert.deepEqual(browserPush.reader_not_run, ["integration-tests:test:gpt_live_public_e2e"]);
+  const browserPr = planFor([browser], ["--event", "pull_request"]);
+  assert.deepEqual(
+    [browserPr.reader_rows, browserPr.deferred_to_push.reader_rows, browserPr.reader_not_run],
+    [[], ["integration-tests:package", "integration-tests:test:gpt_live_replay"], ["integration-tests:test:gpt_live_public_e2e"]],
+  );
+  const browserLines = outputs(["--event", "pull_request", "--", browser]);
+  assert.equal(browserLines.reader_not_run, "integration-tests:test:gpt_live_public_e2e", "the gate names the readers no lane runs");
+  assert.doesNotMatch(browserLines.deferred_to_push, /gpt_live_public_e2e/, "and does not call them deferred");
   // An in-crate doc the crate compiles in selects the crate like its code
   // (no reader row: the crate's own lanes run); other in-crate docs select
   // nothing.
   for (const event of ["pull_request", "push"]) {
+    // Only the push's whole-checkout reader row (above) remains.
+    const wholeCheckout = event === "push" ? [machineContracts] : [];
     const skill = planFor(["crates/meerkat-hooks/skills/hook-authoring/SKILL.md"], ["--event", event]);
-    assert.deepEqual([skill.mode, skill.packages, skill.reader_rows], ["packages", ["meerkat-hooks"], []], `${event}: a compiled-in skill`);
+    assert.deepEqual([skill.mode, skill.packages, rowsOf(skill)], ["packages", ["meerkat-hooks"], wholeCheckout], `${event}: a compiled-in skill`);
     for (const doc of ["crates/meerkat-core/README.md", "crates/meerkat-mob-mcp/LIVE_DELEGATION.md"]) {
       const plan = planFor([doc], ["--event", event]);
-      assert.deepEqual([plan.mode, plan.reader_rows], ["none", []], `${event}: ${doc}`);
+      assert.deepEqual([plan.mode, rowsOf(plan)], ["none", wholeCheckout], `${event}: ${doc}`);
     }
   }
 }

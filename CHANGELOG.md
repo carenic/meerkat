@@ -42,7 +42,11 @@ them.
   adds the exact targets that read it to the integration lane, as listed
   in `scripts/ci-non-rust-readers.json`: on a pull request, unless the
   reader compiles meerkat-mob (then on the push, named in the plan); on a
-  push without a main unit lane, for the lib, bin and example targets.
+  push without a main unit lane, for the lib, bin and example targets; and
+  on every push for a test target that needs features the push's
+  closure-tests rows do not build (xtask's machine-authority contracts,
+  the GPT Live replay suite). A reader that needs live-provider
+  credentials runs in no CI lane, and the plan and the `CI gate` name it.
   Before, a docs-only pull request ran none of them and a docs-only push
   never ran rkat's doc-example test. A crate's in-crate documentation that
   it compiles in (the `skills/*/SKILL.md` files) is now a build input of

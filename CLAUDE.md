@@ -475,10 +475,15 @@ and its CI must be green before a release tag (`require_ci_green`):
   (`scripts/ci-non-rust-readers.json`: docs, skills, CHANGELOG, specs,
   fixtures), with the inventory's features and a filter on the reading
   tests, where no other lane of the plan runs it (`reader_rows`). A pull
-  request leaves the readers that compile meerkat-mob to the push and the
-  readers keyed only by the whole checkout to the push's `closure-tests`; a
-  push with no `main-unit` gets reader rows for lib, bin and example
-  targets. In-crate documentation the crate compiles in (`include_str!` of
+  request leaves the readers that compile meerkat-mob and the readers
+  keyed only by the whole checkout to the push; the push's `closure-tests`
+  run test targets with the features a workspace build resolves, so a test
+  target that needs others (xtask's `machine-authority` contracts) gets a
+  reader row there, and a push with no `main-unit` gets reader rows for
+  lib, bin and example targets. A reader that needs live-provider
+  credentials (`integration-real-tests`, `openai-live-e2e`) runs in no CI
+  lane (`reader_not_run`, printed by the gate). In-crate documentation the
+  crate compiles in (`include_str!` of
   its `skills/*/SKILL.md`) is a build input of that crate.
   The unit lanes run `--lib --bins` only; `closure-tests` runs the
   integration tests of every package in its test scope.

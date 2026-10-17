@@ -67,11 +67,16 @@
 // filter on the tests the inventory names. A pull request plans them
 // where no other lane of its plan runs them, except the readers that
 // compile meerkat-mob (left to the push and named) and the readers keyed
-// only by the whole checkout (live audits that every path selects; the
-// push's closure-tests rows run them). A push runs its readers' test
-// targets in the closure-tests rows and every package's lib and bins in
-// the main unit lane; a push without a main unit lane (no Rust-relevant
-// path) gets reader rows for the lib, bin and example targets. Documentation
+// only by the whole checkout (live audits that every path selects, left
+// to the push). A push runs its readers' test targets in the closure-tests
+// rows, which build each package with the features a whole-workspace build
+// resolves, and every package's lib and bins in the main unit lane; a test
+// target that needs other features (Cargo drops a target whose required
+// features are off) gets a reader row with them, and a push without a main
+// unit lane (no Rust-relevant path) gets reader rows for the lib, bin and
+// example targets. A reader that needs a live-provider feature
+// (LIVE_ONLY_FEATURES) runs in no CI lane: the plan names it
+// (reader_not_run) instead of planning or deferring it. Documentation
 // inside a crate directory is no build input, except documentation the
 // crate compiles in (include_str!/include_bytes! in library, binary or
 // build-script code, which the inventory lists): that selects the crate
@@ -1248,11 +1253,15 @@ function shortName(name) {
   return name.startsWith("meerkat-") ? name.slice("meerkat-".length) : name;
 }
 
+// Features whose tests need live-provider credentials: the live gates run
+// them on demand, no CI lane does.
+export const LIVE_ONLY_FEATURES = ["integration-real-tests", "openai-live-e2e"];
+
 // The reader rows of a plan (see the header): for each reader selection
 // (scripts/ci-non-rust-readers.mjs) the targets no other lane of the plan
 // runs, as one integration-lane row. A pull request leaves the readers that
 // compile meerkat-mob to the push (named in `deferred.reader_rows`).
-function readerRows({ selections, result, byName, heavyChain, deferToPush, deferred, compiledInDocs }) {
+function readerRows({ selections, result, byName, heavyChain, deferToPush, deferred, compiledInDocs, unified }) {
   const mainUnit = result.main_unit_shards.length > 0;
   // The unit lane of this plan runs the package's lib and bins (default
   // features): a pull request's unit lane, a push's main unit lane (every
@@ -1272,13 +1281,16 @@ function readerRows({ selections, result, byName, heavyChain, deferToPush, defer
       const named = (suite.test_flags ?? "").split(" ").filter((_, i, all) => all[i - 1] === "--test");
       return named.length === 0 || (test !== null && named.includes(test));
     });
+  // The push's closure-tests rows build each test-scope package with the
+  // features a whole-workspace build resolves; Cargo drops a target whose
+  // required features are off.
+  const closureBuilds = (selection) => selection.features.every((feature) => unified.get(selection.package)?.has(feature));
+  const notRun = [];
   const rows = [];
   for (const selection of selections) {
-    // A reader keyed only by the whole checkout is a live audit that every
-    // path selects: the push's closure-tests rows run it. Documentation the
-    // package compiles in selects the package like its code (see the
-    // header): its own lanes run it.
-    if (selection.reads.every((key) => key === WHOLE_CHECKOUT || compiledInDocs.has(`${key}\0${selection.package}`))) continue;
+    // Documentation the package compiles in selects the package like its
+    // code (see the header): its own lanes run it.
+    if (selection.reads.every((key) => compiledInDocs.has(`${key}\0${selection.package}`))) continue;
     const pkg = byName.get(selection.package);
     const colon = selection.target.indexOf(":");
     const kind = colon < 0 ? selection.target : selection.target.slice(0, colon);
@@ -1288,22 +1300,35 @@ function readerRows({ selections, result, byName, heavyChain, deferToPush, defer
     }
     // Library, binary or build-script code is reached by every test.
     const whole = selection.scope === "package" || kind === "build";
+    const label = `${shortName(selection.package)}:${whole ? "package" : selection.target}`;
+    // A reader keyed only by the whole checkout is a live audit that every
+    // path selects: a pull request leaves it to the push, whose
+    // closure-tests rows run its package's test targets with the features
+    // they build. A test target that needs other features gets a row there.
+    if (selection.reads.every((key) => key === WHOLE_CHECKOUT || compiledInDocs.has(`${key}\0${selection.package}`))) {
+      if (deferToPush || kind !== "test" || closureBuilds(selection) || suiteRuns(selection.package, name, selection.features)) continue;
+    }
+    if (selection.features.some((feature) => LIVE_ONLY_FEATURES.includes(feature))) {
+      notRun.push(label);
+      continue;
+    }
     const unitCovered = selection.features.length === 0 && unitRuns(selection.package);
     let targets;
     if (whole) {
-      // A push runs its test scope's test targets in the closure-tests rows,
-      // and a selected integration suite a pull request's. Otherwise every
-      // test target: Cargo's --tests, which skips a target whose required
-      // features are off (a `--test '*'` glob refuses it) and also runs the
-      // lib and bins.
-      const testsRun = !deferToPush || suiteRuns(selection.package, null, selection.features);
+      // A push runs its test scope's test targets in the closure-tests rows
+      // (when they build the reader's features), and a selected integration
+      // suite a pull request's. Otherwise every test target: Cargo's --tests,
+      // which skips a target whose required features are off (a
+      // `--test '*'` glob refuses it) and also runs the lib and bins.
+      const testsRun = suiteRuns(selection.package, null, selection.features) || (!deferToPush && closureBuilds(selection));
       targets = testsRun ? (unitCovered ? [] : ["--lib", "--bins"]) : ["--tests"];
     } else if (kind === "lib") {
       targets = unitCovered ? [] : ["--lib"];
     } else if (kind === "bin") {
       targets = unitCovered ? [] : ["--bin", name];
     } else if (kind === "test") {
-      targets = !deferToPush || suiteRuns(selection.package, name, selection.features) ? [] : ["--test", name];
+      const testRuns = suiteRuns(selection.package, name, selection.features) || (!deferToPush && closureBuilds(selection));
+      targets = testRuns ? [] : ["--test", name];
     } else if (kind === "example") {
       // An example program reads its inputs when run, which no CI lane does;
       // only the tests an example target holds run here.
@@ -1312,7 +1337,6 @@ function readerRows({ selections, result, byName, heavyChain, deferToPush, defer
       throw new Error(`internal error: reader target ${selection.target} of ${selection.package}`);
     }
     if (targets.length === 0) continue;
-    const label = `${shortName(selection.package)}:${whole ? "package" : selection.target}`;
     if (deferToPush && heavyChain.has(selection.package)) {
       deferred.reader_rows.push(label);
       continue;
@@ -1343,6 +1367,7 @@ function readerRows({ selections, result, byName, heavyChain, deferToPush, defer
     wide.has(target) ||
     (target.startsWith("--bin ") && wide.has("--bins")) ||
     (target.startsWith("--test ") && wide.has("--tests"));
+  result.reader_not_run = [...new Set(notRun)].sort();
   const unique = [...new Map(rows.map((row) => [`${row.package_flags}\0${row.test_flags}`, row])).values()];
   return unique
     .filter((row) => {
@@ -1960,6 +1985,7 @@ function plan(args) {
     mcp_confinement_positive: false,
     reader_rows: [],
   };
+  result.reader_not_run = [];
 
   const archivedPackages = new Map(
     ARCHIVED_UNIT_LANES.map((lane) => {
@@ -2251,6 +2277,7 @@ function plan(args) {
     deferToPush,
     deferred,
     compiledInDocs,
+    unified: workspaceFeatures(metadata, packages),
   });
   const hook = hookModel(hookText);
   // The `--workspace --lib` row runs only on a runner that can build it in
@@ -2550,6 +2577,7 @@ function githubOutput(result) {
   // The integration lane runs the selected suites and the reader rows.
   const integrationRows = [...result.integration_suites, ...result.reader_rows];
   scalar("integration_count", String(integrationRows.length));
+  scalar("reader_not_run", result.reader_not_run.join(" "));
   scalar("integration_matrix", matrixOf(integrationRows));
   scalar("test_scope_count", String(result.test_scope.length));
   scalar("hook_binary_count", String(result.hook_coverage.hook_binaries));
@@ -2602,7 +2630,7 @@ function main() {
     process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
   }
   process.stderr.write(
-    `ci-cargo-lanes: event=${result.event} mode=${result.mode} release_projection=${result.release_projection !== null} packages=${result.packages.length} closure=${result.closure.length} clippy_shards=${result.shards.length} unit_shards=${result.unit_shards.length} feature_suites=${result.unit_feature_shards.length}/${result.main_feature_unit_shards.length} unit_deferred=${result.unit_deferred.length} unit_rows_on_main=${result.unit_rows_on_main.length} integration=${result.integration_suites.length} reader_rows=${result.reader_rows.length} feature_check_jobs=${result.feature_check_jobs.length} test_scope=${result.test_scope.length} closure_tests=${result.closure_test_rows.length} first_wave=${Object.values(result.waves).reduce((sum, wave) => sum + wave.first.length, 0)} rest_wave=${Object.values(result.waves).reduce((sum, wave) => sum + wave.rest.length, 0)} hook_binaries=${result.hook_coverage.hook_binaries} hook_retained=${result.hook_coverage.hook_retained} deferred_to_push=[${deferredSummary(result.deferred_to_push)}] (${result.reason})\n`,
+    `ci-cargo-lanes: event=${result.event} mode=${result.mode} release_projection=${result.release_projection !== null} packages=${result.packages.length} closure=${result.closure.length} clippy_shards=${result.shards.length} unit_shards=${result.unit_shards.length} feature_suites=${result.unit_feature_shards.length}/${result.main_feature_unit_shards.length} unit_deferred=${result.unit_deferred.length} unit_rows_on_main=${result.unit_rows_on_main.length} integration=${result.integration_suites.length} reader_rows=${result.reader_rows.length} reader_not_run=${result.reader_not_run.length} feature_check_jobs=${result.feature_check_jobs.length} test_scope=${result.test_scope.length} closure_tests=${result.closure_test_rows.length} first_wave=${Object.values(result.waves).reduce((sum, wave) => sum + wave.first.length, 0)} rest_wave=${Object.values(result.waves).reduce((sum, wave) => sum + wave.rest.length, 0)} hook_binaries=${result.hook_coverage.hook_binaries} hook_retained=${result.hook_coverage.hook_retained} deferred_to_push=[${deferredSummary(result.deferred_to_push)}] (${result.reason})\n`,
   );
 }
 
