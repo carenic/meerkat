@@ -35,6 +35,16 @@ them.
 
 ## [Unreleased]
 
+### Breaking
+
+- `meerkat-machine-kernels`: the generated occurrence lifecycle's
+  `TransitionId` (`generated::occurrence_lifecycle::TransitionId`) gains
+  `SyncTargetSnapshotDispatching` (a dispatching occurrence records the
+  session its dispatch materialized; see Fixed). An exhaustive match needs an
+  arm for it, and the implicit discriminants of the variants after it change
+  (`TransitionId::*`); match them by variant name, not by numeric cast or
+  position.
+
 ### Fixed
 
 - The first fire of a materialize-on-demand schedule completes, in every
