@@ -194,7 +194,11 @@ them.
   0.9.2 known limitation). A host on another state root takes another
   lock; a write to the user document also composes each realm it states as
   if that realm had no document (below), so none of its checks depends on a
-  document only another state root holds.
+  document only another state root holds. `rkat realm create`, `delete` and
+  `prune` do not take the lock: a delete or prune that races a write naming
+  the realm as a parent leaves that realm with a missing parent, which does
+  not compose. An NFS mount that keeps locks on each machine (`nolock`,
+  `local_lock=flock`) does not carry the lock between machines.
 - A write to the user document checks each realm the user document states a
   section for both with that realm's own document from the writing host's
   state root and as if the realm had none. Several state roots can share one

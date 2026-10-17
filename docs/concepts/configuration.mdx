@@ -808,6 +808,20 @@ the user document's own check composes each realm it states as if that
 realm had no document, so it depends on no document only another state
 root holds.
 
+The lock orders the stores that take it, nothing else. `rkat realm create`,
+`delete` and `prune` do not take it. Creating a realm writes no config
+document. Deleting or pruning one checks that no realm's own document names
+it as a parent and then removes its document, so a write that makes a
+document name it in between leaves that realm with a missing parent: its
+chain does not resolve, and it composes nothing (each use is refused) until
+its document names another parent. The lock is an advisory file lock
+(`flock` on Unix), so on a network filesystem it holds only as far as the
+filesystem carries it: an NFS client emulates it with a byte-range lock
+that other machines see only when the mount's locking reaches the server
+(not with `nolock` or `local_lock=flock`). Hosts on different machines that
+share one state root over such a mount may not take turns; give each
+machine its own state root.
+
 A realm composes only from the documents on its chain, each from its own:
 an ancestor whose own document is missing fails the composition (a missing
 parent) instead of composing as if it required nothing, and `rkat realm

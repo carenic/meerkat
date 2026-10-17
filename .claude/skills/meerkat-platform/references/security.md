@@ -146,7 +146,11 @@ requirement = { baseline = "command_runtime_v1", read = { kind = "paths", paths 
   own sections. Such writes over one state root take turns: each holds an
   exclusive lock on `<state_root>/.realm-config.lock` from before its read
   to after its write (`RealmConfigSource::composition_lock_path`; a source
-  that names none leaves them unserialized). Each ancestor composes from
+  that names none leaves them unserialized). `rkat realm create`, `delete`
+  and `prune` do not take it (a delete racing a write that names the realm
+  as a parent leaves that realm's chain unresolved, so it does not
+  compose), and an NFS mount that keeps locks on each machine (`nolock`,
+  `local_lock=flock`) does not carry it between machines. Each ancestor composes from
   its own document alone, so a
   chain through a missing ancestor fails (a missing parent), and `rkat realm
   delete` and `rkat realm prune` keep a realm another realm names as its
