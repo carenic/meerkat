@@ -9750,6 +9750,16 @@ pub struct MeerkatMachineShared {
     /// reconcile a committed transition after a recoverable dispatch error.
     #[cfg(test)]
     test_fail_next_typed_dsl_post_commit_dispatch: std::sync::atomic::AtomicBool,
+    /// One-shot fault after an exact-run boundary cancel is staged: its
+    /// runtime-effect projection fails. Proves a failure after staging is
+    /// reported as owned by the recorded cancel.
+    #[cfg(test)]
+    test_fail_next_boundary_cancel_effect_projection: std::sync::atomic::AtomicBool,
+    /// One-shot fault in the withdrawal of a staged boundary-cancel dispatch
+    /// after a later failure. Proves the withdrawal's own error is reported
+    /// as owned by the recorded cancel too.
+    #[cfg(test)]
+    test_fail_next_boundary_cancel_dispatch_abort: std::sync::atomic::AtomicBool,
     /// One-shot deterministic gate before the runtime loop's terminal run
     /// commit takes the session driver. The turn is terminal in its live
     /// agent while its run input is still applied and unconsumed, and the
@@ -11586,6 +11596,13 @@ impl MeerkatMachine {
                 test_fail_next_typed_dsl_post_commit_dispatch: std::sync::atomic::AtomicBool::new(
                     false,
                 ),
+                #[cfg(test)]
+                test_fail_next_boundary_cancel_effect_projection:
+                    std::sync::atomic::AtomicBool::new(false),
+                #[cfg(test)]
+                test_fail_next_boundary_cancel_dispatch_abort: std::sync::atomic::AtomicBool::new(
+                    false,
+                ),
                 #[cfg(any(test, feature = "test-support"))]
                 test_runtime_loop_before_terminal_commit: StdMutex::new(None),
                 #[cfg(any(test, feature = "test-support"))]
@@ -11797,6 +11814,13 @@ impl MeerkatMachine {
                 test_fail_post_stop_unregister_after_fence: StdMutex::new(None),
                 #[cfg(test)]
                 test_fail_next_typed_dsl_post_commit_dispatch: std::sync::atomic::AtomicBool::new(
+                    false,
+                ),
+                #[cfg(test)]
+                test_fail_next_boundary_cancel_effect_projection:
+                    std::sync::atomic::AtomicBool::new(false),
+                #[cfg(test)]
+                test_fail_next_boundary_cancel_dispatch_abort: std::sync::atomic::AtomicBool::new(
                     false,
                 ),
                 #[cfg(any(test, feature = "test-support"))]
