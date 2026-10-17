@@ -7,6 +7,9 @@ HARNESS_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/meerkat-pre-push-harness.XXXXXX")"
 trap 'rm -rf "$TEST_ROOT" "$HARNESS_ROOT"' EXIT
 # The gate must build and export the fixture itself, not inherit it.
 unset MEERKAT_MCP_TEST_SERVER
+# Run as a pre-push hook, this inherits the dispatcher's lane-timings file;
+# the stub lanes below would append their times to the real push's report.
+unset MEERKAT_PRE_PUSH_LANE_TIMINGS
 
 if ! grep -Fq "deterministic-locks/\${stamp_key}.lock" "$REPO_ROOT/scripts/pre-push-unit.sh"; then
   echo "pre-push deterministic gate must lock only an identical source fingerprint" >&2

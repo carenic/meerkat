@@ -1,16 +1,17 @@
 {
   "generated": true,
   "source_repository": "https://github.com/lukacf/meerkat-recall",
-  "source_ref": "codex/recall091-budget-anchor",
-  "source_commit": "db77b364a0332f7a252f5ebd5abc48d78f17ca48",
+  "source_ref": "cbd51bdbd15315f4eacc94bb2f1d6922cac7c824",
+  "source_commit": "cbd51bdbd15315f4eacc94bb2f1d6922cac7c824",
   "source_version": "0.9.1",
   "source_docs_dirty": false,
   "public_pages": 45,
-  "content_sha256": "fb11d69deedb3bd067046bc5d66e6228e7295855621150033c0dad5f610fc204",
+  "content_sha256": "cb5e98ce835b3aced31f539816b6c16e0359d986ea9492ad4d534c27ca948a94",
   "content_hash_scope": "All mirrored files except _source.json, sorted by relative path; path NUL bytes NUL.",
   "mirror_adjustments": [
     "Local routes namespaced under /recall.",
     "Existing immutable technical Markdown/source links retain their original public commit; linked target bytes are unchanged.",
-    "Missing Living Wiki icon supplied; Pipeline Work Queue heading retains its stable punctuation-free fragment."
+    "Missing page icons supplied; Pipeline Work Queue and Pipeline Budget Control retain their stable punctuation-free fragments.",
+    "Canonical source uses neutral consuming-host wording and explicitly distinguishes current source defaults from published 0.9.1 binaries; no downstream product or branch name is added to the mirror."
   ]
 }

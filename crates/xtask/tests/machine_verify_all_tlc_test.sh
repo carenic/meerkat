@@ -2,32 +2,33 @@
 set -euo pipefail
 
 # usage: machine_verify_all_tlc_test.sh <xtask-bin> [--part <part>]
-#        machine_verify_all_tlc_test.sh --part audits-a|audits-b
+#        machine_verify_all_tlc_test.sh --part audits-a|audits-b|audits-c
 # The canonical TLC lane, split into parts so each fits a CI job limit:
 #   machine-verify  the bounded adaptive witness plus `machine-verify --all`
 #   audits-a        hand-written audit shard A
 #   audits-b        hand-written audit shard B
+#   audits-c        hand-written audit shard C
 #   all             every part (the default: `make machine-verify`, the
 #                   nightly bounded TLC job and the release gate)
-# Bazel runs the three parts as separate targets (machine_verify_all_tlc_test,
-# machine_verify_audits_a_tlc_test, machine_verify_audits_b_tlc_test) so the
-# BuildBuddy machine-authority lane runs them in parallel; together they are
-# exactly `all`.
+# Bazel runs the four parts as separate targets (machine_verify_all_tlc_test,
+# machine_verify_audits_a_tlc_test, machine_verify_audits_b_tlc_test,
+# machine_verify_audits_c_tlc_test) so the BuildBuddy machine-authority lane
+# runs them in parallel; together they are exactly `all`.
 # The audit shards never execute xtask, so they alone may omit its path.
 lane_part="all"
-if [[ "${1:-}" == "--part" && ( "${2:-}" == "audits-a" || "${2:-}" == "audits-b" ) ]]; then
+if [[ "${1:-}" == "--part" && ( "${2:-}" == "audits-a" || "${2:-}" == "audits-b" || "${2:-}" == "audits-c" ) ]]; then
   xtask_bin=""
   lane_part="$2"
 else
-  xtask_bin="${1:?xtask binary path is required (only --part audits-a|audits-b may omit it)}"
+  xtask_bin="${1:?xtask binary path is required (only --part audits-a|audits-b|audits-c may omit it)}"
   if [[ "${2:-}" == "--part" ]]; then
-    lane_part="${3:?--part needs machine-verify, audits-a, audits-b or all}"
+    lane_part="${3:?--part needs machine-verify, audits-a, audits-b, audits-c or all}"
   fi
 fi
 case "${lane_part}" in
-  machine-verify|audits-a|audits-b|all) ;;
+  machine-verify|audits-a|audits-b|audits-c|all) ;;
   *)
-    echo "error: unknown lane part '${lane_part}' (machine-verify, audits-a, audits-b, all)" >&2
+    echo "error: unknown lane part '${lane_part}' (machine-verify, audits-a, audits-b, audits-c, all)" >&2
     exit 2
     ;;
 esac
@@ -212,7 +213,7 @@ if [[ ! -x "${run_start_hold_audit}" ]]; then
   echo "error: run-start hold audit runner is missing from workspace runfiles: ${run_start_hold_audit}" >&2
   exit 1
 fi
-if run_part audits-a; then
+if run_part audits-c; then
   echo "running bounded run-start hold TLC audit"
   TLC_WORKERS="${tlc_workers}" "${run_start_hold_audit}" "${RUN_START_HOLD_AUDIT_MAX_STEPS:-12}"
 fi
@@ -280,7 +281,7 @@ if [[ ! -x "${live_media_health_audit}" ]]; then
   echo "error: live media health audit runner is missing from workspace runfiles: ${live_media_health_audit}" >&2
   exit 1
 fi
-if run_part audits-b; then
+if run_part audits-c; then
   echo "running bounded live media health TLC audit"
   TLC_WORKERS="${tlc_workers}" "${live_media_health_audit}" "${LIVE_MEDIA_HEALTH_AUDIT_MAX_STEPS:-20}"
 fi
@@ -317,7 +318,7 @@ if [[ ! -x "${live_causal_tail_batch_audit}" ]]; then
   echo "error: live-context causal-tail batch audit runner is missing from workspace runfiles: ${live_causal_tail_batch_audit}" >&2
   exit 1
 fi
-if run_part audits-b; then
+if run_part audits-c; then
   echo "running bounded live-context causal-tail batch TLC audit"
   TLC_WORKERS="${tlc_workers}" "${live_causal_tail_batch_audit}" "${LIVE_CONTEXT_CAUSAL_TAIL_BATCH_AUDIT_MAX_STEPS:-24}" --mutants
 fi
@@ -375,17 +376,23 @@ run_machine_verify() {
     --skip-tlc-composition adaptive_mob_bundle
 }
 
-# Shard assignment balances measured audit cost (4 TLC workers, default
-# bounds): audits-a = live unregister cleanup (168 s), run-start hold (92 s),
-# mob operator grant with --mutants (88 s), live worker start after close
-# (14 s), live-context result barrier with --mutants (22 s);
-# audits-b = durable in-turn steer (113 s), live media health (84 s),
-# live-context outbox (54 s), live delegation steer (23 s), live-context
-# causal-tail batch with --mutants (58 s). A new audit joins
-# the lighter shard. Shard of the two audits the `all` lane runs concurrently
-# with machine-verify below:
+# Shard assignment balances measured audit cost on a hosted 4-vCPU CI runner
+# (4 TLC workers, default bounds, run 38859112297), where each TLC run's JVM
+# start and model parse is most of a small audit:
+# audits-a = live unregister cleanup (295 s), live-context outbox (149 s),
+# live-context result barrier with --mutants (32 s), live worker start after
+# close (26 s): 502 s; plus mob operator grant with --mutants (88 s on a
+# local 4-worker run, not yet hosted; the other audits' hosted runs took
+# 1.5-3.1x their local ones, so expect 130-270 s);
+# audits-b = durable in-turn steer (352 s), live delegation steer (44 s):
+# 396 s;
+# audits-c = run-start hold (239 s), live media health (155 s),
+# live-context causal-tail batch with --mutants (112 s): 506 s.
+# Two shards ran 592 s and 812 s, past the pull-request lane target. A new
+# audit joins the lightest shard. Shard of the two audits the `all` lane runs
+# concurrently with machine-verify below:
 durable_steer_shard="audits-b"
-live_context_outbox_shard="audits-b"
+live_context_outbox_shard="audits-a"
 
 # A single part runs on its own (Bazel gives each part its own executor):
 # machine-verify takes every worker, and an audit shard runs its scheduled
