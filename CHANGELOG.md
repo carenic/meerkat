@@ -92,12 +92,15 @@ them.
   with an internal error ("cancelling the current run of '...' failed:
   Interrupt outcome is not settled ...") when the member's run crosses a
   boundary while the cancel is delivered. The runtime has recorded the
-  cancel for that exact run by then, and the run ends at its next boundary,
-  so the verb now succeeds, as a member stop already did. The same holds
-  when the member's session service does not support the live boundary
-  cancel (`SessionService::cancel_after_boundary`): the runtime has recorded
-  the cancel first, and the verbs report it instead of an internal error.
-  This was the intermittent `member_creation_some_origin_authority_matrix`
+  cancel for that exact run by then, and the run ends at its next boundary;
+  without live delivery the run's work continues until the runtime next
+  observes a boundary (for a service that reports none, the turn's end).
+  The verb now succeeds, as a member stop already did: its success means
+  the cancel is recorded. The same holds when the member's session service
+  does not support the live boundary cancel
+  (`SessionService::cancel_after_boundary`): the runtime has recorded the
+  cancel first, and the verbs report it instead of an internal error. This
+  was the intermittent `member_creation_some_origin_authority_matrix`
   failure in meerkat-mob's tests.
 
 ## [0.9.2] - 2026-10-16
