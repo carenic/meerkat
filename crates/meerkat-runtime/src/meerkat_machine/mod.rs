@@ -2718,6 +2718,18 @@ pub(crate) struct OwedInterruptedToolNotice {
 /// its evidence. Requests past it are not restored; the notice names them.
 const INTERRUPTED_REQUEST_CONTENT_BOUND: usize = 64 * 1024;
 
+/// The transcript facts a run stamped on a recovered input: `for_input`
+/// over its admitted semantics, so a restored request carries the same ones
+/// (its interaction id included). `None` for a row without stored
+/// semantics, which keeps the prompt's own.
+fn stamped_turn_metadata(
+    state: &crate::input_state::InputState,
+) -> Option<meerkat_core::lifecycle::run_primitive::RuntimeTurnMetadata> {
+    let input = state.persisted_input.as_ref()?;
+    let semantics = state.runtime_semantics?;
+    Some(crate::runtime_loop::for_input(input, semantics))
+}
+
 impl MeerkatMachine {
     /// Install trusted native ingress/policy composition on a storeless machine.
     /// Persistent profiles must be selected during fallible construction.
@@ -3233,6 +3245,7 @@ impl PendingRuntimeExecutorAttachment {
             .into_iter()
             .map(|(_, run_id, stored)| {
                 let applied = stored.seed.last_boundary_sequence.is_some();
+                let stamped = stamped_turn_metadata(&stored.state);
                 let (kind, request) = match stored.state.persisted_input {
                     Some(crate::input::Input::Prompt(prompt)) => {
                         let bytes = serde_json::to_vec(&prompt.content)
@@ -3250,7 +3263,8 @@ impl PendingRuntimeExecutorAttachment {
                                 Some((_, used)) => *used += bytes,
                                 None => copied.push((run_id.clone(), bytes)),
                             }
-                            let metadata = prompt.turn_metadata.unwrap_or_default();
+                            let metadata =
+                                stamped.unwrap_or_else(|| prompt.turn_metadata.unwrap_or_default());
                             InterruptedRequest {
                                 content: prompt.content,
                                 created_at: prompt.header.timestamp,

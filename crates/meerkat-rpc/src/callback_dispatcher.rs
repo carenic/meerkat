@@ -1389,9 +1389,13 @@ fn detached_callback_job_spec(
             "detached callback dispatch requires runtime-owned session identity".to_string(),
         )
     })?;
+    // A turn has no lineage when its batch merged inputs of several
+    // interactions, or when none of its inputs named one.
     let interaction_lineage = context.interaction_lineage_id().ok_or_else(|| {
         ToolError::execution_failed(
-            "detached callback dispatch requires runtime-owned interaction lineage".to_string(),
+            "detached callback dispatch requires runtime-owned interaction lineage: this turn \
+             merged several interactions or its input names none"
+                .to_string(),
         )
     })?;
     let arguments_sha256 = plan.canonical_arguments_sha256().ok_or_else(|| {

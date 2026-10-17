@@ -94,6 +94,7 @@ pub(crate) fn for_input(
         _ => {}
     }
     let transient_steer_context = crate::input::input_to_transient_turn_context(input, semantics);
+    let transient_steer = transient_steer_context.is_some();
     if transient_steer_context.is_none()
         && let Some(correlation_id) = input.header().correlation_id.as_ref()
     {
@@ -109,6 +110,17 @@ pub(crate) fn for_input(
         // append and therefore binds to that exact durable identity. Internal
         // steer contexts carry no transcript identity of their own: they join
         // the active turn's existing anchor at the request boundary.
+        metadata.transcript_identity.interaction_id = Some(InteractionId(input.header().id.0));
+    }
+    if matches!(input, Input::Prompt(_))
+        && !transient_steer
+        && metadata.transcript_identity.interaction_id.is_none()
+    {
+        // A prompt's conversational User append is its own interaction when
+        // nothing else named one (no correlation, no caller-supplied id, no
+        // caller context): its rows, run events and runtime-owned work (a
+        // detached callback job) carry its input id. Fill only, never an
+        // override; a transient steer still joins the active turn's anchor.
         metadata.transcript_identity.interaction_id = Some(InteractionId(input.header().id.0));
     }
     metadata
@@ -10295,6 +10307,179 @@ mod tests {
             Some(InteractionId(interaction_uuid))
         );
         assert_eq!(metadata.transcript_identity.run_id, None);
+    }
+
+    fn live_steer_semantics() -> crate::ingress_types::RuntimeInputSemantics {
+        crate::ingress_types::RuntimeInputSemantics {
+            boundary: RunApplyBoundary::RunCheckpoint,
+            execution_kind: meerkat_core::lifecycle::RuntimeExecutionKind::ContentTurn,
+            execution_handling_mode: None,
+            peer_response_terminal_apply_intent: None,
+            live_interrupt_required: true,
+            live_boundary_delivery: None,
+        }
+    }
+
+    fn with_turn_metadata(
+        mut input: Input,
+        metadata: meerkat_core::lifecycle::run_primitive::RuntimeTurnMetadata,
+    ) -> Input {
+        if let Input::Prompt(prompt) = &mut input {
+            prompt.turn_metadata = Some(metadata);
+        }
+        input
+    }
+
+    /// A plain prompt's conversational append is its own interaction when
+    /// nothing else names one. A correlation or a caller-supplied id wins, a
+    /// transient steer still has none of its own, and caller context keeps
+    /// binding to the input id.
+    #[test]
+    fn plain_prompt_turn_metadata_carries_its_own_interaction_id() {
+        use meerkat_core::lifecycle::run_primitive::{RuntimeTurnMetadata, TurnRequestContext};
+        let interaction = |input: &Input, semantics| {
+            for_input(input, semantics)
+                .transcript_identity
+                .interaction_id
+        };
+        let own = |input: &Input| Some(InteractionId(input.header().id.0));
+
+        let plain = make_prompt("plain");
+        assert_eq!(
+            interaction(&plain, admission_semantics(&plain)),
+            own(&plain)
+        );
+
+        let correlation = uuid::Uuid::from_u128(0x1C);
+        let mut correlated = make_prompt("correlated");
+        if let Input::Prompt(prompt) = &mut correlated {
+            prompt.header.correlation_id = Some(crate::CorrelationId::from_uuid(correlation));
+        }
+        assert_eq!(
+            interaction(&correlated, admission_semantics(&correlated)),
+            Some(InteractionId(correlation)),
+            "a correlation wins"
+        );
+
+        let supplied = InteractionId(uuid::Uuid::from_u128(0x5D));
+        let caller = with_turn_metadata(
+            make_prompt("caller id"),
+            RuntimeTurnMetadata {
+                transcript_identity: TranscriptMessageIdentity {
+                    interaction_id: Some(supplied),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            interaction(&caller, admission_semantics(&caller)),
+            Some(supplied),
+            "a caller-supplied id wins"
+        );
+
+        let steer = make_prompt("steer");
+        let steered = for_input(&steer, live_steer_semantics());
+        assert_eq!(
+            steered.transient_turn_context_appends.len(),
+            1,
+            "the input is a transient steer"
+        );
+        assert_eq!(
+            steered.transcript_identity.interaction_id, None,
+            "a transient steer joins the active turn's anchor"
+        );
+
+        let context = with_turn_metadata(
+            make_prompt("with caller context"),
+            RuntimeTurnMetadata {
+                transient_turn_context: Some(
+                    TurnRequestContext::new("caller facts").expect("non-empty caller context"),
+                ),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            interaction(&context, admission_semantics(&context)),
+            own(&context),
+            "caller context binds to the input id as before"
+        );
+
+        let peer = make_peer_message("peer-1", "hello");
+        assert_eq!(
+            interaction(&peer, admission_semantics(&peer)),
+            None,
+            "an uncorrelated peer message still names no interaction"
+        );
+    }
+
+    /// A batch of one plain prompt stamps the prompt's own interaction; a
+    /// batch whose contributors name different interactions (a steer-lane
+    /// prompt with a correlated peer steer) or none (live steers) stamps none.
+    #[test]
+    fn merged_turn_metadata_keeps_one_prompt_interaction_and_drops_disagreeing_ones() {
+        let interaction =
+            |inputs: Vec<Input>, semantics: Vec<crate::ingress_types::RuntimeInputSemantics>| {
+                let inputs = inputs
+                    .into_iter()
+                    .map(|input| (input.id().clone(), input))
+                    .collect::<Vec<_>>();
+                merge_batch_turn_metadata(&inputs, &semantics)
+                    .expect("the batch merges")
+                    .expect("the batch carries metadata")
+                    .transcript_identity
+                    .interaction_id
+            };
+
+        let prompt = make_prompt("single");
+        let own = Some(InteractionId(prompt.header().id.0));
+        let semantics = vec![admission_semantics(&prompt)];
+        assert_eq!(interaction(vec![prompt], semantics), own);
+
+        let steer_lane = |input: Input| match input {
+            Input::Prompt(mut prompt) => {
+                prompt.turn_metadata = Some(
+                    meerkat_core::lifecycle::run_primitive::RuntimeTurnMetadata {
+                        handling_mode: Some(meerkat_core::types::HandlingMode::Steer),
+                        ..Default::default()
+                    },
+                );
+                Input::Prompt(prompt)
+            }
+            Input::Peer(mut peer) => {
+                peer.handling_mode = Some(meerkat_core::types::HandlingMode::Steer);
+                peer.header.correlation_id =
+                    Some(crate::CorrelationId::from_uuid(uuid::Uuid::from_u128(0xA7)));
+                Input::Peer(peer)
+            }
+            other => other,
+        };
+        let queued_steer = crate::ingress_types::RuntimeInputSemantics {
+            live_interrupt_required: false,
+            ..live_steer_semantics()
+        };
+        assert_eq!(
+            interaction(
+                vec![
+                    steer_lane(make_prompt("steer prompt")),
+                    steer_lane(make_peer_message("peer-1", "peer steer")),
+                ],
+                vec![queued_steer, queued_steer],
+            ),
+            None,
+            "contributors naming different interactions stamp none"
+        );
+        assert_eq!(
+            interaction(
+                vec![
+                    make_prompt("live steer prompt"),
+                    make_peer_message("peer-1", "live peer steer"),
+                ],
+                vec![live_steer_semantics(), live_steer_semantics()],
+            ),
+            None,
+            "live steers name no interaction of their own"
+        );
     }
 
     /// One batch contributor for the reasoning-preference fold.

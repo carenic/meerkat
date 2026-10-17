@@ -35,6 +35,32 @@ them.
 
 ## [Unreleased]
 
+### Changed
+
+- A plain prompt is its own interaction. When a prompt names no
+  interaction (no correlation id, no caller-supplied interaction id, no
+  caller context), its transcript rows (the user message and the turn's
+  assistant rows), its run events and the work its run owns now carry an
+  `interaction_id`: the prompt's input id. On a persistent session those
+  rows now also carry their `run_id`. Before, the rows carried neither and
+  the run events no `interaction_id`. A correlation id or a
+  caller-supplied id still wins, a transient steer still joins the active
+  turn without an id of its own, and a turn whose batch merges inputs of
+  different interactions still carries none. A user request restored
+  after an interrupted run carries the id its run stamped.
+
+### Fixed
+
+- Detached callback tools work in ordinary RPC turns. A callback tool
+  registered with `execution.mode: "detached"` refused every call with
+  "requires runtime-owned interaction lineage" unless the turn carried a
+  transient turn context: a plain `turn/start`, the first turn of a
+  deferred session, the immediate turn of `session/create` and a mob
+  member's `mob/turn_start` gave the turn no interaction. Such a call now
+  queues its job. A turn that merges inputs of several interactions, or
+  whose input names none (for example a flow step without a correlation
+  id), still refuses typed, and the refusal now says so.
+
 ## [0.9.2] - 2026-10-16
 
 ### Breaking
