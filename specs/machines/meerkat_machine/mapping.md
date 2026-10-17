@@ -6314,6 +6314,60 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
 - `PeerResponseRepliedDestroyed`
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
+- `ResolvePeerResponseAddresseeRequesterIdle`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolvePeerResponseAddresseeRequesterAttached`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolvePeerResponseAddresseeRequesterRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolvePeerResponseAddresseeRequesterRetired`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolvePeerResponseAddresseeRequesterStopped`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolvePeerResponseAddresseeRequesterDestroyed`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolvePeerResponseAddresseeNotRequesterIdle`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolvePeerResponseAddresseeNotRequesterAttached`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolvePeerResponseAddresseeNotRequesterRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolvePeerResponseAddresseeNotRequesterRetired`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolvePeerResponseAddresseeNotRequesterStopped`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolvePeerResponseAddresseeNotRequesterDestroyed`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolvePeerResponseAddresseeUnknownRequestIdle`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolvePeerResponseAddresseeUnknownRequestAttached`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolvePeerResponseAddresseeUnknownRequestRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolvePeerResponseAddresseeUnknownRequestRetired`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolvePeerResponseAddresseeUnknownRequestStopped`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolvePeerResponseAddresseeUnknownRequestDestroyed`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
 - `AdvanceSessionContextIdle`
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
@@ -8380,6 +8434,9 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
 - `PeerResponseReplyClassified`
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
+- `PeerResponseAddresseeResolved`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
 - `PeerIngressReceiveResolved`
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
@@ -8668,6 +8725,9 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
 - `peer_ingress_owner_consistency`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `inbound_peer_request_requesters_match_requests`
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
 - `supervisor_binding_consistency`

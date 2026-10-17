@@ -12624,6 +12624,44 @@ mod tests {
 
     #[cfg(feature = "comms")]
     #[test]
+    fn test_normalize_rest_comms_send_error_response_to_a_non_requester_is_send_failed() {
+        let addressee = meerkat_core::comms::PeerId::new();
+        let in_reply_to = meerkat_core::interaction::InteractionId(uuid::Uuid::new_v4());
+        let err = normalize_rest_comms_send_error(
+            Some("peer-a"),
+            &meerkat_core::comms::SendError::ResponseAddresseeNotRequester {
+                in_reply_to,
+                addressee,
+            },
+        );
+        let named = [addressee.to_string(), in_reply_to.to_string()];
+        match err {
+            ApiError::InternalWithData {
+                message,
+                code,
+                details,
+            } => {
+                assert_eq!(code, "send_failed");
+                assert!(message.starts_with("send_failed: "), "{message}");
+                assert_eq!(
+                    details.get("code").and_then(Value::as_str),
+                    Some("send_failed")
+                );
+                let detail = details
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                for name in &named {
+                    assert!(message.contains(name.as_str()), "{message}");
+                    assert!(detail.contains(name.as_str()), "{detail}");
+                }
+            }
+            other => panic!("expected structured send_failed, got {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "comms")]
+    #[test]
     fn test_normalize_rest_comms_send_error_transport_maps_to_peer_unreachable() {
         let err = normalize_rest_comms_send_error(
             Some("peer-a"),

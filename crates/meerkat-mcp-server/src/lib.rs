@@ -9928,6 +9928,34 @@ requirement = { baseline = "command_runtime_v1", read = { kind = "paths", paths 
 
     #[cfg(feature = "comms")]
     #[test]
+    fn test_normalize_mcp_comms_send_error_response_to_a_non_requester_is_send_failed() {
+        let addressee = meerkat_core::comms::PeerId::new();
+        let in_reply_to = meerkat_core::interaction::InteractionId(uuid::Uuid::new_v4());
+        let err = normalize_mcp_comms_send_error(
+            Some("peer-a"),
+            &meerkat_core::comms::SendError::ResponseAddresseeNotRequester {
+                in_reply_to,
+                addressee,
+            },
+        );
+        assert_eq!(err.code, -32603);
+        let data = err.data.expect("structured error data");
+        assert_eq!(
+            data.get("code").and_then(Value::as_str),
+            Some("send_failed")
+        );
+        let detail = data
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        for name in [addressee.to_string(), in_reply_to.to_string()] {
+            assert!(err.message.contains(&name), "{}", err.message);
+            assert!(detail.contains(&name), "{detail}");
+        }
+    }
+
+    #[cfg(feature = "comms")]
+    #[test]
     fn test_normalize_mcp_comms_send_error_transport_maps_to_peer_unreachable() {
         let err = normalize_mcp_comms_send_error(
             Some("peer-a"),

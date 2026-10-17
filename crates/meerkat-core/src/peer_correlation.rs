@@ -144,6 +144,27 @@ impl InboundPeerRequestState {
     }
 }
 
+/// Machine-owned verdict on the addressee of a response to an inbound peer
+/// request (local is receiver).
+///
+/// A response, progress or terminal, goes only to the request's requester:
+/// the verified sender recorded when the request was received
+/// ([`crate::handles::PeerInteractionHandle::request_received`]). The
+/// generated authority judges the addressee
+/// ([`crate::handles::PeerInteractionHandle::resolve_response_addressee`])
+/// before any transport, so a refused response reaches no one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum PeerResponseAddresseeVerdict {
+    /// No inbound request with this id is recorded: never received, already
+    /// answered, or received before this session's authority was created.
+    UnknownRequest,
+    /// The addressee is the request's recorded requester.
+    Requester,
+    /// The addressee did not send the request.
+    NotRequester,
+}
+
 /// Typed lifecycle state of an interaction stream reservation (U6 / dogma #5).
 ///
 /// Authoritative truth for whether a reserved stream channel is still

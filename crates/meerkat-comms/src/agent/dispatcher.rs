@@ -2,7 +2,7 @@
 
 use crate::mcp::tools::{
     RuntimeCommsCommandHandle, ToolContext, comms_tool_operation_target,
-    comms_tool_unavailable_reason, handle_tools_call_with_context, tools_list,
+    comms_tool_unavailable_reason, handle_tools_call_typed, tools_list,
 };
 use crate::{Router, TrustedPeersView};
 use async_trait::async_trait;
@@ -374,14 +374,10 @@ impl<T: AgentToolDispatcher + 'static> AgentToolDispatcher for CommsToolDispatch
             let args = ToolCallArguments::from_raw_json(call.args)
                 .map_err(|err| ToolError::invalid_arguments(call.name, err.to_string()))?;
             CommsExecutionAuthority::require_authorized_target(call, args.as_value(), context)?;
-            let result = handle_tools_call_with_context(
-                &self.tool_context,
-                call.name,
-                args.as_value(),
-                context,
-            )
-            .await
-            .map_err(|e| ToolError::ExecutionFailed { message: e })?;
+            let result =
+                handle_tools_call_typed(&self.tool_context, call.name, args.as_value(), context)
+                    .await
+                    .map_err(|error| error.into_tool_error(call.name))?;
             Ok(ToolResult::new(call.id.to_string(), result.to_string(), false).into())
         } else if let Some(inner) = &self.inner {
             inner.dispatch_with_context(call, context).await
@@ -669,14 +665,10 @@ impl AgentToolDispatcher for DynCommsToolDispatcher {
             let args = ToolCallArguments::from_raw_json(call.args)
                 .map_err(|err| ToolError::invalid_arguments(call.name, err.to_string()))?;
             CommsExecutionAuthority::require_authorized_target(call, args.as_value(), context)?;
-            let result = handle_tools_call_with_context(
-                &self.tool_context,
-                call.name,
-                args.as_value(),
-                context,
-            )
-            .await
-            .map_err(|e| ToolError::ExecutionFailed { message: e })?;
+            let result =
+                handle_tools_call_typed(&self.tool_context, call.name, args.as_value(), context)
+                    .await
+                    .map_err(|error| error.into_tool_error(call.name))?;
             Ok(ToolResult::new(call.id.to_string(), result.to_string(), false).into())
         } else {
             self.inner.dispatch_with_context(call, context).await

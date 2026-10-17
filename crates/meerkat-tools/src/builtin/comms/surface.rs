@@ -3,7 +3,7 @@
 use async_trait::async_trait;
 use meerkat_comms::{
     CommsExecutionAuthority, Router, RuntimeCommsCommandHandle, ToolContext, TrustedPeersView,
-    comms_tool_defs, comms_tool_unavailable_reason, handle_tools_call_with_context,
+    comms_tool_defs, comms_tool_unavailable_reason, handle_tools_call_typed,
 };
 use meerkat_core::AgentToolDispatcher;
 use meerkat_core::ToolCallArguments;
@@ -242,9 +242,9 @@ impl AgentToolDispatcher for CommsToolSurface {
             .map_err(|error| ToolError::invalid_arguments(call.name, error.to_string()))?;
         CommsExecutionAuthority::require_authorized_target(call, args.as_value(), context)?;
         let result =
-            handle_tools_call_with_context(&self.tool_context, call.name, args.as_value(), context)
+            handle_tools_call_typed(&self.tool_context, call.name, args.as_value(), context)
                 .await
-                .map_err(|e| ToolError::ExecutionFailed { message: e })?;
+                .map_err(|error| error.into_tool_error(call.name))?;
         Ok(ToolResult::new(call.id.to_string(), result.to_string(), false).into())
     }
 }

@@ -2486,6 +2486,7 @@ async fn runtime_comms_terminal_response_wake_drains_requester_queue() {
         .request_received(
             PeerCorrelationId::from_uuid(request_id),
             meerkat_core::types::HandlingMode::Queue,
+            requester_comms.public_key().to_peer_id(),
         )
         .expect("seed responder inbound request state");
 
@@ -6665,4 +6666,704 @@ async fn a_coalescing_admission_tells_the_host_once() {
         }),
         "the coalesced terminal is readable"
     );
+}
+
+/// A response to an inbound peer request goes only to the peer that sent the
+/// request: the verified signer of its envelope, never a peer named by the
+/// response's caller or by fields inside the request.
+///
+/// Three in-process peers, each with its own attached MeerkatMachine session:
+/// `requester` sends a typed request to `responder`, and `bystander` is a peer
+/// the responder also trusts. Only the responder runs a comms drain, so the
+/// request crosses the real ingress path (signed envelope, generated
+/// classification, the drain recording the inbound request) while whatever
+/// reaches the other two stays in their inboxes for inspection. Every payload
+/// field of the request that could name a sender names the bystander.
+mod peer_response_addressee {
+    use super::*;
+    use meerkat_comms::runtime::comms_runtime::CommsRuntime as InprocCommsRuntime;
+    use meerkat_core::agent::CommsRuntime as CoreCommsRuntime;
+    use meerkat_core::comms::{
+        CommsCommand, InputStreamMode, PeerAddress, PeerDeliveryOutcome, PeerId, PeerName,
+        PeerRoute, PeerTransport, SendError, SendReceipt, TrustedPeerDescriptor,
+    };
+    use meerkat_core::error::ToolError;
+    use meerkat_core::interaction::{InboxInteraction, PeerIngressTerminalOutcomeKind};
+    use meerkat_core::lifecycle::core_executor::{
+        CoreApplyOutput, CoreExecutor, CoreExecutorError,
+    };
+    use meerkat_core::lifecycle::run_primitive::RunPrimitive;
+    use meerkat_core::types::{HandlingMode, ToolCallView};
+    use meerkat_core::{
+        AgentToolDispatcher, InboundPeerRequestState, InteractionContent, InteractionId,
+        PeerCorrelationId, ResponseStatus, ToolDispatchOutcome,
+    };
+    use meerkat_runtime::meerkat_machine::dsl as mm_dsl;
+    use serde_json::json;
+    use uuid::Uuid;
+
+    struct ImmediateExecutor;
+
+    #[async_trait::async_trait]
+    impl CoreExecutor for ImmediateExecutor {
+        async fn apply(
+            &mut self,
+            run_id: RunId,
+            primitive: RunPrimitive,
+        ) -> Result<CoreApplyOutput, CoreExecutorError> {
+            let boundary = match &primitive {
+                RunPrimitive::StagedInput(staged) => staged.boundary,
+                RunPrimitive::ImmediateAppend(_) => RunApplyBoundary::Immediate,
+                _ => RunApplyBoundary::RunStart,
+            };
+            Ok(CoreApplyOutput::with_untyped_snapshot(
+                RunBoundaryReceiptDraft {
+                    run_id,
+                    boundary,
+                    contributing_input_ids: primitive.contributing_input_ids().to_vec(),
+                    conversation_digest: None,
+                    message_count: 0,
+                },
+                None,
+                None,
+            ))
+        }
+
+        async fn cancel_after_boundary(
+            &mut self,
+            _reason: String,
+        ) -> Result<(), CoreExecutorError> {
+            Ok(())
+        }
+
+        async fn stop_runtime_executor(
+            &mut self,
+            _reason: String,
+        ) -> Result<(), CoreExecutorError> {
+            Ok(())
+        }
+    }
+
+    /// One in-process peer with its own MeerkatMachine session.
+    struct Peer {
+        name: String,
+        comms: Arc<InprocCommsRuntime>,
+        adapter: Arc<MeerkatMachine>,
+        sid: SessionId,
+        bindings: meerkat_core::SessionRuntimeBindings,
+    }
+
+    impl Peer {
+        async fn prepared(role: &str, suffix: &str) -> Self {
+            let name = format!("addressee-{role}-{suffix}");
+            let comms =
+                Arc::new(InprocCommsRuntime::inproc_only(&name).expect("inproc comms runtime"));
+            let adapter = Arc::new(MeerkatMachine::ephemeral());
+            let sid = SessionId::new();
+            let bindings = adapter
+                .prepare_bindings(sid.clone())
+                .await
+                .expect("prepare runtime bindings");
+            bindings
+                .install_peer_comms_on(comms.as_ref())
+                .expect("install peer-comms handle");
+            comms.install_peer_request_response_authority(
+                meerkat_comms::PeerRequestResponseAuthority::new(
+                    Arc::clone(bindings.peer_interaction()),
+                    Arc::clone(bindings.interaction_stream()),
+                ),
+            );
+            Self {
+                name,
+                comms,
+                adapter,
+                sid,
+                bindings,
+            }
+        }
+
+        fn peer_id(&self) -> PeerId {
+            self.comms.public_key().to_peer_id()
+        }
+
+        fn route(&self) -> PeerRoute {
+            PeerRoute::with_display_name(
+                self.peer_id(),
+                PeerName::new(self.name.clone()).expect("peer name"),
+            )
+        }
+
+        fn descriptor(&self) -> TrustedPeerDescriptor {
+            TrustedPeerDescriptor {
+                peer_id: self.peer_id(),
+                name: PeerName::new(self.name.clone()).expect("peer name"),
+                address: PeerAddress::new(PeerTransport::Inproc, self.comms.participant_name()),
+                pubkey: *self.comms.public_key().as_bytes(),
+            }
+        }
+
+        async fn trust(&self, peer: &Peer) {
+            let comms: Arc<dyn CoreCommsRuntime> = self.comms.clone();
+            self.adapter
+                .stage_add_direct_peer_endpoint(
+                    &self.sid,
+                    mm_dsl::PeerEndpoint::from(&peer.descriptor()),
+                    comms,
+                )
+                .await
+                .expect("generated trust should apply");
+        }
+
+        async fn attach_executor(&self) {
+            self.adapter
+                .register_session_with_executor(self.sid.clone(), Box::new(ImmediateExecutor))
+                .await
+                .expect("runtime executor registration should succeed");
+        }
+
+        /// The peer inputs this peer holds; it runs no drain, so anything
+        /// sent to it waits here.
+        async fn received(&self) -> Vec<InboxInteraction> {
+            CoreCommsRuntime::handoff_volatile_peer_input_candidates(self.comms.as_ref())
+                .await
+                .expect("volatile peer-input handoff")
+                .into_iter()
+                .map(|candidate| candidate.interaction)
+                .collect()
+        }
+    }
+
+    struct Fixture {
+        requester: Peer,
+        bystander: Peer,
+        responder: Peer,
+        request_id: InteractionId,
+    }
+
+    impl Fixture {
+        /// The requester's request has reached the responder's drain, and its
+        /// params name the bystander as requester, sender and peer.
+        async fn with_spoofed_request() -> Self {
+            let suffix = Uuid::new_v4().simple().to_string();
+            let requester = Peer::prepared("requester", &suffix).await;
+            let bystander = Peer::prepared("bystander", &suffix).await;
+            let responder = Peer::prepared("responder", &suffix).await;
+            requester.trust(&responder).await;
+            bystander.trust(&responder).await;
+            responder.trust(&requester).await;
+            responder.trust(&bystander).await;
+            for peer in [&requester, &bystander, &responder] {
+                peer.attach_executor().await;
+            }
+            let responder_comms: Arc<dyn CoreCommsRuntime> = responder.comms.clone();
+            assert!(
+                responder
+                    .adapter
+                    .update_peer_ingress_context(&responder.sid, true, Some(responder_comms))
+                    .await
+                    .expect("update peer ingress context"),
+                "the responder should spawn its comms drain"
+            );
+
+            let bystander_id = bystander.peer_id().to_string();
+            let receipt = CoreCommsRuntime::send(
+                requester.comms.as_ref(),
+                CommsCommand::PeerRequest {
+                    to: responder.route(),
+                    intent: "checksum_token".to_string(),
+                    params: json!({
+                        "subject": "addressee",
+                        "requester": bystander_id,
+                        "from": bystander_id,
+                        "peer_id": bystander_id,
+                        "sender": bystander_id,
+                    }),
+                    blocks: None,
+                    content_taint: None,
+                    handling_mode: HandlingMode::Queue,
+                    stream: InputStreamMode::None,
+                    objective_id: None,
+                },
+            )
+            .await
+            .expect("the request reaches the responder");
+            let SendReceipt::PeerRequestSent { envelope_id, .. } = receipt else {
+                panic!("expected a peer request receipt, got {receipt:?}");
+            };
+            let fixture = Self {
+                requester,
+                bystander,
+                responder,
+                request_id: InteractionId(envelope_id),
+            };
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while fixture.inbound_state() != Some(InboundPeerRequestState::Received) {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("the responder's drain records the inbound request");
+            fixture
+        }
+
+        fn inbound_state(&self) -> Option<InboundPeerRequestState> {
+            self.responder
+                .bindings
+                .peer_interaction()
+                .inbound_state(PeerCorrelationId::from_uuid(self.request_id.0))
+        }
+
+        fn response(
+            &self,
+            to: &Peer,
+            in_reply_to: InteractionId,
+            status: ResponseStatus,
+        ) -> CommsCommand {
+            CommsCommand::PeerResponse {
+                to: to.route(),
+                in_reply_to,
+                status,
+                result: checksum_result(),
+                blocks: None,
+                content_taint: None,
+                handling_mode: None,
+                objective_id: None,
+            }
+        }
+
+        /// The responder's agent-facing comms tools.
+        fn responder_tools(&self) -> meerkat_comms::CommsToolDispatcher {
+            let material = self.responder.comms.tool_material();
+            meerkat_comms::CommsToolDispatcher::new_with_runtime(
+                material.router().clone(),
+                material.trusted_peers_shared(),
+                material.into_runtime(),
+            )
+        }
+
+        async fn send_response_tool(
+            &self,
+            to: &Peer,
+            in_reply_to: InteractionId,
+        ) -> Result<ToolDispatchOutcome, ToolError> {
+            self.send_response_tool_call(json!({
+                "peer_id": to.peer_id().to_string(),
+                "in_reply_to": in_reply_to.0.to_string(),
+                "status": "completed",
+                "result": checksum_result(),
+            }))
+            .await
+        }
+
+        async fn send_response_tool_call(
+            &self,
+            args: serde_json::Value,
+        ) -> Result<ToolDispatchOutcome, ToolError> {
+            let raw = serde_json::value::RawValue::from_string(args.to_string())
+                .expect("raw tool arguments");
+            self.responder_tools()
+                .dispatch(ToolCallView {
+                    id: "send-response-call",
+                    name: "send_response",
+                    args: &raw,
+                })
+                .await
+        }
+
+        async fn assert_requester_received_the_response(&self) {
+            let received = self.requester.received().await;
+            assert_eq!(
+                received.len(),
+                1,
+                "the requester receives exactly one response, got {received:?}"
+            );
+            assert!(
+                matches!(
+                    &received[0].content,
+                    InteractionContent::Response {
+                        in_reply_to,
+                        status: ResponseStatus::Completed,
+                        ..
+                    } if *in_reply_to == self.request_id
+                ),
+                "the requester receives the response to its request, got {received:?}"
+            );
+        }
+    }
+
+    fn checksum_result() -> serde_json::Value {
+        json!({
+            "request_intent": "checksum_token",
+            "request_subject": "addressee",
+            "token": "addressee-token",
+        })
+    }
+
+    /// The runtime send path, which every surface reaches: a progress or a
+    /// terminal response to the request, addressed to a peer that did not send
+    /// it, is refused before any transport. Nothing reaches anyone and the
+    /// request stays answerable; the response to the requester then succeeds.
+    #[tokio::test]
+    async fn peer_response_to_a_peer_that_did_not_send_the_request_is_refused_and_sends_nothing() {
+        let fixture = Fixture::with_spoofed_request().await;
+
+        for status in [ResponseStatus::Accepted, ResponseStatus::Completed] {
+            let refused = CoreCommsRuntime::send(
+                fixture.responder.comms.as_ref(),
+                fixture.response(&fixture.bystander, fixture.request_id, status),
+            )
+            .await;
+            assert!(
+                matches!(
+                    &refused,
+                    Err(SendError::ResponseAddresseeNotRequester { in_reply_to, addressee })
+                        if *in_reply_to == fixture.request_id
+                            && *addressee == fixture.bystander.peer_id()
+                ),
+                "a {status:?} response addressed to a peer that did not send the request must be refused as not the requester, got {refused:?}"
+            );
+            assert!(
+                fixture.bystander.received().await.is_empty(),
+                "a refused response reaches no one"
+            );
+            assert!(
+                fixture.requester.received().await.is_empty(),
+                "a refused response is not redirected to the requester"
+            );
+            assert_eq!(
+                fixture.inbound_state(),
+                Some(InboundPeerRequestState::Received),
+                "a refused response leaves the request answerable"
+            );
+        }
+
+        let receipt = CoreCommsRuntime::send(
+            fixture.responder.comms.as_ref(),
+            fixture.response(
+                &fixture.requester,
+                fixture.request_id,
+                ResponseStatus::Completed,
+            ),
+        )
+        .await
+        .expect("the response to the requester is sent");
+        assert!(
+            matches!(
+                receipt,
+                SendReceipt::PeerResponseSent { in_reply_to, .. } if in_reply_to == fixture.request_id
+            ),
+            "got {receipt:?}"
+        );
+        fixture.assert_requester_received_the_response().await;
+        assert!(fixture.bystander.received().await.is_empty());
+        assert_eq!(
+            fixture.inbound_state(),
+            None,
+            "the terminal response answers the request"
+        );
+    }
+
+    /// The agent-facing `send_response` tool: an addressee that did not send
+    /// the request is `invalid_arguments` and nothing is sent; the same call
+    /// addressed to the requester succeeds.
+    #[tokio::test]
+    async fn send_response_tool_to_a_peer_that_did_not_send_the_request_is_invalid_arguments() {
+        let fixture = Fixture::with_spoofed_request().await;
+
+        let refused = fixture
+            .send_response_tool(&fixture.bystander, fixture.request_id)
+            .await;
+        assert!(
+            matches!(
+                refused,
+                Err(ToolError::InvalidArguments { ref name, .. }) if name == "send_response"
+            ),
+            "send_response to a peer that did not send the request must be invalid_arguments, got {refused:?}"
+        );
+        assert!(
+            fixture.bystander.received().await.is_empty(),
+            "a refused response reaches no one"
+        );
+        assert!(
+            fixture.requester.received().await.is_empty(),
+            "a refused response is not redirected to the requester"
+        );
+        assert_eq!(
+            fixture.inbound_state(),
+            Some(InboundPeerRequestState::Received),
+            "a refused response leaves the request answerable"
+        );
+
+        fixture
+            .send_response_tool(&fixture.requester, fixture.request_id)
+            .await
+            .expect("send_response to the requester succeeds");
+        fixture.assert_requester_received_the_response().await;
+        assert!(fixture.bystander.received().await.is_empty());
+    }
+
+    /// Unchanged: a request id this session never received (or already
+    /// answered, or received before a restart) keeps its existing refusal,
+    /// before any transport, on both paths.
+    #[tokio::test]
+    async fn peer_response_to_an_unknown_request_keeps_its_refusal_and_sends_nothing() {
+        let fixture = Fixture::with_spoofed_request().await;
+        let unknown = InteractionId(Uuid::new_v4());
+
+        let refused = CoreCommsRuntime::send(
+            fixture.responder.comms.as_ref(),
+            fixture.response(&fixture.requester, unknown, ResponseStatus::Completed),
+        )
+        .await;
+        assert!(
+            matches!(refused, Err(SendError::Validation(_))),
+            "got {refused:?}"
+        );
+        let tool_refused = fixture
+            .send_response_tool(&fixture.requester, unknown)
+            .await;
+        assert!(
+            matches!(tool_refused, Err(ToolError::ExecutionFailed { .. })),
+            "got {tool_refused:?}"
+        );
+        assert!(fixture.requester.received().await.is_empty());
+        assert!(fixture.bystander.received().await.is_empty());
+        assert_eq!(
+            fixture.inbound_state(),
+            Some(InboundPeerRequestState::Received),
+            "a refusal for another id leaves the recorded request untouched"
+        );
+    }
+
+    /// A refused progress response leaves the request answerable: the
+    /// requester still gets a progress response and then the terminal one,
+    /// while the other peer stays refused in between. The refusal is typed and
+    /// names only the caller's addressee, never the recorded requester.
+    #[tokio::test]
+    async fn after_a_refused_progress_response_the_requester_gets_progress_and_terminal() {
+        let fixture = Fixture::with_spoofed_request().await;
+        let requester = fixture.requester.peer_id();
+        let bystander = fixture.bystander.peer_id();
+
+        let refused = CoreCommsRuntime::send(
+            fixture.responder.comms.as_ref(),
+            fixture.response(
+                &fixture.bystander,
+                fixture.request_id,
+                ResponseStatus::Accepted,
+            ),
+        )
+        .await;
+        let error = match refused {
+            Err(error @ SendError::ResponseAddresseeNotRequester { .. }) => error,
+            other => panic!("a progress response to the other peer must be refused, got {other:?}"),
+        };
+        assert!(
+            matches!(
+                &error,
+                SendError::ResponseAddresseeNotRequester { in_reply_to, addressee }
+                    if *in_reply_to == fixture.request_id && *addressee == bystander
+            ),
+            "got {error:?}"
+        );
+        let message = error.to_string();
+        assert!(message.contains(&bystander.to_string()), "{message}");
+        assert!(
+            !message.contains(&requester.to_string()),
+            "the refusal must not disclose the recorded requester: {message}"
+        );
+        assert!(fixture.bystander.received().await.is_empty());
+        assert!(fixture.requester.received().await.is_empty());
+
+        CoreCommsRuntime::send(
+            fixture.responder.comms.as_ref(),
+            fixture.response(
+                &fixture.requester,
+                fixture.request_id,
+                ResponseStatus::Accepted,
+            ),
+        )
+        .await
+        .expect("the progress response to the requester is sent");
+        let progress = fixture.requester.received().await;
+        assert!(
+            matches!(
+                progress.as_slice(),
+                [InboxInteraction {
+                    content: InteractionContent::Response {
+                        in_reply_to,
+                        status: ResponseStatus::Accepted,
+                        ..
+                    },
+                    ..
+                }] if *in_reply_to == fixture.request_id
+            ),
+            "the requester receives exactly the progress response, got {progress:?}"
+        );
+        assert_eq!(
+            fixture.inbound_state(),
+            Some(InboundPeerRequestState::Received),
+            "progress leaves the request answerable"
+        );
+
+        let refused_terminal = CoreCommsRuntime::send(
+            fixture.responder.comms.as_ref(),
+            fixture.response(
+                &fixture.bystander,
+                fixture.request_id,
+                ResponseStatus::Completed,
+            ),
+        )
+        .await;
+        assert!(
+            matches!(
+                refused_terminal,
+                Err(SendError::ResponseAddresseeNotRequester { .. })
+            ),
+            "progress to the requester does not open the request to another peer, got {refused_terminal:?}"
+        );
+        assert!(fixture.bystander.received().await.is_empty());
+
+        CoreCommsRuntime::send(
+            fixture.responder.comms.as_ref(),
+            fixture.response(
+                &fixture.requester,
+                fixture.request_id,
+                ResponseStatus::Completed,
+            ),
+        )
+        .await
+        .expect("the terminal response to the requester is sent");
+        fixture.assert_requester_received_the_response().await;
+        assert!(fixture.bystander.received().await.is_empty());
+        assert_eq!(
+            fixture.inbound_state(),
+            None,
+            "the terminal response answers the request"
+        );
+    }
+
+    /// `send_response` addresses a peer by its canonical id, judged after the
+    /// same parsing the transport routes by; its display name is a diagnostic
+    /// label only. The requester's id in another textual form, under an alias,
+    /// is the requester; the other peer's id under the requester's name is not.
+    #[tokio::test]
+    async fn send_response_tool_judges_the_canonical_peer_id_not_the_display_name() {
+        let fixture = Fixture::with_spoofed_request().await;
+
+        let refused = fixture
+            .send_response_tool_call(json!({
+                "peer_id": fixture.bystander.peer_id().to_string(),
+                "display_name": fixture.requester.name,
+                "in_reply_to": fixture.request_id.0.to_string(),
+                "status": "completed",
+                "result": checksum_result(),
+            }))
+            .await;
+        assert!(
+            matches!(
+                refused,
+                Err(ToolError::InvalidArguments { ref name, .. }) if name == "send_response"
+            ),
+            "the requester's name does not address the other peer's id, got {refused:?}"
+        );
+        assert!(fixture.bystander.received().await.is_empty());
+        assert!(fixture.requester.received().await.is_empty());
+
+        let requester_id_in_another_form = fixture
+            .requester
+            .peer_id()
+            .0
+            .simple()
+            .to_string()
+            .to_uppercase();
+        fixture
+            .send_response_tool_call(json!({
+                "peer_id": requester_id_in_another_form,
+                "display_name": "requester-alias",
+                "in_reply_to": fixture.request_id.0.to_string(),
+                "status": "completed",
+                "result": checksum_result(),
+            }))
+            .await
+            .expect("the requester's id under an alias addresses the requester");
+        fixture.assert_requester_received_the_response().await;
+        assert!(fixture.bystander.received().await.is_empty());
+    }
+
+    /// Another peer that sends a request reusing an outstanding request's id
+    /// does not take it over. The responder's ingress still accepts the reused
+    /// envelope, but its drain finds the id already recorded and does not
+    /// record a requester for it again: the response still goes only to the
+    /// peer that sent the request first.
+    #[tokio::test]
+    async fn a_request_reusing_an_outstanding_id_does_not_rebind_its_requester() {
+        let fixture = Fixture::with_spoofed_request().await;
+
+        // The raw router lets the bystander choose the envelope id.
+        let reuse = fixture
+            .bystander
+            .comms
+            .router()
+            .send_with_id(
+                fixture.responder.peer_id(),
+                fixture.request_id.0,
+                meerkat_comms::MessageKind::Request {
+                    intent: "checksum_token".to_string(),
+                    params: json!({ "subject": "addressee-reuse" }),
+                    blocks: None,
+                    reply_endpoint: None,
+                    content_taint: None,
+                    handling_mode: Some(HandlingMode::Queue),
+                    objective_id: None,
+                },
+                None,
+            )
+            .await;
+        assert!(
+            matches!(
+                &reuse,
+                Ok(outcome) if outcome.delivery
+                    == PeerDeliveryOutcome::DurablyResolved {
+                        outcome: PeerIngressTerminalOutcomeKind::Accepted,
+                    }
+            ),
+            "the responder's ingress accepts the reused envelope, got {reuse:?}"
+        );
+        assert_eq!(
+            fixture.inbound_state(),
+            Some(InboundPeerRequestState::Received),
+            "the reused id leaves the outstanding request in place (reuse send: {reuse:?})"
+        );
+
+        let refused = CoreCommsRuntime::send(
+            fixture.responder.comms.as_ref(),
+            fixture.response(
+                &fixture.bystander,
+                fixture.request_id,
+                ResponseStatus::Completed,
+            ),
+        )
+        .await;
+        assert!(
+            matches!(
+                &refused,
+                Err(SendError::ResponseAddresseeNotRequester { addressee, .. })
+                    if *addressee == fixture.bystander.peer_id()
+            ),
+            "the peer that reused the id is not the requester, got {refused:?} (reuse send: {reuse:?})"
+        );
+        CoreCommsRuntime::send(
+            fixture.responder.comms.as_ref(),
+            fixture.response(
+                &fixture.requester,
+                fixture.request_id,
+                ResponseStatus::Completed,
+            ),
+        )
+        .await
+        .expect("the response to the first requester is sent");
+        fixture.assert_requester_received_the_response().await;
+        assert!(fixture.bystander.received().await.is_empty());
+    }
 }

@@ -120,8 +120,9 @@ pub enum GrantTarget {
     /// `delegate`, `council`, `mob_spawn_member` and a mob member's calls up
     /// to its mob's operator, carry no peer target and stay on the base
     /// lineage, which a peer's lineage neither widens nor narrows. A
-    /// `send_response` addressee is the caller's assertion, not a verified
-    /// requester. Holds when every wrapper between the root and the owner
+    /// `send_response` delivers only to the requester of the request it
+    /// answers; the runtime refuses any other addressee before transport.
+    /// Holds when every wrapper between the root and the owner
     /// forwards plan resolution and resolved dispatch with its context; a
     /// governed comms plan without the owner's target is refused. Not an
     /// egress fence for mob members (see the changelog).

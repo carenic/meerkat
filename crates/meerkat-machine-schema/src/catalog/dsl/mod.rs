@@ -2202,6 +2202,10 @@ pub fn meerkat_machine_schema_metadata() -> MachineSchemaMetadata {
                 "PeerIngressResponseTerminality",
                 &["Progress", "TerminalCompleted", "TerminalFailed"],
             ),
+            NamedTypeBinding::string_enum(
+                "PeerResponseAddresseeVerdict",
+                &["UnknownRequest", "Requester", "NotRequester"],
+            ),
             NamedTypeBinding::string_enum("PeerTerminalDisposition", &["Completed", "Failed"]),
             NamedTypeBinding::string_enum(
                 "PostAdmissionSignalKind",

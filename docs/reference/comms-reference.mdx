@@ -35,7 +35,7 @@ startup instead of silently becoming trust authority.
 | `send_message` | Unsolicited one-way collaboration | Explicit `peer_id`; runtime taint declaration is inherited |
 | `reply_to_peer` | Reply to the peer message that caused this turn | Pre-addressed, turn-scoped reply capability; no `peer_id` input |
 | `send_request` | Typed `intent + params` request needing correlation | Requires runtime command authority |
-| `send_response` | Progress or terminal response to a typed request | Requires runtime command authority |
+| `send_response` | Progress or terminal response to a typed request | Requires runtime command authority; `peer_id` must be the request's requester |
 | `peers` | Read the typed peer directory | Names are display-only; route with `peer_id` |
 
 `reply_to_peer` accepts `body`, optional multimodal `blocks`, required
@@ -98,7 +98,7 @@ discriminator. The table lists the additional required core fields:
 | `peer_message` | `to`, `body` | One-way peer content |
 | `peer_lifecycle` | `to`, `lifecycle_kind`, `params` | Typed one-way lifecycle notice |
 | `peer_request` | `to`, `intent`, `params` | Closed request intent and typed params |
-| `peer_response` | `to`, `in_reply_to`, `status` | `accepted`, `completed`, or `failed` |
+| `peer_response` | `to`, `in_reply_to`, `status` | `accepted`, `completed`, or `failed`; `to` must be the request's requester, or the command fails with `send_failed` and nothing is sent |
 
 For `peer_lifecycle`, `params.peer` is a required display string; `params.role`,
 `params.description`, and `params.peer_spec` are optional. `peer`, `role`, and
