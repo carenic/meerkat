@@ -551,8 +551,8 @@ impl SharedScheduleTargetAdapter {
     /// after the driver's target probe, before the target is resolved for
     /// delivery or a session is materialized. A service from
     /// [`ScheduleService::new`] over a governed realm's store commissions no
-    /// agent, so the adapter fires its schedules unchecked and each fire fails
-    /// later, at runtime admission.
+    /// agent, so the adapter fires its schedules unchecked and each fire
+    /// materializes its session and then fails late (see Known issues).
     pub fn new(
         schedule_service: ScheduleService,
         session_host: Arc<dyn SurfaceScheduleSessionHost>,

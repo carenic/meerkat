@@ -140,10 +140,11 @@ them.
   stock-governed realm rkat and rkat-rpc refuse every fire as
   `schedule_mandate_unavailable` without materializing a session. Any other
   host on a governed runtime whose schedule service records no
-  commissioning agent (`ScheduleService::new`) still materializes the
-  fire's session and then fails the fire late: the fire never runs, and
-  its failure class names the step that refused it, not the missing
-  mandate.
+  commissioning agent (`ScheduleService::new`, or
+  `PersistenceBundle::schedule_service()` outside a stock-governed realm)
+  still materializes the fire's session and then fails the fire late: the
+  fire never runs, and its failure class names the step that refused it,
+  not the missing mandate.
 
 ## [0.9.2] - 2026-10-16
 

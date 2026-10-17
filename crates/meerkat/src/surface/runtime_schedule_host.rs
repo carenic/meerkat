@@ -41,7 +41,7 @@ use meerkat_schedule::{IdentityTargetBinding, ScheduleDeliveryIdentity, Schedule
 /// target probe, before the target is resolved for delivery or a session is
 /// materialized. A service from [`ScheduleService::new`] over a governed
 /// realm's store commissions no agent, so its schedules fire unchecked and
-/// each fire fails later, at runtime admission.
+/// each fire materializes its session and then fails late (see Known issues).
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_runtime_backed_schedule_host<B: SessionAgentBuilder + 'static>(
     service: Arc<PersistentSessionService<B>>,
