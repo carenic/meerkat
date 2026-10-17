@@ -13,9 +13,11 @@ built from the bump commit.
                    `index.json` and the five rkat-rpc archives. Refuse unless
                    the manifest is the complete one for the tag, every rkat-rpc
                    archive is within the SDKs' 256 MiB download cap, re-hashes
-                   to its manifest entry, carries a build attestation signed by
-                   the repository's release workflow (`gh attestation verify`)
-                   and holds exactly one rkat-rpc binary at its root, and both
+                   to its manifest entry, carries a build attestation from the
+                   repository's release workflow run from main or the tag on a
+                   GitHub-hosted runner (`gh attestation verify`, up to three
+                   attempts) and holds exactly one rkat-rpc binary at its root,
+                   and both
                    SDK packages carry the tag's version. Then rewrite both
                    pinned-digest modules (archive digest from the manifest,
                    binary digest from the binary inside the verified archive)
@@ -35,10 +37,13 @@ import argparse
 import hashlib
 import importlib.util
 import json
+import os
+import re
 import shutil
 import subprocess
 import sys
 import tarfile
+import time
 import tomllib
 import zipfile
 from pathlib import Path, PurePosixPath
@@ -64,6 +69,11 @@ UNSTAMPED = {"version": "", "archives": {}}
 # release must never pin one.
 ARCHIVE_MAX_BYTES = 256 * 1024 * 1024
 RELEASE_WORKFLOW = ".github/workflows/release.yml"
+# `gh attestation verify` runs up to this many times per archive, waiting
+# RELEASE_ATTESTATION_RETRY_SECONDS (default 5) and then twice that between
+# attempts: a transient API failure gets two more tries, while a missing or
+# mismatched attestation fails every attempt.
+ATTESTATION_ATTEMPTS = 3
 
 PYTHON_HEADER = '''"""Release-pinned sha256 digests of the rkat-rpc archives this SDK downloads.
 
@@ -209,32 +219,59 @@ def archived_binary_sha256(archive_path: Path, target: str) -> str:
         raise StampError(f"cannot read {archive_path.name}: {error}") from error
 
 
-def verify_attestation(archive_path: Path, repo: str) -> None:
-    """Require a build attestation signed by `repo`'s release workflow."""
+def release_signer_identity(repo: str, tag: str) -> str:
+    """The certificate identity a release archive's attestation must carry:
+    `repo`'s release workflow run from main (prebuild and asset recovery) or
+    from the release tag itself (a tag run), anchored at both ends."""
+    return (
+        f"^https://github\\.com/{re.escape(repo)}/{re.escape(RELEASE_WORKFLOW)}"
+        f"@refs/(heads/main|tags/{re.escape(tag)})$"
+    )
+
+
+def attestation_retry_seconds() -> float:
+    raw = os.environ.get("RELEASE_ATTESTATION_RETRY_SECONDS", "5")
+    try:
+        seconds = float(raw)
+    except ValueError:
+        seconds = -1.0
+    if not seconds >= 0:
+        raise StampError(
+            f"RELEASE_ATTESTATION_RETRY_SECONDS must be a non-negative number, not {raw!r}"
+        )
+    return seconds
+
+
+def verify_attestation(archive_path: Path, repo: str, tag: str) -> None:
+    """Require a build attestation from `repo`'s release workflow, run from
+    main or from `tag` on a GitHub-hosted runner."""
     gh = shutil.which("gh")
     if gh is None:
         raise StampError("the GitHub CLI (gh) is required to verify archive attestations")
-    result = subprocess.run(
-        [
-            gh,
-            "attestation",
-            "verify",
-            str(archive_path),
-            "--repo",
-            repo,
-            "--signer-workflow",
-            f"{repo}/{RELEASE_WORKFLOW}",
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
+    command = [
+        gh,
+        "attestation",
+        "verify",
+        str(archive_path),
+        "--repo",
+        repo,
+        "--cert-identity-regex",
+        release_signer_identity(repo, tag),
+        "--deny-self-hosted-runners",
+    ]
+    delay = attestation_retry_seconds()
+    for attempt in range(1, ATTESTATION_ATTEMPTS + 1):
+        result = subprocess.run(command, capture_output=True, text=True, check=False)
+        if result.returncode == 0:
+            return
+        if attempt < ATTESTATION_ATTEMPTS:
+            time.sleep(delay * 2 ** (attempt - 1))
+    detail = (result.stderr or result.stdout).strip().splitlines()
+    raise StampError(
+        f"{archive_path.name} has no build attestation from {repo}'s release "
+        f"workflow (main or {tag}, GitHub-hosted runner) after {ATTESTATION_ATTEMPTS} "
+        f"attempts: {detail[-1] if detail else f'gh exited {result.returncode}'}"
     )
-    if result.returncode != 0:
-        detail = (result.stderr or result.stdout).strip().splitlines()
-        raise StampError(
-            f"{archive_path.name} has no build attestation from {repo}'s release "
-            f"workflow: {detail[-1] if detail else f'gh exited {result.returncode}'}"
-        )
 
 
 def digest_table(release_dir: Path, tag: str, repo: str) -> dict:
@@ -257,7 +294,7 @@ def digest_table(release_dir: Path, tag: str, repo: str) -> dict:
                 f"{asset} does not match {release_assets.CHECKSUMS_NAME}: "
                 f"expected {checksums[asset]}, got {actual}"
             )
-        verify_attestation(archive_path, repo)
+        verify_attestation(archive_path, repo, tag)
         archives[target] = {
             "asset": asset,
             "archive_sha256": actual,

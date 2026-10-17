@@ -23,7 +23,9 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import math
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -38,13 +40,22 @@ REPO_ROOT = SCRIPTS.parent
 STAMP = SCRIPTS / "release-stamp-sdk-binary-digests"
 AWAIT = SCRIPTS / "release-await-binary-manifest"
 REPO = "example/meerkat"
-SIGNER = f"{REPO}/.github/workflows/release.yml"
+# The release workflow run from main or from the tag, anchored at both ends.
+IDENTITY = (
+    r"^https://github\.com/example/meerkat/\.github/workflows/release\.yml"
+    r"@refs/(heads/main|tags/v9\.9\.9)$"
+)
 
-# `gh attestation verify <file> --repo R --signer-workflow W`: logs each call
-# and refuses the files named in STUB_GH_UNATTESTED.
+# `gh attestation verify <file> --repo R --cert-identity-regex I
+# --deny-self-hosted-runners`: logs each call, fails the first
+# STUB_GH_TRANSIENT_FAILURES calls as a transient API error, and refuses the
+# files named in STUB_GH_UNATTESTED.
 GH_ATTESTATION_STUB = """#!/bin/sh
 printf '%s\\n' "$*" >> "$STUB_GH_LOG"
 [ "$1 $2" = "attestation verify" ] || { echo "stub gh: unsupported $*" >&2; exit 2; }
+if [ "$(wc -l < "$STUB_GH_LOG")" -le "${STUB_GH_TRANSIENT_FAILURES:-0}" ]; then
+  echo "Error: HTTP 502: Bad Gateway" >&2; exit 1
+fi
 for name in $STUB_GH_UNATTESTED; do
   case "$3" in */"$name") echo "Error: HTTP 404: Not Found" >&2; exit 1 ;; esac
 done
@@ -116,6 +127,7 @@ class Fixture:
         self.bin = root / "bin"
         self.gh_log = root / "gh.log"
         self.unattested: list[str] = []
+        self.transient_failures = 0
         self.release.mkdir()
         self.bin.mkdir()
         (self.bin / "gh").write_text(GH_ATTESTATION_STUB, encoding="utf-8")
@@ -187,6 +199,8 @@ class Fixture:
             "PATH": path,
             "STUB_GH_LOG": str(self.gh_log),
             "STUB_GH_UNATTESTED": " ".join(self.unattested),
+            "STUB_GH_TRANSIENT_FAILURES": str(self.transient_failures),
+            "RELEASE_ATTESTATION_RETRY_SECONDS": "0",
         }
         return run(
             "stamp",
@@ -314,17 +328,79 @@ class StampTests(unittest.TestCase):
             sorted(self.fixture.attestation_checks()),
             sorted(
                 f"attestation verify {self.fixture.release / rpc_asset(target, extension)} "
-                f"--repo {REPO} --signer-workflow {SIGNER}"
+                f"--repo {REPO} --cert-identity-regex {IDENTITY} --deny-self-hosted-runners"
                 for target, extension in TARGETS
             ),
         )
+
+    def test_the_signer_identity_admits_the_release_workflow_on_main_or_the_tag_only(
+        self,
+    ) -> None:
+        identity = re.compile(IDENTITY)
+        workflow = "https://github.com/example/meerkat/.github/workflows/release.yml"
+        for admitted in (f"{workflow}@refs/heads/main", f"{workflow}@refs/tags/{TAG}"):
+            self.assertIsNotNone(identity.fullmatch(admitted), admitted)
+        for refused in (
+            f"{workflow}@refs/heads/feature",
+            f"{workflow}@refs/tags/v9.9.90",
+            f"{workflow}@refs/tags/v9x9x9",
+            f"{workflow}@refs/heads/main/x",
+            "https://github.com/example/meerkat/.github/workflows/ci.yml@refs/heads/main",
+            "https://github.com/example/meerkat-fork/.github/workflows/release.yml@refs/heads/main",
+        ):
+            self.assertIsNone(identity.fullmatch(refused), refused)
 
     def test_refuses_an_archive_without_a_build_attestation(self) -> None:
         asset = rpc_asset("aarch64-apple-darwin", "tar.gz")
         self.fixture.unattested = [asset]
         self.assert_refused(
             self.fixture.stamp(),
-            f"{asset} has no build attestation from {REPO}'s release workflow: Error: HTTP 404",
+            f"{asset} has no build attestation from {REPO}'s release workflow "
+            f"(main or {TAG}, GitHub-hosted runner) after 3 attempts: Error: HTTP 404",
+        )
+        checks = [line for line in self.fixture.attestation_checks() if asset in line]
+        self.assertEqual(len(checks), 3, "a real refusal fails every attempt")
+
+    def test_retries_a_transient_attestation_failure(self) -> None:
+        self.fixture.transient_failures = 2
+        result = self.fixture.stamp()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        checks = self.fixture.attestation_checks()
+        self.assertEqual(len(checks), len(TARGETS) + 2, checks)
+        self.assertEqual(len(set(checks[:3])), 1, "the first archive is retried, then verified")
+
+    def test_gives_up_when_every_attempt_fails_transiently(self) -> None:
+        self.fixture.transient_failures = 3
+        self.assert_refused(self.fixture.stamp(), "after 3 attempts: Error: HTTP 502")
+        self.assertEqual(len(self.fixture.attestation_checks()), 3)
+
+    def test_the_sdk_download_caps_equal_the_stamp_cap(self) -> None:
+        def cap(path: Path, pattern: str) -> int:
+            text = (REPO_ROOT / path).read_text(encoding="utf-8")
+            found = re.findall(pattern, text, flags=re.MULTILINE)
+            self.assertEqual(len(found), 1, f"{path}: {found}")
+            factors = [factor.strip() for factor in found[0].split("*")]
+            self.assertTrue(all(factor.isdecimal() for factor in factors), found[0])
+            return math.prod(int(factor) for factor in factors)
+
+        mib_256 = 256 * 1024 * 1024
+        self.assertEqual(
+            cap(Path("scripts/release-stamp-sdk-binary-digests"), r"^ARCHIVE_MAX_BYTES = ([0-9 *]+)$"),
+            mib_256,
+        )
+        self.assertEqual(
+            cap(
+                Path("sdks/python/meerkat/client.py"),
+                r"^_RKAT_RPC_ARCHIVE_MAX_BYTES = ([0-9 *]+)$",
+            ),
+            mib_256,
+        )
+        self.assertEqual(
+            cap(
+                Path("sdks/typescript/src/client.ts"),
+                r"^const RELEASE_ARCHIVE_MAX_BYTES = ([0-9 *]+);$",
+            ),
+            mib_256,
         )
 
     def test_refuses_without_the_github_cli(self) -> None:

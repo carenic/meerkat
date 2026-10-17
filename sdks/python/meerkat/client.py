@@ -5512,9 +5512,10 @@ class MeerkatClient:
     def _fetch_rkat_rpc_archive(url: str) -> bytes:
         """Download one release archive over HTTPS only, redirects included.
 
-        A transport fault, a cut-off body included, is a download failure and
-        never reaches the digest check as tamper; a body over the size cap is
-        refused, by its declared length before anything is read.
+        A transport fault the SDK can detect, a cut-off body included, is a
+        download failure and never reaches the digest check as tamper; a body
+        over the size cap is refused, by its declared length before anything
+        is read. Every read is bounded at one byte past the cap.
         """
         if urllib.parse.urlsplit(url).scheme != "https":
             raise MeerkatError(
@@ -5526,15 +5527,16 @@ class MeerkatClient:
         try:
             with opener.open(url, timeout=30) as response:
                 declared = response.headers.get("Content-Length", "")
-                if not declared.isdigit():
-                    # No declared length: read at most one byte past the cap.
+                # Only ASCII digits declare a length: str.isdigit() also admits
+                # digits int() reads differently or not at all ("²").
+                if not (declared.isascii() and declared.isdigit()):
                     payload = response.read(limit + 1)
                 elif int(declared) > limit:
                     raise _archive_too_large(url)
                 else:
-                    # A whole read raises IncompleteRead on a cut-off body; a
-                    # bounded read would return the short body silently.
-                    payload = response.read()
+                    # A bounded read can return a cut-off body without an
+                    # error, so the length check below is what catches it.
+                    payload = response.read(limit + 1)
                     if len(payload) != int(declared):
                         raise MeerkatError(
                             "BINARY_DOWNLOAD_FAILED",

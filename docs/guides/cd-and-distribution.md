@@ -240,14 +240,17 @@ The SDKs are clients. They start or connect to the JSON-RPC surface rather than
 embedding a separate runtime implementation.
 
 The digests are pinned when the package is built, from the release's
-attested manifest; they are never fetched at download time. Before either
+manifest, with each archive's build attestation verified; they are never
+fetched at download time. Before either
 SDK package builds, `publish_registries` waits for the release's complete
 manifest (`checksums.sha256` and `index.json`;
 `scripts/release-await-binary-manifest`), and
 `scripts/release-stamp-sdk-binary-digests` re-hashes the five `rkat-rpc`
 archives against it, verifies each archive's build attestation
-(`gh attestation verify --signer-workflow <repository>/.github/workflows/release.yml`),
-takes the digest of the binary inside each verified archive, and stamps both
+(`gh attestation verify` with `--cert-identity-regex` for the repository's
+`release.yml` run from `main` or the release tag, and
+`--deny-self-hosted-runners`; up to three attempts per archive), takes the
+digest of the binary inside each verified archive, and stamps both
 SDKs. It refuses an incomplete manifest, an archive that does not re-hash,
 carries no attestation or exceeds the SDKs' 256 MiB download cap, and SDK
 packages of another version; nothing is stamped then and neither package

@@ -521,8 +521,9 @@ cached binary, or `None` for a download), `expected_sha256` and
 `BINARY_DIGEST_UNAVAILABLE` means the package pins no digest for this version
 and platform (a source or git install), so it will not download one; its
 message names the exact release asset URL. `BINARY_DOWNLOAD_FAILED` is a
-transport fault (a cut-off body included), never tamper, and
-`BINARY_DOWNLOAD_TOO_LARGE` an archive over 256 MiB. See
+transport fault (a cut-off body included): a transport fault the SDK can detect
+is never reported as tamper. `BINARY_DOWNLOAD_TOO_LARGE` is an archive over
+256 MiB. See
 [The rkat-rpc binary](/sdks/python/overview#the-rkat-rpc-binary).
 
 A failed `session.send(...)` carries the server's typed `CommsSendErrorData`

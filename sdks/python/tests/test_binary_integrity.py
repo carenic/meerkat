@@ -516,6 +516,45 @@ def test_a_body_shorter_than_its_declared_length_is_a_download_failure(monkeypat
     assert "10 of 100" in excinfo.value.message
 
 
+class _RecordingBody(io.RawIOBase):
+    """A body that records the size of every read it serves."""
+
+    def __init__(self, data: bytes):
+        self.data = data
+        self.sizes: list[int] = []
+
+    def read(self, size=-1):
+        self.sizes.append(size)
+        if size is None or size < 0:
+            chunk, self.data = self.data, b""
+        else:
+            chunk, self.data = self.data[:size], self.data[size:]
+        return chunk
+
+
+@pytest.mark.parametrize("declared", ["\u00b2", "1\u00b2", "\u0661\u0660"])
+def test_a_non_ascii_content_length_declares_no_length(monkeypatch, declared):
+    # str.isdigit() admits these: int() refuses the superscript and reads the
+    # Arabic-Indic digits as 10. The header is ignored and the body is read
+    # under the cap, as when no length is declared.
+    _CannedHttps(
+        monkeypatch,
+        {RELEASE_URL: (200, None, b"archive bytes", {"Content-Length": declared})},
+    )
+
+    assert MeerkatClient._fetch_rkat_rpc_archive(RELEASE_URL) == b"archive bytes"
+
+
+@pytest.mark.parametrize("headers", [{"Content-Length": "13"}, {}])
+def test_every_read_is_bounded_at_one_byte_past_the_cap(monkeypatch, headers):
+    monkeypatch.setattr(client_module, "_RKAT_RPC_ARCHIVE_MAX_BYTES", 16)
+    body = _RecordingBody(b"archive bytes")
+    _CannedHttps(monkeypatch, {RELEASE_URL: (200, None, body, headers)})
+
+    assert MeerkatClient._fetch_rkat_rpc_archive(RELEASE_URL) == b"archive bytes"
+    assert body.sizes == [17]
+
+
 def test_an_archive_declared_larger_than_the_cap_is_refused_unread(monkeypatch):
     too_large = str(256 * 1024 * 1024 + 1)
     _CannedHttps(

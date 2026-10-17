@@ -35,7 +35,8 @@ The first three are binaries you chose, and the SDK runs them as they are:
 trusting them is your decision. Only the download is verified. A published
 `meerkat-sdk` package pins the sha256 of every release archive it may download
 and of the `rkat-rpc` inside it: pinned when the package is built, from the
-release's attested manifest, and never fetched at download time. The
+release's manifest, with each archive's build attestation verified, and never
+fetched at download time. The
 download uses HTTPS only, redirects included, and refuses an archive over
 256 MiB (`BINARY_DOWNLOAD_TOO_LARGE`). The archive
 is checked before anything is extracted, the binary before it is installed,

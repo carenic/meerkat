@@ -322,8 +322,8 @@ The SDK runs `MEERKAT_BIN_PATH`, an explicit `rkatPath` and `rkat-rpc` on
 `$PATH` as they are: trusting a binary you chose is your decision. Only the
 download is verified. A published `@rkat/sdk` package pins the sha256 of every
 release archive it may download and of the `rkat-rpc` inside it: pinned when
-the package is built, from the release's attested manifest, and never fetched
-at download time. The download uses HTTPS only, redirects included, and
+the package is built, from the release's manifest, with each archive's build
+attestation verified, and never fetched at download time. The download uses HTTPS only, redirects included, and
 refuses an archive over 256 MiB (`BINARY_DOWNLOAD_TOO_LARGE`). The archive is checked before anything is written or
 extracted, the binary before it is installed, and the cached binary again each
 time it is reused. A mismatch throws `BinaryIntegrityError` (code

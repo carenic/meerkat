@@ -55,12 +55,14 @@ them.
 - The Python and TypeScript SDKs verify the `rkat-rpc` binary they
   auto-download (#1739). Each published package pins the sha256 of every
   release archive it may download and of the `rkat-rpc` inside it: pinned
-  when the package is built, from the release's attested manifest; never
-  fetched at download time. Before stamping
+  when the package is built, from the release's manifest, with each archive's
+  build attestation verified; never fetched at download time. Before stamping
   (`scripts/release-stamp-sdk-binary-digests`), the release workflow
   re-hashes each archive against the release's `checksums.sha256` and
-  verifies its build attestation (`gh attestation verify`, signed by this
-  repository's `release.yml`); if any check fails nothing is stamped and
+  verifies its build attestation (`gh attestation verify`: signed by this
+  repository's `release.yml` run from `main` or the release tag on a
+  GitHub-hosted runner, with up to three attempts); if any check fails
+  nothing is stamped and
   neither SDK package publishes. The download uses HTTPS only, redirects
   included, and refuses an archive over 256 MiB. The archive is checked
   before anything is written or extracted, the binary before it is
@@ -68,8 +70,9 @@ them.
   raises `BinaryIntegrityError` (code `BINARY_INTEGRITY_MISMATCH`, naming the
   asset and the expected and actual digests): the SDK deletes what failed,
   runs nothing and does not fall back to another binary. A transport fault,
-  a cut-off body included, is `BINARY_DOWNLOAD_FAILED` and is never reported
-  as tamper. `MEERKAT_BIN_PATH`, an explicit binary path and `rkat-rpc` on
+  a cut-off body included, is `BINARY_DOWNLOAD_FAILED`: a transport fault the
+  SDK can detect is never reported as tamper. `MEERKAT_BIN_PATH`, an explicit
+  binary path and `rkat-rpc` on
   `PATH` still run as given: they are the user's own trust decision.
   Residual: the pins are only as trustworthy as the release that produced
   them. Anyone able to run this repository's release workflow can produce
