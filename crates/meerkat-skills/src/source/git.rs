@@ -15,6 +15,8 @@ use meerkat_core::skills::{
 use crate::parser::parse_skill_md;
 use crate::source::remote::{RemoteCache, health_from_cache, load_cached};
 
+mod credential;
+
 #[derive(Debug, Clone)]
 pub enum GitRef {
     Branch(String),
@@ -32,6 +34,11 @@ impl GitRef {
 
 #[derive(Clone)]
 pub enum GitSkillAuth {
+    /// A token for an `https://` repository, which git is given for the
+    /// repository's host alone and never on a command line or in a file
+    /// (on Unix; on Windows it is a header option for the repository URL on
+    /// each git command line, with redirects not followed, never in a
+    /// file). Any other transport is never sent it.
     HttpsToken(String),
     SshKey(String),
 }
@@ -206,6 +213,16 @@ impl GitSkillSource {
             ));
         }
         if self.checkout_dir.join(".git").is_dir() {
+            // A checkout an earlier release cloned holds the HTTPS token in
+            // its remote URL (`.git/config`): the configured URL, which
+            // holds none, replaces it before git reads it.
+            self.run_git(&[
+                "remote",
+                "set-url",
+                "--end-of-options",
+                "origin",
+                &self.config.repo_url,
+            ])?;
             self.run_git(&[
                 "fetch",
                 "--end-of-options",
@@ -216,7 +233,6 @@ impl GitSkillSource {
             return Ok(());
         }
 
-        let auth_url = self.authenticated_url();
         let mut args = vec!["clone"];
         let depth;
         if let Some(value) = self.config.depth {
@@ -232,7 +248,7 @@ impl GitSkillSource {
             GitRef::Commit(_) => {}
         }
         args.push("--end-of-options");
-        args.push(&auth_url);
+        args.push(&self.config.repo_url);
         let checkout = self.checkout_dir.to_string_lossy().to_string();
         args.push(&checkout);
         self.run_git_at(&args, None)?;
@@ -342,25 +358,45 @@ impl GitSkillSource {
             Some(GitSkillAuth::SshKey(path)) => Some(git_ssh_command(path)?),
             _ => None,
         };
+        let untrusted = self
+            .untrusted
+            .as_ref()
+            .map(|untrusted| untrusted.0.as_ref());
+        let https_token = match &self.config.auth {
+            Some(GitSkillAuth::HttpsToken(token)) => {
+                credential::HttpsToken::for_repository(&self.config.repo_url, token)?
+            }
+            _ => None,
+        };
+        // On Unix git asks a socket served for this one invocation for the
+        // token; the socket and its directory go when `served` drops, after
+        // the invocation. Elsewhere the token is on the command line.
+        #[cfg(unix)]
+        let served = match &https_token {
+            Some(token) => Some(credential::CredentialSocket::serve(
+                token,
+                &credential::socket_parents(&self.config.cache_dir),
+                untrusted,
+            )?),
+            None => None,
+        };
+        #[cfg(unix)]
+        let socket = served.as_ref().map(credential::CredentialSocket::path);
+        #[cfg(not(unix))]
+        let socket = None;
+        #[cfg(not(unix))]
+        if https_token.is_some() {
+            warn_command_line_token(&self.config.repo_url);
+        }
         run_git_command(
             args,
             cwd,
             ssh_command.as_deref(),
-            self.untrusted
+            https_token
                 .as_ref()
-                .map(|untrusted| untrusted.0.as_ref()),
+                .map(|token| (token, credential::TokenRoute::new(socket))),
+            untrusted,
         )
-    }
-
-    fn authenticated_url(&self) -> String {
-        let Some(GitSkillAuth::HttpsToken(token)) = &self.config.auth else {
-            return self.config.repo_url.clone();
-        };
-        if let Some(rest) = self.config.repo_url.strip_prefix("https://") {
-            format!("https://x-access-token:{token}@{rest}")
-        } else {
-            self.config.repo_url.clone()
-        }
     }
 }
 
@@ -514,17 +550,35 @@ fn local_repository_path(url: &str) -> Option<PathBuf> {
 /// `protocol.allow=always` cannot re-enable `ext` or another remote helper.
 const GIT_ALLOWED_PROTOCOLS: &str = "ssh:https:http:git:file";
 
+/// git, as a host launch exemption: it, and every program it starts by name,
+/// runs as the host from a `PATH` without the directories a confined process
+/// could change. Resolution refuses a repository whose skill cache such a
+/// process could change.
+fn git_command(
+    untrusted: Option<&meerkat_core::confinement::UntrustedPathFn>,
+) -> std::process::Command {
+    meerkat_core::HostLaunchExemption::git(untrusted)
+}
+
 fn run_git_command(
     args: &[&str],
     cwd: Option<&Path>,
     git_ssh_command: Option<&str>,
+    https_token: Option<(&credential::HttpsToken<'_>, credential::TokenRoute<'_>)>,
     untrusted: Option<&meerkat_core::confinement::UntrustedPathFn>,
 ) -> Result<(), SkillError> {
-    // A host launch exemption: git runs as the host, it and every program it
-    // starts by name from a `PATH` without the directories a confined process
-    // could change. Resolution refuses a repository whose skill cache such a
-    // process could change.
-    let mut command = meerkat_core::HostLaunchExemption::git(untrusted);
+    let mut command = git_command(untrusted);
+    if let Some((token, route)) = &https_token {
+        // Before the subcommand, so no option is written to the checkout.
+        for option in token.config_options(route)? {
+            command.arg("-c").arg(option);
+        }
+        // A credential request the token does not answer fails rather than
+        // asking anyone: no terminal prompt and no askpass program.
+        command.env("GIT_TERMINAL_PROMPT", "0");
+        command.env_remove("GIT_ASKPASS");
+        command.env_remove("SSH_ASKPASS");
+    }
     command.args(args);
     if let Some(cwd) = cwd {
         command.current_dir(cwd);
@@ -539,6 +593,19 @@ fn run_git_command(
     if output.status.success() {
         return Ok(());
     }
+    #[cfg(unix)]
+    if let Some((_, credential::TokenRoute::Socket(socket))) = https_token
+        && !credential_cache_runs(socket, untrusted)
+    {
+        return Err(SkillError::Load(
+            "git skill source: git cannot run its credential-cache helper, which is how an \
+             HTTPS token reaches git on this platform (the host serves the token to it for each \
+             invocation; it is never on a command line or in a file). Use a git built with \
+             credential-cache, an ssh key (auth = { scheme = \"ssh-key\", path = \"...\" }), or \
+             a git credential manager configured for the repository host and no token"
+                .into(),
+        ));
+    }
     let stderr = String::from_utf8_lossy(&output.stderr);
     Err(SkillError::Load(
         format!(
@@ -547,6 +614,43 @@ fn run_git_command(
         )
         .into(),
     ))
+}
+
+/// Whether git can run its `credential-cache` client, which a Unix
+/// invocation asks for the token. A git built without it fails such an
+/// invocation as if the token were wrong; this tells the two apart.
+#[cfg(unix)]
+fn credential_cache_runs(
+    socket: &Path,
+    untrusted: Option<&meerkat_core::confinement::UntrustedPathFn>,
+) -> bool {
+    let mut probe = git_command(untrusted);
+    probe
+        .arg("credential-cache")
+        .arg(format!("--socket={}", socket.display()))
+        .arg("get")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    probe.status().is_ok_and(|status| status.success())
+}
+
+/// Tell the operator once that on this platform an HTTPS token is on each
+/// git command line (never in a file), with the remedies. The token itself
+/// is never logged.
+#[cfg(not(unix))]
+fn warn_command_line_token(repo_url: &str) {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    WARNED.call_once(|| {
+        tracing::warn!(
+            repository = %redact_url(repo_url),
+            "a Git skill repository's HTTPS token is passed on each git command line on this \
+             platform (as a header for the repository URL alone, with redirects not followed): \
+             processes of the same user can read it for that invocation, and git persists it \
+             nowhere; use an ssh key, or a git credential manager configured for the \
+             repository host, instead of a token"
+        );
+    });
 }
 
 fn discover_skill_directories(base: &Path) -> Vec<PathBuf> {
@@ -820,6 +924,119 @@ mod tests {
             git_ssh_command(&key).unwrap(),
             format!("ssh -i '{key}' -o IdentitiesOnly=yes")
         );
+    }
+
+    /// git takes the HTTPS token from the served socket, for the repository's
+    /// host alone, through the options every invocation carries; a credential
+    /// helper the host's git configuration names is neither asked for nor sent
+    /// it. `git credential fill` (what git-remote-https runs on a 401) gets
+    /// the token for the repository's host and nothing for another host or
+    /// plain `http`; `git credential approve` (what git runs after the token
+    /// authenticated a request) leaves the host's `store` helper's file
+    /// without it, though that helper stores what it is sent. Dropping the
+    /// served socket removes it and its directory.
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::unwrap_used, clippy::expect_used)]
+    fn git_takes_the_token_from_the_served_socket_for_the_repository_host_only() {
+        use std::io::Write;
+        use std::process::Stdio;
+
+        const TOKEN: &str = "unit-socket-token-5c1e";
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().canonicalize().unwrap();
+        let stored = base.join("stored-credentials");
+        let host_config = base.join("host-gitconfig");
+        std::fs::write(
+            &host_config,
+            format!(
+                "[credential]\n\thelper = store --file={}\n",
+                stored.display()
+            ),
+        )
+        .unwrap();
+        let token = credential::HttpsToken::for_repository(
+            "https://git.example.com:8443/org/skills.git",
+            TOKEN,
+        )
+        .unwrap()
+        .expect("an https repository takes the token");
+        let served =
+            credential::CredentialSocket::serve(&token, std::slice::from_ref(&base), None).unwrap();
+        let options = token
+            .config_options(&credential::TokenRoute::new(Some(served.path())))
+            .unwrap();
+        let credential = |options: &[String], action: &str, request: &str| {
+            let mut command = git_command(None);
+            for option in options {
+                command.arg("-c").arg(option);
+            }
+            command
+                .args(["credential", action])
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", &host_config)
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .env_remove("GIT_ASKPASS")
+                .env_remove("SSH_ASKPASS")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            let mut child = command.spawn().unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(request.as_bytes())
+                .unwrap();
+            child.wait_with_output().unwrap()
+        };
+
+        let filled = credential(
+            &options,
+            "fill",
+            "protocol=https\nhost=git.example.com:8443\npath=org/skills.git\n\n",
+        );
+        let answer = String::from_utf8_lossy(&filled.stdout);
+        assert!(
+            filled.status.success()
+                && answer.contains("username=x-access-token\n")
+                && answer.contains(&format!("password={TOKEN}\n")),
+            "git takes the token for the repository's host: {answer} {}",
+            String::from_utf8_lossy(&filled.stderr)
+        );
+        for (protocol, host) in [
+            ("https", "elsewhere.example"),
+            ("http", "git.example.com:8443"),
+        ] {
+            let refused = credential(
+                &options,
+                "fill",
+                &format!("protocol={protocol}\nhost={host}\n\n"),
+            );
+            assert!(
+                !refused.status.success()
+                    && !String::from_utf8_lossy(&refused.stdout).contains(TOKEN),
+                "{protocol}://{host} gets no token and no prompt"
+            );
+        }
+
+        let approve = format!(
+            "protocol=https\nhost=git.example.com:8443\nusername=x-access-token\npassword={TOKEN}\n\n"
+        );
+        assert!(credential(&options, "approve", &approve).status.success());
+        assert!(
+            !stored.exists() || !std::fs::read_to_string(&stored).unwrap().contains(TOKEN),
+            "the host's helper is never sent the token"
+        );
+
+        let directory = served.path().parent().unwrap().to_path_buf();
+        drop(served);
+        assert!(!directory.exists(), "the socket's directory goes with it");
+
+        // The control: without the options, the host's helper is sent and
+        // stores what git approves.
+        assert!(credential(&[], "approve", &approve).status.success());
+        assert!(std::fs::read_to_string(&stored).unwrap().contains(TOKEN));
     }
 
     /// Only the supported transports resolve a local path; a `file://` URL or

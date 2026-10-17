@@ -42,6 +42,34 @@ them.
   compose a different `[confinement]` or `[governance]` on a state root that
   holds no document of its own for that realm (see Fixed).
 
+### Security
+
+- A Git skill repository's HTTPS token no longer reaches git's command line
+  or the checkout's `.git/config`. On Unix git asks for it through its own
+  credential protocol: each invocation empties git's credential helper list
+  and names one helper for the repository's host, git's `credential-cache`
+  client, which asks a socket the host serves for that one invocation from
+  a new directory only the host's user may enter (removed with it, however
+  the invocation ends). The token is then on no command line, in no
+  environment variable and in no file, and no credential helper the host's
+  git configuration names (a `store`, a keychain, a credential manager) is
+  asked for it or sent it; a request for another host or for plain `http`
+  gets nothing, and git never prompts. The clone takes the configured URL,
+  and each refresh resets the checkout's `origin` to it, which removes a
+  token an earlier release wrote into `.git/config`. A git built without
+  `credential-cache` fails the refresh with a load error naming the
+  remedies (an ssh key, or a git credential manager for the host) instead
+  of prompting. On Windows (no Unix-domain sockets, and no `credential-cache`
+  in Git for Windows) the token is an `Authorization` header option on each
+  git invocation's own command line, scoped to the configured repository URL
+  (another remote or a submodule never gets it) with redirects not followed
+  (`http.followRedirects=false`, so it is never replayed to another host):
+  processes of the same user can read it for that invocation only, and git
+  persists it nowhere. The first such invocation logs a warning (without the
+  token) naming the remedies. In 0.9.2 the token was in the clone's URL on
+  the command line and stayed in the checkout's `.git/config` (a 0.9.2 known
+  limitation).
+
 ### Added
 
 - `meerkat::open_system_browser_guarded`

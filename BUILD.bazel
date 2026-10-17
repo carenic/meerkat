@@ -892,6 +892,7 @@ test_suite(
         "//crates/meerkat-session:persistence_compat_test",
         "//crates/meerkat-session:planned_identity_fork_test",
         "//crates/meerkat-session:regression_lifecycle_test",
+        "//crates/meerkat-skills:git_https_token_test",
         "//crates/meerkat-skills:meerkat_skills_unit_test",
         "//crates/meerkat-skills:resolver_precedence_test",
         "//crates/meerkat-skills:transport_sources_test",

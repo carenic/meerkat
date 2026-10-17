@@ -270,7 +270,14 @@ except these, which it runs as itself (`meerkat_core::HostLaunchExemption`):
 - Git skill source (`HostLaunchExemption::git`): fetches with the host's
   Git credentials and network; a repository is not loaded when a confined
   process could change the skill cache, and a skill linked out of the
-  checkout is not read.
+  checkout is not read. A repository's HTTPS token reaches git only for the
+  repository: on Unix through git's `credential-cache` client and a socket
+  the host serves for each invocation (for the repository's host; never on
+  a command line or in a file; a git without `credential-cache` fails with
+  the remedies instead of prompting), on Windows as a header option on that
+  invocation's command line (for the configured URL, redirects not
+  followed, never in a file). No credential helper of the host's git
+  configuration is asked for or sent it.
 - Credential command (auth profile `source = { kind = "command" }`,
   `HostLaunchExemption::credential_command`): produces the host's provider
   credentials; without `cwd` it runs from the user's home directory; it is
