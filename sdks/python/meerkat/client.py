@@ -5527,9 +5527,11 @@ class MeerkatClient:
         try:
             with opener.open(url, timeout=30) as response:
                 declared = response.headers.get("Content-Length", "")
-                # Only ASCII digits declare a length: str.isdigit() also admits
-                # digits int() reads differently or not at all ("²").
-                if not (declared.isascii() and declared.isdigit()):
+                # Only up to 20 ASCII digits declare a length, else it counts
+                # as undeclared, as http.client treats a length it cannot
+                # read: str.isdigit() also admits digits int() reads
+                # differently or not at all, and int() refuses more than 4300.
+                if not (declared.isascii() and declared.isdigit() and len(declared) <= 20):
                     payload = response.read(limit + 1)
                 elif int(declared) > limit:
                     raise _archive_too_large(url)

@@ -15,9 +15,10 @@ built from the bump commit.
                    archive is within the SDKs' 256 MiB download cap, re-hashes
                    to its manifest entry, carries a build attestation from the
                    repository's release workflow run from main or the tag on a
-                   GitHub-hosted runner (`gh attestation verify`, up to three
-                   attempts) and holds exactly one rkat-rpc binary at its root,
-                   and both
+                   GitHub-hosted runner whose subject names the exact asset
+                   with the archive's sha256 (`gh attestation verify`, up to
+                   three attempts) and holds exactly one rkat-rpc binary at its
+                   root, and both
                    SDK packages carry the tag's version. Then rewrite both
                    pinned-digest modules (archive digest from the manifest,
                    binary digest from the binary inside the verified archive)
@@ -29,6 +30,12 @@ built from the bump commit.
   check-unstamped  Check that the committed modules are the unstamped
                    rendering, so a source tree pins nothing and the renderer
                    and the committed files cannot drift apart.
+  require-hosted-runner
+                   Refuse a MEERKAT_CI_RUNNER (the runner the BuildBuddy build
+                   job attests on) that does not name a GitHub-hosted Ubuntu
+                   runner: the stamp refuses attestations from self-hosted
+                   runners, so the release preflight refuses one before any
+                   crate publishes.
 """
 
 from __future__ import annotations
@@ -242,9 +249,42 @@ def attestation_retry_seconds() -> float:
     return seconds
 
 
-def verify_attestation(archive_path: Path, repo: str, tag: str) -> None:
+def attested_subject_failure(stdout: str, asset: str, sha256: str) -> str | None:
+    """Why `gh attestation verify --format json` output does not bind this
+    archive, or None when a verified statement names `asset` (the version is
+    in the name) with `sha256`. The identity alone (main) names no commit, so
+    the attested subject is what binds the release version."""
+    try:
+        results = json.loads(stdout)
+    except ValueError:
+        return "gh printed no JSON verification result"
+    if not isinstance(results, list):
+        return "gh printed no list of verification results"
+    subjects = [
+        subject
+        for result in results
+        if isinstance(result, dict)
+        for subject in (
+            ((result.get("verificationResult") or {}).get("statement") or {}).get("subject")
+            or []
+        )
+        if isinstance(subject, dict)
+    ]
+    for subject in subjects:
+        digest = subject.get("digest")
+        if (
+            subject.get("name") == asset
+            and isinstance(digest, dict)
+            and digest.get("sha256") == sha256
+        ):
+            return None
+    return f"no verified attestation subject names {asset} with sha256 {sha256}"
+
+
+def verify_attestation(archive_path: Path, repo: str, tag: str, sha256: str) -> None:
     """Require a build attestation from `repo`'s release workflow, run from
-    main or from `tag` on a GitHub-hosted runner."""
+    main or from `tag` on a GitHub-hosted runner, whose subject names this
+    exact asset with its sha256."""
     gh = shutil.which("gh")
     if gh is None:
         raise StampError("the GitHub CLI (gh) is required to verify archive attestations")
@@ -258,20 +298,53 @@ def verify_attestation(archive_path: Path, repo: str, tag: str) -> None:
         "--cert-identity-regex",
         release_signer_identity(repo, tag),
         "--deny-self-hosted-runners",
+        "--format",
+        "json",
     ]
     delay = attestation_retry_seconds()
+    failures = []
     for attempt in range(1, ATTESTATION_ATTEMPTS + 1):
         result = subprocess.run(command, capture_output=True, text=True, check=False)
         if result.returncode == 0:
-            return
+            failure = attested_subject_failure(result.stdout, archive_path.name, sha256)
+            if failure is None:
+                return
+        else:
+            lines = (result.stderr or result.stdout).strip().splitlines()
+            failure = lines[-1] if lines else f"gh exited {result.returncode}"
+        failures.append(f"attempt {attempt}: {failure}")
         if attempt < ATTESTATION_ATTEMPTS:
             time.sleep(delay * 2 ** (attempt - 1))
-    detail = (result.stderr or result.stdout).strip().splitlines()
     raise StampError(
-        f"{archive_path.name} has no build attestation from {repo}'s release "
-        f"workflow (main or {tag}, GitHub-hosted runner) after {ATTESTATION_ATTEMPTS} "
-        f"attempts: {detail[-1] if detail else f'gh exited {result.returncode}'}"
+        f"{archive_path.name} has no build attestation that passes from {repo}'s release "
+        f"workflow (main or {tag}, GitHub-hosted runner, subject {archive_path.name}) "
+        f"after {ATTESTATION_ATTEMPTS} attempts: {'; '.join(failures)}"
     )
+
+
+# A GitHub-hosted Ubuntu runner label, the only kind the release preflight
+# accepts for MEERKAT_CI_RUNNER (release.yml defaults it to "ubuntu-24.04").
+GITHUB_HOSTED_UBUNTU = re.compile(r"ubuntu-(latest|[0-9]+\.[0-9]+)(-arm)?")
+
+
+def require_hosted_runner(value: str) -> str:
+    """The runner `value` (MEERKAT_CI_RUNNER, JSON as release.yml's fromJSON
+    reads it) names, refused unless it is a GitHub-hosted Ubuntu label."""
+    if not value.strip():
+        return "ubuntu-24.04"
+    try:
+        label = json.loads(value)
+    except ValueError:
+        label = None
+    if not isinstance(label, str) or GITHUB_HOSTED_UBUNTU.fullmatch(label) is None:
+        raise StampError(
+            f"MEERKAT_CI_RUNNER {value!r} does not name a GitHub-hosted Ubuntu runner "
+            "(\"ubuntu-latest\", \"ubuntu-<version>\" or \"ubuntu-<version>-arm\"). The "
+            "BuildBuddy build job attests the release archives on it, and the SDK digest "
+            "stamp refuses attestations from self-hosted runners: the release would publish "
+            "the crates and then refuse both SDK packages."
+        )
+    return label
 
 
 def digest_table(release_dir: Path, tag: str, repo: str) -> dict:
@@ -294,7 +367,7 @@ def digest_table(release_dir: Path, tag: str, repo: str) -> dict:
                 f"{asset} does not match {release_assets.CHECKSUMS_NAME}: "
                 f"expected {checksums[asset]}, got {actual}"
             )
-        verify_attestation(archive_path, repo, tag)
+        verify_attestation(archive_path, repo, tag, actual)
         archives[target] = {
             "asset": asset,
             "archive_sha256": actual,
@@ -414,6 +487,12 @@ def parse_args() -> argparse.Namespace:
         "check-unstamped", help="check the committed modules pin nothing", allow_abbrev=False
     )
     unstamped_args.add_argument("--repo-root", type=Path, default=Path.cwd())
+
+    commands.add_parser(
+        "require-hosted-runner",
+        help="refuse a MEERKAT_CI_RUNNER that is not a GitHub-hosted Ubuntu runner",
+        allow_abbrev=False,
+    )
     return parser.parse_args()
 
 
@@ -431,6 +510,9 @@ def main() -> int:
         elif args.command == "verify":
             verify(args.release_tag, args.expected, args.actual)
             print(f"the package pins the stamped {args.release_tag} rkat-rpc digests")
+        elif args.command == "require-hosted-runner":
+            label = require_hosted_runner(os.environ.get("MEERKAT_CI_RUNNER", ""))
+            print(f"the release archives are attested on the GitHub-hosted runner {label}")
         else:
             check_unstamped(args.repo_root)
             print("the committed SDK digest modules pin nothing")

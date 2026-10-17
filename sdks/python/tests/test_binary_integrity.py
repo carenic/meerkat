@@ -532,11 +532,16 @@ class _RecordingBody(io.RawIOBase):
         return chunk
 
 
-@pytest.mark.parametrize("declared", ["\u00b2", "1\u00b2", "\u0661\u0660"])
-def test_a_non_ascii_content_length_declares_no_length(monkeypatch, declared):
-    # str.isdigit() admits these: int() refuses the superscript and reads the
-    # Arabic-Indic digits as 10. The header is ignored and the body is read
-    # under the cap, as when no length is declared.
+@pytest.mark.parametrize(
+    "declared",
+    ["\u00b2", "1\u00b2", "\u0661\u0660", "1" * 5000, "0" * 4999 + "13"],
+    ids=["superscript", "digit-superscript", "arabic-indic", "5000-digits", "5001-digits"],
+)
+def test_an_unreadable_content_length_declares_no_length(monkeypatch, declared):
+    # str.isdigit() admits all of these: int() refuses the superscript, reads
+    # the Arabic-Indic digits as 10, and refuses more than 4300 digits. The
+    # header is ignored and the body is read under the cap, as when no length
+    # is declared.
     _CannedHttps(
         monkeypatch,
         {RELEASE_URL: (200, None, b"archive bytes", {"Content-Length": declared})},

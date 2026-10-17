@@ -47,19 +47,27 @@ IDENTITY = (
 )
 
 # `gh attestation verify <file> --repo R --cert-identity-regex I
-# --deny-self-hosted-runners`: logs each call, fails the first
-# STUB_GH_TRANSIENT_FAILURES calls as a transient API error, and refuses the
-# files named in STUB_GH_UNATTESTED.
+# --deny-self-hosted-runners --format json`: logs each call; answers the
+# N-th call with the N-th word of STUB_GH_OUTCOMES ("transient": an HTTP 502,
+# "refused": a policy refusal); refuses the files named in STUB_GH_UNATTESTED
+# (HTTP 404); otherwise prints one verified statement whose subject is the
+# file's name edited by STUB_GH_SUBJECT_SED, with its sha256 or
+# STUB_GH_SUBJECT_SHA256.
 GH_ATTESTATION_STUB = """#!/bin/sh
 printf '%s\\n' "$*" >> "$STUB_GH_LOG"
 [ "$1 $2" = "attestation verify" ] || { echo "stub gh: unsupported $*" >&2; exit 2; }
-if [ "$(wc -l < "$STUB_GH_LOG")" -le "${STUB_GH_TRANSIENT_FAILURES:-0}" ]; then
-  echo "Error: HTTP 502: Bad Gateway" >&2; exit 1
-fi
+call="$(wc -l < "$STUB_GH_LOG")"
+outcome="$(printf '%s\\n' $STUB_GH_OUTCOMES | sed -n "${call}p")"
+case "$outcome" in
+  transient) echo "Error: HTTP 502: Bad Gateway" >&2; exit 1 ;;
+  refused) echo "Error: verifying with issuer \\"sigstore.dev\\": SAN does not match" >&2; exit 1 ;;
+esac
 for name in $STUB_GH_UNATTESTED; do
   case "$3" in */"$name") echo "Error: HTTP 404: Not Found" >&2; exit 1 ;; esac
 done
-exit 0
+subject="$(basename "$3" | sed -e "${STUB_GH_SUBJECT_SED:-s/^//}")"
+digest="${STUB_GH_SUBJECT_SHA256:-$(python3 -I -c 'import hashlib, sys; print(hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest())' "$3")}"
+printf '[{"verificationResult": {"statement": {"subject": [{"name": "%s", "digest": {"sha256": "%s"}}]}}}]\\n' "$subject" "$digest"
 """
 PYTHON_MODULE = Path("sdks/python/meerkat/_rkat_rpc_digests.py")
 TYPESCRIPT_MODULE = Path("sdks/typescript/src/rkat-rpc-digests.ts")
@@ -127,7 +135,9 @@ class Fixture:
         self.bin = root / "bin"
         self.gh_log = root / "gh.log"
         self.unattested: list[str] = []
-        self.transient_failures = 0
+        self.outcomes: list[str] = []
+        self.subject_sed = ""
+        self.subject_sha256 = ""
         self.release.mkdir()
         self.bin.mkdir()
         (self.bin / "gh").write_text(GH_ATTESTATION_STUB, encoding="utf-8")
@@ -199,7 +209,9 @@ class Fixture:
             "PATH": path,
             "STUB_GH_LOG": str(self.gh_log),
             "STUB_GH_UNATTESTED": " ".join(self.unattested),
-            "STUB_GH_TRANSIENT_FAILURES": str(self.transient_failures),
+            "STUB_GH_OUTCOMES": " ".join(self.outcomes),
+            "STUB_GH_SUBJECT_SED": self.subject_sed,
+            "STUB_GH_SUBJECT_SHA256": self.subject_sha256,
             "RELEASE_ATTESTATION_RETRY_SECONDS": "0",
         }
         return run(
@@ -328,7 +340,8 @@ class StampTests(unittest.TestCase):
             sorted(self.fixture.attestation_checks()),
             sorted(
                 f"attestation verify {self.fixture.release / rpc_asset(target, extension)} "
-                f"--repo {REPO} --cert-identity-regex {IDENTITY} --deny-self-hosted-runners"
+                f"--repo {REPO} --cert-identity-regex {IDENTITY} --deny-self-hosted-runners "
+                "--format json"
                 for target, extension in TARGETS
             ),
         )
@@ -343,6 +356,7 @@ class StampTests(unittest.TestCase):
         for refused in (
             f"{workflow}@refs/heads/feature",
             f"{workflow}@refs/tags/v9.9.90",
+            f"{workflow}@refs/tags/v9.9.9-evil",
             f"{workflow}@refs/tags/v9x9x9",
             f"{workflow}@refs/heads/main/x",
             "https://github.com/example/meerkat/.github/workflows/ci.yml@refs/heads/main",
@@ -355,14 +369,59 @@ class StampTests(unittest.TestCase):
         self.fixture.unattested = [asset]
         self.assert_refused(
             self.fixture.stamp(),
-            f"{asset} has no build attestation from {REPO}'s release workflow "
-            f"(main or {TAG}, GitHub-hosted runner) after 3 attempts: Error: HTTP 404",
+            f"{asset} has no build attestation that passes from {REPO}'s release workflow "
+            f"(main or {TAG}, GitHub-hosted runner, subject {asset}) after 3 attempts: "
+            "attempt 1: Error: HTTP 404: Not Found; attempt 2: Error: HTTP 404: Not Found; "
+            "attempt 3: Error: HTTP 404: Not Found",
         )
         checks = [line for line in self.fixture.attestation_checks() if asset in line]
         self.assertEqual(len(checks), 3, "a real refusal fails every attempt")
 
+    def assert_refused_for_subject(self, result: subprocess.CompletedProcess) -> None:
+        """Refused because no attested subject names the archive (its exact
+        asset name, version included) with the archive's own sha256."""
+        self.assert_refused(result, "no verified attestation subject names rkat-rpc-")
+        named = re.search(
+            r"no verified attestation subject names (\S+) with sha256 ([0-9a-f]{64})",
+            result.stderr,
+        )
+        self.assertIsNotNone(named, result.stderr)
+        asset, digest = named.groups()
+        self.assertTrue(asset.startswith(f"rkat-rpc-{VERSION}-"), asset)
+        self.assertEqual(digest, sha256((self.fixture.release / asset).read_bytes()))
+
+    def test_refuses_an_attestation_whose_subject_names_another_version(self) -> None:
+        self.fixture.subject_sed = f"s/{VERSION}/9.9.8/"
+        self.assert_refused_for_subject(self.fixture.stamp())
+
+    def test_refuses_an_attestation_whose_subject_digest_differs(self) -> None:
+        self.fixture.subject_sha256 = "0" * 64
+        self.assert_refused_for_subject(self.fixture.stamp())
+
+    def test_runner_preflight_accepts_only_github_hosted_ubuntu(self) -> None:
+        def preflight(value: str | None) -> subprocess.CompletedProcess:
+            env = {key: item for key, item in os.environ.items() if key != "MEERKAT_CI_RUNNER"}
+            if value is not None:
+                env["MEERKAT_CI_RUNNER"] = value
+            return run("require-hosted-runner", env=env)
+
+        for value in (None, "", '"ubuntu-24.04"', '"ubuntu-latest"', '"ubuntu-24.04-arm"'):
+            result = preflight(value)
+            self.assertEqual(result.returncode, 0, f"{value!r}: {result.stderr}")
+        for value in (
+            '"self-hosted"',
+            '["self-hosted", "linux"]',
+            '{"group": "release", "labels": ["linux"]}',
+            '"linux-large"',
+            '"ubuntu-24.04-evil"',
+            "ubuntu-24.04",
+        ):
+            result = preflight(value)
+            self.assertEqual(result.returncode, 1, f"{value!r}: {result.stdout}")
+            self.assertIn("does not name a GitHub-hosted Ubuntu runner", result.stderr)
+
     def test_retries_a_transient_attestation_failure(self) -> None:
-        self.fixture.transient_failures = 2
+        self.fixture.outcomes = ["transient", "transient"]
         result = self.fixture.stamp()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         checks = self.fixture.attestation_checks()
@@ -370,9 +429,20 @@ class StampTests(unittest.TestCase):
         self.assertEqual(len(set(checks[:3])), 1, "the first archive is retried, then verified")
 
     def test_gives_up_when_every_attempt_fails_transiently(self) -> None:
-        self.fixture.transient_failures = 3
-        self.assert_refused(self.fixture.stamp(), "after 3 attempts: Error: HTTP 502")
+        self.fixture.outcomes = ["transient", "transient", "transient"]
+        self.assert_refused(
+            self.fixture.stamp(), "after 3 attempts: attempt 1: Error: HTTP 502"
+        )
         self.assertEqual(len(self.fixture.attestation_checks()), 3)
+
+    def test_reports_a_policy_refusal_that_transient_errors_followed(self) -> None:
+        self.fixture.outcomes = ["refused", "transient", "transient"]
+        result = self.fixture.stamp()
+        self.assert_refused(
+            result,
+            'attempt 1: Error: verifying with issuer "sigstore.dev": SAN does not match; '
+            "attempt 2: Error: HTTP 502: Bad Gateway; attempt 3: Error: HTTP 502: Bad Gateway",
+        )
 
     def test_the_sdk_download_caps_equal_the_stamp_cap(self) -> None:
         def cap(path: Path, pattern: str) -> int:

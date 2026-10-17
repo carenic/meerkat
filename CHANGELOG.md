@@ -60,24 +60,32 @@ them.
   (`scripts/release-stamp-sdk-binary-digests`), the release workflow
   re-hashes each archive against the release's `checksums.sha256` and
   verifies its build attestation (`gh attestation verify`: signed by this
-  repository's `release.yml` run from `main` or the release tag on a
-  GitHub-hosted runner, with up to three attempts); if any check fails
-  nothing is stamped and
-  neither SDK package publishes. The download uses HTTPS only, redirects
+  repository's `release.yml` run from `main` or the release tag, in a job on
+  a GitHub-hosted runner, with a verified subject that names the exact asset,
+  version included, with the archive's sha256; up to three attempts). The
+  release preflight refuses a `MEERKAT_CI_RUNNER` that is not a GitHub-hosted
+  Ubuntu runner before any crate publishes. If any check fails nothing is
+  stamped and neither SDK package publishes. The download uses HTTPS only,
+  redirects
   included, and refuses an archive over 256 MiB. The archive is checked
   before anything is written or extracted, the binary before it is
   installed, and the cached binary every time it is reused. A mismatch
   raises `BinaryIntegrityError` (code `BINARY_INTEGRITY_MISMATCH`, naming the
   asset and the expected and actual digests): the SDK deletes what failed,
   runs nothing and does not fall back to another binary. A transport fault,
-  a cut-off body included, is `BINARY_DOWNLOAD_FAILED`: a transport fault the
-  SDK can detect is never reported as tamper. `MEERKAT_BIN_PATH`, an explicit
-  binary path and `rkat-rpc` on
+  a detected cut-off body included, is `BINARY_DOWNLOAD_FAILED`: a transport
+  fault the SDK can detect is never reported as tamper. `MEERKAT_BIN_PATH`,
+  an explicit binary path and `rkat-rpc` on
   `PATH` still run as given: they are the user's own trust decision.
   Residual: the pins are only as trustworthy as the release that produced
-  them. Anyone able to run this repository's release workflow can produce
-  attested archives, and a package whose own files were replaced after it
-  was built pins whatever digests it then carries.
+  them. The attested identity names the workflow and its ref, and `main`
+  names no commit: the release version is bound by the attested subject
+  name. The GitHub-hosted runner is the job that attested; on a BuildBuddy
+  release the Linux (x86_64 and arm64) and macOS arm64 binaries are compiled
+  by BuildBuddy remote execution, so BuildBuddy's executors and cache are part
+  of what the pins trust. Anyone able to run this repository's release workflow can
+  produce attested archives, and a package whose own files were replaced
+  after it was built pins whatever digests it then carries.
 
 ### Added
 

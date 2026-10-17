@@ -248,20 +248,30 @@ manifest (`checksums.sha256` and `index.json`;
 `scripts/release-stamp-sdk-binary-digests` re-hashes the five `rkat-rpc`
 archives against it, verifies each archive's build attestation
 (`gh attestation verify` with `--cert-identity-regex` for the repository's
-`release.yml` run from `main` or the release tag, and
-`--deny-self-hosted-runners`; up to three attempts per archive), takes the
-digest of the binary inside each verified archive, and stamps both
-SDKs. It refuses an incomplete manifest, an archive that does not re-hash,
-carries no attestation or exceeds the SDKs' 256 MiB download cap, and SDK
-packages of another version; nothing is stamped then and neither package
-publishes. Each publish step then refuses a built package that does not pin
+`release.yml` run from `main` or the release tag,
+`--deny-self-hosted-runners` and `--format json`, requiring a verified
+subject that names the exact asset, version included, with the archive's
+sha256; up to three attempts per archive), takes the digest of the binary
+inside each verified archive, and stamps both SDKs. It refuses an incomplete
+manifest, an archive that does not re-hash, carries no attestation that
+passes or exceeds the SDKs' 256 MiB download cap, and SDK packages of
+another version; nothing is stamped then and neither package publishes.
+Before any crate publishes, the release preflight refuses a
+`MEERKAT_CI_RUNNER` (the runner the BuildBuddy build job attests on) that is
+not a GitHub-hosted Ubuntu runner. Each publish step then refuses a built package that does not pin
 exactly those digests for its version. A source or git install pins nothing
 and refuses to download (`BINARY_DIGEST_UNAVAILABLE`).
 
 The residual: the pins are only as trustworthy as the release that produced
-them. Anyone able to run this repository's release workflow can produce
-attested archives, and a package whose own files were replaced after it was
-built pins whatever digests it then carries.
+them. The attested identity names the workflow and its ref, and `main` names
+no commit: the release version is bound by the attested subject name. The
+GitHub-hosted runner is the job that attested; on a BuildBuddy release the
+Linux (x86_64 and arm64) and macOS arm64 binaries are compiled by BuildBuddy
+remote execution, so BuildBuddy's executors and cache are part of what the
+pins trust. Anyone
+able to run this repository's release workflow can produce attested
+archives, and a package whose own files were replaced after it was built
+pins whatever digests it then carries.
 
 ## Release Workflow
 
