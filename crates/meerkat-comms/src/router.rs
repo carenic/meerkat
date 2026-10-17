@@ -156,7 +156,6 @@ pub struct DeclaredReplyEndpoint {
     pub address: String,
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 /// A declared reply endpoint is staged only under `dest`'s own signing key.
 /// The router addresses a Response sent through the endpoint to that key, so
 /// a key that derives another peer id would carry a response meant for `dest`
@@ -178,6 +177,7 @@ pub(crate) fn validate_declared_reply_signer(
     Ok(())
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn declared_reply_timeout_error(address: &str) -> std::io::Error {
     std::io::Error::new(
         std::io::ErrorKind::TimedOut,
@@ -564,8 +564,7 @@ impl Router {
     ///
     /// # Errors
     /// [`meerkat_core::comms::SendError::Validation`], with nothing staged,
-    /// when the endpoint's key does not derive `dest`
-    /// ([`validate_declared_reply_signer`]).
+    /// when the endpoint's key does not derive `dest`.
     pub fn stage_reply_endpoint(
         &self,
         dest: PeerId,
