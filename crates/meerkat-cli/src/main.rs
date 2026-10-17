@@ -29602,6 +29602,7 @@ default_model = "gemma"
     /// before naming unverified for a missing account evidence, and name the
     /// real disconnect route, which `rkat` itself does not have.
     #[cfg(all(unix, feature = "mcp"))]
+    #[allow(clippy::disallowed_methods)]
     #[test]
     fn mcp_login_remedies_quote_for_the_shell_and_name_the_way_out() {
         use meerkat_auth_core::connector_oauth::ConnectorOAuthRefusal;

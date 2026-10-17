@@ -13,6 +13,7 @@
 
 #![cfg(all(feature = "mcp", target_os = "linux"))]
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
+#![allow(clippy::disallowed_methods)]
 
 use std::path::{Path, PathBuf};
 use std::process::{Output, Stdio};
