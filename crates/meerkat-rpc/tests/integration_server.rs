@@ -2681,4 +2681,247 @@ mod tcp_callback_ownership {
             Err(panic) => std::panic::resume_unwind(panic),
         }
     }
+
+    /// The detached callback tool `name` a connection registers. Each case
+    /// registers its own name and runner, so a job one case queues never
+    /// routes to another case's connection.
+    fn detached_tool(name: &str) -> Value {
+        json!([{
+            "name": name,
+            "description": "connection-owned detached callback",
+            "input_schema": {"type": "object", "properties": {}},
+            "execution": {
+                "mode": "detached",
+                "runner": {"name": format!("host.{name}"), "version": "v1"},
+                "restart_class": "adoptable",
+                "idempotency_scope": "tool_call",
+                "submission_timeout_ms": 5000
+            }
+        }])
+    }
+
+    /// Plan the turn keyed `key`: load the deferred `tool`, call it once,
+    /// finish.
+    fn detached_plan(
+        h: &Harness,
+        key: &str,
+        tool: &'static str,
+        load: &'static str,
+        call: &'static str,
+    ) {
+        h.provider.plan(
+            key,
+            [
+                Step::Load {
+                    tool,
+                    call_id: load,
+                },
+                Step::Call {
+                    tool,
+                    call_id: call,
+                },
+                finish(),
+            ],
+        );
+    }
+
+    /// The result the turn keyed `key` got for its call `call`, as the model
+    /// request after the call carries it.
+    async fn detached_call_result(h: &mut Harness, key: &str, call: &str) -> ToolResult {
+        h.seen(key).await;
+        h.seen(key).await;
+        let seen = h.seen(key).await;
+        let mut results = seen
+            .results
+            .iter()
+            .filter(|result| result.tool_use_id == call)
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(results.len(), 1, "{seen:?}");
+        results.remove(0)
+    }
+
+    /// Whether `result` is a detached call's receipt: its job was queued.
+    fn queued(result: &ToolResult) -> bool {
+        !result.is_error
+            && serde_json::from_str::<Value>(&result.text_content())
+                .is_ok_and(|receipt| receipt["status"] == "queued" && receipt["job_id"].is_string())
+    }
+
+    /// The user row `session/history` shows for `prompt`, once an assistant
+    /// row of the same turn carries its interaction id too (a row without one
+    /// is returned at once). Read on a connection of its own: no callback
+    /// ever routes to it.
+    async fn history_user_row(h: &mut Harness, session: &str, prompt: &str) -> Value {
+        let (_, mut reader) = h.connect().await;
+        let mut last = Value::Null;
+        for id in 100..400 {
+            let history = reader
+                .request(id, "session/history", json!({ "session_id": session }))
+                .await;
+            let messages = history["messages"].as_array().cloned().unwrap_or_default();
+            if let Some(user) = messages.iter().position(|message| {
+                message["role"] == "user" && message["content"].to_string().contains(prompt)
+            }) {
+                last = messages[user].clone();
+                let interaction = &last["interaction_id"];
+                let answered = messages[user + 1..].iter().any(|message| {
+                    message["role"] == "block_assistant"
+                        && message["interaction_id"] == *interaction
+                });
+                if interaction.is_null() || answered {
+                    return last;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("no answered user row {prompt:?} in session {session}: last {last}");
+    }
+
+    impl Connection {
+        async fn register_tools(&mut self, id: u64, tools: Value) {
+            let result = self
+                .request(id, "tools/register", json!({ "tools": tools }))
+                .await;
+            assert!(result["registered"].as_u64().unwrap() > 0, "{result}");
+        }
+    }
+
+    /// A detached callback call queues its job in every RPC turn, not only in
+    /// a turn whose caller context gives it an interaction lineage: the
+    /// deferred first turn (A), a plain turn/start on a live session (B), the
+    /// immediate turn of session/create (C) and a mob member's turn (E). A
+    /// turn/start with a transient turn context (D) is the control.
+    #[tokio::test]
+    async fn tcp_callback_detached_call_queues_its_job_in_every_rpc_turn() {
+        let mut h = Harness::new();
+        h.runtime.set_realm_context(
+            Some(meerkat_core::connection::RealmId::global()),
+            None,
+            None,
+        );
+        let result = AssertUnwindSafe(tokio::time::timeout(Duration::from_secs(50), async {
+            let mut outcomes: Vec<(&str, ToolResult)> = Vec::new();
+            detached_plan(&h, "lineage-deferred", "durable_a", "load-a", "call-a");
+            detached_plan(&h, "lineage-plain", "durable_b", "load-b", "call-b");
+            detached_plan(&h, "lineage-immediate", "durable_c", "load-c", "call-c");
+            detached_plan(&h, "lineage-context", "durable_d", "load-d", "call-d");
+            h.provider.plan("lineage-warm-b", [finish()]);
+            h.provider.plan("lineage-warm-d", [finish()]);
+
+            let (_, mut deferred) = h.connect().await;
+            deferred.register_tools(2, detached_tool("durable_a")).await;
+            let session = deferred.create().await;
+            deferred.start(&session, "lineage-deferred").await;
+            outcomes.push((
+                "A deferred first turn",
+                detached_call_result(&mut h, "lineage-deferred", "call-a").await,
+            ));
+            let mut history = vec![(
+                "A deferred first turn",
+                history_user_row(&mut h, &session, "lineage-deferred").await,
+            )];
+
+            let (_, mut plain) = h.connect().await;
+            plain.register_tools(2, detached_tool("durable_b")).await;
+            let session = plain.create().await;
+            plain.start(&session, "lineage-warm-b").await;
+            plain.response(4).await;
+            h.seen("lineage-warm-b").await;
+            plain.send(json!({"jsonrpc":"2.0","id":5,"method":"turn/start","params":{"session_id":session,"prompt":"lineage-plain"}}))
+                .await;
+            outcomes.push((
+                "B plain turn/start",
+                detached_call_result(&mut h, "lineage-plain", "call-b").await,
+            ));
+            history.push((
+                "B plain turn/start",
+                history_user_row(&mut h, &session, "lineage-plain").await,
+            ));
+
+            let (_, mut immediate) = h.connect().await;
+            immediate.register_tools(2, detached_tool("durable_c")).await;
+            immediate.send(json!({"jsonrpc":"2.0","id":3,"method":"session/create","params":{"prompt":"lineage-immediate","enable_builtins":false,"enable_shell":false,"enable_memory":false,"enable_mob":false}}))
+                .await;
+            outcomes.push((
+                "C session/create immediate turn",
+                detached_call_result(&mut h, "lineage-immediate", "call-c").await,
+            ));
+
+            let (_, mut context) = h.connect().await;
+            context.register_tools(2, detached_tool("durable_d")).await;
+            let session = context.create().await;
+            context.start(&session, "lineage-warm-d").await;
+            context.response(4).await;
+            h.seen("lineage-warm-d").await;
+            context.send(json!({"jsonrpc":"2.0","id":5,"method":"turn/start","params":{"session_id":session,"prompt":"lineage-context","transient_turn_context":"lineage-context"}}))
+                .await;
+            outcomes.push((
+                "D turn/start with transient_turn_context (control)",
+                detached_call_result(&mut h, "lineage-context", "call-d").await,
+            ));
+
+            #[cfg(feature = "mob")]
+            {
+                detached_plan(&h, "lineage-mob", "durable_e", "load-e", "call-e");
+                let (_, mut member) = h.connect().await;
+                member.register_tools(2, detached_tool("durable_e")).await;
+                member.request(5, "mob/create", claim_mob_definition("lineage_mob"))
+                    .await;
+                member.request(
+                    6,
+                    "mob/spawn",
+                    json!({"mob_id":"lineage_mob","profile":"worker","agent_identity":"w1","runtime_mode":"turn_driven"}),
+                )
+                .await;
+                member.send(member_turn(7, "lineage_mob", "lineage-mob")).await;
+                outcomes.push((
+                    "E mob/turn_start member turn",
+                    detached_call_result(&mut h, "lineage-mob", "call-e").await,
+                ));
+            }
+
+            for (case, result) in &outcomes {
+                eprintln!(
+                    "LINEAGE {case}: queued={} is_error={} {}",
+                    queued(result),
+                    result.is_error,
+                    result.text_content()
+                );
+            }
+            for (case, row) in &history {
+                eprintln!(
+                    "HISTORY {case}: interaction_id={} run_id={}",
+                    row["interaction_id"], row["run_id"]
+                );
+            }
+            let refused = outcomes
+                .iter()
+                .filter(|(_, result)| !queued(result))
+                .map(|(case, result)| format!("{case}: {}", result.text_content()))
+                .collect::<Vec<_>>();
+            assert!(
+                refused.is_empty(),
+                "detached callback calls that did not queue their job:\n{}",
+                refused.join("\n")
+            );
+            // The plain prompt's rows carry its interaction in history.
+            for (case, row) in &history {
+                assert!(
+                    row["interaction_id"]
+                        .as_str()
+                        .is_some_and(|id| uuid::Uuid::parse_str(id).is_ok()),
+                    "{case}: history shows no interaction id: {row}"
+                );
+            }
+            h.exhausted();
+        }))
+        .catch_unwind()
+        .await;
+        h.clean().await;
+        match result {
+            Ok(result) => result.expect("bounded complete scenario"),
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
+    }
 }

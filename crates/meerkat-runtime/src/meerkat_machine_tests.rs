@@ -56213,3 +56213,74 @@ async fn a_runtime_owner_identity_names_every_handle_of_its_owner_and_holds_none
         "once every handle of its owner is gone the identity names no new machine"
     );
 }
+
+/// A restored interrupted request carries the transcript identity its run
+/// stamped: a plain prompt's own input id, a correlated prompt's correlation.
+/// A row without stored semantics keeps the prompt's own metadata.
+#[test]
+fn interrupted_request_identity_is_the_one_its_run_stamped() {
+    let prompt = |correlation: Option<uuid::Uuid>| {
+        crate::input::Input::Prompt(crate::input::PromptInput {
+            injected_context: Vec::new(),
+            header: crate::input::InputHeader {
+                ingress_context: None,
+                retained_resume: None,
+                authority_association: None,
+                id: InputId::new(),
+                timestamp: Utc::now(),
+                source: crate::input::InputOrigin::Operator,
+                durability: crate::input::InputDurability::Durable,
+                visibility: crate::input::InputVisibility::default(),
+                idempotency_key: None,
+                supersession_key: None,
+                correlation_id: correlation.map(crate::CorrelationId::from_uuid),
+            },
+            content: "interrupted request".into(),
+            typed_turn_appends: Vec::new(),
+            turn_metadata: None,
+        })
+    };
+    let stored = |input: crate::input::Input, with_semantics: bool| {
+        let mut state = crate::input_state::InputState::new_accepted(input.id().clone());
+        state.runtime_semantics = with_semantics.then(|| {
+            crate::ingress_types::RuntimeInputSemantics::try_from_generated_admission(&input, true)
+                .expect("generated prompt semantics")
+        });
+        state.persisted_input = Some(input);
+        state
+    };
+    let run_stamped = |state: &crate::input_state::InputState| {
+        let input = state.persisted_input.clone().expect("persisted input");
+        let semantics = state.runtime_semantics.expect("stored semantics");
+        crate::runtime_loop::merge_batch_turn_metadata(&[(input.id().clone(), input)], &[semantics])
+            .expect("the batch merges")
+            .expect("the batch carries metadata")
+            .transcript_identity
+    };
+
+    let plain = stored(prompt(None), true);
+    let restored = stamped_turn_metadata(&plain)
+        .expect("stored semantics")
+        .transcript_identity;
+    assert_eq!(restored, run_stamped(&plain));
+    assert_eq!(
+        restored.interaction_id,
+        Some(meerkat_core::interaction::InteractionId(plain.input_id.0))
+    );
+
+    let correlation = uuid::Uuid::from_u128(0xC0);
+    let correlated = stored(prompt(Some(correlation)), true);
+    let restored = stamped_turn_metadata(&correlated)
+        .expect("stored semantics")
+        .transcript_identity;
+    assert_eq!(restored, run_stamped(&correlated));
+    assert_eq!(
+        restored.interaction_id,
+        Some(meerkat_core::interaction::InteractionId(correlation))
+    );
+
+    assert!(
+        stamped_turn_metadata(&stored(prompt(None), false)).is_none(),
+        "a row without stored semantics keeps the prompt's own metadata"
+    );
+}

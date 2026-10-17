@@ -1076,6 +1076,23 @@ them.
   its version. The job's token gains `attestations: read`, and its timeout is
   240 minutes, up from 180. Crate publication and the publication SLO do not
   wait for it.
+- A plain prompt is its own interaction. When a prompt names no interaction
+  (no correlation id, no caller-supplied interaction id, no caller context),
+  its transcript rows (the user message and the turn's assistant rows), its
+  run events and the work its run owns now carry an `interaction_id`: the
+  prompt's input id. RPC `session/create`, `turn/start` and `rkat run` carry
+  the prompt's input id; a surface that runs the prompt as a direct service
+  turn instead (the MCP server's `meerkat_run` and `meerkat_resume`, a mob
+  member's eager initial turn, RPC's non-runtime `SessionRuntime::start_turn`)
+  carries an id minted for that turn. On a persistent session those rows now
+  also carry their `run_id`. Before, the rows carried neither and the run
+  events no `interaction_id`. A correlation id or a caller-supplied id still
+  wins, and a transient steer still joins the active turn without an id of its
+  own. A turn whose batch merges inputs naming different interactions still
+  carries none, a plain prompt's own id never displaces an interaction another
+  input in its batch names, and a batch of several plain prompts carries none.
+  A user request restored after an interrupted run carries the prompt's own
+  id, as a run of that prompt alone stamps it.
 
 ### Deprecated
 
@@ -1511,6 +1528,15 @@ them.
   missing, unless another holder's maintenance fence covers the missing file
   (an archive by rename), which still fails typed; among delivery
   operations, only a write creates the store. No schema change.
+- Detached callback tools work in ordinary RPC turns. A callback tool
+  registered with `execution.mode: "detached"` refused every call with
+  "requires runtime-owned interaction lineage" unless the turn carried a
+  transient turn context: a plain `turn/start`, the first turn of a
+  deferred session, the immediate turn of `session/create` and a mob
+  member's `mob/turn_start` gave the turn no interaction. Such a call now
+  queues its job. A turn that merges inputs of several interactions, or
+  whose input names none (for example a flow step without a correlation
+  id), still refuses typed, and the refusal now says so.
 
 ### Known issues
 
