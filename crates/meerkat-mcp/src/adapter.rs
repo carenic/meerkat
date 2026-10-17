@@ -179,6 +179,8 @@ pub struct McpRouterAdapter {
     /// ([`Self::begin_close`]). Once it is closing, dispatch and every
     /// staging entry refuse before taking a router guard.
     close_index: crate::connection::CloseIndex,
+    /// The router's construction identity, outside the router lock.
+    construction: crate::McpConstructionId,
     /// Test-only acknowledgement sent just before a bind's first read of the
     /// surface handle slot (it reads the slot, then claims it to write).
     #[cfg(test)]
@@ -440,6 +442,7 @@ impl McpRouterAdapter {
         let held_surface_lineages = router.held_surface_lineages();
         let surface_ownership = router.surface_ownership_slot();
         let close_index = router.close_index();
+        let construction = router.construction_id();
         let (shutdown_report, report) = tokio::sync::watch::channel(None);
         Self {
             router: AsyncRwLock::new(Some(router)),
@@ -457,9 +460,18 @@ impl McpRouterAdapter {
             shutdown_report: std::sync::Mutex::new(Some(shutdown_report)),
             shutdown_observer: McpRouterShutdownObserver { report },
             close_index,
+            construction,
             #[cfg(test)]
             bind_claim_attempt: std::sync::Mutex::new(None),
         }
+    }
+
+    /// The construction identity of this adapter's router
+    /// ([`McpRouter::construction_id`]): the
+    /// [`crate::McpAttemptKey::construction`] of its attempts.
+    #[must_use]
+    pub fn construction_id(&self) -> crate::McpConstructionId {
+        self.construction
     }
 
     fn execution_authority_key(&self) -> String {
@@ -678,14 +690,23 @@ impl McpRouterAdapter {
     /// Takes the router out of the adapter and shuts it down in a task of its
     /// own, so dropping this call stops only the wait: the taken router still
     /// finishes its shutdown, and a later call waits for that same shutdown
-    /// and reads the same report. After this call, tool calls will fail.
+    /// and reads the same report. The router lock is released once the
+    /// router is taken, so a reader (an attempt guard's finish among them)
+    /// never waits for the shutdown: it finds the router gone. After this
+    /// call, tool calls will fail.
     pub async fn shutdown_with_report(&self) -> McpRouterShutdownObservation {
         // Every close starts now, without the router lock: an in-flight call
         // that holds a router guard does not delay it.
         drop(self.begin_close());
-        let mut router = self.router.write().await;
-        if let Some(router) = router.take() {
-            self.execution_binding_epoch.fetch_add(1, Ordering::AcqRel);
+        let taken = {
+            let mut router = self.router.write().await;
+            let taken = router.take();
+            if taken.is_some() {
+                self.execution_binding_epoch.fetch_add(1, Ordering::AcqRel);
+            }
+            taken
+        };
+        if let Some(router) = taken {
             let report = self
                 .shutdown_report
                 .lock()
@@ -908,6 +929,71 @@ impl McpRouterAdapter {
             Some(r) => r.servers_awaiting_authorization(),
             None => Vec::new(),
         }
+    }
+
+    /// Host status: the typed setup failure of `server`'s latest failed
+    /// stdio attempt that this router still retains
+    /// ([`meerkat_core::mcp_attachment::McpStdioSetupFailure`]): the failure
+    /// behind that server's latest `Failed` lifecycle notice. Host Rust API
+    /// only; it carries no server text.
+    ///
+    /// The router retains at most one failed attempt per server, from its
+    /// accepted failure until the next attempt for the server is admitted,
+    /// the next accepted completion, its removal, its connection's close,
+    /// shutdown, or the router's drop; `None` after any of those, or when
+    /// the latest failure was not a classified stdio setup failure. It
+    /// reflects results already drained by the normal lifecycle polling and
+    /// drains nothing itself.
+    pub async fn stdio_setup_failure(
+        &self,
+        server: &str,
+    ) -> Option<meerkat_core::mcp_attachment::McpStdioSetupFailure> {
+        self.router
+            .read()
+            .await
+            .as_ref()?
+            .stdio_setup_failure(server)
+    }
+
+    /// Host status: the bounded, redacted stderr tail of the same retained
+    /// attempt as [`Self::stdio_setup_failure`], under the same retention.
+    ///
+    /// SENSITIVE: host and operator only, never model context, events or
+    /// untrusted clients; redaction is defence in depth only
+    /// ([`meerkat_core::mcp_attachment::McpStdioStderrTail`]).
+    pub async fn stdio_stderr_tail(
+        &self,
+        server: &str,
+    ) -> Option<meerkat_core::mcp_attachment::McpStdioStderrTail> {
+        self.router
+            .read()
+            .await
+            .as_ref()?
+            .stdio_stderr_tail(server, None)
+    }
+
+    /// The retained stderr tail of `server`'s exact failed `attempt`, for
+    /// that attempt's observer; `None` once released or the router is gone.
+    pub(crate) async fn stdio_stderr_tail_of(
+        &self,
+        server: &str,
+        attempt: u64,
+    ) -> Option<meerkat_core::mcp_attachment::McpStdioStderrTail> {
+        self.router
+            .read()
+            .await
+            .as_ref()?
+            .stdio_stderr_tail(server, Some(attempt))
+    }
+
+    /// Whether the router still retains the stderr tail of `server`'s exact
+    /// failed `attempt`.
+    pub(crate) async fn retains_stdio_tail(&self, server: &str, attempt: u64) -> bool {
+        self.router
+            .read()
+            .await
+            .as_ref()
+            .is_some_and(|router| router.retains_stdio_tail(server, attempt))
     }
 
     /// After a successful login for `target`, stage again the failed
@@ -1832,6 +1918,14 @@ impl meerkat_core::McpOperationObserver for McpRouterAdapter {
 #[cfg(test)]
 #[path = "shutdown_observer_tests.rs"]
 mod shutdown_observer_tests;
+
+#[cfg(all(test, unix))]
+#[path = "stdio_diagnostics_tests.rs"]
+mod stdio_diagnostics_tests;
+
+#[cfg(all(test, unix))]
+#[path = "attempt_guard_tests.rs"]
+mod attempt_guard_tests;
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]

@@ -11556,6 +11556,7 @@ async fn create_mcp_tools(
     mcp_auth: CliMcpAuthMode,
     external_surface_handle: Option<Arc<dyn meerkat_core::ExternalToolSurfaceHandle>>,
     stdio_profile: CliMcpStdioProfile,
+    owner: Option<&CliMcpRouterOwner>,
 ) -> anyhow::Result<Option<McpRouterAdapter>> {
     use meerkat_core::mcp_config::{McpConfig, McpScope, McpServerSource};
     use meerkat_mcp::{McpConnection, McpRouter};
@@ -11566,6 +11567,7 @@ async fn create_mcp_tools(
     let CliMcpStdioProfile {
         profile: stdio_profile,
         host_confinement,
+        attempt_guards,
     } = stdio_profile;
     let effective = McpConfig::effective_servers_from_roots_trusting(
         realm_servers,
@@ -11634,6 +11636,17 @@ async fn create_mcp_tools(
         stdio_profile,
     )
     .with_mcp_auth(mcp_auth.into(), mcp_auth_resolver);
+    // A guarded factory's attempt guards guard this router too, for the
+    // session it serves.
+    if let Some(guards) = attempt_guards {
+        let Some(owner) = owner else {
+            anyhow::bail!("MCP attempt guards require the session the router serves");
+        };
+        router = router.with_attempt_guards(
+            guards,
+            meerkat::McpConstructionOwner::new(owner.session_id.clone(), owner.member.clone()),
+        );
+    }
     for s in &servers_with_scope {
         tracing::info!("Staging MCP server: {}", s.server.name);
         router
@@ -11761,6 +11774,7 @@ async fn load_mcp_external_tools(
     mcp_auth: CliMcpAuthMode,
     external_surface_handle: Option<Arc<dyn meerkat_core::ExternalToolSurfaceHandle>>,
     stdio_profile: CliMcpStdioProfile,
+    owner: Option<&CliMcpRouterOwner>,
 ) -> anyhow::Result<(
     Option<Arc<dyn AgentToolDispatcher>>,
     Option<Arc<McpRouterAdapter>>,
@@ -11774,6 +11788,7 @@ async fn load_mcp_external_tools(
             mcp_auth,
             external_surface_handle,
             stdio_profile,
+            owner,
         )
         .await
         {
@@ -11796,6 +11811,7 @@ async fn load_mcp_external_tools(
         let _ = mcp_auth;
         let _ = external_surface_handle;
         let _ = stdio_profile;
+        let _ = owner;
         Ok((None, None))
     }
 }
@@ -11803,14 +11819,42 @@ async fn load_mcp_external_tools(
 #[cfg(not(feature = "mcp"))]
 type McpRouterAdapter = ();
 
-/// The local MCP launch boundary of a CLI factory and the host confinement
-/// that decides which `mcp.toml` files it trusts, for the routers the CLI
-/// builds itself (the `rkat run` loader).
+/// The session a CLI-built MCP router serves, and its mob member when it is
+/// one: the owner the factory's attempt guards are scoped to.
+#[cfg_attr(not(feature = "mcp"), allow(dead_code))]
+struct CliMcpRouterOwner {
+    session_id: SessionId,
+    member: Option<meerkat_core::MobMemberBinding>,
+}
+
+impl CliMcpRouterOwner {
+    /// A session `rkat run` creates: never a mob member.
+    fn fresh(session_id: &SessionId) -> Self {
+        Self {
+            session_id: session_id.clone(),
+            member: None,
+        }
+    }
+
+    /// A resumed session keeps its persisted mob member, as the factory
+    /// adopts it for the session's own routers.
+    fn resumed(session_id: &SessionId, metadata: &meerkat_core::SessionMetadata) -> Self {
+        Self {
+            session_id: session_id.clone(),
+            member: metadata.mob_member_binding.clone(),
+        }
+    }
+}
+
+/// The local MCP launch boundary of a CLI factory, the host confinement that
+/// decides which `mcp.toml` files it trusts, and its MCP attempt guards, for
+/// the routers the CLI builds itself (the `rkat run` loader).
 #[cfg(feature = "mcp")]
 #[derive(Clone)]
 struct CliMcpStdioProfile {
     profile: meerkat::McpStdioLaunchProfile,
     host_confinement: meerkat::HostConfinement,
+    attempt_guards: Option<meerkat::McpAttemptGuards>,
 }
 #[cfg(not(feature = "mcp"))]
 type CliMcpStdioProfile = ();
@@ -11823,6 +11867,7 @@ fn cli_mcp_stdio_profile(factory: &AgentFactory) -> CliMcpStdioProfile {
     CliMcpStdioProfile {
         profile: factory.mcp_stdio_launch_profile().clone(),
         host_confinement: factory.host_confinement().cloned().unwrap_or_default(),
+        attempt_guards: factory.mcp_attempt_guards().cloned(),
     }
 }
 
@@ -14338,6 +14383,7 @@ async fn run_agent(
                 mcp_auth,
                 Some(Arc::clone(bindings.external_tool_surface())),
                 mcp_stdio_profile,
+                Some(&CliMcpRouterOwner::fresh(&session_id)),
             )
             .await?
         };
@@ -15138,6 +15184,7 @@ async fn resume_session_with_llm_override(
                 mcp_auth,
                 Some(Arc::clone(resume_bindings.external_tool_surface())),
                 mcp_stdio_profile,
+                Some(&CliMcpRouterOwner::resumed(&session_id, &stored_metadata)),
             )
             .await?
         };
@@ -21885,6 +21932,7 @@ where
         CliMcpAuthMode::Stored,
         None,
         mcp_stdio_profile,
+        None,
     )
     .await?;
 
@@ -29556,6 +29604,7 @@ url = "https://user.example/mcp"
                 meerkat_runtime::handles::RuntimeExternalToolSurfaceHandle::ephemeral(),
             )),
             cli_mcp_stdio_profile(&factory),
+            Some(&CliMcpRouterOwner::fresh(&SessionId::new())),
         )
         .await
         .expect("the loader stages the realm server")
@@ -29578,6 +29627,144 @@ url = "https://user.example/mcp"
             "a refused server never starts its process"
         );
         adapter.shutdown().await;
+    }
+
+    /// Run the CLI loader for one stdio server under a factory whose MCP
+    /// attempt guard refuses everything, for `owner`; assert the server was
+    /// refused before its process started and return what the guard was
+    /// asked.
+    #[cfg(all(feature = "mcp", unix))]
+    async fn cli_loader_guard_request(
+        owner: &CliMcpRouterOwner,
+    ) -> meerkat::McpAttemptGuardRequest {
+        #[derive(Default)]
+        struct Refusing(std::sync::Mutex<Vec<meerkat::McpAttemptGuardRequest>>);
+        #[async_trait::async_trait]
+        impl meerkat::McpAttemptGuardFactory for Refusing {
+            async fn begin(
+                &self,
+                request: meerkat::McpAttemptGuardRequest,
+                _cancel: meerkat::McpAttemptCancellation,
+            ) -> Result<
+                Option<Box<dyn meerkat::McpAttemptGuard>>,
+                meerkat_core::mcp_attachment::McpAttachmentRefusal,
+            > {
+                self.0.lock().unwrap().push(request);
+                Err(meerkat_core::mcp_attachment::McpAttachmentRefusal::Denied)
+            }
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let marker = root.join("guarded-loader-marker");
+        let scope = test_scope(root.join("realms"), "guarded-loader-realm");
+        let refusing = Arc::new(Refusing::default());
+        let guards = meerkat::McpAttemptGuards::new(
+            Arc::clone(&refusing) as Arc<dyn meerkat::McpAttemptGuardFactory>,
+            meerkat::McpAttemptGuardBounds::DEFAULT,
+        );
+        let factory =
+            AgentFactory::new(root.join("sessions")).with_mcp_attempt_guards(guards.clone());
+        let server = meerkat_core::McpServerConfig::stdio(
+            "guarded-realm-server",
+            "/bin/sh",
+            vec!["-c".into(), "printf entered > \"$MARKER\"".into()],
+            HashMap::from([("MARKER".into(), marker.display().to_string())]),
+        );
+
+        let adapter = create_mcp_tools(
+            &scope,
+            &[server],
+            false,
+            CliMcpAuthMode::Stored,
+            Some(Arc::new(
+                meerkat_runtime::handles::RuntimeExternalToolSurfaceHandle::ephemeral(),
+            )),
+            cli_mcp_stdio_profile(&factory),
+            Some(owner),
+        )
+        .await
+        .expect("the loader stages the realm server")
+        .expect("one configured server");
+        let deltas = adapter
+            .wait_until_ready(std::time::Duration::from_secs(15))
+            .await
+            .unwrap();
+
+        assert!(
+            deltas.iter().any(|delta| {
+                delta.target == "guarded-realm-server"
+                    && delta.phase == meerkat_core::ExternalToolDeltaPhase::Failed
+            }),
+            "the host's guard refuses the loader's server: {deltas:?}"
+        );
+        assert!(
+            !marker.exists(),
+            "a refused server never starts its process"
+        );
+        let requests = refusing.0.lock().unwrap().clone();
+        assert_eq!(requests.len(), 1, "the guard began once: {requests:?}");
+        assert_eq!(requests[0].key.server, "guarded-realm-server");
+        assert_eq!(requests[0].key.construction, adapter.construction_id());
+        adapter.shutdown().await;
+        let _ = guards
+            .close_and_join(tokio::time::Instant::now() + std::time::Duration::from_secs(10))
+            .await;
+        requests[0].clone()
+    }
+
+    /// The `rkat run` loader installs its factory's MCP attempt guards, for
+    /// the session it serves: a stdio server begins the host's guard before
+    /// anything of it runs, and a refusing host's server never starts.
+    #[cfg(all(feature = "mcp", unix))]
+    #[tokio::test]
+    async fn test_cli_mcp_loader_begins_the_factory_attempt_guard() {
+        let session_id = SessionId::new();
+        let request = cli_loader_guard_request(&CliMcpRouterOwner::fresh(&session_id)).await;
+        assert_eq!(request.owner.session_id, session_id);
+        assert_eq!(request.owner.member, None);
+    }
+
+    /// `rkat resume` of a mob member's session builds its loader router with
+    /// the member's guard scope, from the session's persisted metadata, as
+    /// the factory adopts it.
+    #[cfg(all(feature = "mcp", unix))]
+    #[tokio::test]
+    async fn test_cli_mcp_loader_begins_the_guard_for_a_resumed_member() {
+        let member = meerkat_core::MobMemberBinding {
+            mob_id: "mob".into(),
+            role: "worker".into(),
+            member: "worker-1".into(),
+        };
+        let metadata = meerkat_core::SessionMetadata {
+            model_fallback: None,
+            schema_version: meerkat_core::SESSION_METADATA_SCHEMA_VERSION,
+            model: "claude-sonnet-4-5".to_string(),
+            max_tokens: 4096,
+            structured_output_retries: 2,
+            provider: meerkat_core::Provider::Anthropic,
+            self_hosted_server_id: None,
+            provider_params: None,
+            tooling: meerkat_core::SessionTooling::default(),
+            keep_alive: false,
+            comms_name: None,
+            peer_meta: None,
+            realm_id: None,
+            instance_id: None,
+            backend: None,
+            config_generation: None,
+            auth_binding: None,
+            mob_member_binding: Some(member.clone()),
+        };
+        let session_id = SessionId::new();
+        let request =
+            cli_loader_guard_request(&CliMcpRouterOwner::resumed(&session_id, &metadata)).await;
+        assert_eq!(request.owner.session_id, session_id);
+        assert_eq!(
+            request.owner.member,
+            Some(member),
+            "a resumed member's loader guard is scoped to its member"
+        );
     }
 
     /// A project `mcp.toml` that a confined process can write is not trusted:
@@ -29649,6 +29836,7 @@ url = "https://user.example/mcp"
                 meerkat_runtime::handles::RuntimeExternalToolSurfaceHandle::ephemeral(),
             )),
             cli_mcp_stdio_profile(&factory),
+            Some(&CliMcpRouterOwner::fresh(&SessionId::new())),
         )
         .await
         .expect("an untrusted file is refused, not an error")
@@ -29740,6 +29928,7 @@ url = "https://user.example/mcp"
                 meerkat_runtime::handles::RuntimeExternalToolSurfaceHandle::ephemeral(),
             )),
             cli_mcp_stdio_profile(&factory),
+            Some(&CliMcpRouterOwner::fresh(&SessionId::new())),
         )
         .await
         .expect("an untrusted file is refused, not an error")

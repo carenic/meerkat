@@ -35,6 +35,125 @@ them.
 
 ## [Unreleased]
 
+### Breaking
+
+- Behaviour-only (not measured by the gate): `meerkat-mcp` closes a stdio
+  MCP server's stderr shortly after its process is gone. A descendant that
+  outlives the server and still writes to stderr then gets `EPIPE` (or
+  `SIGPIPE`); on a trusted-host launch it used to inherit the host's stderr
+  and could keep writing there (see Changed).
+
+### Added
+
+- `meerkat-core`, `meerkat-mcp`: typed host diagnostics for a stdio MCP
+  server whose setup failed. They name the exact server and attempt, the
+  phase (`Launch`, `Initialize`, `ToolDiscovery`) and a fixed class that the
+  transport actually established: `SpawnFailed`, `Closed { exit }` (the
+  server's own exit status when its close proved it), `Rejected { code }`
+  (a JSON-RPC error answer, so a missing method is told apart from a crash),
+  `ProtocolError`, `TimedOut` or `Unknown`. They also give the newest 16 KiB
+  of the server's stderr.
+  - Read them through the attempt observer: `McpAttachmentAttempt::setup_failure`
+    and `stderr_tail`, provided methods on `McpAttachmentAttemptObserver`.
+  - For configured servers, read them through the inherent
+    `McpRouterAdapter::stdio_setup_failure` and `stdio_stderr_tail`. These
+    return the latest retained failure.
+  - The router retains at most one failed attempt per server. It releases it
+    when the next attempt for that server is admitted, on its next accepted
+    completion, removal or connection close, at shutdown, or when the router
+    is dropped.
+  - The stderr tail is sensitive and host-only. It is redacted for obvious
+    secret shapes and for the attempt's own launch environment values. Those
+    values are kept as keyed digests, never as plaintext, at most 64 of
+    them, resolved secrets and the connector binding first; each line of a
+    multi-line value is also tracked.
+  - A private key cut at the tail's edge is redacted up to its END marker.
+  - Control characters other than line feed and tab are removed, and so
+    are the bidirectional and zero-width format characters, so the tail
+    carries no terminal escape sequences and cannot reorder or hide its
+    text. Launch values are matched after that strip, so bytes the strip
+    removes cannot split one past the redaction.
+  - Redaction is defence in depth only. The tail never reaches the model,
+    lifecycle notices, events or errors.
+  - The model's setup-failure notice is unchanged and carries no class.
+  - `meerkat_core::redact::redact_secret_shapes` is the line-preserving
+    redaction helper. `panic_safe_detail` output is unchanged.
+- `meerkat-mcp`, `meerkat`: host attempt guards for stdio MCP servers. A
+  host builds one `McpAttemptGuards` installation around its
+  `McpAttemptGuardFactory` and passes it to the routers it builds
+  (`McpRouter::with_attempt_guards`; a second call on one router is
+  refused), or installs it on its factory
+  (`AgentFactory::with_mcp_attempt_guards`, read back with
+  `AgentFactory::mcp_attempt_guards`). Each construction's own router is
+  guarded, owned by its session and mob member, and so is every session
+  router Core's surfaces build themselves. The facade re-exports the guard
+  types.
+  - The RPC session runtime's live routers (`mcp/add` and restored
+    attachments), REST session routers and the `rkat run` loader install
+    the guards of the factory their sessions are built with. An embedding
+    host gives REST its guards with
+    `AppState::load_with_bootstrap_options_confinement_and_attempt_guards`,
+    which installs them on REST's own factory (its own routers on a
+    governed runtime included), and gives the MCP server its guards with
+    `MeerkatMcpState::new_with_bootstrap_options_confinement_and_attempt_guards`
+    for its fresh, resumed and scheduled sessions' routers. A resumed mob
+    member's routers keep its member scope.
+    `PersistentSessionService::mcp_attempt_guards` and
+    `EphemeralSessionService::mcp_attempt_guards` return the guards of a
+    builder that carries them (`meerkat_session::McpAttemptGuardSource`;
+    the facade's `FactoryAgentBuilder` does).
+  - Begin is called only for stdio attempts, before the attempt's secret
+    resolution, attachment control entry or spawn. HTTP and SSE attempts
+    are neither guarded nor refused by it.
+  - A begin refusal refuses the attempt with nothing spawned, recorded as
+    `Refused{Guard}`; `Ok(None)` lets it proceed unguarded. Both are
+    recorded as a `Begin` completion. `McpRouter::add_server` returns a
+    guard refusal typed (`McpError::AttachmentRefused`).
+  - A guard is finished exactly once: `settle` when its attempt's
+    connection was installed, `cancel` otherwise, once both the open
+    outcome (`McpAttemptOpenOutcome`, fixed when the router processes the
+    attempt's result) and how the process ended (`McpAttemptProcessEnd`)
+    are known.
+  - A begin is never dropped. When its attempt stops waiting (the begin
+    bound, a router stop or drop, the attempt dropped, or the installation
+    closing), the attempt's `McpAttemptCancellation` is requested with its
+    cause, and a guard returned later is cancelled.
+  - Before the next begin for the same owner (mob member, else session) and
+    server, the router awaits that pair's running begins and started
+    finishes, bounded by the settle bound. It never waits for a live
+    process. A prior begin or finish still running then refuses the
+    attempt (`PriorGuardUnsettled`).
+  - `McpRouterShutdownReport::guards` reports the router's guard calls, and
+    `guards_completed` whether each was seen to end.
+    `McpAttemptGuards::close_and_join` refuses new begins, cancels the
+    waiting ones, and joins and reports the rest: those of dropped routers,
+    and those that start while it waits, included. Run it before the tokio
+    runtime shuts down: a call spawned on a runtime that has shut down never
+    runs.
+  - `McpRouter::construction_id` and `McpRouterAdapter::construction_id`
+    name a router construction (`McpAttemptKey::construction`).
+  - Bounds default to 10 s to begin and 5 s to cancel or settle. A zero
+    bound, or one above 60 s, is refused.
+  - Without an installation nothing changes.
+
+### Changed
+
+- `meerkat-mcp`: `McpRouterAdapter::shutdown_with_report` releases its
+  router lock once it has taken the router, so a reader (an attempt guard's
+  finish among them) no longer waits for the shutdown to finish; it finds
+  the router gone.
+- `meerkat-mcp`: a stdio MCP server's stderr is now piped and drained by its
+  process custody. Before, it was inherited on a trusted-host launch and
+  discarded under confinement.
+  - A trusted-host server's stderr is still written to the host's own
+    stderr; a confined server's never is.
+  - While the process is held, the drain keeps reading, so the server does
+    not block on a full stderr pipe. A blocked host stderr can still hold a
+    trusted-host server, as an inherited stderr did.
+  - Shortly after the process is gone, the drain stops, forwarding
+    included, and closes its end. A descendant still writing to stderr then
+    gets `EPIPE` (or `SIGPIPE`).
+
 ## [0.9.2] - 2026-10-16
 
 ### Breaking

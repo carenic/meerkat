@@ -451,6 +451,29 @@ impl AppState {
         Self::load_with_bootstrap_and_options(RuntimeBootstrap::default(), false).await
     }
 
+    /// [`Self::load_from`] with the host's MCP attempt guards installed on
+    /// the state's factory (tests only).
+    #[cfg(all(test, feature = "mcp"))]
+    async fn load_from_with_attempt_guards(
+        instance_root: PathBuf,
+        attempt_guards: meerkat::McpAttemptGuards,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let mut bootstrap = RuntimeBootstrap::default();
+        bootstrap.realm.state_root = Some(instance_root.join("realms"));
+        bootstrap.context.context_root = Some(instance_root.clone());
+        bootstrap.context.user_config_root = Some(instance_root.join("user"));
+        let credentials = test_credential_store(&instance_root);
+        Self::load_from_with_bootstrap_confinement_and_factory(
+            instance_root,
+            bootstrap,
+            false,
+            credentials,
+            None,
+            move |factory| factory.with_mcp_attempt_guards(attempt_guards),
+        )
+        .await
+    }
+
     #[cfg(test)]
     async fn load_from(instance_root: PathBuf) -> Result<Self, Box<dyn std::error::Error>> {
         let mut bootstrap = RuntimeBootstrap::default();
@@ -512,12 +535,56 @@ impl AppState {
         .await
     }
 
+    /// [`Self::load_with_bootstrap_options_and_confinement`] with the host's
+    /// MCP attempt guards installed on this state's agent factory
+    /// ([`meerkat::AgentFactory::with_mcp_attempt_guards`]): each stdio
+    /// attempt of its sessions, on their live routers and on the factory's
+    /// own routers alike, begins the host's guard first.
+    #[cfg(feature = "mcp")]
+    pub async fn load_with_bootstrap_options_confinement_and_attempt_guards(
+        bootstrap: RuntimeBootstrap,
+        expose_paths: bool,
+        confinement: Option<meerkat_core::LaunchConfinement>,
+        attempt_guards: meerkat::McpAttemptGuards,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::load_from_with_bootstrap_confinement_and_factory(
+            rest_instance_root(),
+            bootstrap,
+            expose_paths,
+            meerkat_providers::auth_store::TokenStoreBackend::default_auto()?,
+            confinement,
+            move |factory| factory.with_mcp_attempt_guards(attempt_guards),
+        )
+        .await
+    }
+
     async fn load_from_with_bootstrap_and_confinement(
         instance_root: PathBuf,
         bootstrap: RuntimeBootstrap,
         expose_paths: bool,
         credentials: meerkat_providers::auth_store::TokenStoreBackend,
         confinement: Option<meerkat_core::LaunchConfinement>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::load_from_with_bootstrap_confinement_and_factory(
+            instance_root,
+            bootstrap,
+            expose_paths,
+            credentials,
+            confinement,
+            std::convert::identity,
+        )
+        .await
+    }
+
+    /// `customize` finishes the state's agent factory before its sessions
+    /// are built with it.
+    async fn load_from_with_bootstrap_confinement_and_factory(
+        instance_root: PathBuf,
+        bootstrap: RuntimeBootstrap,
+        expose_paths: bool,
+        credentials: meerkat_providers::auth_store::TokenStoreBackend,
+        confinement: Option<meerkat_core::LaunchConfinement>,
+        customize: impl FnOnce(AgentFactory) -> AgentFactory + Send,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let (event_tx, _) = broadcast::channel(256);
         // Realm-id-first dual-root resolution through the storage layout
@@ -744,6 +811,8 @@ impl AppState {
             factory = factory.user_config_root(user_root);
         }
 
+        // The embedding host's finishing touches (its MCP attempt guards).
+        let factory = customize(factory);
         let skill_runtime = factory.build_skill_runtime(&config).await?;
         let provider_registry = factory.provider_runtime_registry();
         // Each session's live router launches inside the factory's own
@@ -5565,7 +5634,10 @@ async fn create_session_inner(
     let mcp_external_tools = if help_tools.is_some() {
         None
     } else {
-        let adapter = Arc::new(McpRouterAdapter::new(session_mcp_router(state)));
+        let adapter = Arc::new(McpRouterAdapter::new(session_mcp_router(
+            state,
+            &session_id,
+        )));
         let adapter_dispatcher: Arc<dyn AgentToolDispatcher> = adapter.clone();
         let (lifecycle_tx, lifecycle_rx) = mpsc::unbounded_channel();
         let mcp_state = SessionMcpState {
@@ -8056,17 +8128,29 @@ async fn apply_mcp_boundary_to_turn_prompt(
 /// same interactive MCP auth as factory-built sessions: stored credentials,
 /// or the typed human-authorization status. Never a browser. They launch
 /// inside the host's local MCP launch boundary, as a factory-built router's
-/// servers do.
+/// servers do, and each stdio attempt begins the host's attempt guard first
+/// when guards are installed.
 #[cfg(feature = "mcp")]
-fn session_mcp_router(state: &AppState) -> McpRouter {
-    McpRouter::new_with_stdio_profile(state.mcp_stdio_launch_profile.clone()).with_mcp_auth(
-        meerkat::McpAuthMode::Interactive,
-        meerkat::default_mcp_auth_resolver_in_realm(
-            Some(state.provider_auth_persistence.clone()),
-            state.runtime_adapter.provider_auth_runtime_authority(),
-            state.realm.clone(),
+fn session_mcp_router(state: &AppState, session_id: &SessionId) -> McpRouter {
+    let router = McpRouter::new_with_stdio_profile(state.mcp_stdio_launch_profile.clone())
+        .with_mcp_auth(
+            meerkat::McpAuthMode::Interactive,
+            meerkat::default_mcp_auth_resolver_in_realm(
+                Some(state.provider_auth_persistence.clone()),
+                state.runtime_adapter.provider_auth_runtime_authority(),
+                state.realm.clone(),
+            ),
+        );
+    // The guards of the factory this state's sessions are built with. A
+    // REST router serves a session REST created itself, which is never a
+    // mob member, so the owner is the session alone.
+    match state.session_service.mcp_attempt_guards() {
+        Some(guards) => router.with_attempt_guards(
+            guards.clone(),
+            meerkat::McpConstructionOwner::new(session_id.clone(), None),
         ),
-    )
+        None => router,
+    }
 }
 
 /// Validate session existence and retrieve its MCP adapter.
@@ -17499,7 +17583,7 @@ matching the required schema. Output ONLY the JSON, no additional text or markdo
             state.mcp_stdio_launch_profile =
                 meerkat::McpStdioLaunchProfile::required(requirement, root.clone());
 
-            let adapter = McpRouterAdapter::new(session_mcp_router(&state));
+            let adapter = McpRouterAdapter::new(session_mcp_router(&state, &SessionId::new()));
             // Session build binds the session's surface handle the same way.
             meerkat_core::AgentToolDispatcher::bind_external_tool_surface_handle(
                 &adapter,
@@ -17537,6 +17621,90 @@ matching the required schema. Output ONLY the JSON, no additional text or markdo
                 "a refused live add never starts the server process"
             );
             adapter.shutdown().await;
+        }
+
+        /// A REST state loaded with the host's attempt guards begins them
+        /// before each stdio attempt of a session's live router, for that
+        /// session: a refusing host refuses the add, and its process never
+        /// starts.
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn live_mcp_router_begins_the_host_attempt_guard() {
+            #[derive(Default)]
+            struct Refusing(std::sync::Mutex<Vec<meerkat::McpAttemptGuardRequest>>);
+            #[async_trait::async_trait]
+            impl meerkat::McpAttemptGuardFactory for Refusing {
+                async fn begin(
+                    &self,
+                    request: meerkat::McpAttemptGuardRequest,
+                    _cancel: meerkat::McpAttemptCancellation,
+                ) -> Result<
+                    Option<Box<dyn meerkat::McpAttemptGuard>>,
+                    meerkat_core::mcp_attachment::McpAttachmentRefusal,
+                > {
+                    self.0.lock().unwrap().push(request);
+                    Err(meerkat_core::mcp_attachment::McpAttachmentRefusal::Denied)
+                }
+            }
+
+            let refusing = Arc::new(Refusing::default());
+            let guards = meerkat::McpAttemptGuards::new(
+                Arc::clone(&refusing) as Arc<dyn meerkat::McpAttemptGuardFactory>,
+                meerkat::McpAttemptGuardBounds::DEFAULT,
+            );
+            let temp = TempDir::new().unwrap();
+            let state =
+                AppState::load_from_with_attempt_guards(temp.path().to_path_buf(), guards.clone())
+                    .await
+                    .unwrap();
+            // The loader installs the guards on the state's own factory, so
+            // the routers that factory builds (on a governed runtime) are
+            // guarded too.
+            assert!(state.session_service.mcp_attempt_guards().is_some());
+            let marker = temp.path().join("rest-guarded-live-add-marker");
+            let session_id = SessionId::new();
+            let adapter = McpRouterAdapter::new(session_mcp_router(&state, &session_id));
+            meerkat_core::AgentToolDispatcher::bind_external_tool_surface_handle(
+                &adapter,
+                Arc::new(meerkat_runtime::handles::RuntimeExternalToolSurfaceHandle::ephemeral()),
+            );
+            adapter
+                .stage_add(meerkat_core::McpServerConfig::stdio(
+                    "guarded-live-add",
+                    "/bin/sh",
+                    vec!["-c".into(), "printf entered > \"$MARKER\"".into()],
+                    std::collections::HashMap::from([(
+                        "MARKER".into(),
+                        marker.display().to_string(),
+                    )]),
+                ))
+                .await
+                .unwrap();
+            adapter.apply_staged().await.unwrap();
+            let deltas = adapter
+                .wait_until_ready(std::time::Duration::from_secs(15))
+                .await
+                .unwrap();
+            assert!(
+                deltas.iter().any(|delta| {
+                    delta.target == "guarded-live-add"
+                        && delta.phase == meerkat_core::ExternalToolDeltaPhase::Failed
+                }),
+                "the host's guard refuses the live add: {deltas:?}"
+            );
+            assert!(
+                !marker.exists(),
+                "a refused live add never starts the server process"
+            );
+            let requests = refusing.0.lock().unwrap().clone();
+            assert_eq!(requests.len(), 1, "the guard began once: {requests:?}");
+            assert_eq!(requests[0].key.server, "guarded-live-add");
+            assert_eq!(requests[0].key.construction, adapter.construction_id());
+            assert_eq!(requests[0].owner.session_id, session_id);
+            adapter.shutdown().await;
+            let _ = guards
+                .close_and_join(tokio::time::Instant::now() + std::time::Duration::from_secs(10))
+                .await;
         }
 
         #[tokio::test]
@@ -17597,7 +17765,7 @@ matching the required schema. Output ONLY the JSON, no additional text or markdo
             let target =
                 meerkat::McpServerIdentity::from_config_in_realm(state.realm.clone(), &config)
                     .unwrap();
-            let adapter = McpRouterAdapter::new(session_mcp_router(&state));
+            let adapter = McpRouterAdapter::new(session_mcp_router(&state, &SessionId::new()));
             // Session build binds the session's surface handle the same way.
             meerkat_core::AgentToolDispatcher::bind_external_tool_surface_handle(
                 &adapter,

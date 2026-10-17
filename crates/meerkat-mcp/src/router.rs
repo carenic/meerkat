@@ -131,10 +131,35 @@ pub struct McpApplyResult {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum AttemptState {
     Pending,
-    Installed { connection_generation: u64 },
+    Installed {
+        connection_generation: u64,
+    },
     Rejected(String),
-    Failed(String),
+    /// The attempt failed: its detail, and the typed stdio setup failure its
+    /// transport established, if any. The class has no server text and
+    /// stays with the attempt; its stderr tail is retained by the router
+    /// only (see [`McpRouter::stdio_stderr_tail`]).
+    Failed {
+        detail: String,
+        failure: Option<meerkat_core::mcp_attachment::McpStdioSetupFailure>,
+    },
     Superseded,
+}
+
+impl AttemptState {
+    fn failed(detail: impl Into<String>) -> Self {
+        Self::Failed {
+            detail: detail.into(),
+            failure: None,
+        }
+    }
+}
+
+/// The one failed stdio attempt a router retains per server: its typed
+/// failure and its diagnostics record (with the stderr tail).
+struct RetainedStdioFailure {
+    failure: meerkat_core::mcp_attachment::McpStdioSetupFailure,
+    record: Arc<crate::stdio_diagnostics::StdioAttemptRecord>,
 }
 
 pub(crate) type AttemptSender = tokio::sync::watch::Sender<AttemptState>;
@@ -165,6 +190,9 @@ struct PendingResult {
     /// The exact config this attempt connected with.
     config: McpServerConfig,
     result: Result<(McpConnection, Vec<Arc<ToolDef>>), McpError>,
+    /// The attempt's guard record, when its guard was begun: told the open
+    /// outcome when this result is processed.
+    guard: Option<Arc<crate::attempt_guard::AttemptGuardRecord>>,
 }
 
 /// One connection attempt the surface owner accepted as failed with
@@ -1379,6 +1407,7 @@ pub struct McpServerCloseRecord {
 #[derive(Debug)]
 pub struct McpRouterShutdownReport {
     servers: Vec<McpServerCloseRecord>,
+    guards: Vec<crate::McpGuardCompletionRecord>,
 }
 
 impl McpRouterShutdownReport {
@@ -1390,16 +1419,42 @@ impl McpRouterShutdownReport {
     }
 
     /// Whether every close settled ([`McpServerCloseOutcome::is_settled`]).
+    /// Guard calls do not count ([`Self::guards_completed`]).
     #[must_use]
     pub fn is_settled(&self) -> bool {
         self.servers.iter().all(|close| close.outcome.is_settled())
+    }
+
+    /// Every attempt guard call of this router that the shutdown awaited, in
+    /// no particular order: its begins (bounded by the cancel bound) and
+    /// finishes (bounded by the settle bound), and the guards still held.
+    /// Empty without installed guards ([`McpRouter::with_attempt_guards`]).
+    #[must_use]
+    pub fn guards(&self) -> &[crate::McpGuardCompletionRecord] {
+        &self.guards
+    }
+
+    /// Whether every guard call the shutdown awaited was observed to end:
+    /// none is [`crate::McpGuardCompletion::TimedOut`] or
+    /// [`crate::McpGuardCompletion::Held`].
+    #[must_use]
+    pub fn guards_completed(&self) -> bool {
+        self.guards.iter().all(|record| {
+            !matches!(
+                record.completion,
+                crate::McpGuardCompletion::TimedOut | crate::McpGuardCompletion::Held
+            )
+        })
     }
 
     /// A report of exactly these records, for a host's own tests.
     #[doc(hidden)]
     #[must_use]
     pub fn from_records(records: Vec<McpServerCloseRecord>) -> Self {
-        Self { servers: records }
+        Self {
+            servers: records,
+            guards: Vec::new(),
+        }
     }
 }
 
@@ -1471,6 +1526,18 @@ pub struct McpRouter {
     /// `shutdown` terminates it and observes its exit even when the attempt is
     /// aborted mid-handshake.
     pending_child_custody: HashMap<(String, u64), StdioChildCustody>,
+    /// The setup diagnostics of every stdio connect attempt whose result
+    /// the router has not processed yet, keyed like
+    /// `pending_child_custody`: their only strong owner while in flight.
+    pending_stdio_diagnostics:
+        HashMap<(String, u64), Arc<crate::stdio_diagnostics::StdioAttemptRecord>>,
+    /// Host status: per server, the latest accepted stdio setup failure the
+    /// transport classified, with its stderr tail. At most one per server,
+    /// from its accepted failure until the next attempt for the server is
+    /// admitted, the next accepted completion, its removal, its
+    /// connection's close, shutdown or the router's drop. Never projected
+    /// to the agent.
+    failed_stdio_attempts: HashMap<String, RetainedStdioFailure>,
     /// Connection closes the router started (remove, reload, replace, and
     /// rejected completions). Finished closes are reaped on each effect pass;
     /// `shutdown` joins the rest, so every closed server has exited by the
@@ -1533,6 +1600,27 @@ pub struct McpRouter {
     /// `progress`).
     connect_attempts_spawned: u64,
     connect_results_delivered: Arc<std::sync::atomic::AtomicU64>,
+    /// This router construction's identity.
+    construction: crate::McpConstructionId,
+    /// The host's attempt guards and this router's part of them, when
+    /// installed ([`Self::with_attempt_guards`]).
+    attempt_guards: Option<Arc<crate::attempt_guard::RouterGuards>>,
+    /// Set by [`Self::shutdown_with_report`], so the router's drop does not
+    /// treat a shut-down router as dropped.
+    shut_down: bool,
+}
+
+impl Drop for McpRouter {
+    /// A router dropped without its shutdown cancels its attempts' guards as
+    /// `RouterDropped`; their calls stay tracked by the installation, which
+    /// [`crate::McpAttemptGuards::close_and_join`] joins.
+    fn drop(&mut self) {
+        if !self.shut_down
+            && let Some(guards) = &self.attempt_guards
+        {
+            guards.close(crate::McpAttemptCancelCause::RouterDropped);
+        }
+    }
 }
 
 /// A typed wait for MCP router progress, taken under the router lock and
@@ -1883,6 +1971,8 @@ impl McpRouter {
             pending_obligations: HashMap::new(),
             connect_tasks: tokio::task::JoinSet::new(),
             pending_child_custody: HashMap::new(),
+            pending_stdio_diagnostics: HashMap::new(),
+            failed_stdio_attempts: HashMap::new(),
             closing: tokio::task::JoinSet::new(),
             closing_servers: HashMap::new(),
             indexed_closes: std::collections::HashSet::new(),
@@ -1903,6 +1993,9 @@ impl McpRouter {
             progress: Arc::new(tokio::sync::watch::Sender::new(0)),
             connect_attempts_spawned: 0,
             connect_results_delivered: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            construction: crate::McpConstructionId::allocate(),
+            attempt_guards: None,
+            shut_down: false,
         }
     }
 
@@ -2097,6 +2190,41 @@ impl McpRouter {
     pub fn with_stdio_close_bounds(mut self, bounds: crate::McpStdioCloseBounds) -> Self {
         self.stdio_close_bounds = bounds;
         self
+    }
+
+    /// Guard every stdio connect attempt of this router with the host's
+    /// installation, for `owner` (see [`crate::McpAttemptGuards`]). Before
+    /// each attempt's secret resolution, physical entry or spawn, the
+    /// installation's factory begins the attempt's guard; it is finished
+    /// exactly once, after both the attempt's open outcome and its process
+    /// end are known. Only stdio attempts are guarded: remote (HTTP and
+    /// SSE) attempts are neither guarded nor refused by it.
+    ///
+    /// A router takes one installation: a second call is refused (it
+    /// changes nothing, and the first installation and owner stand).
+    #[must_use]
+    pub fn with_attempt_guards(
+        mut self,
+        guards: crate::McpAttemptGuards,
+        owner: crate::McpConstructionOwner,
+    ) -> Self {
+        if self.attempt_guards.is_some() {
+            tracing::warn!(
+                "MCP attempt guards are already installed on this router; the first installation stands"
+            );
+            return self;
+        }
+        let guards = crate::attempt_guard::RouterGuards::new(&guards, self.construction, owner);
+        self.close_index.set_attempt_guards(&guards);
+        self.attempt_guards = Some(guards);
+        self
+    }
+
+    /// This router construction's identity: the
+    /// [`crate::McpAttemptKey::construction`] of its attempts.
+    #[must_use]
+    pub fn construction_id(&self) -> crate::McpConstructionId {
+        self.construction
     }
 
     /// Create a new router with a custom remove-drain timeout, whose local
@@ -2335,6 +2463,8 @@ impl McpRouter {
         );
         // An accepted removal withdraws any pending human-authorization ask.
         self.awaiting_authorization.remove(&server_name);
+        // And releases the server's retained setup failure and stderr tail.
+        self.failed_stdio_attempts.remove(&server_name);
         Ok(())
     }
 
@@ -2599,6 +2729,7 @@ impl McpRouter {
                         entry.connection.take()
                     });
                     self.spawn_close(surface_id.0.clone(), conn);
+                    self.failed_stdio_attempts.remove(&surface_id.0);
                     // K14: the close effect comes from an already-accepted
                     // surface transition, so it must execute; a rejected
                     // lifecycle mirror apply propagates as a typed Failed
@@ -2637,7 +2768,7 @@ impl McpRouter {
         // leaves its attempt nothing to wait for.
         resolve_attempt(
             attempt.as_ref(),
-            AttemptState::Failed("the accepted boundary scheduled no connection".to_string()),
+            AttemptState::failed("the accepted boundary scheduled no connection"),
         );
     }
 
@@ -2651,6 +2782,8 @@ impl McpRouter {
     ) {
         let server_name = config.name.clone();
         let refused = self.refused_payloads.remove(&server_name);
+        // A newer attempt for the server supersedes its retained failure.
+        self.failed_stdio_attempts.remove(&server_name);
         if let Some(attempt) = attempt {
             self.pending_attempts.insert(
                 (server_name.clone(), obligation.pending_task_sequence),
@@ -2673,11 +2806,21 @@ impl McpRouter {
             client: client_custody,
             stop,
             end,
+            diagnostics,
         } = self.close_index.admit(
             &obligation.surface_id,
             matches!(config.transport, McpTransportConfig::Stdio(_))
                 .then_some(self.stdio_close_bounds),
         );
+        if let Some(record) = diagnostics {
+            self.pending_stdio_diagnostics.insert(
+                (
+                    obligation.surface_id.clone(),
+                    obligation.pending_task_sequence,
+                ),
+                record,
+            );
+        }
         if let Some(custody) = &stdio_custody {
             self.pending_child_custody.insert(
                 (
@@ -2696,9 +2839,17 @@ impl McpRouter {
         let client_factory = self.client_service_factory.clone();
         let stdio_profile = self.stdio_launch_profile.clone();
         let http_egress = self.http_egress_profile.clone();
+        // Only stdio attempts are guarded.
+        let attempt_guards = self
+            .attempt_guards
+            .clone()
+            .filter(|_| crate::attempt_guard::guards_transport(&config));
+        let attempt = obligation.pending_task_sequence;
+        let operation = crate::attempt_guard::attempt_operation(obligation.operation);
         // Reap tasks that already finished so the owned set stays bounded.
         while self.connect_tasks.try_join_next().is_some() {}
         self.connect_tasks.spawn(async move {
+            let mut guard = None;
             let result = {
                 // Marks the attempt's end once the connect below is done or
                 // dropped.
@@ -2707,17 +2858,28 @@ impl McpRouter {
                     biased;
                     // The index began its close: the attempt stops here.
                     () = stop.requested() => Err(McpError::RouterShutDown),
-                    result = McpConnection::connect_and_enumerate_with_custody_and_egress(
-                        &config,
-                        auth_mode,
-                        auth_resolver,
-                        client_factory,
-                        stdio_custody,
-                        client_custody,
-                        &stdio_profile,
-                        &http_egress,
-                        control,
-                    ) => result,
+                    result = async {
+                        // The guard begins before secret resolution, the
+                        // physical entry or any spawn; its custody holds it.
+                        if let Some(guards) = &attempt_guards {
+                            guard = guards.begin_attempt(&config, attempt, operation).await?;
+                            if let (Some(record), Some(custody)) = (&guard, &stdio_custody) {
+                                custody.hold_guard(Arc::clone(record));
+                            }
+                        }
+                        McpConnection::connect_and_enumerate_with_custody_and_egress(
+                            &config,
+                            auth_mode,
+                            auth_resolver,
+                            client_factory,
+                            stdio_custody,
+                            client_custody,
+                            &stdio_profile,
+                            &http_egress,
+                            control,
+                        )
+                        .await
+                    } => result,
                 }
             };
             let sent = tx
@@ -2725,6 +2887,7 @@ impl McpRouter {
                     obligation,
                     config,
                     result,
+                    guard,
                 })
                 .await;
             delivered.fetch_add(1, Ordering::AcqRel);
@@ -2758,6 +2921,7 @@ impl McpRouter {
                     obligation,
                     config,
                     result: Err(McpError::Confinement(refusal)),
+                    guard: None,
                 })
                 .await;
             delivered.fetch_add(1, Ordering::AcqRel);
@@ -2809,6 +2973,7 @@ impl McpRouter {
             obligation,
             config,
             result,
+            guard,
         } = result;
         let server_name = obligation.surface_id.clone();
         // The exact attempt this accepted obligation scheduled, if governed.
@@ -2820,6 +2985,16 @@ impl McpRouter {
         let attempt_custody = self
             .pending_child_custody
             .remove(&(server_name.clone(), obligation.pending_task_sequence));
+        // A success or a stale result drops it here; only an accepted
+        // failure keeps it.
+        let attempt_diagnostics = self
+            .pending_stdio_diagnostics
+            .remove(&(server_name.clone(), obligation.pending_task_sequence));
+        let open = |outcome| {
+            if let Some(guard) = &guard {
+                guard.open(outcome);
+            }
+        };
         match result {
             Ok((conn, tools)) => {
                 let tool_count = tools.len();
@@ -2838,6 +3013,7 @@ impl McpRouter {
                         // The owner accepted this attempt's success: any
                         // authorization ask for the server is answered.
                         self.awaiting_authorization.remove(&server_name);
+                        self.failed_stdio_attempts.remove(&server_name);
                         let Some(operation) = lifecycle_operation_from_effects(
                             &transition.effects,
                             SurfaceDeltaPhase::Applied,
@@ -2846,10 +3022,13 @@ impl McpRouter {
                                 server = %server_name,
                                 "Surface owner accepted PendingSucceeded without an applied lifecycle delta"
                             );
+                            open(crate::McpAttemptOpenOutcome::NotInstalled {
+                                reason: crate::McpAttemptNotInstalled::InstallRefused,
+                            });
                             resolve_attempt(
                                 attempt.as_ref(),
-                                AttemptState::Failed(
-                                    "the accepted connection carried no applied delta".to_string(),
+                                AttemptState::failed(
+                                    "the accepted connection carried no applied delta",
                                 ),
                             );
                             return None;
@@ -2864,9 +3043,12 @@ impl McpRouter {
                         // canonical lifecycle channel (the same channel
                         // background connection failures use).
                         if let Err(error) = self.notify_lifecycle_connected(&server_name) {
+                            open(crate::McpAttemptOpenOutcome::NotInstalled {
+                                reason: crate::McpAttemptNotInstalled::InstallRefused,
+                            });
                             resolve_attempt(
                                 attempt.as_ref(),
-                                AttemptState::Failed(error.to_string()),
+                                AttemptState::failed(error.to_string()),
                             );
                             self.spawn_close(server_name.clone(), Some(conn));
                             self.completed_updates.push_back(CompletedLifecycleUpdate {
@@ -2890,6 +3072,9 @@ impl McpRouter {
 
                         // Install the new entry (or replace existing).
                         let connection_generation = conn.connection_id().generation();
+                        open(crate::McpAttemptOpenOutcome::Installed {
+                            connection_generation,
+                        });
                         let config = conn.config().clone();
                         let new_entry = ServerEntry {
                             config,
@@ -2926,6 +3111,9 @@ impl McpRouter {
                             error = %e,
                             "Surface owner rejected PendingSucceeded"
                         );
+                        open(crate::McpAttemptOpenOutcome::NotInstalled {
+                            reason: crate::McpAttemptNotInstalled::Superseded,
+                        });
                         resolve_attempt(attempt.as_ref(), AttemptState::Superseded);
                         self.spawn_close(server_name, Some(conn));
                         None
@@ -2933,6 +3121,22 @@ impl McpRouter {
                 }
             }
             Err(err) => {
+                // The guard learns the open outcome (accepted or stale): the
+                // typed refusal, or the setup failure with the attempt's own
+                // classified failure.
+                open(crate::attempt_guard::open_for_error(
+                    &err,
+                    attempt_diagnostics.as_ref().and_then(|record| {
+                        let (phase, class) = record.failure()?;
+                        Some(meerkat_core::mcp_attachment::McpStdioSetupFailure::new(
+                            server_name.clone(),
+                            obligation.pending_task_sequence,
+                            phase,
+                            class,
+                            record.captured(),
+                        ))
+                    }),
+                ));
                 // The failed attempt closed its own process (or left that
                 // close to its close index), and what that close observes is
                 // still the router's to report: the close index holds it. A
@@ -2970,8 +3174,39 @@ impl McpRouter {
                 ) {
                     Ok(transition) => {
                         self.pending_obligations.remove(&server_name);
-                        resolve_attempt(attempt.as_ref(), AttemptState::Failed(err.to_string()));
+                        let stdio_failure = attempt_diagnostics.and_then(|record| {
+                            let (phase, class) = record.failure()?;
+                            Some(RetainedStdioFailure {
+                                failure: meerkat_core::mcp_attachment::McpStdioSetupFailure::new(
+                                    server_name.clone(),
+                                    obligation.pending_task_sequence,
+                                    phase,
+                                    class,
+                                    record.captured(),
+                                ),
+                                record,
+                            })
+                        });
+                        resolve_attempt(
+                            attempt.as_ref(),
+                            AttemptState::Failed {
+                                detail: err.to_string(),
+                                failure: stdio_failure
+                                    .as_ref()
+                                    .map(|retained| retained.failure.clone()),
+                            },
+                        );
                         self.record_accepted_failure(&server_name, &err, config, &obligation);
+                        // The latest accepted failure is the one retained.
+                        match stdio_failure {
+                            Some(retained) => {
+                                self.failed_stdio_attempts
+                                    .insert(server_name.clone(), retained);
+                            }
+                            None => {
+                                self.failed_stdio_attempts.remove(&server_name);
+                            }
+                        }
                         let Some(operation) = lifecycle_operation_from_effects(
                             &transition.effects,
                             SurfaceDeltaPhase::Failed,
@@ -3054,6 +3289,43 @@ impl McpRouter {
             .values()
             .map(|awaiting| awaiting.target.clone())
             .collect()
+    }
+
+    /// The typed setup failure of `server`'s retained failed stdio attempt
+    /// (see `failed_stdio_attempts`): host status, never projected to the
+    /// agent. It reflects results already drained and drains nothing.
+    pub(crate) fn stdio_setup_failure(
+        &self,
+        server: &str,
+    ) -> Option<meerkat_core::mcp_attachment::McpStdioSetupFailure> {
+        self.failed_stdio_attempts
+            .get(server)
+            .map(|retained| retained.failure.clone())
+    }
+
+    /// The redacted stderr tail of `server`'s retained failed stdio attempt,
+    /// when it is that exact `attempt` (any attempt for `None`). SENSITIVE:
+    /// host and operator only.
+    pub(crate) fn stdio_stderr_tail(
+        &self,
+        server: &str,
+        attempt: Option<u64>,
+    ) -> Option<meerkat_core::mcp_attachment::McpStdioStderrTail> {
+        let retained = self.failed_stdio_attempts.get(server)?;
+        if attempt.is_some_and(|attempt| attempt != retained.failure.attempt) {
+            return None;
+        }
+        retained.record.stderr_tail()
+    }
+
+    /// Whether the router still retains the stderr tail of `server`'s exact
+    /// failed `attempt`.
+    pub(crate) fn retains_stdio_tail(&self, server: &str, attempt: u64) -> bool {
+        self.failed_stdio_attempts
+            .get(server)
+            .is_some_and(|retained| {
+                retained.failure.attempt == attempt && retained.record.captured()
+            })
     }
 
     /// Record the authorization outcome of a failure the surface owner just
@@ -3510,27 +3782,45 @@ impl McpRouter {
             client: client_custody,
             stop,
             end,
+            diagnostics: _diagnostics,
         } = self.close_index.admit(
             &server_name,
             matches!(config.transport, McpTransportConfig::Stdio(_))
                 .then_some(self.stdio_close_bounds),
         );
+        // Only stdio attempts are guarded, as in `spawn_pending`.
+        let attempt_guards = self
+            .attempt_guards
+            .clone()
+            .filter(|_| crate::attempt_guard::guards_transport(&config));
+        let attempt = obligation.pending_task_sequence;
+        let operation = crate::attempt_guard::attempt_operation(obligation.operation);
+        let mut guard = None;
         let result = {
             let _end = end;
             tokio::select! {
                 biased;
                 () = stop.requested() => Err(McpError::RouterShutDown),
-                result = McpConnection::connect_and_enumerate_with_custody_and_egress(
-                    &config,
-                    self.mcp_auth_mode,
-                    self.mcp_auth_resolver.clone(),
-                    self.client_service_factory.clone(),
-                    stdio_custody,
-                    client_custody,
-                    &self.stdio_launch_profile,
-                    &self.http_egress_profile,
-                    None,
-                ) => result,
+                result = async {
+                    if let Some(guards) = &attempt_guards {
+                        guard = guards.begin_attempt(&config, attempt, operation).await?;
+                        if let (Some(record), Some(custody)) = (&guard, &stdio_custody) {
+                            custody.hold_guard(Arc::clone(record));
+                        }
+                    }
+                    McpConnection::connect_and_enumerate_with_custody_and_egress(
+                        &config,
+                        self.mcp_auth_mode,
+                        self.mcp_auth_resolver.clone(),
+                        self.client_service_factory.clone(),
+                        stdio_custody,
+                        client_custody,
+                        &self.stdio_launch_profile,
+                        &self.http_egress_profile,
+                        None,
+                    )
+                    .await
+                } => result,
             }
         };
         let confinement_error = result.as_ref().err().and_then(|error| match error {
@@ -3542,11 +3832,17 @@ impl McpRouter {
             McpError::ServiceSecretRefused { refusal, .. } => Some(refusal.clone()),
             _ => None,
         });
+        // A guard's or the attachment control's refusal stays typed.
+        let attachment_refusal = result.as_ref().err().and_then(|error| match error {
+            McpError::AttachmentRefused(refusal) => Some(refusal.clone()),
+            _ => None,
+        });
         let connect_error = result.as_ref().err().map(ToString::to_string);
         let snapshot_alignment = self.process_pending_result(PendingResult {
             obligation,
             config: config.clone(),
             result,
+            guard,
         });
 
         self.record_snapshot_alignment(snapshot_alignment);
@@ -3567,6 +3863,9 @@ impl McpRouter {
                 server: server_name,
                 refusal,
             });
+        }
+        if let Some(refusal) = attachment_refusal {
+            return Err(McpError::AttachmentRefused(refusal));
         }
         if let Some(message) = connect_error {
             return Err(McpError::ProtocolError { message });
@@ -4602,6 +4901,8 @@ impl McpRouter {
         self.completed_updates.clear();
         self.staged_payloads.clear();
         self.awaiting_authorization.clear();
+        self.failed_stdio_attempts.clear();
+        self.pending_stdio_diagnostics.clear();
         self.staged_controls.clear();
         self.staged_attempts.clear();
         self.pending_attempts.clear();
@@ -4681,7 +4982,17 @@ impl McpRouter {
             closes.push(record);
         }
         let _ = self.publish_projection_snapshot();
-        McpRouterShutdownReport { servers: closes }
+        // The router's guard calls: its begins (the cancel bound), then its
+        // finishes (the settle bound), now that every close ended.
+        let guards = match &self.attempt_guards {
+            Some(guards) => guards.join().await,
+            None => Vec::new(),
+        };
+        self.shut_down = true;
+        McpRouterShutdownReport {
+            servers: closes,
+            guards,
+        }
     }
 
     /// Test hook: set a server's in-flight call count, through the surface
@@ -5502,6 +5813,7 @@ pub(crate) mod tests {
                         HashMap::new(),
                     ),
                     result: Err(error),
+                    guard: None,
                 });
                 let notice = router
                     .completed_updates
@@ -5538,6 +5850,7 @@ pub(crate) mod tests {
                     ),
                     obligation,
                     result: Err(McpError::Confinement(ConfinementRefusal::InvalidLaunch)),
+                    guard: None,
                 });
                 assert!(router.completed_updates.is_empty());
             }
@@ -7602,6 +7915,7 @@ pub(crate) mod tests {
             obligation: first.clone(),
             config: other.clone(),
             result: Ok(stale_connection),
+            guard: None,
         });
         let record = &router.awaiting_authorization["guarded"];
         assert_eq!(record.config, config, "a stale success replaced the record");
@@ -7618,12 +7932,142 @@ pub(crate) mod tests {
                 obligation: first.clone(),
                 config: other.clone(),
                 result: stale,
+                guard: None,
             });
             let record = &router.awaiting_authorization["guarded"];
             assert_eq!(record.target, target);
             assert_eq!(record.config, config, "a stale result replaced the record");
         }
         router.shutdown().await;
+    }
+
+    /// r1 5 (attempt guards): a success whose obligation is already settled
+    /// is stale; it cancels its guard as `NotInstalled{Superseded}` with its
+    /// own close. The surface owner refuses a second boundary while an
+    /// attempt is pending, so, as in the stale-results test above, the stale
+    /// result is replayed for an obligation that already completed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_superseded_success_cancels_as_not_installed() {
+        type Finishes = std::sync::Mutex<Vec<(bool, crate::McpAttemptDisposition)>>;
+        struct Guard(Arc<Finishes>);
+        #[async_trait::async_trait]
+        impl crate::McpAttemptGuard for Guard {
+            async fn settle(
+                self: Box<Self>,
+                disposition: crate::McpAttemptDisposition,
+            ) -> Result<(), crate::McpGuardFinishError> {
+                self.0.lock().unwrap().push((true, disposition));
+                Ok(())
+            }
+            async fn cancel(
+                self: Box<Self>,
+                disposition: crate::McpAttemptDisposition,
+            ) -> Result<(), crate::McpGuardFinishError> {
+                self.0.lock().unwrap().push((false, disposition));
+                Ok(())
+            }
+        }
+        struct Factory(Arc<Finishes>);
+        #[async_trait::async_trait]
+        impl crate::McpAttemptGuardFactory for Factory {
+            async fn begin(
+                &self,
+                _request: crate::McpAttemptGuardRequest,
+                _cancel: crate::McpAttemptCancellation,
+            ) -> Result<Option<Box<dyn crate::McpAttemptGuard>>, McpAttachmentRefusal> {
+                Ok(Some(Box::new(Guard(Arc::clone(&self.0)))))
+            }
+        }
+
+        let finishes: Arc<Finishes> = Arc::default();
+        let guards = crate::McpAttemptGuards::new(
+            Arc::new(Factory(Arc::clone(&finishes))),
+            crate::McpAttemptGuardBounds::DEFAULT,
+        );
+        // `wait_for_phase` watches the server named "guarded".
+        let config = test_server_config("guarded", &mcp_test_server::fixture_binary());
+        let mut router = generated_handle_owner_router().with_attempt_guards(
+            guards,
+            crate::McpConstructionOwner::new(meerkat_core::types::SessionId::new(), None),
+        );
+        router.stage_add(config.clone()).expect("stage add");
+        router.apply_staged().await.expect("apply staged add");
+        let first = router
+            .pending_obligations
+            .get("guarded")
+            .cloned()
+            .expect("the first attempt is pending");
+        wait_for_phase(&mut router, McpLifecyclePhase::Applied).await;
+
+        // A later guarded attempt of the server, whose success arrives for
+        // the settled obligation: its custody holds its guard.
+        let attempt = first.pending_task_sequence + 1;
+        let record = router
+            .attempt_guards
+            .clone()
+            .expect("installed guards")
+            .begin_attempt(&config, attempt, crate::McpAttemptOperation::Add)
+            .await
+            .expect("begun")
+            .expect("a guard");
+        let custody = StdioChildCustody::with_bounds(crate::McpStdioCloseBounds::DEFAULT);
+        custody.hold_guard(Arc::clone(&record));
+        let stale = McpConnection::connect_and_enumerate_with_custody(
+            &config,
+            router.mcp_auth_mode,
+            None,
+            None,
+            Some(custody),
+            &crate::McpStdioLaunchProfile::trusted_host(),
+            None,
+        )
+        .await
+        .expect("a real connection for the stale success");
+        router.process_pending_result(PendingResult {
+            obligation: first,
+            config: config.clone(),
+            result: Ok(stale),
+            guard: Some(record),
+        });
+        tokio::time::timeout(async_connect_test_timeout(), async {
+            while finishes.lock().unwrap().is_empty() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the stale attempt's finish");
+        let (settled, disposition) = finishes.lock().unwrap()[0].clone();
+        assert!(!settled, "a superseded attempt is cancelled");
+        assert_eq!(disposition.key.attempt, attempt);
+        assert_eq!(
+            disposition.open,
+            crate::McpAttemptOpenOutcome::NotInstalled {
+                reason: crate::McpAttemptNotInstalled::Superseded,
+            }
+        );
+        let crate::McpAttemptProcessEnd::Closed(receipt) = &disposition.process else {
+            panic!("closed by its own close: {disposition:?}");
+        };
+        assert!(matches!(
+            receipt.leader,
+            crate::McpStdioLeaderOutcome::Reaped(_)
+        ));
+        assert_eq!(router.active_server_names(), vec!["guarded".to_string()]);
+
+        // The installed attempt settles once the shutdown closed it.
+        router.shutdown().await;
+        tokio::time::timeout(async_connect_test_timeout(), async {
+            while finishes.lock().unwrap().len() < 2 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the installed attempt's settle");
+        let finishes = finishes.lock().unwrap().clone();
+        assert_eq!(finishes.len(), 2, "one finish per attempt: {finishes:#?}");
+        assert!(finishes[1].0, "the installed attempt settles");
+        assert_ne!(finishes[1].1.key.attempt, attempt);
     }
 
     #[tokio::test]
