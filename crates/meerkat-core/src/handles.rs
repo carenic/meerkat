@@ -38,8 +38,9 @@ use crate::lifecycle::run_primitive::ModelId;
 use crate::lifecycle::{InputId, RunId};
 use crate::ops::{AsyncOpRef, OperationId};
 use crate::peer_correlation::{
-    InboundPeerRequestState, InteractionStreamAbandonReason, InteractionStreamState,
-    OutboundPeerRequestState, PeerCorrelationId, PeerResponseAddresseeVerdict,
+    InboundIdClaim, InboundPeerRequestState, InteractionStreamAbandonReason,
+    InteractionStreamState, OutboundPeerRequestState, PeerCorrelationId,
+    PeerResponseAddresseeVerdict,
 };
 use crate::retry::LlmRetrySchedule;
 use crate::tool_scope::{
@@ -2703,6 +2704,31 @@ pub trait PeerInteractionHandle: Send + Sync {
             candidate.interaction.handling_mode,
             requester,
         )
+    }
+
+    /// Who holds `candidate`'s interaction id among the inbound requests this
+    /// handle records, judged for the candidate's admitted sender
+    /// ([`crate::interaction::PeerInputCandidate::from_peer_id`]) by
+    /// [`Self::resolve_response_addressee`]. Ingress admits any candidate,
+    /// request or not, only while the id is [`InboundIdClaim::Unclaimed`] or
+    /// [`InboundIdClaim::ClaimedBySender`]. A request answered between the
+    /// two reads leaves the id unclaimed.
+    fn inbound_id_claim(
+        &self,
+        candidate: &crate::interaction::PeerInputCandidate,
+    ) -> InboundIdClaim {
+        let corr_id = PeerCorrelationId::from_uuid(candidate.interaction.id.0);
+        if self.inbound_state(corr_id).is_none() {
+            return InboundIdClaim::Unclaimed;
+        }
+        let Some(sender) = candidate.from_peer_id() else {
+            return InboundIdClaim::ClaimedByAnother;
+        };
+        match self.resolve_response_addressee(corr_id, sender) {
+            Ok(PeerResponseAddresseeVerdict::Requester) => InboundIdClaim::ClaimedBySender,
+            Ok(PeerResponseAddresseeVerdict::UnknownRequest) => InboundIdClaim::Unclaimed,
+            _ => InboundIdClaim::ClaimedByAnother,
+        }
     }
 
     /// Ask the generated machine authority whether a response to the inbound

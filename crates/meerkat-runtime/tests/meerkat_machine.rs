@@ -6684,11 +6684,11 @@ mod peer_response_addressee {
     use meerkat_comms::runtime::comms_runtime::CommsRuntime as InprocCommsRuntime;
     use meerkat_core::agent::CommsRuntime as CoreCommsRuntime;
     use meerkat_core::comms::{
-        CommsCommand, InputStreamMode, PeerAddress, PeerId, PeerName, PeerRoute, PeerTransport,
-        SendError, SendReceipt, TrustedPeerDescriptor,
+        CommsCommand, InputStreamMode, PeerAddress, PeerDeliveryOutcome, PeerId, PeerName,
+        PeerRoute, PeerTransport, SendError, SendReceipt, TrustedPeerDescriptor,
     };
     use meerkat_core::error::ToolError;
-    use meerkat_core::interaction::InboxInteraction;
+    use meerkat_core::interaction::{InboxInteraction, PeerIngressTerminalOutcomeKind};
     use meerkat_core::lifecycle::core_executor::{
         CoreApplyOutput, CoreExecutor, CoreExecutorError,
     };
@@ -7300,6 +7300,65 @@ mod peer_response_addressee {
             .expect("the requester's id under an alias addresses the requester");
         fixture.assert_requester_received_the_response().await;
         assert!(fixture.bystander.received().await.is_empty());
+    }
+
+    /// The requester's own redelivery of its outstanding request, whose input
+    /// the responder's session already holds, is deduplicated: nothing new
+    /// enters the session, and the request stays answerable to its requester.
+    #[tokio::test]
+    async fn the_requesters_redelivery_of_an_outstanding_request_is_deduplicated() {
+        let fixture = Fixture::with_spoofed_request().await;
+        let admitted_before = fixture.responder_ledger_input_count().await;
+
+        let redelivery = fixture
+            .requester
+            .comms
+            .router()
+            .send_with_id(
+                fixture.responder.peer_id(),
+                fixture.request_id.0,
+                meerkat_comms::MessageKind::Request {
+                    intent: "checksum_token".to_string(),
+                    params: json!({ "subject": "addressee" }),
+                    blocks: None,
+                    reply_endpoint: None,
+                    content_taint: None,
+                    handling_mode: Some(HandlingMode::Queue),
+                    objective_id: None,
+                },
+                None,
+            )
+            .await;
+        assert!(
+            matches!(
+                &redelivery,
+                Ok(outcome) if outcome.delivery
+                    == PeerDeliveryOutcome::DurablyResolved {
+                        outcome: PeerIngressTerminalOutcomeKind::Deduplicated,
+                    }
+            ),
+            "the requester's redelivery is deduplicated, got {redelivery:?}"
+        );
+        assert_eq!(
+            fixture.responder_ledger_input_count().await,
+            admitted_before,
+            "the redelivery adds nothing to the responder's session"
+        );
+        assert_eq!(
+            fixture.inbound_state(),
+            Some(InboundPeerRequestState::Received)
+        );
+        CoreCommsRuntime::send(
+            fixture.responder.comms.as_ref(),
+            fixture.response(
+                &fixture.requester,
+                fixture.request_id,
+                ResponseStatus::Completed,
+            ),
+        )
+        .await
+        .expect("the response to the requester is sent");
+        fixture.assert_requester_received_the_response().await;
     }
 
     /// Another peer that sends a request reusing an outstanding request's id
