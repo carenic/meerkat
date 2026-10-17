@@ -978,6 +978,7 @@ jobs:
             "--all-targets"|"--lib"|"--bins"|"--lib --bins") ;;
             *) echo "::error::unexpected clippy targets '${TARGETS}'"; exit 1 ;;
           esac
+          # shellcheck disable=SC2086
           ./scripts/repo-cargo clippy ${PACKAGES} --no-deps ${TARGETS} --all-features -- -D warnings
 
       - name: Upload sccache server log
@@ -1599,14 +1600,17 @@ jobs:
           if [[ -n "${FILTER}" ]]; then filter_args=(-E "${FILTER}"); fi
           partition_args=()
           if [[ -n "${PARTITION}" ]]; then partition_args=(--partition "${PARTITION}"); fi
+          # shellcheck disable=SC2206
           selection=(${PACKAGES} "${test_flags[@]}" --profile "${PROFILE}" "${filter_args[@]}" "${partition_args[@]}")
           if [[ -n "${MIN_STACK}" ]]; then export RUST_MIN_STACK="${MIN_STACK}"; fi
+          # shellcheck disable=SC2086
           fixture="$(scripts/mcp-test-server-fixture --if-needed ${PACKAGES})"
           if [[ -n "${fixture}" ]]; then
             export MEERKAT_MCP_TEST_SERVER="${fixture}"
             echo "mcp-test-server fixture: ${MEERKAT_MCP_TEST_SERVER}"
           fi
           ./scripts/repo-cargo nextest list "${selection[@]}" --message-format json >"${RUNNER_TEMP}/closure-test-list.json"
+          # shellcheck disable=SC2086
           node scripts/ci-verify-row-binaries.mjs "${RUNNER_TEMP}/closure-test-list.json" "${partition_args[@]}" ${BINARIES}
           ./scripts/repo-cargo nextest run "${selection[@]}" --no-tests="${NO_TESTS}" --no-fail-fast --status-level slow --final-status-level slow
 
@@ -1758,11 +1762,13 @@ jobs:
           set -euo pipefail
           [[ -n "${PACKAGES}" ]] || { echo "::error::empty package list in a main unit lane"; exit 1; }
           if [[ -n "${MIN_STACK}" ]]; then export RUST_MIN_STACK="${MIN_STACK}"; fi
+          # shellcheck disable=SC2086
           fixture="$(scripts/mcp-test-server-fixture --if-needed ${PACKAGES})"
           if [[ -n "${fixture}" ]]; then
             export MEERKAT_MCP_TEST_SERVER="${fixture}"
             echo "mcp-test-server fixture: ${MEERKAT_MCP_TEST_SERVER}"
           fi
+          # shellcheck disable=SC2086
           ./scripts/repo-cargo nextest run ${PACKAGES} --lib --bins --profile ci-pr \
             --no-tests=pass --no-fail-fast --status-level fail --final-status-level fail
 
@@ -2145,6 +2151,7 @@ jobs:
           while IFS= read -r args; do
             [[ -n "${args}" ]] || continue
             echo "::group::cargo check ${args}"
+            # shellcheck disable=SC2086
             if ! ./scripts/repo-cargo check ${args}; then
               echo "::error::cargo check ${args} failed"
               failed=1

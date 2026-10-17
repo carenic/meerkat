@@ -197,7 +197,10 @@ function jobLines(workflow, job) {
   assert.ok(start >= 0, `ci.yml has a ${job} job`);
   let end = start + 1;
   while (end < lines.length && !/^ {0,2}\S/.test(lines[end])) end += 1;
-  return lines.slice(start + 1, end).filter((line) => line.trim() !== "" && !line.trim().startsWith("#"));
+  // Comments are not compared, shellcheck directives are: a copy keeps them.
+  return lines
+    .slice(start + 1, end)
+    .filter((line) => line.trim() !== "" && (!line.trim().startsWith("#") || line.trim().startsWith("# shellcheck ")));
 }
 function assertUnitJobsMatch(workflow, label) {
   const unit = jobLines(workflow, "unit");
