@@ -475,6 +475,13 @@ jobs:
       - name: Release asset provenance accepts an earlier run only through its build gate
         run: scripts/test-verify-release-asset-provenance.sh
 
+      # The SDKs download rkat-rpc only against the digests the release
+      # stamps into them (#1739): the stamp refuses an incomplete manifest
+      # or an archive that does not re-hash, and the publish smokes refuse
+      # an unstamped or wrong-version package.
+      - name: SDK binary digest stamp refuses incomplete releases and unstamped packages
+        run: python3 scripts/test_release_stamp_sdk_binary_digests.py
+
       - name: Intel macOS release binary check refuses each defect
         run: scripts/test-check-macos-x86-release-binary.sh
 

@@ -20,6 +20,8 @@ Example::
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import io
 import json
 import logging
 import os
@@ -28,12 +30,14 @@ import shutil
 import sys
 import tarfile
 import tempfile
+import urllib.parse
 import urllib.request
 import warnings
 import zipfile
-from dataclasses import fields, is_dataclass
+from dataclasses import dataclass, fields, is_dataclass
+from http.client import HTTPMessage
 from pathlib import Path
-from typing import Any, Callable, Literal, cast, get_args, get_origin
+from typing import IO, Any, Callable, Literal, cast, get_args, get_origin
 from urllib.error import URLError
 
 # Python 3.10 has no typing.NotRequired, and its TypedDict ignores it.
@@ -42,7 +46,8 @@ if sys.version_info >= (3, 11):
 else:
     from typing_extensions import NotRequired, TypedDict
 
-from .errors import CapabilityUnavailableError, MeerkatError
+from . import _rkat_rpc_digests
+from .errors import BinaryIntegrityError, CapabilityUnavailableError, MeerkatError
 from .event_envelope import parse_agent_event_envelope
 from .events import RealtimeMessageOrigin, Usage, _parse_usage
 from .generated.rpc_contracts import RpcRequest
@@ -383,6 +388,106 @@ _MEERKAT_BINARY = "rkat-rpc"
 _MEERKAT_BINARY_CACHE_ROOT = (
     Path.home() / ".cache" / "meerkat" / "bin" / _MEERKAT_BINARY
 )
+# A GitHub release download redirects once, to its asset host.
+_RELEASE_DOWNLOAD_MAX_REDIRECTS = 5
+
+
+class _HttpsOnlyRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Follow a release download's redirects only to https URLs."""
+
+    max_redirections = _RELEASE_DOWNLOAD_MAX_REDIRECTS
+
+    def redirect_request(
+        self,
+        req: urllib.request.Request,
+        fp: IO[bytes],
+        code: int,
+        msg: str,
+        headers: HTTPMessage,
+        newurl: str,
+    ) -> urllib.request.Request | None:
+        if urllib.parse.urlsplit(newurl).scheme != "https":
+            fp.close()
+            raise MeerkatError(
+                "BINARY_DOWNLOAD_FAILED",
+                f"Refusing to follow a redirect to a non-HTTPS URL while downloading "
+                f"{_MEERKAT_BINARY}: {newurl}",
+            )
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+@dataclass(frozen=True)
+class _RkatRpcRelease:
+    """One target's release archive and the digests this package pins for it."""
+
+    artifact: str
+    url: str
+    archive_ext: str
+    binary_name: str
+    archive_sha256: str
+    binary_sha256: str
+
+
+def _is_sha256_hex(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(char in "0123456789abcdef" for char in value)
+    )
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _copy_with_sha256(source: IO[bytes], destination: Path) -> str:
+    digest = hashlib.sha256()
+    with destination.open("wb") as out:
+        for chunk in iter(lambda: source.read(1 << 20), b""):
+            digest.update(chunk)
+            out.write(chunk)
+    return digest.hexdigest()
+
+
+def _extract_release_binary(
+    payload: bytes, release: _RkatRpcRelease, destination: Path
+) -> str:
+    """Copy the archive's one ``rkat-rpc`` file to ``destination``; its sha256."""
+    if release.archive_ext == "tar.gz":
+        with tarfile.open(fileobj=io.BytesIO(payload), mode="r:gz") as archive:
+            members = [
+                member
+                for member in archive.getmembers()
+                if member.isfile() and Path(member.name).name == release.binary_name
+            ]
+            source = archive.extractfile(members[0]) if len(members) == 1 else None
+            if source is None:
+                raise _archive_lacks_binary(release)
+            with source:
+                return _copy_with_sha256(source, destination)
+    with zipfile.ZipFile(io.BytesIO(payload)) as archive:
+        entries = [
+            entry
+            for entry in archive.infolist()
+            if not entry.is_dir() and Path(entry.filename).name == release.binary_name
+        ]
+        if len(entries) != 1:
+            raise _archive_lacks_binary(release)
+        with archive.open(entries[0]) as source:
+            return _copy_with_sha256(source, destination)
+
+
+def _archive_lacks_binary(release: _RkatRpcRelease) -> MeerkatError:
+    return MeerkatError(
+        "BINARY_DOWNLOAD_FAILED",
+        f"{release.artifact} does not contain exactly one '{release.binary_name}' file.",
+    )
+
+
 _MOB_SPAWN_MANY_FAILURE_CAUSES = {
     "profile_not_found",
     "member_not_found",
@@ -5254,7 +5359,11 @@ class MeerkatClient:
             return await response_future
         return await response_future
 
-    # -- Binary resolution (unchanged from original) -----------------------
+    # -- Binary resolution -------------------------------------------------
+    #
+    # MEERKAT_BIN_PATH, an explicit rkat_path and rkat-rpc on PATH are the
+    # caller's own binaries and run as given. Only the auto-downloaded release
+    # binary is verified, against the digests this package pins.
 
     async def _resolve_rkat_binary(self, requested_path: str) -> tuple[str, bool]:
         override = os.environ.get("MEERKAT_BIN_PATH")
@@ -5286,23 +5395,15 @@ class MeerkatClient:
             return str(candidate), False
 
         try:
-            cached = await self._download_rkat_rpc_binary()
+            return await self._download_rkat_rpc_binary(), False
+        except BinaryIntegrityError:
+            # A digest mismatch is a tamper signal: surface it instead of
+            # quietly running another binary in its place.
+            raise
         except MeerkatError:
             if shutil.which("rkat"):
                 return "rkat", True
             raise
-
-        if cached is not None:
-            return cached, False
-
-        if shutil.which("rkat"):
-            return "rkat", True
-
-        raise MeerkatError(
-            "BINARY_NOT_FOUND",
-            f"Could not find '{_MEERKAT_BINARY}' on PATH and auto-download failed."
-            " Set MEERKAT_BIN_PATH to a local executable.",
-        )
 
     @staticmethod
     def _resolve_candidate_path(command_or_path: str) -> str | None:
@@ -5365,79 +5466,140 @@ class MeerkatClient:
         return artifact, url
 
     @staticmethod
-    async def _download_rkat_rpc_binary() -> str | None:
-        target, archive_ext, binary_name = MeerkatClient._platform_target()
-        version = CONTRACT_VERSION
-        artifact, url = MeerkatClient._rkat_rpc_release_asset(
-            version, target, archive_ext
-        )
-        cache_dir = _MEERKAT_BINARY_CACHE_ROOT / f"v{version}" / target
-        cache_dir.mkdir(parents=True, exist_ok=True)
-        cached = cache_dir / binary_name
-        if cached.exists():
-            return str(cached)
+    def _pinned_rkat_rpc_archive(
+        version: str, target: str, artifact: str
+    ) -> tuple[str, str]:
+        """The pinned archive and binary sha256 of one release asset.
 
+        Only a package built by the release workflow pins them (see
+        ``meerkat._rkat_rpc_digests``); without them the SDK refuses to
+        download anything.
+        """
+        digests = _rkat_rpc_digests.RKAT_RPC_DIGESTS
+        archives = digests.get("archives") if digests.get("version") == version else None
+        entry = archives.get(target) if isinstance(archives, dict) else None
+        if (
+            not isinstance(entry, dict)
+            or entry.get("asset") != artifact
+            or not _is_sha256_hex(entry.get("archive_sha256"))
+            or not _is_sha256_hex(entry.get("binary_sha256"))
+        ):
+            raise MeerkatError(
+                "BINARY_DIGEST_UNAVAILABLE",
+                f"This meerkat-sdk package pins no release digest for {artifact}, so "
+                f"it will not download {_MEERKAT_BINARY}: only packages built by the "
+                "release workflow pin one, and source or git installs do not. Install "
+                f"{_MEERKAT_BINARY} {version} yourself and put it on PATH, or set "
+                "MEERKAT_BIN_PATH or rkat_path to a binary you trust.",
+            )
+        return entry["archive_sha256"], entry["binary_sha256"]
+
+    @staticmethod
+    def _fetch_rkat_rpc_archive(url: str) -> bytes:
+        """Download one release archive over HTTPS only, redirects included."""
+        if urllib.parse.urlsplit(url).scheme != "https":
+            raise MeerkatError(
+                "BINARY_DOWNLOAD_FAILED",
+                f"Refusing to download {_MEERKAT_BINARY} over a non-HTTPS URL: {url}",
+            )
+        opener = urllib.request.build_opener(_HttpsOnlyRedirectHandler)
         try:
-            with urllib.request.urlopen(url, timeout=30) as response:
-                payload = response.read()
+            with opener.open(url, timeout=30) as response:
+                return response.read()
         except (URLError, OSError) as exc:
             raise MeerkatError(
                 "BINARY_DOWNLOAD_FAILED",
                 f"Failed to download {_MEERKAT_BINARY} from {url}: {exc}",
             ) from exc
 
-        with tempfile.TemporaryDirectory() as tmpdir:
-            archive_path = Path(tmpdir) / f"{_MEERKAT_BINARY}.{archive_ext}"
-            with archive_path.open("wb") as fp:
-                fp.write(payload)
+    @staticmethod
+    async def _download_rkat_rpc_binary() -> str:
+        """This SDK version's release ``rkat-rpc``, verified before it can run.
 
-            temp_binary = cache_dir / f".{binary_name}.download"
-            if archive_ext == "tar.gz":
-                with tarfile.open(archive_path, "r:gz") as archive:
-                    members = [
-                        m
-                        for m in archive.getmembers()
-                        if Path(m.name).name == binary_name
-                    ]
-                    if not members:
-                        raise MeerkatError(
-                            "BINARY_DOWNLOAD_FAILED",
-                            f"Downloaded archive does not contain '{binary_name}'.",
-                        )
-                    source = archive.extractfile(members[0])
-                    if source is None:
-                        raise MeerkatError(
-                            "BINARY_DOWNLOAD_FAILED",
-                            f"Could not extract '{binary_name}' from {artifact}.",
-                        )
-                    with source, temp_binary.open("wb") as out:
-                        out.write(source.read())
-            else:
-                with zipfile.ZipFile(archive_path, "r") as archive:
-                    candidate_names = [entry.filename for entry in archive.infolist()]
-                    if not any(
-                        Path(name).name == binary_name for name in candidate_names
-                    ):
-                        raise MeerkatError(
-                            "BINARY_DOWNLOAD_FAILED",
-                            f"Downloaded archive does not contain '{binary_name}'.",
-                        )
-                    with (
-                        archive.open(
-                            next(
-                                name
-                                for name in candidate_names
-                                if Path(name).name == binary_name
-                            ),
-                        ) as source,
-                        temp_binary.open("wb") as out,
-                    ):
-                        out.write(source.read())
-
-            if os.name != "nt":
-                temp_binary.chmod(0o755)
-            temp_binary.replace(cached)
+        The downloaded archive must match its pinned sha256 before anything
+        is written or extracted, and the binary inside it must match its own
+        pin before it is installed. A cached binary is re-verified on every
+        reuse; one that no longer matches is deleted and refused.
+        """
+        target, archive_ext, binary_name = MeerkatClient._platform_target()
+        version = CONTRACT_VERSION
+        artifact, url = MeerkatClient._rkat_rpc_release_asset(
+            version, target, archive_ext
+        )
+        archive_sha256, binary_sha256 = MeerkatClient._pinned_rkat_rpc_archive(
+            version, target, artifact
+        )
+        release = _RkatRpcRelease(
+            artifact=artifact,
+            url=url,
+            archive_ext=archive_ext,
+            binary_name=binary_name,
+            archive_sha256=archive_sha256,
+            binary_sha256=binary_sha256,
+        )
+        cached = _MEERKAT_BINARY_CACHE_ROOT / f"v{version}" / target / binary_name
+        if cached.exists():
+            await asyncio.to_thread(MeerkatClient._verify_cached_rkat_rpc, release, cached)
             return str(cached)
+        return await asyncio.to_thread(MeerkatClient._install_rkat_rpc, release, cached)
+
+    @staticmethod
+    def _verify_cached_rkat_rpc(release: _RkatRpcRelease, cached: Path) -> None:
+        try:
+            actual = _sha256_file(cached)
+        except OSError as exc:
+            raise MeerkatError(
+                "BINARY_DOWNLOAD_FAILED",
+                f"Could not read the cached {release.binary_name} at {cached}: {exc}",
+            ) from exc
+        if actual == release.binary_sha256:
+            return
+        try:
+            cached.unlink()
+            outcome = "it was removed, and the next connect downloads a verified copy"
+        except OSError as exc:
+            outcome = f"it could not be removed ({exc}); delete it before retrying"
+        raise BinaryIntegrityError(
+            f"The cached {cached} does not match the sha256 this SDK pins for the "
+            f"{release.binary_name} in {release.artifact}; {outcome}.",
+            asset=release.artifact,
+            path=str(cached),
+            expected_sha256=release.binary_sha256,
+            actual_sha256=actual,
+        )
+
+    @staticmethod
+    def _install_rkat_rpc(release: _RkatRpcRelease, cached: Path) -> str:
+        payload = MeerkatClient._fetch_rkat_rpc_archive(release.url)
+        actual = hashlib.sha256(payload).hexdigest()
+        if actual != release.archive_sha256:
+            raise BinaryIntegrityError(
+                f"The downloaded {release.artifact} does not match the sha256 this "
+                "SDK pins for it; it was discarded without being extracted.",
+                asset=release.artifact,
+                path=None,
+                expected_sha256=release.archive_sha256,
+                actual_sha256=actual,
+            )
+        # Extract beside the cache entry, check the binary against its own
+        # pin, then move it into place in one rename.
+        cached.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=cached.parent, prefix=".download-") as staging:
+            staged = Path(staging) / release.binary_name
+            actual = _extract_release_binary(payload, release, staged)
+            if actual != release.binary_sha256:
+                raise BinaryIntegrityError(
+                    f"The {release.binary_name} in {release.artifact} does not match "
+                    "the sha256 this SDK pins for it; it was not installed.",
+                    asset=release.artifact,
+                    path=None,
+                    expected_sha256=release.binary_sha256,
+                    actual_sha256=actual,
+                )
+            if os.name != "nt":
+                staged.chmod(0o755)
+            staged.replace(cached)
+        return str(cached)
 
     # -- Helpers -----------------------------------------------------------
 
