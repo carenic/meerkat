@@ -329,6 +329,8 @@ trap 'rm -rf "$tlc_env_tmp"' EXIT
 # be reported violated.
 # live_context_result_barrier_audit.sh with --mutants requires its
 # summary-dropped mutant to violate AuditResultFollowsSummary.
+# mob_operator_grant_audit.sh requires each of its seven reachability
+# witnesses violated, and with --mutants each seeded defect's property.
 printf '%s\n' \
   '#!/bin/sh' \
   'printf "%s\n" "$JAVA_TOOL_OPTIONS" > "$TLC_JAVA_OPTIONS_CAPTURE"' \
@@ -379,6 +381,15 @@ printf '%s\n' \
   'echo "Error: Action property NeverSilentReopenRunning is violated."' \
   'echo "Error: Action property NeverSilentExhaustedAttached is violated."' \
   'echo "Error: Action property NeverSilentExhaustedRunning is violated."' \
+  'echo "Error: Invariant NotAuditWitnessRebound is violated."' \
+  'echo "Error: Invariant NotAuditWitnessRebindDroppedSpawn is violated."' \
+  'echo "Error: Invariant NotAuditWitnessRebindDroppedManage is violated."' \
+  'echo "Error: Invariant NotAuditWitnessBothScopes is violated."' \
+  'echo "Error: Invariant NotAuditWitnessTwoIncarnations is violated."' \
+  'echo "Error: Invariant NotAuditWitnessRestoredBindings is violated."' \
+  'echo "Error: Invariant NotAuditWitnessResolveCleared is violated."' \
+  'echo "Error: Action property AuditRebindDropsTheOtherScope is violated."' \
+  'echo "Error: Invariant mob_operator_scopes_are_bound_to_an_incarnation is violated."' \
   'echo "State 1: <Initial predicate>"' \
   > "$tlc_env_tmp/tlc"
 chmod +x "$tlc_env_tmp/tlc"
