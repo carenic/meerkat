@@ -8564,6 +8564,24 @@ async fn await_successful_completion(
     );
 }
 
+/// Wait until `session_id`'s runtime loop parks. A resolved completion does
+/// not mean the loop is idle: it resolves a run's completions and then
+/// checks its queue again in the same lap, so an input admitted without a
+/// wake before the park can still run on that lap. The park is published
+/// only with no wake, effect or feed advance pending, and the lap that ran
+/// the input cleared it, so a park observed after the completion means a
+/// queued input stays queued until something wakes the loop.
+async fn await_runtime_loop_parked(machine: &MeerkatMachine, session_id: &SessionId) {
+    let mut parked = machine.runtime_loop_parked();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        parked.wait_for(|sessions| sessions.contains(session_id)),
+    )
+    .await
+    .expect("the runtime loop parks once the run settled")
+    .expect("park signal stays open while the machine lives");
+}
+
 async fn await_input_consumed(
     machine: &MeerkatMachine,
     session_id: &SessionId,
@@ -9510,6 +9528,9 @@ async fn quiescent_close_of_a_settled_owner_resumes_the_same_session_without_rep
         .expect("input is admitted");
     assert!(outcome.is_accepted());
     await_successful_completion(completion, "the first input").await;
+    // Queue only once the loop is idle: until it parks, its lap after the
+    // first run can still take an input admitted without a wake.
+    await_runtime_loop_parked(&adapter, &session_id).await;
 
     // Retained queued work makes the close busy; it then settles.
     let queued = make_prompt("queued before the close");
