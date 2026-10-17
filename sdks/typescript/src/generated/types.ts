@@ -1296,6 +1296,7 @@ export interface RuntimeHostInfo {
 }
 
 export interface Schedule {
+  commissioning_agent?: PrincipalRef | null;
   created_at_utc: string;
   deleted_at_utc?: string | null;
   description?: string | null;

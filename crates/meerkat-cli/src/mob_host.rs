@@ -22,7 +22,7 @@ use async_trait::async_trait;
 use tokio::sync::watch;
 
 use meerkat::surface::{SurfaceScheduleMobHost, spawn_runtime_backed_schedule_host_with_mobs};
-use meerkat::{AgentFactory, LlmIdentityPreflightError, ScheduleService, ScheduleToolDispatcher};
+use meerkat::{AgentFactory, LlmIdentityPreflightError, ScheduleToolDispatcher};
 use meerkat::{FactoryAgentBuilder, PersistentSessionService};
 use meerkat_core::config::MobHostConfig;
 use meerkat_core::connection::{
@@ -787,7 +787,7 @@ pub(crate) async fn run_mob_host(args: MobHostArgs, scope: &RuntimeScope) -> any
         )?);
     let runtime_store = persistence.runtime_store();
     let session_store = persistence.session_store();
-    let schedule_service = ScheduleService::new(persistence.schedule_store());
+    let schedule_service = persistence.schedule_service();
 
     let project_root = scope
         .context_root

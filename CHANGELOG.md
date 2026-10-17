@@ -35,6 +35,31 @@ them.
 
 ## [Unreleased]
 
+### Breaking
+
+- Schedules record the agent whose mandate commissioned them (see Added),
+  which adds the public `commissioning_agent: Option<PrincipalRef>` field to
+  a constructible struct; struct literals must set it (`None` records no
+  agent):
+  - `meerkat_schedule::ScheduleConfig::commissioning_agent`
+
+  The field is written only when set, so existing schedule rows and wire
+  documents keep their bytes and read back as `None`.
+
+### Added
+
+- Schedules record the agent whose mandate commissioned them.
+  `ScheduleService::new_commissioned(store, agent)` builds a service that
+  records `agent` on every schedule it creates or redefines (a redefinition
+  is commissioned by the agent that made it); the agent comes only from the
+  trusted composition, never from a request. `ScheduleService::new` records
+  none, and `ScheduleService::commissioning_agent` reads the service's agent.
+  `PersistenceBundle::schedule_service` builds a stock-governed realm's
+  service commissioned for the realm's opened agent (`rkat` uses it for its
+  schedule tools and hosts) and an ordinary realm's service with none. The
+  wire `Schedule` and the generated SDK types carry `commissioning_agent`
+  when it is set.
+
 ## [0.9.2] - 2026-10-16
 
 ### Breaking

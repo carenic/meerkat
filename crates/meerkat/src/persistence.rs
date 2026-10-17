@@ -471,6 +471,26 @@ impl PersistenceBundle {
         self.schedule_store.clone()
     }
 
+    /// A schedule service over this realm's schedule store. A stock-governed
+    /// realm's service records the realm's opened agent as the agent whose
+    /// mandate commissions each schedule it creates or redefines
+    /// ([`meerkat_schedule::ScheduleService::new_commissioned`]); every other
+    /// realm's records none.
+    pub fn schedule_service(&self) -> meerkat_schedule::ScheduleService {
+        #[cfg(all(
+            feature = "session-store",
+            feature = "local-authorization",
+            not(target_arch = "wasm32")
+        ))]
+        if let Some(stock) = self.stock_governance() {
+            return meerkat_schedule::ScheduleService::new_commissioned(
+                self.schedule_store(),
+                stock.principals().executor.clone(),
+            );
+        }
+        meerkat_schedule::ScheduleService::new(self.schedule_store())
+    }
+
     pub fn workgraph_store(&self) -> Arc<dyn WorkGraphStore> {
         self.workgraph_store.clone()
     }

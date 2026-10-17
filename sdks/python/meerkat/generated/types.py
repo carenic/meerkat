@@ -1697,6 +1697,7 @@ and generated SDK schemas."""
     target: dict[str, Any]
     trigger: dict[str, Any]
     updated_at_utc: str
+    commissioning_agent: Optional[PrincipalRef] = None
     deleted_at_utc: Optional[str] = None
     description: Optional[str] = None
     labels: Optional[dict[str, str]] = None

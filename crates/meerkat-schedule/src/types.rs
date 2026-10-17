@@ -2140,6 +2140,14 @@ pub struct ScheduleConfig {
     pub updated_at_utc: DateTime<Utc>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deleted_at_utc: Option<DateTime<Utc>>,
+    /// The agent whose mandate commissioned this schedule. The schedule
+    /// service records the agent its composition commissions for (a governed
+    /// realm's opened agent, never a request value) each time the schedule is
+    /// created or redefined. `None` in an ungoverned realm and for schedules
+    /// recorded before this field existed; a governed realm fires the
+    /// schedule only under the agent recorded here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commissioning_agent: Option<meerkat_core::PrincipalRef>,
 }
 
 #[derive(Deserialize)]
@@ -2158,6 +2166,8 @@ struct ScheduleConfigWire {
     updated_at_utc: DateTime<Utc>,
     #[serde(default)]
     deleted_at_utc: Option<DateTime<Utc>>,
+    #[serde(default)]
+    commissioning_agent: Option<meerkat_core::PrincipalRef>,
 }
 
 impl<'de> Deserialize<'de> for ScheduleConfig {
@@ -2187,6 +2197,7 @@ impl<'de> Deserialize<'de> for ScheduleConfig {
             created_at_utc: wire.created_at_utc,
             updated_at_utc: wire.updated_at_utc,
             deleted_at_utc: wire.deleted_at_utc,
+            commissioning_agent: wire.commissioning_agent,
         })
     }
 }

@@ -134,6 +134,17 @@ impl ScheduleLifecycleMutator {
         &self.schedule
     }
 
+    /// Record the agent whose mandate commissions the schedule this create
+    /// or update writes. The agent is not lifecycle state: like the name and
+    /// labels it is a config fact of the write, so it is set on the mutated
+    /// schedule before planning reads it.
+    pub(crate) fn record_commissioning_agent(
+        &mut self,
+        commissioning_agent: Option<meerkat_core::PrincipalRef>,
+    ) {
+        self.schedule.config.commissioning_agent = commissioning_agent;
+    }
+
     pub fn effects(&self) -> &[ScheduleLifecycleEffect] {
         &self.effects
     }
@@ -2460,6 +2471,7 @@ fn create_schedule_via_dsl(
             created_at_utc: now,
             updated_at_utc: now,
             deleted_at_utc: None,
+            commissioning_agent: None,
         },
     };
     let effects = map_schedule_effects(&transition)?;

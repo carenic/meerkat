@@ -39,7 +39,7 @@ use meerkat::surface::{
     spawn_schedule_host,
 };
 use meerkat::{
-    AgentFactory, EphemeralSessionService, FactoryAgentBuilder, PersistenceBundle, ScheduleService,
+    AgentFactory, EphemeralSessionService, FactoryAgentBuilder, PersistenceBundle,
     ScheduleToolDispatcher,
 };
 use meerkat_contracts::{SessionLocator, SessionLocatorError, format_session_ref};
@@ -14254,7 +14254,7 @@ async fn run_agent(
         // surface. CLI one-shots must leave the runtime snapshot as durable
         // authority so shared RPC/REST realms can read them without trusting
         // the compatibility SessionStore projection.
-        let schedule_service = ScheduleService::new(persistence.schedule_store());
+        let schedule_service = persistence.schedule_service();
         let default_schedule_tools =
             Some(Arc::new(ScheduleToolDispatcher::new(schedule_service))
                 as Arc<dyn AgentToolDispatcher>);
@@ -15067,7 +15067,7 @@ async fn resume_session_with_llm_override(
         // resumed session would accept the call, commit the request, and never
         // realize it. Routing through the shared CLI builder is what keeps
         // resume identical to a fresh run.
-        let schedule_service = ScheduleService::new(persistence.schedule_store());
+        let schedule_service = persistence.schedule_service();
         let default_schedule_tools =
             Some(Arc::new(ScheduleToolDispatcher::new(schedule_service))
                 as Arc<dyn AgentToolDispatcher>);
@@ -15585,7 +15585,7 @@ async fn get_or_create_cli_persistent_surface_from_bundle(
     }
     let factory = with_cli_confinement(factory, &config, scope, &project_root)?;
 
-    let schedule_service = ScheduleService::new(persistence.schedule_store());
+    let schedule_service = persistence.schedule_service();
     let default_schedule_tools = Some(Arc::new(ScheduleToolDispatcher::new(
         schedule_service.clone(),
     )) as Arc<dyn AgentToolDispatcher>);
@@ -33135,7 +33135,7 @@ default_model = "gpt-5.4"
             .builtins(true)
             .schedule(true);
         let schedule_service =
-            ScheduleService::new(Arc::new(meerkat::MemoryScheduleStore::default()));
+            meerkat::ScheduleService::new(Arc::new(meerkat::MemoryScheduleStore::default()));
         let default_schedule_tools =
             Some(Arc::new(ScheduleToolDispatcher::new(schedule_service))
                 as Arc<dyn AgentToolDispatcher>);
