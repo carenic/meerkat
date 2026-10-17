@@ -86960,9 +86960,13 @@ async fn test_stop_holds_member_run_starts_concurrently() {
     service
         .runtime_adapter
         .delay_hold_run_starts_for_test(Some(HOLD));
-    let started = std::time::Instant::now();
+    service
+        .runtime_adapter
+        .take_max_in_flight_hold_run_starts_for_test();
     let report = handle.stop().await.expect("stop the mob");
-    let elapsed = started.elapsed();
+    let max_in_flight = service
+        .runtime_adapter
+        .take_max_in_flight_hold_run_starts_for_test();
     service.runtime_adapter.delay_hold_run_starts_for_test(None);
 
     assert_eq!(report.members.len(), MEMBERS, "{report:?}");
@@ -86974,10 +86978,102 @@ async fn test_stop_holds_member_run_starts_concurrently() {
         "every member is held: {report:?}"
     );
     assert!(
-        elapsed < HOLD * 3,
-        "a Stop of {MEMBERS} members whose holds each wait {HOLD:?} took {elapsed:?}: \
-         the holds ran one after another"
+        max_in_flight >= MEMBERS.min(super::actor::STOP_RUN_START_HOLD_CONCURRENCY),
+        "a Stop of {MEMBERS} members had at most {max_in_flight} run-start holds in \
+         flight at once: the holds ran one after another"
     );
+}
+
+/// A Stop whose hold fails for one member still holds every other member,
+/// then, having failed, releases them all: the mob keeps running and input a
+/// member queued before the Stop starts (#1500: Stop is a pause, and a Stop
+/// that did not happen pauses nothing).
+#[tokio::test]
+async fn test_failed_stop_releases_every_member_it_held() {
+    let mut definition = sample_definition();
+    for profile in ["lead", "worker"] {
+        definition
+            .profiles
+            .get_mut(&ProfileName::from(profile))
+            .expect("profile")
+            .as_inline_mut()
+            .unwrap()
+            .runtime_mode = crate::MobRuntimeMode::TurnDriven;
+    }
+    let (handle, service) = create_test_mob_with_runtime_backed_real_comms(definition).await;
+    // The lead takes external input; the workers sit on either side of it.
+    let mut members = Vec::new();
+    for (profile, identity) in [
+        ("worker", "worker-released-0"),
+        ("lead", "lead-released"),
+        ("worker", "worker-released-2"),
+    ] {
+        let identity = AgentIdentity::from(identity);
+        let session_id = handle
+            .spawn(ProfileName::from(profile), identity.clone(), None)
+            .await
+            .expect("spawn turn-driven member")
+            .bridge_session_id()
+            .expect("session-backed")
+            .clone();
+        members.push((identity, session_id));
+    }
+
+    // Admit an input to the lead, then hold its runtime loop before it takes
+    // the input into a run: the input is queued when the Stop holds the lead.
+    let (queue_gap_entered, queue_gap_release) = service
+        .runtime_adapter
+        .arm_runtime_loop_before_queue_authority_test_hook(members[1].1.clone());
+    let member = handle.member(&members[1].0).await.expect("member handle");
+    let turn = member
+        .start_turn(
+            ContentInput::Text("admitted before the failed stop".into()),
+            HandlingMode::Queue,
+            crate::MemberTurnOptions::default(),
+            None,
+        )
+        .await
+        .expect("admit the input");
+    tokio::time::timeout(Duration::from_secs(30), queue_gap_entered)
+        .await
+        .expect("the runtime loop reaches the queue gap")
+        .expect("queue-authority hook armed");
+
+    // The first member's hold fails; every other member's hold is taken.
+    service
+        .runtime_adapter
+        .fail_hold_run_starts_for_test(Some(members[0].1.clone()));
+    let error = handle
+        .stop()
+        .await
+        .expect_err("the failed hold fails the stop");
+    service.runtime_adapter.fail_hold_run_starts_for_test(None);
+    assert!(
+        error
+            .to_string()
+            .contains("injected run-start hold failure"),
+        "the stop reports the failed hold: {error:?}"
+    );
+    assert_eq!(handle.status().await.unwrap(), MobState::Running);
+    for (identity, session_id) in &members {
+        assert_eq!(
+            service
+                .runtime_adapter
+                .run_starts_held_for_test(session_id)
+                .await,
+            Some(false),
+            "{identity} is released after the failed stop"
+        );
+    }
+
+    // The released lead's queued input runs.
+    queue_gap_release
+        .send(())
+        .expect("release the runtime loop");
+    tokio::time::timeout(Duration::from_secs(30), turn.wait())
+        .await
+        .expect("the queued input runs")
+        .expect("its turn completes");
 }
 
 /// #1500: an input admitted to a member's runtime before a mob Stop, but not

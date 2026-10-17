@@ -45,9 +45,19 @@ them.
   Stop of a large busy mob blocked its actor for seconds. Both phases now run
   concurrently per member (run-start holds 32 at a time) and keep their order
   (every hold before any interrupt); a failed Stop still reports its first
-  failure in roster order. The actor's inline-step watchdog now names each
-  Stop stage (`stop_checkpointer_cancel`, `stop_run_start_holds`, and so on)
-  in its `stage_timings_ms`.
+  failure in roster order. Every member that can be held is now held even
+  when another member's hold fails (before, the members after the first
+  failure were not held), and a failed Stop now releases every member's
+  hold again (before, they stayed held), except while the actor is
+  fail-stopping for cold recovery, where cold replay decides. After a
+  failed Stop the mob stays Running and input queued before the Stop runs,
+  but the Stop's lifecycle intent stays pending: new member input is
+  refused with `LifecycleOperationPending { intent: "stop" }` until a
+  retried Stop completes and the mob is resumed, or a Reset takes the
+  intent over (Resume alone does not clear it: it resumes only a Stopped
+  mob). The actor's inline-step watchdog now names each Stop stage
+  (`stop_checkpointer_cancel`, `stop_run_start_holds`, and so on) in its
+  `stage_timings_ms`.
 
 ## [0.9.2] - 2026-10-16
 

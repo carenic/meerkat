@@ -6808,17 +6808,60 @@ impl MeerkatMachine {
     #[cfg(any(test, feature = "test-support"))]
     #[doc(hidden)]
     pub fn delay_hold_run_starts_for_test(&self, delay: Option<std::time::Duration>) {
-        *self
-            .test_hold_run_starts_delay
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = delay;
+        self.run_start_holds_for_test().delay = delay;
     }
 
-    /// The delay [`Self::delay_hold_run_starts_for_test`] set.
+    /// Fail every [`Self::hold_run_starts`] of `session_id`, after its delay,
+    /// as a member's hold can fail; `None` clears it. Test builds only.
     #[cfg(any(test, feature = "test-support"))]
-    pub(crate) fn hold_run_starts_delay_for_test(&self) -> Option<std::time::Duration> {
-        *self
-            .test_hold_run_starts_delay
+    #[doc(hidden)]
+    pub fn fail_hold_run_starts_for_test(&self, session_id: Option<SessionId>) {
+        self.run_start_holds_for_test().failing_session = session_id;
+    }
+
+    /// The most [`Self::hold_run_starts`] calls in flight at once since the
+    /// last take, which restarts the count. Test builds only.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn take_max_in_flight_hold_run_starts_for_test(&self) -> usize {
+        let mut seam = self.run_start_holds_for_test();
+        let in_flight = seam.in_flight;
+        std::mem::replace(&mut seam.max_in_flight, in_flight)
+    }
+
+    /// Enter [`Self::hold_run_starts`]'s test seam: the hold counts as in
+    /// flight until the returned guard drops, waits the delay
+    /// [`Self::delay_hold_run_starts_for_test`] set, and fails when
+    /// [`Self::fail_hold_run_starts_for_test`] named its session.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) async fn enter_hold_run_starts_for_test(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<RunStartHoldInFlightForTest<'_>, RuntimeDriverError> {
+        let (delay, fails) = {
+            let mut seam = self.run_start_holds_for_test();
+            seam.in_flight += 1;
+            seam.max_in_flight = seam.max_in_flight.max(seam.in_flight);
+            (
+                seam.delay,
+                seam.failing_session.as_ref() == Some(session_id),
+            )
+        };
+        let in_flight = RunStartHoldInFlightForTest { machine: self };
+        if let Some(delay) = delay {
+            crate::tokio::time::sleep(delay).await;
+        }
+        if fails {
+            return Err(RuntimeDriverError::Internal(format!(
+                "injected run-start hold failure for session {session_id}"
+            )));
+        }
+        Ok(in_flight)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn run_start_holds_for_test(&self) -> std::sync::MutexGuard<'_, RunStartHoldsForTest> {
+        self.test_run_start_holds
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
@@ -9502,6 +9545,33 @@ impl Drop for RunlessTerminalAnnouncement {
     }
 }
 
+/// [`MeerkatMachine::hold_run_starts`]'s seam in test builds: the delay every
+/// hold waits before it takes the session's mutation gate, the session whose
+/// holds fail, and the holds in flight (now and at most at once).
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Debug, Default)]
+struct RunStartHoldsForTest {
+    delay: Option<std::time::Duration>,
+    failing_session: Option<SessionId>,
+    in_flight: usize,
+    max_in_flight: usize,
+}
+
+/// A [`MeerkatMachine::hold_run_starts`] in flight, counted by the test seam
+/// until it drops.
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) struct RunStartHoldInFlightForTest<'a> {
+    machine: &'a MeerkatMachine,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl Drop for RunStartHoldInFlightForTest<'_> {
+    fn drop(&mut self) {
+        let mut seam = self.machine.run_start_holds_for_test();
+        seam.in_flight = seam.in_flight.saturating_sub(1);
+    }
+}
+
 /// Session-scoped execution kernel for the Meerkat runtime.
 ///
 /// Owns per-session runtime state (driver, ops registry, completion waiters,
@@ -9817,14 +9887,12 @@ pub struct MeerkatMachineShared {
     /// counted so tests can wait for the dispatch as a positive event.
     #[cfg(any(test, feature = "test-support"))]
     test_boundary_cancel_dispatches: crate::tokio::sync::watch::Sender<u64>,
+    /// The run-start hold seam ([`RunStartHoldsForTest`]).
+    #[cfg(any(test, feature = "test-support"))]
+    test_run_start_holds: StdMutex<RunStartHoldsForTest>,
     /// One-shot deterministic gate after the runtime loop's first ready-effect
     /// drain but before it acquires queue authority. Tests publish an executor
     /// effect in this exact gap and prove the consumed wake is retained.
-    /// Delay applied to every `hold_run_starts` before it takes the
-    /// session's mutation gate. Tests stand in for a busy session's gate
-    /// wait with it.
-    #[cfg(any(test, feature = "test-support"))]
-    test_hold_run_starts_delay: StdMutex<Option<std::time::Duration>>,
     #[cfg(any(test, feature = "test-support"))]
     test_runtime_loop_before_queue_authority: StdMutex<
         Option<(
@@ -11618,7 +11686,7 @@ impl MeerkatMachine {
                 #[cfg(any(test, feature = "test-support"))]
                 test_runtime_loop_before_boundary_acknowledgement: StdMutex::new(None),
                 #[cfg(any(test, feature = "test-support"))]
-                test_hold_run_starts_delay: StdMutex::new(None),
+                test_run_start_holds: StdMutex::new(RunStartHoldsForTest::default()),
                 #[cfg(any(test, feature = "test-support"))]
                 test_runtime_loop_before_queue_authority: StdMutex::new(None),
                 registration_run_start_holds: std::sync::Mutex::new(HashMap::new()),
@@ -11833,7 +11901,7 @@ impl MeerkatMachine {
                 #[cfg(any(test, feature = "test-support"))]
                 test_runtime_loop_before_boundary_acknowledgement: StdMutex::new(None),
                 #[cfg(any(test, feature = "test-support"))]
-                test_hold_run_starts_delay: StdMutex::new(None),
+                test_run_start_holds: StdMutex::new(RunStartHoldsForTest::default()),
                 #[cfg(any(test, feature = "test-support"))]
                 test_runtime_loop_before_queue_authority: StdMutex::new(None),
                 registration_run_start_holds: std::sync::Mutex::new(HashMap::new()),

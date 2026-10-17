@@ -12275,9 +12275,7 @@ Ok::<(), RuntimeDriverError>(())
         reason: super::RunStartHoldReason,
     ) -> Result<super::RunStartsHold, RuntimeDriverError> {
         #[cfg(any(test, feature = "test-support"))]
-        if let Some(delay) = self.hold_run_starts_delay_for_test() {
-            crate::tokio::time::sleep(delay).await;
-        }
+        let _in_flight = self.enter_hold_run_starts_for_test(session_id).await?;
         let _gate = self
             .lock_current_durability_ready_session_mutation_gate(session_id)
             .await?;

@@ -3190,7 +3190,7 @@ impl StopInlineStage {
 /// member's runtime, so a Stop holds its members concurrently, bounded so a
 /// large mob does not contend every session gate (or, for placed members,
 /// every host) at the same moment.
-const STOP_RUN_START_HOLD_CONCURRENCY: usize = 32;
+pub(super) const STOP_RUN_START_HOLD_CONCURRENCY: usize = 32;
 
 /// Inline-step watchdog (#1102 observability). The loop marks the start of
 /// every command dispatch and the arms refine the current step name; a
@@ -18887,6 +18887,21 @@ impl MobActor {
         }
         if stop_result.is_err() {
             self.provisioner.rearm_all_checkpointers().await;
+            // A Stop that did not happen leaves the mob running (#1500: Stop
+            // is a pause), so it releases the holds it took: a member left
+            // held would keep its queued input waiting while the mob runs.
+            // The Stop's error stays the reported one. An actor
+            // fail-stopping for cold recovery releases none: cold replay
+            // alone decides whether work can start.
+            if !self.durable_uncertainty_fail_stop
+                && let Err(error) = self.release_all_member_run_starts().await
+            {
+                tracing::warn!(
+                    mob_id = %self.definition.id,
+                    error = %error,
+                    "a failed stop could not release every member's run-start hold"
+                );
+            }
         }
         stop_result
     }
