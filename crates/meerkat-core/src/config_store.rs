@@ -1045,16 +1045,19 @@ struct CredentialCommand {
 
 /// Where a binding sends a credential command's token: the id of its
 /// backend profile, that backend as the section states it (`None` when it
-/// states none by that id), and the `[self_hosted.servers]` entry the
-/// backend names as the document states it (`None` when it names none, or
-/// the document states none by that id; a composition takes the entry only
-/// from the command's document, see
-/// [`crate::config::check_composed_command_servers`]).
+/// states none by that id), the `[self_hosted.servers]` entry the backend
+/// names as the document states it (`None` when it names none, or the
+/// document states none by that id; a composition takes the entry only from
+/// the command's document, and refuses a self-hosted backend that names
+/// none, see [`crate::config::check_composed_command_servers`]), and the
+/// binding's default model, which decides the model, and so the server, of
+/// a request through the binding that names none.
 #[derive(PartialEq)]
 struct CredentialCommandRoute {
     backend_profile: String,
     backend: Option<crate::connection::BackendProfileConfig>,
     server: Option<crate::config::SelfHostedServerConfig>,
+    default_model: Option<String>,
 }
 
 impl CredentialCommand {
@@ -1107,6 +1110,7 @@ fn credential_commands(config: &Config) -> CredentialCommands {
                                 backend_profile: binding.backend_profile.clone(),
                                 backend,
                                 server,
+                                default_model: binding.default_model.clone(),
                             },
                         )
                     })
@@ -1140,9 +1144,9 @@ fn persisted_credential_commands(content: &str) -> CredentialCommands {
 /// process confinement, so ordinary config write permission is not its
 /// administration. Where the token goes is the profile's provider and auth
 /// method and each binding of the section that uses the profile: such a
-/// binding added, or re-pointed at the profile, or moved to another backend,
-/// and a change to the backend it names or to the `[self_hosted.servers]`
-/// entry that backend names, are all refused. The host adds or changes any
+/// binding added, re-pointed at the profile, moved to another backend or
+/// given another default model, and a change to the backend it names or to
+/// the `[self_hosted.servers]` entry that backend names, are all refused. The host adds or changes any
 /// of them by editing the document itself. A write that keeps each command
 /// and its routes, changes only a command's timeout or caching, or removes a
 /// command or a binding is ordinary config.
@@ -2961,6 +2965,66 @@ auth_profile = "anonymous"
             moved.self_hosted.servers["open"].base_url,
             "https://moved.example/v1"
         );
+    }
+
+    /// A binding whose auth profile runs a credential command on a
+    /// self-hosted backend must declare that backend's server: without one,
+    /// the binding would authenticate whatever server a request's model is
+    /// served by (or the one its default model names), so the composition is
+    /// refused, naming the binding and the remedy. A declared one composes.
+    #[tokio::test]
+    async fn a_command_binding_on_a_self_hosted_backend_must_declare_its_server() {
+        use crate::connection::RealmId;
+
+        let document = |server_line: &str| {
+            format!(
+                "[realm.global]\n\n\
+                 [self_hosted.servers.box]\nbase_url = \"http://127.0.0.1:9/v1\"\n\n\
+                 [realm.team.backend.boxed]\nprovider = \"self_hosted\"\nbackend_kind = \"self_hosted\"\n{server_line}\n\
+                 [realm.team.auth.helper]\nprovider = \"self_hosted\"\nauth_method = \"api_key\"\n\
+                 source = {{ kind = \"command\", program = \"/usr/bin/helper\" }}\n\n\
+                 [realm.team.binding.main]\nbackend_profile = \"boxed\"\nauth_profile = \"helper\"\n"
+            )
+        };
+        let compose = |user_document: String| {
+            let documents = [("global", user_document), ("team", String::new())];
+            let source = RawMapSource {
+                docs: documents
+                    .iter()
+                    .map(|(realm, text)| {
+                        (
+                            (*realm).to_owned(),
+                            Config::from_persisted_toml(text).unwrap().0,
+                        )
+                    })
+                    .collect(),
+                raw: documents
+                    .iter()
+                    .map(|(realm, text)| ((*realm).to_owned(), toml::from_str(text).unwrap()))
+                    .collect(),
+            };
+            async move {
+                EffectiveConfigReader::new(Arc::new(source))
+                    .effective_config(&RealmId::parse("team").unwrap())
+                    .await
+            }
+        };
+
+        let refused = compose(document(""))
+            .await
+            .expect_err("a command binding with no declared server does not compose");
+        let message = refused.to_string();
+        assert!(
+            message.contains("binding 'main'")
+                && message.contains("credential command")
+                && message.contains("[realm.team.backend.boxed]")
+                && message.contains("declares no server")
+                && message.contains("server = \""),
+            "{message}"
+        );
+        compose(document("server = \"box\""))
+            .await
+            .expect("a command binding that declares its server composes");
     }
 
     const LEGACY_MODEL_FALLBACK_DOC: &str = "[model_fallback]\nenabled = true\n";

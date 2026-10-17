@@ -6190,7 +6190,8 @@ impl AgentFactory {
     ///
     /// An explicit `auth_binding` still wins (it is the operator's escape
     /// hatch), but a binding whose backend DECLARES a different server is a
-    /// contradiction and fails closed.
+    /// contradiction and fails closed, and so does a credential command
+    /// binding whose backend declares none.
     #[cfg(feature = "openai")]
     fn resolve_self_hosted_connection(
         &self,

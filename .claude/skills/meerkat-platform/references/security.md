@@ -291,14 +291,20 @@ except these, which it runs as itself (`meerkat_core::HostLaunchExemption`):
   binding's resolution (no other credential stands in for it). A config
   write cannot add one, change what it runs, or change where its token goes
   (the profile's provider or auth method, a binding of the section that
-  uses it, that binding's backend, or the `[self_hosted.servers]` entry the
-  backend names) (`confinement_administration_required`, naming the auth
-  profile); the host edits the document. A request cannot override a
-  binding's auth profile with another binding's command profile
-  (`ProviderBindingError::CredentialCommandProfileOverride`), and a realm
-  whose command binding takes its server entry from another document does
-  not compose (`ConfigError::CredentialCommandServer`). Credentials that do
-  not come from a command are outside these rules.
+  uses it, that binding's backend or default model, or the
+  `[self_hosted.servers]` entry the backend names)
+  (`confinement_administration_required`, naming the auth profile); the
+  host edits the document. A command binding on a self-hosted backend must
+  declare the server (`server = "<id>"`), so a request's model never
+  decides where its token goes: a realm with one that declares none does
+  not compose (`ConfigError::CredentialCommandServerUndeclared`), and such
+  a binding is never chosen for, or explicitly sent to, a server it does
+  not declare (`SelfHostedConnectionError::CredentialCommandServerUndeclared`).
+  A request cannot override a binding's auth profile with another binding's
+  command profile (`ProviderBindingError::CredentialCommandProfileOverride`),
+  and a realm whose command binding takes its server entry from another
+  document does not compose (`ConfigError::CredentialCommandServer`).
+  Credentials that do not come from a command are outside these rules.
 - Browser opener (`HostLaunchExemption::browser_opener`: `/usr/bin/open`,
   `xdg-open`, the system `rundll32.exe`; OAuth logins and the CLI's HTML
   artifact): must reach the user's desktop session; the URL is one argument.

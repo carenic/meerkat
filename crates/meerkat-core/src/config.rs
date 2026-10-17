@@ -3200,6 +3200,24 @@ pub enum ConfigError {
         server: String,
     },
 
+    /// A binding whose auth profile runs a credential command names a
+    /// self-hosted backend that declares no server. Such a backend's
+    /// endpoint is the server that serves a request's model, so the
+    /// command's token would go wherever a request's model (or the
+    /// binding's `default_model`) is served instead of where its document
+    /// sends it; nothing is composed.
+    #[error(
+        "binding '{binding}' of [realm.{realm}] runs a credential command on self-hosted backend '{backend}', which declares no server, so the command's token would go to whichever server serves a request's model; add server = \"<id>\" to [realm.{realm}.backend.{backend}], naming the [self_hosted.servers] entry the token is for"
+    )]
+    CredentialCommandServerUndeclared {
+        /// The realm section that states the binding.
+        realm: String,
+        /// The binding whose auth profile runs the command.
+        binding: String,
+        /// The self-hosted backend profile the binding names.
+        backend: String,
+    },
+
     #[error("realm inheritance chain error: {0}")]
     RealmChain(#[from] crate::connection::RealmChainError),
 }
@@ -3634,8 +3652,12 @@ pub(crate) fn check_composed_confinement(
 }
 
 /// Refuse a composition in which a binding whose auth profile runs a
-/// credential command takes the `[self_hosted.servers]` entry its backend
-/// names from a document other than the one that states the binding
+/// credential command does not keep the command's token where its document
+/// sends it: its backend is self-hosted and declares no server
+/// ([`ConfigError::CredentialCommandServerUndeclared`]; such a backend's
+/// endpoint is the server that serves a request's model), or it takes the
+/// `[self_hosted.servers]` entry its backend names from a document other
+/// than the one that states the binding
 /// ([`ConfigError::CredentialCommandServer`]). A composed realm section is
 /// the section of the chain member nearest the head whose document states
 /// it, whole, so the binding, its auth profile and its backend all come
@@ -3648,13 +3670,10 @@ pub(crate) fn check_composed_command_servers(
     composed: &Config,
 ) -> Result<(), ConfigError> {
     for (realm, section) in &composed.realm {
-        let Some(stated_by) = chain
+        let stated_by = chain
             .realms()
             .iter()
-            .find_map(|member| docs.get(member).filter(|doc| doc.realm.contains_key(realm)))
-        else {
-            continue;
-        };
+            .find_map(|member| docs.get(member).filter(|doc| doc.realm.contains_key(realm)));
         for (binding_id, binding) in &section.binding {
             let commanded = section.auth.get(&binding.auth_profile).is_some_and(|auth| {
                 matches!(
@@ -3662,14 +3681,25 @@ pub(crate) fn check_composed_command_servers(
                     crate::connection::CredentialSourceSpec::Command { .. }
                 )
             });
-            let Some(server) = section
-                .backend
-                .get(&binding.backend_profile)
-                .and_then(|backend| backend.server.as_ref())
-            else {
+            if !commanded {
+                continue;
+            }
+            let Some(backend) = section.backend.get(&binding.backend_profile) else {
                 continue;
             };
-            if commanded
+            let Some(server) = backend.server.as_ref() else {
+                if crate::provider::Provider::parse_strict(&backend.provider)
+                    == Some(crate::provider::Provider::SelfHosted)
+                {
+                    return Err(ConfigError::CredentialCommandServerUndeclared {
+                        realm: realm.clone(),
+                        binding: binding_id.clone(),
+                        backend: binding.backend_profile.clone(),
+                    });
+                }
+                continue;
+            };
+            if let Some(stated_by) = stated_by
                 && stated_by.self_hosted.servers.get(server)
                     != composed.self_hosted.servers.get(server)
             {

@@ -41,12 +41,27 @@ them.
   also refused when a realm the user document states a section for would
   compose a different `[confinement]` or `[governance]` on a state root that
   holds no document of its own for that realm (see Fixed).
-- `meerkat_core::ConfigError` has a new variant
-  `CredentialCommandServer { realm, binding, profile, server }`: a
+- `meerkat_core::ConfigError` has two new variants:
+  `CredentialCommandServer { realm, binding, profile, server }`, a
   composition in which a binding whose auth profile runs a credential
   command takes the `[self_hosted.servers]` entry its backend names from
-  another config document (see Security); an exhaustive match must handle
-  it.
+  another config document, and
+  `CredentialCommandServerUndeclared { realm, binding, backend }`,
+  one in which such a binding's self-hosted backend declares no server (see
+  Security); an exhaustive match must handle them.
+- `meerkat_core::SelfHostedConnectionError` has a new variant
+  `CredentialCommandServerUndeclared { realm, binding, server, model }`: an
+  explicitly selected binding whose auth profile runs a credential command
+  and whose self-hosted backend declares no server (see Security); an
+  exhaustive match must handle it.
+- Behaviour-only (not measured by the gate): a binding whose auth profile
+  runs a credential command on a self-hosted backend must declare the
+  backend's server. Add `server = "<id>"` to its
+  `[realm.<realm>.backend.<backend>]`, naming the `[self_hosted.servers]`
+  entry the command's token is for. Without it the realm does not compose,
+  and the binding is no longer the one unconstrained self-hosted binding,
+  nor chosen for the server its `default_model` is served by, nor usable
+  when named explicitly for a self-hosted model (see Security).
 - `meerkat_core::ProviderBindingError` has a new variant
   `CredentialCommandProfileOverride { binding, profile }`: an auth binding
   reference whose `profile` override names a credential command profile
@@ -91,15 +106,26 @@ them.
 - A credential command's token goes only where its config document sends
   it. A config write that changes the command profile's provider or auth
   method, adds a binding of the same realm section that uses the profile,
-  re-points a binding at it, moves such a binding to another backend, or
-  changes the backend it names or the `[self_hosted.servers]` entry that
-  backend names, is refused with `confinement_administration_required`,
-  naming the profile, on every config write surface (removing a binding or
-  the command stays ordinary config). A request's auth binding may override
-  its profile with a credential command profile only when it is the
-  binding's own (`ProviderBindingError::CredentialCommandProfileOverride`).
-  A realm composition refuses a credential command binding whose
-  self-hosted server entry another document states or changes
+  re-points a binding at it, moves such a binding to another backend or
+  changes its default model, or changes the backend it names or the
+  `[self_hosted.servers]` entry that backend names, is refused with
+  `confinement_administration_required`, naming the profile, on every
+  config write surface (removing a binding or the command stays ordinary
+  config). A binding that uses a credential command on a self-hosted
+  backend must declare the backend's server: a self-hosted backend's
+  endpoint is otherwise the server that serves a request's model, so the
+  token would follow the request, or the binding's `default_model`, instead
+  of the document. A realm with such a binding does not compose
+  (`ConfigError::CredentialCommandServerUndeclared`), and a config built
+  without composing never sends its token elsewhere either: the binding is
+  never chosen for a server it does not declare, by its default model or as
+  the one unconstrained self-hosted binding, and naming it explicitly for
+  one is refused (`SelfHostedConnectionError::CredentialCommandServerUndeclared`).
+  A request's auth binding may override its profile with a credential
+  command profile only when it is the binding's own
+  (`ProviderBindingError::CredentialCommandProfileOverride`). A realm
+  composition refuses a credential command binding whose self-hosted server
+  entry another document states or changes
   (`ConfigError::CredentialCommandServer`): a realm section composes whole
   from one document, but server entries compose field by field across the
   chain. In 0.9.2 only what a command runs was guarded, so a write could

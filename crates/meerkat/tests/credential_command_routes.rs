@@ -2,9 +2,9 @@
 //! profile and the bindings that use it send it. An ordinary config write
 //! can neither add a command nor change what it runs, nor change where its
 //! token goes: the profile's provider and auth method, a binding that uses
-//! the profile (added, re-pointed at it, or moved to another backend), the
-//! backend such a binding names, or the self-hosted server entry that
-//! backend names. Each is refused as confinement administration naming the
+//! the profile (added, re-pointed at it, moved to another backend, or given
+//! another default model), the backend such a binding names, or the
+//! self-hosted server entry that backend names. Each is refused as confinement administration naming the
 //! profile, and nothing is written. Removing a binding or the command, and
 //! changing what other profiles and bindings use, stays ordinary config.
 
@@ -112,6 +112,10 @@ fn route_changes() -> Vec<(&'static str, serde_json::Value)> {
             serde_json::json!({"realm": {"team": {"backend": {"openai": {"options": {"organization": "attacker"}}}}}}),
         ),
         (
+            "the default model of a binding that uses the command",
+            serde_json::json!({"realm": {"team": {"binding": {"main": {"default_model": "gpt-5.5"}}}}}),
+        ),
+        (
             "the server of the backend a command binding names",
             serde_json::json!({"realm": {"team": {"backend": {"boxed": {"server": "open"}}}}}),
         ),
@@ -166,6 +170,10 @@ async fn a_config_write_cannot_change_where_a_credential_command_token_goes() {
         (
             "another binding moves to the command's backend",
             serde_json::json!({"realm": {"team": {"binding": {"free": {"backend_profile": "openai"}}}}}),
+        ),
+        (
+            "the default model of a binding that does not use the command",
+            serde_json::json!({"realm": {"team": {"binding": {"free": {"default_model": "gpt-5.5"}}}}}),
         ),
         (
             "a backend no command binding names changes",

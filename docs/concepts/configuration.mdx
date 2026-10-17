@@ -734,17 +734,27 @@ token is sent is refused with `confinement_administration_required`, naming
 the auth profile, on every config write surface. Where the token is sent is
 the profile's `provider` and `auth_method` and each binding of the same
 realm section that names the profile as its `auth_profile`: adding such a
-binding, re-pointing one at the profile, moving one to another backend, and
-changing the backend it names (its provider, kind, `base_url`, `options` or
-`server`) or the `[self_hosted.servers]` entry that backend names are all
-refused. Its timeout and caching, removing it, and removing a binding are
-ordinary config.
+binding, re-pointing one at the profile, moving one to another backend or
+changing its `default_model`, and changing the backend it names (its
+provider, kind, `base_url`, `options` or `server`) or the
+`[self_hosted.servers]` entry that backend names are all refused. Its
+timeout and caching, removing it, and removing a binding are ordinary
+config.
 
-Two more rules keep the token where its document sends it. A request may
-override a binding's auth profile (`auth_binding.profile`), but not with a
-credential command profile other than the binding's own: that is refused
-before anything resolves (`credential_command_profile_override`). And a
-realm section composes whole from one document, but `[self_hosted.servers]`
+Three more rules keep the token where its document sends it. A self-hosted
+backend's endpoint is otherwise the server that serves a request's model,
+so a binding that uses a credential command on a self-hosted backend must
+name that backend's server (`server = "<id>"`): a realm with one that does
+not is refused when it composes, naming the binding and the backend. A host
+that builds its config without composing it still never sends such a
+binding's token to a server it does not declare: the binding is never
+chosen for another server, by its `default_model` or as the one
+unconstrained self-hosted binding, and naming it explicitly for one is
+refused. A request may override a binding's auth profile
+(`auth_binding.profile`), but not with a credential command profile other
+than the binding's own: that is refused before anything resolves
+(`credential_command_profile_override`). And a realm section composes whole
+from one document, but `[self_hosted.servers]`
 entries compose field by field across the documents on a realm's chain, so
 a composition in which a credential command binding's server entry differs
 from the one the command's own document states is refused, naming the
