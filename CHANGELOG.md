@@ -151,6 +151,12 @@ them.
   `ResolvePeerResponseSender` (exhaustive matches need arms for them; the
   implicit discriminants and the `PartialOrd` order of the variant enums
   change, so match them by variant name).
+- Behaviour-only (not measured by the gate): a response to an outbound peer
+  request is accepted only from the peer the request was sent to (see
+  Fixed). A relay or forwarding pattern in which another peer answers a
+  request worked in 0.9.2; its responses are now dropped at the requester's
+  ingress, and an in-process sender's send fails with
+  `SendError::AdmissionDropped`. Have the addressee send the answer itself.
 
 ### Added
 
@@ -221,23 +227,29 @@ them.
   generated transition that records the send, before the request frame
   leaves, and removes it when the request ends (answered, rejected, timed
   out or failed to send). Peer ingress asks the machine
-  (`ResolvePeerResponseSender`) about every response frame before it is
-  queued and drops one signed by any other peer with the inbox's existing
+  (`ResolvePeerResponseSender`) about every response frame, for the request
+  id the machine echoed when it classified the frame, before it is queued,
+  and drops one signed by any other peer with the inbox's existing
   `ClassificationRejected` drop reason (an in-process sender's send fails
-  with `SendError::AdmissionDropped`); the drop names no peer. Such a frame
-  never reaches the drain, a waiting tool, a stream or the session, and the
-  request stays open for its addressee. The generated progress, terminal
-  and rejection transitions also take the frame's signer and refuse any
-  other peer, so a response observation from another peer can no longer
-  cancel the request either. A response to a request id this session never
-  sent, already completed, timed out, or sent before a restart keeps its
-  existing path: it is queued and the drain refuses it as unknown. The
-  addressee's own progress and terminal responses are applied as before,
-  and the supervisor bridge, which already matched the responder, behaves as
-  before. The record is not persisted, as the pending request map it belongs
-  to is not. Under open auth (`require_peer_auth = false`) ingress does not
-  verify signatures, so the check compares the key the response envelope
-  declares.
+  with `SendError::AdmissionDropped`; over TCP, where no response frame is
+  acknowledged, the send succeeds as for an accepted response); the drop
+  names no peer. Such a frame never reaches the drain, a waiting tool, a
+  stream or the session, and the request stays open for its addressee. The
+  generated progress, terminal and rejection transitions also take the
+  frame's signer and refuse any other peer, so a response observation from
+  another peer can no longer cancel the request either. A response to a
+  request id this session never sent, already completed, timed out, or sent
+  before a restart keeps its existing path: it is queued and the drain
+  refuses it as unknown. The addressee's own progress and terminal responses
+  are applied as before, and the supervisor bridge, which already matched
+  the responder, behaves as before. The record is not persisted, as the
+  pending request map it belongs to is not. Under open auth
+  (`require_peer_auth = false`) ingress does not verify signatures, so the
+  check compares the key the response envelope declares. Known limitation:
+  an in-process sender that holds a request id can tell from its send result
+  whether this session holds that request for another peer (dropped) or
+  does not hold it (admitted, then refused); the id is only ever sent to the
+  addressee, so a sender that holds it already sees the exchange.
 
 ## [0.9.2] - 2026-10-16
 
