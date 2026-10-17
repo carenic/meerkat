@@ -250,6 +250,35 @@ them.
   load. The test now waits for the loop to park before it queues the input.
   Test-only: the close never answers `Closed` while a non-terminal input
   exists.
+- A GPT Live barge-in duck (`live/assistant_playback_hint`) over an answer
+  now ends once the user has been quiet for 1.6 s, the floor guard's release
+  length, even while the answer is still talking. Since 0.8.51 every duck
+  waited for a 600 ms gap in the assistant's output after the user went
+  quiet, so an answer that started into the user's speech and never paused
+  stayed muted until it ended: in Turbo S S107 the duck ran from 3289 ms to
+  19205 ms over a 12.8 s answer, and the user heard none of it. The broker
+  now keys the restore on what the duck covers, by onset order on the
+  provider audio clock (gpt-live-1 output frames carry no response id). A
+  burst the assistant was voicing when the user started speaking is the one
+  the user interrupted: it keeps the 0.8.51 rule (once the user is quiet,
+  ducked to its next 600 ms output pause or its end, so the stale tail of
+  Turbo S S103 R3 stays silent), and it ends at its first 600 ms pause.
+  Audio after that pause, and any response that starts into or after the
+  user's speech, is an answer and restores on the user's quiet, mid-sentence
+  if need be. So does an answer that follows an early yield within the 1.6 s
+  that would end the interrupted response, and one that follows a user onset
+  within 1.6 s of an answer that had ended at least 600 ms before. The duck
+  still holds
+  while the user speaks, and pauses inside the user's speech (under 1.6 s)
+  never restore it. By design, an answer spoken entirely while the user is
+  still talking stays ducked to its end (Turbo S S106): the user held the
+  floor for all of it. Known limitation: without a response id the broker
+  cannot tell a resumed interrupted response from a new answer. If the
+  interrupted response pauses for 600 ms or more while the user is still
+  talking and then resumes, or the user starts speaking inside a 600 ms to
+  1.6 s pause of a response that then resumes, the resumed audio counts as
+  an answer: it stays ducked while the user speaks and is restored once the
+  user has been quiet for 1.6 s, mid-sentence if need be.
 
 ## [0.9.2] - 2026-10-16
 
