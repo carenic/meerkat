@@ -68,6 +68,18 @@ them.
   is retried within the retry policy with nothing committed, then fails the run
   as `ProviderError(IncompleteResponse)`.
 
+- Behaviour-only (not measured by the gate): the same holds for a Chat
+  Completions `finish_reason` and a Gemini `finishReason` the adapter does not
+  know. Chat Completions knows `stop`, `length`, `tool_calls`, `function_call`
+  and `content_filter`, plus the natural-stop names `eos`, `eos_token` and
+  `stop_sequence` some self-hosted servers send. Gemini maps its whole safety
+  family (`SAFETY`, `RECITATION`, `LANGUAGE`, `BLOCKLIST`,
+  `PROHIBITED_CONTENT`, `SPII`, `IMAGE_SAFETY`, `IMAGE_PROHIBITED_CONTENT`,
+  `IMAGE_RECITATION`) to `content_filter`, which fails the run as above; a
+  malformed or unexpected tool call (`MALFORMED_FUNCTION_CALL`,
+  `UNEXPECTED_TOOL_CALL`, `TOO_MANY_TOOL_CALLS`), `OTHER` and any other reason
+  fail the response as incomplete.
+
 ### Fixed
 
 - An Anthropic `pause_turn` stop (a server-tool loop reached its iteration
@@ -87,6 +99,8 @@ them.
   turn (#1882).
 - An Anthropic stream that carries no stop reason at all (a proxy may omit it)
   still ends as `end_turn`: a missing reason is not an unknown one.
+- The OpenAI realtime adapter still reports a failed response, or an
+  incomplete one with an unknown reason, as `end_turn` (#1883).
 
 ## [0.9.2] - 2026-10-16
 
