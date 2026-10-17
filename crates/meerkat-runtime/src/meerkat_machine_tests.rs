@@ -41400,11 +41400,42 @@ async fn recovered_predecessor_inputs_are_silently_abandoned_before_attachment_s
 /// mutation gate was free when told. Install it before the step that takes
 /// the announcement: an announcement tells the hint that was installed when
 /// it was taken.
+///
+/// A tell counts as after M when M is free at the tell. That cannot
+/// distinguish the owner under test from a waiter queued on M at its release,
+/// which tokio hands M inside the release. A step whose release can find such
+/// a waiter (a runtime loop it lets serve) queues a [`GateReleaseWitness`]
+/// first, and its tells are then classified by that witness's grant instead.
 struct RunlessTerminalTells {
     gate: Arc<tokio::sync::Mutex<()>>,
     with_gate_free: Arc<AtomicUsize>,
     under_gate: Arc<AtomicUsize>,
     told: Arc<Notify>,
+    witness_queued: Arc<AtomicBool>,
+    witness_granted: Arc<AtomicBool>,
+}
+
+type GateWaiter =
+    std::pin::Pin<Box<dyn std::future::Future<Output = tokio::sync::OwnedMutexGuard<()>> + Send>>;
+
+/// A waiter queued on M while the owner under test holds it.
+///
+/// Tokio's mutex is FIFO: the owner's release grants M to this first waiter,
+/// and wakes it, inside the release, before any waiter that queued later can
+/// take M. The grant therefore marks exactly the owner's release, whoever
+/// takes M after it. Once granted it holds M until dropped.
+struct GateReleaseWitness {
+    _waiter: GateWaiter,
+}
+
+/// The waker of a [`GateReleaseWitness`]: tokio wakes it when it grants the
+/// witness M.
+struct GrantFlag(Arc<AtomicBool>);
+
+impl std::task::Wake for GrantFlag {
+    fn wake(self: Arc<Self>) {
+        self.0.store(true, Ordering::SeqCst);
+    }
 }
 
 impl RunlessTerminalTells {
@@ -41416,13 +41447,22 @@ impl RunlessTerminalTells {
         let with_gate_free = Arc::new(AtomicUsize::new(0));
         let under_gate = Arc::new(AtomicUsize::new(0));
         let told = Arc::new(Notify::new());
+        let witness_queued = Arc::new(AtomicBool::new(false));
+        let witness_granted = Arc::new(AtomicBool::new(false));
         machine.set_runless_input_terminal_hint(Arc::new({
             let gate = Arc::clone(&gate);
             let with_gate_free = Arc::clone(&with_gate_free);
             let under_gate = Arc::clone(&under_gate);
             let told = Arc::clone(&told);
+            let witness_queued = Arc::clone(&witness_queued);
+            let witness_granted = Arc::clone(&witness_granted);
             move || {
-                if gate.try_lock().is_ok() {
+                let released = if witness_queued.load(Ordering::SeqCst) {
+                    witness_granted.load(Ordering::SeqCst)
+                } else {
+                    gate.try_lock().is_ok()
+                };
+                if released {
                     with_gate_free.fetch_add(1, Ordering::SeqCst);
                 } else {
                     under_gate.fetch_add(1, Ordering::SeqCst);
@@ -41435,7 +41475,34 @@ impl RunlessTerminalTells {
             with_gate_free,
             under_gate,
             told,
+            witness_queued,
+            witness_granted,
         }
+    }
+
+    /// Queue a [`GateReleaseWitness`] on M, which the owner under test must
+    /// hold now with no other waiter queued, and classify every later tell by
+    /// whether that owner's release has granted the witness M.
+    fn queue_release_witness(&self) -> GateReleaseWitness {
+        // Unconstrained: an exhausted coop budget would return Pending
+        // without queueing, and wake the flag.
+        let mut waiter: GateWaiter = Box::pin(tokio::task::unconstrained(
+            Arc::clone(&self.gate).lock_owned(),
+        ));
+        let waker = std::task::Waker::from(Arc::new(GrantFlag(Arc::clone(&self.witness_granted))));
+        let queued =
+            std::future::Future::poll(waiter.as_mut(), &mut std::task::Context::from_waker(&waker))
+                .is_pending();
+        assert!(
+            queued,
+            "the release witness queues behind the owner holding M"
+        );
+        assert!(
+            !self.witness_granted.load(Ordering::SeqCst),
+            "nothing grants the witness M while it queues"
+        );
+        self.witness_queued.store(true, Ordering::SeqCst);
+        GateReleaseWitness { _waiter: waiter }
     }
 
     fn total(&self) -> usize {
@@ -41574,6 +41641,11 @@ async fn recovered_predecessor_abandonment_is_told_once_its_lease_releases_m() {
         .try_commit_with_retained_publication_lease_under_runtime_turn_finalization_boundary()
         .await
         .expect("retain replacement publication boundary");
+    // The commit lets the replacement's runtime loop serve and wakes it while
+    // the lease still holds M, so the loop can queue on M before the release
+    // and take M inside it. Queued first, the witness is what that release
+    // grants M to.
+    let release_witness = tells.queue_release_witness();
     assert_eq!(
         publication
             .abandon_recovered_predecessor_inputs()
@@ -41591,6 +41663,8 @@ async fn recovered_predecessor_abandonment_is_told_once_its_lease_releases_m() {
         .await
         .expect("publish replacement after predecessor abandonment");
     tells.assert_told_once_after_the_gate("recovered predecessor abandonment");
+    // Hand M on to whatever queued behind the witness.
+    drop(release_witness);
     let stored = machine
         .input_state(&session_id, &input_id)
         .await
