@@ -78,6 +78,11 @@ them.
   showed `rkat mcp add <name> --url <url>` followed by `rkat mcp login
   <name>`, which that refusal stops; they now pass
   `--oauth-account-selection discover`.
+- The MCP reference said MCP OAuth credentials are stored per installation,
+  not per realm. Since 0.9 each realm has its own credential slot in the
+  host's token store (the slot key includes the realm the host serves), as
+  the CLI reference and the 0.9 migration notes say; the reference now says
+  so.
 
 ## [0.9.2] - 2026-10-16
 

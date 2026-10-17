@@ -331,12 +331,17 @@ ask its user.
   verification never falls back to `unverified` or to an unselected
   credential. A selected server must use streamable HTTP without a static
   `Authorization` header and a host OAuth resolver. Mob portable profiles
-  cannot carry `oauth_account_selection` and refuse it. Credentials are
-  stored per installation (the host's token store), not per realm, and a
-  new login over a Known credential stored before account bindings were
-  recorded needs a disconnect first (using it does not). The default account
-  strategy is OpenID Connect UserInfo: it
-  requests `openid`, calls the issuer's `userinfo_endpoint` with the new
+  cannot carry `oauth_account_selection` and refuse it. Credentials live in
+  the host's token store, one per installation (for `rkat`, files under the
+  user's config directory), with a credential slot per realm: the slot key
+  includes the realm the host serves (`HostAuthService::with_mcp_realm`,
+  which `rkat` and the RPC and REST servers set), so each realm logs in,
+  refreshes and logs out on its own and never reads another realm's
+  credential. A credential stored before realms scoped these slots (0.9) is
+  left unused. A new login over a Known credential stored before account
+  bindings were recorded needs a disconnect first (using it does not). The
+  default account strategy is OpenID Connect UserInfo: it requests
+  `openid`, calls the issuer's `userinfo_endpoint` with the new
   access token and reports `sub`, which must equal `oauth_account` when one
   is named. A refresh of a verified credential observes the subject again
   and refuses a different one; if the subject cannot be observed (for
