@@ -99,24 +99,49 @@ pub enum HostStackError {
     #[error(
         "failed to spawn the {name} main thread: {source}. The OS refuses new \
          threads, usually because the process is at its thread limit; the \
-         runtime asks for {workers} worker threads ({workers_from}). {} Set {} \
-         to fewer workers, or raise the limit.",
+         runtime asks for {} ({}). {}{} Set {} to fewer workers, or raise the \
+         limit.",
+        worker_threads_phrase(*.workers),
+        workers_origin(.workers_set_by.as_deref()),
         limit_sentence(.observed_limit.as_deref()),
-        HOST_WORKER_THREADS_ENV
+        stack_sentence(.stack_overridden_by.as_deref(), *.stack_bytes),
+        .workers_set_by.as_deref().unwrap_or(HOST_WORKER_THREADS_ENV)
     )]
     ThreadLimit {
         name: String,
         /// Workers the runtime was built with (not all of them may run).
         workers: usize,
-        /// Where the count came from: one per available CPU, or the variable
-        /// that set it.
-        workers_from: String,
+        /// The variable that set the worker count; `None` is one worker per
+        /// available CPU.
+        workers_set_by: Option<String>,
+        /// Stack bytes per thread.
+        stack_bytes: usize,
+        /// The variable that overrode the stack budget, if any: mapping an
+        /// oversized stack fails with EAGAIN as well.
+        stack_overridden_by: Option<String>,
         /// The limits Linux exposes (cgroup `pids.max`, `RLIMIT_NPROC`), when
         /// readable and finite.
         observed_limit: Option<String>,
         #[source]
         source: std::io::Error,
     },
+}
+
+/// `1 worker thread`, `8 worker threads`.
+fn worker_threads_phrase(workers: usize) -> String {
+    if workers == 1 {
+        "1 worker thread".to_string()
+    } else {
+        format!("{workers} worker threads")
+    }
+}
+
+/// Where a worker count came from, for [`HostStackError::ThreadLimit`].
+fn workers_origin(set_by: Option<&str>) -> String {
+    match set_by {
+        Some(variable) => format!("set by {variable}"),
+        None => "one per available CPU".to_string(),
+    }
 }
 
 /// The limit sentence of [`HostStackError::ThreadLimit`]'s message.
@@ -126,6 +151,18 @@ fn limit_sentence(observed: Option<&str>) -> String {
         None => {
             "The likely limit is a container pids limit or RLIMIT_NPROC (`ulimit -u`).".to_string()
         }
+    }
+}
+
+/// The stack sentence of [`HostStackError::ThreadLimit`]'s message: empty
+/// unless a variable overrode the stack, whose mapping can be what failed.
+fn stack_sentence(overridden_by: Option<&str>, bytes: usize) -> String {
+    match overridden_by {
+        Some(variable) => format!(
+            " {variable} sets each thread's stack to {bytes} bytes, and mapping a \
+             stack that size can also make the OS refuse the thread."
+        ),
+        None => String::new(),
     }
 }
 
@@ -311,10 +348,11 @@ impl HostStackBudget {
         HostStackError::ThreadLimit {
             name: name.to_string(),
             workers,
-            workers_from: match self.worker_threads {
-                Some(workers) => format!("set by {}", workers.set_by),
-                None => "one per available CPU".to_string(),
-            },
+            workers_set_by: self
+                .worker_threads
+                .map(|workers| workers.set_by.to_string()),
+            stack_bytes: self.bytes,
+            stack_overridden_by: self.overridden_by.clone(),
             observed_limit: observed_thread_limits(),
             source,
         }
@@ -359,21 +397,44 @@ pub fn worker_threads_from_env() -> Result<Option<NonZeroUsize>, HostStackError>
 /// The hint a host adds to a fatal error caused by a refused thread or
 /// process spawn: an [`std::io::Error`] of kind `WouldBlock` (EAGAIN)
 /// anywhere in `chain`, the error followed by its sources. `None` for any
-/// other error.
+/// other error. It names the variable that set the worker count, read from
+/// the process environment as [`HostStackBudget::from_env`] reads it.
 pub fn thread_limit_hint<'e>(
+    chain: impl Iterator<Item = &'e (dyn std::error::Error + 'static)>,
+) -> Option<String> {
+    thread_limit_hint_from(chain, env_lookup)
+}
+
+/// [`thread_limit_hint`] with an injected environment, for tests.
+fn thread_limit_hint_from<'e>(
     mut chain: impl Iterator<Item = &'e (dyn std::error::Error + 'static)>,
-) -> Option<&'static str> {
-    chain
-        .any(|link| {
-            link.downcast_ref::<std::io::Error>()
-                .is_some_and(|error| error.kind() == std::io::ErrorKind::WouldBlock)
-        })
-        .then_some(
-            "hint: the OS refused a new thread or process (EAGAIN), usually because \
-             the process is at its thread limit (a container pids limit or \
-             RLIMIT_NPROC). The runtime starts one worker thread per available CPU \
-             unless RKAT_WORKER_THREADS sets fewer; lower it, or raise the limit.",
-        )
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Option<String> {
+    let refused = chain.any(|link| {
+        link.downcast_ref::<std::io::Error>()
+            .is_some_and(|error| error.kind() == std::io::ErrorKind::WouldBlock)
+    });
+    if !refused {
+        return None;
+    }
+    // A bad value stops the host before its runtime exists, so an error
+    // here cannot have come from that host; treat it as unset.
+    let workers = match resolve_worker_threads(lookup) {
+        Ok(Some(workers)) => format!(
+            "The runtime starts {}, set by {}; lower it",
+            worker_threads_phrase(workers.count.get()),
+            workers.set_by
+        ),
+        Ok(None) | Err(_) => format!(
+            "The runtime starts one worker thread per available CPU unless \
+             {HOST_WORKER_THREADS_ENV} sets fewer; set it"
+        ),
+    };
+    Some(format!(
+        "hint: the OS refused a new thread or process (EAGAIN), usually because the \
+         process is at its thread limit (a container pids limit or RLIMIT_NPROC). \
+         {workers}, or raise the limit."
+    ))
 }
 
 /// The limits a refused thread spawn usually hits, as Linux exposes them:
@@ -680,12 +741,16 @@ mod tests {
             HostStackError::ThreadLimit {
                 name,
                 workers,
-                workers_from,
+                workers_set_by,
+                stack_bytes,
+                stack_overridden_by,
                 ..
             } => {
                 assert_eq!(name, "rkat-test");
                 assert_eq!(workers, wanted);
-                assert_eq!(workers_from, "set by RKAT_WORKER_THREADS");
+                assert_eq!(workers_set_by.as_deref(), Some(HOST_WORKER_THREADS_ENV));
+                assert_eq!(stack_bytes, HOST_WORKER_STACK_BUDGET);
+                assert_eq!(stack_overridden_by, None);
             }
             other => panic!("expected ThreadLimit, got {other:?}"),
         }
@@ -703,6 +768,7 @@ mod tests {
             message.contains("Set RKAT_WORKER_THREADS to fewer workers, or raise the limit."),
             "{message}"
         );
+        assert!(!message.contains("stack"), "{message}");
 
         // Without the knob the count is the runtime's own default, and the
         // OS's own EAGAIN is the same refusal.
@@ -712,13 +778,83 @@ mod tests {
             let error = HostStackBudget::default_budget()
                 .run_with_spawn("rkat-test", || async {}, refuse_main_thread(eagain))
                 .unwrap_err();
+            let message = error.to_string();
             match error {
-                HostStackError::ThreadLimit { workers_from, .. } => {
-                    assert_eq!(workers_from, "one per available CPU");
+                HostStackError::ThreadLimit { workers_set_by, .. } => {
+                    assert_eq!(workers_set_by, None);
                 }
                 other => panic!("expected ThreadLimit, got {other:?}"),
             }
+            assert!(message.contains("(one per available CPU)"), "{message}");
+            assert!(message.contains("Set RKAT_WORKER_THREADS to"), "{message}");
         }
+    }
+
+    #[test]
+    fn a_thread_limit_names_the_variable_that_set_the_count_and_one_worker() {
+        let budget = HostStackBudget::from_lookup(
+            &[HOST_WORKER_STACK_ENV],
+            env(&[("TOKIO_WORKER_THREADS", "1")]),
+        )
+        .unwrap();
+        let message = budget
+            .run_with_spawn(
+                "rkat-test",
+                || async {},
+                refuse_main_thread(std::io::Error::from(std::io::ErrorKind::WouldBlock)),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            message.contains("the runtime asks for 1 worker thread (set by TOKIO_WORKER_THREADS)"),
+            "{message}"
+        );
+        assert!(
+            message.contains("Set TOKIO_WORKER_THREADS to fewer workers, or raise the limit."),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn a_thread_limit_under_a_stack_override_names_the_stack_bytes() {
+        let budget = HostStackBudget::from_lookup(
+            &[HOST_WORKER_STACK_ENV],
+            env(&[
+                (HOST_WORKER_STACK_ENV, "1048576"),
+                (HOST_WORKER_THREADS_ENV, "2"),
+            ]),
+        )
+        .unwrap();
+        let error = budget
+            .run_with_spawn(
+                "rkat-test",
+                || async {},
+                refuse_main_thread(std::io::Error::from(std::io::ErrorKind::WouldBlock)),
+            )
+            .unwrap_err();
+        let message = error.to_string();
+        match error {
+            HostStackError::ThreadLimit {
+                stack_bytes,
+                stack_overridden_by,
+                ..
+            } => {
+                assert_eq!(stack_bytes, 1_048_576);
+                assert_eq!(stack_overridden_by.as_deref(), Some(HOST_WORKER_STACK_ENV));
+            }
+            other => panic!("expected ThreadLimit, got {other:?}"),
+        }
+        assert!(
+            message.contains(
+                "RKAT_WORKER_STACK_BYTES sets each thread's stack to 1048576 bytes, and mapping \
+                 a stack that size can also make the OS refuse the thread."
+            ),
+            "{message}"
+        );
+        assert!(
+            message.ends_with("Set RKAT_WORKER_THREADS to fewer workers, or raise the limit."),
+            "{message}"
+        );
     }
 
     #[test]
@@ -807,24 +943,60 @@ mod tests {
     #[error("I/O error: {0}")]
     struct Wrapped(#[source] std::io::Error);
 
-    fn hint_for(error: &(dyn std::error::Error + 'static)) -> Option<&'static str> {
-        thread_limit_hint(std::iter::successors(Some(error), |&link| link.source()))
+    fn hint_for(
+        error: &(dyn std::error::Error + 'static),
+        pairs: &[(&str, &str)],
+    ) -> Option<String> {
+        thread_limit_hint_from(
+            std::iter::successors(Some(error), |&link| link.source()),
+            env(pairs),
+        )
     }
 
     #[test]
     fn the_thread_limit_hint_needs_a_would_block_io_error_in_the_chain() {
         let wrapped = Wrapped(std::io::Error::from(std::io::ErrorKind::WouldBlock));
-        let hint = hint_for(&wrapped).unwrap();
+        let hint = hint_for(&wrapped, &[]).unwrap();
         assert!(
             hint.starts_with("hint: the OS refused a new thread"),
             "{hint}"
         );
-        assert!(hint.contains(HOST_WORKER_THREADS_ENV), "{hint}");
+        assert!(
+            hint.ends_with(
+                "The runtime starts one worker thread per available CPU unless \
+                 RKAT_WORKER_THREADS sets fewer; set it, or raise the limit."
+            ),
+            "{hint}"
+        );
 
         let bare = std::io::Error::from(std::io::ErrorKind::WouldBlock);
-        assert_eq!(hint_for(&bare), Some(hint));
+        assert_eq!(hint_for(&bare, &[]), Some(hint));
 
-        assert_eq!(hint_for(&Wrapped(std::io::Error::other("disk full"))), None);
-        assert_eq!(hint_for(&std::fmt::Error), None);
+        assert_eq!(
+            hint_for(&Wrapped(std::io::Error::other("disk full")), &[]),
+            None
+        );
+        assert_eq!(hint_for(&std::fmt::Error, &[]), None);
+    }
+
+    #[test]
+    fn the_thread_limit_hint_names_the_variable_that_set_the_count() {
+        let refused = std::io::Error::from(std::io::ErrorKind::WouldBlock);
+        let hint = hint_for(&refused, &[(HOST_WORKER_THREADS_ENV, "4")]).unwrap();
+        assert!(
+            hint.ends_with(
+                "The runtime starts 4 worker threads, set by RKAT_WORKER_THREADS; lower it, \
+                 or raise the limit."
+            ),
+            "{hint}"
+        );
+        let hint = hint_for(&refused, &[("TOKIO_WORKER_THREADS", "1")]).unwrap();
+        assert!(
+            hint.ends_with(
+                "The runtime starts 1 worker thread, set by TOKIO_WORKER_THREADS; lower it, \
+                 or raise the limit."
+            ),
+            "{hint}"
+        );
     }
 }

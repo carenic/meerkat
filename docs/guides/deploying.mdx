@@ -406,8 +406,9 @@ Size the limit for everything the host runs, not only its workers:
 - Each live session with a persistent store adds one thread.
 - Blocking work (file and SQLite I/O, DNS lookups) runs on Tokio's blocking
   pool, which can grow to 512 threads per runtime under load; idle ones exit
-  after 10 seconds. A blocking-pool spawn the limit refuses waits for a busy
-  thread instead of failing.
+  after 10 seconds. A blocking-pool spawn the limit refuses is queued until
+  one of the pool's threads is free, but only while the pool has a thread:
+  in a pool with none, Tokio panics instead (`OS can't spawn worker thread`).
 - Every MCP stdio server and shell command is a process inside the same
   limit, with threads of its own.
 

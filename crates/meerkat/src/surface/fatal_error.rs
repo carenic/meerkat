@@ -124,7 +124,7 @@ mod tests {
             lines[2].starts_with("rkat-rpc: hint: the OS refused a new thread or process"),
             "{rendered}"
         );
-        assert!(lines[2].contains("RKAT_WORKER_THREADS"), "{rendered}");
+        assert!(lines[2].contains("worker thread"), "{rendered}");
 
         let other = Io(std::io::Error::other("disk says no"));
         let rendered = FatalErrorReport::new("rkat-rpc", &other).to_string();

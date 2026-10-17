@@ -39,9 +39,11 @@ them.
 
 - `meerkat_runtime::host_stack::HostStackError` is now `#[non_exhaustive]`
   and has two new variants, `InvalidWorkerThreads { name, raw }` and
-  `ThreadLimit { name, workers, workers_from, observed_limit, source }` (see
-  Added and Fixed); an exhaustive match must add a wildcard arm.
-- `meerkat::surface::FatalErrorReport::new` and
+  `ThreadLimit { name, workers, workers_set_by, stack_bytes,
+  stack_overridden_by, observed_limit, source }` (see Added and Fixed); an
+  exhaustive match must add a wildcard arm.
+- Not measured by the gate (cargo-semver-checks does not compare a trait
+  object's lifetime bound): `meerkat::surface::FatalErrorReport::new` and
   `meerkat::surface::report_fatal_error` take `&(dyn Error + 'static)`
   instead of `&dyn Error`, so the report can look for an `std::io::Error` in
   the chain (see Fixed). A `Box<dyn Error>`'s `as_ref()` still fits.
@@ -80,9 +82,12 @@ them.
   (#1799). Tokio launches one worker per CPU and silently queues the ones it
   cannot spawn, so the main thread was the first refusal anyone saw. The
   error now names the worker count and where it came from, the cgroup
-  `pids.max` and `RLIMIT_NPROC` that Linux reports, and `RKAT_WORKER_THREADS`.
-  A fatal error whose chain holds an `std::io::Error` of kind `WouldBlock`
-  (EAGAIN) now ends with a `hint:` line naming the usual causes and the knob,
+  `pids.max` and `RLIMIT_NPROC` that Linux reports, the variable to lower
+  (the one that set the count, else `RKAT_WORKER_THREADS`), and, when
+  `RKAT_WORKER_STACK_BYTES` overrode the stack, its size, since mapping an
+  oversized stack fails with the same EAGAIN. A fatal error whose chain holds
+  an `std::io::Error` of kind `WouldBlock` (EAGAIN) now ends with a `hint:`
+  line naming the usual causes and the variable that set the worker count,
   in `rkat`, `rkat-rpc`, `rkat-rest`, `rkat-mcp` and `rkat-mob-mcp`.
 
 ## [0.9.2] - 2026-10-16
