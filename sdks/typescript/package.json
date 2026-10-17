@@ -31,6 +31,9 @@
     "test:live-smoke": "npm run build && node --test tests/e2e_smoke.test.mjs"
   },
   "license": "MIT OR Apache-2.0",
+  "engines": {
+    "node": "^20.19.0 || >=22.12.0"
+  },
   "dependencies": {
     "ws": "^8.20.0"
   },

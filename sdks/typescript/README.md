@@ -13,7 +13,7 @@ npm install @rkat/sdk
 ## Prerequisites
 
 - **`rkat-rpc` binary on PATH** -- install it with `brew install lukacf/meerkat/rkat` or from the release archive for your platform ([Linux without Homebrew](https://docs.rkat.ai/quickstart#linux-without-homebrew)). The SDK can also resolve and download a release binary automatically.
-- **Node.js >= 18** (uses `node:child_process`, `node:readline`, `node:test`).
+- **Node.js 20.19+ or 22.12+** (`engines.node` is `^20.19.0 || >=22.12.0`). The package ships only an ES module, so `require('@rkat/sdk')` from CommonJS loads it through Node's `require(esm)`, which is on by default from 20.19 and 22.12 but not in Node 21 or 22.0-22.11.
 - **API key** for at least one LLM provider set in your environment (e.g. `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, or `GOOGLE_API_KEY`).
 
 ## tsconfig Requirements
