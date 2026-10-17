@@ -184,6 +184,7 @@ rust_test(
     ],
     size = "medium",
     data = [
+        ":package_runfiles",
         "//crates/meerkat-core:package_runfiles",
     ],
     env = {
