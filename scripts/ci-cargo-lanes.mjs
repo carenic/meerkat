@@ -1271,7 +1271,10 @@ export const LIVE_ONLY_FEATURES = ["integration-real-tests", "openai-live-e2e"];
 // The reader rows of a plan (see the header): for each reader selection
 // (scripts/ci-non-rust-readers.mjs) the targets no other lane of the plan
 // runs, as one integration-lane row. A pull request leaves the readers that
-// compile meerkat-mob to the push (named in `deferred.reader_rows`).
+// compile meerkat-mob to the push (named in `deferred.reader_rows`). The
+// integration lane waits for ci.yml's stagger job (the rest wave), so a
+// reader row, such as the whole-checkout one every push plans, never takes
+// a runner before the long rows.
 export function readerRows({ selections, result, byName, heavyChain, deferToPush, deferred, compiledInDocs, unified }) {
   const mainUnit = result.main_unit_shards.length > 0;
   // The unit lane of this plan runs the package's lib and bins (default
@@ -1308,6 +1311,10 @@ export function readerRows({ selections, result, byName, heavyChain, deferToPush
     const name = colon < 0 ? null : selection.target.slice(colon + 1);
     if (name !== null && !pkg.targets.some((target) => target.name === name && target.kind.includes(kind))) {
       throw new Error(`the non-Rust reader inventory names unknown target ${selection.target} of ${selection.package}`);
+    }
+    // Cargo refuses --lib for a package without a library.
+    if (kind === "lib" && !targetFlags([pkg], { tests: false }).includes("--lib")) {
+      throw new Error(`the non-Rust reader inventory names the library of ${selection.package}, which has none`);
     }
     // Library, binary or build-script code is reached by every test.
     const whole = selection.scope === "package" || kind === "build";

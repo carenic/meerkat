@@ -1404,6 +1404,22 @@ for (const path of [
     }).map((row) => `${row.package_flags} | ${row.test_flags}`);
   assert.deepEqual(rowsFor(false), ["-p binonly | --bins"], "a push with no main unit lane runs its bins, not --lib");
   assert.deepEqual(rowsFor(true), ["-p binonly | --tests"], "a pull request runs every test target");
+  // A library reader of a package without a library is an inventory error,
+  // never a --lib row.
+  assert.throws(
+    () =>
+      readerRows({
+        selections: [{ package: "binonly", target: "lib", scope: "target", tests: null, features: [], paths: ["docs/x.mdx"], reads: ["docs/"] }],
+        result: { main_unit_shards: [], unit_packages: [], unit_shards: [], integration_suites: [] },
+        byName,
+        heavyChain: new Set(),
+        deferToPush: false,
+        deferred: { reader_rows: [] },
+        compiledInDocs: new Set(),
+        unified: new Map([["binonly", new Set()]]),
+      }),
+    /names the library of binonly, which has none/,
+  );
 }
 
 // The two-wave lanes in ci.yml: each lane's rest wave is a copy of its job
@@ -2058,6 +2074,18 @@ for (const path of [
   const license = planFor(["LICENSE-MIT"], ["--event", "pull_request"]);
   assert.deepEqual([license.reader_rows, license.deferred_to_push.reader_rows], [[], []]);
   assert.deepEqual(rowsOf(planFor(["LICENSE-MIT"])), [machineContracts]);
+  // That row runs in the integration lane, which waits for the stagger job
+  // (the rest wave), and in no first-wave matrix: it never takes a runner
+  // before the push's long rows.
+  const licenseLines = outputs(["--", "LICENSE-MIT"]);
+  assert.deepEqual(JSON.parse(licenseLines.integration_matrix).include.map((row) => row.name), ["reader xtask:test:machines_contracts"]);
+  for (const key of ["shard_matrix", "main_unit_shard_matrix", "closure_test_matrix", "feature_check_matrix"]) {
+    assert.doesNotMatch(licenseLines[key], /machines_contracts/, `${key} holds no reader row`);
+  }
+  assert.ok(
+    jobLines(readFileSync(resolve(root, ".github/workflows/ci.yml"), "utf8"), "integration").includes("    needs: [changes, stagger]"),
+    "the integration lane waits for the stagger job",
+  );
   // A test target whose required features the closure-tests rows do not
   // build runs with them on the push; one that needs live-provider
   // credentials runs in no CI lane and is named, not deferred.
