@@ -1996,6 +1996,7 @@ impl CreateSessionModelResolutionError {
                     | meerkat_core::ProviderBindingError::CredentialAccountProfileOverrideMismatch {
                         ..
                     }
+                    | meerkat_core::ProviderBindingError::CredentialCommandProfileOverride { .. }
                     | meerkat_core::ProviderBindingError::UnknownProviderName(_)
                     | meerkat_core::ProviderBindingError::InvalidRealmId { .. }
                     | meerkat_core::ProviderBindingError::ServerRequiresSelfHostedProvider { .. }

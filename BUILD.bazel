@@ -942,6 +942,7 @@ test_suite(
         "//crates/meerkat:consent_notice_delivery_test",
         "//crates/meerkat:continuation_delivery_test",
         "//crates/meerkat:continuation_submit_test",
+        "//crates/meerkat:credential_command_routes_test",
         "//crates/meerkat:embedded_skill_registration_test",
         "//crates/meerkat:factory_build_agent_test",
         "//crates/meerkat:governed_realm_account_binding_test",

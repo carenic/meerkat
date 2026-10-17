@@ -727,12 +727,32 @@ stating the same requirement, is ordinary config. Re-parent a confined or
 governed realm by editing its document as its host.
 
 A credential command (an auth profile's `source = { kind = "command" }`)
-runs as the host, outside confinement, so it is administered the same way:
-a config write that adds one, or changes its program, arguments,
-environment or working directory, is refused with
-`confinement_administration_required`, naming the auth profile, on every
-config write surface. Its timeout and caching, and removing it, are
+runs as the host, outside confinement, so it is administered the same way,
+and so is where its token goes. A config write that adds one, changes its
+program, arguments, environment or working directory, or changes where its
+token is sent is refused with `confinement_administration_required`, naming
+the auth profile, on every config write surface. Where the token is sent is
+the profile's `provider` and `auth_method` and each binding of the same
+realm section that names the profile as its `auth_profile`: adding such a
+binding, re-pointing one at the profile, moving one to another backend, and
+changing the backend it names (its provider, kind, `base_url`, `options` or
+`server`) or the `[self_hosted.servers]` entry that backend names are all
+refused. Its timeout and caching, removing it, and removing a binding are
 ordinary config.
+
+Two more rules keep the token where its document sends it. A request may
+override a binding's auth profile (`auth_binding.profile`), but not with a
+credential command profile other than the binding's own: that is refused
+before anything resolves (`credential_command_profile_override`). And a
+realm section composes whole from one document, but `[self_hosted.servers]`
+entries compose field by field across the documents on a realm's chain, so
+a composition in which a credential command binding's server entry differs
+from the one the command's own document states is refused, naming the
+binding, the profile and the server; state the whole entry in the command's
+document and nowhere else on the chain. Credentials that do not come from a
+command (the managed store, credential accounts, environment variables,
+platform defaults, external resolvers, file descriptors) are outside these
+rules: where they are sent stays ordinary config.
 
 The user document decides for other realms too: its `[realm.global]`
 section puts `global`, and with it the user document's `[governance]`, on

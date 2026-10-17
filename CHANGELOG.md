@@ -41,6 +41,25 @@ them.
   also refused when a realm the user document states a section for would
   compose a different `[confinement]` or `[governance]` on a state root that
   holds no document of its own for that realm (see Fixed).
+- `meerkat_core::ConfigError` has a new variant
+  `CredentialCommandServer { realm, binding, profile, server }`: a
+  composition in which a binding whose auth profile runs a credential
+  command takes the `[self_hosted.servers]` entry its backend names from
+  another config document (see Security); an exhaustive match must handle
+  it.
+- `meerkat_core::ProviderBindingError` has a new variant
+  `CredentialCommandProfileOverride { binding, profile }`: an auth binding
+  reference whose `profile` override names a credential command profile
+  other than the binding's own (see Security); an exhaustive match must
+  handle it.
+- Behaviour-only (not measured by the gate): a config write that changes
+  where a credential command's token goes is refused with
+  `confinement_administration_required` on every config write surface, as
+  one that changes what the command runs already was; a request whose auth
+  binding overrides its profile with another binding's credential command
+  is refused; and a realm whose credential command binding would take its
+  self-hosted server entry from another document does not compose (see
+  Security).
 
 ### Security
 
@@ -69,6 +88,25 @@ them.
   token) naming the remedies. In 0.9.2 the token was in the clone's URL on
   the command line and stayed in the checkout's `.git/config` (a 0.9.2 known
   limitation).
+- A credential command's token goes only where its config document sends
+  it. A config write that changes the command profile's provider or auth
+  method, adds a binding of the same realm section that uses the profile,
+  re-points a binding at it, moves such a binding to another backend, or
+  changes the backend it names or the `[self_hosted.servers]` entry that
+  backend names, is refused with `confinement_administration_required`,
+  naming the profile, on every config write surface (removing a binding or
+  the command stays ordinary config). A request's auth binding may override
+  its profile with a credential command profile only when it is the
+  binding's own (`ProviderBindingError::CredentialCommandProfileOverride`).
+  A realm composition refuses a credential command binding whose
+  self-hosted server entry another document states or changes
+  (`ConfigError::CredentialCommandServer`): a realm section composes whole
+  from one document, but server entries compose field by field across the
+  chain. In 0.9.2 only what a command runs was guarded, so a write could
+  send its token to another endpoint. Credentials that do not come from a
+  command (the managed store, credential accounts, environment variables,
+  platform defaults, external resolvers, file descriptors) are outside this
+  guard: their routes stay ordinary config.
 
 ### Added
 

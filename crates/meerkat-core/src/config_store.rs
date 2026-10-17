@@ -502,6 +502,7 @@ fn compose_reporting_chain_warnings(
 ) -> Result<(Config, Vec<RealmConfigWarning>), ConfigError> {
     let (config, chain) = crate::config::compose_effective_config_with_chain(docs, raw_docs, head)?;
     crate::config::check_composed_confinement(docs, &chain)?;
+    crate::config::check_composed_command_servers(docs, &chain, &config)?;
     warnings.retain(|warning| chain.realms().contains(&warning.realm));
     Ok((config, warnings))
 }
@@ -933,18 +934,60 @@ fn persisted_confinement(content: &str) -> Result<crate::ConfinementConfig, Conf
     }
 }
 
-/// What each credential command of a document runs, by realm and auth
-/// profile: its program, arguments, environment and working directory
-/// (its timeout and caching are ordinary config).
-type CredentialCommands = std::collections::BTreeMap<
-    (String, String),
-    (
+/// The credential commands a document states, by realm section and auth
+/// profile.
+type CredentialCommands = std::collections::BTreeMap<(String, String), CredentialCommand>;
+
+/// A credential command as its document states it: what it runs (its
+/// program, arguments, environment and working directory; its timeout and
+/// caching are ordinary config), the provider and auth method of its auth
+/// profile, and where its token goes: each binding of the same realm section
+/// that names the profile as its auth profile, by id
+/// ([`CredentialCommandRoute`]). A binding resolves its backend and auth
+/// profile within its own section, and a composed section is one document's
+/// section whole, so these are all of the document's routes for the token.
+#[derive(PartialEq)]
+struct CredentialCommand {
+    runs: (
         PathBuf,
         Vec<String>,
         std::collections::BTreeMap<String, String>,
         Option<PathBuf>,
     ),
->;
+    provider: String,
+    auth_method: String,
+    routes: std::collections::BTreeMap<String, CredentialCommandRoute>,
+}
+
+/// Where a binding sends a credential command's token: the id of its
+/// backend profile, that backend as the section states it (`None` when it
+/// states none by that id), and the `[self_hosted.servers]` entry the
+/// backend names as the document states it (`None` when it names none, or
+/// the document states none by that id; a composition takes the entry only
+/// from the command's document, see
+/// [`crate::config::check_composed_command_servers`]).
+#[derive(PartialEq)]
+struct CredentialCommandRoute {
+    backend_profile: String,
+    backend: Option<crate::connection::BackendProfileConfig>,
+    server: Option<crate::config::SelfHostedServerConfig>,
+}
+
+impl CredentialCommand {
+    /// Whether `written` keeps this command: it runs the same thing for the
+    /// same provider and auth method, and each binding that uses it is one
+    /// that already did, sending the token where it did. Removing a binding
+    /// is ordinary config.
+    fn kept_by(&self, written: &Self) -> bool {
+        self.runs == written.runs
+            && self.provider == written.provider
+            && self.auth_method == written.auth_method
+            && written
+                .routes
+                .iter()
+                .all(|(binding, route)| self.routes.get(binding) == Some(route))
+    }
+}
 
 /// The credential commands `config` states.
 fn credential_commands(config: &Config) -> CredentialCommands {
@@ -963,9 +1006,35 @@ fn credential_commands(config: &Config) -> CredentialCommands {
                 else {
                     return None;
                 };
+                let routes = section
+                    .binding
+                    .iter()
+                    .filter(|(_, binding)| &binding.auth_profile == profile)
+                    .map(|(id, binding)| {
+                        let backend = section.backend.get(&binding.backend_profile).cloned();
+                        let server = backend
+                            .as_ref()
+                            .and_then(|backend| backend.server.as_ref())
+                            .and_then(|server| config.self_hosted.servers.get(server))
+                            .cloned();
+                        (
+                            id.clone(),
+                            CredentialCommandRoute {
+                                backend_profile: binding.backend_profile.clone(),
+                                backend,
+                                server,
+                            },
+                        )
+                    })
+                    .collect();
                 Some((
                     (realm.clone(), profile.clone()),
-                    (program.clone(), args.clone(), env.clone(), cwd.clone()),
+                    CredentialCommand {
+                        runs: (program.clone(), args.clone(), env.clone(), cwd.clone()),
+                        provider: auth.provider.clone(),
+                        auth_method: auth.auth_method.clone(),
+                        routes,
+                    },
                 ))
             })
         })
@@ -981,20 +1050,25 @@ fn persisted_credential_commands(content: &str) -> CredentialCommands {
         .unwrap_or_default()
 }
 
-/// Refuse a write that adds a credential command or changes what one runs
-/// ([`ConfigError::CredentialCommandAdministration`], naming the auth
-/// profile): the host runs it as itself, outside its OS process
-/// confinement, so ordinary config write permission is not its
-/// administration. The host adds or changes one by editing the document
-/// itself. A write that keeps each command the document states, changes
-/// only a command's timeout or caching, or removes one is ordinary config.
+/// Refuse a write that adds a credential command, changes what one runs, or
+/// changes where its token goes ([`ConfigError::CredentialCommandAdministration`],
+/// naming the auth profile): the host runs it as itself, outside its OS
+/// process confinement, so ordinary config write permission is not its
+/// administration. Where the token goes is the profile's provider and auth
+/// method and each binding of the section that uses the profile: such a
+/// binding added, or re-pointed at the profile, or moved to another backend,
+/// and a change to the backend it names or to the `[self_hosted.servers]`
+/// entry that backend names, are all refused. The host adds or changes any
+/// of them by editing the document itself. A write that keeps each command
+/// and its routes, changes only a command's timeout or caching, or removes a
+/// command or a binding is ordinary config.
 fn keep_credential_commands(
     committed: &CredentialCommands,
     written: &Config,
 ) -> Result<(), ConfigError> {
     match credential_commands(written)
         .into_iter()
-        .find(|(key, command)| committed.get(key) != Some(command))
+        .find(|(key, command)| committed.get(key).is_none_or(|kept| !kept.kept_by(command)))
     {
         Some(((realm, profile), _)) => {
             Err(ConfigError::CredentialCommandAdministration { realm, profile })
@@ -2512,6 +2586,118 @@ parent = "global"
         assert!(
             eff.skills.enabled,
             "child must re-enable an inherited-disabled skills toggle via presence-aware merge"
+        );
+    }
+
+    /// A binding whose auth profile runs a credential command sends the token
+    /// to the `[self_hosted.servers]` entry its backend names. Server entries
+    /// compose field by field across the documents on a chain, so the
+    /// composition refuses one that another document states or changes: a
+    /// realm document cannot point the user document's command at its own
+    /// endpoint. The same document may change an entry that only a binding
+    /// without a command uses, and a chain whose entry is the command
+    /// document's own composes.
+    #[tokio::test]
+    async fn a_composition_takes_a_command_bindings_server_only_from_its_document() {
+        use crate::connection::RealmId;
+
+        const USER: &str = r#"[realm.global]
+
+[self_hosted.servers.box]
+base_url = "http://127.0.0.1:9/v1"
+
+[self_hosted.servers.open]
+base_url = "http://127.0.0.1:10/v1"
+
+[realm.team.backend.boxed]
+provider = "self_hosted"
+backend_kind = "self_hosted"
+server = "box"
+
+[realm.team.backend.opened]
+provider = "self_hosted"
+backend_kind = "self_hosted"
+server = "open"
+
+[realm.team.auth.helper]
+provider = "self_hosted"
+auth_method = "api_key"
+source = { kind = "command", program = "/usr/bin/helper" }
+
+[realm.team.auth.anonymous]
+provider = "self_hosted"
+auth_method = "none"
+source = { kind = "platform_default" }
+
+[realm.team.binding.main]
+backend_profile = "boxed"
+auth_profile = "helper"
+
+[realm.team.binding.public]
+backend_profile = "opened"
+auth_profile = "anonymous"
+"#;
+        let team = RealmId::parse("team").unwrap();
+        let compose = |team_document: &'static str| {
+            let source = RawMapSource {
+                docs: [("global", USER), ("team", team_document)]
+                    .into_iter()
+                    .map(|(realm, text)| {
+                        (
+                            realm.to_owned(),
+                            Config::from_persisted_toml(text).unwrap().0,
+                        )
+                    })
+                    .collect(),
+                raw: [("global", USER), ("team", team_document)]
+                    .into_iter()
+                    .map(|(realm, text)| (realm.to_owned(), toml::from_str(text).unwrap()))
+                    .collect(),
+            };
+            let team = team.clone();
+            async move {
+                EffectiveConfigReader::new(Arc::new(source))
+                    .effective_config(&team)
+                    .await
+            }
+        };
+
+        for redirect in [
+            "[self_hosted.servers.box]\nbase_url = \"https://attacker.example/v1\"\n",
+            "[self_hosted.servers.box]\napi_style = \"responses\"\n",
+        ] {
+            match compose(redirect).await {
+                Err(ConfigError::CredentialCommandServer {
+                    realm,
+                    binding,
+                    profile,
+                    server,
+                }) => assert_eq!(
+                    (
+                        realm.as_str(),
+                        binding.as_str(),
+                        profile.as_str(),
+                        server.as_str()
+                    ),
+                    ("team", "main", "helper", "box"),
+                    "{redirect}"
+                ),
+                other => panic!("{redirect} is refused: {:?}", other.map(|_| ())),
+            }
+        }
+
+        let composed = compose("").await.unwrap();
+        assert_eq!(
+            composed.self_hosted.servers["box"].base_url,
+            "http://127.0.0.1:9/v1"
+        );
+        let moved =
+            compose("[self_hosted.servers.open]\nbase_url = \"https://moved.example/v1\"\n")
+                .await
+                .unwrap();
+        assert_eq!(
+            moved.self_hosted.servers["open"].base_url,
+            "https://moved.example/v1"
         );
     }
 

@@ -285,9 +285,16 @@ except these, which it runs as itself (`meerkat_core::HostLaunchExemption`):
   confined process could change its program, the interpreter its `#!` line
   names by path, or its working directory, and the refusal ends the
   binding's resolution (no other credential stands in for it). A config
-  write cannot add one or change what it runs
-  (`confinement_administration_required`, naming the auth profile); the
-  host edits the document.
+  write cannot add one, change what it runs, or change where its token goes
+  (the profile's provider or auth method, a binding of the section that
+  uses it, that binding's backend, or the `[self_hosted.servers]` entry the
+  backend names) (`confinement_administration_required`, naming the auth
+  profile); the host edits the document. A request cannot override a
+  binding's auth profile with another binding's command profile
+  (`ProviderBindingError::CredentialCommandProfileOverride`), and a realm
+  whose command binding takes its server entry from another document does
+  not compose (`ConfigError::CredentialCommandServer`). Credentials that do
+  not come from a command are outside these rules.
 - Browser opener (`HostLaunchExemption::browser_opener`: `/usr/bin/open`,
   `xdg-open`, the system `rundll32.exe`; OAuth logins and the CLI's HTML
   artifact): must reach the user's desktop session; the URL is one argument.

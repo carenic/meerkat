@@ -3153,14 +3153,19 @@ pub enum ConfigError {
     },
 
     /// A write would add a credential command (an auth profile's
-    /// `source = { kind = "command" }`) or change what one runs: its
-    /// program, arguments, environment or working directory. The host runs
-    /// a credential command as itself, outside its OS process confinement,
-    /// so the command is confinement administration: the host administers
-    /// it in the document itself. Keeping one, changing only its timeout
-    /// or caching, or removing it is ordinary config. Nothing is written.
+    /// `source = { kind = "command" }`), change what one runs (its program,
+    /// arguments, environment or working directory), or change where its
+    /// token goes: the profile's provider or auth method, a binding of the
+    /// section that uses the profile (added, re-pointed at it, or moved to
+    /// another backend), or the backend such a binding names and the
+    /// `[self_hosted.servers]` entry that backend names. The host runs a
+    /// credential command as itself, outside its OS process confinement, so
+    /// the command and its routes are confinement administration: the host
+    /// administers them in the document itself. Keeping them, changing only
+    /// a command's timeout or caching, or removing a command or a binding is
+    /// ordinary config. Nothing is written.
     #[error(
-        "the credential command of auth profile '{profile}' in [realm.{realm}] runs as the host, outside its confinement; the host administers it in the config document, so a config write cannot add it or change what it runs (edit the document as its host)"
+        "the credential command of auth profile '{profile}' in [realm.{realm}] runs as the host, outside its confinement; the host administers it in the config document, so a config write cannot add it, change what it runs, or change where its token is sent (edit the document as its host)"
     )]
     CredentialCommandAdministration {
         /// The realm section that states the auth profile.
@@ -3173,6 +3178,27 @@ pub enum ConfigError {
     /// differently from the more trusted document that decided it.
     #[error(transparent)]
     ConfinementLayerConflict(#[from] crate::ConfinementLayerConflict),
+
+    /// A binding whose auth profile runs a credential command would send
+    /// the command's token to a `[self_hosted.servers]` entry another config
+    /// document states or changes. A realm section composes whole from one
+    /// document, but server entries compose field by field across the
+    /// documents on the realm's chain, so the composition takes such an
+    /// entry only from the document that states the command; nothing is
+    /// composed.
+    #[error(
+        "binding '{binding}' of [realm.{realm}] would send the token of credential command profile '{profile}' to self-hosted server '{server}', whose entry another config document states or changes; state the whole [self_hosted.servers.{server}] entry in the document that states the command, and in no other document on the realm's chain"
+    )]
+    CredentialCommandServer {
+        /// The realm section that states the binding and the profile.
+        realm: String,
+        /// The binding that uses the profile.
+        binding: String,
+        /// The auth profile whose source is the command.
+        profile: String,
+        /// The self-hosted server the binding's backend names.
+        server: String,
+    },
 
     #[error("realm inheritance chain error: {0}")]
     RealmChain(#[from] crate::connection::RealmChainError),
@@ -3605,6 +3631,58 @@ pub(crate) fn check_composed_confinement(
             .into_iter()
             .map(|(realm, layer)| (realm.as_str(), layer)),
     )
+}
+
+/// Refuse a composition in which a binding whose auth profile runs a
+/// credential command takes the `[self_hosted.servers]` entry its backend
+/// names from a document other than the one that states the binding
+/// ([`ConfigError::CredentialCommandServer`]). A composed realm section is
+/// the section of the chain member nearest the head whose document states
+/// it, whole, so the binding, its auth profile and its backend all come
+/// from that document; the server entry composes field by field across the
+/// chain and must equal that document's own.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn check_composed_command_servers(
+    docs: &std::collections::BTreeMap<crate::connection::RealmId, Config>,
+    chain: &crate::connection::RealmChain,
+    composed: &Config,
+) -> Result<(), ConfigError> {
+    for (realm, section) in &composed.realm {
+        let Some(stated_by) = chain
+            .realms()
+            .iter()
+            .find_map(|member| docs.get(member).filter(|doc| doc.realm.contains_key(realm)))
+        else {
+            continue;
+        };
+        for (binding_id, binding) in &section.binding {
+            let commanded = section.auth.get(&binding.auth_profile).is_some_and(|auth| {
+                matches!(
+                    auth.source,
+                    crate::connection::CredentialSourceSpec::Command { .. }
+                )
+            });
+            let Some(server) = section
+                .backend
+                .get(&binding.backend_profile)
+                .and_then(|backend| backend.server.as_ref())
+            else {
+                continue;
+            };
+            if commanded
+                && stated_by.self_hosted.servers.get(server)
+                    != composed.self_hosted.servers.get(server)
+            {
+                return Err(ConfigError::CredentialCommandServer {
+                    realm: realm.clone(),
+                    binding: binding_id.clone(),
+                    profile: binding.auth_profile.clone(),
+                    server: server.clone(),
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The chain [`compose_effective_config`] folds for `head`, resolved by the

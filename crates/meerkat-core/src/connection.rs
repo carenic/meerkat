@@ -1979,7 +1979,12 @@ impl RealmConnectionSet {
 
     /// Resolve a typed auth binding reference. `AuthBindingRef.profile`, when
     /// present, overrides the binding's configured auth profile while keeping
-    /// the binding's backend and policy authoritative.
+    /// the binding's backend and policy authoritative. An override may not
+    /// name a profile whose source is a credential command, unless it is the
+    /// binding's own auth profile
+    /// ([`ProviderBindingError::CredentialCommandProfileOverride`]): a
+    /// command's token goes only where the bindings that name it send it,
+    /// which the host administers in its config document.
     pub fn lookup_auth_binding(
         &self,
         auth_binding: &AuthBindingRef,
@@ -2003,6 +2008,14 @@ impl RealmConnectionSet {
             .auth_profiles
             .get(auth_profile_id)
             .ok_or_else(|| ProviderBindingError::UnknownAuth(auth_profile_id.to_string()))?;
+        if auth_profile_id != binding.auth_profile
+            && matches!(auth.source, CredentialSourceSpec::Command { .. })
+        {
+            return Err(ProviderBindingError::CredentialCommandProfileOverride {
+                binding: binding.id.clone().into_boxed_str(),
+                profile: auth_profile_id.into(),
+            });
+        }
         if let Some(account) = binding.credential_account.as_ref() {
             let configured_auth = self
                 .auth_profiles
@@ -2069,6 +2082,17 @@ pub enum ProviderBindingError {
     )]
     CredentialAccountProfileOverrideMismatch {
         account: Box<str>,
+        binding: Box<str>,
+        profile: Box<str>,
+    },
+    /// A request's auth binding overrides the binding's auth profile with a
+    /// profile whose source is a credential command, other than the
+    /// binding's own. The host runs a credential command as itself, and its
+    /// token goes only where the bindings that name the profile send it.
+    #[error(
+        "binding '{binding}' cannot take auth profile '{profile}' as an override: its source is a credential command, which only a binding that names it as its own auth profile uses"
+    )]
+    CredentialCommandProfileOverride {
         binding: Box<str>,
         profile: Box<str>,
     },
@@ -3868,6 +3892,85 @@ credential_account = "github_copilot"
         assert!(matches!(
             RealmConnectionSet::from_config("global", &config.realm["global"]),
             Err(ProviderBindingError::CredentialAccountContractMismatch { .. })
+        ));
+    }
+
+    /// A request's auth profile override cannot name a profile whose source
+    /// is a credential command unless it is the binding's own: the command's
+    /// token would otherwise go to the backend of whichever binding the
+    /// request names. The binding's own command profile, and an override to
+    /// any other source, still resolve; resolution reports the refusal as
+    /// the binding's.
+    #[test]
+    fn an_override_cannot_take_another_bindings_credential_command() {
+        let config: Config = toml::from_str(
+            r#"
+[realm.global.backend.vendor]
+provider = "openai"
+backend_kind = "openai_api"
+
+[realm.global.backend.elsewhere]
+provider = "openai"
+backend_kind = "openai_api"
+base_url = "https://elsewhere.example/v1"
+
+[realm.global.auth.helper]
+provider = "openai"
+auth_method = "api_key"
+source = { kind = "command", program = "/usr/bin/helper" }
+
+[realm.global.auth.plain]
+provider = "openai"
+auth_method = "api_key"
+source = { kind = "env", env = "OPENAI_API_KEY" }
+
+[realm.global.binding.main]
+backend_profile = "vendor"
+auth_profile = "helper"
+
+[realm.global.binding.free]
+backend_profile = "elsewhere"
+auth_profile = "plain"
+"#,
+        )
+        .unwrap();
+        let realm = RealmConnectionSet::from_config("global", &config.realm["global"]).unwrap();
+        let reference = |binding: &str, profile: Option<&str>| AuthBindingRef {
+            realm: RealmId::global(),
+            binding: BindingId::parse(binding).unwrap(),
+            profile: profile.map(|profile| ProfileId::parse(profile).unwrap()),
+            origin: BindingOrigin::Configured,
+        };
+
+        assert_eq!(
+            realm
+                .lookup_auth_binding(&reference("free", Some("helper")))
+                .map(|(_, _, auth)| auth.id.clone()),
+            Err(ProviderBindingError::CredentialCommandProfileOverride {
+                binding: "free".into(),
+                profile: "helper".into(),
+            })
+        );
+        for (binding, profile, resolved) in [
+            ("main", Some("helper"), "helper"),
+            ("main", None, "helper"),
+            ("main", Some("plain"), "plain"),
+            ("free", None, "plain"),
+        ] {
+            assert_eq!(
+                realm
+                    .lookup_auth_binding(&reference(binding, profile))
+                    .map(|(_, _, auth)| auth.id.clone()),
+                Ok(resolved.to_owned()),
+                "{binding} with {profile:?}"
+            );
+        }
+        assert!(matches!(
+            resolve_explicit_auth_binding_target(&config, &reference("free", Some("helper"))),
+            Err(ConnectionTargetError::BindingInvalid {
+                source: ProviderBindingError::CredentialCommandProfileOverride { .. },
+                ..
+            })
         ));
     }
 

@@ -399,6 +399,93 @@ fn rkat_rpc_config_writes_cannot_drop_inherited_confinement() {
     assert!(committed.contains("max_tokens = 2048"), "{committed}");
 }
 
+/// A `config/patch` cannot change where a credential command's token goes:
+/// the real server refuses a write that moves the command's binding to
+/// another backend, or changes the backend it names, with the confinement
+/// discriminator, and the realm document keeps its routes. A patch that
+/// keeps them commits.
+#[test]
+fn rkat_rpc_config_writes_cannot_redirect_a_credential_command_token() {
+    let binary = rkat_rpc_binary();
+    let temp = TempDir::new().expect("temp dir");
+    let state_root = temp.path().join("state");
+    let user_root = temp.path().join("user");
+    std::fs::create_dir_all(&user_root).expect("user root should initialize");
+    let document = state_root.join("team").join("config.toml");
+    std::fs::create_dir_all(document.parent().expect("realm dir"))
+        .expect("realm dir should initialize");
+    std::fs::write(
+        &document,
+        r#"[realm.team]
+
+[realm.team.backend.vendor]
+provider = "openai"
+backend_kind = "openai_api"
+
+[realm.team.backend.elsewhere]
+provider = "openai"
+backend_kind = "openai_api"
+base_url = "https://elsewhere.example/v1"
+
+[realm.team.auth.helper]
+provider = "openai"
+auth_method = "api_key"
+source = { kind = "command", program = "/usr/bin/helper" }
+
+[realm.team.binding.main]
+backend_profile = "vendor"
+auth_profile = "helper"
+"#,
+    )
+    .expect("realm document should be written");
+
+    let args = scope_args("team", &state_root, &user_root);
+    let (run, responses) = run_rkat_rpc_with_requests(
+        &binary,
+        temp.path(),
+        &args,
+        &[
+            (
+                "config/patch",
+                serde_json::json!({ "patch": { "realm": { "team": { "binding": { "main": { "backend_profile": "elsewhere" } } } } } }),
+            ),
+            (
+                "config/patch",
+                serde_json::json!({ "patch": { "realm": { "team": { "backend": { "vendor": { "base_url": "https://attacker.example/v1" } } } } } }),
+            ),
+            (
+                "config/patch",
+                serde_json::json!({ "patch": { "max_tokens": 2048 } }),
+            ),
+        ],
+    );
+    assert!(
+        run.answered,
+        "the team realm serves; exit={:?} stderr:\n{}",
+        run.status, run.stderr
+    );
+    for id in [2, 3] {
+        let error = &responses[&id]["error"];
+        assert_eq!(
+            error["data"],
+            serde_json::json!({ "type": "confinement_administration_required" }),
+            "request {id}: {}",
+            responses[&id]
+        );
+    }
+    assert!(
+        responses[&4].get("error").is_none(),
+        "a patch that keeps the routes commits: {}",
+        responses[&4]
+    );
+    let committed = std::fs::read_to_string(&document).expect("team document");
+    assert!(
+        committed.contains("backend_profile = \"vendor\"") && !committed.contains("attacker"),
+        "{committed}"
+    );
+    assert!(committed.contains("max_tokens = 2048"), "{committed}");
+}
+
 /// Without a confinement flag that names a relative path the server never
 /// reads its working directory, so it serves from one that was removed.
 #[cfg(unix)]
