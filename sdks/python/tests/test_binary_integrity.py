@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import email.message
 import hashlib
+import http.client
 import io
 import os
 import tarfile
@@ -256,6 +257,7 @@ async def test_no_pinned_digest_refuses_without_a_request(release, monkeypatch):
     assert excinfo.value.code == "BINARY_DIGEST_UNAVAILABLE"
     assert "MEERKAT_BIN_PATH" in excinfo.value.message
     assert "rkat_path" in excinfo.value.message
+    assert release.url in excinfo.value.message, "the refusal names the exact asset"
     assert release.urls == []
 
 
@@ -416,11 +418,14 @@ class _CannedHttps:
         def https_open(_handler, request):
             url = request.full_url
             canned.requested.append(url)
-            status, location, body = canned.responses[url]
+            status, location, body, *extra = canned.responses[url]
             headers = email.message.Message()
             if location is not None:
                 headers["Location"] = location
-            response = urllib.response.addinfourl(io.BytesIO(body), headers, url, status)
+            for name, value in (extra[0] if extra else {}).items():
+                headers[name] = value
+            source = io.BytesIO(body) if isinstance(body, bytes) else body
+            response = urllib.response.addinfourl(source, headers, url, status)
             response.msg = "Found" if location is not None else "OK"
             return response
 
@@ -471,3 +476,72 @@ def test_the_download_refuses_a_plain_http_url(monkeypatch):
 
     assert excinfo.value.code == "BINARY_DOWNLOAD_FAILED"
     assert canned.requested == []
+
+
+class _CutOffBody(io.RawIOBase):
+    """A body whose connection drops: the read fails like http.client's."""
+
+    def read(self, size=-1):
+        raise http.client.IncompleteRead(b"partial", 100)
+
+
+class _UnreadableBody(io.RawIOBase):
+    def read(self, size=-1):
+        raise AssertionError("an oversized archive must be refused before it is read")
+
+
+def test_a_dropped_connection_is_a_download_failure_not_tamper(monkeypatch):
+    _CannedHttps(monkeypatch, {RELEASE_URL: (200, None, _CutOffBody())})
+
+    with pytest.raises(MeerkatError) as excinfo:
+        MeerkatClient._fetch_rkat_rpc_archive(RELEASE_URL)
+
+    assert not isinstance(excinfo.value, BinaryIntegrityError)
+    assert excinfo.value.code == "BINARY_DOWNLOAD_FAILED"
+
+
+def test_a_body_shorter_than_its_declared_length_is_a_download_failure(monkeypatch):
+    # The connection closed early without the HTTP layer raising: still a
+    # transport fault, never a digest mismatch.
+    _CannedHttps(
+        monkeypatch,
+        {RELEASE_URL: (200, None, b"x" * 10, {"Content-Length": "100"})},
+    )
+
+    with pytest.raises(MeerkatError) as excinfo:
+        MeerkatClient._fetch_rkat_rpc_archive(RELEASE_URL)
+
+    assert not isinstance(excinfo.value, BinaryIntegrityError)
+    assert excinfo.value.code == "BINARY_DOWNLOAD_FAILED"
+    assert "10 of 100" in excinfo.value.message
+
+
+def test_an_archive_declared_larger_than_the_cap_is_refused_unread(monkeypatch):
+    too_large = str(256 * 1024 * 1024 + 1)
+    _CannedHttps(
+        monkeypatch,
+        {RELEASE_URL: (200, None, _UnreadableBody(), {"Content-Length": too_large})},
+    )
+
+    with pytest.raises(MeerkatError) as excinfo:
+        MeerkatClient._fetch_rkat_rpc_archive(RELEASE_URL)
+
+    assert excinfo.value.code == "BINARY_DOWNLOAD_TOO_LARGE"
+    assert "256 MiB" in excinfo.value.message
+
+
+def test_an_archive_that_streams_past_the_cap_is_refused(monkeypatch):
+    monkeypatch.setattr(client_module, "_RKAT_RPC_ARCHIVE_MAX_BYTES", 16)
+    _CannedHttps(monkeypatch, {RELEASE_URL: (200, None, b"x" * 17)})
+
+    with pytest.raises(MeerkatError) as excinfo:
+        MeerkatClient._fetch_rkat_rpc_archive(RELEASE_URL)
+
+    assert excinfo.value.code == "BINARY_DOWNLOAD_TOO_LARGE"
+
+
+def test_an_archive_at_the_cap_is_accepted(monkeypatch):
+    monkeypatch.setattr(client_module, "_RKAT_RPC_ARCHIVE_MAX_BYTES", 16)
+    _CannedHttps(monkeypatch, {RELEASE_URL: (200, None, b"x" * 16, {"Content-Length": "16"})})
+
+    assert MeerkatClient._fetch_rkat_rpc_archive(RELEASE_URL) == b"x" * 16

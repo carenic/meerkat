@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import http.client
 import io
 import json
 import logging
@@ -35,7 +36,6 @@ import urllib.request
 import warnings
 import zipfile
 from dataclasses import dataclass, fields, is_dataclass
-from http.client import HTTPMessage
 from pathlib import Path
 from typing import IO, Any, Callable, Literal, cast, get_args, get_origin
 from urllib.error import URLError
@@ -390,6 +390,8 @@ _MEERKAT_BINARY_CACHE_ROOT = (
 )
 # A GitHub release download redirects once, to its asset host.
 _RELEASE_DOWNLOAD_MAX_REDIRECTS = 5
+# The rkat-rpc release archives are about 100 MB; a far larger body is not one.
+_RKAT_RPC_ARCHIVE_MAX_BYTES = 256 * 1024 * 1024
 
 
 class _HttpsOnlyRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -403,7 +405,7 @@ class _HttpsOnlyRedirectHandler(urllib.request.HTTPRedirectHandler):
         fp: IO[bytes],
         code: int,
         msg: str,
-        headers: HTTPMessage,
+        headers: http.client.HTTPMessage,
         newurl: str,
     ) -> urllib.request.Request | None:
         if urllib.parse.urlsplit(newurl).scheme != "https":
@@ -479,6 +481,15 @@ def _extract_release_binary(
             raise _archive_lacks_binary(release)
         with archive.open(entries[0]) as source:
             return _copy_with_sha256(source, destination)
+
+
+def _archive_too_large(url: str) -> MeerkatError:
+    return MeerkatError(
+        "BINARY_DOWNLOAD_TOO_LARGE",
+        f"Refusing to download {url}: it is larger than "
+        f"{_RKAT_RPC_ARCHIVE_MAX_BYTES // (1024 * 1024)} MiB, far above any "
+        f"{_MEERKAT_BINARY} release archive.",
+    )
 
 
 def _archive_lacks_binary(release: _RkatRpcRelease) -> MeerkatError:
@@ -5458,12 +5469,13 @@ class MeerkatClient:
         Release assets are ``rkat-rpc-<version>-<target>.<ext>`` (no ``v``)
         under the ``v<version>`` tag.
         """
-        owner, repo = _MEERKAT_REPO
         artifact = f"{_MEERKAT_BINARY}-{version}-{target}.{archive_ext}"
-        url = (
-            f"https://github.com/{owner}/{repo}/releases/download/v{version}/{artifact}"
-        )
-        return artifact, url
+        return artifact, MeerkatClient._rkat_rpc_release_url(version, artifact)
+
+    @staticmethod
+    def _rkat_rpc_release_url(version: str, artifact: str) -> str:
+        owner, repo = _MEERKAT_REPO
+        return f"https://github.com/{owner}/{repo}/releases/download/v{version}/{artifact}"
 
     @staticmethod
     def _pinned_rkat_rpc_archive(
@@ -5484,33 +5496,59 @@ class MeerkatClient:
             or not _is_sha256_hex(entry.get("archive_sha256"))
             or not _is_sha256_hex(entry.get("binary_sha256"))
         ):
+            url = MeerkatClient._rkat_rpc_release_url(version, artifact)
             raise MeerkatError(
                 "BINARY_DIGEST_UNAVAILABLE",
                 f"This meerkat-sdk package pins no release digest for {artifact}, so "
                 f"it will not download {_MEERKAT_BINARY}: only packages built by the "
                 "release workflow pin one, and source or git installs do not. Install "
-                f"{_MEERKAT_BINARY} {version} yourself and put it on PATH, or set "
-                "MEERKAT_BIN_PATH or rkat_path to a binary you trust.",
+                f"{_MEERKAT_BINARY} {version} yourself (the release archive is {url}) "
+                "and put it on PATH, or set MEERKAT_BIN_PATH or rkat_path to a binary "
+                "you trust.",
             )
         return entry["archive_sha256"], entry["binary_sha256"]
 
     @staticmethod
     def _fetch_rkat_rpc_archive(url: str) -> bytes:
-        """Download one release archive over HTTPS only, redirects included."""
+        """Download one release archive over HTTPS only, redirects included.
+
+        A transport fault, a cut-off body included, is a download failure and
+        never reaches the digest check as tamper; a body over the size cap is
+        refused, by its declared length before anything is read.
+        """
         if urllib.parse.urlsplit(url).scheme != "https":
             raise MeerkatError(
                 "BINARY_DOWNLOAD_FAILED",
                 f"Refusing to download {_MEERKAT_BINARY} over a non-HTTPS URL: {url}",
             )
+        limit = _RKAT_RPC_ARCHIVE_MAX_BYTES
         opener = urllib.request.build_opener(_HttpsOnlyRedirectHandler)
         try:
             with opener.open(url, timeout=30) as response:
-                return response.read()
-        except (URLError, OSError) as exc:
+                declared = response.headers.get("Content-Length", "")
+                if not declared.isdigit():
+                    # No declared length: read at most one byte past the cap.
+                    payload = response.read(limit + 1)
+                elif int(declared) > limit:
+                    raise _archive_too_large(url)
+                else:
+                    # A whole read raises IncompleteRead on a cut-off body; a
+                    # bounded read would return the short body silently.
+                    payload = response.read()
+                    if len(payload) != int(declared):
+                        raise MeerkatError(
+                            "BINARY_DOWNLOAD_FAILED",
+                            f"Failed to download {_MEERKAT_BINARY} from {url}: the "
+                            f"connection closed after {len(payload)} of {declared} bytes",
+                        )
+        except (URLError, OSError, http.client.HTTPException) as exc:
             raise MeerkatError(
                 "BINARY_DOWNLOAD_FAILED",
                 f"Failed to download {_MEERKAT_BINARY} from {url}: {exc}",
             ) from exc
+        if len(payload) > limit:
+            raise _archive_too_large(url)
+        return payload
 
     @staticmethod
     async def _download_rkat_rpc_binary() -> str:

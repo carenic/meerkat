@@ -57,7 +57,15 @@ function stamped(archive, binary, version = CONTRACT_VERSION) {
 }
 
 const saved = {};
-const SEAMS = ["platformTarget", "binaryCacheRoot", "pinnedDigests", "runCommand", "commandPath", "ensureDownloadedBinary"];
+const SEAMS = [
+  "platformTarget",
+  "binaryCacheRoot",
+  "pinnedDigests",
+  "runCommand",
+  "commandPath",
+  "ensureDownloadedBinary",
+  "releaseArchiveMaxBytes",
+];
 let root;
 let release;
 
@@ -194,6 +202,7 @@ describe("rkat-rpc auto-download integrity", () => {
       assert.ok(!(error instanceof BinaryIntegrityError));
       assert.equal(error.code, "BINARY_DIGEST_UNAVAILABLE");
       assert.match(error.message, /MEERKAT_BIN_PATH/);
+      assert.ok(error.message.includes(RELEASE_URL), "the refusal names the exact asset");
       return true;
     });
     assert.deepEqual(release.requests, []);
@@ -358,6 +367,60 @@ describe("rkat-rpc release download transport", () => {
       { code: "BINARY_DOWNLOAD_FAILED" },
     );
     assert.deepEqual(release.requests, []);
+  });
+
+  it("reports a dropped connection as a download failure, not tamper", async () => {
+    globalThis.fetch = async () =>
+      new Response(new ReadableStream({ start(controller) { controller.error(new Error("socket hang up")); } }), {
+        status: 200,
+      });
+
+    await assert.rejects(MeerkatClient.fetchReleaseArchive(RELEASE_URL), (error) => {
+      assert.ok(!(error instanceof BinaryIntegrityError));
+      assert.equal(error.code, "BINARY_DOWNLOAD_FAILED");
+      assert.match(error.message, /socket hang up/);
+      return true;
+    });
+  });
+
+  it("reports a body shorter than its declared length as a download failure", async () => {
+    globalThis.fetch = async () =>
+      new Response(Buffer.alloc(10, 120), { status: 200, headers: { "content-length": "100" } });
+
+    await assert.rejects(MeerkatClient.fetchReleaseArchive(RELEASE_URL), (error) => {
+      assert.ok(!(error instanceof BinaryIntegrityError));
+      assert.equal(error.code, "BINARY_DOWNLOAD_FAILED");
+      assert.match(error.message, /10 of 100/);
+      return true;
+    });
+  });
+
+  it("refuses an archive declared larger than the cap without reading it", async () => {
+    globalThis.fetch = async () =>
+      new Response(new ReadableStream({ pull() { throw new Error("an oversized archive was read"); } }), {
+        status: 200,
+        headers: { "content-length": String(256 * 1024 * 1024 + 1) },
+      });
+
+    await assert.rejects(MeerkatClient.fetchReleaseArchive(RELEASE_URL), (error) => {
+      assert.equal(error.code, "BINARY_DOWNLOAD_TOO_LARGE");
+      assert.match(error.message, /256 MiB/);
+      return true;
+    });
+  });
+
+  it("refuses an archive that streams past the cap", async () => {
+    MeerkatClient.releaseArchiveMaxBytes = () => 16;
+    globalThis.fetch = async () => new Response(Buffer.alloc(17, 120), { status: 200 });
+
+    await assert.rejects(MeerkatClient.fetchReleaseArchive(RELEASE_URL), { code: "BINARY_DOWNLOAD_TOO_LARGE" });
+  });
+
+  it("accepts an archive at the cap", async () => {
+    MeerkatClient.releaseArchiveMaxBytes = () => 16;
+    globalThis.fetch = async () => new Response(Buffer.alloc(16, 120), { status: 200 });
+
+    assert.deepEqual(Buffer.from(await MeerkatClient.fetchReleaseArchive(RELEASE_URL)), Buffer.alloc(16, 120));
   });
 
   it("refuses an endless redirect chain", async () => {

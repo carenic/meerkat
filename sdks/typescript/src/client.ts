@@ -604,6 +604,8 @@ const MEERKAT_BINARY_CACHE_ROOT = path.join(
 );
 // A GitHub release download redirects once, to its asset host.
 const RELEASE_DOWNLOAD_MAX_REDIRECTS = 5;
+// The rkat-rpc release archives are about 100 MB; a far larger body is not one.
+const RELEASE_ARCHIVE_MAX_BYTES = 256 * 1024 * 1024;
 const SHA256_HEX = /^[0-9a-f]{64}$/;
 
 async function sha256File(file: string): Promise<string> {
@@ -8447,7 +8449,11 @@ export class MeerkatClient {
     archiveExt: PlatformTarget["archiveExt"],
   ): { asset: string; url: string } {
     const asset = `${MEERKAT_RELEASE_BINARY}-${version}-${target}.${archiveExt}`;
-    return { asset, url: `https://github.com/${MEERKAT_REPO}/releases/download/v${version}/${asset}` };
+    return { asset, url: MeerkatClient.releaseUrl(version, asset) };
+  }
+
+  private static releaseUrl(version: string, asset: string): string {
+    return `https://github.com/${MEERKAT_REPO}/releases/download/v${version}/${asset}`;
   }
 
   private static async runCommand(command: string, args: string[]): Promise<void> {
@@ -8510,9 +8516,9 @@ export class MeerkatClient {
         "BINARY_DIGEST_UNAVAILABLE",
         `This @rkat/sdk package pins no release digest for ${asset}, so it will not download ` +
           `${MEERKAT_RELEASE_BINARY}: only packages built by the release workflow pin one, and ` +
-          `source or git installs do not. Install ${MEERKAT_RELEASE_BINARY} ${version} yourself and ` +
-          "put it on PATH, or pass its path to new MeerkatClient(path) or set MEERKAT_BIN_PATH to a " +
-          "binary you trust.",
+          `source or git installs do not. Install ${MEERKAT_RELEASE_BINARY} ${version} yourself (the ` +
+          `release archive is ${MeerkatClient.releaseUrl(version, asset)}) and put it on PATH, or pass ` +
+          "its path to new MeerkatClient(path) or set MEERKAT_BIN_PATH to a binary you trust.",
       );
     }
     return { archiveSha256: entry.archive_sha256, binarySha256: entry.binary_sha256 };
@@ -8549,12 +8555,68 @@ export class MeerkatClient {
           `Failed to download binary from ${current} (HTTP ${response.status})`,
         );
       }
-      return Buffer.from(await response.arrayBuffer());
+      try {
+        return await MeerkatClient.readReleaseArchive(response, current);
+      } catch (error) {
+        // A transport fault while reading the body is a download failure;
+        // it never reaches the digest check as tamper.
+        if (error instanceof MeerkatError) throw error;
+        throw new MeerkatError(
+          "BINARY_DOWNLOAD_FAILED",
+          `Failed to download ${MEERKAT_RELEASE_BINARY} from ${current}: ${String(error)}`,
+        );
+      }
     }
     throw new MeerkatError(
       "BINARY_DOWNLOAD_FAILED",
       `Too many redirects while downloading ${MEERKAT_RELEASE_BINARY} from ${url}`,
     );
+  }
+
+  /** The largest release archive the SDK downloads; a seam for tests. */
+  private static releaseArchiveMaxBytes(): number {
+    return RELEASE_ARCHIVE_MAX_BYTES;
+  }
+
+  /**
+   * Read a release archive body, refusing one over the size cap: by its
+   * declared length before anything is read, else once the stream passes it.
+   */
+  private static async readReleaseArchive(response: Response, url: string): Promise<Buffer> {
+    const limit = MeerkatClient.releaseArchiveMaxBytes();
+    const tooLarge = () =>
+      new MeerkatError(
+        "BINARY_DOWNLOAD_TOO_LARGE",
+        `Refusing to download ${url}: it is larger than ${RELEASE_ARCHIVE_MAX_BYTES / (1024 * 1024)} MiB, ` +
+          `far above any ${MEERKAT_RELEASE_BINARY} release archive.`,
+      );
+    const declared = Number(response.headers.get("content-length") ?? Number.NaN);
+    if (Number.isFinite(declared) && declared > limit) {
+      await response.body?.cancel();
+      throw tooLarge();
+    }
+    if (!response.body) return Buffer.alloc(0);
+    const reader = response.body.getReader();
+    const chunks: Buffer[] = [];
+    let total = 0;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > limit) {
+        await reader.cancel();
+        throw tooLarge();
+      }
+      chunks.push(Buffer.from(value));
+    }
+    if (Number.isFinite(declared) && total !== declared) {
+      throw new MeerkatError(
+        "BINARY_DOWNLOAD_FAILED",
+        `Failed to download ${MEERKAT_RELEASE_BINARY} from ${url}: the connection closed after ` +
+          `${total} of ${declared} bytes`,
+      );
+    }
+    return Buffer.concat(chunks, total);
   }
 
   /** Re-verify a cached binary; delete and refuse one that does not match. */
