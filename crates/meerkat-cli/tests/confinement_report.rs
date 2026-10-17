@@ -77,6 +77,8 @@ fn rkat_reports_its_confinement_on_stderr() {
 /// `rkat skill list` loads skills as a run does, under the host's
 /// confinement: a project skills directory a confined process can write is
 /// not trusted, so a skill planted there is not listed.
+// `rkat skill` exists only in a build with the `skills` feature.
+#[cfg(feature = "skills")]
 #[test]
 fn rkat_skill_list_does_not_load_skills_from_an_untrusted_project() {
     let temp = tempfile::TempDir::new().unwrap();
