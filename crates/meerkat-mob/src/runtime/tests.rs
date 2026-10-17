@@ -48608,8 +48608,14 @@ async fn test_cancel_all_work_abandons_admitted_unstarted_work_and_spares_later_
     assert_cancel_verb_covers_admitted_unstarted_work(true).await;
 }
 
+/// The runtime records a runtime-backed member's exact-run cancel before it
+/// delivers it live. When the session service cannot take the live boundary
+/// cancel, the runtime reports the outcome as owned by that recorded cancel
+/// (`InterruptDispatchOutcomeUnknown`), and cancel-all-work reads it as
+/// cancelled, as a member stop does: one live boundary-cancel attempt, no
+/// fallback to a hard interrupt.
 #[tokio::test]
-async fn test_runtime_adapter_cancel_all_work_rejects_unsupported_boundary_cancel() {
+async fn test_runtime_adapter_cancel_all_work_reports_recorded_cancel_on_unsupported_delivery() {
     let (handle, service) = create_test_mob(sample_definition()).await;
     let member_id = AgentIdentity::from("runtime-unsupported-boundary");
     let session_id = handle
@@ -48658,15 +48664,11 @@ async fn test_runtime_adapter_cancel_all_work_rejects_unsupported_boundary_cance
     let baseline_boundary = service.cancel_after_boundary_call_count();
     let baseline_interrupts = service.interrupt_call_count();
 
-    let error = handle
+    handle
         .cancel_all_work(entry.agent_runtime_id.clone(), entry.fence_token)
         .await
-        .expect_err("unsupported runtime-backed boundary cancel must not report success");
+        .expect("the runtime recorded the exact-run cancel; its live delivery is not the outcome");
 
-    assert!(
-        matches!(&error, MobError::Internal(message) if message.contains("cancel_after_boundary")),
-        "runtime-backed unsupported boundary cancel should surface through the adapter path, got {error:?}"
-    );
     assert_eq!(
         service.cancel_after_boundary_call_count(),
         baseline_boundary + 1,
@@ -86853,6 +86855,65 @@ fn a_stop_cancel_that_finds_its_run_over_reports_it_ended() {
         )
         .is_err(),
         "a real cancel failure stays an error"
+    );
+}
+
+/// A force cancel or cancel-all-work whose exact-run cancel the runtime
+/// recorded, but whose live delivery failed (`InterruptDispatchOutcomeUnknown`:
+/// the run crossed its boundary during the delivery), reports the run
+/// cancelled, as a member stop does: the recorded cancel ends the run at its
+/// next boundary, so it is not a failed cancel.
+#[test]
+fn a_member_cancel_whose_delivery_outcome_is_unknown_reports_the_recorded_cancel() {
+    use super::provisioner::{
+        MemberRunCancelOutcome, classify_member_run_cancel, classify_stop_member_cancel,
+    };
+    use crate::MemberStopRun;
+    let run_id = meerkat_core::lifecycle::RunId::new();
+    let unknown = || meerkat_runtime::RuntimeDriverError::InterruptDispatchOutcomeUnknown {
+        run_id: run_id.clone(),
+        reason: "the run's boundary cancel is recorded in its turn state; its live delivery \
+                 failed"
+            .to_string(),
+    };
+    for cancelled in [Ok(true), Err(unknown())] {
+        assert_eq!(
+            classify_member_run_cancel(cancelled, run_id.clone()).unwrap(),
+            MemberRunCancelOutcome::Cancelled {
+                run_id: run_id.clone()
+            }
+        );
+    }
+    for ended in [
+        Ok(false),
+        Err(meerkat_runtime::RuntimeDriverError::StaleAuthority {
+            reason: "attachment replaced".to_string(),
+        }),
+        Err(meerkat_runtime::RuntimeDriverError::NotReady {
+            state: meerkat_runtime::RuntimeState::Idle,
+        }),
+    ] {
+        assert_eq!(
+            classify_member_run_cancel(ended, run_id.clone()).unwrap(),
+            MemberRunCancelOutcome::RunEndedBeforeCancel {
+                run_id: run_id.clone()
+            }
+        );
+    }
+    assert!(
+        classify_member_run_cancel(
+            Err(meerkat_runtime::RuntimeDriverError::Internal(
+                "boom".to_string()
+            )),
+            run_id.clone(),
+        )
+        .is_err(),
+        "a real cancel failure stays an error"
+    );
+    // The member stop reads the same outcome as its recorded cancel.
+    assert_eq!(
+        classify_stop_member_cancel(Err(unknown()), run_id.clone()).unwrap(),
+        MemberStopRun::CancelledAtBoundary { run_id }
     );
 }
 
