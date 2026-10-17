@@ -455,11 +455,12 @@ and its CI must be green before a release tag (`require_ci_green`):
 - Feature-gated unit suites (`FEATURE_UNIT_SUITES` in
   `scripts/ci-cargo-lanes.mjs`): the unit lanes build default features only,
   so each suite adds a `nextest -p <package> --features <list>` row to
-  `main-unit` on every Rust-relevant main push, and to `unit` when that
-  package changed outside the meerkat-mob chain (on a pull request, unless
-  the suite is marked `pullRequest: false`: the facade's two GPT Live
-  suites). A new test behind a non-default feature needs a suite, or no lane
-  runs it.
+  `main-unit` on every Rust-relevant main push, and to a pull request's
+  `unit` lane when that package changed outside the meerkat-mob chain
+  (unless the suite is marked `pullRequest: false`: the facade's two GPT
+  Live suites). A new test behind a non-default feature needs a suite, or no
+  lane runs it. A push runs no `unit` lane: the unit rows it would run (the
+  same shards and suites) run verbatim in `main-unit` (`unit_rows_on_main`).
 - `integration`: the `tests/*.rs` binaries (`nextest -p <package> --test
   '*'`) of each `INTEGRATION_SUITES` entry in `scripts/ci-cargo-lanes.mjs`
   whose trigger packages or paths changed (meerkat-runtime;
@@ -525,8 +526,9 @@ and its CI must be green before a release tag (`require_ci_green`):
   rule for their own inputs (`sdks/web/`, the runtime, the contracts,
   examples 031-033); `example-web` also runs the Web SDK's `npm test` (type
   tests over the generated events, node unit suites).
-- `push: main` only (no budget): `main-unit` over the whole workspace in
-  eight shards, `sdk-host`, and the push-only lanes above. A red main run is
+- `push: main` only (no budget): `main-unit` over the whole workspace (the
+  unit lane's rows verbatim, then the rest of the workspace in packed
+  shards), `sdk-host`, and the push-only lanes above. A red main run is
   a failed `CI gate` on the main commit and blocks `require_ci_green`.
 - `gate` (`CI gate`, the only required context): fail-closed aggregate; on
   pull requests a 1080-second lane execution budget (classification plus

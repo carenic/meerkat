@@ -295,6 +295,14 @@ try {
   };
   const expected = { repository: REPOSITORY, commit: BUMP_PARENT, tree: BUMP_PARENT_TREE, runId: RUN_ID, runAttempt: 1 };
   assert.deepEqual(attestationProblems(goodAttestation, expected), []);
+  // A push runs its unit rows in the main unit lane: its unit lane is
+  // skipped, and the plan says how many rows ran on main.
+  const unitOnMain = {
+    ...goodAttestation,
+    plan: { ...goodAttestation.plan, unit_rows_on_main_count: 19 },
+    component_results: { ...goodAttestation.component_results, unit: "skipped" },
+  };
+  assert.deepEqual(attestationProblems(unitOnMain, expected), [], "a push whose unit rows ran on main is evidence");
   for (const [label, change] of [
     ["another tree", { tree_sha: "0".repeat(40) }],
     ["another commit", { commit_sha: BUMP }],
@@ -315,6 +323,15 @@ try {
     }],
     ["a packages-mode run", { plan: { mode: "packages" } }],
     ["a workspace run with one lane skipped", { component_results: { ...goodAttestation.component_results, sdk_host: "skipped" } }],
+    ["a skipped unit lane whose rows ran nowhere", { component_results: { ...goodAttestation.component_results, unit: "skipped" } }],
+    ["a skipped unit lane with no unit rows on main", {
+      plan: { ...goodAttestation.plan, unit_rows_on_main_count: 0 },
+      component_results: { ...goodAttestation.component_results, unit: "skipped" },
+    }],
+    ["unit rows on main whose main unit lane failed", {
+      plan: { ...goodAttestation.plan, unit_rows_on_main_count: 19 },
+      component_results: { ...goodAttestation.component_results, unit: "skipped", main_unit: "failure" },
+    }],
     ["a workspace run without a lane", { component_results: Object.fromEntries(WORKSPACE_LANES.filter((lane) => lane !== "closure_tests").map((lane) => [lane, "success"])) }],
     ["recorded reuse", { reused_test_evidence: { workflow_run_id: "1" } }],
   ]) {
@@ -586,6 +603,14 @@ if (args[0] === "api") {
   assert.equal(pullRequestRun.status, 0, `the gate accepts a pull request without the lanes it left to the push: ${pullRequestRun.stdout}`);
   assert.match(pullRequestRun.stdout, /left to the push \(main or release\/\*\*\): 17 closure-tests rows/);
   assert.equal(runGate(pushGate).status, 0, `the gate accepts a push that ran them: ${runGate(pushGate).stdout}`);
+  // A push runs its unit rows in the packed main unit lane, not in a unit
+  // lane of its own: the gate requires that lane instead.
+  const unitOnMainGate = {
+    ...pushGate, UNIT_SHARD_COUNT: "0", UNIT_RESULT: "skipped", UNIT_ROWS_ON_MAIN: "core", UNIT_ROWS_ON_MAIN_COUNT: "1",
+  };
+  const unitOnMainRun = runGate(unitOnMainGate);
+  assert.equal(unitOnMainRun.status, 0, `the gate accepts a push whose unit rows ran on main: ${unitOnMainRun.stdout}`);
+  assert.match(unitOnMainRun.stdout, /the push runs its unit rows in the main unit lane: core/);
   for (const [label, env] of [
     ["a push plan without the closure check", { ...pushGate, CLOSURE_CHECK: "false", CLOSURE_CHECK_RESULT: "skipped" }],
     ["a push plan without governed JSONL", { ...pushGate, GOVERNED_JSONL: "false", GOVERNED_JSONL_RESULT: "skipped" }],
@@ -595,6 +620,10 @@ if (args[0] === "api") {
     ["a push whose closure check did not run", { ...pushGate, CLOSURE_CHECK_RESULT: "skipped" }],
     ["a pull request whose skipped closure check failed", { ...pullRequestGate, CLOSURE_CHECK_RESULT: "failure" }],
     ["a pull request whose governed JSONL lane failed", { ...pullRequestGate, GOVERNED_JSONL_RESULT: "failure" }],
+    ["unit rows on main whose packed main unit lane did not run", { ...unitOnMainGate, MAIN_UNIT_PACKED_RESULT: "skipped" }],
+    ["unit rows on main whose packed main unit lane failed", { ...unitOnMainGate, MAIN_UNIT_PACKED_RESULT: "failure" }],
+    ["a push with neither unit rows nor a deferral", { ...unitOnMainGate, UNIT_ROWS_ON_MAIN: "", UNIT_ROWS_ON_MAIN_COUNT: "0" }],
+    ["unit rows on main beside a failed unit lane", { ...unitOnMainGate, UNIT_RESULT: "failure" }],
   ]) {
     assert.equal(runGate(env).status, 1, `the gate refuses ${label}`);
   }

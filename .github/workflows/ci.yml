@@ -35,7 +35,8 @@ name: CI
 #                     plus the feature-gated suites of the changed packages
 #                     outside the chain (FEATURE_UNIT_SUITES in
 #                     scripts/ci-cargo-lanes.mjs; PR: those not marked
-#                     pullRequest: false)
+#                     pullRequest: false). A push runs these rows in
+#                     main-unit instead, verbatim (unit_rows_on_main)
 #   integration     - (xN) the tests/*.rs binaries of each integration
 #                     suite whose trigger packages or paths changed
 #                     (INTEGRATION_SUITES in scripts/ci-cargo-lanes.mjs):
@@ -311,6 +312,8 @@ jobs:
       unit_shard_matrix: ${{ steps.plan.outputs.unit_shard_matrix }}
       unit_deferred: ${{ steps.plan.outputs.unit_deferred }}
       unit_deferred_count: ${{ steps.plan.outputs.unit_deferred_count }}
+      unit_rows_on_main: ${{ steps.plan.outputs.unit_rows_on_main }}
+      unit_rows_on_main_count: ${{ steps.plan.outputs.unit_rows_on_main_count }}
       main_unit_shard_count: ${{ steps.plan.outputs.main_unit_shard_count }}
       main_unit_shard_matrix: ${{ steps.plan.outputs.main_unit_shard_matrix }}
       main_archive_build_count: ${{ steps.plan.outputs.main_archive_build_count }}
@@ -2297,6 +2300,8 @@ jobs:
           UNIT_SHARD_COUNT: ${{ needs.changes.outputs.unit_shard_count }}
           UNIT_DEFERRED: ${{ needs.changes.outputs.unit_deferred }}
           UNIT_DEFERRED_COUNT: ${{ needs.changes.outputs.unit_deferred_count }}
+          UNIT_ROWS_ON_MAIN: ${{ needs.changes.outputs.unit_rows_on_main }}
+          UNIT_ROWS_ON_MAIN_COUNT: ${{ needs.changes.outputs.unit_rows_on_main_count }}
           PACKAGE_COUNT: ${{ needs.changes.outputs.package_count }}
           CLOSURE_COUNT: ${{ needs.changes.outputs.closure_count }}
           GENERATED_CONTRACT: ${{ needs.changes.outputs.generated_contract }}
@@ -2436,9 +2441,14 @@ jobs:
               failed=1
             fi
             # Fail closed on the unit plan: every changed package is either in
-            # a pull-request unit shard or named as deferred to main.
+            # a pull-request unit shard, in a push's unit rows (which run in
+            # the packed main unit lane, verbatim), or named as deferred to main.
             if [[ "${UNIT_SHARD_COUNT}" =~ ^[0-9]+$ ]] && (( UNIT_SHARD_COUNT > 0 )); then
               require_ran "Unit tests" "${UNIT_RESULT}"
+            elif [[ "${UNIT_ROWS_ON_MAIN_COUNT}" =~ ^[0-9]+$ ]] && (( UNIT_ROWS_ON_MAIN_COUNT > 0 )); then
+              echo "the push runs its unit rows in the main unit lane: ${UNIT_ROWS_ON_MAIN}"
+              require_ran "Main unit tests (packed shards)" "${MAIN_UNIT_PACKED_RESULT}"
+              forbid_failure "Unit tests" "${UNIT_RESULT}"
             elif [[ "${UNIT_DEFERRED_COUNT}" =~ ^[0-9]+$ ]] && (( UNIT_DEFERRED_COUNT > 0 )); then
               echo "no pull-request unit lane: every changed package (${UNIT_DEFERRED}) is in the meerkat-mob compile chain and runs on main."
               forbid_failure "Unit tests" "${UNIT_RESULT}"
@@ -2841,6 +2851,7 @@ jobs:
           CLOSURE_COUNT: ${{ needs.changes.outputs.closure_count }}
           SHARD_COUNT: ${{ needs.changes.outputs.shard_count }}
           UNIT_SHARD_COUNT: ${{ needs.changes.outputs.unit_shard_count }}
+          UNIT_ROWS_ON_MAIN_COUNT: ${{ needs.changes.outputs.unit_rows_on_main_count }}
           MAIN_UNIT_SHARD_COUNT: ${{ needs.changes.outputs.main_unit_shard_count }}
           # Set only by a release-projection plan's verified evidence.
           RELEASE_PROJECTION: ${{ needs.changes.outputs.release_projection }}
@@ -2932,6 +2943,7 @@ jobs:
             --argjson closure_count "${CLOSURE_COUNT:-0}" \
             --argjson shard_count "${SHARD_COUNT:-0}" \
             --argjson unit_shard_count "${UNIT_SHARD_COUNT:-0}" \
+            --argjson unit_rows_on_main_count "${UNIT_ROWS_ON_MAIN_COUNT:-0}" \
             --argjson main_unit_shard_count "${MAIN_UNIT_SHARD_COUNT:-0}" \
             --argjson generated_contract "$([[ "${GENERATED_CONTRACT}" == "true" ]] && echo true || echo false)" \
             --argjson reused "${reused}" \
@@ -2953,6 +2965,7 @@ jobs:
                 closure_count: $closure_count,
                 clippy_shard_count: $shard_count,
                 unit_shard_count: $unit_shard_count,
+                unit_rows_on_main_count: $unit_rows_on_main_count,
                 main_unit_shard_count: $main_unit_shard_count,
                 generated_contract: $generated_contract
               },

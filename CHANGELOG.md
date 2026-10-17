@@ -37,6 +37,15 @@ them.
 
 ### Changed
 
+- A push to `main` or a `release/**` branch runs no separate unit lane. The
+  rows a pull request's unit lane would run for the same change (its
+  shards, with the same `-p` sets, and its feature suites) run verbatim in
+  the main unit lane, which ran the same tests again in other shards; the
+  rest of the workspace is packed around them. The plan names them
+  (`unit_rows_on_main`), the `CI gate` requires the main unit lane in their
+  place, and the exact-tree attestation records their count, which
+  release-projection evidence accepts for the skipped unit lane. A
+  whole-workspace push runs 13 fewer jobs. CI only.
 - A push to `main` runs the payload base's own copy of
   `scripts/ci-push-plan-base.mjs`, which decides the push's diff base, so a
   pushed commit cannot change that decision for its own push; without that

@@ -51,6 +51,12 @@
 // hook to a green CI gate with them. The plan lists what a pull request left
 // to the push (deferred_to_push), and the push plan runs all of it.
 //
+// A push runs no unit lane of its own: the rows a pull request's unit lane
+// would run (the same shards, so the same `-p` sets, because Cargo unifies
+// features across the packages of one run, and the same feature suites)
+// run verbatim in the main unit lane, with the rest of the workspace packed
+// around them (unit_rows_on_main). Both lanes run the same nextest command.
+//
 // Cargo.lock. A lock change that is the only global path is scoped: the
 // package entries the diff adds, removes or changes (version, source,
 // checksum or dependency list) are walked up the head lock's own dependency
@@ -1892,13 +1898,20 @@ function plan(args) {
       }
     }
     // Push-to-main unit lanes: the whole workspace, no budget. Archived
-    // packages leave the packed shards for their build-once lanes.
-    result.main_unit_shards = packShards(
-      allNames.filter((name) => !archivedPackages.has(name)),
-      weights,
-      args.workspaceShards,
-      model,
-    );
+    // packages leave the packed shards for their build-once lanes. A push
+    // runs the unit lane's shards here verbatim and packs the rest of the
+    // workspace around them (see the header).
+    const unitOnMain = !deferToPush;
+    const unitOnMainPackages = new Set(unitOnMain ? result.unit_packages : []);
+    result.main_unit_shards = [
+      ...(unitOnMain ? result.unit_shards : []),
+      ...packShards(
+        allNames.filter((name) => !archivedPackages.has(name) && !unitOnMainPackages.has(name)),
+        weights,
+        args.workspaceShards,
+        model,
+      ),
+    ];
     const archived = archivedLanes(archivedPackages, featureSuites);
     result.main_archive_builds = archived.builds;
     result.main_archive_runs = archived.runs;
@@ -1925,6 +1938,22 @@ function plan(args) {
         );
       }
     }
+    // The push's unit rows move to the main unit lane, the same row objects:
+    // nothing is rebuilt or repacked on the way.
+    result.unit_rows_on_main = [];
+    if (unitOnMain) {
+      const mainRows = [...result.main_unit_shards, ...result.main_feature_unit_shards];
+      const names = mainRows.map((row) => row.name);
+      if (new Set(names).size !== names.length) {
+        throw new Error(`internal error: main unit rows repeat a name (${names.join(", ")})`);
+      }
+      for (const row of [...result.unit_shards, ...result.unit_feature_shards]) {
+        if (!mainRows.includes(row)) throw new Error(`internal error: unit row ${row.name} is not a main unit row`);
+        result.unit_rows_on_main.push(row.name);
+      }
+      result.unit_shards = [];
+      result.unit_feature_shards = [];
+    }
     // Feature checks keep the weight-packed shards: they compile one Bazel
     // set and a few matrix rows per shard, and the head split would only
     // multiply their jobs. A pull request leaves them to the push.
@@ -1936,6 +1965,7 @@ function plan(args) {
     result.unit_deferred = [];
     result.unit_packages = [];
     result.unit_shards = [];
+    result.unit_rows_on_main = [];
     result.main_unit_shards = [];
     result.main_feature_unit_shards = [];
     result.unit_feature_shards = [];
@@ -2271,6 +2301,8 @@ function githubOutput(result) {
   scalar("unit_shard_count", String(unitLanes.length));
   scalar("unit_shard_matrix", matrixOf(unitLanes));
   scalar("unit_deferred", result.unit_deferred.join(" "));
+  scalar("unit_rows_on_main", result.unit_rows_on_main.join(" "));
+  scalar("unit_rows_on_main_count", String(result.unit_rows_on_main.length));
   scalar("unit_deferred_count", String(result.unit_deferred.length));
   scalar("main_unit_shard_count", String(mainUnitLanes.length));
   scalar("main_unit_shard_matrix", matrixOf(mainUnitLanes, { placeholder: false }));
@@ -2322,7 +2354,7 @@ function main() {
     process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
   }
   process.stderr.write(
-    `ci-cargo-lanes: event=${result.event} mode=${result.mode} release_projection=${result.release_projection !== null} packages=${result.packages.length} closure=${result.closure.length} clippy_shards=${result.shards.length} unit_shards=${result.unit_shards.length} feature_suites=${result.unit_feature_shards.length}/${result.main_feature_unit_shards.length} unit_deferred=${result.unit_deferred.length} integration=${result.integration_suites.length} feature_check_jobs=${result.feature_check_jobs.length} test_scope=${result.test_scope.length} closure_tests=${result.closure_test_rows.length} hook_binaries=${result.hook_coverage.hook_binaries} hook_retained=${result.hook_coverage.hook_retained} deferred_to_push=[${deferredSummary(result.deferred_to_push)}] (${result.reason})\n`,
+    `ci-cargo-lanes: event=${result.event} mode=${result.mode} release_projection=${result.release_projection !== null} packages=${result.packages.length} closure=${result.closure.length} clippy_shards=${result.shards.length} unit_shards=${result.unit_shards.length} feature_suites=${result.unit_feature_shards.length}/${result.main_feature_unit_shards.length} unit_deferred=${result.unit_deferred.length} unit_rows_on_main=${result.unit_rows_on_main.length} integration=${result.integration_suites.length} feature_check_jobs=${result.feature_check_jobs.length} test_scope=${result.test_scope.length} closure_tests=${result.closure_test_rows.length} hook_binaries=${result.hook_coverage.hook_binaries} hook_retained=${result.hook_coverage.hook_retained} deferred_to_push=[${deferredSummary(result.deferred_to_push)}] (${result.reason})\n`,
   );
 }
 
