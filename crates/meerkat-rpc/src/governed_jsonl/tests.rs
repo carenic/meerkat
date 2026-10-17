@@ -5707,3 +5707,391 @@ async fn stock_governed_cold_turn(same_binding: bool) {
     let cleanup_failures = cleanup_jsonl(r, &mut w, server_task, &mut http).await;
     finish_scenario(result, cleanup_failures);
 }
+
+/// A due prompt schedule on `model` whose target session is materialized on
+/// demand: its fire builds a new session for the occurrence.
+fn due_materialized_prompt_schedule(model: &str) -> meerkat::CreateScheduleRequest {
+    meerkat::CreateScheduleRequest {
+        name: Some("governed-fire".into()),
+        description: None,
+        trigger: meerkat::TriggerSpec::Once {
+            due_at_utc: chrono::Utc::now() - chrono::Duration::seconds(1),
+        },
+        target: meerkat::TargetBinding::session(
+            meerkat::SessionTargetBinding::materialize_on_demand(
+                meerkat::SessionMaterializationSpec {
+                    model: model.into(),
+                    system_prompt: None,
+                    max_tokens: None,
+                    provider: None,
+                    output_schema: None,
+                    structured_output_retries: None,
+                    provider_params: None,
+                    comms_name: None,
+                    peer_meta: None,
+                    labels: Default::default(),
+                    preload_skills: Vec::new(),
+                    additional_instructions: Vec::new(),
+                    realm_id: None,
+                    instance_id: None,
+                    backend: None,
+                    config_generation: None,
+                    keep_alive: false,
+                    app_context: None,
+                },
+                meerkat::ScheduledSessionAction::Prompt {
+                    prompt: meerkat_core::ContentInput::Text("scheduled-check".into()),
+                    system_prompt: None,
+                    render_metadata: None,
+                    skill_refs: Vec::new(),
+                    additional_instructions: Vec::new(),
+                },
+            ),
+        ),
+        // A loaded host may claim the fire late; it still fires.
+        misfire_policy: meerkat::MisfirePolicy::CatchUpWithin {
+            window_seconds: 3600,
+        },
+        overlap_policy: meerkat::OverlapPolicy::AllowConcurrent,
+        missing_target_policy: meerkat::MissingTargetPolicy::Skip,
+        labels: Default::default(),
+        planning_horizon_days: Some(1),
+        planning_horizon_occurrences: Some(1),
+    }
+}
+
+/// The first occurrence of `schedule_id` once it has left the in-flight
+/// phases.
+async fn terminal_occurrence(
+    schedules: &meerkat::ScheduleService,
+    schedule_id: &meerkat::ScheduleId,
+) -> meerkat::Occurrence {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(45);
+    loop {
+        let occurrence = schedules
+            .list_occurrences(schedule_id)
+            .await
+            .expect("occurrences")
+            .into_iter()
+            .next()
+            .expect("the planned occurrence");
+        if !matches!(
+            occurrence.phase,
+            meerkat::OccurrencePhase::Pending
+                | meerkat::OccurrencePhase::Claimed
+                | meerkat::OccurrencePhase::Dispatching
+                | meerkat::OccurrencePhase::AwaitingCompletion
+        ) {
+            return occurrence;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the fire never terminalized: {occurrence:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Whether `runtime` holds, live or persisted, the session `occurrence`'s
+/// fire materializes.
+async fn fired_session_exists(
+    runtime: &SessionRuntime,
+    sessions: &dyn meerkat::SessionStore,
+    occurrence: &meerkat::Occurrence,
+) -> bool {
+    let session_id = occurrence.materialized_session_id();
+    runtime.session_state(&session_id).await.unwrap().is_some()
+        || meerkat::SessionStore::load(sessions, &session_id)
+            .await
+            .unwrap()
+            .is_some()
+}
+
+/// A due schedule fires on the stock host. The host binds no agent onto a
+/// session it materializes for a fire, and it composes its realm's own
+/// schedule service ([`meerkat::PersistenceBundle::schedule_service`]): the
+/// service records the realm's agent on the schedule it creates, and the
+/// host refuses the fire typed, as `schedule_mandate_unavailable`, before it
+/// materializes a session or reaches the model.
+#[cfg(feature = "mcp")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stock_governed_host_refuses_a_scheduled_fire_before_materializing_its_session() {
+    use meerkat::governed_realm::stock::issuance::{
+        DEFAULT_STOCK_AGENT, StockGrantRequest, StockGrantTarget, grant_stock_agent,
+    };
+    use meerkat::governed_realm::stock::{StockGovernance, StockPrincipals, govern_stock_realm};
+    use meerkat::governed_realm::{RealmGovernance, open_governed_realm_persistence_with_provider};
+    const REALM: &str = "stock-schedule";
+    let mut http = Server::start().await;
+    let root = tempfile::tempdir().unwrap();
+    let open = |governance: RealmGovernance| {
+        open_governed_realm_persistence_with_provider(
+            &meerkat::DiskStorageProvider,
+            root.path(),
+            REALM,
+            Some(meerkat_store::RealmBackend::Sqlite),
+            None,
+            None,
+            governance,
+        )
+    };
+    drop(open(RealmGovernance::Ungoverned).await.unwrap());
+    let realm = RealmId::parse(REALM).unwrap();
+    let principals = StockPrincipals::for_user(&realm, 4242).unwrap();
+    govern_stock_realm(root.path(), REALM, &principals)
+        .await
+        .expect("governed");
+    // The operator grants the agent its controller's actual route, so an
+    // interactive prompt would be served.
+    let client = http_client_in(&http, REALM);
+    let selected = client.controller_model_selection().unwrap();
+    let pin = {
+        use meerkat_core::AgentLlmClient as _;
+        Arc::new(meerkat_llm_core::LlmClientAdapter::new(
+            Arc::clone(&client),
+            selected.model().to_string(),
+        ))
+        .pin_controller()
+        .expect("the controller pin")
+    };
+    let route = meerkat::governed_realm::stock::controller::controller_route_key(&pin)
+        .expect("the controller's actual route");
+    grant_stock_agent(
+        root.path(),
+        REALM,
+        &principals,
+        &StockGrantRequest {
+            agent: DEFAULT_STOCK_AGENT.into(),
+            target: StockGrantTarget::Controller {
+                routes: [route].into(),
+            },
+            expires_in_ms: None,
+        },
+    )
+    .await
+    .expect("issued and selected");
+
+    let governance = StockGovernance::new(realm.clone(), principals.clone());
+    let (_, bundle) = open(RealmGovernance::Stock(Arc::clone(&governance)))
+        .await
+        .unwrap();
+    let sessions = bundle.session_store();
+    let (config, _) = governed_client_config(&http, &selected, &bundle).await;
+    let setup = stock::stock_governed_jsonl_setup(&governance, config, bundle, client, Vec::new())
+        .expect("the stock host's governed JSONL setup");
+    http.receiver.direct_answer.store(true, Ordering::SeqCst);
+    let (client_io, server_io) = tokio::io::duplex(1 << 20);
+    let (r, w) = tokio::io::split(server_io);
+    let (mut server, runtime) = construct(BufReader::new(r), w, setup).unwrap();
+    let server_task = tokio::spawn(async move { server.run().await });
+    let (r, mut w) = tokio::io::split(client_io);
+    let mut r = BufReader::new(r);
+    let effects: Arc<Mutex<Vec<String>>> = Arc::default();
+    let scenario = async {
+        // The host's first session arms its schedule host.
+        send(
+            &mut w,
+            json!({"jsonrpc":"2.0","id":390,"method":"session/create","params":{
+                "prompt":"deferred-seed-schedule", "initial_turn":"deferred"
+            }}),
+        )
+        .await;
+        let created = response(&mut r, &mut w, 390, &effects).await;
+        assert!(created.get("error").is_none(), "{created}");
+
+        let schedules = runtime.schedule_service();
+        let schedule = schedules
+            .create(due_materialized_prompt_schedule(selected.model()))
+            .await
+            .expect("the schedule is created");
+        let occurrence = terminal_occurrence(&schedules, &schedule.schedule_id).await;
+        let observed = (
+            schedule.config.commissioning_agent.clone(),
+            occurrence.phase,
+            serde_json::to_value(occurrence.failure_class).unwrap(),
+            fired_session_exists(&runtime, sessions.as_ref(), &occurrence).await,
+            http.receiver.bodies.lock().unwrap().len(),
+        );
+        eprintln!(
+            "governed RPC fire: commissioning_agent={:?} phase={:?} failure_class={} \
+             session_materialized={} model_requests={} detail={:?}",
+            observed.0, observed.1, observed.2, observed.3, observed.4, occurrence.failure_detail
+        );
+        assert_eq!(
+            observed,
+            (
+                Some(principals.executor.clone()),
+                meerkat::OccurrencePhase::DeliveryFailed,
+                json!("schedule_mandate_unavailable"),
+                false,
+                0,
+            ),
+            "detail: {:?}",
+            occurrence.failure_detail
+        );
+    };
+    let result =
+        std::panic::AssertUnwindSafe(tokio::time::timeout(Duration::from_secs(60), scenario))
+            .catch_unwind()
+            .await;
+    let cleanup_failures = cleanup_jsonl(r, &mut w, server_task, &mut http).await;
+    finish_scenario(result, cleanup_failures);
+}
+
+/// The control: an ordinary realm's RPC host fires the same due schedule.
+/// Its schedule service records no commissioning agent and no mandate gate
+/// refuses the fire: the host materializes the occurrence's session. What
+/// the delivery to that session then does is not this control's concern.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ordinary_rpc_host_materializes_a_scheduled_fire_past_the_mandate_gate() {
+    let root = tempfile::tempdir().unwrap();
+    let (_, bundle) = meerkat::open_realm_persistence_in(
+        root.path(),
+        "ordinary-schedule",
+        Some(meerkat_store::RealmBackend::Sqlite),
+        None,
+    )
+    .await
+    .unwrap();
+    let sessions = bundle.session_store();
+    let runtime = Arc::new(
+        SessionRuntime::new(
+            AgentFactory::minimal(),
+            Config::default(),
+            4,
+            bundle,
+            NotificationSink::noop(),
+        )
+        .expect("compose the RPC session runtime"),
+    );
+    runtime.set_default_llm_client(Some(Arc::new(meerkat_client::TestClient::for_provider(
+        meerkat_core::Provider::Anthropic,
+    ))));
+    let scenario = async {
+        runtime
+            .ensure_schedule_host_started()
+            .await
+            .expect("the schedule host starts");
+        let schedules = runtime.schedule_service();
+        let schedule = schedules
+            .create(due_materialized_prompt_schedule(E1_MODEL))
+            .await
+            .expect("the schedule is created");
+        let occurrence = terminal_occurrence(&schedules, &schedule.schedule_id).await;
+        eprintln!(
+            "ordinary RPC fire: phase={:?} failure_class={:?} detail={:?}",
+            occurrence.phase, occurrence.failure_class, occurrence.failure_detail
+        );
+        assert_eq!(
+            (
+                schedule.config.commissioning_agent.clone(),
+                fired_session_exists(&runtime, sessions.as_ref(), &occurrence).await,
+                occurrence.failure_class
+                    == Some(meerkat::OccurrenceFailureClass::ScheduleMandateUnavailable),
+            ),
+            (None, true, false),
+            "{occurrence:?}"
+        );
+    };
+    let result = tokio::time::timeout(Duration::from_secs(60), scenario).await;
+    let shutdown = runtime.try_shutdown().await;
+    result.expect("the scenario finishes within its bound");
+    shutdown.expect("the runtime shuts down");
+}
+
+/// Both RPC runtime constructors compose the realm's own schedule service. A
+/// stock-governed realm's records the realm's agent on each schedule it
+/// creates or redefines, so a redefinition through the RPC host keeps the
+/// agent another host of the realm recorded rather than erasing it; an
+/// ordinary realm's records none.
+#[tokio::test]
+async fn rpc_runtimes_compose_the_realms_own_schedule_service() {
+    use meerkat::governed_realm::stock::{StockGovernance, StockPrincipals, govern_stock_realm};
+    use meerkat::governed_realm::{RealmGovernance, open_governed_realm_persistence_with_provider};
+    const REALM: &str = "stock-schedule-service";
+    let root = tempfile::tempdir().unwrap();
+    let realm = RealmId::parse(REALM).unwrap();
+    let principals = StockPrincipals::for_user(&realm, 4242).unwrap();
+    let open = |governance: RealmGovernance| {
+        open_governed_realm_persistence_with_provider(
+            &meerkat::DiskStorageProvider,
+            root.path(),
+            REALM,
+            Some(meerkat_store::RealmBackend::Sqlite),
+            None,
+            None,
+            governance,
+        )
+    };
+    let compose = |with_config_store: bool, bundle: PersistenceBundle| {
+        if with_config_store {
+            SessionRuntime::new_with_config_store(
+                AgentFactory::minimal(),
+                Config::default(),
+                Arc::new(MemoryConfigStore::new(
+                    Config::default(),
+                    meerkat_models::canonical(),
+                )),
+                1,
+                bundle,
+                NotificationSink::noop(),
+            )
+        } else {
+            SessionRuntime::new(
+                AgentFactory::minimal(),
+                Config::default(),
+                1,
+                bundle,
+                NotificationSink::noop(),
+            )
+        }
+        .expect("compose the RPC session runtime")
+    };
+    for governed in [false, true] {
+        if governed {
+            govern_stock_realm(root.path(), REALM, &principals)
+                .await
+                .expect("governed");
+        }
+        let recorded = governed.then(|| principals.executor.clone());
+        for with_config_store in [false, true] {
+            let governance = if governed {
+                RealmGovernance::Stock(StockGovernance::new(realm.clone(), principals.clone()))
+            } else {
+                RealmGovernance::Ungoverned
+            };
+            let (_, bundle) = open(governance).await.unwrap();
+            let runtime = compose(with_config_store, bundle);
+            let schedules = runtime.schedule_service();
+            // Another host of the realm records what its own service
+            // commissions: the realm's agent in a stock-governed realm.
+            let other_host = match recorded.clone() {
+                Some(agent) => meerkat::ScheduleService::new_commissioned(schedules.store(), agent),
+                None => meerkat::ScheduleService::new(schedules.store()),
+            };
+            let created = other_host
+                .create(due_materialized_prompt_schedule(E1_MODEL))
+                .await
+                .expect("the schedule is created");
+            let redefined = schedules
+                .update(
+                    &created.schedule_id,
+                    meerkat::UpdateScheduleRequest {
+                        name: Some("redefined".into()),
+                        ..meerkat::UpdateScheduleRequest::default()
+                    },
+                )
+                .await
+                .expect("the schedule is redefined");
+            assert_eq!(
+                (
+                    schedules.commissioning_agent().cloned(),
+                    redefined.config.commissioning_agent,
+                ),
+                (recorded.clone(), recorded.clone()),
+                "governed={governed} with_config_store={with_config_store}"
+            );
+            runtime.try_shutdown().await.unwrap();
+        }
+    }
+}

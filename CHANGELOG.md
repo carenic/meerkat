@@ -70,6 +70,14 @@ them.
   binding, so in a stock-governed realm every fire now fails this way. Such
   a fire used to materialize its session and then fail late, as
   `transport_error` (see Known issues).
+- Behaviour-only (not measured by the gate): rkat-rpc composes its realm's
+  own schedule service. Both `SessionRuntime` constructors take
+  `PersistenceBundle::schedule_service` where they built
+  `ScheduleService::new` over the realm's schedule store. In a
+  stock-governed realm rkat-rpc therefore records the realm's opened agent
+  on each schedule it creates or redefines (a redefinition through rkat-rpc
+  no longer erases the agent another host recorded), and its schedule host
+  refuses each fire as described above. Ordinary realms are unchanged.
 
 ### Security
 
