@@ -38,7 +38,7 @@ mark_path() {
       mark_all
       return
       ;;
-    meerkat-machine-schema/*|meerkat-machine-kernels/*|meerkat-runtime/*|meerkat-session/*|meerkat-mob/*|specs/machines/*|specs/compositions/*)
+    crates/meerkat-machine-schema/*|crates/meerkat-machine-kernels/*|crates/meerkat-runtime/*|crates/meerkat-session/*|crates/meerkat-mob/*|specs/machines/*|specs/compositions/*)
       mark_all
       return
       ;;
@@ -52,10 +52,10 @@ mark_path() {
   esac
 
   case "${path}" in
-    meerkat-web-runtime/*|crates/meerkat-cli/src/web_runtime_template/*)
+    crates/meerkat-web-runtime/*|crates/meerkat-cli/src/web_runtime_template/*)
       wasm_changed=true
       ;;
-    meerkat/*|meerkat-anthropic/*|meerkat-auth-core/*|meerkat-client/*|meerkat-comms/*|meerkat-contracts/*|meerkat-core/*|meerkat-gemini/*|meerkat-hooks/*|meerkat-llm-core/*|meerkat-machine-derive/*|meerkat-machine-dsl/*|meerkat-machine-dsl-core/*|meerkat-machine-kernels/*|meerkat-machine-schema/*|meerkat-mob/*|meerkat-mob-mcp/*|meerkat-mob-pack/*|meerkat-openai/*|meerkat-providers/*|meerkat-runtime/*|meerkat-schedule/*|meerkat-session/*|meerkat-skills/*|meerkat-store/*|meerkat-tools/*)
+    crates/meerkat/*|crates/meerkat-anthropic/*|crates/meerkat-auth-core/*|crates/meerkat-client/*|crates/meerkat-comms/*|crates/meerkat-contracts/*|crates/meerkat-core/*|crates/meerkat-gemini/*|crates/meerkat-hooks/*|crates/meerkat-llm-core/*|crates/meerkat-machine-derive/*|crates/meerkat-machine-dsl/*|crates/meerkat-machine-dsl-core/*|crates/meerkat-machine-kernels/*|crates/meerkat-machine-schema/*|crates/meerkat-mob/*|crates/meerkat-mob-mcp/*|crates/meerkat-mob-pack/*|crates/meerkat-openai/*|crates/meerkat-providers/*|crates/meerkat-runtime/*|crates/meerkat-schedule/*|crates/meerkat-session/*|crates/meerkat-skills/*|crates/meerkat-store/*|crates/meerkat-tools/*)
       wasm_changed=true
       ;;
   esac
@@ -64,19 +64,19 @@ mark_path() {
     sdks/*|tools/sdk-builder/*|tools/sdk-codegen/*)
       sdk_changed=true
       ;;
-    meerkat-rpc/*|meerkat-client/*|meerkat-contracts/*|meerkat-core/*|meerkat-llm-core/*)
+    crates/meerkat-rpc/*|crates/meerkat-client/*|crates/meerkat-contracts/*|crates/meerkat-core/*|crates/meerkat-llm-core/*)
       sdk_changed=true
       ;;
   esac
 
   case "${path}" in
-    meerkat/*|meerkat-client/*|meerkat-core/*|meerkat-store/*|meerkat-tools/*)
+    crates/meerkat/*|crates/meerkat-client/*|crates/meerkat-core/*|crates/meerkat-store/*|crates/meerkat-tools/*)
       minimal_changed=true
       ;;
   esac
 
   case "${path}" in
-    scripts/run-surface-feature-matrix|meerkat/*|meerkat-comms/*|meerkat-gemini/*|meerkat-mob/*|meerkat-mob-mcp/*|meerkat-openai/*|meerkat-providers/*|meerkat-tools/*)
+    scripts/run-surface-feature-matrix|crates/meerkat/*|crates/meerkat-comms/*|crates/meerkat-gemini/*|crates/meerkat-mob/*|crates/meerkat-mob-mcp/*|crates/meerkat-openai/*|crates/meerkat-providers/*|crates/meerkat-tools/*)
       feature_changed=true
       ;;
   esac

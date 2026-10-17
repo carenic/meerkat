@@ -210,8 +210,21 @@ else
 fi
 
 mixed_changed_gate_dry_run="$(./scripts/buildbuddy-changed-gate --owned --dry-run crates/meerkat/tests/support/test_session_store.rs crates/xtask/tests/machines_contracts.rs 2>&1 || true)"
-if [[ "${mixed_changed_gate_dry_run}" == *"test-targets: //crates/meerkat:sdk_agentfactory_test //crates/meerkat:sdk_structured_output_test"* ]] &&
-  [[ "${mixed_changed_gate_dry_run}" == *"clippy-targets: //crates/meerkat:sdk_agentfactory_test //crates/meerkat:sdk_structured_output_test //crates/xtask:machines_contracts_test"* ]] &&
+# The fast importers of the shared support file are tested and linted; the
+# required-feature xtask target is linted only. Membership, not the exact
+# lists: another test that imports the support file joins both.
+mixed_test_targets=" $(sed -n 's/^test-targets: //p' <<<"${mixed_changed_gate_dry_run}" | head -1) "
+mixed_clippy_targets=" $(sed -n 's/^clippy-targets: //p' <<<"${mixed_changed_gate_dry_run}" | head -1) "
+mixed_routing_ok=true
+for target in //crates/meerkat:sdk_agentfactory_test //crates/meerkat:sdk_structured_output_test; do
+  [[ "${mixed_test_targets}" == *" ${target} "* ]] || mixed_routing_ok=false
+done
+for target in ${mixed_test_targets}; do
+  [[ "${mixed_clippy_targets}" == *" ${target} "* ]] || mixed_routing_ok=false
+done
+[[ "${mixed_test_targets}" != *" //crates/xtask:machines_contracts_test "* ]] || mixed_routing_ok=false
+[[ "${mixed_clippy_targets}" == *" //crates/xtask:machines_contracts_test "* ]] || mixed_routing_ok=false
+if [[ "${mixed_routing_ok}" == true ]] &&
   [[ "${mixed_changed_gate_dry_run}" == *"plan: split test + clippy"* ]]; then
   pass "BuildBuddy mixed fast/non-fast edits keep exact clippy coverage"
 else
@@ -239,13 +252,19 @@ else
   bad "BuildBuddy launcher still carries stale vendored oai-rt-rs lock handling"
 fi
 
+# An exact crates.io pin, whatever its version, and the Bazel lock's
+# repository of that same version.
 oai_rt_rs_version="$(awk -F'"' '/^oai-rt-rs = / { print $2; exit }' Cargo.toml)"
-if [[ "${oai_rt_rs_version}" == "=0.4.1" ]] &&
+oai_rt_rs_exact=""
+if [[ "${oai_rt_rs_version}" =~ ^=([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+  oai_rt_rs_exact="${BASH_REMATCH[1]}"
+fi
+if [[ -n "${oai_rt_rs_exact}" ]] &&
   grep -Fq 'features = ["experimental-gpt-live"]' Cargo.toml &&
   ! grep -Fq 'oai-rt-rs = { path = ' Cargo.toml &&
   [[ ! -e tools/third-party/oai-rt-rs/Cargo.toml ]] &&
   ! grep -Fq 'crate = "oai-rt-rs"' MODULE.bazel &&
-  grep -Fq 'crates__oai-rt-rs-0.4.1' MODULE.bazel.lock &&
+  grep -Fq "crates__oai-rt-rs-${oai_rt_rs_exact}" MODULE.bazel.lock &&
   ! grep -Fq 'tools/third-party/oai-rt-rs' MODULE.bazel.lock; then
   pass "oai-rt-rs resolves the published experimental GPT Live crate"
 else

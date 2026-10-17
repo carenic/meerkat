@@ -101,6 +101,12 @@ them.
   `container:` or `image:` value, or a Bazel `docker://` reference without
   a digest, with one named exception: the self-hosted CI image, whose
   registry is private. CI and release builds only.
+- The BuildBuddy edge-lane detector (`scripts/buildbuddy-edge-changes`)
+  matched crate paths without their `crates/` prefix, so a crate change
+  selected none of the WASM, SDK, minimal or feature-matrix edge lanes it
+  should; it now does. `make buildbuddy-doctor` reads the mixed
+  fast/non-fast routing and the `oai-rt-rs` pin without pinning a target
+  list or a crate version. CI only.
 
 ## [0.9.2] - 2026-10-16
 
