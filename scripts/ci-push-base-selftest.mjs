@@ -279,17 +279,32 @@ process.exit(5);
     const c2 = commit(origin, "c2");
     writeFileSync(join(origin, "a.txt"), "3\n");
     const c3 = commit(origin, "c3");
+    // planted: c2 - p3, whose own finder answers what PLANTED_* ask for and
+    // leaves a marker of its own.
+    const plantedStub = [
+      'import { writeFileSync } from "node:fs";',
+      'writeFileSync(`${process.env.STUB_MARKER}.head`, "head");',
+      'process.stdout.write(process.env.PLANTED_OUTPUT ?? "");',
+      'process.exit(Number(process.env.PLANTED_STATUS ?? "0"));',
+      "",
+    ].join("\n");
+    git(origin, "checkout", "-q", "-b", "planted", c2);
+    writeFileSync(join(origin, FINDER_PATH), plantedStub);
+    const p3 = commit(origin, "p3");
+    git(origin, "checkout", "-q", "main");
     // The CI checkout: HEAD and its first parent only.
     const shallow = join(scratch, "shallow");
     git(scratch, "clone", "-q", "--depth", "2", "--branch", "main", `file://${origin}`, shallow);
     assert.notEqual(spawnSync("git", ["cat-file", "-e", `${c1}^{commit}`], { cwd: shallow, env: gitEnv }).status, 0, "the shallow clone lacks c1");
     const nofinder = join(scratch, "nofinder");
     git(scratch, "clone", "-q", "--branch", "nofinder", origin, nofinder);
+    const plantedClone = join(scratch, "planted");
+    git(scratch, "clone", "-q", "--depth", "2", "--branch", "planted", `file://${origin}`, plantedClone);
     const lone = join(scratch, "lone");
     git(scratch, "init", "-q", "-b", "main", lone);
     commit(lone, "root");
 
-    const plan = (cwd, payloadBase, { output = "", status = 0, compare = {} } = {}) => {
+    const plan = (cwd, payloadBase, { output = "", status = 0, compare = {}, env = {} } = {}) => {
       const fixture = join(scratch, `fixture-${nextId++}.json`);
       writeFileSync(fixture, JSON.stringify({ commits: [], runs: [], attestations: {}, compare }));
       const marker = join(scratch, `marker-${nextId++}`);
@@ -303,9 +318,10 @@ process.exit(5);
           STUB_OUTPUT: output,
           STUB_STATUS: String(status),
           STUB_MARKER: marker,
+          ...env,
         },
       });
-      return { ...result, finderArgs: existsSync(marker) ? readFileSync(marker, "utf8") : null };
+      return { ...result, marker, finderArgs: existsSync(marker) ? readFileSync(marker, "utf8") : null };
     };
     const expectPlanned = (label, cwd, payloadBase, options, base) => {
       const result = plan(cwd, payloadBase, options);
@@ -321,6 +337,22 @@ process.exit(5);
       assert.equal(result.finderArgs !== null, finderRuns, `${label}: the finder ${finderRuns ? "runs" : "never runs"}`);
     };
     const ahead = (base) => ({ status: "ahead", merge_base_commit: { sha: base } });
+
+    // HEAD's own finder never runs: when the pushed commit rewrites it
+    // (to name an older ancestor, or to fail), the parent's copy answers.
+    for (const [label, plantedOutput, plantedStatus] of [
+      ["a HEAD finder that names an older ancestor", `${c0}\n`, 0],
+      ["a HEAD finder that fails", "", 1],
+    ]) {
+      const result = plan(plantedClone, c2, {
+        output: `${c2}\n`,
+        env: { PLANTED_OUTPUT: plantedOutput, PLANTED_STATUS: String(plantedStatus) },
+      });
+      assert.equal(result.status, 0, `${label}: ${result.stderr}`);
+      assert.equal(result.stdout, `${c2}\n`, `${label}: the parent's finder answers`);
+      assert.equal(result.finderArgs, `--repository ${REPO} --head ${p3}`, `${label}: the parent's finder walks back from HEAD`);
+      assert.equal(existsSync(`${result.marker}.head`), false, `${label}: HEAD's finder never runs`);
+    }
 
     // A one-commit push: the parent is the payload base.
     expectPlanned("the parent itself", shallow, c2, { output: `${c2}\n` }, c2);
@@ -382,14 +414,18 @@ process.exit(5);
 
   // ci.yml: a push to main plans against the wrapper's base, given the
   // payload base (github.event.before), and plans the whole workspace
-  // without one; it never runs the parent's finder itself; a release
-  // projection keeps its verified first parent.
+  // without one; the wrapper itself comes from the payload base's tree, so
+  // a pushed commit cannot edit the decider for its own push; ci.yml never
+  // runs the parent's finder itself; a release projection keeps its
+  // verified first parent.
   const workflow = readFileSync(resolve(root, ".github/workflows/ci.yml"), "utf8");
   assert.match(
     workflow,
-    /if found_base="\$\(node scripts\/ci-push-plan-base\.mjs --repository "\$\{GITHUB_REPOSITORY\}" --payload-base "\$\{BASE_SHA\}"\)"; then/,
-    "a main push takes its base from ci-push-plan-base.mjs with the payload base",
+    /if git show "\$\{BASE_SHA\}:scripts\/ci-push-plan-base\.mjs" > "\$\{decider\}" 2>\/dev\/null \\\n\s+&& found_base="\$\(node "\$\{decider\}" --repository "\$\{GITHUB_REPOSITORY\}" --payload-base "\$\{BASE_SHA\}"\)"; then/,
+    "a main push runs the payload base's copy of ci-push-plan-base.mjs, with the payload base",
   );
+  assert.match(workflow, /decider="\$\{RUNNER_TEMP\}\/push-base-tools\/ci-push-plan-base\.mjs"/, "the copy lives outside the checkout");
+  assert.doesNotMatch(workflow, /node scripts\/ci-push-plan-base\.mjs/, "ci.yml never runs HEAD's own decider");
   assert.match(workflow, /github\.event_name == 'push' && github\.event\.before \|\|/, "BASE_SHA is a push's payload base");
   assert.doesNotMatch(workflow, /HEAD\^1:scripts\/ci-push-base\.mjs/, "ci.yml never runs the parent's finder directly");
   assert.match(

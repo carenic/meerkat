@@ -360,7 +360,9 @@ and its CI must be green before a release tag (`require_ci_green`):
   whose main CI run completed green with an attestation
   (`scripts/ci-push-base.mjs`), not the payload base, so a superseded,
   cancelled or failed main run's changes are planned again.
-  `scripts/ci-push-plan-base.mjs` runs the finder from HEAD's first parent
+  `scripts/ci-push-plan-base.mjs`, the payload base's own copy (so a pushed
+  commit cannot edit the decider for its own push; without that copy the
+  push plans the whole workspace), runs the finder from HEAD's first parent
   only when that parent is the payload base (`github.event.before`), and
   accepts only a full sha of an ancestor of HEAD other than HEAD (the
   checkout's history, or GitHub's compare API where it is shallow); a push
