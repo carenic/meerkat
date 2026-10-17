@@ -154,6 +154,11 @@ pub struct BuildAgentConfigParams<'a> {
     /// (typically restored from durable session metadata) and the
     /// resolver preserves it.
     pub mob_tool_authority_context: Option<MobToolAuthorityContext>,
+    /// The incarnation of the mob the member is built in, when this process
+    /// runs it. The default spawn-profile scope a `tools.mob` profile gets is
+    /// bound to it. `None` (a placed member compiled on its host) grants no
+    /// default scope: that host does not run the mob.
+    pub mob_incarnation: Option<meerkat_core::service::MobIncarnationId>,
     /// Pre-resolved inherited tool filter from spawn tooling.
     ///
     /// When set, stored in canonical session tool-visibility state so the
@@ -210,6 +215,7 @@ pub async fn build_agent_config(
         additional_instructions,
         shell_env,
         mob_tool_authority_context,
+        mob_incarnation,
         inherited_tool_filter,
         tool_access_policy,
         system_prompt_override,
@@ -318,7 +324,10 @@ pub async fn build_agent_config(
         profile.tools.mob && mob_tool_authority_context.is_none();
     let (override_mob, mut authority) =
         resolve_profile_mob_operator_access(profile, mob_tool_authority_context);
-    if should_grant_default_spawn_profiles && let Some(authority_context) = authority.take() {
+    if should_grant_default_spawn_profiles
+        && let Some(mob_incarnation) = mob_incarnation
+        && let Some(authority_context) = authority.take()
+    {
         let profile_names = definition
             .profiles
             .keys()
@@ -328,6 +337,7 @@ pub async fn build_agent_config(
             meerkat_runtime::mob_operator_authority::grant_spawn_profiles_in_mob(
                 &authority_context,
                 mob_id.as_str(),
+                mob_incarnation,
                 profile_names,
             )
             .map_err(|error| {
@@ -1351,7 +1361,12 @@ mod tests {
     fn injected_authority() -> Option<MobToolAuthorityContext> {
         let authority =
             meerkat_runtime::mob_operator_authority::create_only_mob_operator_authority().ok()?;
-        meerkat_runtime::mob_operator_authority::grant_manage_mob(&authority, "test-mob").ok()
+        meerkat_runtime::mob_operator_authority::grant_manage_mob(
+            &authority,
+            "test-mob",
+            meerkat_core::service::MobIncarnationId::mint(),
+        )
+        .ok()
     }
 
     struct TestVisibilityToolDispatcher {
@@ -1562,6 +1577,7 @@ mod tests {
             additional_instructions: None,
             shell_env: None,
             mob_tool_authority_context: None,
+            mob_incarnation: Some(meerkat_core::service::MobIncarnationId::mint()),
             tool_access_policy: None,
             inherited_tool_filter: None,
             system_prompt_override: None,
@@ -1595,6 +1611,7 @@ mod tests {
             additional_instructions: None,
             shell_env: None,
             mob_tool_authority_context: None,
+            mob_incarnation: Some(meerkat_core::service::MobIncarnationId::mint()),
             inherited_tool_filter: None,
             tool_access_policy: None,
             system_prompt_override: None,
@@ -1627,6 +1644,7 @@ mod tests {
                 additional_instructions: None,
                 shell_env: None,
                 mob_tool_authority_context: None,
+                mob_incarnation: Some(meerkat_core::service::MobIncarnationId::mint()),
                 inherited_tool_filter: None,
                 tool_access_policy: None,
                 system_prompt_override: None,
@@ -1680,6 +1698,7 @@ mod tests {
             additional_instructions: None,
             shell_env: None,
             mob_tool_authority_context: None,
+            mob_incarnation: Some(meerkat_core::service::MobIncarnationId::mint()),
             tool_access_policy: None,
             inherited_tool_filter: None,
             system_prompt_override: None,
@@ -1715,6 +1734,7 @@ mod tests {
             additional_instructions: None,
             shell_env: None,
             mob_tool_authority_context: None,
+            mob_incarnation: Some(meerkat_core::service::MobIncarnationId::mint()),
             tool_access_policy: policy,
             inherited_tool_filter: None,
             system_prompt_override: None,
@@ -1782,6 +1802,7 @@ mod tests {
             additional_instructions: None,
             shell_env: None,
             mob_tool_authority_context: None,
+            mob_incarnation: Some(meerkat_core::service::MobIncarnationId::mint()),
             tool_access_policy: policy,
             inherited_tool_filter: None,
             system_prompt_override: None,
@@ -1857,6 +1878,7 @@ mod tests {
             additional_instructions: None,
             shell_env: None,
             mob_tool_authority_context: None,
+            mob_incarnation: Some(meerkat_core::service::MobIncarnationId::mint()),
             tool_access_policy: Some(meerkat_core::ops::ToolAccessPolicy::DenyList(
                 Default::default(),
             )),
@@ -1903,6 +1925,7 @@ mod tests {
             additional_instructions: None,
             shell_env: None,
             mob_tool_authority_context: None,
+            mob_incarnation: Some(meerkat_core::service::MobIncarnationId::mint()),
             tool_access_policy: None,
             inherited_tool_filter: None,
             system_prompt_override: None,
@@ -1945,6 +1968,7 @@ mod tests {
             additional_instructions: None,
             shell_env: None,
             mob_tool_authority_context: None,
+            mob_incarnation: Some(meerkat_core::service::MobIncarnationId::mint()),
             tool_access_policy: None,
             inherited_tool_filter: None,
             system_prompt_override: None,
@@ -2214,6 +2238,7 @@ mod tests {
             additional_instructions: None,
             shell_env: None,
             mob_tool_authority_context: None,
+            mob_incarnation: Some(meerkat_core::service::MobIncarnationId::mint()),
             tool_access_policy: None,
             inherited_tool_filter: None,
             system_prompt_override: None,
@@ -2282,6 +2307,7 @@ mod tests {
             additional_instructions: None,
             shell_env: None,
             mob_tool_authority_context: None,
+            mob_incarnation: Some(meerkat_core::service::MobIncarnationId::mint()),
             tool_access_policy: None,
             inherited_tool_filter: None,
             system_prompt_override: None,
@@ -2326,6 +2352,7 @@ mod tests {
             additional_instructions: None,
             shell_env: None,
             mob_tool_authority_context: None,
+            mob_incarnation: Some(meerkat_core::service::MobIncarnationId::mint()),
             tool_access_policy: None,
             inherited_tool_filter: None,
             system_prompt_override: None,
@@ -2362,6 +2389,7 @@ mod tests {
             additional_instructions: None,
             shell_env: None,
             mob_tool_authority_context: None,
+            mob_incarnation: Some(meerkat_core::service::MobIncarnationId::mint()),
             tool_access_policy: None,
             inherited_tool_filter: None,
             system_prompt_override: None,
@@ -2400,9 +2428,16 @@ mod tests {
             .mob_tool_authority_context
             .as_ref()
             .expect("mob profile should receive generated authority");
-        assert!(authority.spawn_profile_scope_contains("test-mob", "lead"));
-        assert!(authority.spawn_profile_scope_contains("test-mob", "worker"));
-        assert!(!authority.can_manage_mob("test-mob"));
+        // The default spawn-profile scope is bound to the incarnation the
+        // build was given, and to no other.
+        let incarnation = authority.mob_incarnations()["test-mob"];
+        assert!(authority.spawn_profile_scope_contains("test-mob", incarnation, "lead"));
+        assert!(authority.spawn_profile_scope_contains("test-mob", incarnation, "worker"));
+        assert!(!authority.can_manage_mob("test-mob", incarnation));
+        assert!(!authority.spawn_profile_scope_present(
+            "test-mob",
+            meerkat_core::service::MobIncarnationId::mint()
+        ));
         // Worker profile has builtins=true, shell=false, memory=false
         let worker = def.profiles[&ProfileName::from("worker")]
             .as_inline()
@@ -2421,6 +2456,7 @@ mod tests {
             additional_instructions: None,
             shell_env: None,
             mob_tool_authority_context: None,
+            mob_incarnation: Some(meerkat_core::service::MobIncarnationId::mint()),
             tool_access_policy: None,
             inherited_tool_filter: None,
             system_prompt_override: None,
@@ -2475,6 +2511,7 @@ mod tests {
             additional_instructions: None,
             shell_env: None,
             mob_tool_authority_context: None,
+            mob_incarnation: Some(meerkat_core::service::MobIncarnationId::mint()),
             tool_access_policy: None,
             inherited_tool_filter: None,
             system_prompt_override: None,
@@ -2555,6 +2592,7 @@ mod tests {
             additional_instructions: None,
             shell_env: None,
             mob_tool_authority_context: None,
+            mob_incarnation: Some(meerkat_core::service::MobIncarnationId::mint()),
             tool_access_policy: None,
             inherited_tool_filter: Some(inherited_authority),
             system_prompt_override: None,
@@ -2611,6 +2649,7 @@ mod tests {
             additional_instructions: None,
             shell_env: None,
             mob_tool_authority_context: None,
+            mob_incarnation: Some(meerkat_core::service::MobIncarnationId::mint()),
             tool_access_policy: None,
             inherited_tool_filter: Some(inherited_authority.clone()),
             system_prompt_override: None,
@@ -2699,6 +2738,7 @@ mod tests {
             additional_instructions: None,
             shell_env: None,
             mob_tool_authority_context: injected_authority(),
+            mob_incarnation: Some(meerkat_core::service::MobIncarnationId::mint()),
             tool_access_policy: None,
             inherited_tool_filter: None,
             system_prompt_override: None,
@@ -2749,6 +2789,7 @@ mod tests {
                 additional_instructions: None,
                 shell_env: None,
                 mob_tool_authority_context: None,
+                mob_incarnation: Some(meerkat_core::service::MobIncarnationId::mint()),
                 tool_access_policy: None,
                 inherited_tool_filter: None,
                 system_prompt_override: None,
@@ -2814,6 +2855,7 @@ mod tests {
                 additional_instructions: Some(additional_instructions.clone()),
                 shell_env: Some(shell_env),
                 mob_tool_authority_context: None,
+                mob_incarnation: Some(meerkat_core::service::MobIncarnationId::mint()),
                 tool_access_policy: None,
                 inherited_tool_filter: None,
                 system_prompt_override: Some(crate::runtime::SpawnSystemPromptOverride::Replace(
@@ -2877,6 +2919,7 @@ mod tests {
                 additional_instructions: Some(vec!["persisted section".to_string()]),
                 shell_env: None,
                 mob_tool_authority_context: None,
+                mob_incarnation: Some(meerkat_core::service::MobIncarnationId::mint()),
                 tool_access_policy: None,
                 inherited_tool_filter: None,
                 system_prompt_override: Some(crate::runtime::SpawnSystemPromptOverride::Replace(
@@ -2940,6 +2983,7 @@ mod tests {
                 additional_instructions: None,
                 shell_env: None,
                 mob_tool_authority_context: None,
+                mob_incarnation: Some(meerkat_core::service::MobIncarnationId::mint()),
                 tool_access_policy: None,
                 inherited_tool_filter: None,
                 system_prompt_override: None,
@@ -3035,6 +3079,7 @@ mod tests {
                 additional_instructions: None,
                 shell_env: None,
                 mob_tool_authority_context: None,
+                mob_incarnation: Some(meerkat_core::service::MobIncarnationId::mint()),
                 tool_access_policy: None,
                 inherited_tool_filter: Some(inherited_authority.clone()),
                 system_prompt_override: None,
@@ -3137,6 +3182,7 @@ mod tests {
                 additional_instructions: None,
                 shell_env: None,
                 mob_tool_authority_context: None,
+                mob_incarnation: Some(meerkat_core::service::MobIncarnationId::mint()),
                 tool_access_policy: None,
                 inherited_tool_filter: Some(inherited_authority),
                 system_prompt_override: None,
@@ -3186,6 +3232,7 @@ mod tests {
             additional_instructions: None,
             shell_env: None,
             mob_tool_authority_context: None,
+            mob_incarnation: Some(meerkat_core::service::MobIncarnationId::mint()),
             tool_access_policy: None,
             inherited_tool_filter: None,
             system_prompt_override: None,
@@ -3235,6 +3282,7 @@ mod tests {
             additional_instructions: None,
             shell_env: None,
             mob_tool_authority_context: None,
+            mob_incarnation: Some(meerkat_core::service::MobIncarnationId::mint()),
             tool_access_policy: None,
             inherited_tool_filter: None,
             system_prompt_override: None,
@@ -3275,6 +3323,7 @@ mod tests {
             additional_instructions: None,
             shell_env: None,
             mob_tool_authority_context: None,
+            mob_incarnation: Some(meerkat_core::service::MobIncarnationId::mint()),
             tool_access_policy: None,
             inherited_tool_filter: None,
             system_prompt_override: Some(crate::SpawnSystemPromptOverride::Replace(
@@ -3317,6 +3366,7 @@ mod tests {
             additional_instructions: None,
             shell_env: None,
             mob_tool_authority_context: None,
+            mob_incarnation: Some(meerkat_core::service::MobIncarnationId::mint()),
             tool_access_policy: None,
             inherited_tool_filter: None,
             system_prompt_override: None,
@@ -3362,6 +3412,7 @@ mod tests {
             additional_instructions: None,
             shell_env: None,
             mob_tool_authority_context: None,
+            mob_incarnation: Some(meerkat_core::service::MobIncarnationId::mint()),
             tool_access_policy: None,
             inherited_tool_filter: None,
             system_prompt_override: None,
@@ -3407,6 +3458,7 @@ mod tests {
             additional_instructions: None,
             shell_env: None,
             mob_tool_authority_context: None,
+            mob_incarnation: Some(meerkat_core::service::MobIncarnationId::mint()),
             tool_access_policy: None,
             inherited_tool_filter: None,
             system_prompt_override: None,
@@ -3446,6 +3498,7 @@ mod tests {
             additional_instructions: None,
             shell_env: None,
             mob_tool_authority_context: None,
+            mob_incarnation: Some(meerkat_core::service::MobIncarnationId::mint()),
             tool_access_policy: None,
             inherited_tool_filter: None,
             system_prompt_override: None,
@@ -3476,6 +3529,7 @@ mod tests {
             additional_instructions: None,
             shell_env: None,
             mob_tool_authority_context: None,
+            mob_incarnation: Some(meerkat_core::service::MobIncarnationId::mint()),
             tool_access_policy: None,
             inherited_tool_filter: None,
             system_prompt_override: None,
@@ -3508,6 +3562,7 @@ mod tests {
             additional_instructions: None,
             shell_env: None,
             mob_tool_authority_context: None,
+            mob_incarnation: Some(meerkat_core::service::MobIncarnationId::mint()),
             tool_access_policy: None,
             inherited_tool_filter: None,
             system_prompt_override: None,
@@ -3582,6 +3637,7 @@ mod tests {
             additional_instructions: None,
             shell_env: None,
             mob_tool_authority_context: None,
+            mob_incarnation: Some(meerkat_core::service::MobIncarnationId::mint()),
             tool_access_policy: None,
             inherited_tool_filter: None,
             system_prompt_override: None,
@@ -3639,6 +3695,7 @@ mod tests {
                 additional_instructions: None,
                 shell_env: None,
                 mob_tool_authority_context: None,
+                mob_incarnation: Some(meerkat_core::service::MobIncarnationId::mint()),
                 tool_access_policy: None,
                 inherited_tool_filter: None,
                 system_prompt_override: None,
@@ -3707,6 +3764,7 @@ mod tests {
             additional_instructions: None,
             shell_env: None,
             mob_tool_authority_context: None,
+            mob_incarnation: Some(meerkat_core::service::MobIncarnationId::mint()),
             tool_access_policy: None,
             inherited_tool_filter: None,
             system_prompt_override: None,
@@ -3759,6 +3817,7 @@ mod tests {
             additional_instructions: None,
             shell_env: None,
             mob_tool_authority_context: None,
+            mob_incarnation: Some(meerkat_core::service::MobIncarnationId::mint()),
             tool_access_policy: None,
             inherited_tool_filter: None,
             system_prompt_override: None,
@@ -3796,6 +3855,7 @@ mod tests {
             additional_instructions: None,
             shell_env: None,
             mob_tool_authority_context: None,
+            mob_incarnation: Some(meerkat_core::service::MobIncarnationId::mint()),
             tool_access_policy: None,
             inherited_tool_filter: None,
             system_prompt_override: None,
@@ -3830,6 +3890,7 @@ mod tests {
             additional_instructions: None,
             shell_env: None,
             mob_tool_authority_context: None,
+            mob_incarnation: Some(meerkat_core::service::MobIncarnationId::mint()),
             tool_access_policy: None,
             inherited_tool_filter: None,
             system_prompt_override: None,
@@ -3880,6 +3941,7 @@ mod tests {
             additional_instructions: None,
             shell_env: None,
             mob_tool_authority_context: None,
+            mob_incarnation: Some(meerkat_core::service::MobIncarnationId::mint()),
             tool_access_policy: None,
             inherited_tool_filter: None,
             system_prompt_override: None,
@@ -3992,6 +4054,7 @@ mod tests {
             additional_instructions: None,
             shell_env: None,
             mob_tool_authority_context: None,
+            mob_incarnation: Some(meerkat_core::service::MobIncarnationId::mint()),
             tool_access_policy: None,
             inherited_tool_filter: None,
             system_prompt_override: None,
@@ -4067,6 +4130,7 @@ mod tests {
             additional_instructions: None,
             shell_env: None,
             mob_tool_authority_context: None,
+            mob_incarnation: Some(meerkat_core::service::MobIncarnationId::mint()),
             tool_access_policy: None,
             inherited_tool_filter: None,
             system_prompt_override: None,
@@ -4756,6 +4820,7 @@ mod tests {
             additional_instructions: None,
             shell_env: None,
             mob_tool_authority_context: None,
+            mob_incarnation: Some(meerkat_core::service::MobIncarnationId::mint()),
             tool_access_policy: None,
             inherited_tool_filter: None,
             system_prompt_override: None,

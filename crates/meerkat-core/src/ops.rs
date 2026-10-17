@@ -1020,9 +1020,9 @@ mod tests {
 
     #[test]
     fn session_effect_replace_mob_authority_context_deserializes_without_authority_seal() {
-        let effect = SessionEffect::ReplaceMobToolAuthorityContext {
-            authority_context: generated_mob_authority_for_test(),
-        };
+        let authority_context = generated_mob_authority_for_test();
+        let incarnation = authority_context.mob_incarnations()["test-mob"];
+        let effect = SessionEffect::ReplaceMobToolAuthorityContext { authority_context };
         let json = serde_json::to_value(&effect).unwrap();
         let parsed: SessionEffect = serde_json::from_value(json).unwrap();
         match parsed {
@@ -1030,7 +1030,7 @@ mod tests {
                 assert!(!authority_context.is_generated_authority_context());
                 assert!(!authority_context.can_create_mobs());
                 assert!(!authority_context.can_mutate_profiles());
-                assert!(!authority_context.can_manage_mob("test-mob"));
+                assert!(!authority_context.can_manage_mob("test-mob", incarnation));
             }
             other => panic!("unexpected session effect: {other:?}"),
         }

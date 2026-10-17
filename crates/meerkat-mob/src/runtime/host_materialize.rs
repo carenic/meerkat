@@ -2794,6 +2794,10 @@ impl HostMemberMaterializer {
             // host-local process env; nothing to inject per-member.
             shell_env: None,
             mob_tool_authority_context: decompiled.mob_tool_authority_context.clone(),
+            // This host does not run the controlling mob: no incarnation to
+            // bind a default spawn-profile scope to. The member's operator
+            // calls go through the upcall lane, re-minted controlling-side.
+            mob_incarnation: None,
             // Inherited tool filters are hard-deny superseded for remote
             // spawns (ADJ-6) — structurally absent from the spec.
             inherited_tool_filter: None,

@@ -35,6 +35,70 @@ them.
 
 ## [Unreleased]
 
+### Breaking
+
+- Mob operator grants name the mob incarnation they were granted for (see
+  Security). The scope readers and the grant functions take a
+  `meerkat_core::service::MobIncarnationId`:
+  - `meerkat_core::service::MobToolAuthorityContext::can_manage_mob`
+  - `meerkat_core::service::MobToolAuthorityContext::spawn_profile_scope_present`
+  - `meerkat_core::service::MobToolAuthorityContext::spawn_profile_scope_contains`
+  - `meerkat_runtime::mob_operator_authority::grant_manage_mob`
+  - `meerkat_runtime::mob_operator_authority::grant_spawn_profile_in_mob`
+  - `meerkat_runtime::mob_operator_authority::grant_spawn_profiles_in_mob`
+  - `meerkat_runtime::mob_operator_authority::mint_mob_operator_authority_from_facts`
+    also takes the id of the mob that holds the facts, and refuses facts
+    that scope any other mob.
+
+  Pass the incarnation of the live mob the grant or check is about:
+  `meerkat_mob::MobHandle::incarnation`.
+- `meerkat-runtime` and `meerkat-machine-schema`: the MeerkatMachine DSL
+  types carry the incarnation bindings (struct literals and exhaustive
+  patterns need them): `MeerkatMachineState` gains
+  `mob_operator_mob_incarnations`;
+  `MeerkatMachineInput::RestoreMobOperatorAuthority` gains `mob_incarnations`;
+  `MeerkatMachineInput::GrantMobOperatorManageMob` and
+  `MeerkatMachineInput::SetMobOperatorSpawnProfilesInMob` gain
+  `mob_incarnation`.
+- `meerkat-machine-kernels`: new public fields on exhaustively constructible
+  structs: `State` gains `mob_operator_mob_incarnations`;
+  `RestoreMobOperatorAuthority` gains `mob_incarnations`;
+  `GrantMobOperatorManageMob` and `SetMobOperatorSpawnProfilesInMob` gain
+  `mob_incarnation`. `TransitionId` gains `RebindMobOperatorManageMob` and
+  `RebindMobOperatorSpawnProfilesInMob`, so the implicit discriminants of the
+  variants after them change (`TransitionId::*`); match them by variant name,
+  not by numeric cast or position.
+- Behaviour-only (not measured by the gate): an agent's `delegate` refuses
+  with the ordinary access denial when the mob registered under its
+  session's implicit delegation mob id is not that session's implicit mob
+  (its owner-bridge record does not mark it implicit for the session); it
+  used to act on that mob.
+
+### Security
+
+- Mob operator grants no longer reach a later mob created under the same
+  id. A session's manage and spawn-profile scope used to name a mob only by
+  id, so a session that created and destroyed mob `X` could list, spawn
+  into and destroy a mob `X` that another session created later. Each mob
+  runtime now mints an opaque `MobIncarnationId` when it starts (a create,
+  or a resume by a later process); a grant names that incarnation, and
+  every scope check compares it with the incarnation of the mob the call
+  acts on. A grant for a new incarnation of an id replaces the binding and
+  drops the other scope held for the old one. An agent's `mob_create`
+  grants the incarnation its own create started; `delegate` grants the
+  incarnation its session's implicit mob runs at, and only when the mob's
+  owner-bridge record marks it as that session's implicit mob. Incarnations
+  are never decoded from input: `Deserialize` always refuses and `Debug`
+  and `Serialize` render them redacted. Grants are still not persisted, so
+  no grant survives a restart; a member's operator facts re-bind to the
+  incarnation of the mob that holds them on each upcall.
+
+### Added
+
+- `meerkat_core::service::MobIncarnationId`, `meerkat_mob::MobHandle::incarnation`
+  and `meerkat_core::service::MobToolAuthorityContext::mob_incarnations` (see
+  Security).
+
 ## [0.9.2] - 2026-10-16
 
 ### Breaking

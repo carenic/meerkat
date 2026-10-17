@@ -169,10 +169,26 @@ fn routed_script(
 // Surfaces and calls
 // ===========================================================================
 
+/// The incarnation the live mob `mob_id` runs at in `state`: the binding a
+/// grant over that mob names.
+async fn live_incarnation(
+    state: &MobMcpState,
+    mob_id: &str,
+) -> meerkat_core::service::MobIncarnationId {
+    state
+        .handle_for(&meerkat_mob::MobId::from(mob_id))
+        .await
+        .expect("live mob handle")
+        .incarnation()
+}
+
 /// A member's fork authority: it may spawn its own role, nothing else. No
 /// manage scope, so every observation of another member goes through
 /// ownership admission.
-fn forker_authority(mob_id: &str) -> meerkat_core::service::MobToolAuthorityContext {
+fn forker_authority(
+    mob_id: &str,
+    incarnation: meerkat_core::service::MobIncarnationId,
+) -> meerkat_core::service::MobToolAuthorityContext {
     let authority = meerkat_runtime::mob_operator_authority::create_only_mob_operator_authority()
         .expect("generated authority");
     let authority =
@@ -181,6 +197,7 @@ fn forker_authority(mob_id: &str) -> meerkat_core::service::MobToolAuthorityCont
     meerkat_runtime::mob_operator_authority::grant_spawn_profile_in_mob(
         &authority,
         mob_id,
+        incarnation,
         "participant",
     )
     .expect("spawnable participant profile, no manage scope")
@@ -188,10 +205,13 @@ fn forker_authority(mob_id: &str) -> meerkat_core::service::MobToolAuthorityCont
 
 /// A convener's authority: create scope (councils) and manage scope over the
 /// source mob whose members participate.
-fn convener_authority(mob_id: &str) -> meerkat_core::service::MobToolAuthorityContext {
+fn convener_authority(
+    mob_id: &str,
+    incarnation: meerkat_core::service::MobIncarnationId,
+) -> meerkat_core::service::MobToolAuthorityContext {
     let authority = meerkat_runtime::mob_operator_authority::create_only_mob_operator_authority()
         .expect("generated authority");
-    meerkat_runtime::mob_operator_authority::grant_manage_mob(&authority, mob_id)
+    meerkat_runtime::mob_operator_authority::grant_manage_mob(&authority, mob_id, incarnation)
         .expect("manage scope over the source mob")
 }
 
@@ -247,7 +267,10 @@ async fn member_surface(fixture: &CouncilFixture, member: &str) -> BoundSurface 
     bind_surface(
         &fixture.state,
         session,
-        forker_authority(fixture.source_mob_id().as_str()),
+        forker_authority(
+            fixture.source_mob_id().as_str(),
+            live_incarnation(&fixture.state, fixture.source_mob_id().as_str()).await,
+        ),
     )
 }
 
@@ -731,7 +754,7 @@ async fn detached_council_completion_reaches_the_convener() {
     let convener = bind_surface(
         &fixture.state,
         member_session(&fixture, "convener").await,
-        convener_authority(&mob_id),
+        convener_authority(&mob_id, live_incarnation(&fixture.state, &mob_id).await),
     );
 
     let started = call(&convener.surface, "council", council_args(&fixture, None))
@@ -907,7 +930,7 @@ async fn one_shot_hosts_block_for_the_council_result() {
     let convener = bind_surface(
         &fixture.state,
         member_session(&fixture, "convener").await,
-        convener_authority(&mob_id),
+        convener_authority(&mob_id, live_incarnation(&fixture.state, &mob_id).await),
     );
 
     let outcome = dispatch(
@@ -1011,7 +1034,7 @@ async fn a_failing_detached_council_completes_its_job_as_failed() {
     let convener = bind_surface(
         &fixture.state,
         member_session(&fixture, "convener").await,
-        convener_authority(&mob_id),
+        convener_authority(&mob_id, live_incarnation(&fixture.state, &mob_id).await),
     );
 
     let started = call(&convener.surface, "council", council_args(&fixture, None))
@@ -1084,7 +1107,7 @@ async fn an_implicit_service_runtime_delivers_fork_and_council_completions() {
     let convener = bind_surface(
         &fixture.state,
         forker.session.clone(),
-        convener_authority(&mob_id),
+        convener_authority(&mob_id, live_incarnation(&fixture.state, &mob_id).await),
     );
     let council = call(
         &convener.surface,
@@ -1216,7 +1239,7 @@ async fn detached_council_completion_revives_a_convener_whose_executor_was_torn_
     let convener = bind_surface(
         &fixture.state,
         member_session(&fixture, "convener").await,
-        convener_authority(&mob_id),
+        convener_authority(&mob_id, live_incarnation(&fixture.state, &mob_id).await),
     );
     assert_eq!(
         drive_turn(&fixture, "convener", "FOLLOW-UP-W warm up").await,
@@ -1306,7 +1329,7 @@ async fn a_live_completion_for_an_unservable_owner_is_applied_once_it_can_be_ser
     let convener = bind_surface(
         &fixture.state,
         member_session(&fixture, "convener").await,
-        convener_authority(&mob_id),
+        convener_authority(&mob_id, live_incarnation(&fixture.state, &mob_id).await),
     );
     let started = call(&convener.surface, "council", council_args(&fixture, None))
         .await
@@ -1758,7 +1781,11 @@ async fn forker_checks_lists_and_retires_only_its_own_children() {
     .expect("a member without children gets an empty owner view");
     assert!(member_names(&listed).is_empty(), "{listed}");
 
-    let outsider = bind_surface(&fixture.state, SessionId::new(), forker_authority(&mob_id));
+    let outsider = bind_surface(
+        &fixture.state,
+        SessionId::new(),
+        forker_authority(&mob_id, live_incarnation(&fixture.state, &mob_id).await),
+    );
     assert!(
         matches!(
             call(
@@ -1825,7 +1852,7 @@ async fn owned_member_tools_type_a_retired_or_missing_target_as_not_found() {
     let manager = bind_surface(
         &fixture.state,
         SessionId::new(),
-        convener_authority(&mob_id),
+        convener_authority(&mob_id, live_incarnation(&fixture.state, &mob_id).await),
     );
 
     let job_id =
@@ -2071,7 +2098,7 @@ async fn spawned_by_survives_resume_restart_and_successor_respawn() {
     let forker_after_restart = bind_surface(
         &restarted,
         forker.session.clone(),
-        forker_authority(mob_id.as_str()),
+        forker_authority(mob_id.as_str(), restored.incarnation()),
     );
     // The restored mob's fork re-link pass reads its children's status
     // concurrently; the forker's check neither waits on it nor is refused.
@@ -2415,7 +2442,7 @@ async fn a_plain_session_convener_on_a_hookless_host_gets_the_council_in_turn() 
     let convener = bind_surface(
         &fixture.state,
         SessionId::new(),
-        convener_authority(&mob_id),
+        convener_authority(&mob_id, live_incarnation(&fixture.state, &mob_id).await),
     );
 
     let outcome = dispatch(
@@ -2453,7 +2480,7 @@ async fn a_member_convener_on_a_hookless_host_runs_the_council_detached() {
     let convener = bind_surface(
         &fixture.state,
         member_session(&fixture, "convener").await,
-        convener_authority(&mob_id),
+        convener_authority(&mob_id, live_incarnation(&fixture.state, &mob_id).await),
     );
 
     let started = result_json(
@@ -2486,7 +2513,7 @@ async fn an_owner_hook_lets_a_plain_session_convener_run_the_council_detached() 
     let convener = bind_surface(
         &fixture.state,
         SessionId::new(),
-        convener_authority(&mob_id),
+        convener_authority(&mob_id, live_incarnation(&fixture.state, &mob_id).await),
     );
 
     let started = result_json(
@@ -2564,7 +2591,7 @@ async fn a_hooked_host_revives_a_member_convener_through_its_mob() {
     let convener = bind_surface(
         &fixture.state,
         member_session(&fixture, "convener").await,
-        convener_authority(&mob_id),
+        convener_authority(&mob_id, live_incarnation(&fixture.state, &mob_id).await),
     );
     assert_eq!(
         drive_turn(&fixture, "convener", "FOLLOW-UP-W warm up").await,

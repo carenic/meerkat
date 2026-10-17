@@ -5521,6 +5521,8 @@ enum SpawnProvisionInput {
 #[derive(Clone)]
 struct DeferredResumeProvision {
     definition: Arc<MobDefinition>,
+    /// The incarnation of the mob the member is rebuilt in.
+    mob_incarnation: meerkat_core::service::MobIncarnationId,
     realm_profile_store: Option<Arc<dyn crate::store::RealmProfileStore>>,
     profile_name: ProfileName,
     agent_identity: AgentIdentity,
@@ -5628,6 +5630,7 @@ impl DeferredResumeProvision {
     ) -> Result<ProvisionMemberRequest, MobError> {
         let Self {
             definition,
+            mob_incarnation,
             realm_profile_store,
             profile_name,
             agent_identity,
@@ -5684,6 +5687,7 @@ impl DeferredResumeProvision {
                 additional_instructions,
                 shell_env,
                 mob_tool_authority_context: None,
+                mob_incarnation: Some(mob_incarnation),
                 inherited_tool_filter,
                 tool_access_policy,
                 system_prompt_override,
@@ -7274,6 +7278,10 @@ pub(super) enum ResumePostCommitMemberOutcome {
 
 pub(super) struct MobActor {
     pub(super) definition: Arc<MobDefinition>,
+    /// The incarnation this runtime start minted (see
+    /// [`super::MobHandle::incarnation`]). Mob operator scope minted for
+    /// members of this mob is bound to it.
+    pub(super) incarnation: meerkat_core::service::MobIncarnationId,
     pub(super) roster: Arc<RwLock<RosterAuthority>>,
     pub(super) events: Arc<dyn MobEventStore>,
     pub(super) placed_completion_durable_index: Arc<std::sync::Mutex<PlacedCompletionDurableIndex>>,
@@ -14008,6 +14016,7 @@ impl MobActor {
             public_owner: None,
             ownership: Arc::clone(&self.ownership),
             admission_closed_rx: self.admission_closed_tx.subscribe(),
+            incarnation: self.incarnation,
         }
     }
 
@@ -30879,6 +30888,7 @@ impl MobActor {
                         let external_tools = precomputed_external_tools?;
                         let deferred = DeferredResumeProvision {
                             definition: preparation_context.definition.clone(),
+                            mob_incarnation: preparation_context.incarnation,
                             realm_profile_store: preparation_context.realm_profile_store.clone(),
                             profile_name: profile_name.clone(),
                             agent_identity: agent_identity.clone(),
@@ -30968,6 +30978,7 @@ impl MobActor {
                                 additional_instructions,
                                 shell_env,
                                 mob_tool_authority_context: None,
+                                mob_incarnation: Some(preparation_context.incarnation),
                                 inherited_tool_filter: inherited_tool_filter.clone(),
                                 tool_access_policy: tool_access_policy.clone(),
                                 system_prompt_override: system_prompt_override.clone(),
@@ -31076,6 +31087,7 @@ impl MobActor {
                 additional_instructions,
                 shell_env,
                 mob_tool_authority_context: None,
+                mob_incarnation: Some(preparation_context.incarnation),
                 inherited_tool_filter,
                 tool_access_policy,
                 system_prompt_override,
@@ -32776,6 +32788,7 @@ impl MobActor {
         let compiled = match super::spec_compiler::compile_portable_member_spec(
             super::spec_compiler::CompileMemberSpecParams {
                 mob_id: &self.definition.id,
+                mob_incarnation: self.incarnation,
                 profile_name: &profile_name,
                 agent_identity: &agent_identity,
                 profile: &profile,
@@ -34169,6 +34182,7 @@ impl MobActor {
             additional_instructions,
             shell_env,
             mob_tool_authority_context: None,
+            mob_incarnation: Some(self.incarnation),
             inherited_tool_filter,
             tool_access_policy,
             system_prompt_override,

@@ -131,6 +131,9 @@ impl SpawnBasePromptSource for FactoryChainSpawnBasePromptSource {
 /// the spawn-spec destructure.
 pub(crate) struct CompileMemberSpecParams<'a> {
     pub mob_id: &'a MobId,
+    /// The incarnation of the controlling mob the operator authority minted
+    /// for a `tools.mob` member is bound to.
+    pub mob_incarnation: meerkat_core::service::MobIncarnationId,
     pub profile_name: &'a ProfileName,
     pub agent_identity: &'a AgentIdentity,
     /// AFTER override/realm/inherited-open resolution.
@@ -584,6 +587,7 @@ pub(crate) async fn compile_portable_member_spec(
 ) -> Result<CompiledMemberSpec, MobError> {
     let CompileMemberSpecParams {
         mob_id,
+        mob_incarnation,
         profile_name,
         agent_identity,
         profile,
@@ -659,6 +663,7 @@ pub(crate) async fn compile_portable_member_spec(
                     meerkat_runtime::mob_operator_authority::grant_spawn_profiles_in_mob(
                         &authority_context,
                         mob_id.as_str(),
+                        mob_incarnation,
                         profile_names,
                     )
                     .map_err(|error| {
@@ -675,6 +680,7 @@ pub(crate) async fn compile_portable_member_spec(
                     meerkat_runtime::mob_operator_authority::grant_manage_mob(
                         &authority_context,
                         mob_id.as_str(),
+                        mob_incarnation,
                     )
                     .map_err(|error| {
                         MobError::Internal(format!(
@@ -845,6 +851,7 @@ mod tests {
     ) -> CompileMemberSpecParams<'a> {
         CompileMemberSpecParams {
             mob_id,
+            mob_incarnation: meerkat_core::service::MobIncarnationId::mint(),
             profile_name,
             agent_identity: identity,
             profile,

@@ -617,11 +617,12 @@ impl MobUpcallSeams {
         tool_name: &str,
     ) -> Result<(), ToolError> {
         let mob_id = self.handle.mob_id().as_str();
+        let incarnation = self.handle.incarnation();
         let admission = self
             .handle
             .resolve_spawn_tool_admission(
-                context.can_manage_mob(mob_id),
-                context.spawn_profile_scope_present(mob_id),
+                context.can_manage_mob(mob_id, incarnation),
+                context.spawn_profile_scope_present(mob_id, incarnation),
             )
             .await
             .map_err(|error| {
@@ -646,9 +647,14 @@ impl MobUpcallSeams {
         spec: &MemberOperatorSpawnSpec,
     ) -> Result<(), ToolError> {
         let mob_id = self.handle.mob_id().as_str();
+        let incarnation = self.handle.incarnation();
         let observations = SpawnMemberAdmissionObservations {
-            manage_scope_present: context.can_manage_mob(mob_id),
-            profile_scope_contains: context.spawn_profile_scope_contains(mob_id, &spec.profile),
+            manage_scope_present: context.can_manage_mob(mob_id, incarnation),
+            profile_scope_contains: context.spawn_profile_scope_contains(
+                mob_id,
+                incarnation,
+                &spec.profile,
+            ),
             runtime_mode_present: spec.runtime_mode.is_some(),
             launch_mode_present: spec.launch_mode.is_some(),
             tool_access_policy_present: spec.requested_tool_access_policy_present,
@@ -930,8 +936,16 @@ impl UpcallServeSeams for MobUpcallSeams {
         let provenance = MobToolCallerProvenance::default()
             .with_mob_id(fenced.handle.mob_id().as_str())
             .with_member_id(requester.as_str());
-        let context = mint_mob_operator_authority_from_facts(&facts, provenance, request_id)
-            .map_err(UpcallExecuteError::AuthorityRemint)?;
+        // The record is this mob's own: its scope binds to the incarnation
+        // of the mob that holds it, never to a later mob under the same id.
+        let context = mint_mob_operator_authority_from_facts(
+            &facts,
+            fenced.handle.mob_id().as_str(),
+            fenced.handle.incarnation(),
+            provenance,
+            request_id,
+        )
+        .map_err(UpcallExecuteError::AuthorityRemint)?;
 
         Ok(match op {
             MemberOperatorOp::SpawnMember(spec) => {
@@ -2060,15 +2074,27 @@ mod tests {
         let provenance = MobToolCallerProvenance::default()
             .with_mob_id("mob-a")
             .with_member_id("b2");
-        let context = mint_mob_operator_authority_from_facts(&facts, provenance, "req-1")
-            .expect("facts re-mint through the generated ladder");
+        let incarnation = meerkat_core::service::MobIncarnationId::mint();
+        let context = mint_mob_operator_authority_from_facts(
+            &facts,
+            "mob-a",
+            incarnation,
+            provenance,
+            "req-1",
+        )
+        .expect("facts re-mint through the generated ladder");
         assert!(
             context.is_generated_authority_context(),
             "sealed generated context"
         );
-        assert!(context.can_manage_mob("mob-a"));
-        assert!(context.spawn_profile_scope_contains("mob-a", "worker"));
-        assert!(!context.can_manage_mob("mob-other"));
+        assert!(context.can_manage_mob("mob-a", incarnation));
+        assert!(context.spawn_profile_scope_contains("mob-a", incarnation, "worker"));
+        assert!(!context.can_manage_mob("mob-other", incarnation));
+        // The record binds to the holder's live incarnation only: a later
+        // mob under the same id is not in scope.
+        let later = meerkat_core::service::MobIncarnationId::mint();
+        assert!(!context.can_manage_mob("mob-a", later));
+        assert!(!context.spawn_profile_scope_present("mob-a", later));
     }
 
     /// A recovered Pending for every high-risk mutator terminalizes
