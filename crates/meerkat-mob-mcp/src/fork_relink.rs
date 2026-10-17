@@ -113,6 +113,9 @@ pub struct RelinkDelivery {
     /// The host's managed mobs, read afresh each time an owner bound outside
     /// the child's mob is looked up, so a mob inserted later is found.
     managed_mobs: Option<ManagedMobs>,
+    /// Child retirements still to fail before they reach the mob, one per
+    /// retirement (a test seam; `None` on every host).
+    child_retirement_faults: Option<Arc<std::sync::atomic::AtomicUsize>>,
 }
 
 impl RelinkDelivery {
@@ -123,6 +126,7 @@ impl RelinkDelivery {
             runtime: state.runtime_adapter_for_relink(),
             completions: state.detached_delivery_route().ok(),
             managed_mobs: Some(state.managed_mobs()),
+            child_retirement_faults: None,
         }
     }
 
@@ -133,6 +137,38 @@ impl RelinkDelivery {
     pub fn without_managed_mobs(mut self) -> Self {
         self.managed_mobs = None;
         self
+    }
+
+    /// This delivery failing its next `count` child retirements before they
+    /// reach the mob, as a retirement whose cleanup fails does (a test seam).
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_child_retirement_faults(mut self, count: usize) -> Self {
+        self.child_retirement_faults = Some(Arc::new(std::sync::atomic::AtomicUsize::new(count)));
+        self
+    }
+
+    /// Retire `child` with its descendants: every retirement the re-link
+    /// makes goes through here.
+    async fn retire_child(
+        &self,
+        handle: &MobHandle,
+        child: &AgentIdentity,
+    ) -> Result<(), MobError> {
+        if let Some(faults) = &self.child_retirement_faults
+            && faults
+                .fetch_update(
+                    std::sync::atomic::Ordering::AcqRel,
+                    std::sync::atomic::Ordering::Acquire,
+                    |left| left.checked_sub(1),
+                )
+                .is_ok()
+        {
+            return Err(MobError::Internal(
+                "injected re-link child retirement failure".to_string(),
+            ));
+        }
+        handle.retire_with_descendants(child.clone()).await
     }
 
     /// The member seated on `owner_session_id` in a mob other than
@@ -575,7 +611,7 @@ async fn relink_owned_child(
         };
         if let Some(delivered) = delivered
             && delivered.retires_child()
-            && let Err(error) = handle.retire_with_descendants(child.clone()).await
+            && let Err(error) = delivery.retire_child(handle, child).await
         {
             report_child_retirement_incomplete(
                 mob_id,
@@ -603,7 +639,7 @@ async fn relink_owned_child(
                         | ForkRelinkAction::AlreadyDelivered
                         | ForkRelinkAction::OwnerGone
                 )
-                && let Err(error) = handle.retire_with_descendants(child.clone()).await
+                && let Err(error) = delivery.retire_child(handle, child).await
             {
                 report_child_retirement_incomplete(
                     mob_id,
@@ -1474,7 +1510,7 @@ async fn fence_by_retirement(
     spec: &meerkat_mob::BoundedResultSpec,
     reason: Option<RestartInterruptedReason>,
 ) -> ForkRelinkAction {
-    if let Err(error) = handle.retire_with_descendants(child.clone()).await {
+    if let Err(error) = delivery.retire_child(handle, child).await {
         report_child_retirement_incomplete(
             mob_id,
             child,
@@ -1607,7 +1643,7 @@ fn deliver_receipt<'a>(
         // The live custodian retires a child whose own turn failed; so does the
         // re-link, once that outcome is settled.
         if retires_after_delivery(&action, service, mob_id, child, job).await
-            && let Err(error) = handle.retire_with_descendants(child.clone()).await
+            && let Err(error) = delivery.retire_child(handle, child).await
         {
             report_child_retirement_incomplete(
                 mob_id,
@@ -1699,7 +1735,7 @@ fn limit_elapsed<'a>(
         completion.max_run_secs = job.max_run_ms.map(|limit| limit / 1000);
         let action = deliver(delivery, owner, mob_id, handle, child, job, completion).await;
         if retires_after_delivery(&action, service, mob_id, child, job).await
-            && let Err(error) = handle.retire_with_descendants(child.clone()).await
+            && let Err(error) = delivery.retire_child(handle, child).await
         {
             report_child_retirement_incomplete(
                 mob_id,
