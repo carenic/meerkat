@@ -2,6 +2,7 @@
 //!
 //! These tests spawn a real kennel TCP server and exercise the control protocol
 //! through signed envelopes. No LLM API key needed.
+#![allow(clippy::disallowed_methods)]
 
 use anyhow::Context;
 use mdm_tux::{

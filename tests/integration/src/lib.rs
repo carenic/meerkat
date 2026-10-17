@@ -1,4 +1,4 @@
-#![allow(clippy::bool_assert_comparison)]
+#![allow(clippy::bool_assert_comparison, clippy::disallowed_methods)]
 
 pub mod coverage_matrix;
 pub mod e2e_lanes;

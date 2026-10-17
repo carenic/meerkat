@@ -2735,4 +2735,19 @@ impl meerkat_core::RealmConfigSource for FilesystemRealmConfigSource {
         let value: toml::Value = toml::from_str(&text)?;
         Ok(Some(value))
     }
+
+    /// `<state_root>/.realm-config.lock`: every guarded store over this
+    /// state root's documents (the user document's included) holds it
+    /// across its read, check and write. A host on another state root takes
+    /// another lock; a write to the user document also composes each realm
+    /// it states as if that realm had no document, so none of its checks
+    /// depends on a document only another state root holds.
+    fn composition_lock_path(&self) -> Option<PathBuf> {
+        Some(self.state_root.join(REALM_CONFIG_LOCK_FILE))
+    }
 }
+
+/// The composition lock file at the root of a realm state root
+/// ([`meerkat_core::RealmConfigSource::composition_lock_path`]).
+#[cfg(not(target_arch = "wasm32"))]
+const REALM_CONFIG_LOCK_FILE: &str = ".realm-config.lock";

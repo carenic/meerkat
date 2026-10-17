@@ -19,7 +19,12 @@
 //! model but before it acknowledged the evidence: the final incarnation must
 //! still record exactly one notice and never replay the input.
 
-#![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
+#![allow(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    clippy::panic,
+    clippy::disallowed_methods
+)]
 
 #[cfg(all(
     feature = "session-store",

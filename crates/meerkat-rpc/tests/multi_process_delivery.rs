@@ -22,7 +22,8 @@
     clippy::expect_used,
     clippy::large_futures,
     clippy::panic,
-    clippy::unwrap_used
+    clippy::unwrap_used,
+    clippy::disallowed_methods
 )]
 
 use std::path::{Path, PathBuf};

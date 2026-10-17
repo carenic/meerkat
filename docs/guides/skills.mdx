@@ -57,6 +57,21 @@ resolver does not expand `${ENV_VAR}` references or `~` in these fields. Keep
 realm configuration access restricted, or materialize secrets and absolute
 paths before starting Meerkat.
 
+An HTTPS token goes to git for the repository's host only. On Linux and
+macOS git asks for it through its own credential protocol: its
+`credential-cache` client asks a socket Meerkat serves for each git
+invocation, so the token is never on a command line or in a file (the
+checkout's `.git/config` included), and no credential helper of your git
+configuration is asked for it or sent it. This needs a git built with
+`credential-cache`, as the usual Linux and macOS packages are; without it a
+refresh fails with an error naming the alternatives. On Windows the token
+is a header option on each git invocation's own command line, for the
+configured repository URL alone and with redirects not followed (so the URL
+must be the repository's final one). Processes of your user can read it
+there for that invocation, and it is never written to a file: prefer an ssh
+key, or a git credential manager configured for the repository host and no
+token.
+
 ### HTTP sources
 
 ```toml

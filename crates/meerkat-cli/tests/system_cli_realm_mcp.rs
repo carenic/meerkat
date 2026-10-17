@@ -1,5 +1,10 @@
 #![cfg(feature = "integration-real-tests")]
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::disallowed_methods
+)]
 //! Real-binary regression: an MCP server installed in one realm's own config
 //! is part of an ordinary `rkat` session in that realm, and only there.
 //!

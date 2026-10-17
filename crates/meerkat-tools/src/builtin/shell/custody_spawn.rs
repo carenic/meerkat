@@ -218,6 +218,8 @@ pub(super) async fn spawn_in_custody(
                 let child = command.spawn()?.into();
                 return finish_gated_spawn(gate, child, entry, make_group).await;
             }
+            // A launch site: the shell's trusted-host branch.
+            #[allow(clippy::disallowed_methods)]
             let mut command = Command::new(program);
             command.args(args);
             configure_trusted(&mut command, directory, environment);

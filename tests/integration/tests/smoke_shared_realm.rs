@@ -5,7 +5,8 @@
     dead_code,
     unused_assignments,
     unused_variables,
-    deprecated
+    deprecated,
+    clippy::disallowed_methods
 )]
 
 use std::collections::{BTreeMap, BTreeSet};

@@ -1,3 +1,6 @@
+// Test code: it runs the compiler whose refusals it checks.
+#![allow(clippy::disallowed_methods)]
+
 use std::collections::VecDeque;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};

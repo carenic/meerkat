@@ -66,6 +66,9 @@ impl StdioSkillRunner for TrustedHostStdioSkillRunner {
         input: &[u8],
         timeout: Duration,
     ) -> Result<StdioSkillOutput, SkillError> {
+        // A launch site: the trusted-host runner of stdio skill sources,
+        // used only when the host leaves `mcp_stdio` unconfined.
+        #[allow(clippy::disallowed_methods)]
         let mut command = Command::new(&launch.command);
         command.args(&launch.args).envs(&launch.env);
         if let Some(cwd) = &launch.cwd {

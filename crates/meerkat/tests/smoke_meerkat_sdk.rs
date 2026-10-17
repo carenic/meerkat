@@ -3,7 +3,8 @@
     clippy::expect_used,
     clippy::large_futures,
     clippy::panic,
-    clippy::unwrap_used
+    clippy::unwrap_used,
+    clippy::disallowed_methods
 )]
 //!
 //! E2E smoke tests for the Meerkat native Rust SDK.

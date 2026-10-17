@@ -1,5 +1,10 @@
 #![cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
-#![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
+#![allow(
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unwrap_used,
+    clippy::disallowed_methods
+)]
 
 use std::path::PathBuf;
 

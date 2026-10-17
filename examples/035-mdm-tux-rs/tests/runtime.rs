@@ -1,3 +1,5 @@
+#![allow(clippy::disallowed_methods)]
+
 use mdm_tux::{
     rpc_client::{RpcClient, turn_params},
     runtime::ManagedRpcHost,

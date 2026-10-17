@@ -31,13 +31,22 @@
 //! A binding that declares one server while defaulting to a model on another is
 //! [`SelfHostedBindingServer::Conflicting`]: it never matches, and it is
 //! reported in the considered list so the contradiction is visible.
+//!
+//! A binding whose auth profile runs a credential command authenticates only
+//! the server its backend declares: the host administers where the command's
+//! token goes through that declaration, so neither the binding's
+//! `default_model` nor a request's model may decide it. Such a binding is
+//! never matched by inference and never the unconstrained fallback, and an
+//! explicit selection of one that declares no server is refused
+//! ([`SelfHostedConnectionError::CredentialCommandServerUndeclared`]).
 
 use thiserror::Error;
 
 use crate::Config;
 use crate::connection::{
-    BindingId, BindingOrigin, ConnectionTargetError, ProviderBinding, RealmChain,
-    RealmConnectionSet, RealmId, ResolvedConnectionTarget, materialize_connection_target,
+    BindingId, BindingOrigin, ConnectionTargetError, CredentialSourceSpec, ProviderBinding,
+    RealmChain, RealmConnectionSet, RealmId, ResolvedConnectionTarget,
+    materialize_connection_target,
 };
 use crate::provider::Provider;
 
@@ -206,6 +215,23 @@ pub enum SelfHostedConnectionError {
         server: String,
         model: String,
     },
+    /// An explicitly named binding whose auth profile runs a credential
+    /// command declares no server. The host administers where such a
+    /// binding's token goes through the server its backend declares, so a
+    /// binding that declares none authenticates no server: neither the one
+    /// its `default_model` is served by nor the one the request's model is.
+    #[error(
+        "auth binding '{realm}:{binding}' runs a credential command, but its backend declares no \
+         self-hosted server, so its token is sent to none, and model '{model}' is served by \
+         '{server}'; add server = \"<id>\" to the binding's backend profile, naming the server \
+         the command's token is for"
+    )]
+    CredentialCommandServerUndeclared {
+        realm: String,
+        binding: String,
+        server: String,
+        model: String,
+    },
     /// The realm chain itself could not be resolved.
     #[error(transparent)]
     ConnectionTarget(#[from] ConnectionTargetError),
@@ -280,6 +306,39 @@ fn ordered_self_hosted_bindings(realm: &RealmConnectionSet) -> Vec<&ProviderBind
     bindings
 }
 
+/// A self-hosted binding reachable from a head realm: the realm that states
+/// it, the candidate an error reports, and whether its auth profile runs a
+/// credential command.
+struct ReachableBinding {
+    realm: RealmConnectionSet,
+    candidate: SelfHostedBindingCandidate,
+    runs_command: bool,
+}
+
+impl ReachableBinding {
+    /// Whether this binding names `server_id`. A credential command binding
+    /// names a server only by declaring it: the host administers where its
+    /// token goes through the declaration, not through its `default_model`.
+    fn names(&self, server_id: &str) -> bool {
+        match &self.candidate.server {
+            SelfHostedBindingServer::Declared { server } => server == server_id,
+            SelfHostedBindingServer::DerivedFromDefaultModel { server } => {
+                !self.runs_command && server == server_id
+            }
+            SelfHostedBindingServer::Conflicting { .. } | SelfHostedBindingServer::Undeclared => {
+                false
+            }
+        }
+    }
+
+    /// Whether this binding may stand in for any server: it names none and
+    /// does not run a credential command, whose token goes only to the
+    /// server its backend declares.
+    fn is_unconstrained(&self) -> bool {
+        self.candidate.server.is_undeclared() && !self.runs_command
+    }
+}
+
 /// Collect every self-hosted binding reachable from `head`, child realm first,
 /// each with its typed server identity.
 ///
@@ -289,7 +348,7 @@ fn ordered_self_hosted_bindings(realm: &RealmConnectionSet) -> Vec<&ProviderBind
 fn collect_self_hosted_candidates(
     config: &Config,
     head: &RealmId,
-) -> Result<Vec<(RealmConnectionSet, SelfHostedBindingCandidate)>, SelfHostedConnectionError> {
+) -> Result<Vec<ReachableBinding>, SelfHostedConnectionError> {
     let chain = RealmChain::resolve(config, head).map_err(ConnectionTargetError::from)?;
     let mut out = Vec::new();
     for member in chain.realms() {
@@ -310,14 +369,19 @@ fn collect_self_hosted_candidates(
                 continue;
             };
             let server = self_hosted_binding_server(config, &realm, binding);
-            out.push((
-                realm.clone(),
-                SelfHostedBindingCandidate {
+            let runs_command = realm
+                .auth_profiles
+                .get(&binding.auth_profile)
+                .is_some_and(|auth| matches!(auth.source, CredentialSourceSpec::Command { .. }));
+            out.push(ReachableBinding {
+                realm: realm.clone(),
+                candidate: SelfHostedBindingCandidate {
                     realm: realm.realm_id.clone(),
                     binding: binding_id,
                     server,
                 },
-            ));
+                runs_command,
+            });
         }
     }
     Ok(out)
@@ -328,9 +392,12 @@ fn collect_self_hosted_candidates(
 /// Selection order:
 /// 1. the nearest binding that positively names `server_id` (child realm
 ///    first; within a realm, `default_binding`, then the typed
-///    `provider_default` marker, then binding-id order);
+///    `provider_default` marker, then binding-id order); a binding whose
+///    auth profile runs a credential command names a server only by
+///    declaring it;
 /// 2. the single unconstrained ([`SelfHostedBindingServer::Undeclared`])
-///    binding on the chain, if there is exactly one.
+///    binding on the chain, if there is exactly one; a credential command
+///    binding is never unconstrained.
 ///
 /// Anything else fails closed with a typed [`SelfHostedConnectionError`] that
 /// names the server and every binding considered. A realm's own
@@ -351,16 +418,16 @@ pub fn resolve_self_hosted_binding_for_server(
     // identity is a filter over it, not a competing precedence. Declaration vs
     // inference decides whether a binding names the server at all, never which
     // of two naming bindings is preferred.
-    if let Some((realm, candidate)) = candidates
+    if let Some(reachable) = candidates
         .iter()
-        .find(|(_, candidate)| candidate.server.matches(server_id))
+        .find(|reachable| reachable.names(server_id))
     {
-        return materialize(realm.clone(), candidate.binding.clone());
+        return materialize(reachable.realm.clone(), reachable.candidate.binding.clone());
     }
 
     let considered: Vec<SelfHostedBindingCandidate> = candidates
         .iter()
-        .map(|(_, candidate)| candidate.clone())
+        .map(|reachable| reachable.candidate.clone())
         .collect();
     if considered.is_empty() {
         return Err(SelfHostedConnectionError::NoSelfHostedBindings {
@@ -371,11 +438,13 @@ pub fn resolve_self_hosted_binding_for_server(
 
     let mut unconstrained = candidates
         .iter()
-        .filter(|(_, candidate)| candidate.server.is_undeclared());
+        .filter(|reachable| reachable.is_unconstrained());
     match (unconstrained.next(), unconstrained.next()) {
         // Exactly one unconstrained binding: the documented single-server setup
         // keeps resolving without annotation.
-        (Some((realm, candidate)), None) => materialize(realm.clone(), candidate.binding.clone()),
+        (Some(reachable), None) => {
+            materialize(reachable.realm.clone(), reachable.candidate.binding.clone())
+        }
         (Some(_), Some(_)) => Err(SelfHostedConnectionError::AmbiguousServerBinding {
             server: server_id.to_string(),
             considered,
@@ -409,7 +478,10 @@ fn materialize(
 /// operator declarations that contradict the request. An undeclared binding, or
 /// one whose server is only inferred from `default_model`, still resolves - an
 /// explicit selection remains the operator's escape hatch, including for a
-/// credential deliberately shared across servers.
+/// credential deliberately shared across servers - unless its auth profile
+/// runs a credential command: such a binding authenticates only the server
+/// its backend declares, so naming one that declares none is refused
+/// ([`SelfHostedConnectionError::CredentialCommandServerUndeclared`]).
 pub fn validate_explicit_self_hosted_target(
     config: &Config,
     target: &ResolvedConnectionTarget,
@@ -421,7 +493,22 @@ pub fn validate_explicit_self_hosted_target(
         SelfHostedBindingServer::Declared { server } => server.clone(),
         SelfHostedBindingServer::Conflicting { declared, .. } => declared.clone(),
         SelfHostedBindingServer::DerivedFromDefaultModel { .. }
-        | SelfHostedBindingServer::Undeclared => return Ok(()),
+        | SelfHostedBindingServer::Undeclared => {
+            if matches!(
+                target.auth_profile.source,
+                CredentialSourceSpec::Command { .. }
+            ) {
+                return Err(
+                    SelfHostedConnectionError::CredentialCommandServerUndeclared {
+                        realm: target.auth_binding.realm.as_str().to_string(),
+                        binding: target.auth_binding.binding.as_str().to_string(),
+                        server: server_id.to_string(),
+                        model: model.to_string(),
+                    },
+                );
+            }
+            return Ok(());
+        }
     };
     if declared == server_id {
         return Ok(());
@@ -674,6 +761,123 @@ mod tests {
                 "message must contain {expected}: {message}"
             );
         }
+    }
+
+    /// Make `binding_id`'s auth profile in `realm_id` run a credential
+    /// command.
+    fn run_credential_command(config: &mut Config, realm_id: &str, binding_id: &str) {
+        let auth = config
+            .realm
+            .get_mut(realm_id)
+            .and_then(|realm| realm.auth.get_mut(&format!("{binding_id}_auth")))
+            .expect("the binding's auth profile");
+        auth.source = CredentialSourceSpec::Command {
+            program: "/usr/bin/helper".into(),
+            args: Vec::new(),
+            cwd: None,
+            env: std::collections::BTreeMap::new(),
+            timeout_ms: 30_000,
+            refresh_interval_ms: None,
+        };
+    }
+
+    /// The explicitly selected target of `binding_id` in `realm_id`.
+    fn explicit_target(
+        config: &Config,
+        realm_id: &str,
+        binding_id: &str,
+    ) -> ResolvedConnectionTarget {
+        crate::connection::resolve_explicit_auth_binding_target(
+            config,
+            &crate::connection::AuthBindingRef {
+                realm: realm(realm_id),
+                binding: BindingId::parse(binding_id).unwrap(),
+                profile: None,
+                origin: BindingOrigin::Configured,
+            },
+        )
+        .expect("the binding resolves when named")
+    }
+
+    /// A binding whose auth profile runs a credential command sends a token
+    /// the host administers, so it authenticates only the server its backend
+    /// declares. Without a declaration it is neither the unconstrained
+    /// fallback for a model on another server nor, by its default model, the
+    /// binding of that model's server, whether the request leaves the choice
+    /// to the resolver or names the binding; a declared one still resolves
+    /// for its own server alone.
+    #[test]
+    fn a_credential_command_binding_authenticates_only_its_declared_server() {
+        let mut undeclared = base_config();
+        add_binding(&mut undeclared, "ws", "helper", None, None, true);
+        run_credential_command(&mut undeclared, "ws", "helper");
+        let mut derived = base_config();
+        add_binding(
+            &mut derived,
+            "ws",
+            "helper",
+            None,
+            Some("cerebras-gpt-oss-120b"),
+            true,
+        );
+        run_credential_command(&mut derived, "ws", "helper");
+
+        for (case, config, server, model) in [
+            ("undeclared", &undeclared, "muse_vllm", "muse-glimmer-30b"),
+            (
+                "derived from its default model",
+                &derived,
+                "cerebras",
+                "cerebras-gpt-oss-120b",
+            ),
+        ] {
+            let implicit =
+                resolve_self_hosted_binding_for_server(config, server, Some(&realm("ws")));
+            assert!(
+                matches!(
+                    implicit,
+                    Err(SelfHostedConnectionError::NoBindingForServer { .. })
+                ),
+                "{case}: the resolver never picks it for {server}: {:?}",
+                implicit.map(|target| target.auth_binding.binding.to_string())
+            );
+            let explicit = validate_explicit_self_hosted_target(
+                config,
+                &explicit_target(config, "ws", "helper"),
+                server,
+                model,
+            )
+            .expect_err("a named credential command binding needs a declared server");
+            let message = explicit.to_string();
+            assert!(
+                message.contains("ws:helper")
+                    && message.contains(server)
+                    && message.contains("server = \""),
+                "{case}: {message}"
+            );
+        }
+
+        let mut declared = base_config();
+        add_binding(&mut declared, "ws", "helper", Some("muse_vllm"), None, true);
+        run_credential_command(&mut declared, "ws", "helper");
+        let target =
+            resolve_self_hosted_binding_for_server(&declared, "muse_vllm", Some(&realm("ws")))
+                .expect("its declared server resolves");
+        validate_explicit_self_hosted_target(&declared, &target, "muse_vllm", "muse-glimmer-30b")
+            .expect("its declared server passes");
+        assert!(
+            resolve_self_hosted_binding_for_server(&declared, "cerebras", Some(&realm("ws")))
+                .is_err()
+        );
+        assert!(
+            validate_explicit_self_hosted_target(
+                &declared,
+                &target,
+                "cerebras",
+                "cerebras-gpt-oss-120b"
+            )
+            .is_err()
+        );
     }
 
     #[test]

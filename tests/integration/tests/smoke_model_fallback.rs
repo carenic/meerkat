@@ -1,5 +1,10 @@
 //! Real provider adapters and SQLite authority across fresh OS processes.
-#![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
+#![allow(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    clippy::panic,
+    clippy::disallowed_methods
+)]
 
 use std::convert::Infallible;
 use std::sync::Arc;

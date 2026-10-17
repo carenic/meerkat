@@ -1,4 +1,4 @@
-#![allow(clippy::expect_used, clippy::panic)]
+#![allow(clippy::expect_used, clippy::panic, clippy::disallowed_methods)]
 
 use std::collections::BTreeSet;
 use std::fs;

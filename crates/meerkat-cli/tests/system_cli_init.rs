@@ -1,4 +1,5 @@
 #![cfg(feature = "integration-real-tests")]
+#![allow(clippy::disallowed_methods)]
 
 use std::path::PathBuf;
 use tempfile::TempDir;

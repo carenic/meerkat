@@ -7,7 +7,12 @@
 //! events on stderr (at the `info` default and under a `RUST_LOG` override)
 //! and only JSON on stdout, which is the MCP channel.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::disallowed_methods
+)]
 
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};

@@ -8,7 +8,12 @@
 //! conflict, refused before any storage is touched; its `Display` text and
 //! its `Debug` variant name (`ConflictingSelection`) differ visibly.
 
-#![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
+#![allow(
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unwrap_used,
+    clippy::disallowed_methods
+)]
 
 use std::path::PathBuf;
 use std::process::{Command, Stdio};

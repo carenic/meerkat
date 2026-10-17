@@ -3,7 +3,7 @@
 //! host's own inputs from its confined processes, besides the warnings for
 //! what the operator should act on.
 
-#![allow(clippy::expect_used, clippy::unwrap_used)]
+#![allow(clippy::expect_used, clippy::unwrap_used, clippy::disallowed_methods)]
 
 use std::path::PathBuf;
 use std::process::Command;

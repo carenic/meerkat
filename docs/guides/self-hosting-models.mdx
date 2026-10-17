@@ -124,6 +124,13 @@ A binding that declares neither is *unconstrained*: it is used only when it is
 the single unconstrained self-hosted binding reachable from the active realm, so
 one-server setups keep working with no annotation.
 
+A binding whose auth profile runs a credential command
+(`source = { kind = "command" }`) must declare `server`: the command's token is
+the host's, and only the declaration says where it goes. A realm with such a
+binding that declares none does not compose. The binding is never inferred from
+its `default_model` and never unconstrained, and naming it explicitly for a model
+it does not declare fails closed.
+
 When the server cannot be identified honestly - no binding names it, or several
 unconstrained bindings are reachable - the run fails closed with an error naming
 the server and every binding considered, rather than sending some other server's
@@ -131,7 +138,8 @@ key and surfacing that endpoint's `Unauthorized`. Fix it by adding
 `server = "<server_id>"` to the backend profile that authenticates it, or by
 selecting the binding explicitly with `--auth-binding <realm>:<binding>`. An
 explicit selection wins, except when the named binding declares a *different*
-server: that contradiction fails closed too.
+server, or is a credential command binding that declares none: those fail
+closed too.
 
 ## Alias Shape
 

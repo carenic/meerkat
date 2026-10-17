@@ -12,7 +12,12 @@
 //! `crossproc_child_runner` performs the locked increment and exits.
 
 #![cfg(all(not(target_arch = "wasm32"), feature = "file-lock"))]
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::disallowed_methods
+)]
 
 use std::path::PathBuf;
 use std::process::Command;

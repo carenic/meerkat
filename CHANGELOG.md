@@ -276,6 +276,44 @@ them.
   on each schedule it creates or redefines (a redefinition through rkat-rpc
   no longer erases the agent another host recorded), and its schedule host
   refuses each fire as described above. Ordinary realms are unchanged.
+- Behaviour-only (not measured by the gate): a write to the user document is
+  also refused when a realm the user document states a section for would
+  compose a different `[confinement]` or `[governance]` on a state root that
+  holds no document of its own for that realm (see Fixed).
+- `meerkat_core::ConfigError` has two new variants:
+  `CredentialCommandServer { realm, binding, profile, server }`, a
+  composition in which a binding whose auth profile runs a credential
+  command takes the `[self_hosted.servers]` entry its backend names from
+  another config document, and
+  `CredentialCommandServerUndeclared { realm, binding, backend }`,
+  one in which such a binding's self-hosted backend declares no server (see
+  Security); an exhaustive match must handle them.
+- `meerkat_core::SelfHostedConnectionError` has a new variant
+  `CredentialCommandServerUndeclared { realm, binding, server, model }`: an
+  explicitly selected binding whose auth profile runs a credential command
+  and whose self-hosted backend declares no server (see Security); an
+  exhaustive match must handle it.
+- Behaviour-only (not measured by the gate): a binding whose auth profile
+  runs a credential command on a self-hosted backend must declare the
+  backend's server. Add `server = "<id>"` to its
+  `[realm.<realm>.backend.<backend>]`, naming the `[self_hosted.servers]`
+  entry the command's token is for. Without it the realm does not compose,
+  and the binding is no longer the one unconstrained self-hosted binding,
+  nor chosen for the server its `default_model` is served by, nor usable
+  when named explicitly for a self-hosted model (see Security).
+- `meerkat_core::ProviderBindingError` has a new variant
+  `CredentialCommandProfileOverride { binding, profile }`: an auth binding
+  reference whose `profile` override names a credential command profile
+  other than the binding's own (see Security); an exhaustive match must
+  handle it.
+- Behaviour-only (not measured by the gate): a config write that changes
+  where a credential command's token goes is refused with
+  `confinement_administration_required` on every config write surface, as
+  one that changes what the command runs already was; a request whose auth
+  binding overrides its profile with another binding's credential command
+  is refused; and a realm whose credential command binding would take its
+  self-hosted server entry from another document does not compose (see
+  Security).
 
 ### Security
 
@@ -297,6 +335,61 @@ them.
   `ScheduleService::new` over the realm's store is not gated: it fires, and
   the fire fails later, after materializing its session (see Known issues).
   Ungoverned realms are unchanged.
+- A Git skill repository's HTTPS token no longer reaches git's command line
+  or the checkout's `.git/config`. On Unix git asks for it through its own
+  credential protocol: each invocation empties git's credential helper list
+  and names one helper for the repository's host, git's `credential-cache`
+  client, which asks a socket the host serves for that one invocation from
+  a new directory only the host's user may enter (removed with it, however
+  the invocation ends). The token is then on no command line, in no
+  environment variable and in no file, and no credential helper the host's
+  git configuration names (a `store`, a keychain, a credential manager) is
+  asked for it or sent it; a request for another host or for plain `http`
+  gets nothing, and git never prompts. The clone takes the configured URL,
+  and each refresh resets the checkout's `origin` to it, which removes a
+  token an earlier release wrote into `.git/config`. A git built without
+  `credential-cache` fails the refresh with a load error naming the
+  remedies (an ssh key, or a git credential manager for the host) instead
+  of prompting. On Windows (no Unix-domain sockets, and no `credential-cache`
+  in Git for Windows) the token is an `Authorization` header option on each
+  git invocation's own command line, scoped to the configured repository URL
+  (another remote or a submodule never gets it) with redirects not followed
+  (`http.followRedirects=false`, so it is never replayed to another host):
+  processes of the same user can read it for that invocation only, and git
+  persists it nowhere. The first such invocation logs a warning (without the
+  token) naming the remedies. In 0.9.2 the token was in the clone's URL on
+  the command line and stayed in the checkout's `.git/config` (a 0.9.2 known
+  limitation).
+- A credential command's token goes only where its config document sends
+  it. A config write that changes the command profile's provider or auth
+  method, adds a binding of the same realm section that uses the profile,
+  re-points a binding at it, moves such a binding to another backend or
+  changes its default model, or changes the backend it names or the
+  `[self_hosted.servers]` entry that backend names, is refused with
+  `confinement_administration_required`, naming the profile, on every
+  config write surface (removing a binding or the command stays ordinary
+  config). A binding that uses a credential command on a self-hosted
+  backend must declare the backend's server: a self-hosted backend's
+  endpoint is otherwise the server that serves a request's model, so the
+  token would follow the request, or the binding's `default_model`, instead
+  of the document. A realm with such a binding does not compose
+  (`ConfigError::CredentialCommandServerUndeclared`), and a config built
+  without composing never sends its token elsewhere either: the binding is
+  never chosen for a server it does not declare, by its default model or as
+  the one unconstrained self-hosted binding, and naming it explicitly for
+  one is refused (`SelfHostedConnectionError::CredentialCommandServerUndeclared`).
+  A request's auth binding may override its profile with a credential
+  command profile only when it is the binding's own
+  (`ProviderBindingError::CredentialCommandProfileOverride`). A realm
+  composition refuses a credential command binding whose self-hosted server
+  entry another document states or changes
+  (`ConfigError::CredentialCommandServer`): a realm section composes whole
+  from one document, but server entries compose field by field across the
+  chain. In 0.9.2 only what a command runs was guarded, so a write could
+  send its token to another endpoint. Credentials that do not come from a
+  command (the managed store, credential accounts, environment variables,
+  platform defaults, external resolvers, file descriptors) are outside this
+  guard: their routes stay ordinary config.
 
 ### Added
 
@@ -480,6 +573,17 @@ them.
   server's or the facade's runtime-backed host) calls
   `bind_scheduled_session` yet, so a host composing a binding must bind its
   own scheduled sessions, or they run unbound.
+- `meerkat_core::RealmConfigSource::composition_lock_path` (provided,
+  default `None`): the file a store declared with
+  `FileConfigStore::with_realm_chain` locks across its read, its
+  composition check and its write. `meerkat_store::FilesystemRealmConfigSource`
+  returns `<state_root>/.realm-config.lock` (see Fixed); a source that
+  wraps it forwards it.
+- `meerkat::open_system_browser_guarded`
+  (`meerkat_auth_core::mcp_oauth::open_system_browser_guarded`) opens a URL
+  with the platform browser opener under the host's launch guard
+  (`HostConfinement::launch_guard`), `None` for a host that confines no launch
+  kind. `rkat` opens every browser with it.
 
 ### Changed
 
@@ -679,6 +783,38 @@ them.
   whole-workspace push runs 13 fewer jobs. Each unit row runs only the
   target kinds its packages have (`--bins` for the binary-only rkat and
   surface-build-fixtures, which a push runs in rows of their own). CI only.
+- Clippy refuses every API that starts a process: the new workspace
+  `clippy.toml` disallows `std::process::Command::new`,
+  `tokio::process::Command::new`, `CommandExt::exec`, the `libc` `fork`,
+  `vfork`, `clone`, `exec*`, `posix_spawn*`, `system` and `popen` functions,
+  `nix::unistd::fork` and `exec*`, and `webbrowser::open*`, including when a
+  call goes through an aliased import or a re-export the source test cannot
+  see. Shipped code allows the lint only at the launch sites
+  `crates/meerkat/tests/host_launch_sites.rs` lists, once per launch
+  expression, and that test now checks it, so `SITES` stays the one list;
+  each host launch exemption keeps its one fixed-program constructor. Test
+  code, the `xtask` developer tooling and the examples allow the lint for
+  themselves. The test also fails when anything turns the lint off in bulk:
+  a second Clippy configuration file (a crate's own `clippy.toml` or
+  `.clippy.toml` would replace the root one for that crate), a `warnings`,
+  `clippy::all` or `clippy::style` allow or expect in shipped code, a Cargo
+  manifest entry for the lint or an allow of its group, or a Cargo
+  configuration file in the tree (`.cargo/config.toml`) whose `rustflags`
+  allow the lint, its groups or `warnings` or cap lint levels, or whose
+  `[env]` sets `CLIPPY_CONF_DIR` or `CLIPPY_ARGS`. A run whose environment
+  sets those variables or such `RUSTFLAGS`, or a Cargo configuration outside
+  the checkout, is outside the test; the repository's lanes and CI set none.
+
+### Deprecated
+
+- `meerkat::open_system_browser`
+  (`meerkat_auth_core::mcp_oauth::open_system_browser`) and
+  `McpOAuthPendingLogin::launch_system_browser`, which name no host judgement:
+  a host that confines its agents' launches and called them would run a
+  browser opener a confined process planted on `PATH`. Use
+  `open_system_browser_guarded` with the host's launch guard, or
+  `open_system_browser_trusting`, and pass it to
+  `McpOAuthPendingLogin::launch_browser`. Their behaviour is unchanged.
 
 ### Fixed
 
@@ -1003,6 +1139,47 @@ them.
   too. This was the intermittent
   `member_creation_some_origin_authority_matrix` failure in meerkat-mob's
   tests.
+- Guarded config writes over one state root take turns. Every store
+  declared with its realm chain (`FileConfigStore::with_realm_chain`, as the
+  stock hosts' stores are, and `SdkConfigStore::with_realm_document`) holds
+  an exclusive advisory lock on the state root's composition lock file from
+  before it reads its own document, through its composition check, to after
+  its write, in one process and across processes. A check that reads
+  another document can then never read one another writer is about to
+  replace, so two writes that each pass alone cannot combine into a
+  composition neither checked. In 0.9.2 each write was checked alone (the
+  0.9.2 known limitation). A host on another state root takes another
+  lock; a write to the user document also composes each realm it states as
+  if that realm had no document (below), so none of its checks depends on a
+  document only another state root holds. `rkat realm create`, `delete` and
+  `prune` do not take the lock: a delete or prune that races a write naming
+  the realm as a parent leaves that realm with a missing parent, which does
+  not compose. An NFS mount that keeps locks on each machine (`nolock`,
+  `local_lock=flock`) does not carry the lock between machines.
+- A write to the user document checks each realm the user document states a
+  section for both with that realm's own document from the writing host's
+  state root and as if the realm had none. Several state roots can share one
+  user document, and on one that holds no document for a realm, that realm
+  takes the user document's section for it. In 0.9.2 the check composed such
+  a realm only from the writing host's state root (the 0.9.2 known
+  limitation), so a write there could, for example, remove the
+  `parent = "global"` edge of `[realm.team]` that put the user document's
+  `[governance]` on `team`'s chain wherever `team` has no document. A stated
+  realm whose chain resolves on no such state root, before or after the
+  write, composes nothing there and does not refuse it. One whose chain
+  resolves there only after the write (removing a stale `[realm.team]
+  parent = "org"` where `org` has no document, say) is refused with an
+  error naming the realm on a state root without its own document and the
+  remedy, editing the user document by hand: such roots refuse to compose
+  the realm before the write, and would compose it from the user document
+  alone after it.
+- `rkat` hides a client secret typed at its terminal where neither
+  `/bin/stty` nor `/usr/bin/stty` exists (NixOS): terminal control
+  (`HostLaunchExemption::terminal_control`) falls back to the `stty` the
+  launch's `PATH` finds, which under a host that confines its launches holds
+  no relative directory and no directory a confined process could change. In
+  0.9.2 it ran `/bin/stty` regardless, so on such a host `rkat` refused to
+  read a secret typed at the terminal (the 0.9.2 known limitation).
 
 ### Known issues
 
