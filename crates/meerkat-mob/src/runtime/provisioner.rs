@@ -1444,7 +1444,7 @@ struct MemberWorkCancelOutcome {
 
 /// What a force cancel or cancel-all-work did to the member's run.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum MemberRunCancelOutcome {
+pub(super) enum MemberRunCancelOutcome {
     /// The member had no run.
     NoRun,
     /// The run current when the cancel was taken is cancelled at its next
@@ -1459,12 +1459,23 @@ enum MemberRunCancelOutcome {
 }
 
 /// Classify an exact-run cancel's result for the cancel verbs, by type.
-fn classify_member_run_cancel(
+///
+/// `InterruptDispatchOutcomeUnknown` is a cancel the runtime accepted and
+/// recorded for the exact run, and whose live delivery then failed, for
+/// example because the run crossed a boundary during the delivery. The
+/// recorded cancel still ends the run at its next boundary (meerkat-runtime's
+/// `exact_run_boundary_cancel_delivery_failure_keeps_the_recorded_cancel`),
+/// so it is `Cancelled`, as the member stop's `classify_stop_member_cancel`
+/// reads it.
+pub(super) fn classify_member_run_cancel(
     cancelled: Result<bool, meerkat_runtime::RuntimeDriverError>,
     run_id: meerkat_core::lifecycle::RunId,
 ) -> Result<MemberRunCancelOutcome, meerkat_runtime::RuntimeDriverError> {
     match cancelled {
-        Ok(true) => Ok(MemberRunCancelOutcome::Cancelled { run_id }),
+        Ok(true)
+        | Err(meerkat_runtime::RuntimeDriverError::InterruptDispatchOutcomeUnknown { .. }) => {
+            Ok(MemberRunCancelOutcome::Cancelled { run_id })
+        }
         Ok(false)
         | Err(
             meerkat_runtime::RuntimeDriverError::StaleAuthority { .. }
