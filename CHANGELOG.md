@@ -35,6 +35,41 @@ them.
 
 ## [Unreleased]
 
+### Breaking
+
+- Behaviour-only (not measured by the gate): `rkat mob deploy --surface rpc`
+  now refuses to start when the realm declares
+  `[storage] hosting = "multiprocess"` and its stores cannot provide trusted
+  cross-process hosting, as the `cli` surface already did (see Fixed). 0.9.2
+  served such a deploy and built its members anyway.
+
+### Added
+
+- `meerkat::HostConfigLayer`: a host's own final layer over a realm's
+  composed config, for settings the host process owns rather than any realm
+  document. `meerkat::RealmInheritance::with_host_layer` attaches one, and
+  `RealmInheritance::compose_over` applies it after folding the realm chain,
+  so the agent builds, model resolution and model hot-swaps that read through
+  that inheritance all see it. Config writes stay on the raw realm document,
+  so the layer is never written there.
+  `meerkat_rpc::session_runtime::SessionRuntime::set_realm_config_source_with_host_layer`
+  installs one on an RPC host.
+
+### Fixed
+
+- `rkat mob deploy --surface rpc` now builds from the deploy config, as the
+  default `cli` surface does. The deploy flags (`--model`,
+  `--max-total-tokens`, `--max-duration`, `--max-tool-calls`) and the pack's
+  deploy defaults (`max_tokens`, `[models]`, `[budget]`, `[compaction]`)
+  apply to every member and session the RPC host builds, and to its model
+  resolution and model hot-swaps. A flag wins over the realm config, which
+  wins over the pack default. The host used to build from the realm's config
+  documents alone (a known issue since 0.9.1). The deploy values are not
+  written to the realm document: `config/get` and `config/set` on the host
+  still read and write the realm's own document. The host now also refuses
+  to start when the realm declares multi-process hosting its stores cannot
+  provide, as the `cli` surface already did (see Breaking).
+
 ## [0.9.2] - 2026-10-16
 
 ### Breaking

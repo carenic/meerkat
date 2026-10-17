@@ -451,9 +451,9 @@ Since 0.9.1 `rkat mob deploy
 set each member's `[limits]` (`budget`, `max_duration`, `max_tool_calls`) on
 the default `--surface cli` and for `rkat mob run`; a flag wins over the
 realm's `[limits]`, which wins over the pack default (0.9.0 recorded them but
-did not enforce them). Known issue: with `rkat mob deploy --surface rpc`,
-members are built from the realm config store, so deploy flags and pack
-overlays (budget, models, `max_tokens`, compaction, `--model`) do not apply.
+did not enforce them). Since 0.9.3 `rkat mob deploy --surface rpc` builds its
+members from the same deploy config, so deploy flags and pack overlays
+(budget, models, `max_tokens`, compaction, `--model`) apply there too.
 
 The parser accepts `--transport websocket|webrtc` on `rkat mob live open`, but
 the current member-live family rejects WebRTC for both local and placed

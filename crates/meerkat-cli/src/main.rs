@@ -21084,13 +21084,14 @@ async fn execute_mob_run_pack(
 
     let params = parse_mob_run_params(invocation.raw_params, invocation.prompt)?;
     validate_mobpack_input_params(&archive, &params)?;
-    let mut effective_config = load_deploy_runtime_config(scope, CliOverrides::default()).await?;
-    apply_pack_deploy_policy(
-        &mut effective_config,
+    let mut effective_config = load_deploy_realm_config(scope).await?;
+    let layers = DeployConfigLayers::resolve(
         &archive.manifest,
         &archive.deploy_policy,
         DeploySurfaceArg::Cli,
+        CliOverrides::default(),
     )?;
+    meerkat::HostConfigLayer::apply(&layers, &mut effective_config);
     let flow_id = choose_mobpack_flow(&archive, invocation.flow)?;
     if invocation.detach && flow_id.is_none() {
         // Refuse before the durable mob-create side effect below.
@@ -21315,13 +21316,14 @@ async fn execute_mob_deploy_internal(
     .await?;
     validate_required_capabilities(&archive.manifest, &runtime_capabilities(invocation.surface))
         .map_err(|err| anyhow::anyhow!("mob deploy failed: {err}"))?;
-    let mut effective_config = load_deploy_runtime_config(scope, invocation.cli_overrides).await?;
-    apply_pack_deploy_policy(
-        &mut effective_config,
+    let mut effective_config = load_deploy_realm_config(scope).await?;
+    let layers = DeployConfigLayers::resolve(
         &archive.manifest,
         &archive.deploy_policy,
         invocation.surface,
+        invocation.cli_overrides,
     )?;
+    meerkat::HostConfigLayer::apply(&layers, &mut effective_config);
     if let Some(observer) = invocation.config_observer.as_ref() {
         observer(&effective_config);
     }
@@ -21341,6 +21343,7 @@ async fn execute_mob_deploy_internal(
             let result = Box::pin(run_rpc_surface(
                 scope,
                 effective_config,
+                layers,
                 &archive,
                 prompt,
                 reader,
@@ -21483,19 +21486,14 @@ fn read_config_trust_policy(scope: &RuntimeScope) -> anyhow::Result<Option<Trust
         .map(Some)
 }
 
-/// Build the operator-owned deploy config: realm config file, then environment
-/// secrets, then CLI overrides.
+/// Compose the realm config a mobpack deploy builds on: the head realm's own
+/// document, then its parent chain and the implicit `global` tail, then
+/// environment secrets.
 ///
-/// The pack contributes nothing here. Pack-authored deploy defaults are applied
-/// separately and only through the typed, capability-gated
-/// [`meerkat_mob_pack::deploy_policy::MobpackDeployPolicy`] layered *after* this
-/// config (see [`apply_pack_deploy_policy`]). A pack may never override
-/// operator-owned realm/env/CLI truth or set out-of-allow-list fields.
+/// The deploy's own settings are not applied here: [`DeployConfigLayers`]
+/// layers the deploy flags and the pack's deploy defaults over this config.
 #[cfg(feature = "mob")]
-async fn load_deploy_runtime_config(
-    scope: &RuntimeScope,
-    cli_overrides: CliOverrides,
-) -> anyhow::Result<Config> {
+async fn load_deploy_realm_config(scope: &RuntimeScope) -> anyhow::Result<Config> {
     // A direct `rkat mob run/deploy` can be the first credential-reading
     // command after an upgrade. Finish the dev->global compatibility bootstrap
     // before composing the global config tail used by member builds.
@@ -21531,110 +21529,139 @@ async fn load_deploy_runtime_config(
     config
         .apply_env_overrides()
         .map_err(|err| anyhow::anyhow!("failed applying env overrides: {err}"))?;
-    config.apply_cli_overrides(cli_overrides);
     Ok(config)
 }
 
-/// Resolve a pack's typed deploy policy through the same capability allow-list
-/// as the manifest `[requires]` gate, then apply only the validated
-/// allow-listed knobs onto `config`.
+/// The settings a mobpack deploy layers over the realm's composed config, in
+/// the one order every deploy surface applies them: the operator's deploy
+/// flags, then the pack's deploy defaults.
 ///
-/// `config` already carries realm/env/CLI truth, so the pack contributes deploy
-/// *defaults* over operator config without ever overriding it: only fields a
-/// realm config left at its default are moved, and gated knobs apply solely
-/// when the manifest declared and the runtime provides the backing capability.
+/// [`Self::resolve`] runs the pack's capability gate once per deploy. The
+/// `cli` surface and `rkat mob run <pack>` apply the layers to their config
+/// snapshot; the `rpc` surface installs them as its host's config layer, so
+/// every read of the realm's live config on that host applies them as well.
+/// A pack may never override operator-owned realm/env/flag truth or set
+/// out-of-allow-list fields.
 #[cfg(feature = "mob")]
-fn apply_pack_deploy_policy(
-    config: &mut Config,
-    manifest: &meerkat_mob_pack::manifest::MobpackManifest,
-    policy: &meerkat_mob_pack::deploy_policy::MobpackDeployPolicy,
-    surface: DeploySurfaceArg,
-) -> anyhow::Result<()> {
-    use meerkat_contracts::capability::CapabilityId;
+#[derive(Clone, Debug)]
+struct DeployConfigLayers {
+    flags: CliOverrides,
+    pack_defaults: meerkat_mob_pack::deploy_policy::MobpackDeployPolicy,
+}
 
-    let manifest_declares = |capability: CapabilityId| {
-        manifest.requires.as_ref().is_some_and(|requires| {
-            requires.capability_ids().any(|id| {
-                matches!(
-                    id,
-                    meerkat_contracts::capability::MobpackCapabilityId::Known(known)
-                        if known == capability
-                )
+#[cfg(feature = "mob")]
+impl DeployConfigLayers {
+    /// Resolve a pack's typed deploy policy through the same capability
+    /// allow-list as the manifest `[requires]` gate: a gated knob is kept only
+    /// when the manifest declared and the runtime provides its capability.
+    fn resolve(
+        manifest: &meerkat_mob_pack::manifest::MobpackManifest,
+        policy: &meerkat_mob_pack::deploy_policy::MobpackDeployPolicy,
+        surface: DeploySurfaceArg,
+        flags: CliOverrides,
+    ) -> anyhow::Result<Self> {
+        use meerkat_contracts::capability::CapabilityId;
+
+        let manifest_declares = |capability: CapabilityId| {
+            manifest.requires.as_ref().is_some_and(|requires| {
+                requires.capability_ids().any(|id| {
+                    matches!(
+                        id,
+                        meerkat_contracts::capability::MobpackCapabilityId::Known(known)
+                            if known == capability
+                    )
+                })
             })
+        };
+        let runtime_provides =
+            |capability: CapabilityId| deploy_runtime_provides_capability(capability, surface);
+
+        policy
+            .validate(manifest_declares, runtime_provides)
+            .map_err(|err| anyhow::anyhow!("mob deploy failed: {err}"))?;
+        Ok(Self {
+            flags,
+            pack_defaults: policy.clone(),
         })
-    };
-    let runtime_provides =
-        |capability: CapabilityId| deploy_runtime_provides_capability(capability, surface);
+    }
+}
 
-    policy
-        .validate(manifest_declares, runtime_provides)
-        .map_err(|err| anyhow::anyhow!("mob deploy failed: {err}"))?;
+/// The flags win over everything they set. The pack then contributes deploy
+/// *defaults* without ever overriding operator truth: only fields the realm
+/// config and the flags left at their default are moved, and gated knobs were
+/// admitted by [`DeployConfigLayers::resolve`].
+#[cfg(feature = "mob")]
+impl meerkat::HostConfigLayer for DeployConfigLayers {
+    fn apply(&self, config: &mut Config) {
+        config.apply_cli_overrides(self.flags.clone());
 
-    let baseline = Config::default();
-    if let Some(max_tokens) = policy.max_tokens
-        && config.max_tokens == baseline.max_tokens
-    {
-        config.max_tokens = Some(max_tokens);
+        let policy = &self.pack_defaults;
+        let baseline = Config::default();
+        if let Some(max_tokens) = policy.max_tokens
+            && config.max_tokens == baseline.max_tokens
+        {
+            config.max_tokens = Some(max_tokens);
+        }
+        if let Some(model) = policy.models.anthropic.as_ref()
+            && config.models.anthropic == baseline.models.anthropic
+        {
+            config.models.anthropic = model.as_str().to_string();
+        }
+        if let Some(model) = policy.models.openai.as_ref()
+            && config.models.openai == baseline.models.openai
+        {
+            config.models.openai = model.as_str().to_string();
+        }
+        if let Some(model) = policy.models.gemini.as_ref()
+            && config.models.gemini == baseline.models.gemini
+        {
+            config.models.gemini = model.as_str().to_string();
+        }
+        // The pack's `[budget]` fills the enforced `[limits]` dimensions that
+        // `Config::budget_limits` gives every member built from this config. The
+        // legacy `[budget]` table is not enforced, so it neither receives these
+        // values nor blocks them. Precedence per dimension: a
+        // `rkat mob deploy --max-*` flag (applied above) > the operator's realm
+        // `[limits]` chain > the pack default.
+        if let Some(max_tokens) = policy.budget.max_tokens
+            && config.limits.budget.is_none()
+        {
+            config.limits.budget = Some(max_tokens);
+        }
+        if let Some(secs) = policy.budget.max_duration_secs
+            && config.limits.max_duration.is_none()
+        {
+            config.limits.max_duration = Some(std::time::Duration::from_secs(secs));
+        }
+        if let Some(calls) = policy.budget.max_tool_calls
+            && config.limits.max_tool_calls.is_none()
+        {
+            config.limits.max_tool_calls = Some(calls);
+        }
+        if let Some(threshold) = policy.compaction.auto_compact_threshold
+            && config.compaction.auto_compact_threshold
+                == baseline.compaction.auto_compact_threshold
+        {
+            config.compaction.auto_compact_threshold = threshold;
+            config.compaction.auto_compact_threshold_explicit = true;
+        }
+        if let Some(budget) = policy.compaction.recent_turn_budget
+            && config.compaction.recent_turn_budget == baseline.compaction.recent_turn_budget
+        {
+            config.compaction.recent_turn_budget = budget;
+        }
+        if let Some(tokens) = policy.compaction.max_summary_tokens
+            && config.compaction.max_summary_tokens == baseline.compaction.max_summary_tokens
+        {
+            config.compaction.max_summary_tokens = tokens;
+        }
+        if let Some(turns) = policy.compaction.min_turns_between_compactions
+            && config.compaction.min_turns_between_compactions
+                == baseline.compaction.min_turns_between_compactions
+        {
+            config.compaction.min_turns_between_compactions = turns;
+        }
     }
-    if let Some(model) = policy.models.anthropic.as_ref()
-        && config.models.anthropic == baseline.models.anthropic
-    {
-        config.models.anthropic = model.as_str().to_string();
-    }
-    if let Some(model) = policy.models.openai.as_ref()
-        && config.models.openai == baseline.models.openai
-    {
-        config.models.openai = model.as_str().to_string();
-    }
-    if let Some(model) = policy.models.gemini.as_ref()
-        && config.models.gemini == baseline.models.gemini
-    {
-        config.models.gemini = model.as_str().to_string();
-    }
-    // The pack's `[budget]` fills the enforced `[limits]` dimensions that
-    // `Config::budget_limits` gives every member built from this config. The
-    // legacy `[budget]` table is not enforced, so it neither receives these
-    // values nor blocks them. Precedence per dimension: a
-    // `rkat mob deploy --max-*` flag (applied by `load_deploy_runtime_config`)
-    // > the operator's realm `[limits]` chain > the pack default.
-    if let Some(max_tokens) = policy.budget.max_tokens
-        && config.limits.budget.is_none()
-    {
-        config.limits.budget = Some(max_tokens);
-    }
-    if let Some(secs) = policy.budget.max_duration_secs
-        && config.limits.max_duration.is_none()
-    {
-        config.limits.max_duration = Some(std::time::Duration::from_secs(secs));
-    }
-    if let Some(calls) = policy.budget.max_tool_calls
-        && config.limits.max_tool_calls.is_none()
-    {
-        config.limits.max_tool_calls = Some(calls);
-    }
-    if let Some(threshold) = policy.compaction.auto_compact_threshold
-        && config.compaction.auto_compact_threshold == baseline.compaction.auto_compact_threshold
-    {
-        config.compaction.auto_compact_threshold = threshold;
-        config.compaction.auto_compact_threshold_explicit = true;
-    }
-    if let Some(budget) = policy.compaction.recent_turn_budget
-        && config.compaction.recent_turn_budget == baseline.compaction.recent_turn_budget
-    {
-        config.compaction.recent_turn_budget = budget;
-    }
-    if let Some(tokens) = policy.compaction.max_summary_tokens
-        && config.compaction.max_summary_tokens == baseline.compaction.max_summary_tokens
-    {
-        config.compaction.max_summary_tokens = tokens;
-    }
-    if let Some(turns) = policy.compaction.min_turns_between_compactions
-        && config.compaction.min_turns_between_compactions
-            == baseline.compaction.min_turns_between_compactions
-    {
-        config.compaction.min_turns_between_compactions = turns;
-    }
-    Ok(())
 }
 
 /// Whether the deploy runtime provides a typed capability that gates a pack
@@ -21745,6 +21772,7 @@ fn validate_required_capabilities(
 async fn run_rpc_surface<R, W>(
     scope: &RuntimeScope,
     config: Config,
+    layers: DeployConfigLayers,
     archive: &MobpackArchive,
     prompt: &str,
     reader: R,
@@ -21760,6 +21788,11 @@ where
     W: meerkat_rpc::transport::TransportWriter,
 {
     let (manifest, persistence) = create_persistence_bundle(scope).await?;
+    // #1813: a realm that declares multi-process hosting refuses to start
+    // when its stores cannot provide it, as on the cli surface.
+    persistence
+        .require_hosting_mode(config.storage.hosting_mode())
+        .map_err(|error| anyhow::anyhow!(error))?;
     let session_store = persistence.session_store();
     let paths =
         meerkat_store::realm_paths_in(&scope.locator.state_root, scope.locator.realm.as_str());
@@ -21869,7 +21902,12 @@ where
     // Attach the realm source AFTER realm context so the agent-BUILD path
     // composes this realm's parent chain (→ `global`) into the effective config,
     // matching REST/RPC. `set_realm_config_source` reads `realm_id()` for the head.
-    runtime.set_realm_config_source(cli_realm_config_source(scope));
+    // The deploy's own layers (its flags, then the pack's deploy defaults) apply
+    // over that chain on every read of it (agent builds, model resolution and
+    // hot-swap), so this host builds from the deploy config as the cli surface
+    // does, while config get/set keep the realm's raw document.
+    runtime
+        .set_realm_config_source_with_host_layer(cli_realm_config_source(scope), Arc::new(layers));
     let runtime = Arc::new(runtime);
 
     // Pre-initialize the callback channel so the ExternalToolsProvider closure
@@ -24316,10 +24354,7 @@ mod tests {
         );
 
         let config = TEST_CREDENTIAL_READ_PERSISTENCE
-            .scope(
-                persistence,
-                load_deploy_runtime_config(&scope, CliOverrides::default()),
-            )
+            .scope(persistence, load_deploy_realm_config(&scope))
             .await
             .expect("direct mob config load through production wrapper");
 
@@ -24384,7 +24419,7 @@ mod tests {
         let config = TEST_CREDENTIAL_READ_PERSISTENCE
             .scope(
                 test_provider_auth_persistence(store),
-                load_deploy_runtime_config(&scope, CliOverrides::default()),
+                load_deploy_realm_config(&scope),
             )
             .await
             .expect("legacy docs must not brick the mob deploy config loader");
@@ -30789,13 +30824,14 @@ capabilities = ["core", "skills", "hooks", "adaptive_flow"]
         ))
         .expect("valid policy");
 
-        apply_pack_deploy_policy(
-            &mut config,
+        let layers = DeployConfigLayers::resolve(
             &empty_deploy_manifest(),
             &policy,
             DeploySurfaceArg::Cli,
+            CliOverrides::default(),
         )
         .expect("ungated knobs apply");
+        meerkat::HostConfigLayer::apply(&layers, &mut config);
 
         assert_eq!(
             config.models.openai, "operator-openai",
@@ -30823,13 +30859,14 @@ capabilities = ["core", "skills", "hooks", "adaptive_flow"]
         ))
         .expect("valid policy");
 
-        apply_pack_deploy_policy(
-            &mut config,
+        let layers = DeployConfigLayers::resolve(
             &empty_deploy_manifest(),
             &policy,
             DeploySurfaceArg::Cli,
+            CliOverrides::default(),
         )
         .expect("ungated budget knobs apply");
+        meerkat::HostConfigLayer::apply(&layers, &mut config);
 
         assert_eq!(
             config.budget_limits(),
@@ -30853,22 +30890,22 @@ capabilities = ["core", "skills", "hooks", "adaptive_flow"]
         config
             .merge_toml_str("[limits]\nbudget = 1000\n\n[budget]\nmax_duration = \"30m\"\n")
             .expect("realm config merge");
-        config.apply_cli_overrides(CliOverrides {
-            max_tool_calls: Some(7),
-            ..CliOverrides::default()
-        });
         let policy = meerkat_mob_pack::deploy_policy::MobpackDeployPolicy::parse(Some(
             b"[budget]\nmax_tokens = 200000\nmax_duration_secs = 900\nmax_tool_calls = 50\n",
         ))
         .expect("valid policy");
 
-        apply_pack_deploy_policy(
-            &mut config,
+        let layers = DeployConfigLayers::resolve(
             &empty_deploy_manifest(),
             &policy,
             DeploySurfaceArg::Cli,
+            CliOverrides {
+                max_tool_calls: Some(7),
+                ..CliOverrides::default()
+            },
         )
         .expect("ungated budget knobs apply");
+        meerkat::HostConfigLayer::apply(&layers, &mut config);
 
         assert_eq!(
             config.budget_limits(),
@@ -30903,17 +30940,16 @@ capabilities = ["core", "skills", "hooks", "adaptive_flow"]
     fn test_pack_deploy_policy_gated_knob_requires_declared_capability() {
         // The compaction knob is gated by session_compaction; a pack that does
         // not declare that capability cannot tune compaction.
-        let mut config = Config::default();
         let policy = meerkat_mob_pack::deploy_policy::MobpackDeployPolicy::parse(Some(
             b"[compaction]\nrecent_turn_budget = 9\n",
         ))
         .expect("valid policy");
 
-        let err = apply_pack_deploy_policy(
-            &mut config,
+        let err = DeployConfigLayers::resolve(
             &empty_deploy_manifest(),
             &policy,
             DeploySurfaceArg::Cli,
+            CliOverrides::default(),
         )
         .expect_err("undeclared gating capability must reject");
         assert!(
@@ -31190,6 +31226,295 @@ capabilities = ["rpc"]
             output.contains("surface=rpc"),
             "unexpected output: {output}"
         );
+    }
+
+    /// Send one JSON-RPC request to a deploy host and return the response with
+    /// the same id, skipping any notification written before it.
+    #[cfg(all(feature = "mob", feature = "rpc-surface"))]
+    async fn deploy_rpc_call<W, R>(
+        input: &mut W,
+        output: &mut tokio::io::Lines<R>,
+        id: u64,
+        method: &str,
+        params: serde_json::Value,
+    ) -> serde_json::Value
+    where
+        W: AsyncWrite + Unpin,
+        R: AsyncBufRead + Unpin,
+    {
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+            "params": params,
+        });
+        let mut line = serde_json::to_vec(&request).expect("encode request");
+        line.push(b'\n');
+        input.write_all(&line).await.expect("write request");
+        input.flush().await.expect("flush request");
+        loop {
+            let line = output
+                .next_line()
+                .await
+                .expect("read deploy host output")
+                .expect("deploy host closed its output before answering");
+            let message: serde_json::Value =
+                serde_json::from_str(&line).expect("deploy host writes JSON lines");
+            if message["id"] == serde_json::json!(id) {
+                return message;
+            }
+        }
+    }
+
+    /// The `--surface rpc` host builds from the deploy config, as the cli
+    /// surface does: the `--model` flag outranks the realm's `[agent] model`
+    /// when the host resolves a session's default model, and the pack's
+    /// `max_tokens` deploy default fills what the realm left unset for a
+    /// member spawned over JSON-RPC.
+    #[cfg(all(feature = "mob", feature = "rpc-surface", feature = "openai"))]
+    #[tokio::test]
+    async fn test_mob_deploy_rpc_surface_builds_from_the_deploy_config() {
+        use tokio::io::AsyncBufReadExt;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut scope = test_scope_with_context(temp.path().to_path_buf());
+        scope.user_config_root = Some(temp.path().to_path_buf());
+        // An inline-secret binding lets the host build OpenAI agents offline.
+        let user_doc = cli_global_config_path(&scope);
+        std::fs::create_dir_all(user_doc.parent().expect("user doc parent"))
+            .expect("mkdir user doc");
+        std::fs::write(
+            &user_doc,
+            r#"[realm.global]
+default_binding = "openai_inline"
+
+[realm.global.backend.openai]
+provider = "openai"
+backend_kind = "openai_api"
+
+[realm.global.auth.inline]
+provider = "openai"
+auth_method = "api_key"
+source = { kind = "inline_secret", secret = "provider-free-test-secret" }
+
+[realm.global.binding.openai_inline]
+backend_profile = "openai"
+auth_profile = "inline"
+"#,
+        )
+        .expect("write user doc");
+        let realm_doc =
+            meerkat_store::realm_paths_in(&scope.locator.state_root, scope.locator.realm.as_str())
+                .config_path;
+        std::fs::create_dir_all(realm_doc.parent().expect("realm doc parent"))
+            .expect("mkdir realm doc");
+        std::fs::write(&realm_doc, "[agent]\nmodel = \"gpt-5.4\"\n").expect("write realm doc");
+
+        let mob_id = unique_test_mob_id("rpc-deploy-config");
+        let mob_dir = write_mobpack_fixture_dir(
+            temp.path(),
+            "rpc-deploy-config",
+            &serde_json::json!({
+                "id": mob_id,
+                "profiles": {
+                    "lead": {
+                        "model": "gpt-5.5",
+                        "skills": [],
+                        "tools": {"comms": true},
+                        "peer_description": "Lead",
+                        "external_addressable": true
+                    }
+                },
+                "skills": {}
+            }),
+            false,
+        );
+        std::fs::create_dir_all(mob_dir.join("config")).expect("config dir");
+        std::fs::write(
+            mob_dir.join("config").join("defaults.toml"),
+            "max_tokens = 4321\n",
+        )
+        .expect("write pack defaults");
+        let pack_out = temp.path().join("rpc-deploy-config.mobpack");
+        execute_mob_pack(&mob_dir, &pack_out, None)
+            .await
+            .expect("pack succeeds");
+
+        let (mut client_in, server_in) = tokio::io::duplex(64 * 1024);
+        let (server_out, client_out) = tokio::io::duplex(4 * 1024 * 1024);
+        let mut responses = BufReader::new(client_out).lines();
+        let scope_for_deploy = scope.clone();
+        let pack_for_deploy = pack_out.clone();
+        let deploy_task = tokio::spawn(async move {
+            let deployment: std::pin::Pin<
+                Box<dyn std::future::Future<Output = anyhow::Result<String>> + Send + '_>,
+            > = Box::pin(execute_mob_deploy_internal(
+                &scope_for_deploy,
+                &pack_for_deploy,
+                "hello",
+                DeployInvocation {
+                    cli_trust_policy: Some(TrustPolicyArg::Permissive),
+                    surface: DeploySurfaceArg::Rpc,
+                    cli_overrides: CliOverrides {
+                        model: Some("gpt-5.5".to_string()),
+                        ..CliOverrides::default()
+                    },
+                    rpc_io: Some((Box::new(BufReader::new(server_in)), Box::new(server_out))),
+                    config_observer: None,
+                },
+            ));
+            deployment.await
+        });
+
+        let exchange = async {
+            let created = deploy_rpc_call(
+                &mut client_in,
+                &mut responses,
+                1,
+                "session/create",
+                serde_json::json!({"prompt": "hello", "initial_turn": "deferred"}),
+            )
+            .await;
+            let session_id = created["result"]["session_id"]
+                .as_str()
+                .unwrap_or_else(|| panic!("session/create failed: {created}"))
+                .to_string();
+            let read = deploy_rpc_call(
+                &mut client_in,
+                &mut responses,
+                2,
+                "session/read",
+                serde_json::json!({"session_id": session_id}),
+            )
+            .await;
+            let spawned = deploy_rpc_call(
+                &mut client_in,
+                &mut responses,
+                3,
+                "mob/spawn",
+                serde_json::json!({
+                    "mob_id": mob_id,
+                    "profile": "lead",
+                    "agent_identity": "lead-1",
+                    "runtime_mode": "turn_driven"
+                }),
+            )
+            .await;
+            (read, spawned)
+        };
+        let (read, spawned) = tokio::time::timeout(Duration::from_mins(1), exchange)
+            .await
+            .expect("the deploy host answers within a minute");
+        client_in.shutdown().await.expect("close deploy input");
+        let output = deploy_task
+            .await
+            .expect("deploy task join")
+            .expect("deploy exits after its input closes");
+        assert!(
+            output.contains("surface=rpc"),
+            "unexpected output: {output}"
+        );
+        assert!(spawned["error"].is_null(), "mob/spawn failed: {spawned}");
+
+        let (_manifest, persistence) = create_persistence_bundle(&scope)
+            .await
+            .expect("reopen the realm");
+        let store = persistence.session_store();
+        let mut member_max_tokens = Vec::new();
+        for meta in store
+            .list(meerkat_core::SessionFilter::default())
+            .await
+            .expect("list sessions")
+        {
+            let Some(session) = store.load(&meta.id).await.expect("load session") else {
+                continue;
+            };
+            let Some(metadata) = session.try_session_metadata().expect("typed metadata") else {
+                continue;
+            };
+            if metadata
+                .mob_member_binding
+                .as_ref()
+                .is_some_and(|binding| binding.mob_id == mob_id && binding.member == "lead-1")
+            {
+                member_max_tokens.push(metadata.max_tokens);
+            }
+        }
+        assert_eq!(
+            (
+                read["result"]["model"].as_str(),
+                member_max_tokens.as_slice()
+            ),
+            (Some("gpt-5.5"), [4321].as_slice()),
+            "the rpc deploy host resolves a session's default model from the --model flag over \
+             the realm [agent] model, and builds a spawned member with the pack's max_tokens \
+             deploy default: {read}"
+        );
+    }
+
+    /// A realm that declares multi-process hosting its stores cannot provide
+    /// is refused by `rkat mob deploy` on both surfaces. The `--surface rpc`
+    /// host refuses before it composes a runtime or reads its input, so it
+    /// builds no member: a host that had started serving would wait on that
+    /// still-open input instead of returning.
+    #[cfg(all(feature = "mob", feature = "rpc-surface"))]
+    #[tokio::test]
+    async fn test_mob_deploy_refuses_unavailable_multiprocess_hosting_on_both_surfaces() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut scope = test_scope_with_context(temp.path().to_path_buf());
+        scope.user_config_root = Some(temp.path().to_path_buf());
+        // A memory realm's runtime store has no cross-process hosting claims.
+        scope.backend_hint = Some(RealmBackend::Memory);
+        let realm_doc =
+            meerkat_store::realm_paths_in(&scope.locator.state_root, scope.locator.realm.as_str())
+                .config_path;
+        std::fs::create_dir_all(realm_doc.parent().expect("realm doc parent"))
+            .expect("mkdir realm doc");
+        std::fs::write(&realm_doc, "[storage]\nhosting = \"multiprocess\"\n")
+            .expect("write realm doc");
+        let mob_dir = create_mobpack_fixture_dir(temp.path());
+        let pack_out = temp.path().join("hosting.mobpack");
+        execute_mob_pack(&mob_dir, &pack_out, None)
+            .await
+            .expect("pack succeeds");
+
+        let cli_err = execute_mob_deploy(
+            &scope,
+            &pack_out,
+            "hello",
+            Some(TrustPolicyArg::Permissive),
+            DeploySurfaceArg::Cli,
+            CliOverrides::default(),
+        )
+        .await
+        .expect_err("the cli surface refuses the realm");
+
+        let (_client_in, server_in) = tokio::io::duplex(1024);
+        let (server_out, _client_out) = tokio::io::duplex(1024);
+        let rpc_deploy = Box::pin(execute_mob_deploy_internal(
+            &scope,
+            &pack_out,
+            "hello",
+            DeployInvocation {
+                cli_trust_policy: Some(TrustPolicyArg::Permissive),
+                surface: DeploySurfaceArg::Rpc,
+                cli_overrides: CliOverrides::default(),
+                rpc_io: Some((Box::new(BufReader::new(server_in)), Box::new(server_out))),
+                config_observer: None,
+            },
+        ));
+        let rpc_err = tokio::time::timeout(Duration::from_secs(20), rpc_deploy)
+            .await
+            .expect("the rpc host refuses the realm instead of serving it")
+            .expect_err("the rpc surface refuses the realm");
+
+        for err in [&cli_err, &rpc_err] {
+            assert!(
+                err.to_string()
+                    .contains("multi-process hosting is unavailable for this realm"),
+                "unexpected error: {err}"
+            );
+        }
     }
 
     #[cfg(feature = "mob")]
