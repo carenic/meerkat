@@ -441,7 +441,9 @@ and its CI must be green before a release tag (`require_ci_green`):
   `RUSTC_WRAPPER` is `scripts/ci-clippy-sccache-wrapper`, which sends the
   crates Clippy does not lint to sccache as plain rustc so they are cached;
   the lane's own packages still go through clippy-driver.
-- `unit`: `nextest --lib --bins --profile ci-pr` (`fast` plus a 4-minute hung-test kill) for
+- `unit`: `nextest --lib --bins --profile ci-pr` (`fast` plus a 4-minute hung-test kill; a
+  row names only the target kinds its packages have, so the binary-only
+  rkat and surface-build-fixtures run `--bins`) for
   the changed packages outside the meerkat-mob compile chain; crates that
   compile `meerkat-mob` (mob, mob-adaptive, mob-mcp, mob-pack, rpc, rest,
   mcp-server, rkat, web-runtime, integration-tests, machine-codegen;
@@ -455,11 +457,12 @@ and its CI must be green before a release tag (`require_ci_green`):
 - Feature-gated unit suites (`FEATURE_UNIT_SUITES` in
   `scripts/ci-cargo-lanes.mjs`): the unit lanes build default features only,
   so each suite adds a `nextest -p <package> --features <list>` row to
-  `main-unit` on every Rust-relevant main push, and to `unit` when that
-  package changed outside the meerkat-mob chain (on a pull request, unless
-  the suite is marked `pullRequest: false`: the facade's two GPT Live
-  suites). A new test behind a non-default feature needs a suite, or no lane
-  runs it.
+  `main-unit` on every Rust-relevant main push, and to a pull request's
+  `unit` lane when that package changed outside the meerkat-mob chain
+  (unless the suite is marked `pullRequest: false`: the facade's two GPT
+  Live suites). A new test behind a non-default feature needs a suite, or no
+  lane runs it. A push runs no `unit` lane: the unit rows it would run (the
+  same shards and suites) run verbatim in `main-unit` (`unit_rows_on_main`).
 - `integration`: the `tests/*.rs` binaries (`nextest -p <package> --test
   '*'`) of each `INTEGRATION_SUITES` entry in `scripts/ci-cargo-lanes.mjs`
   whose trigger packages or paths changed (meerkat-runtime;
@@ -525,12 +528,19 @@ and its CI must be green before a release tag (`require_ci_green`):
   rule for their own inputs (`sdks/web/`, the runtime, the contracts,
   examples 031-033); `example-web` also runs the Web SDK's `npm test` (type
   tests over the generated events, node unit suites).
-- `push: main` only (no budget): `main-unit` over the whole workspace in
-  eight shards, `sdk-host`, and the push-only lanes above. A red main run is
+- `push: main` only (no budget): `main-unit` over the whole workspace (the
+  unit lane's rows verbatim, then the rest of the workspace in packed
+  shards), `sdk-host`, and the push-only lanes above.
+- Long rows first: `clippy`, `main-unit`, `closure-tests` and
+  `feature-check` run in two waves (`<lane>` and `<lane>-rest`, a copy the
+  lanes self-test checks); rows measured at 8 minutes or more
+  (`scripts/ci-row-durations.json`), or never measured, start first, and the
+  rest and the short lanes wait for the `stagger` job. A red main run is
   a failed `CI gate` on the main commit and blocks `require_ci_green`.
 - `gate` (`CI gate`, the only required context): fail-closed aggregate; on
-  pull requests a 1080-second lane execution budget (classification plus
-  each lane's own run time, runner queue excluded) and a 1200-second
+  pull requests a 1080-second lane execution budget (classification, the
+  stagger job for the lanes that wait for it, and each lane's own run time,
+  runner queue excluded) and a 1200-second
   push-to-terminal runaway ceiling (the owner's cap is 20 minutes from the
   start of the pre-push hook, which takes about a minute) (each lane timed from the start of the
   run attempt it ran in, runner queue on its path excluded); runner queue

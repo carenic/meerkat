@@ -67,10 +67,13 @@ fn ci_runs_fail_closed_cargo_lanes_on_hosted_runners() {
             "bazel-graph",
             "changes",
             "clippy",
+            "clippy-rest",
             "closure-check",
             "closure-tests",
+            "closure-tests-rest",
             "example-web",
             "feature-check",
+            "feature-check-rest",
             "fmt-governance",
             "gate",
             "governance-gates",
@@ -79,9 +82,11 @@ fn ci_runs_fail_closed_cargo_lanes_on_hosted_runners() {
             "main-unit",
             "main-unit-archive-build",
             "main-unit-archive-run",
+            "main-unit-rest",
             "mcp-confinement-positive",
             "ratchets",
             "sdk-host",
+            "stagger",
             "tlc-audits",
             "unit",
             "wasm-check",
@@ -269,7 +274,8 @@ fn ci_runs_fail_closed_cargo_lanes_on_hosted_runners() {
     for lane in [
         "--no-deps ${TARGETS} --all-features -- -D warnings",
         "\"--all-targets\"|\"--lib\"|\"--bins\"|\"--lib --bins\") ;;",
-        "--lib --bins --profile ci-pr",
+        "nextest run ${PACKAGES} ${TARGETS} --profile ci-pr",
+        "\"--lib\"|\"--bins\"|\"--lib --bins\") ;;",
         "unit_shard_matrix",
         "main_unit_shard_matrix",
         "CLOSURE_CHECK_TARGETS: lib",
@@ -347,40 +353,50 @@ fn pull_requests_leave_the_chain_and_closure_lanes_to_the_push() {
             "{job} runs exactly when the plan selects it"
         );
     }
-    assert!(
-        job_if("closure-tests").contains("needs.changes.outputs.closure_test_count != '0'"),
-        "closure-tests runs the rows the plan names"
-    );
-    assert!(
-        job_if("feature-check").contains("needs.changes.outputs.feature_check_count != '0'"),
-        "feature-check runs the rows the plan names"
-    );
+    // Each of these lanes runs in two waves (long rows first): the job holds
+    // the first wave, its -rest copy the rest.
+    for (job, rows) in [
+        ("closure-tests", "closure_test"),
+        ("feature-check", "feature_check"),
+    ] {
+        assert!(
+            job_if(job).contains(&format!("needs.changes.outputs.{rows}_first_count != '0'")),
+            "{job} runs the first-wave rows the plan names"
+        );
+        assert!(
+            job_if(&format!("{job}-rest"))
+                .contains(&format!("needs.changes.outputs.{rows}_rest_count != '0'")),
+            "{job}-rest runs the rest of the rows the plan names"
+        );
+    }
     // The push lints every target of every changed package, the chain heads
     // a pull request left to it included, and a Clippy failure is a red CI
-    // gate: neither the job nor its lint step may soft-fail.
-    let clippy = jobs
-        .get(serde_yaml::Value::String("clippy".to_string()))
-        .and_then(serde_yaml::Value::as_mapping)
-        .expect("clippy job");
-    assert!(
-        clippy.get("continue-on-error").is_none(),
-        "the Clippy job never soft-fails"
-    );
-    let lint_step = clippy
-        .get("steps")
-        .and_then(serde_yaml::Value::as_sequence)
-        .expect("clippy steps")
-        .iter()
-        .find(|step| {
-            step.get("run")
-                .and_then(serde_yaml::Value::as_str)
-                .is_some_and(|run| run.contains("./scripts/repo-cargo clippy"))
-        })
-        .expect("the Clippy lint step");
-    assert!(
-        lint_step.get("continue-on-error").is_none(),
-        "the Clippy lint step never soft-fails"
-    );
+    // gate: neither job (one per wave) nor its lint step may soft-fail.
+    for name in ["clippy", "clippy-rest"] {
+        let clippy = jobs
+            .get(serde_yaml::Value::String(name.to_string()))
+            .and_then(serde_yaml::Value::as_mapping)
+            .unwrap_or_else(|| panic!("{name} job"));
+        assert!(
+            clippy.get("continue-on-error").is_none(),
+            "the {name} job never soft-fails"
+        );
+        let lint_step = clippy
+            .get("steps")
+            .and_then(serde_yaml::Value::as_sequence)
+            .unwrap_or_else(|| panic!("{name} steps"))
+            .iter()
+            .find(|step| {
+                step.get("run")
+                    .and_then(serde_yaml::Value::as_str)
+                    .is_some_and(|run| run.contains("./scripts/repo-cargo clippy"))
+            })
+            .unwrap_or_else(|| panic!("the {name} lint step"));
+        assert!(
+            lint_step.get("continue-on-error").is_none(),
+            "the {name} lint step never soft-fails"
+        );
+    }
     for contract in [
         "a push plan left lanes to a later push",
         "forbid_failure \"Closure check\" \"${CLOSURE_CHECK_RESULT}\"",

@@ -104,8 +104,16 @@ export const CI_ROW_STEPS = [
     ],
     targets: null,
     profile: null,
+    // The rows run in two waves (long rows first, scripts/ci-cargo-lanes.mjs):
+    // the rest wave's job is a copy of the job above, bound the same way.
+    twins: [{ job: "closure-tests-rest", matrix: "closure_test_rest_matrix" }],
   },
 ];
+
+// Every job that executes a spec's rows: the spec's own and its twins.
+export function rowStepBindings() {
+  return CI_ROW_STEPS.flatMap((spec) => [spec, ...(spec.twins ?? []).map((twin) => ({ ...spec, ...twin }))]);
+}
 
 // The lines of a bound step its pins govern: nextest, the binary check, the
 // selection variables, the step's inputs and its exports, each as a whole
@@ -150,7 +158,7 @@ function block(text, header, indent) {
 // Binds each CI_ROW_STEPS entry to its job and step in the workflow.
 export function bindRowSteps(workflowText) {
   const errors = [];
-  for (const spec of CI_ROW_STEPS) {
+  for (const spec of rowStepBindings()) {
     const where = `${WORKFLOW} job ${spec.job}`;
     const job = block(workflowText, `  ${spec.job}:`, 2);
     if (job.error) {

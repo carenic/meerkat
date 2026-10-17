@@ -51,6 +51,25 @@
 // hook to a green CI gate with them. The plan lists what a pull request left
 // to the push (deferred_to_push), and the push plan runs all of it.
 //
+// A push runs no unit lane of its own: the rows a pull request's unit lane
+// would run (the same shards, so the same `-p` sets, because Cargo unifies
+// features across the packages of one run, and the same feature suites)
+// run verbatim in the main unit lane, with the rest of the workspace packed
+// around them (unit_rows_on_main). Both lanes run the same nextest command.
+//
+// Long rows first. The rows of the Clippy, main unit, closure-tests and
+// feature-check lanes take 1-17 minutes on hosted runners, and a push makes
+// about a hundred jobs ready at once for an account-wide pool of about 40
+// runners, which take queued jobs in no reliable order: a long row picked
+// late set the run's wall time. Each of those lanes is planned in two waves
+// (waves): the rows that took WAVE_FIRST_SECONDS or more on a green run, or
+// were never measured, start right after this classification; the rest
+// also wait for ci.yml's stagger job, a short sleep that lets the first
+// wave take runners first. The measurements are ROW_DURATIONS
+// (--row-durations), regenerated from green runs with
+// scripts/ci-row-durations.mjs; a stale entry only moves a row between
+// waves, never out of the plan.
+//
 // Cargo.lock. A lock change that is the only global path is scoped: the
 // package entries the diff adds, removes or changes (version, source,
 // checksum or dependency list) are walked up the head lock's own dependency
@@ -442,6 +461,43 @@ export const INTEGRATION_SUITES = [
 // `partitions` jobs that execute the archive with `--partition hash:k/n`.
 export const ARCHIVED_UNIT_LANES = [{ package: "meerkat-mob", partitions: 2 }];
 
+// Long rows first (see the header): a row measured at this many seconds or
+// more, or never measured, is in the first wave.
+export const WAVE_FIRST_SECONDS = 480;
+export const ROW_DURATIONS = "scripts/ci-row-durations.json";
+// The lanes planned in two waves, by their key in ROW_DURATIONS. A main
+// unit row may carry a unit row's measurement: a push runs the unit lane's
+// rows there.
+export const WAVE_LANES = ["clippy", "main-unit", "closure-tests", "feature-check"];
+const MEASURED_LANES = ["unit", ...WAVE_LANES];
+
+// The measured row durations, `<lane>:<row name>` to whole seconds.
+export function readRowDurations(path) {
+  const data = JSON.parse(readFileSync(path, "utf8"));
+  if (data?.schema_version !== 1 || !data.rows || typeof data.rows !== "object" || Array.isArray(data.rows)) {
+    throw new Error(`${path} is not a schema-1 row-duration table`);
+  }
+  for (const [key, seconds] of Object.entries(data.rows)) {
+    if (!MEASURED_LANES.includes(key.slice(0, key.indexOf(":"))) || !Number.isInteger(seconds) || seconds <= 0) {
+      throw new Error(`${path}: row ${JSON.stringify(key)} has no measured lane or no whole positive seconds`);
+    }
+  }
+  return data.rows;
+}
+
+// A lane's rows in their two waves, by name.
+export function waveOf(lane, rows, durations) {
+  const names = rows.map((row) => row.name);
+  if (new Set(names).size !== names.length) throw new Error(`internal error: ${lane} rows repeat a name`);
+  const lookup = lane === "main-unit" ? [lane, "unit"] : [lane];
+  const wave = { first: [], rest: [] };
+  for (const row of rows) {
+    const seconds = lookup.map((name) => durations[`${name}:${row.name}`]).find((value) => value !== undefined);
+    wave[seconds === undefined || seconds >= WAVE_FIRST_SECONDS ? "first" : "rest"].push(row.name);
+  }
+  return wave;
+}
+
 // No package of the chain runs its unit tests in the pull request.
 // meerkat-rpc's default-feature row (its lib tests carry the MCP restart
 // controls, governed_jsonl::tests::stock_governed_*) ran there as the one
@@ -683,6 +739,7 @@ function parseArgs(argv) {
     workspacePlanRequested: false,
     event: "push",
     baseLock: "",
+    rowDurations: "",
   };
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
@@ -698,6 +755,9 @@ function parseArgs(argv) {
         throw new Error("--event must be pull_request, push or workflow_dispatch");
       }
       args.event = event === "pull_request" ? "pull_request" : "push";
+    } else if (arg === "--row-durations") {
+      args.rowDurations = argv[++i] ?? "";
+      if (!args.rowDurations) throw new Error("--row-durations requires a file");
     } else if (arg === "--base-lock") {
       args.baseLock = argv[++i] ?? "";
       if (!args.baseLock) throw new Error("--base-lock requires a file");
@@ -1892,13 +1952,20 @@ function plan(args) {
       }
     }
     // Push-to-main unit lanes: the whole workspace, no budget. Archived
-    // packages leave the packed shards for their build-once lanes.
-    result.main_unit_shards = packShards(
-      allNames.filter((name) => !archivedPackages.has(name)),
-      weights,
-      args.workspaceShards,
-      model,
-    );
+    // packages leave the packed shards for their build-once lanes. A push
+    // runs the unit lane's shards here verbatim and packs the rest of the
+    // workspace around them (see the header).
+    const unitOnMain = !deferToPush;
+    const unitOnMainPackages = new Set(unitOnMain ? result.unit_packages : []);
+    result.main_unit_shards = [
+      ...(unitOnMain ? result.unit_shards : []),
+      ...packShards(
+        allNames.filter((name) => !archivedPackages.has(name) && !unitOnMainPackages.has(name)),
+        weights,
+        args.workspaceShards,
+        model,
+      ),
+    ];
     const archived = archivedLanes(archivedPackages, featureSuites);
     result.main_archive_builds = archived.builds;
     result.main_archive_runs = archived.runs;
@@ -1925,6 +1992,22 @@ function plan(args) {
         );
       }
     }
+    // The push's unit rows move to the main unit lane, the same row objects:
+    // nothing is rebuilt or repacked on the way.
+    result.unit_rows_on_main = [];
+    if (unitOnMain) {
+      const mainRows = [...result.main_unit_shards, ...result.main_feature_unit_shards];
+      const names = mainRows.map((row) => row.name);
+      if (new Set(names).size !== names.length) {
+        throw new Error(`internal error: main unit rows repeat a name (${names.join(", ")})`);
+      }
+      for (const row of [...result.unit_shards, ...result.unit_feature_shards]) {
+        if (!mainRows.includes(row)) throw new Error(`internal error: unit row ${row.name} is not a main unit row`);
+        result.unit_rows_on_main.push(row.name);
+      }
+      result.unit_shards = [];
+      result.unit_feature_shards = [];
+    }
     // Feature checks keep the weight-packed shards: they compile one Bazel
     // set and a few matrix rows per shard, and the head split would only
     // multiply their jobs. A pull request leaves them to the push.
@@ -1936,6 +2019,7 @@ function plan(args) {
     result.unit_deferred = [];
     result.unit_packages = [];
     result.unit_shards = [];
+    result.unit_rows_on_main = [];
     result.main_unit_shards = [];
     result.main_feature_unit_shards = [];
     result.unit_feature_shards = [];
@@ -2055,6 +2139,25 @@ function plan(args) {
       `the plan does not cover the workspace test lanes for its scope: missing ${coverage.missing.join(", ") || "none"}; errors ${coverage.errors.join("; ") || "none"}`,
     );
   }
+  // The targets each unit-lane row runs: its packages' lib and bin targets.
+  // Cargo refuses --lib when no package of a run has a library (rkat and
+  // surface-build-fixtures are binaries only), so a row names only the
+  // kinds its packages have.
+  for (const key of ["unit_shards", "unit_feature_shards", "main_unit_shards", "main_feature_unit_shards"]) {
+    result[key] = result[key].map((row) => {
+      const flags = targetFlags(row.packages.map((name) => byName.get(name)), { tests: false });
+      if (flags.length === 0) throw new Error(`unit row ${row.name} has no lib or bin target`);
+      return { ...row, targets: flags.join(" ") };
+    });
+  }
+  // Long rows first (see the header).
+  const durations = readRowDurations(args.rowDurations || resolve(root, ROW_DURATIONS));
+  result.waves = {
+    clippy: waveOf("clippy", result.shards, durations),
+    main_unit: waveOf("main-unit", [...result.main_unit_shards, ...result.main_feature_unit_shards], durations),
+    closure_tests: waveOf("closure-tests", result.closure_test_rows, durations),
+    feature_check: waveOf("feature-check", result.feature_check_jobs, durations),
+  };
   return result;
 }
 
@@ -2260,20 +2363,36 @@ function githubOutput(result) {
   scalar("governed_jsonl", String(result.governed_jsonl));
   scalar("mcp_confinement_positive", String(result.mcp_confinement_positive));
   scalar("deferred_to_push", deferredSummary(result.deferred_to_push));
+  // Each two-wave lane's first wave keeps the lane's matrix name; its rest
+  // is the _rest matrix of the twin job that waits for the stagger job. The
+  // counts without a wave are the lane's whole.
+  const inWave = (rows, names) => rows.filter((row) => names.includes(row.name));
+  const clippyFirst = inWave(result.shards, result.waves.clippy.first);
+  const clippyRest = inWave(result.shards, result.waves.clippy.rest);
   scalar("shard_count", String(result.shards.length));
+  scalar("shard_first_count", String(clippyFirst.length));
+  scalar("shard_rest_count", String(clippyRest.length));
   // A matrix must never be empty when the lanes are conditioned on it; keep a
   // placeholder so `fromJSON` stays well-formed and the consumer job's `if:`
   // decides whether it runs.
-  scalar("shard_matrix", matrixOf(result.shards));
+  scalar("shard_matrix", matrixOf(clippyFirst));
+  scalar("shard_rest_matrix", matrixOf(clippyRest));
   // The feature-gated suites run in the same unit jobs as extra matrix rows.
   const unitLanes = [...result.unit_shards, ...result.unit_feature_shards];
   const mainUnitLanes = [...result.main_unit_shards, ...result.main_feature_unit_shards];
   scalar("unit_shard_count", String(unitLanes.length));
   scalar("unit_shard_matrix", matrixOf(unitLanes));
   scalar("unit_deferred", result.unit_deferred.join(" "));
+  scalar("unit_rows_on_main", result.unit_rows_on_main.join(" "));
+  scalar("unit_rows_on_main_count", String(result.unit_rows_on_main.length));
   scalar("unit_deferred_count", String(result.unit_deferred.length));
+  const mainUnitFirst = inWave(mainUnitLanes, result.waves.main_unit.first);
+  const mainUnitRest = inWave(mainUnitLanes, result.waves.main_unit.rest);
   scalar("main_unit_shard_count", String(mainUnitLanes.length));
-  scalar("main_unit_shard_matrix", matrixOf(mainUnitLanes, { placeholder: false }));
+  scalar("main_unit_first_count", String(mainUnitFirst.length));
+  scalar("main_unit_rest_count", String(mainUnitRest.length));
+  scalar("main_unit_shard_matrix", matrixOf(mainUnitFirst, { placeholder: false }));
+  scalar("main_unit_rest_shard_matrix", matrixOf(mainUnitRest, { placeholder: false }));
   scalar("main_archive_build_count", String(result.main_archive_builds.length));
   scalar("main_archive_build_matrix", archiveMatrixOf(result.main_archive_builds));
   scalar("main_archive_run_count", String(result.main_archive_runs.length));
@@ -2284,17 +2403,26 @@ function githubOutput(result) {
   scalar("hook_binary_count", String(result.hook_coverage.hook_binaries));
   scalar("hook_retained_count", String(result.hook_coverage.hook_retained));
   scalar("hook_retained_lanes", result.hook_retained_lanes.join(","));
+  const closureFirst = inWave(result.closure_test_rows, result.waves.closure_tests.first);
+  const closureRest = inWave(result.closure_test_rows, result.waves.closure_tests.rest);
   scalar("closure_test_count", String(result.closure_test_rows.length));
-  scalar("closure_test_matrix", closureMatrixOf(result.closure_test_rows));
-  scalar("feature_check_count", String(result.feature_check_jobs.length));
-  scalar(
-    "feature_check_matrix",
+  scalar("closure_test_first_count", String(closureFirst.length));
+  scalar("closure_test_rest_count", String(closureRest.length));
+  scalar("closure_test_matrix", closureMatrixOf(closureFirst));
+  scalar("closure_test_rest_matrix", closureMatrixOf(closureRest));
+  const featureMatrixOf = (jobs) =>
     JSON.stringify({
-      include: result.feature_check_jobs.length > 0
-        ? result.feature_check_jobs.map((job) => ({ name: job.name, commands: job.commands.join("\n") }))
+      include: jobs.length > 0
+        ? jobs.map((job) => ({ name: job.name, commands: job.commands.join("\n") }))
         : [{ name: "none", commands: "" }],
-    }),
-  );
+    });
+  const featureFirst = inWave(result.feature_check_jobs, result.waves.feature_check.first);
+  const featureRest = inWave(result.feature_check_jobs, result.waves.feature_check.rest);
+  scalar("feature_check_count", String(result.feature_check_jobs.length));
+  scalar("feature_check_first_count", String(featureFirst.length));
+  scalar("feature_check_rest_count", String(featureRest.length));
+  scalar("feature_check_matrix", featureMatrixOf(featureFirst));
+  scalar("feature_check_rest_matrix", featureMatrixOf(featureRest));
   return `${lines.join("\n")}\n`;
 }
 
@@ -2322,7 +2450,7 @@ function main() {
     process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
   }
   process.stderr.write(
-    `ci-cargo-lanes: event=${result.event} mode=${result.mode} release_projection=${result.release_projection !== null} packages=${result.packages.length} closure=${result.closure.length} clippy_shards=${result.shards.length} unit_shards=${result.unit_shards.length} feature_suites=${result.unit_feature_shards.length}/${result.main_feature_unit_shards.length} unit_deferred=${result.unit_deferred.length} integration=${result.integration_suites.length} feature_check_jobs=${result.feature_check_jobs.length} test_scope=${result.test_scope.length} closure_tests=${result.closure_test_rows.length} hook_binaries=${result.hook_coverage.hook_binaries} hook_retained=${result.hook_coverage.hook_retained} deferred_to_push=[${deferredSummary(result.deferred_to_push)}] (${result.reason})\n`,
+    `ci-cargo-lanes: event=${result.event} mode=${result.mode} release_projection=${result.release_projection !== null} packages=${result.packages.length} closure=${result.closure.length} clippy_shards=${result.shards.length} unit_shards=${result.unit_shards.length} feature_suites=${result.unit_feature_shards.length}/${result.main_feature_unit_shards.length} unit_deferred=${result.unit_deferred.length} unit_rows_on_main=${result.unit_rows_on_main.length} integration=${result.integration_suites.length} feature_check_jobs=${result.feature_check_jobs.length} test_scope=${result.test_scope.length} closure_tests=${result.closure_test_rows.length} first_wave=${Object.values(result.waves).reduce((sum, wave) => sum + wave.first.length, 0)} rest_wave=${Object.values(result.waves).reduce((sum, wave) => sum + wave.rest.length, 0)} hook_binaries=${result.hook_coverage.hook_binaries} hook_retained=${result.hook_coverage.hook_retained} deferred_to_push=[${deferredSummary(result.deferred_to_push)}] (${result.reason})\n`,
   );
 }
 

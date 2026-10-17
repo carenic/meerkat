@@ -68,7 +68,9 @@ export const ATTESTATION_BACKEND = "github-hosted-cargo";
 export const RELEASE_PROJECTION_MODE = "release-projection";
 export const REUSE_CLASSIFIER = "release-projection-only";
 // Every lane of the CI attestation's component_results, all of which a
-// workspace-mode main push runs.
+// workspace-mode main push runs. The unit lane is the one exception: a push
+// runs its unit rows in the main unit lane (plan.unit_rows_on_main_count), so
+// it is skipped there.
 export const WORKSPACE_LANES = [
   "changes",
   "fmt_governance",
@@ -140,7 +142,11 @@ export function attestationProblems(attestation, { repository, commit, tree, run
   if (!components || typeof components !== "object" || Array.isArray(components)) {
     problems.push("component_results is missing");
   } else {
-    for (const lane of WORKSPACE_LANES) expect(`component_results.${lane}`, components[lane], "success");
+    const unitRowsOnMain = attestation?.plan?.unit_rows_on_main_count;
+    for (const lane of WORKSPACE_LANES) {
+      if (lane === "unit" && components.unit === "skipped" && Number.isInteger(unitRowsOnMain) && unitRowsOnMain > 0) continue;
+      expect(`component_results.${lane}`, components[lane], "success");
+    }
     for (const [lane, result] of Object.entries(components)) {
       if (!WORKSPACE_LANES.includes(lane) && result !== "success") {
         problems.push(`component_results.${lane} is ${JSON.stringify(result)}, not "success"`);
