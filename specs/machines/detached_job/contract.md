@@ -78,6 +78,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `notification_identity_and_sequence_cardinality_match`
 - `applied_notifications_are_committed`
 - `nonterminal_has_no_terminal_delivery`
+- `terminal_delivery_follows_every_notification`
 
 ## Transitions
 ### `SubmitQueued`

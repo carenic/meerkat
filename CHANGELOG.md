@@ -35,6 +35,16 @@ them.
 
 ## [Unreleased]
 
+### Changed
+
+- `DetachedJobMachine` declares the generated invariant
+  `terminal_delivery_follows_every_notification`: every notification is
+  sequenced before the job's terminal delivery. TLC checks it, and recovering
+  a stored job state that breaks it fails with
+  `RecoveredStateInvariantRejected` (every state the machine commits holds
+  it). It is why the terminal and notification `MarkDeliveryApplied` arms
+  never both match, even for a notification whose id is `terminal` (#1811).
+
 ## [0.9.2] - 2026-10-16
 
 ### Breaking

@@ -1,7 +1,8 @@
 #![allow(clippy::expect_used)]
 
 use meerkat_jobs::machines::detached_job::{
-    DetachedJobInput, DetachedJobMachineAuthority, DetachedJobMachineMutator, DetachedJobPhase,
+    DetachedJobInput, DetachedJobMachineAuthority, DetachedJobMachineMutator,
+    DetachedJobMachineTransitionError, DetachedJobPhase,
 };
 
 fn submitted() -> DetachedJobMachineAuthority {
@@ -262,4 +263,57 @@ fn checkpoint_resumable_loss_cannot_schedule_a_retry_without_a_committed_checkpo
         DetachedJobPhase::LossObserved
     );
     assert_eq!(authority.state().current_fence, 1);
+}
+
+#[test]
+fn recovery_refuses_a_notification_sequenced_at_or_after_the_terminal_delivery() {
+    let mut authority = submitted();
+    claim(&mut authority, "attempt-1", 1);
+    // A notification may carry the terminal delivery's own id: the two
+    // `MarkDeliveryApplied` arms are told apart by sequence alone.
+    DetachedJobMachineMutator::apply(
+        &mut authority,
+        DetachedJobInput::EmitNotification {
+            attempt_id: "attempt-1".into(),
+            fence: 1,
+            notification_id: "terminal".into(),
+            idempotency_key: "terminal:named".into(),
+            runtime_delivery_id: "job-1:notification:terminal".into(),
+            observed_at_ms: 2,
+        },
+    )
+    .expect("emit");
+    DetachedJobMachineMutator::apply(
+        &mut authority,
+        DetachedJobInput::CompleteAttempt {
+            attempt_id: "attempt-1".into(),
+            fence: 1,
+            completed_at_ms: 3,
+        },
+    )
+    .expect("complete");
+    let committed = authority.state().clone();
+    assert_eq!(committed.notification_sequences.get("terminal"), Some(&1));
+    assert_eq!(committed.terminal_delivery_sequence, 2);
+    DetachedJobMachineAuthority::recover_from_state(committed.clone())
+        .expect("a committed terminal state recovers");
+
+    let mut reordered = committed;
+    let terminal_sequence = reordered.terminal_delivery_sequence;
+    reordered
+        .notification_sequences
+        .insert("terminal".into(), terminal_sequence);
+    let refused = DetachedJobMachineAuthority::recover_from_state(reordered).map(|_| ());
+    assert!(
+        matches!(
+            refused,
+            Err(
+                DetachedJobMachineTransitionError::RecoveredStateInvariantRejected {
+                    invariant: "terminal_delivery_follows_every_notification",
+                    ..
+                }
+            )
+        ),
+        "a notification at the terminal delivery's sequence must be refused: {refused:?}"
+    );
 }
