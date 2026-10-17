@@ -101,7 +101,8 @@ jobs:
     needs: machine-verify
     if: ${{ !cancelled() && !inputs.graph_only }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    # Measured ~91 min on 4 vCPU: make test-unit ~58 (38 compile + 20 run) + rpc all-features ~31.
+    timeout-minutes: 150
     env:
       RUSTC_WRAPPER: sccache
     steps:
