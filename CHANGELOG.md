@@ -70,6 +70,17 @@ them.
   fire now fails this way before a session is materialized. Such a fire used
   to materialize its session and then fail as `transport_error`: the realm's
   runtime refused its input at admission (see Known issues).
+- Behaviour-only (not measured by the gate): rkat-rpc composes its realm's
+  own schedule service. Both `SessionRuntime` constructors take
+  `PersistenceBundle::schedule_service` where they built
+  `ScheduleService::new` over the realm's schedule store. In a
+  stock-governed realm rkat-rpc therefore records the realm's opened agent
+  on each schedule it creates or redefines (a redefinition through rkat-rpc
+  no longer erases the agent another host recorded), and its schedule host,
+  which composes no session agent binding, refuses every fire as
+  `schedule_mandate_unavailable` before a session is materialized, as rkat's
+  does. Such a fire used to materialize its session and then fail as
+  `transport_error`. Ordinary realms are unchanged.
 
 ### Security
 
