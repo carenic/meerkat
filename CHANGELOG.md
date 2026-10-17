@@ -123,12 +123,19 @@ them.
 
 ### Known issues
 
-- A stock-governed realm does not run scheduled agent work yet: its runtime
-  admits only work bound to an authenticated original, and a schedule fire
-  carries none. rkat and rkat-rpc refuse every such fire as
-  `schedule_mandate_unavailable` without materializing a session. A Rust
-  host whose schedule service is an uncommissioned `ScheduleService::new`
-  still materializes the fire's session and then fails the fire late.
+- No governed runtime runs scheduled agent work yet, whether it is a
+  stock-governed realm or an embedder's native grant configuration (a
+  `NativeGrantWorkConfiguration` installed with
+  `MeerkatMachine::persistent_with_local_grant_authorization`). Such a
+  runtime admits only work bound to an authenticated original, and a
+  schedule fire carries none, so no fire runs outside a mandate. In a
+  stock-governed realm rkat and rkat-rpc refuse every fire as
+  `schedule_mandate_unavailable` without materializing a session. Any other
+  host on a governed runtime whose schedule service records no
+  commissioning agent (`ScheduleService::new`) still materializes the
+  fire's session and then fails the fire late: the fire never runs, and
+  its failure class names the step that refused it, not the missing
+  mandate.
 
 ## [0.9.2] - 2026-10-16
 
