@@ -61,9 +61,10 @@ them.
   default `cli` surface does. The deploy flags (`--model`,
   `--max-total-tokens`, `--max-duration`, `--max-tool-calls`) and the pack's
   deploy defaults (`max_tokens`, `[models]`, `[budget]`, `[compaction]`)
-  apply to every member and session the RPC host builds, and to its model
-  resolution and model hot-swaps. A flag wins over the realm config, which
-  wins over the pack default. The host used to build from the realm's config
+  apply, as defaults, to every member and session the RPC host builds, and
+  to its model resolution and model hot-swaps; an explicit `session/create`
+  or mob spawn parameter replaces them for that session. A flag wins over
+  the realm config, which wins over the pack default. The host used to build from the realm's config
   documents alone (a known issue since 0.9.1). The deploy values are not
   written to the realm document: `config/get` and `config/set` on the host
   still read and write the realm's own document. The host now also refuses
