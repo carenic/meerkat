@@ -402,7 +402,9 @@ fn main_pushes_diff_against_the_last_green_attested_main_commit() {
     let ci = std::fs::read_to_string(&ci_yml)
         .unwrap_or_else(|e| panic!("read {}: {e}", ci_yml.display()));
     for contract in [
-        "if found_base=\"$(node scripts/ci-push-plan-base.mjs --repository \"${GITHUB_REPOSITORY}\" --payload-base \"${BASE_SHA}\")\"; then",
+        "decider=\"${RUNNER_TEMP}/push-base-tools/ci-push-plan-base.mjs\"",
+        "if git show \"${BASE_SHA}:scripts/ci-push-plan-base.mjs\" > \"${decider}\" 2>/dev/null \\",
+        "&& found_base=\"$(node \"${decider}\" --repository \"${GITHUB_REPOSITORY}\" --payload-base \"${BASE_SHA}\")\"; then",
         "--base \"${plan_base}\" --head HEAD \"${plan_args[@]}\"",
         "no qualifying green, attested main CI run before HEAD (reason above); planning the whole workspace.",
     ] {
@@ -418,6 +420,10 @@ fn main_pushes_diff_against_the_last_green_attested_main_commit() {
     assert!(
         !ci.contains("HEAD^1:scripts/ci-push-base.mjs"),
         "ci.yml must run the parent's finder only through scripts/ci-push-plan-base.mjs"
+    );
+    assert!(
+        !ci.contains("node scripts/ci-push-plan-base.mjs"),
+        "ci.yml must run the payload base's copy of the decider, never the pushed commit's"
     );
 }
 
@@ -525,7 +531,13 @@ fn cargo_diagnostic_workflow_preserves_the_full_gate_set() {
             .and_then(serde_yaml::Value::as_str)
             .is_some_and(|run| run.contains("make machine-verify"))
     }));
-    assert!(cargo.contains("actions/setup-java@v5"));
+    assert!(
+        cargo.lines().any(|line| {
+            let line = line.trim();
+            line.starts_with("uses: actions/setup-java@") && line.ends_with(" # v5")
+        }),
+        "cargo.yml installs Java with actions/setup-java, pinned to v5's commit"
+    );
     assert!(cargo.contains("uses: ./.github/actions/setup-tlc-ci"));
     assert!(cargo.contains("scripts/machine-authority-changed"));
     assert!(cargo.contains("machine_authority_changed:"));

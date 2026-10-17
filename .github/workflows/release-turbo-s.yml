@@ -46,12 +46,15 @@ jobs:
           done
 
       - name: Checkout exact main
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
       - name: Setup BuildBuddy submitter
         uses: ./.github/actions/setup-buildbuddy-ci
         with:
           profile: submitter
+          # A dispatch restores and never saves: a save lands in the default
+          # branch's cache scope, which every tag run would restore.
+          repository-cache: restore
 
       - name: Run Turbo S on BuildBuddy
         shell: bash

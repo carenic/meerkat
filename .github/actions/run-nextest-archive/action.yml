@@ -26,13 +26,13 @@ runs:
         components: rustfmt
 
     - name: Download portable test archive
-      uses: actions/download-artifact@v7
+      uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
       with:
         name: nextest-${{ inputs.family }}-${{ github.sha }}
         path: ${{ runner.temp }}/nextest-archives
 
     - name: Install nextest
-      uses: taiki-e/install-action@nextest
+      uses: taiki-e/install-action@9252097d36d2d3618ad98f5d873696a962b6897c # nextest
       env:
         HOME: ${{ runner.temp }}/install-action-home-${{ github.job }}
 

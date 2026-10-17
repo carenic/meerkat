@@ -36,7 +36,8 @@ import subprocess
 import sys
 import tempfile
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from functools import lru_cache
 from pathlib import Path
 
 DEFAULT_WORKFLOW = Path(".github/workflows/release.yml")
@@ -1934,8 +1935,9 @@ def check_token_permissions(text: str) -> list[str]:
     full-graph caller, for buildbuddy.yml's OIDC) may mint OIDC tokens, only
     the build jobs may write attestations, and only the release publishers
     may write repository contents. No checkout in a job granted a write
-    scope persists the token, and no reusable workflow receives every secret
-    (`secrets: inherit`).
+    scope persists the token. No job of any workflow in the repository
+    passes every secret to a reusable workflow (`secrets: inherit`): a
+    caller lists the secrets the called workflow reads.
     """
     violations: list[str] = []
     lines = text.splitlines()
@@ -1957,6 +1959,17 @@ def check_token_permissions(text: str) -> list[str]:
             inputs = step.nested("with")
             if CHECKOUT_ACTION in step.fields.get("uses", "") and inputs.get("persist-credentials") != "false":
                 violations.append(f"job `{job}` step `{step.name}` persists the workflow token in its checkout")
+    # The other workflows hand a called workflow the same repository secrets.
+    for path in sorted((REPO_ROOT / ".github" / "workflows").glob("*.y*ml")):
+        if path.name == DEFAULT_WORKFLOW.name:
+            continue
+        source = path.read_text(encoding="utf-8")
+        for job in _job_names(source):
+            if parse_mapping(job_block(source, job), 4).get("secrets", "").strip() == "inherit":
+                violations.append(
+                    f"{path.name} job `{job}` passes every repository secret to a reusable workflow "
+                    "(`secrets: inherit`)"
+                )
     return violations
 
 # Jobs that hold a registry or publish token (or write the GitHub release):
@@ -1992,6 +2005,32 @@ TRUSTED_SAVE_TRIGGERS = ("push", "pull_request", "schedule", "merge_group")
 # The tree the local actions and the other workflows are read from; the
 # release doctor's fixtures point it at a mutated copy (--repo-root).
 REPO_ROOT = Path(__file__).resolve().parent.parent
+# The Bazel external repository cache setup-buildbuddy-ci restores and
+# saves: a tag run restores none of it, and only trusted runs save it.
+BAZEL_REPOSITORY_CACHE = ("key", "buildbuddy-bazel-repository-*")
+# The workflows whose runs produce what a tag run trusts: ci.yml's exact-tree
+# attestation (require_ci_green), release-semver-readiness.yml's semver
+# attestation (release_semver_gate) and release.yml's prebuild artifacts. A
+# dispatch-like run of one of them, or of any workflow that checks out a ref
+# its inputs choose, saves no cache: it would save into the scope the next
+# trusted run restores from.
+TAG_TRUSTED_WORKFLOWS = ("ci.yml", "release-semver-readiness.yml", "release.yml")
+# The one release.yml job that restores a cache: the semver gate's dispatch
+# measurement, whose family release-semver-readiness.yml's push to main
+# writes. Every other release job restores none, on a tag or a dispatch
+# (a prebuild or a recovery): nothing on main saves their keys, so a
+# restore could only return an entry some other run wrote.
+RELEASE_RESTORE_JOBS = ("release_semver_gate",)
+# The sccache setup every CI lane runs: the GCS objects it writes are what
+# the push to main compiles from before it attests, so only push and
+# schedule runs set the sccache client to write them (a client-side
+# setting: a later step can still read the job's GCS credentials file,
+# SCCACHE_GCS_KEY_PATH, whose identity can write). It installs a release
+# checked against a pinned sha256 itself, not through sccache-action, which
+# would export the job's Actions cache token to the run steps after it.
+SCCACHE_ACTION = "./.github/actions/setup-sccache-ci"
+SCCACHE_WRITERS = ("push", "schedule")
+SCCACHE_READERS = ("pull_request", "pull_request_target", "workflow_dispatch", "merge_group", "workflow_run")
 
 
 @dataclass(frozen=True)
@@ -2015,15 +2054,17 @@ def _known_truthy(value: object) -> bool | None:
 @dataclass(frozen=True)
 class OpenFrame:
     """One run as the cache check reads it: its event (None for a reusable
-    workflow, whose caller's event is unknown), its ref, and the inputs of
-    the local action being read (None outside one). Everything else is
-    unknown, so a condition counts as false only when it is false whatever
-    the unknowns are."""
+    workflow, whose caller's event is unknown), its ref, the inputs of the
+    local action or reusable workflow being read (None outside one), and the
+    job's static env (_static_env). Everything else is unknown, so a
+    condition counts as false only when it is false whatever the unknowns
+    are."""
 
     label: str
     event_name: str | None
     ref: str = "refs/heads/main"
     inputs: dict[str, object] | None = None
+    env: dict[str, str] | None = None
 
     def resolve(self, path: str) -> object:
         if path == "github.event_name":
@@ -2035,6 +2076,8 @@ class OpenFrame:
         if path.startswith("inputs.") and self.inputs is not None:
             # An input the action does not declare reads as empty.
             return self.inputs.get(path[len("inputs.") :], "")
+        if path.startswith("env.") and self.env is not None and path[len("env.") :] in self.env:
+            return self.env[path[len("env.") :]]
         return UNKNOWN
 
 
@@ -2268,10 +2311,14 @@ class _CacheUse:
     step: Step
     kind: str  # cache | restore | save | rust-cache | setup
     frame: OpenFrame
+    # The release.yml job that runs this step through a reusable workflow.
+    caller: str = ""
 
     @property
     def where(self) -> str:
         chain = " > ".join(f"`{name}`" for name in self.via)
+        if self.caller:
+            return f"job `{self.caller}` (through {self.workflow} job `{self.job}`" + (f" in {chain}" if chain else "") + ")"
         return f"job `{self.job}`" + (f" (in {chain})" if chain else "")
 
     @property
@@ -2373,7 +2420,7 @@ def _walk_cache_steps(
         inputs: dict[str, object] = dict(action.defaults)
         for name, value in step.nested("with").items():
             inputs[name] = _open_template(value, frame, None)
-        inner = OpenFrame(frame.label, frame.event_name, frame.ref, inputs)
+        inner = OpenFrame(frame.label, frame.event_name, frame.ref, inputs, frame.env)
         yield from _walk_cache_steps(action.steps, inner, root, workflow, job, (*via, action.name))
 
 
@@ -2397,6 +2444,44 @@ def _workflow_triggers(text: str) -> set[str]:
     raise ContractError("the workflow has no `on:` triggers")
 
 
+def _env_mapping(lines: list[str], indent: int) -> dict[str, str]:
+    """The `env:` mapping at `indent` (a workflow's at 0, a job's at 4)."""
+    for index, line in enumerate(lines):
+        if line == " " * indent + "env:":
+            nested: list[str] = []
+            for candidate in lines[index + 1 :]:
+                if candidate.strip() and _indent(candidate) <= indent:
+                    break
+                nested.append(candidate)
+            return {key: value.strip().strip("'\"") for key, value in parse_mapping(nested, indent + 2).items()}
+    return {}
+
+
+@lru_cache(maxsize=None)
+def _github_env_writes(root: Path) -> frozenset[str]:
+    """Every name a run script under .github may set through $GITHUB_ENV: a
+    superset, each NAME= or NAME<< in a file that mentions GITHUB_ENV."""
+    names: set[str] = set()
+    for path in sorted((root / ".github").rglob("*")):
+        if path.suffix not in (".yml", ".yaml") or not path.is_file():
+            continue
+        text = path.read_text(encoding="utf-8")
+        if "GITHUB_ENV" in text:
+            names.update(re.findall(r"\b([A-Za-z_][A-Za-z0-9_]*)(?:=|<<)", text))
+    return frozenset(names)
+
+
+def _static_env(text: str, block: list[str], root: Path) -> dict[str, str]:
+    """A job's env that a static reading knows: the workflow's and the job's
+    `env:` values that hold no expression and that no run script can
+    replace through $GITHUB_ENV."""
+    lines = text.splitlines()
+    top = lines[: lines.index("jobs:")] if "jobs:" in lines else lines
+    env = {**_env_mapping(top, 0), **_env_mapping(block, 4)}
+    written = _github_env_writes(root)
+    return {key: value for key, value in env.items() if "${{" not in value and key not in written}
+
+
 def _job_cache_uses(
     text: str, workflow: str, job: str, frame: OpenFrame, root: Path
 ) -> list[_CacheUse] | None:
@@ -2407,23 +2492,171 @@ def _job_cache_uses(
         return None
     if not _may_hold(fields.get("if"), frame):
         return []
-    return list(_walk_cache_steps(job_steps(block), frame, root, workflow, job))
+    framed = OpenFrame(frame.label, frame.event_name, frame.ref, frame.inputs, _static_env(text, block, root))
+    return list(_walk_cache_steps(job_steps(block), framed, root, workflow, job))
+
+
+def _job_with(block: list[str]) -> dict[str, str]:
+    """A reusable-workflow call's `with:` inputs, values unquoted."""
+    for index, line in enumerate(block):
+        match = KEY_LINE.match(line)
+        if match and len(match.group(1)) == 4 and match.group(2) == "with":
+            nested: list[str] = []
+            for candidate in block[index + 1 :]:
+                if candidate.strip() and _indent(candidate) <= 4:
+                    break
+                nested.append(candidate)
+            return {key: value.strip().strip("'\"") for key, value in parse_mapping(nested, 6).items()}
+    return {}
+
+
+def _workflow_call_defaults(text: str) -> dict[str, str]:
+    """The defaults of a reusable workflow's `on: workflow_call: inputs:`."""
+    defaults: dict[str, str] = {}
+    lines = text.splitlines()
+    start = next((index for index, line in enumerate(lines) if re.match(r"^  workflow_call:\s*$", line)), None)
+    if start is None:
+        return defaults
+    in_inputs = False
+    current: str | None = None
+    for line in lines[start + 1 :]:
+        if line.strip() and _indent(line) <= 2:
+            break
+        if re.match(r"^    \S", line):
+            in_inputs = line.strip() == "inputs:"
+            continue
+        if not in_inputs:
+            continue
+        name = re.match(r"^      ([A-Za-z0-9_-]+):\s*$", line)
+        if name:
+            current = name.group(1)
+            continue
+        default = re.match(r"^        default:\s*(.*?)\s*$", line)
+        if default and current is not None:
+            defaults[current] = default.group(1).strip("'\"")
+    return defaults
+
+
+def _reusable_cache_uses(
+    text: str, job: str, frame: OpenFrame, root: Path
+) -> list[tuple[_CacheUse, bool]] | None:
+    """The cache steps a reusable-workflow call runs under `frame`.
+
+    Each job of the called workflow is read with the caller's `with:` over
+    the workflow's input defaults, in the caller's event and ref, and paired
+    with whether it may mint OIDC tokens or attest (its own permissions or
+    its workflow's). None when the call cannot be read: not a workflow of
+    this repository, or one that calls another reusable workflow.
+    """
+    block = job_block(text, job)
+    uses = parse_mapping(block, 4).get("uses", "").split("#", 1)[0].strip()
+    if not uses.startswith("./.github/workflows/"):
+        return None
+    path = root / uses[2:]
+    if not path.is_file():
+        return None
+    source = path.read_text(encoding="utf-8")
+    inputs: dict[str, object] = dict(_workflow_call_defaults(source))
+    for name, value in _job_with(block).items():
+        inputs[name] = _open_template(value, frame, None)
+    called_frame = OpenFrame(frame.label, frame.event_name, frame.ref, inputs)
+    lines = source.splitlines()
+    workflow_scopes = _permission_scopes(lines[: lines.index("jobs:")], 0) if "jobs:" in lines else {}
+    found: list[tuple[_CacheUse, bool]] = []
+    for called in _job_names(source):
+        uses_found = _job_cache_uses(source, path.name, called, called_frame, root)
+        if uses_found is None:
+            return None
+        scopes = {**workflow_scopes, **_permission_scopes(job_block(source, called), 4)}
+        sensitive = scopes.get("id-token") == "write" or scopes.get("attestations") == "write"
+        found.extend((replace(use, caller=job), sensitive) for use in uses_found)
+    return found
+
+
+def _sccache_problems(root: Path) -> list[str]:
+    """Which runs set the sccache client to write, and how the setup installs
+    sccache (see SCCACHE_ACTION)."""
+    where = SCCACHE_ACTION[2:]
+    try:
+        action = _local_action(SCCACHE_ACTION, root)
+    except ContractError as error:
+        return [f"{where}: {error}"]
+    if action is None:
+        return [f"{where} is not a local action"]
+    problems: list[str] = []
+    steps = list(action.steps)
+    if any("mozilla-actions/sccache-action" in step.fields.get("uses", "") for step in steps):
+        problems.append(
+            f"{where} installs sccache through sccache-action, which exports the job's Actions cache token"
+            " to the run steps after it"
+        )
+    pinned = [
+        step
+        for step in steps
+        if re.fullmatch(r"v\d+\.\d+\.\d+", step.env.get("SCCACHE_VERSION", ""))
+        and re.fullmatch(r"[0-9a-f]{64}", step.env.get("SCCACHE_SHA256", ""))
+        and re.search(r'^\s*echo "\$\{SCCACHE_SHA256\}  .*" \| sha256sum --check --strict$', step.run, re.M)
+    ]
+    if not pinned:
+        problems.append(
+            f"{where} installs no sccache release checked against a pinned sha256"
+            " (SCCACHE_VERSION, SCCACHE_SHA256, sha256sum --check --strict)"
+        )
+    writes = [step for step in steps if "SCCACHE_GCS_RW_MODE=" in step.run]
+    if not writes:
+        problems.append(f"{where} sets no SCCACHE_GCS_RW_MODE")
+    for step in writes:
+        if "SCCACHE_GCS_RW_MODE=${RW_MODE}" not in step.run or step.run.count("SCCACHE_GCS_RW_MODE=") != 1:
+            problems.append(f"{where} step `{step.name}` sets SCCACHE_GCS_RW_MODE other than from RW_MODE")
+            continue
+        mode = step.env.get("RW_MODE")
+        if mode is None:
+            problems.append(f"{where} step `{step.name}` has no RW_MODE")
+            continue
+        for event in (*SCCACHE_WRITERS, *SCCACHE_READERS):
+            got = _open_evaluate(mode, OpenFrame(label=f"a {event} run", event_name=event))
+            wanted = "READ_WRITE" if event in SCCACHE_WRITERS else "READ_ONLY"
+            if got != wanted:
+                shown = "unknown" if isinstance(got, _Unknown) else got
+                problems.append(f"{where} gives a {event} run sccache mode {shown}, not {wanted}")
+    return problems
+
+
+def _checks_out_input_ref(text: str) -> bool:
+    """Does any job check out a ref that the run's inputs choose?"""
+    for job in _job_names(text):
+        for step in _steps_of(text, job):
+            if CHECKOUT_ACTION in step.fields.get("uses", "") and "inputs." in step.nested("with").get("ref", ""):
+                return True
+    return False
 
 
 def check_release_caches(text: str) -> list[str]:
     """What release.yml's caches can carry, read through every local action.
 
     Covers each release.yml job and the local composite actions it calls,
-    recursively (not a reusable workflow: such a job must never run on a
-    dispatch). A dispatch on main saves into the default branch's cache
-    scope, which every tag run restores, so no cache step saves on a
+    recursively, and on a tag the reusable workflows it calls, read with the
+    caller's inputs (a call that can run on a dispatch, or one this check
+    cannot read, fails). A dispatch on main saves into the default branch's
+    cache scope, which every tag run restores, so no cache step saves on a
     dispatch; no rust-cache caches ~/.cargo/bin, so a restored binary cannot
     shadow a tool on PATH; a job holding a registry or publish token (or
-    `contents: write`) runs no cache step; and a job that mints OIDC tokens
-    or attests artifacts (`id-token` or `attestations: write`) restores only
-    caches that no workflow in the repository saves on a dispatch-like run
-    (any trigger but push, pull_request, schedule and merge_group), through
-    the same local action or an overlapping key.
+    `contents: write`) runs no cache step; no release job restores a cache,
+    on a tag or a dispatch, but the semver gate's dispatch measurement
+    (RELEASE_RESTORE_JOBS); and a job that mints OIDC tokens or attests
+    artifacts
+    (`id-token` or `attestations: write`) restores only caches that no
+    workflow in the repository saves on a dispatch-like run (any trigger but
+    push, pull_request, schedule and merge_group), through the same local
+    action or an overlapping key. No workflow saves the Bazel repository
+    cache on a dispatch-like run at all: such runs only restore it. A
+    workflow that produces what a tag run trusts (TAG_TRUSTED_WORKFLOWS),
+    or that checks out a ref its inputs choose, saves no cache at all on a
+    dispatch-like run. Only push and schedule runs set the CI lanes' sccache
+    client to write its bucket (a client-side setting, not a credential),
+    and the lanes install a sha256-pinned sccache release themselves, so no
+    step exports the Actions cache token to their run steps
+    (_sccache_problems).
     """
     root = REPO_ROOT
     violations: list[str] = []
@@ -2443,42 +2676,68 @@ def check_release_caches(text: str) -> list[str]:
             violations.append(message)
 
     restored: list[tuple[_CacheUse, str]] = []
-    for job in names:
-        for frame in (dispatch, tag):
-            uses = _job_cache_uses(text, DEFAULT_WORKFLOW.name, job, frame, root)
-            if uses is None:
-                fields = parse_mapping(job_block(text, job), 4)
-                if job in token_jobs:
-                    report(f"job `{job}` holds a registry or publish token and calls a reusable workflow")
-                if frame is dispatch and _may_hold(fields.get("if"), dispatch):
-                    report(
-                        f"job `{job}` calls a reusable workflow on a dispatch, whose cache saves "
-                        "this check does not read"
-                    )
-                break
-            for use in uses:
-                if job in token_jobs:
-                    report(f"{use.where} holds a registry or publish token and restores a cache (`{use.uses}`)")
-                    continue
-                if use.kind == "rust-cache" and str(use._with("cache-bin")).lower() != "false":
-                    report(f"{use.where} caches ~/.cargo/bin (`cache-bin` is not false)")
-                if frame is dispatch and use.may_save():
-                    if use.kind == "rust-cache":
-                        report(f"{use.where} saves its rust-cache on a dispatch")
-                    else:
-                        saved = ", ".join(f"`{pattern}`" for _, pattern in use.key_specs()[1])
-                        report(f"{use.where} saves cache {saved} on a dispatch (`{use.uses}`)")
-                if job in sensitive and use.may_restore():
-                    restored.extend((use, spec) for spec in use.key_specs()[0])
 
-    if not restored:
-        return violations
+    def inspect(use: _CacheUse, frame: OpenFrame, token_job: bool, sensitive_job: bool) -> None:
+        if token_job:
+            report(f"{use.where} holds a registry or publish token and restores a cache (`{use.uses}`)")
+            return
+        if use.kind == "rust-cache" and str(use._with("cache-bin")).lower() != "false":
+            report(f"{use.where} caches ~/.cargo/bin (`cache-bin` is not false)")
+        if frame is dispatch and use.may_save():
+            if use.kind == "rust-cache":
+                report(f"{use.where} saves its rust-cache on a dispatch")
+            else:
+                saved = ", ".join(f"`{pattern}`" for _, pattern in use.key_specs()[1])
+                report(f"{use.where} saves cache {saved} on a dispatch (`{use.uses}`)")
+        if use.may_restore() and (frame is tag or use.job not in RELEASE_RESTORE_JOBS):
+            for spec in use.key_specs()[0]:
+                report(f"{use.where} restores `{spec[1]}` on {frame.label}; a release job restores no cache")
+        if sensitive_job and use.may_restore():
+            restored.extend((use, spec) for spec in use.key_specs()[0])
+
+    for job in names:
+        fields = parse_mapping(job_block(text, job), 4)
+        if "uses" in fields:
+            if job in token_jobs:
+                report(f"job `{job}` holds a registry or publish token and calls a reusable workflow")
+            if _may_hold(fields.get("if"), dispatch):
+                report(
+                    f"job `{job}` calls a reusable workflow on a dispatch, whose cache saves "
+                    "this check does not read"
+                )
+            if not _may_hold(fields.get("if"), tag):
+                continue
+            called = _reusable_cache_uses(text, job, tag, root)
+            if called is None:
+                report(f"job `{job}` calls a reusable workflow on a tag that this check cannot read")
+                continue
+            for use, called_sensitive in called:
+                inspect(use, tag, job in token_jobs, job in sensitive or called_sensitive)
+            continue
+        for frame in (dispatch, tag):
+            for use in _job_cache_uses(text, DEFAULT_WORKFLOW.name, job, frame, root) or []:
+                inspect(use, frame, job in token_jobs, job in sensitive)
+
     workflows = sorted((root / ".github" / "workflows").glob("*.y*ml"))
     sources = {path.name: path.read_text(encoding="utf-8") for path in workflows}
     # The workflow under check, which may be a mutated copy.
     sources[DEFAULT_WORKFLOW.name] = text
+    for problem in _sccache_problems(root):
+        report(problem)
+    for trusted in TAG_TRUSTED_WORKFLOWS:
+        if trusted not in sources:
+            report(f"{trusted}, a workflow whose runs a tag trusts, is missing; update TAG_TRUSTED_WORKFLOWS")
     for workflow, source in sorted(sources.items()):
         triggers = _workflow_triggers(source)
+        # release.yml's own jobs are checked on a dispatch above.
+        guarded = [] if workflow == DEFAULT_WORKFLOW.name else [
+            reason
+            for reason, applies in (
+                ("produces what a tag run trusts", workflow in TAG_TRUSTED_WORKFLOWS),
+                ("checks out a ref its inputs choose", _checks_out_input_ref(source)),
+            )
+            if applies
+        ]
         for trigger in sorted(triggers - set(TRUSTED_SAVE_TRIGGERS)):
             frame = OpenFrame(
                 label=f"a {trigger} run",
@@ -2488,7 +2747,17 @@ def check_release_caches(text: str) -> list[str]:
                 for writer in _job_cache_uses(source, workflow, job, frame, root) or []:
                     if not writer.may_save():
                         continue
+                    if guarded:
+                        report(
+                            f"{workflow} {writer.where} saves a cache on {frame.label} (`{writer.uses}`); "
+                            f"a workflow that {' and '.join(guarded)} saves none on such a run"
+                        )
                     for saved in writer.key_specs()[1]:
+                        if _specs_overlap(BAZEL_REPOSITORY_CACHE, saved):
+                            report(
+                                f"{workflow} {writer.where} saves `{saved[1]}` on {frame.label}; "
+                                "such runs only restore the Bazel repository cache"
+                            )
                         for use, spec in restored:
                             if _specs_overlap(spec, saved):
                                 report(
@@ -2498,7 +2767,6 @@ def check_release_caches(text: str) -> list[str]:
     return violations
 
 
-# Makes build-wasm.mjs run `wasm-pack build --mode no-install`.
 WEB_SDK_PACK_MODE_ENV = "MEERKAT_WEB_WASM_PACK_MODE"
 
 

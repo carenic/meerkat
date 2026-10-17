@@ -398,6 +398,19 @@
         ]
       }
     ],
+    ".github/actions/setup-buildbuddy-ci/": [
+      {
+        "package": "xtask",
+        "target": "test:release_workflow_asset_manifest",
+        "scope": "target",
+        "tests": [
+          "buildbuddy_binary_build_runs_the_workflows_own_setup"
+        ],
+        "sources": [
+          "crates/xtask/tests/release_workflow_asset_manifest.rs"
+        ]
+      }
+    ],
     ".github/actions/setup-buildbuddy-ci/action.yml": [
       {
         "package": "xtask",
@@ -408,6 +421,17 @@
         ],
         "sources": [
           "crates/xtask/tests/buildbuddy_static_lanes.rs"
+        ]
+      },
+      {
+        "package": "xtask",
+        "target": "test:release_workflow_asset_manifest",
+        "scope": "target",
+        "tests": [
+          "buildbuddy_binary_build_runs_the_workflows_own_setup"
+        ],
+        "sources": [
+          "crates/xtask/tests/release_workflow_asset_manifest.rs"
         ]
       }
     ],

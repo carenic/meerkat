@@ -208,8 +208,11 @@ the start of the pre-push hook to a green `CI gate`, and the gate also
 enforces 1080 s of lane execution and a 1200 s push-to-terminal ceiling on
 it, runner queue excluded; the push runs every lane.
 Compiled
-objects are cached by sccache (content-addressed, shared by every lane and
-readable from `main` by every pull request); rust-cache holds only the
+objects are cached by sccache (a release pinned by sha256, content-addressed
+and shared by every lane; push and schedule runs set the client to write it,
+every other run, a pull request included, to only read it, a client-side
+setting, see [Known limits](#known-limits));
+rust-cache holds only the
 registry, because per-lane target caches exceeded the repository's 10 GB
 cache limit in one pull request:
 
@@ -220,7 +223,7 @@ the exact-tree attestation; nightly and the release tag carry the rest):
 
 | Lane | `pull_request` | `push: main` | nightly | release tag |
 | --- | --- | --- | --- | --- |
-| `changes`: classify the diff with `scripts/ci-cargo-lanes.mjs --event <event>`; a `Cargo.lock`-only global change is scoped to the members that resolve a changed lock entry; a push to `main` diffs against the last main commit whose run completed green with an attestation (`scripts/ci-push-base.mjs`, run by `scripts/ci-push-plan-base.mjs` from HEAD's first parent only when that parent is the payload base, its answer accepted only as an ancestor of HEAD), or plans the whole workspace without one or for a push of several commits | yes | yes | - | - |
+| `changes`: classify the diff with `scripts/ci-cargo-lanes.mjs --event <event>`; a `Cargo.lock`-only global change is scoped to the members that resolve a changed lock entry; a push to `main` diffs against the last main commit whose run completed green with an attestation (`scripts/ci-push-base.mjs`, run by the payload base's own copy of `scripts/ci-push-plan-base.mjs` from HEAD's first parent only when that parent is the payload base, its answer accepted only as an ancestor of HEAD), or plans the whole workspace without one or for a push of several commits | yes | yes | - | - |
 | `fmt-governance`: fmt, docs, semver self-test, version parity, lock consistency, release config, lane and path classifier self-tests, ripgrep tombstone scans (legacy surface, session-control routes, deprecated backend) | yes | yes | - | - |
 | `ratchets`: schema/SDK/RPC/REST freshness when contract paths changed; machine and protocol drift when machine authority changed; machine poster coverage and freshness when machine authority or a poster input (`scripts/machine-posters-changed`) changed | yes | yes | - | - |
 | `governance-gates`: the typed governance gates (`rmat-audit`, `seam-inventory`, `runtime-authority-bypass`, `machine-authority-docs-gate`) when machine authority or a dogma document changed | yes | yes | - | - |
@@ -330,6 +333,33 @@ PRs and failed runs emit no such attestation.
 `.github/workflows/cargo.yml` remains a separate reusable/manual workflow with
 its own `Cargo lane gate`; it is a diagnostic fallback, not the per-push job
 graph.
+
+### Known limits
+
+- The sccache read-only mode is a client-side setting. A run that only
+  reads the bucket (a pull request from this repository, a dispatch) still
+  authenticates as the identity push runs write with: any of its steps can
+  read the credentials file `SCCACHE_GCS_KEY_PATH` names. Only a separate
+  read-only identity for those runs, an IAM change outside this
+  repository, closes that.
+- The bearer token in that credentials file (`gha-creds-*.json`) is the
+  job's Actions runtime token: the runner sets
+  `ACTIONS_ID_TOKEN_REQUEST_TOKEN` to the same token. No step exports the
+  token to the lanes' run steps, but a run step of a lane that
+  authenticated to GCS can still read it there. The token reaches the
+  repository's Actions caches; no release job restores one, so the reach
+  ends at CI caches.
+- Nightly, `cargo.yml` and the dense Mob topology workflow still install
+  sccache through `mozilla-actions/sccache-action` (with a pinned
+  `version`), by design: they use its GitHub Actions cache backend, which
+  needs the token the action exports.
+- A release job whose checkout can be an older tag runs its setup action
+  from `.release-tooling`, a sparse checkout of the workflow's own commit,
+  but a local action that action calls in turn (`uses: ./.github/actions/...`)
+  resolves against the job's workspace, the tag's checkout. No release job
+  reaches one (`setup-buildbuddy-ci` calls `setup-tlc-ci` for its `full`
+  profile only), and the BuildBuddy release validation, which runs the
+  lane actions of the tree it checks out, refuses a release tag.
 
 ## CI Retry And Concurrency
 

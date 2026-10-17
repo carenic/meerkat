@@ -40,11 +40,14 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
       - uses: ./.github/actions/setup-buildbuddy-ci
         with:
           profile: native
+          # A dispatch restores and never saves: a save lands in the default
+          # branch's cache scope, which every tag run would restore.
+          repository-cache: restore
 
       - name: Build release binaries via BuildBuddy
         shell: bash
@@ -113,7 +116,7 @@ jobs:
             bin: rkat-mcp
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           persist-credentials: false
 
@@ -123,9 +126,13 @@ jobs:
         run: rustup target add x86_64-apple-darwin
 
       - name: Cache cargo registry
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           key: release-x86_64-apple-darwin-cross
+          # As in release.yml: a dispatch saves no release cache, and
+          # ~/.cargo/bin is never cached.
+          save-if: ${{ github.event_name != 'workflow_dispatch' }}
+          cache-bin: "false"
 
       - name: Cross-compile the surface binary
         shell: bash

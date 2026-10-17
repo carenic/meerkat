@@ -75,11 +75,13 @@ runs:
         tar -xzf "${RUNNER_TEMP}/${archive}" -C "${RUNNER_TEMP}/xwin-bin" cargo-xwin
         cargo xwin --version
 
-    # Restored here, saved after the build only when the caller allows it
-    # (never from a workflow_dispatch; see save-sdk-cache).
+    # Restored and saved only for a caller that saves it (never from a
+    # workflow_dispatch; see save-sdk-cache), and never on a tag: the
+    # release jobs download the SDK themselves.
     - name: Restore Windows SDK cache
       id: sdk-cache
-      uses: actions/cache/restore@v4
+      if: ${{ inputs.save-sdk-cache == 'true' && !startsWith(github.ref, 'refs/tags/') }}
+      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
       with:
         path: ${{ runner.temp }}/xwin-cache
         key: xwin-sdk-${{ runner.os }}-cargo-xwin-${{ inputs.cargo-xwin-version }}
@@ -116,8 +118,8 @@ runs:
           -p rkat -p meerkat-rpc -p meerkat-rest -p meerkat-mcp-server
 
     - name: Save Windows SDK cache
-      if: ${{ inputs.save-sdk-cache == 'true' && steps.sdk-cache.outputs.cache-hit != 'true' }}
-      uses: actions/cache/save@v4
+      if: ${{ inputs.save-sdk-cache == 'true' && !startsWith(github.ref, 'refs/tags/') && steps.sdk-cache.outputs.cache-hit != 'true' }}
+      uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
       with:
         path: ${{ runner.temp }}/xwin-cache
         key: xwin-sdk-${{ runner.os }}-cargo-xwin-${{ inputs.cargo-xwin-version }}

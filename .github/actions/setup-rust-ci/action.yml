@@ -11,12 +11,14 @@ runs:
   using: composite
   steps:
     - name: Install Rust
-      uses: dtolnay/rust-toolchain@1.94.1
+      uses: dtolnay/rust-toolchain@ee868d7805ade43a1b47dd054727ab76c9108b4f # 1.94.1
       with:
         # The CI lanes run fmt/clippy directly; the dtolnay action installs a
         # minimal profile, so name the components explicitly.
         components: ${{ inputs.components }}
 
+    # From the action's own tree: a release job runs this action from its
+    # tooling checkout (.release-tooling) beside an older tag's checkout.
     - name: Pin Rust toolchain binaries
       shell: bash
-      run: scripts/ci-pin-rust-toolchain-env
+      run: bash "${GITHUB_ACTION_PATH}/../../../scripts/ci-pin-rust-toolchain-env"
