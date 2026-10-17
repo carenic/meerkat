@@ -62,6 +62,39 @@ fn walk_files(root: &Path, files: &mut Vec<PathBuf>) {
     }
 }
 
+/// The files of `root`'s git work tree that `git ls-files` reports, or every
+/// file under `root` when it is not a work tree (Bazel runfiles hold only the
+/// declared inputs).
+///
+/// A gitignored local tree, such as a Python virtualenv or build output, is
+/// not repository content, so a scan of what the repository contains never
+/// reads it.
+fn tracked_files(root: &Path) -> Vec<PathBuf> {
+    if !root.join(".git").exists() {
+        let mut files = Vec::new();
+        walk_files(root, &mut files);
+        return files;
+    }
+    let output = Command::new("git")
+        .current_dir(root)
+        .args(["ls-files", "-z"])
+        .output()
+        .unwrap_or_else(|err| panic!("run git ls-files in {}: {err}", root.display()));
+    assert!(
+        output.status.success(),
+        "git ls-files in {} failed: {}",
+        root.display(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+        .map(|path| root.join(std::str::from_utf8(path).expect("utf-8 tracked path")))
+        .filter(|path| path.is_file())
+        .collect()
+}
+
 fn relative(root: &Path, path: &Path) -> String {
     path.strip_prefix(root)
         .unwrap_or(path)
@@ -766,8 +799,8 @@ fn retired_session_control_names_are_absent() {
 #[test]
 fn deprecated_backend_references_stay_rejected_only() {
     let root = repo_root();
-    let mut files = Vec::new();
-    walk_files(&root, &mut files);
+    // Tracked files only: a local virtualenv's lexer keyword lists name redb.
+    let files = tracked_files(&root);
     let mut matches = Vec::new();
     for file in files {
         let rel = relative(&root, &file);
