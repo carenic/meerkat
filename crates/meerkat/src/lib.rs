@@ -481,9 +481,9 @@ mod meerkat_machine;
 // Factory-backed SessionService wiring (substrate — testing/embedded use).
 // Production surfaces use runtime-backed paths (see meerkat-rpc, meerkat-rest).
 mod service_factory;
-#[cfg(not(target_arch = "wasm32"))]
-pub use service_factory::RealmInheritance;
 pub use service_factory::{FactoryAgent, FactoryAgentBuilder, build_ephemeral_service};
+#[cfg(not(target_arch = "wasm32"))]
+pub use service_factory::{HostConfigLayer, RealmInheritance};
 #[cfg(feature = "session-store")]
 pub use service_factory::{
     build_persistent_service, build_persistent_service_with_runtime_adapter,

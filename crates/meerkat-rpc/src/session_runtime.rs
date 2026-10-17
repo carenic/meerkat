@@ -3914,6 +3914,27 @@ impl SessionRuntime {
     ///
     /// Writes never compose — `config get/set` stay on the raw `config_runtime`.
     pub fn set_realm_config_source(&self, source: Arc<dyn meerkat_core::RealmConfigSource>) {
+        self.install_realm_config_source(source, None);
+    }
+
+    /// [`Self::set_realm_config_source`], with `layer` applied over the
+    /// composed chain on every read of the effective config: agent builds,
+    /// model resolution ([`Self::effective_config`]) and model hot-swap.
+    /// `config get/set` stay on the raw `config_runtime`, so the layer is never
+    /// written to a realm document.
+    pub fn set_realm_config_source_with_host_layer(
+        &self,
+        source: Arc<dyn meerkat_core::RealmConfigSource>,
+        layer: Arc<dyn meerkat::HostConfigLayer>,
+    ) {
+        self.install_realm_config_source(source, Some(layer));
+    }
+
+    fn install_realm_config_source(
+        &self,
+        source: Arc<dyn meerkat_core::RealmConfigSource>,
+        host_layer: Option<Arc<dyn meerkat::HostConfigLayer>>,
+    ) {
         let head = self
             .realm_id()
             .unwrap_or_else(meerkat_core::connection::RealmId::global);
@@ -3921,11 +3942,14 @@ impl SessionRuntime {
             .realm_config_source
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::clone(&source));
+        let inheritance = meerkat::RealmInheritance::new(source, head);
         *self
             .builder_realm_inheritance
             .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) =
-            Some(meerkat::RealmInheritance::new(source, head));
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(match host_layer {
+            Some(layer) => inheritance.with_host_layer(layer),
+            None => inheritance,
+        });
     }
 
     /// Per-realm config-document source for inheritance composition, if attached.
@@ -17862,6 +17886,117 @@ mod tests {
             )
             .expect("compose the RPC session runtime"),
         )
+    }
+
+    /// In-memory realm documents for realm-inheritance tests.
+    struct RealmDocs(BTreeMap<String, Config>);
+
+    #[async_trait]
+    impl meerkat_core::RealmConfigSource for RealmDocs {
+        async fn config_for_realm(
+            &self,
+            realm: &meerkat_core::connection::RealmId,
+        ) -> Result<Option<Config>, meerkat_core::ConfigError> {
+            Ok(self.0.get(realm.as_str()).cloned())
+        }
+    }
+
+    /// A host layer shaped like a deploy's: it sets the default model, and
+    /// fills the token budget and the per-turn output limit only where the
+    /// realm chain left them unset.
+    struct DeployLikeLayer;
+
+    impl meerkat::HostConfigLayer for DeployLikeLayer {
+        fn apply(&self, config: &mut Config) {
+            config.agent.model = "layer-model".to_string();
+            if config.limits.budget.is_none() {
+                config.limits.budget = Some(9);
+            }
+            if config.max_tokens.is_none() {
+                config.max_tokens = Some(4321);
+            }
+        }
+    }
+
+    /// An RPC host given a host layer reads its effective config (the read
+    /// model resolution shares with agent builds and hot-swap) through it,
+    /// while `config get` keeps reading the raw head document, which never
+    /// carries the layer.
+    #[tokio::test]
+    async fn host_layer_reaches_the_effective_config_but_not_the_raw_config() {
+        use meerkat_core::connection::{RealmConfigSection, RealmId};
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut global = Config::default();
+        global.agent.model = "chain-model".to_string();
+        global.limits.budget = Some(1000);
+        global
+            .realm
+            .insert("global".to_string(), RealmConfigSection::default());
+        let mut head = Config::default();
+        head.realm.insert(
+            "deploy".to_string(),
+            RealmConfigSection {
+                parent: Some(RealmId::global()),
+                ..Default::default()
+            },
+        );
+        let config_store: Arc<dyn meerkat_core::ConfigStore> = Arc::new(
+            meerkat_core::MemoryConfigStore::new(head, meerkat_models::canonical()),
+        );
+        let runtime = SessionRuntime::new_with_config_store(
+            temp_factory(&temp),
+            Config::default(),
+            Arc::clone(&config_store),
+            1,
+            meerkat::PersistenceBundle::new(
+                Arc::new(meerkat::MemoryStore::new()),
+                Arc::new(meerkat_runtime::InMemoryRuntimeStore::new()),
+                Arc::new(meerkat_store::MemoryBlobStore::new()),
+            )
+            .expect("construct runtime authority"),
+            crate::router::NotificationSink::noop(),
+        )
+        .expect("compose the RPC session runtime");
+        runtime.set_realm_context(
+            Some(RealmId::parse("deploy").expect("valid realm")),
+            None,
+            None,
+        );
+        runtime.set_config_runtime(Arc::new(meerkat_core::ConfigRuntime::new(
+            Arc::clone(&config_store),
+            temp.path().join("config_state.json"),
+        )));
+        runtime.set_realm_config_source_with_host_layer(
+            Arc::new(RealmDocs(BTreeMap::from([("global".to_string(), global)]))),
+            Arc::new(DeployLikeLayer),
+        );
+
+        let effective = runtime
+            .effective_config()
+            .await
+            .expect("the effective config");
+        assert_eq!(
+            (
+                effective.agent.model.as_str(),
+                effective.limits.budget,
+                effective.max_tokens
+            ),
+            ("layer-model", Some(1000), Some(4321)),
+            "the layer applies over the folded chain and fills only what the chain left unset"
+        );
+        let raw = runtime
+            .config_runtime()
+            .expect("config runtime")
+            .get()
+            .await
+            .expect("the raw head document")
+            .config;
+        assert_eq!(
+            (raw.agent.model.as_str(), raw.limits.budget, raw.max_tokens),
+            (Config::default().agent.model.as_str(), None, None),
+            "config get reads the raw head document, which never carries the layer"
+        );
     }
 
     fn make_runtime_with_session_store(
