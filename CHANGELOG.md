@@ -52,8 +52,13 @@ them.
   with an error or its ten-minute hang guard elapsed. The rows it still holds
   are applied in arrival order at the next point each can land, with no
   further deadline; the settlement's outcome and its recorded deferral are
-  unchanged. A row the session refuses for any other reason is reported with
-  a warning. (#1821)
+  unchanged. (#1821)
+- Live channels: a row deferred to a close that the session then refuses for
+  a reason other than a held turn boundary is no longer dropped silently. A
+  warning and a `live_transcript_row_unrecorded` runtime notice in the
+  session's transcript record that it was not recorded, naming the channel,
+  the row kind, its provider item id and the refusal class, never the row's
+  content. (#1821)
 - GPT Live: speech whose output start waited behind a running member turn
   when the channel closed is committed under its generated output instead of
   being abandoned with its captions retracted. The segment's release follows

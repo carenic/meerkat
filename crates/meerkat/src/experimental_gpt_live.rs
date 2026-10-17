@@ -15446,6 +15446,135 @@ mod tests {
         );
     }
 
+    /// The `live_transcript_row_unrecorded` runtime notice payloads in the
+    /// persisted transcript, waiting (bounded) for at least one.
+    async fn eventually_unrecorded_row_notices(
+        service: &crate::PersistentSessionService<crate::FactoryAgentBuilder>,
+        session_id: &meerkat_core::SessionId,
+    ) -> Vec<serde_json::Value> {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let session = service
+                    .load_authoritative_session(session_id)
+                    .await
+                    .expect("read the persisted transcript")
+                    .expect("session");
+                let payloads: Vec<serde_json::Value> = session
+                    .messages()
+                    .iter()
+                    .filter_map(|message| match message {
+                        meerkat_core::Message::SystemNotice(notice) => Some(notice),
+                        _ => None,
+                    })
+                    .flat_map(|notice| notice.blocks.iter())
+                    .filter_map(|block| match block {
+                        meerkat_core::types::SystemNoticeBlock::RuntimeNotice {
+                            category,
+                            payload,
+                            ..
+                        } if category == "live_transcript_row_unrecorded" => payload.clone(),
+                        _ => None,
+                    })
+                    .collect();
+                if !payloads.is_empty() {
+                    break payloads;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the unrecorded row leaves a typed runtime notice")
+    }
+
+    /// An output start whose provider turn never reached the machine: no
+    /// generated custody can admit it, so the session refuses it.
+    fn output_start_without_custody() -> meerkat_core::live_adapter::LiveAdapterObservation {
+        meerkat_core::live_adapter::LiveAdapterObservation::AssistantOutputStarted {
+            provider_turn_ref: "turn-without-custody".to_string(),
+            response_id: "response-without-custody".to_string(),
+            provider_item_id: "item-without-custody".to_string(),
+            content_index: 0,
+        }
+    }
+
+    fn unrecorded_output_start_notice() -> serde_json::Value {
+        serde_json::json!({
+            "channel_id": "deferred-close-rows",
+            "row": "assistant_output_started",
+            "provider_item_id": "item-without-custody",
+            "refusal": "rejected",
+        })
+    }
+
+    /// #1821 (F1 last resort): a deferred row the session refuses after the
+    /// close for a reason other than a held boundary is not recorded. A typed
+    /// runtime notice in the transcript says so, without the row's content.
+    #[tokio::test]
+    async fn an_unrecordable_deferred_row_leaves_a_typed_runtime_notice() {
+        let (service, runtime, host, session_id, channel_id, _temp) = deferred_rows_fixture().await;
+        assert_eq!(
+            crate::session_runtime::live_orchestration::settle_live_close_playback_deferred(
+                Arc::clone(&service),
+                Arc::clone(&runtime),
+                host.owned_handle(),
+                vec![output_start_without_custody()],
+                session_id.clone(),
+                channel_id.clone(),
+                None,
+            )
+            .await,
+            crate::session_runtime::live_orchestration::DeferredCloseSettlementOutcome::Settled,
+        );
+        assert_eq!(
+            eventually_unrecorded_row_notices(&service, &session_id).await,
+            vec![unrecorded_output_start_notice()]
+        );
+    }
+
+    /// #1821 (F1 last resort): the same notice when the row is refused by the
+    /// replay that follows a given-up settlement.
+    #[tokio::test]
+    async fn an_unrecordable_row_replayed_after_a_give_up_leaves_a_typed_runtime_notice() {
+        let (service, runtime, host, session_id, channel_id, _temp) = deferred_rows_fixture().await;
+        run_uncommitted_member_turn(&service, &session_id).await;
+        discard_staged_member_turn_checkpoint(&service, &session_id).await;
+        service
+            .apply_runtime_turn(
+                &session_id,
+                meerkat_core::lifecycle::RunId::new(),
+                meerkat_core::StartTurnRequest {
+                    injected_context: Vec::new(),
+                    prompt: String::new().into(),
+                    system_prompt: None,
+                    event_tx: None,
+                    runtime: meerkat_core::service::StartTurnRuntimeSemantics::default(),
+                },
+                meerkat_core::lifecycle::run_primitive::RunApplyBoundary::RunStart,
+                vec![meerkat_core::lifecycle::InputId::new()],
+            )
+            .await
+            .expect_err("a runtime turn without an execution kind ends with an error");
+        assert_eq!(
+            crate::session_runtime::live_orchestration::settle_live_close_playback_deferred(
+                Arc::clone(&service),
+                Arc::clone(&runtime),
+                host.owned_handle(),
+                vec![output_start_without_custody()],
+                session_id.clone(),
+                channel_id.clone(),
+                None,
+            )
+            .await,
+            crate::session_runtime::live_orchestration::DeferredCloseSettlementOutcome::GaveUp(
+                crate::session_runtime::live_orchestration::DeferredCloseSettlementGiveUp::BoundaryNotCommitted
+            ),
+        );
+        assert_eq!(
+            eventually_unrecorded_row_notices(&service, &session_id).await,
+            vec![unrecorded_output_start_notice()]
+        );
+    }
+
     /// #1821 (R2): a member turn that holds the boundary past the documented
     /// hang guard ends the close settlement. The rows the transport deferred
     /// to it must still reach the transcript once the turn releases the

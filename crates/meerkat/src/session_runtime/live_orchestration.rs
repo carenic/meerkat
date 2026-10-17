@@ -1183,12 +1183,12 @@ mod orchestrator {
                     transcript_first.pop_front();
                 }
                 Ok(Err(error)) => {
-                    tracing::info!(
-                        target: meerkat_live::LIVE_CLOSE_TRACE_TARGET,
-                        channel = %channel_id,
-                        ?observation,
-                        %error,
-                        "deferred live projection was refused after the close"
+                    report_unrecorded_live_row(
+                        &service,
+                        &session_id,
+                        &channel_id,
+                        observation,
+                        &error,
                     );
                     transcript_first.pop_front();
                 }
@@ -1299,12 +1299,12 @@ mod orchestrator {
                     ?outcome,
                     "deferred live projection applied at the member turn boundary"
                 ),
-                Err(error) => tracing::info!(
-                    target: meerkat_live::LIVE_CLOSE_TRACE_TARGET,
-                    channel = %channel_id,
-                    ?observation,
-                    %error,
-                    "deferred live projection was refused after the close"
+                Err(error) => report_unrecorded_live_row(
+                    &service,
+                    &session_id,
+                    &channel_id,
+                    &observation,
+                    &error,
                 ),
             }
         }
@@ -1401,7 +1401,13 @@ mod orchestrator {
                         advanced.await;
                     }
                     Err(error) => {
-                        report_unrecorded_live_row(&session_id, &channel_id, observation, &error);
+                        report_unrecorded_live_row(
+                            &service,
+                            &session_id,
+                            &channel_id,
+                            observation,
+                            &error,
+                        );
                         rows.pop_front();
                     }
                 }
@@ -1410,22 +1416,142 @@ mod orchestrator {
         });
     }
 
+    /// The `RuntimeNotice` category recorded for a deferred live row the
+    /// session refused.
+    const LIVE_TRANSCRIPT_ROW_UNRECORDED_NOTICE: &str = "live_transcript_row_unrecorded";
+
     /// The last resort for a deferred row the session refused for a reason
-    /// other than a held boundary: it is not recorded, so say so, typed.
-    fn report_unrecorded_live_row(
+    /// other than a held boundary: it is not recorded. A typed warning and a
+    /// typed runtime notice in the session's transcript say so, naming the
+    /// channel, the row kind, its provider item id and the refusal class,
+    /// never the row's content. The notice is recorded at the session's turn
+    /// boundary on its own task, so it never delays the close's settlement.
+    fn report_unrecorded_live_row<B: SessionAgentBuilder + 'static>(
+        service: &Arc<PersistentSessionService<B>>,
         session_id: &SessionId,
         channel_id: &LiveChannelId,
         observation: &meerkat_core::live_adapter::LiveAdapterObservation,
         error: &meerkat_live::LiveAdapterHostError,
     ) {
+        let (row, provider_item_id) = unrecorded_live_row_identity(observation);
+        let refusal = unrecorded_live_row_refusal(error);
         tracing::warn!(
             target: meerkat_live::LIVE_CLOSE_TRACE_TARGET,
             %session_id,
             channel = %channel_id,
-            ?observation,
-            %error,
+            row,
+            provider_item_id,
+            refusal,
             "deferred live transcript row was refused after the close; it is not recorded"
         );
+        let payload = serde_json::json!({
+            "channel_id": channel_id.to_string(),
+            "row": row,
+            "provider_item_id": provider_item_id,
+            "refusal": refusal,
+        });
+        let notice = meerkat_core::types::SystemNoticeMessage::with_block(
+            meerkat_core::types::SystemNoticeKind::Generic,
+            Some(
+                "A live transcript row from a closed channel could not be recorded; its content is not in this transcript."
+                    .to_owned(),
+            ),
+            meerkat_core::types::SystemNoticeBlock::RuntimeNotice {
+                category: LIVE_TRANSCRIPT_ROW_UNRECORDED_NOTICE.to_owned(),
+                detail: Some(payload.to_string()),
+                payload: Some(payload),
+                content: Vec::new(),
+            },
+        );
+        let service = Arc::clone(service);
+        let session_id = session_id.clone();
+        tokio::spawn(async move {
+            let _boundary = service
+                .acquire_runtime_turn_finalization_guard(&session_id)
+                .await;
+            if let Err(error) = service
+                .append_system_notice_under_runtime_turn_boundary(&session_id, notice.into())
+                .await
+            {
+                tracing::warn!(
+                    target: meerkat_live::LIVE_CLOSE_TRACE_TARGET,
+                    %session_id,
+                    %error,
+                    "the notice for an unrecorded live transcript row could not be recorded"
+                );
+            }
+        });
+    }
+
+    /// The kind and provider item id of a deferred live row, for the
+    /// unrecorded-row notice; never its content.
+    fn unrecorded_live_row_identity(
+        observation: &meerkat_core::live_adapter::LiveAdapterObservation,
+    ) -> (&'static str, Option<&str>) {
+        use meerkat_core::live_adapter::LiveAdapterObservation as Row;
+        match observation {
+            Row::WithContextObservation { observation, .. } => {
+                unrecorded_live_row_identity(observation)
+            }
+            Row::UserTranscriptFinal {
+                provider_item_id, ..
+            } => ("user_transcript_final", provider_item_id.as_deref()),
+            Row::UserContentCommitted { item_id, .. } => {
+                ("user_content_committed", Some(item_id.as_str()))
+            }
+            Row::AssistantOutputStarted {
+                provider_item_id, ..
+            } => ("assistant_output_started", Some(provider_item_id.as_str())),
+            Row::AssistantPlaybackTerminalObserved {
+                provider_item_id, ..
+            } => (
+                "assistant_playback_terminal",
+                Some(provider_item_id.as_str()),
+            ),
+            Row::AssistantPlaybackCompleted {
+                provider_item_id, ..
+            } => (
+                "assistant_playback_completed",
+                Some(provider_item_id.as_str()),
+            ),
+            Row::AssistantTranscriptFinal {
+                provider_item_id, ..
+            } => (
+                "assistant_transcript_final",
+                Some(provider_item_id.as_str()),
+            ),
+            Row::AssistantTranscriptTruncated {
+                provider_item_id, ..
+            } => (
+                "assistant_transcript_truncated",
+                provider_item_id.as_deref(),
+            ),
+            Row::AssistantTranscriptDelta {
+                provider_item_id, ..
+            } => ("assistant_transcript_delta", provider_item_id.as_deref()),
+            Row::AssistantTextDelta {
+                provider_item_id, ..
+            } => ("assistant_text_delta", provider_item_id.as_deref()),
+            _ => ("other_observation", None),
+        }
+    }
+
+    /// The typed class of a deferred row's refusal, for the unrecorded-row
+    /// notice; never the refusal's message.
+    fn unrecorded_live_row_refusal(error: &meerkat_live::LiveAdapterHostError) -> &'static str {
+        use meerkat_live::{LiveAdapterHostError as Host, LiveProjectionError as Projection};
+        match error {
+            Host::ProjectionError(Projection::SessionNotFound(_)) => "session_not_found",
+            Host::ProjectionError(Projection::Rejected(_)) => "rejected",
+            Host::ProjectionError(Projection::SessionBusy(_)) => "session_busy",
+            Host::ProjectionError(Projection::SessionNotRunning(_)) => "session_not_running",
+            Host::ProjectionError(
+                Projection::CapabilityDisabled { code, .. } | Projection::Session { code, .. },
+            ) => code,
+            Host::ProjectionError(_) => "projection_refused",
+            Host::ChannelNotFound(_) => "channel_not_found",
+            _ => "host_refused",
+        }
     }
 
     fn is_unmeasured_playback_release(
