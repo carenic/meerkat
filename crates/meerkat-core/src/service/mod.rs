@@ -1203,6 +1203,52 @@ impl std::fmt::Display for OpaquePrincipalToken {
     }
 }
 
+/// One incarnation of a mob: a mob runtime from the moment it starts (a
+/// create, or a resume by a later process) until it stops for good. A mob
+/// destroyed and created again under the same id, or resumed by a later
+/// process, is a new incarnation.
+///
+/// Mob operator grants name the incarnation they were minted for, so a grant
+/// never reaches a later mob under the same id. The mob runtime mints one
+/// with [`Self::mint`] when it starts (UUID v4, 122 random bits) and hands it
+/// out through its handles; a value minted anywhere else names no running
+/// mob, so a grant naming it reaches nothing. The value is opaque and is
+/// never decoded: deserialization always refuses, and `Debug` and
+/// `Serialize` render it redacted. It is not a credential; the authority is
+/// the sealed [`MobToolAuthorityContext`] that names it.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct MobIncarnationId(uuid::Uuid);
+
+impl MobIncarnationId {
+    /// A fresh incarnation, never handed out before. The mob runtime calls
+    /// this when a mob starts; any other caller gets a value no mob runs at.
+    pub fn mint() -> Self {
+        Self(uuid::Uuid::new_v4())
+    }
+}
+
+const REDACTED_MOB_INCARNATION: &str = "[redacted mob incarnation]";
+
+impl std::fmt::Debug for MobIncarnationId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(REDACTED_MOB_INCARNATION)
+    }
+}
+
+impl Serialize for MobIncarnationId {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(REDACTED_MOB_INCARNATION)
+    }
+}
+
+impl<'de> Deserialize<'de> for MobIncarnationId {
+    fn deserialize<D: serde::Deserializer<'de>>(_deserializer: D) -> Result<Self, D::Error> {
+        Err(serde::de::Error::custom(
+            "a mob incarnation is minted by the mob runtime and never decoded",
+        ))
+    }
+}
+
 /// Runtime-supplied caller provenance carried alongside mob tool authority.
 ///
 /// This is informational/projection-only data. It is not a second authority
@@ -1269,6 +1315,11 @@ pub struct MobToolAuthorityContext {
     managed_mob_scope: BTreeSet<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     spawn_profile_scope: BTreeMap<String, BTreeSet<String>>,
+    /// The mob incarnation each scoped mob id is bound to: a scope entry
+    /// reaches only the mob instance it was granted for. Part of the
+    /// generated seal, so a persisted projection binds no mob.
+    #[serde(skip)]
+    mob_incarnations: BTreeMap<String, MobIncarnationId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     caller_provenance: Option<MobToolCallerProvenance>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1296,6 +1347,8 @@ impl MobToolAuthorityContextSeal {
 static EMPTY_MOB_AUTHORITY_MANAGED_SCOPE: LazyLock<BTreeSet<String>> = LazyLock::new(BTreeSet::new);
 static EMPTY_MOB_AUTHORITY_SPAWN_SCOPE: LazyLock<BTreeMap<String, BTreeSet<String>>> =
     LazyLock::new(BTreeMap::new);
+static EMPTY_MOB_AUTHORITY_INCARNATIONS: LazyLock<BTreeMap<String, MobIncarnationId>> =
+    LazyLock::new(BTreeMap::new);
 static UNTRUSTED_MOB_AUTHORITY_PRINCIPAL: LazyLock<OpaquePrincipalToken> =
     LazyLock::new(|| OpaquePrincipalToken::new("untrusted-mob-authority-context"));
 
@@ -1309,11 +1362,21 @@ impl MobToolAuthorityContext {
         capabilities: MobToolAuthorityCapabilities,
         managed_mob_scope: BTreeSet<String>,
         spawn_profile_scope: BTreeMap<String, BTreeSet<String>>,
+        mob_incarnations: BTreeMap<String, MobIncarnationId>,
         caller_provenance: Option<MobToolCallerProvenance>,
         audit_invocation_id: Option<String>,
     ) -> Result<Self, String> {
         if principal_token.as_str().trim().is_empty() {
             return Err("generated mob tool authority requires a non-empty principal token".into());
+        }
+        if let Some(unbound) = managed_mob_scope
+            .iter()
+            .chain(spawn_profile_scope.keys())
+            .find(|mob_id| !mob_incarnations.contains_key(mob_id.as_str()))
+        {
+            return Err(format!(
+                "generated mob tool authority scopes mob '{unbound}' without binding its incarnation"
+            ));
         }
         Ok(Self {
             generated_authority_seal: MobToolAuthorityContextSeal::generated(),
@@ -1323,11 +1386,15 @@ impl MobToolAuthorityContext {
             can_run_adaptive_packs: capabilities.can_run_adaptive_packs,
             managed_mob_scope,
             spawn_profile_scope,
+            mob_incarnations,
             caller_provenance,
             audit_invocation_id,
         })
     }
 
+    /// A generated-shape context for core's own tests. Every scoped mob is
+    /// bound to a fresh incarnation, read back through
+    /// [`Self::mob_incarnations`].
     #[cfg(test)]
     #[allow(clippy::expect_used, clippy::too_many_arguments)]
     pub(crate) fn generated_for_test(
@@ -1340,6 +1407,11 @@ impl MobToolAuthorityContext {
         caller_provenance: Option<MobToolCallerProvenance>,
         audit_invocation_id: Option<String>,
     ) -> Self {
+        let mob_incarnations = managed_mob_scope
+            .iter()
+            .chain(spawn_profile_scope.keys())
+            .map(|mob_id| (mob_id.clone(), MobIncarnationId::mint()))
+            .collect();
         Self::from_generated_parts(
             principal_token,
             MobToolAuthorityCapabilities {
@@ -1349,6 +1421,7 @@ impl MobToolAuthorityContext {
             },
             managed_mob_scope,
             spawn_profile_scope,
+            mob_incarnations,
             caller_provenance,
             audit_invocation_id,
         )
@@ -1400,6 +1473,23 @@ impl MobToolAuthorityContext {
         }
     }
 
+    /// The mob incarnation each scoped mob id is bound to. A projection
+    /// binds none.
+    pub fn mob_incarnations(&self) -> &BTreeMap<String, MobIncarnationId> {
+        if self.is_generated_authority_context() {
+            &self.mob_incarnations
+        } else {
+            &EMPTY_MOB_AUTHORITY_INCARNATIONS
+        }
+    }
+
+    /// Whether this context's scope for `mob_id` is bound to `incarnation`,
+    /// the incarnation of the mob a caller is about to act on. A grant for an
+    /// earlier mob under the same id names an earlier incarnation.
+    fn scope_bound_to(&self, mob_id: &str, incarnation: MobIncarnationId) -> bool {
+        self.mob_incarnations().get(mob_id) == Some(&incarnation)
+    }
+
     pub fn caller_provenance(&self) -> Option<&MobToolCallerProvenance> {
         self.is_generated_authority_context()
             .then_some(self.caller_provenance.as_ref())
@@ -1412,20 +1502,26 @@ impl MobToolAuthorityContext {
             .flatten()
     }
 
-    pub fn can_manage_mob(&self, mob_id: &str) -> bool {
-        self.managed_mob_scope().contains(mob_id)
+    /// Raw, atomic observation: whether the operator holds manage scope over
+    /// the mob `mob_id` at `incarnation`, the incarnation of the live mob the
+    /// caller resolved. A grant for a destroyed mob never matches a later
+    /// mob under the same id.
+    pub fn can_manage_mob(&self, mob_id: &str, incarnation: MobIncarnationId) -> bool {
+        self.managed_mob_scope().contains(mob_id) && self.scope_bound_to(mob_id, incarnation)
     }
 
     /// Raw, atomic observation: whether the operator holds a non-empty
-    /// spawn-profile scope for `mob_id`. This is one of the two pure facts the
-    /// spawn-tool shell feeds to MobMachine's `ResolveSpawnToolAdmission`
-    /// (alongside [`Self::can_manage_mob`]); the machine — not the shell —
-    /// composes the disjunction into the Allow/Deny verdict. This is NOT a
-    /// pre-reduced admission conclusion.
-    pub fn spawn_profile_scope_present(&self, mob_id: &str) -> bool {
-        self.spawn_profile_scope()
-            .get(mob_id)
-            .is_some_and(|profiles| !profiles.is_empty())
+    /// spawn-profile scope for the mob `mob_id` at `incarnation`. This is one
+    /// of the two pure facts the spawn-tool shell feeds to MobMachine's
+    /// `ResolveSpawnToolAdmission` (alongside [`Self::can_manage_mob`]); the
+    /// machine - not the shell - composes the disjunction into the
+    /// Allow/Deny verdict. This is NOT a pre-reduced admission conclusion.
+    pub fn spawn_profile_scope_present(&self, mob_id: &str, incarnation: MobIncarnationId) -> bool {
+        self.scope_bound_to(mob_id, incarnation)
+            && self
+                .spawn_profile_scope()
+                .get(mob_id)
+                .is_some_and(|profiles| !profiles.is_empty())
     }
 
     /// Raw, atomic observation: whether the operator's spawn-profile scope SET
@@ -1436,11 +1532,19 @@ impl MobToolAuthorityContext {
     /// `ResolveSpawnMemberAdmission`; the machine — not the shell — composes the
     /// `manage_scope_present || profile_scope_contains` disjunction into the
     /// Allow/Deny verdict. This is a RAW per-profile set-membership fact, NOT a
-    /// pre-reduced admission conclusion (it does not OR in manage scope).
-    pub fn spawn_profile_scope_contains(&self, mob_id: &str, profile: &str) -> bool {
-        self.spawn_profile_scope()
-            .get(mob_id)
-            .is_some_and(|profiles| profiles.contains(profile))
+    /// pre-reduced admission conclusion (it does not OR in manage scope). Like
+    /// the other scope observations it holds only at the bound `incarnation`.
+    pub fn spawn_profile_scope_contains(
+        &self,
+        mob_id: &str,
+        incarnation: MobIncarnationId,
+        profile: &str,
+    ) -> bool {
+        self.scope_bound_to(mob_id, incarnation)
+            && self
+                .spawn_profile_scope()
+                .get(mob_id)
+                .is_some_and(|profiles| profiles.contains(profile))
     }
 }
 
@@ -1461,7 +1565,7 @@ unsafe extern "Rust" {
 #[allow(improper_ctypes_definitions, unsafe_code)]
 #[allow(clippy::too_many_arguments)]
 #[unsafe(export_name = concat!(
-    "__meerkat_core_runtime_generated_mob_tool_authority_context_build_v1_",
+    "__meerkat_core_runtime_generated_mob_tool_authority_context_build_v2_",
     env!("MEERKAT_GENERATED_AUTHORITY_BRIDGE_SYMBOL_SUFFIX")
 ))]
 pub(crate) extern "Rust" fn runtime_generated_mob_tool_authority_context_build(
@@ -1472,6 +1576,7 @@ pub(crate) extern "Rust" fn runtime_generated_mob_tool_authority_context_build(
     can_run_adaptive_packs: bool,
     managed_mob_scope: BTreeSet<String>,
     spawn_profile_scope: BTreeMap<String, BTreeSet<String>>,
+    mob_incarnations: BTreeMap<String, MobIncarnationId>,
     caller_provenance: Option<MobToolCallerProvenance>,
     audit_invocation_id: Option<String>,
 ) -> Result<MobToolAuthorityContext, String> {
@@ -1492,6 +1597,7 @@ pub(crate) extern "Rust" fn runtime_generated_mob_tool_authority_context_build(
         },
         managed_mob_scope,
         spawn_profile_scope,
+        mob_incarnations,
         caller_provenance,
         audit_invocation_id,
     )
@@ -4058,10 +4164,87 @@ mod tests {
             None,
         );
 
-        assert!(ctx.spawn_profile_scope_present("mob-1"));
-        assert!(ctx.spawn_profile_scope_contains("mob-1", "investigator"));
-        assert!(!ctx.spawn_profile_scope_contains("mob-1", "writer"));
-        assert!(!ctx.can_manage_mob("mob-1"));
+        let incarnation = ctx.mob_incarnations()["mob-1"];
+        assert!(ctx.spawn_profile_scope_present("mob-1", incarnation));
+        assert!(ctx.spawn_profile_scope_contains("mob-1", incarnation, "investigator"));
+        assert!(!ctx.spawn_profile_scope_contains("mob-1", incarnation, "writer"));
+        assert!(!ctx.can_manage_mob("mob-1", incarnation));
+    }
+
+    /// Scope observations hold only at the incarnation the scope is bound
+    /// to: a later mob under the same id is another incarnation.
+    #[test]
+    fn scope_observations_hold_only_at_the_bound_incarnation() {
+        let ctx = MobToolAuthorityContext::generated_for_test(
+            OpaquePrincipalToken::new("generated-test"),
+            false,
+            false,
+            false,
+            BTreeSet::from(["mob-1".to_string()]),
+            BTreeMap::from([(
+                "mob-1".to_string(),
+                BTreeSet::from(["investigator".to_string()]),
+            )]),
+            None,
+            None,
+        );
+        let bound = ctx.mob_incarnations()["mob-1"];
+        let later = MobIncarnationId::mint();
+        assert_ne!(bound, later);
+
+        assert!(ctx.can_manage_mob("mob-1", bound));
+        assert!(!ctx.can_manage_mob("mob-1", later));
+        assert!(!ctx.spawn_profile_scope_present("mob-1", later));
+        assert!(!ctx.spawn_profile_scope_contains("mob-1", later, "investigator"));
+        assert!(!ctx.can_manage_mob("mob-2", bound));
+    }
+
+    /// The generated constructor refuses a scope entry without a bound
+    /// incarnation: no generated context can name a mob by id alone.
+    #[test]
+    fn generated_context_refuses_an_unbound_scope() {
+        let error = MobToolAuthorityContext::from_generated_parts(
+            OpaquePrincipalToken::new("generated-test"),
+            MobToolAuthorityCapabilities::default(),
+            BTreeSet::from(["mob-1".to_string()]),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            None,
+            None,
+        )
+        .expect_err("an unbound manage scope must be refused");
+        assert!(error.contains("mob-1"), "{error}");
+        let error = MobToolAuthorityContext::from_generated_parts(
+            OpaquePrincipalToken::new("generated-test"),
+            MobToolAuthorityCapabilities::default(),
+            BTreeSet::new(),
+            BTreeMap::from([("mob-2".to_string(), BTreeSet::from(["worker".to_string()]))]),
+            BTreeMap::from([("mob-1".to_string(), MobIncarnationId::mint())]),
+            None,
+            None,
+        )
+        .expect_err("an unbound spawn-profile scope must be refused");
+        assert!(error.contains("mob-2"), "{error}");
+    }
+
+    /// A mob incarnation is opaque: it never decodes from any input, and
+    /// neither `Debug` nor `Serialize` renders its value.
+    #[test]
+    fn mob_incarnation_is_never_decoded_and_renders_redacted() {
+        let incarnation = MobIncarnationId::mint();
+        assert_ne!(incarnation, MobIncarnationId::mint());
+        let rendered = format!("{incarnation:?}");
+        let serialized = serde_json::to_value(incarnation).expect("serialize incarnation");
+        assert_eq!(rendered, "[redacted mob incarnation]");
+        assert_eq!(serialized, serde_json::json!("[redacted mob incarnation]"));
+        for input in [
+            serialized,
+            serde_json::json!("6f7f0d5c-3c2d-4c4e-9a54-0e8b0f1d2c3b"),
+            serde_json::json!({}),
+        ] {
+            serde_json::from_value::<MobIncarnationId>(input)
+                .expect_err("a mob incarnation never decodes");
+        }
     }
 
     #[test]
@@ -4080,14 +4263,20 @@ mod tests {
             Some("audit-1".to_string()),
         );
 
-        let restored: MobToolAuthorityContext =
-            serde_json::from_value(serde_json::to_value(ctx).unwrap()).unwrap();
+        let incarnation = ctx.mob_incarnations()["mob-1"];
+        let value = serde_json::to_value(&ctx).unwrap();
+        assert!(
+            value.get("mob_incarnations").is_none(),
+            "a projection carries no incarnation binding: {value}"
+        );
+        let restored: MobToolAuthorityContext = serde_json::from_value(value).unwrap();
 
         assert!(!restored.is_generated_authority_context());
         assert!(!restored.can_create_mobs());
         assert!(!restored.can_mutate_profiles());
-        assert!(!restored.can_manage_mob("mob-1"));
-        assert!(!restored.spawn_profile_scope_present("mob-1"));
+        assert!(!restored.can_manage_mob("mob-1", incarnation));
+        assert!(!restored.spawn_profile_scope_present("mob-1", incarnation));
+        assert!(restored.mob_incarnations().is_empty());
         assert!(restored.caller_provenance().is_none());
         assert!(restored.audit_invocation_id().is_none());
     }

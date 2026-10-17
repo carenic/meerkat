@@ -1289,6 +1289,70 @@ impl meerkat_mob::store::TemporaryCouncilStore for AmbiguousThenPanicCouncilStor
     }
 }
 
+/// Holds a council's first custody commit until a gate opens, then commits
+/// it unchanged.
+///
+/// The first commit is the execution claim: the convener's admission of its
+/// source mobs has happened, and no participant is seated yet. A test that
+/// waits for the gate then has one deterministic point between the two.
+pub struct GatedClaimCouncilStore {
+    inner: Arc<dyn meerkat_mob::store::TemporaryCouncilStore>,
+    commits: AtomicUsize,
+    gate: Arc<TurnGate>,
+}
+
+impl GatedClaimCouncilStore {
+    pub fn new(
+        inner: Arc<dyn meerkat_mob::store::TemporaryCouncilStore>,
+        gate: Arc<TurnGate>,
+    ) -> Self {
+        Self {
+            inner,
+            commits: AtomicUsize::new(0),
+            gate,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl meerkat_mob::store::TemporaryCouncilStore for GatedClaimCouncilStore {
+    fn durability(&self) -> meerkat_mob::temporary_council::TemporaryCouncilStoreDurability {
+        self.inner.durability()
+    }
+
+    async fn insert_new(
+        &self,
+        record: &meerkat_mob::store::TemporaryCouncilRecord,
+    ) -> Result<meerkat_mob::store::TemporaryCouncilRecord, meerkat_mob::store::MobStoreError> {
+        self.inner.insert_new(record).await
+    }
+
+    async fn load(
+        &self,
+        council_id: &meerkat_mob::temporary_council::TemporaryCouncilId,
+    ) -> Result<Option<meerkat_mob::store::TemporaryCouncilRecord>, meerkat_mob::store::MobStoreError>
+    {
+        self.inner.load(council_id).await
+    }
+
+    async fn commit(
+        &self,
+        record: &meerkat_mob::store::TemporaryCouncilRecord,
+    ) -> Result<meerkat_mob::store::TemporaryCouncilRecord, meerkat_mob::store::MobStoreError> {
+        if self.commits.fetch_add(1, Ordering::SeqCst) == 0 {
+            self.gate.wait().await;
+        }
+        self.inner.commit(record).await
+    }
+
+    async fn list_all(
+        &self,
+    ) -> Result<Vec<meerkat_mob::store::TemporaryCouncilRecord>, meerkat_mob::store::MobStoreError>
+    {
+        self.inner.list_all().await
+    }
+}
+
 /// A capability store with two independent, precisely-placed fault knobs.
 ///
 /// * `request_id_failures` fails `load_by_request_id` for ACTIVATED records.

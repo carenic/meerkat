@@ -347,6 +347,16 @@ if run_part audits-b; then
   TLC_WORKERS="${tlc_workers}" "${peer_request_maps_audit}" "${PEER_REQUEST_MAPS_AUDIT_MAX_STEPS:-8}" --mutants
 fi
 
+mob_operator_grant_audit="${workspace_root}/specs/machines/meerkat_machine/mob_operator_grant_audit.sh"
+if [[ ! -x "${mob_operator_grant_audit}" ]]; then
+  echo "error: mob operator grant audit runner is missing from workspace runfiles: ${mob_operator_grant_audit}" >&2
+  exit 1
+fi
+if run_part audits-a; then
+  echo "running bounded mob operator grant TLC audit"
+  TLC_WORKERS="${tlc_workers}" "${mob_operator_grant_audit}" "${MOB_OPERATOR_GRANT_AUDIT_MAX_STEPS:-5}" --mutants
+fi
+
 # Broad composition full-TLC skips are CI-time/memory-budget exceptions, NOT
 # codegen defects. `machine-verify` still validates drift and the generated
 # ci.cfg structural-invariant contract before honoring these skips. The earlier
@@ -395,7 +405,9 @@ run_machine_verify() {
 # start and model parse is most of a small audit:
 # audits-a = live unregister cleanup (295 s), live-context outbox (149 s),
 # live-context result barrier with --mutants (32 s), live worker start after
-# close (26 s): 502 s;
+# close (26 s): 502 s; plus mob operator grant with --mutants (88 s on a
+# local 4-worker run, not yet hosted; the other audits' hosted runs took
+# 1.5-3.1x their local ones, so expect 130-270 s);
 # audits-b = durable in-turn steer (352 s), live delegation steer (44 s),
 # peer request maps with --mutants (64 s measured on a local 4-worker run,
 # not yet hosted; the other audits' hosted runs took 1.5-3.1x their local

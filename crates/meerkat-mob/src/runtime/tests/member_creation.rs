@@ -92,7 +92,10 @@ async fn member_creation_operator_ingress_proves_owner_or_records_unproven() {
             Arc::new(super::super::tools::MobOperatorToolDispatcher::new(
                 handle.clone(),
                 true,
-                generated_mob_operator_authority_with_scope(handle.mob_id().as_str()),
+                generated_mob_operator_authority_with_scope(
+                    handle.mob_id().as_str(),
+                    handle.incarnation(),
+                ),
             ));
         // The owner is the dispatch context's origin session, as an agent
         // turn of the parent session dispatches it.
@@ -178,7 +181,10 @@ async fn member_creation_operator_capture_fault_is_classified_traced_and_admits_
         Arc::new(super::super::tools::MobOperatorToolDispatcher::new(
             handle.clone(),
             true,
-            generated_mob_operator_authority_with_scope(handle.mob_id().as_str()),
+            generated_mob_operator_authority_with_scope(
+                handle.mob_id().as_str(),
+                handle.incarnation(),
+            ),
         )),
         parent_session.clone(),
     );
@@ -243,7 +249,10 @@ async fn member_creation_stale_origin_is_refused_on_owned_target_checks() {
         Arc::new(super::super::tools::MobOperatorToolDispatcher::new(
             handle.clone(),
             true,
-            generated_mob_operator_authority_with_scope(handle.mob_id().as_str()),
+            generated_mob_operator_authority_with_scope(
+                handle.mob_id().as_str(),
+                handle.incarnation(),
+            ),
         ))
     };
     let stale = super::dispatched_from_session(operator(), SessionId::new());
@@ -350,7 +359,10 @@ async fn member_creation_some_origin_authority_matrix() {
             Arc::new(super::super::tools::MobOperatorToolDispatcher::new(
                 handle.clone(),
                 true,
-                generated_mob_operator_authority_with_scope(handle.mob_id().as_str()),
+                generated_mob_operator_authority_with_scope(
+                    handle.mob_id().as_str(),
+                    handle.incarnation(),
+                ),
             )),
             session,
         )

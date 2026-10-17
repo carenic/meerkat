@@ -6043,6 +6043,7 @@ impl std::fmt::Display for MobId {
         f.write_str(&self.0)
     }
 }
+pub type MobIncarnationId = meerkat_core::service::MobIncarnationId;
 #[allow(non_camel_case_types)]
 #[derive(
     Debug,
@@ -13856,6 +13857,7 @@ pub struct State {
     pub mob_operator_managed_mob_scope: std::collections::BTreeSet<String>,
     pub mob_operator_spawn_profile_scope:
         std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
+    pub mob_operator_mob_incarnations: std::collections::BTreeMap<String, MobIncarnationId>,
     pub mob_operator_caller_provenance: Option<MobToolCallerProvenance>,
     pub mob_operator_audit_invocation_id: Option<String>,
     pub drain_phase: DrainPhase,
@@ -14590,6 +14592,13 @@ impl std::fmt::Debug for State {
             .field(
                 "mob_operator_spawn_profile_scope",
                 &self.mob_operator_spawn_profile_scope,
+            )
+            .field(
+                "mob_operator_mob_incarnations",
+                &format_args!(
+                    "<redacted; {} entries>",
+                    self.mob_operator_mob_incarnations.len()
+                ),
             )
             .field(
                 "mob_operator_caller_provenance",
@@ -16114,7 +16123,7 @@ pub mod inputs {
         pub caller_provenance: Option<MobToolCallerProvenance>,
         pub audit_invocation_id: Option<String>,
     }
-    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    #[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct RestoreMobOperatorAuthority {
         pub principal_token: OpaquePrincipalToken,
         pub can_create_mobs: bool,
@@ -16122,8 +16131,26 @@ pub mod inputs {
         pub managed_mob_scope: std::collections::BTreeSet<String>,
         pub spawn_profile_scope:
             std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
+        pub mob_incarnations: std::collections::BTreeMap<String, MobIncarnationId>,
         pub caller_provenance: Option<MobToolCallerProvenance>,
         pub audit_invocation_id: Option<String>,
+    }
+    impl std::fmt::Debug for RestoreMobOperatorAuthority {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("RestoreMobOperatorAuthority")
+                .field("principal_token", &self.principal_token)
+                .field("can_create_mobs", &self.can_create_mobs)
+                .field("can_mutate_profiles", &self.can_mutate_profiles)
+                .field("managed_mob_scope", &self.managed_mob_scope)
+                .field("spawn_profile_scope", &self.spawn_profile_scope)
+                .field(
+                    "mob_incarnations",
+                    &format_args!("<redacted; {} entries>", self.mob_incarnations.len()),
+                )
+                .field("caller_provenance", &self.caller_provenance)
+                .field("audit_invocation_id", &self.audit_invocation_id)
+                .finish()
+        }
     }
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct SetMobOperatorProfileMutation {
@@ -16133,14 +16160,33 @@ pub mod inputs {
     pub struct SetMobOperatorCreateAuthority {
         pub allowed: bool,
     }
-    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    #[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct GrantMobOperatorManageMob {
         pub mob_id: String,
+        pub mob_incarnation: MobIncarnationId,
     }
-    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    impl std::fmt::Debug for GrantMobOperatorManageMob {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("GrantMobOperatorManageMob")
+                .field("mob_id", &self.mob_id)
+                .field("mob_incarnation", &"<redacted>")
+                .finish()
+        }
+    }
+    #[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct SetMobOperatorSpawnProfilesInMob {
         pub mob_id: String,
+        pub mob_incarnation: MobIncarnationId,
         pub profiles: std::collections::BTreeSet<String>,
+    }
+    impl std::fmt::Debug for SetMobOperatorSpawnProfilesInMob {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("SetMobOperatorSpawnProfilesInMob")
+                .field("mob_id", &self.mob_id)
+                .field("mob_incarnation", &"<redacted>")
+                .field("profiles", &self.profiles)
+                .finish()
+        }
     }
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct Reset {}
@@ -22725,7 +22771,9 @@ pub enum TransitionId {
     SetMobOperatorProfileMutation,
     SetMobOperatorCreateAuthority,
     GrantMobOperatorManageMob,
+    RebindMobOperatorManageMob,
     SetMobOperatorSpawnProfilesInMob,
+    RebindMobOperatorSpawnProfilesInMob,
     BeginUnregisterSessionIdle,
     BeginUnregisterSessionAttached,
     BeginUnregisterSessionRunning,
@@ -25451,6 +25499,7 @@ pub fn initial_state() -> State {
         mob_operator_can_mutate_profiles: false,
         mob_operator_managed_mob_scope: Default::default(),
         mob_operator_spawn_profile_scope: Default::default(),
+        mob_operator_mob_incarnations: Default::default(),
         mob_operator_caller_provenance: None,
         mob_operator_audit_invocation_id: None,
         drain_phase: DrainPhase::Inactive,

@@ -2229,6 +2229,10 @@ pub fn meerkat_machine_schema_metadata() -> MachineSchemaMetadata {
                 &["Inherit", "Enable", "Disable"],
             ),
             NamedTypeBinding::type_path(
+                "MobIncarnationId",
+                "meerkat_core::service::MobIncarnationId",
+            ),
+            NamedTypeBinding::type_path(
                 "MobToolCallerProvenance",
                 "meerkat_core::service::MobToolCallerProvenance",
             ),

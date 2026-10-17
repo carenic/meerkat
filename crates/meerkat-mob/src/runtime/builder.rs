@@ -6806,6 +6806,9 @@ struct RuntimeWiring {
     command_tx: mpsc::Sender<super::scope_gate::RoutedMobCommand>,
     command_rx: mpsc::Receiver<super::scope_gate::RoutedMobCommand>,
     composition_binding: super::composition::MobCompositionBinding,
+    /// The incarnation this runtime start mints, shared by the preview
+    /// handle, the launched handle and the actor.
+    incarnation: meerkat_core::service::MobIncarnationId,
 }
 
 /// Owns the supervisor bridge until actor publication succeeds. Builder
@@ -7972,6 +7975,9 @@ impl MobBuilder {
                 command_tx: command_tx.clone(),
                 command_rx,
                 composition_binding,
+                // A resumed mob is a new incarnation: no grant from before
+                // this process names it.
+                incarnation: meerkat_core::service::MobIncarnationId::mint(),
             };
             let per_spawn_external_tools: super::handle::PerSpawnExternalTools = Arc::default();
             let preview_handle = MobHandle {
@@ -8008,6 +8014,7 @@ impl MobBuilder {
                 public_owner: None,
                 ownership: super::admission_close::MobOwnership::new(),
                 admission_closed_rx: tokio::sync::watch::channel(None).1,
+                incarnation: wiring.incarnation,
             };
             // session_service is still live here (not consumed until start_runtime_with_components)
             if let Some(hook) = before_activation {
@@ -9307,6 +9314,7 @@ impl MobBuilder {
                             additional_instructions: restore_spec.additional_instructions.clone(),
                             shell_env: restore_spec.shell_env.clone(),
                             mob_tool_authority_context: None,
+                            mob_incarnation: Some(tool_handle.incarnation()),
                             inherited_tool_filter: restore_spec.inherited_tool_filter.clone(),
                             tool_access_policy: restore_spec.tool_access_policy.clone(),
                             system_prompt_override: restore_spec.system_prompt_override.clone(),
@@ -9563,6 +9571,7 @@ impl MobBuilder {
                 additional_instructions: restore_spec.additional_instructions.clone(),
                 shell_env: restore_spec.shell_env.clone(),
                 mob_tool_authority_context: None,
+                mob_incarnation: Some(tool_handle.incarnation()),
                 inherited_tool_filter: restore_spec.inherited_tool_filter.clone(),
                 tool_access_policy: restore_spec.tool_access_policy.clone(),
                 system_prompt_override: restore_spec.system_prompt_override.clone(),
@@ -10046,6 +10055,7 @@ impl MobBuilder {
                 command_tx,
                 command_rx,
                 composition_binding,
+                incarnation: meerkat_core::service::MobIncarnationId::mint(),
             };
             let flow_target_provisioner = Arc::new(std::sync::RwLock::new(None));
             let explicit_resume_operations =
@@ -10181,6 +10191,7 @@ impl MobBuilder {
                 command_tx,
                 command_rx,
                 composition_binding,
+                incarnation,
             } = wiring;
             let handle_session_service = session_service.clone();
             let wiring_public_phase = seeded_mob_public_phase(dsl_authority.state());
@@ -10222,6 +10233,7 @@ impl MobBuilder {
                 public_owner: None,
                 ownership: Arc::clone(&ownership),
                 admission_closed_rx,
+                incarnation,
             };
             if let Some(hook) = before_activation {
                 hook(handle.read_handle()).await?;
@@ -10349,6 +10361,7 @@ impl MobBuilder {
 
             let mut actor = MobActor {
                 definition,
+                incarnation,
                 roster,
                 events,
                 placed_completion_durable_index,

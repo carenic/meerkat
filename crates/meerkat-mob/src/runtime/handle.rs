@@ -5510,6 +5510,9 @@ pub struct MobHandle {
     /// actor is the sole writer.
     pub(super) admission_closed_rx:
         tokio::sync::watch::Receiver<Option<super::admission_close::MobAdmissionCloseReason>>,
+    /// The incarnation this mob's runtime minted when it started; see
+    /// [`MobHandle::incarnation`].
+    pub(super) incarnation: meerkat_core::service::MobIncarnationId,
 }
 
 /// Per-member retained per-spawn tool overlays (`SpawnMemberSpec::external_tools`)
@@ -8221,6 +8224,16 @@ impl MobHandle {
     /// Mob ID.
     pub fn mob_id(&self) -> &MobId {
         &self.definition.id
+    }
+
+    /// The incarnation of this mob: minted once when its runtime started
+    /// (create, or resume in a new process) and shared by every clone. A mob
+    /// destroyed and created again under the same id is a new incarnation,
+    /// so mob operator scope granted for this mob
+    /// (`meerkat_runtime::mob_operator_authority::grant_manage_mob`) never
+    /// reaches a later one.
+    pub fn incarnation(&self) -> meerkat_core::service::MobIncarnationId {
+        self.incarnation
     }
 
     /// Change-notification seam over the actor-published machine state.

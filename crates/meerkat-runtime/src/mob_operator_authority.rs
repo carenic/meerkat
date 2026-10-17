@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use meerkat_core::ToolCategoryOverride;
 use meerkat_core::service::{
-    MobToolAuthorityContext, MobToolCallerProvenance, OpaquePrincipalToken,
+    MobIncarnationId, MobToolAuthorityContext, MobToolCallerProvenance, OpaquePrincipalToken,
 };
 
 use crate::meerkat_machine::dsl;
@@ -38,7 +38,7 @@ pub extern "Rust" fn generated_authority_bridge_token_is_valid(
 #[allow(improper_ctypes_definitions, unsafe_code)]
 unsafe extern "Rust" {
     #[link_name = concat!(
-        "__meerkat_core_runtime_generated_mob_tool_authority_context_build_v1_",
+        "__meerkat_core_runtime_generated_mob_tool_authority_context_build_v2_",
         env!("MEERKAT_GENERATED_AUTHORITY_BRIDGE_SYMBOL_SUFFIX")
     )]
     fn core_generated_mob_tool_authority_context_build(
@@ -49,6 +49,7 @@ unsafe extern "Rust" {
         can_run_adaptive_packs: bool,
         managed_mob_scope: BTreeSet<String>,
         spawn_profile_scope: BTreeMap<String, BTreeSet<String>>,
+        mob_incarnations: BTreeMap<String, MobIncarnationId>,
         caller_provenance: Option<MobToolCallerProvenance>,
         audit_invocation_id: Option<String>,
     ) -> Result<MobToolAuthorityContext, String>;
@@ -127,6 +128,10 @@ fn resolve_requested_mob_operator_authority(
 /// [`restore_mob_operator_authority`] rejects unsealed contexts). Every read
 /// re-mints a sealed context from these facts through the generated ladder
 /// via [`mint_mob_operator_authority_from_facts`].
+///
+/// The facts name mobs by id only: they are the durable record of the one
+/// mob that holds them, and the re-mint binds every scope entry to that
+/// mob's live incarnation.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct MobOperatorAuthorityFacts {
     pub can_create_mobs: bool,
@@ -144,22 +149,43 @@ pub struct MobOperatorAuthorityFacts {
 /// `is_generated_authority_context()` — no stored-context rehydration exists
 /// on this path.
 ///
-/// `caller_provenance` carries the member identity; `audit_invocation_id`
-/// carries the upcall `request_id` so operator-action provenance names the
-/// member caller and request.
+/// `holder_mob_id` and `holder_incarnation` name the mob whose store holds
+/// the facts, as it runs now: every scope entry is bound to that incarnation,
+/// and facts that scope any other mob are refused, since a record never
+/// grants authority over a mob that does not hold it. `caller_provenance`
+/// carries the member identity; `audit_invocation_id` carries the upcall
+/// `request_id` so operator-action provenance names the member caller and
+/// request.
 pub fn mint_mob_operator_authority_from_facts(
     facts: &MobOperatorAuthorityFacts,
+    holder_mob_id: &str,
+    holder_incarnation: MobIncarnationId,
     caller_provenance: MobToolCallerProvenance,
     audit_invocation_id: impl Into<String>,
 ) -> Result<MobToolAuthorityContext, String> {
+    if let Some(foreign) = facts
+        .managed_mob_scope
+        .iter()
+        .chain(facts.spawn_profile_scope.keys())
+        .find(|mob_id| mob_id.as_str() != holder_mob_id)
+    {
+        return Err(format!(
+            "mob operator authority facts held by mob '{holder_mob_id}' scope another mob '{foreign}'"
+        ));
+    }
     let mut context = create_only_mob_operator_authority()?;
     context = set_create_authority(&context, facts.can_create_mobs)?;
     context = set_profile_mutation(&context, facts.can_mutate_profiles)?;
     for mob_id in &facts.managed_mob_scope {
-        context = grant_manage_mob(&context, mob_id.clone())?;
+        context = grant_manage_mob(&context, mob_id.clone(), holder_incarnation)?;
     }
     for (mob_id, profiles) in &facts.spawn_profile_scope {
-        context = grant_spawn_profiles_in_mob(&context, mob_id.clone(), profiles.iter().cloned())?;
+        context = grant_spawn_profiles_in_mob(
+            &context,
+            mob_id.clone(),
+            holder_incarnation,
+            profiles.iter().cloned(),
+        )?;
     }
     context = with_caller_provenance(&context, caller_provenance)?;
     with_audit_invocation_id(&context, audit_invocation_id)
@@ -197,15 +223,21 @@ pub fn set_profile_mutation(
     context_from_authority_state(authority.state())
 }
 
+/// Grant manage scope over the mob `mob_id` as it runs at `mob_incarnation`,
+/// the incarnation its runtime minted when it started. The grant never
+/// reaches a later mob under the same id. A grant for a new incarnation of an
+/// id replaces the old binding and drops the spawn-profile scope held for it.
 pub fn grant_manage_mob(
     authority_context: &MobToolAuthorityContext,
     mob_id: impl Into<String>,
+    mob_incarnation: MobIncarnationId,
 ) -> Result<MobToolAuthorityContext, String> {
     let mut authority = authority_from_context(authority_context)?;
     apply(
         &mut authority,
         dsl::MeerkatMachineInput::GrantMobOperatorManageMob {
             mob_id: mob_id.into(),
+            mob_incarnation,
         },
     )?;
     context_from_authority_state(authority.state())
@@ -214,14 +246,19 @@ pub fn grant_manage_mob(
 pub fn grant_spawn_profile_in_mob(
     authority_context: &MobToolAuthorityContext,
     mob_id: impl Into<String>,
+    mob_incarnation: MobIncarnationId,
     profile: impl Into<String>,
 ) -> Result<MobToolAuthorityContext, String> {
-    grant_spawn_profiles_in_mob(authority_context, mob_id, [profile.into()])
+    grant_spawn_profiles_in_mob(authority_context, mob_id, mob_incarnation, [profile.into()])
 }
 
+/// Grant spawn-profile scope in the mob `mob_id` as it runs at
+/// `mob_incarnation`. A grant for a new incarnation of an id replaces the old
+/// binding and drops the manage scope held for it.
 pub fn grant_spawn_profiles_in_mob<I, S>(
     authority_context: &MobToolAuthorityContext,
     mob_id: impl Into<String>,
+    mob_incarnation: MobIncarnationId,
     profiles: I,
 ) -> Result<MobToolAuthorityContext, String>
 where
@@ -233,6 +270,7 @@ where
         &mut authority,
         dsl::MeerkatMachineInput::SetMobOperatorSpawnProfilesInMob {
             mob_id: mob_id.into(),
+            mob_incarnation,
             profiles: profiles.into_iter().map(Into::into).collect(),
         },
     )?;
@@ -297,6 +335,7 @@ fn apply_restore(
             can_mutate_profiles: authority_context.can_mutate_profiles(),
             managed_mob_scope: authority_context.managed_mob_scope().clone(),
             spawn_profile_scope: authority_context.spawn_profile_scope().clone(),
+            mob_incarnations: authority_context.mob_incarnations().clone(),
             caller_provenance: caller_provenance
                 .unwrap_or_else(|| authority_context.caller_provenance().cloned()),
             audit_invocation_id: audit_invocation_id
@@ -334,6 +373,7 @@ fn context_from_authority_state(
             false,
             state.mob_operator_managed_mob_scope.clone(),
             state.mob_operator_spawn_profile_scope.clone(),
+            state.mob_operator_mob_incarnations.clone(),
             state.mob_operator_caller_provenance.clone(),
             state.mob_operator_audit_invocation_id.clone(),
         )
@@ -356,10 +396,16 @@ mod tests {
     fn persisted_mob_authority_projection_does_not_restore_behavior_authority() {
         let authority = create_only_mob_operator_authority()
             .expect("generated authority should allow explicit create request");
-        let authority = grant_manage_mob(&authority, "mob-1")
+        let incarnation = MobIncarnationId::mint();
+        let authority = grant_manage_mob(&authority, "mob-1", incarnation)
             .expect("generated authority should accept manage scope grant");
-        let authority = grant_spawn_profile_in_mob(&authority, "mob-2", "investigator")
-            .expect("generated authority should accept spawn-profile scope grant");
+        let authority = grant_spawn_profile_in_mob(
+            &authority,
+            "mob-2",
+            MobIncarnationId::mint(),
+            "investigator",
+        )
+        .expect("generated authority should accept spawn-profile scope grant");
         let authority = with_caller_provenance(
             &authority,
             MobToolCallerProvenance::default().with_mob_id("mob-1"),
@@ -371,7 +417,7 @@ mod tests {
         let projected = persisted_projection(authority);
         assert!(!projected.is_generated_authority_context());
         assert!(!projected.can_create_mobs());
-        assert!(!projected.can_manage_mob("mob-1"));
+        assert!(!projected.can_manage_mob("mob-1", incarnation));
 
         let (override_mob, restored) =
             resolve_mob_operator_access(ToolCategoryOverride::Enable, Some(projected));
@@ -394,8 +440,11 @@ mod tests {
                 BTreeSet::from(["investigator".to_string(), "writer".to_string()]),
             )]),
         };
+        let incarnation = MobIncarnationId::mint();
         let minted = mint_mob_operator_authority_from_facts(
             &facts,
+            "mob-1",
+            incarnation,
             MobToolCallerProvenance::default().with_mob_id("mob-1"),
             "req-42",
         )
@@ -404,8 +453,10 @@ mod tests {
         assert!(minted.is_generated_authority_context());
         assert!(!minted.can_create_mobs());
         assert!(minted.can_mutate_profiles());
-        assert!(minted.can_manage_mob("mob-1"));
-        assert!(!minted.can_manage_mob("mob-2"));
+        assert!(minted.can_manage_mob("mob-1", incarnation));
+        assert!(!minted.can_manage_mob("mob-1", MobIncarnationId::mint()));
+        assert!(!minted.can_manage_mob("mob-2", incarnation));
+        assert!(minted.spawn_profile_scope_contains("mob-1", incarnation, "writer"));
         assert_eq!(minted.managed_mob_scope(), &facts.managed_mob_scope);
         assert_eq!(minted.spawn_profile_scope(), &facts.spawn_profile_scope);
         assert_eq!(minted.audit_invocation_id(), Some("req-42"));
@@ -423,6 +474,8 @@ mod tests {
         };
         let minted = mint_mob_operator_authority_from_facts(
             &facts,
+            "mob-1",
+            MobIncarnationId::mint(),
             MobToolCallerProvenance::default(),
             "req-1",
         )
@@ -440,12 +493,153 @@ mod tests {
             .expect("generated authority should allow explicit create request");
         let projected = persisted_projection(authority);
 
-        let error = grant_manage_mob(&projected, "mob-1")
+        let error = grant_manage_mob(&projected, "mob-1", MobIncarnationId::mint())
             .expect_err("unsealed projection must not drive live authority mutation");
 
         assert!(
             error.contains("was not minted by generated authority"),
             "unexpected error: {error}"
         );
+    }
+
+    fn create_only() -> MobToolAuthorityContext {
+        create_only_mob_operator_authority()
+            .expect("generated authority should allow explicit create request")
+    }
+
+    /// A grant reaches only the incarnation it names: a later mob under the
+    /// same id is another incarnation and is not in scope.
+    #[test]
+    fn grant_binds_scope_to_the_named_incarnation() {
+        let first = MobIncarnationId::mint();
+        let later = MobIncarnationId::mint();
+        let authority = grant_manage_mob(&create_only(), "mob-1", first)
+            .expect("generated authority should accept manage scope grant");
+        let authority = grant_spawn_profile_in_mob(&authority, "mob-2", first, "worker")
+            .expect("generated authority should accept spawn-profile scope grant");
+
+        assert!(authority.can_manage_mob("mob-1", first));
+        assert!(!authority.can_manage_mob("mob-1", later));
+        assert!(authority.spawn_profile_scope_contains("mob-2", first, "worker"));
+        assert!(!authority.spawn_profile_scope_present("mob-2", later));
+        assert_eq!(authority.mob_incarnations().get("mob-1"), Some(&first));
+
+        // The same grant again is idempotent.
+        let again = grant_manage_mob(&authority, "mob-1", first)
+            .expect("a repeated grant for the same incarnation is accepted");
+        assert_eq!(again.managed_mob_scope(), authority.managed_mob_scope());
+        assert_eq!(again.mob_incarnations(), authority.mob_incarnations());
+    }
+
+    /// Manage scope for mob X at I1, then a spawn grant for X at I2: the
+    /// spawn grant replaces the binding and the stale manage scope is gone,
+    /// for both incarnations.
+    #[test]
+    fn a_spawn_grant_for_a_new_incarnation_drops_stale_manage_scope() {
+        let stale = MobIncarnationId::mint();
+        let current = MobIncarnationId::mint();
+        let authority = grant_manage_mob(&create_only(), "mob-x", stale)
+            .expect("generated authority should accept manage scope grant");
+        assert!(authority.can_manage_mob("mob-x", stale));
+
+        let authority = grant_spawn_profile_in_mob(&authority, "mob-x", current, "worker")
+            .expect("a spawn grant for a new incarnation rebinds the mob id");
+
+        assert!(!authority.can_manage_mob("mob-x", current));
+        assert!(!authority.can_manage_mob("mob-x", stale));
+        assert!(!authority.managed_mob_scope().contains("mob-x"));
+        assert!(authority.spawn_profile_scope_contains("mob-x", current, "worker"));
+        assert!(!authority.spawn_profile_scope_present("mob-x", stale));
+        assert_eq!(authority.mob_incarnations().get("mob-x"), Some(&current));
+    }
+
+    /// Spawn scope for mob X at I1, then a manage grant for X at I2: the
+    /// stale spawn-profile scope does not carry over to the new mob.
+    #[test]
+    fn a_manage_grant_for_a_new_incarnation_drops_stale_spawn_scope() {
+        let stale = MobIncarnationId::mint();
+        let current = MobIncarnationId::mint();
+        let authority = grant_spawn_profile_in_mob(&create_only(), "mob-x", stale, "worker")
+            .expect("generated authority should accept spawn-profile scope grant");
+
+        let authority = grant_manage_mob(&authority, "mob-x", current)
+            .expect("a manage grant for a new incarnation rebinds the mob id");
+
+        assert!(authority.can_manage_mob("mob-x", current));
+        assert!(!authority.spawn_profile_scope_present("mob-x", current));
+        assert!(!authority.spawn_profile_scope_contains("mob-x", current, "worker"));
+        assert!(authority.spawn_profile_scope().get("mob-x").is_none());
+    }
+
+    /// Re-minting provenance or the audit id keeps every binding.
+    #[test]
+    fn provenance_and_audit_re_mints_keep_incarnation_bindings() {
+        let incarnation = MobIncarnationId::mint();
+        let authority = grant_manage_mob(&create_only(), "mob-1", incarnation)
+            .expect("generated authority should accept manage scope grant");
+        let authority = with_caller_provenance(
+            &authority,
+            MobToolCallerProvenance::default().with_mob_id("mob-1"),
+        )
+        .expect("generated authority should accept caller provenance");
+        let authority = with_audit_invocation_id(&authority, "audit-1")
+            .expect("generated authority should accept audit invocation id");
+        let restored =
+            restore_mob_operator_authority(&authority).expect("a sealed context restores");
+
+        assert!(restored.can_manage_mob("mob-1", incarnation));
+        assert_eq!(restored.mob_incarnations(), authority.mob_incarnations());
+    }
+
+    /// The generated restore refuses a scope that names a mob without an
+    /// incarnation binding.
+    #[test]
+    fn generated_restore_refuses_an_unbound_scope() {
+        let mut authority = fresh_authority();
+        let error = apply(
+            &mut authority,
+            dsl::MeerkatMachineInput::RestoreMobOperatorAuthority {
+                principal_token: OpaquePrincipalToken::generated(),
+                can_create_mobs: true,
+                can_mutate_profiles: true,
+                managed_mob_scope: BTreeSet::from(["mob-1".to_string()]),
+                spawn_profile_scope: BTreeMap::new(),
+                mob_incarnations: BTreeMap::new(),
+                caller_provenance: None,
+                audit_invocation_id: None,
+            },
+        )
+        .expect_err("a restore whose scope names an unbound mob must be refused");
+        assert!(error.contains("rejected"), "{error}");
+        assert!(!authority.state().mob_operator_authority_present);
+    }
+
+    /// Facts are the record of the mob that holds them: facts that scope any
+    /// other mob are refused instead of re-minted.
+    #[test]
+    fn facts_naming_another_mob_are_refused() {
+        for facts in [
+            MobOperatorAuthorityFacts {
+                managed_mob_scope: BTreeSet::from(["other-mob".to_string()]),
+                ..MobOperatorAuthorityFacts::default()
+            },
+            MobOperatorAuthorityFacts {
+                spawn_profile_scope: BTreeMap::from([(
+                    "other-mob".to_string(),
+                    BTreeSet::from(["worker".to_string()]),
+                )]),
+                ..MobOperatorAuthorityFacts::default()
+            },
+        ] {
+            let error = mint_mob_operator_authority_from_facts(
+                &facts,
+                "holder-mob",
+                MobIncarnationId::mint(),
+                MobToolCallerProvenance::default(),
+                "req-1",
+            )
+            .expect_err("facts scoping another mob must be refused");
+            assert!(error.contains("other-mob"), "{error}");
+        }
     }
 }

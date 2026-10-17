@@ -368,6 +368,49 @@ impl TemporaryCouncilHostBootstrap {
     }
 }
 
+/// The incarnation each participant's source mob was admitted at, by
+/// participant order.
+///
+/// Belongs to the attempt, like [`TemporaryCouncilHostBootstrap`]: held in
+/// memory by the run its caller admitted, never fingerprinted or persisted
+/// (a joined caller or a replay uses the owning run's). Seating refuses a
+/// participant whose source mob id names another incarnation by then, so a
+/// mob destroyed and created again under the id after the admission is
+/// never forked. A run with no admitted sources (a host's own council) seats
+/// the source mob it finds under the id. A council is never run again after
+/// its process dies (recovery seals it interrupted), so no seating outlives
+/// the incarnations it was admitted at.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct TemporaryCouncilAdmittedSources {
+    by_order: BTreeMap<u32, meerkat_core::service::MobIncarnationId>,
+}
+
+impl TemporaryCouncilAdmittedSources {
+    /// Record that participant `order`'s source mob was admitted at
+    /// `incarnation`.
+    pub(crate) fn admit(
+        &mut self,
+        order: u32,
+        incarnation: meerkat_core::service::MobIncarnationId,
+    ) {
+        self.by_order.insert(order, incarnation);
+    }
+
+    /// The incarnation participant `order`'s source mob was admitted at.
+    fn incarnation_of(&self, order: u32) -> Option<meerkat_core::service::MobIncarnationId> {
+        self.by_order.get(&order).copied()
+    }
+}
+
+/// What belongs to one attempt to run a council rather than to its
+/// identity: never fingerprinted or persisted, and ignored by a replay or a
+/// joined caller, which use the owning run's.
+#[derive(Debug, Clone, Default)]
+struct TemporaryCouncilAttempt {
+    host_bootstrap: TemporaryCouncilHostBootstrap,
+    admitted_sources: TemporaryCouncilAdmittedSources,
+}
+
 /// The typed contract a `StructuredResult` merge must satisfy.
 ///
 /// A council does not accept "any syntactically valid JSON" as a structured
@@ -1180,8 +1223,27 @@ impl TemporaryCouncilCoordinator {
         &self,
         request: TemporaryCouncilRequest,
     ) -> Result<TemporaryCouncilOutcome, TemporaryCouncilError> {
-        self.run_with_host_bootstrap(request, TemporaryCouncilHostBootstrap::none(), None)
+        self.run_with_host_bootstrap(request, TemporaryCouncilAttempt::default(), None)
             .await
+    }
+
+    /// [`Self::run`] for a convener admitted to each participant's source
+    /// mob at `sources`: a participant whose source mob is another
+    /// incarnation by its seating is refused.
+    pub(crate) async fn run_admitted(
+        &self,
+        request: TemporaryCouncilRequest,
+        sources: TemporaryCouncilAdmittedSources,
+    ) -> Result<TemporaryCouncilOutcome, TemporaryCouncilError> {
+        self.run_with_host_bootstrap(
+            request,
+            TemporaryCouncilAttempt {
+                host_bootstrap: TemporaryCouncilHostBootstrap::none(),
+                admitted_sources: sources,
+            },
+            None,
+        )
+        .await
     }
 
     /// [`Self::run`] for a convener that runs the council detached and
@@ -1196,20 +1258,40 @@ impl TemporaryCouncilCoordinator {
         request: TemporaryCouncilRequest,
         job: TemporaryCouncilJobBinding,
     ) -> Result<TemporaryCouncilOutcome, TemporaryCouncilError> {
-        self.run_with_host_bootstrap(request, TemporaryCouncilHostBootstrap::none(), Some(job))
+        self.run_with_host_bootstrap(request, TemporaryCouncilAttempt::default(), Some(job))
             .await
     }
 
-    /// [`Self::run`] with the one-time host bootstrap a council needs to seat
-    /// HOST-owned participants.
+    /// [`Self::run_detached`] for a convener admitted to each participant's
+    /// source mob at `sources` (see [`Self::run_admitted`]).
+    pub(crate) async fn run_detached_admitted(
+        &self,
+        request: TemporaryCouncilRequest,
+        job: TemporaryCouncilJobBinding,
+        sources: TemporaryCouncilAdmittedSources,
+    ) -> Result<TemporaryCouncilOutcome, TemporaryCouncilError> {
+        self.run_with_host_bootstrap(
+            request,
+            TemporaryCouncilAttempt {
+                host_bootstrap: TemporaryCouncilHostBootstrap::none(),
+                admitted_sources: sources,
+            },
+            Some(job),
+        )
+        .await
+    }
+
+    /// [`Self::run`] with what belongs to this attempt: the one-time host
+    /// bootstrap a council needs to seat HOST-owned participants, and the
+    /// incarnations its convener was admitted to the source mobs at.
     ///
-    /// The bootstrap belongs to the ATTEMPT, not to the council identity: a
-    /// replay or a joined caller reuses the owning task's bootstrap and this
-    /// one is ignored, and nothing from it is fingerprinted or persisted.
+    /// Both belong to the ATTEMPT, not to the council identity: a replay or a
+    /// joined caller reuses the owning task's and this one is ignored, and
+    /// nothing from it is fingerprinted or persisted.
     async fn run_with_host_bootstrap(
         &self,
         request: TemporaryCouncilRequest,
-        host_bootstrap: TemporaryCouncilHostBootstrap,
+        attempt: TemporaryCouncilAttempt,
         detached_job: Option<TemporaryCouncilJobBinding>,
     ) -> Result<TemporaryCouncilOutcome, TemporaryCouncilError> {
         // Shape validation only. Deadline resolution is deliberately NOT done
@@ -1246,7 +1328,7 @@ impl TemporaryCouncilCoordinator {
             match self
                 .admit_owned(
                     &validated,
-                    host_bootstrap,
+                    attempt,
                     detached_job,
                     key,
                     owner_tx.clone(),
@@ -1295,7 +1377,7 @@ impl TemporaryCouncilCoordinator {
     async fn admit_owned(
         &self,
         validated: &ValidatedRequest,
-        host_bootstrap: TemporaryCouncilHostBootstrap,
+        attempt: TemporaryCouncilAttempt,
         detached_job: Option<TemporaryCouncilJobBinding>,
         key: String,
         tx: tokio::sync::watch::Sender<Option<CouncilPublish>>,
@@ -1470,7 +1552,8 @@ impl TemporaryCouncilCoordinator {
                         state: state.clone(),
                         validated,
                         record,
-                        host_bootstrap,
+                        host_bootstrap: attempt.host_bootstrap,
+                        admitted_sources: attempt.admitted_sources,
                         claim: claim.clone(),
                     };
                     // A panic inside execution must not be a silent hang: it is
@@ -2052,6 +2135,8 @@ struct CouncilRun {
     validated: ValidatedRequest,
     record: TemporaryCouncilRecord,
     host_bootstrap: TemporaryCouncilHostBootstrap,
+    /// The incarnations the convener was admitted to the source mobs at.
+    admitted_sources: TemporaryCouncilAdmittedSources,
     /// This executor's claim. Every machine advance carries it, so a takeover
     /// by another process fences this task at its very next commit.
     claim: CouncilClaim,
@@ -2298,6 +2383,18 @@ impl CouncilRun {
                     });
                 }
             };
+            // The convener was admitted to one mob; a mob created under the
+            // id since then is not it, and nothing of it is forked.
+            if self
+                .admitted_sources
+                .incarnation_of(custody.order)
+                .is_some_and(|admitted| source.incarnation() != admitted)
+            {
+                return Err(TemporaryCouncilExitReason::ParticipantSourceReplaced {
+                    participant_order: custody.order,
+                    source_mob_id: custody.source_mob_id.clone(),
+                });
+            }
             let source_profile = source
                 .effective_member_profile_witness(&custody.source_identity)
                 .await

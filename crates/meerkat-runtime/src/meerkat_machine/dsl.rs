@@ -4870,6 +4870,7 @@ impl PeerAddress {
 // outside this macro invocation; canonical semantics live in the catalog DSL.
 meerkat_machine_schema::meerkat_catalog_machine_dsl!("meerkat-runtime", "meerkat_machine::dsl");
 
+pub type MobIncarnationId = meerkat_core::service::MobIncarnationId;
 pub type MobToolCallerProvenance = meerkat_core::service::MobToolCallerProvenance;
 pub type OpaquePrincipalToken = meerkat_core::service::OpaquePrincipalToken;
 

@@ -764,6 +764,7 @@ pub(super) fn compose_external_tools_for_profile(
                 meerkat_runtime::mob_operator_authority::grant_spawn_profiles_in_mob(
                     &authority_context,
                     mob_id,
+                    mob_handle.incarnation(),
                     profiles,
                 )
                 .map_err(|error| {
@@ -973,7 +974,9 @@ impl MobOperatorToolDispatcher {
         // projection. MobMachine — not this shell — decides the Allow/Deny
         // verdict; we mirror it (Denied -> access_denied). Fails closed.
         let mob_id = self.handle.definition().id.as_str();
-        let can_manage_mob = self.authority_context.can_manage_mob(mob_id);
+        let can_manage_mob = self
+            .authority_context
+            .can_manage_mob(mob_id, self.handle.incarnation());
         let admission = self
             .handle
             .resolve_current_mob_admission(can_manage_mob)
@@ -1049,7 +1052,8 @@ impl MobOperatorToolDispatcher {
 
     fn can_manage_current_mob(&self) -> bool {
         let mob_id = self.handle.definition().id.as_str();
-        self.authority_context.can_manage_mob(mob_id)
+        self.authority_context
+            .can_manage_mob(mob_id, self.handle.incarnation())
     }
 
     async fn ensure_spawn_member_scope(
@@ -1066,11 +1070,14 @@ impl MobOperatorToolDispatcher {
         // `.is_some()` presence and the raw per-profile scope set membership;
         // args this surface's spawn tool does not accept stay `false`.
         let mob_id = self.handle.definition().id.as_str();
+        let incarnation = self.handle.incarnation();
         let observations = SpawnMemberAdmissionObservations {
-            manage_scope_present: self.authority_context.can_manage_mob(mob_id),
-            profile_scope_contains: self
-                .authority_context
-                .spawn_profile_scope_contains(mob_id, &args.profile),
+            manage_scope_present: self.authority_context.can_manage_mob(mob_id, incarnation),
+            profile_scope_contains: self.authority_context.spawn_profile_scope_contains(
+                mob_id,
+                incarnation,
+                &args.profile,
+            ),
             resume_bridge_session_present: args.resume_bridge_session_id.is_some(),
             resume_session_present: args.resume_session_id.is_some(),
             backend_present: args.backend.is_some(),
@@ -1110,9 +1117,11 @@ impl MobOperatorToolDispatcher {
     /// here rather than reduced in the shell. Fails closed.
     async fn ensure_spawn_tool_scope(&self, tool_name: &str) -> Result<(), ToolError> {
         let mob_id = self.handle.definition().id.as_str();
-        let can_manage_mob = self.authority_context.can_manage_mob(mob_id);
-        let spawn_profile_scope_present =
-            self.authority_context.spawn_profile_scope_present(mob_id);
+        let incarnation = self.handle.incarnation();
+        let can_manage_mob = self.authority_context.can_manage_mob(mob_id, incarnation);
+        let spawn_profile_scope_present = self
+            .authority_context
+            .spawn_profile_scope_present(mob_id, incarnation);
         let admission = self
             .handle
             .resolve_spawn_tool_admission(can_manage_mob, spawn_profile_scope_present)
