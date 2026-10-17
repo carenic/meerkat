@@ -24,7 +24,9 @@ use meerkat_client::{
     AnthropicClient, GeminiClient, LlmDoneOutcome, LlmEvent, LlmRequest, OpenAiClient,
     types::LlmClient,
 };
-use meerkat_core::model_profile::capabilities::{EffortLevel, ModelCapabilities, ThinkingSupport};
+use meerkat_core::model_profile::capabilities::{
+    AnthropicDisabledThinking, EffortLevel, ModelCapabilities, ThinkingSupport,
+};
 use meerkat_core::{Message, Provider, UserMessage};
 use meerkat_models::{CatalogEntry, capabilities_for, catalog};
 
@@ -349,7 +351,7 @@ async fn thinking_modes_per_capability() {
                 ..Default::default()
             })
         };
-        let configs: Vec<(&'static str, ProviderTag)> = match caps.thinking {
+        let mut configs: Vec<(&'static str, ProviderTag)> = match caps.thinking {
             ThinkingSupport::None | ThinkingSupport::GeminiThinkingLevel => {
                 // Gemini thinking goes through a separate knob
                 // (thinking_level); `effort_levels_accepted` exercises every
@@ -390,6 +392,14 @@ async fn thinking_modes_per_capability() {
                 ),
             ],
         };
+        // Disabled thinking is a per-row fact beside the thinking mode; it
+        // runs at the model's default effort, inside every recorded ceiling.
+        if caps.anthropic_disabled_thinking != AnthropicDisabledThinking::Refused {
+            configs.push((
+                "disabled",
+                anthropic_thinking(AnthropicThinkingConfig::Disabled),
+            ));
+        }
 
         let client = match build_client(entry.provider, api_key) {
             Ok(c) => c,

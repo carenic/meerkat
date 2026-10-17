@@ -5,7 +5,9 @@
 //! and `ai.google.dev/gemini-api/docs/gemini-3`.
 
 use meerkat_core::Provider;
-use meerkat_core::model_profile::capabilities::{EffortLevel, ModelCapabilities, ThinkingSupport};
+use meerkat_core::model_profile::capabilities::{
+    AnthropicDisabledThinking, EffortLevel, ModelCapabilities, ThinkingSupport,
+};
 use meerkat_core::model_profile::catalog::{ModelReleaseStage, ModelTier};
 
 /// Thinking levels of models that refuse `minimal`: the API answers 400
@@ -81,6 +83,7 @@ pub const CAPABILITIES: &[ModelCapabilities] = &[
         supports_top_p: false,
         supports_top_k: false,
         thinking: ThinkingSupport::GeminiThinkingLevel,
+        anthropic_disabled_thinking: AnthropicDisabledThinking::Refused,
         supports_reasoning: false,
         effort_levels: GEMINI_LOW_TO_HIGH,
         openai_responses_params: None,
@@ -134,6 +137,7 @@ pub const CAPABILITIES: &[ModelCapabilities] = &[
         supports_top_p: false,
         supports_top_k: false,
         thinking: ThinkingSupport::GeminiThinkingLevel,
+        anthropic_disabled_thinking: AnthropicDisabledThinking::Refused,
         supports_reasoning: false,
         effort_levels: GEMINI_LOW_TO_HIGH,
         openai_responses_params: None,
@@ -191,6 +195,7 @@ pub const CAPABILITIES: &[ModelCapabilities] = &[
         supports_top_p: false,
         supports_top_k: false,
         thinking: ThinkingSupport::GeminiThinkingLevel,
+        anthropic_disabled_thinking: AnthropicDisabledThinking::Refused,
         supports_reasoning: false,
         effort_levels: GEMINI_LOW_TO_HIGH,
         openai_responses_params: None,
@@ -254,6 +259,7 @@ pub const CAPABILITIES: &[ModelCapabilities] = &[
         supports_top_p: false,
         supports_top_k: false,
         thinking: ThinkingSupport::GeminiThinkingLevel,
+        anthropic_disabled_thinking: AnthropicDisabledThinking::Refused,
         supports_reasoning: false,
         effort_levels: GEMINI_MINIMAL_TO_HIGH,
         openai_responses_params: None,
@@ -314,6 +320,7 @@ pub const CAPABILITIES: &[ModelCapabilities] = &[
         supports_top_p: true,
         supports_top_k: true,
         thinking: ThinkingSupport::GeminiThinkingLevel,
+        anthropic_disabled_thinking: AnthropicDisabledThinking::Refused,
         supports_reasoning: false,
         effort_levels: GEMINI_MINIMAL_TO_HIGH,
         openai_responses_params: None,
@@ -375,6 +382,7 @@ pub const CAPABILITIES: &[ModelCapabilities] = &[
         supports_top_p: false,
         supports_top_k: false,
         thinking: ThinkingSupport::GeminiThinkingLevel,
+        anthropic_disabled_thinking: AnthropicDisabledThinking::Refused,
         supports_reasoning: false,
         effort_levels: GEMINI_MINIMAL_TO_HIGH,
         openai_responses_params: None,
@@ -427,6 +435,7 @@ pub const CAPABILITIES: &[ModelCapabilities] = &[
         supports_top_p: true,
         supports_top_k: true,
         thinking: ThinkingSupport::GeminiThinkingLevel,
+        anthropic_disabled_thinking: AnthropicDisabledThinking::Refused,
         supports_reasoning: false,
         effort_levels: GEMINI_LOW_TO_HIGH,
         openai_responses_params: None,
@@ -490,6 +499,7 @@ pub const CAPABILITIES: &[ModelCapabilities] = &[
         supports_top_p: true,
         supports_top_k: true,
         thinking: ThinkingSupport::GeminiThinkingLevel,
+        anthropic_disabled_thinking: AnthropicDisabledThinking::Refused,
         supports_reasoning: false,
         effort_levels: GEMINI_MINIMAL_TO_HIGH,
         openai_responses_params: None,
@@ -540,6 +550,7 @@ pub const CAPABILITIES: &[ModelCapabilities] = &[
         supports_top_p: true,
         supports_top_k: true,
         thinking: ThinkingSupport::GeminiThinkingLevel,
+        anthropic_disabled_thinking: AnthropicDisabledThinking::Refused,
         supports_reasoning: false,
         effort_levels: GEMINI_MINIMAL_TO_HIGH,
         openai_responses_params: None,

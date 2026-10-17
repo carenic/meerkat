@@ -80,9 +80,11 @@ fn apply(
                 {
                     return Err(ReasoningNotAppliedReason::BudgetConflict);
                 }
-                // Between-tools thinking is accepted at `high` effort or
-                // below.
-                if matches!(tag.thinking, Some(AnthropicThinkingConfig::BetweenTools))
+                // A thinking type the row accepts only at `high` effort or
+                // below (between_tools, and disabled on some rows) caps the
+                // level.
+                if let Some(thinking) = tag.thinking.as_ref()
+                    && capabilities.anthropic_thinking_capped_at_high_effort(thinking)
                     && level > EffortLevel::High
                 {
                     return Err(ReasoningNotAppliedReason::ThinkingModeConflict);
@@ -467,6 +469,52 @@ mod tests {
             ReasoningLoweringOutcome::NotApplied(ReasoningNotAppliedReason::ThinkingModeConflict)
         );
         assert_eq!(max, between_tools);
+    }
+
+    #[test]
+    fn anthropic_disabled_thinking_caps_the_level_only_where_the_row_records_a_ceiling() {
+        use crate::model_profile::capabilities::AnthropicDisabledThinking;
+        let disabled = Some(ProviderParamsOverride {
+            provider_tag: Some(ProviderTag::Anthropic(AnthropicProviderTag {
+                thinking: Some(AnthropicThinkingConfig::Disabled),
+                ..Default::default()
+            })),
+            ..Default::default()
+        });
+        let row = |ceiling| ModelCapabilities {
+            anthropic_disabled_thinking: ceiling,
+            ..caps(Provider::Anthropic, false, ANTHROPIC_LEVELS)
+        };
+        let lower = |caps: &ModelCapabilities, level| {
+            let mut params = disabled.clone();
+            let (_, outcome) =
+                lower_reasoning_preference(Some(caps), Provider::Anthropic, level, &mut params);
+            (outcome, params)
+        };
+
+        let capped = row(AnthropicDisabledThinking::AtOrBelowHighEffort);
+        let (outcome, params) = lower(&capped, EffortLevel::High);
+        assert_eq!(
+            outcome,
+            ReasoningLoweringOutcome::Applied(EffortLevel::High)
+        );
+        let Some(ProviderTag::Anthropic(tag)) = params.and_then(|params| params.provider_tag)
+        else {
+            panic!("anthropic tag")
+        };
+        assert_eq!(tag.effort, Some(AnthropicEffort::High));
+        assert_eq!(tag.thinking, Some(AnthropicThinkingConfig::Disabled));
+
+        let (outcome, params) = lower(&capped, EffortLevel::Max);
+        assert_eq!(
+            outcome,
+            ReasoningLoweringOutcome::NotApplied(ReasoningNotAppliedReason::ThinkingModeConflict)
+        );
+        assert_eq!(params, disabled, "the baseline is untouched");
+
+        let any = row(AnthropicDisabledThinking::AnyEffort);
+        let (outcome, _) = lower(&any, EffortLevel::Max);
+        assert_eq!(outcome, ReasoningLoweringOutcome::Applied(EffortLevel::Max));
     }
 
     #[test]

@@ -433,6 +433,21 @@ them.
   arm for it, and the implicit discriminants of the variants after it change
   (`TransitionId::*`); match them by variant name, not by numeric cast or
   position.
+- `meerkat_core::lifecycle::run_primitive::AnthropicThinkingConfig` gains the
+  variant `AnthropicThinkingConfig::Disabled`, and its wire mirror
+  `meerkat_contracts::wire::runtime::WireAnthropicThinkingConfig` gains
+  `WireAnthropicThinkingConfig::Disabled` (wire value `{"type": "disabled"}`)
+  (enum variant added). Exhaustive matches must handle them.
+- `meerkat_core::model_profile::capabilities::ModelCapabilities` gains the
+  public field `anthropic_disabled_thinking: AnthropicDisabledThinking`
+  (constructible struct adds field); struct literals must set it
+  (`AnthropicDisabledThinking::Refused` for every non-Anthropic row and for
+  any row whose model does not accept `disabled`).
+- Behaviour-only (not measured by the gate): the advertised `params_schema`
+  of an Anthropic model that accepts `disabled` lists it in its `thinking`
+  property; for the budget-only models (Claude Sonnet 4.5, Haiku 4.5 and
+  Opus 4.5) that property becomes a `oneOf` of the budget form and
+  `{"type": "disabled"}`.
 
 ### Security
 
@@ -777,6 +792,24 @@ them.
   `BINARY_INTEGRITY_MISMATCH`, `BINARY_DIGEST_UNAVAILABLE` (whose message
   names the exact release asset URL for a manual install) and
   `BINARY_DOWNLOAD_TOO_LARGE` (an auto-download archive over 256 MiB).
+- Anthropic `thinking: {"type": "disabled"}`
+  (`AnthropicThinkingConfig::Disabled`) turns thinking off. Each catalog row
+  records whether its model accepts it
+  (`ModelCapabilities::anthropic_disabled_thinking`, from Anthropic's
+  per-model thinking table): Claude Opus 4.8, Opus 4.7, Sonnet 5, Sonnet 4.6,
+  Sonnet 4.5, Haiku 4.5 and Opus 4.5 at every effort, and Claude Opus 5 and
+  Haiku 5.5 at `high` effort or below. Claude Fable 5.1, Fable 5, Opus 5.5
+  and Sonnet 5.5 (whose lowest setting is `between_tools`) refuse it, so
+  Meerkat refuses it there with a typed local error when the agent is built
+  and before each request, as it does above `high` effort on Opus 5 and
+  Haiku 5.5. A per-turn reasoning preference above `high` is not applied
+  with disabled thinking on Opus 5 and Haiku 5.5 (`ThinkingModeConflict`).
+  A forced tool choice is sent with thinking disabled. The adaptive pack's
+  layer-decision schema stays the released one, so packs keep loading across
+  host versions, and it does not offer disabled thinking to an adaptive
+  flowmaster's inline layer profiles until pack schemas are versioned; a
+  layer decision that carries it anyway is honoured as `Disabled`, and
+  refused with the same typed error where the model refuses it.
 
 ### Changed
 
@@ -1495,6 +1528,12 @@ them.
   no `finishReason`) still fails as an incomplete response, retried and then
   failing the run as `ProviderError(IncompleteResponse)`, instead of as
   `content_filtered` (#1888).
+- Disabled Anthropic thinking is not live-verified in this release: which
+  models accept it comes from Anthropic's per-model thinking table. Claude
+  Opus 5 and Haiku 5.5 accept it only at `high` effort or below, and a
+  request that sets no effort relies on their documented default efforts
+  (`high` and `medium`); set the effort explicitly at `high` or below on
+  those two models to be certain.
 
 ## [0.9.2] - 2026-10-16
 

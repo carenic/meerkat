@@ -43,12 +43,24 @@ pub(crate) fn forced_tool_choice_refusal(
     model: &str,
     tag: Option<&meerkat_core::lifecycle::run_primitive::AnthropicProviderTag>,
 ) -> Option<meerkat_llm_core::ToolChoiceRefusal> {
-    if tag.is_some_and(|tag| tag.thinking.is_some() || tag.thinking_budget_tokens.is_some()) {
+    if tag.is_some_and(turns_thinking_on) {
         return Some(meerkat_llm_core::ToolChoiceRefusal::ForcedToolWithThinking);
     }
     meerkat_models::capabilities_for(Provider::Anthropic, model)
         .is_some_and(|caps| !caps.supports_forced_tool_choice)
         .then_some(meerkat_llm_core::ToolChoiceRefusal::ModelDoesNotSupportForcedToolChoice)
+}
+
+/// Whether `tag` turns thinking on explicitly, as the lowering sends it: a
+/// thinking type other than `disabled`, or, with no type, the legacy flat
+/// budget.
+fn turns_thinking_on(tag: &meerkat_core::lifecycle::run_primitive::AnthropicProviderTag) -> bool {
+    use meerkat_core::lifecycle::run_primitive::AnthropicThinkingConfig as Thinking;
+    match tag.thinking {
+        Some(Thinking::Disabled) => false,
+        Some(Thinking::Adaptive | Thinking::Enabled { .. } | Thinking::BetweenTools) => true,
+        None => tag.thinking_budget_tokens.is_some(),
+    }
 }
 
 /// The typed refusal for Anthropic's own rejection of a forced tool choice:
@@ -291,6 +303,27 @@ mod sonnet_5_5_request_shaping {
     }
 
     #[test]
+    fn disabled_thinking_is_refused_locally_never_substituted() {
+        for effort in [None, Some(AnthropicEffort::Low)] {
+            let message = refusal(body(
+                MODEL,
+                None,
+                Some(AnthropicProviderTag {
+                    thinking: Some(AnthropicThinkingConfig::Disabled),
+                    effort,
+                    ..Default::default()
+                }),
+            ));
+            assert!(
+                message.contains(
+                    "does not accept thinking type 'disabled'; accepted: [adaptive, between_tools]"
+                ),
+                "{message}"
+            );
+        }
+    }
+
+    #[test]
     fn top_k_is_refused_locally() {
         let message = refusal(body(
             MODEL,
@@ -407,5 +440,108 @@ mod sonnet_5_5_request_shaping {
             error.to_string().contains("thinking_budget_tokens"),
             "{error}"
         );
+    }
+}
+
+/// `thinking: {"type": "disabled"}` across every cataloged Anthropic row:
+/// lowered as is where the row accepts it, refused locally (never sent)
+/// where it does not, and refused above `high` effort on rows with that
+/// ceiling.
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod disabled_thinking_request_shaping {
+    use meerkat_core::lifecycle::run_primitive::{
+        AnthropicEffort, AnthropicProviderTag, AnthropicThinkingConfig, ProviderTag,
+    };
+    use meerkat_core::model_profile::capabilities::{AnthropicDisabledThinking, EffortLevel};
+    use meerkat_core::{Message, Provider, UserMessage};
+    use meerkat_llm_core::{LlmError, LlmRequest};
+    use serde_json::{Value, json};
+
+    use crate::AnthropicClient;
+
+    fn body(model: &str, effort: Option<AnthropicEffort>) -> Result<Value, LlmError> {
+        let client = AnthropicClient::new("test-key".to_string()).unwrap();
+        let mut request = LlmRequest::new(model, vec![Message::User(UserMessage::text("hello"))]);
+        request.provider_params = Some(ProviderTag::Anthropic(AnthropicProviderTag {
+            thinking: Some(AnthropicThinkingConfig::Disabled),
+            effort,
+            ..Default::default()
+        }));
+        client.build_request_body(&request)
+    }
+
+    fn refusal(model: &str, result: Result<Value, LlmError>) -> String {
+        match result {
+            Err(LlmError::InvalidRequest { message }) => message,
+            other => panic!("{model}: expected a typed local refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn every_anthropic_row_lowers_or_refuses_disabled_thinking_as_cataloged() {
+        let rows: Vec<_> = meerkat_models::capabilities::all_capabilities()
+            .filter(|caps| caps.provider == Provider::Anthropic)
+            .collect();
+        assert!(rows.len() >= 14, "{} Anthropic rows", rows.len());
+        for caps in rows {
+            let model = caps.id;
+            let level = |level: EffortLevel, effort: AnthropicEffort| {
+                caps.effort_levels.contains(&level).then_some(effort)
+            };
+            let within: Vec<Option<AnthropicEffort>> = std::iter::once(None)
+                .chain(level(EffortLevel::Low, AnthropicEffort::Low).map(Some))
+                .chain(level(EffortLevel::High, AnthropicEffort::High).map(Some))
+                .collect();
+            let above: Vec<AnthropicEffort> = [
+                level(EffortLevel::Xhigh, AnthropicEffort::XHigh),
+                level(EffortLevel::Max, AnthropicEffort::Max),
+            ]
+            .into_iter()
+            .flatten()
+            .collect();
+            match caps.anthropic_disabled_thinking {
+                AnthropicDisabledThinking::Refused => {
+                    for effort in within.into_iter().chain(above.into_iter().map(Some)) {
+                        let message = refusal(model, body(model, effort));
+                        assert!(
+                            message.contains("does not accept thinking type 'disabled'"),
+                            "{model}: {message}"
+                        );
+                    }
+                }
+                AnthropicDisabledThinking::AtOrBelowHighEffort
+                | AnthropicDisabledThinking::AnyEffort => {
+                    for effort in within {
+                        let body = body(model, effort).unwrap();
+                        assert_eq!(
+                            body["thinking"],
+                            json!({"type": "disabled"}),
+                            "{model} {effort:?}: disabled takes no other field"
+                        );
+                    }
+                    for effort in above {
+                        let result = body(model, Some(effort));
+                        if caps.anthropic_disabled_thinking
+                            == AnthropicDisabledThinking::AtOrBelowHighEffort
+                        {
+                            let message = refusal(model, result);
+                            assert!(
+                                message.contains(
+                                    "accepts thinking type 'disabled' only at 'high' effort or below"
+                                ),
+                                "{model}: {message}"
+                            );
+                        } else {
+                            assert_eq!(
+                                result.unwrap()["thinking"],
+                                json!({"type": "disabled"}),
+                                "{model} {effort:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 }

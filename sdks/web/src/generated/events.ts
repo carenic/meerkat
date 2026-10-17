@@ -110,6 +110,8 @@ export type AnthropicThinkingConfig = {
   type: "enabled";
 } | {
   type: "between_tools";
+} | {
+  type: "disabled";
 };
 
 export interface AssistantImageEvent {

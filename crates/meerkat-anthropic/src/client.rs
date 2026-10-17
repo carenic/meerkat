@@ -1075,6 +1075,7 @@ impl AnthropicClient {
                     AnthropicThinkingConfig::BetweenTools => {
                         serde_json::json!({"type": "between_tools"})
                     }
+                    AnthropicThinkingConfig::Disabled => serde_json::json!({"type": "disabled"}),
                     AnthropicThinkingConfig::Enabled { budget_tokens } => serde_json::json!({
                         "type": "enabled",
                         "budget_tokens": budget_tokens,

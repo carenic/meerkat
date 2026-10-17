@@ -1825,8 +1825,8 @@ fn validate_openai_prompt_cache_retention(
 
 /// Refuse Anthropic request-shaping knobs the resolved catalog row rejects
 /// (a thinking type or budget the model does not accept, `top_k` without
-/// top-k support, `between_tools` above `high` effort) when the agent is
-/// built, instead of failing its first request. The generic
+/// top-k support, `between_tools` or a capped `disabled` above `high`
+/// effort) when the agent is built, instead of failing its first request. The generic
 /// `thinking_budget_tokens` is checked as the Anthropic lowering applies it.
 fn validate_anthropic_request_shaping(
     provider: Provider,
@@ -12810,6 +12810,68 @@ mod tests {
             .is_ok(),
             "only a Gemini build is judged by the Gemini rows"
         );
+    }
+
+    /// Disabled Anthropic thinking is refused when the agent is built on a
+    /// row that refuses it, or above `high` effort on a row with that
+    /// ceiling; rows that accept it, uncatalogued models and other providers
+    /// pass.
+    #[test]
+    fn disabled_anthropic_thinking_is_refused_at_build_where_the_row_refuses_it() {
+        use meerkat_core::lifecycle::run_primitive::{
+            AnthropicEffort, AnthropicProviderTag, AnthropicThinkingConfig, ProviderParamsOverride,
+            ProviderTag,
+        };
+        let params = |effort| ProviderParamsOverride {
+            provider_tag: Some(ProviderTag::Anthropic(AnthropicProviderTag {
+                thinking: Some(AnthropicThinkingConfig::Disabled),
+                effort,
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        let Err(BuildAgentError::Config(message)) = validate_anthropic_request_shaping(
+            Provider::Anthropic,
+            "claude-opus-5-5",
+            Some(&params(None)),
+        ) else {
+            panic!("claude-opus-5-5 refuses disabled thinking at every effort");
+        };
+        assert!(
+            message.contains("does not accept thinking type 'disabled'"),
+            "{message}"
+        );
+        let Err(BuildAgentError::Config(message)) = validate_anthropic_request_shaping(
+            Provider::Anthropic,
+            "claude-opus-5",
+            Some(&params(Some(AnthropicEffort::Max))),
+        ) else {
+            panic!("claude-opus-5 accepts disabled thinking only at high effort or below");
+        };
+        assert!(
+            message.contains("'disabled' only at 'high' effort or below"),
+            "{message}"
+        );
+        for (provider, model, effort) in [
+            (Provider::Anthropic, "claude-opus-5", None),
+            (
+                Provider::Anthropic,
+                "claude-opus-5",
+                Some(AnthropicEffort::High),
+            ),
+            (
+                Provider::Anthropic,
+                "claude-opus-4-8",
+                Some(AnthropicEffort::Max),
+            ),
+            (Provider::Anthropic, "claude-uncatalogued-preview", None),
+            (Provider::OpenAI, "claude-opus-5-5", None),
+        ] {
+            assert!(
+                validate_anthropic_request_shaping(provider, model, Some(&params(effort))).is_ok(),
+                "{provider:?} {model} {effort:?}"
+            );
+        }
     }
 
     /// A realm whose OpenAI binding is the private ChatGPT backend.
