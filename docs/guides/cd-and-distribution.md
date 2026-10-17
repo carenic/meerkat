@@ -478,7 +478,11 @@ restored binary can shadow a tool on `PATH`; the jobs that hold registry or
 publish tokens restore no cache at all; and the jobs that mint OIDC tokens or
 attest artifacts restore only caches that no workflow in the repository saves
 on a dispatch-like run (any trigger but `push`, `pull_request`, `schedule`
-and `merge_group`). A tag run restores no Bazel repository cache: the
+and `merge_group`). The workflows whose runs a tag trusts (`ci.yml`, which
+writes the exact-tree attestation, and `release-semver-readiness.yml`,
+which writes the semver attestation) and any workflow that checks out a
+ref its inputs choose save no cache on a dispatch-like run either. A tag
+run restores no Bazel repository cache: the
 BuildBuddy release binary build passes `repository-cache: "false"` and the
 full-graph validation passes `buildbuddy.yml` `repository_cache: "false"`.
 No workflow saves that cache on a dispatch-like run either

@@ -129,6 +129,10 @@ jobs:
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           key: release-x86_64-apple-darwin-cross
+          # As in release.yml: a dispatch saves no release cache, and
+          # ~/.cargo/bin is never cached.
+          save-if: ${{ github.event_name != 'workflow_dispatch' }}
+          cache-bin: "false"
 
       - name: Cross-compile the surface binary
         shell: bash

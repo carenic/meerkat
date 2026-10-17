@@ -93,6 +93,12 @@ jobs:
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           shared-key: release-semver-breaks
+          # Saved only by a push to main, the run that writes the semver
+          # attestation a tag trusts; a dispatch measures a ref its input
+          # chooses and saves nothing. ~/.cargo/bin is never cached, as in
+          # release.yml.
+          save-if: ${{ github.event_name == 'push' }}
+          cache-bin: "false"
 
       - name: Install cargo-semver-checks
         if: ${{ steps.unpublished.outputs.needed == 'true' }}

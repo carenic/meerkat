@@ -39,8 +39,8 @@ TRAILING_PASS="PASS Linux and macOS arm64 assets publish without waiting for the
 TRAILING_FAIL="FAIL The trailing Intel macOS and Windows lanes must not gate the critical assets, and no upload may replace a published asset"
 WEB_TOOLS_PASS="PASS The Web SDK release build checks every download's sha256 and wasm-pack installs nothing: wasm-bindgen (Cargo.lock's version) and wasm-opt are pinned"
 TOKEN_PASS="PASS Release workflow token is read-only except for the jobs that attest or publish, which never persist it in a checkout; no workflow passes every secret to a reusable workflow"
-CACHES_PASS="PASS GitHub Actions caches in release.yml jobs, the local actions they call and, on a tag, the reusable workflows they call are never saved on a dispatch and never cache ~/.cargo/bin; token jobs restore none, a tag run restores no Bazel repository cache, OIDC or attesting jobs restore none that a dispatch-like run of any workflow saves, and no dispatch-like run saves the Bazel repository cache (reusable workflows never run on a dispatch)"
-CACHES_FAIL="FAIL A release cache can be saved on a dispatch, cache ~/.cargo/bin, reach a token, OIDC or attesting job, or a tag run"
+CACHES_PASS="PASS GitHub Actions caches in release.yml jobs, the local actions they call and, on a tag, the reusable workflows they call are never saved on a dispatch and never cache ~/.cargo/bin; token jobs restore none, a tag run restores no Bazel repository cache, OIDC or attesting jobs restore none that a dispatch-like run of any workflow saves, and no dispatch-like run saves the Bazel repository cache (reusable workflows never run on a dispatch); a workflow that produces what a tag trusts or checks out a ref its inputs choose saves no cache on a dispatch-like run"
+CACHES_FAIL="FAIL A release cache can be saved on a dispatch, cache ~/.cargo/bin, reach a token, OIDC or attesting job, or a tag run, or a workflow a tag trusts saves a cache on a dispatch-like run"
 
 fail() {
   echo "release doctor workflow contract violated: $1" >&2
@@ -710,6 +710,53 @@ elif name == "dispatch-saves-repository-cache":
         "          repository-cache: restore\n",
         "",
     )
+elif name == "semver-readiness-dispatch-save":
+    # The pre-review semver measurement saved its rust-cache on a dispatch.
+    replace_once(
+        ".github/workflows/release-semver-readiness.yml",
+        "          save-if: ${{ github.event_name == 'push' }}\n",
+        "",
+    )
+elif name == "ci-dispatch-save":
+    # A CI lane that saves its rust-cache on a dispatch.
+    path = root / ".github/workflows/ci.yml"
+    text = path.read_text()
+    job = text.index("\n  fmt-governance:\n")
+    needle = "          save-if: ${{ github.event_name != 'workflow_dispatch' }}\n"
+    at = text.index(needle, job)
+    path.write_text(text[:at] + text[at + len(needle):])
+elif name == "input-ref-dispatch-save":
+    # A dispatch that checks out a ref its input chooses and saves a cache.
+    (root / ".github/workflows/measure-ref.yml").write_text(
+        "name: Measure a ref\n"
+        "\n"
+        "on:\n"
+        "  workflow_dispatch:\n"
+        "    inputs:\n"
+        "      ref:\n"
+        "        required: true\n"
+        "        type: string\n"
+        "\n"
+        "permissions:\n"
+        "  contents: read\n"
+        "\n"
+        "jobs:\n"
+        "  measure:\n"
+        "    runs-on: ubuntu-24.04\n"
+        "    steps:\n"
+        "      - name: Checkout\n"
+        "        uses: actions/checkout@v6\n"
+        "        with:\n"
+        "          ref: ${{ inputs.ref }}\n"
+        "\n"
+        "      - name: Cache cargo\n"
+        "        uses: Swatinem/rust-cache@v2\n"
+        "        with:\n"
+        "          shared-key: measure-ref\n"
+    )
+elif name == "trusted-workflow-missing":
+    # A renamed semver readiness workflow leaves the trusted list stale.
+    (root / ".github/workflows/release-semver-readiness.yml").unlink()
 elif name == "nightly-secrets-inherit":
     # The pre-review nightly full graph passed buildbuddy.yml every
     # repository secret.
@@ -1013,6 +1060,18 @@ expect_tree_fail_named cache-dispatch-shared-registry "${TEST_ROOT}/cache-dispat
 mutate_tree dispatch-saves-repository-cache "${TEST_ROOT}/dispatch-saves-repository-cache"
 expect_tree_fail_named dispatch-saves-repository-cache "${TEST_ROOT}/dispatch-saves-repository-cache" \
   "release-binaries-check.yml job \`build\` (in \`.github/actions/setup-buildbuddy-ci\`) saves \`buildbuddy-bazel-repository-*-*\` on a workflow_dispatch run; such runs only restore the Bazel repository cache" release-caches
+mutate_tree semver-readiness-dispatch-save "${TEST_ROOT}/semver-readiness-dispatch-save"
+expect_tree_fail_named semver-readiness-dispatch-save "${TEST_ROOT}/semver-readiness-dispatch-save" \
+  "release-semver-readiness.yml job \`semver\` saves a cache on a workflow_dispatch run" release-caches
+mutate_tree ci-dispatch-save "${TEST_ROOT}/ci-dispatch-save"
+expect_tree_fail_named ci-dispatch-save "${TEST_ROOT}/ci-dispatch-save" \
+  "ci.yml job \`fmt-governance\` saves a cache on a workflow_dispatch run" release-caches
+mutate_tree input-ref-dispatch-save "${TEST_ROOT}/input-ref-dispatch-save"
+expect_tree_fail_named input-ref-dispatch-save "${TEST_ROOT}/input-ref-dispatch-save" \
+  "measure-ref.yml job \`measure\` saves a cache on a workflow_dispatch run (\`Swatinem/rust-cache@v2\`); a workflow that checks out a ref its inputs choose saves none on such a run" release-caches
+mutate_tree trusted-workflow-missing "${TEST_ROOT}/trusted-workflow-missing"
+expect_tree_fail_named trusted-workflow-missing "${TEST_ROOT}/trusted-workflow-missing" \
+  "release-semver-readiness.yml, a workflow whose runs a tag trusts, is missing" release-caches
 mutate_tree cache-token-job-action "${TEST_ROOT}/cache-token-job-action"
 expect_tree_fail_named cache-token-job-action "${TEST_ROOT}/cache-token-job-action" \
   "job \`update_homebrew\` (in \`.github/actions/update-homebrew\`) holds a registry or publish token and restores a cache" release-caches

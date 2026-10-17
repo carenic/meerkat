@@ -66,6 +66,13 @@ them.
   `renovate.json`, `Makefile` and `scripts/` explicitly, so the CI, release
   and dependency-update configuration keeps that owner if the default
   owner changes. Repository configuration only.
+- **A dispatch saves no cache that a tag-trusted run restores.** `ci.yml`
+  (which writes the exact-tree attestation), `release-semver-readiness.yml`
+  (the semver attestation) and `release-binaries-check.yml` save no cache
+  on a `workflow_dispatch` run, and the release doctor fails on a
+  dispatch-like run that saves a cache in any workflow whose runs a tag
+  trusts or that checks out a ref its inputs choose. The semver readiness
+  and release binaries checks no longer cache `~/.cargo/bin`. CI only.
 
 ## [0.9.2] - 2026-10-16
 

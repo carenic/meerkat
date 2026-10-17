@@ -2008,6 +2008,13 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 # The Bazel external repository cache setup-buildbuddy-ci restores and
 # saves: a tag run restores none of it, and only trusted runs save it.
 BAZEL_REPOSITORY_CACHE = ("key", "buildbuddy-bazel-repository-*")
+# The workflows whose runs produce what a tag run trusts: ci.yml's exact-tree
+# attestation (require_ci_green), release-semver-readiness.yml's semver
+# attestation (release_semver_gate) and release.yml's prebuild artifacts. A
+# dispatch-like run of one of them, or of any workflow that checks out a ref
+# its inputs choose, saves no cache: it would save into the scope the next
+# trusted run restores from.
+TAG_TRUSTED_WORKFLOWS = ("ci.yml", "release-semver-readiness.yml", "release.yml")
 
 
 @dataclass(frozen=True)
@@ -2550,6 +2557,15 @@ def _reusable_cache_uses(
     return found
 
 
+def _checks_out_input_ref(text: str) -> bool:
+    """Does any job check out a ref that the run's inputs choose?"""
+    for job in _job_names(text):
+        for step in _steps_of(text, job):
+            if CHECKOUT_ACTION in step.fields.get("uses", "") and "inputs." in step.nested("with").get("ref", ""):
+                return True
+    return False
+
+
 def check_release_caches(text: str) -> list[str]:
     """What release.yml's caches can carry, read through every local action.
 
@@ -2566,7 +2582,10 @@ def check_release_caches(text: str) -> list[str]:
     workflow in the repository saves on a dispatch-like run (any trigger but
     push, pull_request, schedule and merge_group), through the same local
     action or an overlapping key. No workflow saves the Bazel repository
-    cache on a dispatch-like run at all: such runs only restore it.
+    cache on a dispatch-like run at all: such runs only restore it. A
+    workflow that produces what a tag run trusts (TAG_TRUSTED_WORKFLOWS),
+    or that checks out a ref its inputs choose, saves no cache at all on a
+    dispatch-like run.
     """
     root = REPO_ROOT
     violations: list[str] = []
@@ -2633,8 +2652,20 @@ def check_release_caches(text: str) -> list[str]:
     sources = {path.name: path.read_text(encoding="utf-8") for path in workflows}
     # The workflow under check, which may be a mutated copy.
     sources[DEFAULT_WORKFLOW.name] = text
+    for trusted in TAG_TRUSTED_WORKFLOWS:
+        if trusted not in sources:
+            report(f"{trusted}, a workflow whose runs a tag trusts, is missing; update TAG_TRUSTED_WORKFLOWS")
     for workflow, source in sorted(sources.items()):
         triggers = _workflow_triggers(source)
+        # release.yml's own jobs are checked on a dispatch above.
+        guarded = [] if workflow == DEFAULT_WORKFLOW.name else [
+            reason
+            for reason, applies in (
+                ("produces what a tag run trusts", workflow in TAG_TRUSTED_WORKFLOWS),
+                ("checks out a ref its inputs choose", _checks_out_input_ref(source)),
+            )
+            if applies
+        ]
         for trigger in sorted(triggers - set(TRUSTED_SAVE_TRIGGERS)):
             frame = OpenFrame(
                 label=f"a {trigger} run",
@@ -2644,6 +2675,11 @@ def check_release_caches(text: str) -> list[str]:
                 for writer in _job_cache_uses(source, workflow, job, frame, root) or []:
                     if not writer.may_save():
                         continue
+                    if guarded:
+                        report(
+                            f"{workflow} {writer.where} saves a cache on {frame.label} (`{writer.uses}`); "
+                            f"a workflow that {' and '.join(guarded)} saves none on such a run"
+                        )
                     for saved in writer.key_specs()[1]:
                         if _specs_overlap(BAZEL_REPOSITORY_CACHE, saved):
                             report(
