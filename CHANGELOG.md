@@ -58,8 +58,11 @@ them.
   after a restart) must register a tool that declares exactly that, compared
   on every use, before any attempt is claimed or any callback is sent;
   otherwise the job goes to `needs_attention` (`callback_binding_changed`).
-  The submitting connection itself is not checked. In 0.9.2 any route that
-  registered a tool of the same name and runner took the job.
+  The submitting connection itself is not checked. A job whose recorded
+  specification no longer decodes goes to `needs_attention`
+  (`callback_specification_unreadable`) instead of being skipped on every
+  pass. In 0.9.2 any route that registered a tool of the same name and
+  runner took the job.
 
 ### Added
 

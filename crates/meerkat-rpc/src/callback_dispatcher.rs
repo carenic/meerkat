@@ -480,6 +480,10 @@ pub struct CallbackToolDispatcher {
     /// Snapshot of global tool names from the last `poll_external_updates` (or creation).
     /// Used to detect additions/removals between polls.
     last_seen_globals: StdRwLock<HashSet<String>>,
+    /// Runs between a detached job's route check and the send to that route
+    /// (reconcile and cancel), so a test can hand the mob slot over there.
+    #[cfg(test)]
+    check_send_seam: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl CallbackToolDispatcher {
@@ -571,6 +575,8 @@ impl CallbackToolDispatcher {
             inline_names,
             detached_jobs: None,
             last_seen_globals: StdRwLock::new(HashSet::new()),
+            #[cfg(test)]
+            check_send_seam: None,
         };
         let last_seen_globals = dispatcher.current_global_names();
         dispatcher.last_seen_globals = StdRwLock::new(last_seen_globals);
@@ -613,6 +619,21 @@ impl CallbackToolDispatcher {
                 meerkat_core::ToolUnavailableReason::CallbackRouteUnclaimed
             }
         }
+    }
+
+    /// Run the test seam between a detached job's route check and the send to
+    /// that route, if one is set.
+    fn run_check_send_seam(&self) {
+        #[cfg(test)]
+        if let Some(seam) = &self.check_send_seam {
+            seam();
+        }
+    }
+
+    #[cfg(test)]
+    fn with_check_send_seam(mut self, seam: Arc<dyn Fn() + Send + Sync>) -> Self {
+        self.check_send_seam = Some(seam);
+        self
     }
 
     /// The route detached callback jobs are started and reconciled on.
@@ -802,67 +823,101 @@ impl CallbackToolDispatcher {
         let jobs = runtime.store.list_all(10_000).await.map_err(|error| {
             format!("failed to enumerate detached callbacks for reconciliation: {error}")
         })?;
+        let active = jobs
+            .into_iter()
+            .filter(|job| {
+                job.spec.realm_id == runtime.realm_id
+                    && self.owns_detached_callback_spec(&job.spec)
+                    && matches!(
+                        job.machine_state.lifecycle_phase,
+                        meerkat::JobPhase::Running | meerkat::JobPhase::WaitingExternal
+                    )
+            })
+            .collect::<Vec<_>>();
+        // One route for the pass: every active job is checked against the
+        // route its reconcile request then goes to.
+        let route = if active.is_empty() {
+            None
+        } else {
+            Some(self.job_route()?)
+        };
         let mut attempts = Vec::new();
-        for job in jobs.into_iter().filter(|job| {
-            job.spec.realm_id == runtime.realm_id && self.owns_detached_callback_spec(&job.spec)
-        }) {
-            match job.machine_state.lifecycle_phase {
-                meerkat::JobPhase::Queued | meerkat::JobPhase::RetryScheduled => {}
-                meerkat::JobPhase::Running | meerkat::JobPhase::WaitingExternal => {
-                    match self.keeps_its_tool_binding(&runtime, &job.spec).await {
-                        Ok(true) => {}
-                        Ok(false) => {
-                            mark_callback_binding_changed(&runtime, &job.job_id).await?;
-                            continue;
-                        }
-                        Err(error) => {
-                            tracing::warn!(
-                                job_id = %job.job_id,
-                                %error,
-                                "active detached callback left unreconciled"
-                            );
-                            continue;
-                        }
-                    }
-                    let Some(attempt_id) = job.machine_state.current_attempt_id.as_deref() else {
-                        return Err(format!(
-                            "active detached callback {} has no committed attempt id",
-                            job.job_id
-                        ));
-                    };
-                    let Some(runner_handle) = job.machine_state.runner_handle.as_deref() else {
-                        return Err(format!(
-                            "active detached callback {} has no committed runner handle",
-                            job.job_id
-                        ));
-                    };
-                    let Some(lease_expires_at_ms) = job.machine_state.lease_expires_at_ms else {
-                        return Err(format!(
-                            "active detached callback {} has no committed lease",
-                            job.job_id
-                        ));
-                    };
-                    attempts.push(meerkat_contracts::CallbackJobReconcileAttempt {
-                        authority: meerkat_contracts::JobAttemptAuthority {
-                            job_id: job.job_id.to_string(),
-                            attempt_id: attempt_id.to_string(),
-                            fence: job.machine_state.current_fence,
-                        },
-                        runner: meerkat_contracts::JobRunner {
-                            name: job.spec.runner.name().to_string(),
-                            version: job.spec.runner.version().to_string(),
-                        },
-                        restart_class: wire_restart_class(job.spec.restart_class),
-                        runner_handle: runner_handle.to_string(),
-                        checkpoint_ref: job
-                            .machine_state
-                            .checkpoint_ref
-                            .as_ref()
-                            .map(ToString::to_string),
-                        lease_expires_at_ms,
-                    });
+        if let Some(route) = route.as_ref() {
+            for job in active {
+                if !registry_owns_detached_callback_spec(&route.registry(), &job.spec) {
+                    continue;
                 }
-                _ => {}
+                match Self::route_may_act_on(&runtime, &job.spec, route).await {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        mark_callback_needs_attention(
+                            &runtime,
+                            &job.job_id,
+                            CALLBACK_BINDING_CHANGED,
+                        )
+                        .await?;
+                        continue;
+                    }
+                    Err(SpecificationReadError::Unreadable(error)) => {
+                        tracing::warn!(
+                            job_id = %job.job_id,
+                            %error,
+                            "active detached callback has an unreadable specification"
+                        );
+                        mark_callback_needs_attention(
+                            &runtime,
+                            &job.job_id,
+                            CALLBACK_SPECIFICATION_UNREADABLE,
+                        )
+                        .await?;
+                        continue;
+                    }
+                    Err(SpecificationReadError::Unavailable(error)) => {
+                        tracing::warn!(
+                            job_id = %job.job_id,
+                            %error,
+                            "active detached callback left unreconciled"
+                        );
+                        continue;
+                    }
+                }
+                let Some(attempt_id) = job.machine_state.current_attempt_id.as_deref() else {
+                    return Err(format!(
+                        "active detached callback {} has no committed attempt id",
+                        job.job_id
+                    ));
+                };
+                let Some(runner_handle) = job.machine_state.runner_handle.as_deref() else {
+                    return Err(format!(
+                        "active detached callback {} has no committed runner handle",
+                        job.job_id
+                    ));
+                };
+                let Some(lease_expires_at_ms) = job.machine_state.lease_expires_at_ms else {
+                    return Err(format!(
+                        "active detached callback {} has no committed lease",
+                        job.job_id
+                    ));
+                };
+                attempts.push(meerkat_contracts::CallbackJobReconcileAttempt {
+                    authority: meerkat_contracts::JobAttemptAuthority {
+                        job_id: job.job_id.to_string(),
+                        attempt_id: attempt_id.to_string(),
+                        fence: job.machine_state.current_fence,
+                    },
+                    runner: meerkat_contracts::JobRunner {
+                        name: job.spec.runner.name().to_string(),
+                        version: job.spec.runner.version().to_string(),
+                    },
+                    restart_class: wire_restart_class(job.spec.restart_class),
+                    runner_handle: runner_handle.to_string(),
+                    checkpoint_ref: job
+                        .machine_state
+                        .checkpoint_ref
+                        .as_ref()
+                        .map(ToString::to_string),
+                    lease_expires_at_ms,
+                });
             }
         }
         if !attempts.is_empty() {
@@ -871,7 +926,13 @@ impl CallbackToolDispatcher {
                 .iter()
                 .map(|attempt| attempt.authority.clone())
                 .collect::<Vec<_>>();
-            let route = self.job_route()?;
+            let Some(route) = route else {
+                return Err(
+                    "detached callback reconciliation offered attempts it checked against no route"
+                        .to_string(),
+                );
+            };
+            self.run_check_send_seam();
             let result: meerkat_contracts::CallbackJobReconcileResult = send_callback_request(
                 route.sender(),
                 route.id_counter(),
@@ -973,6 +1034,9 @@ impl CallbackToolDispatcher {
         }) {
             let runtime = runtime.clone();
             let route = self.job_route()?;
+            if !registry_owns_detached_callback_spec(&route.registry(), &job.spec) {
+                continue;
+            }
             let callback_tx = route.sender();
             let id_counter = route.id_counter();
             let acting = ActingRoute {
@@ -997,42 +1061,24 @@ impl CallbackToolDispatcher {
     }
 
     fn owns_detached_callback_spec(&self, spec: &meerkat::JobSpec) -> bool {
-        let Some(registry) = self.advertised_registry() else {
-            return false;
-        };
-        registry
-            .state
-            .read()
-            .map(|state| {
-                state.tools.iter().any(|registered| {
-                    registered.tool.name == spec.tool.name()
-                        && registered
-                            .execution
-                            .detached_policy()
-                            .is_some_and(|policy| {
-                                policy.runner().name() == spec.runner.name()
-                                    && policy.runner().version() == spec.runner.version()
-                            })
-                })
-            })
-            .unwrap_or(false)
+        self.advertised_registry()
+            .is_some_and(|registry| registry_owns_detached_callback_spec(&registry, spec))
     }
 
-    /// Whether the route this dispatcher acts through may act on the job
-    /// `spec` describes ([`RetainedCallbackSpecification::admits`]): it is
-    /// the route that submitted the job, or its tool declares what the job
-    /// recorded. A job whose specification recorded neither (written before
-    /// 0.9.3) is never admitted. `Err` when its specification cannot be read.
-    async fn keeps_its_tool_binding(
-        &self,
+    /// Whether `route` may act on the job `spec` describes
+    /// ([`RetainedCallbackSpecification::admits`]): it is the route that
+    /// submitted the job, or its tool declares what the job recorded. A job
+    /// whose specification recorded neither (written before 0.9.3) is never
+    /// admitted. `Err` when its specification cannot be read.
+    async fn route_may_act_on(
         runtime: &DetachedCallbackJobRuntime,
         spec: &meerkat::JobSpec,
-    ) -> Result<bool, String> {
+        route: &CallbackRoute,
+    ) -> Result<bool, SpecificationReadError> {
         let Some(reference) = spec.runner_specification_ref.as_ref() else {
             return Ok(false);
         };
         let specification = read_callback_specification(runtime, reference).await?;
-        let route = self.job_route()?;
         Ok(specification.admits(&ActingRoute {
             route_id: route.route_id().clone(),
             tool_binding: registered_tool_binding_in(&route.registry(), spec.tool.name()),
@@ -1063,15 +1109,33 @@ impl CallbackToolDispatcher {
         {
             return Ok(());
         }
-        if !self.keeps_its_tool_binding(runtime, &job.spec).await? {
-            return mark_callback_binding_changed(runtime, job_id).await;
+        // One route for the check and the send.
+        let route = self.job_route()?;
+        if !registry_owns_detached_callback_spec(&route.registry(), &job.spec) {
+            return Ok(());
+        }
+        match Self::route_may_act_on(runtime, &job.spec, &route).await {
+            Ok(true) => {}
+            Ok(false) => {
+                return mark_callback_needs_attention(runtime, job_id, CALLBACK_BINDING_CHANGED)
+                    .await;
+            }
+            Err(SpecificationReadError::Unreadable(_)) => {
+                return mark_callback_needs_attention(
+                    runtime,
+                    job_id,
+                    CALLBACK_SPECIFICATION_UNREADABLE,
+                )
+                .await;
+            }
+            Err(error) => return Err(error.to_string()),
         }
         let attempt_id = job
             .machine_state
             .current_attempt_id
             .as_deref()
             .ok_or_else(|| format!("active detached callback {job_id} has no attempt id"))?;
-        let route = self.job_route()?;
+        self.run_check_send_seam();
         let result: meerkat_contracts::CallbackJobCancelResult = send_callback_request(
             route.sender(),
             route.id_counter(),
@@ -1526,6 +1590,30 @@ impl RetainedCallbackSpecification {
     }
 }
 
+/// Whether `registry` registers a detached tool of the name and runner the
+/// job `spec` describes.
+fn registry_owns_detached_callback_spec(
+    registry: &CallbackToolRegistry,
+    spec: &meerkat::JobSpec,
+) -> bool {
+    registry
+        .state
+        .read()
+        .map(|state| {
+            state.tools.iter().any(|registered| {
+                registered.tool.name == spec.tool.name()
+                    && registered
+                        .execution
+                        .detached_policy()
+                        .is_some_and(|policy| {
+                            policy.runner().name() == spec.runner.name()
+                                && policy.runner().version() == spec.runner.version()
+                        })
+            })
+        })
+        .unwrap_or(false)
+}
+
 /// The declaration of the callback tool `tool_name` that `registry`
 /// registers now ([`meerkat_core::ToolBindingDigest`]), `None` when it
 /// registers none.
@@ -1546,17 +1634,22 @@ fn registered_tool_binding_in(
         })
 }
 
-/// Move a detached callback job that the acting route may not act on
-/// ([`RetainedCallbackSpecification::admits`]) to NeedsAttention
-/// (`callback_binding_changed`) instead of starting, reconciling or
-/// cancelling it through that route. A job another writer moved first is
-/// left as it is.
-async fn mark_callback_binding_changed(
+/// The NeedsAttention reason of a detached callback job the acting route may
+/// not act on ([`RetainedCallbackSpecification::admits`]).
+const CALLBACK_BINDING_CHANGED: &str = "callback_binding_changed";
+
+/// The NeedsAttention reason of a detached callback job whose retained
+/// specification no longer decodes.
+const CALLBACK_SPECIFICATION_UNREADABLE: &str = "callback_specification_unreadable";
+
+/// Move a detached callback job to NeedsAttention for `reason` instead of
+/// acting on it. A job another writer moved first is left as it is.
+async fn mark_callback_needs_attention(
     runtime: &DetachedCallbackJobRuntime,
     job_id: &meerkat::JobId,
+    reason: &str,
 ) -> Result<(), String> {
-    let reason = meerkat::JobFailureCode::new("callback_binding_changed")
-        .map_err(|error| error.to_string())?;
+    let reason = meerkat::JobFailureCode::new(reason).map_err(|error| error.to_string())?;
     match runtime
         .service
         .mark_needs_attention(job_id, unix_time_ms()?, reason)
@@ -1701,6 +1794,30 @@ async fn read_callback_arguments(
     read_callback_specification(runtime, reference)
         .await
         .map(|specification| specification.arguments)
+        .map_err(|error| error.to_string())
+}
+
+/// Why a detached callback job's retained specification could not be read.
+enum SpecificationReadError {
+    /// The blob store cannot return it now (an I/O error, a missing blob):
+    /// a later pass reads it again.
+    Unavailable(String),
+    /// It no longer decodes (or the store reports it corrupt): no later pass
+    /// reads it either.
+    Unreadable(String),
+}
+
+impl std::fmt::Display for SpecificationReadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unavailable(error) => {
+                write!(f, "detached callback specification is unavailable: {error}")
+            }
+            Self::Unreadable(error) => {
+                write!(f, "detached callback specification is corrupt: {error}")
+            }
+        }
+    }
 }
 
 /// Read the retained specification of a detached callback job, of either
@@ -1708,14 +1825,18 @@ async fn read_callback_arguments(
 async fn read_callback_specification(
     runtime: &DetachedCallbackJobRuntime,
     reference: &meerkat::RunnerSpecificationRef,
-) -> Result<RetainedCallbackSpecification, String> {
+) -> Result<RetainedCallbackSpecification, SpecificationReadError> {
     let payload = runtime
         .blob_store
         .get(&meerkat_core::BlobId::new(reference.as_str()))
         .await
-        .map_err(|error| error.to_string())?;
-    decode_callback_specification(&payload)
-        .map_err(|error| format!("detached callback specification is corrupt: {error}"))
+        .map_err(|error| match error {
+            meerkat_core::BlobStoreError::Corrupt { .. } => {
+                SpecificationReadError::Unreadable(error.to_string())
+            }
+            error => SpecificationReadError::Unavailable(error.to_string()),
+        })?;
+    decode_callback_specification(&payload).map_err(SpecificationReadError::Unreadable)
 }
 
 /// Decode a retained specification: a [`CallbackSpecification`] record
@@ -1839,8 +1960,8 @@ fn wire_restart_class(class: meerkat::RestartClass) -> meerkat_contracts::JobRes
 
 /// Start the next attempt of a runnable detached callback job through the
 /// `acting` route. A job that route may not act on
-/// ([`RetainedCallbackSpecification::admits`]) goes to NeedsAttention
-/// instead, unclaimed.
+/// ([`RetainedCallbackSpecification::admits`]), or whose specification no
+/// longer decodes, goes to NeedsAttention instead, unclaimed.
 async fn start_detached_callback_attempt(
     runtime: DetachedCallbackJobRuntime,
     callback_tx: mpsc::Sender<CallbackRequestEnvelope>,
@@ -1869,9 +1990,20 @@ async fn start_detached_callback_attempt(
         .runner_specification_ref
         .clone()
         .ok_or_else(|| format!("detached callback job {job_id} has no runner specification"))?;
-    let specification = read_callback_specification(&runtime, &specification_ref).await?;
+    let specification = match read_callback_specification(&runtime, &specification_ref).await {
+        Ok(specification) => specification,
+        Err(SpecificationReadError::Unreadable(_)) => {
+            return mark_callback_needs_attention(
+                &runtime,
+                &job_id,
+                CALLBACK_SPECIFICATION_UNREADABLE,
+            )
+            .await;
+        }
+        Err(error) => return Err(error.to_string()),
+    };
     if !specification.admits(&acting) {
-        return mark_callback_binding_changed(&runtime, &job_id).await;
+        return mark_callback_needs_attention(&runtime, &job_id, CALLBACK_BINDING_CHANGED).await;
     }
 
     let lease_expires_at_ms = claimed_at_ms
@@ -2620,6 +2752,15 @@ mod tests {
         job_store: &Arc<dyn meerkat::DetachedJobStore>,
         job_id: &meerkat::JobId,
     ) {
+        await_needs_attention(job_store, job_id, "callback_binding_changed").await;
+    }
+
+    /// Wait until the job is in `needs_attention` for `reason`.
+    async fn await_needs_attention(
+        job_store: &Arc<dyn meerkat::DetachedJobStore>,
+        job_id: &meerkat::JobId,
+        reason: &str,
+    ) {
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
                 let job = job_store.get(job_id).await.unwrap().expect("job");
@@ -2627,8 +2768,7 @@ mod tests {
                     assert_eq!(
                         job.terminal_result,
                         Some(meerkat::JobTerminalResult::NeedsAttention {
-                            reason: meerkat::JobFailureCode::new("callback_binding_changed")
-                                .unwrap(),
+                            reason: meerkat::JobFailureCode::new(reason).unwrap(),
                         })
                     );
                     return;
@@ -2638,6 +2778,19 @@ mod tests {
         })
         .await
         .expect("the job moves to needs_attention");
+    }
+
+    async fn job_phase(
+        job_store: &Arc<dyn meerkat::DetachedJobStore>,
+        job_id: &meerkat::JobId,
+    ) -> meerkat::JobPhase {
+        job_store
+            .get(job_id)
+            .await
+            .unwrap()
+            .expect("job")
+            .machine_state
+            .lifecycle_phase
     }
 
     fn detached_callback_context() -> meerkat_core::ToolDispatchContext {
@@ -2888,18 +3041,30 @@ mod tests {
         let declaration = meerkat_core::ToolBindingDigest::of_catalog_entry(
             &callback_catalog_entry(tool.clone(), durable_detached_contract()),
         );
-        let (planner, _callback_rx) =
-            detached_callback_dispatcher_registering(job_store.clone(), blob_store.clone(), tool);
-        let planner: Arc<dyn AgentToolDispatcher> = planner;
-        let context = detached_callback_context();
-        let plan = resolve_detached_callback_plan(&planner, call, &context);
-        let (spec, _) = detached_callback_job_spec("realm-a", call, &context, &plan).unwrap();
         let record = serde_json::to_vec(&CallbackSpecification {
             arguments: call.args.to_owned(),
             tool_binding_sha256: declaration,
             submitted_route: CallbackRouteId::mint().as_str().to_string(),
         })
         .unwrap();
+        queue_detached_callback_under(job_store, blob_store, call, tool, &record).await
+    }
+
+    /// Queue `call` as [`queue_detached_callback`] does, under the v2
+    /// record `record` exactly as given (corrupt ones included).
+    async fn queue_detached_callback_under(
+        job_store: &Arc<dyn meerkat::DetachedJobStore>,
+        blob_store: &Arc<dyn meerkat_core::BlobStore>,
+        call: ToolCallView<'_>,
+        tool: ToolDef,
+        record: &[u8],
+    ) -> meerkat::JobId {
+        let (planner, _callback_rx) =
+            detached_callback_dispatcher_registering(job_store.clone(), blob_store.clone(), tool);
+        let planner: Arc<dyn AgentToolDispatcher> = planner;
+        let context = detached_callback_context();
+        let plan = resolve_detached_callback_plan(&planner, call, &context);
+        let (spec, _) = detached_callback_job_spec("realm-a", call, &context, &plan).unwrap();
         let stored = blob_store
             .put_artifact(
                 CALLBACK_SPECIFICATION_MEDIA_TYPE,
@@ -3219,6 +3384,323 @@ mod tests {
             .expect("job");
         assert_eq!(
             job.machine_state.lifecycle_phase,
+            meerkat::JobPhase::Running
+        );
+    }
+
+    /// A registry holding `tool` under the fixture's detached contract, and a
+    /// route over it with that route's receiving end.
+    fn route_registering(
+        tool: ToolDef,
+    ) -> (CallbackRoute, mpsc::Receiver<CallbackRequestEnvelope>) {
+        let registry = Arc::new(CallbackToolRegistry::default());
+        registry
+            .replace_or_add_with_contracts(vec![(tool, durable_detached_contract())])
+            .unwrap();
+        let (callback_tx, callback_rx) = mpsc::channel(2);
+        (
+            CallbackRoute::from_parts(callback_tx, Arc::new(AtomicU64::new(0)), registry),
+            callback_rx,
+        )
+    }
+
+    /// A dispatcher over a mob slot `first` holds, whose slot changes hands
+    /// between the dispatcher's check of a detached job against the route it
+    /// acts through and its send to that route: `first`'s connection closes
+    /// and `second` claims the slot. The flag records that it did.
+    fn dispatcher_whose_slot_changes_hands(
+        job_store: &Arc<dyn meerkat::DetachedJobStore>,
+        blob_store: &Arc<dyn meerkat_core::BlobStore>,
+        first: (CallbackRoute, mpsc::Receiver<CallbackRequestEnvelope>),
+        second: CallbackRoute,
+    ) -> (CallbackToolDispatcher, Arc<std::sync::atomic::AtomicBool>) {
+        let (first_route, first_rx) = first;
+        let slot = Arc::new(MobCallbackRouteSlot::claimed_by(first_route));
+        let first_rx = std::sync::Mutex::new(Some(first_rx));
+        let handed_over = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let handover = {
+            let slot = Arc::clone(&slot);
+            let handed_over = Arc::clone(&handed_over);
+            Arc::new(move || {
+                drop(first_rx.lock().unwrap().take());
+                slot.claim(&second).unwrap();
+                handed_over.store(true, Ordering::SeqCst);
+            })
+        };
+        let dispatcher = CallbackToolDispatcher::from_mob_slot_with_job_runtime(
+            slot,
+            vec![],
+            "realm-a",
+            job_store.clone(),
+            blob_store.clone(),
+        )
+        .with_check_send_seam(handover);
+        (dispatcher, handed_over)
+    }
+
+    /// The method of the next request offered on `callback_rx` within half a
+    /// second; `None` when none arrives or the channel closes.
+    async fn offered_method(
+        callback_rx: &mut mpsc::Receiver<CallbackRequestEnvelope>,
+    ) -> Option<String> {
+        match tokio::time::timeout(std::time::Duration::from_millis(500), callback_rx.recv()).await
+        {
+            Ok(Some(envelope)) => Some(envelope.into_parts().0.method),
+            Ok(None) | Err(_) => None,
+        }
+    }
+
+    /// A reconcile sends to the route it checked. The mob slot's holder
+    /// declares what the active job recorded and is checked; before the send,
+    /// its connection closes and a connection declaring another tool claims
+    /// the slot. That new holder, never checked, is offered nothing, and the
+    /// job keeps running.
+    #[tokio::test]
+    async fn a_reconcile_sends_only_to_the_route_it_checked() {
+        let root = tempfile::tempdir().unwrap();
+        let (job_store, _verbatim, strict) = open_detached_callback_stores(root.path());
+        let args = RawValue::from_string(r#"{"target": "lan"}"#.to_string()).unwrap();
+        let job =
+            submit_and_abandon_detached_callback(&job_store, &strict, "tc-handover", &args).await;
+        let mut other = make_provenanced_tool_def("durable");
+        other.description = "another connection's durable tool".to_string();
+        let (second, mut second_rx) = route_registering(other);
+        let (dispatcher, handed_over) = dispatcher_whose_slot_changes_hands(
+            &job_store,
+            &strict,
+            route_registering(make_provenanced_tool_def("durable")),
+            second,
+        );
+        let reconcile = tokio::spawn(async move { dispatcher.reconcile_detached_jobs().await });
+        assert_eq!(
+            offered_method(&mut second_rx).await,
+            None,
+            "the job is offered to a route that was never checked"
+        );
+        assert!(
+            handed_over.load(Ordering::SeqCst),
+            "the slot changed hands between the check and the send"
+        );
+        assert!(
+            reconcile.await.unwrap().is_err(),
+            "the checked route closed before the send"
+        );
+        assert_eq!(
+            job_phase(&job_store, &job).await,
+            meerkat::JobPhase::Running
+        );
+    }
+
+    /// A cancel sends to the route it checked, as a reconcile does.
+    #[tokio::test]
+    async fn a_cancel_sends_only_to_the_route_it_checked() {
+        let root = tempfile::tempdir().unwrap();
+        let (job_store, _verbatim, strict) = open_detached_callback_stores(root.path());
+        let args = RawValue::from_string(r#"{"target": "lan"}"#.to_string()).unwrap();
+        let job =
+            submit_and_abandon_detached_callback(&job_store, &strict, "tc-handover", &args).await;
+        meerkat::DetachedJobService::new(job_store.clone())
+            .request_cancel(&job)
+            .await
+            .unwrap();
+        let mut other = make_provenanced_tool_def("durable");
+        other.description = "another connection's durable tool".to_string();
+        let (second, mut second_rx) = route_registering(other);
+        let (dispatcher, handed_over) = dispatcher_whose_slot_changes_hands(
+            &job_store,
+            &strict,
+            route_registering(make_provenanced_tool_def("durable")),
+            second,
+        );
+        let cancelled = job.clone();
+        let cancel = tokio::spawn(async move { dispatcher.cancel_detached_job(&cancelled).await });
+        assert_eq!(
+            offered_method(&mut second_rx).await,
+            None,
+            "the cancel goes to a route that was never checked"
+        );
+        assert!(
+            handed_over.load(Ordering::SeqCst),
+            "the slot changed hands between the check and the send"
+        );
+        assert!(
+            cancel.await.unwrap().is_err(),
+            "the checked route closed before the send"
+        );
+        assert_eq!(
+            job_phase(&job_store, &job).await,
+            meerkat::JobPhase::Running
+        );
+    }
+
+    /// A job whose retained specification no longer decodes goes to
+    /// needs_attention (`callback_specification_unreadable`) at its next
+    /// start or reconcile, instead of being skipped on every pass; nothing
+    /// is offered for it.
+    #[tokio::test]
+    async fn an_unreadable_specification_moves_the_job_to_needs_attention() {
+        let root = tempfile::tempdir().unwrap();
+        let (job_store, _verbatim, strict) = open_detached_callback_stores(root.path());
+        let args = RawValue::from_string(r#"{"target": "lan"}"#.to_string()).unwrap();
+        let truncated = br#"{"arguments": {"target": "lan"}, "tool_binding_sha256": "#;
+        let queued = queue_detached_callback_under(
+            &job_store,
+            &strict,
+            ToolCallView {
+                id: "tc-queued",
+                name: "durable",
+                args: &args,
+            },
+            make_provenanced_tool_def("durable"),
+            truncated,
+        )
+        .await;
+        let active = queue_detached_callback_under(
+            &job_store,
+            &strict,
+            ToolCallView {
+                id: "tc-active",
+                name: "durable",
+                args: &args,
+            },
+            make_provenanced_tool_def("durable"),
+            truncated,
+        )
+        .await;
+        let claimed_at_ms = unix_time_ms().unwrap();
+        meerkat::DetachedJobService::new(job_store.clone())
+            .claim_attempt(
+                &active,
+                meerkat::AttemptClaim::new(
+                    meerkat::WorkerId::new("worker-before").unwrap(),
+                    claimed_at_ms,
+                    claimed_at_ms + 120_000,
+                    meerkat::RunnerHandleRef::new("handle-before").unwrap(),
+                ),
+            )
+            .await
+            .unwrap();
+
+        let (dispatcher, mut callback_rx) = detached_callback_dispatcher_registering(
+            job_store.clone(),
+            strict.clone(),
+            make_provenanced_tool_def("durable"),
+        );
+        dispatcher.reconcile_detached_jobs().await.unwrap();
+        await_needs_attention(&job_store, &active, "callback_specification_unreadable").await;
+        await_needs_attention(&job_store, &queued, "callback_specification_unreadable").await;
+        assert!(
+            callback_rx.try_recv().is_err(),
+            "nothing is offered for an unreadable job"
+        );
+    }
+
+    /// A blob store whose reads fail while `failing` is set, as a store that
+    /// cannot be reached would.
+    struct FlakyBlobStore {
+        inner: Arc<dyn meerkat_core::BlobStore>,
+        failing: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait]
+    impl meerkat_core::BlobStore for FlakyBlobStore {
+        async fn put_image(
+            &self,
+            media_type: &str,
+            data: &str,
+        ) -> Result<meerkat_core::BlobRef, meerkat_core::BlobStoreError> {
+            self.inner.put_image(media_type, data).await
+        }
+
+        async fn get(
+            &self,
+            blob_id: &meerkat_core::BlobId,
+        ) -> Result<meerkat_core::BlobPayload, meerkat_core::BlobStoreError> {
+            if self.failing.load(Ordering::SeqCst) {
+                return Err(meerkat_core::BlobStoreError::ReadFailed(
+                    "the blob store is unreachable".to_string(),
+                ));
+            }
+            self.inner.get(blob_id).await
+        }
+
+        async fn delete(
+            &self,
+            blob_id: &meerkat_core::BlobId,
+        ) -> Result<(), meerkat_core::BlobStoreError> {
+            self.inner.delete(blob_id).await
+        }
+
+        fn is_persistent(&self) -> bool {
+            self.inner.is_persistent()
+        }
+    }
+
+    /// A job whose specification the blob store cannot return now is left as
+    /// it is (with a warning), and a later pass reconciles it once the store
+    /// answers again.
+    #[tokio::test]
+    async fn an_unavailable_specification_leaves_the_job_for_a_later_pass() {
+        let root = tempfile::tempdir().unwrap();
+        let (job_store, _verbatim, strict) = open_detached_callback_stores(root.path());
+        let flaky = Arc::new(FlakyBlobStore {
+            inner: strict,
+            failing: std::sync::atomic::AtomicBool::new(false),
+        });
+        let blobs: Arc<dyn meerkat_core::BlobStore> = flaky.clone();
+        let args = RawValue::from_string(r#"{"target": "lan"}"#.to_string()).unwrap();
+        let job = submit_and_abandon_detached_callback(&job_store, &blobs, "tc-flaky", &args).await;
+
+        flaky.failing.store(true, Ordering::SeqCst);
+        let (first, mut first_rx) = detached_callback_dispatcher_registering(
+            job_store.clone(),
+            blobs.clone(),
+            make_provenanced_tool_def("durable"),
+        );
+        first.reconcile_detached_jobs().await.unwrap();
+        assert!(
+            first_rx.try_recv().is_err(),
+            "nothing is offered while the specification is unavailable"
+        );
+        assert_eq!(
+            job_phase(&job_store, &job).await,
+            meerkat::JobPhase::Running
+        );
+
+        flaky.failing.store(false, Ordering::SeqCst);
+        let (second, mut second_rx) = detached_callback_dispatcher_registering(
+            job_store.clone(),
+            blobs.clone(),
+            make_provenanced_tool_def("durable"),
+        );
+        let reconcile = tokio::spawn(async move { second.reconcile_detached_jobs().await });
+        let envelope = tokio::time::timeout(std::time::Duration::from_secs(5), second_rx.recv())
+            .await
+            .expect("the job is reconciled once its specification reads again")
+            .expect("callback channel");
+        let (request, response_tx, _permit) = envelope.into_parts();
+        assert_eq!(request.method, "callback/job/reconcile");
+        let params: meerkat_contracts::CallbackJobReconcileParams =
+            serde_json::from_str(request.params.as_deref().unwrap().get()).unwrap();
+        assert!(
+            response_tx
+                .send(CallbackResponseHandoff::unmetered_for_test(
+                    RpcResponse::success(
+                        request.id,
+                        meerkat_contracts::CallbackJobReconcileResult {
+                            live_attempts: params
+                                .attempts
+                                .iter()
+                                .map(|attempt| attempt.authority.clone())
+                                .collect(),
+                        },
+                    ),
+                ))
+                .is_ok()
+        );
+        reconcile.await.unwrap().unwrap();
+        assert_eq!(
+            job_phase(&job_store, &job).await,
             meerkat::JobPhase::Running
         );
     }

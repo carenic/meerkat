@@ -535,6 +535,8 @@ job, and every route after a restart, is held to that declaration: a job
 whose recorded declaration differs, or that recorded none (submitted before
 0.9.3), goes to `needs_attention` with the reason `callback_binding_changed`
 instead of being started, reconciled or cancelled through that route. A
+job whose recorded specification no longer decodes goes to
+`needs_attention` with the reason `callback_specification_unreadable`. A
 detached callback call made while no open connection holds the route is
 refused before anything durable is written.
 
