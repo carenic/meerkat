@@ -98,7 +98,8 @@ them.
   `participant_source_replaced`
   (`TemporaryCouncilExitReason::ParticipantSourceReplaced`), and nothing of
   that mob is forked; a council is never run again after a restart, so no
-  seating outlives its admission.
+  seating outlives its admission. `mob_create` records its operator
+  provenance only in the mob its own create started.
   Incarnations are never decoded from input: `Deserialize` always refuses
   and `Debug` and `Serialize` render them redacted. Grants are still not
   persisted, so no grant survives a restart; a member's operator facts

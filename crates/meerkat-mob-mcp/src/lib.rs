@@ -17980,6 +17980,64 @@ mod tests {
         assert!(member_ids(&state, implicit_id.as_str()).await.is_empty());
     }
 
+    /// A create records its operator provenance in the mob it started or
+    /// nowhere: when that mob is destroyed and another session creates one
+    /// under the id before the record is written, the new mob's log holds its
+    /// own creator's provenance only.
+    #[tokio::test]
+    async fn a_create_never_records_provenance_in_a_mob_recreated_under_its_id() {
+        let state = MobMcpState::new_in_memory();
+        let first = OperatorSession::new(&state);
+        let second = OperatorSession::new(&state);
+        let mob_id = "raced-create-mob";
+
+        let hold = hold_next_agent_call(&state);
+        let create = first.create(mob_id);
+        let race = async {
+            wait_parked(&hold).await;
+            state
+                .mob_destroy(&MobId::from(mob_id))
+                .await
+                .expect("the console destroys the created mob");
+            second.create(mob_id).await;
+            hold.release.notify_one();
+        };
+        tokio::join!(create, race);
+
+        let principal_of = |session: &OperatorSession| {
+            session
+                .authority
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .principal_token()
+                .clone()
+        };
+        let events = state
+            .handle_for(&MobId::from(mob_id))
+            .await
+            .expect("the mob under the id")
+            .poll_events(0, 10_000)
+            .await
+            .expect("the mob's events");
+        let recorded: Vec<_> = events
+            .iter()
+            .filter_map(|event| match &event.kind {
+                meerkat_mob::MobEventKind::OperatorActionRecorded {
+                    tool_name,
+                    principal_token,
+                    ..
+                } => Some((tool_name.clone(), principal_token.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            recorded,
+            vec![("mob_create".to_string(), principal_of(&second))],
+            "only the new mob's creator is recorded in it"
+        );
+        assert_ne!(principal_of(&first), principal_of(&second));
+    }
+
     /// While a destroyed mob's storage cleanup is owed, its id is not
     /// created again, since a new mob would use that storage; once nothing
     /// is owed the id is free.

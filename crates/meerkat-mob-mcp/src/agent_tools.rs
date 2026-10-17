@@ -1287,7 +1287,13 @@ impl AgentMobToolSurface {
         let session_effects =
             vec![meerkat_core::SessionEffect::ReplaceMobToolAuthorityContext { authority_context }];
         let mob_id = created.mob_id;
-        if let Ok(handle) = self.bound_handle(&mob_id).await {
+        self.state.pause_agent_call().await;
+        // The provenance record goes to the mob this create started: a mob
+        // registered under the id since then is another incarnation and
+        // gets none.
+        if let Ok(handle) = self.bound_handle(&mob_id).await
+            && handle.incarnation() == created.incarnation
+        {
             self.record_successful_operator_action_boxed(&handle, call.name)
                 .await;
         }
