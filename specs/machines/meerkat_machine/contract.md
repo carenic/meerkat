@@ -108,6 +108,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `mob_operator_can_mutate_profiles`: `Bool`
 - `mob_operator_managed_mob_scope`: `Set<String>`
 - `mob_operator_spawn_profile_scope`: `Map<String, Set<String>>`
+- `mob_operator_mob_incarnations`: `Map<String, MobIncarnationId>`
 - `mob_operator_caller_provenance`: `Option<MobToolCallerProvenance>`
 - `mob_operator_audit_invocation_id`: `Option<String>`
 - `drain_phase`: `DrainPhase`
@@ -564,11 +565,11 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `FinishDeferredSessionArchive`(session_id: SessionId)
 - `DropDeferredSession`(session_id: SessionId)
 - `ResolveMobOperatorCreateAuthority`(request_kind: MobOperatorAccessRequestKind, principal_token: OpaquePrincipalToken, caller_provenance: Option<MobToolCallerProvenance>, audit_invocation_id: Option<String>)
-- `RestoreMobOperatorAuthority`(principal_token: OpaquePrincipalToken, can_create_mobs: Bool, can_mutate_profiles: Bool, managed_mob_scope: Set<String>, spawn_profile_scope: Map<String, Set<String>>, caller_provenance: Option<MobToolCallerProvenance>, audit_invocation_id: Option<String>)
+- `RestoreMobOperatorAuthority`(principal_token: OpaquePrincipalToken, can_create_mobs: Bool, can_mutate_profiles: Bool, managed_mob_scope: Set<String>, spawn_profile_scope: Map<String, Set<String>>, mob_incarnations: Map<String, MobIncarnationId>, caller_provenance: Option<MobToolCallerProvenance>, audit_invocation_id: Option<String>)
 - `SetMobOperatorProfileMutation`(allowed: Bool)
 - `SetMobOperatorCreateAuthority`(allowed: Bool)
-- `GrantMobOperatorManageMob`(mob_id: String)
-- `SetMobOperatorSpawnProfilesInMob`(mob_id: String, profiles: Set<String>)
+- `GrantMobOperatorManageMob`(mob_id: String, mob_incarnation: MobIncarnationId)
+- `SetMobOperatorSpawnProfilesInMob`(mob_id: String, mob_incarnation: MobIncarnationId, profiles: Set<String>)
 - `RuntimeExecutorExited`
 - `RecoverRuntimeCompletionResultCorrelation`(run_id: RunId, terminal_outcome: Option<TurnTerminalOutcome>, terminal_cause_kind: Option<TurnTerminalCauseKind>)
 - `ResolveRuntimeCompletionResult`(run_id: Option<RunId>, terminal: RuntimeCompletionTerminalObservation, finalization: RuntimeCompletionFinalizationObservation)
@@ -1407,6 +1408,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `live_media_health_budget_and_verdicts_are_consistent`
 - `fence_requires_bound_runtime`
 - `runtime_generation_requires_bound_runtime`
+- `mob_operator_scopes_are_bound_to_an_incarnation`
 - `live_execution_binding_is_complete_and_channel_scoped`
 - `live_execution_phase_is_explicit_and_revocation_is_terminal`
 - `live_bridge_operation_identity_is_complete_and_direct`
@@ -1998,7 +2000,9 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `RestoreMobOperatorAuthority`
 - From: `Initializing`
-- On: `RestoreMobOperatorAuthority`(principal_token, can_create_mobs, can_mutate_profiles, managed_mob_scope, spawn_profile_scope, caller_provenance, audit_invocation_id)
+- On: `RestoreMobOperatorAuthority`(principal_token, can_create_mobs, can_mutate_profiles, managed_mob_scope, spawn_profile_scope, mob_incarnations, caller_provenance, audit_invocation_id)
+- Guards:
+  - `scoped_mobs_are_bound`
 - To: `Initializing`
 
 ### `SetMobOperatorProfileMutation`
@@ -2017,16 +2021,34 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `GrantMobOperatorManageMob`
 - From: `Initializing`
-- On: `GrantMobOperatorManageMob`(mob_id)
+- On: `GrantMobOperatorManageMob`(mob_id, mob_incarnation)
 - Guards:
   - `authority_present`
+  - `mob_unbound_or_same_incarnation`
+- To: `Initializing`
+
+### `RebindMobOperatorManageMob`
+- From: `Initializing`
+- On: `GrantMobOperatorManageMob`(mob_id, mob_incarnation)
+- Guards:
+  - `authority_present`
+  - `mob_bound_to_another_incarnation`
 - To: `Initializing`
 
 ### `SetMobOperatorSpawnProfilesInMob`
 - From: `Initializing`
-- On: `SetMobOperatorSpawnProfilesInMob`(mob_id, profiles)
+- On: `SetMobOperatorSpawnProfilesInMob`(mob_id, mob_incarnation, profiles)
 - Guards:
   - `authority_present`
+  - `mob_unbound_or_same_incarnation`
+- To: `Initializing`
+
+### `RebindMobOperatorSpawnProfilesInMob`
+- From: `Initializing`
+- On: `SetMobOperatorSpawnProfilesInMob`(mob_id, mob_incarnation, profiles)
+- Guards:
+  - `authority_present`
+  - `mob_bound_to_another_incarnation`
 - To: `Initializing`
 
 ### `BeginUnregisterSessionIdle`

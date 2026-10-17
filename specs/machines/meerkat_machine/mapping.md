@@ -209,7 +209,13 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
 - `GrantMobOperatorManageMob`
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
+- `RebindMobOperatorManageMob`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
 - `SetMobOperatorSpawnProfilesInMob`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `RebindMobOperatorSpawnProfilesInMob`
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
 - `BeginUnregisterSessionIdle`
@@ -8509,6 +8515,9 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
 - `runtime_generation_requires_bound_runtime`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `mob_operator_scopes_are_bound_to_an_incarnation`
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
 - `live_execution_binding_is_complete_and_channel_scoped`
