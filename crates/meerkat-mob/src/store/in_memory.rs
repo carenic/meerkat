@@ -442,6 +442,7 @@ pub struct InMemoryMobRuntimeMetadataStore {
     forked_participant_member_associations:
         Arc<RwLock<BTreeMap<(MobId, String), MobForkedParticipantMemberAssociation>>>,
     external_binding_overlays: Arc<RwLock<ExternalBindingOverlayMap>>,
+    callback_claim_verifiers: Arc<RwLock<BTreeMap<MobId, crate::MobClaimVerifier>>>,
 }
 
 /// In-memory first-class identity authority store. One lock preserves
@@ -1797,6 +1798,40 @@ impl MobRuntimeMetadataStore for InMemoryMobRuntimeMetadataStore {
         mob_id: &MobId,
     ) -> Result<Option<SupervisorAuthorityRecord>, MobStoreError> {
         Ok(self.supervisor_records.read().await.get(mob_id).cloned())
+    }
+
+    async fn put_callback_claim_verifier_if_absent(
+        &self,
+        mob_id: &MobId,
+        verifier: &crate::MobClaimVerifier,
+    ) -> Result<bool, MobStoreError> {
+        let mut verifiers = self.callback_claim_verifiers.write().await;
+        if verifiers.contains_key(mob_id) {
+            return Ok(false);
+        }
+        verifiers.insert(mob_id.clone(), verifier.clone());
+        Ok(true)
+    }
+
+    async fn load_callback_claim_verifier(
+        &self,
+        mob_id: &MobId,
+    ) -> Result<Option<crate::MobClaimVerifier>, MobStoreError> {
+        Ok(self
+            .callback_claim_verifiers
+            .read()
+            .await
+            .get(mob_id)
+            .cloned())
+    }
+
+    async fn delete_callback_claim_verifier(&self, mob_id: &MobId) -> Result<bool, MobStoreError> {
+        Ok(self
+            .callback_claim_verifiers
+            .write()
+            .await
+            .remove(mob_id)
+            .is_some())
     }
 
     async fn put_supervisor_authority(
@@ -5752,6 +5787,18 @@ mod tests {
     async fn realm_profile_list_empty() {
         let store = InMemoryRealmProfileStore::new();
         contract_tests::test_list_empty(&store).await;
+    }
+
+    #[tokio::test]
+    async fn callback_claim_verifier_is_recorded_once_and_kept() {
+        let store = InMemoryMobRuntimeMetadataStore::new();
+        crate::store::callback_claim_verifier_contract::recorded_once_and_kept(&store).await;
+    }
+
+    #[tokio::test]
+    async fn callback_claim_verifier_is_deleted_and_recorded_anew() {
+        let store = InMemoryMobRuntimeMetadataStore::new();
+        crate::store::callback_claim_verifier_contract::deleted_and_recorded_anew(&store).await;
     }
 
     // --- Temporary council orchestration store conformance ---

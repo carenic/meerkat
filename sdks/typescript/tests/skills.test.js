@@ -4,6 +4,7 @@
 
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
+import { inspect } from "node:util";
 import { DeferredSession, Session } from "../dist/session.js";
 import { MeerkatClient } from "../dist/client.js";
 import { MeerkatError } from "../dist/index.js";
@@ -675,7 +676,7 @@ describe("Skills v2.1", () => {
     client.request = async (method, params) => {
       calls.push({ method, params });
       if (method === "mob/create") {
-        return { ok: true, mob_id: "m1" };
+        return { ok: true, mob_id: "m1", claim_token: "mct_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" };
       }
       return {};
     };
@@ -687,6 +688,12 @@ describe("Skills v2.1", () => {
     });
 
     assert.equal(mob.mobId, "m1");
+    assert.equal(mob.claimToken, "mct_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+    // The token never prints: inspecting, spreading or serializing the
+    // handle leaves it out.
+    assert.equal(Object.keys(mob).includes("claimToken"), false);
+    assert.equal(inspect(mob).includes("mct_"), false);
+    assert.equal(JSON.stringify({ ...mob, client: undefined }).includes("mct_"), false);
     assert.deepEqual(calls, [
       {
         method: "mob/create",

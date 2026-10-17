@@ -847,9 +847,9 @@
       "result_type": "MobRotateSupervisorResult"
     },
     {
-      "description": "Bind a mob's member callback route to this connection",
+      "description": "Bind a mob's member callback route to this connection with the mob's claim token",
       "name": "mob/claim_callback_route",
-      "params_type": "MobIdParams",
+      "params_type": "MobClaimCallbackRouteParams",
       "result_type": "MobClaimCallbackRouteResult"
     },
     {

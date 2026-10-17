@@ -476,11 +476,16 @@ surface contracts.
 A mob's members reach the callback tools registered on the JSON-RPC
 connection that holds the mob's callback route: the connection whose
 `mob/create` created it, or the one that claimed it with
-`mob/claim_callback_route {mob_id}`. A mob restored after a restart, created
-any other way, or whose connection closed, has no route: its members'
-callbacks fail `tool_unavailable` until a connection claims it. The claim
-reaches live and later members alike; while the holding connection is open,
-another connection's claim is refused with `-32002`.
+`mob/claim_callback_route {mob_id, claim_token}`, presenting the claim token
+`mob/create` returned once to the creator (the mob keeps only its SHA-256).
+A mob restored after a restart, created any other way, or whose connection
+closed, has no route: its members' callbacks fail `tool_unavailable` until a
+connection claims it. A mob created other than by `mob/create` has no token
+and is not claimable unless its host mints one
+(`MobMcpState::mint_callback_claim_token`, Rust only). The claim reaches live
+and later members alike; another token is refused with `-32002`
+(`claim_token_mismatch`), and so is a claim while the holding connection is
+open (`held_by_open_connection`).
 
 ### REST
 

@@ -987,8 +987,8 @@ pub fn rpc_method_catalog(options: RpcMethodCatalogOptions) -> Vec<RpcMethodDesc
             ),
             RpcMethodDescriptor::typed(
                 "mob/claim_callback_route",
-                "Bind a mob's member callback route to this connection",
-                "MobIdParams",
+                "Bind a mob's member callback route to this connection with the mob's claim token",
+                "MobClaimCallbackRouteParams",
                 "MobClaimCallbackRouteResult",
             ),
             RpcMethodDescriptor::typed(
@@ -1855,7 +1855,7 @@ mod tests {
             ),
             (
                 "mob/claim_callback_route",
-                Some("MobIdParams"),
+                Some("MobClaimCallbackRouteParams"),
                 Some("MobClaimCallbackRouteResult"),
             ),
             (

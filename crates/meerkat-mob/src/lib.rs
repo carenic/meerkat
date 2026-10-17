@@ -63,6 +63,7 @@ pub mod tokio {
 pub mod adaptive;
 pub mod backend;
 mod build;
+pub mod claim_token;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod continuation;
 pub mod control_policy;
@@ -103,6 +104,7 @@ pub use member_creation::{
 
 // Re-exports for convenience
 pub use backend::{MobBackendKind, RuntimeBinding};
+pub use claim_token::{CallbackClaimCheck, MobClaimToken, MobClaimTokenError, MobClaimVerifier};
 pub use control_policy::{
     CommandAuthority, CommandAuthorityKind, ControlScope, MobControlPrincipal, OperatorGrant,
     ResolvedControlPolicy, ScopeDenial,

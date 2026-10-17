@@ -6457,6 +6457,7 @@ struct RuntimeMetadataSnapshot {
     supervisor: Option<crate::store::SupervisorAuthorityRecord>,
     external_binding_overlays: Vec<crate::store::ExternalBindingOverlayRecord>,
     member_operator_requests: Vec<crate::store::MobMemberOperatorRequestRecord>,
+    callback_claim_verifier: Option<crate::MobClaimVerifier>,
 }
 
 // Not `Copy`: `BridgeRejectionCause` carries payload variants since V4.
@@ -47547,6 +47548,10 @@ impl MobActor {
                 .runtime_metadata
                 .list_member_operator_requests(&self.definition.id)
                 .await?,
+            callback_claim_verifier: self
+                .runtime_metadata
+                .load_callback_claim_verifier(&self.definition.id)
+                .await?,
         })
     }
 
@@ -47663,6 +47668,27 @@ impl MobActor {
                         ),
                     )));
                 }
+            }
+        }
+        if let Some(verifier) = &snapshot.callback_claim_verifier {
+            let restored = self
+                .runtime_metadata
+                .put_callback_claim_verifier_if_absent(&self.definition.id, verifier)
+                .await?;
+            if !restored
+                && self
+                    .runtime_metadata
+                    .load_callback_claim_verifier(&self.definition.id)
+                    .await?
+                    .as_ref()
+                    != Some(verifier)
+            {
+                return Err(MobError::from(crate::store::MobStoreError::CasConflict(
+                    format!(
+                        "callback claim verifier changed while restoring metadata for mob '{}'",
+                        self.definition.id
+                    ),
+                )));
             }
         }
         Ok(())
@@ -48860,6 +48886,25 @@ impl MobActor {
         if let Err(error) = boxed_arm_future(|| {
             self.runtime_metadata
                 .delete_member_event_cursors(&self.definition.id)
+        })
+        .await
+        {
+            return Err(boxed_arm_future(|| {
+                self.incomplete_after_metadata_scrub_error(
+                    report,
+                    &runtime_metadata_snapshot,
+                    error,
+                )
+            })
+            .await);
+        }
+        // The callback claim verifier answers the mob's claim token: a mob
+        // created again under the id in a store the host kept must not take
+        // it. The snapshot above restores it if this destroy stays
+        // incomplete.
+        if let Err(error) = boxed_arm_future(|| {
+            self.runtime_metadata
+                .delete_callback_claim_verifier(&self.definition.id)
         })
         .await
         {

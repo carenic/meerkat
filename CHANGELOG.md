@@ -488,6 +488,32 @@ them.
   22.12. Installing on a Node outside that range now warns, and package
   managers that enforce `engines` (yarn classic, or npm with `engine-strict`)
   refuse it.
+- `meerkat-contracts`: `MobCreateResult` (the `mob/create` result) gains the
+  public field `claim_token` (constructible struct adds field); struct
+  literals must set it. Its `Debug` redacts the token.
+- `meerkat-mob-mcp`: `MobMcpState::mob_claim_member_external_tools` takes
+  the presented `&MobClaimToken` and answers
+  `Result<Result<T, CallbackRouteClaimTokenRefused>, MobError>`.
+- Behaviour-only (not measured by the gate): `mob/claim_callback_route` takes
+  `MobClaimCallbackRouteParams { mob_id, claim_token }` (unknown fields
+  refused) instead of `MobIdParams`, and refuses a claim without the claim
+  token its `mob/create` returned (see Changed). SDKs: Python
+  `MeerkatClient.mob_claim_callback_route(mob_id, claim_token)` and
+  `Mob.claim_token`; TypeScript
+  `MeerkatClient.mobClaimCallbackRoute(mobId, claimToken)` and
+  `Mob.claimToken`.
+- Behaviour-only (not measured by the gate): mob destroy loads and deletes
+  the mob's callback claim verifier through its `MobRuntimeMetadataStore`,
+  so a store implementation that keeps the refusing defaults of
+  `load_callback_claim_verifier` or `delete_callback_claim_verifier` cannot
+  complete a destroy (it ends `Incomplete`). The in-memory and SQLite stores
+  implement both.
+- Behaviour-only (not measured by the gate): 0.9.3 migrates a mob's SQLite
+  store to schema version 11 (a table for the mob's callback claim
+  verifier) when it opens it, and 0.9.2 refuses a store at version 11 with
+  its typed future-schema error. Downgrading after the migration is not
+  supported: keep a copy of the mob stores from before the upgrade to roll
+  back.
 
 ### Security
 
@@ -881,6 +907,22 @@ them.
   names the session serving a drained member address.
   `meerkat::PersistenceBundle::producer_job_store` is the bundle's job store
   as job producers use it (see Fixed); `job_store` stays the host's own store.
+- `meerkat_core::ToolBindingDigest` and `ToolBindingDigestParseError`: a
+  durable SHA-256 digest of what a tool catalog entry declares (never its
+  live authorities or current callability), with the text form
+  `sha256:<64 hex digits>`.
+- `meerkat_mob::MobClaimToken`, `MobClaimVerifier`, `MobClaimTokenError`
+  and `CallbackClaimCheck`; `MobBuilder::with_callback_claim_verifier`;
+  `MobHandle::check_callback_claim_token` and
+  `record_callback_claim_verifier_if_absent`;
+  `MobRuntimeMetadataStore::put_callback_claim_verifier_if_absent`,
+  `load_callback_claim_verifier` and `delete_callback_claim_verifier`,
+  provided methods that refuse by default (the in-memory and SQLite stores
+  implement them).
+- `meerkat_mob_mcp::MobMcpState::mob_create_definition_with_claim_verifier`
+  and `mint_callback_claim_token`, and
+  `meerkat_mob_mcp::CallbackRouteClaimTokenRefused`.
+- `meerkat_contracts::MobClaimCallbackRouteParams`.
 
 ### Changed
 
@@ -1154,6 +1196,35 @@ them.
   input in its batch names, and a batch of several plain prompts carries none.
   A user request restored after an interrupted run carries the prompt's own
   id, as a run of that prompt alone stamps it.
+- A mob's callback route is claimed with the mob's claim token.
+  `mob/create` returns the token (`mct_` and the unpadded base64url of 32
+  bytes of OS entropy) once, to the creating connection, and the mob keeps
+  only its SHA-256, in its own store, written before anything else the
+  create keeps: a create refused because the store already holds one for
+  the id writes nothing, and a create that fails after writing it deletes
+  it again, so the id can be created again. `mob/claim_callback_route`
+  compares the presented token in constant time before anything else:
+  another token is refused (`-32002`, `claim_token_mismatch`), and a mob
+  created without one (by an agent's `mob_create`, implicitly, or by a
+  host's Rust create) is not claimable (`not_claimable`) unless its host
+  mints it one (`MobMcpState::mint_callback_claim_token`, a Rust API with
+  no wire method). Destroy deletes the stored hash, so a mob destroyed and
+  created again under its id, even on a store the host kept, never answers
+  the old token. A lost token cannot be minted again (the host mint
+  refuses a mob that keeps a verifier): destroying and creating the mob
+  again is the only recovery, so a creator that must claim the route after
+  a restart persists the token. The SDKs do not print it: Python's `Mob`
+  and the generated `MobCreateResult` and `MobClaimCallbackRouteParams`
+  leave it out of their reprs, and TypeScript's `Mob.claimToken` is not
+  enumerable. The token decides which connection a route claim follows
+  and nothing else: every connection to one `rkat-rpc` host keeps the same
+  owner authority.
+- Upgrading: a mob created over RPC before 0.9.3 keeps no claim token
+  verifier, so after the upgrade no connection can claim its callback
+  route over the wire. Destroy it and create it again (the new
+  `mob/create` returns its token), or have the host mint it a token through
+  `MobMcpState::mint_callback_claim_token` (a Rust API with no wire
+  method).
 
 ### Deprecated
 

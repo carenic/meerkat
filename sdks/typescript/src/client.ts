@@ -2224,6 +2224,11 @@ export class MeerkatClient {
         "mob_id",
         "Invalid mob/create response",
       ),
+      MeerkatClient.requireStringField(
+        result,
+        "claim_token",
+        "Invalid mob/create response",
+      ),
     );
   }
 
@@ -3262,12 +3267,24 @@ export class MeerkatClient {
    * Wraps the `mob/claim_callback_route` RPC. A mob restored after a restart,
    * or one whose owning connection closed, has no callback route: its
    * members' callback tools fail `tool_unavailable` until a connection claims
-   * it. After the claim, its live and future members call the tools this
-   * connection registered. A claim while the connection that holds the route
-   * is still open is refused with `-32002`.
+   * it with the mob's claim token, the one `createMob` returned to its
+   * creator (`Mob.claimToken`); a lost token cannot be minted again, so a
+   * creator that must claim after a restart persists it (destroying and
+   * creating the mob again is the only recovery). After the claim, its live
+   * and future members call the tools this connection registered. A claim is refused with
+   * `-32002`, its reason in `data.reason`: `claim_token_mismatch` for another
+   * token, `not_claimable` for a mob created without one, and
+   * `held_by_open_connection` while the connection that holds the route is
+   * still open.
    */
-  async mobClaimCallbackRoute(mobId: string): Promise<MobClaimCallbackRouteResult> {
-    const result = await this.request("mob/claim_callback_route", { mob_id: mobId });
+  async mobClaimCallbackRoute(
+    mobId: string,
+    claimToken: string,
+  ): Promise<MobClaimCallbackRouteResult> {
+    const result = await this.request("mob/claim_callback_route", {
+      mob_id: mobId,
+      claim_token: claimToken,
+    });
     MeerkatClient.requireStringField(
       result,
       "mob_id",

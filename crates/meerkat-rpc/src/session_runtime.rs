@@ -2587,8 +2587,10 @@ pub struct SessionRuntime {
     /// connection) are never written here: a connection's callbacks are never
     /// borrowed by another connection while it is open. The one hand-over is
     /// a mob's callback route slot
-    /// ([`crate::callback_dispatcher::MobCallbackRouteSlot`]): once the
-    /// connection holding it closes, the first connection to claim it
+    /// ([`crate::callback_dispatcher::MobCallbackRouteSlot`]), to a
+    /// connection presenting the mob's claim token (`mob/create` returns it
+    /// to the mob's creator; the mob keeps only its verifier), once the
+    /// connection holding it closed: the first such connection to claim it
     /// (`mob/claim_callback_route`) takes over the mob's member callbacks,
     /// including the pending detached callback jobs the closed connection's
     /// tools started, when it registers tools of the same name and runner:

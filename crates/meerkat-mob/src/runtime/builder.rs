@@ -639,6 +639,9 @@ pub struct MobBuilder {
         crate::control_policy::CommandAuthority,
         StartAdmittedDestroyCustodyWatch,
     )>,
+    /// The verifier of the created mob's callback claim token; see
+    /// [`MobBuilder::with_callback_claim_verifier`].
+    callback_claim_verifier: Option<crate::MobClaimVerifier>,
 }
 
 enum BuilderMode {
@@ -6909,6 +6912,7 @@ impl MobBuilder {
             member_live_host: None,
             restored_member_run_start_holds: BTreeMap::new(),
             start_destroy_admission: None,
+            callback_claim_verifier: None,
         }
     }
 
@@ -6991,7 +6995,20 @@ impl MobBuilder {
             member_live_host: None,
             restored_member_run_start_holds: BTreeMap::new(),
             start_destroy_admission: None,
+            callback_claim_verifier: None,
         }
+    }
+
+    /// Keep `verifier`, the verifier of the claim token the creator of this
+    /// mob receives, in the created mob's store: `create` writes it before
+    /// anything else durable (the mob's first event), so a created mob
+    /// always has it. A store that already holds one for the mob's id (an
+    /// earlier mob's, whose store was kept) fails the create before it
+    /// writes anything, rather than let that token claim this mob. Resume
+    /// ignores it: a resumed mob keeps the verifier it has.
+    pub fn with_callback_claim_verifier(mut self, verifier: crate::MobClaimVerifier) -> Self {
+        self.callback_claim_verifier = Some(verifier);
+        self
     }
 
     /// Compose the controlling-side reverse-lane acceptor (ADJ-P4-2). Cloned
@@ -7294,6 +7311,7 @@ impl MobBuilder {
                 restored_member_run_start_holds: _,
                 // Nor a restored destroy to admit.
                 start_destroy_admission: _,
+                callback_claim_verifier,
             } = builder;
             #[cfg(not(feature = "runtime-adapter"))]
             let runtime_adapter: RuntimeAdapterOption = None;
@@ -7386,111 +7404,149 @@ impl MobBuilder {
             )?;
             finish_seeded_mob_authority_phase(&mut dsl_authority, MobState::Running)?;
 
-            // Emit MobCreated event first
-            let definition_for_event = (*definition).clone();
-            storage
-                .events
-                .append(NewMobEvent {
-                    mob_id: definition.id.clone(),
-                    timestamp: None,
-                    kind: MobEventKind::MobCreated {
-                        definition: Box::new(definition_for_event),
-                    },
-                })
-                .await?;
-            if let Some(owner_bridge_event) = owner_bridge_event {
+            // The creator's claim verifier before anything else durable: a
+            // store that already holds one for the id (an earlier mob's,
+            // whose store was kept) refuses the create before it writes an
+            // event. A create that fails after writing it deletes it again
+            // (below), so a retry of the id on this store records its own.
+            let mut claim_verifier_cleanup = None;
+            if let Some(verifier) = callback_claim_verifier.as_ref() {
+                if !storage
+                    .runtime_metadata
+                    .put_callback_claim_verifier_if_absent(&definition.id, verifier)
+                    .await?
+                {
+                    return Err(MobError::Internal(format!(
+                        "the store of mob '{}' already holds a callback claim verifier, from an \
+                         earlier mob under this id",
+                        definition.id
+                    )));
+                }
+                claim_verifier_cleanup =
+                    Some((storage.runtime_metadata.clone(), definition.id.clone()));
+            }
+
+            let created = Box::pin(async move {
+                // Emit MobCreated event first
+                let definition_for_event = (*definition).clone();
                 storage
                     .events
                     .append(NewMobEvent {
                         mob_id: definition.id.clone(),
                         timestamp: None,
-                        kind: owner_bridge_event,
+                        kind: MobEventKind::MobCreated {
+                            definition: Box::new(definition_for_event),
+                        },
                     })
                     .await?;
-            }
-            Self::sync_definition_with_spec_store(&storage, definition.as_ref(), 1).await?;
-            Self::ensure_supervisor_authority(
-                storage.runtime_metadata.clone(),
-                definition.id.clone(),
-                &mut dsl_authority,
-            )
-            .await?;
-            Self::recover_host_bindings(
-                storage.runtime_metadata.clone(),
-                &definition.id,
-                &mut dsl_authority,
-                "create_after_insert_race",
-            )
-            .await?;
-            let supervisor_authority = storage
-                .runtime_metadata
-                .load_supervisor_authority(&definition.id)
-                .await?
-                .ok_or_else(|| {
-                    MobError::Internal(format!(
-                        "missing supervisor runtime metadata for newly created mob '{}'",
-                        definition.id
-                    ))
-                })?;
-            let supervisor_bridge = Arc::new(
-                MobSupervisorBridge::new_with_controlling_acceptor(
-                    &definition.id,
-                    supervisor_authority.clone(),
-                    definition
-                        .backend
-                        .external
-                        .as_ref()
-                        .and_then(|external| external.supervisor_bridge.clone()),
-                    controlling_acceptor.clone(),
+                if let Some(owner_bridge_event) = owner_bridge_event {
+                    storage
+                        .events
+                        .append(NewMobEvent {
+                            mob_id: definition.id.clone(),
+                            timestamp: None,
+                            kind: owner_bridge_event,
+                        })
+                        .await?;
+                }
+                Self::sync_definition_with_spec_store(&storage, definition.as_ref(), 1).await?;
+                Self::ensure_supervisor_authority(
+                    storage.runtime_metadata.clone(),
+                    definition.id.clone(),
+                    &mut dsl_authority,
                 )
-                .await?,
-            );
+                .await?;
+                Self::recover_host_bindings(
+                    storage.runtime_metadata.clone(),
+                    &definition.id,
+                    &mut dsl_authority,
+                    "create_after_insert_race",
+                )
+                .await?;
+                let supervisor_authority = storage
+                    .runtime_metadata
+                    .load_supervisor_authority(&definition.id)
+                    .await?
+                    .ok_or_else(|| {
+                        MobError::Internal(format!(
+                            "missing supervisor runtime metadata for newly created mob '{}'",
+                            definition.id
+                        ))
+                    })?;
+                let supervisor_bridge = Arc::new(
+                    MobSupervisorBridge::new_with_controlling_acceptor(
+                        &definition.id,
+                        supervisor_authority.clone(),
+                        definition
+                            .backend
+                            .external
+                            .as_ref()
+                            .and_then(|external| external.supervisor_bridge.clone()),
+                        controlling_acceptor.clone(),
+                    )
+                    .await?,
+                );
 
-            #[cfg(not(target_arch = "wasm32"))]
-            let supervisor_startup_guard =
-                SupervisorBridgeStartupGuard::new(Arc::clone(&supervisor_bridge));
-
-            let start_result = Self::start_runtime(
-                definition,
-                Roster::new(),
-                dsl_authority,
-                storage.events.clone(),
-                storage.runs.clone(),
-                storage.runtime_metadata.clone(),
-                storage.identity.clone(),
-                storage.identity_member.clone(),
-                storage.identity_status.clone(),
                 #[cfg(not(target_arch = "wasm32"))]
-                storage.identity_status_projection_order.clone(),
-                supervisor_bridge,
-                session_service,
-                runtime_adapter,
-                member_runtime_registration_hook,
-                workgraph_service,
-                tool_bundles,
-                default_llm_client,
-                tool_consequence_policy_registry,
-                default_external_tools_provider,
-                identity_local_external_tools_provider,
-                spawn_base_prompt_source,
-                spawn_member_customizer,
-                storage.realm_profiles.clone(),
-                storage.forked_participants.clone(),
-                notify_orchestrator_on_resume,
-                realtime_session_factory,
-                controlling_acceptor,
-                member_live_host,
-                before_activation,
-            )
+                let supervisor_startup_guard =
+                    SupervisorBridgeStartupGuard::new(Arc::clone(&supervisor_bridge));
+
+                let start_result = Self::start_runtime(
+                    definition,
+                    Roster::new(),
+                    dsl_authority,
+                    storage.events.clone(),
+                    storage.runs.clone(),
+                    storage.runtime_metadata.clone(),
+                    storage.identity.clone(),
+                    storage.identity_member.clone(),
+                    storage.identity_status.clone(),
+                    #[cfg(not(target_arch = "wasm32"))]
+                    storage.identity_status_projection_order.clone(),
+                    supervisor_bridge,
+                    session_service,
+                    runtime_adapter,
+                    member_runtime_registration_hook,
+                    workgraph_service,
+                    tool_bundles,
+                    default_llm_client,
+                    tool_consequence_policy_registry,
+                    default_external_tools_provider,
+                    identity_local_external_tools_provider,
+                    spawn_base_prompt_source,
+                    spawn_member_customizer,
+                    storage.realm_profiles.clone(),
+                    storage.forked_participants.clone(),
+                    notify_orchestrator_on_resume,
+                    realtime_session_factory,
+                    controlling_acceptor,
+                    member_live_host,
+                    before_activation,
+                )
+                .await;
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    supervisor_startup_guard.settle(start_result).await
+                }
+                #[cfg(target_arch = "wasm32")]
+                {
+                    start_result
+                }
+            })
             .await;
-            #[cfg(not(target_arch = "wasm32"))]
+            if created.is_err()
+                && let Some((runtime_metadata, mob_id)) = claim_verifier_cleanup
+                && let Err(error) = runtime_metadata
+                    .delete_callback_claim_verifier(&mob_id)
+                    .await
             {
-                supervisor_startup_guard.settle(start_result).await
+                tracing::warn!(
+                    mob_id = %mob_id,
+                    error = %error,
+                    "a failed mob create could not delete the callback claim verifier it wrote"
+                );
             }
-            #[cfg(target_arch = "wasm32")]
-            {
-                start_result
-            }
+            created
         })
     }
 
@@ -7536,6 +7592,7 @@ impl MobBuilder {
             member_live_host,
             restored_member_run_start_holds,
             start_destroy_admission,
+            callback_claim_verifier: _,
         } = self;
         #[cfg(not(feature = "runtime-adapter"))]
         let runtime_adapter: RuntimeAdapterOption = None;

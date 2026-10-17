@@ -7431,6 +7431,27 @@ impl MobRuntimeMetadataStore for FaultInjectedRuntimeMetadataStore {
             .delete_member_live_cleanup_record(mob_id, expected)
             .await
     }
+
+    async fn put_callback_claim_verifier_if_absent(
+        &self,
+        mob_id: &MobId,
+        verifier: &crate::MobClaimVerifier,
+    ) -> Result<bool, MobStoreError> {
+        self.inner
+            .put_callback_claim_verifier_if_absent(mob_id, verifier)
+            .await
+    }
+
+    async fn load_callback_claim_verifier(
+        &self,
+        mob_id: &MobId,
+    ) -> Result<Option<crate::MobClaimVerifier>, MobStoreError> {
+        self.inner.load_callback_claim_verifier(mob_id).await
+    }
+
+    async fn delete_callback_claim_verifier(&self, mob_id: &MobId) -> Result<bool, MobStoreError> {
+        self.inner.delete_callback_claim_verifier(mob_id).await
+    }
 }
 
 // -----------------------------------------------------------------------
@@ -15266,6 +15287,222 @@ async fn test_mob_builder_allows_ephemeral_session_service_when_opted_in() {
         .await
         .expect("create should allow ephemeral sessions when explicitly enabled");
     assert_eq!(handle.status().await.unwrap(), MobState::Running);
+}
+
+/// A mob created with a callback claim verifier answers its creator's token
+/// and no other; a mob created without one answers none until the host
+/// records one, which is never replaced. A store that already holds a
+/// verifier for the mob's id (an earlier mob's) fails the create.
+#[tokio::test]
+async fn a_created_mob_answers_only_its_own_callback_claim_token() {
+    use crate::CallbackClaimCheck;
+
+    let token = crate::MobClaimToken::mint().expect("entropy");
+    let other = crate::MobClaimToken::mint().expect("entropy");
+    let service = Arc::new(MockSessionService::new());
+    let _ = service.enable_runtime_adapter();
+    let handle = MobBuilder::new(sample_definition(), MobStorage::in_memory())
+        .with_session_service(service.clone())
+        .with_callback_claim_verifier(token.verifier())
+        .create()
+        .await
+        .expect("create mob");
+    assert_eq!(
+        handle.check_callback_claim_token(&token).await.unwrap(),
+        CallbackClaimCheck::Verified
+    );
+    assert_eq!(
+        handle.check_callback_claim_token(&other).await.unwrap(),
+        CallbackClaimCheck::Mismatch
+    );
+
+    // Each mob here has its own id: a live mob holds its id's supervisor
+    // participant name.
+    let mut tokenless = sample_definition();
+    tokenless.id = MobId::from(format!("{}-tokenless", tokenless.id));
+    let (unclaimable, _service) = create_test_mob(tokenless).await;
+    assert_eq!(
+        unclaimable
+            .check_callback_claim_token(&token)
+            .await
+            .unwrap(),
+        CallbackClaimCheck::NotClaimable
+    );
+    assert!(
+        unclaimable
+            .record_callback_claim_verifier_if_absent(&other.verifier())
+            .await
+            .unwrap()
+    );
+    assert!(
+        !unclaimable
+            .record_callback_claim_verifier_if_absent(&token.verifier())
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        unclaimable
+            .check_callback_claim_token(&other)
+            .await
+            .unwrap(),
+        CallbackClaimCheck::Verified
+    );
+
+    let mut earlier = sample_definition();
+    earlier.id = MobId::from(format!("{}-earlier", earlier.id));
+    let kept = MobStorage::in_memory();
+    assert!(
+        kept.runtime_metadata
+            .put_callback_claim_verifier_if_absent(&earlier.id, &other.verifier())
+            .await
+            .unwrap()
+    );
+    let refused = MobBuilder::new(earlier.clone(), kept.clone())
+        .with_session_service(service)
+        .with_callback_claim_verifier(token.verifier())
+        .create()
+        .await;
+    assert!(
+        matches!(
+            &refused,
+            Err(MobError::Internal(message)) if message.contains("already holds a callback claim verifier")
+        ),
+        "{:?}",
+        refused.map(|_| ())
+    );
+    assert!(
+        kept.events.replay_all().await.unwrap().is_empty(),
+        "a refused create writes no event"
+    );
+    assert!(
+        kept.runtime_metadata
+            .load_callback_claim_verifier(&earlier.id)
+            .await
+            .unwrap()
+            .is_some_and(|found| found.verifies(&other)),
+        "a refused create keeps the verifier it found"
+    );
+}
+
+/// Destroy deletes the mob's callback claim verifier with the rest of its
+/// runtime metadata: a mob created again under the id on the store the host
+/// kept never answers the destroyed mob's token, and the host can mint the
+/// new mob one of its own.
+#[tokio::test]
+async fn a_destroyed_mobs_claim_token_never_claims_a_mob_created_again_on_a_kept_store() {
+    use crate::CallbackClaimCheck;
+
+    let token = crate::MobClaimToken::mint().expect("entropy");
+    let service = Arc::new(MockSessionService::new());
+    let _ = service.enable_runtime_adapter();
+    let definition = with_unique_mob_id(sample_definition(), "claim-recreated");
+    let kept = MobStorage::in_memory();
+    let destroyed = MobBuilder::new(definition.clone(), kept.clone())
+        .with_session_service(service.clone())
+        .with_callback_claim_verifier(token.verifier())
+        .create()
+        .await
+        .expect("create mob");
+    assert_eq!(
+        destroyed.check_callback_claim_token(&token).await.unwrap(),
+        CallbackClaimCheck::Verified
+    );
+    destroyed.destroy().await.expect("destroy");
+    drop(destroyed);
+    await_supervisor_route_release(&definition.id).await;
+
+    let again = MobBuilder::new(definition, kept)
+        .with_session_service(service)
+        .create()
+        .await
+        .expect("create the mob again under its id on the kept store");
+    assert_eq!(
+        again.check_callback_claim_token(&token).await.unwrap(),
+        CallbackClaimCheck::NotClaimable,
+        "the destroyed mob's token claims nothing"
+    );
+    let minted = crate::MobClaimToken::mint().expect("entropy");
+    assert!(
+        again
+            .record_callback_claim_verifier_if_absent(&minted.verifier())
+            .await
+            .unwrap(),
+        "the host mints the new mob a token of its own"
+    );
+    assert_eq!(
+        again.check_callback_claim_token(&token).await.unwrap(),
+        CallbackClaimCheck::Mismatch
+    );
+    assert_eq!(
+        again.check_callback_claim_token(&minted).await.unwrap(),
+        CallbackClaimCheck::Verified
+    );
+}
+
+/// A create that fails after it wrote the creator's claim verifier deletes
+/// that verifier again: a retry of the mob's id on the same store records its
+/// own, and the mob answers only the retry's token.
+#[tokio::test]
+async fn a_create_that_fails_after_writing_its_claim_verifier_leaves_the_id_creatable() {
+    use crate::CallbackClaimCheck;
+
+    let events = Arc::new(FaultInjectedMobEventStore::new());
+    let storage = MobStorage::with_events_and_runtime_metadata(
+        events.clone(),
+        Arc::new(InMemoryMobRuntimeMetadataStore::new()),
+    );
+    let service = Arc::new(MockSessionService::new());
+    let _ = service.enable_runtime_adapter();
+    let definition = with_unique_mob_id(sample_definition(), "claim-failed-create");
+    let failed_token = crate::MobClaimToken::mint().expect("entropy");
+    events.fail_appends_for("MobCreated").await;
+    let failed = MobBuilder::new(definition.clone(), storage.clone())
+        .with_session_service(service.clone())
+        .with_callback_claim_verifier(failed_token.verifier())
+        .create()
+        .await;
+    let error = match failed {
+        Ok(_) => panic!("the create fails at its first event"),
+        Err(error) => error,
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("fault-injected append failure for MobCreated"),
+        "{error}"
+    );
+    assert!(
+        storage
+            .runtime_metadata
+            .load_callback_claim_verifier(&definition.id)
+            .await
+            .unwrap()
+            .is_none(),
+        "the failed create deleted the verifier it wrote"
+    );
+
+    events.allow_appends_for("MobCreated").await;
+    let retry_token = crate::MobClaimToken::mint().expect("entropy");
+    let retried = MobBuilder::new(definition, storage)
+        .with_session_service(service)
+        .with_callback_claim_verifier(retry_token.verifier())
+        .create()
+        .await
+        .expect("a retry of the id on the same store creates the mob");
+    assert_eq!(
+        retried
+            .check_callback_claim_token(&retry_token)
+            .await
+            .unwrap(),
+        CallbackClaimCheck::Verified
+    );
+    assert_eq!(
+        retried
+            .check_callback_claim_token(&failed_token)
+            .await
+            .unwrap(),
+        CallbackClaimCheck::Mismatch
+    );
 }
 
 #[tokio::test]

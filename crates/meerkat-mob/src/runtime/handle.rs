@@ -8227,6 +8227,37 @@ impl MobHandle {
         })
     }
 
+    /// Answer a presented callback claim token with the verifier this mob's
+    /// store keeps ([`crate::CallbackClaimCheck`]).
+    pub async fn check_callback_claim_token(
+        &self,
+        token: &crate::MobClaimToken,
+    ) -> Result<crate::CallbackClaimCheck, MobError> {
+        Ok(
+            match self
+                .runtime_metadata
+                .load_callback_claim_verifier(&self.definition.id)
+                .await?
+            {
+                None => crate::CallbackClaimCheck::NotClaimable,
+                Some(verifier) if verifier.verifies(token) => crate::CallbackClaimCheck::Verified,
+                Some(_) => crate::CallbackClaimCheck::Mismatch,
+            },
+        )
+    }
+
+    /// Keep `verifier` as this mob's callback claim verifier when it has
+    /// none. Returns `false`, keeping the one it has, when it has one.
+    pub async fn record_callback_claim_verifier_if_absent(
+        &self,
+        verifier: &crate::MobClaimVerifier,
+    ) -> Result<bool, MobError> {
+        Ok(self
+            .runtime_metadata
+            .put_callback_claim_verifier_if_absent(&self.definition.id, verifier)
+            .await?)
+    }
+
     /// Mob ID.
     pub fn mob_id(&self) -> &MobId {
         &self.definition.id

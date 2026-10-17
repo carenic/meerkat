@@ -682,6 +682,20 @@ pub struct MemberExternalTools {
 /// See [`MemberExternalTools::on_managed`].
 pub type MemberExternalToolsOnManaged = Box<dyn FnOnce(&MobId) + Send>;
 
+/// A callback route claim refused for its claim token
+/// ([`MobMcpState::mob_claim_member_external_tools`]), before the claim ran.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum CallbackRouteClaimTokenRefused {
+    /// The presented token is not the mob's claim token.
+    #[error("the claim token is not the mob's")]
+    Mismatch,
+    /// The mob keeps no claim token (it was created other than over RPC, or
+    /// before 0.9.3, and the host minted none), so no token claims its
+    /// callback route.
+    #[error("the mob has no claim token, so no connection can claim its callback route")]
+    NotClaimable,
+}
+
 /// Builds the default external tools of one mob's members from the mob's id
 /// (see [`MobMcpState::with_member_external_tools_factory`]).
 pub type MemberExternalToolsFactory =
@@ -3867,7 +3881,7 @@ impl MobMcpState {
         &self,
         definition: MobDefinition,
     ) -> Result<MobId, MobError> {
-        self.mob_create_definition_inner(definition, None, None)
+        self.mob_create_definition_inner(definition, None, None, None)
             .await
             .map(|created| created.mob_id)
     }
@@ -3883,27 +3897,56 @@ impl MobMcpState {
         definition: MobDefinition,
         member_external_tools: meerkat_mob::ExternalToolsProvider,
     ) -> Result<MobId, MobError> {
-        self.mob_create_definition_inner(definition, None, Some(member_external_tools))
+        self.mob_create_definition_inner(definition, None, Some(member_external_tools), None)
             .await
             .map(|created| created.mob_id)
     }
 
+    /// [`Self::mob_create_definition`] for a creator that will hold the
+    /// mob's callback route: the created mob keeps `claim_verifier`, the
+    /// verifier of the claim token its creator receives, in its own store
+    /// before it is managed, so [`Self::mob_claim_member_external_tools`]
+    /// needs that token for it. `member_external_tools`, when given, are the
+    /// creator's own, as for
+    /// [`Self::mob_create_definition_with_member_external_tools`].
+    pub async fn mob_create_definition_with_claim_verifier(
+        &self,
+        definition: MobDefinition,
+        member_external_tools: Option<meerkat_mob::ExternalToolsProvider>,
+        claim_verifier: meerkat_mob::MobClaimVerifier,
+    ) -> Result<MobId, MobError> {
+        self.mob_create_definition_inner(
+            definition,
+            None,
+            member_external_tools,
+            Some(claim_verifier),
+        )
+        .await
+        .map(|created| created.mob_id)
+    }
+
     /// Claim the member external tools of an existing mob for a caller (an
-    /// RPC connection claiming a mob's callback route).
+    /// RPC connection claiming a mob's callback route) that presents the
+    /// mob's claim token.
     ///
     /// Needs the console owner (`SendCommand`) and is held by this state's
     /// admission while it runs, so a stood-down state admits no claim; the
     /// host's create hook is not asked, since a claim creates nothing. A
     /// restored mob is restored first, so the claim reaches the tools its
-    /// restored members were built with. `claim` is the caller's own binding
-    /// of what it claims; it runs while the managed set is read with the mob
-    /// in it (so after the mob's [`MemberExternalTools::on_managed`]), and
-    /// its answer is returned unchanged.
+    /// restored members were built with. The token is checked against the
+    /// verifier the mob keeps while the managed set is read with the mob in
+    /// it; a token that is not the mob's, or a mob that keeps no verifier,
+    /// refuses the claim ([`CallbackRouteClaimTokenRefused`]) before `claim`
+    /// runs. `claim` is the caller's own binding of what it claims; it runs
+    /// under the same read (so after the mob's
+    /// [`MemberExternalTools::on_managed`]), and its answer is returned
+    /// unchanged.
     pub async fn mob_claim_member_external_tools<T, F>(
         &self,
         mob_id: &MobId,
+        claim_token: &meerkat_mob::MobClaimToken,
         claim: F,
-    ) -> Result<T, MobError>
+    ) -> Result<Result<T, CallbackRouteClaimTokenRefused>, MobError>
     where
         F: FnOnce() -> T + Send,
         T: Send,
@@ -3912,16 +3955,61 @@ impl MobMcpState {
         let _admission = self.admit("mob callback route claim")?;
         self.ensure_restored().await?;
         let mobs = self.mobs.read().await;
-        if !mobs.contains_key(mob_id) {
+        let Some(managed) = mobs.get(mob_id) else {
             drop(mobs);
             return Err(self
                 .held_child_mob_error(mob_id)
                 .await
                 .unwrap_or_else(|| MobError::MobNotFound(mob_id.clone())));
-        }
-        let answer = claim();
+        };
+        let answer = match managed
+            .handle
+            .check_callback_claim_token(claim_token)
+            .await?
+        {
+            meerkat_mob::CallbackClaimCheck::Verified => Ok(claim()),
+            meerkat_mob::CallbackClaimCheck::Mismatch => {
+                Err(CallbackRouteClaimTokenRefused::Mismatch)
+            }
+            meerkat_mob::CallbackClaimCheck::NotClaimable => {
+                Err(CallbackRouteClaimTokenRefused::NotClaimable)
+            }
+        };
         drop(mobs);
         Ok(answer)
+    }
+
+    /// Mint a callback claim token for a managed mob that keeps no verifier
+    /// (one created before 0.9.3, or other than over RPC), for the host to
+    /// hand to the one connection it trusts with the mob's callback route.
+    /// A Rust API only: no wire method reaches it. `None` when the mob
+    /// already keeps a verifier, which is never replaced.
+    ///
+    /// Needs the console owner (`SendCommand`) and this state's admission,
+    /// as a claim does.
+    pub async fn mint_callback_claim_token(
+        &self,
+        mob_id: &MobId,
+    ) -> Result<Option<meerkat_mob::MobClaimToken>, MobError> {
+        self.require_console_owner(ControlScope::SendCommand)?;
+        let _admission = self.admit("mob callback claim token mint")?;
+        self.ensure_restored().await?;
+        let mobs = self.mobs.read().await;
+        let Some(managed) = mobs.get(mob_id) else {
+            drop(mobs);
+            return Err(self
+                .held_child_mob_error(mob_id)
+                .await
+                .unwrap_or_else(|| MobError::MobNotFound(mob_id.clone())));
+        };
+        let token = meerkat_mob::MobClaimToken::mint()
+            .map_err(|error| MobError::Internal(error.to_string()))?;
+        let recorded = managed
+            .handle
+            .record_callback_claim_verifier_if_absent(&token.verifier())
+            .await?;
+        drop(mobs);
+        Ok(recorded.then_some(token))
     }
 
     pub async fn mob_create_from_mobpack(
@@ -4075,6 +4163,7 @@ impl MobMcpState {
                 implicit_delegation_mob,
             )),
             None,
+            None,
         )
         .await
     }
@@ -4084,6 +4173,7 @@ impl MobMcpState {
         definition: MobDefinition,
         owner_bridge_session_authority: Option<(SessionId, bool, bool)>,
         member_external_tools: Option<meerkat_mob::ExternalToolsProvider>,
+        claim_verifier: Option<meerkat_mob::MobClaimVerifier>,
     ) -> Result<CreatedMob, MobError> {
         // (b) gate, ADJ-P5-11: no per-mob grant can authorize creating a
         // mob that does not exist yet.
@@ -4099,6 +4189,7 @@ impl MobMcpState {
                             definition,
                             owner_bridge_session_authority,
                             member_external_tools,
+                            claim_verifier,
                         )
                         .await
                 })
@@ -4109,6 +4200,7 @@ impl MobMcpState {
             definition,
             owner_bridge_session_authority,
             member_external_tools,
+            claim_verifier,
         )
         .await
     }
@@ -4140,6 +4232,7 @@ impl MobMcpState {
         mut definition: MobDefinition,
         owner_bridge_session_authority: Option<(SessionId, bool, bool)>,
         member_external_tools: Option<meerkat_mob::ExternalToolsProvider>,
+        claim_verifier: Option<meerkat_mob::MobClaimVerifier>,
     ) -> Result<CreatedMob, MobError> {
         self.hydrate_definition_skill_sources(&mut definition)
             .await?;
@@ -4203,6 +4296,9 @@ impl MobMcpState {
                 destroy_on_owner_archive,
                 implicit_delegation_mob,
             );
+        }
+        if let Some(claim_verifier) = claim_verifier {
+            builder = builder.with_callback_claim_verifier(claim_verifier);
         }
         let handle = builder.create().await?;
         let incarnation = handle.incarnation();

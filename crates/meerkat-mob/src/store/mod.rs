@@ -4757,6 +4757,43 @@ pub trait MobRuntimeMetadataStore: Send + Sync {
 
     /// Delete all overlays for the given mob.
     async fn delete_external_binding_overlays(&self, mob_id: &MobId) -> Result<(), MobStoreError>;
+
+    /// Record the verifier of the mob's callback claim token
+    /// ([`crate::MobClaimVerifier`]) if the mob has none. Returns `true` when
+    /// this call recorded it, `false` when the mob already had one, which is
+    /// kept. It lives as long as the mob's store: a destroy removes it with
+    /// the store. A store without the capability refuses, so no mob takes a
+    /// token it cannot keep.
+    async fn put_callback_claim_verifier_if_absent(
+        &self,
+        mob_id: &MobId,
+        verifier: &crate::MobClaimVerifier,
+    ) -> Result<bool, MobStoreError> {
+        let _ = (mob_id, verifier);
+        runtime_metadata_capability_unavailable("put_callback_claim_verifier_if_absent")
+    }
+
+    /// The verifier of the mob's callback claim token; `None` when it has
+    /// none. A store without the capability refuses, so no token claims its
+    /// mobs' routes.
+    async fn load_callback_claim_verifier(
+        &self,
+        mob_id: &MobId,
+    ) -> Result<Option<crate::MobClaimVerifier>, MobStoreError> {
+        let _ = mob_id;
+        runtime_metadata_capability_unavailable("load_callback_claim_verifier")
+    }
+
+    /// Delete the verifier of the mob's callback claim token, if it has one.
+    /// Returns whether one was deleted. Mob destroy deletes it with the rest
+    /// of the mob's runtime metadata, so a mob created again under the id in
+    /// a store the host kept never answers the destroyed mob's token. A
+    /// store without the capability refuses, which leaves such a destroy
+    /// incomplete.
+    async fn delete_callback_claim_verifier(&self, mob_id: &MobId) -> Result<bool, MobStoreError> {
+        let _ = mob_id;
+        runtime_metadata_capability_unavailable("delete_callback_claim_verifier")
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -7468,6 +7505,117 @@ mod runtime_metadata_store_compatibility_tests {
         assert_capability_unavailable(
             store.list_mob_operator_grants(&mob_id).await,
             "list_mob_operator_grants",
+        );
+        let verifier = crate::MobClaimToken::mint().unwrap().verifier();
+        assert_capability_unavailable(
+            store
+                .put_callback_claim_verifier_if_absent(&mob_id, &verifier)
+                .await,
+            "put_callback_claim_verifier_if_absent",
+        );
+        assert_capability_unavailable(
+            store.load_callback_claim_verifier(&mob_id).await,
+            "load_callback_claim_verifier",
+        );
+        assert_capability_unavailable(
+            store.delete_callback_claim_verifier(&mob_id).await,
+            "delete_callback_claim_verifier",
+        );
+    }
+}
+
+/// The callback claim verifier contract every runtime metadata store keeps.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+pub(crate) mod callback_claim_verifier_contract {
+    use super::*;
+
+    /// A mob has no verifier until one is recorded; the first record wins
+    /// and a later one is refused, keeping the first; other mobs are apart.
+    /// Returns the mob and the verifier it keeps.
+    pub(crate) async fn recorded_once_and_kept(
+        store: &dyn MobRuntimeMetadataStore,
+    ) -> (MobId, crate::MobClaimVerifier) {
+        let mob_id = MobId::from("claim-mob");
+        let first = crate::MobClaimToken::mint().unwrap();
+        let second = crate::MobClaimToken::mint().unwrap();
+        assert_eq!(
+            store.load_callback_claim_verifier(&mob_id).await.unwrap(),
+            None
+        );
+        assert!(
+            store
+                .put_callback_claim_verifier_if_absent(&mob_id, &first.verifier())
+                .await
+                .unwrap()
+        );
+        assert!(
+            !store
+                .put_callback_claim_verifier_if_absent(&mob_id, &second.verifier())
+                .await
+                .unwrap(),
+            "a mob's verifier is never replaced"
+        );
+        let kept = store
+            .load_callback_claim_verifier(&mob_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(kept.verifies(&first) && !kept.verifies(&second));
+        assert_eq!(
+            store
+                .load_callback_claim_verifier(&MobId::from("other-mob"))
+                .await
+                .unwrap(),
+            None
+        );
+        (mob_id, kept)
+    }
+
+    /// Deleting a mob's verifier forgets it (another mob's is kept); a
+    /// second delete finds none, and the id then records a new one.
+    pub(crate) async fn deleted_and_recorded_anew(store: &dyn MobRuntimeMetadataStore) {
+        let mob_id = MobId::from("deleted-mob");
+        let other = MobId::from("kept-mob");
+        let first = crate::MobClaimToken::mint().unwrap();
+        let second = crate::MobClaimToken::mint().unwrap();
+        assert!(
+            store
+                .put_callback_claim_verifier_if_absent(&mob_id, &first.verifier())
+                .await
+                .unwrap()
+        );
+        assert!(
+            store
+                .put_callback_claim_verifier_if_absent(&other, &first.verifier())
+                .await
+                .unwrap()
+        );
+        assert!(store.delete_callback_claim_verifier(&mob_id).await.unwrap());
+        assert_eq!(
+            store.load_callback_claim_verifier(&mob_id).await.unwrap(),
+            None
+        );
+        assert!(!store.delete_callback_claim_verifier(&mob_id).await.unwrap());
+        assert!(
+            store
+                .load_callback_claim_verifier(&other)
+                .await
+                .unwrap()
+                .is_some_and(|kept| kept.verifies(&first))
+        );
+        assert!(
+            store
+                .put_callback_claim_verifier_if_absent(&mob_id, &second.verifier())
+                .await
+                .unwrap()
+        );
+        assert!(
+            store
+                .load_callback_claim_verifier(&mob_id)
+                .await
+                .unwrap()
+                .is_some_and(|kept| kept.verifies(&second) && !kept.verifies(&first))
         );
     }
 }
