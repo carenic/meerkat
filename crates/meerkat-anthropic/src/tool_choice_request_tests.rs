@@ -251,6 +251,27 @@ fn forced_choice_is_refused_under_explicit_thinking_never_switched_off() {
 }
 
 #[test]
+fn forced_choice_is_sent_with_thinking_disabled() {
+    // Disabled thinking is no thinking, so a forced call is compatible; a
+    // stale legacy budget beside it is not sent either.
+    for model in [FORCEABLE, "claude-haiku-5-5"] {
+        for choice in forced() {
+            let disabled = request(model, choice.clone()).with_anthropic_tag_merge(|tag| {
+                tag.thinking = Some(AnthropicThinkingConfig::Disabled);
+                tag.thinking_budget_tokens = Some(2048);
+            });
+            let body = body(&disabled).unwrap();
+            assert_eq!(body["thinking"], json!({"type": "disabled"}), "{model}");
+            let expected = match &choice {
+                ToolChoice::Tool { name } => json!({"type": "tool", "name": name}),
+                _ => json!({"type": "any"}),
+            };
+            assert_eq!(body["tool_choice"], expected, "{model} {choice:?}");
+        }
+    }
+}
+
+#[test]
 fn uncatalogued_models_pass_the_forced_choice_through() {
     let body = body(&request("claude-future-9", ToolChoice::Required)).unwrap();
     assert_eq!(body["tool_choice"], json!({"type": "any"}));

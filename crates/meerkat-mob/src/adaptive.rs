@@ -316,9 +316,29 @@ pub struct FinishResult {
 /// `description` documentation keywords are removed), so a stale or
 /// hand-rolled schema fails closed while a reworded doc comment does not
 /// invalidate packs built before it.
+///
+/// Anthropic thinking types added after the released schema (`disabled`) are
+/// left out, so packs keep loading across host versions: a layer profile
+/// cannot select them until packs carry a versioned schema, while static
+/// profiles and every API surface accept them.
 #[cfg(feature = "schema")]
 pub fn layer_decision_schema() -> Result<serde_json::Value, serde_json::Error> {
-    serde_json::to_value(schemars::schema_for!(LayerDecision))
+    let mut schema = serde_json::to_value(schemars::schema_for!(LayerDecision))?;
+    if let Some(variants) = schema
+        .pointer_mut("/$defs/AnthropicThinkingConfig/oneOf")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        variants.retain(|variant| {
+            variant
+                .pointer("/properties/type/const")
+                .and_then(serde_json::Value::as_str)
+                != Some(
+                    meerkat_core::lifecycle::run_primitive::AnthropicThinkingConfig::Disabled
+                        .wire_type(),
+                )
+        });
+    }
+    Ok(schema)
 }
 
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
@@ -3665,6 +3685,72 @@ mod tests {
             "result": { "result": { "ok": true } }
         });
         assert!(validator.is_valid(&finish));
+    }
+
+    #[cfg(feature = "schema")]
+    #[test]
+    fn layer_decision_schema_admits_only_the_released_anthropic_thinking_types() {
+        let thinking_types = |schema: &serde_json::Value| {
+            schema
+                .pointer("/$defs/AnthropicThinkingConfig/oneOf")
+                .and_then(serde_json::Value::as_array)
+                .expect("AnthropicThinkingConfig variants")
+                .iter()
+                .map(|variant| {
+                    variant
+                        .pointer("/properties/type/const")
+                        .and_then(serde_json::Value::as_str)
+                        .expect("variant type")
+                        .to_owned()
+                })
+                .collect::<Vec<_>>()
+        };
+        let layer = layer_decision_schema().expect("canonical schema serializes");
+        assert_eq!(
+            thinking_types(&layer),
+            ["adaptive", "enabled", "between_tools"],
+            "the released pack schema's thinking types"
+        );
+        // The type itself, as every API surface renders it, admits disabled.
+        let core = serde_json::to_value(schemars::schema_for!(
+            meerkat_core::lifecycle::run_primitive::AnthropicThinkingConfig
+        ))
+        .expect("thinking schema serializes");
+        let core_types = core
+            .get("oneOf")
+            .and_then(serde_json::Value::as_array)
+            .expect("thinking variants")
+            .iter()
+            .filter_map(|variant| variant.pointer("/properties/type/const"))
+            .filter_map(serde_json::Value::as_str)
+            .collect::<Vec<_>>();
+        assert!(core_types.contains(&"disabled"), "{core_types:?}");
+        let validator =
+            jsonschema::validator_for(&layer).expect("canonical schema is a valid JSON schema");
+        let decision = |thinking: &str| {
+            serde_json::json!({
+                "decision": "run_layer",
+                "reason": "test",
+                "plan": {
+                    "id": "layer-1",
+                    "objective": "do work",
+                    "shape": { "kind": "solo" },
+                    "profiles": { "solo": { "inline": {
+                        "model": "claude-opus-4-8",
+                        "provider_params": { "provider_tag": {
+                            "provider": "anthropic",
+                            "thinking": { "type": thinking }
+                        } }
+                    } } },
+                    "collector": {
+                        "profile": "solo",
+                        "output_schema": { "inline": { "type": "object" } }
+                    }
+                }
+            })
+        };
+        assert!(validator.is_valid(&decision("adaptive")));
+        assert!(!validator.is_valid(&decision("disabled")));
     }
 
     fn limits(value: u64) -> AdaptiveLimitRecord {

@@ -31,9 +31,10 @@ pub fn build_params_schema(caps: &ModelCapabilities) -> Value {
 // Anthropic
 //
 // Current hand-written shape (matched for parity):
-// - thinking: oneOf
-//     * { type: "adaptive" }                          (only when adaptive is supported)
-//     * { type: "enabled", budget_tokens: integer }   (always supported where thinking != None)
+// - thinking: the types the row accepts (`accepts_anthropic_thinking`), as
+//   one object or, when the row accepts both kinds, a oneOf of:
+//     * { type: "adaptive" | "between_tools" | "disabled" }   (fieldless types)
+//     * { type: "enabled", budget_tokens: integer }            (budget form)
 // - thinking_budget: integer  (legacy flat alternative)
 // - top_k: integer
 // - effort: string enum       (only on models with effort_levels non-empty)
@@ -44,7 +45,7 @@ pub fn build_params_schema(caps: &ModelCapabilities) -> Value {
 fn build_anthropic_schema(caps: &ModelCapabilities) -> Value {
     let mut props = serde_json::Map::new();
 
-    if let Some(thinking) = anthropic_thinking_schema(caps.thinking) {
+    if let Some(thinking) = anthropic_thinking_schema(caps) {
         props.insert("thinking".into(), thinking);
     }
     if caps.supports_thinking_budget_legacy && caps.thinking != ThinkingSupport::None {
@@ -80,55 +81,75 @@ fn build_anthropic_schema(caps: &ModelCapabilities) -> Value {
     object_schema(props)
 }
 
-fn anthropic_thinking_schema(mode: ThinkingSupport) -> Option<Value> {
-    match mode {
-        ThinkingSupport::None | ThinkingSupport::GeminiThinkingLevel => None,
-        ThinkingSupport::AnthropicEnabledOnly => Some(json!({
-            "description": "Extended thinking configuration. Format: {\"type\": \"enabled\", \"budget_tokens\": N}.",
+fn anthropic_thinking_schema(caps: &ModelCapabilities) -> Option<Value> {
+    use crate::lifecycle::run_primitive::AnthropicThinkingConfig as Thinking;
+    // Thinking types that carry no other field, in wire order, and whether
+    // the budget form is accepted: what the row accepts at some effort.
+    let simple: Vec<Thinking> = [
+        Thinking::Adaptive,
+        Thinking::BetweenTools,
+        Thinking::Disabled,
+    ]
+    .into_iter()
+    .filter(|thinking| caps.accepts_anthropic_thinking(thinking))
+    .collect();
+    let budget = caps.accepts_anthropic_thinking(&Thinking::Enabled { budget_tokens: 0 });
+    let describe = |thinking: &Thinking| {
+        let shape = format!("{{\"type\": \"{}\"}}", thinking.wire_type());
+        let note = match thinking {
+            Thinking::BetweenTools => "no up-front thinking",
+            Thinking::Disabled => "no thinking",
+            Thinking::Adaptive | Thinking::Enabled { .. } => return shape,
+        };
+        if caps.anthropic_thinking_capped_at_high_effort(thinking) {
+            format!("{shape} ({note}; `high` effort or below)")
+        } else {
+            format!("{shape} ({note})")
+        }
+    };
+    let mut formats: Vec<String> = simple.iter().map(describe).collect();
+    if budget {
+        formats.push("{\"type\": \"enabled\", \"budget_tokens\": N}".to_string());
+    }
+    let simple_schema = (!simple.is_empty()).then(|| {
+        json!({
+            "type": "object",
+            "required": ["type"],
+            "properties": {
+                "type": {
+                    "type": "string",
+                    "enum": simple.iter().map(Thinking::wire_type).collect::<Vec<_>>()
+                }
+            }
+        })
+    });
+    let budget_schema = budget.then(|| {
+        json!({
             "type": "object",
             "required": ["type", "budget_tokens"],
             "properties": {
                 "type": { "type": "string", "enum": ["enabled"] },
                 "budget_tokens": { "type": "integer", "minimum": 0 }
             }
-        })),
-        ThinkingSupport::AnthropicAdaptiveOnly => Some(json!({
-            "description": "Extended thinking configuration. Format: {\"type\": \"adaptive\"}.",
-            "type": "object",
-            "required": ["type"],
-            "properties": {
-                "type": { "type": "string", "enum": ["adaptive"] }
-            }
-        })),
-        ThinkingSupport::AnthropicAdaptiveOrBetweenTools => Some(json!({
-            "description": "Extended thinking configuration. Format: {\"type\": \"adaptive\"} or {\"type\": \"between_tools\"} (no up-front thinking; `high` effort or below).",
-            "type": "object",
-            "required": ["type"],
-            "properties": {
-                "type": { "type": "string", "enum": ["adaptive", "between_tools"] }
-            }
-        })),
-        ThinkingSupport::AnthropicAdaptiveAndEnabled => Some(json!({
-            "description": "Extended thinking configuration. Format: {\"type\": \"adaptive\"} or {\"type\": \"enabled\", \"budget_tokens\": N}.",
-            "oneOf": [
-                {
-                    "type": "object",
-                    "required": ["type"],
-                    "properties": {
-                        "type": { "type": "string", "enum": ["adaptive"] }
-                    }
-                },
-                {
-                    "type": "object",
-                    "required": ["type", "budget_tokens"],
-                    "properties": {
-                        "type": { "type": "string", "enum": ["enabled"] },
-                        "budget_tokens": { "type": "integer", "minimum": 0 }
-                    }
-                }
-            ]
-        })),
+        })
+    });
+    let schema = match (simple_schema, budget_schema) {
+        (Some(simple), Some(budget)) => json!({ "oneOf": [simple, budget] }),
+        (Some(one), None) | (None, Some(one)) => one,
+        (None, None) => return None,
+    };
+    let mut described = serde_json::Map::new();
+    described.insert(
+        "description".into(),
+        Value::String(format!(
+            "Extended thinking configuration. Format: {}.",
+            formats.join(" or ")
+        )),
+    );
+    if let Value::Object(fields) = schema {
+        described.extend(fields);
     }
+    Some(Value::Object(described))
 }
 
 // ---------------------------------------------------------------------------
@@ -484,6 +505,110 @@ mod tests {
         assert!(caps.effort_levels.is_empty());
         let schema = build_params_schema(caps);
         assert!(!property_keys(&schema).contains("effort"));
+    }
+
+    #[test]
+    fn anthropic_thinking_schema_lists_disabled_only_where_the_row_accepts_it() {
+        use crate::model_profile::capabilities::{AnthropicDisabledThinking, ModelCapabilities};
+
+        let base = TEST_CATALOG
+            .capabilities_for(crate::Provider::Anthropic, "test-anthropic-default")
+            .expect("test anthropic row");
+        let thinking_schema = |thinking, disabled| {
+            let caps = ModelCapabilities {
+                thinking,
+                anthropic_disabled_thinking: disabled,
+                ..*base
+            };
+            build_params_schema(&caps)["properties"]["thinking"].clone()
+        };
+        let fieldless = |types: &[&str]| {
+            json!({
+                "type": "object",
+                "required": ["type"],
+                "properties": { "type": { "type": "string", "enum": types } }
+            })
+        };
+        let budget = json!({
+            "type": "object",
+            "required": ["type", "budget_tokens"],
+            "properties": {
+                "type": { "type": "string", "enum": ["enabled"] },
+                "budget_tokens": { "type": "integer", "minimum": 0 }
+            }
+        });
+        let without_description = |mut schema: Value| {
+            let description = schema
+                .as_object_mut()
+                .and_then(|object| object.remove("description"))
+                .and_then(|description| description.as_str().map(str::to_owned))
+                .expect("thinking schema description");
+            (schema, description)
+        };
+
+        let (refused, description) = without_description(thinking_schema(
+            ThinkingSupport::AnthropicAdaptiveOnly,
+            AnthropicDisabledThinking::Refused,
+        ));
+        assert_eq!(refused, fieldless(&["adaptive"]));
+        assert_eq!(
+            description,
+            "Extended thinking configuration. Format: {\"type\": \"adaptive\"}."
+        );
+
+        let (any, description) = without_description(thinking_schema(
+            ThinkingSupport::AnthropicAdaptiveOnly,
+            AnthropicDisabledThinking::AnyEffort,
+        ));
+        assert_eq!(any, fieldless(&["adaptive", "disabled"]));
+        assert!(
+            description.ends_with("or {\"type\": \"disabled\"} (no thinking)."),
+            "{description}"
+        );
+
+        let (capped, description) = without_description(thinking_schema(
+            ThinkingSupport::AnthropicAdaptiveOnly,
+            AnthropicDisabledThinking::AtOrBelowHighEffort,
+        ));
+        assert_eq!(capped, fieldless(&["adaptive", "disabled"]));
+        assert!(
+            description.contains("{\"type\": \"disabled\"} (no thinking; `high` effort or below)"),
+            "{description}"
+        );
+
+        let (budget_only, _) = without_description(thinking_schema(
+            ThinkingSupport::AnthropicEnabledOnly,
+            AnthropicDisabledThinking::Refused,
+        ));
+        assert_eq!(budget_only, budget);
+        let (budget_or_disabled, _) = without_description(thinking_schema(
+            ThinkingSupport::AnthropicEnabledOnly,
+            AnthropicDisabledThinking::AnyEffort,
+        ));
+        assert_eq!(
+            budget_or_disabled,
+            json!({ "oneOf": [fieldless(&["disabled"]), budget] })
+        );
+
+        let (between_tools, description) = without_description(thinking_schema(
+            ThinkingSupport::AnthropicAdaptiveOrBetweenTools,
+            AnthropicDisabledThinking::Refused,
+        ));
+        assert_eq!(between_tools, fieldless(&["adaptive", "between_tools"]));
+        assert_eq!(
+            description,
+            "Extended thinking configuration. Format: {\"type\": \"adaptive\"} or \
+             {\"type\": \"between_tools\"} (no up-front thinking; `high` effort or below)."
+        );
+
+        let (adaptive_and_budget, _) = without_description(thinking_schema(
+            ThinkingSupport::AnthropicAdaptiveAndEnabled,
+            AnthropicDisabledThinking::AnyEffort,
+        ));
+        assert_eq!(
+            adaptive_and_budget,
+            json!({ "oneOf": [fieldless(&["adaptive", "disabled"]), budget] })
+        );
     }
 
     #[test]

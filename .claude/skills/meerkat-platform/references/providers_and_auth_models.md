@@ -121,15 +121,16 @@ recommended, S = supported):
 |---|---|---|---|---|
 | `claude-fable-5-1`, `claude-fable-5` | R | 1M / 128K | adaptive only | low, medium, high, xhigh, max |
 | `claude-opus-5-5` (default) | R | 1M / 128K | adaptive only | low..max |
-| `claude-opus-5`, `claude-opus-4-8` | R | 1M / 128K | adaptive only | low..max |
-| `claude-opus-4-7` | S | 1M / 128K | adaptive only | low..max |
+| `claude-opus-5` | R | 1M / 128K | adaptive or `disabled` (effort `high` or below) | low..max |
+| `claude-opus-4-8` | R | 1M / 128K | adaptive or `disabled` | low..max |
+| `claude-opus-4-7` | S | 1M / 128K | adaptive or `disabled` | low..max |
 | `claude-sonnet-5-5` | R | 1M / 128K | adaptive or `between_tools` | low..max |
-| `claude-sonnet-5` | S | 1M / 128K | adaptive only | low..max |
-| `claude-sonnet-4-6` | R | 1M / 64K | adaptive or enabled (budget) | low, medium, high, max |
-| `claude-haiku-5-5` (0.9.1) | R | 1M / 128K | adaptive only | low..max |
-| `claude-haiku-4-5`, `claude-haiku-4-5-20251001` | R | 200K / 64K | enabled (budget) | - |
-| `claude-sonnet-4-5` | S | 200K / 64K | enabled (budget) | - |
-| `claude-opus-4-5` | S | 200K / 64K | enabled (budget) | low, medium, high |
+| `claude-sonnet-5` | S | 1M / 128K | adaptive or `disabled` | low..max |
+| `claude-sonnet-4-6` | R | 1M / 64K | adaptive, enabled (budget) or `disabled` | low, medium, high, max |
+| `claude-haiku-5-5` (0.9.1) | R | 1M / 128K | adaptive or `disabled` (effort `high` or below) | low..max |
+| `claude-haiku-4-5`, `claude-haiku-4-5-20251001` | R | 200K / 64K | enabled (budget) or `disabled` | - |
+| `claude-sonnet-4-5` | S | 200K / 64K | enabled (budget) or `disabled` | - |
+| `claude-opus-4-5` | S | 200K / 64K | enabled (budget) or `disabled` | low, medium, high |
 
 | OpenAI | Tier | Context / output | Reasoning effort |
 |---|---|---|---|
@@ -205,9 +206,10 @@ Capability flags come from the catalog row, never from the model name:
   and `gemini-3.1-pro-preview`, 900 s for `gemini-4-argon`, 7200 s for
   `gpt-5.5-pro`. Custom and self-hosted entries set their own.
 
-Thinking and effort are typed per model (tables above); `between_tools` is
-accepted only at effort `high` or below. An unsupported thinking type, budget
-or `top_k` is refused when the agent is built and before each request.
+Thinking and effort are typed per model (tables above); `between_tools`, and
+`disabled` on `claude-opus-5` and `claude-haiku-5-5`, are accepted only at
+effort `high` or below. An unsupported thinking type, budget or `top_k` is
+refused when the agent is built and before each request.
 
 ## Provider parameters
 
@@ -231,7 +233,8 @@ Rust `AgentBuildConfig.provider_params`. A realm-level
 `provider_tag` fields:
 
 - Anthropic (`"provider": "anthropic"`): `thinking` (`{"type": "adaptive"}`,
-  `{"type": "enabled", "budget_tokens": N}`, `{"type": "between_tools"}`),
+  `{"type": "enabled", "budget_tokens": N}`, `{"type": "between_tools"}`,
+  `{"type": "disabled"}`),
   `thinking_budget_tokens`, `effort` (`low`, `medium`, `high`, `xhigh`,
   `max`), `top_k`, `inference_geo` (`{"kind": "us"}`, `{"kind": "global"}`,
   `{"kind": "other", "region": "..."}`),

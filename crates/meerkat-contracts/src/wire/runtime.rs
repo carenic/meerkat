@@ -601,6 +601,9 @@ pub enum WireAnthropicThinkingConfig {
     },
     /// No up-front thinking; progress updates between tool calls only.
     BetweenTools,
+    /// Thinking turned off; accepted only by models whose catalog row admits
+    /// it.
+    Disabled,
 }
 
 impl From<meerkat_core::lifecycle::run_primitive::AnthropicThinkingConfig>
@@ -612,6 +615,7 @@ impl From<meerkat_core::lifecycle::run_primitive::AnthropicThinkingConfig>
             Core::Adaptive => Self::Adaptive,
             Core::Enabled { budget_tokens } => Self::Enabled { budget_tokens },
             Core::BetweenTools => Self::BetweenTools,
+            Core::Disabled => Self::Disabled,
         }
     }
 }
@@ -626,6 +630,7 @@ impl From<WireAnthropicThinkingConfig>
                 Self::Enabled { budget_tokens }
             }
             WireAnthropicThinkingConfig::BetweenTools => Self::BetweenTools,
+            WireAnthropicThinkingConfig::Disabled => Self::Disabled,
         }
     }
 }

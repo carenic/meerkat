@@ -8,7 +8,9 @@
 #![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 
 use meerkat_core::Provider;
-use meerkat_core::model_profile::capabilities::{EffortLevel, ThinkingSupport};
+use meerkat_core::model_profile::capabilities::{
+    AnthropicDisabledThinking, EffortLevel, ThinkingSupport,
+};
 use meerkat_core::model_profile::catalog::{
     ImageGenerationModelRoute, ImageGenerationSizeParameter, ModelTier,
 };
@@ -461,6 +463,48 @@ fn claude_sonnet_5_capability_row_matches_the_official_model_page() {
 /// Provider inference is an exact catalog match by design: an uncatalogued
 /// `claude-*` id fails loudly instead of resolving by family or prefix, and
 /// the Sonnet 5 row does not make neighbouring ids resolve.
+/// `thinking: {"type": "disabled"}` per Anthropic row, from the per-model
+/// table "Thinking support, defaults, and rejected configurations by model"
+/// (https://platform.claude.com/docs/en/build-with-claude/thinking-troubleshooting):
+/// a thinking type a row does not list as rejected is accepted, and footnote 2
+/// limits Opus 5 and Haiku 5.5 to `high` effort or below.
+#[test]
+fn anthropic_disabled_thinking_rows_follow_the_per_model_thinking_table() {
+    use AnthropicDisabledThinking::{AnyEffort, AtOrBelowHighEffort, Refused};
+    let expected = [
+        ("claude-fable-5-1", Refused),
+        ("claude-fable-5", Refused),
+        ("claude-opus-5-5", Refused),
+        ("claude-opus-5", AtOrBelowHighEffort),
+        ("claude-opus-4-8", AnyEffort),
+        ("claude-opus-4-7", AnyEffort),
+        ("claude-sonnet-5-5", Refused),
+        ("claude-sonnet-5", AnyEffort),
+        ("claude-sonnet-4-6", AnyEffort),
+        ("claude-sonnet-4-5", AnyEffort),
+        ("claude-haiku-5-5", AtOrBelowHighEffort),
+        ("claude-haiku-4-5-20251001", AnyEffort),
+        ("claude-haiku-4-5", AnyEffort),
+        ("claude-opus-4-5", AnyEffort),
+    ];
+    for (id, disabled) in expected {
+        let caps = capabilities_for(Provider::Anthropic, id).unwrap_or_else(|| panic!("{id} row"));
+        assert_eq!(caps.anthropic_disabled_thinking, disabled, "{id}");
+    }
+    let anthropic: HashSet<&str> = all_capabilities()
+        .filter(|caps| caps.provider == Provider::Anthropic)
+        .map(|caps| caps.id)
+        .collect();
+    assert_eq!(
+        anthropic,
+        expected.iter().map(|(id, _)| *id).collect::<HashSet<_>>(),
+        "every Anthropic row records its disabled-thinking fact here"
+    );
+    for caps in all_capabilities().filter(|caps| caps.provider != Provider::Anthropic) {
+        assert_eq!(caps.anthropic_disabled_thinking, Refused, "{}", caps.id);
+    }
+}
+
 #[test]
 fn uncatalogued_claude_ids_still_fail_provider_inference() {
     for model in [
@@ -1658,6 +1702,20 @@ mod schema {
             .and_then(|t| t.get("enum"))
             .expect("fable 5 thinking type enum");
         assert_eq!(thinking_type, &serde_json::json!(["adaptive"]));
+    }
+
+    #[test]
+    fn anthropic_thinking_schemas_list_disabled_only_where_the_row_accepts_it() {
+        for caps in all_capabilities().filter(|caps| caps.provider == Provider::Anthropic) {
+            let schema = build_params_schema(caps);
+            let thinking = schema["properties"]["thinking"].to_string();
+            assert_eq!(
+                thinking.contains("\"disabled\""),
+                caps.anthropic_disabled_thinking != AnthropicDisabledThinking::Refused,
+                "{}: {thinking}",
+                caps.id
+            );
+        }
     }
 
     #[test]

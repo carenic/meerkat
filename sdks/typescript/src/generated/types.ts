@@ -4171,7 +4171,11 @@ export interface WireAnthropicThinkingConfigBetweenTools {
   type: "between_tools";
 }
 
-export type WireAnthropicThinkingConfig = WireAnthropicThinkingConfigAdaptive | WireAnthropicThinkingConfigEnabled | WireAnthropicThinkingConfigBetweenTools;
+export interface WireAnthropicThinkingConfigDisabled {
+  type: "disabled";
+}
+
+export type WireAnthropicThinkingConfig = WireAnthropicThinkingConfigAdaptive | WireAnthropicThinkingConfigEnabled | WireAnthropicThinkingConfigBetweenTools | WireAnthropicThinkingConfigDisabled;
 
 export type WireGeminiThinkingLevel = "minimal" | "low" | "medium" | "high";
 

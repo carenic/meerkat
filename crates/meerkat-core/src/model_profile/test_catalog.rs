@@ -6,7 +6,9 @@
 
 use super::ModelCatalog;
 use crate::Provider;
-use crate::model_profile::capabilities::{ModelCapabilities, ThinkingSupport};
+use crate::model_profile::capabilities::{
+    AnthropicDisabledThinking, ModelCapabilities, ThinkingSupport,
+};
 use crate::model_profile::catalog::{
     CatalogEntry, ImageGenerationModelProfile, ImageGenerationModelRoute,
     ImageGenerationSizeParameter, ModelReleaseStage, ModelTier, ProviderDefaults,
@@ -45,6 +47,7 @@ const BASE_CAPS: ModelCapabilities = ModelCapabilities {
     supports_top_p: false,
     supports_top_k: false,
     thinking: ThinkingSupport::None,
+    anthropic_disabled_thinking: AnthropicDisabledThinking::Refused,
     supports_reasoning: false,
     effort_levels: &[],
     openai_responses_params: None,

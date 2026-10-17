@@ -3040,6 +3040,19 @@
               "type"
             ],
             "type": "object"
+          },
+          {
+            "description": "Thinking turned off: the model answers without thinking blocks.\nAccepted only on models whose catalog row admits it (its\n`anthropic_disabled_thinking`), on some of them only at `high`\neffort or below; wire shape `{\"type\": \"disabled\"}`.",
+            "properties": {
+              "type": {
+                "const": "disabled",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type"
+            ],
+            "type": "object"
           }
         ]
       },
@@ -15167,6 +15180,19 @@
               "type"
             ],
             "type": "object"
+          },
+          {
+            "description": "Thinking turned off; accepted only by models whose catalog row admits\nit.",
+            "properties": {
+              "type": {
+                "const": "disabled",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type"
+            ],
+            "type": "object"
           }
         ]
       },
@@ -18558,6 +18584,19 @@
             "properties": {
               "type": {
                 "const": "between_tools",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Thinking turned off: the model answers without thinking blocks.\nAccepted only on models whose catalog row admits it (its\n`anthropic_disabled_thinking`), on some of them only at `high`\neffort or below; wire shape `{\"type\": \"disabled\"}`.",
+            "properties": {
+              "type": {
+                "const": "disabled",
                 "type": "string"
               }
             },
@@ -28889,6 +28928,19 @@
               "type"
             ],
             "type": "object"
+          },
+          {
+            "description": "Thinking turned off; accepted only by models whose catalog row admits\nit.",
+            "properties": {
+              "type": {
+                "const": "disabled",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type"
+            ],
+            "type": "object"
           }
         ]
       },
@@ -32025,6 +32077,19 @@
               "type"
             ],
             "type": "object"
+          },
+          {
+            "description": "Thinking turned off; accepted only by models whose catalog row admits\nit.",
+            "properties": {
+              "type": {
+                "const": "disabled",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type"
+            ],
+            "type": "object"
           }
         ]
       },
@@ -33239,6 +33304,19 @@
             "properties": {
               "type": {
                 "const": "between_tools",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Thinking turned off; accepted only by models whose catalog row admits\nit.",
+            "properties": {
+              "type": {
+                "const": "disabled",
                 "type": "string"
               }
             },
@@ -35423,6 +35501,19 @@
               "type"
             ],
             "type": "object"
+          },
+          {
+            "description": "Thinking turned off; accepted only by models whose catalog row admits\nit.",
+            "properties": {
+              "type": {
+                "const": "disabled",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type"
+            ],
+            "type": "object"
           }
         ]
       },
@@ -37494,6 +37585,19 @@
             "properties": {
               "type": {
                 "const": "between_tools",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Thinking turned off; accepted only by models whose catalog row admits\nit.",
+            "properties": {
+              "type": {
+                "const": "disabled",
                 "type": "string"
               }
             },
@@ -42814,6 +42918,19 @@
               "type"
             ],
             "type": "object"
+          },
+          {
+            "description": "Thinking turned off: the model answers without thinking blocks.\nAccepted only on models whose catalog row admits it (its\n`anthropic_disabled_thinking`), on some of them only at `high`\neffort or below; wire shape `{\"type\": \"disabled\"}`.",
+            "properties": {
+              "type": {
+                "const": "disabled",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type"
+            ],
+            "type": "object"
           }
         ]
       },
@@ -45164,6 +45281,19 @@
             "properties": {
               "type": {
                 "const": "between_tools",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Thinking turned off: the model answers without thinking blocks.\nAccepted only on models whose catalog row admits it (its\n`anthropic_disabled_thinking`), on some of them only at `high`\neffort or below; wire shape `{\"type\": \"disabled\"}`.",
+            "properties": {
+              "type": {
+                "const": "disabled",
                 "type": "string"
               }
             },
