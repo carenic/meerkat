@@ -441,7 +441,9 @@ and its CI must be green before a release tag (`require_ci_green`):
   `RUSTC_WRAPPER` is `scripts/ci-clippy-sccache-wrapper`, which sends the
   crates Clippy does not lint to sccache as plain rustc so they are cached;
   the lane's own packages still go through clippy-driver.
-- `unit`: `nextest --lib --bins --profile ci-pr` (`fast` plus a 4-minute hung-test kill) for
+- `unit`: `nextest --lib --bins --profile ci-pr` (`fast` plus a 4-minute hung-test kill; a
+  row names only the target kinds its packages have, so the binary-only
+  rkat and surface-build-fixtures run `--bins`) for
   the changed packages outside the meerkat-mob compile chain; crates that
   compile `meerkat-mob` (mob, mob-adaptive, mob-mcp, mob-pack, rpc, rest,
   mcp-server, rkat, web-runtime, integration-tests, machine-codegen;

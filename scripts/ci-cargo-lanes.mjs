@@ -2139,6 +2139,17 @@ function plan(args) {
       `the plan does not cover the workspace test lanes for its scope: missing ${coverage.missing.join(", ") || "none"}; errors ${coverage.errors.join("; ") || "none"}`,
     );
   }
+  // The targets each unit-lane row runs: its packages' lib and bin targets.
+  // Cargo refuses --lib when no package of a run has a library (rkat and
+  // surface-build-fixtures are binaries only), so a row names only the
+  // kinds its packages have.
+  for (const key of ["unit_shards", "unit_feature_shards", "main_unit_shards", "main_feature_unit_shards"]) {
+    result[key] = result[key].map((row) => {
+      const flags = targetFlags(row.packages.map((name) => byName.get(name)), { tests: false });
+      if (flags.length === 0) throw new Error(`unit row ${row.name} has no lib or bin target`);
+      return { ...row, targets: flags.join(" ") };
+    });
+  }
   // Long rows first (see the header).
   const durations = readRowDurations(args.rowDurations || resolve(root, ROW_DURATIONS));
   result.waves = {

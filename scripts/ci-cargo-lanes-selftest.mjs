@@ -1313,6 +1313,60 @@ for (const path of [
   }
 }
 
+// Every unit-lane row names the targets its packages have: Cargo refuses
+// --lib for a run whose packages have no library (rkat and
+// surface-build-fixtures are binaries only; a push's main unit lane runs
+// rkat in a row of its own), and a row still covers every lib and bin
+// target of its packages. Checked over every row of the workspace plans and
+// of each binary-only package's own push.
+{
+  const LIB_KINDS = ["lib", "rlib", "cdylib", "dylib", "staticlib", "proc-macro"];
+  const kinds = new Map(workspacePackages(readMetadata()).map((pkg) => [pkg.name, new Set(pkg.targets.flatMap((target) => target.kind))]));
+  const binaryOnly = [...kinds].filter(([, set]) => !LIB_KINDS.some((kind) => set.has(kind))).map(([name]) => name).sort();
+  assert.deepEqual(binaryOnly, ["rkat", "surface-build-fixtures"], "the workspace's binary-only packages");
+  const UNIT_KEYS = ["unit_shards", "unit_feature_shards", "main_unit_shards", "main_feature_unit_shards"];
+  let checked = 0;
+  for (const [label, paths, extra] of [
+    ["workspace push", ["Cargo.lock"], []],
+    ["workspace pull request", ["Cargo.lock"], ["--event", "pull_request"]],
+    ["rkat push", ["crates/meerkat-cli/src/main.rs"], []],
+    ["fixtures push", ["tests/fixtures/surface-build-fixtures/src/main.rs"], []],
+  ]) {
+    const plan = planFor(paths, extra);
+    for (const key of UNIT_KEYS) {
+      for (const row of plan[key]) {
+        const where = `${label}: ${key} ${row.name}`;
+        // The unit jobs run `${TARGETS}` and refuse any other value.
+        assert.ok(["--lib", "--bins", "--lib --bins"].includes(row.targets), `${where}: targets ${row.targets}`);
+        const flags = row.targets.split(" ");
+        const lib = row.packages.some((name) => LIB_KINDS.some((kind) => kinds.get(name).has(kind)));
+        const bins = row.packages.some((name) => kinds.get(name).has("bin"));
+        assert.equal(flags.includes("--lib"), lib, `${where}: --lib exactly when a package has a library`);
+        assert.equal(flags.includes("--bins"), bins, `${where}: --bins exactly when a package has a binary`);
+        checked += 1;
+      }
+    }
+  }
+  assert.ok(checked >= 40, `the check covers the workspace's unit rows (${checked})`);
+  // rkat runs alone in a main unit row on a workspace push: its binary only.
+  const rkat = planFor(["Cargo.lock"]).main_unit_shards.find((row) => row.packages.includes("rkat"));
+  assert.deepEqual([rkat.packages, rkat.targets], [["rkat"], "--bins"]);
+  const lines = Object.fromEntries(
+    run(["--format", "github", "--", "Cargo.lock"]).stdout.trim().split("\n").map((line) => [line.slice(0, line.indexOf("=")), line.slice(line.indexOf("=") + 1)]),
+  );
+  const mainRows = ["main_unit_shard_matrix", "main_unit_rest_shard_matrix"].flatMap((key) => JSON.parse(lines[key]).include);
+  assert.equal(mainRows.find((row) => row.packages === "-p rkat")?.targets, "--bins", "the matrix carries a row's targets");
+  // The three unit jobs run the row's targets.
+  const workflow = readFileSync(resolve(root, ".github/workflows/ci.yml"), "utf8");
+  for (const job of ["unit", "main-unit", "main-unit-rest"]) {
+    const text = jobLines(workflow, job).join("\n");
+    assert.match(text, /^ {10}TARGETS: \$\{\{ matrix\.targets \}\}$/m, `${job} reads the row's targets`);
+    assert.match(text, /^ {12}"--lib"\|"--bins"\|"--lib --bins"\) ;;$/m, `${job} refuses other targets`);
+    assert.match(text, /nextest run \$\{PACKAGES\} \$\{TARGETS\} --profile ci-pr/, `${job} runs them`);
+    assert.doesNotMatch(text, /nextest run \$\{PACKAGES\} --lib --bins/, `${job} names no fixed targets`);
+  }
+}
+
 // The two-wave lanes in ci.yml: each lane's rest wave is a copy of its job
 // that differs only in its key, its needs (the stagger job), its row count
 // and its matrix; the stagger job waits on a push only; the short lanes queue
