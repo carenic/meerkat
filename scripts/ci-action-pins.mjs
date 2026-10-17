@@ -22,9 +22,11 @@
 //   type's settings). A `docker://` action, a `container:` or `image:`
 //   value in .github, and a `docker://` reference in the Bazel files under
 //   tools/bazel/ (and .bazelrc) must name its image by `@sha256:` digest;
-//   UNPINNED_IMAGES lists the exceptions, each with its reason. Every
-//   offender is reported as file:line (or renovate.json: ...); exit 1 on
-//   any.
+//   UNPINNED_IMAGES lists the exceptions, each with its reason. A step
+//   using an action in PINNED_INPUTS names an exact release in its own
+//   `with` (sccache-action's `version`, which would otherwise install the
+//   newest sccache at run time). Every offender is reported as file:line
+//   (or renovate.json: ...); exit 1 on any.
 
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { dirname, join, relative, resolve } from "node:path";
@@ -46,6 +48,9 @@ export const UNPINNED_IMAGES = new Map([
       "exists (the repository variable MEERKAT_BUILDBUDDY_CI_IMAGE, which overrides it at run time, too)",
   ],
 ]);
+// Actions that would resolve a moving "latest" at run time unless an input
+// names an exact release, and that input.
+export const PINNED_INPUTS = new Map([["mozilla-actions/sccache-action", { input: "version", value: /^v\d+\.\d+\.\d+$/ }]]);
 // A key whose value is a block scalar (`run: |`, `description: >-`).
 const BLOCK_SCALAR = /^(\s*)(-\s+)?[^\s#-][^#]*?:\s*[|>][-+0-9]*\s*$/;
 const PINNED = /^[^@\s]+\/[^@\s]+@[0-9a-f]{40}$/;
@@ -101,10 +106,35 @@ export function* yamlLines(text) {
   }
 }
 
+// The value of `with.<name>` in the step whose `uses:` key is at `usesIndex`,
+// or null. The step opens with a `- ` item at two columns left of its keys.
+function stepInput(lines, usesIndex, name) {
+  const column = lines[usesIndex].indexOf("uses:");
+  const indentOf = (line) => line.length - line.trimStart().length;
+  const keyColumn = (line) => /^\s*(?:- )?/.exec(line)[0].length;
+  const opensStep = (line) => indentOf(line) === column - 2 && line.trimStart().startsWith("- ");
+  let start = usesIndex;
+  while (!opensStep(lines[start]) && start > 0 && (lines[start - 1].trim() === "" || indentOf(lines[start - 1]) >= column - 2)) {
+    start -= 1;
+  }
+  let end = usesIndex + 1;
+  while (end < lines.length && (lines[end].trim() === "" || indentOf(lines[end]) >= column)) end += 1;
+  const input = new RegExp(`^\\s+${name}:\\s*(.*?)\\s*$`);
+  for (let i = start; i < end; i += 1) {
+    if (keyColumn(lines[i]) !== column || withoutComment(lines[i]).slice(column).trimEnd() !== "with:") continue;
+    for (let j = i + 1; j < end && (lines[j].trim() === "" || indentOf(lines[j]) > column); j += 1) {
+      const found = input.exec(withoutComment(lines[j]));
+      if (found) return found[1].replace(/^(['"])(.*)\1$/, "$2");
+    }
+  }
+  return null;
+}
+
 export function usesProblems(root) {
   const problems = [];
   for (const path of workflowFiles(join(root, ".github"))) {
-    for (const [index, line] of yamlLines(readFileSync(path, "utf8"))) {
+    const lines = readFileSync(path, "utf8").split("\n");
+    for (const [index, line] of yamlLines(lines.join("\n"))) {
       if (!USES_KEY.test(withoutComment(line))) continue;
       const where = `${relative(root, path)}:${index + 1}`;
       const match = USES.exec(line);
@@ -124,6 +154,13 @@ export function usesProblems(root) {
         problems.push(`${where}: \`${token}\` is not pinned to a full commit SHA`);
       } else if (!REF_COMMENT.test(match[2])) {
         problems.push(`${where}: \`${token}\` has no \`# <ref>\` comment naming the tag or branch it pins`);
+      }
+      const required = PINNED_INPUTS.get(token.split("@", 1)[0]);
+      if (required) {
+        const value = stepInput(lines, index, required.input);
+        if (value === null || !required.value.test(value)) {
+          problems.push(`${where}: \`${token.split("@", 1)[0]}\` must pin \`with.${required.input}\` to an exact release (got ${value === null ? "none" : `\`${value}\``})`);
+        }
       }
     }
   }
@@ -299,7 +336,7 @@ function main(argv) {
     return 1;
   }
   process.stdout.write(
-    "ci-action-pins: every third-party action is SHA-pinned, every container image digest-pinned, and Renovate never automerges an action\n",
+    "ci-action-pins: every third-party action is SHA-pinned, every container image digest-pinned, every sccache-action step names an exact release, and Renovate never automerges an action\n",
   );
   return 0;
 }

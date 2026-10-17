@@ -151,6 +151,47 @@ try {
     ]);
   }
 
+  // A step using an action in PINNED_INPUTS names an exact release in its
+  // own `with`, wherever the step puts that key.
+  {
+    const sccache = `mozilla-actions/sccache-action@${SHA} # v0.0.10`;
+    const job = (body) => `jobs:\n  a:\n    steps:\n${body}`;
+    for (const [label, body] of [
+      ["with after uses", `      - uses: ${sccache}\n        with:\n          version: v0.18.0\n`],
+      [
+        "with before uses quoted with comments",
+        "      - name: Set up sccache\n" +
+          "        with:  # inputs\n" +
+          "          # The release it installs.\n" +
+          "          token: ${{ github.token }}\n" +
+          '          version: "v0.18.0" # pinned\n' +
+          `        uses: ${sccache}\n`,
+      ],
+    ]) {
+      assert.deepEqual(checkRepository(tree(`sccache-${label.replaceAll(" ", "-")}`, job(body))), [], label);
+    }
+    for (const [label, body, line, got] of [
+      ["no version", `      - uses: ${sccache}\n`, 4, "none"],
+      ["the newest release", `      - uses: ${sccache}\n        with:\n          version: latest\n`, 4, "`latest`"],
+      ["a minor version", `      - uses: ${sccache}\n        with:\n          version: v0.18\n`, 4, "`v0.18`"],
+      ["an expression", `      - uses: ${sccache}\n        with:\n          version: \${{ vars.SCCACHE_VERSION }}\n`, 4, "`${{ vars.SCCACHE_VERSION }}`"],
+      ["the next step's version", `      - uses: ${sccache}\n      - uses: actions/setup-node@${SHA} # v6\n        with:\n          version: v0.18.0\n`, 4, "none"],
+      [
+        "the previous step's version",
+        `      - uses: actions/setup-node@${SHA} # v6\n        with:\n          version: v0.18.0\n      - name: Set up sccache\n        uses: ${sccache}\n`,
+        8,
+        "none",
+      ],
+    ]) {
+      const problems = checkRepository(tree(`sccache-${label.replaceAll(" ", "-").replaceAll("'", "")}`, job(body)));
+      assert.deepEqual(
+        problems,
+        [`.github/workflows/ci.yml:${line}: \`mozilla-actions/sccache-action\` must pin \`with.version\` to an exact release (got ${got})`],
+        label,
+      );
+    }
+  }
+
   // Renovate: the pin preset, the cooldown, digest updates held for
   // approval, and a final github-actions rule that turns automerge off
   // after anything that could turn it on.

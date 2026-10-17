@@ -14,6 +14,16 @@
         "(?:docker://)?(?<depName>docker\\.io/[a-z0-9._/-]+):(?<currentValue>[A-Za-z0-9._-]+)@(?<currentDigest>sha256:[a-f0-9]{64})"
       ],
       "datasourceTemplate": "docker"
+    },
+    {
+      "customType": "regex",
+      "description": "The sccache release every sccache-action step installs (the action would otherwise take the newest at run time).",
+      "managerFilePatterns": ["/^\\.github/.+\\.ya?ml$/"],
+      "matchStrings": [
+        "mozilla-actions/sccache-action@[0-9a-f]{40} # \\S+\\n\\s+with:\\n(?:\\s+#[^\\n]*\\n)*\\s+version: (?<currentValue>v[0-9]+\\.[0-9]+\\.[0-9]+)"
+      ],
+      "depNameTemplate": "mozilla/sccache",
+      "datasourceTemplate": "github-releases"
     }
   ],
   "packageRules": [

@@ -140,6 +140,14 @@ them.
   run, pull requests from this repository included, uses it read-only, and
   the run steps after the sccache action no longer see the Actions cache
   token it exports. The release doctor checks both. CI only.
+- **CI installs a pinned sccache release.** Every
+  `mozilla-actions/sccache-action` step names the sccache release it
+  installs (`version: v0.18.0`) instead of taking the newest one when the
+  job runs. The action checks a download only against the `.sha256` file
+  of the same release and takes no checksum input, so the exact version
+  is the pin. Renovate proposes new releases through a regex manager, and
+  `scripts/ci-action-pins.mjs` fails on a step that does not name an
+  exact release. CI only.
 - **The Linux release build image is pinned by digest.**
   `buildpack-deps:bullseye` (the release workflow's Linux build container
   and the Bazel x86_64 and arm64 execution platforms) is named by its

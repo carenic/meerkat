@@ -208,7 +208,8 @@ the start of the pre-push hook to a green `CI gate`, and the gate also
 enforces 1080 s of lane execution and a 1200 s push-to-terminal ceiling on
 it, runner queue excluded; the push runs every lane.
 Compiled
-objects are cached by sccache (content-addressed and shared by every lane;
+objects are cached by sccache (a pinned release, content-addressed and
+shared by every lane;
 push and schedule runs write it, every other run, a pull request included,
 only reads it, and no run step keeps the Actions cache token the sccache
 action exports); rust-cache holds only the
