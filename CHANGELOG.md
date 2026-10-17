@@ -42,11 +42,16 @@ them.
   workflows and composite actions (release and reusable workflows included)
   names the full commit its tag or branch resolved to, with the ref in a
   trailing comment; Renovate keeps them current
-  (`helpers:pinGitHubActionDigests`) and proposes action updates in a group
-  of their own, a week after release, without automerge.
-  `scripts/ci-action-pins.mjs` (in `make path-classifier-selftest`) fails on
-  an unpinned third-party action, naming its file and line, and on a
-  Renovate configuration that could automerge one. The pinned
+  (`helpers:pinGitHubActionDigests`), proposes new action versions in a
+  group of their own a week after their release, holds a digest update (a
+  tag that now names another commit) for approval on the dependency
+  dashboard, and never automerges one. `scripts/ci-action-pins.mjs` (in
+  `make path-classifier-selftest`) fails on an unpinned third-party action
+  and on any spelling of a `uses` key it cannot read (quoted, in a flow
+  mapping, its value on the next line), naming its file and line, and on a
+  Renovate configuration that could automerge an action update, including
+  automerge set outside packageRules (`vulnerabilityAlerts`, an update
+  type's settings), or release its digest updates from approval. The pinned
   `dtolnay/rust-toolchain` now names its toolchain as an input. CI only.
 - **A release tag no longer restores a Bazel repository cache another run
   could have saved.** The tag's full BuildBuddy graph (`buildbuddy.yml`

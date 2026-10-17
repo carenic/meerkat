@@ -17,9 +17,30 @@ const goodRenovate = {
   extends: ["config:recommended", "helpers:pinGitHubActionDigests"],
   packageRules: [
     { matchUpdateTypes: ["patch"], automerge: true },
+    { matchManagers: ["github-actions"], matchUpdateTypes: ["digest"], dependencyDashboardApproval: true },
     { matchManagers: ["github-actions"], automerge: false, minimumReleaseAge: "7 days" },
   ],
 };
+// A workflow written to slip `uses` keys past a line-by-line reader (a
+// value on the next line, a flow mapping, a quoted key) beside a plain tag
+// ref; each must fail.
+const BYPASS = [
+  "on: push",
+  "jobs:",
+  "  a:",
+  "    runs-on: ubuntu-24.04",
+  "    steps:",
+  "      - name: next-line value",
+  "        uses:",
+  "          actions/checkout@v4",
+  "      - { name: flow mapping, uses: actions/setup-node@v4 }",
+  '      - "uses": actions/setup-python@v5',
+  "  b:",
+  "    runs-on: ubuntu-24.04",
+  "    steps:",
+  "      - uses: actions/checkout@v4",
+  "",
+].join("\n");
 
 const scratch = mkdtempSync(join(tmpdir(), "meerkat-ci-action-pins-"));
 try {
@@ -65,8 +86,33 @@ try {
     assert.match(result.stderr, /\.github\/workflows\/ci\.yml:5: /);
   }
 
-  // Renovate: the pin preset, the cooldown, and a final github-actions rule
-  // that turns automerge off after anything that could turn it on.
+  // Every other spelling of a `uses` key fails as unreadable, named by file
+  // and line; `uses` text in a block scalar or a comment is not a key.
+  {
+    const problems = checkRepository(tree("bypass", BYPASS));
+    assert.deepEqual(
+      problems.map((problem) => problem.split(": ")[0]),
+      [".github/workflows/ci.yml:7", ".github/workflows/ci.yml:9", ".github/workflows/ci.yml:10", ".github/workflows/ci.yml:14"],
+      problems.join("; "),
+    );
+    for (const problem of problems.slice(0, 3)) assert.match(problem, /a `uses` this check cannot read/);
+    assert.match(problems[3], /`actions\/checkout@v4` is not pinned/);
+    const prose =
+      steps(`actions/checkout@${SHA} # v6`) +
+      "      - name: Say it\n" +
+      "        run: |\n" +
+      "          echo 'uses: actions/checkout@v4'\n" +
+      "          echo \"uses: tj-actions/changed-files@v1\"\n" +
+      "        # uses: actions/setup-node@v4 in a comment\n" +
+      "      - name: Folded\n" +
+      "        run: >-\n" +
+      "          uses: actions/setup-go@v5\n";
+    assert.deepEqual(checkRepository(tree("prose", prose)), [], "block scalars and comments are not keys");
+  }
+
+  // Renovate: the pin preset, the cooldown, digest updates held for
+  // approval, and a final github-actions rule that turns automerge off
+  // after anything that could turn it on.
   assert.deepEqual(renovateProblems(goodRenovate), []);
   for (const [label, config, message] of [
     ["no pin preset", { ...goodRenovate, extends: ["config:recommended"] }, "pinGitHubActionDigests"],
@@ -97,6 +143,29 @@ try {
       { ...goodRenovate, packageRules: [{ matchUpdateTypes: ["patch"], automerge: true }, { matchManagers: ["github-actions"], automerge: false }] },
       "minimumReleaseAge",
     ],
+    [
+      "digest updates not held",
+      { ...goodRenovate, packageRules: goodRenovate.packageRules.filter((rule) => !rule.dependencyDashboardApproval) },
+      "holds every github-actions digest update",
+    ],
+    [
+      "digest updates held for one action only",
+      {
+        ...goodRenovate,
+        packageRules: goodRenovate.packageRules.map((rule) =>
+          rule.dependencyDashboardApproval ? { ...rule, matchPackageNames: ["actions/checkout"] } : rule,
+        ),
+      },
+      "holds every github-actions digest update",
+    ],
+    [
+      "a later rule that releases them",
+      { ...goodRenovate, packageRules: [...goodRenovate.packageRules, { matchManagers: ["github-actions"], dependencyDashboardApproval: false }] },
+      "can release github-actions digest updates",
+    ],
+    ["automerge for vulnerability fixes", { ...goodRenovate, vulnerabilityAlerts: { automerge: true } }, "vulnerabilityAlerts.automerge turns automerge on"],
+    ["automerge for an update type", { ...goodRenovate, digest: { automerge: true } }, "digest.automerge turns automerge on"],
+    ["automerge for lock file maintenance", { ...goodRenovate, lockFileMaintenance: { enabled: true, automerge: true } }, "lockFileMaintenance.automerge"],
   ]) {
     const problems = renovateProblems(config);
     assert.ok(problems.some((problem) => problem.includes(message)), `${label}: ${problems.join("; ")}`);

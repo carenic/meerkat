@@ -17,7 +17,13 @@
       "automerge": true
     },
     {
-      "description": "GitHub Actions run with the workflow token, OIDC and release secrets: pinned to commit SHAs (helpers:pinGitHubActionDigests, checked by scripts/ci-action-pins.mjs), proposed a week after release, in a group of their own, and never automerged. Keep this rule last.",
+      "description": "A digest update of a pinned action (its tag now names another commit) waits for approval on the dependency dashboard: minimumReleaseAge holds back new versions only, and a moved tag keeps its original date.",
+      "matchManagers": ["github-actions"],
+      "matchUpdateTypes": ["digest"],
+      "dependencyDashboardApproval": true
+    },
+    {
+      "description": "GitHub Actions run with the workflow token, OIDC and release secrets: pinned to commit SHAs (helpers:pinGitHubActionDigests, checked by scripts/ci-action-pins.mjs), new versions proposed a week after their release, in a group of their own, and never automerged. Keep this rule last.",
       "matchManagers": ["github-actions"],
       "groupName": "github actions",
       "groupSlug": "github-actions",
