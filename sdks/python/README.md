@@ -20,6 +20,38 @@ For local development:
 pip install -e "sdks/python[dev]"
 ```
 
+## The rkat-rpc binary
+
+`MeerkatClient` starts the first `rkat-rpc` it finds:
+
+1. `MEERKAT_BIN_PATH`, when set.
+2. An explicit `MeerkatClient(rkat_path=...)` other than the default `"rkat-rpc"`.
+3. `rkat-rpc` on `PATH`.
+4. The release binary of this SDK's own version, downloaded once from the
+   project's GitHub release and cached under
+   `~/.cache/meerkat/bin/rkat-rpc/v<version>/<target>/`.
+
+The first three are binaries you chose, and the SDK runs them as they are:
+trusting them is your decision. Only the download is verified. A published
+`meerkat-sdk` package pins the sha256 of every release archive it may download
+and of the `rkat-rpc` inside it. The release workflow stamps them from that
+release's own manifest; the SDK never takes a digest from the server it
+downloads from. The download uses HTTPS only, redirects included. The archive
+is checked before anything is extracted, the binary before it is installed,
+and the cached binary again each time it is reused (a few tenths of a second).
+On a mismatch the SDK raises `BinaryIntegrityError` (code
+`BINARY_INTEGRITY_MISMATCH`, with `asset`, `path`, `expected_sha256` and
+`actual_sha256`), deletes what failed, runs nothing and does not fall back to
+another binary.
+
+A source or git install of the SDK (for example `pip install -e`) pins no
+digests, so instead of downloading it raises `MeerkatError` with code
+`BINARY_DIGEST_UNAVAILABLE`. Install `rkat-rpc` yourself
+(`brew install lukacf/meerkat/rkat`, or the release archive for your platform)
+and put it on `PATH`, or set `MEERKAT_BIN_PATH` or `rkat_path` to a binary you
+trust. In that case, and when the download fails, an `rkat` binary on `PATH`
+is still used through its `rpc` subcommand.
+
 ## Quick start
 
 The selected model needs a compatible credential route: an already provisioned

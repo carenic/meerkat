@@ -35,6 +35,55 @@ them.
 
 ## [Unreleased]
 
+### Breaking
+
+- Behaviour-only (not measured by the gate): the Python and TypeScript SDKs
+  refuse to auto-download `rkat-rpc` when the package pins no digest for its
+  version and platform, raising `MeerkatError` with code
+  `BINARY_DIGEST_UNAVAILABLE` instead (see Security). Only packages the
+  release workflow builds pin digests; a source or git install pins none.
+  Install `rkat-rpc` yourself and put it on `PATH`, or set `MEERKAT_BIN_PATH`
+  or the client's binary path (`rkat_path`, `new MeerkatClient(path)`); a
+  legacy `rkat` on `PATH` is still used through its `rpc` subcommand.
+- Behaviour-only: a cached auto-downloaded `rkat-rpc` that does not match its
+  pinned digest is deleted and refused with `BinaryIntegrityError` (it used to
+  run as found), an integrity failure no longer falls back to a legacy `rkat`
+  on `PATH`, and the download no longer follows a redirect to a non-HTTPS URL.
+
+### Security
+
+- The Python and TypeScript SDKs verify the `rkat-rpc` binary they
+  auto-download (#1739). Each published package pins the sha256 of every
+  release archive it may download and of the `rkat-rpc` inside it, stamped by
+  the release workflow from that release's own manifest
+  (`scripts/release-stamp-sdk-binary-digests`), never taken from the server
+  the binary comes from. The download uses HTTPS only, redirects included.
+  The archive is checked before anything is written or extracted, the binary
+  before it is installed, and the cached binary every time it is reused. A
+  mismatch raises `BinaryIntegrityError` (code `BINARY_INTEGRITY_MISMATCH`,
+  naming the asset and the expected and actual digests): the SDK deletes what
+  failed, runs nothing and does not fall back to another binary.
+  `MEERKAT_BIN_PATH`, an explicit binary path and `rkat-rpc` on `PATH` still
+  run as given: they are the user's own trust decision.
+
+### Added
+
+- `BinaryIntegrityError`, a `MeerkatError` subclass exported by both SDKs
+  (`meerkat.BinaryIntegrityError` with `asset`, `path`, `expected_sha256` and
+  `actual_sha256`; `BinaryIntegrityError` from `@rkat/sdk` with `asset`,
+  `path`, `expectedSha256` and `actualSha256`), and the SDK error codes
+  `BINARY_INTEGRITY_MISMATCH` and `BINARY_DIGEST_UNAVAILABLE`.
+
+### Changed
+
+- Release: before it builds the Python and TypeScript SDK packages,
+  `publish_registries` waits for the release's complete binary manifest (up
+  to 150 minutes on a tag run, usually no time with a prebuild; a package
+  recovery needs it already published), stamps the pinned digests into both
+  SDKs and refuses to publish a package that does not pin exactly them for
+  its version. The job's timeout is 240 minutes, up from 180. Crate
+  publication and the publication SLO do not wait for it.
+
 ## [0.9.2] - 2026-10-16
 
 ### Breaking

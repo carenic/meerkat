@@ -502,10 +502,25 @@ client.require_capability("comms")
 Errors:
 
 ```python
-from meerkat import MeerkatError, CapabilityUnavailableError, SessionNotFoundError, SkillNotFoundError
+from meerkat import (
+    BinaryIntegrityError,
+    CapabilityUnavailableError,
+    MeerkatError,
+    SessionNotFoundError,
+    SkillNotFoundError,
+)
 ```
 
 All SDK errors derive from `MeerkatError`.
+
+`BinaryIntegrityError` (code `BINARY_INTEGRITY_MISMATCH`) means the
+auto-downloaded `rkat-rpc` archive, the binary inside it or its cached copy
+does not match the sha256 the package pins; it carries `asset`, `path` (the
+cached binary, or `None` for a download), `expected_sha256` and
+`actual_sha256`, and the SDK never falls back to another binary.
+`BINARY_DIGEST_UNAVAILABLE` means the package pins no digest for this version
+and platform (a source or git install), so it will not download one. See
+[The rkat-rpc binary](/sdks/python/overview#the-rkat-rpc-binary).
 
 A failed `session.send(...)` carries the server's typed `CommsSendErrorData`
 in `MeerkatError.details`, tagged on `code` (`peer_not_found_or_not_trusted`,

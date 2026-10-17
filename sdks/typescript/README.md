@@ -12,9 +12,39 @@ npm install @rkat/sdk
 
 ## Prerequisites
 
-- **`rkat-rpc` binary on PATH** -- install it with `brew install lukacf/meerkat/rkat` or from the release archive for your platform ([Linux without Homebrew](https://docs.rkat.ai/quickstart#linux-without-homebrew)). The SDK can also resolve and download a release binary automatically.
+- **`rkat-rpc` binary on PATH** -- install it with `brew install lukacf/meerkat/rkat` or from the release archive for your platform ([Linux without Homebrew](https://docs.rkat.ai/quickstart#linux-without-homebrew)). Without one, the SDK downloads the release binary of its own version and verifies it first (see [The rkat-rpc binary](#the-rkat-rpc-binary)).
 - **Node.js >= 18** (uses `node:child_process`, `node:readline`, `node:test`).
 - **API key** for at least one LLM provider set in your environment (e.g. `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, or `GOOGLE_API_KEY`).
+
+## The rkat-rpc binary
+
+`MeerkatClient` starts the first `rkat-rpc` it finds:
+
+1. `MEERKAT_BIN_PATH`, when set.
+2. An explicit `new MeerkatClient(rkatPath)` other than the default `"rkat-rpc"`.
+3. `rkat-rpc` on `PATH`.
+4. The release binary of this SDK's own version, downloaded once from the
+   project's GitHub release and cached under
+   `~/.cache/meerkat/bin/rkat-rpc/v<version>/<target>/`.
+
+The first three are binaries you chose, and the SDK runs them as they are:
+trusting them is your decision. Only the download is verified. A published
+`@rkat/sdk` package pins the sha256 of every release archive it may download
+and of the `rkat-rpc` inside it. The release workflow stamps them from that
+release's own manifest; the SDK never takes a digest from the server it
+downloads from. The download uses HTTPS only, redirects included. The archive
+is checked before anything is written or extracted, the binary before it is
+installed, and the cached binary again each time it is reused (a few tenths of
+a second). On a mismatch the SDK throws `BinaryIntegrityError` (code
+`BINARY_INTEGRITY_MISMATCH`), deletes what failed, runs nothing and does not
+fall back to another binary.
+
+A source or git install of the SDK pins no digests, so instead of downloading
+it throws `MeerkatError` with code `BINARY_DIGEST_UNAVAILABLE`. Install
+`rkat-rpc` yourself and put it on `PATH`, or pass its path to
+`new MeerkatClient(path)` or set `MEERKAT_BIN_PATH` to a binary you trust. In
+that case, and when the download fails, an `rkat` binary on `PATH` is still
+used through its `rpc` subcommand.
 
 ## tsconfig Requirements
 
@@ -465,6 +495,19 @@ class SkillNotFoundError extends MeerkatError {}
 ```
 
 Thrown when a referenced skill cannot be found.
+
+### BinaryIntegrityError
+
+```ts
+class BinaryIntegrityError extends MeerkatError {
+  readonly asset: string;
+  readonly path: string | null;
+  readonly expectedSha256: string;
+  readonly actualSha256: string;
+}
+```
+
+Thrown with code `"BINARY_INTEGRITY_MISMATCH"` when the auto-downloaded `rkat-rpc` archive, the binary inside it, or the cached binary does not match the sha256 the package pins. `path` names the cached binary, or is `null` for a download. The SDK has deleted what failed and never falls back to another binary. See [The rkat-rpc binary](#the-rkat-rpc-binary).
 
 ### Error handling example
 
