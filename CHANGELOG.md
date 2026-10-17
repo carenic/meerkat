@@ -136,10 +136,16 @@ them.
   workflow's push to main saves. Only a re-run of the same tag loses a
   warm cache. The release doctor fails on any cache a release job would
   restore, on any event. CI only.
-- **Only push and schedule runs write the CI sccache bucket.** Every other
-  run, pull requests from this repository included, uses it read-only, and
-  the run steps after the sccache action no longer see the Actions cache
-  token it exports. The release doctor checks both. CI only.
+- **Only push and schedule runs set the CI sccache client to write its
+  bucket.** Every other run, pull requests from this repository included,
+  runs it read-only (`SCCACHE_GCS_RW_MODE=READ_ONLY`), and the Actions
+  cache token the sccache action exports is removed from the environment
+  of the run steps after it. Both are client-side settings, not
+  credentials: any later step of such a run can read the credentials file
+  `SCCACHE_GCS_KEY_PATH` names, which carries a bearer token for the same
+  identity the push runs write with, and the job's actions still receive
+  the Actions cache token. The release doctor checks both settings. CI
+  only.
 - **CI installs a pinned sccache release.** Every
   `mozilla-actions/sccache-action` step names the sccache release it
   installs (`version: v0.18.0`) instead of taking the newest one when the

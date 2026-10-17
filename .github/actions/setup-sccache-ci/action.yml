@@ -1,8 +1,9 @@
 name: Setup sccache for CI
 description: >-
   Install sccache and point it at the GCS object cache through the repository's
-  GCP workload identity: read-write for push and schedule runs, read-only for
-  every other run (pull requests from this repository included). When that
+  GCP workload identity: the client writes for push and schedule runs and only
+  reads for every other run (pull requests from this repository included), a
+  setting of the client, not of the identity. When that
   identity is unavailable (pull requests from forks have no id-token, or the
   variables are unset) run with a local disk cache only, with no remote cache,
   instead of failing the lane.
@@ -52,8 +53,9 @@ runs:
     # The action exports the job's Actions cache token for its GitHub
     # Actions cache backend, which neither backend below uses, and has no
     # input to keep it. The runner hands JavaScript and container actions
-    # the token itself, so blanking it here takes it only from the run
-    # steps that follow (builds, build scripts, tests).
+    # the token itself, so blanking it here takes it from the environment
+    # of the run steps that follow (builds, build scripts, tests), not from
+    # the job.
     - name: Withdraw the Actions cache token from later run steps
       shell: bash
       run: echo "ACTIONS_RUNTIME_TOKEN=" >> "${GITHUB_ENV}"
@@ -81,9 +83,11 @@ runs:
         KEY_PREFIX: ${{ inputs.key_prefix }}
         GCP_OUTCOME: ${{ steps.gcp.outcome }}
         CREDENTIALS_FILE: ${{ steps.gcp.outputs.credentials_file_path }}
-        # Only a push (main or a release branch) or a schedule writes the
-        # bucket, whose objects the push to main compiles from before it
-        # attests; every other run, a pull request included, only reads it.
+        # Only a push (main or a release branch) or a schedule has sccache
+        # write the bucket, whose objects the push to main compiles from
+        # before it attests; every other run, a pull request included, has
+        # it only read. The mode binds the client: the credentials file
+        # exported below is the same identity's in every run.
         RW_MODE: ${{ (github.event_name == 'push' || github.event_name == 'schedule') && 'READ_WRITE' || 'READ_ONLY' }}
       run: |
         set -euo pipefail

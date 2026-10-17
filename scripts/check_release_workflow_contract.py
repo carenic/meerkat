@@ -2023,8 +2023,11 @@ TAG_TRUSTED_WORKFLOWS = ("ci.yml", "release-semver-readiness.yml", "release.yml"
 RELEASE_RESTORE_JOBS = ("release_semver_gate",)
 # The sccache setup every CI lane runs: the GCS objects it writes are what
 # the push to main compiles from before it attests, so only push and
-# schedule runs write them, and no run step keeps the Actions cache token
-# the sccache action exports.
+# schedule runs set the sccache client to write them, and the run steps
+# after the sccache action do not inherit the Actions cache token it
+# exports. Both are client-side settings: a later step can still read the
+# job's GCS credentials file (SCCACHE_GCS_KEY_PATH), whose identity can
+# write, and the job's actions still receive the token.
 SCCACHE_ACTION = "./.github/actions/setup-sccache-ci"
 SCCACHE_WRITERS = ("push", "schedule")
 SCCACHE_READERS = ("pull_request", "pull_request_target", "workflow_dispatch", "merge_group", "workflow_run")
@@ -2571,7 +2574,9 @@ def _reusable_cache_uses(
 
 
 def _sccache_problems(root: Path) -> list[str]:
-    """Who writes the sccache bucket, and who keeps the Actions cache token."""
+    """Which runs set the sccache client to write, and whether the run steps
+    after the sccache action inherit the Actions cache token (both
+    client-side settings, see SCCACHE_ACTION)."""
     where = SCCACHE_ACTION[2:]
     try:
         action = _local_action(SCCACHE_ACTION, root)
@@ -2641,9 +2646,10 @@ def check_release_caches(text: str) -> list[str]:
     cache on a dispatch-like run at all: such runs only restore it. A
     workflow that produces what a tag run trusts (TAG_TRUSTED_WORKFLOWS),
     or that checks out a ref its inputs choose, saves no cache at all on a
-    dispatch-like run. The CI lanes' sccache bucket is written only by push
-    and schedule runs, and no run step after the sccache action keeps the
-    Actions cache token it exports (_sccache_problems).
+    dispatch-like run. Only push and schedule runs set the CI lanes' sccache
+    client to write its bucket, and the run steps after the sccache action
+    do not inherit the Actions cache token it exports (_sccache_problems);
+    both are client-side settings, not credentials.
     """
     root = REPO_ROOT
     violations: list[str] = []
