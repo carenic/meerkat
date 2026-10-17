@@ -42,8 +42,8 @@ const IMAGE_KEY = /^\s*(?:-\s*)?(container|image):\s*(\S.*?)\s*$/;
 export const UNPINNED_IMAGES = new Map([
   [
     "docker://europe-west1-docker.pkg.dev/king-dnn-training-dev/meerkat-ci/meerkat-ci-rust:1.94.0",
-    "the self-hosted CI image is in a private registry; pin it once its digest is resolved (the repository " +
-      "variable MEERKAT_BUILDBUDDY_CI_IMAGE overrides it at run time)",
+    "the self-hosted CI image is in a private registry: its digest gets pinned once registry read access " +
+      "exists (the repository variable MEERKAT_BUILDBUDDY_CI_IMAGE, which overrides it at run time, too)",
   ],
 ]);
 // A key whose value is a block scalar (`run: |`, `description: >-`).
