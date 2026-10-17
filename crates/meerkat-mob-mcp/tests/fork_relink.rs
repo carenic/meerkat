@@ -1797,9 +1797,192 @@ async fn a_failed_boundary_commit_makes_the_run_input_read_an_error() {
         "{unheld:?}"
     );
     drop(run);
-    // No teardown: destroying a mob whose member session has degraded
-    // durability waits on that session's durable reload, which nothing here
-    // performs. The test process ends with the test.
+    // The destroy reloads the degraded member from its durable store and
+    // retires it.
+    tokio::time::timeout(DEGRADED_DESTROY_BOUND, fixture.teardown())
+        .await
+        .expect("teardown destroys a mob whose member lost a boundary commit");
+}
+
+/// How long a destroy may take when a member lost a boundary commit: twice
+/// the per-member retire budget, so a destroy that waits on a reload nobody
+/// performs fails the test instead of hanging it.
+const DEGRADED_DESTROY_BOUND: Duration = Duration::from_mins(1);
+
+/// A forked child whose boundary commit failed after its run consumed its
+/// input in memory (the setup of
+/// `a_failed_boundary_commit_makes_the_run_input_read_an_error`). The
+/// child's runtime is reload-required, and its exited runtime loop keeps
+/// the session's mutation gate until a reload releases it.
+struct DegradedChild {
+    fixture: CouncilFixture,
+    store: Arc<support::commit_gate::CommitGateRuntimeStore>,
+    child: AgentIdentity,
+    child_session: meerkat_core::SessionId,
+}
+
+async fn fork_child_whose_boundary_commit_failed(child: &str) -> DegradedChild {
+    let store = Arc::new(support::commit_gate::CommitGateRuntimeStore::new());
+    let gate = TurnGate::new();
+    let turn_gate = Arc::clone(&gate);
+    let fixture = CouncilFixture::new_with_runtime_store(
+        move |request| {
+            if support::last_user_text(request).contains(CHILD_TASK) {
+                ScriptedTurn::Gated(Arc::clone(&turn_gate), CHILD_REPLY.to_string())
+            } else {
+                ScriptedTurn::Text("noted".to_string())
+            }
+        },
+        store.clone(),
+    );
+    fixture.seed_source_mob(&["forker"]).await;
+    let owner = forker_session(&fixture).await;
+    let handle = fixture
+        .state
+        .handle_for(&fixture.source_mob_id())
+        .await
+        .unwrap();
+    let child = AgentIdentity::from(child);
+    let (_fork, run) = handle
+        .fork_member_then_run_detached(
+            &AgentIdentity::from("forker"),
+            child_spec(child.as_str()),
+            None,
+            "fork_off_result",
+            16 * 1024,
+            meerkat_core::DurableForkSourceAdmission::Quiescent,
+            None,
+            Some(ForkJobBinding {
+                job_id: format!("job-{}", child.as_str()),
+                owner_session_id: owner,
+                retained_work: None,
+            }),
+        )
+        .await
+        .expect("fork");
+    gate.wait_entered(1).await;
+    let child_session = handle
+        .resolve_bridge_session_id(&child)
+        .await
+        .expect("child session");
+    let runtime =
+        meerkat_mob::MobSessionService::acquire_runtime_adapter(fixture.service.as_ref(), None)
+            .expect("acquire runtime authority")
+            .expect("the service derives its runtime");
+    store.arm_failure(meerkat_runtime::LogicalRuntimeId::for_session(
+        &child_session,
+    ));
+    gate.open();
+    store.failed().await;
+    let degraded = runtime
+        .session_has_uncommitted_run_input(&child_session)
+        .await
+        .expect_err("the child's durability is degraded");
+    assert!(
+        matches!(
+            degraded,
+            meerkat_runtime::RuntimeDriverError::RecoveryRepairBlocked { .. }
+        ),
+        "{degraded:?}"
+    );
+    drop(run);
+    DegradedChild {
+        fixture,
+        store,
+        child,
+        child_session,
+    }
+}
+
+/// Destroying a mob whose member lost a boundary commit finishes. The
+/// destroy reloads the member's runtime from its durable store, where the
+/// run input whose consumption never committed is still pending, and then
+/// retires it: the retirement records that input as abandoned, so its fate
+/// is durable instead of lost with the in-memory run.
+#[tokio::test(flavor = "multi_thread")]
+async fn destroying_a_mob_reloads_and_retires_a_member_whose_boundary_commit_failed() {
+    let degraded = fork_child_whose_boundary_commit_failed("reloaded-child").await;
+    let mob_id = degraded.fixture.source_mob_id();
+    let report = tokio::time::timeout(
+        DEGRADED_DESTROY_BOUND,
+        degraded.fixture.state.mob_destroy(&mob_id),
+    )
+    .await
+    .expect("the destroy finishes instead of waiting on a reload nobody performs")
+    .expect("the destroy reloads the degraded member and retires it");
+    assert!(report.errors.is_empty(), "{report:?}");
+    assert!(
+        degraded.fixture.state.handle_for(&mob_id).await.is_err(),
+        "the destroyed mob is gone"
+    );
+    let inputs = meerkat_runtime::RuntimeStore::load_input_states_strict(
+        degraded.store.as_ref(),
+        &meerkat_runtime::LogicalRuntimeId::for_session(&degraded.child_session),
+    )
+    .await
+    .expect("the child's durable inputs");
+    assert!(
+        inputs.iter().any(|stored| stored.seed.terminal_outcome
+            == Some(meerkat_runtime::InputTerminalOutcome::Abandoned {
+                reason: meerkat_runtime::InputAbandonReason::Retired,
+            })),
+        "the retirement records the input the failed commit never consumed durably: {:?}",
+        inputs
+            .iter()
+            .map(|stored| (
+                stored.state.input_id.clone(),
+                stored.seed.phase,
+                stored.seed.terminal_outcome.clone()
+            ))
+            .collect::<Vec<_>>()
+    );
+}
+
+/// A degraded member whose runtime cannot reload stops the destroy before it
+/// starts: the destroy answers a typed incomplete report naming the member
+/// and the reload, and the mob stays for a retry. Once the store reads
+/// again, the same destroy completes.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_destroy_that_cannot_reload_a_degraded_member_is_incomplete_and_retryable() {
+    let degraded = fork_child_whose_boundary_commit_failed("unreloadable-child").await;
+    let mob_id = degraded.fixture.source_mob_id();
+    degraded
+        .store
+        .fail_input_recovery_reads(meerkat_runtime::LogicalRuntimeId::for_session(
+            &degraded.child_session,
+        ));
+    let refused = tokio::time::timeout(
+        DEGRADED_DESTROY_BOUND,
+        degraded.fixture.state.mob_destroy(&mob_id),
+    )
+    .await
+    .expect("the destroy answers instead of waiting on a reload nobody performs");
+    let report = match refused {
+        Err(meerkat_mob_mcp::MobMcpDestroyError::Incomplete { report }) => report,
+        other => panic!("a reload that fails makes the destroy incomplete: {other:?}"),
+    };
+    assert!(
+        report.errors.iter().any(|error| {
+            error.contains(degraded.child.as_str()) && error.contains("durability reload")
+        }),
+        "the report names the member and its reload: {report:?}"
+    );
+    assert!(
+        degraded.fixture.state.handle_for(&mob_id).await.is_ok(),
+        "the mob stays for a retry"
+    );
+    degraded.store.restore_input_recovery_reads();
+    tokio::time::timeout(
+        DEGRADED_DESTROY_BOUND,
+        degraded.fixture.state.mob_destroy(&mob_id),
+    )
+    .await
+    .expect("the retried destroy finishes")
+    .expect("the retried destroy reloads the member and completes");
+    assert!(
+        degraded.fixture.state.handle_for(&mob_id).await.is_err(),
+        "the destroyed mob is gone"
+    );
 }
 
 /// A receipt that lands while the ceiling-deciding status read is held is
