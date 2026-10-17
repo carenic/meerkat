@@ -524,7 +524,8 @@ impl ScheduleDriver {
         // One claimed occurrence's fault must not strand the rest of the
         // batch, claimed but undelivered until their leases expire: every
         // claimed occurrence is handled, then the tick fails with the first
-        // fault.
+        // fault. Only a claim scan that breaks the store contract still fails
+        // the tick at once.
         let mut first_fault = None;
         for commit in claimed.transitions {
             let successor = commit.successor();
@@ -535,9 +536,10 @@ impl ScheduleDriver {
                         .iter()
                         .any(|effect| matches!(effect, OccurrenceLifecycleEffect::Claimed))
                     {
-                        return Err(ScheduleDomainError::Internal(
+                        return Err(claim_scan_contract_violation(
                             "claim scan committed a Claimed successor without a Claimed effect"
                                 .to_string(),
+                            first_fault.as_ref(),
                         ));
                     }
                     report.claimed_occurrences += 1;
@@ -561,9 +563,10 @@ impl ScheduleDriver {
                         .iter()
                         .any(|effect| matches!(effect, OccurrenceLifecycleEffect::Misfired))
                     {
-                        return Err(ScheduleDomainError::Internal(
+                        return Err(claim_scan_contract_violation(
                             "claim scan committed a Misfired successor without a Misfired effect"
                                 .to_string(),
+                            first_fault.as_ref(),
                         ));
                     }
                 }
@@ -573,16 +576,20 @@ impl ScheduleDriver {
                         .iter()
                         .any(|effect| matches!(effect, OccurrenceLifecycleEffect::LeaseExpired))
                     {
-                        return Err(ScheduleDomainError::Internal(
+                        return Err(claim_scan_contract_violation(
                             "claim scan committed a Pending lease-expiry successor without a LeaseExpired effect"
                                 .to_string(),
+                            first_fault.as_ref(),
                         ));
                     }
                 }
                 phase => {
-                    return Err(ScheduleDomainError::Internal(format!(
-                        "claim scan returned unsupported committed occurrence phase {phase:?}"
-                    )));
+                    return Err(claim_scan_contract_violation(
+                        format!(
+                            "claim scan returned unsupported committed occurrence phase {phase:?}"
+                        ),
+                        first_fault.as_ref(),
+                    ));
                 }
             }
         }
@@ -1057,6 +1064,22 @@ impl ScheduleDriver {
             }
         });
     }
+}
+
+/// A claim scan that breaks the store contract fails the tick at once. The
+/// tick returns the violation, so a fault an earlier claimed occurrence of the
+/// same tick hit is logged rather than dropped.
+fn claim_scan_contract_violation(
+    detail: String,
+    earlier_fault: Option<&ScheduleDomainError>,
+) -> ScheduleDomainError {
+    if let Some(earlier) = earlier_fault {
+        tracing::error!(
+            error = %earlier,
+            "claimed occurrence fault superseded by a claim scan contract violation in the same tick"
+        );
+    }
+    ScheduleDomainError::Internal(detail)
 }
 
 fn validate_dispatch_receipt(

@@ -138,9 +138,11 @@ them.
   occurrence), a `ScheduleDriver` tick returned that error at once. Every
   occurrence the tick had claimed after it stayed claimed and undelivered
   until its lease expired (60 seconds in the schedule host), then fired late
-  or misfired. The tick now handles every occurrence it claimed, logs each
-  later error, and then returns the first, so the schedule host still
-  records the failed tick.
+  or misfired. The tick now handles every occurrence it claimed, unless the
+  claim scan breaks the store contract, which still fails the tick at once.
+  It returns the first handling error, or that contract violation, and logs
+  every error it does not return, so the schedule host still records the
+  failed tick.
 
 ### Known issues
 
