@@ -35,6 +35,15 @@ them.
 
 ## [Unreleased]
 
+### Added
+
+- `MeerkatMachine::hold_live_assistant_output_handles` and
+  `LiveAssistantOutputRetirementHold` (`meerkat-runtime`, `live` feature):
+  keep a closed live channel's generated assistant outputs addressable while
+  its deferred close settlement replays rows that need them. A retirement
+  requested meanwhile runs when the last hold ends; a held output never
+  becomes reservable. (#1821)
+
 ## [0.9.2] - 2026-10-16
 
 ### Breaking
