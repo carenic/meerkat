@@ -65,10 +65,14 @@ them.
   and Sonnet 5.5 (whose lowest setting is `between_tools`) refuse it, so
   Meerkat refuses it there with a typed local error when the agent is built
   and before each request, as it does above `high` effort on Opus 5 and
-  Haiku 5.5. A forced tool choice is sent with thinking disabled. Adaptive
-  flowmaster inline layer profiles cannot select disabled thinking until
-  pack schemas are versioned: the adaptive pack's layer-decision schema stays
-  the released one, so packs keep loading across host versions.
+  Haiku 5.5. A per-turn reasoning preference above `high` is not applied
+  with disabled thinking on Opus 5 and Haiku 5.5 (`ThinkingModeConflict`).
+  A forced tool choice is sent with thinking disabled. The adaptive pack's
+  layer-decision schema stays the released one, so packs keep loading across
+  host versions, and it does not offer disabled thinking to an adaptive
+  flowmaster's inline layer profiles until pack schemas are versioned; a
+  layer decision that carries it anyway is honoured as `Disabled`, and
+  refused with the same typed error where the model refuses it.
 
 ## [0.9.2] - 2026-10-16
 

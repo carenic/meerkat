@@ -460,9 +460,6 @@ fn claude_sonnet_5_capability_row_matches_the_official_model_page() {
     );
 }
 
-/// Provider inference is an exact catalog match by design: an uncatalogued
-/// `claude-*` id fails loudly instead of resolving by family or prefix, and
-/// the Sonnet 5 row does not make neighbouring ids resolve.
 /// `thinking: {"type": "disabled"}` per Anthropic row, from the per-model
 /// table "Thinking support, defaults, and rejected configurations by model"
 /// (https://platform.claude.com/docs/en/build-with-claude/thinking-troubleshooting):
@@ -505,6 +502,9 @@ fn anthropic_disabled_thinking_rows_follow_the_per_model_thinking_table() {
     }
 }
 
+/// Provider inference is an exact catalog match by design: an uncatalogued
+/// `claude-*` id fails loudly instead of resolving by family or prefix, and
+/// the Sonnet 5 row does not make neighbouring ids resolve.
 #[test]
 fn uncatalogued_claude_ids_still_fail_provider_inference() {
     for model in [

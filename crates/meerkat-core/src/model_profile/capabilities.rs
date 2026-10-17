@@ -363,7 +363,8 @@ impl ModelCapabilities {
             {
                 return Some(format!(
                     "Anthropic model '{model}' accepts thinking type '{}' only at \
-                     'high' effort or below; use adaptive thinking for effort '{}'",
+                     'high' effort or below; lower the effort to 'high' or use adaptive \
+                     thinking for effort '{}'",
                     thinking.wire_type(),
                     tag.effort
                         .map(AnthropicEffort::as_legacy_str)
@@ -840,7 +841,10 @@ mod tests {
                 "{refusal}"
             );
             assert!(
-                refusal.contains(&format!("effort '{}'", effort.as_legacy_str())),
+                refusal.contains(&format!(
+                    "lower the effort to 'high' or use adaptive thinking for effort '{}'",
+                    effort.as_legacy_str()
+                )),
                 "{refusal}"
             );
         }
