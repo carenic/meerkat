@@ -3249,8 +3249,10 @@ export class MeerkatClient {
    * or one whose owning connection closed, has no callback route: its
    * members' callback tools fail `tool_unavailable` until a connection claims
    * it with the mob's claim token, the one `createMob` returned to its
-   * creator (`Mob.claimToken`). After the claim, its live and future members
-   * call the tools this connection registered. A claim is refused with
+   * creator (`Mob.claimToken`); a lost token cannot be minted again, so a
+   * creator that must claim after a restart persists it (destroying and
+   * creating the mob again is the only recovery). After the claim, its live
+   * and future members call the tools this connection registered. A claim is refused with
    * `-32002`, its reason in `data.reason`: `claim_token_mismatch` for another
    * token, `not_claimable` for a mob created without one, and
    * `held_by_open_connection` while the connection that holds the route is

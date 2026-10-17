@@ -2206,7 +2206,7 @@ class MobCreateParams:
 @dataclass
 class MobCreateResult:
     """Response payload for `mob/create`."""
-    claim_token: str
+    claim_token: str = field(repr=False)
     mob_id: str
 
 
@@ -2992,7 +2992,7 @@ class MobRotateSupervisorResult:
 @dataclass
 class MobClaimCallbackRouteParams:
     """Request payload for `mob/claim_callback_route`."""
-    claim_token: str
+    claim_token: str = field(repr=False)
     mob_id: str
 
 

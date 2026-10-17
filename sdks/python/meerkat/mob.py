@@ -330,9 +330,12 @@ class Mob:
     """First-class mob handle backed by explicit RPC methods.
 
     ``claim_token`` is the mob's callback claim token when this handle came
-    from ``create_mob`` (``None`` otherwise): bearer authority over the mob's
-    callback route (see ``MeerkatClient.mob_claim_callback_route``). Keep it
-    secret and never log it.
+    from ``create_mob`` (``None`` otherwise): what a claim of the mob's
+    callback route presents (see ``MeerkatClient.mob_claim_callback_route``).
+    Keep it secret and out of logs; the handle's repr leaves it out. The
+    server returns it only from ``mob/create`` and cannot mint a lost one
+    again: a creator that must claim the route after a restart persists it,
+    and destroying and creating the mob again is the only recovery.
     """
 
     def __init__(self, client: Any, mob_id: str, *, claim_token: str | None = None):

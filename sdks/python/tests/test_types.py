@@ -8701,3 +8701,16 @@ def test_hook_failed_public_reason_exports_keep_generated_known_causes_and_unkno
     assert UnknownHookFailureReason in get_args(HookFailureReason)
     assert UnknownHookFailureReason in get_args(get_type_hints(HookFailed)["reason"])
     assert {"HookFailureReason", "UnknownHookFailureReason", "ConfinementRefusal"} <= set(meerkat.__all__)
+
+
+def test_generated_claim_token_fields_stay_out_of_repr():
+    from meerkat.generated.types import MobClaimCallbackRouteParams, MobCreateResult
+
+    token = "mct_" + "A" * 43
+    created = MobCreateResult(claim_token=token, mob_id="m1")
+    params = MobClaimCallbackRouteParams(claim_token=token, mob_id="m1")
+    assert created.claim_token == token
+    assert params.claim_token == token
+    assert token not in repr(created)
+    assert token not in repr(params)
+    assert "m1" in repr(created)

@@ -99,7 +99,13 @@ them.
   mints it one (`MobMcpState::mint_callback_claim_token`, a Rust API with
   no wire method). Destroy deletes the stored hash, so a mob destroyed and
   created again under its id, even on a store the host kept, never answers
-  the old token. The token decides which connection a route claim follows
+  the old token. A lost token cannot be minted again (the host mint
+  refuses a mob that keeps a verifier): destroying and creating the mob
+  again is the only recovery, so a creator that must claim the route after
+  a restart persists the token. The SDKs do not print it: Python's `Mob`
+  and the generated `MobCreateResult` and `MobClaimCallbackRouteParams`
+  leave it out of their reprs, and TypeScript's `Mob.claimToken` is not
+  enumerable. The token decides which connection a route claim follows
   and nothing else: every connection to one `rkat-rpc` host keeps the same
   owner authority.
 - Upgrading: a mob created over RPC before 0.9.3 keeps no claim token

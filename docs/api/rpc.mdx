@@ -500,8 +500,14 @@ connection, and returns the mob's claim token once, to that connection
 presents it can take the route later. The mob keeps only the token's
 SHA-256, in its own store, so the token survives restarts but is never
 read back; a mob destroyed and created again under its id gets a new one.
-The token is bearer authority over the mob's callbacks: keep it secret and
-never log it. Where a restored mob's route starts depends on the server:
+Keep the token secret and out of logs. It decides which connection a route
+claim follows and nothing else: every connection to one `rkat-rpc` host
+keeps the same owner authority. It cannot be minted again: the host mint
+described below refuses a mob that keeps a verifier, so a lost token is
+lost for good, and destroying the mob and creating it again is the only
+recovery. A creator that must claim the route after a restart (its own or
+the server's) persists the token. Where a restored mob's route starts
+depends on the server:
 
 - On a connection-owned server, where every connection owns its own route
   (`rkat-rpc` over stdio or TCP), a mob restored after a restart starts
@@ -532,7 +538,10 @@ a mob created without one (by an agent's `mob_create`, implicitly, by a
 host's Rust create, or before 0.9.3) is refused with
 `{"mob_id":"team","reason":"not_claimable"}`, unless its host minted it a
 token (`MobMcpState::mint_callback_claim_token`, a Rust API with no wire
-method). With the mob's token, the claim returns `{"mob_id":"team"}` and
+method). After an upgrade to 0.9.3, a mob created over RPC before it has no
+token, so no connection can claim its route over the wire until the mob is
+destroyed and created again or its host mints it one. With the mob's
+token, the claim returns `{"mob_id":"team"}` and
 reaches the mob's live members and the ones it spawns later, which then call
 the tools this connection registered. While the connection that holds the
 route is open, another connection's claim is refused with `-32002` and

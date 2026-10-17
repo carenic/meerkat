@@ -96,6 +96,10 @@ JOBS_RPC_CONTRACT_ALIAS_TYPES = [
     "WireHandlingMode",
 ]
 
+# Fields that carry a secret. Generated Python dataclasses keep them out of
+# `repr`, so printing or logging a value never shows the secret.
+PYTHON_REPR_HIDDEN_FIELDS = frozenset({"claim_token"})
+
 MOB_RPC_CONTRACT_TYPES = [
     "MobIdParams",
     "MobMemberParams",
@@ -3536,10 +3540,13 @@ def generate_python_types(schemas: dict, output_dir: Path, *, has_comms: bool = 
                 or is_optional_type
             ):
                 annotation = f"Optional[{field_type}]"
+            hidden = field_name in PYTHON_REPR_HIDDEN_FIELDS
             if is_required:
-                required_lines.append(f"    {python_field_name}: {annotation}\n")
+                default = " = field(repr=False)" if hidden else ""
+                required_lines.append(f"    {python_field_name}: {annotation}{default}\n")
             else:
-                optional_lines.append(f"    {python_field_name}: {annotation} = None\n")
+                default = " = field(default=None, repr=False)" if hidden else " = None"
+                optional_lines.append(f"    {python_field_name}: {annotation}{default}\n")
         for line in required_lines + optional_lines:
             types_content += line
         if parser_closure.get(name) == "struct" and _lookup_named_schema(wire_schema, name) is schema:
