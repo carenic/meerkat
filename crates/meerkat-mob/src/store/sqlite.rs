@@ -6044,6 +6044,24 @@ impl MobRuntimeMetadataStore for SqliteMobRuntimeMetadataStore {
         .await
     }
 
+    async fn delete_callback_claim_verifier(&self, mob_id: &MobId) -> Result<bool, MobStoreError> {
+        let path = self.path.clone();
+        let mob_id = mob_id.clone();
+        run_sqlite_task(move || {
+            let mut conn = open_connection(&path)?;
+            let tx = begin_immediate(&mut conn)?;
+            let deleted = tx
+                .execute(
+                    "DELETE FROM mob_runtime_callback_claim_verifiers WHERE mob_id = ?1",
+                    params![mob_id.as_str()],
+                )
+                .map_err(se)?;
+            tx.commit().map_err(se)?;
+            Ok(deleted > 0)
+        })
+        .await
+    }
+
     async fn load_mob_host_authority(
         &self,
         mob_id: &MobId,
@@ -14314,6 +14332,15 @@ mod tests {
                 .unwrap(),
             Some(kept)
         );
+    }
+
+    #[tokio::test]
+    async fn callback_claim_verifier_is_deleted_and_recorded_anew() {
+        let (_dir, path) = temp_db_path();
+        let store = SqliteMobStores::open(&path)
+            .unwrap()
+            .runtime_metadata_store();
+        crate::store::callback_claim_verifier_contract::deleted_and_recorded_anew(&store).await;
     }
 
     // --- Temporary council orchestration store conformance ---

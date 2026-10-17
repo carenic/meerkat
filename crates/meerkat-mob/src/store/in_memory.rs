@@ -1825,6 +1825,15 @@ impl MobRuntimeMetadataStore for InMemoryMobRuntimeMetadataStore {
             .cloned())
     }
 
+    async fn delete_callback_claim_verifier(&self, mob_id: &MobId) -> Result<bool, MobStoreError> {
+        Ok(self
+            .callback_claim_verifiers
+            .write()
+            .await
+            .remove(mob_id)
+            .is_some())
+    }
+
     async fn put_supervisor_authority(
         &self,
         mob_id: &MobId,
@@ -5784,6 +5793,12 @@ mod tests {
     async fn callback_claim_verifier_is_recorded_once_and_kept() {
         let store = InMemoryMobRuntimeMetadataStore::new();
         crate::store::callback_claim_verifier_contract::recorded_once_and_kept(&store).await;
+    }
+
+    #[tokio::test]
+    async fn callback_claim_verifier_is_deleted_and_recorded_anew() {
+        let store = InMemoryMobRuntimeMetadataStore::new();
+        crate::store::callback_claim_verifier_contract::deleted_and_recorded_anew(&store).await;
     }
 
     // --- Temporary council orchestration store conformance ---

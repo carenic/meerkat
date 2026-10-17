@@ -22,7 +22,7 @@ const CLAIM_TOKEN_BODY_LEN: usize = (CLAIM_TOKEN_BYTES * 4).div_ceil(3);
 /// A mob's callback claim token: `mct_` and the unpadded base64url of 32
 /// bytes of OS entropy. Bearer authority for one mob's callback route; its
 /// `Debug` is redacted, and it is never logged or persisted in clear.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone)]
 pub struct MobClaimToken(String);
 
 /// A text that is not a [`MobClaimToken`].
@@ -170,10 +170,13 @@ mod tests {
         let text = token.expose_secret();
         assert!(text.starts_with("mct_"));
         assert_eq!(text.len(), 4 + 43);
-        assert_eq!(MobClaimToken::parse(text), Ok(token.clone()));
+        assert_eq!(
+            MobClaimToken::parse(text).map(|parsed| parsed.expose_secret().to_owned()),
+            Ok(text.to_owned())
+        );
         assert_ne!(
-            MobClaimToken::mint().expect("entropy"),
-            token,
+            MobClaimToken::mint().expect("entropy").expose_secret(),
+            text,
             "independent mints differ"
         );
         assert_eq!(format!("{token:?}"), "MobClaimToken([REDACTED])");
@@ -203,9 +206,11 @@ mod tests {
             format!("mct_{}=", &body[1..]),
             format!("mct_{} ", &body[1..]),
         ] {
-            assert_eq!(
-                MobClaimToken::parse(&other),
-                Err(MobClaimTokenError::Malformed),
+            assert!(
+                matches!(
+                    MobClaimToken::parse(&other),
+                    Err(MobClaimTokenError::Malformed)
+                ),
                 "{other}"
             );
         }

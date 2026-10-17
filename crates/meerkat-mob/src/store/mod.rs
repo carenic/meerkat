@@ -4783,6 +4783,17 @@ pub trait MobRuntimeMetadataStore: Send + Sync {
         let _ = mob_id;
         runtime_metadata_capability_unavailable("load_callback_claim_verifier")
     }
+
+    /// Delete the verifier of the mob's callback claim token, if it has one.
+    /// Returns whether one was deleted. Mob destroy deletes it with the rest
+    /// of the mob's runtime metadata, so a mob created again under the id in
+    /// a store the host kept never answers the destroyed mob's token. A
+    /// store without the capability refuses, which leaves such a destroy
+    /// incomplete.
+    async fn delete_callback_claim_verifier(&self, mob_id: &MobId) -> Result<bool, MobStoreError> {
+        let _ = mob_id;
+        runtime_metadata_capability_unavailable("delete_callback_claim_verifier")
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -7506,6 +7517,10 @@ mod runtime_metadata_store_compatibility_tests {
             store.load_callback_claim_verifier(&mob_id).await,
             "load_callback_claim_verifier",
         );
+        assert_capability_unavailable(
+            store.delete_callback_claim_verifier(&mob_id).await,
+            "delete_callback_claim_verifier",
+        );
     }
 }
 
@@ -7555,6 +7570,53 @@ pub(crate) mod callback_claim_verifier_contract {
             None
         );
         (mob_id, kept)
+    }
+
+    /// Deleting a mob's verifier forgets it (another mob's is kept); a
+    /// second delete finds none, and the id then records a new one.
+    pub(crate) async fn deleted_and_recorded_anew(store: &dyn MobRuntimeMetadataStore) {
+        let mob_id = MobId::from("deleted-mob");
+        let other = MobId::from("kept-mob");
+        let first = crate::MobClaimToken::mint().unwrap();
+        let second = crate::MobClaimToken::mint().unwrap();
+        assert!(
+            store
+                .put_callback_claim_verifier_if_absent(&mob_id, &first.verifier())
+                .await
+                .unwrap()
+        );
+        assert!(
+            store
+                .put_callback_claim_verifier_if_absent(&other, &first.verifier())
+                .await
+                .unwrap()
+        );
+        assert!(store.delete_callback_claim_verifier(&mob_id).await.unwrap());
+        assert_eq!(
+            store.load_callback_claim_verifier(&mob_id).await.unwrap(),
+            None
+        );
+        assert!(!store.delete_callback_claim_verifier(&mob_id).await.unwrap());
+        assert!(
+            store
+                .load_callback_claim_verifier(&other)
+                .await
+                .unwrap()
+                .is_some_and(|kept| kept.verifies(&first))
+        );
+        assert!(
+            store
+                .put_callback_claim_verifier_if_absent(&mob_id, &second.verifier())
+                .await
+                .unwrap()
+        );
+        assert!(
+            store
+                .load_callback_claim_verifier(&mob_id)
+                .await
+                .unwrap()
+                .is_some_and(|kept| kept.verifies(&second) && !kept.verifies(&first))
+        );
     }
 }
 
