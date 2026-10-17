@@ -546,40 +546,46 @@ fn a_caught_owner_poison_inside_an_excluded_operation_stays_poisoned() {
     ));
 }
 
-/// The append reserved before the poison still lands, but its publication
-/// never overwrites the poison: the child stays unusable until
-/// reconstruction, and the same intent then recovers it.
+/// A conjunct that poisons the publication on its own thread, here through
+/// a caught host panic, is seen before the append: the issuance refuses
+/// `Unavailable` and appends nothing, the poison stands, and after
+/// reconstruction the same intent issues the child afresh.
 #[test]
 fn a_caught_owner_poison_inside_a_child_issuance_is_never_overwritten() {
     let mut owner = authority(Arc::new(Clock));
     let parent = issue(&owner, "parent");
     let before = stamp(&owner);
+    let revision_before = revision(&owner);
     let publication = owner.publication.clone();
     let host = Mutex::new(());
     let intent = child_intent(&parent, "child");
-    let issued = owner
-        .issue_or_recover_child_under_exclusion(&intent, || {
+    assert_eq!(
+        owner.issue_or_recover_child_under_exclusion(&intent, || {
             caught_host_poison(&publication, &host);
             Ok(open())
-        })
-        .expect("the append reserved before the poison lands");
-    assert!(
-        matches!(issued, ChildGrantOutcome::Issued { .. }),
-        "{issued:?}"
+        }),
+        Err(ChildGrantRefusal::Unavailable),
+        "a conjunct's own poison refuses the append"
     );
-    let lineage = issued.lineage().to_vec();
+    assert_eq!(revision(&owner), revision_before, "nothing was appended");
+    assert!(
+        !owner
+            .owner
+            .lock()
+            .expect("owner")
+            .state()
+            .records
+            .contains_key(&intent.id),
+        "no row is retained for the intent"
+    );
     assert_eq!(
         before.check_current(),
         Err(PublicationError::Unavailable),
-        "the issuance's publication must not overwrite the poison"
+        "the poison stands"
     );
     assert!(matches!(
         owner.publication.observe(|| ()),
         Err(PublicationError::Unavailable)
-    ));
-    assert!(matches!(
-        owner.resolve_controller_lineage(&lineage, &who("helper"), None),
-        Err(GrantRefusal::Unavailable)
     ));
     assert_eq!(
         owner.issue_or_recover_child_under_exclusion(&intent, || Ok(open())),
@@ -590,15 +596,16 @@ fn a_caught_owner_poison_inside_a_child_issuance_is_never_overwritten() {
         .expect("the only reference to the owner")
         .reconstruct(LocalAuthorizationPublication::new())
         .expect("reconstructed under a new publication");
-    assert_eq!(
-        owner.issue_or_recover_child_under_exclusion(&intent, || Ok(open())),
-        Ok(ChildGrantOutcome::Recovered {
-            lineage: lineage.clone()
-        })
+    let issued = owner
+        .issue_or_recover_child_under_exclusion(&intent, || Ok(open()))
+        .expect("issued afresh after reconstruction");
+    assert!(
+        matches!(issued, ChildGrantOutcome::Issued { .. }),
+        "a fresh issuance, not a recovery: {issued:?}"
     );
     owner
-        .resolve_controller_lineage(&lineage, &who("helper"), None)
-        .expect("the recovered child is usable again");
+        .resolve_controller_lineage(issued.lineage(), &who("helper"), None)
+        .expect("the issued child is usable");
 }
 
 /// A child issued and published before a poison keeps its outcome: it is

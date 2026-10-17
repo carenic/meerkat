@@ -129,6 +129,10 @@ impl LocalAuthorizationPublication {
     /// any outer `catch_unwind` can swallow the panic. A `catch_unwind`
     /// placed between the lock guard and the sentinel would poison the lock
     /// and leave this publication healthy.
+    ///
+    /// As defense in depth, an owner callback that finds its entry lock
+    /// poisoned, or catches a panic, returns an error and never reads the
+    /// owner's state through `PoisonError::into_inner`.
     #[must_use = "the sentinel poisons only while it is held"]
     pub fn poison_on_unwind(&self) -> OwnerPoisonSentinel<'_> {
         OwnerPoisonSentinel { publication: self }
@@ -248,6 +252,7 @@ impl LocalPublicationGuard<'_> {
     /// For the deferred path this is the mutation linearization point:
     /// canonical apply has succeeded, but the actual owner lock must still
     /// hide its facts. Keep that lock until this returns.
+    #[must_use = "a poisoned publication stays unpublished; say why the result is not needed"]
     pub(crate) fn publish(&mut self) -> bool {
         if !self.published {
             // While this guard holds the writer, only a poison can move the
@@ -264,6 +269,15 @@ impl LocalPublicationGuard<'_> {
                 .is_ok();
         }
         self.published
+    }
+
+    /// Whether the publication is still exactly as this reservation found
+    /// it: not published and not poisoned since. One `Acquire` load. A poison
+    /// raised earlier on this thread, for example by a caught panic in a
+    /// callback run under this reservation, is always seen here; one raised
+    /// by another thread after this check is not.
+    pub(crate) fn reservation_is_intact(&self) -> bool {
+        self.inner.sequence.load(Ordering::Acquire) == self.completed_sequence - 2
     }
 
     /// Whether `stamp` was observed on this same publication and no owner
