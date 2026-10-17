@@ -809,17 +809,10 @@ impl CoreCommsRuntime for CommsRuntime {
         signer_pubkey: [u8; 32],
         declared_address: String,
     ) -> Result<(), SendError> {
-        // The router addresses the staged Response to this key, so it must
-        // be `dest`'s own, as for a correlated endpoint: a key that derives
-        // another peer id would deliver a response meant for `dest` to that
-        // other peer.
+        // The key must be `dest`'s own, as for a correlated endpoint, even
+        // when the peer is already routable and nothing is staged.
         let signer_pubkey = PubKey::new(signer_pubkey);
-        let signer_peer_id = signer_pubkey.to_peer_id();
-        if signer_peer_id != dest {
-            return Err(SendError::Validation(format!(
-                "declared reply signer derives peer id {signer_peer_id}, not destination {dest}"
-            )));
-        }
+        crate::router::validate_declared_reply_signer(dest, &signer_pubkey)?;
         // Skip-if-routable: trust-store entries always win at send time, so
         // staging for an already-routable peer would only leave a stale
         // one-shot entry behind. The trust store (public + private union) is
@@ -833,8 +826,7 @@ impl CoreCommsRuntime for CommsRuntime {
                 pubkey: signer_pubkey,
                 address: declared_address,
             },
-        );
-        Ok(())
+        )
     }
 
     async fn stage_correlated_reply_endpoint(

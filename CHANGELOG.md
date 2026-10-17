@@ -103,6 +103,12 @@ them.
   `PeerResponse` whose `to` is not the recorded requester; host `comms/send`
   fails with `send_failed` and `send_response` with `invalid_arguments` where
   they delivered (see Fixed).
+- `meerkat-comms`: `Router::stage_reply_endpoint` returns
+  `Result<(), meerkat_core::comms::SendError>` instead of `()`, and refuses
+  with `SendError::Validation`, staging nothing, an endpoint whose key does not
+  derive `dest`. Behaviour-only (not measured by the gate):
+  `CommsRuntime::stage_declared_reply_endpoint` refuses the same case where it
+  staged the endpoint (see Fixed).
 
 ### Added
 
@@ -152,12 +158,12 @@ them.
   the envelope declares, the same identity trust and routing use in that
   mode. Before, the runtime checked only that the request id named a request
   this session had received and could still answer.
-- `CommsRuntime::stage_declared_reply_endpoint` refuses, with
-  `SendError::Validation`, a signing key that does not derive the destination
-  peer id, as `stage_correlated_reply_endpoint` already did, and stages
-  nothing. The router addresses a Response sent through a staged endpoint to
-  that key, so a mismatched key would have carried a response meant for one
-  peer to another.
+- `CommsRuntime::stage_declared_reply_endpoint` and
+  `Router::stage_reply_endpoint` refuse, with `SendError::Validation`, a
+  signing key that does not derive the destination peer id, as
+  `stage_correlated_reply_endpoint` already did, and stage nothing. The router
+  addresses a Response sent through a staged endpoint to that key, so a
+  mismatched key would have carried a response meant for one peer to another.
 
 ## [0.9.2] - 2026-10-16
 
