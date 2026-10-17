@@ -37,6 +37,10 @@ them.
 
 ### Changed
 
+- A push to `main` runs the payload base's own copy of
+  `scripts/ci-push-plan-base.mjs`, which decides the push's diff base, so a
+  pushed commit cannot change that decision for its own push; without that
+  copy the push plans the whole workspace. CI only.
 - **Pull-request CI and the pre-push hook do less, to fit 20 minutes from
   the start of the hook to a green `CI gate`.** The lane classifier
   (`scripts/ci-cargo-lanes.mjs --event`) plans a pull request without the

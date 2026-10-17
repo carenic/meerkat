@@ -324,10 +324,13 @@ fi
 
 # The pre-push hook reuses source-test evidence across lock-only changes and
 # leaves compiling the resolved graph to the required CI Clippy lanes: the CI
-# planner treats Cargo.lock as global, so every package gets a Clippy lane.
+# planner treats a Cargo.lock change it cannot scope as global, so every
+# package of the workspace plan is in a Clippy shard over all its targets
+# (the shard's TARGETS).
 lock_ci_probe="$(node scripts/ci-cargo-lanes.mjs --format json -- Cargo.lock 2>/dev/null || true)"
 if [[ "${lock_ci_probe}" == *'"mode": "workspace"'* || "${lock_ci_probe}" == *'"mode":"workspace"'* ]] &&
-  grep -Fq -- '--no-deps --all-targets --all-features -- -D warnings' .github/workflows/ci.yml &&
+  node -e 'const plan = JSON.parse(require("fs").readFileSync(0, "utf8")); const linted = new Set(plan.shards.flatMap((shard) => (shard.targets === "--all-targets" ? shard.packages : []))); process.exit(plan.packages.length > 0 && plan.packages.every((name) => linted.has(name)) ? 0 : 1)' <<<"${lock_ci_probe}" 2>/dev/null &&
+  grep -Fq -- '--no-deps ${TARGETS} --all-features -- -D warnings' .github/workflows/ci.yml &&
   grep -Fq 'require_ran "Clippy"' .github/workflows/ci.yml; then
   pass "lock-only pushes leave the resolved workspace graph to required CI Clippy before merge"
 else
