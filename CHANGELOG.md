@@ -135,7 +135,13 @@ them.
   expression, and that test now checks it, so `SITES` stays the one list;
   each host launch exemption keeps its one fixed-program constructor. Test
   code, the `xtask` developer tooling and the examples allow the lint for
-  themselves.
+  themselves. The test also fails when anything turns the lint off in bulk:
+  a second Clippy configuration file (a crate's own `clippy.toml` or
+  `.clippy.toml` would replace the root one for that crate), a `warnings`,
+  `clippy::all` or `clippy::style` allow or expect in shipped code, or a
+  Cargo manifest entry for the lint or an allow of its group. A Clippy run
+  with `CLIPPY_CONF_DIR` set reads another configuration; the repository's
+  lanes and CI never set it.
 
 ### Deprecated
 

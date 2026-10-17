@@ -170,6 +170,12 @@ fn repo_root() -> PathBuf {
 
 /// Every `.rs` file under `root`, skipping build output and VCS metadata.
 fn walk_rust_sources(root: &Path) -> Vec<PathBuf> {
+    walk_files(root, |name| name.ends_with(".rs"))
+}
+
+/// Every file under `root` whose name `keep` accepts, skipping build output
+/// and VCS metadata.
+fn walk_files(root: &Path, keep: impl Fn(&str) -> bool) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let mut pending = vec![root.to_path_buf()];
     while let Some(dir) = pending.pop() {
@@ -191,7 +197,7 @@ fn walk_rust_sources(root: &Path) -> Vec<PathBuf> {
                 {
                     pending.push(path);
                 }
-            } else if name.ends_with(".rs") {
+            } else if keep(&name) {
                 out.push(path);
             }
         }
@@ -625,11 +631,76 @@ fn clippy_disallows_every_process_launch_api() {
     }
 }
 
+/// The lint names an `allow` or `expect` attribute in `code` lists that
+/// silence the launch lint with everything else: `warnings`, and the
+/// `clippy::all` and `clippy::style` groups `disallowed_methods` and
+/// `disallowed_types` belong to.
+fn wholesale_lint_allows(code: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    for marker in ["allow(", "expect("] {
+        let mut rest = code;
+        while let Some(at) = rest.find(marker) {
+            let after = &rest[at + marker.len()..];
+            let list = after.split(')').next().unwrap_or_default();
+            found.extend(
+                list.split(',')
+                    .map(str::trim)
+                    .filter(|lint| matches!(*lint, "warnings" | "clippy::all" | "clippy::style"))
+                    .map(str::to_owned),
+            );
+            rest = after;
+        }
+    }
+    found
+}
+
+/// The entries of a Cargo manifest's `[lints.clippy]` or
+/// `[workspace.lints.clippy]` that would turn the launch lint off: any entry
+/// for `disallowed_methods` or `disallowed_types`, and an `allow` of the
+/// `all` or `style` group they belong to.
+fn manifest_launch_lint_entries(manifest: &toml::Table) -> Vec<String> {
+    let tables = [
+        manifest.get("lints").and_then(|lints| lints.get("clippy")),
+        manifest
+            .get("workspace")
+            .and_then(|workspace| workspace.get("lints"))
+            .and_then(|lints| lints.get("clippy")),
+    ];
+    let mut found = Vec::new();
+    for table in tables
+        .into_iter()
+        .flatten()
+        .filter_map(toml::Value::as_table)
+    {
+        for (lint, level) in table {
+            let name = lint.replace('-', "_");
+            let level = level
+                .as_str()
+                .or_else(|| level.get("level").and_then(toml::Value::as_str));
+            if matches!(name.as_str(), "disallowed_methods" | "disallowed_types")
+                || (matches!(name.as_str(), "all" | "style") && level == Some("allow"))
+            {
+                found.push(format!("{lint} = {level:?}"));
+            }
+        }
+    }
+    found
+}
+
 /// Shipped code allows the launch lint only at the sites `SITES` lists
 /// as starting a process themselves (the confinement backend, a confined
 /// kind's trusted-host branch, the exemptions' one constructor), once per
 /// launch expression there; an exempt launch goes through its exemption's
 /// fixed-program constructor and needs none. `SITES` stays the one list.
+///
+/// Nothing turns the lint off in bulk either: the workspace has one Clippy
+/// configuration file (a crate's own `clippy.toml` or `.clippy.toml` would
+/// replace the root one, and its disallowed list, for that crate), shipped
+/// code allows neither `warnings` nor the `clippy::all` or `clippy::style`
+/// group, and no Cargo manifest configures the lint or allows its group.
+/// Clippy also reads its configuration from `CLIPPY_CONF_DIR` when that is
+/// set, which no file in the tree can show: the repository's build lanes and
+/// CI never set it, and a run that does lints against another file.
 #[test]
 fn the_launch_lint_is_allowed_only_at_the_listed_launch_sites() {
     let root = repo_root();
@@ -640,6 +711,7 @@ fn the_launch_lint_is_allowed_only_at_the_listed_launch_sites() {
         }
     }
     let mut found: BTreeMap<String, usize> = BTreeMap::new();
+    let mut bulk: Vec<String> = Vec::new();
     for path in walk_rust_sources(&root) {
         let relative = path
             .strip_prefix(&root)
@@ -656,13 +728,50 @@ fn the_launch_lint_is_allowed_only_at_the_listed_launch_sites() {
         let count = code.matches("clippy::disallowed_methods").count()
             + code.matches("clippy::disallowed_types").count();
         if count > 0 {
-            found.insert(relative, count);
+            found.insert(relative.clone(), count);
+        }
+        let wholesale = wholesale_lint_allows(&code);
+        if !wholesale.is_empty() {
+            bulk.push(format!("{relative}: allows {wholesale:?}"));
         }
     }
     assert_eq!(
         found, expected,
         "shipped code allows the process launch lint exactly once per launch expression \
          of the sites SITES lists as launching themselves, and nowhere else"
+    );
+
+    let relative = |path: &Path| {
+        path.strip_prefix(&root)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .replace('\\', "/")
+    };
+    let clippy_configs: Vec<String> =
+        walk_files(&root, |name| matches!(name, "clippy.toml" | ".clippy.toml"))
+            .iter()
+            .map(|path| relative(path))
+            .collect();
+    assert_eq!(
+        clippy_configs,
+        ["clippy.toml"],
+        "the workspace has one Clippy configuration, at its root"
+    );
+    for manifest in walk_files(&root, |name| name == "Cargo.toml") {
+        let text = fs::read_to_string(&manifest)
+            .unwrap_or_else(|error| panic!("read {}: {error}", manifest.display()));
+        let table: toml::Table = text
+            .parse()
+            .unwrap_or_else(|error| panic!("parse {}: {error}", manifest.display()));
+        let entries = manifest_launch_lint_entries(&table);
+        if !entries.is_empty() {
+            bulk.push(format!("{}: {entries:?}", relative(&manifest)));
+        }
+    }
+    assert!(
+        bulk.is_empty(),
+        "nothing turns the process launch lint off in bulk:\n{}",
+        bulk.join("\n")
     );
 }
 
@@ -691,6 +800,43 @@ fn every_host_launch_exemption_is_in_use_and_named_where_it_launches() {
             );
         }
     }
+}
+
+/// The bulk checks see what they look for: a `warnings` or group allow in
+/// an `allow` or `expect` list, and a manifest entry for the lint or an
+/// allow of its group, but not a lint or level that leaves it on.
+#[test]
+fn the_bulk_lint_checks_see_what_turns_the_lint_off() {
+    assert_eq!(
+        wholesale_lint_allows(
+            "#![allow(clippy::all)] #[allow(dead_code, warnings)] #[expect(clippy::style)] \
+             #[allow(clippy::pedantic, clippy::allow_attributes)] fn allow(x: u8) {}"
+        ),
+        ["clippy::all", "warnings", "clippy::style"]
+    );
+    let manifest = |text: &str| -> Vec<String> {
+        manifest_launch_lint_entries(&text.parse::<toml::Table>().unwrap())
+    };
+    assert_eq!(
+        manifest(
+            "[lints.clippy]\ndisallowed-methods = \"warn\"\nall = { level = \"allow\", priority = -1 }\n\
+             pedantic = \"allow\"\n"
+        )
+        .len(),
+        2
+    );
+    assert_eq!(
+        manifest("[workspace.lints.clippy]\nstyle = \"allow\"\ndisallowed_types = \"allow\"\n")
+            .len(),
+        2
+    );
+    assert!(
+        manifest(
+            "[workspace.lints.clippy]\nall = { level = \"warn\", priority = -1 }\npanic = \"deny\"\n\
+             [lints]\nworkspace = true\n"
+        )
+        .is_empty()
+    );
 }
 
 #[test]
