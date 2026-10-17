@@ -1253,6 +1253,17 @@ function shortName(name) {
   return name.startsWith("meerkat-") ? name.slice("meerkat-".length) : name;
 }
 
+// In-crate documentation a crate compiles in (see the header): a reader of
+// package scope whose .md or .mdx input lies in the reader's own crate
+// directory. Another crate's reader of the same file is an ordinary reader.
+export function compiledInDocKeys(entries, ownerOf) {
+  return new Set(
+    entries
+      .filter((entry) => entry.scope === "package" && /\.(md|mdx)$/.test(entry.path) && ownerOf(entry.path) === entry.package)
+      .map((entry) => `${entry.path}\0${entry.package}`),
+  );
+}
+
 // Features whose tests need live-provider credentials: the live gates run
 // them on demand, no CI lane does.
 export const LIVE_ONLY_FEATURES = ["integration-real-tests", "openai-live-e2e"];
@@ -1752,12 +1763,7 @@ function plan(args) {
   const changed = rawPaths === null ? null : [...new Set(rawPaths.map(normalizePath))].sort();
   const releaseProjection = releaseProjectionPlan(args, changed, pathReason);
   const readerInventory = loadNonRustReaders();
-  // In-crate documentation the crate compiles in (see the header).
-  const compiledInDocs = new Set(
-    readerInventory.entries
-      .filter((entry) => entry.scope === "package" && /\.(md|mdx)$/.test(entry.path))
-      .map((entry) => `${entry.path}\0${entry.package}`),
-  );
+  const compiledInDocs = compiledInDocKeys(readerInventory.entries, (path) => packageForFile(path, dirs)?.name);
 
   const result = {
     schema_version: 1,

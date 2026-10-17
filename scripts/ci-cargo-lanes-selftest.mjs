@@ -32,6 +32,7 @@ import {
   lockScope,
   parseCargoLock,
   readRowDurations,
+  compiledInDocKeys,
   readerRows,
 } from "./ci-cargo-lanes.mjs";
 import { readMetadata, workspacePackages } from "./rust-test-selector.mjs";
@@ -1366,6 +1367,23 @@ for (const path of [
     assert.match(text, /nextest run \$\{PACKAGES\} \$\{TARGETS\} --profile ci-pr/, `${job} runs them`);
     assert.doesNotMatch(text, /nextest run \$\{PACKAGES\} --lib --bins/, `${job} names no fixed targets`);
   }
+}
+
+// Compiled-in documentation is a crate's reader of a doc in its own
+// directory: another crate's reader of that doc, a test-only reader and a
+// reader of a doc outside every crate are ordinary readers.
+{
+  const owners = { "crates/a/skills/x/SKILL.md": "a", "crates/a/README.md": "a" };
+  const keys = compiledInDocKeys(
+    [
+      { path: "crates/a/skills/x/SKILL.md", package: "a", scope: "package" },
+      { path: "crates/a/skills/x/SKILL.md", package: "b", scope: "package" },
+      { path: "crates/a/README.md", package: "a", scope: "target" },
+      { path: "docs/x.mdx", package: "a", scope: "package" },
+    ],
+    (path) => owners[path],
+  );
+  assert.deepEqual([...keys], ["crates/a/skills/x/SKILL.md\0a"]);
 }
 
 // A reader in library, binary or build-script code of a binary-only
