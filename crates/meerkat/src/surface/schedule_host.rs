@@ -541,6 +541,15 @@ impl SharedScheduleTargetAdapter {
     /// long as the clone lives, so whatever the hosts hold (a session service,
     /// mob state) stays owned while any clone does. See
     /// [`spawn_schedule_host`] for what an embedder clears after teardown.
+    ///
+    /// A host over a stock-governed realm passes the realm's commissioned
+    /// service ([`crate::PersistenceBundle::schedule_service`]) and, to fire,
+    /// composes [`crate::PersistenceBundle::scheduled_session_agent_binding`]
+    /// with [`Self::with_session_agent_binding`]; without the binding it
+    /// refuses every fire as `schedule_mandate_unavailable` before any
+    /// delivery. A service from [`ScheduleService::new`] over a governed
+    /// realm's store commissions no agent, so this adapter fires its
+    /// schedules unchecked and each fire fails later, at runtime admission.
     pub fn new(
         schedule_service: ScheduleService,
         session_host: Arc<dyn SurfaceScheduleSessionHost>,
