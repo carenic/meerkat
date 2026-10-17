@@ -3705,6 +3705,12 @@ impl PendingRuntimeExecutorAttachment {
         let witness = self
             .try_commit_publication(on_committed, retain_mutation_guard, replaces_predecessor)
             .await?;
+        #[cfg(any(test, feature = "test-support"))]
+        if self.interrupted_tool_notices.is_some() {
+            self.machine
+                .run_attachment_interrupted_notice_handoff_test_hook(witness.session_id())
+                .await;
+        }
         if let Some(notices) = self.interrupted_tool_notices.take() {
             // Owed to the model, recorded at the loop's next pre-dequeue
             // position so the notice joins the next real turn's transcript
@@ -3715,6 +3721,21 @@ impl PendingRuntimeExecutorAttachment {
                     .interrupted_tool_notices
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(notices);
+                // The publication may have woken the loop, which runs on its
+                // own runtime and can spend that wake on a pre-dequeue check
+                // made before this hand-off, or not woken it at all: a
+                // replacement that fenced its predecessor's inputs has no
+                // queued work to wake for. Wake the exact attached loop now
+                // that the notices are in place, so an idle session records
+                // them now, not at its next input. A retained publication's
+                // slot is still pending here; its lease wakes the loop when it
+                // commits, after this hand-off.
+                if entry.epoch_id == witness.epoch_id
+                    && let RuntimeLoopAttachmentSlot::Attached(attachment) = &entry.attachment_slot
+                    && attachment.id == witness.attachment_id
+                {
+                    let _ = attachment.wake_tx.try_send(());
+                }
             }
         }
         Ok(witness)
@@ -6709,6 +6730,113 @@ impl MeerkatMachine {
         let armed = {
             let mut hook = self
                 .test_runtime_loop_before_boundary_acknowledgement
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if hook
+                .as_ref()
+                .is_some_and(|(armed_session_id, _, _)| armed_session_id == session_id)
+            {
+                hook.take()
+            } else {
+                None
+            }
+        };
+        if let Some((_, entered_tx, release_rx)) = armed {
+            let _ = entered_tx.send(());
+            let _ = release_rx.await;
+        }
+    }
+
+    /// Deterministically pause the next executor attachment commit of
+    /// `session_id` that owes interrupted-run notices, after its publication
+    /// (the runtime loop serves and was woken) and before the notices are
+    /// handed to the session. The first receiver resolves when the commit
+    /// reaches the gate; sending on (or dropping) the returned sender lets it
+    /// go on. Exposed only by test builds.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn arm_attachment_interrupted_notice_handoff_test_hook(
+        &self,
+        session_id: SessionId,
+    ) -> (
+        crate::tokio::sync::oneshot::Receiver<()>,
+        crate::tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (entered_tx, entered_rx) = crate::tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = crate::tokio::sync::oneshot::channel();
+        let mut hook = self
+            .test_attachment_interrupted_notice_handoff
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(
+            hook.is_none(),
+            "attachment interrupted-notice hand-off test hook already armed"
+        );
+        *hook = Some((session_id, entered_tx, release_rx));
+        (entered_rx, release_tx)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) async fn run_attachment_interrupted_notice_handoff_test_hook(
+        &self,
+        session_id: &SessionId,
+    ) {
+        let armed = {
+            let mut hook = self
+                .test_attachment_interrupted_notice_handoff
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if hook
+                .as_ref()
+                .is_some_and(|(armed_session_id, _, _)| armed_session_id == session_id)
+            {
+                hook.take()
+            } else {
+                None
+            }
+        };
+        if let Some((_, entered_tx, release_rx)) = armed {
+            let _ = entered_tx.send(());
+            let _ = release_rx.await;
+        }
+    }
+
+    /// Deterministically pause `session_id`'s runtime loop at its next
+    /// pre-dequeue check that finds no owed interrupted-run notice, with the
+    /// turn-finalization boundary held. The first receiver resolves when the
+    /// loop reaches the gate; sending on (or dropping) the returned sender
+    /// lets it go on. Exposed only by test builds.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn arm_runtime_loop_after_empty_interrupted_notice_check_test_hook(
+        &self,
+        session_id: SessionId,
+    ) -> (
+        crate::tokio::sync::oneshot::Receiver<()>,
+        crate::tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (entered_tx, entered_rx) = crate::tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = crate::tokio::sync::oneshot::channel();
+        let mut hook = self
+            .test_runtime_loop_after_empty_interrupted_notice_check
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(
+            hook.is_none(),
+            "runtime-loop empty interrupted-notice check test hook already armed"
+        );
+        *hook = Some((session_id, entered_tx, release_rx));
+        (entered_rx, release_tx)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) async fn run_runtime_loop_after_empty_interrupted_notice_check_test_hook(
+        &self,
+        session_id: &SessionId,
+    ) {
+        let armed = {
+            let mut hook = self
+                .test_runtime_loop_after_empty_interrupted_notice_check
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if hook
@@ -9781,6 +9909,28 @@ pub struct MeerkatMachineShared {
             crate::tokio::sync::oneshot::Receiver<()>,
         )>,
     >,
+    /// One-shot deterministic gate in an executor attachment commit that
+    /// owes interrupted-run notices: after its publication (the loop serves
+    /// and was woken), before the notices are handed to the session.
+    #[cfg(any(test, feature = "test-support"))]
+    test_attachment_interrupted_notice_handoff: StdMutex<
+        Option<(
+            SessionId,
+            crate::tokio::sync::oneshot::Sender<()>,
+            crate::tokio::sync::oneshot::Receiver<()>,
+        )>,
+    >,
+    /// One-shot deterministic gate at the runtime loop's next pre-dequeue
+    /// check that finds no owed interrupted-run notice (the
+    /// turn-finalization boundary is held).
+    #[cfg(any(test, feature = "test-support"))]
+    test_runtime_loop_after_empty_interrupted_notice_check: StdMutex<
+        Option<(
+            SessionId,
+            crate::tokio::sync::oneshot::Sender<()>,
+            crate::tokio::sync::oneshot::Receiver<()>,
+        )>,
+    >,
     /// Runtime-loop parks on held run starts (#1500), counted so tests can
     /// wait for the park as a positive event.
     #[cfg(any(test, feature = "test-support"))]
@@ -11591,6 +11741,10 @@ impl MeerkatMachine {
                 #[cfg(any(test, feature = "test-support"))]
                 test_runtime_loop_before_boundary_acknowledgement: StdMutex::new(None),
                 #[cfg(any(test, feature = "test-support"))]
+                test_attachment_interrupted_notice_handoff: StdMutex::new(None),
+                #[cfg(any(test, feature = "test-support"))]
+                test_runtime_loop_after_empty_interrupted_notice_check: StdMutex::new(None),
+                #[cfg(any(test, feature = "test-support"))]
                 test_runtime_loop_before_queue_authority: StdMutex::new(None),
                 registration_run_start_holds: std::sync::Mutex::new(HashMap::new()),
                 #[cfg(any(test, feature = "test-support"))]
@@ -11803,6 +11957,10 @@ impl MeerkatMachine {
                 test_runtime_loop_before_terminal_commit: StdMutex::new(None),
                 #[cfg(any(test, feature = "test-support"))]
                 test_runtime_loop_before_boundary_acknowledgement: StdMutex::new(None),
+                #[cfg(any(test, feature = "test-support"))]
+                test_attachment_interrupted_notice_handoff: StdMutex::new(None),
+                #[cfg(any(test, feature = "test-support"))]
+                test_runtime_loop_after_empty_interrupted_notice_check: StdMutex::new(None),
                 #[cfg(any(test, feature = "test-support"))]
                 test_runtime_loop_before_queue_authority: StdMutex::new(None),
                 registration_run_start_holds: std::sync::Mutex::new(HashMap::new()),
