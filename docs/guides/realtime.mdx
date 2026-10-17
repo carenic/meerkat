@@ -843,7 +843,10 @@ whose provider turn never reached the runtime) is not recorded. The session's
 transcript then carries a `RuntimeNotice` system notice with category
 `live_transcript_row_unrecorded` whose payload names the channel, the row kind,
 its provider item id, its position among the rows the close held and the
-refusal class; it never carries the row's content. The notice is recorded the
+refusal class; it never carries the row's content. A refused assistant output
+start is not reported on its own while a later row of the same provider item
+(its segment's release) is still to be applied: that row records the speech,
+or is reported itself if the session refuses it too. The notice is recorded the
 same way as other transcript writes, so a session that refuses every write
 refuses it too, and only a warning remains.
 

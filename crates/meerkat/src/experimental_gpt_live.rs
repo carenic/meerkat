@@ -15616,6 +15616,65 @@ mod tests {
         );
     }
 
+    /// The release of [`output_start_without_custody`]'s segment.
+    fn release_without_custody() -> meerkat_core::live_adapter::LiveAdapterObservation {
+        meerkat_core::live_adapter::LiveAdapterObservation::AssistantPlaybackTerminalObserved {
+            interaction_id: meerkat_core::InteractionId::new(),
+            provider_item_id: "item-without-custody".to_string(),
+            content_index: 0,
+            response_id: "response-without-custody".to_string(),
+            evidence: meerkat_core::LiveAssistantPlaybackEvidence::ProviderManagedUnmeasured(
+                "Speech without custody.".to_string(),
+            ),
+            stop_reason: StopReason::EndTurn,
+            usage: TurnUsage::host_declared(
+                Provider::OpenAI,
+                "gpt-live-1-codex".to_string(),
+                Usage::default(),
+            ),
+        }
+    }
+
+    /// #1821: a refused output start is left to the later row of its
+    /// provider item. When the session refuses that row (the segment's
+    /// release) too, the release is reported: one notice, never a second one
+    /// for the start.
+    #[tokio::test]
+    async fn a_refused_start_is_reported_through_its_refused_release() {
+        let (service, runtime, host, session_id, channel_id, _temp) = deferred_rows_fixture().await;
+        assert_eq!(
+            crate::session_runtime::live_orchestration::settle_live_close_playback_deferred(
+                Arc::clone(&service),
+                Arc::clone(&runtime),
+                host.owned_handle(),
+                vec![output_start_without_custody(), release_without_custody()],
+                session_id.clone(),
+                channel_id.clone(),
+                None,
+            )
+            .await,
+            crate::session_runtime::live_orchestration::DeferredCloseSettlementOutcome::Settled,
+        );
+        wait_for_resolved_close_settlement(&runtime, &session_id).await;
+        let notices = unrecorded_row_notices_now(&service, &session_id).await;
+        assert_eq!(
+            notices
+                .iter()
+                .map(|notice| (
+                    notice["row"].as_str(),
+                    notice["provider_item_id"].as_str(),
+                    notice["row_index"].as_u64(),
+                ))
+                .collect::<Vec<_>>(),
+            vec![(
+                Some("assistant_playback_terminal"),
+                Some("item-without-custody"),
+                Some(1),
+            )],
+            "the refused release is reported once, and its refused start is not: {notices:?}"
+        );
+    }
+
     /// #1821 (F1 last resort): the same notice when the row is refused by the
     /// replay that follows a given-up settlement.
     #[tokio::test]
@@ -19120,6 +19179,22 @@ mod tests {
         run_shipping_close_matrix(MatrixSelection::ParkedStartBehindMemberTurn).await;
     }
 
+    /// #1821: a delegation seals one provider turn's speech between two
+    /// segments while the member turn holds the session boundary, so both
+    /// segment output starts park behind it on the closing channel. Once the
+    /// turn ends, both segments reach the transcript in order, no caption is
+    /// retracted, and no row is reported as unrecorded.
+    #[cfg(all(
+        feature = "session-store",
+        feature = "memory-store",
+        feature = "test-realtime-fixtures",
+        not(target_arch = "wasm32")
+    ))]
+    #[tokio::test]
+    async fn speech_segments_whose_starts_parked_behind_the_member_turn_survive_the_close() {
+        run_shipping_close_matrix(MatrixSelection::ParkedSegmentsBehindMemberTurn).await;
+    }
+
     /// #1821 (R4, R6): rows parked behind a running member turn when the
     /// channel closes. The close drains the transport before it commits, so
     /// nothing is left unapplied in the adapter and nothing is deferred to
@@ -19431,6 +19506,7 @@ mod tests {
         Shipping,
         ContextFirst { peer: bool },
         ParkedStartBehindMemberTurn,
+        ParkedSegmentsBehindMemberTurn,
         ParkedRowsBehindMemberTurn { deferral_fails: bool },
     }
 
@@ -19458,6 +19534,7 @@ mod tests {
             UnmeasuredMemberTurnEndsMidClose,
             UnmeasuredEofDuringMemberTurn,
             UnmeasuredStartParkedBehindMemberTurn,
+            UnmeasuredSegmentsParkedBehindMemberTurn,
             RowsParkedBehindMemberTurn,
             SnapshotCut,
             PrefixCut,
@@ -19495,6 +19572,7 @@ mod tests {
             ExitKind::UnmeasuredMemberTurnEndsMidClose,
             ExitKind::UnmeasuredEofDuringMemberTurn,
             ExitKind::UnmeasuredStartParkedBehindMemberTurn,
+            ExitKind::UnmeasuredSegmentsParkedBehindMemberTurn,
             ExitKind::RowsParkedBehindMemberTurn,
             ExitKind::SnapshotCut,
             ExitKind::PrefixCut,
@@ -19530,6 +19608,9 @@ mod tests {
             MatrixSelection::ParkedStartBehindMemberTurn => {
                 matches!(exit, ExitKind::UnmeasuredStartParkedBehindMemberTurn)
             }
+            MatrixSelection::ParkedSegmentsBehindMemberTurn => {
+                matches!(exit, ExitKind::UnmeasuredSegmentsParkedBehindMemberTurn)
+            }
             MatrixSelection::ParkedRowsBehindMemberTurn { .. } => {
                 matches!(exit, ExitKind::RowsParkedBehindMemberTurn)
             }
@@ -19538,6 +19619,7 @@ mod tests {
                 ExitKind::ContextFirstTyped
                     | ExitKind::ContextFirstPeer
                     | ExitKind::UnmeasuredStartParkedBehindMemberTurn
+                    | ExitKind::UnmeasuredSegmentsParkedBehindMemberTurn
                     | ExitKind::RowsParkedBehindMemberTurn
             ),
         }) {
@@ -19669,6 +19751,7 @@ mod tests {
                     | ExitKind::UnmeasuredMemberTurnEndsMidClose
                     | ExitKind::UnmeasuredEofDuringMemberTurn
                     | ExitKind::UnmeasuredStartParkedBehindMemberTurn
+                    | ExitKind::UnmeasuredSegmentsParkedBehindMemberTurn
                     | ExitKind::PrefixCut
                     | ExitKind::UnmeasuredCut
                     | ExitKind::UnmeasuredRetry
@@ -19683,6 +19766,7 @@ mod tests {
                     | ExitKind::UnmeasuredMemberTurnEndsMidClose
                     | ExitKind::UnmeasuredEofDuringMemberTurn
                     | ExitKind::UnmeasuredStartParkedBehindMemberTurn
+                    | ExitKind::UnmeasuredSegmentsParkedBehindMemberTurn
                     | ExitKind::ContextFirstTyped
                     | ExitKind::ContextFirstPeer
             ) {
@@ -20325,6 +20409,7 @@ mod tests {
             let early_boundary = if matches!(
                 exit,
                 ExitKind::UnmeasuredStartParkedBehindMemberTurn
+                    | ExitKind::UnmeasuredSegmentsParkedBehindMemberTurn
                     | ExitKind::RowsParkedBehindMemberTurn
             ) {
                 Some(
@@ -20386,6 +20471,7 @@ mod tests {
                     | ExitKind::UnmeasuredMemberTurnEndsMidClose
                     | ExitKind::UnmeasuredEofDuringMemberTurn
                     | ExitKind::UnmeasuredStartParkedBehindMemberTurn
+                    | ExitKind::UnmeasuredSegmentsParkedBehindMemberTurn
                     | ExitKind::PrefixCut
                     | ExitKind::UnmeasuredCut
                     | ExitKind::UnmeasuredRetry
@@ -20398,6 +20484,39 @@ mod tests {
                         delta: "First spoken checkpoint.".to_string(),
                     },
                 ));
+            }
+            if matches!(exit, ExitKind::UnmeasuredSegmentsParkedBehindMemberTurn) {
+                // A delegation is a typed between-speech boundary: the open
+                // segment seals and the provider turn continues in a second
+                // segment, whose output start parks behind the member turn
+                // too. The matrix activator acts on no delegation, so the
+                // request has no effect beyond the seal.
+                let delegating_user = LiveSidebandTurnRef::__from_provider_observation(
+                    binding.channel_id(),
+                    format!("parked-segments-user-{ordinal}"),
+                    format!("private-parked-segments-user-{ordinal}"),
+                )
+                .expect("delegating user turn");
+                for kind in [
+                    LiveSidebandObservationKind::DelegationRequested {
+                        turn: delegating_user,
+                        delegation: LiveSidebandDelegationRef::__from_provider_observation(
+                            format!("parked-segments-delegation-{ordinal}"),
+                            format!("private-parked-segments-delegation-{ordinal}"),
+                        )
+                        .expect("fixture delegation identity"),
+                        final_transcript: format!("matrix user {ordinal}"),
+                        request_transcript: format!("matrix user {ordinal}"),
+                        assistant_context: "First spoken checkpoint.".to_string(),
+                        represented_user_rows: Vec::new(),
+                    },
+                    LiveSidebandObservationKind::TurnSnapshotDelta {
+                        turn: assistant_turn.clone(),
+                        delta: "Second spoken checkpoint.".to_string(),
+                    },
+                ] {
+                    sideband.push(LiveSidebandObservation::new(binding.clone(), kind));
+                }
             }
             if matches!(exit, ExitKind::ProviderManaged) {
                 use futures::{FutureExt as _, StreamExt as _};
@@ -20915,6 +21034,7 @@ mod tests {
             if matches!(
                 exit,
                 ExitKind::UnmeasuredStartParkedBehindMemberTurn
+                    | ExitKind::UnmeasuredSegmentsParkedBehindMemberTurn
                     | ExitKind::RowsParkedBehindMemberTurn
             ) {
                 let boundary =
@@ -20974,6 +21094,36 @@ mod tests {
                         unrecorded_row_notices_now(&service, &session_id).await,
                         Vec::<serde_json::Value>::new(),
                         "speech that committed is never reported as unrecorded"
+                    );
+                } else if matches!(exit, ExitKind::UnmeasuredSegmentsParkedBehindMemberTurn) {
+                    assert!(
+                        captions.retractions().is_empty(),
+                        "speech whose output starts were parked is never retracted"
+                    );
+                    wait_for_resolved_close_settlement(&runtime, &session_id).await;
+                    let rows: Vec<String> = unmeasured_rows(
+                        &service
+                            .load_authoritative_session(&session_id)
+                            .await
+                            .expect("read committed speech")
+                            .expect("session"),
+                    )
+                    .into_iter()
+                    .map(|(text, _)| text)
+                    .collect();
+                    assert_eq!(
+                        (
+                            rows,
+                            unrecorded_row_notices_now(&service, &session_id).await
+                        ),
+                        (
+                            vec![
+                                "First spoken checkpoint.".to_string(),
+                                "Second spoken checkpoint.".to_string(),
+                            ],
+                            Vec::<serde_json::Value>::new(),
+                        ),
+                        "both parked segments commit in order, and speech that committed is never reported as unrecorded"
                     );
                 } else {
                     // R6: every row the transport deferred reached the close's
@@ -22084,6 +22234,7 @@ mod tests {
                 | ExitKind::UnmeasuredMemberTurnEndsMidClose
                 | ExitKind::UnmeasuredEofDuringMemberTurn
                 | ExitKind::UnmeasuredStartParkedBehindMemberTurn
+                | ExitKind::UnmeasuredSegmentsParkedBehindMemberTurn
                 | ExitKind::RowsParkedBehindMemberTurn
                 | ExitKind::PrefixCut
                 | ExitKind::UnmeasuredCut

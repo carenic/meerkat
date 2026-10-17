@@ -71,6 +71,12 @@ them.
 - A deferred playback release replayed after its channel closed no longer
   fails on the closed channel's playback segment: its speech commits and the
   release succeeds (it was reported as refused although recorded). (#1821)
+- Live channels: a closed channel that replays two spoken segments of one
+  provider turn, both of whose output starts waited behind a member turn, no
+  longer reports the second segment's output start as unrecorded while its
+  release commits that speech. A refused output start is reported only when
+  no later row of its provider item follows it among the rows the close held;
+  otherwise that row records the speech, or is reported itself. (#1821)
 - GPT Live: speech whose output start waited behind a running member turn
   when the channel closed is committed under its generated output instead of
   being abandoned with its captions retracted. The segment's release follows

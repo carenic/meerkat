@@ -1205,6 +1205,7 @@ mod orchestrator {
                         observation,
                         Some(*index),
                         &error,
+                        transcript_first.iter().skip(1).map(|(_, row)| row),
                     );
                     transcript_first.pop_front();
                 }
@@ -1353,6 +1354,7 @@ mod orchestrator {
                         observation,
                         Some(*index),
                         &error,
+                        rows.iter().skip(1).map(|(_, row)| row),
                     );
                     rows.pop_front();
                 }
@@ -1461,6 +1463,7 @@ mod orchestrator {
                             observation,
                             Some(*index),
                             &error,
+                            rows.iter().skip(1).map(|(_, row)| row),
                         );
                         rows.pop_front();
                     }
@@ -1476,22 +1479,66 @@ mod orchestrator {
 
     /// The last resort for a deferred row the session refused for a reason
     /// other than a held boundary: see [`record_unrecorded_live_row`].
-    fn report_unrecorded_live_row<B: SessionAgentBuilder + 'static>(
+    /// `later_rows` are the rows of the same list still to be applied after
+    /// it. A refused output start is not reported while a later row of its
+    /// provider item follows (its segment's release): that row records the
+    /// speech, or is reported itself if the session refuses it too, so no
+    /// notice names speech that lands. A second spoken segment of a provider
+    /// turn whose output starts both waited behind the member turn is
+    /// replayed that way: its start finds the turn's output still bound to
+    /// the first segment, while its release commits under the target the
+    /// start admitted.
+    fn report_unrecorded_live_row<'a, B, L>(
         service: &Arc<PersistentSessionService<B>>,
         session_id: &SessionId,
         channel_id: &LiveChannelId,
         observation: &meerkat_core::live_adapter::LiveAdapterObservation,
         row_index: Option<usize>,
         error: &meerkat_live::LiveAdapterHostError,
-    ) {
+        later_rows: L,
+    ) where
+        B: SessionAgentBuilder + 'static,
+        L: IntoIterator<Item = &'a meerkat_core::live_adapter::LiveAdapterObservation>,
+    {
+        let refusal = unrecorded_live_row_refusal(error);
+        if let Some(item) = output_start_item(observation)
+            && later_rows
+                .into_iter()
+                .any(|later| unrecorded_live_row_identity(later).1 == Some(item))
+        {
+            tracing::info!(
+                target: meerkat_live::LIVE_CLOSE_TRACE_TARGET,
+                %session_id,
+                channel = %channel_id,
+                provider_item_id = item,
+                row_index,
+                refusal,
+                "a refused live output start is left to the later row of its provider item"
+            );
+            return;
+        }
         record_unrecorded_live_row(
             service,
             session_id,
             channel_id,
             observation,
             row_index,
-            unrecorded_live_row_refusal(error),
+            refusal,
         );
+    }
+
+    /// The provider item id of a deferred output start.
+    fn output_start_item(
+        observation: &meerkat_core::live_adapter::LiveAdapterObservation,
+    ) -> Option<&str> {
+        use meerkat_core::live_adapter::LiveAdapterObservation as Row;
+        match observation {
+            Row::WithContextObservation { observation, .. } => output_start_item(observation),
+            Row::AssistantOutputStarted {
+                provider_item_id, ..
+            } => Some(provider_item_id),
+            _ => None,
+        }
     }
 
     /// A live row that is not recorded: a typed warning and a typed runtime
