@@ -23356,6 +23356,97 @@ async fn exact_run_boundary_cancel_delivery_failure_keeps_the_recorded_cancel() 
         .expect("first apply should still be blocked");
 }
 
+/// A failure inside the runtime after the exact-run cancel was staged (its
+/// runtime-effect projection) withdraws the dispatch, keeps the run's
+/// recorded cancel, and reports the outcome as owned by that cancel, never as
+/// a bare internal error. Nothing reaches the live boundary handle.
+#[tokio::test]
+async fn exact_run_boundary_cancel_projection_failure_keeps_the_recorded_cancel() {
+    let (mut race, run_id) = persistent_boundary_cancel_race(false).await;
+    race.adapter
+        .test_fail_next_boundary_cancel_effect_projection
+        .store(true, std::sync::atomic::Ordering::Release);
+    let result = tokio::time::timeout(
+        Duration::from_secs(1),
+        race.adapter
+            .cancel_after_boundary_run_if_current(&race.session_id, &run_id),
+    )
+    .await
+    .expect("the exact cancellation completes");
+    assert!(
+        matches!(
+            &result,
+            Err(RuntimeDriverError::InterruptDispatchOutcomeUnknown { run_id: failed, .. })
+                if failed == &run_id
+        ),
+        "a failure after the cancel was staged is outcome-unknown for that run: {result:?}"
+    );
+    let state = race
+        .adapter
+        .session_dsl_state(&race.session_id)
+        .await
+        .expect("running session should retain DSL authority");
+    assert!(
+        state.cancel_after_boundary,
+        "the withdrawal never erases the staged cancel"
+    );
+    assert!(
+        !state.boundary_cancel_dispatch_pending,
+        "the dispatch is withdrawn"
+    );
+    assert_eq!(race.handle_calls.load(Ordering::SeqCst), 0);
+
+    race.first_apply_release
+        .take()
+        .expect("race should expose its first-apply release")
+        .send(())
+        .expect("first apply should still be blocked");
+}
+
+/// When withdrawing the staged dispatch fails as well, that error is also
+/// reported as owned by the recorded cancel: after staging, an exact-run
+/// cancel never returns a bare error.
+#[tokio::test]
+async fn exact_run_boundary_cancel_dispatch_withdrawal_failure_keeps_the_recorded_cancel() {
+    let (mut race, run_id) = persistent_boundary_cancel_race(false).await;
+    race.adapter
+        .test_fail_next_boundary_cancel_effect_projection
+        .store(true, std::sync::atomic::Ordering::Release);
+    race.adapter
+        .test_fail_next_boundary_cancel_dispatch_abort
+        .store(true, std::sync::atomic::Ordering::Release);
+    let result = tokio::time::timeout(
+        Duration::from_secs(1),
+        race.adapter
+            .cancel_after_boundary_run_if_current(&race.session_id, &run_id),
+    )
+    .await
+    .expect("the exact cancellation completes");
+    assert!(
+        matches!(
+            &result,
+            Err(RuntimeDriverError::InterruptDispatchOutcomeUnknown { run_id: failed, .. })
+                if failed == &run_id
+        ),
+        "a failed withdrawal after the cancel was staged is outcome-unknown for that run: {result:?}"
+    );
+    assert!(
+        race.adapter
+            .session_dsl_state(&race.session_id)
+            .await
+            .expect("running session should retain DSL authority")
+            .cancel_after_boundary,
+        "the staged cancel stays recorded"
+    );
+    assert_eq!(race.handle_calls.load(Ordering::SeqCst), 0);
+
+    race.first_apply_release
+        .take()
+        .expect("race should expose its first-apply release")
+        .send(())
+        .expect("first apply should still be blocked");
+}
+
 /// Retirement may open the unregister drain after admitting an input but
 /// before that input binds its run. The drain must continue rejecting public
 /// cancellation as new ingress while allowing teardown to cancel only the

@@ -881,9 +881,14 @@ them.
   the cancel is recorded. The same holds when the member's session service
   does not support the live boundary cancel
   (`SessionService::cancel_after_boundary`): the runtime has recorded the
-  cancel first, and the verbs report it instead of an internal error. This
-  was the intermittent `member_creation_some_origin_authority_matrix`
-  failure in meerkat-mob's tests.
+  cancel first, and the verbs report it instead of an internal error.
+  `MeerkatMachine::cancel_after_boundary_run_if_current` also reports
+  `InterruptDispatchOutcomeUnknown` rather than a bare `Internal` for the
+  other failures that follow the recorded cancel (its effect projection, the
+  withdrawal of its dispatch), so the verbs report the recorded cancel there
+  too. This was the intermittent
+  `member_creation_some_origin_authority_matrix` failure in meerkat-mob's
+  tests.
 
 ## [0.9.2] - 2026-10-16
 

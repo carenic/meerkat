@@ -16548,6 +16548,38 @@ impl MeerkatMachine {
         }
     }
 
+    /// Withdraw a staged boundary-cancel dispatch after a failure that follows
+    /// the staging. An exact-run cancel is recorded by then, so the
+    /// withdrawal's own failure is reported as owned by that recorded cancel
+    /// too: after staging, an exact-run cancel never fails with a bare error.
+    fn abort_staged_boundary_cancel_dispatch(
+        &self,
+        authority: &Arc<std::sync::Mutex<crate::meerkat_machine::dsl::MeerkatMachineAuthority>>,
+        dispatch_generation: u64,
+        requested_run_id: Option<&meerkat_core::RunId>,
+    ) -> Result<(), RuntimeDriverError> {
+        self.abort_boundary_cancel_dispatch(authority, dispatch_generation)
+            .map(|_| ())
+            .map_err(|error| Self::accepted_exact_cancel_failure(requested_run_id, error))
+    }
+
+    fn abort_boundary_cancel_dispatch(
+        &self,
+        authority: &Arc<std::sync::Mutex<crate::meerkat_machine::dsl::MeerkatMachineAuthority>>,
+        dispatch_generation: u64,
+    ) -> Result<bool, RuntimeDriverError> {
+        #[cfg(test)]
+        if self
+            .test_fail_next_boundary_cancel_dispatch_abort
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+        {
+            return Err(RuntimeDriverError::Internal(
+                "injected boundary-cancel dispatch abort failure".to_string(),
+            ));
+        }
+        Self::abort_dsl_boundary_cancel_dispatch_if_current(authority, dispatch_generation)
+    }
+
     pub(super) async fn cancel_after_boundary_inner_for_incarnation(
         &self,
         session_id: &SessionId,
@@ -16739,23 +16771,35 @@ impl MeerkatMachine {
                     return Err(RuntimeDriverError::NotReady { state });
                 }
             };
-            let projected_effect =
-                match crate::effect::runtime_effect_projection_optional_from_dsl_effects(
-                    &staged.effects,
-                ) {
-                    Ok(projected_effect) => projected_effect,
-                    Err(error) => {
-                        let dispatch_generation = staged
-                            .committed_snapshot
-                            .state()
-                            .boundary_cancel_dispatch_generation;
-                        Self::abort_dsl_boundary_cancel_dispatch_if_current(
-                            &captured_dsl_authority,
-                            dispatch_generation,
-                        )?;
-                        return Err(RuntimeDriverError::Internal(error));
-                    }
-                };
+            let projection =
+                crate::effect::runtime_effect_projection_optional_from_dsl_effects(&staged.effects);
+            #[cfg(test)]
+            let projection = if self
+                .test_fail_next_boundary_cancel_effect_projection
+                .swap(false, std::sync::atomic::Ordering::AcqRel)
+            {
+                Err("injected boundary-cancel effect projection failure".to_string())
+            } else {
+                projection
+            };
+            let projected_effect = match projection {
+                Ok(projected_effect) => projected_effect,
+                Err(error) => {
+                    let dispatch_generation = staged
+                        .committed_snapshot
+                        .state()
+                        .boundary_cancel_dispatch_generation;
+                    self.abort_staged_boundary_cancel_dispatch(
+                        &captured_dsl_authority,
+                        dispatch_generation,
+                        requested_run_id,
+                    )?;
+                    return Err(Self::accepted_exact_cancel_failure(
+                        requested_run_id,
+                        RuntimeDriverError::Internal(error),
+                    ));
+                }
+            };
             let Some(projected_effect) = projected_effect else {
                 // Machine-owned convergence: a boundary-cancel dispatch is
                 // already outstanding, so the machine took the typed
@@ -16799,9 +16843,10 @@ impl MeerkatMachine {
             let sessions = self.sessions.read().await;
             let Some(entry) = sessions.get(session_id) else {
                 drop(sessions);
-                Self::abort_dsl_boundary_cancel_dispatch_if_current(
+                self.abort_staged_boundary_cancel_dispatch(
                     &captured_dsl_authority,
                     dispatch_generation,
+                    requested_run_id,
                 )?;
                 return Err(Self::accepted_exact_cancel_failure(
                     requested_run_id,
@@ -16814,9 +16859,10 @@ impl MeerkatMachine {
                 || !Arc::ptr_eq(&entry.dsl_authority, &captured_dsl_authority)
             {
                 drop(sessions);
-                Self::abort_dsl_boundary_cancel_dispatch_if_current(
+                self.abort_staged_boundary_cancel_dispatch(
                     &captured_dsl_authority,
                     dispatch_generation,
+                    requested_run_id,
                 )?;
                 return Err(Self::accepted_exact_cancel_failure(
                     requested_run_id,
@@ -16828,9 +16874,10 @@ impl MeerkatMachine {
             }
             let Some(attachment_id) = entry.live_attachment_id() else {
                 drop(sessions);
-                Self::abort_dsl_boundary_cancel_dispatch_if_current(
+                self.abort_staged_boundary_cancel_dispatch(
                     &captured_dsl_authority,
                     dispatch_generation,
+                    requested_run_id,
                 )?;
                 return Err(Self::accepted_exact_cancel_failure(
                     requested_run_id,
@@ -16841,9 +16888,10 @@ impl MeerkatMachine {
             };
             let Some(effect_tx) = entry.effect_sender() else {
                 drop(sessions);
-                Self::abort_dsl_boundary_cancel_dispatch_if_current(
+                self.abort_staged_boundary_cancel_dispatch(
                     &captured_dsl_authority,
                     dispatch_generation,
+                    requested_run_id,
                 )?;
                 return Err(Self::accepted_exact_cancel_failure(
                     requested_run_id,
