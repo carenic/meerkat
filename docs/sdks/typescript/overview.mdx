@@ -18,6 +18,11 @@ service APIs. For agents that run in the browser itself, use the
     ```bash
     npm install @rkat/sdk
     ```
+
+    The SDK needs Node.js 20.19+ or 22.12+ (`engines.node`). It ships only
+    an ES module, so `require()` from CommonJS relies on Node's
+    `require(esm)`, which those releases enable by default; Node 21 and
+    22.0-22.11 are outside the range.
   </Step>
   <Step title="Install the RPC binary">
     ```bash

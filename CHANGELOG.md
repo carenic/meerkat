@@ -481,6 +481,13 @@ them.
   `InProgress`, or `Failed` with the error); `relink_child` and
   `relink_child_within` return the new `ForkRelinkOutcome` (`action` and
   `child_retirement`) instead of a `ForkRelinkAction`.
+- Behaviour-only (not measured by the gate): `@rkat/sdk` declares its Node
+  floor, `engines.node` `^20.19.0 || >=22.12.0`. The package ships only an ES
+  module (its `import` and `default` exports both name it), so `require()`
+  from CommonJS needs Node's `require(esm)`, enabled by default from 20.19 and
+  22.12. Installing on a Node outside that range now warns, and package
+  managers that enforce `engines` (yarn classic, or npm with `engine-strict`)
+  refuse it.
 
 ### Security
 

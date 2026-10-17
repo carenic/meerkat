@@ -82,7 +82,7 @@ After installing the local SDK and each example's documented dependencies:
 make -C examples verify
 ```
 
-The regression harness requires Node.js 22 or newer, Python 3.11 or newer,
+The regression harness requires Node.js 22.12 or newer, Python 3.11 or newer,
 the repository's pinned Rust toolchain, and Chrome/Chromium for headless
 browser checks. These are test-harness prerequisites, not a claim that every
 example uses every toolchain. The WebCM guest check also requires example
