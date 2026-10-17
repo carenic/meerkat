@@ -390,6 +390,7 @@ printf '%s\n' \
   'echo "Error: Action property AuditResponsesOnlyFromAddressee is violated."' \
   'echo "Error: Action property AuditSenderVerdictExact is violated."' \
   'echo "Error: Action property AuditAddresseeVerdictExact is violated."' \
+  'echo "Error: Action property AuditRequesterStable is violated."' \
   'echo "Error: Invariant pending_peer_request_addressees_match_requests is violated."' \
   'echo "Error: Invariant inbound_peer_request_requesters_match_requests is violated."' \
   'echo "State 1: <Initial predicate>"' \
