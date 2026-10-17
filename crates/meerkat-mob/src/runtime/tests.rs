@@ -15219,6 +15219,89 @@ async fn test_mob_builder_allows_ephemeral_session_service_when_opted_in() {
     assert_eq!(handle.status().await.unwrap(), MobState::Running);
 }
 
+/// A mob created with a callback claim verifier answers its creator's token
+/// and no other; a mob created without one answers none until the host
+/// records one, which is never replaced. A store that already holds a
+/// verifier for the mob's id (an earlier mob's) fails the create.
+#[tokio::test]
+async fn a_created_mob_answers_only_its_own_callback_claim_token() {
+    use crate::CallbackClaimCheck;
+
+    let token = crate::MobClaimToken::mint().expect("entropy");
+    let other = crate::MobClaimToken::mint().expect("entropy");
+    let service = Arc::new(MockSessionService::new());
+    let _ = service.enable_runtime_adapter();
+    let handle = MobBuilder::new(sample_definition(), MobStorage::in_memory())
+        .with_session_service(service.clone())
+        .with_callback_claim_verifier(token.verifier())
+        .create()
+        .await
+        .expect("create mob");
+    assert_eq!(
+        handle.check_callback_claim_token(&token).await.unwrap(),
+        CallbackClaimCheck::Verified
+    );
+    assert_eq!(
+        handle.check_callback_claim_token(&other).await.unwrap(),
+        CallbackClaimCheck::Mismatch
+    );
+
+    // Each mob here has its own id: a live mob holds its id's supervisor
+    // participant name.
+    let mut tokenless = sample_definition();
+    tokenless.id = MobId::from(format!("{}-tokenless", tokenless.id));
+    let (unclaimable, _service) = create_test_mob(tokenless).await;
+    assert_eq!(
+        unclaimable
+            .check_callback_claim_token(&token)
+            .await
+            .unwrap(),
+        CallbackClaimCheck::NotClaimable
+    );
+    assert!(
+        unclaimable
+            .record_callback_claim_verifier_if_absent(&other.verifier())
+            .await
+            .unwrap()
+    );
+    assert!(
+        !unclaimable
+            .record_callback_claim_verifier_if_absent(&token.verifier())
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        unclaimable
+            .check_callback_claim_token(&other)
+            .await
+            .unwrap(),
+        CallbackClaimCheck::Verified
+    );
+
+    let mut earlier = sample_definition();
+    earlier.id = MobId::from(format!("{}-earlier", earlier.id));
+    let kept = MobStorage::in_memory();
+    assert!(
+        kept.runtime_metadata
+            .put_callback_claim_verifier_if_absent(&earlier.id, &other.verifier())
+            .await
+            .unwrap()
+    );
+    let refused = MobBuilder::new(earlier, kept)
+        .with_session_service(service)
+        .with_callback_claim_verifier(token.verifier())
+        .create()
+        .await;
+    assert!(
+        matches!(
+            &refused,
+            Err(MobError::Internal(message)) if message.contains("already holds a callback claim verifier")
+        ),
+        "{:?}",
+        refused.map(|_| ())
+    );
+}
+
 #[tokio::test]
 async fn test_nonpersistent_resume_helper_rejects_persistent_service_claim() {
     let service = MockSessionService::new();

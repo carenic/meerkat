@@ -639,6 +639,9 @@ pub struct MobBuilder {
         crate::control_policy::CommandAuthority,
         StartAdmittedDestroyCustodyWatch,
     )>,
+    /// The verifier of the created mob's callback claim token; see
+    /// [`MobBuilder::with_callback_claim_verifier`].
+    callback_claim_verifier: Option<crate::MobClaimVerifier>,
 }
 
 enum BuilderMode {
@@ -6906,6 +6909,7 @@ impl MobBuilder {
             member_live_host: None,
             restored_member_run_start_holds: BTreeMap::new(),
             start_destroy_admission: None,
+            callback_claim_verifier: None,
         }
     }
 
@@ -6988,7 +6992,19 @@ impl MobBuilder {
             member_live_host: None,
             restored_member_run_start_holds: BTreeMap::new(),
             start_destroy_admission: None,
+            callback_claim_verifier: None,
         }
+    }
+
+    /// Keep `verifier`, the verifier of the claim token the creator of this
+    /// mob receives, in the created mob's store before `create` returns, so
+    /// the mob is never managed without it. A store that already holds one
+    /// for the mob's id (an earlier mob's, whose store was kept) fails the
+    /// create rather than let that token claim this mob. Resume ignores it:
+    /// a resumed mob keeps the verifier it has.
+    pub fn with_callback_claim_verifier(mut self, verifier: crate::MobClaimVerifier) -> Self {
+        self.callback_claim_verifier = Some(verifier);
+        self
     }
 
     /// Compose the controlling-side reverse-lane acceptor (ADJ-P4-2). Cloned
@@ -7291,6 +7307,7 @@ impl MobBuilder {
                 restored_member_run_start_holds: _,
                 // Nor a restored destroy to admit.
                 start_destroy_admission: _,
+                callback_claim_verifier,
             } = builder;
             #[cfg(not(feature = "runtime-adapter"))]
             let runtime_adapter: RuntimeAdapterOption = None;
@@ -7412,6 +7429,19 @@ impl MobBuilder {
                 &mut dsl_authority,
             )
             .await?;
+            if let Some(verifier) = callback_claim_verifier.as_ref() {
+                if !storage
+                    .runtime_metadata
+                    .put_callback_claim_verifier_if_absent(&definition.id, verifier)
+                    .await?
+                {
+                    return Err(MobError::Internal(format!(
+                        "the store of mob '{}' already holds a callback claim verifier, from an \
+                         earlier mob under this id",
+                        definition.id
+                    )));
+                }
+            }
             Self::recover_host_bindings(
                 storage.runtime_metadata.clone(),
                 &definition.id,
@@ -7533,6 +7563,7 @@ impl MobBuilder {
             member_live_host,
             restored_member_run_start_holds,
             start_destroy_admission,
+            callback_claim_verifier: _,
         } = self;
         #[cfg(not(feature = "runtime-adapter"))]
         let runtime_adapter: RuntimeAdapterOption = None;

@@ -35,12 +35,28 @@ them.
 
 ## [Unreleased]
 
+### Breaking
+
+- Behaviour-only (not measured by the gate): 0.9.3 migrates a mob's SQLite
+  store to schema version 11 (a table for the mob's callback claim
+  verifier) when it opens it, and 0.9.2 refuses a store at version 11 with
+  its typed future-schema error. Downgrading after the migration is not
+  supported: keep a copy of the mob stores from before the upgrade to roll
+  back.
+
 ### Added
 
 - `meerkat_core::ToolBindingDigest` and `ToolBindingDigestParseError`: a
   durable SHA-256 digest of what a tool catalog entry declares (never its
   live authorities or current callability), with the text form
   `sha256:<64 hex digits>`.
+- `meerkat_mob::MobClaimToken`, `MobClaimVerifier`, `MobClaimTokenError`
+  and `CallbackClaimCheck`; `MobBuilder::with_callback_claim_verifier`;
+  `MobHandle::check_callback_claim_token` and
+  `record_callback_claim_verifier_if_absent`;
+  `MobRuntimeMetadataStore::put_callback_claim_verifier_if_absent` and
+  `load_callback_claim_verifier`, provided methods that refuse by default
+  (the in-memory and SQLite stores implement them).
 
 ## [0.9.2] - 2026-10-16
 
