@@ -342,6 +342,17 @@ graph.
   read the credentials file `SCCACHE_GCS_KEY_PATH` names. Only a separate
   read-only identity for those runs, an IAM change outside this
   repository, closes that.
+- The bearer token in that credentials file (`gha-creds-*.json`) is the
+  job's Actions runtime token: the runner sets
+  `ACTIONS_ID_TOKEN_REQUEST_TOKEN` to the same token. No step exports the
+  token to the lanes' run steps, but a run step of a lane that
+  authenticated to GCS can still read it there. The token reaches the
+  repository's Actions caches; no release job restores one, so the reach
+  ends at CI caches.
+- Nightly, `cargo.yml` and the dense Mob topology workflow still install
+  sccache through `mozilla-actions/sccache-action` (with a pinned
+  `version`), by design: they use its GitHub Actions cache backend, which
+  needs the token the action exports.
 - A release job whose checkout can be an older tag runs its setup action
   from `.release-tooling`, a sparse checkout of the workflow's own commit,
   but a local action that action calls in turn (`uses: ./.github/actions/...`)

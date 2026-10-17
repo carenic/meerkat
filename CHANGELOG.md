@@ -148,11 +148,13 @@ them.
   bucket.** Every other run, pull requests from this repository included,
   runs it read-only (`SCCACHE_GCS_RW_MODE=READ_ONLY`), and the lanes no
   longer install sccache through sccache-action, so no step exports the
-  job's Actions cache token to their run steps. The read-only mode is a
-  client-side setting, not a credential: any later step of such a run can
-  read the credentials file `SCCACHE_GCS_KEY_PATH` names, which carries a
-  bearer token for the same identity the push runs write with. The release
-  doctor checks the mode and the install. CI only.
+  job's Actions cache token to their run steps. Both stop short of a
+  credential: the read-only mode is a client-side setting, and any later
+  step of a lane that authenticated to GCS can read the credentials file
+  `SCCACHE_GCS_KEY_PATH` names, whose bearer is the job's Actions runtime
+  token (the runner sets `ACTIONS_ID_TOKEN_REQUEST_TOKEN` to the same
+  token). That token reaches the Actions caches, which no release job
+  restores. The release doctor checks the mode and the install. CI only.
 - **CI installs a pinned sccache release.** The CI lanes' setup
   (`.github/actions/setup-sccache-ci`) downloads the sccache v0.18.0
   tarball itself and checks it against a pinned sha256, instead of
