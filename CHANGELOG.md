@@ -91,7 +91,14 @@ them.
   mob tool acts through the mob it was admitted against and never resolves
   the id again, so a mob destroyed and created again under the id while a
   call is in flight is never touched by that call (a destroy re-checks the
-  admitted incarnation and refuses with the ordinary access denial).
+  admitted incarnation and refuses with the ordinary access denial). A
+  `council` seats forks only of the source mobs its convener was admitted
+  to: a participant whose source mob id names another incarnation by its
+  seating is refused with the new typed exit reason
+  `participant_source_replaced`
+  (`TemporaryCouncilExitReason::ParticipantSourceReplaced`), and nothing of
+  that mob is forked; a council is never run again after a restart, so no
+  seating outlives its admission.
   Incarnations are never decoded from input: `Deserialize` always refuses
   and `Debug` and `Serialize` render them redacted. Grants are still not
   persisted, so no grant survives a restart; a member's operator facts

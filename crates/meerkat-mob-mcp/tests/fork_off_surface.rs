@@ -33,7 +33,10 @@ use meerkat_mob_mcp::{
     AgentMobToolSurface, DetachedCompletionDelivery, DetachedDeliveryUnavailable, MobMcpState,
 };
 use serde_json::{Value, json};
-use support::{CouncilFixture, ScriptedTurn, TurnGate, last_user_text, role_in_request, user_text};
+use support::{
+    CouncilFixture, GatedClaimCouncilStore, ScriptedTurn, TurnGate, last_user_text,
+    role_in_request, user_text,
+};
 
 /// Marker in every child task, so the script can tell a child's turn from
 /// the forker's own turns.
@@ -959,6 +962,84 @@ async fn one_shot_hosts_block_for_the_council_result() {
         ),
         0,
         "no completion record on the blocking path"
+    );
+    fixture.teardown().await;
+}
+
+/// A council seats forks of the source mob its convener was admitted to, or
+/// nothing: when that mob is destroyed and another is created under its id
+/// with members of the same identities between the admission and the
+/// seating, the council refuses the participant, typed, and never forks a
+/// member of the new mob.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_council_never_seats_a_member_of_a_mob_recreated_under_its_source_id() {
+    let gate = TurnGate::new();
+    let _open_on_drop = OpenOnDrop(Arc::clone(&gate));
+    let council_store: Arc<dyn meerkat_mob::store::TemporaryCouncilStore> =
+        Arc::new(GatedClaimCouncilStore::new(
+            Arc::new(meerkat_mob::store::InMemoryTemporaryCouncilStore::new()),
+            Arc::clone(&gate),
+        ));
+    let fixture = CouncilFixture::new_runtime_backed_with(
+        routed_script(RequestLog::default(), Vec::new()),
+        move |state, _root| state.with_temporary_council_store(council_store),
+    );
+    fixture.seed_source_mob(&["alice", "bob"]).await;
+    fixture
+        .state
+        .set_detached_completion_delivery(DetachedCompletionDelivery::Unavailable);
+    let mob_id = fixture.source_mob_id();
+    let convener = bind_surface(
+        &fixture.state,
+        SessionId::new(),
+        convener_authority(
+            mob_id.as_str(),
+            live_incarnation(&fixture.state, mob_id.as_str()).await,
+        ),
+    );
+
+    let council = dispatch(
+        &convener.surface,
+        "council",
+        council_args(&fixture, Some("recreated-source")),
+    );
+    let recreate = async {
+        gate.wait_entered(1).await;
+        fixture
+            .state
+            .mob_destroy(&mob_id)
+            .await
+            .expect("the console destroys the admitted source mob");
+        fixture.seed_source_mob(&["alice", "bob"]).await;
+        gate.open();
+    };
+    let (outcome, ()) = tokio::join!(council, recreate);
+
+    let result = result_json(&outcome.expect("the council returns its sealed result"));
+    let rendered = result.to_string();
+    for member in ["alice", "bob"] {
+        let replacement = member_session(&fixture, member).await;
+        assert!(
+            !rendered.contains(&replacement.to_string()),
+            "the council forked {member} of the mob created under its source id: {result}"
+        );
+    }
+    assert_eq!(
+        result["result"]["exit_reason"]["reason"], "participant_source_replaced",
+        "{result}"
+    );
+    assert_eq!(
+        result["result"]["exit_reason"]["participant_order"], 0,
+        "{result}"
+    );
+    let participants = result["result"]["participants"]
+        .as_array()
+        .expect("participants");
+    assert!(
+        participants.iter().all(|participant| {
+            participant["seated"] == false && participant.get("capability").is_none()
+        }),
+        "no participant holds a capability or a seat: {result}"
     );
     fixture.teardown().await;
 }

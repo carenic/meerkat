@@ -183,7 +183,11 @@ decision-support action, not a human-operated lifecycle surface.
 The caller names existing source members and the question to decide. The tool
 resolves each member's current profile and placement, synthesizes the explicit
 temporary `MobDefinition`, derives stable branch identities, and starts the
-council. How the sealed result reaches the caller depends on the host:
+council. Each participant is seated from the source mob the caller was
+admitted to: when that mob is destroyed and another is created under its id
+before the participant is seated, the council refuses the participant with the
+typed `participant_source_replaced` exit reason and forks nothing of the new
+mob. How the sealed result reaches the caller depends on the host:
 
 - **Detached (hosts that outlive the call).** A host with a runtime adapter
   (the JSON-RPC, REST, and MCP servers, Meta), `rkat run --keep-alive`, and
@@ -206,7 +210,8 @@ council. How the sealed result reaches the caller depends on the host:
   revived when the continuation is applied: through its mob when it is a mob member, or through the
   host's `DetachedOwnerHost` when it is a plain session. The status is
   **`failed`** when the exit reason is a failure (`participant_seating_failed`,
-  `wiring_incomplete`, `exchange_failed`, `coordinator_interrupted`); the
+  `participant_source_replaced`, `wiring_incomplete`, `exchange_failed`,
+  `coordinator_interrupted`); the
   record still carries the full sealed outcome, and bound-limited ends
   (`max_exchanges_reached`, `deadline_exceeded`) complete normally with their
   partial result. The notice survives later model calls, turns, and reloads

@@ -1731,6 +1731,10 @@ impl AgentMobToolSurface {
         let mut definition = MobDefinition::explicit(MobId::from("agent-council-template"));
         let mut participants = Vec::with_capacity(args.participants.len());
         let mut target_identities = Vec::with_capacity(args.participants.len());
+        // The incarnation each source mob was admitted at: seating refuses a
+        // source mob id that names another mob by then.
+        let mut admitted_sources =
+            crate::temporary_council::TemporaryCouncilAdmittedSources::default();
 
         for (index, participant) in args.participants.into_iter().enumerate() {
             let source_mob_id = MobId::from(participant.mob_id);
@@ -1748,6 +1752,7 @@ impl AgentMobToolSurface {
             let order = u32::try_from(index).map_err(|_| {
                 ToolError::invalid_arguments(call.name, "too many council participants")
             })?;
+            admitted_sources.admit(order, source.incarnation());
             let target_profile = ProfileName::from(format!("council_p{order}"));
             definition.profiles.insert(
                 target_profile.clone(),
@@ -1830,7 +1835,7 @@ impl AgentMobToolSurface {
                 let outcome = self
                     .state
                     .temporary_council()
-                    .run(request)
+                    .run_admitted(request, admitted_sources)
                     .await
                     .map_err(|error| Self::map_council_error(call, error))?;
                 let mut value = council_outcome_json(&outcome);
@@ -1857,7 +1862,10 @@ impl AgentMobToolSurface {
             crate::state_tasks::StateTaskKind::Owned,
             "detached council run",
             async move {
-                let outcome = match council.run_detached(request, job).await {
+                let outcome = match council
+                    .run_detached_admitted(request, job, admitted_sources)
+                    .await
+                {
                     // A council that ran but failed (e.g. participant seating)
                     // is delivered as failed; the record keeps the full typed
                     // outcome either way.
