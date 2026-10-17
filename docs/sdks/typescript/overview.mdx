@@ -321,10 +321,10 @@ new MeerkatClient(rkatPath?: string)
 The SDK runs `MEERKAT_BIN_PATH`, an explicit `rkatPath` and `rkat-rpc` on
 `$PATH` as they are: trusting a binary you chose is your decision. Only the
 download is verified. A published `@rkat/sdk` package pins the sha256 of every
-release archive it may download and of the `rkat-rpc` inside it, stamped by
-the release workflow from that release's own manifest; the SDK never takes a
-digest from the server it downloads from. The download uses HTTPS only,
-redirects included. The archive is checked before anything is written or
+release archive it may download and of the `rkat-rpc` inside it: pinned when
+the package is built, from the release's attested manifest, and never fetched
+at download time. The download uses HTTPS only, redirects included, and
+refuses an archive over 256 MiB (`BINARY_DOWNLOAD_TOO_LARGE`). The archive is checked before anything is written or
 extracted, the binary before it is installed, and the cached binary again each
 time it is reused. A mismatch throws `BinaryIntegrityError` (code
 `BINARY_INTEGRITY_MISMATCH`, with `asset`, `path`, `expectedSha256` and

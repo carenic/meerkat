@@ -868,7 +868,8 @@ class BinaryIntegrityError extends MeerkatError {
 | `BINARY_NOT_FOUND` | `rkat-rpc` not found and auto-download failed |
 | `BINARY_DIGEST_UNAVAILABLE` | The package pins no `rkat-rpc` digest for its version and platform (a source or git install), so it will not download one |
 | `BINARY_INTEGRITY_MISMATCH` | `BinaryIntegrityError`: a downloaded or cached `rkat-rpc` does not match its pinned digest |
-| `BINARY_DOWNLOAD_FAILED` | The release download failed, or redirected to a non-HTTPS URL |
+| `BINARY_DOWNLOAD_FAILED` | The release download failed (a transport fault or a cut-off body), or redirected to a non-HTTPS URL |
+| `BINARY_DOWNLOAD_TOO_LARGE` | The release archive is over 256 MiB, far above any `rkat-rpc` release archive |
 | `UNKNOWN_EVENT_TYPE` | Streamed event `type` not in the generated known-event inventory |
 
 ### Typed comms/send errors

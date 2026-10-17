@@ -239,16 +239,26 @@ Python and TypeScript SDK users should not need a local Rust toolchain.
 The SDKs are clients. They start or connect to the JSON-RPC surface rather than
 embedding a separate runtime implementation.
 
-The digests come from the release itself, never from the server the SDK
-downloads from. Before either SDK package builds, `publish_registries` waits
-for the release's complete manifest (`checksums.sha256` and `index.json`),
-and `scripts/release-stamp-sdk-binary-digests` re-hashes the five `rkat-rpc`
-archives against it, takes the digest of the binary inside each verified
-archive, and stamps both SDKs. It refuses an incomplete manifest, an archive
-that does not re-hash and SDK packages of another version. Each publish step
-then refuses a built package that does not pin exactly those digests for its
-version. A source or git install pins nothing and refuses to download
-(`BINARY_DIGEST_UNAVAILABLE`).
+The digests are pinned when the package is built, from the release's
+attested manifest; they are never fetched at download time. Before either
+SDK package builds, `publish_registries` waits for the release's complete
+manifest (`checksums.sha256` and `index.json`;
+`scripts/release-await-binary-manifest`), and
+`scripts/release-stamp-sdk-binary-digests` re-hashes the five `rkat-rpc`
+archives against it, verifies each archive's build attestation
+(`gh attestation verify --signer-workflow <repository>/.github/workflows/release.yml`),
+takes the digest of the binary inside each verified archive, and stamps both
+SDKs. It refuses an incomplete manifest, an archive that does not re-hash,
+carries no attestation or exceeds the SDKs' 256 MiB download cap, and SDK
+packages of another version; nothing is stamped then and neither package
+publishes. Each publish step then refuses a built package that does not pin
+exactly those digests for its version. A source or git install pins nothing
+and refuses to download (`BINARY_DIGEST_UNAVAILABLE`).
+
+The residual: the pins are only as trustworthy as the release that produced
+them. Anyone able to run this repository's release workflow can produce
+attested archives, and a package whose own files were replaced after it was
+built pins whatever digests it then carries.
 
 ## Release Workflow
 

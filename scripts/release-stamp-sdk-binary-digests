@@ -12,12 +12,14 @@ built from the bump commit.
   stamp            Read a release directory holding `checksums.sha256`,
                    `index.json` and the five rkat-rpc archives. Refuse unless
                    the manifest is the complete one for the tag, every rkat-rpc
-                   archive re-hashes to its manifest entry and holds exactly
-                   one rkat-rpc binary at its root, and both SDK packages carry
-                   the tag's version. Then rewrite both pinned-digest modules
-                   (archive digest from the manifest, binary digest from the
-                   binary inside the verified archive) and optionally write the
-                   table as JSON for `verify`.
+                   archive is within the SDKs' 256 MiB download cap, re-hashes
+                   to its manifest entry, carries a build attestation signed by
+                   the repository's release workflow (`gh attestation verify`)
+                   and holds exactly one rkat-rpc binary at its root, and both
+                   SDK packages carry the tag's version. Then rewrite both
+                   pinned-digest modules (archive digest from the manifest,
+                   binary digest from the binary inside the verified archive)
+                   and optionally write the table as JSON for `verify`.
   verify           Check what a built package pins (JSON of its CONTRACT_VERSION
                    and pinned table, dumped from the installed package) against
                    the stamped table: refuses an unstamped, wrong-version,
@@ -33,6 +35,8 @@ import argparse
 import hashlib
 import importlib.util
 import json
+import shutil
+import subprocess
 import sys
 import tarfile
 import tomllib
@@ -55,6 +59,11 @@ TYPESCRIPT_MODULE = Path("sdks/typescript/src/rkat-rpc-digests.ts")
 PYPROJECT = Path("sdks/python/pyproject.toml")
 PACKAGE_JSON = Path("sdks/typescript/package.json")
 UNSTAMPED = {"version": "", "archives": {}}
+# The SDKs refuse to download a larger archive (_RKAT_RPC_ARCHIVE_MAX_BYTES in
+# the Python client, RELEASE_ARCHIVE_MAX_BYTES in the TypeScript client), so a
+# release must never pin one.
+ARCHIVE_MAX_BYTES = 256 * 1024 * 1024
+RELEASE_WORKFLOW = ".github/workflows/release.yml"
 
 PYTHON_HEADER = '''"""Release-pinned sha256 digests of the rkat-rpc archives this SDK downloads.
 
@@ -200,7 +209,35 @@ def archived_binary_sha256(archive_path: Path, target: str) -> str:
         raise StampError(f"cannot read {archive_path.name}: {error}") from error
 
 
-def digest_table(release_dir: Path, tag: str) -> dict:
+def verify_attestation(archive_path: Path, repo: str) -> None:
+    """Require a build attestation signed by `repo`'s release workflow."""
+    gh = shutil.which("gh")
+    if gh is None:
+        raise StampError("the GitHub CLI (gh) is required to verify archive attestations")
+    result = subprocess.run(
+        [
+            gh,
+            "attestation",
+            "verify",
+            str(archive_path),
+            "--repo",
+            repo,
+            "--signer-workflow",
+            f"{repo}/{RELEASE_WORKFLOW}",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip().splitlines()
+        raise StampError(
+            f"{archive_path.name} has no build attestation from {repo}'s release "
+            f"workflow: {detail[-1] if detail else f'gh exited {result.returncode}'}"
+        )
+
+
+def digest_table(release_dir: Path, tag: str, repo: str) -> dict:
     tag, version = normalized(tag)
     checksums = read_complete_manifest(release_dir, tag, version)
     archives = {}
@@ -209,12 +246,18 @@ def digest_table(release_dir: Path, tag: str) -> dict:
         archive_path = release_dir / asset
         if not archive_path.is_file():
             raise StampError(f"{asset} is missing from {release_dir}")
+        if archive_path.stat().st_size > ARCHIVE_MAX_BYTES:
+            raise StampError(
+                f"{asset} is larger than {ARCHIVE_MAX_BYTES // (1024 * 1024)} MiB, "
+                "which the SDKs refuse to download"
+            )
         actual = release_assets.sha256(archive_path)
         if actual != checksums[asset]:
             raise StampError(
                 f"{asset} does not match {release_assets.CHECKSUMS_NAME}: "
                 f"expected {checksums[asset]}, got {actual}"
             )
+        verify_attestation(archive_path, repo)
         archives[target] = {
             "asset": asset,
             "archive_sha256": actual,
@@ -238,8 +281,10 @@ def require_sdk_versions(repo_root: Path, version: str) -> None:
             raise StampError(f"{manifest} is version {found!r}, not the release's {version!r}")
 
 
-def stamp(release_dir: Path, tag: str, repo_root: Path, table_out: Path | None) -> dict:
-    table = digest_table(release_dir, tag)
+def stamp(
+    release_dir: Path, tag: str, repo: str, repo_root: Path, table_out: Path | None
+) -> dict:
+    table = digest_table(release_dir, tag, repo)
     require_sdk_versions(repo_root, table["version"])
     (repo_root / PYTHON_MODULE).write_text(render_python(table), encoding="utf-8")
     (repo_root / TYPESCRIPT_MODULE).write_text(render_typescript(table), encoding="utf-8")
@@ -304,22 +349,32 @@ def check_unstamped(repo_root: Path) -> None:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    # No prefix matching: --repo must never be read as --repo-root.
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0], allow_abbrev=False)
     commands = parser.add_subparsers(dest="command", required=True)
 
-    stamp_args = commands.add_parser("stamp", help="pin a release's digests into both SDKs")
+    stamp_args = commands.add_parser(
+        "stamp", help="pin a release's digests into both SDKs", allow_abbrev=False
+    )
     stamp_args.add_argument("--release-dir", type=Path, required=True)
     stamp_args.add_argument("--release-tag", required=True)
+    stamp_args.add_argument(
+        "--repo",
+        required=True,
+        help="OWNER/REPO whose release workflow must have attested every archive",
+    )
     stamp_args.add_argument("--repo-root", type=Path, default=Path.cwd())
     stamp_args.add_argument("--table-out", type=Path)
 
-    verify_args = commands.add_parser("verify", help="check a built package's pinned digests")
+    verify_args = commands.add_parser(
+        "verify", help="check a built package's pinned digests", allow_abbrev=False
+    )
     verify_args.add_argument("--release-tag", required=True)
     verify_args.add_argument("--expected", type=Path, required=True)
     verify_args.add_argument("--actual", type=Path, required=True)
 
     unstamped_args = commands.add_parser(
-        "check-unstamped", help="check the committed modules pin nothing"
+        "check-unstamped", help="check the committed modules pin nothing", allow_abbrev=False
     )
     unstamped_args.add_argument("--repo-root", type=Path, default=Path.cwd())
     return parser.parse_args()
@@ -329,7 +384,9 @@ def main() -> int:
     args = parse_args()
     try:
         if args.command == "stamp":
-            table = stamp(args.release_dir, args.release_tag, args.repo_root, args.table_out)
+            table = stamp(
+                args.release_dir, args.release_tag, args.repo, args.repo_root, args.table_out
+            )
             print(
                 f"pinned {len(table['archives'])} rkat-rpc archives of "
                 f"{args.release_tag} into {PYTHON_MODULE} and {TYPESCRIPT_MODULE}"

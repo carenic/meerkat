@@ -315,7 +315,7 @@ repos:
         entry: scripts/test_release_stamp_sdk_binary_digests.py
         language: script
         pass_filenames: false
-        always_run: true
+        files: ^(scripts/(release-stamp-sdk-binary-digests|release-await-binary-manifest|test_release_stamp_sdk_binary_digests\.py|verify-release-assets\.py)|sdks/python/meerkat/(_rkat_rpc_digests|client)\.py|sdks/typescript/src/(rkat-rpc-digests|client)\.ts)$
         stages: [pre-push]
 
       - id: gcp-buildbuddy-workflow-gate-contract

@@ -2890,6 +2890,12 @@ jobs:
     # manifest (Stamp the SDK binary digests) after the crates publish; the
     # SLO step after them must still run.
     timeout-minutes: 240
+    # Read-only. The SDK digest stamp lists this run's jobs, downloads the
+    # release manifest and verifies the archives' build attestations.
+    permissions:
+      actions: read
+      attestations: read
+      contents: read
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -2955,10 +2961,11 @@ jobs:
         # which publish_github_release writes once from the published archives
         # after every platform lane: a tag run waits for it (with a prebuild
         # it is usually there already) and fails at once if that job fails; a
-        # package recovery needs it present. The script refuses an incomplete
-        # manifest or an archive that does not re-hash, and pins the binary
-        # inside each verified archive. A tag tree whose SDKs predate pinned
-        # digests has nothing to stamp.
+        # package recovery needs it present. The stamp refuses an incomplete
+        # manifest, an archive that does not re-hash or carries no build
+        # attestation from this repository's release workflow, and pins the
+        # binary inside each verified archive. A tag tree whose SDKs predate
+        # pinned digests has nothing to stamp.
         if: >-
           ${{
             github.event_name != 'workflow_dispatch' ||
@@ -2976,32 +2983,7 @@ jobs:
             echo "${RELEASE_TAG}'s SDKs pin no rkat-rpc digests; nothing to stamp"
             exit 0
           fi
-          deadline=$(( $(date +%s) + 9000 ))
-          while true; do
-            assets="$(gh release view "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" \
-              --json assets --jq '.assets[].name' 2>/dev/null || true)"
-            if grep -Fxq checksums.sha256 <<<"${assets}" && grep -Fxq index.json <<<"${assets}"; then
-              break
-            fi
-            if [[ "${WAIT_FOR_MANIFEST}" != "true" ]]; then
-              echo "::error::${RELEASE_TAG} has no complete manifest (checksums.sha256 + index.json) to stamp the SDK digests from; publish its assets first (make release-assets)"
-              exit 1
-            fi
-            publisher="$(gh api --paginate "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/attempts/${GITHUB_RUN_ATTEMPT}/jobs?per_page=100" \
-              --jq '.jobs[] | select(.name == "Publish GitHub release assets") | (.conclusion // "pending")')"
-            case "${publisher:-pending}" in
-              pending|success) ;;
-              *)
-                echo "::error::Publish GitHub release assets ${publisher}: no complete ${RELEASE_TAG} manifest to stamp the SDK digests from; after an asset recovery, publish the SDKs with a package recovery (make release-packages)"
-                exit 1
-                ;;
-            esac
-            if (( $(date +%s) >= deadline )); then
-              echo "::error::no complete ${RELEASE_TAG} manifest after 150 minutes"
-              exit 1
-            fi
-            sleep 60
-          done
+          scripts/release-await-binary-manifest "${RELEASE_TAG}"
           release_dir="${RUNNER_TEMP}/sdk-binary-digests-release"
           mkdir -p "${release_dir}"
           gh release download "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" --dir "${release_dir}" \
@@ -3009,6 +2991,7 @@ jobs:
           python3 scripts/release-stamp-sdk-binary-digests stamp \
             --release-dir "${release_dir}" \
             --release-tag "${RELEASE_TAG}" \
+            --repo "${GITHUB_REPOSITORY}" \
             --table-out "${RUNNER_TEMP}/sdk-binary-digests.json"
 
       - name: Publish Python SDK

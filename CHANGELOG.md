@@ -54,17 +54,27 @@ them.
 
 - The Python and TypeScript SDKs verify the `rkat-rpc` binary they
   auto-download (#1739). Each published package pins the sha256 of every
-  release archive it may download and of the `rkat-rpc` inside it, stamped by
-  the release workflow from that release's own manifest
-  (`scripts/release-stamp-sdk-binary-digests`), never taken from the server
-  the binary comes from. The download uses HTTPS only, redirects included.
-  The archive is checked before anything is written or extracted, the binary
-  before it is installed, and the cached binary every time it is reused. A
-  mismatch raises `BinaryIntegrityError` (code `BINARY_INTEGRITY_MISMATCH`,
-  naming the asset and the expected and actual digests): the SDK deletes what
-  failed, runs nothing and does not fall back to another binary.
-  `MEERKAT_BIN_PATH`, an explicit binary path and `rkat-rpc` on `PATH` still
-  run as given: they are the user's own trust decision.
+  release archive it may download and of the `rkat-rpc` inside it: pinned
+  when the package is built, from the release's attested manifest; never
+  fetched at download time. Before stamping
+  (`scripts/release-stamp-sdk-binary-digests`), the release workflow
+  re-hashes each archive against the release's `checksums.sha256` and
+  verifies its build attestation (`gh attestation verify`, signed by this
+  repository's `release.yml`); if any check fails nothing is stamped and
+  neither SDK package publishes. The download uses HTTPS only, redirects
+  included, and refuses an archive over 256 MiB. The archive is checked
+  before anything is written or extracted, the binary before it is
+  installed, and the cached binary every time it is reused. A mismatch
+  raises `BinaryIntegrityError` (code `BINARY_INTEGRITY_MISMATCH`, naming the
+  asset and the expected and actual digests): the SDK deletes what failed,
+  runs nothing and does not fall back to another binary. A transport fault,
+  a cut-off body included, is `BINARY_DOWNLOAD_FAILED` and is never reported
+  as tamper. `MEERKAT_BIN_PATH`, an explicit binary path and `rkat-rpc` on
+  `PATH` still run as given: they are the user's own trust decision.
+  Residual: the pins are only as trustworthy as the release that produced
+  them. Anyone able to run this repository's release workflow can produce
+  attested archives, and a package whose own files were replaced after it
+  was built pins whatever digests it then carries.
 
 ### Added
 
@@ -72,17 +82,22 @@ them.
   (`meerkat.BinaryIntegrityError` with `asset`, `path`, `expected_sha256` and
   `actual_sha256`; `BinaryIntegrityError` from `@rkat/sdk` with `asset`,
   `path`, `expectedSha256` and `actualSha256`), and the SDK error codes
-  `BINARY_INTEGRITY_MISMATCH` and `BINARY_DIGEST_UNAVAILABLE`.
+  `BINARY_INTEGRITY_MISMATCH`, `BINARY_DIGEST_UNAVAILABLE` (whose message
+  names the exact release asset URL for a manual install) and
+  `BINARY_DOWNLOAD_TOO_LARGE` (an auto-download archive over 256 MiB).
 
 ### Changed
 
 - Release: before it builds the Python and TypeScript SDK packages,
-  `publish_registries` waits for the release's complete binary manifest (up
-  to 150 minutes on a tag run, usually no time with a prebuild; a package
-  recovery needs it already published), stamps the pinned digests into both
+  `publish_registries` waits for the release's complete binary manifest
+  (`scripts/release-await-binary-manifest`: up to 150 minutes on a tag run,
+  usually no time with a prebuild, a failed API call counting as "not yet";
+  a package recovery needs the manifest already published), verifies each
+  `rkat-rpc` archive's build attestation, stamps the pinned digests into both
   SDKs and refuses to publish a package that does not pin exactly them for
-  its version. The job's timeout is 240 minutes, up from 180. Crate
-  publication and the publication SLO do not wait for it.
+  its version. The job's token gains `attestations: read`, and its timeout is
+  240 minutes, up from 180. Crate publication and the publication SLO do not
+  wait for it.
 
 ## [0.9.2] - 2026-10-16
 

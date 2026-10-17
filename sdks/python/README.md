@@ -34,9 +34,10 @@ pip install -e "sdks/python[dev]"
 The first three are binaries you chose, and the SDK runs them as they are:
 trusting them is your decision. Only the download is verified. A published
 `meerkat-sdk` package pins the sha256 of every release archive it may download
-and of the `rkat-rpc` inside it. The release workflow stamps them from that
-release's own manifest; the SDK never takes a digest from the server it
-downloads from. The download uses HTTPS only, redirects included. The archive
+and of the `rkat-rpc` inside it: pinned when the package is built, from the
+release's attested manifest, and never fetched at download time. The
+download uses HTTPS only, redirects included, and refuses an archive over
+256 MiB (`BINARY_DOWNLOAD_TOO_LARGE`). The archive
 is checked before anything is extracted, the binary before it is installed,
 and the cached binary again each time it is reused (a few tenths of a second).
 On a mismatch the SDK raises `BinaryIntegrityError` (code
