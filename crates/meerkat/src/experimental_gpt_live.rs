@@ -15751,10 +15751,12 @@ mod tests {
     }
 
     /// The completion of [`output_start_without_custody`]'s response.
-    fn completion_without_custody() -> meerkat_core::live_adapter::LiveAdapterObservation {
+    fn completion_without_custody(
+        stop_reason: StopReason,
+    ) -> meerkat_core::live_adapter::LiveAdapterObservation {
         meerkat_core::live_adapter::LiveAdapterObservation::TurnCompleted {
             response_id: Some("response-without-custody".to_string()),
-            stop_reason: StopReason::EndTurn,
+            stop_reason,
             usage: TurnUsage::host_declared(
                 Provider::OpenAI,
                 "gpt-live-1-codex".to_string(),
@@ -15857,7 +15859,7 @@ mod tests {
         let (spoken, notices) = settle_held_rows(vec![
             output_start_without_custody(),
             final_without_custody(HELD_SPEECH),
-            completion_without_custody(),
+            completion_without_custody(StopReason::EndTurn),
         ])
         .await;
         assert_eq!(
@@ -15876,7 +15878,7 @@ mod tests {
             output_start_without_custody(),
             delta_without_custody("delta-1", "Speech the close"),
             delta_without_custody("delta-2", " held."),
-            completion_without_custody(),
+            completion_without_custody(StopReason::EndTurn),
         ])
         .await;
         assert_eq!(
@@ -15884,6 +15886,98 @@ mod tests {
             (vec![HELD_SPEECH.to_string()], Vec::new()),
             "the completed deltas are recorded, and their refused start is not reported: {notices:?}"
         );
+    }
+
+    /// A barge-in interrupt of [`output_start_without_custody`]'s response.
+    fn interrupt_without_custody() -> meerkat_core::live_adapter::LiveAdapterObservation {
+        meerkat_core::live_adapter::LiveAdapterObservation::TurnInterrupted {
+            response_id: Some("response-without-custody".to_string()),
+        }
+    }
+
+    /// Settle `rows`, then assert that none of the item's text is recorded
+    /// and that the refused start at row 0 is the one row reported.
+    async fn assert_only_the_refused_start_is_reported(
+        rows: Vec<meerkat_core::live_adapter::LiveAdapterObservation>,
+        case: &str,
+    ) {
+        let (spoken, notices) = settle_held_rows(rows).await;
+        assert_eq!(
+            (spoken, notice_rows(&notices)),
+            (
+                Vec::<String>::new(),
+                vec![(
+                    Some("assistant_output_started"),
+                    Some("item-without-custody"),
+                    Some(0),
+                )],
+            ),
+            "{case}: nothing is recorded, and the refused start is reported: {notices:?}"
+        );
+    }
+
+    /// #1821 (M1): a tool-call completion removes its response's completion
+    /// and records none of the text it staged, so a refused start whose
+    /// deltas end in a tool call is reported.
+    #[tokio::test]
+    async fn a_refused_start_whose_deltas_end_in_a_tool_call_is_reported() {
+        assert_only_the_refused_start_is_reported(
+            vec![
+                output_start_without_custody(),
+                delta_without_custody("delta-1", "Speech the close"),
+                delta_without_custody("delta-2", " held."),
+                completion_without_custody(StopReason::ToolUse),
+            ],
+            "deltas, then a tool-call completion",
+        )
+        .await;
+    }
+
+    /// #1821 (M1): the same for a final that ends in a tool call.
+    #[tokio::test]
+    async fn a_refused_start_whose_final_ends_in_a_tool_call_is_reported() {
+        assert_only_the_refused_start_is_reported(
+            vec![
+                output_start_without_custody(),
+                final_without_custody(HELD_SPEECH),
+                completion_without_custody(StopReason::ToolUse),
+            ],
+            "a final, then a tool-call completion",
+        )
+        .await;
+    }
+
+    /// #1821 (M1): a barge-in interrupt discards the text every in-flight
+    /// response staged, and the response's cancelled completion records
+    /// nothing, so a refused start whose deltas were interrupted is reported.
+    #[tokio::test]
+    async fn a_refused_start_whose_deltas_were_interrupted_is_reported() {
+        assert_only_the_refused_start_is_reported(
+            vec![
+                output_start_without_custody(),
+                delta_without_custody("delta-1", "Speech the close"),
+                delta_without_custody("delta-2", " held."),
+                interrupt_without_custody(),
+                completion_without_custody(StopReason::Cancelled),
+            ],
+            "deltas, an interrupt, then a cancelled completion",
+        )
+        .await;
+    }
+
+    /// #1821 (M1): the same for an interrupted final.
+    #[tokio::test]
+    async fn a_refused_start_whose_final_was_interrupted_is_reported() {
+        assert_only_the_refused_start_is_reported(
+            vec![
+                output_start_without_custody(),
+                final_without_custody(HELD_SPEECH),
+                interrupt_without_custody(),
+                completion_without_custody(StopReason::Cancelled),
+            ],
+            "a final, an interrupt, then a cancelled completion",
+        )
+        .await;
     }
 
     /// #1821 (F1 last resort): the same notice when the row is refused by the

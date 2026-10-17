@@ -78,10 +78,11 @@ them.
   later rows among the rows the close held settle its provider item's speech:
   a playback terminal such as that release, a playback completion or
   truncation, or the item's final transcript or spoken transcript deltas
-  followed by the completion of their response. The session applies those
+  whose response then completes normally (not cancelled, not a tool call)
+  with no barge-in interrupt discarding them first. The session applies those
   rows by its usual rules, or refuses one and it is reported itself. Text
-  whose response never completes among those rows stays staged and does not
-  count, so the start is still reported. (#1821)
+  whose response does not complete that way among those rows is not
+  recorded, so the start is still reported. (#1821)
 - GPT Live: speech whose output start waited behind a running member turn
   when the channel closed is committed under its generated output instead of
   being abandoned with its captions retracted. The segment's release follows
@@ -112,6 +113,14 @@ them.
   channel close replays in that window can then go unrecorded: it is reported
   with a warning, and its `live_transcript_row_unrecorded` notice can be
   refused the same way. (#1821)
+- For a refused live output start a channel close replays: text of its item
+  that arrives after its response's completion is recorded at once, yet the
+  start is still reported, so that notice over-reports. A refused
+  completion's own notice names no item or response, so the text it would
+  have recorded cannot be attributed from the notice. Staged text is also
+  recorded only after the item before it in the transcript, so text whose
+  earlier item never lands keeps waiting while its start is not reported.
+  (#1821)
 
 ## [0.9.2] - 2026-10-16
 

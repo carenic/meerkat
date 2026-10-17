@@ -847,14 +847,20 @@ refusal class; it never carries the row's content. A refused assistant output
 start is not reported on its own while later rows that settle the same
 provider item's speech are still to be applied: a playback terminal (such as a
 segment's release), a playback completion or truncation, or text the item
-stages (its final transcript or spoken transcript deltas) followed by the
-completion of the same response. The session applies those rows by its usual
-rules, or refuses one, and then that row is reported itself. Staged text is
-recorded only when its response completes, and a closed channel completes
-nothing on its own, so a start followed only by text whose response never
-completes is still reported. The notice is recorded the same way as other
-transcript writes, so a session that refuses every write refuses it too, and
-only a warning remains.
+stages (its final transcript or spoken transcript deltas) whose response then
+completes normally (not cancelled, not a tool call) with no barge-in interrupt
+discarding it first. The session applies those rows by its usual rules, or
+refuses one, and then that row is reported itself. Staged text is recorded only
+when its response completes normally, and a closed channel completes nothing
+on its own, so a start followed only by text whose response never completes
+that way is still reported. Text that arrives after its response's completion
+is recorded at once, yet its start is still reported, so that notice
+over-reports. A refused completion's own notice names no item or response, so
+the text it would have recorded cannot be attributed from the notice. Staged
+text is also recorded only after the item before it in the transcript, so text
+whose earlier item never lands keeps waiting while its start is not reported.
+The notice is recorded the same way as other transcript writes, so a session
+that refuses every write refuses it too, and only a warning remains.
 
 ### Continuous media without fabricated playback completion
 

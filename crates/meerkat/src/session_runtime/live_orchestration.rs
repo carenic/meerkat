@@ -1542,16 +1542,20 @@ mod orchestrator {
 
     /// Whether `later_rows` settle the speech of provider item `item`. A
     /// playback terminal (an unmeasured segment's release among them), a
-    /// playback completion or a truncation of the item settles it.
-    /// Text the item stages (its final transcript or its spoken transcript
-    /// deltas) settles it only when a completion of the same response
-    /// follows it: the session stages such text until its response
-    /// completes, and a closed channel completes nothing on its own.
+    /// playback completion or a truncation of the item settles it. Text the
+    /// item stages (its final transcript or its spoken transcript deltas)
+    /// settles it only when a later completion of the same response records
+    /// it: one that is neither cancelled nor a tool call (the session's own
+    /// decision, read through `realtime_completion_records_staged_text`),
+    /// with no barge-in interrupt before it, since an interrupt discards the
+    /// text every in-flight response staged. A closed channel completes
+    /// nothing on its own.
     fn later_rows_settle_item_speech<'a, L>(later_rows: L, item: &str) -> bool
     where
         L: IntoIterator<Item = &'a meerkat_core::live_adapter::LiveAdapterObservation>,
     {
         use meerkat_core::live_adapter::LiveAdapterObservation as Row;
+        use meerkat_core::realtime_transcript_revision::realtime_completion_records_staged_text;
         let mut staged_responses: Vec<&str> = Vec::new();
         for later in later_rows {
             let mut row = later;
@@ -1570,8 +1574,22 @@ mod orchestrator {
                 } if provider_item_id.as_deref() == Some(item) => return true,
                 Row::TurnCompleted {
                     response_id: Some(response_id),
+                    stop_reason,
                     ..
-                } if staged_responses.contains(&response_id.as_str()) => return true,
+                } if staged_responses.contains(&response_id.as_str()) => {
+                    if realtime_completion_records_staged_text(*stop_reason) {
+                        return true;
+                    }
+                    // A cancelled or tool-call completion records none of
+                    // the text its response staged.
+                    staged_responses.retain(|staged| *staged != response_id.as_str());
+                    continue;
+                }
+                // A barge-in discards the text every in-flight response staged.
+                Row::TurnInterrupted { .. } => {
+                    staged_responses.clear();
+                    continue;
+                }
                 Row::AssistantTranscriptFinal {
                     provider_item_id,
                     response_id,
