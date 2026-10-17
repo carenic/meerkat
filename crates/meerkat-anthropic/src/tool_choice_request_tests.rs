@@ -251,22 +251,32 @@ fn forced_choice_is_refused_under_explicit_thinking_never_switched_off() {
 }
 
 #[test]
-fn forced_choice_is_sent_with_thinking_disabled() {
+fn forced_choice_is_sent_with_thinking_disabled_and_refused_with_thinking_on() {
     // Disabled thinking is no thinking, so a forced call is compatible; a
-    // stale legacy budget beside it is not sent either.
+    // stale legacy budget beside it is not sent either. The same request
+    // with thinking on is still refused locally.
     for model in [FORCEABLE, "claude-haiku-5-5"] {
         for choice in forced() {
             let disabled = request(model, choice.clone()).with_anthropic_tag_merge(|tag| {
                 tag.thinking = Some(AnthropicThinkingConfig::Disabled);
                 tag.thinking_budget_tokens = Some(2048);
             });
-            let body = body(&disabled).unwrap();
-            assert_eq!(body["thinking"], json!({"type": "disabled"}), "{model}");
+            let sent = body(&disabled).unwrap();
+            assert_eq!(sent["thinking"], json!({"type": "disabled"}), "{model}");
             let expected = match &choice {
                 ToolChoice::Tool { name } => json!({"type": "tool", "name": name}),
                 _ => json!({"type": "any"}),
             };
-            assert_eq!(body["tool_choice"], expected, "{model} {choice:?}");
+            assert_eq!(sent["tool_choice"], expected, "{model} {choice:?}");
+
+            let thinking_on = request(model, choice.clone()).with_anthropic_tag_merge(|tag| {
+                tag.thinking = Some(AnthropicThinkingConfig::Adaptive);
+            });
+            assert_eq!(
+                refusal(body(&thinking_on)),
+                ToolChoiceRefusal::ForcedToolWithThinking,
+                "{model} {choice:?}"
+            );
         }
     }
 }

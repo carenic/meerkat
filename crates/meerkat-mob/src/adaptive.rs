@@ -318,12 +318,20 @@ pub struct FinishResult {
 /// invalidate packs built before it.
 ///
 /// Anthropic thinking types added after the released schema (`disabled`) are
-/// left out, so packs keep loading across host versions: a layer profile
-/// cannot select them until packs carry a versioned schema, while static
-/// profiles and every API surface accept them.
+/// left out of this schema, and only this one. The schema is pinned for
+/// cross-version pack compatibility: hosts require a bundled schema to equal
+/// their own, so a new variant here would make this host refuse every pack
+/// earlier hosts built, and theirs refuse every pack this host builds.
+/// Versioned pack schemas, which would let an adaptive flowmaster's inline
+/// layer profile select `disabled`, are a 0.9.4 follow-up. Static profiles
+/// and every API surface accept it now; a decision that carries it anyway is
+/// parsed as `Disabled` and judged by the member's build like any other
+/// request.
 #[cfg(feature = "schema")]
 pub fn layer_decision_schema() -> Result<serde_json::Value, serde_json::Error> {
     let mut schema = serde_json::to_value(schemars::schema_for!(LayerDecision))?;
+    // Pinned for cross-version pack compatibility (see above): strip the
+    // thinking types the released schema does not carry.
     if let Some(variants) = schema
         .pointer_mut("/$defs/AnthropicThinkingConfig/oneOf")
         .and_then(serde_json::Value::as_array_mut)
@@ -3751,6 +3759,125 @@ mod tests {
         };
         assert!(validator.is_valid(&decision("adaptive")));
         assert!(!validator.is_valid(&decision("disabled")));
+    }
+
+    /// A layer decision that carries disabled Anthropic thinking despite the
+    /// released schema (hand-built, or provider output that skipped the
+    /// schema): the schema refuses it; parsed anyway, as the planning turn
+    /// parses the flow's output, it stays `Disabled` through compilation into
+    /// the layer's mob definition and into the member's agent build config.
+    /// There the factory's request-shaping check refuses it typed on a model
+    /// that refuses it (or above `high` effort on a capped one), and the
+    /// Anthropic client lowers it as is elsewhere. It never becomes another
+    /// thinking mode.
+    #[cfg(feature = "schema")]
+    #[tokio::test]
+    async fn a_layer_decision_with_disabled_thinking_keeps_it_to_the_member_build() {
+        use meerkat_core::lifecycle::run_primitive::{
+            AnthropicProviderTag, AnthropicThinkingConfig, ProviderParamsOverride, ProviderTag,
+        };
+        let thinking_of = |params: Option<&ProviderParamsOverride>| match params
+            .and_then(|params| params.provider_tag.as_ref())
+        {
+            Some(ProviderTag::Anthropic(tag)) => tag.thinking.clone(),
+            other => panic!("an Anthropic provider tag, got {other:?}"),
+        };
+        let decision_with = |thinking: AnthropicThinkingConfig| {
+            let mut inline = profile();
+            inline.model = "claude-opus-5-5".to_string();
+            inline.provider = Some(meerkat_core::Provider::Anthropic);
+            // Mob members require comms.
+            inline.tools.comms = true;
+            inline.provider_params = Some(ProviderParamsOverride {
+                provider_tag: Some(ProviderTag::Anthropic(AnthropicProviderTag {
+                    thinking: Some(thinking),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            });
+            let mut plan = layer_plan();
+            plan.profiles.insert(
+                ProfileName::from("verifier"),
+                LayerProfile::Inline {
+                    inline: Box::new(inline),
+                },
+            );
+            serde_json::to_value(LayerDecision::RunLayer {
+                reason: "verify".to_string(),
+                plan,
+            })
+            .expect("decision serializes")
+        };
+
+        let validator = jsonschema::validator_for(&layer_decision_schema().expect("schema"))
+            .expect("canonical schema is a valid JSON schema");
+        assert!(validator.is_valid(&decision_with(AnthropicThinkingConfig::Adaptive)));
+        let disabled = decision_with(AnthropicThinkingConfig::Disabled);
+        assert_eq!(
+            disabled
+                .pointer("/plan/profiles/verifier/inline/provider_params/provider_tag/thinking"),
+            Some(&serde_json::json!({ "type": "disabled" }))
+        );
+        assert!(
+            !validator.is_valid(&disabled),
+            "the released schema refuses disabled thinking"
+        );
+
+        let LayerDecision::RunLayer { plan, .. } =
+            serde_json::from_value(disabled).expect("the variant parses")
+        else {
+            panic!("a run_layer decision")
+        };
+        let Some(LayerProfile::Inline { inline }) =
+            plan.profiles.get(&ProfileName::from("verifier"))
+        else {
+            panic!("the inline verifier profile")
+        };
+        assert_eq!(
+            thinking_of(inline.provider_params.as_ref()),
+            Some(AnthropicThinkingConfig::Disabled)
+        );
+
+        let mut policy = compile_policy();
+        policy.allow_inline_profiles = true;
+        let compiled = compile_layer(&plan, &compile_context(), &policy).expect("layer compiles");
+        let verifier = ProfileName::from("verifier");
+        let profile = compiled
+            .definition
+            .profiles
+            .get(&verifier)
+            .and_then(ProfileBinding::as_inline)
+            .expect("the compiled verifier profile");
+        assert_eq!(
+            thinking_of(profile.provider_params.as_ref()),
+            Some(AnthropicThinkingConfig::Disabled)
+        );
+
+        let config = crate::build::build_agent_config(crate::build::BuildAgentConfigParams {
+            mob_id: &compiled.definition.id,
+            profile_name: &verifier,
+            agent_identity: &crate::ids::AgentIdentity::from("verifier-one"),
+            profile,
+            definition: &compiled.definition,
+            realm_profile_store: None,
+            external_tools: None,
+            compaction_curator_override: None,
+            context: None,
+            labels: None,
+            additional_instructions: None,
+            shell_env: None,
+            mob_tool_authority_context: None,
+            tool_access_policy: None,
+            inherited_tool_filter: None,
+            system_prompt_override: None,
+        })
+        .await
+        .expect("member build config");
+        assert_eq!(
+            thinking_of(config.provider_params.as_ref()),
+            Some(AnthropicThinkingConfig::Disabled),
+            "the member's build sees exactly what the decision carried"
+        );
     }
 
     fn limits(value: u64) -> AdaptiveLimitRecord {

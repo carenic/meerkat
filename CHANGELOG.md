@@ -66,8 +66,9 @@ them.
   Meerkat refuses it there with a typed local error when the agent is built
   and before each request, as it does above `high` effort on Opus 5 and
   Haiku 5.5. A forced tool choice is sent with thinking disabled. Adaptive
-  mobpack layer decisions cannot select it: their schema stays the released
-  one, so packs keep loading across host versions.
+  flowmaster inline layer profiles cannot select disabled thinking until
+  pack schemas are versioned: the adaptive pack's layer-decision schema stays
+  the released one, so packs keep loading across host versions.
 
 ## [0.9.2] - 2026-10-16
 
