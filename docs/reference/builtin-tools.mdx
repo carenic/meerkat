@@ -514,7 +514,13 @@ cancelled, `max_run_elapsed` is delivered, and the child and its descendants
 are retired once that delivery settles (submitted durably, or the owner gone).
 A submission that fails keeps the cancelled child and its job record, and a
 later pass delivers and retires it; a child left seated after its record was
-committed is retired by the next pass without a second record.
+committed is retired by the next pass without a second record. A retirement
+the settled outcome requires (the turn's own failure, or `max_run_elapsed`)
+that fails is retried for up to about ten seconds, within that child's own
+settlement, so it never holds up another child. One that still fails is
+reported, as `ChildRetirement::Failed` in the pass's `ForkRelinkReport` (and in
+the `ForkRelinkOutcome` of `fork_relink::relink_child`) and as a logged
+warning, and the child stays seated until the next pass retires it.
 
 The job's owner is its bound owner session, never read back from the child's
 roster entry: a member of the child's mob or of another mob the host manages

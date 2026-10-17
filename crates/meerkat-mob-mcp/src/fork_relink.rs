@@ -59,6 +59,13 @@
 //! durable from submission: a forker that cannot be served yet (its mob is
 //! not running, or the mob's resume of it is still in progress) receives it
 //! when it is, from the host's delivery owner, with no pass of its own.
+//!
+//! A retirement the settled outcome requires (the job turn's own failure, or
+//! `max_run_elapsed`) that fails is retried for at most
+//! `CHILD_RETIREMENT_RETRY_BUDGET`, within that child's own settlement, and
+//! its result is typed ([`ChildRetirement`], in each [`ForkRelinkReport`]
+//! and [`ForkRelinkOutcome`]). A child whose retirement still fails stays
+//! seated with its job record, and the next pass retires it.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -92,13 +99,61 @@ pub enum ForkRelinkAction {
     Failed(String),
 }
 
+/// The retirement a child's settled outcome requires (its own turn failed,
+/// or it ran past its `max_run`), as the re-link left it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ChildRetirement {
+    /// The outcome does not retire the child.
+    NotRequired,
+    /// The child, with its descendants, is retired (or was already gone).
+    Retired,
+    /// Another retirement of the child is still running, and completes on
+    /// its own.
+    InProgress,
+    /// The retirement failed, retries included: the re-link retries a failed
+    /// retirement for about ten seconds. The child stays seated with its job
+    /// record, so the next pass (after a restart, or an explicit
+    /// `MobMcpState::relink_restored_fork_children`) retires it.
+    Failed {
+        /// The last retirement error.
+        error: String,
+    },
+}
+
+/// What re-linking one child did: its delivery, and the retirement its
+/// outcome requires.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ForkRelinkOutcome {
+    pub action: ForkRelinkAction,
+    pub child_retirement: ChildRetirement,
+}
+
+impl ForkRelinkOutcome {
+    fn new(action: ForkRelinkAction, child_retirement: ChildRetirement) -> Self {
+        Self {
+            action,
+            child_retirement,
+        }
+    }
+
+    /// A delivery whose outcome retires nothing.
+    fn retiring_nothing(action: ForkRelinkAction) -> Self {
+        Self::new(action, ChildRetirement::NotRequired)
+    }
+}
+
 /// One child's re-link result.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ForkRelinkReport {
     pub mob_id: MobId,
     pub child: AgentIdentity,
     pub job_id: String,
     pub action: ForkRelinkAction,
+    /// The retirement the child's outcome requires.
+    pub child_retirement: ChildRetirement,
 }
 
 /// How a re-link delivers an outcome to a job's owner.
@@ -430,7 +485,7 @@ async fn relink_mob_fork_children_where(
             let mob_id = mob_id.clone();
             let handle = handle.clone();
             box_in_own_frame(move || async move {
-                let action = box_in_own_frame(|| {
+                let outcome = box_in_own_frame(|| {
                     relink_owned_child(
                         service,
                         &delivery,
@@ -447,7 +502,8 @@ async fn relink_mob_fork_children_where(
                     mob_id,
                     child,
                     job_id: job.job_id.clone(),
-                    action,
+                    action: outcome.action,
+                    child_retirement: outcome.child_retirement,
                 }
             })
         })
@@ -524,7 +580,7 @@ pub async fn relink_child(
     handle: &MobHandle,
     child: &AgentIdentity,
     job: &ForkJobRecord,
-) -> ForkRelinkAction {
+) -> ForkRelinkOutcome {
     relink_child_within(
         service,
         delivery,
@@ -547,7 +603,7 @@ pub async fn relink_child_within(
     child: &AgentIdentity,
     job: &ForkJobRecord,
     commit_pending_ceiling: Duration,
-) -> ForkRelinkAction {
+) -> ForkRelinkOutcome {
     let owner = JobOwner::resolve(handle, child, &job.owner_session_id).await;
     box_in_own_frame(|| {
         relink_owned_child(
@@ -574,7 +630,7 @@ async fn relink_owned_child(
     job: &ForkJobRecord,
     owner: JobOwner,
     commit_pending_ceiling: Duration,
-) -> ForkRelinkAction {
+) -> ForkRelinkOutcome {
     let runtime = delivery.runtime.as_deref();
     // A job whose completion the forker's runtime already admitted is over.
     // The child stays seated for further work that is no longer this job's,
@@ -609,18 +665,19 @@ async fn relink_owned_child(
             Some(pending) => Some(pending),
             None => committed_completion(&service, mob_id, child, job).await,
         };
-        if let Some(delivered) = delivered
-            && delivered.retires_child()
-            && let Err(error) = delivery.retire_child(handle, child).await
-        {
-            report_child_retirement_incomplete(
+        let child_retirement = if delivered.is_some_and(|delivered| delivered.retires_child()) {
+            retire_owed_child(
+                delivery,
                 mob_id,
+                handle,
                 child,
-                &error,
                 "fork_off re-link: the child whose delivered outcome retires it",
-            );
-        }
-        return ForkRelinkAction::AlreadyDelivered;
+            )
+            .await
+        } else {
+            ChildRetirement::NotRequired
+        };
+        return ForkRelinkOutcome::new(ForkRelinkAction::AlreadyDelivered, child_retirement);
     }
     // A job whose outcome is already committed (its custodian recorded it,
     // then the host went down before the owner admitted it) is settled by
@@ -632,26 +689,28 @@ async fn relink_owned_child(
                     .await;
             let retires = serde_json::from_value::<CommittedOutcome>(recorded.outcome.clone())
                 .is_ok_and(|committed| committed.status.retires_child());
-            if retires
+            let child_retirement = if retires
                 && matches!(
                     action,
                     ForkRelinkAction::Delivered
                         | ForkRelinkAction::AlreadyDelivered
                         | ForkRelinkAction::OwnerGone
-                )
-                && let Err(error) = delivery.retire_child(handle, child).await
-            {
-                report_child_retirement_incomplete(
+                ) {
+                retire_owed_child(
+                    delivery,
                     mob_id,
+                    handle,
                     child,
-                    &error,
                     "fork_off re-link: the child whose recorded outcome retires it",
-                );
-            }
-            return action;
+                )
+                .await
+            } else {
+                ChildRetirement::NotRequired
+            };
+            return ForkRelinkOutcome::new(action, child_retirement);
         }
         Ok(None) => {}
-        Err(error) => return ForkRelinkAction::Failed(error),
+        Err(error) => return ForkRelinkOutcome::retiring_nothing(ForkRelinkAction::Failed(error)),
     }
     if let Some(turn_delivery) = &job.turn_delivery {
         return box_in_own_frame(|| {
@@ -670,7 +729,9 @@ async fn relink_owned_child(
         .await;
     }
     if let Some(completion) = durable_reply(&service, mob_id, handle, child, job).await {
-        return deliver(delivery, &owner, mob_id, handle, child, job, completion).await;
+        return ForkRelinkOutcome::retiring_nothing(
+            deliver(delivery, &owner, mob_id, handle, child, job, completion).await,
+        );
     }
     let deadline_ms = job
         .max_run_ms
@@ -684,7 +745,9 @@ async fn relink_owned_child(
         let remaining_ms = deadline_ms.map(|deadline| deadline.saturating_sub(now_ms()));
         if remaining_ms == Some(0) {
             if let Some(completion) = durable_reply(&service, mob_id, handle, child, job).await {
-                return deliver(delivery, &owner, mob_id, handle, child, job, completion).await;
+                return ForkRelinkOutcome::retiring_nothing(
+                    deliver(delivery, &owner, mob_id, handle, child, job, completion).await,
+                );
             }
             return limit_elapsed(&service, delivery, &owner, mob_id, handle, child, job).await;
         }
@@ -714,7 +777,9 @@ async fn relink_owned_child(
             }
             ChildObservation::Settled => {
                 let completion = settled_outcome(&service, mob_id, handle, child, job).await;
-                return deliver(delivery, &owner, mob_id, handle, child, job, completion).await;
+                return ForkRelinkOutcome::retiring_nothing(
+                    deliver(delivery, &owner, mob_id, handle, child, job, completion).await,
+                );
             }
             ChildObservation::Unobserved(detail) => {
                 // The read says nothing about the child's state, so it
@@ -723,7 +788,9 @@ async fn relink_owned_child(
                 // again.
                 if let Some(completion) = durable_reply(&service, mob_id, handle, child, job).await
                 {
-                    return deliver(delivery, &owner, mob_id, handle, child, job, completion).await;
+                    return ForkRelinkOutcome::retiring_nothing(
+                        deliver(delivery, &owner, mob_id, handle, child, job, completion).await,
+                    );
                 }
                 tracing::debug!(
                     mob_id = %mob_id,
@@ -743,7 +810,9 @@ async fn relink_owned_child(
                     && let Some(completion) =
                         durable_reply(&service, mob_id, handle, child, job).await
                 {
-                    return deliver(delivery, &owner, mob_id, handle, child, job, completion).await;
+                    return ForkRelinkOutcome::retiring_nothing(
+                        deliver(delivery, &owner, mob_id, handle, child, job, completion).await,
+                    );
                 }
                 (Some(evidence), None)
             }
@@ -757,7 +826,9 @@ async fn relink_owned_child(
         };
         // A reply that did land wins over the bound.
         if let Some(completion) = durable_reply(&service, mob_id, handle, child, job).await {
-            return deliver(delivery, &owner, mob_id, handle, child, job, completion).await;
+            return ForkRelinkOutcome::retiring_nothing(
+                deliver(delivery, &owner, mob_id, handle, child, job, completion).await,
+            );
         }
         tracing::warn!(
             mob_id = %mob_id,
@@ -773,7 +844,9 @@ async fn relink_owned_child(
             ForkOffCompletionStatus::RestartInterrupted,
         );
         completion.restart_reason = reason;
-        return deliver(delivery, &owner, mob_id, handle, child, job, completion).await;
+        return ForkRelinkOutcome::retiring_nothing(
+            deliver(delivery, &owner, mob_id, handle, child, job, completion).await,
+        );
     }
 }
 
@@ -1121,11 +1194,15 @@ async fn relink_by_receipt(
     job: &ForkJobRecord,
     turn_delivery: &meerkat_mob::store::MobDeliveryIdentity,
     commit_pending_ceiling: Duration,
-) -> ForkRelinkAction {
+) -> ForkRelinkOutcome {
     let spec =
         match meerkat_mob::BoundedResultSpec::new(job.result_label.clone(), job.max_text_bytes) {
             Ok(spec) => spec,
-            Err(error) => return ForkRelinkAction::Failed(error.to_string()),
+            Err(error) => {
+                return ForkRelinkOutcome::retiring_nothing(ForkRelinkAction::Failed(
+                    error.to_string(),
+                ));
+            }
         };
     let runtime = delivery.runtime.as_deref();
     let deadline_ms = job
@@ -1191,16 +1268,18 @@ async fn relink_by_receipt(
                         return limit_elapsed(service, delivery, owner, mob_id, handle, child, job)
                             .await;
                     }
-                    return deliver(
-                        delivery,
-                        owner,
-                        mob_id,
-                        handle,
-                        child,
-                        job,
-                        restart_interrupted(mob_id, child),
-                    )
-                    .await;
+                    return ForkRelinkOutcome::retiring_nothing(
+                        deliver(
+                            delivery,
+                            owner,
+                            mob_id,
+                            handle,
+                            child,
+                            job,
+                            restart_interrupted(mob_id, child),
+                        )
+                        .await,
+                    );
                 }
             },
             Err(error) => {
@@ -1362,7 +1441,9 @@ async fn relink_by_receipt(
         );
         let mut completion = restart_interrupted(mob_id, child);
         completion.restart_reason = reason;
-        return deliver(delivery, owner, mob_id, handle, child, job, completion).await;
+        return ForkRelinkOutcome::retiring_nothing(
+            deliver(delivery, owner, mob_id, handle, child, job, completion).await,
+        );
     }
 }
 
@@ -1509,18 +1590,28 @@ async fn fence_by_retirement(
     turn_delivery: &meerkat_mob::store::MobDeliveryIdentity,
     spec: &meerkat_mob::BoundedResultSpec,
     reason: Option<RestartInterruptedReason>,
-) -> ForkRelinkAction {
-    if let Err(error) = delivery.retire_child(handle, child).await {
-        report_child_retirement_incomplete(
-            mob_id,
-            child,
-            &error,
-            "fork_off re-link: the child whose job input it could not settle (the job stays owed)",
+) -> ForkRelinkOutcome {
+    let fence = retire_owed_child(
+        delivery,
+        mob_id,
+        handle,
+        child,
+        "fork_off re-link: the child whose job input it could not settle (the job stays owed)",
+    )
+    .await;
+    let detail = match &fence {
+        ChildRetirement::Retired => None,
+        ChildRetirement::InProgress => Some("is already being retired".to_string()),
+        ChildRetirement::Failed { error } => Some(format!("could not be retired: {error}")),
+        ChildRetirement::NotRequired => Some("could not be retired".to_string()),
+    };
+    if let Some(detail) = detail {
+        return ForkRelinkOutcome::new(
+            ForkRelinkAction::Failed(format!(
+                "the job turn's input could not be settled, and its child {detail}"
+            )),
+            fence,
         );
-        return ForkRelinkAction::Failed(format!(
-            "the job turn's input could not be settled, and its child {}: {error}",
-            child_retirement_incomplete(&error)
-        ));
     }
     // The retired member's runtime no longer runs anything; a terminal it
     // finalized before retiring is durable and read from the store.
@@ -1534,15 +1625,19 @@ async fn fence_by_retirement(
     })
     .await
     .map(|report| report.into_parts().1);
-    if let Ok(meerkat_mob::DeliveryTerminalWait::Terminal(record)) = settled {
-        return deliver_receipt(
+    // The fence retired the child, whatever the delivered outcome requires.
+    let action = if let Ok(meerkat_mob::DeliveryTerminalWait::Terminal(record)) = settled {
+        deliver_receipt(
             service, delivery, owner, mob_id, handle, child, job, *record, reason,
         )
-        .await;
-    }
-    let mut completion = restart_interrupted(mob_id, child);
-    completion.restart_reason = reason;
-    deliver(delivery, owner, mob_id, handle, child, job, completion).await
+        .await
+        .action
+    } else {
+        let mut completion = restart_interrupted(mob_id, child);
+        completion.restart_reason = reason;
+        deliver(delivery, owner, mob_id, handle, child, job, completion).await
+    };
+    ForkRelinkOutcome::new(action, ChildRetirement::Retired)
 }
 
 /// What the receipt watch does with a job input still owed a terminal
@@ -1598,7 +1693,7 @@ fn deliver_receipt<'a>(
     job: &'a ForkJobRecord,
     record: meerkat_mob::DeliveryTerminalRecord,
     restart_reason: Option<RestartInterruptedReason>,
-) -> OwnFrameFuture<'a, ForkRelinkAction> {
+) -> OwnFrameFuture<'a, ForkRelinkOutcome> {
     box_in_own_frame(move || async move {
         let interrupted = || {
             let mut completion = restart_interrupted(mob_id, child);
@@ -1616,7 +1711,9 @@ fn deliver_receipt<'a>(
                     ForkOffCompletionStatus::Completed,
                 );
                 completion.record_completed_turn(&turn);
-                return deliver(delivery, owner, mob_id, handle, child, job, completion).await;
+                return ForkRelinkOutcome::retiring_nothing(
+                    deliver(delivery, owner, mob_id, handle, child, job, completion).await,
+                );
             }
             meerkat_mob::DeliveryTerminalResolution::Receipt {
                 result: Err(failure),
@@ -1627,11 +1724,15 @@ fn deliver_receipt<'a>(
             // abandoned before a run began), or a resolution this build does not
             // know: the turn did not survive.
             _ => {
-                return deliver(delivery, owner, mob_id, handle, child, job, interrupted()).await;
+                return ForkRelinkOutcome::retiring_nothing(
+                    deliver(delivery, owner, mob_id, handle, child, job, interrupted()).await,
+                );
             }
         };
         if receipt_failure(&failure, &terminal) == ReceiptFailure::RestartCaused {
-            return deliver(delivery, owner, mob_id, handle, child, job, interrupted()).await;
+            return ForkRelinkOutcome::retiring_nothing(
+                deliver(delivery, owner, mob_id, handle, child, job, interrupted()).await,
+            );
         }
         let mut completion = ForkOffCompletion::empty(
             child.to_string(),
@@ -1642,17 +1743,20 @@ fn deliver_receipt<'a>(
         let action = deliver(delivery, owner, mob_id, handle, child, job, completion).await;
         // The live custodian retires a child whose own turn failed; so does the
         // re-link, once that outcome is settled.
-        if retires_after_delivery(&action, service, mob_id, child, job).await
-            && let Err(error) = delivery.retire_child(handle, child).await
+        let child_retirement = if retires_after_delivery(&action, service, mob_id, child, job).await
         {
-            report_child_retirement_incomplete(
+            retire_owed_child(
+                delivery,
                 mob_id,
+                handle,
                 child,
-                &error,
                 "fork_off re-link delivered a failed job; its child",
-            );
-        }
-        action
+            )
+            .await
+        } else {
+            ChildRetirement::NotRequired
+        };
+        ForkRelinkOutcome::new(action, child_retirement)
     })
 }
 
@@ -1724,7 +1828,7 @@ fn limit_elapsed<'a>(
     handle: &'a MobHandle,
     child: &'a AgentIdentity,
     job: &'a ForkJobRecord,
-) -> OwnFrameFuture<'a, ForkRelinkAction> {
+) -> OwnFrameFuture<'a, ForkRelinkOutcome> {
     box_in_own_frame(move || async move {
         let _ = handle.force_cancel_member(child.clone()).await;
         let mut completion = ForkOffCompletion::empty(
@@ -1734,18 +1838,105 @@ fn limit_elapsed<'a>(
         );
         completion.max_run_secs = job.max_run_ms.map(|limit| limit / 1000);
         let action = deliver(delivery, owner, mob_id, handle, child, job, completion).await;
-        if retires_after_delivery(&action, service, mob_id, child, job).await
-            && let Err(error) = delivery.retire_child(handle, child).await
+        let child_retirement = if retires_after_delivery(&action, service, mob_id, child, job).await
         {
-            report_child_retirement_incomplete(
+            retire_owed_child(
+                delivery,
                 mob_id,
+                handle,
                 child,
-                &error,
                 "fork_off re-link delivered max_run_elapsed; its child (seated, cancelled, for its forker)",
+            )
+            .await
+        } else {
+            ChildRetirement::NotRequired
+        };
+        ForkRelinkOutcome::new(action, child_retirement)
+    })
+}
+
+/// How long the re-link keeps retrying a required child retirement that
+/// failed, retries and the pauses before them in all. The retries run in the
+/// child's own settlement, and the pass settles its children concurrently,
+/// so they never hold up another child's re-link.
+const CHILD_RETIREMENT_RETRY_BUDGET: Duration = Duration::from_secs(10);
+
+/// The pauses before the retries of a failed required child retirement.
+const CHILD_RETIREMENT_RETRY_PAUSES: [Duration; 2] =
+    [Duration::from_secs(1), Duration::from_secs(3)];
+
+/// Retire `child`, whose settled outcome requires it, and say how that
+/// ended. A failure is retried within [`CHILD_RETIREMENT_RETRY_BUDGET`]
+/// (retiring re-drives a stuck retirement; it is idempotent); a retirement
+/// already in progress is not, since it completes on its own. A child no
+/// longer seated after a failed attempt is retired. A retry still running
+/// when the budget runs out is left to its saga and reported failed: the
+/// re-link did not see it complete, and the next pass retires the child if
+/// it is still seated.
+async fn retire_owed_child(
+    delivery: &RelinkDelivery,
+    mob_id: &MobId,
+    handle: &MobHandle,
+    child: &AgentIdentity,
+    subject: &'static str,
+) -> ChildRetirement {
+    let mut error = match delivery.retire_child(handle, child).await {
+        Ok(()) => return ChildRetirement::Retired,
+        Err(error) => error,
+    };
+    let deadline = meerkat_core::time_compat::Instant::now() + CHILD_RETIREMENT_RETRY_BUDGET;
+    let remaining =
+        || deadline.saturating_duration_since(meerkat_core::time_compat::Instant::now());
+    for pause in CHILD_RETIREMENT_RETRY_PAUSES {
+        if error.is_retirement_in_progress() || child_gone(handle, child).await {
+            break;
+        }
+        tokio::time::sleep(pause.min(remaining())).await;
+        match tokio::time::timeout(remaining(), delivery.retire_child(handle, child)).await {
+            Ok(Ok(())) => return ChildRetirement::Retired,
+            Ok(Err(retry_error)) => error = retry_error,
+            Err(_) => {
+                error = MobError::Internal(format!(
+                    "the retirement did not finish within the re-link's {}s retry budget",
+                    CHILD_RETIREMENT_RETRY_BUDGET.as_secs()
+                ));
+                break;
+            }
+        }
+    }
+    if child_gone(handle, child).await {
+        return ChildRetirement::Retired;
+    }
+    report_child_retirement_incomplete(mob_id, child, &error, subject);
+    if error.is_retirement_in_progress() {
+        ChildRetirement::InProgress
+    } else {
+        ChildRetirement::Failed {
+            error: error.to_string(),
+        }
+    }
+}
+
+/// Log each child of a pass whose required retirement still failed: the
+/// automatic passes' reports have no caller to read them.
+pub(crate) fn log_failed_child_retirements(reports: &[ForkRelinkReport]) {
+    for report in reports {
+        if let ChildRetirement::Failed { error } = &report.child_retirement {
+            tracing::warn!(
+                mob_id = %report.mob_id,
+                child = %report.child,
+                job_id = %report.job_id,
+                error = %error,
+                "fork_off re-link: a child whose outcome retires it stays seated; the next pass retires it"
             );
         }
-        action
-    })
+    }
+}
+
+/// Whether `child` is no longer seated in its mob (an unreadable roster
+/// entry counts as still seated).
+async fn child_gone(handle: &MobHandle, child: &AgentIdentity) -> bool {
+    matches!(handle.get_member(child).await, Ok(None))
 }
 
 /// How a re-link describes a child retirement that did not complete. A typed

@@ -3819,6 +3819,7 @@ impl MobMcpState {
                     true,
                 )
                 .await;
+                crate::fork_relink::log_failed_child_retirements(&reports);
                 if !reports.is_empty() {
                     tracing::info!(
                         children = reports.len(),
@@ -4277,6 +4278,7 @@ impl MobMcpState {
                         restored_before_ms,
                     )
                     .await;
+                    crate::fork_relink::log_failed_child_retirements(&reports);
                     if !reports.is_empty() {
                         tracing::info!(
                             mob_id = %mob_id,

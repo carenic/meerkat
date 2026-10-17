@@ -35,6 +35,24 @@ them.
 
 ## [Unreleased]
 
+### Breaking
+
+- `meerkat_mob_mcp::fork_relink`: `ForkRelinkReport` gains `child_retirement`
+  (a new `ChildRetirement`: `NotRequired`, `Retired`, `InProgress`, or
+  `Failed` with the error) and is now `#[non_exhaustive]`; `relink_child` and
+  `relink_child_within` return the new `ForkRelinkOutcome` (`action` and
+  `child_retirement`) instead of a `ForkRelinkAction`.
+
+### Fixed
+
+- The fork_off re-link after a restart no longer only logs a failed
+  retirement of a child whose settled outcome retires it (its own turn
+  failed, or it ran past its `max_run`). It retries the retirement for up to
+  about ten seconds, in that child's own settlement, and reports the result
+  typed (`ChildRetirement`) in each report and outcome; a child whose
+  retirement still fails is reported `Failed`, logged, and retired by the
+  next pass (a restart, or `MobMcpState::relink_restored_fork_children`).
+
 ## [0.9.2] - 2026-10-16
 
 ### Breaking
