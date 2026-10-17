@@ -322,6 +322,30 @@ if run_part audits-b; then
   TLC_WORKERS="${tlc_workers}" "${live_causal_tail_batch_audit}" "${LIVE_CONTEXT_CAUSAL_TAIL_BATCH_AUDIT_MAX_STEPS:-24}" --mutants
 fi
 
+# The peer request identity maps (the addressee each outbound request was
+# sent to; the requester each inbound request came from) are empty in the ci
+# sweep, whose PeerCorrelationIdValues and PeerIdValues are {}, so their
+# guards and invariants hold there only vacuously. A hand-written audit over
+# the same generated model gives one registered session one correlation id
+# and two peers and explores every arm that records, advances, answers,
+# rejects, times out or fails an outbound request, every arm that records or
+# answers an inbound request, and both verdict signals, in Idle and Attached,
+# under every generated invariant plus: exactly one verdict of each kind is
+# enabled, a progress, terminal or rejection step is taken only for the
+# recorded addressee, and each verdict matches the record. It requires six
+# witnesses reached (answered, progress then answered, NotAddressee,
+# UnknownRequest after the answer, replied, NotRequester) and refuses five
+# seeded defects (--mutants). 8 steps reach every witness.
+peer_request_maps_audit="${workspace_root}/specs/machines/meerkat_machine/peer_request_maps_audit.sh"
+if [[ ! -x "${peer_request_maps_audit}" ]]; then
+  echo "error: peer request maps audit runner is missing from workspace runfiles: ${peer_request_maps_audit}" >&2
+  exit 1
+fi
+if run_part audits-a; then
+  echo "running bounded peer request maps TLC audit"
+  TLC_WORKERS="${tlc_workers}" "${peer_request_maps_audit}" "${PEER_REQUEST_MAPS_AUDIT_MAX_STEPS:-8}" --mutants
+fi
+
 # Broad composition full-TLC skips are CI-time/memory-budget exceptions, NOT
 # codegen defects. `machine-verify` still validates drift and the generated
 # ci.cfg structural-invariant contract before honoring these skips. The earlier
@@ -368,10 +392,10 @@ run_machine_verify() {
 # Shard assignment balances measured audit cost (4 TLC workers, default
 # bounds): audits-a = live unregister cleanup (168 s), run-start hold (92 s),
 # live worker start after close (14 s), live-context result barrier with
-# --mutants (22 s);
+# --mutants (22 s), peer request maps with --mutants (64 s);
 # audits-b = durable in-turn steer (113 s), live media health (84 s),
 # live-context outbox (54 s), live delegation steer (23 s), live-context
-# causal-tail batch (with --mutants). A new audit joins
+# causal-tail batch with --mutants (58 s). A new audit joins
 # the lighter shard. Shard of the two audits the `all` lane runs concurrently
 # with machine-verify below:
 durable_steer_shard="audits-b"

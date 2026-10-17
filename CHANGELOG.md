@@ -187,6 +187,17 @@ them.
   machine enum, and the invariant
   `pending_peer_request_addressees_match_requests` (the addressees map has
   exactly the keys of the pending outbound requests map).
+- `specs/machines/meerkat_machine/peer_request_maps_audit.{tla,sh}`, run in
+  audit shard A of the canonical TLC lane: a bounded audit over the generated
+  MeerkatMachine model with one correlation id and two peers. The generated
+  ci sweep sets both value sets to `{}`, so it never records a peer request
+  and the peer maps' guards and invariants held there only vacuously. The
+  audit checks `pending_peer_request_addressees` and
+  `inbound_peer_request_requesters` under every generated invariant plus:
+  exactly one response-sender verdict and one response-addressee verdict is
+  enabled, a progress, terminal or rejection step is taken only for the
+  recorded addressee, and each verdict matches the record. Six reachability
+  witnesses and five seeded defects keep it from passing vacuously.
 
 ### Fixed
 
