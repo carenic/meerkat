@@ -139,6 +139,119 @@ fn release_workflows_use_the_repository_pinned_rust_toolchain() {
     );
 }
 
+fn job_steps<'a>(workflow: &'a serde_yaml::Value, job: &str) -> &'a [serde_yaml::Value] {
+    workflow["jobs"][job]["steps"]
+        .as_sequence()
+        .unwrap_or_else(|| panic!("release job {job} must contain steps"))
+}
+
+#[test]
+fn buildbuddy_binary_build_runs_the_workflows_own_setup() {
+    // An asset recovery checks out an older tag, whose local actions name
+    // third-party actions by tag: the setup action, and every script it
+    // runs, come from the workflow's own commit.
+    const TOOLING_SETUP: &str = "./.release-tooling/.github/actions/setup-buildbuddy-ci";
+    const ACTION_ROOT: &str = "${GITHUB_ACTION_PATH}/../../../";
+    let release_path = workflow_yml_path();
+    let workflow = read_workflow(&release_path);
+    let steps = job_steps(&workflow, "build_binaries_buildbuddy");
+    let setups: Vec<usize> = steps
+        .iter()
+        .enumerate()
+        .filter(|(_, step)| {
+            step["uses"]
+                .as_str()
+                .is_some_and(|uses| uses.ends_with(".github/actions/setup-buildbuddy-ci"))
+        })
+        .map(|(index, _)| index)
+        .collect();
+    assert_eq!(
+        setups.len(),
+        1,
+        "build_binaries_buildbuddy must run the BuildBuddy setup exactly once"
+    );
+    assert_eq!(
+        steps[setups[0]]["uses"].as_str(),
+        Some(TOOLING_SETUP),
+        "build_binaries_buildbuddy must run the BuildBuddy setup as {TOOLING_SETUP}"
+    );
+    let tooling: Vec<&str> = steps[..setups[0]]
+        .iter()
+        .filter(|step| {
+            step["with"]["path"].as_str() == Some(".release-tooling")
+                && step["with"]["ref"].as_str() == Some("${{ github.sha }}")
+        })
+        .filter_map(|step| step["with"]["sparse-checkout"].as_str())
+        .flat_map(str::lines)
+        .map(str::trim)
+        .collect();
+    assert!(
+        tooling.contains(&".github/actions/setup-buildbuddy-ci/action.yml"),
+        "build_binaries_buildbuddy must check out the workflow's own BuildBuddy setup as .release-tooling before running it"
+    );
+
+    let action_path = release_path
+        .parent()
+        .and_then(Path::parent)
+        .expect("release.yml sits in .github/workflows")
+        .join("actions/setup-buildbuddy-ci/action.yml");
+    let action = read_workflow(&action_path);
+    let runs: Vec<&str> = action["runs"]["steps"]
+        .as_sequence()
+        .expect("setup-buildbuddy-ci must contain steps")
+        .iter()
+        .filter_map(|step| step["run"].as_str())
+        .collect();
+    for script in runs {
+        for (at, _) in script.match_indices("scripts/") {
+            let name: String = script[at..]
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '_' | '-' | '.'))
+                .collect();
+            assert!(
+                script[..at].ends_with(ACTION_ROOT),
+                "setup-buildbuddy-ci must run {name} from its own tree ({ACTION_ROOT}), not the job's checkout"
+            );
+            assert!(
+                tooling.contains(&name.as_str()),
+                "build_binaries_buildbuddy's tooling checkout must include {name}, which its setup runs"
+            );
+        }
+    }
+}
+
+#[test]
+fn buildbuddy_release_validation_refuses_a_release_tag() {
+    // The BuildBuddy validation runs the local actions of the tree it checks
+    // out, so it validates the dispatched ref only; a tag's validation
+    // dispatch takes the GitHub-hosted backend.
+    let workflow = read_workflow(&workflow_yml_path());
+    let steps = job_steps(&workflow, "release_validate_buildbuddy");
+    let refusal = steps.iter().position(|step| {
+        step["if"]
+            .as_str()
+            .is_some_and(|condition| condition.contains("github.event.inputs.release_tag != ''"))
+            && step["run"]
+                .as_str()
+                .is_some_and(|script| script.trim_end().ends_with("exit 1"))
+    });
+    let checkout = steps.iter().position(|step| {
+        step["uses"]
+            .as_str()
+            .is_some_and(|uses| uses.starts_with("actions/checkout@"))
+    });
+    assert!(
+        matches!((refusal, checkout), (Some(refusal), Some(checkout)) if refusal < checkout),
+        "release_validate_buildbuddy must fail on a release tag before it checks anything out"
+    );
+    assert!(
+        steps.iter().all(|step| !step["with"]["ref"]
+            .as_str()
+            .is_some_and(|reference| reference.contains("release_tag"))),
+        "release_validate_buildbuddy must never check out release_tag"
+    );
+}
+
 fn workflow_step<'a>(
     workflow: &'a serde_yaml::Value,
     path: &Path,

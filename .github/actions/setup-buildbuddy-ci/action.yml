@@ -24,12 +24,15 @@ runs:
       if: ${{ inputs.profile == 'submitter' || inputs.profile == 'doctor' || inputs.profile == 'lint' || inputs.profile == 'sdk' || inputs.profile == 'rust' || inputs.profile == 'wasm' || inputs.profile == 'audit' || inputs.profile == 'native' || inputs.profile == 'full' }}
       uses: dtolnay/rust-toolchain@ee868d7805ade43a1b47dd054727ab76c9108b4f # 1.94.1
 
+    # Scripts from the action's own tree: release.yml's BuildBuddy binary
+    # build runs this action from its tooling checkout (.release-tooling)
+    # beside an older tag's checkout.
     - name: Pin Rust toolchain binaries
       if: ${{ inputs.profile == 'submitter' || inputs.profile == 'doctor' || inputs.profile == 'lint' || inputs.profile == 'sdk' || inputs.profile == 'rust' || inputs.profile == 'wasm' || inputs.profile == 'audit' || inputs.profile == 'native' || inputs.profile == 'full' }}
       shell: bash
       env:
         RUSTUP_TOOLCHAIN: 1.94.1
-      run: scripts/ci-pin-rust-toolchain-env
+      run: bash "${GITHUB_ACTION_PATH}/../../../scripts/ci-pin-rust-toolchain-env"
 
     - name: Add wasm32 target
       if: ${{ inputs.profile == 'wasm' || inputs.profile == 'full' }}
@@ -103,7 +106,7 @@ runs:
     - name: Install pinned BuildBuddy CLI
       shell: bash
       run: |
-        bb_bin="$(scripts/install-buildbuddy-cli --dir "${RUNNER_TEMP}/buildbuddy-cli")"
+        bb_bin="$(bash "${GITHUB_ACTION_PATH}/../../../scripts/install-buildbuddy-cli" --dir "${RUNNER_TEMP}/buildbuddy-cli")"
         echo "$(dirname "${bb_bin}")" >> "${GITHUB_PATH}"
 
     - name: Restore Bazel external repositories

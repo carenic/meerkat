@@ -97,10 +97,13 @@ them.
   type's settings), or release its digest updates from approval. The pinned
   `dtolnay/rust-toolchain` commit is that of its `1.94.1` branch, which
   installs that toolchain; the trailing comment names it. The release jobs
-  whose checkout can be an older tag (a recovery dispatch) run the Rust
-  setup action from a checkout of the workflow's own commit, so an older
-  tag's local actions never run, and the setup installs the channel the
-  checked-out tree names when it differs. CI only.
+  whose checkout can be an older tag (a recovery dispatch) run their setup
+  action, Rust or BuildBuddy, and the scripts it runs from a checkout of
+  the workflow's own commit, so an older tag's setup action never runs,
+  and the Rust setup installs the channel the checked-out tree names when
+  it differs. The BuildBuddy release validation, which runs the actions of
+  the tree it checks out, refuses a release tag; the github-hosted backend
+  validates one. CI only.
 - **A release tag no longer restores a Bazel repository cache another run
   could have saved.** The tag's full BuildBuddy graph (`buildbuddy.yml`
   with `repository_cache: "false"`) restores none, and the dispatch-only

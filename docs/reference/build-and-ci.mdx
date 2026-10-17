@@ -345,6 +345,13 @@ graph.
   still receive the Actions cache token. Only a separate read-only
   identity for those runs, an IAM change outside this repository, closes
   that.
+- A release job whose checkout can be an older tag runs its setup action
+  from `.release-tooling`, a sparse checkout of the workflow's own commit,
+  but a local action that action calls in turn (`uses: ./.github/actions/...`)
+  resolves against the job's workspace, the tag's checkout. No release job
+  reaches one (`setup-buildbuddy-ci` calls `setup-tlc-ci` for its `full`
+  profile only), and the BuildBuddy release validation, which runs the
+  lane actions of the tree it checks out, refuses a release tag.
 
 ## CI Retry And Concurrency
 

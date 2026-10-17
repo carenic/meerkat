@@ -624,10 +624,20 @@ jobs:
       BUILDBUDDY_API_KEY: ${{ secrets.BUILDBUDDY_API_KEY }}
       MEERKAT_BUILDBUDDY_CI_JOBS: ${{ vars.MEERKAT_RELEASE_BUILDBUDDY_JOBS || vars.MEERKAT_BUILDBUDDY_CI_JOBS || '64' }}
     steps:
+      # This job runs the local actions of the tree it checks out, so it
+      # validates the dispatched ref only: an older tag's actions, which
+      # name third-party actions by tag, never run here. A tag's validation
+      # dispatch takes the github-hosted backend, whose Cargo validation
+      # runs its setup from the workflow's own commit.
+      - name: Refuse a release tag
+        if: ${{ github.event.inputs.release_tag != '' }}
+        run: |
+          echo "::error::release_backend buildbuddy validates the dispatched ref only; dispatch a release tag's validation with release_backend github-hosted" >&2
+          exit 1
+
       - name: Checkout
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag != '' && github.event.inputs.release_tag || github.ref }}
           fetch-depth: 0
 
       - uses: ./.github/actions/run-buildbuddy-ci-lane
@@ -1705,7 +1715,25 @@ jobs:
           ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.prebuild_release_artifacts == 'true' && github.sha || github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag != '' && github.event.inputs.release_tag || github.ref }}
           persist-credentials: false
 
-      - uses: ./.github/actions/setup-buildbuddy-ci
+      # The setup action, the scripts it runs and the test-code marker
+      # guard come from the workflow's commit: an asset recovery checks out
+      # an older tag, whose local actions name third-party actions by tag
+      # and whose tree may predate the guard. Sparse, so the checkout adds
+      # no Cargo or Bazel package to the build.
+      - name: Checkout release tooling
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.sha }}
+          path: .release-tooling
+          persist-credentials: false
+          sparse-checkout: |
+            .github/actions/setup-buildbuddy-ci/action.yml
+            scripts/check-release-binary-markers
+            scripts/ci-pin-rust-toolchain-env
+            scripts/install-buildbuddy-cli
+          sparse-checkout-cone-mode: false
+
+      - uses: ./.release-tooling/.github/actions/setup-buildbuddy-ci
         with:
           profile: native
           # The archives are attested: no GitHub Actions cache entry another
@@ -1754,19 +1782,6 @@ jobs:
           fi
 
           exit "${status}"
-
-      # The test-code marker guard comes from the workflow ref: an asset
-      # recovery of an older tag builds a tree that predates it. Sparse, so
-      # the checkout adds no Cargo or Bazel package to the build.
-      - name: Checkout release binary guard
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-        with:
-          ref: ${{ github.sha }}
-          path: .release-tooling
-          persist-credentials: false
-          sparse-checkout: |
-            scripts/check-release-binary-markers
-          sparse-checkout-cone-mode: false
 
       - name: Package artifacts
         shell: bash
