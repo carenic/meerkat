@@ -56,9 +56,12 @@ them.
   starts, reconciles or cancels it (one that took over the mob's callback
   route or registered a tool of the same name and runner, and every route
   after a restart) must register a tool that declares exactly that, compared
-  on every use, before any attempt is claimed or any callback is sent;
-  otherwise the job goes to `needs_attention` (`callback_binding_changed`).
-  The submitting connection itself is not checked. A job whose recorded
+  on every use, before any attempt is claimed or any callback is sent. A
+  running job such a route may not act on goes to `needs_attention`
+  (`callback_binding_changed`); a queued one is left queued, unchanged, for
+  a route that may (nothing expires it: it waits until such a route or its
+  submitter starts it, or `jobs/cancel` cancels it). The submitting
+  connection itself is not checked. A job whose recorded
   specification no longer decodes goes to `needs_attention`
   (`callback_specification_unreadable`) instead of being skipped on every
   pass. In 0.9.2 any route that registered a tool of the same name and

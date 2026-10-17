@@ -1960,8 +1960,10 @@ fn wire_restart_class(class: meerkat::RestartClass) -> meerkat_contracts::JobRes
 
 /// Start the next attempt of a runnable detached callback job through the
 /// `acting` route. A job that route may not act on
-/// ([`RetainedCallbackSpecification::admits`]), or whose specification no
-/// longer decodes, goes to NeedsAttention instead, unclaimed.
+/// ([`RetainedCallbackSpecification::admits`]) is not its to start: it is
+/// left as it is for a route that may, or goes to NeedsAttention when its
+/// record names no declaration (written before 0.9.3), since no route ever
+/// may. A job whose specification no longer decodes goes to NeedsAttention.
 async fn start_detached_callback_attempt(
     runtime: DetachedCallbackJobRuntime,
     callback_tx: mpsc::Sender<CallbackRequestEnvelope>,
@@ -2003,6 +2005,12 @@ async fn start_detached_callback_attempt(
         Err(error) => return Err(error.to_string()),
     };
     if !specification.admits(&acting) {
+        // Another declaration: the job stays queued, unclaimed and
+        // unrecorded, for a route serving the declaration it recorded or
+        // for the route that submitted it.
+        if specification.tool_binding.is_some() {
+            return Ok(());
+        }
         return mark_callback_needs_attention(&runtime, &job_id, CALLBACK_BINDING_CHANGED).await;
     }
 
@@ -3029,14 +3037,15 @@ mod tests {
         }
     }
 
-    /// Queue `call` as the creator's route would have: a v2 record holding
-    /// its arguments and the declaration `tool` has under the fixture's
-    /// contract, and the job admitted under it, unstarted.
+    /// Queue `call` as the route `submitted_route` would have: a v2 record
+    /// holding its arguments, the declaration `tool` has under the fixture's
+    /// contract and that route, and the job admitted under it, unstarted.
     async fn queue_detached_callback(
         job_store: &Arc<dyn meerkat::DetachedJobStore>,
         blob_store: &Arc<dyn meerkat_core::BlobStore>,
         call: ToolCallView<'_>,
         tool: ToolDef,
+        submitted_route: &CallbackRouteId,
     ) -> meerkat::JobId {
         let declaration = meerkat_core::ToolBindingDigest::of_catalog_entry(
             &callback_catalog_entry(tool.clone(), durable_detached_contract()),
@@ -3044,7 +3053,7 @@ mod tests {
         let record = serde_json::to_vec(&CallbackSpecification {
             arguments: call.args.to_owned(),
             tool_binding_sha256: declaration,
-            submitted_route: CallbackRouteId::mint().as_str().to_string(),
+            submitted_route: submitted_route.as_str().to_string(),
         })
         .unwrap();
         queue_detached_callback_under(job_store, blob_store, call, tool, &record).await
@@ -3081,27 +3090,31 @@ mod tests {
             .job_id
     }
 
-    /// A queued detached callback job starts only through a route whose
-    /// tool declares exactly what the job recorded when it was submitted. A
-    /// route registering the same name and runner with another declaration
-    /// (another connection that took over the mob's callback route) moves
-    /// the job to needs_attention without offering it; a route declaring
-    /// what the job recorded (its creator reconnecting with the same tools)
-    /// starts it.
+    /// A queued detached callback job is started only by the route that
+    /// submitted it or by a route whose tool declares exactly what it
+    /// recorded. To any other route it is not its own to start: a connection
+    /// registering the same name and runner with another declaration that
+    /// reconciles first (as every tools/register does) is offered nothing,
+    /// and the job stays queued, unclaimed and unchanged, until its live
+    /// submitter starts it. A route declaring what a job recorded (its
+    /// creator reconnecting with the same tools) starts it too.
     #[tokio::test]
     async fn a_queued_callback_job_starts_only_under_the_declaration_it_recorded() {
         let root = tempfile::tempdir().unwrap();
         let (job_store, _verbatim, strict) = open_detached_callback_stores(root.path());
         let args = RawValue::from_string(r#"{"target": "lan"}"#.to_string()).unwrap();
-        let changed_job = queue_detached_callback(
+        let (submitter_route, mut submitter_rx) =
+            route_registering(make_provenanced_tool_def("durable"));
+        let queued = queue_detached_callback(
             &job_store,
             &strict,
             ToolCallView {
-                id: "tc-changed",
+                id: "tc-queued",
                 name: "durable",
                 args: &args,
             },
             make_provenanced_tool_def("durable"),
+            submitter_route.route_id(),
         )
         .await;
 
@@ -3109,22 +3122,31 @@ mod tests {
         other.description = "another connection's durable tool".to_string();
         let (claimer, mut claimer_rx) =
             detached_callback_dispatcher_registering(job_store.clone(), strict.clone(), other);
-        claimer.start_due_detached_jobs().await.unwrap();
-        await_binding_changed(&job_store, &changed_job).await;
-        assert!(
-            claimer_rx.try_recv().is_err(),
-            "the job is never offered to a route declaring another tool"
-        );
+        claimer.reconcile_detached_jobs().await.unwrap();
         assert_eq!(
-            job_store
-                .get(&changed_job)
-                .await
-                .unwrap()
-                .expect("job")
-                .machine_state
-                .attempt_count,
-            0
+            offered_method(&mut claimer_rx).await,
+            None,
+            "the job is offered to a route declaring another tool"
         );
+        let job = job_store.get(&queued).await.unwrap().expect("job");
+        assert_eq!(
+            job.machine_state.lifecycle_phase,
+            meerkat::JobPhase::Queued,
+            "the job stays queued for a route serving its declaration"
+        );
+        assert_eq!(job.machine_state.attempt_count, 0);
+
+        let submitter = CallbackToolDispatcher::from_route_with_job_runtime(
+            &submitter_route,
+            vec![],
+            "realm-a",
+            job_store.clone(),
+            strict.clone(),
+        );
+        submitter.start_due_detached_jobs().await.unwrap();
+        let start = accept_detached_callback_start(&mut submitter_rx).await;
+        assert_eq!(start.authority.job_id, queued.to_string());
+        assert_eq!(start.arguments, serde_json::json!({"target": "lan"}));
 
         let kept_job = queue_detached_callback(
             &job_store,
@@ -3135,6 +3157,7 @@ mod tests {
                 args: &args,
             },
             make_provenanced_tool_def("durable"),
+            &CallbackRouteId::mint(),
         )
         .await;
         let (creator, mut creator_rx) = detached_callback_dispatcher_registering(
