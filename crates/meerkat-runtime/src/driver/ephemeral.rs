@@ -7156,6 +7156,101 @@ mod tests {
         });
     }
 
+    /// An invalid (cancelled) terminal observation of `request_uuid` whose
+    /// admitted signer is `peer_id`.
+    fn cancelled_terminal_observation(peer_id: &str, request_uuid: uuid::Uuid) -> Input {
+        Input::Peer(PeerInput {
+            directed_interaction_id: None,
+            objective_id: None,
+            system_prompts: Vec::new(),
+            injected_context: Vec::new(),
+            sender_taint: None,
+            header: InputHeader {
+                ingress_context: None,
+                retained_resume: None,
+                authority_association: None,
+                id: InputId::new(),
+                timestamp: Utc::now(),
+                source: InputOrigin::Peer {
+                    peer_id: peer_id.into(),
+                    display_identity: Some("Analyst".into()),
+                    runtime_id: None,
+                },
+                durability: InputDurability::Durable,
+                visibility: InputVisibility::default(),
+                idempotency_key: None,
+                supersession_key: None,
+                correlation_id: None,
+            },
+            convention: Some(PeerConvention::ResponseTerminal {
+                request_id: request_uuid.to_string(),
+                status: meerkat_core::handles::PeerResponseTerminalProjectionStatus::Cancelled,
+            }),
+            content: meerkat_core::types::ContentInput::Text(String::new()),
+            payload: Some(serde_json::json!({"ok": false})),
+            handling_mode: None,
+        })
+    }
+
+    /// Only the request's addressee can cancel it. An invalid terminal
+    /// observation whose admitted signer is another peer is refused as
+    /// before, and the generated rejection, guarded on the recorded
+    /// addressee, leaves the request pending; the same observation from the
+    /// addressee then cancels it.
+    #[tokio::test]
+    async fn an_invalid_terminal_observation_from_another_peer_leaves_the_request_pending() {
+        let mut driver =
+            EphemeralRuntimeDriver::new(LogicalRuntimeId::new("other-peer-cancelled-terminal"));
+        let addressee = "550e8400-e29b-41d4-a716-446655440000";
+        let other_peer = "6ba7b810-9dad-11d1-80b4-00c04fd430c8";
+        let request_uuid = uuid::Uuid::parse_str("018f6f79-7a82-7c4e-a552-a3b86f9630f2").unwrap();
+        let corr_id = mm_dsl::PeerCorrelationId::from(request_uuid);
+        // Without a registered session the machine records no request.
+        driver
+            .ensure_contract_session_authority()
+            .expect("generated session registration");
+        driver
+            .dsl_apply(
+                mm_dsl::MeerkatMachineInput::PeerRequestSent {
+                    corr_id: corr_id.clone(),
+                    addressee: mm_dsl::PeerId(addressee.to_string()),
+                },
+                "PeerRequestSent(test)",
+            )
+            .unwrap();
+        driver.with_dsl_state(|state| {
+            assert!(state.pending_peer_requests.contains_key(&corr_id));
+            assert_eq!(
+                state.pending_peer_request_addressees.get(&corr_id),
+                Some(&mm_dsl::PeerId(addressee.to_string()))
+            );
+        });
+
+        for (signer, pending_after) in [(other_peer, true), (addressee, false)] {
+            let outcome = driver
+                .accept_input(cancelled_terminal_observation(signer, request_uuid))
+                .await
+                .unwrap();
+            match outcome {
+                crate::accept::AcceptOutcome::Rejected {
+                    reason: crate::accept::RejectReason::PeerResponseTerminalInvalid { detail },
+                } => assert!(detail.contains("rejected by generated authority")),
+                other => panic!("expected generated peer terminal rejection, got {other:?}"),
+            }
+            driver.with_dsl_state(|state| {
+                assert_eq!(
+                    state.pending_peer_requests.contains_key(&corr_id),
+                    pending_after,
+                    "after an invalid terminal observation signed by {signer}, the request is pending: {pending_after}"
+                );
+                assert_eq!(
+                    state.pending_peer_request_addressees.get(&corr_id).cloned(),
+                    pending_after.then(|| mm_dsl::PeerId(addressee.to_string())),
+                );
+            });
+        }
+    }
+
     #[tokio::test]
     async fn abandon_all_non_terminal_projects_generated_terminal_outcome() {
         let mut driver = EphemeralRuntimeDriver::new(LogicalRuntimeId::new("abandon-projection"));
