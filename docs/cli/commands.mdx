@@ -682,9 +682,14 @@ selection. Without one it refuses before any network request and prints the
 and `--oauth-account` need account evidence: the default strategy reads the
 issuer's OpenID Connect UserInfo endpoint, and an issuer without one is
 refused before client registration, with no credential stored and the
-selection unchanged; the refusal names `unverified` as the deliberate
-alternative. A login reports the account it bound, or that the credential is
-unverified.
+selection unchanged; the refusal says to retry first if the issuer could not
+be reached, and names `unverified` as the deliberate alternative. A slot that
+holds a credential this login may not replace is refused with the way to
+disconnect it (RPC `auth/logout` with the MCP target, or the SDK helpers;
+`rkat` has no disconnect command). The printed commands single-quote the
+server name and URL, so they paste as shown. A login, including one during
+`rkat run --mcp-auth interactive`, reports the account it bound, or that the
+credential is unverified.
 Use `rkat mcp login <NAME>` to open the browser flow ahead of time
 (`--allow-headless` permits it without an interactive terminal and prints the
 authorize URL to stderr if no browser opens, so avoid it where output is

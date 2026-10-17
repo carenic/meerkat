@@ -317,9 +317,11 @@ async fn first_login_with_discover_and_no_account_evidence_is_refused_before_reg
             &format!("MCP server '{SERVER}' gave no account evidence this host can verify"),
             "OpenID Connect UserInfo",
             "no credential was stored",
-            &format!("rkat mcp remove {SERVER} --scope project"),
+            "could not be reached or failed temporarily, retry first",
+            &format!("rkat mcp login '{SERVER}' --scope project"),
+            &format!("rkat mcp remove '{SERVER}' --scope project"),
             &format!(
-                "rkat mcp add {SERVER} --scope project --url {} --oauth-account-selection unverified",
+                "rkat mcp add '{SERVER}' --scope project --url '{}' --oauth-account-selection unverified",
                 fixture.mcp_url()
             ),
             "no account is verified, stored or reported",
@@ -459,13 +461,19 @@ async fn first_login_with_unverified_needs_no_account_evidence_and_says_so() {
     assert_eq!(entry["oauth_account_selection"], "unverified");
 }
 
-/// A server added without a selection is refused before any request, with
-/// the server, its scope and every way to choose a selection named.
+/// A server added without a selection is refused before any request and
+/// before the credential store is opened, with the server, its scope and
+/// every way to choose a selection named. The printed commands paste into a
+/// shell as shown, for a URL with `?` and `&`.
 #[tokio::test]
 async fn first_login_without_a_selection_names_every_remedy_before_any_request() {
     let fixture = McpOAuthFixture::spawn().await.expect("OAuth MCP fixture");
     let roots = Roots::new();
-    assert_success("mcp add", &roots.add(&fixture, &[]).await);
+    let url = format!("{}?tenant=a&team=b", fixture.mcp_url());
+    assert_success(
+        "mcp add",
+        &roots.run(&["mcp", "add", SERVER, "--url", &url]).await,
+    );
 
     let refused = roots.login().await;
     assert!(!refused.success, "a server without a selection must fail");
@@ -473,27 +481,54 @@ async fn first_login_without_a_selection_names_every_remedy_before_any_request()
         refused.authorize_url.is_none(),
         "refused before any browser step: {refused:#?}"
     );
+    let example = format!(
+        "rkat mcp add '{SERVER}' --scope project --url '{url}' --oauth-account-selection discover"
+    );
     assert_mentions(
         "missing selection",
         &refused.stderr,
         &[
             &format!("MCP server '{SERVER}' has no OAuth account selection"),
-            &format!("rkat mcp remove {SERVER} --scope project"),
+            &format!("rkat mcp remove '{SERVER}' --scope project"),
             "--oauth-account-selection discover",
             "--oauth-account <SUBJECT_ID>",
             "--oauth-account-selection unverified",
-            &format!(
-                "For example: rkat mcp add {SERVER} --scope project --url {} --oauth-account-selection discover",
-                fixture.mcp_url()
-            ),
+            &format!("For example: {example}"),
         ],
+    );
+    let pasted = std::process::Command::new("/bin/sh")
+        .arg("-c")
+        .arg(format!("printf '%s\\n' {example}"))
+        .output()
+        .expect("run /bin/sh");
+    assert_eq!(
+        String::from_utf8(pasted.stdout)
+            .expect("UTF-8 words")
+            .lines()
+            .collect::<Vec<_>>(),
+        [
+            "rkat",
+            "mcp",
+            "add",
+            SERVER,
+            "--scope",
+            "project",
+            "--url",
+            url.as_str(),
+            "--oauth-account-selection",
+            "discover",
+        ],
+        "the printed command pastes as one word per argument"
     );
     assert!(
         fixture.request_paths().is_empty(),
         "refused before any request: {:?}",
         fixture.request_paths()
     );
-    assert!(roots.credentials().is_empty(), "nothing is stored");
+    assert!(
+        !roots.home.join("config/meerkat/credentials").exists(),
+        "refused before the credential store is opened"
+    );
 }
 
 /// `rkat mcp add` names the account choices for a streamable HTTP server

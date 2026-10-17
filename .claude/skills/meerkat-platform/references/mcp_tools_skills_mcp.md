@@ -369,10 +369,10 @@ normal tool policy: visibility is not authorization.
 | `execution_failed` ("Tool call failed for ...", "Server 'X' is not accepting new calls ...") | Server or transport failure |
 | `confinement_refused` | Host launch confinement refused the process |
 | "MCP server 'X' is awaiting human authorization" | No usable OAuth credential: log in |
-| "... already has a credential this login cannot replace; disconnect it first" | Slot holds another account: `auth/logout` first |
+| "... already has a credential this login cannot replace; disconnect it first" | Slot holds another account, issuer or client, or an unverified credential: RPC `auth/logout` with the MCP target (SDK `auth_mcp_logout` / `authMcpLogout`) first; `rkat` has no disconnect command |
 | "MCP OAuth account selection requires its OAuth resolver and streamable HTTP without static Authorization" | `oauth_account` or `oauth_account_selection` on stdio, SSE or with an `Authorization` header |
 | "MCP server 'X' has no OAuth account selection, so `rkat mcp login` cannot bind its credential to an account" | Add it again with `--oauth-account-selection discover`, `--oauth-account <SUBJECT_ID>` or `--oauth-account-selection unverified` |
-| "MCP server 'X' gave no account evidence this host can verify" | Issuer has no usable OpenID Connect UserInfo; nothing stored. Re-add with `--oauth-account-selection unverified` only if resource-bound access is acceptable |
+| "MCP server 'X' gave no account evidence this host can verify" | No usable OpenID Connect UserInfo, or the issuer was unreachable; nothing stored. Retry first; re-add with `--oauth-account-selection unverified` only if the issuer publishes no UserInfo and resource-bound access is acceptable |
 | "The account signed in for MCP server 'X' is not the subject its --oauth-account names" | Another account signed in; nothing stored |
 | "MCP server 'X' has an invalid access policy: ..." | Empty or malformed `access` |
 | "MCP attachment refused: ..." | Governed attachment decision refused |

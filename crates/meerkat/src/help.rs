@@ -473,6 +473,31 @@ mod tests {
         );
     }
 
+    /// The help corpus teaches the `rkat mcp add` account-selection flag by
+    /// its exact spelling, beside `--oauth-account`, wherever it lists the
+    /// `mcp add` synopsis.
+    #[test]
+    fn help_corpus_pins_the_mcp_oauth_account_selection_flag() {
+        const SELECTION_FLAG: &str =
+            "--oauth-account <ACCOUNT_ID> | --oauth-account-selection discover|unverified";
+        let mcp_reference = MEERKAT_PLATFORM_SKILL_EXTENSIONS
+            .iter()
+            .find(|(path, _)| *path == "references/mcp_tools_skills_mcp.md")
+            .map(|(_, content)| *content)
+            .expect("the platform skill must embed the MCP reference");
+        for (source, body) in [
+            ("CLI reference", MEERKAT_CLI_REFERENCE_SKILL_BODY),
+            ("platform skill", MEERKAT_PLATFORM_SKILL_BODY),
+            ("API reference", MEERKAT_PLATFORM_API_REFERENCE),
+            ("MCP reference", mcp_reference),
+        ] {
+            assert!(
+                body.contains(SELECTION_FLAG),
+                "the {source} must document `rkat mcp add {SELECTION_FLAG}`"
+            );
+        }
+    }
+
     #[test]
     fn platform_skill_embeds_mobpack_authoring_contract() {
         fn fenced_block<'a>(section: &'a str, language: &str) -> &'a str {

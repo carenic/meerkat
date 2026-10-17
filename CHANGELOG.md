@@ -59,16 +59,24 @@ them.
   `rkat mcp add` commands for each choice. A `discover` (or
   `--oauth-account`) server whose authorization server publishes no usable
   OpenID Connect UserInfo is still refused before client registration with
-  nothing stored, and the refusal now says so and names `unverified` as the
-  deliberate alternative and what it means; it never switches the server to
-  `unverified`. An account other than the selected one is refused naming the
-  server. A successful login says whether the account was bound by
-  discovery, and an unverified login says it carries no account
-  verification.
+  nothing stored, and the refusal now says so, says to retry first when the
+  issuer could not be reached (one typed reason covers both), and names
+  `unverified` as the deliberate alternative and what it means; it never
+  switches the server to `unverified`. An account other than the selected
+  one is refused naming the server, and for a `discover` server how to bind
+  another account. A slot holding a credential the login may not replace is
+  refused with the real way to disconnect it (RPC `auth/logout` with the MCP
+  target, or the SDK `auth_mcp_logout` / `authMcpLogout` helpers; `rkat` has
+  no disconnect command). The printed commands single-quote the server name
+  and URL, so a URL with `?` or `&` pastes as shown. A successful login says
+  whether the account was bound by discovery, and an unverified login says
+  it carries no account verification.
 - `rkat run --mcp-auth interactive` logs in to `discover` and `unverified`
   servers when they first require OAuth. The CLI's in-session login refused
   every server without an `oauth_account`, unlike `rkat mcp login`; only a
-  server without any account selection is refused now.
+  server without any account selection is refused now. An in-session login
+  prints the same one-line outcome as `rkat mcp login` on stderr, including
+  that an unverified credential carries no account verification.
 - The `McpOAuthError::AccountSelectionRequired` text (shown by RPC and REST
   for the `account_selection_required` reason) now names both ways to
   select: "MCP OAuth interactive login requires an account selection:

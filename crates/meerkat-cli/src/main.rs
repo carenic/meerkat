@@ -11264,7 +11264,7 @@ impl meerkat_mcp::McpAuthResolver for CliMcpHostAuthResolver {
                 server_name: target.server_name().to_owned(),
             });
         }
-        cli_mcp_browser_login(
+        let completed = cli_mcp_browser_login(
             &self.service,
             target,
             www_authenticate,
@@ -11278,6 +11278,8 @@ impl meerkat_mcp::McpAuthResolver for CliMcpHostAuthResolver {
                 reason: other.to_string(),
             },
         })?;
+        // The same line `rkat mcp login` prints, on stderr beside the run.
+        eprintln!("{}", mcp_login_outcome(target, &completed));
         self.authority.require_stored_bearer_token(target).await
     }
 
@@ -18772,16 +18774,42 @@ struct McpLoginRemedy<'a> {
     url: &'a str,
 }
 
+/// `value` as one POSIX shell word: single-quoted, each `'` closed, escaped
+/// and reopened, so a printed command pastes as shown into sh, bash or zsh.
+#[cfg(feature = "mcp")]
+fn shell_word(value: &str) -> String {
+    format!("'{}'", value.replace('\'', r"'\''"))
+}
+
+/// How an MCP credential this login may not replace is removed: there is no
+/// `rkat` command for it.
+#[cfg(feature = "mcp")]
+const MCP_DISCONNECT_ROUTE: &str = "`rkat` has no disconnect command: use the RPC `auth/logout` method with this MCP target in the same realm (`rkat-rpc`), or the SDK helpers `auth_mcp_logout` (Python) or `authMcpLogout` (TypeScript)";
+
 #[cfg(feature = "mcp")]
 impl McpLoginRemedy<'_> {
+    fn login(&self) -> String {
+        format!(
+            "rkat mcp login {} --scope {}",
+            shell_word(self.server),
+            self.scope
+        )
+    }
+
     fn remove(&self) -> String {
-        format!("rkat mcp remove {} --scope {}", self.server, self.scope)
+        format!(
+            "rkat mcp remove {} --scope {}",
+            shell_word(self.server),
+            self.scope
+        )
     }
 
     fn add(&self, selection: &str) -> String {
         format!(
             "rkat mcp add {} --scope {} --url {} {selection}",
-            self.server, self.scope, self.url
+            shell_word(self.server),
+            self.scope,
+            shell_word(self.url)
         )
     }
 
@@ -18797,8 +18825,10 @@ impl McpLoginRemedy<'_> {
     }
 
     /// A Known or Discover selection found no account evidence it can
-    /// verify. Unverified is named as the deliberate alternative, never
-    /// taken.
+    /// verify. The refusal does not say why (no UserInfo, an unreachable
+    /// issuer or no usable egress client are one typed reason), so a retry
+    /// comes first; unverified is named as the deliberate alternative,
+    /// never taken.
     fn no_account_evidence(&self, known: bool) -> String {
         let outcome = if known {
             "Its --oauth-account subject cannot be verified; no credential was stored."
@@ -18806,8 +18836,9 @@ impl McpLoginRemedy<'_> {
             "Its `discover` selection cannot bind an account; no credential was stored."
         };
         format!(
-            "MCP server '{server}' gave no account evidence this host can verify: its authorization server publishes no usable OpenID Connect UserInfo endpoint, or it could not be reached.\n{outcome}\nIf resource-bound access without account evidence is acceptable for this server, select it deliberately:\n  {remove}\n  {add}\nAn unverified credential is bound to the server, issuer and client only: no account is verified, stored or reported, and it acts as whichever account signs in.",
+            "MCP server '{server}' gave no account evidence this host can verify: its authorization server publishes no usable OpenID Connect UserInfo endpoint, or it could not be reached.\n{outcome}\nIf the authorization server could not be reached or failed temporarily, retry first:\n  {login}\nIf it publishes no OpenID Connect UserInfo and resource-bound access without account evidence is acceptable for this server, select it deliberately:\n  {remove}\n  {add}\nAn unverified credential is bound to the server, issuer and client only: no account is verified, stored or reported, and it acts as whichever account signs in.",
             server = self.server,
+            login = self.login(),
             remove = self.remove(),
             add = self.add("--oauth-account-selection unverified"),
         )
@@ -18822,10 +18853,19 @@ impl McpLoginRemedy<'_> {
             )
         } else {
             format!(
-                "The account signed in for MCP server '{}' is not the account its credential is bound to; no credential was stored. Sign in with that account.",
+                "The account signed in for MCP server '{}' is not the account its credential is bound to; no credential was stored. Sign in with that account. To bind another account, disconnect the stored credential first, then log in again. {MCP_DISCONNECT_ROUTE}.",
                 self.server
             )
         }
+    }
+
+    /// The server's credential slot holds a credential this login may not
+    /// replace.
+    fn disconnect_required(&self) -> String {
+        format!(
+            "MCP server '{}' already has a credential this login cannot replace; disconnect it first. It holds another account, another authorization server or client, or an unverified credential, and this login stored nothing. {MCP_DISCONNECT_ROUTE}, then log in again.",
+            self.server
+        )
     }
 
     /// `error` as the operator sees it: a refusal they can act on names
@@ -18849,6 +18889,12 @@ impl McpLoginRemedy<'_> {
                 _,
             ) => Some(self.missing_selection()),
             (
+                meerkat::HostAuthError::McpOAuth(meerkat::McpOAuthError::DisconnectRequired {
+                    ..
+                }),
+                _,
+            ) => Some(self.disconnect_required()),
+            (
                 meerkat::HostAuthError::McpOAuth(meerkat::McpOAuthError::Verification(
                     ConnectorOAuthRefusal::VerificationUnavailable,
                 )),
@@ -18866,6 +18912,35 @@ impl McpLoginRemedy<'_> {
             Some(message) => exit_status::typed_failure(error, |_| message),
             None => anyhow::anyhow!("{error}"),
         }
+    }
+}
+
+/// The one line a completed MCP login reports, for `rkat mcp login` and an
+/// in-session login alike: the account it bound, or that the credential
+/// carries no account verification.
+#[cfg(feature = "mcp")]
+fn mcp_login_outcome(
+    target: &meerkat::McpServerIdentity,
+    completed: &meerkat::McpOAuthLoginComplete,
+) -> String {
+    let logged_in = format!(
+        "Logged in MCP server '{}' ({})",
+        target.server_name(),
+        target.server_url()
+    );
+    if completed.account_verification
+        == meerkat_auth_core::connector_oauth::AccountVerification::Unverified
+    {
+        return format!(
+            "{logged_in} without account verification (unverified, resource-bound access)"
+        );
+    }
+    match (completed.account_id.as_deref(), target.selection()) {
+        (Some(account), meerkat_auth_core::McpAccountSelection::Discover) => {
+            format!("{logged_in} as {account} (bound by discovery)")
+        }
+        (Some(account), _) => format!("{logged_in} as {account}"),
+        (None, _) => logged_in,
     }
 }
 
@@ -18935,24 +19010,7 @@ async fn login_mcp_server(
     )
     .await
     .map_err(|error| remedy.failure(&target, error))?;
-    let unverified = completed.account_verification
-        == meerkat_auth_core::connector_oauth::AccountVerification::Unverified;
-    let discovered = *target.selection() == meerkat_auth_core::McpAccountSelection::Discover;
-    match completed.account_id.as_deref() {
-        _ if unverified => println!(
-            "Logged in MCP server '{}' ({}) without account verification (unverified, resource-bound access)",
-            server.name, http.url
-        ),
-        Some(account) if discovered => println!(
-            "Logged in MCP server '{}' ({}) as {account} (bound by discovery)",
-            server.name, http.url
-        ),
-        Some(account) => println!(
-            "Logged in MCP server '{}' ({}) as {account}",
-            server.name, http.url
-        ),
-        None => println!("Logged in MCP server '{}' ({})", server.name, http.url),
-    }
+    println!("{}", mcp_login_outcome(&target, &completed));
     Ok(())
 }
 
@@ -29335,6 +29393,166 @@ default_model = "gemma"
                 Err(meerkat::McpOAuthError::AccountSelectionRequired)
             ),
             "{legacy:?}"
+        );
+    }
+
+    /// `rkat mcp login` remedies paste into a POSIX shell as one word per
+    /// argument (a name with a space, a URL with `?`, `&` and `'`), retry
+    /// before naming unverified for a missing account evidence, and name the
+    /// real disconnect route, which `rkat` itself does not have.
+    #[cfg(all(unix, feature = "mcp"))]
+    #[test]
+    fn mcp_login_remedies_quote_for_the_shell_and_name_the_way_out() {
+        use meerkat_auth_core::connector_oauth::ConnectorOAuthRefusal;
+        let url = "https://mcp.example.test/mcp?tenant=a&note=it's";
+        let remedy = McpLoginRemedy {
+            server: "team tracker",
+            scope: meerkat_core::McpServerSource::File(McpScope::User),
+            url,
+        };
+        let words = |command: &str| -> Vec<String> {
+            let output = std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg(format!("printf '%s\\n' {command}"))
+                .output()
+                .expect("run /bin/sh");
+            assert!(output.status.success(), "{command}");
+            String::from_utf8(output.stdout)
+                .expect("UTF-8 words")
+                .lines()
+                .map(str::to_owned)
+                .collect()
+        };
+        assert_eq!(
+            words(&remedy.add("--oauth-account-selection unverified")),
+            [
+                "rkat",
+                "mcp",
+                "add",
+                "team tracker",
+                "--scope",
+                "user",
+                "--url",
+                url,
+                "--oauth-account-selection",
+                "unverified",
+            ]
+        );
+        assert_eq!(
+            words(&remedy.remove()),
+            ["rkat", "mcp", "remove", "team tracker", "--scope", "user"]
+        );
+        assert_eq!(
+            words(&remedy.login()),
+            ["rkat", "mcp", "login", "team tracker", "--scope", "user"]
+        );
+
+        let evidence = remedy.no_account_evidence(false);
+        let retry = evidence.find("retry first").expect("a retry comes first");
+        let unverified = evidence
+            .find("--oauth-account-selection unverified")
+            .expect("unverified is named");
+        assert!(retry < unverified, "{evidence}");
+
+        let discover = {
+            let mut server =
+                meerkat_core::McpServerConfig::streamable_http("team tracker", url, HashMap::new());
+            if let McpTransportConfig::Http(http) = &mut server.transport {
+                http.oauth_account_selection =
+                    Some(meerkat_core::mcp_config::McpOAuthAccountSelection::Discover);
+            }
+            meerkat::McpServerIdentity::from_config(&server).expect("the server's OAuth target")
+        };
+        let disconnect = remedy
+            .failure(
+                &discover,
+                meerkat::HostAuthError::McpOAuth(meerkat::McpOAuthError::DisconnectRequired {
+                    server_name: "team tracker".into(),
+                }),
+            )
+            .to_string();
+        for needle in [
+            "MCP server 'team tracker' already has a credential this login cannot replace",
+            "this login stored nothing",
+            "`rkat` has no disconnect command",
+            "RPC `auth/logout` method with this MCP target in the same realm",
+            "`auth_mcp_logout` (Python)",
+            "`authMcpLogout` (TypeScript)",
+        ] {
+            assert!(disconnect.contains(needle), "{needle}: {disconnect}");
+        }
+        let rebind = remedy
+            .failure(
+                &discover,
+                meerkat::HostAuthError::McpOAuth(meerkat::McpOAuthError::Verification(
+                    ConnectorOAuthRefusal::AccountMismatch,
+                )),
+            )
+            .to_string();
+        for needle in [
+            "is not the account its credential is bound to",
+            "To bind another account, disconnect the stored credential first",
+            "RPC `auth/logout` method",
+        ] {
+            assert!(rebind.contains(needle), "{needle}: {rebind}");
+        }
+    }
+
+    /// `rkat mcp login` and an in-session login report a completed login
+    /// with one shared line: the bound account, labelled when discovery
+    /// bound it, or that an unverified credential carries no account
+    /// verification.
+    #[cfg(feature = "mcp")]
+    #[test]
+    fn mcp_login_outcome_labels_discovered_and_unverified_logins() {
+        use meerkat_auth_core::connector_oauth::AccountVerification;
+        use meerkat_core::mcp_config::McpOAuthAccountSelection;
+        let target = |selection: Option<McpOAuthAccountSelection>, account: Option<&str>| {
+            let mut server = meerkat_core::McpServerConfig::streamable_http(
+                "tracker",
+                "https://mcp.example.test/mcp",
+                HashMap::new(),
+            );
+            if let McpTransportConfig::Http(http) = &mut server.transport {
+                http.oauth_account_selection = selection;
+                http.oauth_account = account.map(str::to_owned);
+            }
+            meerkat::McpServerIdentity::from_config(&server).expect("the server's OAuth target")
+        };
+        let completed =
+            |target: &meerkat::McpServerIdentity, account: Option<&str>, account_verification| {
+                meerkat::McpOAuthLoginComplete {
+                    target: target.clone(),
+                    account_id: account.map(str::to_owned),
+                    account_verification,
+                    expires_at: None,
+                    has_refresh_token: true,
+                    scopes: Vec::new(),
+                }
+            };
+        let unverified = target(Some(McpOAuthAccountSelection::Unverified), None);
+        assert_eq!(
+            mcp_login_outcome(
+                &unverified,
+                &completed(&unverified, None, AccountVerification::Unverified)
+            ),
+            "Logged in MCP server 'tracker' (https://mcp.example.test/mcp) without account verification (unverified, resource-bound access)"
+        );
+        let discover = target(Some(McpOAuthAccountSelection::Discover), None);
+        assert_eq!(
+            mcp_login_outcome(
+                &discover,
+                &completed(&discover, Some("subject-7"), AccountVerification::Verified)
+            ),
+            "Logged in MCP server 'tracker' (https://mcp.example.test/mcp) as subject-7 (bound by discovery)"
+        );
+        let known = target(None, Some("subject-7"));
+        assert_eq!(
+            mcp_login_outcome(
+                &known,
+                &completed(&known, Some("subject-7"), AccountVerification::Verified)
+            ),
+            "Logged in MCP server 'tracker' (https://mcp.example.test/mcp) as subject-7"
         );
     }
 
