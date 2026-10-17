@@ -37,22 +37,23 @@ them.
 
 ### Changed
 
-- A plain prompt is its own interaction. When a prompt names no
-  interaction (no correlation id, no caller-supplied interaction id, no
-  caller context), its transcript rows (the user message and the turn's
-  assistant rows), its run events and the work its run owns now carry an
-  `interaction_id`: the prompt's input id, or, for a prompt a surface runs
-  as a direct service turn (the immediate turn of `session/create`,
-  `rkat run`), an id minted for that turn. On a persistent session those
-  rows now also carry their `run_id`. Before, the rows carried neither and
-  the run events no `interaction_id`. A correlation id or a
-  caller-supplied id still wins, and a transient steer still joins the
-  active turn without an id of its own. A turn whose batch merges inputs
-  naming different interactions still carries none, a plain prompt's own id
-  never displaces an interaction another input in its batch names, and a
-  batch of several plain prompts carries none. A user request restored
-  after an interrupted run carries the prompt's own id, as a run of that
-  prompt alone stamps it.
+- A plain prompt is its own interaction. When a prompt names no interaction
+  (no correlation id, no caller-supplied interaction id, no caller context),
+  its transcript rows (the user message and the turn's assistant rows), its
+  run events and the work its run owns now carry an `interaction_id`: the
+  prompt's input id. RPC `session/create`, `turn/start` and `rkat run` carry
+  the prompt's input id; a surface that runs the prompt as a direct service
+  turn instead (the MCP server's `meerkat_run` and `meerkat_resume`, a mob
+  member's eager initial turn, RPC's non-runtime `SessionRuntime::start_turn`)
+  carries an id minted for that turn. On a persistent session those rows now
+  also carry their `run_id`. Before, the rows carried neither and the run
+  events no `interaction_id`. A correlation id or a caller-supplied id still
+  wins, and a transient steer still joins the active turn without an id of its
+  own. A turn whose batch merges inputs naming different interactions still
+  carries none, a plain prompt's own id never displaces an interaction another
+  input in its batch names, and a batch of several plain prompts carries none.
+  A user request restored after an interrupted run carries the prompt's own
+  id, as a run of that prompt alone stamps it.
 
 ### Fixed
 
