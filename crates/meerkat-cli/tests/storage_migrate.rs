@@ -447,7 +447,7 @@ fn fresh_workspace_runs_use_durable_sqlite_fallback_without_touching_legacy_real
     let legacy_before = std::fs::read(&legacy_database).unwrap();
     let state_root_arg = state_root.to_str().unwrap();
 
-    let invocations = [
+    let mut invocations = vec![
         (
             vec![
                 "--state-root",
@@ -481,6 +481,11 @@ fn fresh_workspace_runs_use_durable_sqlite_fallback_without_touching_legacy_real
             false,
         ),
     ];
+    // `rkat help` answers from the embedded skills, so a build without the
+    // `skills` feature refuses it; there only the prompt runs are checked.
+    if !cfg!(feature = "skills") {
+        invocations.retain(|(args, _)| !args.contains(&"help"));
+    }
     let mut fallback_realms = Vec::new();
     for (index, (args, json_output)) in invocations.iter().enumerate() {
         let output = run_rkat(&temp, args);
