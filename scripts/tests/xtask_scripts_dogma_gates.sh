@@ -436,14 +436,16 @@ audit_lines() { grep -E '^running bounded .* TLC audit$' | sort; }
 if all_out="$(lane_part_output)" \
   && a_out="$(lane_part_output --part audits-a)" \
   && b_out="$(lane_part_output --part audits-b)" \
+  && c_out="$(lane_part_output --part audits-c)" \
   && mv_out="$(lane_part_output --part machine-verify)" \
   && [ -n "$(printf '%s\n' "$a_out" | audit_lines)" ] \
   && [ -n "$(printf '%s\n' "$b_out" | audit_lines)" ] \
+  && [ -n "$(printf '%s\n' "$c_out" | audit_lines)" ] \
   && [ -z "$(printf '%s\n' "$mv_out" | audit_lines)" ] \
   && printf '%s\n' "$mv_out" | grep -Fq 'running bounded adaptive_mob_bundle layer_terminal_feedback TLC witness' \
-  && ! printf '%s\n' "$a_out" "$b_out" | grep -Fq 'running bounded adaptive_mob_bundle' \
-  && [ -z "$(comm -12 <(printf '%s\n' "$a_out" | audit_lines) <(printf '%s\n' "$b_out" | audit_lines))" ] \
-  && [ "$( (printf '%s\n' "$a_out"; printf '%s\n' "$b_out") | audit_lines)" = "$(printf '%s\n' "$all_out" | audit_lines)" ]; then
+  && ! printf '%s\n' "$a_out" "$b_out" "$c_out" | grep -Fq 'running bounded adaptive_mob_bundle' \
+  && [ -z "$( (printf '%s\n' "$a_out" | audit_lines; printf '%s\n' "$b_out" | audit_lines; printf '%s\n' "$c_out" | audit_lines) | sort | uniq -d)" ] \
+  && [ "$( (printf '%s\n' "$a_out"; printf '%s\n' "$b_out"; printf '%s\n' "$c_out") | audit_lines)" = "$(printf '%s\n' "$all_out" | audit_lines)" ]; then
   ok "TLC lane parts: each hand audit runs in exactly one shard, machine-verify runs none, and the shards cover the whole lane"
 else
   bad "TLC lane parts drop, duplicate, or misplace a hand audit, or the machine-verify part runs one"
