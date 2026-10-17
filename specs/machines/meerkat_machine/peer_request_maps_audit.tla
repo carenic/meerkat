@@ -30,13 +30,16 @@
 \*     verdict is Requester exactly for the recorded requester, NotRequester
 \*     for any other peer, and UnknownRequest only when no inbound request
 \*     is held under the id.
+\*   AuditRequesterStable (action property): while an inbound request is
+\*     held under the id, no step changes the requester recorded for it.
 \*
 \* AuditWitness* operators are reachability goals the runner checks as
 \* expected violations, so the properties are not vacuous. The runner's
 \* --mutants mode also checks that seeded model defects are refused: a
 \* terminal response that ignores its responder, swapped sender verdicts,
-\* swapped addressee verdicts, a send that records no addressee and a
-\* receipt that records no requester.
+\* swapped addressee verdicts, a send that records no addressee, a receipt
+\* that records no requester and a second receipt that rebinds the
+\* requester.
 \*
 \* The TLC config is DERIVED from the generated ci.cfg on every run by
 \* peer_request_maps_audit.sh. Run a deeper bound by hand with:
@@ -189,6 +192,12 @@ AuditAddresseeVerdictExact ==
          /\ AddresseeNotRequester(AuditCorr, a)
                 => (AuditCorr \in DOMAIN inbound_peer_requests /\ ~RecordedRequester(a))
          /\ AddresseeUnknown(AuditCorr, a) => AuditCorr \notin DOMAIN inbound_peer_requests]_<<vars, auditVars>>
+
+AuditRequesterStable ==
+    [][(AuditCorr \in DOMAIN inbound_peer_request_requesters
+        /\ AuditCorr \in DOMAIN inbound_peer_request_requesters')
+           => inbound_peer_request_requesters'[AuditCorr]
+                  = inbound_peer_request_requesters[AuditCorr]]_<<vars, auditVars>>
 
 \* Reachability goals, each checked as an expected violation of its negation.
 \* The addressee's terminal response ended a request: both maps are empty.

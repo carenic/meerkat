@@ -7,17 +7,18 @@
 #
 # Derives the TLC config from the generated ci.cfg next to this script (every
 # generated constant and invariant, unchanged), then gives the audit one
-# correlation id, two peers and one session, adds its invariant, its three
+# correlation id, two peers and one session, adds its invariant, its four
 # action properties and its step bound, and checks them over the whole
 # bounded space. It then reruns the same space once per reachability witness,
 # with that witness's negation as an extra invariant, and requires TLC to
 # report exactly that violation, so the invariants are not vacuous. With
-# --mutants it then seeds five defects into a copy of the generated model (a
+# --mutants it then seeds six defects into a copy of the generated model (a
 # terminal response that ignores its responder, swapped sender verdicts,
 # swapped addressee verdicts, a send that records no addressee, a receipt that
-# records no requester) and requires TLC to refuse each with the property or
-# invariant it breaks. An anchor this script expects but cannot find fails
-# the run. Each TLC run is held to the canonical lane's per-run cap
+# records no requester, a second receipt that rebinds the requester) and
+# requires TLC to refuse each with the property or invariant it breaks. An
+# anchor this script expects but cannot find fails the run. Each TLC run is
+# held to the canonical lane's per-run cap
 # (`TLC_RUN_CAP_SECS`, default 900 s, see tlc_run_cap.sh); a run that hits it
 # fails closed as TLC INCOMPLETE (exit 3).
 set -euo pipefail
@@ -68,6 +69,7 @@ write_cfg() {
   AuditResponsesOnlyFromAddressee
   AuditSenderVerdictExact
   AuditAddresseeVerdictExact
+  AuditRequesterStable
 INVARIANTS
   AuditVerdictsTotal${extra}" "${cfg}"
   replace_exact_line "  CiStateConstraint" "  AuditStateConstraint" "${cfg}"
@@ -243,6 +245,27 @@ old = "inbound_peer_request_requesters' = MapSet(inbound_peer_request_requesters
 count = text.count(old)
 assert count == 6, f"expected 6 receipt updates, found {count}"
 text = text.replace(old, "inbound_peer_request_requesters' = inbound_peer_request_requesters")
+open(path, "w").write(text)
+PY
+
+  mutate receipt_rebinds_requester "property AuditRequesterStable is violated" "$@" <<'PY'
+import os, re
+path = os.environ["MODEL"]
+text = open(path).read()
+guard = "    /\\ ~((corr_id \\in DOMAIN inbound_peer_requests))\n"
+pattern = re.compile(
+    r"^PeerRequestReceived(?:Idle|Attached|Running|Retired|Stopped|Destroyed)\(.*?\n\n",
+    re.S | re.M,
+)
+hits = 0
+def drop(block):
+    global hits
+    body = block.group(0)
+    assert body.count(guard) == 1, f"inbound guard not found once in {body.splitlines()[0]}"
+    hits += 1
+    return body.replace(guard, "    /\\ TRUE\n")
+text = pattern.sub(drop, text)
+assert hits == 6, f"expected 6 receipt arms, found {hits}"
 open(path, "w").write(text)
 PY
 fi
