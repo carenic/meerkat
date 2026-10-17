@@ -1,7 +1,9 @@
 #!/usr/bin/env node
 // Hook coverage equivalence: does a CI lane plan run every test binary that
-// the pre-push hook's cargo-test body (scripts/pre-push-unit.sh) runs, under
-// the feature set the hook builds it with?
+// the deterministic workspace lanes (scripts/pre-push-unit.sh, the hook's
+// cargo-test body, which the pre-push hook now runs only on demand) run,
+// under the feature set they build it with? The push runs these rows; a
+// pull-request plan runs none and is checked against its push's rows.
 //
 // The hook builds every workspace test binary in one invocation,
 //   cargo nextest list --workspace -E 'kind(lib) or kind(test)'
@@ -36,18 +38,21 @@
 // selection are credited together, and only when they hold every partition
 // 1..N exactly once.
 //
-// A plan may leave hook lanes to the hook (hook_retained_lanes, by the
-// lane's label in the hook script): the lib binaries such a lane runs need
-// no row, because the hook runs them before the push. Only lib binaries:
-// whatever else a retained lane runs still needs a row, as does
-// HeadCanonical. The planner leaves the hook's kind(lib) lane there when no
-// runner can build the `--workspace --lib` row in time (--lib-row-runner).
-// A row that names a runner must run exactly where its bound job runs.
+// A plan may leave lanes of the hook script without a row
+// (hook_retained_lanes, by the lane's label in the hook script): the lib
+// binaries such a lane runs need no row, because the push-to-main unit lanes
+// run every member's lib tests and nightly's workspace unit lane runs them
+// under the workspace feature set. Only lib binaries: whatever else a
+// retained lane runs still needs a row, as does HeadCanonical. The planner
+// leaves the hook's kind(lib) lane there when no runner can build the
+// `--workspace --lib` row in time (--lib-row-runner). A row that names a
+// runner must run exactly where its bound job runs.
 //
 // usage: ci-hook-coverage.mjs [--plan <file>|-] [--map]
 //   Reads a plan (ci-cargo-lanes.mjs --format json) and prints the coverage
 //   summary; exits 1 on a gap. --map prints every hook binary with the CI row
-//   that runs it, or the hook lane the plan leaves it to.
+//   that runs it, or the hook lane the plan leaves to the unit lanes. A
+//   pull-request plan holds no rows: check its push plan instead.
 
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
@@ -512,10 +517,10 @@ export function checkHookCoverage(plan, { metadata = readMetadata(), nextestText
     if (!byName.has(name)) errors.push(`test scope names unknown package ${name}`);
   }
 
-  // The hook's workspace binaries for the scope, keyed package::kind::binary:
-  // built by the workspace inventory, run by at least one of its lanes. A lib
-  // binary that a lane the plan leaves to the hook runs is the hook's; every
-  // other one needs a row.
+  // The lane script's workspace binaries for the scope, keyed
+  // package::kind::binary: built by the workspace inventory, run by at least
+  // one of its lanes. A lib binary of a lane the plan leaves without a row
+  // runs in the unit lanes; every other one needs a row.
   const builtFilter = parseFilter(hook.buildFilter);
   const lanes = hook.lanes.map((lane) => ({
     label: lane.label,
@@ -524,7 +529,7 @@ export function checkHookCoverage(plan, { metadata = readMetadata(), nextestText
   }));
   const retainedLabels = [...new Set(plan.hook_retained_lanes ?? [])].sort();
   for (const label of retainedLabels) {
-    if (!lanes.some((lane) => lane.label === label)) errors.push(`the plan leaves "${label}" to the hook, which has no such workspace lane`);
+    if (!lanes.some((lane) => lane.label === label)) errors.push(`the plan leaves "${label}" without a row, but the lane script has no such workspace lane`);
   }
   const expected = new Map();
   const retained = new Map();
@@ -649,7 +654,7 @@ export function checkHookCoverage(plan, { metadata = readMetadata(), nextestText
     map: Object.fromEntries([
       ...[...expected.keys(), ...retained.keys()].sort().map((key) => [
         key,
-        covered.get(key) ?? (retained.has(key) ? `hook: ${retained.get(key).lane}` : null),
+        covered.get(key) ?? (retained.has(key) ? `unit lanes (main, nightly): ${retained.get(key).lane}` : null),
       ]),
       ...(headCanonicalExpected ? [[headKey, headCanonical]] : []),
     ]),
@@ -666,6 +671,9 @@ function main() {
     else throw new Error(`unknown argument: ${args[index]}`);
   }
   const plan = JSON.parse(readFileSync(planPath === "-" ? 0 : planPath, "utf8"));
+  if (plan.event === "pull_request" && plan.deferred_to_push) {
+    throw new Error("a pull-request plan leaves its closure-tests rows to the push; plan the same change with --event push");
+  }
   const report = checkHookCoverage(plan);
   const summary = {
     scope_packages: report.scope_packages,

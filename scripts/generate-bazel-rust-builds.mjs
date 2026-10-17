@@ -2867,10 +2867,10 @@ for (const pkg of localPackages.values()) {
     const rustfmtLib = "@@rules_rust++rust+rustfmt_nightly-2026-04-16__aarch64-apple-darwin_tools//:rustc_lib";
     const rustfmtLinux = "@@rules_rust++rust+rustfmt_nightly-2026-04-16__x86_64-unknown-linux-gnu_tools//:rustfmt_bin";
     const rustfmtLinuxLib = "@@rules_rust++rust+rustfmt_nightly-2026-04-16__x86_64-unknown-linux-gnu_tools//:rustc_lib";
-    // The canonical TLC lane runs as three parts, so each fits a CI job
+    // The canonical TLC lane runs as four parts, so each fits a CI job
     // limit and the machine-authority lane runs them in parallel: the
-    // machine-verify sweep plus adaptive witness, and two hand-written audit
-    // shards. `make machine-verify` runs all of them (`--part all`).
+    // machine-verify sweep plus adaptive witness, and three hand-written
+    // audit shards. `make machine-verify` runs all of them (`--part all`).
     // Each part reserves its share of a c3d-standard-30 executor, so the
     // BuildBuddy pool does not pack it with a heavy cargo-equivalent action,
     // and sizes TLC to that reservation (workers, heap) rather than to the
@@ -2883,6 +2883,9 @@ for (const pkg of localPackages.values()) {
         `"TLC_WORKERS": "8",
         "JAVA_TOOL_OPTIONS": "-Xmx16g",`],
       ["machine_verify_audits_b_tlc_test", "audits-b", "8", "24GB",
+        `"TLC_WORKERS": "8",
+        "JAVA_TOOL_OPTIONS": "-Xmx16g",`],
+      ["machine_verify_audits_c_tlc_test", "audits-c", "8", "24GB",
         `"TLC_WORKERS": "8",
         "JAVA_TOOL_OPTIONS": "-Xmx16g",`],
     ]) {

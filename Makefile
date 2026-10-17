@@ -318,11 +318,15 @@ ci-lanes-selftest:
 	@echo "$(GREEN)Self-testing release-projection evidence reuse (classifier, plan, evidence, gate)...$(NC)"
 	@scripts/test-release-projection-only.sh
 	@node scripts/ci-release-projection-selftest.mjs
+	@echo "$(GREEN)Self-testing the main push's diff base (last green, attested main run)...$(NC)"
+	@node scripts/ci-push-base-selftest.mjs
 	@echo "$(GREEN)Checking the non-Rust reader inventory against the Rust sources...$(NC)"
 	@node scripts/ci-non-rust-readers-guard.mjs
 	@node scripts/ci-non-rust-readers-selftest.mjs
 	@scripts/test-ci-non-rust-readers.sh
 	@scripts/test-ci-clippy-sccache-wrapper.sh
+	@echo "$(GREEN)Checking that CI runs what the pre-push hook no longer runs...$(NC)"
+	@scripts/test-pre-push-ratchets.sh
 
 .PHONY: native-cost-analysis-selftest
 native-cost-analysis-selftest:
