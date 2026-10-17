@@ -7290,4 +7290,68 @@ mod peer_response_addressee {
         fixture.assert_requester_received_the_response().await;
         assert!(fixture.bystander.received().await.is_empty());
     }
+
+    /// Another peer that sends a request reusing an outstanding request's id
+    /// does not take it over: the recorded requester stays the peer that sent
+    /// the request first, so the response still goes only to that peer.
+    #[tokio::test]
+    async fn a_request_reusing_an_outstanding_id_does_not_rebind_its_requester() {
+        let fixture = Fixture::with_spoofed_request().await;
+
+        // The raw router lets the bystander choose the envelope id.
+        let reuse = fixture
+            .bystander
+            .comms
+            .router()
+            .send_with_id(
+                fixture.responder.peer_id(),
+                fixture.request_id.0,
+                meerkat_comms::MessageKind::Request {
+                    intent: "checksum_token".to_string(),
+                    params: json!({ "subject": "addressee-reuse" }),
+                    blocks: None,
+                    reply_endpoint: None,
+                    content_taint: None,
+                    handling_mode: Some(HandlingMode::Queue),
+                    objective_id: None,
+                },
+                None,
+            )
+            .await;
+        assert_eq!(
+            fixture.inbound_state(),
+            Some(InboundPeerRequestState::Received),
+            "the reused id leaves the outstanding request in place (reuse send: {reuse:?})"
+        );
+
+        let refused = CoreCommsRuntime::send(
+            fixture.responder.comms.as_ref(),
+            fixture.response(
+                &fixture.bystander,
+                fixture.request_id,
+                ResponseStatus::Completed,
+            ),
+        )
+        .await;
+        assert!(
+            matches!(
+                &refused,
+                Err(SendError::ResponseAddresseeNotRequester { addressee, .. })
+                    if *addressee == fixture.bystander.peer_id()
+            ),
+            "the peer that reused the id is not the requester, got {refused:?} (reuse send: {reuse:?})"
+        );
+        CoreCommsRuntime::send(
+            fixture.responder.comms.as_ref(),
+            fixture.response(
+                &fixture.requester,
+                fixture.request_id,
+                ResponseStatus::Completed,
+            ),
+        )
+        .await
+        .expect("the response to the first requester is sent");
+        fixture.assert_requester_received_the_response().await;
+        assert!(fixture.bystander.received().await.is_empty());
+    }
 }

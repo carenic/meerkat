@@ -460,6 +460,58 @@ fn duplicate_inbound_request_keeps_its_first_requester() {
     );
 }
 
+/// Recording an inbound request from its ingress fact needs the sender
+/// ingress admitted: a request candidate without one (here a plain event) is
+/// refused and records nothing, so it can never be answered.
+#[test]
+fn an_inbound_request_without_an_admitted_sender_is_refused() {
+    use meerkat_core::interaction::{
+        InboxInteraction, InteractionContent, InteractionId, PeerIngressFact, PeerIngressKind,
+        PeerInputCandidate, PeerInputClass,
+    };
+
+    let handle = new_handle();
+    let id = InteractionId(uuid::Uuid::new_v4());
+    let candidate = PeerInputCandidate {
+        interaction: InboxInteraction {
+            objective_id: None,
+            sender_taint: None,
+            id,
+            from_route: Some(PeerId::new()),
+            from: "claimed-sender".to_string(),
+            content: InteractionContent::Request {
+                intent: "checksum_token".to_string(),
+                params: serde_json::json!({ "subject": "no-sender" }),
+                blocks: None,
+            },
+            rendered_text: String::new(),
+            handling_mode: meerkat_core::types::HandlingMode::Queue,
+            render_metadata: None,
+        },
+        ingress: PeerIngressFact::plain_event(
+            id,
+            "plain-source",
+            PeerInputClass::ActionableRequest,
+            PeerIngressKind::Request,
+            None,
+        ),
+        lifecycle_peer: None,
+        response_terminality: None,
+    };
+    assert_eq!(candidate.from_peer_id(), None);
+
+    let err = handle
+        .request_received_from_ingress(&candidate)
+        .expect_err("a request without an admitted sender must be refused");
+    assert_eq!(err.context, "PeerInteractionHandle::request_received");
+    let corr_id = PeerCorrelationId::from_uuid(id.0);
+    assert_eq!(handle.inbound_state(corr_id), None, "nothing is recorded");
+    assert_eq!(
+        resolve(&handle, corr_id, PeerId::new()),
+        PeerResponseAddresseeVerdict::UnknownRequest
+    );
+}
+
 fn assert_requesters_match_requests(dsl: &HandleDslAuthority, step: &str) {
     let state = dsl.snapshot_state();
     assert_eq!(
