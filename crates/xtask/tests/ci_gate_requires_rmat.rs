@@ -402,9 +402,9 @@ fn main_pushes_diff_against_the_last_green_attested_main_commit() {
     let ci = std::fs::read_to_string(&ci_yml)
         .unwrap_or_else(|e| panic!("read {}: {e}", ci_yml.display()));
     for contract in [
-        "git show \"HEAD^1:scripts/ci-push-base.mjs\" > \"${push_base_tool}\"",
+        "if found_base=\"$(node scripts/ci-push-plan-base.mjs --repository \"${GITHUB_REPOSITORY}\" --payload-base \"${BASE_SHA}\")\"; then",
         "--base \"${plan_base}\" --head HEAD \"${plan_args[@]}\"",
-        "no green, attested main CI run of an ancestor of HEAD was found; planning the whole workspace.",
+        "no qualifying green, attested main CI run before HEAD (reason above); planning the whole workspace.",
     ] {
         assert!(
             ci.contains(contract),
@@ -414,6 +414,10 @@ fn main_pushes_diff_against_the_last_green_attested_main_commit() {
     assert!(
         !ci.contains("--base \"${classification_base}\" --head HEAD \"${plan_args[@]}\""),
         "a push to main must not plan against its payload base"
+    );
+    assert!(
+        !ci.contains("HEAD^1:scripts/ci-push-base.mjs"),
+        "ci.yml must run the parent's finder only through scripts/ci-push-plan-base.mjs"
     );
 }
 
