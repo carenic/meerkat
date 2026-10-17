@@ -3407,7 +3407,7 @@ impl SessionRuntime {
         let job_store = persistence.job_store();
         let runtime_delivery_inbox = persistence.runtime_delivery_inbox();
         let continuation_bindings = persistence.continuation_bindings();
-        let schedule_service = ScheduleService::new(persistence.schedule_store());
+        let schedule_service = persistence.schedule_service();
         let workgraph_store = persistence.workgraph_store();
         let artifact_store = persistence.artifact_store();
         let factory_clone = factory.clone();
@@ -3579,7 +3579,7 @@ impl SessionRuntime {
         let job_store = persistence.job_store();
         let runtime_delivery_inbox = persistence.runtime_delivery_inbox();
         let continuation_bindings = persistence.continuation_bindings();
-        let schedule_service = ScheduleService::new(persistence.schedule_store());
+        let schedule_service = persistence.schedule_service();
         let workgraph_store = persistence.workgraph_store();
         let artifact_store = persistence.artifact_store();
         let factory_clone = factory.clone();

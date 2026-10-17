@@ -560,6 +560,9 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
 - `DeliveryFailureInternalError`
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
+- `DeliveryFailureScheduleMandateUnavailable`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
 - `TargetProbeReadyClaimed`
   - anchors: (unclaimed)
   - scenarios: (unclaimed)

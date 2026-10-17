@@ -1510,6 +1510,14 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - Emits: `DeliveryFailed`
 - To: `DeliveryFailed`
 
+### `DeliveryFailureScheduleMandateUnavailable`
+- From: `Claimed`, `Dispatching`, `AwaitingCompletion`
+- On: `ResolveDeliveryFailure`(reason, detail, at_utc_ms)
+- Guards:
+  - `schedule_mandate_unavailable`
+- Emits: `DeliveryFailed`
+- To: `DeliveryFailed`
+
 ### `TargetProbeReadyClaimed`
 - From: `Claimed`
 - On: `ResolveTargetProbe`(outcome, detail, at_utc_ms)

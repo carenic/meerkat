@@ -31,6 +31,15 @@ use meerkat_schedule::{IdentityTargetBinding, ScheduleDeliveryIdentity, Schedule
 /// The host's session host holds `service` and judges `schedule_service`'s
 /// identity targets only while the host runs; no clone of the schedule
 /// service keeps it after the host stops. See [`spawn_schedule_host`].
+///
+/// In a stock-governed realm, build `schedule_service` with
+/// [`crate::PersistenceBundle::schedule_service`]: this host composes no
+/// scheduled-session agent binding, so it then refuses each occurrence as
+/// `schedule_mandate_unavailable` when it is delivered, after the driver's
+/// target probe, before the target is resolved for delivery or a session is
+/// materialized. A service from [`ScheduleService::new`] over a governed
+/// realm's store commissions no agent, so its schedules fire unchecked and
+/// each fire materializes its session and then fails late (see Known issues).
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_runtime_backed_schedule_host<B: SessionAgentBuilder + 'static>(
     service: Arc<PersistentSessionService<B>>,
@@ -1748,5 +1757,126 @@ mod tests {
             other.materialized_session_id(),
             "distinct occurrences must derive distinct session ids"
         );
+    }
+
+    /// The runtime-backed host (the one rkat's mob host composes) over a
+    /// service that commissions schedules for an agent, as
+    /// `PersistenceBundle::schedule_service` builds one for a stock-governed
+    /// realm, and composed without a session agent binding fires none: the
+    /// fire fails as `schedule_mandate_unavailable` and no session is
+    /// materialized for it.
+    #[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
+    #[tokio::test]
+    async fn a_commissioned_runtime_backed_host_without_a_binding_materializes_nothing() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let persistence = crate::PersistenceBundle::new(
+            Arc::new(meerkat_store::MemoryStore::new()) as Arc<dyn crate::SessionStore>,
+            Arc::new(meerkat_runtime::InMemoryRuntimeStore::new())
+                as Arc<dyn meerkat_runtime::RuntimeStore>,
+            Arc::new(crate::MemoryBlobStore::new()),
+        )
+        .expect("construct runtime authority");
+        let mut builder = crate::FactoryAgentBuilder::new(
+            crate::AgentFactory::new(temp.path().join("sessions")),
+            crate::Config::default(),
+        );
+        builder.default_llm_client = Some(Arc::new(meerkat_client::TestClient::for_provider(
+            meerkat_core::Provider::OpenAI,
+        )));
+        let (service, runtime_adapter) =
+            crate::surface::build_runtime_backed_service(builder, 4, persistence)
+                .expect("compose the runtime-backed service");
+        let service = Arc::new(service);
+        let store = Arc::new(meerkat_schedule::MemoryScheduleStore::new())
+            as Arc<dyn meerkat_schedule::ScheduleStore>;
+        let agent =
+            meerkat_core::PrincipalRef::new(meerkat_core::PrincipalKind::PersonalAgent, "agent-a")
+                .expect("agent principal");
+        let schedules = ScheduleService::new_commissioned(store, agent);
+        let host = spawn_runtime_backed_schedule_host_with_mobs(
+            Arc::clone(&service),
+            runtime_adapter,
+            crate::Config::default(),
+            schedules.clone(),
+            SessionBuildOptions::default(),
+            Arc::new(NoopScheduleMobHost::new("mob targets are not under test")),
+            None,
+            None,
+            "commissioned-runtime-host",
+        )
+        .expect("a memory schedule store is hosted");
+
+        let mut create = sample_materialization_spec();
+        create.comms_name = None;
+        let schedule = schedules
+            .create(meerkat_schedule::CreateScheduleRequest {
+                name: Some("commissioned-runtime-fire".to_string()),
+                description: None,
+                trigger: meerkat_schedule::TriggerSpec::Once {
+                    due_at_utc: chrono::Utc::now() - chrono::Duration::seconds(1),
+                },
+                target: crate::TargetBinding::session(SessionTargetBinding::materialize_on_demand(
+                    create,
+                    meerkat_schedule::ScheduledSessionAction::Prompt {
+                        prompt: ContentInput::Text("scheduled check".to_string()),
+                        system_prompt: None,
+                        render_metadata: None,
+                        skill_refs: Vec::new(),
+                        additional_instructions: Vec::new(),
+                    },
+                )),
+                misfire_policy: meerkat_schedule::MisfirePolicy::Skip,
+                overlap_policy: meerkat_schedule::OverlapPolicy::AllowConcurrent,
+                missing_target_policy: meerkat_schedule::MissingTargetPolicy::Skip,
+                labels: Default::default(),
+                planning_horizon_days: Some(1),
+                planning_horizon_occurrences: Some(1),
+            })
+            .await
+            .expect("the schedule is created");
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        let occurrence = loop {
+            let occurrence = schedules
+                .list_occurrences(&schedule.schedule_id)
+                .await
+                .expect("occurrences")
+                .into_iter()
+                .next()
+                .expect("the planned occurrence");
+            if !matches!(
+                occurrence.phase,
+                meerkat_schedule::OccurrencePhase::Pending
+                    | meerkat_schedule::OccurrencePhase::Claimed
+                    | meerkat_schedule::OccurrencePhase::Dispatching
+                    | meerkat_schedule::OccurrencePhase::AwaitingCompletion
+            ) {
+                break occurrence;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the fire never terminalized: {occurrence:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        };
+        assert_eq!(
+            occurrence.phase,
+            meerkat_schedule::OccurrencePhase::DeliveryFailed
+        );
+        assert_eq!(
+            occurrence.failure_class,
+            Some(meerkat_schedule::OccurrenceFailureClass::ScheduleMandateUnavailable),
+            "detail: {:?}",
+            occurrence.failure_detail
+        );
+        assert!(
+            service
+                .load_authoritative_session(&occurrence.materialized_session_id())
+                .await
+                .expect("session read")
+                .is_none(),
+            "no session is materialized for a refused fire"
+        );
+        host.shutdown().await;
     }
 }

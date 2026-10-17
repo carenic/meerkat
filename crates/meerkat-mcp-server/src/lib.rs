@@ -12420,4 +12420,62 @@ requirement = { baseline = "command_runtime_v1", read = { kind = "paths", paths 
             "expected serde error mentioning malformed result, got: {message}"
         );
     }
+
+    /// rkat-mcp never hosts a stock-governed realm's schedules: it opens its
+    /// realm only through the ordinary open, so its startup refuses a governed
+    /// realm with `PersistenceError::RealmGoverned`. The control starts an
+    /// ungoverned realm through the same constructor.
+    #[tokio::test]
+    async fn mcp_server_startup_refuses_a_governed_realm() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let realms_root = temp.path().join("realms");
+        let bootstrap = |realm_id: &str| {
+            let mut bootstrap = RuntimeBootstrap::default();
+            bootstrap.realm.selection = RealmSelection::Explicit {
+                realm_id: realm_id.into(),
+            };
+            bootstrap.realm.backend_hint = Some("sqlite".into());
+            bootstrap.realm.state_root = Some(realms_root.clone());
+            bootstrap.context.user_config_root = Some(temp.path().join("user"));
+            bootstrap
+        };
+        let start = |bootstrap| {
+            MeerkatMcpState::new_with_bootstrap_options_and_llm(
+                bootstrap,
+                false,
+                Some(Arc::new(TestClient::for_provider(Provider::Anthropic))),
+                None,
+            )
+        };
+        meerkat_store::ensure_realm_manifest_in(
+            &realms_root,
+            "governed-mcp",
+            Some(meerkat_store::RealmBackend::Sqlite),
+            None,
+        )
+        .await
+        .expect("materialize the realm");
+        meerkat_store::govern_realm_in(&realms_root, "governed-mcp")
+            .await
+            .expect("govern the realm");
+
+        let control = start(bootstrap("ordinary-mcp")).await;
+        assert!(
+            control.is_ok(),
+            "an ungoverned realm starts: {:?}",
+            control.err().map(|error| error.to_string())
+        );
+
+        let refused = start(bootstrap("governed-mcp"))
+            .await
+            .err()
+            .expect("a governed realm is refused at startup");
+        assert!(
+            matches!(
+                refused.downcast_ref::<meerkat::PersistenceError>(),
+                Some(meerkat::PersistenceError::RealmGoverned { .. })
+            ),
+            "{refused}"
+        );
+    }
 }

@@ -1693,6 +1693,7 @@ mod tests {
                 created_at_utc: now,
                 updated_at_utc: now,
                 deleted_at_utc: None,
+                commissioning_agent: None,
             },
         };
         let public_value = serde_json::to_value(public_schedule).expect("serialize schedule");

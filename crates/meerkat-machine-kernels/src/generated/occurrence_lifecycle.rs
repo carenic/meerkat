@@ -411,6 +411,8 @@ pub enum DeliveryFailureReason {
     TransportError,
     #[serde(rename = "InternalError")]
     InternalError,
+    #[serde(rename = "ScheduleMandateUnavailable")]
+    ScheduleMandateUnavailable,
 }
 impl DeliveryFailureReason {
     pub fn as_str(&self) -> &'static str {
@@ -422,6 +424,7 @@ impl DeliveryFailureReason {
             Self::MobRejected => "MobRejected",
             Self::TransportError => "TransportError",
             Self::InternalError => "InternalError",
+            Self::ScheduleMandateUnavailable => "ScheduleMandateUnavailable",
         }
     }
 }
@@ -436,6 +439,7 @@ impl std::convert::TryFrom<&str> for DeliveryFailureReason {
             "MobRejected" => Ok(Self::MobRejected),
             "TransportError" => Ok(Self::TransportError),
             "InternalError" => Ok(Self::InternalError),
+            "ScheduleMandateUnavailable" => Ok(Self::ScheduleMandateUnavailable),
             other => Err(format!("invalid DeliveryFailureReason value `{other}`")),
         }
     }
@@ -741,6 +745,8 @@ pub enum OccurrenceFailureClass {
     TransportError,
     #[serde(rename = "InternalError")]
     InternalError,
+    #[serde(rename = "ScheduleMandateUnavailable")]
+    ScheduleMandateUnavailable,
 }
 impl OccurrenceFailureClass {
     pub fn as_str(&self) -> &'static str {
@@ -753,6 +759,7 @@ impl OccurrenceFailureClass {
             Self::LeaseLost => "LeaseLost",
             Self::TransportError => "TransportError",
             Self::InternalError => "InternalError",
+            Self::ScheduleMandateUnavailable => "ScheduleMandateUnavailable",
         }
     }
 }
@@ -768,6 +775,7 @@ impl std::convert::TryFrom<&str> for OccurrenceFailureClass {
             "LeaseLost" => Ok(Self::LeaseLost),
             "TransportError" => Ok(Self::TransportError),
             "InternalError" => Ok(Self::InternalError),
+            "ScheduleMandateUnavailable" => Ok(Self::ScheduleMandateUnavailable),
             other => Err(format!("invalid OccurrenceFailureClass value `{other}`")),
         }
     }
@@ -2090,6 +2098,7 @@ pub enum TransitionId {
     DeliveryFailureMobRejected,
     DeliveryFailureTransportError,
     DeliveryFailureInternalError,
+    DeliveryFailureScheduleMandateUnavailable,
     TargetProbeReadyClaimed,
     TargetProbeBusyAllowedByPolicy,
     TargetProbeBusySkipByPolicy,

@@ -235,6 +235,68 @@ them.
   without a signal, and a supervisor bridge request under such an id is
   dropped before dispatch, also on the mob host and the mob supervisor
   inbox (see Fixed).
+- Schedules record the agent whose mandate commissioned them (see Added),
+  which adds the public `commissioning_agent: Option<PrincipalRef>` field to
+  a constructible struct; struct literals must set it (`None` records no
+  agent):
+  - `meerkat_schedule::ScheduleConfig::commissioning_agent`
+
+  The field is written only when set, so existing schedule rows and wire
+  documents keep their bytes and read back as `None`.
+- A governed host refuses a schedule its agent did not commission (see
+  Security) with the new failure class `ScheduleMandateUnavailable`, which
+  adds a variant to these exhaustive public enums (matches must handle it):
+  - `meerkat_schedule::OccurrenceFailureClass::ScheduleMandateUnavailable`
+  - `meerkat_schedule::DeliveryFailureReason::ScheduleMandateUnavailable`
+  - `meerkat_machine_schema::catalog::dsl::occurrence_lifecycle::OccurrenceFailureClass::ScheduleMandateUnavailable`
+  - `meerkat_machine_schema::catalog::dsl::occurrence_lifecycle::DeliveryFailureReason::ScheduleMandateUnavailable`
+  - `meerkat_machine_kernels::generated::occurrence_lifecycle::OccurrenceFailureClass::ScheduleMandateUnavailable`
+  - `meerkat_machine_kernels::generated::occurrence_lifecycle::DeliveryFailureReason::ScheduleMandateUnavailable`
+
+  Wire: an occurrence's and a delivery receipt's `failure_class`
+  (`OccurrenceFailureClass`) can be `schedule_mandate_unavailable`; a client
+  that rejects unknown values must accept it. The occurrence lifecycle
+  machine gains the transition `DeliveryFailureScheduleMandateUnavailable`
+  (to `DeliveryFailed`).
+- Behaviour-only (not measured by the gate): a `SharedScheduleTargetAdapter`
+  over a schedule service that commissions schedules for an agent
+  (`ScheduleService::commissioning_agent` is set, as
+  `PersistenceBundle::schedule_service` builds it in a stock-governed realm)
+  and composed without a session agent binding fires no occurrence: each
+  fails as `schedule_mandate_unavailable` when it is delivered, before a
+  session is materialized. rkat's and rkat-rpc's schedule hosts compose no
+  binding, so in a stock-governed realm every fire now fails this way. Such
+  a fire used to materialize its session and then fail late, as
+  `transport_error` (see Known issues).
+- Behaviour-only (not measured by the gate): rkat-rpc composes its realm's
+  own schedule service. Both `SessionRuntime` constructors take
+  `PersistenceBundle::schedule_service` where they built
+  `ScheduleService::new` over the realm's schedule store. In a
+  stock-governed realm rkat-rpc therefore records the realm's opened agent
+  on each schedule it creates or redefines (a redefinition through rkat-rpc
+  no longer erases the agent another host recorded), and its schedule host
+  refuses each fire as described above. Ordinary realms are unchanged.
+
+### Security
+
+- A stock-governed realm's schedules no longer fire outside the mandate of
+  the agent that commissioned them. Every fire there, including each
+  schedule recorded before commissioning agents existed, fails closed with
+  the typed failure class `schedule_mandate_unavailable` when it is
+  delivered, before a session is materialized or an input admitted (a fire
+  whose target the driver's probe finds missing still misfires or fails as
+  `target_missing`); the occurrence and its terminal receipt show it. This
+  holds for every host that can open such a realm: `rkat` (its schedule
+  hosts, `rkat mob` hosts included) and `rkat-rpc`, whose schedule services
+  commission each schedule for the realm's opened agent and which compose no
+  session agent binding in this release. `rkat-rest` and `rkat-mcp` never
+  open a governed realm: their startup refuses it ("realm '<id>' is governed
+  and cannot be opened as an ordinary realm"). A Rust host that opens one
+  (`open_stock_realm_persistence*`) refuses early only when its schedule
+  service comes from `PersistenceBundle::schedule_service()`; one built with
+  `ScheduleService::new` over the realm's store is not gated: it fires, and
+  the fire fails later, after materializing its session (see Known issues).
+  Ungoverned realms are unchanged.
 
 ### Added
 
@@ -392,6 +454,32 @@ them.
   `ClaimedByAnother`; non-exhaustive) and the provided method
   `PeerInteractionHandle::inbound_id_claim`: who holds a candidate's
   interaction id among the inbound requests a handle records.
+- Schedules record the agent whose mandate commissioned them.
+  `ScheduleService::new_commissioned(store, agent)` builds a service that
+  records `agent` on every schedule it creates or redefines (a redefinition
+  is commissioned by the agent that made it); the agent comes only from the
+  trusted composition, never from a request. `ScheduleService::new` records
+  none, and `ScheduleService::commissioning_agent` reads the service's agent.
+  `PersistenceBundle::schedule_service` builds a stock-governed realm's
+  service commissioned for the realm's opened agent (`rkat` and `rkat-rpc`
+  use it for their schedule tools and hosts) and an ordinary realm's
+  service with none. The wire `Schedule` and the generated SDK types carry
+  `commissioning_agent` when it is set.
+- Governed schedule hosts. `meerkat::surface::ScheduledSessionAgentBinding`
+  is the agent a governed host's scheduled sessions act as (`agent`) and its
+  binding onto a session the host materializes or revives for a fire
+  (`bind_scheduled_session(machine, session_id, configured_servers)`, called
+  after the session's registration and before its agent is built).
+  `SharedScheduleTargetAdapter::with_session_agent_binding` composes one into
+  a host's delivery adapter, which then fires a schedule only when its
+  recorded `commissioning_agent` is the binding's agent.
+  `PersistenceBundle::scheduled_session_agent_binding` returns a
+  stock-governed realm's binding (`StockGovernance` implements the trait for
+  the realm's opened agent) and `None` for every other realm. The adapter
+  only gates: no session host in this release (rkat's, rkat-rpc's, the MCP
+  server's or the facade's runtime-backed host) calls
+  `bind_scheduled_session` yet, so a host composing a binding must bind its
+  own scheduled sessions, or they run unbound.
 
 ### Changed
 
@@ -915,6 +1003,23 @@ them.
   too. This was the intermittent
   `member_creation_some_origin_authority_matrix` failure in meerkat-mob's
   tests.
+
+### Known issues
+
+- No governed runtime runs scheduled agent work yet, whether it is a
+  stock-governed realm or an embedder's native grant configuration (a
+  `NativeGrantWorkConfiguration` installed with
+  `MeerkatMachine::persistent_with_local_grant_authorization`). Such a
+  runtime admits only work bound to an authenticated original, and a
+  schedule fire carries none, so no fire runs outside a mandate. In a
+  stock-governed realm rkat and rkat-rpc refuse every fire as
+  `schedule_mandate_unavailable` without materializing a session. Any other
+  host on a governed runtime whose schedule service records no
+  commissioning agent (`ScheduleService::new`, or
+  `PersistenceBundle::schedule_service()` outside a stock-governed realm)
+  still materializes the fire's session and then fails the fire late: the
+  fire never runs, and its failure class names the step that refused it,
+  not the missing mandate.
 
 ## [0.9.2] - 2026-10-16
 

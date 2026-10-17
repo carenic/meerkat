@@ -4068,6 +4068,34 @@ occurrence_DeliveryFailureInternalError(arg_reason, arg_detail, arg_at_utc_ms) =
        /\ model_step_count' = model_step_count + 1
 
 
+occurrence_DeliveryFailureScheduleMandateUnavailable(arg_reason, arg_detail, arg_at_utc_ms) ==
+    /\ \E packet \in SeqElements(pending_inputs) :
+       /\ packet.machine = "occurrence"
+       /\ packet.variant = "ResolveDeliveryFailure"
+       /\ packet.payload.reason = arg_reason
+       /\ packet.payload.detail = arg_detail
+       /\ packet.payload.at_utc_ms = arg_at_utc_ms
+       /\ ~HigherPriorityReady("occurrence_authority")
+       /\ occurrence_phase = "Claimed" \/ occurrence_phase = "Dispatching" \/ occurrence_phase = "AwaitingCompletion"
+       /\ (packet.payload.reason = "ScheduleMandateUnavailable")
+       /\ occurrence_phase' = "DeliveryFailed"
+       /\ occurrence_receipt_recorded_at_utc_ms' = Some(packet.payload.at_utc_ms)
+       /\ occurrence_receipt_stage' = Some("DeliveryFailed")
+       /\ occurrence_receipt_failure_class' = Some("ScheduleMandateUnavailable")
+       /\ occurrence_receipt_detail' = packet.payload.detail
+       /\ occurrence_failure_class' = Some("ScheduleMandateUnavailable")
+       /\ occurrence_failure_detail' = packet.payload.detail
+       /\ occurrence_completed_at_utc_ms' = Some(packet.payload.at_utc_ms)
+       /\ UnchangedFrame_082b16d063426bc5
+       /\ pending_inputs' = SeqRemove(pending_inputs, packet)
+       /\ observed_inputs' = observed_inputs
+       /\ pending_routes' = pending_routes
+       /\ delivered_routes' = delivered_routes
+       /\ emitted_effects' = emitted_effects \cup { [machine |-> "occurrence", variant |-> "DeliveryFailed", payload |-> [tag |-> "unit"], effect_id |-> (model_step_count + 1), source_transition |-> "DeliveryFailureScheduleMandateUnavailable"] }
+       /\ observed_transitions' = observed_transitions \cup {[machine |-> "occurrence", transition |-> "DeliveryFailureScheduleMandateUnavailable", actor |-> "occurrence_authority", step |-> (model_step_count + 1), from_phase |-> occurrence_phase, to_phase |-> "DeliveryFailed"]}
+       /\ model_step_count' = model_step_count + 1
+
+
 occurrence_TargetProbeReadyClaimed(arg_outcome, arg_detail, arg_at_utc_ms) ==
     /\ \E packet \in SeqElements(pending_inputs) :
        /\ packet.machine = "occurrence"
@@ -5235,6 +5263,7 @@ EntryPacketAdmissible_occurrence(packet) ==
     \/ /\ (packet.variant = "ResolveDeliveryFailure") /\ (occurrence_phase = "Claimed" \/ occurrence_phase = "Dispatching" \/ occurrence_phase = "AwaitingCompletion") /\ ((packet.payload.reason = "MobRejected"))
     \/ /\ (packet.variant = "ResolveDeliveryFailure") /\ (occurrence_phase = "Claimed" \/ occurrence_phase = "Dispatching" \/ occurrence_phase = "AwaitingCompletion") /\ ((packet.payload.reason = "TransportError"))
     \/ /\ (packet.variant = "ResolveDeliveryFailure") /\ (occurrence_phase = "Claimed" \/ occurrence_phase = "Dispatching" \/ occurrence_phase = "AwaitingCompletion") /\ ((packet.payload.reason = "InternalError"))
+    \/ /\ (packet.variant = "ResolveDeliveryFailure") /\ (occurrence_phase = "Claimed" \/ occurrence_phase = "Dispatching" \/ occurrence_phase = "AwaitingCompletion") /\ ((packet.payload.reason = "ScheduleMandateUnavailable"))
     \/ /\ (packet.variant = "ResolveTargetProbe") /\ (occurrence_phase = "Claimed") /\ ((packet.payload.outcome = "Ready"))
     \/ /\ (packet.variant = "ResolveTargetProbe") /\ (occurrence_phase = "Claimed") /\ ((packet.payload.outcome = "Busy")) /\ ((occurrence_overlap_policy = "AllowConcurrent"))
     \/ /\ (packet.variant = "ResolveTargetProbe") /\ (occurrence_phase = "Claimed") /\ ((packet.payload.outcome = "Busy")) /\ ((occurrence_overlap_policy = "SkipIfRunning"))
@@ -5522,6 +5551,7 @@ CoreNext ==
     \/ \E arg_reason \in DeliveryFailureReasonValues : \E arg_detail \in OptionStringValues : \E arg_at_utc_ms \in 0..2 : occurrence_DeliveryFailureMobRejected(arg_reason, arg_detail, arg_at_utc_ms)
     \/ \E arg_reason \in DeliveryFailureReasonValues : \E arg_detail \in OptionStringValues : \E arg_at_utc_ms \in 0..2 : occurrence_DeliveryFailureTransportError(arg_reason, arg_detail, arg_at_utc_ms)
     \/ \E arg_reason \in DeliveryFailureReasonValues : \E arg_detail \in OptionStringValues : \E arg_at_utc_ms \in 0..2 : occurrence_DeliveryFailureInternalError(arg_reason, arg_detail, arg_at_utc_ms)
+    \/ \E arg_reason \in DeliveryFailureReasonValues : \E arg_detail \in OptionStringValues : \E arg_at_utc_ms \in 0..2 : occurrence_DeliveryFailureScheduleMandateUnavailable(arg_reason, arg_detail, arg_at_utc_ms)
     \/ \E arg_outcome \in OccurrenceTargetProbeOutcomeValues : \E arg_detail \in OptionStringValues : \E arg_at_utc_ms \in 0..2 : occurrence_TargetProbeReadyClaimed(arg_outcome, arg_detail, arg_at_utc_ms)
     \/ \E arg_outcome \in OccurrenceTargetProbeOutcomeValues : \E arg_detail \in OptionStringValues : \E arg_at_utc_ms \in 0..2 : occurrence_TargetProbeBusyAllowedByPolicy(arg_outcome, arg_detail, arg_at_utc_ms)
     \/ \E arg_outcome \in OccurrenceTargetProbeOutcomeValues : \E arg_detail \in OptionStringValues : \E arg_at_utc_ms \in 0..2 : occurrence_TargetProbeBusySkipByPolicy(arg_outcome, arg_detail, arg_at_utc_ms)

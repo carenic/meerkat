@@ -134,6 +134,17 @@ impl ScheduleLifecycleMutator {
         &self.schedule
     }
 
+    /// Record the agent whose mandate commissions the schedule this create
+    /// or update writes. The agent is not lifecycle state: like the name and
+    /// labels it is a config fact of the write, so it is set on the mutated
+    /// schedule before planning reads it.
+    pub(crate) fn record_commissioning_agent(
+        &mut self,
+        commissioning_agent: Option<meerkat_core::PrincipalRef>,
+    ) {
+        self.schedule.config.commissioning_agent = commissioning_agent;
+    }
+
     pub fn effects(&self) -> &[ScheduleLifecycleEffect] {
         &self.effects
     }
@@ -2006,6 +2017,9 @@ fn to_dsl_delivery_failure_reason(reason: DeliveryFailureReason) -> occ_dsl::Del
         DeliveryFailureReason::MobRejected => occ_dsl::DeliveryFailureReason::MobRejected,
         DeliveryFailureReason::TransportError => occ_dsl::DeliveryFailureReason::TransportError,
         DeliveryFailureReason::InternalError => occ_dsl::DeliveryFailureReason::InternalError,
+        DeliveryFailureReason::ScheduleMandateUnavailable => {
+            occ_dsl::DeliveryFailureReason::ScheduleMandateUnavailable
+        }
     }
 }
 
@@ -2460,6 +2474,7 @@ fn create_schedule_via_dsl(
             created_at_utc: now,
             updated_at_utc: now,
             deleted_at_utc: None,
+            commissioning_agent: None,
         },
     };
     let effects = map_schedule_effects(&transition)?;
@@ -3154,6 +3169,9 @@ fn from_dsl_failure_class(fc: occ_dsl::FailureClass) -> OccurrenceFailureClass {
         occ_dsl::FailureClass::LeaseLost => OccurrenceFailureClass::LeaseLost,
         occ_dsl::FailureClass::TransportError => OccurrenceFailureClass::TransportError,
         occ_dsl::FailureClass::InternalError => OccurrenceFailureClass::InternalError,
+        occ_dsl::FailureClass::ScheduleMandateUnavailable => {
+            OccurrenceFailureClass::ScheduleMandateUnavailable
+        }
     }
 }
 
