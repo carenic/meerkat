@@ -62,10 +62,12 @@ them.
   verifies its build attestation (`gh attestation verify`: signed by this
   repository's `release.yml` run from `main` or the release tag, in a job on
   a GitHub-hosted runner, with a verified subject that names the exact asset,
-  version included, with the archive's sha256; up to three attempts). The
-  release preflight refuses a `MEERKAT_CI_RUNNER` that is not a GitHub-hosted
-  Ubuntu runner before any crate publishes. If any check fails nothing is
-  stamped and neither SDK package publishes. The download uses HTTPS only,
+  version included, with the archive's sha256; up to three attempts). Before
+  any crate publishes, the release preflight fails when `MEERKAT_CI_RUNNER`
+  names a label that is not a GitHub-hosted Ubuntu label; it checks the
+  label, not where the runner is hosted, so the stamp's
+  `--deny-self-hosted-runners` stays the enforcement. If any check fails
+  nothing is stamped and neither SDK package publishes. The download uses HTTPS only,
   redirects
   included, and refuses an archive over 256 MiB. The archive is checked
   before anything is written or extracted, the binary before it is

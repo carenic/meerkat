@@ -31,11 +31,12 @@ built from the bump commit.
                    rendering, so a source tree pins nothing and the renderer
                    and the committed files cannot drift apart.
   require-hosted-runner
-                   Refuse a MEERKAT_CI_RUNNER (the runner the BuildBuddy build
-                   job attests on) that does not name a GitHub-hosted Ubuntu
-                   runner: the stamp refuses attestations from self-hosted
-                   runners, so the release preflight refuses one before any
-                   crate publishes.
+                   Fail when MEERKAT_CI_RUNNER (the runner the BuildBuddy build
+                   job attests on) names a label that is not a GitHub-hosted
+                   Ubuntu label, so the release stops before any crate
+                   publishes. It checks the label, not where the runner is
+                   hosted: the stamp's --deny-self-hosted-runners stays the
+                   enforcement.
 """
 
 from __future__ import annotations
@@ -259,7 +260,7 @@ def attested_subject_failure(stdout: str, asset: str, sha256: str) -> str | None
     except ValueError:
         return "gh printed no JSON verification result"
     if not isinstance(results, list):
-        return "gh printed no list of verification results"
+        return "gh printed no JSON verification result"
     subjects = [
         subject
         for result in results
@@ -328,8 +329,10 @@ GITHUB_HOSTED_UBUNTU = re.compile(r"ubuntu-(latest|[0-9]+\.[0-9]+)(-arm)?")
 
 
 def require_hosted_runner(value: str) -> str:
-    """The runner `value` (MEERKAT_CI_RUNNER, JSON as release.yml's fromJSON
-    reads it) names, refused unless it is a GitHub-hosted Ubuntu label."""
+    """The runner label `value` (MEERKAT_CI_RUNNER, JSON as release.yml's
+    fromJSON reads it) names, refused unless it is a GitHub-hosted Ubuntu
+    label. A label says nothing certain about where a runner is hosted; the
+    attestation check (--deny-self-hosted-runners) is the enforcement."""
     if not value.strip():
         return "ubuntu-24.04"
     try:
@@ -338,10 +341,10 @@ def require_hosted_runner(value: str) -> str:
         label = None
     if not isinstance(label, str) or GITHUB_HOSTED_UBUNTU.fullmatch(label) is None:
         raise StampError(
-            f"MEERKAT_CI_RUNNER {value!r} does not name a GitHub-hosted Ubuntu runner "
-            "(\"ubuntu-latest\", \"ubuntu-<version>\" or \"ubuntu-<version>-arm\"). The "
-            "BuildBuddy build job attests the release archives on it, and the SDK digest "
-            "stamp refuses attestations from self-hosted runners: the release would publish "
+            f"MEERKAT_CI_RUNNER {value!r} names a label that is not a GitHub-hosted Ubuntu "
+            "label (\"ubuntu-latest\", \"ubuntu-<version>\" or \"ubuntu-<version>-arm\"). "
+            "The BuildBuddy build job attests the release archives on it, and the SDK digest "
+            "stamp refuses attestations from self-hosted runners: the release could publish "
             "the crates and then refuse both SDK packages."
         )
     return label
@@ -490,7 +493,7 @@ def parse_args() -> argparse.Namespace:
 
     commands.add_parser(
         "require-hosted-runner",
-        help="refuse a MEERKAT_CI_RUNNER that is not a GitHub-hosted Ubuntu runner",
+        help="fail when MEERKAT_CI_RUNNER names a label that is not a GitHub-hosted Ubuntu label",
         allow_abbrev=False,
     )
     return parser.parse_args()
@@ -512,7 +515,7 @@ def main() -> int:
             print(f"the package pins the stamped {args.release_tag} rkat-rpc digests")
         elif args.command == "require-hosted-runner":
             label = require_hosted_runner(os.environ.get("MEERKAT_CI_RUNNER", ""))
-            print(f"the release archives are attested on the GitHub-hosted runner {label}")
+            print(f"MEERKAT_CI_RUNNER names the GitHub-hosted Ubuntu label {label}")
         else:
             check_unstamped(args.repo_root)
             print("the committed SDK digest modules pin nothing")

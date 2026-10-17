@@ -256,9 +256,11 @@ inside each verified archive, and stamps both SDKs. It refuses an incomplete
 manifest, an archive that does not re-hash, carries no attestation that
 passes or exceeds the SDKs' 256 MiB download cap, and SDK packages of
 another version; nothing is stamped then and neither package publishes.
-Before any crate publishes, the release preflight refuses a
-`MEERKAT_CI_RUNNER` (the runner the BuildBuddy build job attests on) that is
-not a GitHub-hosted Ubuntu runner. Each publish step then refuses a built package that does not pin
+Before any crate publishes, the release preflight fails when
+`MEERKAT_CI_RUNNER` (the runner the BuildBuddy build job attests on) names a
+label that is not a GitHub-hosted Ubuntu label. It checks the label, not
+where the runner is hosted: the stamp's `--deny-self-hosted-runners` stays
+the enforcement. Each publish step then refuses a built package that does not pin
 exactly those digests for its version. A source or git install pins nothing
 and refuses to download (`BINARY_DIGEST_UNAVAILABLE`).
 

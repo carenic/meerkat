@@ -50,9 +50,9 @@ IDENTITY = (
 # --deny-self-hosted-runners --format json`: logs each call; answers the
 # N-th call with the N-th word of STUB_GH_OUTCOMES ("transient": an HTTP 502,
 # "refused": a policy refusal); refuses the files named in STUB_GH_UNATTESTED
-# (HTTP 404); otherwise prints one verified statement whose subject is the
-# file's name edited by STUB_GH_SUBJECT_SED, with its sha256 or
-# STUB_GH_SUBJECT_SHA256.
+# (HTTP 404); otherwise prints STUB_GH_STDOUT when set, else one verified
+# statement whose subject is the file's name edited by STUB_GH_SUBJECT_SED,
+# with its sha256 or STUB_GH_SUBJECT_SHA256.
 GH_ATTESTATION_STUB = """#!/bin/sh
 printf '%s\\n' "$*" >> "$STUB_GH_LOG"
 [ "$1 $2" = "attestation verify" ] || { echo "stub gh: unsupported $*" >&2; exit 2; }
@@ -65,6 +65,7 @@ esac
 for name in $STUB_GH_UNATTESTED; do
   case "$3" in */"$name") echo "Error: HTTP 404: Not Found" >&2; exit 1 ;; esac
 done
+if [ -n "${STUB_GH_STDOUT:-}" ]; then printf '%s\\n' "$STUB_GH_STDOUT"; exit 0; fi
 subject="$(basename "$3" | sed -e "${STUB_GH_SUBJECT_SED:-s/^//}")"
 digest="${STUB_GH_SUBJECT_SHA256:-$(python3 -I -c 'import hashlib, sys; print(hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest())' "$3")}"
 printf '[{"verificationResult": {"statement": {"subject": [{"name": "%s", "digest": {"sha256": "%s"}}]}}}]\\n' "$subject" "$digest"
@@ -138,6 +139,7 @@ class Fixture:
         self.outcomes: list[str] = []
         self.subject_sed = ""
         self.subject_sha256 = ""
+        self.gh_stdout = ""
         self.release.mkdir()
         self.bin.mkdir()
         (self.bin / "gh").write_text(GH_ATTESTATION_STUB, encoding="utf-8")
@@ -212,6 +214,7 @@ class Fixture:
             "STUB_GH_OUTCOMES": " ".join(self.outcomes),
             "STUB_GH_SUBJECT_SED": self.subject_sed,
             "STUB_GH_SUBJECT_SHA256": self.subject_sha256,
+            "STUB_GH_STDOUT": self.gh_stdout,
             "RELEASE_ATTESTATION_RETRY_SECONDS": "0",
         }
         return run(
@@ -418,7 +421,18 @@ class StampTests(unittest.TestCase):
         ):
             result = preflight(value)
             self.assertEqual(result.returncode, 1, f"{value!r}: {result.stdout}")
-            self.assertIn("does not name a GitHub-hosted Ubuntu runner", result.stderr)
+            self.assertIn(
+                "names a label that is not a GitHub-hosted Ubuntu label", result.stderr
+            )
+
+    def test_refuses_gh_output_that_is_not_json(self) -> None:
+        self.fixture.gh_stdout = "Loaded digest sha256:abc for file://archive"
+        self.assert_refused(self.fixture.stamp(), "gh printed no JSON verification result")
+
+    def test_refuses_gh_json_that_is_not_a_list(self) -> None:
+        for stdout in ('{"verificationResult": {}}', "7", '"verified"'):
+            self.fixture.gh_stdout = stdout
+            self.assert_refused(self.fixture.stamp(), "gh printed no JSON verification result")
 
     def test_retries_a_transient_attestation_failure(self) -> None:
         self.fixture.outcomes = ["transient", "transient"]
