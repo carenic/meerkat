@@ -104,12 +104,15 @@ pub enum ForkRelinkAction {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ChildRetirement {
-    /// The outcome does not retire the child.
+    /// Nothing to retire now: the outcome does not retire the child, or its
+    /// delivery did not settle.
     NotRequired,
     /// The child, with its descendants, is retired (or was already gone).
     Retired,
-    /// Another retirement of the child is still running, and completes on
-    /// its own.
+    /// A retirement of the child was still in progress when the re-link's
+    /// retries ended. Its saga keeps the child's teardown authority, and
+    /// finishes when it converges or when the retirement is driven again, as
+    /// the next pass does.
     InProgress,
     /// The retirement failed, retries included: the re-link retries a failed
     /// retirement for about ten seconds. The child stays seated with its job
@@ -167,9 +170,25 @@ pub struct RelinkDelivery {
     /// The host's managed mobs, read afresh each time an owner bound outside
     /// the child's mob is looked up, so a mob inserted later is found.
     managed_mobs: Option<ManagedMobs>,
-    /// Child retirements still to fail before they reach the mob, one per
-    /// retirement (a test seam; `None` on every host).
-    child_retirement_faults: Option<Arc<std::sync::atomic::AtomicUsize>>,
+    /// Scripted outcomes for the next child retirements, one per retirement,
+    /// before any reaches the mob (a test seam; `None` on every host).
+    child_retirement_script:
+        Option<Arc<std::sync::Mutex<std::collections::VecDeque<InjectedChildRetirement>>>>,
+}
+
+/// What a scripted child retirement does instead of reaching the mob (a test
+/// seam: see [`RelinkDelivery::with_child_retirement_script`]).
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InjectedChildRetirement {
+    /// Fails, as a retirement whose cleanup fails does.
+    Fail,
+    /// Answers that the retirement is still in progress, as a saga whose
+    /// runtime teardown did not converge does: it keeps the teardown
+    /// authority for a retry to finish.
+    InProgress,
+    /// Never answers.
+    Hang,
 }
 
 impl RelinkDelivery {
@@ -180,7 +199,7 @@ impl RelinkDelivery {
             runtime: state.runtime_adapter_for_relink(),
             completions: state.detached_delivery_route().ok(),
             managed_mobs: Some(state.managed_mobs()),
-            child_retirement_faults: None,
+            child_retirement_script: None,
         }
     }
 
@@ -197,8 +216,22 @@ impl RelinkDelivery {
     /// reach the mob, as a retirement whose cleanup fails does (a test seam).
     #[doc(hidden)]
     #[must_use]
-    pub fn with_child_retirement_faults(mut self, count: usize) -> Self {
-        self.child_retirement_faults = Some(Arc::new(std::sync::atomic::AtomicUsize::new(count)));
+    pub fn with_child_retirement_faults(self, count: usize) -> Self {
+        self.with_child_retirement_script(std::iter::repeat_n(InjectedChildRetirement::Fail, count))
+    }
+
+    /// This delivery answering its next child retirements from `script`, one
+    /// per retirement, before any reaches the mob; once the script is spent,
+    /// retirements reach the mob (a test seam).
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_child_retirement_script(
+        mut self,
+        script: impl IntoIterator<Item = InjectedChildRetirement>,
+    ) -> Self {
+        self.child_retirement_script = Some(Arc::new(std::sync::Mutex::new(
+            script.into_iter().collect(),
+        )));
         self
     }
 
@@ -209,20 +242,23 @@ impl RelinkDelivery {
         handle: &MobHandle,
         child: &AgentIdentity,
     ) -> Result<(), MobError> {
-        if let Some(faults) = &self.child_retirement_faults
-            && faults
-                .fetch_update(
-                    std::sync::atomic::Ordering::AcqRel,
-                    std::sync::atomic::Ordering::Acquire,
-                    |left| left.checked_sub(1),
-                )
-                .is_ok()
-        {
-            return Err(MobError::Internal(
+        let injected = self.child_retirement_script.as_ref().and_then(|script| {
+            script
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .pop_front()
+        });
+        match injected {
+            Some(InjectedChildRetirement::Fail) => Err(MobError::Internal(
                 "injected re-link child retirement failure".to_string(),
-            ));
+            )),
+            Some(InjectedChildRetirement::InProgress) => Err(MobError::RetirementInProgress {
+                session_id: meerkat_core::SessionId::new(),
+                stage: "injected: the runtime teardown did not converge".to_string(),
+            }),
+            Some(InjectedChildRetirement::Hang) => std::future::pending().await,
+            None => handle.retire_with_descendants(child.clone()).await,
         }
-        handle.retire_with_descendants(child.clone()).await
     }
 
     /// The member seated on `owner_session_id` in a mob other than
@@ -1865,11 +1901,14 @@ const CHILD_RETIREMENT_RETRY_PAUSES: [Duration; 2] =
     [Duration::from_secs(1), Duration::from_secs(3)];
 
 /// Retire `child`, whose settled outcome requires it, and say how that
-/// ended. A failure is retried within [`CHILD_RETIREMENT_RETRY_BUDGET`]
-/// (retiring re-drives a stuck retirement; it is idempotent); a retirement
-/// already in progress is not, since it completes on its own. A child no
-/// longer seated after a failed attempt is retired. A retry still running
-/// when the budget runs out is left to its saga and reported failed: the
+/// ended. A failure, or an answer that the retirement is still in progress,
+/// is retried within [`CHILD_RETIREMENT_RETRY_BUDGET`]: retiring is
+/// idempotent, re-drives a stuck retirement, and joins or resumes a saga
+/// still in progress (one whose runtime teardown did not converge keeps its
+/// teardown authority until something drives it again). A child no longer
+/// seated after a failed attempt is retired. A retry is only made when the
+/// budget leaves time after its pause; one still running when the budget
+/// runs out is dropped (its saga keeps going) and reported failed: the
 /// re-link did not see it complete, and the next pass retires the child if
 /// it is still seated.
 async fn retire_owed_child(
@@ -1887,10 +1926,10 @@ async fn retire_owed_child(
     let remaining =
         || deadline.saturating_duration_since(meerkat_core::time_compat::Instant::now());
     for pause in CHILD_RETIREMENT_RETRY_PAUSES {
-        if error.is_retirement_in_progress() || child_gone(handle, child).await {
+        if child_gone(handle, child).await || remaining() <= pause {
             break;
         }
-        tokio::time::sleep(pause.min(remaining())).await;
+        tokio::time::sleep(pause).await;
         match tokio::time::timeout(remaining(), delivery.retire_child(handle, child)).await {
             Ok(Ok(())) => return ChildRetirement::Retired,
             Ok(Err(retry_error)) => error = retry_error,
@@ -1940,8 +1979,8 @@ async fn child_gone(handle: &MobHandle, child: &AgentIdentity) -> bool {
 
 /// How a re-link describes a child retirement that did not complete. A typed
 /// retirement-in-progress answer ([`MobError::is_retirement_in_progress`]) is
-/// not a failure: another owner is already retiring the child, and that
-/// retirement completes on its own.
+/// not a failure: a retirement saga still owns the child's teardown, and
+/// retrying the retirement joins or resumes it.
 fn child_retirement_incomplete(error: &MobError) -> &'static str {
     if error.is_retirement_in_progress() {
         "is already being retired"
