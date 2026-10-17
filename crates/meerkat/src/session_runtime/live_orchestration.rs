@@ -1547,9 +1547,10 @@ mod orchestrator {
     /// settles it only when a later completion of the same response records
     /// it: one that is neither cancelled nor a tool call (the session's own
     /// decision, read through `realtime_completion_records_staged_text`),
-    /// with no barge-in interrupt before it, since an interrupt discards the
-    /// text every in-flight response staged. A closed channel completes
-    /// nothing on its own.
+    /// with no barge-in interrupt of that response before it. An interrupt
+    /// discards the text every in-flight response staged, and the session
+    /// ignores the text and completions that arrive afterwards for a response
+    /// it discarded. A closed channel completes nothing on its own.
     fn later_rows_settle_item_speech<'a, L>(later_rows: L, item: &str) -> bool
     where
         L: IntoIterator<Item = &'a meerkat_core::live_adapter::LiveAdapterObservation>,
@@ -1557,6 +1558,7 @@ mod orchestrator {
         use meerkat_core::live_adapter::LiveAdapterObservation as Row;
         use meerkat_core::realtime_transcript_revision::realtime_completion_records_staged_text;
         let mut staged_responses: Vec<&str> = Vec::new();
+        let mut interrupted_responses: Vec<&str> = Vec::new();
         for later in later_rows {
             let mut row = later;
             while let Row::WithContextObservation { observation, .. } = row {
@@ -1585,9 +1587,14 @@ mod orchestrator {
                     staged_responses.retain(|staged| *staged != response_id.as_str());
                     continue;
                 }
-                // A barge-in discards the text every in-flight response staged.
-                Row::TurnInterrupted { .. } => {
-                    staged_responses.clear();
+                // A barge-in discards every in-flight response, the one it
+                // names among them, for good: the text they staged and what
+                // they stage afterwards.
+                Row::TurnInterrupted { response_id } => {
+                    interrupted_responses.append(&mut staged_responses);
+                    if let Some(response_id) = response_id.as_deref().filter(|id| !id.is_empty()) {
+                        interrupted_responses.push(response_id);
+                    }
                     continue;
                 }
                 Row::AssistantTranscriptFinal {
@@ -1602,7 +1609,9 @@ mod orchestrator {
                 } if provider_item_id.as_deref() == Some(item) => response_id,
                 _ => continue,
             };
-            if let Some(response_id) = staged_response.as_deref().filter(|id| !id.is_empty()) {
+            if let Some(response_id) = staged_response.as_deref().filter(|id| !id.is_empty())
+                && !interrupted_responses.contains(&response_id)
+            {
                 staged_responses.push(response_id);
             }
         }

@@ -858,9 +858,10 @@ is recorded at once, yet its start is still reported, so that notice
 over-reports. A refused completion's own notice names no item or response, so
 the text it would have recorded cannot be attributed from the notice. Staged
 text is also recorded only after the item before it in the transcript, so text
-whose earlier item never lands keeps waiting while its start is not reported.
-The notice is recorded the same way as other transcript writes, so a session
-that refuses every write refuses it too, and only a warning remains.
+whose earlier item has not landed waits while its start is not reported; if
+that item never lands, the text is lost without a notice. The notice is
+recorded the same way as other transcript writes, so a session that refuses
+every write refuses it too, and only a warning remains.
 
 ### Continuous media without fabricated playback completion
 
