@@ -36,11 +36,12 @@ use meerkat_schedule::{IdentityTargetBinding, ScheduleDeliveryIdentity, Schedule
 ///
 /// In a stock-governed realm, build `schedule_service` with
 /// [`crate::PersistenceBundle::schedule_service`]: this host composes no
-/// scheduled-session agent binding, so it then refuses every fire as
-/// `schedule_mandate_unavailable` before materializing a session. A service
-/// from [`ScheduleService::new`] over a governed realm's store commissions no
-/// agent, so its schedules fire unchecked and each fire fails later, at
-/// runtime admission.
+/// scheduled-session agent binding, so it then refuses each occurrence as
+/// `schedule_mandate_unavailable` when it is delivered, after the driver's
+/// target probe, before the target is resolved for delivery or a session is
+/// materialized. A service from [`ScheduleService::new`] over a governed
+/// realm's store commissions no agent, so its schedules fire unchecked and
+/// each fire fails later, at runtime admission.
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_runtime_backed_schedule_host<B: SessionAgentBuilder + 'static>(
     service: Arc<PersistentSessionService<B>>,
