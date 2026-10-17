@@ -940,6 +940,24 @@ them.
   becomes reservable. Both are additive public API.
   `retire_live_assistant_output_handles` keeps its signature but now defers
   the retirement while a hold exists. (#1821)
+- `meerkat_authorization::publication::LocalAuthorizationPublication::poison`
+  permanently poisons a publication without taking its writer, so an owner
+  that shares the publication can call it from a callback that runs under a
+  held reservation. Every retained stamp, prepared final entry and grant check
+  then answers `Unavailable`, retained consent eligibility is no longer
+  current, and no new observation or owner change is admitted until the
+  owners are reconstructed under a new publication. A child grant issuance
+  under exclusion refuses (`Unavailable`, appending nothing) when the
+  publication was poisoned after its reservation and before its pre-append
+  check (always so for its own conjunct's poison). Effects that already
+  passed their final entry keep their outcomes. A revocation refused while
+  the publication is poisoned did not happen; retry it after reconstruction.
+- `LocalAuthorizationPublication::poison_on_unwind` returns an
+  `OwnerPoisonSentinel` that poisons the publication when it is dropped during
+  an unwind. An owner creates it right after acquiring its own entry lock, in
+  the same scope, and holds it as long as that lock, reads included: the panic
+  that poisons the lock then poisons the publication before any outer
+  `catch_unwind` can swallow it.
 
 ### Changed
 
@@ -1811,6 +1829,14 @@ them.
   being abandoned with its captions retracted. The segment's release follows
   its start to the close, and the close keeps the channel's generated outputs
   addressable until its deferred settlement has replayed both. (#1821)
+- Guard writes no longer overwrite a poisoned authorization publication. A
+  poison that lands while an owner change holds the publication's writer
+  stands when that change publishes or completes, instead of becoming current
+  again. `begin_owner_change` and `try_begin_owner_change` return
+  `Unavailable` when the publication was poisoned before the change published,
+  and `LocalGrantAuthority::reconstruct` returns
+  `ReplacementPublicationUnavailable`, installing nothing, when its
+  replacement publication is poisoned during the reconstruction.
 
 ### Known issues
 
