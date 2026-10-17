@@ -7505,6 +7505,17 @@ mod peer_response_addressee {
             fixture
         }
 
+        /// Inputs the responder's runtime ledger holds, terminal ones included.
+        async fn responder_ledger_input_count(&self) -> usize {
+            self.responder
+                .adapter
+                .meerkat_machine_spine_snapshot(&self.responder.sid)
+                .await
+                .expect("responder session snapshot")
+                .ledger
+                .input_count
+        }
+
         fn inbound_state(&self) -> Option<InboundPeerRequestState> {
             self.responder
                 .bindings
@@ -7890,14 +7901,74 @@ mod peer_response_addressee {
         assert!(fixture.bystander.received().await.is_empty());
     }
 
-    /// Another peer that sends a request reusing an outstanding request's id
-    /// does not take it over. The responder's ingress still accepts the reused
-    /// envelope, but its drain finds the id already recorded and does not
-    /// record a requester for it again: the response still goes only to the
-    /// peer that sent the request first.
+    /// The requester's own redelivery of its outstanding request, whose input
+    /// the responder's session already holds, is deduplicated: nothing new
+    /// enters the session, and the request stays answerable to its requester.
     #[tokio::test]
-    async fn a_request_reusing_an_outstanding_id_does_not_rebind_its_requester() {
+    async fn the_requesters_redelivery_of_an_outstanding_request_is_deduplicated() {
         let fixture = Fixture::with_spoofed_request().await;
+        let admitted_before = fixture.responder_ledger_input_count().await;
+
+        let redelivery = fixture
+            .requester
+            .comms
+            .router()
+            .send_with_id(
+                fixture.responder.peer_id(),
+                fixture.request_id.0,
+                meerkat_comms::MessageKind::Request {
+                    intent: "checksum_token".to_string(),
+                    params: json!({ "subject": "addressee" }),
+                    blocks: None,
+                    reply_endpoint: None,
+                    content_taint: None,
+                    handling_mode: Some(HandlingMode::Queue),
+                    objective_id: None,
+                },
+                None,
+            )
+            .await;
+        assert!(
+            matches!(
+                &redelivery,
+                Ok(outcome) if outcome.delivery
+                    == PeerDeliveryOutcome::DurablyResolved {
+                        outcome: PeerIngressTerminalOutcomeKind::Deduplicated,
+                    }
+            ),
+            "the requester's redelivery is deduplicated, got {redelivery:?}"
+        );
+        assert_eq!(
+            fixture.responder_ledger_input_count().await,
+            admitted_before,
+            "the redelivery adds nothing to the responder's session"
+        );
+        assert_eq!(
+            fixture.inbound_state(),
+            Some(InboundPeerRequestState::Received)
+        );
+        CoreCommsRuntime::send(
+            fixture.responder.comms.as_ref(),
+            fixture.response(
+                &fixture.requester,
+                fixture.request_id,
+                ResponseStatus::Completed,
+            ),
+        )
+        .await
+        .expect("the response to the requester is sent");
+        fixture.assert_requester_received_the_response().await;
+    }
+
+    /// Another peer that sends a request reusing an outstanding request's id
+    /// is refused before admission: none of its content enters the
+    /// responder's session under the first requester's interaction, the
+    /// outstanding request keeps its requester, and the response still goes
+    /// only to the peer that sent the request first.
+    #[tokio::test]
+    async fn a_request_reusing_an_outstanding_id_from_another_peer_is_refused() {
+        let fixture = Fixture::with_spoofed_request().await;
+        let admitted_before = fixture.responder_ledger_input_count().await;
 
         // The raw router lets the bystander choose the envelope id.
         let reuse = fixture
@@ -7922,12 +7993,15 @@ mod peer_response_addressee {
         assert!(
             matches!(
                 &reuse,
-                Ok(outcome) if outcome.delivery
-                    == PeerDeliveryOutcome::DurablyResolved {
-                        outcome: PeerIngressTerminalOutcomeKind::Accepted,
-                    }
+                Err(meerkat_comms::SendError::DurableAdmissionRejected { envelope_id })
+                    if *envelope_id == fixture.request_id.0
             ),
-            "the responder's ingress accepts the reused envelope, got {reuse:?}"
+            "the responder refuses the reused id durably, got {reuse:?}"
+        );
+        assert_eq!(
+            fixture.responder_ledger_input_count().await,
+            admitted_before,
+            "the reused request's content must not enter the responder's session (reuse send: {reuse:?})"
         );
         assert_eq!(
             fixture.inbound_state(),

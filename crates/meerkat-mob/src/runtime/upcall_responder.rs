@@ -1343,8 +1343,9 @@ async fn serve_candidate(
 }
 
 /// Record the inbound request on the generated peer-interaction authority.
-/// `false` means the candidate was completed and must not be decoded or
-/// served (host_actor twin).
+/// `false` means the candidate must not be decoded or served: it was
+/// completed, or another requester's outstanding request holds its id
+/// (host_actor twin).
 fn record_inbound_request(
     runtime: &Arc<dyn CoreCommsRuntime>,
     candidate: &PeerInputCandidate,
@@ -1358,8 +1359,20 @@ fn record_inbound_request(
         return false;
     };
     let corr_id = meerkat_core::PeerCorrelationId::from_uuid(candidate.interaction.id.0);
-    if handle.inbound_state(corr_id).is_some() {
-        return true;
+    // Only the outstanding request's own requester may send its id again.
+    // Another peer's bridge request under the id is dropped before decode or
+    // dispatch, and the outstanding request's interaction stays open.
+    match handle.inbound_id_claim(candidate) {
+        meerkat_core::InboundIdClaim::Unclaimed => {}
+        meerkat_core::InboundIdClaim::ClaimedBySender => return true,
+        _ => {
+            tracing::warn!(
+                corr_id = %corr_id,
+                sender = ?candidate.from_peer_id(),
+                "upcall responder: dropped a bridge request under another requester's outstanding id"
+            );
+            return false;
+        }
     }
     if let Err(error) = handle.request_received_from_ingress(candidate) {
         tracing::warn!(
@@ -1537,6 +1550,49 @@ async fn resolve_peer_route(
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A bridge request under the id of another requester's outstanding
+    /// request is dropped before decode or dispatch, without completing that
+    /// request's interaction; the recorded requester's redelivery is served.
+    #[test]
+    fn upcall_bridge_request_under_another_requesters_outstanding_id_is_dropped() {
+        use crate::runtime::bridge_request_claim_test_support::{
+            ClaimRecordingRuntime, bridge_request_from, registered_peer_handle,
+        };
+        use meerkat_core::handles::PeerInteractionHandle as _;
+
+        let handle = registered_peer_handle();
+        let id = meerkat_core::interaction::InteractionId(uuid::Uuid::new_v4());
+        let corr_id = meerkat_core::PeerCorrelationId::from_uuid(id.0);
+        let requester = meerkat_core::comms::PeerId::from_ed25519_pubkey(&[3u8; 32]);
+        let bystander = meerkat_core::comms::PeerId::from_ed25519_pubkey(&[4u8; 32]);
+        handle
+            .request_received(corr_id, meerkat_core::types::HandlingMode::Queue, requester)
+            .expect("the outstanding request is recorded");
+        let recording = Arc::new(ClaimRecordingRuntime::new(handle.clone()));
+        let runtime: Arc<dyn meerkat_core::agent::CommsRuntime> = recording.clone();
+
+        assert!(
+            !record_inbound_request(&runtime, &bridge_request_from(bystander, id)),
+            "another peer's bridge request under the outstanding id is not served"
+        );
+        assert_eq!(
+            recording.completed(),
+            0,
+            "the outstanding request's interaction is not completed"
+        );
+        assert!(
+            record_inbound_request(&runtime, &bridge_request_from(requester, id)),
+            "the recorded requester's redelivery is served"
+        );
+        assert_eq!(
+            handle
+                .resolve_response_addressee(corr_id, requester)
+                .expect("the machine judges the addressee"),
+            meerkat_core::PeerResponseAddresseeVerdict::Requester,
+            "the outstanding request keeps its requester"
+        );
+    }
 
     #[cfg(not(target_arch = "wasm32"))]
     #[tokio::test]

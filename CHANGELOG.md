@@ -228,6 +228,13 @@ them.
   `[storage] hosting = "multiprocess"` and its stores cannot provide trusted
   cross-process hosting, as the `cli` surface already did (see Fixed). 0.9.2
   served such a deploy and built its members anyway.
+- Behaviour-only (not measured by the gate): a peer request, message or
+  event under the id of another peer's request that the session has not yet
+  answered is refused where it was admitted: a durable delivery's sender
+  gets `SendError::DurableAdmissionRejected`, a volatile one is dropped
+  without a signal, and a supervisor bridge request under such an id is
+  dropped before dispatch, also on the mob host and the mob supervisor
+  inbox (see Fixed).
 
 ### Added
 
@@ -381,6 +388,10 @@ them.
   or a static `Authorization` header one line naming the three choices.
   `rkat mcp login` itself never sets or changes a selection, and no default
   changed.
+- `meerkat-core`: `InboundIdClaim` (`Unclaimed`, `ClaimedBySender`,
+  `ClaimedByAnother`; non-exhaustive) and the provided method
+  `PeerInteractionHandle::inbound_id_claim`: who holds a candidate's
+  interaction id among the inbound requests a handle records.
 
 ### Changed
 
@@ -817,6 +828,27 @@ them.
   host's token store (the slot key includes the realm the host serves), as
   the CLI reference and the 0.9 migration notes say; the reference now says
   so.
+- A peer request, message or event that reuses the id of another peer's
+  request the session has not yet answered is refused before admission.
+  Before, the comms drain recorded no second requester for the id but still
+  admitted the candidate, so its content reached the session under the
+  first request's interaction (the answer still went only to the first
+  requester). Now only the recorded requester may send under an outstanding
+  id again (a redelivery, which runtime admission deduplicates). Another
+  peer's candidate, or one without an admitted sender, is refused: a
+  durable delivery is terminalized as rejected and its sender gets
+  `SendError::DurableAdmissionRejected`; a volatile one is dropped without
+  a signal. The outstanding request keeps its requester and interaction. A
+  supervisor bridge request under such an id is dropped before it is
+  decoded or dispatched, on the session's comms drain, the mob host and
+  the mob supervisor inbox. The first request to use an id keeps it; the
+  ids Meerkat's senders generate are random (`Uuid::new_v4`), so another
+  peer can only claim one it has learned. The requester record lasts for
+  the responder process: after a restart, an id whose request is still
+  queued can be claimed by another peer until it is answered. A host that
+  mints its own request ids (`send_peer_request_with_id`,
+  `Router::send_with_id`) must keep them unguessable; a predicted id can be
+  claimed first, and the host's own request is then refused.
 
 ## [0.9.2] - 2026-10-16
 

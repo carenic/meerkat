@@ -208,6 +208,8 @@ mod actor_turn_executor;
 mod admission_close;
 pub mod bridge;
 pub mod bridge_protocol;
+#[cfg(test)]
+mod bridge_request_claim_test_support;
 mod builder;
 pub mod composition;
 pub mod conditions;

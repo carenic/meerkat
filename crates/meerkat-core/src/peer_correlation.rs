@@ -189,6 +189,26 @@ pub enum PeerResponseSenderVerdict {
     NotAddressee,
 }
 
+/// Who holds an inbound peer interaction's id, as seen by another candidate
+/// that arrives under the same id
+/// ([`crate::handles::PeerInteractionHandle::inbound_id_claim`]).
+///
+/// An inbound request's id is that interaction's identity on both sides while
+/// the request is outstanding, so only its recorded requester may send under
+/// the id again (a redelivery). The first request to use an id keeps it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum InboundIdClaim {
+    /// No inbound request is outstanding under the id.
+    Unclaimed,
+    /// The candidate's sender is the outstanding request's recorded requester.
+    ClaimedBySender,
+    /// Another peer's outstanding request holds the id, or the candidate has
+    /// no admitted sender, or the machine could not judge it: the candidate
+    /// must not be admitted.
+    ClaimedByAnother,
+}
+
 /// Typed lifecycle state of an interaction stream reservation (U6 / dogma #5).
 ///
 /// Authoritative truth for whether a reserved stream channel is still
