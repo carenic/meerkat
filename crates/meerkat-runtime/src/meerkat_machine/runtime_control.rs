@@ -15272,10 +15272,28 @@ impl MeerkatMachine {
         )
         .await
         .map_err(|reason| RuntimeDriverError::ValidationFailed { reason })?;
+        #[cfg(any(test, feature = "test-support"))]
+        if self
+            .test_fail_next_live_close_settlement_deferral
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+        {
+            return Err(RuntimeDriverError::Internal(
+                "injected failure persisting the deferred live close settlement".to_string(),
+            ));
+        }
         #[cfg(feature = "live")]
         self.persist_live_bridge_recovery_state(session_id, "DeferLiveCloseSettlement")
             .await?;
         Ok(())
+    }
+
+    /// Fail the next [`Self::defer_live_close_settlement`] after its machine
+    /// transition, as a failed recovery-state persist does (test support).
+    #[cfg(all(feature = "live", any(test, feature = "test-support")))]
+    #[doc(hidden)]
+    pub fn __fail_next_live_close_settlement_deferral_for_test(&self) {
+        self.test_fail_next_live_close_settlement_deferral
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 
     #[cfg(feature = "live")]

@@ -42,8 +42,9 @@ them.
   keep a closed live channel's generated assistant outputs addressable while
   its deferred close settlement replays rows that need them. A retirement
   requested meanwhile runs when the last hold ends; a held output never
-  becomes reservable. Both are additive public API; no existing item changes.
-  (#1821)
+  becomes reservable. Both are additive public API.
+  `retire_live_assistant_output_handles` keeps its signature but now defers
+  the retirement while a hold exists. (#1821)
 
 ### Fixed
 
@@ -58,8 +59,18 @@ them.
   a reason other than a held turn boundary is no longer dropped silently. A
   warning and a `live_transcript_row_unrecorded` runtime notice in the
   session's transcript record that it was not recorded, naming the channel,
-  the row kind, its provider item id and the refusal class, never the row's
-  content. (#1821)
+  the row kind, its provider item id, its position among the rows the close
+  held and the refusal class, never the row's content. (#1821)
+- Live channels: a close takes the rows the transport deferred to it only once
+  it has committed, so a close that fails before that leaves them deferred on
+  the channel for its retry; a close that cannot record its deferred
+  settlement still applies its rows at the boundary; and a row its settlement
+  applies after settling playback, finding the channel released again while a
+  member turn holds the boundary, waits for the boundary instead of being
+  reported as unrecorded. (#1821)
+- A deferred playback release replayed after its channel closed no longer
+  fails on the closed channel's playback segment: its speech commits and the
+  release succeeds (it was reported as refused although recorded). (#1821)
 - GPT Live: speech whose output start waited behind a running member turn
   when the channel closed is committed under its generated output instead of
   being abandoned with its captions retracted. The segment's release follows
@@ -80,6 +91,10 @@ them.
 - Rows a channel close holds for replay after its deferred settlement gave up
   are held in memory only: they are lost if the process exits before the next
   boundary lets them land. Durable staging is planned. (#1821)
+- A row the transport cannot hand to its closing channel because the channel
+  is already gone from the host is dropped with a warning only. The shipped
+  close order keeps the channel reachable until the close has taken its rows,
+  so this needs a close out of that order. (#1821)
 - A member turn that ends with an error after it staged its final checkpoint
   leaves that checkpoint staged until the runtime recovers it, and while it is
   staged the store can refuse ordinary live writes to the session. A row a

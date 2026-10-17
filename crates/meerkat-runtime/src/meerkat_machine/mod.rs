@@ -9800,6 +9800,10 @@ pub struct MeerkatMachineShared {
     /// reconcile a committed transition after a recoverable dispatch error.
     #[cfg(test)]
     test_fail_next_typed_dsl_post_commit_dispatch: std::sync::atomic::AtomicBool,
+    /// Fail the next record of a deferred close-time playback settlement
+    /// after its machine transition, as a failed recovery-state persist does.
+    #[cfg(any(test, feature = "test-support"))]
+    test_fail_next_live_close_settlement_deferral: std::sync::atomic::AtomicBool,
     /// One-shot deterministic gate before the runtime loop's terminal run
     /// commit takes the session driver. The turn is terminal in its live
     /// agent while its run input is still applied and unconsumed, and the
@@ -11639,6 +11643,10 @@ impl MeerkatMachine {
                     false,
                 ),
                 #[cfg(any(test, feature = "test-support"))]
+                test_fail_next_live_close_settlement_deferral: std::sync::atomic::AtomicBool::new(
+                    false,
+                ),
+                #[cfg(any(test, feature = "test-support"))]
                 test_runtime_loop_before_terminal_commit: StdMutex::new(None),
                 #[cfg(any(test, feature = "test-support"))]
                 test_runtime_loop_before_boundary_acknowledgement: StdMutex::new(None),
@@ -11851,6 +11859,10 @@ impl MeerkatMachine {
                 test_fail_post_stop_unregister_after_fence: StdMutex::new(None),
                 #[cfg(test)]
                 test_fail_next_typed_dsl_post_commit_dispatch: std::sync::atomic::AtomicBool::new(
+                    false,
+                ),
+                #[cfg(any(test, feature = "test-support"))]
+                test_fail_next_live_close_settlement_deferral: std::sync::atomic::AtomicBool::new(
                     false,
                 ),
                 #[cfg(any(test, feature = "test-support"))]

@@ -7760,8 +7760,9 @@ async fn defer_unmeasured_release(
             tracing::warn!(
                 target: meerkat_live::LIVE_CLOSE_TRACE_TARGET,
                 channel = %binding.channel_id(),
+                row = "assistant_playback_terminal",
                 %error,
-                "unmeasured segment release could not be deferred to the close; it is dropped"
+                "unmeasured segment release could not be deferred to the close; it is dropped and its captions are retracted"
             );
             UnmeasuredSegmentRelease::Abandoned
         }
@@ -8549,13 +8550,20 @@ fn spawn_sideband_actors(
                             "live projection parked behind the member turn boundary was deferred to the boundary by the close"
                         );
                     }
-                    Err(error) => tracing::warn!(
-                        target: meerkat_live::LIVE_CLOSE_TRACE_TARGET,
-                        channel = %pump_binding.channel_id(),
-                        observation = ?observation,
-                        %error,
-                        "live projection parked behind the member turn boundary could not be deferred; it is dropped by the close"
-                    ),
+                    Err(error) => {
+                        let (row, provider_item_id) =
+                            crate::session_runtime::live_orchestration::unrecorded_live_row_identity(
+                                observation,
+                            );
+                        tracing::warn!(
+                            target: meerkat_live::LIVE_CLOSE_TRACE_TARGET,
+                            channel = %pump_binding.channel_id(),
+                            row,
+                            provider_item_id,
+                            %error,
+                            "live projection parked behind the member turn boundary could not be deferred; it is dropped by the close"
+                        );
+                    }
                 }
                 pending_projection = None;
                 unapplied.pending_projection.store(false, Ordering::Release);
@@ -15446,6 +15454,33 @@ mod tests {
         );
     }
 
+    /// The `live_transcript_row_unrecorded` runtime notice payloads the
+    /// persisted transcript holds now.
+    async fn unrecorded_row_notices_now(
+        service: &crate::PersistentSessionService<crate::FactoryAgentBuilder>,
+        session_id: &meerkat_core::SessionId,
+    ) -> Vec<serde_json::Value> {
+        service
+            .load_authoritative_session(session_id)
+            .await
+            .expect("read the persisted transcript")
+            .expect("session")
+            .messages()
+            .iter()
+            .filter_map(|message| match message {
+                meerkat_core::Message::SystemNotice(notice) => Some(notice),
+                _ => None,
+            })
+            .flat_map(|notice| notice.blocks.iter())
+            .filter_map(|block| match block {
+                meerkat_core::types::SystemNoticeBlock::RuntimeNotice {
+                    category, payload, ..
+                } if category == "live_transcript_row_unrecorded" => payload.clone(),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// The `live_transcript_row_unrecorded` runtime notice payloads in the
     /// persisted transcript, waiting (bounded) for at least one.
     async fn eventually_unrecorded_row_notices(
@@ -15454,28 +15489,7 @@ mod tests {
     ) -> Vec<serde_json::Value> {
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
-                let session = service
-                    .load_authoritative_session(session_id)
-                    .await
-                    .expect("read the persisted transcript")
-                    .expect("session");
-                let payloads: Vec<serde_json::Value> = session
-                    .messages()
-                    .iter()
-                    .filter_map(|message| match message {
-                        meerkat_core::Message::SystemNotice(notice) => Some(notice),
-                        _ => None,
-                    })
-                    .flat_map(|notice| notice.blocks.iter())
-                    .filter_map(|block| match block {
-                        meerkat_core::types::SystemNoticeBlock::RuntimeNotice {
-                            category,
-                            payload,
-                            ..
-                        } if category == "live_transcript_row_unrecorded" => payload.clone(),
-                        _ => None,
-                    })
-                    .collect();
+                let payloads = unrecorded_row_notices_now(service, session_id).await;
                 if !payloads.is_empty() {
                     break payloads;
                 }
@@ -15484,6 +15498,76 @@ mod tests {
         })
         .await
         .expect("the unrecorded row leaves a typed runtime notice")
+    }
+
+    /// Wait (bounded) until no close settlement of the session is still
+    /// deferred, then give any notice it reported time to land.
+    async fn wait_for_resolved_close_settlement(
+        runtime: &meerkat_runtime::MeerkatMachine,
+        session_id: &meerkat_core::SessionId,
+    ) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !runtime
+                .live_close_settlement_deferred_channels(session_id)
+                .await
+                .is_empty()
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the deferred close settlement resolves");
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+
+    /// #1821 (L2): a row the close settlement applies after it settled
+    /// playback finds its channel released again while the member's next
+    /// turn holds the boundary (a later close of the channel). The row waits
+    /// for the boundary instead of being reported as unrecorded.
+    #[tokio::test]
+    async fn rows_after_the_settlement_wait_out_a_re_released_channel() {
+        let (service, runtime, host, session_id, channel_id, _temp) = deferred_rows_fixture().await;
+        const ROW: &str = "A row the settlement applies after a re-release.";
+        let boundary = service
+            .acquire_runtime_turn_finalization_guard(&session_id)
+            .await;
+        let settlement = tokio::spawn(
+            crate::session_runtime::live_orchestration::settle_live_close_playback_deferred(
+                Arc::clone(&service),
+                Arc::clone(&runtime),
+                host.owned_handle(),
+                vec![deferred_user_row("item:l2", ROW)],
+                session_id.clone(),
+                channel_id.clone(),
+                None,
+            ),
+        );
+        // The settlement queues on the boundary the member turn holds.
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+        }
+        drop(boundary);
+        // The member's next turn queues right behind it and takes the
+        // boundary as soon as the settlement has settled playback; a later
+        // close of the channel then releases its projections again.
+        let next_turn = service
+            .acquire_runtime_turn_finalization_guard(&session_id)
+            .await;
+        service.release_live_projection_turn_boundary_waiters(&session_id, &channel_id);
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+        }
+        drop(next_turn);
+        assert_eq!(
+            settlement.await.expect("settlement task"),
+            crate::session_runtime::live_orchestration::DeferredCloseSettlementOutcome::Settled,
+        );
+        assert_eventually_user_row(&service, &session_id, ROW).await;
+        assert_eq!(
+            unrecorded_row_notices_now(&service, &session_id).await,
+            Vec::<serde_json::Value>::new(),
+            "a row that waited out the boundary is never reported as unrecorded"
+        );
     }
 
     /// An output start whose provider turn never reached the machine: no
@@ -15502,6 +15586,7 @@ mod tests {
             "channel_id": "deferred-close-rows",
             "row": "assistant_output_started",
             "provider_item_id": "item-without-custody",
+            "row_index": 0,
             "refusal": "rejected",
         })
     }
@@ -19047,7 +19132,28 @@ mod tests {
     ))]
     #[tokio::test]
     async fn rows_parked_behind_the_member_turn_are_all_handed_to_the_close() {
-        run_shipping_close_matrix(MatrixSelection::ParkedRowsBehindMemberTurn).await;
+        run_shipping_close_matrix(MatrixSelection::ParkedRowsBehindMemberTurn {
+            deferral_fails: false,
+        })
+        .await;
+    }
+
+    /// #1821 (L1): rows parked behind the member turn when the channel
+    /// closes, and the close cannot record its deferred settlement (the
+    /// recovery-state persist fails). The rows it took still reach the
+    /// transcript once the turn releases the boundary.
+    #[cfg(all(
+        feature = "session-store",
+        feature = "memory-store",
+        feature = "test-realtime-fixtures",
+        not(target_arch = "wasm32")
+    ))]
+    #[tokio::test]
+    async fn rows_parked_behind_the_member_turn_survive_a_failed_deferral_record() {
+        run_shipping_close_matrix(MatrixSelection::ParkedRowsBehindMemberTurn {
+            deferral_fails: true,
+        })
+        .await;
     }
 
     #[cfg(all(
@@ -19325,7 +19431,7 @@ mod tests {
         Shipping,
         ContextFirst { peer: bool },
         ParkedStartBehindMemberTurn,
-        ParkedRowsBehindMemberTurn,
+        ParkedRowsBehindMemberTurn { deferral_fails: bool },
     }
 
     #[cfg(all(
@@ -19424,7 +19530,7 @@ mod tests {
             MatrixSelection::ParkedStartBehindMemberTurn => {
                 matches!(exit, ExitKind::UnmeasuredStartParkedBehindMemberTurn)
             }
-            MatrixSelection::ParkedRowsBehindMemberTurn => {
+            MatrixSelection::ParkedRowsBehindMemberTurn { .. } => {
                 matches!(exit, ExitKind::RowsParkedBehindMemberTurn)
             }
             MatrixSelection::Shipping => !matches!(
@@ -20813,6 +20919,14 @@ mod tests {
             ) {
                 let boundary =
                     early_boundary.expect("the member turn holds the boundary before speech");
+                if matches!(
+                    selection,
+                    MatrixSelection::ParkedRowsBehindMemberTurn {
+                        deferral_fails: true
+                    }
+                ) {
+                    runtime.__fail_next_live_close_settlement_deferral_for_test();
+                }
                 // The pump is parked on the first projection; the speech is
                 // lowered (and captioned) while the close drains it.
                 // The close releases the channel's projections from the
@@ -20855,6 +20969,12 @@ mod tests {
                         "First spoken checkpoint.",
                     )
                     .await;
+                    wait_for_resolved_close_settlement(&runtime, &session_id).await;
+                    assert_eq!(
+                        unrecorded_row_notices_now(&service, &session_id).await,
+                        Vec::<serde_json::Value>::new(),
+                        "speech that committed is never reported as unrecorded"
+                    );
                 } else {
                     // R6: every row the transport deferred reached the close's
                     // settlement; none was deferred after the close took them.
