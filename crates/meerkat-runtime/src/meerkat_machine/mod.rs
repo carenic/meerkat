@@ -6801,6 +6801,28 @@ impl MeerkatMachine {
         wake_tx.is_some_and(|wake_tx| wake_tx.try_send(()).is_ok())
     }
 
+    /// Delay every [`Self::hold_run_starts`] by `delay` before it takes the
+    /// session's mutation gate, standing in for a hold that waits on a busy
+    /// session (a running turn's commit holds that gate); `None` clears it.
+    /// Test builds only.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn delay_hold_run_starts_for_test(&self, delay: Option<std::time::Duration>) {
+        *self
+            .test_hold_run_starts_delay
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = delay;
+    }
+
+    /// The delay [`Self::delay_hold_run_starts_for_test`] set.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn hold_run_starts_delay_for_test(&self) -> Option<std::time::Duration> {
+        *self
+            .test_hold_run_starts_delay
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     /// Deterministically pause the runtime loop after its ready-effect drain
     /// and before queue authority is acquired. Exposed only by test builds so
     /// cross-crate integration tests can admit a complete same-boundary batch.
@@ -9798,6 +9820,11 @@ pub struct MeerkatMachineShared {
     /// One-shot deterministic gate after the runtime loop's first ready-effect
     /// drain but before it acquires queue authority. Tests publish an executor
     /// effect in this exact gap and prove the consumed wake is retained.
+    /// Delay applied to every `hold_run_starts` before it takes the
+    /// session's mutation gate. Tests stand in for a busy session's gate
+    /// wait with it.
+    #[cfg(any(test, feature = "test-support"))]
+    test_hold_run_starts_delay: StdMutex<Option<std::time::Duration>>,
     #[cfg(any(test, feature = "test-support"))]
     test_runtime_loop_before_queue_authority: StdMutex<
         Option<(
@@ -11591,6 +11618,8 @@ impl MeerkatMachine {
                 #[cfg(any(test, feature = "test-support"))]
                 test_runtime_loop_before_boundary_acknowledgement: StdMutex::new(None),
                 #[cfg(any(test, feature = "test-support"))]
+                test_hold_run_starts_delay: StdMutex::new(None),
+                #[cfg(any(test, feature = "test-support"))]
                 test_runtime_loop_before_queue_authority: StdMutex::new(None),
                 registration_run_start_holds: std::sync::Mutex::new(HashMap::new()),
                 #[cfg(any(test, feature = "test-support"))]
@@ -11803,6 +11832,8 @@ impl MeerkatMachine {
                 test_runtime_loop_before_terminal_commit: StdMutex::new(None),
                 #[cfg(any(test, feature = "test-support"))]
                 test_runtime_loop_before_boundary_acknowledgement: StdMutex::new(None),
+                #[cfg(any(test, feature = "test-support"))]
+                test_hold_run_starts_delay: StdMutex::new(None),
                 #[cfg(any(test, feature = "test-support"))]
                 test_runtime_loop_before_queue_authority: StdMutex::new(None),
                 registration_run_start_holds: std::sync::Mutex::new(HashMap::new()),
