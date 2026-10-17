@@ -54,7 +54,11 @@
 //! notification is sequenced before the terminal delivery
 //! (`terminal_delivery_follows_every_notification`), so the arms' sequence
 //! checks never both hold, even for a notification named like the terminal
-//! delivery.
+//! delivery. The RuntimeDeliveryMachine pair that #1811 names,
+//! `ObserveAlreadyRefusedDelivery` against `SettleRefusedDeliveryAtCursor`,
+//! is an `invariant:` entry too: a refused delivery is at or below the applied
+//! cursor (`refused_deliveries_are_committed_and_passed`), and settling needs
+//! a delivery above it.
 //!
 //! Follow-up (0.9.4): triage the `unproven-1811` entries (a checker gap, an
 //! undeclared invariant, or a real overlap), have TLC prove exclusivity for
@@ -1292,7 +1296,7 @@ RuntimeDeliveryMachine Active input:ClassifyDeliveryStatus ClassifyApplied Class
 RuntimeDeliveryMachine Active input:ClassifyDeliveryStatus ClassifyMixed ClassifyPending unproven-1811
 RuntimeDeliveryMachine Active input:ClassifyDeliveryStatus ClassifyPending ClassifyRefused unproven-1811
 RuntimeDeliveryMachine Active input:FinishDeliveryRecipients FinishSettledDeliveryRecipients ObserveFinishedDeliveryRecipients unproven-1811
-RuntimeDeliveryMachine Active input:SettleRefusedDelivery ObserveAlreadyRefusedDelivery SettleRefusedDeliveryAtCursor unproven-1811
+RuntimeDeliveryMachine Active input:SettleRefusedDelivery ObserveAlreadyRefusedDelivery SettleRefusedDeliveryAtCursor invariant:refused_deliveries_are_committed_and_passed
 SessionDocumentMachine Ready input:AuthorizeSessionResumeOverrides AuthorizeSessionResumeOverridesAcceptRecomputeProvider AuthorizeSessionResumeOverridesAcceptRetainStored unproven-1811
 SessionDocumentMachine Ready input:AuthorizeSessionResumeOverrides AuthorizeSessionResumeOverridesAcceptRecomputeProvider AuthorizeSessionResumeOverridesRejectBuildOnlyAfterFirstTurn unproven-1811
 SessionDocumentMachine Ready input:AuthorizeSessionResumeOverrides AuthorizeSessionResumeOverridesAcceptRecomputeProviderWithSelfHostedOverride AuthorizeSessionResumeOverridesAcceptRetainStoredWithSelfHostedOverride unproven-1811
