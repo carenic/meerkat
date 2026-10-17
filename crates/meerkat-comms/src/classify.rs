@@ -341,17 +341,25 @@ impl IngressClassificationContext {
                     );
                     return None;
                 };
+                let request_id = parse_admission_interaction_id(admission.request_id.as_deref());
                 // A response frame, progress or terminal, is accepted only
                 // from the peer its request was sent to. A frame signed by any
                 // other peer is dropped here, before it is queued: it never
                 // reaches a consumer, so it is never applied and the request
-                // stays open for its addressee.
-                if let MessageKind::Response { in_reply_to, .. } = &envelope.kind
-                    && !self.machine_admits_response_sender(*in_reply_to, canonical_from_peer_id)
-                {
-                    return None;
+                // stays open for its addressee. The request is the one the
+                // machine echoed for this frame (R084, as for the sender), not
+                // the shell's copy of the envelope field.
+                if matches!(&envelope.kind, MessageKind::Response { .. }) {
+                    let Some(in_reply_to) = request_id else {
+                        tracing::warn!(
+                            "machine classified peer response without request id; rejecting ingress"
+                        );
+                        return None;
+                    };
+                    if !self.machine_admits_response_sender(in_reply_to.0, canonical_from_peer_id) {
+                        return None;
+                    }
                 }
-                let request_id = parse_admission_interaction_id(admission.request_id.as_deref());
                 let classification = admission.classification;
                 let lifecycle_peer = admission.lifecycle_peer.clone();
                 let convention = match &envelope.kind {
@@ -1214,12 +1222,24 @@ mod tests {
         );
     }
 
+    /// The request id a test classification echoes for a response frame.
+    #[derive(Clone, Copy)]
+    enum RequestIdEcho {
+        /// What the runtime machine echoes: the envelope's `in_reply_to`.
+        Machine,
+        /// Another id, so a test can tell the echoed id from the raw one.
+        Other(Uuid),
+        /// No request id.
+        Missing,
+    }
+
     /// Classifies like the runtime handle and answers every response-sender
     /// question with one fixed answer, recording what it was asked.
     struct FixedResponseSenderHandle {
         answer: Option<meerkat_core::PeerResponseSenderVerdict>,
         asked: parking_lot::Mutex<Vec<(PeerCorrelationId, meerkat_core::comms::PeerId)>>,
         delegate: Arc<dyn meerkat_core::handles::PeerCommsHandle>,
+        echo: RequestIdEcho,
     }
 
     impl meerkat_core::handles::PeerCommsHandle for FixedResponseSenderHandle {
@@ -1227,7 +1247,13 @@ mod tests {
             &self,
             facts: PeerIngressEnvelopeFacts,
         ) -> Result<PeerIngressAdmission, meerkat_core::handles::DslTransitionError> {
-            self.delegate.classify_external_envelope(facts)
+            let mut admission = self.delegate.classify_external_envelope(facts)?;
+            match self.echo {
+                RequestIdEcho::Machine => {}
+                RequestIdEcho::Other(id) => admission.request_id = Some(id.to_string()),
+                RequestIdEcho::Missing => admission.request_id = None,
+            }
+            Ok(admission)
         }
 
         fn classify_plain_event(
@@ -1306,6 +1332,7 @@ mod tests {
                     answer,
                     asked: parking_lot::Mutex::new(Vec::new()),
                     delegate: test_support::runtime_peer_comms_handle(),
+                    echo: RequestIdEcho::Machine,
                 });
                 let ctx = make_context_with_machine_and_namespace(
                     true,
@@ -1342,6 +1369,65 @@ mod tests {
                     "the machine judges the request id and the envelope's signer"
                 );
             }
+        }
+    }
+
+    /// The response sender is judged on the request id the machine echoed
+    /// for the frame, as the sender identity is (R084), never on the shell's
+    /// copy of the envelope field. A response the machine echoes no request
+    /// id for is rejected before the question is asked.
+    #[test]
+    fn a_response_sender_is_judged_on_the_machine_echoed_request_id() {
+        let sender = make_keypair();
+        let raw = Uuid::new_v4();
+        let echoed = Uuid::new_v4();
+        for (echo, asked, queued_as) in [
+            (
+                RequestIdEcho::Other(echoed),
+                vec![(
+                    PeerCorrelationId::from_uuid(echoed),
+                    sender.public_key().to_peer_id(),
+                )],
+                Some(InteractionId(echoed)),
+            ),
+            (RequestIdEcho::Missing, Vec::new(), None),
+        ] {
+            let handle = Arc::new(FixedResponseSenderHandle {
+                answer: Some(meerkat_core::PeerResponseSenderVerdict::Addressee),
+                asked: parking_lot::Mutex::new(Vec::new()),
+                delegate: test_support::runtime_peer_comms_handle(),
+                echo,
+            });
+            let ctx = make_context_with_machine_and_namespace(
+                true,
+                make_trusted_peers("responder", &sender.public_key()),
+                vec![],
+                Some(handle.clone()),
+                None,
+            );
+            let envelope = make_envelope(
+                &sender,
+                MessageKind::Response {
+                    objective_id: None,
+                    in_reply_to: raw,
+                    status: crate::types::Status::Completed,
+                    result: serde_json::json!({}),
+                    blocks: None,
+                    content_taint: None,
+                    handling_mode: None,
+                },
+            );
+            let prepared = ctx.prepare(InboxItem::External { envelope });
+            assert_eq!(
+                prepared.as_ref().map(|prepared| prepared.request_id),
+                queued_as.map(Some),
+                "the response is queued under the echoed request id, or not at all"
+            );
+            assert_eq!(
+                handle.asked.lock().clone(),
+                asked,
+                "the machine judges the echoed request id and the envelope's signer"
+            );
         }
     }
 
