@@ -56,6 +56,7 @@
         "scope": "package",
         "sources": [
           "crates/xtask/src/audit_generated_headers.rs",
+          "crates/xtask/src/authority_language.rs",
           "crates/xtask/src/bridge_classifier.rs",
           "crates/xtask/src/effect_authority.rs",
           "crates/xtask/src/machines.rs",

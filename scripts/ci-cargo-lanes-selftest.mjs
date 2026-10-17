@@ -1369,6 +1369,35 @@ for (const path of [
   }
 }
 
+// The nested-Cargo canaries outlast a reader row's hung-test kill: a
+// reader row of their binary runs its other named tests, and a pull request
+// names the canaries as left to the push's closure-tests rows (one count
+// partition each).
+{
+  const canaryRows = (tests) => {
+    const deferred = { reader_rows: [] };
+    const rows = readerRows({
+      selections: [{ package: "facade", target: "test:canarybin", scope: "target", tests, features: [], paths: ["scripts/x"], reads: ["scripts/x"] }],
+      result: { main_unit_shards: [], unit_packages: [], unit_shards: [], integration_suites: [] },
+      byName: new Map([["facade", { name: "facade", targets: [{ name: "facade", kind: ["lib"] }, { name: "canarybin", kind: ["test"] }] }]]),
+      heavyChain: new Set(),
+      deferToPush: true,
+      deferred,
+      compiledInDocs: new Set(),
+      unified: new Map([["facade", new Set()]]),
+      canary: { binary: "canarybin", prefix: "downstream_" },
+    });
+    return [rows.map((row) => row.test_flags), deferred.reader_rows];
+  };
+  assert.deepEqual(canaryRows(["downstream_builds", "static_check"]), [
+    ["--test canarybin -E test(/(^|::)(static_check)$/)"],
+    ["facade:test:canarybin canaries"],
+  ]);
+  assert.deepEqual(canaryRows(["downstream_builds"]), [[], ["facade:test:canarybin canaries"]]);
+  assert.deepEqual(canaryRows(null), [[], ["facade:test:canarybin canaries"]], "the whole canary binary is the push's");
+  assert.deepEqual(canaryRows(["static_check"]), [["--test canarybin -E test(/(^|::)(static_check)$/)"], []]);
+}
+
 // Compiled-in documentation is a crate's reader of a doc in its own
 // directory: another crate's reader of that doc, a test-only reader and a
 // reader of a doc outside every crate are ordinary readers.
@@ -1403,7 +1432,7 @@ for (const path of [
       unified: new Map([["binonly", new Set()]]),
     }).map((row) => `${row.package_flags} | ${row.test_flags}`);
   assert.deepEqual(rowsFor(false), ["-p binonly | --bins"], "a push with no main unit lane runs its bins, not --lib");
-  assert.deepEqual(rowsFor(true), ["-p binonly | --tests"], "a pull request runs every test target");
+  assert.deepEqual(rowsFor(true), ["-p binonly | --bins"], "a pull request runs its bins and leaves its test targets to the push");
   // A library reader of a package without a library is an inventory error,
   // never a --lib row.
   assert.throws(
@@ -2016,29 +2045,34 @@ for (const path of [
   };
   const rowsOf = (plan) => plan.reader_rows.map((row) => `${row.name} | ${row.package_flags} | ${row.test_flags}`);
   // A docs edit on a pull request: the machine-authority docs alignment
-  // test filtered to the tests that read docs/, and every xtask test (its
-  // library reads docs/: the authority-language gate; Cargo's --tests skips
-  // the targets whose required features are off), which subsumes the
-  // static-lanes reader. rkat's doc-example test compiles meerkat-mob: left
-  // to the push and named.
+  // test and xtask's static lanes, filtered to the tests that read docs/,
+  // and xtask's lib and bins (its library reads docs/: the
+  // authority-language gate, whose live-docs test is a library test). The
+  // package's test targets, like every test target a pull request's unit
+  // lanes leave, are the push's closure-tests rows' and named; so is rkat's
+  // doc-example test, which compiles meerkat-mob.
+  const staticLanes =
+    "reader xtask:test:buildbuddy_static_lanes | -p xtask | --test buildbuddy_static_lanes -E test(/(^|::)(deprecated_backend_references_stay_rejected_only|generated_header_truthfulness_is_clean|retired_public_surface_tokens_stay_out_of_unowned_paths|retired_session_control_names_are_absent)$/)";
   const pullRequest = planFor(["docs/index.mdx"], ["--event", "pull_request"]);
   assert.deepEqual(rowsOf(pullRequest), [
     "reader machine-schema:test:docs_machine_authority_alignment | -p meerkat-machine-schema | --test docs_machine_authority_alignment -E test(/(^|::)(doctrine_count_claims_match_canonical_registry)$/)",
-    "reader xtask:package | -p xtask | --tests",
+    "reader xtask:package | -p xtask | --lib --bins",
+    staticLanes,
   ]);
-  assert.deepEqual(pullRequest.reader_rows.map((row) => row.reads), [["docs/index.mdx"], ["docs/index.mdx"]]);
-  assert.deepEqual(pullRequest.deferred_to_push.reader_rows, ["rkat:bin:rkat"]);
+  assert.deepEqual(pullRequest.reader_rows.map((row) => row.reads), [["docs/index.mdx"], ["docs/index.mdx"], ["docs/index.mdx"]]);
+  assert.deepEqual(pullRequest.deferred_to_push.reader_rows, ["rkat:bin:rkat", "xtask:package test targets"]);
   const prLines = outputs(["--event", "pull_request", "--", "docs/index.mdx"]);
-  assert.equal(prLines.integration_count, "2", "the integration lane runs the reader rows");
-  assert.deepEqual(JSON.parse(prLines.integration_matrix).include, [
-    {
-      name: "reader machine-schema:test:docs_machine_authority_alignment",
-      packages: "-p meerkat-machine-schema",
-      tests: "--test docs_machine_authority_alignment -E test(/(^|::)(doctrine_count_claims_match_canonical_registry)$/)",
-    },
-    { name: "reader xtask:package", packages: "-p xtask", tests: "--tests" },
+  assert.equal(prLines.integration_count, "3", "the integration lane runs the reader rows");
+  assert.deepEqual(JSON.parse(prLines.integration_matrix).include.map((row) => [row.name, row.packages, row.tests]), [
+    [
+      "reader machine-schema:test:docs_machine_authority_alignment",
+      "-p meerkat-machine-schema",
+      "--test docs_machine_authority_alignment -E test(/(^|::)(doctrine_count_claims_match_canonical_registry)$/)",
+    ],
+    ["reader xtask:package", "-p xtask", "--lib --bins"],
+    staticLanes.split(" | "),
   ]);
-  assert.match(prLines.deferred_to_push, /(^|; )reader rows rkat:bin:rkat($|;)/, "the gate prints the readers left to the push");
+  assert.match(prLines.deferred_to_push, /(^|; )reader rows rkat:bin:rkat, xtask:package test targets($|;)/, "the gate prints the readers left to the push");
   // Every push plans xtask's machine-authority contracts, a whole-checkout
   // audit whose test target needs a feature the closure-tests rows do not
   // build, unless an xtask integration suite with that feature runs.

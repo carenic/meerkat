@@ -45,14 +45,18 @@ them.
   push without a main unit lane, for the lib, bin and example targets; and
   on every push for a test target that needs features the push's
   closure-tests rows do not build (xtask's machine-authority contracts,
-  the GPT Live replay suite). A reader that needs live-provider
-  credentials runs in no CI lane, and the plan and the `CI gate` name it.
-  Before, a docs-only pull request ran none of them and a docs-only push
-  never ran rkat's doc-example test. A crate's in-crate documentation that
-  it compiles in (the `skills/*/SKILL.md` files) is now a build input of
-  that crate, and the authority-language check of
-  `xtask machine-check-drift` runs on the live docs in an xtask test, so a
-  docs change runs it too. CI only.
+  the GPT Live replay suite). For a reader in library code a pull request
+  runs the lib and bins and leaves its test targets to the push's
+  closure-tests rows, as for a code change; the nested-Cargo canary tests
+  run only there. The plan names what a pull request leaves to the push.
+  A reader that needs live-provider credentials runs in no CI lane, and
+  the plan and the `CI gate` name it. Before, a docs-only pull request ran
+  none of them and a docs-only push never ran rkat's doc-example test. A
+  crate's in-crate documentation that it compiles in (the
+  `skills/*/SKILL.md` files) is now a build input of that crate, and the
+  authority-language check of `xtask machine-check-drift` runs on the live
+  docs in an xtask library test, so a docs pull request runs it too. CI
+  only.
 - **CI starts its long rows first.** The Clippy, main unit, closure-tests
   and feature-check lanes run in two waves: the rows that took 8 minutes or
   more on a green run (`scripts/ci-row-durations.json`, regenerated with

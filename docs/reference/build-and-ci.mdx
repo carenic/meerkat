@@ -249,9 +249,11 @@ reads `docs/` and `.claude/skills/`, xtask's static lanes read
 such input and its reader (`scripts/ci-non-rust-readers-guard.mjs` keeps it
 complete), and a change to one adds the exact target that reads it to the
 `integration` lane: `-p` the reader with the inventory's features, its
-lib, bin, test or example target (every target for a reader in library or
-build-script code) and a filter on the reading tests, where no other lane
-of the plan runs it. A pull request leaves the readers that compile
+lib, bin, test or example target (the lib and bins for a reader in
+library or build-script code: its test targets, like those of a pull
+request's code change, are the push's `closure-tests` rows', which also
+keep the nested-Cargo canaries) and a filter on the reading tests, where
+no other lane of the plan runs it. A pull request leaves the readers that compile
 meerkat-mob (named) and the readers keyed only by the whole checkout (live
 audits that every path selects) to the push. A push runs its readers'
 test targets in `closure-tests`, which build each package with the

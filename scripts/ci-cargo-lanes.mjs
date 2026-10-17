@@ -62,9 +62,11 @@
 // .claude/skills/, CHANGELOG.md, specs/, fixtures. A change to such a file
 // alone selects no package, so the plan adds the exact targets that read
 // it (reader_rows, run in the integration lane): `-p` the reader with the
-// inventory's features, its lib, bin, test or example target (every
-// target for a reader in library, binary or build-script code) and a
-// filter on the tests the inventory names. A pull request plans them
+// inventory's features, its lib, bin, test or example target (the lib and
+// bins for a reader in library, binary or build-script code, whose test
+// targets are the push's closure-tests rows', as they are for a pull
+// request's code change; the nested-Cargo canaries run only there too) and
+// a filter on the tests the inventory names. A pull request plans them
 // where no other lane of its plan runs them, except the readers that
 // compile meerkat-mob (left to the push and named) and the readers keyed
 // only by the whole checkout (live audits that every path selects, left
@@ -1275,7 +1277,7 @@ export const LIVE_ONLY_FEATURES = ["integration-real-tests", "openai-live-e2e"];
 // integration lane waits for ci.yml's stagger job (the rest wave), so a
 // reader row, such as the whole-checkout one every push plans, never takes
 // a runner before the long rows.
-export function readerRows({ selections, result, byName, heavyChain, deferToPush, deferred, compiledInDocs, unified }) {
+export function readerRows({ selections, result, byName, heavyChain, deferToPush, deferred, compiledInDocs, unified, canary = null }) {
   const mainUnit = result.main_unit_shards.length > 0;
   // The unit lane of this plan runs the package's lib and bins (default
   // features): a pull request's unit lane, a push's main unit lane (every
@@ -1332,16 +1334,21 @@ export function readerRows({ selections, result, byName, heavyChain, deferToPush
     }
     const unitCovered = selection.features.length === 0 && unitRuns(selection.package);
     let targets;
+    let testsDeferred = false;
+    let tests = selection.tests;
     if (whole) {
-      // A push runs its test scope's test targets in the closure-tests rows
-      // (when they build the reader's features), and a selected integration
-      // suite a pull request's. Otherwise every test target: Cargo's --tests,
-      // which skips a target whose required features are off (a
-      // `--test '*'` glob refuses it) and also runs the lib and bins.
+      // Its lib and bins run here (the unit lanes' targets: only the kinds
+      // the package has, since Cargo refuses --lib for a package without a
+      // library). Its test targets run in the push's closure-tests rows,
+      // which run them the way the hook does (the canary partitions, the
+      // profile, the stack), when they build the reader's features; a pull
+      // request leaves them there and names them, unless a selected
+      // integration suite runs them. A push whose closure-tests rows do not
+      // build the reader's features runs them here (Cargo's --tests skips a
+      // target whose required features are off).
       const testsRun = suiteRuns(selection.package, null, selection.features) || (!deferToPush && closureBuilds(selection));
-      // Only the kinds the package has: Cargo refuses --lib for a package
-      // without a library.
-      targets = testsRun ? (unitCovered ? [] : targetFlags([pkg], { tests: false })) : ["--tests"];
+      if (deferToPush) testsDeferred = !testsRun;
+      targets = testsRun || deferToPush ? (unitCovered ? [] : targetFlags([pkg], { tests: false })) : ["--tests"];
     } else if (kind === "lib") {
       targets = unitCovered ? [] : ["--lib"];
     } else if (kind === "bin") {
@@ -1349,19 +1356,32 @@ export function readerRows({ selections, result, byName, heavyChain, deferToPush
     } else if (kind === "test") {
       const testRuns = suiteRuns(selection.package, name, selection.features) || (!deferToPush && closureBuilds(selection));
       targets = testRuns ? [] : ["--test", name];
+      // The nested-Cargo canaries (CANARY_TEST_GROUP) outlast a reader row's
+      // hung-test kill: they run only in the push's closure-tests rows, one
+      // count partition each. A reader row runs the binary's other named
+      // tests; a pull request names the canaries as left to the push.
+      if (targets.length > 0 && canary && name === canary.binary) {
+        const others = (tests ?? []).filter((test) => !test.startsWith(canary.prefix));
+        if (tests === null || others.length < tests.length) {
+          if (deferToPush) deferred.reader_rows.push(`${label} canaries`);
+          tests = others;
+          if (others.length === 0) targets = [];
+        }
+      }
     } else if (kind === "example") {
       // An example program reads its inputs when run, which no CI lane does;
       // only the tests an example target holds run here.
-      targets = selection.tests?.length ? ["--example", name] : [];
+      targets = tests?.length ? ["--example", name] : [];
     } else {
       throw new Error(`internal error: reader target ${selection.target} of ${selection.package}`);
     }
-    if (targets.length === 0) continue;
     if (deferToPush && heavyChain.has(selection.package)) {
-      deferred.reader_rows.push(label);
+      if (targets.length > 0 || testsDeferred) deferred.reader_rows.push(label);
       continue;
     }
-    const filter = selection.tests?.length ? ["-E", `test(/(^|::)(${selection.tests.join("|")})$/)`] : [];
+    if (testsDeferred) deferred.reader_rows.push(`${label} test targets`);
+    if (targets.length === 0) continue;
+    const filter = tests?.length ? ["-E", `test(/(^|::)(${tests.join("|")})$/)`] : [];
     rows.push({
       name: `reader ${label}`,
       packages: [selection.package],
@@ -2293,6 +2313,7 @@ function plan(args) {
     deferred,
     compiledInDocs,
     unified: workspaceFeatures(metadata, packages),
+    canary: canaryGroup(nextestText),
   });
   const hook = hookModel(hookText);
   // The `--workspace --lib` row runs only on a runner that can build it in

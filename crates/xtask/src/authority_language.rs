@@ -81,3 +81,24 @@ fn collect_text_paths(dir: &Path, paths: &mut Vec<PathBuf>) -> Result<()> {
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::expect_used)]
+
+    use super::collect_authority_language_mismatches;
+
+    /// The gate on the live documentation (docs/ and the spec READMEs). It
+    /// is a library test, so the xtask reader row CI plans for a docs change
+    /// (its lib and bins) runs it, on a pull request too.
+    #[test]
+    fn live_docs_carry_no_stale_authority_language() {
+        let root = crate::public_contracts::repo_root().expect("resolve the repository root");
+        let mismatches = collect_authority_language_mismatches(&root)
+            .expect("scan the authority-language paths");
+        assert!(
+            mismatches.is_empty(),
+            "stale authority language in the live docs: {mismatches:#?}"
+        );
+    }
+}
