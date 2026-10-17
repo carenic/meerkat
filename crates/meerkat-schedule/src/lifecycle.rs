@@ -2017,6 +2017,9 @@ fn to_dsl_delivery_failure_reason(reason: DeliveryFailureReason) -> occ_dsl::Del
         DeliveryFailureReason::MobRejected => occ_dsl::DeliveryFailureReason::MobRejected,
         DeliveryFailureReason::TransportError => occ_dsl::DeliveryFailureReason::TransportError,
         DeliveryFailureReason::InternalError => occ_dsl::DeliveryFailureReason::InternalError,
+        DeliveryFailureReason::ScheduleMandateUnavailable => {
+            occ_dsl::DeliveryFailureReason::ScheduleMandateUnavailable
+        }
     }
 }
 
@@ -3166,6 +3169,9 @@ fn from_dsl_failure_class(fc: occ_dsl::FailureClass) -> OccurrenceFailureClass {
         occ_dsl::FailureClass::LeaseLost => OccurrenceFailureClass::LeaseLost,
         occ_dsl::FailureClass::TransportError => OccurrenceFailureClass::TransportError,
         occ_dsl::FailureClass::InternalError => OccurrenceFailureClass::InternalError,
+        occ_dsl::FailureClass::ScheduleMandateUnavailable => {
+            OccurrenceFailureClass::ScheduleMandateUnavailable
+        }
     }
 }
 

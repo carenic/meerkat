@@ -13441,7 +13441,8 @@
           "mob_rejected",
           "lease_lost",
           "transport_error",
-          "internal_error"
+          "internal_error",
+          "schedule_mandate_unavailable"
         ],
         "type": "string"
       },

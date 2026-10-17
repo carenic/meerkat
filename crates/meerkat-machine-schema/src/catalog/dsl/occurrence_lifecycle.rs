@@ -1717,6 +1717,25 @@ machine! {
             emit DeliveryFailed
         }
 
+        // A governed host fires a schedule only under the agent whose mandate
+        // commissioned it; any other host refuses the fire before delivery.
+        transition DeliveryFailureScheduleMandateUnavailable {
+            on input ResolveDeliveryFailure { reason, detail, at_utc_ms }
+            guard { self.lifecycle_phase == Phase::Claimed || self.lifecycle_phase == Phase::Dispatching || self.lifecycle_phase == Phase::AwaitingCompletion }
+            guard "schedule_mandate_unavailable" { reason == DeliveryFailureReason::ScheduleMandateUnavailable }
+            update {
+                self.failure_class = Some(OccurrenceFailureClass::ScheduleMandateUnavailable);
+                self.failure_detail = detail;
+                self.completed_at_utc_ms = Some(at_utc_ms);
+                self.receipt_recorded_at_utc_ms = Some(at_utc_ms);
+                self.receipt_stage = Some(DeliveryReceiptStage::DeliveryFailed);
+                self.receipt_failure_class = Some(OccurrenceFailureClass::ScheduleMandateUnavailable);
+                self.receipt_detail = detail;
+            }
+            to DeliveryFailed
+            emit DeliveryFailed
+        }
+
         // --- Target probe resolution ---
         //
         // Shells report typed target observations; occurrence authority owns
@@ -2267,6 +2286,7 @@ pub enum OccurrenceFailureClass {
     LeaseLost,
     TransportError,
     InternalError,
+    ScheduleMandateUnavailable,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2302,6 +2322,7 @@ pub enum DeliveryFailureReason {
     MobRejected,
     TransportError,
     InternalError,
+    ScheduleMandateUnavailable,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

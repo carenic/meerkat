@@ -1793,6 +1793,21 @@ DeliveryFailureInternalError(reason, detail, at_utc_ms) ==
     /\ UnchangedFrame_baba76eb08ae0995
 
 
+DeliveryFailureScheduleMandateUnavailable(reason, detail, at_utc_ms) ==
+    /\ phase = "Claimed" \/ phase = "Dispatching" \/ phase = "AwaitingCompletion"
+    /\ (reason = "ScheduleMandateUnavailable")
+    /\ phase' = "DeliveryFailed"
+    /\ model_step_count' = model_step_count + 1
+    /\ receipt_recorded_at_utc_ms' = Some(at_utc_ms)
+    /\ receipt_stage' = Some("DeliveryFailed")
+    /\ receipt_failure_class' = Some("ScheduleMandateUnavailable")
+    /\ receipt_detail' = detail
+    /\ failure_class' = Some("ScheduleMandateUnavailable")
+    /\ failure_detail' = detail
+    /\ completed_at_utc_ms' = Some(at_utc_ms)
+    /\ UnchangedFrame_baba76eb08ae0995
+
+
 TargetProbeReadyClaimed(outcome, detail, at_utc_ms) ==
     /\ phase = "Claimed"
     /\ (outcome = "Ready")
@@ -2294,6 +2309,7 @@ Next ==
     \/ (phase = "Claimed" \/ phase = "Dispatching" \/ phase = "AwaitingCompletion") /\ \E reason \in DeliveryFailureReasonValues : \E detail \in OptionStringValues : \E at_utc_ms \in 0..2 : DeliveryFailureMobRejected(reason, detail, at_utc_ms)
     \/ (phase = "Claimed" \/ phase = "Dispatching" \/ phase = "AwaitingCompletion") /\ \E reason \in DeliveryFailureReasonValues : \E detail \in OptionStringValues : \E at_utc_ms \in 0..2 : DeliveryFailureTransportError(reason, detail, at_utc_ms)
     \/ (phase = "Claimed" \/ phase = "Dispatching" \/ phase = "AwaitingCompletion") /\ \E reason \in DeliveryFailureReasonValues : \E detail \in OptionStringValues : \E at_utc_ms \in 0..2 : DeliveryFailureInternalError(reason, detail, at_utc_ms)
+    \/ (phase = "Claimed" \/ phase = "Dispatching" \/ phase = "AwaitingCompletion") /\ \E reason \in DeliveryFailureReasonValues : \E detail \in OptionStringValues : \E at_utc_ms \in 0..2 : DeliveryFailureScheduleMandateUnavailable(reason, detail, at_utc_ms)
     \/ (phase = "Claimed") /\ \E outcome \in OccurrenceTargetProbeOutcomeValues : \E detail \in OptionStringValues : \E at_utc_ms \in 0..2 : TargetProbeReadyClaimed(outcome, detail, at_utc_ms)
     \/ (phase = "Claimed") /\ \E outcome \in OccurrenceTargetProbeOutcomeValues : \E detail \in OptionStringValues : \E at_utc_ms \in 0..2 : TargetProbeBusyAllowedByPolicy(outcome, detail, at_utc_ms)
     \/ (phase = "Claimed") /\ \E outcome \in OccurrenceTargetProbeOutcomeValues : \E detail \in OptionStringValues : \E at_utc_ms \in 0..2 : TargetProbeBusySkipByPolicy(outcome, detail, at_utc_ms)

@@ -300,6 +300,7 @@ fn occurrence_failure_class_to_wire(failure_class: occ_dsl::FailureClass) -> &'s
         occ_dsl::FailureClass::LeaseLost => "lease_lost",
         occ_dsl::FailureClass::TransportError => "transport_error",
         occ_dsl::FailureClass::InternalError => "internal_error",
+        occ_dsl::FailureClass::ScheduleMandateUnavailable => "schedule_mandate_unavailable",
     }
 }
 
@@ -317,6 +318,9 @@ fn occurrence_failure_class_from_wire(
         "lease_lost" | "LeaseLost" => Ok(occ_dsl::FailureClass::LeaseLost),
         "transport_error" | "TransportError" => Ok(occ_dsl::FailureClass::TransportError),
         "internal_error" | "InternalError" => Ok(occ_dsl::FailureClass::InternalError),
+        "schedule_mandate_unavailable" | "ScheduleMandateUnavailable" => {
+            Ok(occ_dsl::FailureClass::ScheduleMandateUnavailable)
+        }
         other => Err(format!("invalid OccurrenceFailureClass `{other}`")),
     }
 }
@@ -467,6 +471,9 @@ fn failure_class_to_machine(failure_class: OccurrenceFailureClass) -> occ_dsl::F
         OccurrenceFailureClass::LeaseLost => occ_dsl::FailureClass::LeaseLost,
         OccurrenceFailureClass::TransportError => occ_dsl::FailureClass::TransportError,
         OccurrenceFailureClass::InternalError => occ_dsl::FailureClass::InternalError,
+        OccurrenceFailureClass::ScheduleMandateUnavailable => {
+            occ_dsl::FailureClass::ScheduleMandateUnavailable
+        }
     }
 }
 
@@ -482,6 +489,9 @@ fn failure_class_from_machine(failure_class: occ_dsl::FailureClass) -> Occurrenc
         occ_dsl::FailureClass::LeaseLost => OccurrenceFailureClass::LeaseLost,
         occ_dsl::FailureClass::TransportError => OccurrenceFailureClass::TransportError,
         occ_dsl::FailureClass::InternalError => OccurrenceFailureClass::InternalError,
+        occ_dsl::FailureClass::ScheduleMandateUnavailable => {
+            OccurrenceFailureClass::ScheduleMandateUnavailable
+        }
     }
 }
 
@@ -1973,6 +1983,11 @@ pub enum OccurrenceFailureClass {
     LeaseLost,
     TransportError,
     InternalError,
+    // A governed host refused the fire: the schedule's recorded
+    // commissioning agent is not the agent the host acts as, or the
+    // schedule records none. (A plain comment keeps the wire enum's schema
+    // a plain string enum.)
+    ScheduleMandateUnavailable,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1996,6 +2011,11 @@ pub enum DeliveryFailureReason {
     MobRejected,
     TransportError,
     InternalError,
+    // A governed host refused the fire: the schedule's recorded
+    // commissioning agent is not the agent the host acts as, or the
+    // schedule records none. (A plain comment keeps the wire enum's schema
+    // a plain string enum.)
+    ScheduleMandateUnavailable,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -3645,5 +3665,32 @@ mod tests {
         );
         assert_ne!(compact, different);
         assert_ne!(compact, absent);
+    }
+
+    /// A refused fire's failure class survives the occurrence authority's
+    /// persisted state and the wire.
+    #[test]
+    fn schedule_mandate_unavailable_failure_class_round_trips() {
+        let persisted =
+            occurrence_failure_class_to_wire(occ_dsl::FailureClass::ScheduleMandateUnavailable);
+        assert_eq!(persisted, "schedule_mandate_unavailable");
+        assert_eq!(
+            occurrence_failure_class_from_wire(persisted),
+            Ok(occ_dsl::FailureClass::ScheduleMandateUnavailable)
+        );
+        assert_eq!(
+            failure_class_from_machine(failure_class_to_machine(
+                OccurrenceFailureClass::ScheduleMandateUnavailable
+            )),
+            OccurrenceFailureClass::ScheduleMandateUnavailable
+        );
+        assert_eq!(
+            serde_json::to_value(OccurrenceFailureClass::ScheduleMandateUnavailable).unwrap(),
+            serde_json::json!("schedule_mandate_unavailable")
+        );
+        assert_eq!(
+            serde_json::to_value(DeliveryFailureReason::ScheduleMandateUnavailable).unwrap(),
+            serde_json::json!("schedule_mandate_unavailable")
+        );
     }
 }

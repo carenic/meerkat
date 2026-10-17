@@ -491,6 +491,26 @@ impl PersistenceBundle {
         meerkat_schedule::ScheduleService::new(self.schedule_store())
     }
 
+    /// The binding a schedule host of this realm composes
+    /// ([`crate::surface::SharedScheduleTargetAdapter::with_session_agent_binding`])
+    /// and its session host calls on each session it materializes or revives
+    /// for a fire: a stock-governed realm's opened agent, the agent its
+    /// [`Self::schedule_service`] commissions schedules for. `None` for every
+    /// other realm.
+    pub fn scheduled_session_agent_binding(
+        &self,
+    ) -> Option<Arc<dyn crate::surface::ScheduledSessionAgentBinding>> {
+        #[cfg(all(
+            feature = "session-store",
+            feature = "local-authorization",
+            not(target_arch = "wasm32")
+        ))]
+        if let Some(stock) = self.stock_governance() {
+            return Some(Arc::clone(stock) as Arc<dyn crate::surface::ScheduledSessionAgentBinding>);
+        }
+        None
+    }
+
     pub fn workgraph_store(&self) -> Arc<dyn WorkGraphStore> {
         self.workgraph_store.clone()
     }

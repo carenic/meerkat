@@ -4667,6 +4667,7 @@ pub fn occurrence_lifecycle_schema_metadata() -> MachineSchemaMetadata {
                     "MobRejected",
                     "TransportError",
                     "InternalError",
+                    "ScheduleMandateUnavailable",
                 ],
             ),
             NamedTypeBinding::string_enum("MisfirePolicy", &["Skip", "CatchUpWithin"]),
@@ -4682,6 +4683,7 @@ pub fn occurrence_lifecycle_schema_metadata() -> MachineSchemaMetadata {
                     "LeaseLost",
                     "TransportError",
                     "InternalError",
+                    "ScheduleMandateUnavailable",
                 ],
             ),
             NamedTypeBinding::string_enum(

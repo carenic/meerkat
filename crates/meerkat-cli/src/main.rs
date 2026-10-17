@@ -23229,6 +23229,135 @@ mod tests {
         );
     }
 
+    /// A schedule fire in a stock-governed realm through rkat's own schedule
+    /// host: the realm's runtime admits only work bound to an authenticated
+    /// original, which a fire does not carry, so the host refuses it typed
+    /// (`schedule_mandate_unavailable`) before materializing a session.
+    #[cfg(all(feature = "local-authorization", feature = "session-store"))]
+    #[tokio::test]
+    async fn a_governed_realm_refuses_a_scheduled_fire_before_materializing_its_session() {
+        let state_root = tempfile::tempdir().expect("tempdir");
+        let scope = test_scope(state_root.path().to_path_buf(), "governed-schedule");
+        let (_, persistence) = create_persistence_bundle(&scope)
+            .await
+            .expect("an ordinary first open materializes the realm");
+        drop(persistence);
+        govern_realm(&scope, "governed-schedule")
+            .await
+            .expect("the operator governs the realm");
+        let (manifest, persistence) = create_persistence_bundle(&scope)
+            .await
+            .expect("a governed realm opens governed");
+        assert!(persistence.stock_governance().is_some());
+        let schedules = meerkat::ScheduleService::new(persistence.schedule_store());
+        let sessions = persistence.session_store();
+        let _surface = get_or_create_cli_persistent_surface_from_bundle(
+            &scope,
+            Config::default(),
+            manifest,
+            persistence,
+        )
+        .await
+        .expect("the persistent surface starts its schedule host");
+
+        let schedule = schedules
+            .create(meerkat::CreateScheduleRequest {
+                name: Some("governed-fire".to_string()),
+                description: None,
+                trigger: meerkat::TriggerSpec::Once {
+                    due_at_utc: chrono::Utc::now() - chrono::Duration::seconds(1),
+                },
+                target: meerkat::TargetBinding::session(
+                    meerkat::SessionTargetBinding::materialize_on_demand(
+                        meerkat::SessionMaterializationSpec {
+                            model: "claude-sonnet-4-6".to_string(),
+                            system_prompt: None,
+                            max_tokens: None,
+                            provider: None,
+                            output_schema: None,
+                            structured_output_retries: None,
+                            provider_params: None,
+                            comms_name: None,
+                            peer_meta: None,
+                            labels: std::collections::BTreeMap::new(),
+                            preload_skills: Vec::new(),
+                            additional_instructions: Vec::new(),
+                            realm_id: None,
+                            instance_id: None,
+                            backend: None,
+                            config_generation: None,
+                            keep_alive: false,
+                            app_context: None,
+                        },
+                        meerkat::ScheduledSessionAction::Prompt {
+                            prompt: meerkat_core::ContentInput::Text("scheduled check".to_string()),
+                            system_prompt: None,
+                            render_metadata: None,
+                            skill_refs: Vec::new(),
+                            additional_instructions: Vec::new(),
+                        },
+                    ),
+                ),
+                misfire_policy: meerkat::MisfirePolicy::Skip,
+                overlap_policy: meerkat::OverlapPolicy::AllowConcurrent,
+                missing_target_policy: meerkat::MissingTargetPolicy::Skip,
+                labels: std::collections::BTreeMap::new(),
+                planning_horizon_days: Some(1),
+                planning_horizon_occurrences: Some(1),
+            })
+            .await
+            .expect("the schedule is created");
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+        let occurrence = loop {
+            let occurrence = schedules
+                .list_occurrences(&schedule.schedule_id)
+                .await
+                .expect("occurrences")
+                .into_iter()
+                .next()
+                .expect("the planned occurrence");
+            if !matches!(
+                occurrence.phase,
+                meerkat::OccurrencePhase::Pending
+                    | meerkat::OccurrencePhase::Claimed
+                    | meerkat::OccurrencePhase::Dispatching
+                    | meerkat::OccurrencePhase::AwaitingCompletion
+            ) {
+                break occurrence;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the fire never terminalized: {occurrence:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        };
+        let materialized =
+            meerkat::SessionStore::load(sessions.as_ref(), &occurrence.materialized_session_id())
+                .await
+                .expect("session store read")
+                .is_some();
+        let observed = (
+            occurrence.phase,
+            serde_json::to_value(occurrence.failure_class).expect("failure class"),
+            materialized,
+        );
+        eprintln!(
+            "governed fire: phase={:?} failure_class={} materialized={} detail={:?}",
+            observed.0, observed.1, observed.2, occurrence.failure_detail
+        );
+        assert_eq!(
+            observed,
+            (
+                meerkat::OccurrencePhase::DeliveryFailed,
+                serde_json::json!("schedule_mandate_unavailable"),
+                false,
+            ),
+            "detail: {:?}",
+            occurrence.failure_detail
+        );
+    }
+
     #[test]
     fn fresh_run_storage_fallback_is_workspace_only_and_forces_durable_sqlite() {
         let state_root = tempfile::tempdir().expect("tempdir");
