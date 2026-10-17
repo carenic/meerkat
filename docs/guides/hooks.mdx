@@ -46,6 +46,8 @@ Fourteen extension points are available:
 
 Classification is determined by the `is_pre()` and `is_post()` methods on `HookPoint`. Foreground hooks block loop progression; background hooks run asynchronously for observation.
 
+`PostLlmResponse` does not run for a response the provider stopped with `refusal`, `content_filter` or `context_window_exceeded`: the agent fails that turn before the hook point, commits nothing of it and runs none of its tool calls.
+
 The six post-commit points are intrinsically observe-only. Their session-scoped
 dispatcher owns spawned tasks, reaps completed work, and aborts remaining work
 when the dispatcher is dropped. A returned denial, timeout, or hook runtime

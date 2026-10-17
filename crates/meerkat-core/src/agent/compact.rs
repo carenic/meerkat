@@ -12,7 +12,7 @@ use crate::compact::{
 use crate::event::AgentEvent;
 #[cfg(target_arch = "wasm32")]
 use crate::tokio;
-use crate::types::{AssistantBlock, Message, TurnUsage, Usage};
+use crate::types::{AssistantBlock, Message, StopReason, TurnUsage, Usage};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -700,6 +700,25 @@ impl CompactionObservationSource {
     }
 }
 
+/// A summary call that came back but whose text is not the summary: the
+/// provider refused or filtered it, or stopped it because the model context
+/// window filled (whether the mechanical fallback then runs or the compaction
+/// fails). The provider did that work, so the caller charges it and records
+/// its request row although nothing of it is committed.
+#[derive(Debug)]
+pub(crate) struct UncommittedSummaryCall {
+    pub(crate) usage: TurnUsage,
+    pub(crate) identity_dispute:
+        Option<crate::provider_evidence::DisputedTurnUsageAccountingIdentity>,
+}
+
+/// One compaction attempt: its result, and the summary call it did not
+/// commit, reported on success (the mechanical fallback) and failure alike.
+pub(crate) struct CompactionAttempt {
+    pub(crate) result: Result<CompactionOutcome, CompactionError>,
+    pub(crate) uncommitted_call: Option<UncommittedSummaryCall>,
+}
+
 pub(crate) async fn run_compaction<C>(
     client: &C,
     compactor: &Arc<dyn Compactor>,
@@ -707,6 +726,35 @@ pub(crate) async fn run_compaction<C>(
     invocation: CompactionInvocation<'_>,
     event_tx: &Option<mpsc::Sender<AgentEvent>>,
     event_tap: &crate::event_tap::EventTap,
+) -> CompactionAttempt
+where
+    C: crate::agent::AgentLlmClient + ?Sized,
+{
+    let mut uncommitted_call = None;
+    let result = compact_history(
+        client,
+        compactor,
+        curator,
+        invocation,
+        event_tx,
+        event_tap,
+        &mut uncommitted_call,
+    )
+    .await;
+    CompactionAttempt {
+        result,
+        uncommitted_call,
+    }
+}
+
+async fn compact_history<C>(
+    client: &C,
+    compactor: &Arc<dyn Compactor>,
+    curator: Option<&Arc<dyn CompactionCurator>>,
+    invocation: CompactionInvocation<'_>,
+    event_tx: &Option<mpsc::Sender<AgentEvent>>,
+    event_tap: &crate::event_tap::EventTap,
+    uncommitted_call: &mut Option<UncommittedSummaryCall>,
 ) -> Result<CompactionOutcome, CompactionError>
 where
     C: crate::agent::AgentLlmClient + ?Sized,
@@ -810,6 +858,56 @@ where
             )
             .await;
 
+        // A summary the provider stopped because the model context window
+        // filled is truncated. It joins the capacity fallback below instead
+        // of being committed. A refused or content-filtered summary fails this
+        // compaction: its text must never become the session summary, so the
+        // history stays as it is and the run goes on. Either call did real
+        // provider work, so it is handed back as the uncommitted call, which
+        // the caller charges whatever this attempt's result.
+        let llm_result = match llm_result {
+            Ok(result)
+                if matches!(
+                    result.stop_reason(),
+                    StopReason::ContextWindowExceeded
+                        | StopReason::Refusal
+                        | StopReason::ContentFilter
+                ) =>
+            {
+                *uncommitted_call = validated_compaction_summary_usage(
+                    result.usage().clone(),
+                    client.provider(),
+                    client.model(),
+                )
+                .ok()
+                .map(|(usage, identity_dispute)| UncommittedSummaryCall {
+                    usage,
+                    identity_dispute,
+                });
+                if result.stop_reason() == StopReason::ContextWindowExceeded {
+                    Err(crate::error::AgentError::llm_context_window_stop(
+                        client.provider().as_str(),
+                        None,
+                        uncommitted_call
+                            .as_ref()
+                            .map(|call| call.usage.normalized_total_tokens()),
+                    ))
+                } else {
+                    Err(crate::error::AgentError::llm(
+                        client.provider().as_str(),
+                        crate::error::LlmFailureReason::ProviderError(
+                            crate::error::LlmProviderError::non_retryable(
+                                crate::error::LlmProviderErrorKind::ContentFiltered,
+                                serde_json::json!({ "stop_reason": result.stop_reason() }),
+                            ),
+                        ),
+                        "the provider refused the compaction summary",
+                    ))
+                }
+            }
+            other => other,
+        };
+
         match llm_result {
             Ok(result) => {
                 // Extract summary text from response blocks
@@ -851,6 +949,9 @@ where
                     estimated_history_tokens = estimated,
                     "compaction summary request exceeded provider capacity; using mechanical progress fallback"
                 );
+                // No provider request backs the mechanical summary. A call the
+                // provider stopped at the context window first is the
+                // uncommitted call, charged by the caller on its own.
                 (
                     MECHANICAL_CAPACITY_SUMMARY.to_string(),
                     TurnUsage::host_declared(
@@ -1056,7 +1157,10 @@ pub enum CompactionSummarySource {
     ProviderCall,
     /// A configured host curator; no provider request was made.
     HostCurator,
-    /// The mechanical capacity fallback; no provider request was made.
+    /// The mechanical capacity fallback; no provider request backs the
+    /// summary. When the provider answered first and stopped at the model
+    /// context window, that call is still charged to the session, apart from
+    /// this outcome.
     MechanicalFallback,
 }
 
@@ -1312,10 +1416,17 @@ mod tests {
         }
     }
 
-    async fn compact_observed_source(
+    async fn compact_observed_source<C: crate::agent::AgentLlmClient>(
         session: &Session,
-        client: &ObservationSummaryClient,
+        client: &C,
     ) -> Result<CompactionOutcome, CompactionError> {
+        attempt_observed_source(session, client).await.result
+    }
+
+    async fn attempt_observed_source<C: crate::agent::AgentLlmClient>(
+        session: &Session,
+        client: &C,
+    ) -> CompactionAttempt {
         let model_messages = session.messages_for_model_boundary();
         let compactor: Arc<dyn Compactor> = Arc::new(ObservationCompactor);
         run_compaction(
@@ -1436,6 +1547,174 @@ mod tests {
                 if user.text_content().contains(MECHANICAL_CAPACITY_SUMMARY)));
     }
 
+    /// A summary call the provider stopped because the model context window
+    /// filled.
+    struct ContextWindowStoppedSummaryClient;
+
+    #[async_trait::async_trait]
+    impl crate::agent::AgentLlmClient for ContextWindowStoppedSummaryClient {
+        async fn stream_response(
+            &self,
+            _: &[Message],
+            tools: &[Arc<crate::ToolDef>],
+            _: u32,
+            _: Option<f32>,
+            _: Option<&crate::ProviderParamsOverride>,
+        ) -> Result<crate::LlmStreamResult, crate::error::AgentError> {
+            assert!(tools.is_empty());
+            Ok(crate::LlmStreamResult::new(
+                vec![AssistantBlock::Text {
+                    text: "Blueprint review was discussed and the".into(),
+                    meta: None,
+                }],
+                StopReason::ContextWindowExceeded,
+                Usage {
+                    input_tokens: 10,
+                    output_tokens: 3,
+                    provider_accounting: Some(crate::ProviderTokenAccounting::openai(
+                        "test-observation-summary",
+                        10,
+                    )),
+                    ..Usage::default()
+                },
+            ))
+        }
+        fn provider(&self) -> crate::Provider {
+            crate::Provider::OpenAI
+        }
+        fn model(&self) -> &'static str {
+            "test-observation-summary"
+        }
+    }
+
+    #[tokio::test]
+    async fn context_window_stopped_summary_joins_the_capacity_fallback() {
+        let mut ordinary = Session::new();
+        ordinary.push(Message::User(UserMessage::text("One")));
+        ordinary.push(Message::User(UserMessage::text("Two")));
+        let attempt = attempt_observed_source(&ordinary, &ContextWindowStoppedSummaryClient).await;
+        let outcome = attempt
+            .result
+            .expect("a truncated summary takes the mechanical capacity fallback");
+        assert!(matches!(&outcome.new_messages[0], Message::User(user)
+                if user.text_content().contains(MECHANICAL_CAPACITY_SUMMARY)));
+        assert_eq!(
+            outcome.summary_source,
+            CompactionSummarySource::MechanicalFallback
+        );
+        assert_eq!(outcome.summary_usage.output_tokens, 0);
+        // The provider answered, so its work stays charged, apart from the
+        // mechanical summary.
+        assert_eq!(
+            attempt
+                .uncommitted_call
+                .map(|call| call.usage.output_tokens),
+            Some(3)
+        );
+
+        // With unsummarized voice observations the fallback is closed, as for
+        // a refused summary request: the source is preserved, and the stopped
+        // call is still charged.
+        let session = session_with_unmeasured_voice();
+        let before = serde_json::to_vec(&session).unwrap();
+        let attempt = attempt_observed_source(&session, &ContextWindowStoppedSummaryClient).await;
+        assert!(matches!(
+            attempt.result,
+            Err(CompactionError::LlmFailed(crate::error::AgentError::Llm {
+                reason: crate::error::LlmFailureReason::ContextExceeded { .. },
+                ..
+            }))
+        ));
+        assert_eq!(
+            attempt
+                .uncommitted_call
+                .map(|call| call.usage.output_tokens),
+            Some(3)
+        );
+        assert_eq!(serde_json::to_vec(&session).unwrap(), before);
+    }
+
+    /// A summary call that stopped with a refusal or a content filter.
+    struct RefusedSummaryClient {
+        stop_reason: StopReason,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::agent::AgentLlmClient for RefusedSummaryClient {
+        async fn stream_response(
+            &self,
+            _: &[Message],
+            _: &[Arc<crate::ToolDef>],
+            _: u32,
+            _: Option<f32>,
+            _: Option<&crate::ProviderParamsOverride>,
+        ) -> Result<crate::LlmStreamResult, crate::error::AgentError> {
+            Ok(crate::LlmStreamResult::new(
+                vec![AssistantBlock::Text {
+                    text: "I can't help with summarizing this conversation.".into(),
+                    meta: None,
+                }],
+                self.stop_reason,
+                Usage {
+                    input_tokens: 10,
+                    output_tokens: 3,
+                    provider_accounting: Some(crate::ProviderTokenAccounting::openai(
+                        "test-observation-summary",
+                        10,
+                    )),
+                    ..Usage::default()
+                },
+            ))
+        }
+        fn provider(&self) -> crate::Provider {
+            crate::Provider::OpenAI
+        }
+        fn model(&self) -> &'static str {
+            "test-observation-summary"
+        }
+    }
+
+    /// The refusal text never becomes the session summary: the compaction
+    /// fails as a content-filtered LLM failure and the history is untouched.
+    #[tokio::test]
+    async fn refused_summary_fails_the_compaction_and_keeps_the_history() {
+        for stop_reason in [StopReason::Refusal, StopReason::ContentFilter] {
+            let mut session = Session::new();
+            session.push(Message::User(UserMessage::text("One")));
+            session.push(Message::User(UserMessage::text("Two")));
+            let before = serde_json::to_vec(&session).unwrap();
+            let attempt =
+                attempt_observed_source(&session, &RefusedSummaryClient { stop_reason }).await;
+            let outcome = attempt.result;
+            assert!(
+                matches!(
+                    &outcome,
+                    Err(CompactionError::LlmFailed(crate::error::AgentError::Llm {
+                        reason: crate::error::LlmFailureReason::ProviderError(provider_error),
+                        ..
+                    })) if provider_error.kind
+                        == crate::error::LlmProviderErrorKind::ContentFiltered
+                ),
+                "{stop_reason:?}: {:?}",
+                outcome.as_ref().err()
+            );
+            assert_eq!(
+                serde_json::to_vec(&session).unwrap(),
+                before,
+                "{stop_reason:?}"
+            );
+            // The refused call did real provider work: it is handed back to
+            // be charged although nothing of it is committed.
+            assert_eq!(
+                attempt
+                    .uncommitted_call
+                    .map(|call| call.usage.output_tokens),
+                Some(3),
+                "{stop_reason:?}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn compaction_integrates_voice_observations_before_rebase_and_reload() {
         let mut session = session_with_unmeasured_voice();
@@ -1462,6 +1741,7 @@ mod tests {
             &crate::event_tap::new_event_tap(),
         )
         .await
+        .result
         .unwrap();
         assert!(
             outcome

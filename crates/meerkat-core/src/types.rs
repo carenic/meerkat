@@ -3608,6 +3608,17 @@ pub enum StopReason {
     ContentFilter,
     /// Request was cancelled
     Cancelled,
+    /// The model declined the response (Anthropic `refusal`). The agent loop
+    /// commits nothing of a refused turn and never runs its tool calls.
+    Refusal,
+    /// The provider paused a long-running server-tool turn (Anthropic
+    /// `pause_turn`). The turn is committed as it stands; sending it back
+    /// lets the model continue.
+    PauseTurn,
+    /// Generation stopped because the model's context window filled
+    /// (Anthropic `model_context_window_exceeded`). The agent loop commits
+    /// nothing of the turn and fails the run as context exceeded.
+    ContextWindowExceeded,
 }
 
 /// Security mode for tool execution (e.g. shell)

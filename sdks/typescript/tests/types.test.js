@@ -344,6 +344,27 @@ describe("Typed Events", () => {
     }
   });
 
+  it("parses turn_completed for every wire stop reason", () => {
+    for (const stopReason of [
+      "end_turn",
+      "tool_use",
+      "max_tokens",
+      "stop_sequence",
+      "content_filter",
+      "cancelled",
+      "refusal",
+      "pause_turn",
+      "context_window_exceeded",
+    ]) {
+      const event = parseEvent({ type: "turn_completed", stop_reason: stopReason });
+      if (isTurnCompleted(event)) {
+        assert.equal(event.stopReason, stopReason);
+      } else {
+        assert.fail(`Expected TurnCompletedEvent for ${stopReason}`);
+      }
+    }
+  });
+
   it("rejects malformed turn_completed usage attribution", () => {
     const malformed = [
       { provider: "anthropic", model: "claude-opus-5", presented_tokens: 4420 },

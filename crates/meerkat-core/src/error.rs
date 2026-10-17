@@ -23,6 +23,13 @@ pub enum LlmFailureReason {
     RateLimited {
         retry_after: Option<std::time::Duration>,
     },
+    /// The request did not fit the model's context. Both counts are tokens as
+    /// the failure reported them: a refusal before dispatch names the
+    /// request's estimate and the limit it exceeds; a response the provider
+    /// stopped because the window filled names the call's reported tokens,
+    /// which can be at or below `max`; a provider rejection names the counts
+    /// its error carried, or placeholders when it carried none. They are
+    /// evidence, not an overflow to compute.
     ContextExceeded {
         max: u32,
         requested: u32,
@@ -1017,6 +1024,37 @@ impl AgentError {
                 }),
             )),
             "LLM completed without user-visible text, images, or tool calls",
+        )
+    }
+
+    /// The provider stopped a response because the model's context window
+    /// filled ([`crate::types::StopReason::ContextWindowExceeded`]).
+    ///
+    /// `requested` is the call's reported token count (presented input plus
+    /// output). `max` is the model's declared context window; a model that
+    /// declares none reports the count the provider stopped at, which is
+    /// where its window was reached. The provider, not this count, decided
+    /// that the window was full, so `requested` can be at or below `max` (the
+    /// provider counts differently, or the call reported no usage and
+    /// `requested` falls back to the window): never derive an overflow from
+    /// the two.
+    pub fn llm_context_window_stop(
+        provider: &'static str,
+        context_window_tokens: Option<u32>,
+        reported_tokens: Option<u64>,
+    ) -> Self {
+        let requested = reported_tokens
+            .map(|tokens| u32::try_from(tokens).unwrap_or(u32::MAX))
+            .or(context_window_tokens)
+            .unwrap_or(0);
+        let max = context_window_tokens.unwrap_or(requested);
+        Self::llm(
+            provider,
+            LlmFailureReason::ContextExceeded { max, requested },
+            format!(
+                "the provider stopped the response because the model context window filled \
+                 ({requested} tokens reported, {max}-token window)"
+            ),
         )
     }
 

@@ -968,6 +968,7 @@
           {
             "properties": {
               "max": {
+                "description": "The context limit the failure reported, in tokens: the model's\nwindow or input ceiling, or 0 when a provider error named none.",
                 "format": "uint32",
                 "minimum": 0,
                 "type": "integer"
@@ -977,6 +978,7 @@
                 "type": "string"
               },
               "requested": {
+                "description": "The token count the failure reported. A refusal before dispatch\nreports the request's estimate, above `max`. After dispatch it is\nthe provider's count and can be at or below `max`: a response the\nprovider stopped because the window filled reports the call's own\ntokens. Do not compute an overflow from `max` and `requested`.",
                 "format": "uint32",
                 "minimum": 0,
                 "type": "integer"
@@ -13250,6 +13252,21 @@
             "const": "cancelled",
             "description": "Request was cancelled",
             "type": "string"
+          },
+          {
+            "const": "refusal",
+            "description": "The model declined the response (Anthropic `refusal`). The agent loop\ncommits nothing of a refused turn and never runs its tool calls.",
+            "type": "string"
+          },
+          {
+            "const": "pause_turn",
+            "description": "The provider paused a long-running server-tool turn (Anthropic\n`pause_turn`). The turn is committed as it stands; sending it back\nlets the model continue.",
+            "type": "string"
+          },
+          {
+            "const": "context_window_exceeded",
+            "description": "Generation stopped because the model's context window filled\n(Anthropic `model_context_window_exceeded`). The agent loop commits\nnothing of the turn and fails the run as context exceeded.",
+            "type": "string"
           }
         ]
       },
@@ -17701,7 +17718,10 @@
           "max_tokens",
           "stop_sequence",
           "content_filter",
-          "cancelled"
+          "cancelled",
+          "refusal",
+          "pause_turn",
+          "context_window_exceeded"
         ],
         "type": "string"
       },
@@ -23423,7 +23443,10 @@
           "max_tokens",
           "stop_sequence",
           "content_filter",
-          "cancelled"
+          "cancelled",
+          "refusal",
+          "pause_turn",
+          "context_window_exceeded"
         ],
         "type": "string"
       },
@@ -41431,7 +41454,10 @@
           "max_tokens",
           "stop_sequence",
           "content_filter",
-          "cancelled"
+          "cancelled",
+          "refusal",
+          "pause_turn",
+          "context_window_exceeded"
         ],
         "type": "string"
       },

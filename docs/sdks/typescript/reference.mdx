@@ -638,7 +638,10 @@ type StopReason =
   | "max_tokens"
   | "stop_sequence"
   | "content_filter"
-  | "cancelled";
+  | "cancelled"
+  | "refusal"
+  | "pause_turn"
+  | "context_window_exceeded";
 ```
 
 ### Tool execution events
