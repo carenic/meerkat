@@ -2718,10 +2718,12 @@ pub(crate) struct OwedInterruptedToolNotice {
 /// its evidence. Requests past it are not restored; the notice names them.
 const INTERRUPTED_REQUEST_CONTENT_BOUND: usize = 64 * 1024;
 
-/// The transcript facts a run stamped on a recovered input: `for_input`
-/// over its admitted semantics, so a restored request carries the same ones
-/// (its interaction id included). `None` for a row without stored
-/// semantics, which keeps the prompt's own.
+/// The transcript facts `for_input` stamps on a recovered input from its
+/// admitted semantics, its interaction id included. They match what its run
+/// stamped only when that run held this one input: a run that merged several
+/// inputs stamped their merged identity, which can differ from this input's
+/// own (possibly none). `None` for a row without stored semantics, which
+/// keeps the prompt's own.
 fn stamped_turn_metadata(
     state: &crate::input_state::InputState,
 ) -> Option<meerkat_core::lifecycle::run_primitive::RuntimeTurnMetadata> {

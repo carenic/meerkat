@@ -43,6 +43,23 @@ pub(crate) fn for_input(
     input: &Input,
     semantics: crate::ingress_types::RuntimeInputSemantics,
 ) -> meerkat_core::lifecycle::run_primitive::RuntimeTurnMetadata {
+    stamp_input(input, semantics).metadata
+}
+
+/// What [`for_input`] stamps for one input, and whether its interaction id is
+/// the prompt's own, filled because nothing named one. The marker lives only
+/// here: [`merge_batch_turn_metadata`] reads it so that such an id never
+/// displaces an interaction another input of the batch names. It never
+/// reaches the turn metadata, the wire or persistence.
+struct StampedInput {
+    metadata: meerkat_core::lifecycle::run_primitive::RuntimeTurnMetadata,
+    own_interaction: bool,
+}
+
+fn stamp_input(
+    input: &Input,
+    semantics: crate::ingress_types::RuntimeInputSemantics,
+) -> StampedInput {
     use meerkat_core::lifecycle::run_primitive::RuntimeTurnMetadata;
     let mut metadata = match input {
         Input::Prompt(prompt) => prompt.turn_metadata.clone().unwrap_or_default(),
@@ -112,18 +129,22 @@ pub(crate) fn for_input(
         // the active turn's existing anchor at the request boundary.
         metadata.transcript_identity.interaction_id = Some(InteractionId(input.header().id.0));
     }
-    if matches!(input, Input::Prompt(_))
+    let own_interaction = matches!(input, Input::Prompt(_))
         && !transient_steer
-        && metadata.transcript_identity.interaction_id.is_none()
-    {
+        && metadata.transcript_identity.interaction_id.is_none();
+    if own_interaction {
         // A prompt's conversational User append is its own interaction when
         // nothing else named one (no correlation, no caller-supplied id, no
         // caller context): its rows, run events and runtime-owned work (a
         // detached callback job) carry its input id. Fill only, never an
         // override; a transient steer still joins the active turn's anchor.
+        // In a batch this id never displaces one another input names.
         metadata.transcript_identity.interaction_id = Some(InteractionId(input.header().id.0));
     }
-    metadata
+    StampedInput {
+        metadata,
+        own_interaction,
+    }
 }
 
 /// Canonical constructor for the member-side bridge turn-directive lane
@@ -200,13 +221,16 @@ pub(crate) fn merge_batch_turn_metadata(
     // refusing because they affect the actual LLM/tool configuration.
     let mut batch_handling_mode = None;
     for ((_, input), semantics) in inputs.iter().zip(semantics.iter()) {
-        let mut meta = for_input(input, *semantics);
+        let StampedInput {
+            metadata: mut meta,
+            own_interaction,
+        } = stamp_input(input, *semantics);
         if batch_handling_mode.is_none() {
             batch_handling_mode = meta.handling_mode;
         }
         meta.work_authorization = None; // Rebuilt only from accepted contributor rows at staging.
         meta.handling_mode = None;
-        transcript_identity.observe(&meta.transcript_identity);
+        transcript_identity.observe(&meta.transcript_identity, own_interaction);
         // The reasoning preference is folded across the whole batch (set
         // semantics, never a pairwise conflict), from each contributor's own
         // preference and its own explicit reasoning settings.
@@ -331,7 +355,12 @@ impl<T: Eq> IdentityFieldConsensus<T> {
 
 #[derive(Debug, Clone, Default)]
 struct TranscriptIdentityConsensus {
+    /// The interactions the batch's inputs name: a correlation, a
+    /// caller-supplied id or caller context.
     interaction_id: IdentityFieldConsensus<InteractionId>,
+    /// Plain prompts' own ids (`StampedInput::own_interaction`), which
+    /// stamp the batch only when none of its inputs names an interaction.
+    own_interaction_id: IdentityFieldConsensus<InteractionId>,
     run_id: IdentityFieldConsensus<RunId>,
     objective_id: IdentityFieldConsensus<meerkat_core::interaction::ObjectiveId>,
     turn_input: TurnInputConsensus,
@@ -367,17 +396,29 @@ impl TurnInputConsensus {
 }
 
 impl TranscriptIdentityConsensus {
-    fn observe(&mut self, identity: &TranscriptMessageIdentity) {
-        self.interaction_id.observe(identity.interaction_id);
+    fn observe(&mut self, identity: &TranscriptMessageIdentity, own_interaction: bool) {
+        if own_interaction {
+            self.own_interaction_id.observe(identity.interaction_id);
+        } else {
+            self.interaction_id.observe(identity.interaction_id);
+        }
         self.run_id.observe(identity.run_id.clone());
         self.objective_id.observe(identity.objective_id);
         self.turn_input.observe(identity.turn_input);
     }
 
     fn finish(self) -> TranscriptMessageIdentity {
+        // A prompt's own id never displaces an interaction another input
+        // names: the named ids decide as they always did (agreeing ids give
+        // that id, disagreeing ones none). Only a batch that names none takes
+        // its prompts' own id, and only when there is exactly one.
+        let interaction_id = match self.interaction_id {
+            IdentityFieldConsensus::Unseen => self.own_interaction_id.finish(),
+            named => named.finish(),
+        };
         TranscriptMessageIdentity {
             realtime_origin: None,
-            interaction_id: self.interaction_id.finish(),
+            interaction_id,
             run_id: self.run_id.finish(),
             objective_id: self.objective_id.finish(),
             turn_input: self.turn_input.finish(),
@@ -10413,70 +10454,158 @@ mod tests {
         );
     }
 
-    /// A batch of one plain prompt stamps the prompt's own interaction; a
-    /// batch whose contributors name different interactions (a steer-lane
-    /// prompt with a correlated peer steer) or none (live steers) stamps none.
-    #[test]
-    fn merged_turn_metadata_keeps_one_prompt_interaction_and_drops_disagreeing_ones() {
-        let interaction =
-            |inputs: Vec<Input>, semantics: Vec<crate::ingress_types::RuntimeInputSemantics>| {
-                let inputs = inputs
-                    .into_iter()
-                    .map(|input| (input.id().clone(), input))
-                    .collect::<Vec<_>>();
-                merge_batch_turn_metadata(&inputs, &semantics)
-                    .expect("the batch merges")
-                    .expect("the batch carries metadata")
-                    .transcript_identity
-                    .interaction_id
-            };
+    /// The interaction a batch of `(input, admitted semantics)` stamps.
+    fn batch_interaction(
+        batch: Vec<(Input, crate::ingress_types::RuntimeInputSemantics)>,
+    ) -> Option<InteractionId> {
+        let (inputs, semantics): (Vec<_>, Vec<_>) = batch
+            .into_iter()
+            .map(|(input, semantics)| ((input.id().clone(), input), semantics))
+            .unzip();
+        merge_batch_turn_metadata(&inputs, &semantics)
+            .expect("the batch merges")
+            .expect("the batch carries metadata")
+            .transcript_identity
+            .interaction_id
+    }
 
-        let prompt = make_prompt("single");
-        let own = Some(InteractionId(prompt.header().id.0));
-        let semantics = vec![admission_semantics(&prompt)];
-        assert_eq!(interaction(vec![prompt], semantics), own);
-
-        let steer_lane = |input: Input| match input {
-            Input::Prompt(mut prompt) => {
-                prompt.turn_metadata = Some(
-                    meerkat_core::lifecycle::run_primitive::RuntimeTurnMetadata {
-                        handling_mode: Some(meerkat_core::types::HandlingMode::Steer),
-                        ..Default::default()
-                    },
-                );
-                Input::Prompt(prompt)
-            }
-            Input::Peer(mut peer) => {
-                peer.handling_mode = Some(meerkat_core::types::HandlingMode::Steer);
-                peer.header.correlation_id =
-                    Some(crate::CorrelationId::from_uuid(uuid::Uuid::from_u128(0xA7)));
-                Input::Peer(peer)
-            }
-            other => other,
-        };
-        let queued_steer = crate::ingress_types::RuntimeInputSemantics {
+    fn queued_steer_semantics() -> crate::ingress_types::RuntimeInputSemantics {
+        crate::ingress_types::RuntimeInputSemantics {
             live_interrupt_required: false,
             ..live_steer_semantics()
-        };
+        }
+    }
+
+    /// A plain prompt on the steer lane, queued rather than delivered live.
+    fn steer_lane_prompt(text: &str) -> Input {
+        with_turn_metadata(
+            make_prompt(text),
+            meerkat_core::lifecycle::run_primitive::RuntimeTurnMetadata {
+                handling_mode: Some(meerkat_core::types::HandlingMode::Steer),
+                ..Default::default()
+            },
+        )
+    }
+
+    /// A peer steer correlated with `interaction`.
+    fn correlated_peer_steer(interaction: u128) -> Input {
+        let mut input = make_peer_message("peer-1", "peer steer");
+        if let Input::Peer(peer) = &mut input {
+            peer.handling_mode = Some(meerkat_core::types::HandlingMode::Steer);
+            peer.header.correlation_id = Some(crate::CorrelationId::from_uuid(
+                uuid::Uuid::from_u128(interaction),
+            ));
+        }
+        input
+    }
+
+    /// A prompt whose caller names its interaction, as a console send does.
+    fn caller_named_prompt(text: &str, interaction: InteractionId) -> Input {
+        with_turn_metadata(
+            make_prompt(text),
+            meerkat_core::lifecycle::run_primitive::RuntimeTurnMetadata {
+                transcript_identity: TranscriptMessageIdentity {
+                    interaction_id: Some(interaction),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+    }
+
+    fn own_interaction(input: &Input) -> Option<InteractionId> {
+        Some(InteractionId(input.header().id.0))
+    }
+
+    #[test]
+    fn merged_batch_of_one_plain_prompt_stamps_its_own_interaction() {
+        let prompt = make_prompt("single");
+        let own = own_interaction(&prompt);
+        let semantics = admission_semantics(&prompt);
+        assert_eq!(batch_interaction(vec![(prompt, semantics)]), own);
+    }
+
+    #[test]
+    fn merged_plain_prompt_and_live_steer_stamp_the_prompt_interaction() {
+        let prompt = make_prompt("plain");
+        let own = own_interaction(&prompt);
+        let semantics = admission_semantics(&prompt);
         assert_eq!(
-            interaction(
-                vec![
-                    steer_lane(make_prompt("steer prompt")),
-                    steer_lane(make_peer_message("peer-1", "peer steer")),
-                ],
-                vec![queued_steer, queued_steer],
-            ),
+            batch_interaction(vec![
+                (prompt, semantics),
+                (make_prompt("live steer"), live_steer_semantics()),
+            ]),
+            own,
+            "a live steer names no interaction of its own"
+        );
+    }
+
+    #[test]
+    fn merged_plain_steer_prompts_stamp_no_interaction() {
+        assert_eq!(
+            batch_interaction(vec![
+                (steer_lane_prompt("first"), queued_steer_semantics()),
+                (steer_lane_prompt("second"), queued_steer_semantics()),
+            ]),
             None,
-            "contributors naming different interactions stamp none"
+            "two plain prompts are two interactions"
+        );
+    }
+
+    /// A Meta console send batched with a plain prompt keeps the interaction
+    /// its caller named, as at 0.9.2.
+    #[test]
+    fn merged_plain_prompt_never_displaces_a_caller_named_interaction() {
+        let named = InteractionId(uuid::Uuid::from_u128(0xC5));
+        let plain = make_prompt("plain");
+        let plain_semantics = admission_semantics(&plain);
+        let console = caller_named_prompt("console send", named);
+        let console_semantics = admission_semantics(&console);
+        assert_eq!(
+            batch_interaction(vec![(plain, plain_semantics), (console, console_semantics)]),
+            Some(named)
+        );
+    }
+
+    /// A steer-lane prompt batched with a correlated peer steer keeps the
+    /// peer's interaction, as at 0.9.2.
+    #[test]
+    fn merged_plain_prompt_never_displaces_a_correlated_peer_steer() {
+        assert_eq!(
+            batch_interaction(vec![
+                (steer_lane_prompt("steer prompt"), queued_steer_semantics()),
+                (correlated_peer_steer(0xA7), queued_steer_semantics()),
+            ]),
+            Some(InteractionId(uuid::Uuid::from_u128(0xA7)))
+        );
+    }
+
+    /// Named interactions decide as at 0.9.2 whatever the batch's prompts
+    /// fill: disagreeing ones stamp none, and live steers name none.
+    #[test]
+    fn merged_named_interactions_that_disagree_stamp_none() {
+        let plain = make_prompt("plain");
+        let plain_semantics = admission_semantics(&plain);
+        let console =
+            caller_named_prompt("console send", InteractionId(uuid::Uuid::from_u128(0xC5)));
+        let console_semantics = admission_semantics(&console);
+        assert_eq!(
+            batch_interaction(vec![
+                (plain, plain_semantics),
+                (console, console_semantics),
+                (correlated_peer_steer(0xA7), queued_steer_semantics()),
+            ]),
+            None,
+            "named interactions that disagree stamp none"
         );
         assert_eq!(
-            interaction(
-                vec![
-                    make_prompt("live steer prompt"),
+            batch_interaction(vec![
+                (make_prompt("live steer prompt"), live_steer_semantics()),
+                (
                     make_peer_message("peer-1", "live peer steer"),
-                ],
-                vec![live_steer_semantics(), live_steer_semantics()],
-            ),
+                    live_steer_semantics(),
+                ),
+            ]),
             None,
             "live steers name no interaction of their own"
         );

@@ -41,13 +41,18 @@ them.
   interaction (no correlation id, no caller-supplied interaction id, no
   caller context), its transcript rows (the user message and the turn's
   assistant rows), its run events and the work its run owns now carry an
-  `interaction_id`: the prompt's input id. On a persistent session those
+  `interaction_id`: the prompt's input id, or, for a prompt a surface runs
+  as a direct service turn (the immediate turn of `session/create`,
+  `rkat run`), an id minted for that turn. On a persistent session those
   rows now also carry their `run_id`. Before, the rows carried neither and
   the run events no `interaction_id`. A correlation id or a
-  caller-supplied id still wins, a transient steer still joins the active
-  turn without an id of its own, and a turn whose batch merges inputs of
-  different interactions still carries none. A user request restored
-  after an interrupted run carries the id its run stamped.
+  caller-supplied id still wins, and a transient steer still joins the
+  active turn without an id of its own. A turn whose batch merges inputs
+  naming different interactions still carries none, a plain prompt's own id
+  never displaces an interaction another input in its batch names, and a
+  batch of several plain prompts carries none. A user request restored
+  after an interrupted run carries the prompt's own id, as a run of that
+  prompt alone stamps it.
 
 ### Fixed
 
