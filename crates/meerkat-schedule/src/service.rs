@@ -16,7 +16,7 @@ use crate::types::{
 use chrono::{Duration, Utc};
 use meerkat_core::SessionId;
 use std::collections::BTreeSet;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Weak};
 
 #[cfg(target_arch = "wasm32")]
 use crate::tokio::sync::{Mutex, watch};
@@ -28,10 +28,12 @@ pub struct ScheduleService {
     store: Arc<dyn ScheduleStore>,
     planning_lock: Arc<Mutex<()>>,
     mutation_generation: watch::Sender<u64>,
-    /// Surface-attached create-time identity-target probe, shared across all
-    /// clones of this service (the tool dispatcher and the delivery host
-    /// hold clones of the same instance).
-    identity_target_probe: Arc<OnceLock<Arc<dyn ScheduleIdentityTargetProbe>>>,
+    /// Surface-attached create-time identity-target probes, in attach order,
+    /// shared across all clones of this service (the tool dispatcher and the
+    /// delivery host hold clones of the same instance). Held weakly: each
+    /// probe's attaching surface owns it, so no clone of this service keeps
+    /// a stopped surface's hosts alive.
+    identity_target_probes: Arc<std::sync::Mutex<Vec<Weak<dyn ScheduleIdentityTargetProbe>>>>,
 }
 
 struct ExpectedScheduleTransition {
@@ -205,30 +207,60 @@ impl ScheduleService {
             store,
             planning_lock: Arc::new(Mutex::new(())),
             mutation_generation,
-            identity_target_probe: Arc::new(OnceLock::new()),
+            identity_target_probes: Arc::new(std::sync::Mutex::new(Vec::new())),
         }
     }
 
-    /// Attach the surface's create-time identity-target deliverability probe.
+    /// Attach a surface's create-time identity-target deliverability probe.
     ///
-    /// The first attach wins across every clone of this service; later
-    /// attaches are ignored so a replacement host cannot silently swap the
-    /// deliverability authority mid-flight. Without an attached probe the
-    /// service cannot judge identity deliverability and keeps accepting
-    /// identity targets (the fire-time probe and `missing_target_policy`
-    /// remain the delivery-time authority).
+    /// The service holds the probe weakly: the caller owns it, and it judges
+    /// for as long as the caller keeps it (a surface keeps it for the life of
+    /// its schedule host), so no clone of this service, such as the one
+    /// inside agent schedule tools installed on a session builder, keeps the
+    /// surface's session and mob hosts alive after teardown.
     ///
-    /// The probe is never detached: it, and whatever it holds (a surface's
-    /// session and mob hosts), lives as long as any clone of this service. A
-    /// host that tears its surface down while its process keeps running drops
-    /// every clone it still holds once teardown has succeeded, including the
-    /// clone inside agent schedule tools installed on a session builder.
-    pub fn attach_identity_target_probe(&self, probe: Arc<dyn ScheduleIdentityTargetProbe>) {
-        let _ = self.identity_target_probe.set(probe);
+    /// The earliest attached probe that is still alive judges, so a later
+    /// attach cannot swap a live deliverability authority mid-flight; once
+    /// its owner drops it, the next live one (such as a host started after
+    /// teardown) judges. Without any attached probe the service cannot judge
+    /// identity deliverability and keeps accepting identity targets (the
+    /// fire-time probe and `missing_target_policy` remain the delivery-time
+    /// authority). Once every attached probe is gone, the surface that
+    /// declared the authority has stopped, and identity targets are refused
+    /// with [`ScheduleDomainError::DriverStopped`] until a new probe attaches.
+    pub fn attach_identity_target_probe(&self, probe: &Arc<dyn ScheduleIdentityTargetProbe>) {
+        let mut probes = self
+            .identity_target_probes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        probes.retain(|attached| attached.strong_count() > 0);
+        probes.push(Arc::downgrade(probe));
+    }
+
+    /// The probe that judges identity deliverability now: `None` when no
+    /// probe was ever attached, the earliest live one otherwise, and
+    /// [`ScheduleDomainError::DriverStopped`] when every attached probe is
+    /// gone.
+    fn identity_target_probe(
+        &self,
+    ) -> Result<Option<Arc<dyn ScheduleIdentityTargetProbe>>, ScheduleDomainError> {
+        let probes = self
+            .identity_target_probes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if probes.is_empty() {
+            return Ok(None);
+        }
+        probes
+            .iter()
+            .find_map(Weak::upgrade)
+            .map(Some)
+            .ok_or(ScheduleDomainError::DriverStopped)
     }
 
     /// Fail closed at create/update when the composed surface hosts declare
-    /// an identity target permanently undeliverable.
+    /// an identity target permanently undeliverable, or when the surface
+    /// that judged identity targets has stopped.
     async fn refuse_undeliverable_identity_target(
         &self,
         target: &TargetBinding,
@@ -236,7 +268,7 @@ impl ScheduleService {
         let TargetBinding::Identity(binding) = target else {
             return Ok(());
         };
-        let Some(probe) = self.identity_target_probe.get() else {
+        let Some(probe) = self.identity_target_probe()? else {
             return Ok(());
         };
         match probe.probe_identity_target(binding).await? {
@@ -1823,5 +1855,78 @@ mod tests {
         };
 
         assert_eq!(spec.model, "claude-sonnet-4-6");
+    }
+
+    /// A create-time identity judgement a test fixes.
+    struct FixedIdentityProbe(IdentityTargetDeliverability);
+
+    #[async_trait::async_trait]
+    impl ScheduleIdentityTargetProbe for FixedIdentityProbe {
+        async fn probe_identity_target(
+            &self,
+            _binding: &crate::IdentityTargetBinding,
+        ) -> Result<IdentityTargetDeliverability, ScheduleDomainError> {
+            Ok(self.0.clone())
+        }
+    }
+
+    /// The service holds attached probes weakly: the earliest live one
+    /// judges, the next one judges once the first owner drops its probe, and
+    /// with every probe gone identity targets are refused as `DriverStopped`
+    /// while other targets are still never judged.
+    #[tokio::test]
+    async fn identity_targets_are_judged_by_the_earliest_live_attached_probe() {
+        let service = ScheduleService::new(Arc::new(MemoryScheduleStore::new()));
+        service
+            .create(identity_create_request("domain:ops", plain_prompt_action()))
+            .await
+            .expect("without an attached probe identity targets are not judged");
+
+        let refusing: Arc<dyn ScheduleIdentityTargetProbe> = Arc::new(FixedIdentityProbe(
+            IdentityTargetDeliverability::NeverDeliverable {
+                detail: Some("refused by the first probe".into()),
+            },
+        ));
+        let vouching: Arc<dyn ScheduleIdentityTargetProbe> = Arc::new(FixedIdentityProbe(
+            IdentityTargetDeliverability::Deliverable,
+        ));
+        service.attach_identity_target_probe(&refusing);
+        // Clones share the attached probes.
+        service.clone().attach_identity_target_probe(&vouching);
+        let refused = service
+            .create(identity_create_request("domain:ops", plain_prompt_action()))
+            .await
+            .expect_err("the earliest live probe judges");
+        assert!(
+            matches!(
+                &refused,
+                ScheduleDomainError::InvalidSchedule(reason)
+                    if reason.contains("refused by the first probe")
+            ),
+            "expected the first probe's refusal, found {refused:?}"
+        );
+
+        drop(refusing);
+        service
+            .create(identity_create_request("domain:ops", plain_prompt_action()))
+            .await
+            .expect("the next live probe judges once the first is gone");
+
+        drop(vouching);
+        let stopped = service
+            .create(identity_create_request("domain:ops", plain_prompt_action()))
+            .await
+            .expect_err("no live probe is left to judge identity targets");
+        assert!(
+            matches!(stopped, ScheduleDomainError::DriverStopped),
+            "expected DriverStopped, found {stopped:?}"
+        );
+        service
+            .create(CreateScheduleRequest {
+                target: materialize_on_demand_target("still stored"),
+                ..identity_create_request("domain:ops", plain_prompt_action())
+            })
+            .await
+            .expect("session targets are never judged");
     }
 }

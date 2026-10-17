@@ -35,13 +35,15 @@ fn map_schedule_error(id: Option<RpcId>, error: ScheduleDomainError) -> RpcRespo
         ScheduleDomainError::Store(ScheduleStoreError::ScheduleNotFound { .. }) => {
             RpcResponse::error(id, error::SCHEDULE_NOT_FOUND, "schedule not found")
         }
-        ScheduleDomainError::Store(ScheduleStoreError::UnsupportedBackend { .. }) => {
-            RpcResponse::error(
-                id,
-                meerkat_contracts::ErrorCode::CapabilityUnavailable.jsonrpc_code(),
-                error.to_string(),
-            )
-        }
+        // No schedule capability here: the backend lacks it, or the schedule
+        // host that judged identity targets has stopped (as the schedule
+        // tools report it).
+        ScheduleDomainError::Store(ScheduleStoreError::UnsupportedBackend { .. })
+        | ScheduleDomainError::DriverStopped => RpcResponse::error(
+            id,
+            meerkat_contracts::ErrorCode::CapabilityUnavailable.jsonrpc_code(),
+            error.to_string(),
+        ),
         ScheduleDomainError::InvalidSchedule(_)
         | ScheduleDomainError::InvalidTrigger(_)
         | ScheduleDomainError::InvalidCron(_) => {
@@ -513,6 +515,48 @@ mod tests {
             return;
         };
         assert_eq!(error.code, crate::error::SCHEDULE_NOT_FOUND);
+    }
+
+    /// A runtime shutdown that lands after a handler's host start leaves no
+    /// live schedule host to judge identity targets: the create reaches the
+    /// wire as capability unavailable, as through the schedule tools.
+    #[tokio::test]
+    async fn schedule_create_after_its_host_stopped_is_capability_unavailable() {
+        let temp = TempDir::new().expect("temp dir");
+        let runtime = test_runtime(&temp);
+        runtime
+            .ensure_schedule_host_started()
+            .await
+            .expect("start the schedule host");
+        runtime.shutdown().await;
+        let request: CreateScheduleRequest = serde_json::from_value(json!({
+            "name": "after-shutdown",
+            "trigger": {
+                "type": "once",
+                "due_at_utc": (Utc::now() + Duration::days(1)).to_rfc3339(),
+            },
+            "target": {
+                "target_kind": "identity",
+                "type": "resumable_identity",
+                "identity": "domain:ops",
+                "action": { "type": "prompt", "prompt": "check in" }
+            },
+            "missing_target_policy": "mark_misfired",
+            "planning_horizon_days": 1,
+            "planning_horizon_occurrences": 1
+        }))
+        .expect("identity schedule request");
+
+        let error = schedule_service(&runtime)
+            .create(request)
+            .await
+            .expect_err("no stopped host judges an identity target");
+        let response = map_schedule_error(Some(RpcId::Num(1)), error);
+        let error = response.error.expect("the create is refused");
+        assert_eq!(
+            error.code,
+            meerkat_contracts::ErrorCode::CapabilityUnavailable.jsonrpc_code()
+        );
     }
 
     #[tokio::test]

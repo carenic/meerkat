@@ -438,26 +438,25 @@ helper-tooling modes that depend on an active parent context.
 Rust hosts that compose scheduling themselves (agent-side schedule tools in
 the factory builder's `default_schedule_tools` slot, and a schedule host from
 `spawn_runtime_backed_schedule_host`, its `_with_mobs` variants or
-`spawn_schedule_host`) own one teardown step. The schedule host attaches its
-session and mob hosts to the `ScheduleService` as the create-time target
-probe, and every clone of the service keeps that probe for as long as the
-clone lives. The runtime-backed session host holds the session service, a
-mob host holds the mob state, the schedule tools in the builder's slot hold
-a clone of the service, and the session service owns the builder, so these
-keep one another alive after the schedule host stops.
+`spawn_schedule_host`) need no extra teardown step for them. The schedule
+host attaches its session and mob hosts to the `ScheduleService` as the
+create-time target probe for as long as the host runs, and the service and
+every clone of it, including the one inside the schedule tools in the
+builder's slot, hold that probe only weakly. Once the schedule host has shut
+down, nothing reached through the service keeps the session service (which
+the runtime-backed session host holds) or the mob state (which a mob host
+holds) alive, so a mob store's observer drain
+(`SqliteMobStores::drain_observers`) does not need the slot cleared. Anything
+the host holds itself, such as a registry that resolves schedule targets to
+mob state, stays its own to release.
 
-After a successful teardown (the schedule host shut down and joined, every
-other task that holds the `ScheduleService` stopped, and the session service
-shut down), clear the builder's `default_schedule_tools` slot and every other
-holder of the service or of its hosts, such as a registry that resolves
-schedule targets to mob state. The builder moves into the session service, so
-keep a clone of the slot before that and write `None` through it, or call
-`meerkat::surface::set_default_schedule_tools` with `None` while you still
-hold the builder. Do not clear anything earlier: agent builds read the slot
-until the session service is down. Skipping this step keeps the session
-service and the mob state owned, and a mob store's observer drain
-(`SqliteMobStores::drain_observers`) refuses because other owners are still
-alive. A process that exits after teardown needs no extra step.
+After the schedule host stops, and until another one starts for the same
+service, no surface judges identity targets: creating a schedule with an
+identity target, or updating a schedule to one, fails with
+`ScheduleDomainError::DriverStopped`, and the agent-facing schedule tools
+report the tool as temporarily unavailable. Session targets and every other
+schedule operation (get, list, pause, resume, delete, occurrences) keep
+working against the store.
 
 ## See also
 

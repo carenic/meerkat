@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use meerkat_core::error::ToolError;
 use meerkat_core::types::SessionId;
 use meerkat_core::types::{ToolCallView, ToolDef, ToolProvenance, ToolResult, ToolSourceKind};
-use meerkat_core::{AgentToolDispatcher, ToolDispatchOutcome};
+use meerkat_core::{AgentToolDispatcher, ToolDispatchOutcome, ToolUnavailableReason};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -176,9 +176,9 @@ impl AgentToolDispatcher for ScheduleToolDispatcher {
                 format!("invalid schedule tool-call arguments JSON: {error}"),
             )
         })?;
-        let result = handle_schedule_tools_call(&self.service, call.name, &arguments)
+        let result = run_schedule_tools_call(&self.service, call.name, &arguments)
             .await
-            .map_err(|error| map_schedule_tool_dispatch_error(call.name, error))?;
+            .map_err(|failure| map_schedule_tool_dispatch_error(call.name, failure))?;
 
         Ok(ToolResult::new(call.id.to_string(), result.to_string(), false).into())
     }
@@ -599,74 +599,107 @@ pub async fn handle_schedule_tools_call(
     name: &str,
     arguments: &Value,
 ) -> Result<Value, ScheduleToolError> {
+    run_schedule_tools_call(service, name, arguments)
+        .await
+        .map_err(ScheduleToolFailure::into_wire_error)
+}
+
+/// Why a schedule tool call failed. The service's error stays typed until a
+/// caller renders it, so the in-process tool dispatchers can report a stopped
+/// schedule host as an unavailable tool while the wire keeps its error code.
+pub(crate) enum ScheduleToolFailure {
+    /// The call's arguments, or the encoding of its result.
+    Call(ScheduleToolError),
+    /// The schedule service refused or failed the operation.
+    Service(ScheduleDomainError),
+}
+
+impl From<ScheduleToolError> for ScheduleToolFailure {
+    fn from(error: ScheduleToolError) -> Self {
+        Self::Call(error)
+    }
+}
+
+impl From<ScheduleDomainError> for ScheduleToolFailure {
+    fn from(error: ScheduleDomainError) -> Self {
+        Self::Service(error)
+    }
+}
+
+impl ScheduleToolFailure {
+    /// The agent-facing error when the surface's schedule host stopped and
+    /// no host judges identity targets: a host attached later judges them
+    /// again, so the tool is unavailable for now rather than failed.
+    pub(crate) fn unavailable_tool_error(&self, name: &str) -> Option<ToolError> {
+        matches!(self, Self::Service(ScheduleDomainError::DriverStopped))
+            .then(|| ToolError::unavailable(name, ToolUnavailableReason::TemporarilyUnavailable))
+    }
+
+    /// The wire error for this failure.
+    pub(crate) fn into_wire_error(self) -> ScheduleToolError {
+        match self {
+            Self::Call(error) => error,
+            Self::Service(error) => map_schedule_error(error),
+        }
+    }
+}
+
+pub(crate) async fn run_schedule_tools_call(
+    service: &ScheduleService,
+    name: &str,
+    arguments: &Value,
+) -> Result<Value, ScheduleToolFailure> {
     match name {
         "meerkat_schedule_create" => {
             let request: CreateScheduleRequest = parse_args(name, arguments)?;
-            let schedule = service.create(request).await.map_err(map_schedule_error)?;
-            encode(name, schedule)
+            let schedule = service.create(request).await?;
+            Ok(encode(name, schedule)?)
         }
         "meerkat_schedule_get" => {
             let args: ScheduleIdArgs = parse_args(name, arguments)?;
             let schedule_id = parse_schedule_id(&args.schedule_id)?;
-            let schedule = service
-                .get(&schedule_id)
-                .await
-                .map_err(map_schedule_error)?;
-            encode(name, schedule)
+            let schedule = service.get(&schedule_id).await?;
+            Ok(encode(name, schedule)?)
         }
         "meerkat_schedule_list" => {
             let _: EmptyArgs = parse_args(name, arguments)?;
-            let schedules = service.list().await.map_err(map_schedule_error)?;
-            encode(name, json!({ "schedules": schedules }))
+            let schedules = service.list().await?;
+            Ok(encode(name, json!({ "schedules": schedules }))?)
         }
         "meerkat_schedule_update" => {
             let args: UpdateScheduleArgs = parse_args(name, arguments)?;
             let schedule_id = parse_schedule_id(&args.schedule_id)?;
-            let schedule = service
-                .update(&schedule_id, args.update)
-                .await
-                .map_err(map_schedule_error)?;
-            encode(name, schedule)
+            let schedule = service.update(&schedule_id, args.update).await?;
+            Ok(encode(name, schedule)?)
         }
         "meerkat_schedule_pause" => {
             let args: ScheduleIdArgs = parse_args(name, arguments)?;
             let schedule_id = parse_schedule_id(&args.schedule_id)?;
-            let schedule = service
-                .pause(&schedule_id)
-                .await
-                .map_err(map_schedule_error)?;
-            encode(name, schedule)
+            let schedule = service.pause(&schedule_id).await?;
+            Ok(encode(name, schedule)?)
         }
         "meerkat_schedule_resume" => {
             let args: ScheduleIdArgs = parse_args(name, arguments)?;
             let schedule_id = parse_schedule_id(&args.schedule_id)?;
-            let schedule = service
-                .resume(&schedule_id)
-                .await
-                .map_err(map_schedule_error)?;
-            encode(name, schedule)
+            let schedule = service.resume(&schedule_id).await?;
+            Ok(encode(name, schedule)?)
         }
         "meerkat_schedule_delete" => {
             let args: ScheduleIdArgs = parse_args(name, arguments)?;
             let schedule_id = parse_schedule_id(&args.schedule_id)?;
-            let schedule = service
-                .delete(&schedule_id)
-                .await
-                .map_err(map_schedule_error)?;
-            encode(name, schedule)
+            let schedule = service.delete(&schedule_id).await?;
+            Ok(encode(name, schedule)?)
         }
         "meerkat_schedule_occurrences" => {
             let args: ScheduleIdArgs = parse_args(name, arguments)?;
             let schedule_id = parse_schedule_id(&args.schedule_id)?;
-            let occurrences = service
-                .list_occurrences(&schedule_id)
-                .await
-                .map_err(map_schedule_error)?;
-            encode_occurrences(occurrences)
+            let occurrences = service.list_occurrences(&schedule_id).await?;
+            Ok(encode_occurrences(occurrences)?)
         }
         other => Err(ScheduleToolError::invalid_arguments(format!(
             "unknown schedule tool: {other}"
-        ))),
+        ))
+        .into()),
     }
 }
 
@@ -707,13 +740,14 @@ fn map_schedule_error(error: ScheduleDomainError) -> ScheduleToolError {
                 data: None,
             }
         }
-        ScheduleDomainError::Store(ScheduleStoreError::UnsupportedBackend { .. }) => {
-            ScheduleToolError {
-                code: CAPABILITY_UNAVAILABLE,
-                message: error.to_string(),
-                data: None,
-            }
-        }
+        // No schedule capability here: the backend lacks it, or the schedule
+        // host that judged identity targets has stopped.
+        ScheduleDomainError::Store(ScheduleStoreError::UnsupportedBackend { .. })
+        | ScheduleDomainError::DriverStopped => ScheduleToolError {
+            code: CAPABILITY_UNAVAILABLE,
+            message: error.to_string(),
+            data: None,
+        },
         ScheduleDomainError::InvalidSchedule(_)
         | ScheduleDomainError::InvalidTrigger(_)
         | ScheduleDomainError::InvalidCron(_) => ScheduleToolError {
@@ -729,7 +763,11 @@ fn map_schedule_error(error: ScheduleDomainError) -> ScheduleToolError {
     }
 }
 
-fn map_schedule_tool_dispatch_error(name: &str, error: ScheduleToolError) -> ToolError {
+fn map_schedule_tool_dispatch_error(name: &str, failure: ScheduleToolFailure) -> ToolError {
+    if let Some(unavailable) = failure.unavailable_tool_error(name) {
+        return unavailable;
+    }
+    let error = failure.into_wire_error();
     if error.code == INVALID_ARGUMENTS {
         return ToolError::invalid_arguments(name, error.message);
     }
@@ -2338,6 +2376,77 @@ mod tests {
             .expect_err("unsupported backend should fail");
 
         assert!(matches!(err, ToolError::ExecutionFailed { .. }));
+    }
+
+    /// Once every attached identity probe is gone, an identity create reaches
+    /// agents as a temporarily unavailable tool through both schedule tool
+    /// dispatchers, and the wire as `CAPABILITY_UNAVAILABLE`.
+    #[tokio::test]
+    async fn schedule_tools_report_a_stopped_identity_judge_as_unavailable() {
+        struct VouchingProbe;
+
+        #[async_trait]
+        impl crate::ScheduleIdentityTargetProbe for VouchingProbe {
+            async fn probe_identity_target(
+                &self,
+                _binding: &IdentityTargetBinding,
+            ) -> Result<crate::IdentityTargetDeliverability, ScheduleDomainError> {
+                Ok(crate::IdentityTargetDeliverability::Deliverable)
+            }
+        }
+
+        let service = ScheduleService::new(Arc::new(MemoryScheduleStore::default()));
+        let probe: Arc<dyn crate::ScheduleIdentityTargetProbe> = Arc::new(VouchingProbe);
+        service.attach_identity_target_probe(&probe);
+        drop(probe);
+        let mut request = schedule_request();
+        request.target = TargetBinding::identity(IdentityTargetBinding::resumable(
+            "domain:ops",
+            ScheduledSessionAction::Prompt {
+                prompt: ContentInput::from("tool surface"),
+                system_prompt: None,
+                render_metadata: None,
+                skill_refs: Vec::new(),
+                additional_instructions: Vec::new(),
+            },
+        ));
+        let arguments = serde_json::to_value(&request).expect("schedule request json");
+        let raw = RawValue::from_string(arguments.to_string()).expect("raw args");
+
+        let dispatched = ScheduleToolDispatcher::new(service.clone())
+            .dispatch(tool_call(
+                "sched-4",
+                "meerkat_schedule_create",
+                raw.as_ref(),
+            ))
+            .await
+            .expect_err("no live probe judges the identity target");
+        assert!(
+            matches!(
+                dispatched,
+                ToolError::Unavailable {
+                    reason: ToolUnavailableReason::TemporarilyUnavailable,
+                    ..
+                }
+            ),
+            "expected a temporarily unavailable tool, found {dispatched:?}"
+        );
+        let surfaced = crate::ScheduleToolSurface::new(service.clone())
+            .dispatch(tool_call(
+                "sched-5",
+                "meerkat_schedule_create",
+                raw.as_ref(),
+            ))
+            .await
+            .expect_err("no live probe judges the identity target");
+        assert!(
+            matches!(surfaced, ToolError::Unavailable { .. }),
+            "expected an unavailable tool, found {surfaced:?}"
+        );
+        let wire = handle_schedule_tools_call(&service, "meerkat_schedule_create", &arguments)
+            .await
+            .expect_err("no live probe judges the identity target");
+        assert_eq!(wire.code, CAPABILITY_UNAVAILABLE);
     }
 
     #[test]
