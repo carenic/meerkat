@@ -5,6 +5,17 @@
   "branchConcurrentLimit": 1,
   "prConcurrentLimit": 1,
   "prHourlyLimit": 1,
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "Container images pinned by digest where no built-in manager reads them: the release workflow's build container expression and the Bazel execution platforms.",
+      "managerFilePatterns": ["/^\\.github/workflows/release\\.yml$/", "/^tools/bazel/platforms/BUILD\\.bazel$/"],
+      "matchStrings": [
+        "(?:docker://)?(?<depName>docker\\.io/[a-z0-9._/-]+):(?<currentValue>[A-Za-z0-9._-]+)@(?<currentDigest>sha256:[a-f0-9]{64})"
+      ],
+      "datasourceTemplate": "docker"
+    }
+  ],
   "packageRules": [
     {
       "description": "Keep routine dependency updates in one validation train",

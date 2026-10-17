@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 // Supply-chain guard for GitHub Actions: every third-party action is pinned
-// to a full commit SHA, and Renovate never automerges an action update.
+// to a full commit SHA, every container image the workflows and the Bazel
+// execution platforms name is pinned by digest, and Renovate never
+// automerges an action update.
 //
 // usage: ci-action-pins.mjs [--root DIR]
 //   Reads every .github/**/*.yml and *.yaml under DIR (default: the
@@ -17,8 +19,12 @@
 //   approval, and end with a github-actions rule that turns automerge off,
 //   after every rule that could turn it on for them; nothing outside
 //   packageRules may turn automerge on (vulnerabilityAlerts, an update
-//   type's settings). Every offender is reported as file:line (or
-//   renovate.json: ...); exit 1 on any.
+//   type's settings). A `docker://` action, a `container:` or `image:`
+//   value in .github, and a `docker://` reference in the Bazel files under
+//   tools/bazel/ (and .bazelrc) must name its image by `@sha256:` digest;
+//   UNPINNED_IMAGES lists the exceptions, each with its reason. Every
+//   offender is reported as file:line (or renovate.json: ...); exit 1 on
+//   any.
 
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { dirname, join, relative, resolve } from "node:path";
@@ -28,6 +34,18 @@ import { fileURLToPath } from "node:url";
 const USES = /^\s*(?:-\s*)?uses:\s*(\S+)(.*)$/;
 // A `uses` key in any spelling: plain, quoted, or inside a flow mapping.
 const USES_KEY = /(?:^|[\s{,-])(["']?)uses\1\s*:/;
+// An image reference that names its digest.
+const DIGEST = /@sha256:[0-9a-f]{64}$/;
+// A `container:` or `image:` key with an inline value.
+const IMAGE_KEY = /^\s*(?:-\s*)?(container|image):\s*(\S.*?)\s*$/;
+// Image references this check accepts without a digest, and why.
+export const UNPINNED_IMAGES = new Map([
+  [
+    "docker://europe-west1-docker.pkg.dev/king-dnn-training-dev/meerkat-ci/meerkat-ci-rust:1.94.0",
+    "the self-hosted CI image is in a private registry; pin it once its digest is resolved (the repository " +
+      "variable MEERKAT_BUILDBUDDY_CI_IMAGE overrides it at run time)",
+  ],
+]);
 // A key whose value is a block scalar (`run: |`, `description: >-`).
 const BLOCK_SCALAR = /^(\s*)(-\s+)?[^\s#-][^#]*?:\s*[|>][-+0-9]*\s*$/;
 const PINNED = /^[^@\s]+\/[^@\s]+@[0-9a-f]{40}$/;
@@ -95,7 +113,13 @@ export function usesProblems(root) {
         continue;
       }
       const token = match[1].replace(/^['"]|['"]$/g, "");
-      if (token.startsWith("./") || token.startsWith("docker://")) continue;
+      if (token.startsWith("docker://")) {
+        if (!DIGEST.test(token) && !UNPINNED_IMAGES.has(token)) {
+          problems.push(`${where}: \`${token}\` names its image without an @sha256: digest`);
+        }
+        continue;
+      }
+      if (token.startsWith("./")) continue;
       if (!PINNED.test(token)) {
         problems.push(`${where}: \`${token}\` is not pinned to a full commit SHA`);
       } else if (!REF_COMMENT.test(match[2])) {
@@ -115,6 +139,69 @@ function ruleScope(rule) {
   const criteria = Object.keys(rule).filter((key) => key.startsWith("match") || key.startsWith("exclude"));
   const onlyManager = criteria.every((key) => key === "matchManagers");
   return { some: true, all: onlyManager && Array.isArray(managers) && managers.length === 1 };
+}
+
+// The image references a `container:` or `image:` value names: the value
+// itself, or the quoted literals of an expression that look like one; null
+// when an expression names none this check can read.
+function imageReferences(value) {
+  const unquoted = value.replace(/^['"]|['"]$/g, "");
+  if (!unquoted.includes("${{")) return [unquoted];
+  const literals = [...unquoted.matchAll(/'([^']*)'/g)].map((found) => found[1]);
+  const images = literals.filter((literal) => literal !== "" && !/\s/.test(literal) && /[/:]/.test(literal));
+  return images.length > 0 ? images : null;
+}
+
+export function imageProblems(root) {
+  const problems = [];
+  for (const path of workflowFiles(join(root, ".github"))) {
+    for (const [index, line] of yamlLines(readFileSync(path, "utf8"))) {
+      const match = IMAGE_KEY.exec(withoutComment(line));
+      if (!match) continue;
+      const where = `${relative(root, path)}:${index + 1}`;
+      const images = imageReferences(match[2]);
+      if (images === null) {
+        problems.push(`${where}: a \`${match[1]}\` this check cannot read; name the image and its @sha256: digest literally`);
+        continue;
+      }
+      for (const image of images) {
+        if (!DIGEST.test(image) && !UNPINNED_IMAGES.has(image)) {
+          problems.push(`${where}: \`${image}\` names its image without an @sha256: digest`);
+        }
+      }
+    }
+  }
+  const bazel = [];
+  const tools = join(root, "tools", "bazel");
+  try {
+    const walk = (dir) => {
+      for (const name of readdirSync(dir).sort()) {
+        const child = join(dir, name);
+        if (statSync(child).isDirectory()) walk(child);
+        else if (name === "BUILD.bazel" || name === "BUILD" || name.endsWith(".bzl")) bazel.push(child);
+      }
+    };
+    walk(tools);
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
+  }
+  const bazelrc = join(root, ".bazelrc");
+  try {
+    if (statSync(bazelrc).isFile()) bazel.push(bazelrc);
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
+  }
+  for (const path of bazel) {
+    readFileSync(path, "utf8").split("\n").forEach((line, index) => {
+      for (const found of line.matchAll(/docker:\/\/[^\s"',)]+/g)) {
+        const image = found[0];
+        if (!DIGEST.test(image) && !UNPINNED_IMAGES.has(image)) {
+          problems.push(`${relative(root, path)}:${index + 1}: \`${image}\` names its image without an @sha256: digest`);
+        }
+      }
+    });
+  }
+  return problems;
 }
 
 // Every `automerge: true` below `value`, by path.
@@ -187,7 +274,7 @@ export function renovateProblems(config) {
 }
 
 export function checkRepository(root) {
-  const problems = usesProblems(root);
+  const problems = [...usesProblems(root), ...imageProblems(root)];
   let config;
   try {
     config = JSON.parse(readFileSync(join(root, "renovate.json"), "utf8"));
@@ -211,7 +298,9 @@ function main(argv) {
     process.stderr.write(`${problems.join("\n")}\n${problems.length} action supply-chain problem(s)\n`);
     return 1;
   }
-  process.stdout.write("ci-action-pins: every third-party action is SHA-pinned and Renovate never automerges one\n");
+  process.stdout.write(
+    "ci-action-pins: every third-party action is SHA-pinned, every container image digest-pinned, and Renovate never automerges an action\n",
+  );
   return 0;
 }
 

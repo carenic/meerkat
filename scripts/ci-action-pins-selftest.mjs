@@ -8,11 +8,12 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { checkRepository, renovateProblems } from "./ci-action-pins.mjs";
+import { UNPINNED_IMAGES, checkRepository, renovateProblems } from "./ci-action-pins.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const checker = resolve(here, "ci-action-pins.mjs");
 const SHA = "0123456789abcdef0123456789abcdef01234567";
+const IMAGE_DIGEST = `sha256:${"ab".repeat(32)}`;
 const goodRenovate = {
   extends: ["config:recommended", "helpers:pinGitHubActionDigests"],
   packageRules: [
@@ -23,18 +24,20 @@ const goodRenovate = {
 };
 // A workflow written to slip `uses` keys past a line-by-line reader (a
 // value on the next line, a flow mapping, a quoted key) beside a plain tag
-// ref; each must fail.
+// ref and two images named without a digest; each must fail.
 const BYPASS = [
   "on: push",
   "jobs:",
   "  a:",
   "    runs-on: ubuntu-24.04",
+  "    container: docker.io/library/buildpack-deps:bullseye",
   "    steps:",
   "      - name: next-line value",
   "        uses:",
   "          actions/checkout@v4",
   "      - { name: flow mapping, uses: actions/setup-node@v4 }",
   '      - "uses": actions/setup-python@v5',
+  "      - uses: docker://alpine:latest",
   "  b:",
   "    runs-on: ubuntu-24.04",
   "    steps:",
@@ -58,11 +61,11 @@ try {
   };
   const steps = (...uses) => `jobs:\n  a:\n    steps:\n${uses.map((use) => `      - uses: ${use}\n`).join("")}`;
 
-  // Pinned third-party actions pass; local actions, reusable workflows and
-  // docker images are not third-party refs.
+  // Pinned third-party actions pass; local actions and reusable workflows
+  // are not third-party refs, and a docker image passes with its digest.
   const good = tree(
     "good",
-    steps(`actions/checkout@${SHA} # v6`, "./.github/actions/setup", "docker://alpine:3.20", `taiki-e/install-action@${SHA} # nextest`) +
+    steps(`actions/checkout@${SHA} # v6`, "./.github/actions/setup", `docker://alpine:3.20@${IMAGE_DIGEST}`, `taiki-e/install-action@${SHA} # nextest`) +
       "  b:\n    uses: ./.github/workflows/other.yml\n",
   );
   assert.deepEqual(checkRepository(good), []);
@@ -90,13 +93,12 @@ try {
   // and line; `uses` text in a block scalar or a comment is not a key.
   {
     const problems = checkRepository(tree("bypass", BYPASS));
-    assert.deepEqual(
-      problems.map((problem) => problem.split(": ")[0]),
-      [".github/workflows/ci.yml:7", ".github/workflows/ci.yml:9", ".github/workflows/ci.yml:10", ".github/workflows/ci.yml:14"],
-      problems.join("; "),
-    );
-    for (const problem of problems.slice(0, 3)) assert.match(problem, /a `uses` this check cannot read/);
-    assert.match(problems[3], /`actions\/checkout@v4` is not pinned/);
+    const at = (line) => problems.filter((problem) => problem.startsWith(`.github/workflows/ci.yml:${line}: `));
+    assert.equal(problems.length, 6, problems.join("; "));
+    assert.match(at(5)[0], /`docker\.io\/library\/buildpack-deps:bullseye` names its image without an @sha256: digest/);
+    for (const line of [8, 10, 11]) assert.match(at(line)[0], /a `uses` this check cannot read/);
+    assert.match(at(12)[0], /`docker:\/\/alpine:latest` names its image without an @sha256: digest/);
+    assert.match(at(16)[0], /`actions\/checkout@v4` is not pinned/);
     const prose =
       steps(`actions/checkout@${SHA} # v6`) +
       "      - name: Say it\n" +
@@ -108,6 +110,45 @@ try {
       "        run: >-\n" +
       "          uses: actions/setup-go@v5\n";
     assert.deepEqual(checkRepository(tree("prose", prose)), [], "block scalars and comments are not keys");
+  }
+
+  // Container images: a `container:` or `image:` value (plain, or the
+  // literals of an expression) and a `docker://` reference in the Bazel
+  // files name a digest; UNPINNED_IMAGES are the named exceptions.
+  {
+    const jobs = (body) => `jobs:\n  a:\n    runs-on: ubuntu-24.04\n${body}    steps:\n      - uses: actions/checkout@${SHA} # v6\n`;
+    const pinned = `docker.io/library/buildpack-deps:bullseye@${IMAGE_DIGEST}`;
+    for (const [label, body] of [
+      ["a pinned container", `    container: ${pinned}\n`],
+      ["a pinned container in an expression", `    container: \${{ contains(matrix.target, 'linux-gnu') && '${pinned}' || '' }}\n`],
+      ["a pinned service image", `    services:\n      db:\n        image: postgres:16@${IMAGE_DIGEST}\n`],
+    ]) {
+      assert.deepEqual(checkRepository(tree(label.replaceAll(" ", "-"), jobs(body))), [], label);
+    }
+    for (const [label, body, message] of [
+      ["a container in an expression", "    container: ${{ contains(matrix.target, 'linux-gnu') && 'docker.io/library/buildpack-deps:bullseye' || '' }}\n", "names its image without"],
+      ["a container mapping's image", "    container:\n      image: node:22\n", "`node:22` names its image without"],
+      ["a service image", "    services:\n      db:\n        image: postgres:16\n", "`postgres:16` names its image without"],
+      ["a container from the matrix", "    container: ${{ matrix.image }}\n", "a `container` this check cannot read"],
+    ]) {
+      const problems = checkRepository(tree(label.replaceAll(" ", "-"), jobs(body)));
+      assert.equal(problems.length, 1, `${label}: ${problems.join("; ")}`);
+      assert.ok(problems[0].includes(message), `${label}: ${problems[0]}`);
+    }
+    const bazel = (name, content) => {
+      const root = tree(name, steps(`actions/checkout@${SHA} # v6`));
+      mkdirSync(join(root, "tools", "bazel", "platforms"), { recursive: true });
+      writeFileSync(join(root, "tools", "bazel", "platforms", "BUILD.bazel"), content);
+      return checkRepository(root);
+    };
+    const platform = (image) => `platform(\n    exec_properties = {\n        "container-image": "${image}",\n    },\n)\n`;
+    assert.deepEqual(bazel("bazel-pinned", platform(`docker://${pinned}`)), []);
+    const [excepted] = UNPINNED_IMAGES.keys();
+    assert.deepEqual(bazel("bazel-excepted", platform(excepted)), [], "a named exception passes");
+    const problems = bazel("bazel-unpinned", platform("docker://docker.io/library/buildpack-deps:bullseye"));
+    assert.deepEqual(problems, [
+      "tools/bazel/platforms/BUILD.bazel:3: `docker://docker.io/library/buildpack-deps:bullseye` names its image without an @sha256: digest",
+    ]);
   }
 
   // Renovate: the pin preset, the cooldown, digest updates held for

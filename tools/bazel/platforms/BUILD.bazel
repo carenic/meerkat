@@ -69,7 +69,9 @@ platform(
         # 22.04 (glibc 2.35) shipped binaries Bullseye could not load.
         # scripts/check-linux-release-binary-portability.sh enforces the floor
         # at packaging time - keep the two in sync when bumping this image.
-        "container-image": "docker://docker.io/library/buildpack-deps:bullseye",
+        # Pinned by digest (Renovate's container-image regex manager keeps it
+        # current; scripts/ci-action-pins.mjs refuses a reference without one).
+        "container-image": "docker://docker.io/library/buildpack-deps:bullseye@sha256:30d62be8c0d1960899261429cd3960bccffbd075f324adae967c79f410bde24f",
     },
     parents = ["@toolchains_buildbuddy//platforms:linux_x86_64"],
 )
@@ -105,7 +107,7 @@ platform(
         "OSFamily": "linux",
         # Same glibc 2.31 floor as linux_x86_64 above; the portability gate
         # enforces it for every packaged Linux release binary.
-        "container-image": "docker://docker.io/library/buildpack-deps:bullseye",
+        "container-image": "docker://docker.io/library/buildpack-deps:bullseye@sha256:30d62be8c0d1960899261429cd3960bccffbd075f324adae967c79f410bde24f",
     },
     parents = ["@toolchains_buildbuddy//platforms:linux_arm64"],
 )

@@ -88,6 +88,14 @@ them.
   run, pull requests from this repository included, uses it read-only, and
   the run steps after the sccache action no longer see the Actions cache
   token it exports. The release doctor checks both. CI only.
+- **The Linux release build image is pinned by digest.**
+  `buildpack-deps:bullseye` (the release workflow's Linux build container
+  and the Bazel x86_64 and arm64 execution platforms) is named by its
+  multi-arch index digest, which a Renovate regex manager keeps current.
+  `scripts/ci-action-pins.mjs` refuses a `docker://` action, a
+  `container:` or `image:` value, or a Bazel `docker://` reference without
+  a digest, with one named exception: the self-hosted CI image, whose
+  registry is private. CI and release builds only.
 
 ## [0.9.2] - 2026-10-16
 

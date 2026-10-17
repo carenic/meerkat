@@ -1054,7 +1054,7 @@ jobs:
     # building directly on the hosted runner (Ubuntu 24.04, glibc 2.39) would
     # silently reintroduce the v0.8.21 Bullseye loader failure whenever this
     # fallback lane is active. Non-Linux matrix entries get no container.
-    container: ${{ contains(matrix.platform.target, 'unknown-linux-gnu') && 'docker.io/library/buildpack-deps:bullseye' || '' }}
+    container: ${{ contains(matrix.platform.target, 'unknown-linux-gnu') && 'docker.io/library/buildpack-deps:bullseye@sha256:30d62be8c0d1960899261429cd3960bccffbd075f324adae967c79f410bde24f' || '' }}
     # One job per (target, surface binary). Each job builds exactly one
     # package, so every binary keeps the feature set its own package
     # resolves: one `cargo build -p` for all four would unify features
