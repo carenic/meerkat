@@ -1359,6 +1359,17 @@ SyncTargetSnapshotClaimed(arg_target_binding_key, arg_target_materialized_sessio
     /\ UnchangedFrame_e096a8be19cf8a1c
 
 
+SyncTargetSnapshotDispatching(arg_target_binding_key, arg_target_materialized_session_id) ==
+    /\ phase = "Dispatching"
+    /\ (arg_target_materialized_session_id # None)
+    /\ (IF (target_materialized_session_id = None) THEN TRUE ELSE ((target_materialized_session_id = arg_target_materialized_session_id) /\ (target_binding_key = arg_target_binding_key)))
+    /\ phase' = "Dispatching"
+    /\ model_step_count' = model_step_count + 1
+    /\ target_binding_key' = arg_target_binding_key
+    /\ target_materialized_session_id' = arg_target_materialized_session_id
+    /\ UnchangedFrame_e096a8be19cf8a1c
+
+
 RecordReceiptPending(correlation_id, detail, materialized_session_id, arg_runtime_outcome_key) ==
     /\ phase = "Pending"
     /\ ((receipt_stage # None) /\ (receipt_recorded_at_utc_ms # None) /\ (receipt_detail = detail) /\ (delivery_correlation_id = correlation_id) /\ (target_materialized_session_id = materialized_session_id))
@@ -2265,6 +2276,7 @@ Next ==
     \/ (phase = "Superseded") /\ \E schedule_phase \in ClaimedDispatchSchedulePhaseValues : \E current_schedule_revision \in 0..2 : ClassifyCompletionSupersessionAlreadySuperseded(schedule_phase, current_schedule_revision)
     \/ (phase = "Pending") /\ \E arg_target_binding_key \in TargetBindingIdValues : \E arg_target_materialized_session_id \in OptionSessionIdValues : SyncTargetSnapshotPending(arg_target_binding_key, arg_target_materialized_session_id)
     \/ (phase = "Claimed") /\ \E arg_target_binding_key \in TargetBindingIdValues : \E arg_target_materialized_session_id \in OptionSessionIdValues : SyncTargetSnapshotClaimed(arg_target_binding_key, arg_target_materialized_session_id)
+    \/ (phase = "Dispatching") /\ \E arg_target_binding_key \in TargetBindingIdValues : \E arg_target_materialized_session_id \in OptionSessionIdValues : SyncTargetSnapshotDispatching(arg_target_binding_key, arg_target_materialized_session_id)
     \/ (phase = "Pending") /\ \E correlation_id \in OptionCorrelationIdValues : \E detail \in OptionStringValues : \E materialized_session_id \in OptionSessionIdValues : \E arg_runtime_outcome_key \in OptionRuntimeOutcomeKeyValues : RecordReceiptPending(correlation_id, detail, materialized_session_id, arg_runtime_outcome_key)
     \/ (phase = "Claimed") /\ \E correlation_id \in OptionCorrelationIdValues : \E detail \in OptionStringValues : \E materialized_session_id \in OptionSessionIdValues : \E arg_runtime_outcome_key \in OptionRuntimeOutcomeKeyValues : RecordReceiptClaimed(correlation_id, detail, materialized_session_id, arg_runtime_outcome_key)
     \/ (phase = "Dispatching") /\ \E correlation_id \in OptionCorrelationIdValues : \E detail \in OptionStringValues : \E materialized_session_id \in OptionSessionIdValues : \E arg_runtime_outcome_key \in OptionRuntimeOutcomeKeyValues : RecordReceiptDispatching(correlation_id, detail, materialized_session_id, arg_runtime_outcome_key)

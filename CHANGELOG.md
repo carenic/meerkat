@@ -35,6 +35,17 @@ them.
 
 ## [Unreleased]
 
+### Fixed
+
+- The first fire of a materialize-on-demand schedule completes, in every
+  schedule host. After the dispatch materialized its session, the schedule
+  driver synced the in-flight occurrence's target to the newly bound session,
+  and generated occurrence authority refused that sync while the occurrence
+  was dispatching: the driver tick failed, and the occurrence never completed
+  and was retried after each lease expiry. A dispatching occurrence now
+  records the session its dispatch materialized, once; rebinding it stays
+  refused.
+
 ## [0.9.2] - 2026-10-16
 
 ### Breaking

@@ -3256,6 +3256,29 @@ occurrence_SyncTargetSnapshotClaimed(arg_target_binding_key, arg_target_material
        /\ model_step_count' = model_step_count + 1
 
 
+occurrence_SyncTargetSnapshotDispatching(arg_target_binding_key, arg_target_materialized_session_id) ==
+    /\ \E packet \in SeqElements(pending_inputs) :
+       /\ packet.machine = "occurrence"
+       /\ packet.variant = "SyncTargetSnapshot"
+       /\ packet.payload.target_binding_key = arg_target_binding_key
+       /\ packet.payload.target_materialized_session_id = arg_target_materialized_session_id
+       /\ ~HigherPriorityReady("occurrence_authority")
+       /\ occurrence_phase = "Dispatching"
+       /\ (packet.payload.target_materialized_session_id # None)
+       /\ (IF (occurrence_target_materialized_session_id = None) THEN TRUE ELSE ((occurrence_target_materialized_session_id = packet.payload.target_materialized_session_id) /\ (occurrence_target_binding_key = packet.payload.target_binding_key)))
+       /\ occurrence_phase' = "Dispatching"
+       /\ occurrence_target_binding_key' = packet.payload.target_binding_key
+       /\ occurrence_target_materialized_session_id' = packet.payload.target_materialized_session_id
+       /\ UnchangedFrame_7550c7a0a4cb7792
+       /\ pending_inputs' = SeqRemove(pending_inputs, packet)
+       /\ observed_inputs' = observed_inputs
+       /\ pending_routes' = pending_routes
+       /\ delivered_routes' = delivered_routes
+       /\ emitted_effects' = emitted_effects
+       /\ observed_transitions' = observed_transitions \cup {[machine |-> "occurrence", transition |-> "SyncTargetSnapshotDispatching", actor |-> "occurrence_authority", step |-> (model_step_count + 1), from_phase |-> occurrence_phase, to_phase |-> "Dispatching"]}
+       /\ model_step_count' = model_step_count + 1
+
+
 occurrence_RecordReceiptPending(arg_correlation_id, arg_detail, arg_materialized_session_id, arg_runtime_outcome_key) ==
     /\ \E packet \in SeqElements(pending_inputs) :
        /\ packet.machine = "occurrence"
@@ -5206,6 +5229,7 @@ EntryPacketAdmissible_occurrence(packet) ==
     \/ /\ (packet.variant = "ClassifyCompletionSupersession") /\ (occurrence_phase = "Superseded")
     \/ /\ (packet.variant = "SyncTargetSnapshot") /\ (occurrence_phase = "Pending")
     \/ /\ (packet.variant = "SyncTargetSnapshot") /\ (occurrence_phase = "Claimed")
+    \/ /\ (packet.variant = "SyncTargetSnapshot") /\ (occurrence_phase = "Dispatching") /\ ((packet.payload.target_materialized_session_id # None)) /\ ((IF (occurrence_target_materialized_session_id = None) THEN TRUE ELSE ((occurrence_target_materialized_session_id = packet.payload.target_materialized_session_id) /\ (occurrence_target_binding_key = packet.payload.target_binding_key))))
     \/ /\ (packet.variant = "RecordReceipt") /\ (occurrence_phase = "Pending") /\ (((occurrence_receipt_stage # None) /\ (occurrence_receipt_recorded_at_utc_ms # None) /\ (occurrence_receipt_detail = packet.payload.detail) /\ (occurrence_delivery_correlation_id = packet.payload.correlation_id) /\ (occurrence_target_materialized_session_id = packet.payload.materialized_session_id)))
     \/ /\ (packet.variant = "RecordReceipt") /\ (occurrence_phase = "Claimed") /\ (((occurrence_receipt_stage # None) /\ (occurrence_receipt_recorded_at_utc_ms # None) /\ (occurrence_receipt_detail = packet.payload.detail) /\ (occurrence_delivery_correlation_id = packet.payload.correlation_id) /\ (occurrence_target_materialized_session_id = packet.payload.materialized_session_id)))
     \/ /\ (packet.variant = "RecordReceipt") /\ (occurrence_phase = "Dispatching") /\ (((occurrence_receipt_stage # None) /\ (occurrence_receipt_recorded_at_utc_ms # None) /\ (occurrence_receipt_detail = packet.payload.detail) /\ (occurrence_delivery_correlation_id = packet.payload.correlation_id) /\ (occurrence_target_materialized_session_id = packet.payload.materialized_session_id)))
@@ -5493,6 +5517,7 @@ CoreNext ==
     \/ \E arg_schedule_phase \in ClaimedDispatchSchedulePhaseValues : \E arg_current_schedule_revision \in 0..2 : occurrence_ClassifyCompletionSupersessionAlreadySuperseded(arg_schedule_phase, arg_current_schedule_revision)
     \/ \E arg_target_binding_key \in TargetBindingIdValues : \E arg_target_materialized_session_id \in OptionSessionIdValues : occurrence_SyncTargetSnapshotPending(arg_target_binding_key, arg_target_materialized_session_id)
     \/ \E arg_target_binding_key \in TargetBindingIdValues : \E arg_target_materialized_session_id \in OptionSessionIdValues : occurrence_SyncTargetSnapshotClaimed(arg_target_binding_key, arg_target_materialized_session_id)
+    \/ \E arg_target_binding_key \in TargetBindingIdValues : \E arg_target_materialized_session_id \in OptionSessionIdValues : occurrence_SyncTargetSnapshotDispatching(arg_target_binding_key, arg_target_materialized_session_id)
     \/ \E arg_correlation_id \in OptionCorrelationIdValues : \E arg_detail \in OptionStringValues : \E arg_materialized_session_id \in OptionSessionIdValues : \E arg_runtime_outcome_key \in OptionRuntimeOutcomeKeyValues : occurrence_RecordReceiptPending(arg_correlation_id, arg_detail, arg_materialized_session_id, arg_runtime_outcome_key)
     \/ \E arg_correlation_id \in OptionCorrelationIdValues : \E arg_detail \in OptionStringValues : \E arg_materialized_session_id \in OptionSessionIdValues : \E arg_runtime_outcome_key \in OptionRuntimeOutcomeKeyValues : occurrence_RecordReceiptClaimed(arg_correlation_id, arg_detail, arg_materialized_session_id, arg_runtime_outcome_key)
     \/ \E arg_correlation_id \in OptionCorrelationIdValues : \E arg_detail \in OptionStringValues : \E arg_materialized_session_id \in OptionSessionIdValues : \E arg_runtime_outcome_key \in OptionRuntimeOutcomeKeyValues : occurrence_RecordReceiptDispatching(arg_correlation_id, arg_detail, arg_materialized_session_id, arg_runtime_outcome_key)

@@ -2061,6 +2061,7 @@ pub enum TransitionId {
     ClassifyCompletionSupersessionAlreadySuperseded,
     SyncTargetSnapshotPending,
     SyncTargetSnapshotClaimed,
+    SyncTargetSnapshotDispatching,
     RecordReceiptPending,
     RecordReceiptClaimed,
     RecordReceiptDispatching,
