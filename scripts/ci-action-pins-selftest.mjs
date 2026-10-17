@@ -112,6 +112,39 @@ try {
     assert.deepEqual(checkRepository(tree("prose", prose)), [], "block scalars and comments are not keys");
   }
 
+  // A key whose name a line cannot show fails wherever it appears: an
+  // explicit `?` key (its value on the next line), an escape in a quoted
+  // key (block or flow), an alias; values with escapes and a `?` inside a
+  // value are not keys, and an escaped quote does not end a quoted key.
+  {
+    const opaque = [
+      "on: push",
+      "jobs:",
+      "  a:",
+      "    runs-on: ubuntu-24.04",
+      "    steps:",
+      "      - ? uses",
+      "        : actions/checkout@v4",
+      '      - "u\\x73es": actions/setup-node@v4',
+      '      - { name: flow, "\\u0075ses": actions/setup-go@v5 }',
+      "      - *step : actions/setup-python@v5",
+      "      - !!str &key \"u\\x73es\": actions/cache@v4",
+      `      - uses: actions/checkout@${SHA} # v6`,
+      '        with: { path: "a\\tb", ref: "x\\"y" }',
+      "      - name: Is it set ? yes",
+      '        run: echo "a\\tb: c"',
+      '      - "u\\" # not a comment": actions/setup-node@v4',
+      "",
+    ].join("\n");
+    const problems = checkRepository(tree("opaque", opaque));
+    assert.deepEqual(
+      problems.map((problem) => problem.slice(0, problem.indexOf(": "))),
+      [6, 8, 9, 10, 11, 16].map((line) => `.github/workflows/ci.yml:${line}`),
+      problems.join("; "),
+    );
+    for (const problem of problems) assert.match(problem, /a key this check cannot read/);
+  }
+
   // Container images: a `container:` or `image:` value (plain, or the
   // literals of an expression) and a `docker://` reference in the Bazel
   // files name a digest; UNPINNED_IMAGES are the named exceptions.

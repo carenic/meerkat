@@ -91,10 +91,12 @@ them.
   dashboard, and never automerges one. `scripts/ci-action-pins.mjs` (in
   `make path-classifier-selftest`) fails on an unpinned third-party action
   and on any spelling of a `uses` key it cannot read (quoted, in a flow
-  mapping, its value on the next line), naming its file and line, and on a
-  Renovate configuration that could automerge an action update, including
-  automerge set outside packageRules (`vulnerabilityAlerts`, an update
-  type's settings), or release its digest updates from approval. The pinned
+  mapping, its value on the next line) or any key whose name a line cannot
+  show (an explicit `?` key, an alias, an escape in a quoted key), naming
+  its file and line, and on a Renovate configuration that could automerge
+  an action update, including automerge set outside packageRules
+  (`vulnerabilityAlerts`, an update type's settings), or release its
+  digest updates from approval. The pinned
   `dtolnay/rust-toolchain` commit is that of its `1.94.1` branch, which
   installs that toolchain; the trailing comment names it. The release jobs
   whose checkout can be an older tag (a recovery dispatch) run their setup

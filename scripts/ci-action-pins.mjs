@@ -11,7 +11,9 @@
 //   # <ref>` on one line: the commit, and the tag or branch it was resolved
 //   from, which Renovate's helpers:pinGitHubActionDigests keeps current.
 //   Any other spelling of a `uses` key (quoted, inside a flow mapping, its
-//   value on the next line) fails as unreadable, so none slips past;
+//   value on the next line) fails as unreadable, so none slips past, and so
+//   does any key whose name a line cannot show (an explicit `?` key, an
+//   alias, an escape in a quoted key);
 //   comments and block scalars (`run: |`) are not read. renovate.json must
 //   extend that preset, give github-actions updates a 7-day
 //   minimumReleaseAge (new versions), hold their digest updates (a tag
@@ -36,6 +38,13 @@ import { fileURLToPath } from "node:url";
 const USES = /^\s*(?:-\s*)?uses:\s*(\S+)(.*)$/;
 // A `uses` key in any spelling: plain, quoted, or inside a flow mapping.
 const USES_KEY = /(?:^|[\s{,-])(["']?)uses\1\s*:/;
+// A key whose name no line reader can see: an explicit `?` key, an alias,
+// or a double-quoted key with an escape (`"u\x73es"`). Any of them fails,
+// whatever it names.
+const OPAQUE_KEY = new RegExp(
+  String.raw`(?:^\s*(?:-\s+)*|[{,[]\s*)` +
+    String.raw`(?:\?(?:\s|$)|(?:[!&]\S*\s+)*(?:"(?:[^"\\]|\\.)*\\.(?:[^"\\]|\\.)*"\s*:|\*[^\s,[\]{}]+\s*:(?:\s|$)))`,
+);
 // An image reference that names its digest.
 const DIGEST = /@sha256:[0-9a-f]{64}$/;
 // A `container:` or `image:` key with an inline value.
@@ -79,7 +88,8 @@ function withoutComment(line) {
   for (let i = 0; i < line.length; i += 1) {
     const char = line[i];
     if (quote) {
-      if (char === quote) quote = null;
+      if (quote === '"' && char === "\\") i += 1;
+      else if (char === quote) quote = null;
     } else if (char === "'" || char === '"') {
       quote = char;
     } else if (char === "#" && (i === 0 || /\s/.test(line[i - 1]))) {
@@ -135,8 +145,12 @@ export function usesProblems(root) {
   for (const path of workflowFiles(join(root, ".github"))) {
     const lines = readFileSync(path, "utf8").split("\n");
     for (const [index, line] of yamlLines(lines.join("\n"))) {
-      if (!USES_KEY.test(withoutComment(line))) continue;
       const where = `${relative(root, path)}:${index + 1}`;
+      if (OPAQUE_KEY.test(withoutComment(line))) {
+        problems.push(`${where}: a key this check cannot read (an explicit \`?\` key, an alias, or an escape in a quoted key); write keys plainly`);
+        continue;
+      }
+      if (!USES_KEY.test(withoutComment(line))) continue;
       const match = USES.exec(line);
       if (!match || match[1].startsWith("#")) {
         problems.push(`${where}: a \`uses\` this check cannot read; write it as \`uses: OWNER/REPO@<sha> # <ref>\` on one line`);
