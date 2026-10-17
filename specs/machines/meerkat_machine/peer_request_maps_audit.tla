@@ -32,6 +32,12 @@
 \*     is held under the id.
 \*   AuditRequesterStable (action property): while an inbound request is
 \*     held under the id, no step changes the requester recorded for it.
+\*     TLC takes receipts only through the Idle and Attached arms. The
+\*     other four phase arms carry the same not_already_inbound guard by
+\*     construction, and the receipt_rebinds_requester mutant's anchor
+\*     check requires that guard in all six arms. The property is a
+\*     regression pin on the generated machine, not evidence for the
+\*     comms drain's refusal of a reused id.
 \*
 \* AuditWitness* operators are reachability goals the runner checks as
 \* expected violations, so the properties are not vacuous. The runner's
