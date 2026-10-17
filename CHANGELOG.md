@@ -42,8 +42,8 @@ them.
   keep a closed live channel's generated assistant outputs addressable while
   its deferred close settlement replays rows that need them. A retirement
   requested meanwhile runs when the last hold ends; a held output never
-  becomes reservable. Additive public API: the semver gate lists the new type
-  and method as additions. (#1821)
+  becomes reservable. Both are additive public API; no existing item changes.
+  (#1821)
 
 ### Fixed
 
@@ -80,6 +80,12 @@ them.
 - Rows a channel close holds for replay after its deferred settlement gave up
   are held in memory only: they are lost if the process exits before the next
   boundary lets them land. Durable staging is planned. (#1821)
+- A member turn that ends with an error after it staged its final checkpoint
+  leaves that checkpoint staged until the runtime recovers it, and while it is
+  staged the store can refuse ordinary live writes to the session. A row a
+  channel close replays in that window can then go unrecorded: it is reported
+  with a warning, and its `live_transcript_row_unrecorded` notice can be
+  refused the same way. (#1821)
 
 ## [0.9.2] - 2026-10-16
 
