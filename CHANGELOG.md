@@ -35,6 +35,20 @@ them.
 
 ## [Unreleased]
 
+### Fixed
+
+- A mob Stop no longer holds up every later mob command for one session wait
+  per member. It cancelled every member session's checkpoint gate, then held
+  every member's run starts, one member after another, and each of those
+  steps can wait on that member's session: an in-flight checkpoint save holds
+  its gate, and a running turn's commit holds the session's mutation gate. A
+  Stop of a large busy mob blocked its actor for seconds. Both phases now run
+  concurrently per member (run-start holds 32 at a time) and keep their order
+  (every hold before any interrupt); a failed Stop still reports its first
+  failure in roster order. The actor's inline-step watchdog now names each
+  Stop stage (`stop_checkpointer_cancel`, `stop_run_start_holds`, and so on)
+  in its `stage_timings_ms`.
+
 ## [0.9.2] - 2026-10-16
 
 ### Breaking

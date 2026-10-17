@@ -86928,6 +86928,58 @@ async fn test_stop_reports_a_turn_driven_members_running_turn_left_running() {
         .expect("its turn completes");
 }
 
+/// A mob Stop holds its members' run starts concurrently. Each hold waits on
+/// its own member's runtime (the session's mutation gate, which a running
+/// turn's commit holds), so a Stop of many busy members lasts about one hold
+/// instead of all of them one after another, and the actor's inline Stop
+/// step stays short.
+#[tokio::test]
+async fn test_stop_holds_member_run_starts_concurrently() {
+    const MEMBERS: usize = 8;
+    const HOLD: Duration = Duration::from_millis(250);
+    let mut definition = sample_definition();
+    definition
+        .profiles
+        .get_mut(&ProfileName::from("worker"))
+        .expect("worker profile")
+        .as_inline_mut()
+        .unwrap()
+        .runtime_mode = crate::MobRuntimeMode::TurnDriven;
+    let (handle, service) = create_test_mob_with_runtime_backed_real_comms(definition).await;
+    for index in 0..MEMBERS {
+        handle
+            .spawn(
+                ProfileName::from("worker"),
+                AgentIdentity::from(format!("worker-held-{index}")),
+                None,
+            )
+            .await
+            .expect("spawn turn-driven worker");
+    }
+
+    service
+        .runtime_adapter
+        .delay_hold_run_starts_for_test(Some(HOLD));
+    let started = std::time::Instant::now();
+    let report = handle.stop().await.expect("stop the mob");
+    let elapsed = started.elapsed();
+    service.runtime_adapter.delay_hold_run_starts_for_test(None);
+
+    assert_eq!(report.members.len(), MEMBERS, "{report:?}");
+    assert!(
+        report
+            .members
+            .values()
+            .all(|outcome| outcome.starts == crate::MemberRunStarts::Held),
+        "every member is held: {report:?}"
+    );
+    assert!(
+        elapsed < HOLD * 3,
+        "a Stop of {MEMBERS} members whose holds each wait {HOLD:?} took {elapsed:?}: \
+         the holds ran one after another"
+    );
+}
+
 /// #1500: an input admitted to a member's runtime before a mob Stop, but not
 /// yet prepared into a run, must not start a run while the mob is Stopped.
 /// Stop is a pause: the input stays queued and runs once after Resume.

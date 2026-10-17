@@ -15828,12 +15828,17 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
     /// its required physical projection cannot be silently omitted. Use this
     /// during `stop()` to prevent checkpoint writes from racing with external
     /// cleanup operations.
+    ///
+    /// A save holds its session's gate across the store write, so each cancel
+    /// waits for that session's in-flight save. The gates are cancelled
+    /// together: no session's save delays another session's cancel, and a
+    /// session cancelled later cannot start further saves in the meantime.
     pub async fn cancel_all_checkpointers(&self) {
         let gates = self.checkpointer_gates.lock().await;
-        for gate in gates.values() {
-            let mut cancelled = gate.cancelled.lock().await;
-            *cancelled = true;
-        }
+        futures::future::join_all(gates.values().map(|gate| async move {
+            *gate.cancelled.lock().await = true;
+        }))
+        .await;
     }
 
     /// Re-enable checkpointer gates for all tracked sessions.
@@ -36590,6 +36595,61 @@ mod tests {
         assert!(
             service.checkpointer_gates.lock().await.is_empty(),
             "unknown-session append must not allocate a checkpointer gate"
+        );
+    }
+
+    /// A mob Stop cancels every session's checkpoint gate. Each cancel still
+    /// waits for its own session's in-flight save (a save holds its gate
+    /// across the store write), but not behind the other sessions' cancels:
+    /// a session cancelled later keeps saving meanwhile, so cancelling the
+    /// gates one after another waits for a further save of every one of them.
+    #[tokio::test(start_paused = true)]
+    async fn cancel_all_checkpointers_waits_for_each_in_flight_save_concurrently() {
+        const SESSIONS: u32 = 4;
+        const SAVE: std::time::Duration = std::time::Duration::from_millis(100);
+        let service = PersistentSessionService::new(
+            DummyBuilder,
+            4,
+            Arc::new(MemoryStore::new()),
+            Arc::new(InMemoryRuntimeStore::new()),
+            memory_blob_store(),
+        );
+        let mut savers = Vec::new();
+        for _ in 0..SESSIONS {
+            let gate = service.gate_for_session(&SessionId::new()).await;
+            let (saving_tx, saving_rx) = tokio::sync::oneshot::channel();
+            // A session that checkpoints back to back: each save holds the
+            // gate for SAVE, as `checkpoint_run` holds it across its store
+            // write, and the next save starts unless the gate was cancelled.
+            savers.push(tokio::spawn(async move {
+                let mut saving_tx = Some(saving_tx);
+                loop {
+                    let cancelled = gate.cancelled.lock().await;
+                    if *cancelled {
+                        break;
+                    }
+                    if let Some(saving_tx) = saving_tx.take() {
+                        let _ = saving_tx.send(());
+                    }
+                    tokio::time::sleep(SAVE).await;
+                    drop(cancelled);
+                }
+            }));
+            saving_rx
+                .await
+                .expect("the session's first save is in flight");
+        }
+
+        let started = tokio::time::Instant::now();
+        service.cancel_all_checkpointers().await;
+        let elapsed = started.elapsed();
+        for saver in savers {
+            saver.await.expect("the saver stops at its cancelled gate");
+        }
+        assert!(
+            elapsed >= SAVE && elapsed < SAVE * 2,
+            "cancelling {SESSIONS} gates took {elapsed:?}: each cancel waits for its own \
+             in-flight save ({SAVE:?}) and none waits behind another session's cancel"
         );
     }
 
