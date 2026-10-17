@@ -37,6 +37,49 @@ them.
 
 ### Changed
 
+- **Pull-request CI and the pre-push hook do less, to fit 20 minutes from
+  the start of the hook to a green `CI gate`.** The lane classifier
+  (`scripts/ci-cargo-lanes.mjs --event`) plans a pull request without the
+  lanes that compile the meerkat-mob chain or sweep the reverse-dependency
+  closure, and the push to `main` (or a `release/**` branch), whose CI must
+  be green before a release tag, runs them: the `closure-tests` rows,
+  `closure-check`, `feature-check`, `governed-jsonl`,
+  `mcp-confinement-positive`, the integration suites whose package compiles
+  meerkat-mob, the facade's two GPT Live feature suites, the test targets of
+  the mob-chain packages' Clippy (a pull request lints their lib and bin
+  targets), the Clippy of rkat, meerkat-integration-tests and meerkat-rpc
+  when the change invalidates meerkat-mob's build (workspace mode, or a
+  change to meerkat-mob or a crate its library compiles; a pull request that
+  leaves meerkat-mob's build alone lints them), and the wasm lanes that only
+  the reverse-dependency closure selected. The plan names what a pull request left to the push
+  (`deferred_to_push`), the gate prints it, and the gate refuses a push plan
+  that left anything. meerkat-rpc's default-feature unit row no longer runs
+  in the pull request (`PR_UNIT_CHAIN_EXCEPTIONS` is gone; `main-unit` runs
+  it). A `Cargo.lock` change that is the only global path is scoped to the
+  members that resolve a changed lock entry instead of the whole workspace,
+  falling back to the workspace on anything the scoping cannot read. The TLC
+  audits run in three shards instead of two, xtask's unit tests (5-7
+  minutes) run in a lane of their own, and a `governance-gates` job
+  runs the typed governance gates (`rmat-audit`, `seam-inventory`,
+  `runtime-authority-bypass`, `machine-authority-docs-gate`) when machine
+  authority or a dogma document changes. The pre-push hook no longer runs the
+  changed-path ratchets, the machine codegen drift check, the canonical TLC
+  lane or the deterministic workspace test gate (they are manual hooks; CI
+  runs each before merge or on the push a release tag requires green,
+  except the gate's lib tests under the workspace's unified features, which
+  only nightly's workspace unit lane runs: the push runs every member's lib
+  tests with that member's own features), skips the release
+  contract tests CI already runs on every pull request, and runs its two
+  slow harness contracts only when a push changes what they exercise. The
+  `CI gate`'s pull-request budgets drop to 1080 s of lane execution and
+  1200 s push-to-terminal (runner queue still excluded), from 1500 s and
+  2700 s. A push to `main` now diffs against the last main commit whose CI
+  run completed green with its attestation instead of the push's payload
+  base, so the changes of a cancelled, superseded or failed main run still
+  run the push-only lanes; it plans the whole workspace when no such commit
+  is found, when the push carries more than one commit (the finder runs from
+  HEAD's first parent only when that parent is the push's payload base), or
+  when the finder's answer is not a full sha of an ancestor of HEAD.
 - **Every third-party GitHub Action is pinned to a commit SHA, and Renovate
   no longer automerges action updates.** Each `uses:` in `.github/`
   workflows and composite actions (release and reusable workflows included)

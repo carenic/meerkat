@@ -387,8 +387,8 @@ if grep -Fq 'name: CI' .github/workflows/ci.yml &&
   job_has_line .github/workflows/ci.yml gate 'name: Check lane results' &&
   job_has_line .github/workflows/ci.yml gate 'require_ran "Clippy"' &&
   job_has_line .github/workflows/ci.yml gate 'Enforce lane execution budget' &&
-  grep -Fq 'CI_MAX_EXEC_SECONDS: "1500"' .github/workflows/ci.yml &&
-  grep -Fq 'CI_MAX_TERMINAL_SECONDS: "2700"' .github/workflows/ci.yml &&
+  grep -Fq 'CI_MAX_EXEC_SECONDS: "1080"' .github/workflows/ci.yml &&
+  grep -Fq 'CI_MAX_TERMINAL_SECONDS: "1200"' .github/workflows/ci.yml &&
   grep -Fq 'scripts/ci-cargo-lanes.mjs' .github/workflows/ci.yml &&
   ! grep -Fq 'uses: ./.github/workflows/cargo.yml' .github/workflows/ci.yml &&
   ! grep -Fq 'uses: ./.github/workflows/buildbuddy.yml' .github/workflows/ci.yml &&
@@ -646,8 +646,10 @@ fi
 if grep -Fq '//crates/xtask:machine_verify_all_tlc_test' scripts/buildbuddy-bazel-poc &&
   grep -Fq '//crates/xtask:machine_verify_audits_a_tlc_test' scripts/buildbuddy-bazel-poc &&
   grep -Fq '//crates/xtask:machine_verify_audits_b_tlc_test' scripts/buildbuddy-bazel-poc &&
+  grep -Fq '//crates/xtask:machine_verify_audits_c_tlc_test' scripts/buildbuddy-bazel-poc &&
   grep -Fq 'name = "machine_verify_audits_a_tlc_test"' crates/xtask/BUILD.bazel &&
   grep -Fq 'name = "machine_verify_audits_b_tlc_test"' crates/xtask/BUILD.bazel &&
+  grep -Fq 'name = "machine_verify_audits_c_tlc_test"' crates/xtask/BUILD.bazel &&
   grep -Fq '//crates/meerkat-machine-schema:docs_machine_authority_alignment_test' scripts/buildbuddy-bazel-poc &&
   grep -Fq 'name = "machine_verify_all_tlc_test"' crates/xtask/BUILD.bazel &&
   grep -Fq 'machine-verify --all --skip-cargo-tests' crates/xtask/tests/machine_verify_all_tlc_test.sh &&
