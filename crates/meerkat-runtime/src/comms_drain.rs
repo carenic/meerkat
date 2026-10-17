@@ -666,8 +666,41 @@ pub fn spawn_comms_drain(
                             // a response to it goes only to that peer.
                             let corr_id =
                                 meerkat_core::PeerCorrelationId::from_uuid(interaction_id.0);
-                            if handle.inbound_state(corr_id).is_none()
-                                && let Err(err) = handle.request_received_from_ingress(&candidate)
+                            if handle.inbound_state(corr_id).is_some() {
+                                // The id is an outstanding request's. Only that
+                                // request's requester may send it again (a
+                                // redelivery, which runtime admission
+                                // deduplicates); another peer's request under
+                                // the id is refused before admission, and the
+                                // outstanding request keeps its interaction.
+                                if !reused_request_id_is_requesters(
+                                    handle.as_ref(),
+                                    corr_id,
+                                    &candidate,
+                                ) {
+                                    tracing::warn!(
+                                        corr_id = %corr_id,
+                                        sender = ?candidate.from_peer_id(),
+                                        "comms_drain: refused a request reusing another requester's outstanding id"
+                                    );
+                                    if let Err(error) = refuse_peer_ingress_before_admission(
+                                        &adapter,
+                                        claim,
+                                        format!(
+                                            "request id {corr_id} is another requester's outstanding request"
+                                        ),
+                                    ) {
+                                        tracing::warn!(
+                                            %error,
+                                            "comms_drain: failed to refuse a request reusing an outstanding id"
+                                        );
+                                        notify_claim_mechanism_failure(&adapter, &session_id).await;
+                                        return;
+                                    }
+                                    continue;
+                                }
+                            } else if let Err(err) =
+                                handle.request_received_from_ingress(&candidate)
                             {
                                 tracing::warn!(
                                     error = %err,
@@ -830,6 +863,49 @@ async fn accept_routed_peer_ingress(
                 .await
                 .map(|(_, completion)| completion),
         },
+    }
+}
+
+/// Whether `candidate`, a request under the id of an outstanding request,
+/// comes from the requester the machine recorded for that request. A request
+/// id is one interaction's identity on both sides, so while the request is
+/// outstanding only its requester may send the id again. A candidate without
+/// an admitted sender, or one the machine cannot judge, does not qualify.
+fn reused_request_id_is_requesters(
+    handle: &dyn meerkat_core::handles::PeerInteractionHandle,
+    corr_id: meerkat_core::PeerCorrelationId,
+    candidate: &PeerInputCandidate,
+) -> bool {
+    candidate.from_peer_id().is_some_and(|sender| {
+        matches!(
+            handle.resolve_response_addressee(corr_id, sender),
+            Ok(meerkat_core::PeerResponseAddresseeVerdict::Requester)
+        )
+    })
+}
+
+/// Terminalize a claim the drain refused before admission as `Rejected`:
+/// nothing reaches the session, and the sender of a durable delivery learns of
+/// the refusal. A volatile claim was handed off when it was routed, so
+/// refusing it only admits nothing.
+fn refuse_peer_ingress_before_admission(
+    adapter: &MeerkatMachine,
+    claim: RoutedPeerIngressClaim,
+    reason: String,
+) -> Result<(), crate::RuntimeDriverError> {
+    let RoutedPeerIngressClaim::Durable(claim) = claim else {
+        return Ok(());
+    };
+    let facts = PeerIngressClaimCommitFacts {
+        claim_id: claim.claim_id(),
+        raw_item_id: claim.raw_item_id(),
+        class: claim.class(),
+    };
+    match adapter.reject_peer_ingress_before_admission(facts, reason) {
+        crate::meerkat_machine::PeerIngressAcceptFinalization::Finalized { receipt, .. } => {
+            finalize_peer_ingress_claim(RoutedPeerIngressClaim::Durable(claim), receipt)
+        }
+        crate::meerkat_machine::PeerIngressAcceptFinalization::MechanismError(error) => Err(error),
     }
 }
 
@@ -2810,7 +2886,18 @@ fn record_bridge_inbound_peer_request(
     };
     let corr_id = meerkat_core::PeerCorrelationId::from_uuid(candidate.interaction.id.0);
     if handle.inbound_state(corr_id).is_some() {
-        return true;
+        // Only the outstanding request's own requester may send its id again.
+        // Another peer's bridge request under the id is dropped before decode
+        // or dispatch, and the outstanding request's interaction stays open.
+        if reused_request_id_is_requesters(handle.as_ref(), corr_id, candidate) {
+            return true;
+        }
+        tracing::warn!(
+            corr_id = %corr_id,
+            sender = ?candidate.from_peer_id(),
+            "comms_drain: dropped a supervisor bridge request reusing another requester's outstanding id"
+        );
+        return false;
     }
     if let Err(err) = handle.request_received_from_ingress(candidate) {
         tracing::warn!(
@@ -9757,6 +9844,140 @@ mod tests {
         }
     }
 
+    /// Records `requester` as the requester of `candidate`'s id, as the drain
+    /// did when an earlier request with that id was admitted.
+    fn record_outstanding_request(
+        peer_handle: &CountingPeerInteractionHandle,
+        candidate: &PeerInputCandidate,
+        requester: PeerId,
+    ) -> meerkat_core::PeerCorrelationId {
+        let corr_id = meerkat_core::PeerCorrelationId::from_uuid(candidate.interaction.id.0);
+        meerkat_core::handles::PeerInteractionHandle::request_received(
+            peer_handle,
+            corr_id,
+            HandlingMode::Queue,
+            requester,
+        )
+        .expect("the outstanding request is recorded");
+        corr_id
+    }
+
+    /// A request reusing the id of another requester's outstanding request is
+    /// refused before admission: none of its content enters the session's
+    /// work, the outstanding request keeps its requester, and that request's
+    /// interaction stream is neither abandoned nor completed.
+    #[tokio::test]
+    async fn request_reusing_another_requesters_outstanding_id_is_refused_before_admission() {
+        for class in [
+            PeerInputClass::SilentRequest,
+            PeerInputClass::ActionableRequest,
+        ] {
+            let adapter = Arc::new(MeerkatMachine::ephemeral());
+            let session_id = SessionId::new();
+            adapter
+                .register_session(session_id.clone())
+                .await
+                .expect("register session");
+
+            let candidate = inbound_peer_request_candidate(class);
+            let peer_handle = Arc::new(CountingPeerInteractionHandle::default());
+            let first_requester = PeerId::new();
+            let corr_id = record_outstanding_request(&peer_handle, &candidate, first_requester);
+            let peer_authority: Arc<dyn meerkat_core::handles::PeerInteractionHandle> =
+                peer_handle.clone();
+            let runtime = Arc::new(OneShotPeerRequestRuntime::with_complete_authority(
+                candidate,
+                peer_authority,
+            ));
+            let drain = spawn_authorized_test_comms_drain(
+                adapter.clone(),
+                session_id.clone(),
+                runtime.clone(),
+                Duration::from_millis(10),
+            )
+            .await;
+
+            tokio::time::timeout(Duration::from_secs(1), drain)
+                .await
+                .expect("drain should exit after one candidate")
+                .expect("drain task should not panic");
+
+            let snapshot = adapter
+                .meerkat_machine_spine_snapshot(&session_id)
+                .await
+                .expect("registered session snapshot");
+            assert_eq!(
+                snapshot.ledger.input_count, 0,
+                "a {class:?} reusing another requester's id must not enter the session's work"
+            );
+            assert_eq!(
+                peer_handle.recorded_requester(corr_id),
+                Some(first_requester),
+                "the outstanding request keeps its requester"
+            );
+            assert_eq!(peer_handle.request_received_count(), 1);
+            assert!(
+                runtime.abandonment_reasons().is_empty(),
+                "the refusal must leave the outstanding {class:?}'s interaction stream alone"
+            );
+            assert_eq!(runtime.completed_count(), 0);
+        }
+    }
+
+    /// The same request redelivered by the peer the drain recorded as its
+    /// requester is admitted as before: the runtime deduplicates by sender
+    /// and id.
+    #[tokio::test]
+    async fn request_redelivered_by_its_recorded_requester_is_admitted() {
+        for class in [
+            PeerInputClass::SilentRequest,
+            PeerInputClass::ActionableRequest,
+        ] {
+            let adapter = Arc::new(MeerkatMachine::ephemeral());
+            let session_id = SessionId::new();
+            adapter
+                .register_session(session_id.clone())
+                .await
+                .expect("register session");
+
+            let candidate = inbound_peer_request_candidate(class);
+            let sender = candidate
+                .from_peer_id()
+                .expect("the test request has an admitted sender");
+            let peer_handle = Arc::new(CountingPeerInteractionHandle::default());
+            record_outstanding_request(&peer_handle, &candidate, sender);
+            let peer_authority: Arc<dyn meerkat_core::handles::PeerInteractionHandle> =
+                peer_handle.clone();
+            let runtime = Arc::new(OneShotPeerRequestRuntime::with_complete_authority(
+                candidate,
+                peer_authority,
+            ));
+            let drain = spawn_authorized_test_comms_drain(
+                adapter.clone(),
+                session_id.clone(),
+                runtime.clone(),
+                Duration::from_millis(10),
+            )
+            .await;
+
+            tokio::time::timeout(Duration::from_secs(1), drain)
+                .await
+                .expect("drain should exit after one candidate")
+                .expect("drain task should not panic");
+
+            let snapshot = adapter
+                .meerkat_machine_spine_snapshot(&session_id)
+                .await
+                .expect("registered session snapshot");
+            assert_eq!(
+                snapshot.ledger.input_count, 1,
+                "a {class:?} redelivered by its recorded requester is admitted"
+            );
+            assert_eq!(peer_handle.request_received_count(), 1);
+            assert!(runtime.abandonment_reasons().is_empty());
+        }
+    }
+
     /// The drain records an inbound request's requester from its admitted
     /// ingress fact, the verified sender of the signed envelope. The display
     /// label, `from_route` and payload fields that name another peer change
@@ -13331,6 +13552,54 @@ mod tests {
             completed_count.load(std::sync::atomic::Ordering::SeqCst),
             1,
             "bridge request rejected by peer authority should be marked complete"
+        );
+    }
+
+    /// A bridge request reusing the id of another requester's outstanding
+    /// request is dropped before decode or dispatch, and the outstanding
+    /// request's interaction is not marked complete.
+    #[tokio::test]
+    async fn bridge_request_reusing_another_requesters_id_is_dropped_before_dispatch() {
+        let payload = sample_bind_payload();
+        let sender = payload.supervisor.peer_id.clone();
+        let mut runtime_impl = bootstrap_runtime(
+            PEER_ID_RECEIVER,
+            "inproc://receiver",
+            Some("expected-token"),
+        );
+        let counting = Arc::new(CountingPeerInteractionHandle::default());
+        let candidate = bridge_candidate(&sender, &BridgeCommand::BindMember(payload));
+        let first_requester = PeerId::new();
+        let corr_id = record_outstanding_request(&counting, &candidate, first_requester);
+        let peer_handle: Arc<dyn meerkat_core::handles::PeerInteractionHandle> = counting.clone();
+        runtime_impl.peer_handle = Some(peer_handle.clone());
+        runtime_impl.peer_request_response_handle = Some(peer_handle);
+        let completed_count = runtime_impl.completed_count.clone();
+        let runtime: Arc<dyn CommsRuntime> = Arc::new(runtime_impl);
+        let adapter = Arc::new(MeerkatMachine::ephemeral());
+        let session_id = SessionId::new();
+        adapter
+            .register_session(session_id.clone())
+            .await
+            .expect("register session");
+
+        assert!(
+            try_handle_supervisor_bridge_command(&adapter, &session_id, &runtime, &candidate).await,
+            "bridge handler must own bridge requests it refuses"
+        );
+        assert!(
+            matches!(
+                adapter.supervisor_binding(&session_id).await,
+                SupervisorBinding::Unbound
+            ),
+            "a bridge request reusing another requester's id must not bind a supervisor"
+        );
+        assert_eq!(counting.recorded_requester(corr_id), Some(first_requester));
+        assert_eq!(counting.request_received_count(), 1);
+        assert_eq!(
+            completed_count.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the outstanding request's interaction must not be marked complete"
         );
     }
 

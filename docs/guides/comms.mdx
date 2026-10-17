@@ -529,6 +529,14 @@ so the recorded requester is the peer that holds that key. Under open auth
 recorded requester is the key the envelope declares: the same identity that
 trust and routing use in that mode.
 
+A request ID belongs to one request while that request is open. A request
+from another peer that reuses the ID of a request the session has not yet
+answered is refused before the session sees it: its sender gets a durable
+rejection (`DurableAdmissionRejected`), and the open request keeps its
+requester. The request that first used an ID keeps it; the request IDs
+Meerkat generates are random UUIDs, so another peer can only reuse one it
+has learned.
+
 <Note>
 The LLM-facing comms tools return lightweight tool receipts. Host-side `comms/send` returns richer typed receipts such as `peer_message_sent`, `peer_request_sent`, and `peer_response_sent`, with identifiers and ACK-related data for application code.
 </Note>

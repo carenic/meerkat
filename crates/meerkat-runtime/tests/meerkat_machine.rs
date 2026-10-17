@@ -6684,11 +6684,11 @@ mod peer_response_addressee {
     use meerkat_comms::runtime::comms_runtime::CommsRuntime as InprocCommsRuntime;
     use meerkat_core::agent::CommsRuntime as CoreCommsRuntime;
     use meerkat_core::comms::{
-        CommsCommand, InputStreamMode, PeerAddress, PeerDeliveryOutcome, PeerId, PeerName,
-        PeerRoute, PeerTransport, SendError, SendReceipt, TrustedPeerDescriptor,
+        CommsCommand, InputStreamMode, PeerAddress, PeerId, PeerName, PeerRoute, PeerTransport,
+        SendError, SendReceipt, TrustedPeerDescriptor,
     };
     use meerkat_core::error::ToolError;
-    use meerkat_core::interaction::{InboxInteraction, PeerIngressTerminalOutcomeKind};
+    use meerkat_core::interaction::InboxInteraction;
     use meerkat_core::lifecycle::core_executor::{
         CoreApplyOutput, CoreExecutor, CoreExecutorError,
     };
@@ -6904,6 +6904,17 @@ mod peer_response_addressee {
             .await
             .expect("the responder's drain records the inbound request");
             fixture
+        }
+
+        /// Inputs the responder's runtime ledger holds, terminal ones included.
+        async fn responder_ledger_input_count(&self) -> usize {
+            self.responder
+                .adapter
+                .meerkat_machine_spine_snapshot(&self.responder.sid)
+                .await
+                .expect("responder session snapshot")
+                .ledger
+                .input_count
         }
 
         fn inbound_state(&self) -> Option<InboundPeerRequestState> {
@@ -7292,13 +7303,14 @@ mod peer_response_addressee {
     }
 
     /// Another peer that sends a request reusing an outstanding request's id
-    /// does not take it over. The responder's ingress still accepts the reused
-    /// envelope, but its drain finds the id already recorded and does not
-    /// record a requester for it again: the response still goes only to the
-    /// peer that sent the request first.
+    /// is refused before admission: none of its content enters the
+    /// responder's session under the first requester's interaction, the
+    /// outstanding request keeps its requester, and the response still goes
+    /// only to the peer that sent the request first.
     #[tokio::test]
-    async fn a_request_reusing_an_outstanding_id_does_not_rebind_its_requester() {
+    async fn a_request_reusing_an_outstanding_id_from_another_peer_is_refused() {
         let fixture = Fixture::with_spoofed_request().await;
+        let admitted_before = fixture.responder_ledger_input_count().await;
 
         // The raw router lets the bystander choose the envelope id.
         let reuse = fixture
@@ -7323,12 +7335,15 @@ mod peer_response_addressee {
         assert!(
             matches!(
                 &reuse,
-                Ok(outcome) if outcome.delivery
-                    == PeerDeliveryOutcome::DurablyResolved {
-                        outcome: PeerIngressTerminalOutcomeKind::Accepted,
-                    }
+                Err(meerkat_comms::SendError::DurableAdmissionRejected { envelope_id })
+                    if *envelope_id == fixture.request_id.0
             ),
-            "the responder's ingress accepts the reused envelope, got {reuse:?}"
+            "the responder refuses the reused id durably, got {reuse:?}"
+        );
+        assert_eq!(
+            fixture.responder_ledger_input_count().await,
+            admitted_before,
+            "the reused request's content must not enter the responder's session (reuse send: {reuse:?})"
         );
         assert_eq!(
             fixture.inbound_state(),

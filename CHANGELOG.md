@@ -109,6 +109,11 @@ them.
   derive `dest`. Behaviour-only (not measured by the gate):
   `CommsRuntime::stage_declared_reply_endpoint` refuses the same case where it
   staged the endpoint (see Fixed).
+- Behaviour-only (not measured by the gate): a peer request under the id of
+  another peer's request that the session has not yet answered is refused
+  where it was admitted: its sender gets
+  `SendError::DurableAdmissionRejected`, and a supervisor bridge request
+  under such an id is dropped before dispatch (see Fixed).
 
 ### Added
 
@@ -164,6 +169,19 @@ them.
   `stage_correlated_reply_endpoint` already did, and stage nothing. The router
   addresses a Response sent through a staged endpoint to that key, so a
   mismatched key would have carried a response meant for one peer to another.
+- A peer request that reuses the id of another peer's request the session has
+  not yet answered is refused before admission. Before, the comms drain
+  recorded no second requester for the id but still admitted the request,
+  so its content reached the session under the first request's interaction
+  (the answer still went only to the first requester). Now only the
+  recorded requester may send an outstanding id again (a redelivery, which
+  runtime admission deduplicates); another peer's request is terminalized
+  as rejected, its sender gets `SendError::DurableAdmissionRejected`, and
+  the outstanding request keeps its requester and interaction. A supervisor
+  bridge request under such an id is dropped before it is decoded or
+  dispatched. The first request to use an id keeps it; the ids Meerkat's
+  senders generate are random (`Uuid::new_v4`), so another peer can only
+  claim one first after it has leaked.
 
 ## [0.9.2] - 2026-10-16
 

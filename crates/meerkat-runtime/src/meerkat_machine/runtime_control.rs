@@ -17051,6 +17051,21 @@ impl MeerkatMachine {
         self.finalize_peer_ingress_accept(facts, submitted_input_id, result)
     }
 
+    /// Terminalize a peer-ingress claim the drain refused before admission as
+    /// `Rejected`, admitting nothing, so the sender learns of a definite
+    /// refusal rather than an ambiguous delivery.
+    pub(crate) fn reject_peer_ingress_before_admission(
+        &self,
+        facts: meerkat_core::interaction::PeerIngressClaimCommitFacts,
+        reason: String,
+    ) -> super::PeerIngressAcceptFinalization {
+        self.finalize_peer_ingress_accept(
+            facts,
+            meerkat_core::lifecycle::InputId::new(),
+            Err(RuntimeDriverError::ValidationFailed { reason }),
+        )
+    }
+
     fn finalize_peer_ingress_accept(
         &self,
         facts: meerkat_core::interaction::PeerIngressClaimCommitFacts,
