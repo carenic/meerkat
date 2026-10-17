@@ -1935,6 +1935,12 @@ pub struct MobDestroyReport {
     /// Human-readable cleanup errors captured while destroying.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub errors: Vec<String>,
+    /// Members whose runtime required a durability reload (a boundary commit
+    /// failed after their run consumed its input in memory). The destroy
+    /// reloaded each one from its durable store before retiring it, so the
+    /// retirement recorded what became of that input.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reloaded_members: Vec<AgentIdentity>,
 }
 
 impl MobDestroyReport {

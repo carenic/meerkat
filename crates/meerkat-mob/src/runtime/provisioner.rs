@@ -3949,6 +3949,50 @@ impl MemberSessionDisposalArc {
         .await
     }
 
+    /// Reload `registration`, `session_id`'s current registration, from
+    /// durable authority when its persistent shell is durability-degraded,
+    /// bounded by `deadline`.
+    ///
+    /// The reload-required discard replaces the degraded process shell, and
+    /// the mutation fence its exited runtime loop retained, with a cold
+    /// successor recovered from the durable store. Input that a failed
+    /// boundary commit consumed only in memory is pending there again, so the
+    /// retirement that follows records its fate instead of losing it with
+    /// the in-memory run. A registration that is not degraded, or no longer
+    /// current, is left untouched (`NotDegraded`, `NotCurrent`).
+    pub(super) async fn reload_durability_degraded_registration_until(
+        adapter: &Arc<MeerkatMachine>,
+        ops_adapter: Option<&Arc<super::ops_adapter::MobOpsAdapter>>,
+        registration: &RuntimeSessionRegistrationWitness,
+        session_id: &SessionId,
+        deadline: Instant,
+    ) -> Result<meerkat_runtime::ReloadRequiredRegistrationDisposition, SessionError> {
+        // A reload-required discard atomically replaces the registration
+        // with a cold successor. The exact bound operation identity must
+        // ride that replacement as a durable retention request so the
+        // later finalization-boundary rebind finds it in the successor
+        // registry instead of failing closed on a stripped operation.
+        let prior_ops_binding = Self::recoverable_ops_binding_witness(ops_adapter, session_id)?;
+        let remaining =
+            Self::retirement_remaining(session_id, deadline, "durability_reload_discard")?;
+        tokio::time::timeout(
+            remaining,
+            adapter.recover_or_discard_reload_required_registration_with_operation_if_current(
+                registration,
+                prior_ops_binding
+                    .as_ref()
+                    .map(|witness| witness.retention_request()),
+            ),
+        )
+        .await
+        .map_err(|_| Self::runtime_retirement_in_progress(session_id, "durability_reload_discard"))?
+        .map_err(|error| {
+            Self::runtime_archive_error(format!(
+                "durability-reload disposal failed for {session_id}: {error}"
+            ))
+        })
+    }
+
     pub(super) async fn cancel_active_runtime_turn_before_retire_with_adapter_until(
         runtime_adapter: Option<&Arc<MeerkatMachine>>,
         ops_adapter: Option<&Arc<super::ops_adapter::MobOpsAdapter>>,
@@ -3968,32 +4012,14 @@ impl MemberSessionDisposalArc {
             {
                 return Ok(());
             }
-            // A reload-required discard atomically replaces the registration
-            // with a cold successor. The exact bound operation identity must
-            // ride that replacement as a durable retention request so the
-            // later finalization-boundary rebind finds it in the successor
-            // registry instead of failing closed on a stripped operation.
-            let prior_ops_binding = Self::recoverable_ops_binding_witness(ops_adapter, session_id)?;
-            let remaining =
-                Self::retirement_remaining(session_id, deadline, "durability_reload_discard")?;
-            let disposition = tokio::time::timeout(
-                remaining,
-                adapter.recover_or_discard_reload_required_registration_with_operation_if_current(
-                    &registration,
-                    prior_ops_binding
-                        .as_ref()
-                        .map(|witness| witness.retention_request()),
-                ),
+            let disposition = Self::reload_durability_degraded_registration_until(
+                adapter,
+                ops_adapter,
+                &registration,
+                session_id,
+                deadline,
             )
-            .await
-            .map_err(|_| {
-                Self::runtime_retirement_in_progress(session_id, "durability_reload_discard")
-            })?
-            .map_err(|error| {
-                Self::runtime_archive_error(format!(
-                    "durability-reload disposal failed for {session_id}: {error}"
-                ))
-            })?;
+            .await?;
             if matches!(
                 disposition,
                 meerkat_runtime::ReloadRequiredRegistrationDisposition::Discarded

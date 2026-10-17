@@ -1861,6 +1861,13 @@ async fn fork_child_whose_boundary_commit_failed(child: &str) -> DegradedChild {
         .await
         .expect("fork");
     gate.wait_entered(1).await;
+    // End the run's supervisor while it still waits on the turn, as a
+    // process exit does: once the turn fails it would retire the child
+    // itself, racing the destroy under test.
+    assert_eq!(
+        run.end_supervisor_as_process_exit_for_test().await,
+        meerkat_mob::ForkSupervisorExitForTest::EndedBeforeOutcome,
+    );
     let child_session = handle
         .resolve_bridge_session_id(&child)
         .await
@@ -1885,7 +1892,6 @@ async fn fork_child_whose_boundary_commit_failed(child: &str) -> DegradedChild {
         ),
         "{degraded:?}"
     );
-    drop(run);
     DegradedChild {
         fixture,
         store,
@@ -1911,6 +1917,11 @@ async fn destroying_a_mob_reloads_and_retires_a_member_whose_boundary_commit_fai
     .expect("the destroy finishes instead of waiting on a reload nobody performs")
     .expect("the destroy reloads the degraded member and retires it");
     assert!(report.errors.is_empty(), "{report:?}");
+    assert_eq!(
+        report.reloaded_members,
+        vec![degraded.child.clone()],
+        "the report names the member the destroy reloaded"
+    );
     assert!(
         degraded.fixture.state.handle_for(&mob_id).await.is_err(),
         "the destroyed mob is gone"
@@ -1968,17 +1979,22 @@ async fn a_destroy_that_cannot_reload_a_degraded_member_is_incomplete_and_retrya
         "the report names the member and its reload: {report:?}"
     );
     assert!(
+        report.reloaded_members.is_empty(),
+        "no member was reloaded: {report:?}"
+    );
+    assert!(
         degraded.fixture.state.handle_for(&mob_id).await.is_ok(),
         "the mob stays for a retry"
     );
     degraded.store.restore_input_recovery_reads();
-    tokio::time::timeout(
+    let report = tokio::time::timeout(
         DEGRADED_DESTROY_BOUND,
         degraded.fixture.state.mob_destroy(&mob_id),
     )
     .await
     .expect("the retried destroy finishes")
     .expect("the retried destroy reloads the member and completes");
+    assert_eq!(report.reloaded_members, vec![degraded.child.clone()]);
     assert!(
         degraded.fixture.state.handle_for(&mob_id).await.is_err(),
         "the destroyed mob is gone"

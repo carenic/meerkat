@@ -35,6 +35,42 @@ them.
 
 ## [Unreleased]
 
+### Added
+
+- `meerkat_mob::MobDestroyReport` gains `reloaded_members`: the members whose
+  runtime required a durability reload, which the destroy reloaded from their
+  durable store before retiring them. The field is left out of the
+  serialized report when it is empty, so the `mob/destroy` result of any
+  other destroy is unchanged.
+
+### Fixed
+
+- Destroying a mob no longer hangs when one of its members lost a boundary
+  commit: the commit failed after the member's run consumed its input in
+  memory, so the member's runtime requires a durability reload. The member's
+  exited runtime loop keeps the session's mutation gate until a reload
+  releases it, and the destroy waited on that gate in the member's ingress
+  detach forever, because nothing performed the reload. The destroy now
+  reloads such a member first, as retirement already did: its runtime is
+  replaced by one recovered from the durable store, where the consumed input
+  is pending again, and the member's retirement records that input as
+  abandoned (`Retired`) instead of losing it with the in-memory run. The
+  reload runs before the destroy writes anything, and again just before each
+  member's ingress detach. A reload that fails or overruns the member retire
+  budget makes the destroy a typed `MobDestroyError::Incomplete` whose report
+  names the member and the reload error; when that happens before the destroy
+  started, the mob is left as it was, and the destroy can be retried.
+
+### Known limitations
+
+- A member whose boundary commit fails while the destroy is already waiting
+  on that member's ingress detach still holds the destroy: the detach waits
+  on the session's mutation gate before it can see that the runtime needs a
+  reload.
+- `MobHandle::force_cancel_member` cannot cancel a member whose runtime
+  requires a durability reload: it fails with the runtime's repair-blocked
+  error. Retiring the member, or destroying the mob, reloads it first.
+
 ## [0.9.2] - 2026-10-16
 
 ### Breaking
