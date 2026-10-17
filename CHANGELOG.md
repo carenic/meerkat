@@ -37,9 +37,9 @@ them.
 
 ### Breaking
 
-- `meerkat_mob_mcp::fork_relink`: `ForkRelinkReport` gains `child_retirement`
-  (a new `ChildRetirement`: `NotRequired`, `Retired`, `InProgress`, or
-  `Failed` with the error) and is now `#[non_exhaustive]`; `relink_child` and
+- `meerkat_mob_mcp::fork_relink`: `ForkRelinkReport` gains the field
+  `child_retirement` (a new `ChildRetirement`: `NotRequired`, `Retired`,
+  `InProgress`, or `Failed` with the error); `relink_child` and
   `relink_child_within` return the new `ForkRelinkOutcome` (`action` and
   `child_retirement`) instead of a `ForkRelinkAction`.
 

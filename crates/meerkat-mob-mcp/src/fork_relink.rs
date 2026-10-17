@@ -146,7 +146,6 @@ impl ForkRelinkOutcome {
 
 /// One child's re-link result.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
 pub struct ForkRelinkReport {
     pub mob_id: MobId,
     pub child: AgentIdentity,
