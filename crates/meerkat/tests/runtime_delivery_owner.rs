@@ -1385,3 +1385,314 @@ async fn an_owed_change_the_source_announces_runs_exactly_one_round() {
     );
     assert_eq!(host.pages().len(), 2, "exactly one round");
 }
+
+/// Records the session each application reached.
+#[derive(Default)]
+struct RecipientSink {
+    applied: Mutex<Vec<(JobId, SessionId)>>,
+}
+
+#[async_trait::async_trait]
+impl JobDeliverySink for RecipientSink {
+    async fn apply(
+        &self,
+        application: JobDeliveryApplication,
+    ) -> Result<(), JobDeliveryApplyError> {
+        let (job_id, session_id) = match &application {
+            JobDeliveryApplication::Record {
+                job_id,
+                subscription,
+                ..
+            }
+            | JobDeliveryApplication::Notification {
+                job_id,
+                subscription,
+                ..
+            }
+            | JobDeliveryApplication::Event {
+                job_id,
+                subscription,
+                ..
+            } => (job_id.clone(), subscription.session_id().clone()),
+        };
+        self.applied.lock().await.push((job_id, session_id));
+        Ok(())
+    }
+}
+
+/// A host whose mob member, addressed at `member`, was repointed by an
+/// explicit resume to the session `successor`: the member's address resolves
+/// to the successor. Every session is served here, the superseded one too.
+struct RepointedMemberHost {
+    sink: Arc<RecipientSink>,
+    member: meerkat_runtime::LogicalRuntimeId,
+    successor: SessionId,
+}
+
+#[async_trait::async_trait]
+impl RuntimeDeliveryHost for RepointedMemberHost {
+    async fn delivery_route(&self, _session_id: &SessionId) -> Option<meerkat::DeliveryRoute> {
+        Some(meerkat::DeliveryRoute::ServedHere(self.sink.clone()))
+    }
+
+    async fn claim_cold_delivery(
+        &self,
+        session_id: &SessionId,
+    ) -> Option<Result<meerkat_runtime::HostingClaim, meerkat_runtime::HostingRefused>> {
+        Some(meerkat_runtime::grant_session_hosting(
+            &meerkat_runtime::HostingCapability::ProcessLocal,
+            &meerkat_runtime::HostingOwner::mint(),
+            session_id,
+        ))
+    }
+
+    async fn resolve_address(
+        &self,
+        address: &meerkat_runtime::LogicalRuntimeId,
+    ) -> meerkat::AddressResolution {
+        if address == &self.member {
+            meerkat::AddressResolution::Session(self.successor.clone())
+        } else {
+            meerkat::default_address_resolution(address)
+        }
+    }
+}
+
+/// Submit, claim, notify once and complete a job from `spec`.
+async fn notified_and_completed_job(jobs: &DetachedJobService, spec: JobSpec) -> JobId {
+    let job = jobs.submit(spec).await.expect("submit").job_id;
+    let claim = jobs
+        .claim_attempt(
+            &job,
+            AttemptClaim::new(
+                WorkerId::new("worker").expect("worker"),
+                1,
+                100,
+                RunnerHandleRef::new("runner-handle").expect("handle"),
+            ),
+        )
+        .await
+        .expect("claim");
+    jobs.emit_notification(
+        &job,
+        (&claim).into(),
+        2,
+        meerkat::JobNotification::new("line", "line:1", "Match", "pattern seen")
+            .expect("notification"),
+    )
+    .await
+    .expect("emit notification");
+    jobs.complete_attempt(
+        &job,
+        (&claim).into(),
+        3,
+        Some(JobResultRef::new("result").expect("result")),
+    )
+    .await
+    .expect("complete");
+    job
+}
+
+/// Wait until `count` applications reached the sink.
+async fn wait_for_applications(
+    sink: &RecipientSink,
+    count: usize,
+    passes: &mut watch::Receiver<RuntimeDeliveryPass>,
+) -> Vec<(JobId, SessionId)> {
+    tokio::time::timeout(EVENT_GUARD, async {
+        loop {
+            let applied = sink.applied.lock().await.clone();
+            if applied.len() >= count {
+                return applied;
+            }
+            passes.changed().await.expect("owner pass channel open");
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{count} applications never reached the sink"))
+}
+
+/// #1790: a job a mob member's session submitted records the member's
+/// delivery address as its origin member. Its notification and its terminal
+/// are applied in the session serving the member when they are delivered,
+/// the successor after an explicit-resume repoint, never in the superseded
+/// session it was submitted from.
+#[tokio::test]
+async fn a_member_jobs_deliveries_reach_the_member_after_a_repoint() {
+    let fixture = Fixture::new();
+    let superseded = SessionId::new();
+    let successor = SessionId::new();
+    let member = meerkat::member_delivery_address("team", "worker", 1).expect("member address");
+    let sink = Arc::new(RecipientSink::default());
+    let handle = fixture
+        .owner()
+        .arm(Arc::new(RepointedMemberHost {
+            sink: sink.clone(),
+            member: member.clone(),
+            successor: successor.clone(),
+        }))
+        .expect("arm owner");
+    let mut passes = handle.subscribe_passes();
+
+    let job = notified_and_completed_job(
+        &fixture.jobs,
+        spec("default", "member-job", superseded.clone()).with_origin_member_id(
+            meerkat::OriginMemberId::new(member.0.clone()).expect("origin member"),
+        ),
+    )
+    .await;
+    let applied = wait_for_applications(&sink, 2, &mut passes).await;
+    assert_eq!(
+        applied,
+        vec![(job.clone(), successor.clone()), (job, successor)],
+        "the member's job reached the session it was submitted from, not the member"
+    );
+}
+
+/// A job that records no member (or an origin member that is not a member
+/// delivery address) is delivered to its origin session, as before.
+#[tokio::test]
+async fn a_job_without_a_member_address_reaches_its_origin_session() {
+    let fixture = Fixture::new();
+    let origin = SessionId::new();
+    let member = meerkat::member_delivery_address("team", "worker", 1).expect("member address");
+    let sink = Arc::new(RecipientSink::default());
+    let handle = fixture
+        .owner()
+        .arm(Arc::new(RepointedMemberHost {
+            sink: sink.clone(),
+            member,
+            successor: SessionId::new(),
+        }))
+        .expect("arm owner");
+    let mut passes = handle.subscribe_passes();
+
+    let plain =
+        notified_and_completed_job(&fixture.jobs, spec("default", "plain", origin.clone())).await;
+    let opaque = notified_and_completed_job(
+        &fixture.jobs,
+        spec("default", "opaque", origin.clone())
+            .with_origin_member_id(meerkat::OriginMemberId::new("worker-7").expect("member id")),
+    )
+    .await;
+    let mut applied = wait_for_applications(&sink, 4, &mut passes).await;
+    applied.sort();
+    let mut expected = vec![
+        (plain.clone(), origin.clone()),
+        (plain, origin.clone()),
+        (opaque.clone(), origin.clone()),
+        (opaque, origin),
+    ];
+    expected.sort();
+    assert_eq!(applied, expected);
+}
+
+/// Reports one session as the current session of the member at `address`.
+struct MemberSessions {
+    session: SessionId,
+    address: meerkat_runtime::LogicalRuntimeId,
+}
+
+#[async_trait::async_trait]
+impl meerkat::ContinuationAddressResolver for MemberSessions {
+    async fn current_address(
+        &self,
+        _owner: &ContinuationOwner,
+    ) -> Result<Option<meerkat_runtime::LogicalRuntimeId>, String> {
+        Ok(None)
+    }
+
+    async fn resolve_address(
+        &self,
+        _address: &meerkat_runtime::LogicalRuntimeId,
+    ) -> Result<meerkat::AddressResolution, String> {
+        Ok(meerkat::AddressResolution::NotServed)
+    }
+
+    async fn member_address_of_session(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Option<meerkat_runtime::LogicalRuntimeId>, String> {
+        Ok((session_id == &self.session).then(|| self.address.clone()))
+    }
+}
+
+struct NoRetainedJobs;
+
+#[async_trait::async_trait]
+impl meerkat::RetainedJobSource for NoRetainedJobs {
+    async fn retained_job(
+        &self,
+        _producer: &ContinuationProducer,
+        _job_id: &str,
+    ) -> meerkat::RetainedJobLookup {
+        meerkat::RetainedJobLookup::Absent
+    }
+}
+
+/// #1790: the job store a bundle hands producers records, as a submission's
+/// origin member, the delivery address of the member whose current session
+/// submits the job, as
+/// the host's bound continuation resolver reports it. A session no member
+/// serves, and a submission that already names an origin member, are stored
+/// as given.
+#[cfg(feature = "session-store")]
+#[tokio::test]
+async fn a_bundles_job_store_records_the_submitting_members_address() {
+    let bundle = meerkat::PersistenceBundle::new(
+        Arc::new(meerkat_store::MemoryStore::new()) as Arc<dyn meerkat::SessionStore>,
+        Arc::new(InMemoryRuntimeStore::new()) as Arc<dyn meerkat_runtime::RuntimeStore>,
+        Arc::new(meerkat::MemoryBlobStore::new()),
+    )
+    .expect("persistence bundle");
+    let member_session = SessionId::new();
+    let member = meerkat::member_delivery_address("team", "worker", 1).expect("member address");
+    let _binding = bundle
+        .continuation_bindings()
+        .bind(
+            Arc::new(MemberSessions {
+                session: member_session.clone(),
+                address: member.clone(),
+            }),
+            Arc::new(NoRetainedJobs),
+        )
+        .expect("bind the host's resolver");
+    let store = bundle.producer_job_store();
+    let jobs = DetachedJobService::new(store.clone());
+
+    let stamped = jobs
+        .submit(spec("default", "stamped", member_session.clone()))
+        .await
+        .expect("submit")
+        .job_id;
+    let plain = jobs
+        .submit(spec("default", "plain", SessionId::new()))
+        .await
+        .expect("submit")
+        .job_id;
+    let named = jobs
+        .submit(
+            spec("default", "named", member_session).with_origin_member_id(
+                meerkat::OriginMemberId::new("worker-7").expect("member id"),
+            ),
+        )
+        .await
+        .expect("submit")
+        .job_id;
+
+    let origin_member = |job: Option<meerkat_jobs::StoredJob>| {
+        job.expect("job")
+            .spec
+            .origin_member_id
+            .map(|id| id.as_str().to_string())
+    };
+    assert_eq!(
+        origin_member(store.get(&stamped).await.expect("read")),
+        Some(member.0)
+    );
+    assert_eq!(origin_member(store.get(&plain).await.expect("read")), None);
+    assert_eq!(
+        origin_member(store.get(&named).await.expect("read")),
+        Some("worker-7".to_string())
+    );
+}

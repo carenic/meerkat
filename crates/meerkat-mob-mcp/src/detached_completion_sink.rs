@@ -363,6 +363,13 @@ impl meerkat_mob::continuation::MobHandleLookup for MobJobOwner {
             .into_iter()
             .find_map(|(id, handle)| (&id == mob_id).then_some(handle))
     }
+
+    async fn mob_handles(&self) -> Vec<(MobId, MobHandle)> {
+        match self.state.upgrade() {
+            Some(state) => state.managed_mob_handles().await,
+            None => Vec::new(),
+        }
+    }
 }
 
 /// The host's continuation resolver: members through their mobs (revived
@@ -381,6 +388,13 @@ impl ContinuationAddressResolver for HostContinuationResolver {
         owner: &ContinuationOwner,
     ) -> Result<Option<LogicalRuntimeId>, String> {
         self.mobs.current_address(owner).await
+    }
+
+    async fn member_address_of_session(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Option<LogicalRuntimeId>, String> {
+        self.mobs.member_address_of_session(session_id).await
     }
 
     async fn resolve_address(

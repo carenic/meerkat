@@ -1493,6 +1493,9 @@ async fn resubmit_under_recorded_arguments(
     }
     let mut replay = spec;
     replay.runner_specification_ref = Some(recorded_ref);
+    // The admitted job's origin member: a replay from a session its member
+    // has since left no longer derives it (#1790).
+    replay.origin_member_id = admitted.spec.origin_member_id;
     runtime
         .service
         .submit(replay)
@@ -2484,6 +2487,58 @@ mod tests {
             Some(&reference)
         );
         assert_eq!(jobs[0].machine_state.attempt_count, 1);
+    }
+
+    /// #1790: a job admitted with the delivery address of the mob member
+    /// whose session submitted it is the job a replay of the same call joins
+    /// after that member moved to a successor session, when the replay no
+    /// longer derives the address: the store refuses the replay without it
+    /// as another submission, and the conflict path adopts the admitted
+    /// job's origin member along with its recorded arguments.
+    #[tokio::test]
+    async fn a_replay_without_the_origin_member_joins_the_admitted_job() {
+        let root = tempfile::tempdir().unwrap();
+        let (job_store, _verbatim, strict) = open_detached_callback_stores(root.path());
+        let args = RawValue::from_string(r#"{"target": "lan"}"#.to_string()).unwrap();
+        let call = ToolCallView {
+            id: "tc-member",
+            name: "durable",
+            args: &args,
+        };
+        let (dispatcher, _callback_rx) =
+            detached_callback_dispatcher(job_store.clone(), strict.clone());
+
+        // The member's session admitted the call with its address.
+        let recorded = strict
+            .put_artifact(
+                CALLBACK_ARGUMENTS_MEDIA_TYPE,
+                &base64::engine::general_purpose::STANDARD.encode(args.get().as_bytes()),
+            )
+            .await
+            .unwrap();
+        let context = detached_callback_context();
+        let plan = resolve_detached_callback_plan(&dispatcher, call, &context);
+        let (spec, _) = detached_callback_job_spec("realm-a", call, &context, &plan).unwrap();
+        let member = meerkat::OriginMemberId::new("rt:member:team:worker:1").unwrap();
+        let admitted = meerkat::DetachedJobService::new(job_store.clone())
+            .submit(
+                spec.with_runner_specification_ref(
+                    meerkat::RunnerSpecificationRef::new(recorded.blob_id.to_string()).unwrap(),
+                )
+                .with_origin_member_id(member.clone()),
+            )
+            .await
+            .unwrap();
+
+        // The replay derives no member: it joins the admitted job.
+        let replay = submit_detached_callback(&dispatcher, call)
+            .await
+            .expect("the replay joins the admitted job");
+        assert_eq!(replay.job_id, admitted.job_id.to_string());
+        assert!(replay.deduplicated);
+        let jobs = job_store.list_all(usize::MAX).await.unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].spec.origin_member_id, Some(member));
     }
 
     #[tokio::test]

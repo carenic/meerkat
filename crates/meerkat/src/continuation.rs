@@ -401,6 +401,17 @@ pub trait ContinuationAddressResolver: Send + Sync {
     ) -> Result<AddressObservation, String> {
         Ok(AddressObservation::MayServe)
     }
+
+    /// The delivery address of the mob member whose current session is
+    /// `session_id`, if any: a detached job that session submits records it,
+    /// so the job's deliveries follow the member across a repoint to a
+    /// successor session (#1790). The default knows of no members.
+    async fn member_address_of_session(
+        &self,
+        _session_id: &SessionId,
+    ) -> Result<Option<LogicalRuntimeId>, String> {
+        Ok(None)
+    }
 }
 
 /// Resolves standalone-session owners only: a session's address is its own
@@ -1192,6 +1203,29 @@ impl ContinuationHostBindings {
                 .await
                 .unwrap_or(AddressResolution::NotServed),
             None => crate::default_address_resolution(address),
+        }
+    }
+
+    /// The delivery address of the mob member `session_id` serves now,
+    /// through the bound resolver
+    /// ([`ContinuationAddressResolver::member_address_of_session`]). `None`
+    /// without a binding, for a session no member serves, and when the
+    /// resolver cannot tell: a job then keeps its session's address.
+    pub async fn member_address_of_session(
+        &self,
+        session_id: &SessionId,
+    ) -> Option<LogicalRuntimeId> {
+        let resolver = self.resolver()?;
+        match resolver.member_address_of_session(session_id).await {
+            Ok(address) => address,
+            Err(error) => {
+                tracing::warn!(
+                    %session_id,
+                    %error,
+                    "the member a submitting session serves is unknown; its job keeps the session's address"
+                );
+                None
+            }
         }
     }
 }

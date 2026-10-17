@@ -157,6 +157,13 @@ The job outbox and runtime inbox form an ordered, replay-safe handoff. A crash
 on either side retries the same durable identity, and the origin session can
 be woken from idle keep-alive without keeping a provider call open.
 
+A job a mob member's session submits is addressed to the member rather than to
+that session: its notifications and terminal are applied in whichever session
+serves the member when they are delivered, so an explicit-resume repoint to a
+successor session does not strand them. A member respawned under the same
+identity is a new generation and never receives an earlier generation's rows.
+Jobs submitted before 0.9.3 keep their session's address.
+
 ## Script Monitors
 
 `monitors/start` is a convenience submission surface over the same durable job

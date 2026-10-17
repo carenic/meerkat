@@ -458,6 +458,8 @@ mod approval_issuer;
 pub mod governed_realm;
 #[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
 pub use approval_issuer::{ApprovalIssuerSelection, ApprovalIssuerSelectionError};
+#[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
+mod job_origin;
 mod persistence;
 #[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
 pub mod storage_provider;

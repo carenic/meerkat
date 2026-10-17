@@ -479,6 +479,26 @@ impl PersistenceBundle {
         self.job_store.clone()
     }
 
+    /// The bundle's detached job store as the producers that submit jobs
+    /// use it (#1790): a job a mob member's current session submits records
+    /// the member's delivery address
+    /// ([`crate::ContinuationAddressResolver::member_address_of_session`]),
+    /// so its deliveries follow the member across a repoint. Every other
+    /// operation is [`Self::job_store`]'s.
+    pub fn producer_job_store(&self) -> Arc<dyn meerkat_jobs::DetachedJobStore> {
+        #[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
+        {
+            Arc::new(crate::job_origin::MemberOriginJobStore::new(
+                self.job_store.clone(),
+                Arc::clone(&self.continuation_bindings),
+            ))
+        }
+        #[cfg(not(all(feature = "session-store", not(target_arch = "wasm32"))))]
+        {
+            self.job_store.clone()
+        }
+    }
+
     #[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
     pub fn manifest(&self) -> Option<&RealmManifest> {
         self.manifest.as_ref()

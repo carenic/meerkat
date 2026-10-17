@@ -10,6 +10,7 @@ use std::sync::Arc;
 use meerkat::{
     AddressObservation, AddressResolution, ContinuationAddressResolver, ContinuationOwner,
 };
+use meerkat_core::SessionId;
 use meerkat_runtime::LogicalRuntimeId;
 
 use crate::ids::{AgentIdentity, MobId};
@@ -20,6 +21,12 @@ use crate::runtime::MobHandle;
 #[async_trait::async_trait]
 pub trait MobHandleLookup: Send + Sync {
     async fn mob_handle(&self, mob_id: &MobId) -> Option<MobHandle>;
+
+    /// Every mob the host holds now, with its id: the rosters a session's
+    /// member is looked up in. The default holds none.
+    async fn mob_handles(&self) -> Vec<(MobId, MobHandle)> {
+        Vec::new()
+    }
 }
 
 /// Resolves continuation owners and delivery addresses through mob rosters,
@@ -113,6 +120,27 @@ impl ContinuationAddressResolver for MobContinuationResolver {
             ) => Ok(AddressResolution::Retired),
             Err(_) => Ok(AddressResolution::NotServed),
         }
+    }
+
+    /// The member whose current session is `session_id`, by roster: its
+    /// incarnation's address. A superseded session names no member.
+    async fn member_address_of_session(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Option<LogicalRuntimeId>, String> {
+        for (mob_id, handle) in self.mobs.mob_handles().await {
+            let roster = handle.roster().await;
+            if let Some(entry) = roster.find_by_bridge_session_id(session_id) {
+                return meerkat::member_delivery_address(
+                    mob_id.as_str(),
+                    entry.agent_identity.as_str(),
+                    entry.generation.get(),
+                )
+                .map(Some)
+                .map_err(|error| error.to_string());
+            }
+        }
+        Ok(None)
     }
 
     /// Observed from the roster and the mob's published lifecycle only, with

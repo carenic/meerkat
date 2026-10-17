@@ -35,6 +35,40 @@ them.
 
 ## [Unreleased]
 
+### Added
+
+- `meerkat::ContinuationAddressResolver::member_address_of_session` and
+  `meerkat_mob::continuation::MobHandleLookup::mob_handles`, provided
+  methods (the defaults know of no members and hold no mobs): a host that
+  resolves member delivery addresses reports the mob member a session serves
+  now. `meerkat::ContinuationHostBindings::member_address_of_session` asks
+  the bound resolver. `meerkat::JobRuntimeDeliveryApplier::with_address_session`
+  names the session serving a drained member address.
+  `meerkat::PersistenceBundle::producer_job_store` is the bundle's job store
+  as job producers use it (see Fixed); `job_store` stays the host's own store.
+
+### Fixed
+
+- A detached job a mob member's session submitted delivered its
+  notifications and terminal to that session's runtime, and an
+  explicit-resume repoint moves the member to a successor session without
+  migrating delivery rows, so after a repoint they stranded on the
+  superseded session (#1790). The job store the persistence bundle hands
+  producers (`PersistenceBundle::producer_job_store`, which the RPC host and
+  the runtime-backed surfaces use) now records the delivery address of the
+  member whose current session submits a job
+  (`rt:member:{mob}:{identity}:{generation}`, as the host's continuation
+  resolver reports it) as the job's origin member (`JobSpec::origin_member_id`),
+  and the delivery owner applies such a job's rows in the session serving the
+  member when they are delivered; other sessions' subscriptions are
+  unchanged. A replay of the same call from the superseded session joins the
+  admitted job: the callback and shell producers adopt its origin member. A
+  member respawned under its identity is a new generation that never receives
+  an earlier generation's rows, which stay pending. Jobs submitted before
+  0.9.3, and jobs of sessions no member serves, keep their session's
+  address. Not yet covered: the terminal a background shell job applies
+  itself, in the session that ran it.
+
 ## [0.9.2] - 2026-10-16
 
 ### Breaking
