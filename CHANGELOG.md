@@ -35,6 +35,51 @@ them.
 
 ## [Unreleased]
 
+### Breaking
+
+- `meerkat-mob`: `MemberShutdownOutcome::UnregisterPending` carries
+  `settlement: MemberUnregisterSettlement` and is `#[non_exhaustive]`: match
+  it with `{ stage, .. }`. The settlement follows the exact registration's
+  runtime unregister after Shutdown returns.
+
+### Added
+
+- `meerkat-mob`: `MemberUnregisterSettlement` and `MemberUnregisterState`
+  (`Settled`, `Pending`, `Failed`; non-exhaustive). A settlement reads its
+  state without waiting (`try_state`) or waits for it until a deadline
+  (`settle_within`), also after the mob's actor exited. It joins the
+  runtime's unregister coordinator for the member's exact registration,
+  admits that unregister through the same exact-registration path when
+  Shutdown's deadline passed before it was admitted, and holds the mob's
+  runtime handle only weakly: a dropped handle settles only once the
+  registration has provably ended.
+- `meerkat-runtime`: `RuntimeSessionRegistrationWitness::has_ended`, whether
+  an exact registration has ended for good (no runtime holds its entry).
+
+### Changed
+
+- `meerkat-mob`: a runtime refusal of a member's unregister until its
+  registration's durability is repaired
+  (`RuntimeDriverError::RecoveryRepairBlocked`) is reported
+  `UnregisterPending` at the stage `durability_reload_discard`, not as a
+  Shutdown teardown failure: its settlement runs the reload-required discard
+  and admits the unregister again.
+
+### Fixed
+
+- A mob Shutdown's runtime teardown, and the settlement it reports,
+  unregister a member whose runtime registration is durability-degraded
+  (`meerkat-mob`). A failed boundary commit leaves the session
+  `ReloadRequired`, and its exited runtime loop can keep the session's
+  mutation fence, which only the runtime's reload-required discard releases.
+  The teardown's exact unregister admission waited on that fence, so the
+  member was reported `UnregisterPending` and stayed registered until the
+  process exited. The teardown and the settlement now run the discard first,
+  as retire and destroy do, and unregister the cold successor it publishes.
+  An unregister coordinator admitted before the session degraded still waits
+  on the fence; its settlement stays pending, bounded by each call's
+  deadline.
+
 ## [0.9.3] - 2026-10-18
 
 ### Breaking
