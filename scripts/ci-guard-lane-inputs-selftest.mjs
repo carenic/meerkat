@@ -10,7 +10,10 @@
 // resolved to the Rust files of its target that define it; a selection that
 // resolves to no file, a defining file outside the lane's inputs, a selected
 // package whose manifest is not an input, or an input that no longer exists
-// fails.
+// fails. So does a module declaration (the `mod` item and its attributes)
+// that compiles the selected cases in and differs from its pin, and a second
+// module whose name ends in governed_jsonl (the governed JSONL step selects by
+// substring).
 
 import assert from "node:assert/strict";
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
@@ -102,6 +105,7 @@ function filterAtoms(expression) {
 }
 
 const selections = { governed_jsonl: [], mcp_confinement_positive: [] };
+let governedFiles = [];
 
 // Governed JSONL: the job's expected list over its command's target.
 {
@@ -114,6 +118,7 @@ const selections = { governed_jsonl: [], mcp_confinement_positive: [] };
   assert.ok(command, "ci.yml: the governed JSONL step has no command");
   const args = [...command.matchAll(/"([^"]+)"/g)].map((match) => match[1]).join(" ");
   const target = targetFiles(args.slice(args.indexOf("-p ")));
+  governedFiles = target.files;
   for (const name of names) {
     selections.governed_jsonl.push({ label: name, pkg: target.pkg, dir: target.dir, files: definingFiles(target.files, name, "test") });
   }
@@ -166,6 +171,39 @@ for (const [lane, selected] of Object.entries(selections)) {
     }
   }
 }
+
+// The declarations that compile the selected cases in, pinned: a cfg that
+// drops a module on Linux, or a moved or second declaration, fails here (and
+// a pull request that changes one runs the lane: GUARD_LANE_DEFINITIONS).
+// Changing a declaration means changing its pin.
+const PINNED_DECLARATIONS = {
+  governed_jsonl: {
+    "crates/meerkat-rpc/src/lib.rs": '#[cfg(feature = "local-authorization")]\npub mod governed_jsonl;',
+  },
+  mcp_confinement_positive: {
+    "crates/meerkat-mcp/src/connection.rs":
+      '#[cfg(test)]\n#[path = "process_confinement_tests.rs"]\nmod process_confinement_tests;',
+    "crates/meerkat-tools/src/builtin/shell/mod.rs": "#[cfg(all(test, unix))]\nmod confinement_tests;",
+    "crates/meerkat/src/lib.rs": '#[cfg(any(target_os = "linux", target_os = "macos"))]\nmod process_custody;',
+  },
+};
+for (const [lane, pins] of Object.entries(PINNED_DECLARATIONS)) {
+  const declared = GUARD_LANE_DEFINITIONS[lane].map(([path]) => path).filter((path) => path.endsWith(".rs"));
+  if (declared.sort().join(" ") !== Object.keys(pins).sort().join(" ")) {
+    failures.push(`${lane}: GUARD_LANE_DEFINITIONS reads declarations from ${declared.join(", ")}, the pins are ${Object.keys(pins).join(", ")}`);
+  }
+  for (const [path, pinned] of Object.entries(pins)) {
+    const found = GUARD_LANE_DEFINITIONS[lane].find(([file]) => file === path)?.[1](read(path)) ?? "";
+    if (found !== pinned) failures.push(`${lane}: ${path} declares\n${found || "(nothing)"}\ninstead of the pinned\n${pinned}`);
+  }
+}
+const governedModules = governedFiles.flatMap((file) =>
+  [...read(file).matchAll(/^\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+(\w*governed_jsonl)\b/gm)].map((match) => `${file}: mod ${match[1]}`),
+);
+if (governedModules.length !== 1) {
+  failures.push(`governed_jsonl: the step's filter governed_jsonl::tests:: needs exactly one module ending in governed_jsonl, found ${governedModules.join("; ") || "none"}`);
+}
+
 if (failures.length > 0) {
   for (const failure of failures) console.error(`guard lane inputs: ${failure}`);
   process.exit(1);
@@ -173,4 +211,5 @@ if (failures.length > 0) {
 const counts = Object.entries(selections)
   .map(([lane, selected]) => `${lane} ${selected.length} selections in ${new Set(selected.flatMap((s) => s.files)).size} files`)
   .join(", ");
-console.log(`exact-profile lane inputs cover every selected case (${counts})`);
+const pinned = Object.values(PINNED_DECLARATIONS).flatMap(Object.keys).length;
+console.log(`exact-profile lane inputs cover every selected case (${counts}); ${pinned} declarations match their pins`);
