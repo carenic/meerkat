@@ -59,6 +59,10 @@ them.
   apart. The read consults no live state, revives nothing, and submits,
   replays or releases nothing. `SessionServiceRuntimeExt::durable_admitted_original`
   forwards it; its default answers `Unavailable`.
+- `meerkat-sqlite`: `preflight_domain_version` runs the schema eligibility
+  check that `preflight_schema_eligibility` runs and returns the ledger
+  version it verified (`None` for a fresh domain), read in the same snapshot
+  as the check.
 
 ### Fixed
 
@@ -102,6 +106,24 @@ them.
   `Unavailable` if the failure persists. A standalone
   `LocalGrantAuthority::resolve_lineage` still reports a concurrent change
   as `GrantRefusal::Unavailable`.
+- Stores no longer refuse to open with "schema domain ... has no ledger row
+  but already owns objects" when another process creates the same schema
+  domain at that moment (the 0.9.3 known issue "First concurrent durable
+  delivery"). The open-time check now reads the schema ledger and the
+  catalog in one snapshot, so a domain created concurrently is seen whole or
+  not at all. Two processes racing their first durable delivery write
+  (`runtime-delivery`) hit this most often. A durable delivery read also
+  decides from the version its own check verified whether that domain
+  exists and which of its tables to read, so a domain stamped after the read
+  opened, possibly by a newer binary, is checked before it is read.
+- A job delivery whose projection into the runtime inbox failed is retried
+  on the delivery owner's next wake of any kind. While it keeps failing,
+  each further retry waits for twice as many wakes (up to 64), so a busy
+  runtime does not retry it on every wake; it is never retried by itself
+  or in a loop. Before, only a job commit or a delivery generation change
+  retried it, so it could stay pending until the process restarted. This
+  was the retry half of the 0.9.3 known issue "First concurrent durable
+  delivery".
 
 ## [0.9.3] - 2026-10-18
 
