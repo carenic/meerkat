@@ -34627,6 +34627,7 @@ fn runtime_recovery_compaction_session(
         summary_tokens: 4,
         messages_before: 2,
         messages_after: 1,
+        summary_source: None,
     };
     session
         .add_compaction_projection_intent(intent.clone())

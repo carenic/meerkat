@@ -37,15 +37,23 @@ them.
 
 ### Breaking
 
-- `meerkat-core`: `Compactor::prepare_for_summarization` takes the
-  summarization source budget, `(messages: &[Message], budget:
-  Option<SummarizationSourceBudget>)`, and has no default implementation:
-  every compactor states how it bounds the transcript it sends to the model
-  that writes the summary. The budget is that model's
+- `meerkat-core`: a compaction summary reports what its source carried.
+  `Compactor::prepare_for_summarization` takes the summarization source budget
+  and returns the source with its bound, `(messages: &[Message], budget:
+  Option<SummarizationSourceBudget>) -> SummarizationSource`, and has no
+  default implementation: every compactor states how it bounds the transcript
+  it sends to the model that writes the summary. The budget is that model's
   (`SummarizationSourceBudget::for_summary_model`), `None` when the model
-  declares no context window. The implementors in this repository
-  (`DefaultCompactor` and the test compactors) are updated; no published
-  example implements the trait.
+  declares no context window. `CompactionSummarySource::ProviderCall` carries
+  the call's `source_bound`, and `AgentEvent::CompactionCompleted` and
+  `CompactionProjectionIntent` gain `summary_source`, `None` only for one
+  recorded before this release (on the wire the field is optional). A
+  compactor that used the default keeps its old behaviour by returning
+  `SummarizationSource::whole(meerkat_core::materialize_latest_system_prompt_versions(messages))`
+  and ignoring the budget; to fit the summarizing model, it also bounds the
+  result by the budget and reports the bound, as `DefaultCompactor` does. The
+  implementors in this repository (`DefaultCompactor` and the test
+  compactors) are updated; no published example implements the trait.
 
 ### Added
 
@@ -53,6 +61,14 @@ them.
   the transcript a compactor sends to the summarizing model.
   `for_summary_model` derives it from that model's context window and
   `from_compaction_threshold` from a compaction threshold.
+- `meerkat-core`: `SummarizationSource` and `SummarizationSourceBound`
+  (`whole`, `trimmed` with the last `SummarizationTrimStage` cut, or
+  `requests_only` with how many of the user requests it kept);
+  `CompactionSummarySource` is serializable and exported from the crate root.
+  The `compaction_completed` wire event carries it as `summary_source`, and
+  the Python (`CompactionCompleted.summary_source`) and TypeScript
+  (`CompactionCompletedEvent.summarySource`) SDKs parse it; a kind they do
+  not know parses to `unknown` with the wire object.
 
 ### Changed
 
@@ -64,10 +80,18 @@ them.
   With the model-aware default threshold that is about ten times more (for a
   200,000-token window, about 390 KB instead of 40 KB), so a summary call can
   cost more input tokens as the model window grows; it never costs more than
-  the history being compacted, because the source is never larger than that
-  history. A model with a small window and a large explicit threshold no
-  longer gets a summary request larger than its window. A model that declares
-  no context window keeps the threshold rule.
+  the history being compacted plus the compaction prompt, because the source
+  is never larger than that history. A model with a small window and a large
+  explicit threshold gets a source its window holds instead of one sized for
+  the threshold; only a window too small for the 4 KiB minimum still
+  overflows, and the capacity fallback then writes a mechanical summary. A
+  model that declares no context window keeps the threshold rule.
+
+### Fixed
+
+- `meerkat-session`: the last-resort compaction source (user requests only)
+  no longer claims to keep every user request. Its note says it carries the
+  newest N of the M requests, and the completion reports the same counts.
 
 ## [0.9.3] - 2026-10-18
 

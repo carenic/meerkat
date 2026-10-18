@@ -3723,8 +3723,10 @@ where
                             // can silently refund usage.
                             self.charge_compaction_summary_call(
                                 &outcome.summary_usage,
-                                outcome.summary_source
-                                    == crate::agent::compact::CompactionSummarySource::ProviderCall,
+                                matches!(
+                                    outcome.summary_source,
+                                    crate::agent::compact::CompactionSummarySource::ProviderCall { .. }
+                                ),
                                 outcome.summary_usage_identity_dispute.clone(),
                                 event_tx,
                             )
@@ -3877,6 +3879,7 @@ where
                                                             summary_tokens: outcome.summary_usage.output_tokens,
                                                             messages_before: outcome.messages_before,
                                                             messages_after: outcome.messages_after,
+                                                            summary_source: Some(outcome.summary_source),
                                                         };
                                                         match compacted_session
                                                             .add_compaction_projection_intent(intent)
@@ -4078,6 +4081,7 @@ where
                                             summary_tokens: outcome.summary_usage.output_tokens,
                                             messages_before: outcome.messages_before,
                                             messages_after: outcome.messages_after,
+                                            summary_source: Some(outcome.summary_source),
                                         },
                                     )
                                     .await
@@ -4484,6 +4488,7 @@ where
                     summary_tokens: intent.summary_tokens,
                     messages_before: intent.messages_before,
                     messages_after: intent.messages_after,
+                    summary_source: intent.summary_source,
                 },
             )
             .await
@@ -10569,8 +10574,10 @@ mod tests {
             &self,
             messages: &[Message],
             _budget: Option<crate::compact::SummarizationSourceBudget>,
-        ) -> Vec<Message> {
-            crate::types::materialize_latest_system_prompt_versions(messages)
+        ) -> crate::compact::SummarizationSource {
+            crate::compact::SummarizationSource::whole(
+                crate::types::materialize_latest_system_prompt_versions(messages),
+            )
         }
 
         fn rebuild_history(&self, messages: &[Message], summary: &str) -> CompactionResult {
@@ -10625,8 +10632,10 @@ mod tests {
             &self,
             messages: &[Message],
             _budget: Option<crate::compact::SummarizationSourceBudget>,
-        ) -> Vec<Message> {
-            crate::types::materialize_latest_system_prompt_versions(messages)
+        ) -> crate::compact::SummarizationSource {
+            crate::compact::SummarizationSource::whole(
+                crate::types::materialize_latest_system_prompt_versions(messages),
+            )
         }
 
         fn rebuild_history(&self, messages: &[Message], summary: &str) -> CompactionResult {
@@ -10797,13 +10806,21 @@ mod tests {
 
     struct DiscardingCompactor {
         compact_on_boundary: u64,
+        source_bound: crate::compact::SummarizationSourceBound,
     }
 
     impl DiscardingCompactor {
         fn new(compact_on_boundary: u64) -> Self {
             Self {
                 compact_on_boundary,
+                source_bound: crate::compact::SummarizationSourceBound::Whole,
             }
+        }
+
+        /// Report `source_bound` for every summarization source.
+        fn reporting(mut self, source_bound: crate::compact::SummarizationSourceBound) -> Self {
+            self.source_bound = source_bound;
+            self
         }
     }
 
@@ -10824,8 +10841,11 @@ mod tests {
             &self,
             messages: &[Message],
             _budget: Option<crate::compact::SummarizationSourceBudget>,
-        ) -> Vec<Message> {
-            crate::types::materialize_latest_system_prompt_versions(messages)
+        ) -> crate::compact::SummarizationSource {
+            crate::compact::SummarizationSource {
+                messages: crate::types::materialize_latest_system_prompt_versions(messages),
+                bound: self.source_bound,
+            }
         }
 
         fn rebuild_history(&self, messages: &[Message], summary: &str) -> CompactionResult {
@@ -10907,8 +10927,10 @@ mod tests {
             &self,
             messages: &[Message],
             _budget: Option<crate::compact::SummarizationSourceBudget>,
-        ) -> Vec<Message> {
-            crate::types::materialize_latest_system_prompt_versions(messages)
+        ) -> crate::compact::SummarizationSource {
+            crate::compact::SummarizationSource::whole(
+                crate::types::materialize_latest_system_prompt_versions(messages),
+            )
         }
 
         fn rebuild_history(&self, messages: &[Message], summary: &str) -> CompactionResult {
@@ -10935,8 +10957,10 @@ mod tests {
             &self,
             messages: &[Message],
             _budget: Option<crate::compact::SummarizationSourceBudget>,
-        ) -> Vec<Message> {
-            crate::types::materialize_latest_system_prompt_versions(messages)
+        ) -> crate::compact::SummarizationSource {
+            crate::compact::SummarizationSource::whole(
+                crate::types::materialize_latest_system_prompt_versions(messages),
+            )
         }
 
         fn rebuild_history(&self, messages: &[Message], summary: &str) -> CompactionResult {
@@ -10992,8 +11016,10 @@ mod tests {
             &self,
             messages: &[Message],
             _budget: Option<crate::compact::SummarizationSourceBudget>,
-        ) -> Vec<Message> {
-            crate::types::materialize_latest_system_prompt_versions(messages)
+        ) -> crate::compact::SummarizationSource {
+            crate::compact::SummarizationSource::whole(
+                crate::types::materialize_latest_system_prompt_versions(messages),
+            )
         }
 
         fn rebuild_history(&self, messages: &[Message], summary: &str) -> CompactionResult {
@@ -11912,6 +11938,15 @@ mod tests {
         ));
         let intents = agent.session().compaction_projection_intents().unwrap();
         assert_eq!(intents.len(), 1);
+        assert_eq!(
+            intents[0].summary_source,
+            Some(
+                crate::agent::compact::CompactionSummarySource::ProviderCall {
+                    source_bound: crate::compact::SummarizationSourceBound::Whole,
+                }
+            ),
+            "the staged intent carries the summary source to the completion its commit emits"
+        );
         assert_eq!(transaction.projections, vec![intents[0].projection.clone()]);
         assert_eq!(
             memory_store.staged.lock().unwrap().as_slice(),
@@ -11974,6 +12009,7 @@ mod tests {
                 summary_tokens: 1,
                 messages_before,
                 messages_after: 1,
+                summary_source: None,
             })
             .unwrap();
         projection
@@ -14500,10 +14536,19 @@ mod tests {
         let mut turns_completed = 0usize;
         while let Ok(event) = rx.try_recv() {
             match event {
-                crate::event::AgentEvent::CompactionCompleted { summary_tokens, .. } => {
+                crate::event::AgentEvent::CompactionCompleted {
+                    summary_tokens,
+                    summary_source,
+                    ..
+                } => {
                     assert_eq!(
                         summary_tokens, 0,
                         "curated summaries consume no LLM tokens; summary usage must be zero"
+                    );
+                    assert_eq!(
+                        summary_source,
+                        Some(crate::agent::compact::CompactionSummarySource::HostCurator),
+                        "the completion names the curator as the summary's author"
                     );
                     saw_completed = true;
                 }
@@ -14546,6 +14591,43 @@ mod tests {
                         && user.text_content().contains("curated summary")
             )),
             "the committed history must carry the curated summary as a typed compaction-summary message"
+        );
+    }
+
+    /// The completion event says who wrote the summary and, for a provider
+    /// call, how much of the history its source carried, as the compactor
+    /// reported it.
+    #[tokio::test]
+    async fn compaction_completed_reports_the_summary_source_bound() {
+        let bound = crate::compact::SummarizationSourceBound::RequestsOnly { kept: 1, of: 2 };
+        let client = Arc::new(CompactionAwareLlmClient::new());
+        let mut agent = with_test_turn_state_handle(AgentBuilder::new())
+            .compactor(Arc::new(DiscardingCompactor::new(1).reporting(bound)))
+            .build_standalone(client, Arc::new(NoTools), Arc::new(NoopStore))
+            .await;
+
+        agent.run("first".into()).await.unwrap();
+        let (tx, mut rx) = mpsc::channel::<crate::event::AgentEvent>(128);
+        agent
+            .run_with_events("second".into(), tx)
+            .await
+            .expect("the compaction commits and the turn continues");
+
+        let sources: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok())
+            .filter_map(|event| match event {
+                crate::event::AgentEvent::CompactionCompleted { summary_source, .. } => {
+                    Some(summary_source)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            sources,
+            vec![Some(
+                crate::agent::compact::CompactionSummarySource::ProviderCall {
+                    source_bound: bound
+                }
+            )]
         );
     }
 
@@ -15062,8 +15144,10 @@ mod tests {
             &self,
             messages: &[Message],
             _budget: Option<crate::compact::SummarizationSourceBudget>,
-        ) -> Vec<Message> {
-            crate::types::materialize_latest_system_prompt_versions(messages)
+        ) -> crate::compact::SummarizationSource {
+            crate::compact::SummarizationSource::whole(
+                crate::types::materialize_latest_system_prompt_versions(messages),
+            )
         }
         fn rebuild_history(&self, messages: &[Message], summary: &str) -> CompactionResult {
             let tail_start = messages
@@ -16924,9 +17008,11 @@ mod tests {
             &self,
             messages: &[Message],
             budget: Option<crate::compact::SummarizationSourceBudget>,
-        ) -> Vec<Message> {
+        ) -> crate::compact::SummarizationSource {
             self.seen_budgets.lock().unwrap().push(budget);
-            crate::types::materialize_latest_system_prompt_versions(messages)
+            crate::compact::SummarizationSource::whole(
+                crate::types::materialize_latest_system_prompt_versions(messages),
+            )
         }
 
         fn rebuild_history(&self, messages: &[Message], summary: &str) -> CompactionResult {

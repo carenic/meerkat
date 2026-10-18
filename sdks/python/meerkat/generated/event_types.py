@@ -451,6 +451,64 @@ class CompactionFailureReasonProjectionHandoffRefused(TypedDict, total=False):
 CompactionFailureReason = CompactionFailureReasonLlmFailed | CompactionFailureReasonEmptySummary | CompactionFailureReasonCuratorFailed | CompactionFailureReasonEstimationFailed | CompactionFailureReasonMemoryIndexingFailed | CompactionFailureReasonTranscriptRewriteFailed | CompactionFailureReasonProjectionHandoffRefused
 
 
+# The kinds of text a summarization source is trimmed through, in order:
+# tool results first, user requests last.
+SummarizationTrimStage = Literal['tool_results', 'context', 'user_requests']
+
+
+class SummarizationSourceBoundWhole(TypedDict, total=False):
+    """Every message, nothing cut to fit the budget.
+    """
+    kind: Required[Literal['whole']]
+
+
+class SummarizationSourceBoundTrimmed(TypedDict, total=False):
+    """Every message, with the texts too large for the budget cut around an
+    omission marker the summarizing model sees.
+    """
+    kind: Required[Literal['trimmed']]
+    through: Required[SummarizationTrimStage]
+
+
+class SummarizationSourceBoundRequestsOnly(TypedDict, total=False):
+    """Only the newest `kept` of the history's `of` user requests; everything
+    else is omitted.
+    """
+    kept: Required[int]
+    kind: Required[Literal['requests_only']]
+    of: Required[int]
+
+
+# How much of the history being compacted a summarization source carries.
+SummarizationSourceBound = SummarizationSourceBoundWhole | SummarizationSourceBoundTrimmed | SummarizationSourceBoundRequestsOnly
+
+
+class CompactionSummarySourceProviderCall(TypedDict, total=False):
+    """The summarization LLM call: a real provider request.
+    """
+    kind: Required[Literal['provider_call']]
+    source_bound: Required[SummarizationSourceBound]
+
+
+class CompactionSummarySourceHostCurator(TypedDict, total=False):
+    """A configured host curator; no provider request was made.
+    """
+    kind: Required[Literal['host_curator']]
+
+
+class CompactionSummarySourceMechanicalFallback(TypedDict, total=False):
+    """The mechanical capacity fallback; no provider request backs the
+    summary. When the provider answered first and stopped at the model
+    context window, that call is still charged to the session, apart from
+    this outcome.
+    """
+    kind: Required[Literal['mechanical_fallback']]
+
+
+# Who produced a compaction summary.
+CompactionSummarySource = CompactionSummarySourceProviderCall | CompactionSummarySourceHostCurator | CompactionSummarySourceMechanicalFallback
+
+
 class SkillKey(TypedDict, total=False):
     """Canonical runtime identity for a skill.
 
@@ -2035,6 +2093,7 @@ class AgentEventCompactionCompleted(TypedDict, total=False):
     """
     messages_after: Required[int]
     messages_before: Required[int]
+    summary_source: NotRequired[Optional[CompactionSummarySource]]
     summary_tokens: Required[int]
     type: Required[Literal['compaction_completed']]
 

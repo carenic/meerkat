@@ -4,7 +4,8 @@
 
 use meerkat_core::compact::{
     COMPACTION_SUMMARY_PREFIX, CompactionConfig, CompactionContext, CompactionResult,
-    CompactionSummary, Compactor, SummarizationSourceBudget,
+    CompactionSummary, Compactor, SummarizationSource, SummarizationSourceBound,
+    SummarizationSourceBudget,
 };
 use meerkat_core::types::{
     AssistantBlock, BlockAssistantMessage, ContentBlock, Message,
@@ -30,7 +31,6 @@ const MIN_RETAINED_HISTORY_BUDGET_BYTES: u64 = 4 * 1024;
 /// source; below it, the next role is trimmed instead.
 const MIN_TRIMMED_TEXT_BYTES: usize = 512;
 const TRIMMED_TEXT_MARKER: &str = "\n[... trimmed for the compaction source ...]\n";
-const REQUESTS_ONLY_SOURCE_PREFIX: &str = "[Bounded compaction source. The projected transcript is larger than the safe summarization window even with every tool result and message trimmed. The user requests are kept, newest included; everything else is omitted.]\n";
 
 /// Default compaction strategy implementation.
 pub struct DefaultCompactor {
@@ -181,6 +181,16 @@ enum TrimRole {
     User,
 }
 
+impl TrimRole {
+    fn stage(self) -> meerkat_core::compact::SummarizationTrimStage {
+        match self {
+            Self::ToolResults => meerkat_core::compact::SummarizationTrimStage::ToolResults,
+            Self::Context => meerkat_core::compact::SummarizationTrimStage::Context,
+            Self::User => meerkat_core::compact::SummarizationTrimStage::UserRequests,
+        }
+    }
+}
+
 fn serialized_len(messages: &[Message]) -> Result<usize, serde_json::Error> {
     serde_json::to_vec(messages).map(|encoded| encoded.len())
 }
@@ -292,15 +302,34 @@ fn largest_text(messages: &[Message], role: TrimRole) -> usize {
         .unwrap_or(0)
 }
 
+/// The note opening the last-resort source, naming how many of the
+/// history's user requests the source carries.
+fn requests_only_note(kept: usize, of: usize) -> String {
+    format!(
+        "[Bounded compaction source. The projected transcript is larger than the safe summarization window even with every tool result and message trimmed. Only the newest {kept} of the {of} user requests are kept, in their original order; everything else is omitted.]\n"
+    )
+}
+
+/// The user requests of `messages`, newest first.
+fn user_requests_newest_first(
+    messages: &[Message],
+) -> impl Iterator<Item = &meerkat_core::types::UserMessage> {
+    messages.iter().rev().filter_map(|message| match message {
+        Message::User(user) if !user.transcript_role.is_compaction_summary() => Some(user),
+        _ => None,
+    })
+}
+
 /// The last-resort source: only the user requests, newest first while the
 /// source's final serialized size (envelope and JSON escaping included)
 /// stays within `budget`, in transcript order. The newest request is always
 /// kept, cut further if it alone does not fit.
-fn requests_only_source(messages: &[Message], budget: usize) -> Vec<Message> {
+fn requests_only_source(messages: &[Message], budget: usize) -> SummarizationSource {
+    let of = user_requests_newest_first(messages).count();
     let source = |newest_first: &[String]| {
         let lines: String = newest_first.iter().rev().map(String::as_str).collect();
         vec![Message::User(meerkat_core::types::UserMessage::text(
-            format!("{REQUESTS_ONLY_SOURCE_PREFIX}{lines}"),
+            format!("{}{lines}", requests_only_note(newest_first.len(), of)),
         ))]
     };
     let fits = |candidate: &[Message]| serialized_len(candidate).is_ok_and(|len| len <= budget);
@@ -308,10 +337,7 @@ fn requests_only_source(messages: &[Message], budget: usize) -> Vec<Message> {
     // message carries a new timestamp, whose serialized width varies.
     let mut kept: Vec<String> = Vec::new();
     let mut checked = source(&kept);
-    for user in messages.iter().rev().filter_map(|message| match message {
-        Message::User(user) if !user.transcript_role.is_compaction_summary() => Some(user),
-        _ => None,
-    }) {
+    for user in user_requests_newest_first(messages) {
         let mut text = user.text_content();
         trim_text(&mut text, MIN_TRIMMED_TEXT_BYTES);
         let mut candidate = kept.clone();
@@ -329,8 +355,10 @@ fn requests_only_source(messages: &[Message], budget: usize) -> Vec<Message> {
             loop {
                 cap /= 2;
                 trim_text(&mut text, cap);
-                let built = source(&[format!("- {text}\n")]);
+                let newest = vec![format!("- {text}\n")];
+                let built = source(&newest);
                 if fits(&built) || cap <= TRIMMED_TEXT_MARKER.len() {
+                    kept = newest;
                     checked = built;
                     break;
                 }
@@ -338,7 +366,13 @@ fn requests_only_source(messages: &[Message], budget: usize) -> Vec<Message> {
         }
         break;
     }
-    checked
+    SummarizationSource {
+        messages: checked,
+        bound: SummarizationSourceBound::RequestsOnly {
+            kept: kept.len(),
+            of,
+        },
+    }
 }
 
 /// Bound an oversized typed projection to `budget` serialized bytes, by
@@ -348,19 +382,25 @@ fn requests_only_source(messages: &[Message], budget: usize) -> Vec<Message> {
 /// dropped from the typed projection; only a source that cannot fit even
 /// fully trimmed falls back to the user requests alone. The original
 /// session messages are never mutated.
-fn bound_summarization_projection(messages: Vec<Message>, budget: usize) -> Vec<Message> {
+fn bound_summarization_projection(messages: Vec<Message>, budget: usize) -> SummarizationSource {
     let projected_bytes = match serialized_len(&messages) {
         Ok(projected_bytes) => projected_bytes,
         Err(error) => {
-            return vec![Message::User(meerkat_core::types::UserMessage::text(
-                format!(
-                    "[Compaction source projection could not be serialized: {error}. Continue with a mechanical handoff summary.]"
-                ),
-            ))];
+            return SummarizationSource {
+                messages: vec![Message::User(meerkat_core::types::UserMessage::text(
+                    format!(
+                        "[Compaction source projection could not be serialized: {error}. Continue with a mechanical handoff summary.]"
+                    ),
+                ))],
+                bound: SummarizationSourceBound::RequestsOnly {
+                    kept: 0,
+                    of: user_requests_newest_first(&messages).count(),
+                },
+            };
         }
     };
     if projected_bytes <= budget {
-        return messages;
+        return SummarizationSource::whole(messages);
     }
     let user_rows = messages
         .iter()
@@ -384,7 +424,12 @@ fn bound_summarization_projection(messages: Vec<Message>, budget: usize) -> Vec<
                     trimmed_through = ?role,
                     "bounded oversized compaction summarization source by trimming"
                 );
-                return bounded;
+                return SummarizationSource {
+                    messages: bounded,
+                    bound: SummarizationSourceBound::Trimmed {
+                        through: role.stage(),
+                    },
+                };
             }
         }
     }
@@ -515,7 +560,7 @@ impl Compactor for DefaultCompactor {
         &self,
         messages: &[Message],
         budget: Option<SummarizationSourceBudget>,
-    ) -> Vec<Message> {
+    ) -> SummarizationSource {
         let messages = materialize_latest_system_prompt_versions(messages);
         bound_summarization_projection(
             project_messages_for_summarization(&messages),
@@ -1302,7 +1347,7 @@ mod tests {
             Message::User(UserMessage::text("recent turn")),
         ];
 
-        let summary_input = c.prepare_for_summarization(&messages, None);
+        let summary_input = c.prepare_for_summarization(&messages, None).messages;
         assert!(summary_input.iter().all(
             |message| !matches!(message, Message::System(system) if system.content == "version one")
         ));
@@ -1812,7 +1857,16 @@ mod tests {
         )))];
         let source_bytes = serde_json::to_vec(&messages).unwrap().len();
 
-        let by_threshold = c.prepare_for_summarization(&messages, None);
+        let SummarizationSource {
+            messages: by_threshold,
+            bound,
+        } = c.prepare_for_summarization(&messages, None);
+        assert_eq!(
+            bound,
+            SummarizationSourceBound::Trimmed {
+                through: meerkat_core::compact::SummarizationTrimStage::UserRequests
+            }
+        );
         let threshold_bytes = c.summarization_source_budget_bytes(None);
         assert!(serde_json::to_vec(&by_threshold).unwrap().len() <= threshold_bytes);
         assert!(
@@ -1823,7 +1877,11 @@ mod tests {
 
         let large = SummarizationSourceBudget::from_compaction_threshold(400_000);
         assert!(source_bytes <= usize::try_from(large.bytes()).unwrap());
-        let by_large_budget = c.prepare_for_summarization(&messages, Some(large));
+        let SummarizationSource {
+            messages: by_large_budget,
+            bound,
+        } = c.prepare_for_summarization(&messages, Some(large));
+        assert_eq!(bound, SummarizationSourceBound::Whole);
         assert!(
             serde_json::to_string(&by_large_budget)
                 .unwrap()
@@ -1832,7 +1890,16 @@ mod tests {
         );
 
         let small = SummarizationSourceBudget::from_compaction_threshold(40_000);
-        let by_small_budget = c.prepare_for_summarization(&messages, Some(small));
+        let SummarizationSource {
+            messages: by_small_budget,
+            bound,
+        } = c.prepare_for_summarization(&messages, Some(small));
+        assert_eq!(
+            bound,
+            SummarizationSourceBound::Trimmed {
+                through: meerkat_core::compact::SummarizationTrimStage::UserRequests
+            }
+        );
         assert!(
             serde_json::to_vec(&by_small_budget).unwrap().len()
                 <= usize::try_from(small.bytes()).unwrap()
@@ -1871,7 +1938,7 @@ mod tests {
             )]),
         ];
 
-        let prepared = c.prepare_for_summarization(&messages, None);
+        let prepared = c.prepare_for_summarization(&messages, None).messages;
         assert_eq!(prepared.len(), 2);
 
         // User message: text preserved, image replaced
@@ -1927,7 +1994,16 @@ mod tests {
             )]),
         ];
 
-        let prepared = c.prepare_for_summarization(&messages, None);
+        let SummarizationSource {
+            messages: prepared,
+            bound,
+        } = c.prepare_for_summarization(&messages, None);
+        assert_eq!(
+            bound,
+            SummarizationSourceBound::Trimmed {
+                through: meerkat_core::compact::SummarizationTrimStage::ToolResults
+            }
+        );
         assert_eq!(
             prepared.len(),
             messages.len(),
@@ -1969,7 +2045,10 @@ mod tests {
             })
             .collect();
         assert!(serde_json::to_vec(&messages).unwrap().len() > budget);
-        let prepared = c.prepare_for_summarization(&messages, None);
+        let SummarizationSource {
+            messages: prepared,
+            bound,
+        } = c.prepare_for_summarization(&messages, None);
         let source = serde_json::to_string(&prepared).unwrap();
         assert!(
             source.len() <= budget,
@@ -1977,16 +2056,31 @@ mod tests {
             source.len()
         );
         assert!(source.contains("req-7"), "the newest request is kept");
+        // The source says how many of the requests it carries, in its text
+        // and in its bound.
+        let SummarizationSourceBound::RequestsOnly { kept, of } = bound else {
+            panic!("an over-budget source falls back to the requests: {bound:?}");
+        };
+        assert_eq!(of, 8);
+        assert!((1..8).contains(&kept), "kept {kept} of 8");
+        assert!(source.contains(&format!("Only the newest {kept} of the 8 user requests")));
+        assert_eq!(
+            (0..8)
+                .filter(|n| source.contains(&format!("req-{n}")))
+                .count(),
+            kept,
+            "the note counts exactly the requests the source carries"
+        );
 
         // The returned source is the exact message that was measured: at a
         // budget equal to one measured source, every returned source stays
         // within it (a rebuilt message would carry a new timestamp of
         // varying serialized width).
-        let tight = serde_json::to_vec(&requests_only_source(&messages[7..], usize::MAX))
+        let tight = serde_json::to_vec(&requests_only_source(&messages[7..], usize::MAX).messages)
             .unwrap()
             .len();
         for _ in 0..500 {
-            let returned = requests_only_source(&messages, tight);
+            let returned = requests_only_source(&messages, tight).messages;
             assert!(
                 serde_json::to_vec(&returned).unwrap().len() <= tight,
                 "the returned requests-only source exceeds the budget it was checked against"
@@ -2019,7 +2113,7 @@ mod tests {
             )]),
         ];
 
-        let prepared = c.prepare_for_summarization(&messages, None);
+        let prepared = c.prepare_for_summarization(&messages, None).messages;
 
         match &prepared[0] {
             Message::User(user) => {
@@ -2393,7 +2487,7 @@ mod tests {
             )),
         ];
 
-        let prepared = c.prepare_for_summarization(&messages, None);
+        let prepared = c.prepare_for_summarization(&messages, None).messages;
         assert_eq!(prepared.len(), 2);
 
         if let Message::BlockAssistant(a) = &prepared[1] {
@@ -2428,7 +2522,7 @@ mod tests {
             Message::User(UserMessage::text("Second".to_string())),
         ];
 
-        let prepared = c.prepare_for_summarization(&messages, None);
+        let prepared = c.prepare_for_summarization(&messages, None).messages;
         assert_eq!(
             prepared.len(),
             2,
@@ -2631,7 +2725,7 @@ mod tests {
             )]),
         ];
 
-        let prepared = c.prepare_for_summarization(&messages, None);
+        let prepared = c.prepare_for_summarization(&messages, None).messages;
         let source = serde_json::to_string(&prepared).unwrap();
         assert!(
             source.contains(request),

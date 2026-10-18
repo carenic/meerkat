@@ -21674,6 +21674,7 @@ ORDER BY runtime_id";
                 summary_tokens: 5,
                 messages_before: 2,
                 messages_after: 1,
+                summary_source: None,
             };
             session
                 .add_compaction_projection_intent(intent.clone())
@@ -21705,6 +21706,7 @@ ORDER BY runtime_id";
                 summary_tokens: 1,
                 messages_before: 2,
                 messages_after: 1,
+                summary_source: None,
             }
         }
 

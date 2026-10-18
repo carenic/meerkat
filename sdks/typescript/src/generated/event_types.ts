@@ -343,6 +343,38 @@ export type CompactionFailureReason = {
 };
 
 /**
+ * The kinds of text a summarization source is trimmed through, in order:
+ * tool results first, user requests last.
+ */
+export type SummarizationTrimStage = "tool_results" | "context" | "user_requests";
+
+/**
+ * How much of the history being compacted a summarization source carries.
+ */
+export type SummarizationSourceBound = {
+  kind: "whole";
+} | {
+  kind: "trimmed";
+  through: SummarizationTrimStage;
+} | {
+  kept: number;
+  kind: "requests_only";
+  of: number;
+};
+
+/**
+ * Who produced a compaction summary.
+ */
+export type CompactionSummarySource = {
+  kind: "provider_call";
+  source_bound: SummarizationSourceBound;
+} | {
+  kind: "host_curator";
+} | {
+  kind: "mechanical_fallback";
+};
+
+/**
  * Provider-native convention used to normalize tokens presented to a model.
  */
 export type PresentedTokenConvention = "anthropic_disjoint_input_components" | "open_ai_input_includes_cached_subset" | "gemini_prompt_includes_cached_subset" | "open_ai_compatible_prompt_includes_cache_details" | "host_declared_inclusive_input_total";
@@ -1441,6 +1473,7 @@ export type AgentEvent = {
 } | {
   messages_after: number;
   messages_before: number;
+  summary_source?: CompactionSummarySource | null;
   summary_tokens: number;
   type: "compaction_completed";
 } | {

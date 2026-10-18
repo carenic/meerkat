@@ -6481,3 +6481,76 @@ it("hook failed displays every remaining known reason exactly", () => {
     assert.equal(event.error, display);
   }
 });
+
+describe("Compaction summary source", () => {
+  const base = {
+    type: "compaction_completed",
+    summary_tokens: 7,
+    messages_before: 40,
+    messages_after: 3,
+  };
+
+  it("parses the typed summary source and keeps legacy events without one", () => {
+    const legacy = parseEvent(base);
+    assert.equal(legacy.type, "compaction_completed");
+    assert.equal("summarySource" in legacy, false);
+
+    const trimmed = parseEvent({
+      ...base,
+      summary_source: {
+        kind: "provider_call",
+        source_bound: { kind: "trimmed", through: "tool_results" },
+      },
+    });
+    assert.deepEqual(trimmed.summarySource, {
+      kind: "provider_call",
+      sourceBound: { kind: "trimmed", through: "tool_results" },
+    });
+
+    const requestsOnly = parseEvent({
+      ...base,
+      summary_source: {
+        kind: "provider_call",
+        source_bound: { kind: "requests_only", kept: 3, of: 40 },
+      },
+    });
+    assert.deepEqual(requestsOnly.summarySource.sourceBound, {
+      kind: "requests_only",
+      kept: 3,
+      of: 40,
+    });
+
+    const curator = parseEvent({ ...base, summary_source: { kind: "host_curator" } });
+    assert.deepEqual(curator.summarySource, { kind: "host_curator" });
+  });
+
+  it("keeps kinds this SDK does not know as unknown with the wire object", () => {
+    const futureSource = { kind: "future_author", detail: 1 };
+    assert.deepEqual(parseEvent({ ...base, summary_source: futureSource }).summarySource, {
+      kind: "unknown",
+      rawKind: "future_author",
+      raw: futureSource,
+    });
+
+    const futureBound = { kind: "sampled", ratio: 2 };
+    assert.deepEqual(
+      parseEvent({
+        ...base,
+        summary_source: { kind: "provider_call", source_bound: futureBound },
+      }).summarySource.sourceBound,
+      { kind: "unknown", rawKind: "sampled", raw: futureBound },
+    );
+
+    const futureStage = { kind: "trimmed", through: "attachments" };
+    assert.deepEqual(
+      parseEvent({
+        ...base,
+        summary_source: { kind: "provider_call", source_bound: futureStage },
+      }).summarySource.sourceBound,
+      { kind: "unknown", rawKind: "trimmed", raw: futureStage },
+    );
+
+    const malformed = parseEvent({ ...base, summary_source: "provider_call" });
+    assert.equal(malformed.type, "malformed_event");
+  });
+});

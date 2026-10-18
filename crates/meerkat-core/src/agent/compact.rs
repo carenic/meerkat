@@ -846,8 +846,10 @@ where
         let compaction_prompt = compactor.compaction_prompt();
         let max_summary_tokens = compactor.max_summary_tokens();
 
-        let mut compaction_messages =
-            compactor.prepare_for_summarization(model_messages, summarization_budget);
+        let crate::compact::SummarizationSource {
+            messages: mut compaction_messages,
+            bound: source_bound,
+        } = compactor.prepare_for_summarization(model_messages, summarization_budget);
         compaction_messages.push(Message::User(crate::types::UserMessage::text(
             compaction_prompt.to_string(),
         )));
@@ -946,7 +948,11 @@ where
                     client.model(),
                 )?;
                 summary_usage_identity_dispute = dispute;
-                (summary, usage, CompactionSummarySource::ProviderCall)
+                (
+                    summary,
+                    usage,
+                    CompactionSummarySource::ProviderCall { source_bound },
+                )
             }
             Err(e) if is_compaction_capacity_error(&e) && !observation_source.has_observations => {
                 tracing::warn!(
@@ -1157,10 +1163,15 @@ impl ValidatedCompactionRewrite {
 }
 
 /// Who produced a compaction summary.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CompactionSummarySource {
     /// The summarization LLM call: a real provider request.
-    ProviderCall,
+    ProviderCall {
+        /// How much of the history the call's source carried.
+        source_bound: crate::compact::SummarizationSourceBound,
+    },
     /// A configured host curator; no provider request was made.
     HostCurator,
     /// The mechanical capacity fallback; no provider request backs the
@@ -1303,8 +1314,10 @@ mod tests {
             &self,
             messages: &[Message],
             _budget: Option<crate::compact::SummarizationSourceBudget>,
-        ) -> Vec<Message> {
-            crate::types::materialize_latest_system_prompt_versions(messages)
+        ) -> crate::compact::SummarizationSource {
+            crate::compact::SummarizationSource::whole(
+                crate::types::materialize_latest_system_prompt_versions(messages),
+            )
         }
         fn rebuild_history(
             &self,

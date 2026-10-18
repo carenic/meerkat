@@ -8747,3 +8747,84 @@ def test_generated_claim_token_fields_stay_out_of_repr():
     assert token not in repr(created)
     assert token not in repr(params)
     assert "m1" in repr(created)
+
+
+def test_parse_compaction_completed_summary_source():
+    from meerkat.events import CompactionCompleted, CompactionSummarySource, SummarizationSourceBound
+
+    base = {
+        "type": "compaction_completed",
+        "summary_tokens": 7,
+        "messages_before": 40,
+        "messages_after": 3,
+    }
+    legacy = parse_event(base)
+    assert isinstance(legacy, CompactionCompleted)
+    assert legacy.summary_source is None
+
+    trimmed = parse_event({
+        **base,
+        "summary_source": {
+            "kind": "provider_call",
+            "source_bound": {"kind": "trimmed", "through": "tool_results"},
+        },
+    })
+    assert isinstance(trimmed, CompactionCompleted)
+    assert trimmed.summary_source == CompactionSummarySource(
+        kind="provider_call",
+        source_bound=SummarizationSourceBound(kind="trimmed", through="tool_results"),
+    )
+
+    requests_only = parse_event({
+        **base,
+        "summary_source": {
+            "kind": "provider_call",
+            "source_bound": {"kind": "requests_only", "kept": 3, "of": 40},
+        },
+    })
+    assert requests_only.summary_source.source_bound == SummarizationSourceBound(
+        kind="requests_only", kept=3, of=40,
+    )
+
+    curator = parse_event({**base, "summary_source": {"kind": "host_curator"}})
+    assert curator.summary_source == CompactionSummarySource(kind="host_curator")
+
+
+def test_parse_compaction_completed_unknown_summary_source_kinds():
+    from meerkat.events import CompactionCompleted, CompactionSummarySource, SummarizationSourceBound
+
+    base = {
+        "type": "compaction_completed",
+        "summary_tokens": 7,
+        "messages_before": 40,
+        "messages_after": 3,
+    }
+    future_source = {"kind": "future_author", "detail": 1}
+    event = parse_event({**base, "summary_source": future_source})
+    assert isinstance(event, CompactionCompleted)
+    assert event.summary_source == CompactionSummarySource(
+        kind="unknown", raw_kind="future_author", raw=future_source,
+    )
+
+    future_bound = {"kind": "sampled", "ratio": 2}
+    event = parse_event({
+        **base,
+        "summary_source": {"kind": "provider_call", "source_bound": future_bound},
+    })
+    assert event.summary_source.source_bound == SummarizationSourceBound(
+        kind="unknown", raw_kind="sampled", raw=future_bound,
+    )
+
+    future_stage = {"kind": "trimmed", "through": "attachments"}
+    event = parse_event({
+        **base,
+        "summary_source": {"kind": "provider_call", "source_bound": future_stage},
+    })
+    assert event.summary_source.source_bound == SummarizationSourceBound(
+        kind="unknown", raw_kind="trimmed", raw=future_stage,
+    )
+
+    malformed = {**base, "summary_source": "provider_call"}
+    event = parse_event(malformed)
+    assert isinstance(event, UnknownEvent)
+    assert event.type == "malformed_event"

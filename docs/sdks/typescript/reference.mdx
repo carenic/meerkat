@@ -656,7 +656,17 @@ interface ToolExecutionTimedOutEvent  { type: "tool_execution_timed_out";   id: 
 
 ```typescript
 interface CompactionStartedEvent   { type: "compaction_started";   inputTokens: number; estimatedHistoryTokens: number; messageCount: number }
-interface CompactionCompletedEvent { type: "compaction_completed";  summaryTokens: number; messagesBefore: number; messagesAfter: number }
+interface CompactionCompletedEvent { type: "compaction_completed";  summaryTokens: number; messagesBefore: number; messagesAfter: number; summarySource?: CompactionSummarySource }
+// Who wrote the summary; a provider call says how much of the history its source carried.
+type CompactionSummarySource =
+  | { kind: "provider_call"; sourceBound: SummarizationSourceBound }
+  | { kind: "host_curator" } | { kind: "mechanical_fallback" }
+  | { kind: "unknown"; rawKind: string; raw: Record<string, unknown> }
+type SummarizationSourceBound =
+  | { kind: "whole" }
+  | { kind: "trimmed"; through: "tool_results" | "context" | "user_requests" }
+  | { kind: "requests_only"; kept: number; of: number }
+  | { kind: "unknown"; rawKind: string; raw: Record<string, unknown> }
 // `reason` mirrors the Rust CompactionFailureReason tagged enum ({ kind, ... }).
 interface CompactionFailedEvent    { type: "compaction_failed";     reason: Record<string, unknown> }
 ```

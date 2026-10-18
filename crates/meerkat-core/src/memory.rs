@@ -58,6 +58,11 @@ pub struct CompactionProjectionIntent {
     pub summary_tokens: u64,
     pub messages_before: usize,
     pub messages_after: usize,
+    /// Who wrote the summary, carried to the completion event the commit
+    /// emits. `None` only for an intent an earlier version staged before it
+    /// recorded the source.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary_source: Option<crate::agent::compact::CompactionSummarySource>,
 }
 
 impl CompactionProjectionId {
@@ -1088,6 +1093,26 @@ impl MemoryStoreError {
 mod tests {
     use super::*;
     use crate::time_compat::{Duration, UNIX_EPOCH};
+
+    /// An intent staged before the summary source existed still reads, with
+    /// no source, and writes back to the same bytes.
+    #[test]
+    fn compaction_projection_intent_without_a_summary_source_reads_and_round_trips() {
+        let legacy = serde_json::json!({
+            "projection": {
+                "session_id": crate::types::SessionId::new(),
+                "parent_revision": "parent",
+                "revision": "child",
+                "commit_fingerprint": "sha256:legacy-intent",
+            },
+            "summary_tokens": 4,
+            "messages_before": 6,
+            "messages_after": 2,
+        });
+        let intent: CompactionProjectionIntent = serde_json::from_value(legacy.clone()).unwrap();
+        assert_eq!(intent.summary_source, None);
+        assert_eq!(serde_json::to_value(&intent).unwrap(), legacy);
+    }
 
     fn range(start: u64, end: u64) -> MessageRange {
         MessageRange::new(start, end).unwrap()

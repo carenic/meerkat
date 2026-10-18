@@ -407,6 +407,67 @@ impl SummarizationSourceBudget {
     }
 }
 
+/// How much of the history being compacted a summarization source carries.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum SummarizationSourceBound {
+    /// Every message, nothing cut to fit the budget.
+    Whole,
+    /// Every message, with the texts too large for the budget cut around an
+    /// omission marker the summarizing model sees.
+    Trimmed {
+        /// The last kind of text cut to fit.
+        through: SummarizationTrimStage,
+    },
+    /// Only the newest `kept` of the history's `of` user requests; everything
+    /// else is omitted.
+    RequestsOnly {
+        /// User requests the source carries.
+        kept: usize,
+        /// User requests in the history being compacted.
+        of: usize,
+    },
+}
+
+/// The kinds of text a summarization source is trimmed through, in order:
+/// tool results first, user requests last.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum SummarizationTrimStage {
+    /// Tool results.
+    ToolResults,
+    /// System prompts and assistant text, with oversized tool-call arguments
+    /// replaced by their size.
+    Context,
+    /// User requests.
+    UserRequests,
+}
+
+/// The transcript a compactor sends to the summarizing model, and how much of
+/// the history it carries.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SummarizationSource {
+    /// The source messages. The compaction prompt is sent after them.
+    pub messages: Vec<Message>,
+    /// How much of the history `messages` carries.
+    pub bound: SummarizationSourceBound,
+}
+
+impl SummarizationSource {
+    /// A source that carries the whole history.
+    #[must_use]
+    pub fn whole(messages: Vec<Message>) -> Self {
+        Self {
+            messages,
+            bound: SummarizationSourceBound::Whole,
+        }
+    }
+}
+
 /// Provider-agnostic compaction strategy.
 ///
 /// Determines when to compact and how to rebuild the history after summarization.
@@ -437,7 +498,7 @@ pub trait Compactor: Send + Sync {
     /// Maximum tokens the summarization response may consume.
     fn max_summary_tokens(&self) -> u32;
 
-    /// Prepare messages for the summarization LLM call.
+    /// Prepare the source for the summarization LLM call.
     ///
     /// Called before sending the history to the LLM for summarization.
     /// Implementations may strip content that is not suitable for the
@@ -449,11 +510,13 @@ pub trait Compactor: Send + Sync {
     /// take for its source ([`SummarizationSourceBudget::for_summary_model`]);
     /// `None` when that model declares no context window. A source larger
     /// than the budget makes the summary request exceed the model's window.
+    /// The returned source states how much of the history it carries; the
+    /// compaction completion reports it.
     fn prepare_for_summarization(
         &self,
         messages: &[Message],
         budget: Option<SummarizationSourceBudget>,
-    ) -> Vec<Message>;
+    ) -> SummarizationSource;
 
     /// Rebuild history while carrying the exact provider request pressure that
     /// triggered compaction, when available.

@@ -461,7 +461,7 @@ match event {
 
     // Compaction
     AgentEvent::CompactionStarted { input_tokens, estimated_history_tokens, message_count } => {}
-    AgentEvent::CompactionCompleted { summary_tokens, messages_before, messages_after } => {}
+    AgentEvent::CompactionCompleted { summary_tokens, messages_before, messages_after, summary_source } => {}
     AgentEvent::CompactionFailed { reason } => {}
 
     // Budget
