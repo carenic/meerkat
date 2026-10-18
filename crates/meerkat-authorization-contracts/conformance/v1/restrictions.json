@@ -2,7 +2,7 @@
   "schema_version": 1,
   "contract_version": {
     "major": 1,
-    "minor": 0
+    "minor": 1
   },
   "atoms": {
     "actions": {
@@ -41,6 +41,17 @@
           }
         },
         "namespace": "records"
+      },
+      "ledger-A": {
+        "authority": {
+          "kind": "service_account",
+          "id": "resource-owner",
+          "qualification": {
+            "kind": "qualified",
+            "trust_domain_id": "authority-A"
+          }
+        },
+        "namespace": "ledger"
       }
     },
     "processors": {
@@ -112,6 +123,24 @@
             "kind": "qualified",
             "trust_domain_id": "authority-B"
           }
+        }
+      }
+    },
+    "owners": {
+      "owner-A": {
+        "kind": "service_account",
+        "id": "resource-owner",
+        "qualification": {
+          "kind": "qualified",
+          "trust_domain_id": "authority-A"
+        }
+      },
+      "owner-B": {
+        "kind": "service_account",
+        "id": "resource-owner",
+        "qualification": {
+          "kind": "qualified",
+          "trust_domain_id": "authority-B"
         }
       }
     }
@@ -874,6 +903,322 @@
           "remaining": 1,
           "unresolved": []
         }
+      }
+    }
+  ],
+  "domain_cases": [
+    {
+      "id": "owned-by-matches-every-namespace-of-its-owner",
+      "inputs": [
+        {
+          "bound": "owned_by",
+          "values": [
+            "owner-A"
+          ],
+          "unresolved": []
+        }
+      ],
+      "expected": {
+        "bound": "owned_by",
+        "values": [
+          "owner-A"
+        ],
+        "unresolved": []
+      },
+      "probes": [
+        {
+          "value": "records-A",
+          "expected": "matches"
+        },
+        {
+          "value": "ledger-A",
+          "expected": "matches"
+        },
+        {
+          "value": "records-B",
+          "expected": "outside_bounds"
+        }
+      ]
+    },
+    {
+      "id": "owned-by-meets-exact-as-its-owners-domains",
+      "inputs": [
+        {
+          "bound": "owned_by",
+          "values": [
+            "owner-A"
+          ],
+          "unresolved": []
+        },
+        {
+          "bound": "exact",
+          "values": [
+            "records-A",
+            "records-B"
+          ],
+          "unresolved": []
+        }
+      ],
+      "expected": {
+        "bound": "exact",
+        "values": [
+          "records-A"
+        ],
+        "unresolved": []
+      },
+      "probes": [
+        {
+          "value": "records-A",
+          "expected": "matches"
+        },
+        {
+          "value": "ledger-A",
+          "expected": "outside_bounds"
+        },
+        {
+          "value": "records-B",
+          "expected": "outside_bounds"
+        }
+      ]
+    },
+    {
+      "id": "child-naming-another-owner-permits-nothing",
+      "inputs": [
+        {
+          "bound": "owned_by",
+          "values": [
+            "owner-A"
+          ],
+          "unresolved": []
+        },
+        {
+          "bound": "exact",
+          "values": [
+            "records-B"
+          ],
+          "unresolved": []
+        }
+      ],
+      "expected": {
+        "bound": "exact",
+        "values": [],
+        "unresolved": []
+      },
+      "probes": [
+        {
+          "value": "records-B",
+          "expected": "outside_bounds"
+        },
+        {
+          "value": "records-A",
+          "expected": "outside_bounds"
+        }
+      ]
+    },
+    {
+      "id": "unrestricted-child-cannot-widen-owned-by",
+      "inputs": [
+        {
+          "bound": "owned_by",
+          "values": [
+            "owner-A"
+          ],
+          "unresolved": []
+        },
+        {
+          "bound": "unrestricted",
+          "values": [],
+          "unresolved": []
+        }
+      ],
+      "expected": {
+        "bound": "owned_by",
+        "values": [
+          "owner-A"
+        ],
+        "unresolved": []
+      },
+      "probes": [
+        {
+          "value": "ledger-A",
+          "expected": "matches"
+        },
+        {
+          "value": "records-B",
+          "expected": "outside_bounds"
+        }
+      ]
+    },
+    {
+      "id": "disjoint-owners-meet-as-exact-empty",
+      "inputs": [
+        {
+          "bound": "owned_by",
+          "values": [
+            "owner-A"
+          ],
+          "unresolved": []
+        },
+        {
+          "bound": "owned_by",
+          "values": [
+            "owner-B"
+          ],
+          "unresolved": []
+        }
+      ],
+      "expected": {
+        "bound": "exact",
+        "values": [],
+        "unresolved": []
+      },
+      "probes": [
+        {
+          "value": "records-A",
+          "expected": "outside_bounds"
+        },
+        {
+          "value": "records-B",
+          "expected": "outside_bounds"
+        }
+      ]
+    },
+    {
+      "id": "owner-sets-intersect",
+      "inputs": [
+        {
+          "bound": "owned_by",
+          "values": [
+            "owner-A",
+            "owner-B"
+          ],
+          "unresolved": []
+        },
+        {
+          "bound": "owned_by",
+          "values": [
+            "owner-A"
+          ],
+          "unresolved": []
+        }
+      ],
+      "expected": {
+        "bound": "owned_by",
+        "values": [
+          "owner-A"
+        ],
+        "unresolved": []
+      },
+      "probes": [
+        {
+          "value": "records-A",
+          "expected": "matches"
+        },
+        {
+          "value": "records-B",
+          "expected": "outside_bounds"
+        }
+      ]
+    },
+    {
+      "id": "unknown-keeps-owned-by-parent-bound",
+      "inputs": [
+        {
+          "bound": "owned_by",
+          "values": [
+            "owner-A"
+          ],
+          "unresolved": []
+        },
+        {
+          "bound": "unrestricted",
+          "values": [],
+          "unresolved": [
+            "unknown"
+          ]
+        }
+      ],
+      "expected": {
+        "bound": "owned_by",
+        "values": [
+          "owner-A"
+        ],
+        "unresolved": [
+          "unknown"
+        ]
+      },
+      "probes": [
+        {
+          "value": "records-A",
+          "expected": "unresolved"
+        },
+        {
+          "value": "records-B",
+          "expected": "unresolved"
+        }
+      ]
+    }
+  ],
+  "domain_decode_rejections": [
+    {
+      "id": "empty-owned-by",
+      "wire": {
+        "bound": {
+          "bound": "owned_by",
+          "values": []
+        },
+        "unresolved": []
+      }
+    },
+    {
+      "id": "owned-by-without-values",
+      "wire": {
+        "bound": {
+          "bound": "owned_by"
+        },
+        "unresolved": []
+      }
+    },
+    {
+      "id": "unknown-bound-kind",
+      "wire": {
+        "bound": {
+          "bound": "prefix",
+          "values": [
+            "records"
+          ]
+        },
+        "unresolved": []
+      }
+    },
+    {
+      "id": "reserved-unrestricted-payload",
+      "wire": {
+        "bound": {
+          "bound": "unrestricted",
+          "values": null
+        },
+        "unresolved": []
+      }
+    },
+    {
+      "id": "extra-bound-field",
+      "wire": {
+        "bound": {
+          "bound": "owned_by",
+          "values": [
+            {
+              "kind": "service_account",
+              "id": "resource-owner",
+              "qualification": {
+                "kind": "qualified",
+                "trust_domain_id": "authority-A"
+              }
+            }
+          ],
+          "pattern": "*"
+        },
+        "unresolved": []
       }
     }
   ],

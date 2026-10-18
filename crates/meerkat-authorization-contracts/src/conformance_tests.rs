@@ -7,14 +7,15 @@ use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
 use crate::constraints::{
-    DelegationDepth, ExactRestriction, ExecutionRestrictions, LifetimeRestriction,
+    DelegationDepth, DomainRestriction, ExactRestriction, ExecutionRestrictions,
+    LifetimeRestriction,
 };
 
 pub(crate) fn corpus() -> Value {
     let corpus: Value = serde_json::from_str(include_str!("../conformance/v1/restrictions.json"))
         .expect("versioned shared conformance JSON");
     assert_eq!(corpus["schema_version"], 1);
-    assert_eq!(corpus["contract_version"], json!({"major": 1, "minor": 0}));
+    assert_eq!(corpus["contract_version"], json!({"major": 1, "minor": 1}));
     corpus
 }
 
@@ -44,6 +45,28 @@ pub(crate) fn restriction<T: Ord + DeserializeOwned>(
     } else {
         assert!(values.is_empty(), "unrestricted has no listed exact values");
         json!({"bound": kind})
+    };
+    decode(&json!({"bound": bound, "unresolved": spec["unresolved"]}))
+}
+
+/// A resource-domain bound: `exact` lists domain atoms, `owned_by` lists
+/// owner atoms, and `unrestricted` lists nothing.
+pub(crate) fn domain_restriction(spec: &Value, corpus: &Value) -> DomainRestriction {
+    let kind = name(&spec["bound"]);
+    let atoms = if kind == "owned_by" {
+        &corpus["atoms"]["owners"]
+    } else {
+        &corpus["atoms"]["resource_domains"]
+    };
+    let values: Vec<_> = entries(&spec["values"])
+        .iter()
+        .map(|id| atoms[name(id)].clone())
+        .collect();
+    let bound = if kind == "unrestricted" {
+        assert!(values.is_empty(), "unrestricted has no listed values");
+        json!({"bound": kind})
+    } else {
+        json!({"bound": kind, "values": values})
     };
     decode(&json!({"bound": bound, "unresolved": spec["unresolved"]}))
 }
