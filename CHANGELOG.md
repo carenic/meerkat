@@ -35,6 +35,34 @@ them.
 
 ## [Unreleased]
 
+### Added
+
+- `meerkat-core`: `TurnStateHandle` gains three provided methods.
+  `turn_phase` reads the turn phase alone. `apply_turn_input_observing_phase`
+  applies a typed turn input and returns its effects together with the phase
+  the authority holds after it. `scalars` returns the new `TurnStateScalars`:
+  the scalar fields of a `TurnStateSnapshot` without its collections and
+  without the terminality classification. The defaults derive the answers
+  from `snapshot` and `apply_turn_input`, so existing implementors keep
+  working unchanged. `RuntimeTurnStateHandle` reads all three from the
+  borrowed machine state under the authority lock, and samples the phase
+  after an input in the same critical section as the transition.
+
+### Changed
+
+- Turn-state reads copy less of the machine state.
+  `RuntimeTurnStateHandle::snapshot` projects its fields from the borrowed
+  machine state under the authority lock and copies the whole state once, for
+  the generated terminality classification, instead of twice. The agent loop
+  reads the phase before each turn input and takes the phase after it from
+  the transition itself, instead of building two snapshots per input, and
+  reads single scalar facts through `scalars`. Results are unchanged:
+  differential tests compare each new read with the old copying projection
+  after every input of a generated walk that reaches every turn phase. In the
+  opt-in `turn_projection_cost` benchmarks (ignored timing tests in
+  `meerkat-runtime` and `meerkat`) a snapshot read takes about 25% less time
+  and a whole scripted turn with three tool calls about 23% less.
+
 ## [0.9.3] - 2026-10-18
 
 ### Breaking
