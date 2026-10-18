@@ -5,13 +5,17 @@
 //! only who may invoke what, now: the operator, through the stock ingress
 //! actor, in this realm, invoking an executor for itself (no represented
 //! subject) at one of the operator's own stock session destinations, under a
-//! grant-lineage mandate. In the host-authenticated posture
-//! ([`super::caller`]) the requester is instead a caller the trusted host
-//! authenticated, admitted only by the host's exact-target decision for the
-//! session it invokes; the operator stays the session's canonical owner and
-//! is no requester. It keeps no registry and no store. Every other conjunct
-//! stays with its owner and is never widened here: the native grant owner
-//! resolves the lineage, the operation owner answers resources, accounts and
+//! grant-lineage mandate. The stock ingress itself is the only other
+//! requester there, and only of the outcome of an administrative command its
+//! own process reports ([`super::StockGovernance::bind_host_outcome`]),
+//! under the same mandate; no person requested that work. In the
+//! host-authenticated posture ([`super::caller`]) the requester is instead a
+//! caller the trusted host authenticated, admitted only by the host's
+//! exact-target decision for the session it invokes; the operator stays the
+//! session's canonical owner and is no requester, and neither is the
+//! ingress. It keeps no registry and no store. Every other conjunct stays
+//! with its owner and is never widened here: the native grant owner resolves
+//! the lineage, the operation owner answers resources, accounts and
 //! connectors, and the realm's MCP installation ceiling is enforced by the
 //! connection.
 //!
@@ -156,36 +160,62 @@ fn denied() -> OperationRefused {
     OperationRefused::new(OperationRefusalKind::Denied)
 }
 
-/// Whether `requester` may be the requester of work in `session`, a session
-/// owned by `operator`, invoking `executor`, in `posture`: in the
-/// local-operator posture only the operator; in the host-authenticated
-/// posture only a caller the host admits for exactly that session, and never
-/// the operator. The one requester rule of the native invocation policy and
-/// of the stock binding of a caller's input, which asks it before the
-/// session's binding changes ([`super::StockGovernance::bind_caller_prompt`]).
+/// Which requester the stock requester rule admitted: the one typed fact
+/// the review text and every face of the policy select by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum StockRequester {
+    /// The local operator.
+    Operator,
+    /// The composition's own stock ingress, reporting the outcome of an
+    /// administrative command its process ran.
+    Ingress,
+    /// A caller the trusted host authenticated.
+    Caller,
+}
+
+/// Which requester `requester` is, if it may be the requester of work in
+/// `session`, a session owned by `operator`, invoking `executor`, in
+/// `posture`, with the lifetime of the login it was admitted in. In the
+/// local-operator posture only the operator, or the composition's own
+/// stock ingress `ingress_actor` itself, exactly (another runtime host, or
+/// the ingress's id in another trust domain, is not it). In the
+/// host-authenticated posture only a caller the host admits for exactly that
+/// session, and never the operator or the ingress: those are refused before
+/// the host is asked. The one requester rule of the native invocation
+/// policy and of the stock binding of a caller's input, which asks it
+/// before the session's binding changes
+/// ([`super::StockGovernance::bind_caller_prompt`]).
 pub(super) fn admit_stock_requester(
     posture: &StockCallerPosture,
     operator: &PrincipalRef,
+    ingress_actor: &PrincipalRef,
     executor: &PrincipalRef,
     requester: &PrincipalRef,
     authentication: Option<&HistoricalEvidenceRef>,
     session: &SessionId,
-) -> Result<StockLoginLifetime, OperationAuthorizationError> {
+) -> Result<(StockRequester, StockLoginLifetime), OperationAuthorizationError> {
     match posture {
         StockCallerPosture::LocalOperator if requester == operator => {
-            Ok(StockLoginLifetime::UntilRetired)
+            Ok((StockRequester::Operator, StockLoginLifetime::UntilRetired))
+        }
+        StockCallerPosture::LocalOperator if requester == ingress_actor => {
+            Ok((StockRequester::Ingress, StockLoginLifetime::UntilRetired))
         }
         StockCallerPosture::LocalOperator => Err(denied().into()),
-        StockCallerPosture::HostAuthenticated(_) if requester == operator => Err(denied().into()),
-        StockCallerPosture::HostAuthenticated(access) => {
-            access.authorize_caller(&StockCallerRequest {
+        StockCallerPosture::HostAuthenticated(_)
+            if requester == operator || requester == ingress_actor =>
+        {
+            Err(denied().into())
+        }
+        StockCallerPosture::HostAuthenticated(access) => access
+            .authorize_caller(&StockCallerRequest {
                 caller: requester,
                 authentication,
                 executor,
                 owner: operator,
                 session,
             })
-        }
+            .map(|login| (StockRequester::Caller, login)),
     }
 }
 
@@ -260,10 +290,11 @@ impl StockInvocationPolicy {
         requester: &PrincipalRef,
         authentication: Option<&HistoricalEvidenceRef>,
         session: &SessionId,
-    ) -> Result<StockLoginLifetime, OperationAuthorizationError> {
+    ) -> Result<(StockRequester, StockLoginLifetime), OperationAuthorizationError> {
         admit_stock_requester(
             &self.posture,
             &self.operator,
+            &self.ingress_actor,
             &self.executor,
             requester,
             authentication,
@@ -277,7 +308,7 @@ impl StockInvocationPolicy {
     fn admit(
         &self,
         association: &InputAuthorityAssociation,
-    ) -> Result<StockLoginLifetime, OperationAuthorizationError> {
+    ) -> Result<(StockRequester, StockLoginLifetime), OperationAuthorizationError> {
         let claims = association.candidate();
         let mandate = match &claims.authority_basis {
             WorkAuthorityBasis::GrantLineage { lineage } => !lineage.is_empty(),
@@ -373,7 +404,13 @@ impl AdmittedWorkPolicyOwner for StockInvocationPolicy {
         {
             return Err(denied().into());
         }
-        let login = self.admit_requester(&facts.requester, None, control.session_id())?;
+        // An attachment control is a connection's: the ingress reports
+        // outcomes and never attaches.
+        let (requester, login) =
+            self.admit_requester(&facts.requester, None, control.session_id())?;
+        if requester == StockRequester::Ingress {
+            return Err(denied().into());
+        }
         self.installations
             .authorize_configured(control.server())
             .map_err(|refusal| match refusal {
@@ -394,12 +431,13 @@ impl AdmittedWorkPolicyOwner for StockInvocationPolicy {
         _purpose: LocalPolicyPurpose,
         now_ms: u64,
     ) -> Result<WorkOwnerAllowance, OperationAuthorizationError> {
-        let login = self.admit(association)?;
+        let (_, login) = self.admit(association)?;
         Self::allowance(now_ms, login)
     }
 
     /// The stock mandate is the checked invocation itself: the admitted
-    /// requester (the operator, or the host's authenticated caller), through
+    /// requester (the operator, the stock ingress reporting its own
+    /// administrative outcome, or the host's authenticated caller), through
     /// the stock ingress, in this realm, invoking the realm's executor at one
     /// of the operator's own session destinations, under a grant-lineage
     /// mandate that the grant owner resolves at every operation. Stock holds
@@ -408,7 +446,11 @@ impl AdmittedWorkPolicyOwner for StockInvocationPolicy {
     /// at authorization. The text names this policy's own principals and the
     /// admitted requester, each in its serialized form (kind, id and
     /// qualification); it never repeats a lineage reference, which
-    /// identifies a grant and is not consent.
+    /// identifies a grant and is not consent. The text is selected by which
+    /// requester the rule admitted, never by posture: for the ingress it
+    /// says that the ingress itself requested the work, that no person did
+    /// and that it is not the operator's consent, and it attributes the
+    /// event's content to the ingress rather than asserting it.
     ///
     /// It states the bounds that mandate imposes on this operation now:
     /// the lineage the work's basis selects for the binding's target,
@@ -426,7 +468,7 @@ impl AdmittedWorkPolicyOwner for StockInvocationPolicy {
         binding: &PreparedAuthorizationBinding,
         now_ms: u64,
     ) -> Result<Option<String>, OperationAuthorizationError> {
-        self.admit(association)?;
+        let (requester, _) = self.admit(association)?;
         let claims = association.candidate();
         let lineage = match &claims.authority_basis {
             WorkAuthorityBasis::GrantLineage { lineage } => lineage.as_slice(),
@@ -460,8 +502,8 @@ impl AdmittedWorkPolicyOwner for StockInvocationPolicy {
         let principal = |principal: &PrincipalRef| {
             serde_json::to_string(principal).map_err(|_| OperationAuthorizationError::Unavailable)
         };
-        Ok(Some(match &self.posture {
-            StockCallerPosture::LocalOperator => format!(
+        Ok(Some(match requester {
+            StockRequester::Operator => format!(
                 "The local operator {} invoked the realm agent {} through the stock ingress {} \
                  in realm {}, for one of the operator's own sessions, under a grant-lineage \
                  mandate. With the work's admitted ceiling it bounds this operation to: {bounds}",
@@ -470,7 +512,20 @@ impl AdmittedWorkPolicyOwner for StockInvocationPolicy {
                 principal(&self.ingress_actor)?,
                 self.realm.as_str(),
             ),
-            StockCallerPosture::HostAuthenticated(_) => format!(
+            StockRequester::Ingress => format!(
+                "The requester of this work is the stock ingress {} itself, a runtime host in \
+                 the process of the local operator {}: it submitted an event it reports as \
+                 the outcome of an administrative command run through that process, for one \
+                 of the operator's own sessions, invoking the realm agent {} in realm {}. No \
+                 person requested this work, and it is not the operator's consent to this \
+                 operation. It runs under the operator's grant-lineage mandate, which with \
+                 the work's admitted ceiling bounds this operation to: {bounds}",
+                principal(&self.ingress_actor)?,
+                principal(&self.operator)?,
+                principal(&self.executor)?,
+                self.realm.as_str(),
+            ),
+            StockRequester::Caller => format!(
                 "The caller {} authenticated by the trusted host invoked the realm agent {} \
                  through the ingress {} in realm {}, for a session owned by {}, as the host's \
                  access decision for that session allows, under a grant-lineage mandate. With \
@@ -833,7 +888,7 @@ impl OperationPolicyOwner for StockInvocationPolicy {
         purpose: LocalPolicyPurpose,
         now_ms: u64,
     ) -> Result<LocalPolicyAllowance, OperationAuthorizationError> {
-        let login = self.admit(association)?;
+        let (_, login) = self.admit(association)?;
         let operation_values = match (&binding.facts().operation, purpose) {
             (AuthorizationOperation::Model(facts), purpose) => {
                 self.model(association, facts, purpose)?
@@ -3456,5 +3511,154 @@ mod tests {
         let error = prepare(granted(&session, &lineage)).expect_err("unmapped under one grant");
         assert_eq!(error, OperationAuthorizationError::Unavailable);
         assert_eq!(owner.1.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// The review text of work the stock ingress requested itself, with
+    /// `bounds`.
+    fn host_mandate(bounds: &str) -> String {
+        format!(
+            "The requester of this work is the stock ingress {} itself, a runtime host in the \
+             process of the local operator {}: it submitted an event it reports as the outcome \
+             of an administrative command run through that process, for one of the operator's \
+             own sessions, invoking the realm agent {} in realm stock-realm. No person requested \
+             this work, and it is not the operator's consent to this operation. It runs under \
+             the operator's grant-lineage mandate, which with the work's admitted ceiling bounds \
+             this operation to: {bounds}",
+            json(&ingress()),
+            json(&operator()),
+            json(&executor()),
+        )
+    }
+
+    /// The stock ingress reporting its own administrative outcome is
+    /// admitted in the local-operator posture, under the operator's grant
+    /// lineage, and its review states that no person requested the work.
+    #[test]
+    fn the_ingress_reporting_its_own_outcome_is_admitted_and_reviewed_as_the_host() {
+        let session = SessionId::new();
+        let grants = grant_owner();
+        let policy = policy_over(Arc::clone(&grants));
+        let lineage = issue(
+            &grants,
+            "stock-grant",
+            ExecutionRestrictions::unrestricted(),
+        );
+        let reported = association(&session, |c| {
+            c.requester = ingress();
+            c.authority_basis = WorkAuthorityBasis::GrantLineage {
+                lineage: vec![lineage],
+            };
+        });
+        policy
+            .authorize_invocation(&ingress_context(ingress()), &reported)
+            .expect("the ingress reports its own outcome");
+        policy
+            .authorize_admitted_work(
+                &reported,
+                &operation(&session),
+                LocalPolicyPurpose::Operation,
+                5,
+            )
+            .expect("its admitted work is allowed now");
+        assert_eq!(
+            policy.review_mandate(&reported, &operation(&session), 5),
+            Ok(Some(host_mandate(
+                "actions any; resources any; processors any; audiences any; effective until no \
+                 expiry."
+            )))
+        );
+    }
+
+    /// Besides the operator, only this composition's own ingress, exactly,
+    /// is admitted: the ingress's id in another trust domain, another
+    /// runtime host of the realm and a person named like the ingress are
+    /// each a Denied verdict.
+    #[test]
+    fn only_the_compositions_own_ingress_is_admitted_besides_the_operator() {
+        let session = SessionId::new();
+        let policy = policy();
+        let elsewhere = PrincipalRef::in_domain(
+            PrincipalKind::RuntimeHost,
+            "rkat-cli",
+            TrustDomainId::new("another-domain").expect("domain"),
+        )
+        .expect("qualified");
+        for (label, requester) in [
+            ("the ingress's id in another trust domain", elsewhere),
+            (
+                "another runtime host of the realm",
+                principal(PrincipalKind::RuntimeHost, "rkat-host"),
+            ),
+            (
+                "a person named like the ingress",
+                principal(PrincipalKind::Human, "rkat-cli"),
+            ),
+        ] {
+            let claimed = association(&session, |c| c.requester = requester.clone());
+            let refused = policy
+                .authorize_invocation(&ingress_context(requester), &claimed)
+                .expect_err(label);
+            assert!(
+                matches!(&refused, NativeAdmissionError::Refused(refusal)
+                    if refusal.kind() == OperationRefusalKind::Denied),
+                "{label}: {refused:?}"
+            );
+        }
+    }
+
+    /// A host-authenticated composition never admits its own ingress as a
+    /// requester, even when the host would admit every caller, and the host
+    /// is never asked.
+    #[test]
+    fn a_host_authenticated_composition_refuses_its_own_ingress_without_asking() {
+        let session = SessionId::new();
+        let access = HostAccess::answering(Ok(()));
+        let hosted = host_policy(&access);
+        let reported = association(&session, |c| c.requester = ingress());
+        assert!(matches!(
+            hosted.authorize_invocation(&ingress_context(ingress()), &reported),
+            Err(NativeAdmissionError::Refused(_))
+        ));
+        assert!(is_denied_verdict(
+            &hosted
+                .authorize_admitted_work(
+                    &reported,
+                    &operation(&session),
+                    LocalPolicyPurpose::Operation,
+                    5,
+                )
+                .expect_err("the ingress is no caller")
+        ));
+        assert!(access.asked().is_empty(), "{:?}", access.asked().len());
+    }
+
+    /// An attachment control is a connection's, never the ingress's own: the
+    /// attachment face refuses the ingress as its requester.
+    #[test]
+    fn an_attachment_control_never_comes_from_the_ingress_itself() {
+        let session = SessionId::new();
+        let policy = policy();
+        let destination = StockSessionDestination::for_session(&operator(), &session, 4).unwrap();
+        let control = McpAttachmentControlRequest::from_trusted_ingress(
+            session.clone(),
+            installed_server(),
+            McpAttachmentFacts {
+                requester: ingress(),
+                actor: ingress(),
+                realm: realm(),
+                destination: destination.mcp_destination(),
+            },
+            Arc::new(()),
+        )
+        .expect("trusted control");
+        assert!(is_denied_verdict(
+            &AdmittedWorkPolicyOwner::authorize_mcp_attachment(
+                policy.as_ref(),
+                &control,
+                &operation(&session),
+                1,
+            )
+            .expect_err("the ingress attaches nothing")
+        ));
     }
 }
