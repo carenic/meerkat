@@ -35,6 +35,35 @@ them.
 
 ## [Unreleased]
 
+### Breaking
+
+- `meerkat-authorization-contracts`: `ExecutionRestrictions.resource_domains`
+  is a `DomainRestriction` (it was `ExactRestriction<ResourceDomain>`). Build
+  it with `DomainRestriction::{unrestricted, exact, owned_by, unresolved}` and
+  read it through `DomainRestriction::bound`, which returns the
+  `#[non_exhaustive]` `DomainBound` (`Unrestricted`, `Exact`, `OwnedBy`). A
+  reader that cannot interpret a bound kind must treat it as naming nothing.
+  Unrestricted and exact bounds keep the earlier wire bytes in both
+  directions. A 0.9.3 binary refuses to restore a grant owner whose journal
+  holds an owner-scoped restriction (`RestartRequired`); a journal that holds
+  none stays readable by 0.9.3.
+
+### Added
+
+- `meerkat-authorization-contracts`: an owner-scoped resource-domain bound,
+  `DomainBound::OwnedBy`: every domain whose typed authority is one of a
+  non-empty set of owners, under any namespace. A parent grant can now fix the
+  application while each child names its exact session domain. Conjunction is
+  the exact intersection of both match sets: an owner bound meets exact
+  domains as the owners' own domains, two owner sets meet as their
+  intersection, and no owner is the empty exact set. Namespaces stay opaque.
+  The bound isolates applications only as far as each application's domains
+  carry an authority that no other application shares. An owner bound records
+  no MCP connector approval (an operation under it is missing evidence, as
+  under a wildcard), and the review text states it as "owned by" and its
+  owners. The shared restriction conformance corpus moves to contract 1.1
+  with owner-scoped vectors; the 1.0 vectors are unchanged.
+
 ## [0.9.3] - 2026-10-18
 
 ### Breaking

@@ -14,8 +14,8 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use meerkat_authorization_contracts::constraints::{
-    ActionRef, AudienceRef, DelegationDepth, ExactRestriction, LifetimeRestriction, ProcessorRef,
-    ResourceDomain, UnresolvedConstraint,
+    ActionRef, AudienceRef, DelegationDepth, DomainRestriction, ExactRestriction,
+    LifetimeRestriction, ProcessorRef, ResourceDomain, UnresolvedConstraint,
 };
 use meerkat_authorization_contracts::evidence::{
     EvidenceDigest, EvidenceId, HistoricalEvidenceRef,

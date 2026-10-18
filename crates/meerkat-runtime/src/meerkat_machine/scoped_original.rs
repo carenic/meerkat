@@ -575,9 +575,10 @@ impl AdmittedWorkPolicyOwner for NamedContributorWork {
 /// presentation: the exact values of the action, resource, processor and
 /// audience bounds, each value in its own serialized form (a principal with
 /// its kind, id and qualification), "any" where a dimension is unbounded,
-/// and the effective expiry, the earlier of `expires_at_ms` and the end of
-/// the bounds' own lifetime window (or "no expiry"). It is data only and
-/// grants nothing.
+/// "owned by" and the owners where the resource bound names the authorities
+/// that own its domains, and the effective expiry, the earlier of
+/// `expires_at_ms` and the end of the bounds' own lifetime window (or "no
+/// expiry"). It is data only and grants nothing.
 ///
 /// # Errors
 /// Bounds that permit nothing at `now_ms` (an empty set, an empty, not yet
@@ -590,7 +591,9 @@ pub fn review_bounds_text(
     expires_at_ms: u64,
     now_ms: u64,
 ) -> Result<String, meerkat_core::OperationAuthorizationError> {
-    use meerkat_authorization_contracts::constraints::{ExactRestriction, LifetimeBound, SetBound};
+    use meerkat_authorization_contracts::constraints::{
+        DomainBound, DomainRestriction, ExactRestriction, LifetimeBound, SetBound,
+    };
     fn permits_none<T: Ord>(restriction: &ExactRestriction<T>) -> bool {
         !restriction.unresolved_facts().is_empty()
             || matches!(restriction.bound(), SetBound::Exact(values) if values.is_empty())
@@ -604,13 +607,34 @@ pub fn review_bounds_text(
                 .map_err(|_| meerkat_core::OperationAuthorizationError::Unavailable),
         }
     }
+    // An owner bound is never empty, so only an empty exact set or an
+    // unresolved fact permits no domain.
+    fn domains_permit_none(restriction: &DomainRestriction) -> bool {
+        !restriction.unresolved_facts().is_empty()
+            || matches!(restriction.bound(), DomainBound::Exact(values) if values.is_empty())
+    }
+    // A bound kind this text cannot name is not rendered as "any": it is
+    // unavailable, as an unserializable value is.
+    fn listed_domains(
+        restriction: &DomainRestriction,
+    ) -> Result<String, meerkat_core::OperationAuthorizationError> {
+        let unavailable = |_| meerkat_core::OperationAuthorizationError::Unavailable;
+        match restriction.bound() {
+            DomainBound::Unrestricted => Ok("any".to_owned()),
+            DomainBound::Exact(values) => serde_json::to_string(values).map_err(unavailable),
+            DomainBound::OwnedBy(owners) => serde_json::to_string(owners)
+                .map(|owners| format!("owned by {owners}"))
+                .map_err(unavailable),
+            _ => Err(meerkat_core::OperationAuthorizationError::Unavailable),
+        }
+    }
     let denied = || {
         meerkat_core::OperationAuthorizationError::from(OperationRefused::new(
             OperationRefusalKind::Denied,
         ))
     };
     if permits_none(&restrictions.actions)
-        || permits_none(&restrictions.resource_domains)
+        || domains_permit_none(&restrictions.resource_domains)
         || permits_none(&restrictions.processors)
         || permits_none(&restrictions.audiences)
         || !restrictions.lifetime.unresolved_facts().is_empty()
@@ -641,7 +665,7 @@ pub fn review_bounds_text(
             )
     };
     let actions = listed(&restrictions.actions)?;
-    let resources = listed(&restrictions.resource_domains)?;
+    let resources = listed_domains(&restrictions.resource_domains)?;
     let processors = listed(&restrictions.processors)?;
     let audiences = listed(&restrictions.audiences)?;
     Ok(format!(

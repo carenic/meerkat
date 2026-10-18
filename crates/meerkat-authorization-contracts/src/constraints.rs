@@ -735,7 +735,7 @@ impl DelegationDepth {
 #[serde(deny_unknown_fields)]
 pub struct ExecutionRestrictions {
     pub actions: ExactRestriction<ActionRef>,
-    pub resource_domains: ExactRestriction<ResourceDomain>,
+    pub resource_domains: DomainRestriction,
     pub processors: ExactRestriction<ProcessorRef>,
     pub audiences: ExactRestriction<AudienceRef>,
     pub lifetime: LifetimeRestriction,
@@ -780,7 +780,7 @@ impl ExecutionRestrictions {
     pub fn unrestricted() -> Self {
         Self {
             actions: ExactRestriction::unrestricted(),
-            resource_domains: ExactRestriction::unrestricted(),
+            resource_domains: DomainRestriction::unrestricted(),
             processors: ExactRestriction::unrestricted(),
             audiences: ExactRestriction::unrestricted(),
             lifetime: LifetimeRestriction::unrestricted(),

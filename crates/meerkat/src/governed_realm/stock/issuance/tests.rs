@@ -159,7 +159,7 @@ fn a_controller_grant_admits_only_its_named_routes() {
     let operator = principals().operator;
     let label_only = ExecutionRestrictions {
         actions: ExactRestriction::exact([action(STOCK_FEATURE, "infer")]),
-        resource_domains: ExactRestriction::exact([domain(&operator, "model-route".to_string())]),
+        resource_domains: DomainRestriction::exact([domain(&operator, "model-route".to_string())]),
         ..ExecutionRestrictions::unrestricted()
     };
     assert!(!stock_op(&label_only, "infer", route('1').as_str()));
@@ -1581,7 +1581,10 @@ fn an_mcp_grant_records_its_installations_connector_approval() {
     let connector_domain = mcp_connector_domain(&operator, "alpha", &approval);
     let connector_action = mcp_connector_action("alpha", &approval);
     let exact_grant = restrictions(&mcp("alpha", exact(&["read"]))).unwrap();
-    assert!(lists(&exact_grant.resource_domains, &connector_domain));
+    assert!(lists_domain(
+        &exact_grant.resource_domains,
+        &connector_domain
+    ));
     assert!(lists(&exact_grant.actions, &connector_action));
     // The ordinary Exact grant reads as exactly its raw operation, with its
     // installation entitlement and connector approval kept beside it.
@@ -1596,7 +1599,7 @@ fn an_mcp_grant_records_its_installations_connector_approval() {
     );
     assert!(view.unresolved.is_empty());
     let every = restrictions(&mcp("alpha", McpOperations::All)).unwrap();
-    assert!(lists(&every.resource_domains, &connector_domain));
+    assert!(lists_domain(&every.resource_domains, &connector_domain));
     let view = mcp_operations_view(&every);
     assert_eq!(view.operations, StockMcpOperations::All);
     assert!(view.other_actions.is_empty() && view.unresolved.is_empty());
@@ -1622,6 +1625,16 @@ fn lists<T: Ord>(restriction: &ExactRestriction<T>, value: &T) -> bool {
     matches!(
         restriction.bound(),
         meerkat_authorization_contracts::constraints::SetBound::Exact(values)
+            if values.contains(value)
+    )
+}
+
+/// Whether an exact domain bound explicitly lists `value` (an unrestricted
+/// or owner-scoped bound lists nothing).
+fn lists_domain(restriction: &DomainRestriction, value: &ResourceDomain) -> bool {
+    matches!(
+        restriction.bound(),
+        meerkat_authorization_contracts::constraints::DomainBound::Exact(values)
             if values.contains(value)
     )
 }

@@ -904,6 +904,132 @@
           "unresolved": []
         }
       }
+    },
+    {
+      "id": "owned-by-parent-keeps-only-its-owners-domains",
+      "parent": {
+        "actions": {
+          "bound": "exact",
+          "values": [
+            "read"
+          ],
+          "unresolved": []
+        },
+        "resource_domains": {
+          "bound": "owned_by",
+          "values": [
+            "owner-A"
+          ],
+          "unresolved": []
+        },
+        "processors": {
+          "bound": "exact",
+          "values": [
+            "route-A"
+          ],
+          "unresolved": []
+        },
+        "audiences": {
+          "bound": "exact",
+          "values": [
+            "alice"
+          ],
+          "unresolved": []
+        },
+        "lifetime": {
+          "bound": "window",
+          "not_before_ms": 100,
+          "expires_at_ms": 200,
+          "unresolved": []
+        },
+        "delegation_depth": {
+          "bound": "remaining",
+          "remaining": 1,
+          "unresolved": []
+        }
+      },
+      "requested": {
+        "actions": {
+          "bound": "exact",
+          "values": [
+            "read",
+            "write"
+          ],
+          "unresolved": []
+        },
+        "resource_domains": {
+          "bound": "exact",
+          "values": [
+            "records-A",
+            "records-B"
+          ],
+          "unresolved": []
+        },
+        "processors": {
+          "bound": "unrestricted",
+          "values": [],
+          "unresolved": []
+        },
+        "audiences": {
+          "bound": "exact",
+          "values": [
+            "alice",
+            "bob"
+          ],
+          "unresolved": []
+        },
+        "lifetime": {
+          "bound": "window",
+          "not_before_ms": 0,
+          "expires_at_ms": 999,
+          "unresolved": []
+        },
+        "delegation_depth": {
+          "bound": "unrestricted",
+          "unresolved": []
+        }
+      },
+      "expected": {
+        "actions": {
+          "bound": "exact",
+          "values": [
+            "read"
+          ],
+          "unresolved": []
+        },
+        "resource_domains": {
+          "bound": "exact",
+          "values": [
+            "records-A"
+          ],
+          "unresolved": []
+        },
+        "processors": {
+          "bound": "exact",
+          "values": [
+            "route-A"
+          ],
+          "unresolved": []
+        },
+        "audiences": {
+          "bound": "exact",
+          "values": [
+            "alice"
+          ],
+          "unresolved": []
+        },
+        "lifetime": {
+          "bound": "window",
+          "not_before_ms": 100,
+          "expires_at_ms": 200,
+          "unresolved": []
+        },
+        "delegation_depth": {
+          "bound": "remaining",
+          "remaining": 0,
+          "unresolved": []
+        }
+      }
     }
   ],
   "domain_cases": [

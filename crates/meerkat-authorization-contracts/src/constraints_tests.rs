@@ -236,7 +236,7 @@ mod tests {
                 }
                 RestrictionDimension::ResourceDomain => {
                     unknown.resource_domains =
-                        ExactRestriction::unresolved(UnresolvedConstraint::Unknown);
+                        DomainRestriction::unresolved(UnresolvedConstraint::Unknown);
                 }
                 RestrictionDimension::Processor => {
                     unknown.processors =
@@ -374,13 +374,37 @@ mod tests {
                 );
             }
         }
+        // The resource-domain dimension is a `DomainRestriction`; its exact
+        // vectors keep the same wire and expectations.
+        fn check_domain_set(case: &serde_json::Value, corpus: &serde_json::Value) {
+            let atoms = &corpus["atoms"]["resource_domains"];
+            let mut actual = DomainRestriction::unrestricted();
+            for input in fixture::entries(&case["inputs"]) {
+                actual = actual.conjoin(&fixture::domain_restriction(input, corpus));
+            }
+            assert_eq!(
+                actual,
+                fixture::domain_restriction(&case["expected"], corpus),
+                "{}",
+                case["id"]
+            );
+            for probe in fixture::entries(&case["probes"]) {
+                let value: ResourceDomain = fixture::decode(&atoms[fixture::name(&probe["value"])]);
+                assert_eq!(
+                    outcome(&actual.check(&value)),
+                    fixture::name(&probe["expected"]),
+                    "{}",
+                    case["id"]
+                );
+            }
+        }
         let corpus = fixture::corpus();
         for case in fixture::entries(&corpus["set_cases"]) {
             let dimension = fixture::name(&case["dimension"]);
             let atoms = &corpus["atoms"][dimension];
             match dimension {
                 "actions" => check_set::<ActionRef>(case, atoms),
-                "resource_domains" => check_set::<ResourceDomain>(case, atoms),
+                "resource_domains" => check_domain_set(case, &corpus),
                 "processors" => check_set::<ProcessorRef>(case, atoms),
                 other => {
                     assert_eq!(other, "audiences", "unsupported corpus dimension");
@@ -450,7 +474,7 @@ mod tests {
             );
         }
         assert_eq!(fixture::entries(&corpus["depth_cases"]).len(), 5);
-        assert_eq!(fixture::entries(&corpus["attenuation_cases"]).len(), 2);
+        assert_eq!(fixture::entries(&corpus["attenuation_cases"]).len(), 3);
     }
 }
 
@@ -581,6 +605,85 @@ mod domain_restriction_tests {
             parent.conjoin(&DomainRestriction::owned_by([app, principal("other-app")])),
             parent
         );
+    }
+
+    fn session_values<'a>(
+        domain: &'a ResourceDomain,
+        action: &'a ActionRef,
+        processor: &'a ProcessorRef,
+        audience: &'a AudienceRef,
+    ) -> OperationRestrictionValues<'a> {
+        OperationRestrictionValues {
+            action,
+            resource_domain: domain,
+            processor,
+            audience,
+            now_ms: 150,
+        }
+    }
+
+    /// A child grant under an owner-scoped parent: naming another
+    /// authority's domain permits nothing, naming the owner's own domain
+    /// permits only that domain, and asking for more keeps the owner bound.
+    #[test]
+    fn child_of_owned_by_parent_naming_another_authority_permits_nothing() {
+        let app = principal("app");
+        let other = principal("other-app");
+        let action = ActionRef {
+            feature: "catalog".into(),
+            action: "read".into(),
+        };
+        let processor = ProcessorRef::Principal {
+            principal: principal("helper"),
+        };
+        let audience = AudienceRef::Principal {
+            principal: principal("helper"),
+        };
+        let mut parent = ExecutionRestrictions::unrestricted();
+        parent.resource_domains = DomainRestriction::owned_by([app.clone()]);
+        parent.delegation_depth = DelegationDepth::remaining(1);
+        let mut foreign = ExecutionRestrictions::unrestricted();
+        foreign.resource_domains = DomainRestriction::exact([domain(&other, "s1")]);
+        let child = parent.for_child(&foreign).expect("one child edge");
+        assert_eq!(child.resource_domains, DomainRestriction::exact([]));
+        assert_eq!(
+            child.check_bounds(session_values(
+                &domain(&other, "s1"),
+                &action,
+                &processor,
+                &audience
+            )),
+            Err(RestrictionFailure::OutsideBounds {
+                dimension: RestrictionDimension::ResourceDomain
+            })
+        );
+        let mut own = ExecutionRestrictions::unrestricted();
+        own.resource_domains = DomainRestriction::exact([domain(&app, "s1")]);
+        let child = parent.for_child(&own).expect("one child edge");
+        assert_eq!(
+            child.check_bounds(session_values(
+                &domain(&app, "s1"),
+                &action,
+                &processor,
+                &audience
+            )),
+            Ok(())
+        );
+        assert_eq!(
+            child.check_bounds(session_values(
+                &domain(&app, "s2"),
+                &action,
+                &processor,
+                &audience
+            )),
+            Err(RestrictionFailure::OutsideBounds {
+                dimension: RestrictionDimension::ResourceDomain
+            })
+        );
+        let wider = parent
+            .for_child(&ExecutionRestrictions::unrestricted())
+            .expect("one child edge");
+        assert_eq!(wider.resource_domains, DomainRestriction::owned_by([app]));
     }
 
     #[test]

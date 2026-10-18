@@ -921,7 +921,7 @@ impl OperationPolicyOwner for StockInvocationPolicy {
 mod tests {
     use super::*;
     use meerkat_authorization_contracts::constraints::{
-        AudienceRef, ExactRestriction, LifetimeRestriction, ResourceDomain,
+        AudienceRef, DomainRestriction, ExactRestriction, LifetimeRestriction, ResourceDomain,
     };
     use meerkat_authorization_contracts::evidence::{
         EvidenceDigest, EvidenceId, HistoricalEvidenceRef,
@@ -2142,7 +2142,7 @@ mod tests {
             "narrow-grant",
             ExecutionRestrictions {
                 actions: ExactRestriction::exact([memory_read.clone()]),
-                resource_domains: ExactRestriction::exact([session_memory.clone()]),
+                resource_domains: DomainRestriction::exact([session_memory.clone()]),
                 processors: ExactRestriction::exact([by_executor.clone()]),
                 lifetime: LifetimeRestriction::window(0, GRANT_UNTIL_MS),
                 ..ExecutionRestrictions::unrestricted()

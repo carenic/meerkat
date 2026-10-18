@@ -11,7 +11,9 @@ use meerkat_authorization::grants::LocalGrantAuthority;
 use meerkat_authorization::mcp_installation::{
     MCP_INSTALLATION_FEATURE, mcp_connector_action, mcp_connector_domain,
 };
-use meerkat_authorization_contracts::constraints::{ExactRestriction, LifetimeRestriction};
+use meerkat_authorization_contracts::constraints::{
+    DomainRestriction, ExactRestriction, LifetimeRestriction,
+};
 use meerkat_authorization_contracts::grant::GrantLineageRef;
 use meerkat_core::mcp_attachment::{ConfiguredMcpAttachmentAuthority, McpAttachmentRefusal};
 use meerkat_core::mcp_config::McpConnectorBinding;
@@ -254,7 +256,7 @@ impl Fixture {
                             mcp_connector_action(server, &McpConnectorApproval::NoConnector),
                         ]
                     })),
-                    resource_domains: ExactRestriction::exact(
+                    resource_domains: DomainRestriction::exact(
                         servers.iter().map(|server| server_domain(realm, server)),
                     ),
                     lifetime,
@@ -291,7 +293,7 @@ impl Fixture {
                                 .map(|approval| mcp_connector_action(server, approval)),
                         ),
                     ),
-                    resource_domains: ExactRestriction::exact([server_domain("alpha", server)]),
+                    resource_domains: DomainRestriction::exact([server_domain("alpha", server)]),
                     ..ExecutionRestrictions::unrestricted()
                 },
             )
@@ -314,7 +316,7 @@ impl Fixture {
                 who(agent),
                 None,
                 ExecutionRestrictions {
-                    resource_domains: ExactRestriction::exact(
+                    resource_domains: DomainRestriction::exact(
                         std::iter::once(server_domain("alpha", server)).chain(
                             approvals.iter().map(|approval| {
                                 mcp_connector_domain(&operator_of("alpha"), server, approval)
@@ -708,6 +710,39 @@ async fn an_every_operation_grant_approves_only_the_connector_its_domains_name()
             authority.authorize_configured(&configured),
             Err(McpAttachmentRefusal::Denied),
             "a same-name descriptor with another binding"
+        );
+    }
+}
+
+/// An owner-scoped grant covers the installation's domain but records no
+/// connector approval: every configured descriptor of the server is
+/// unavailable (missing evidence), never admitted and never denied.
+#[tokio::test]
+async fn an_owner_scoped_grant_approves_no_connector() {
+    let fx = fixture();
+    let grant = fx
+        .grants
+        .issue_root(
+            &who("operator"),
+            EvidenceId::new("a-owned").expect("id"),
+            who("agent-a"),
+            None,
+            ExecutionRestrictions {
+                resource_domains: DomainRestriction::owned_by([operator_of("alpha")]),
+                ..ExecutionRestrictions::unrestricted()
+            },
+        )
+        .expect("issue");
+    let (_, witness, authority) = fx.session().await;
+    fx.select(&witness, "agent-a", grant).await.expect("select");
+    for configured in [
+        connector_server("sentinel", "account-a"),
+        server("sentinel"),
+    ] {
+        assert_eq!(
+            authority.authorize_configured(&configured),
+            Err(McpAttachmentRefusal::Unavailable),
+            "an owner bound records no approval"
         );
     }
 }

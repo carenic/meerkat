@@ -95,7 +95,7 @@ pub(crate) fn execution(spec: &Value, corpus: &Value) -> ExecutionRestrictions {
     let atoms = &corpus["atoms"];
     ExecutionRestrictions {
         actions: restriction(&spec["actions"], &atoms["actions"]),
-        resource_domains: restriction(&spec["resource_domains"], &atoms["resource_domains"]),
+        resource_domains: domain_restriction(&spec["resource_domains"], corpus),
         processors: restriction(&spec["processors"], &atoms["processors"]),
         audiences: restriction(&spec["audiences"], &atoms["audiences"]),
         lifetime: lifetime(&spec["lifetime"]),
