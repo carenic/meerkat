@@ -641,8 +641,9 @@ export function touchesGuardLane(lane, paths) {
 
 // The two lanes' definitions, beside their inputs: each lane's job in ci.yml,
 // the confinement lane's CONFINEMENT_* assignments and recipe in the
-// Makefile, and the module declarations (the `mod` item and its attributes)
-// that compile the selected cases in. A pull request that changes one
+// Makefile and the selection of the default nextest profile it runs, and the
+// module declarations (the `mod` item and its attributes) that compile the
+// selected cases in. A pull request that changes one
 // between its base and head runs that lane. [path, extract]: extract(text) is
 // the part of the file that defines the lane.
 // scripts/ci-guard-lane-inputs-selftest.mjs reads the selections from these
@@ -655,6 +656,7 @@ export const GUARD_LANE_DEFINITIONS = {
   mcp_confinement_positive: [
     [".github/workflows/ci.yml", (text) => workflowJob(text, "mcp-confinement-positive")],
     ["Makefile", confinementMakeDefinition],
+    [".config/nextest.toml", nextestDefaultSelection],
     ["crates/meerkat-mcp/src/connection.rs", (text) => moduleDeclarations(text, "process_confinement_tests")],
     ["crates/meerkat-tools/src/builtin/shell/mod.rs", (text) => moduleDeclarations(text, "confinement_tests")],
     ["crates/meerkat/src/lib.rs", (text) => moduleDeclarations(text, "process_custody")],
@@ -684,6 +686,25 @@ export function confinementMakeDefinition(text) {
   const end = lines.findIndex((line, index) => index > start && !line.startsWith("\t"));
   const assignments = lines.filter((line) => /^CONFINEMENT_\w+\s*[:?+]?=/.test(line));
   return [...assignments, ...lines.slice(start, end < 0 ? lines.length : end)].join("\n");
+}
+
+// What decides the default nextest profile's selection: its
+// [profile.default] table and every default override that sets a (platform)
+// default-filter, without comment and blank lines.
+export function nextestDefaultSelection(text) {
+  return text
+    .split(/^(?=\[)/m)
+    .filter((section) => {
+      const header = section.split("\n", 1)[0].replace(/#.*/, "").trim();
+      return (
+        header === "[profile.default]" ||
+        (header === "[[profile.default.overrides]]" && /^default-filter\s*=/m.test(section))
+      );
+    })
+    .join("")
+    .split("\n")
+    .filter((line) => !/^\s*(#.*)?$/.test(line))
+    .join("\n");
 }
 
 // Every declaration of module `name` in a Rust source: the `mod` line and the

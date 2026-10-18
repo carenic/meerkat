@@ -534,19 +534,20 @@ and its CI must be green before a release tag (`require_ci_green`):
   between its base and head, `GUARD_LANE_DEFINITIONS` (its ci.yml job
   without comment and blank lines, with the governed step's expected list
   and command; the Makefile's CONFINEMENT_* assignments and the
-  test-mcp-confinement-positive recipe with its cargo flags; the
-  attributes and `mod` line declaring each module that holds selected
+  test-mcp-confinement-positive recipe with its cargo flags; the selection
+  of the default nextest profile that recipe runs, `.config/nextest.toml`'s
+  `[profile.default]` and any default override that sets a `default-filter`;
+  the attributes and `mod` line declaring each module that holds selected
   cases), and when its diff is unknown.
   `scripts/ci-guard-lane-inputs-selftest.mjs` resolves every selected case
   to the files that define it and fails when such a file or its crate's
   manifest is not an input, when one of those declarations differs from
   its pin, or when a second module name ends in governed_jsonl. Neither
   watches the parent modules' declarations, the scripts the recipe calls or
-  global build configuration such as `.config/nextest.toml`): exactly the
-  non-MCP governed JSONL tests of meerkat-rpc that the step's expected list
-  names, and exactly the Linux positive confinement cases of
-  `make test-mcp-confinement-positive` (its CONFINEMENT_* filters and
-  counts), on every Rust change.
+  other global build configuration): exactly the non-MCP governed JSONL
+  tests of meerkat-rpc that the step's expected list names, and exactly the
+  Linux positive confinement cases of `make test-mcp-confinement-positive`
+  (its CONFINEMENT_* filters and counts), on every Rust change.
 - `feature-check` (push only; two jobs per clippy shard, Bazel set and matrix): compile-only checks of the
   shard's packages under the feature sets the Bazel graph builds them with
   (`--no-default-features` plus exactly the set their generated
