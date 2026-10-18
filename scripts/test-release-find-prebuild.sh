@@ -6,8 +6,9 @@
 # the release commit (release.yml, workflow_dispatch, main, this repository,
 # a successful "Release prebuild gate", downloadable critical artifacts), as
 # soon as that gate passed even while the run's trailing lanes still build,
-# prefer the newest, wait for a gate that has not concluded, and fail loudly
-# when the API fails instead of reporting "no prebuild".
+# prefer the newest, wait for a gate that has not concluded unless a job it
+# needs already failed, and fail loudly when the API fails instead of
+# reporting "no prebuild".
 
 set -euo pipefail
 
@@ -96,6 +97,7 @@ runs() {
 }
 
 # jobs <run id> <prebuild gate conclusion, "pending" or "absent"> [variant suffix]
+#      [another job's name and conclusion, as JSON members]
 jobs() {
   local gate=""
   case "$2" in
@@ -103,7 +105,7 @@ jobs() {
     pending) gate=', {"name": "Release prebuild gate", "conclusion": null}' ;;
     *) gate=", {\"name\": \"Release prebuild gate\", \"conclusion\": \"$2\"}" ;;
   esac
-  printf '{"jobs": [{"name": "Release binary build gate", "conclusion": null}%s]}\n' "${gate}" \
+  printf '{"jobs": [{"name": "Release binary build gate", "conclusion": null}%s%s]}\n' "${gate}" "${4:+, {$4\}}" \
     >"${FIXTURES}/$(key_for "repos/${REPO}/actions/runs/$1/jobs?per_page=100")${3:-}.json"
 }
 
@@ -248,6 +250,27 @@ runs "" "$(run_json 402 in_progress)"
 jobs 402 success
 artifacts 402 "${critical_only[@]}" "rkat-web-package:false"
 lookup critical-ready-while-trailing-run "402 2" 0
+
+# 8b. A gate that has not concluded is not waited for once a job it needs
+#     failed, timed out or was cancelled; a trailing job's failure does not
+#     stop the wait.
+for ended in '"name": "Build Web SDK package", "conclusion": "failure"' \
+  '"name": "Build and package surface binaries with GitHub-hosted runners (rkat, aarch64-apple-darwin)", "conclusion": "cancelled"' \
+  '"name": "Release critical binary build gate", "conclusion": "timed_out"'; do
+  reset
+  runs "" "$(run_json 451 in_progress)"
+  jobs 451 pending "" "${ended}"
+  WAIT_SECONDS=120 lookup critical-job-ended "" 0
+  [[ "$(cat "${FIXTURES}/.calls-$(key_for "${runs_url}")")" -eq 1 ]] ||
+    fail "critical-job-ended: waited for a gate that cannot pass (${ended})"
+done
+reset
+runs "" "$(run_json 452 in_progress)"
+trailing='"name": "Cross-compile and package Windows surface binaries on Linux", "conclusion": "failure"'
+jobs 452 pending ".1" "${trailing}"
+jobs 452 success ".2" "${trailing}"
+complete_artifacts 452
+lookup trailing-job-failed "452 2" 0
 
 # 9. A run whose gate has not concluded past the wait budget is not waited
 #    for forever.

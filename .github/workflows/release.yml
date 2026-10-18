@@ -997,7 +997,8 @@ jobs:
   # whose Release prebuild gate succeeded (critical binaries and Web SDK
   # package ready; its trailing lanes may still be running) and whose
   # critical artifacts have not expired (scripts/release-find-prebuild; a
-  # gate that has not concluded is waited for). Its run id is the only thing reused: publish_github_release
+  # gate that has not concluded is waited for unless a job it needs already
+  # failed). Its run id is the only thing reused: publish_github_release
   # verifies every archive exactly as for an assets_run_id recovery (each one
   # and its source stamp attested by release.yml at that commit on
   # refs/heads/main, the run's binary build gate green, every binary

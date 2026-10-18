@@ -370,7 +370,10 @@ attempt the lookup examined and refuse it if the run was re-run since;
 a gate that has not concluded yet is waited for, because the prebuild
 finishes no later than a fresh build would, for up to 140 minutes from the
 prebuild's start (`MEERKAT_PREBUILD_WAIT_SECONDS`, default 8400; v0.9.2's
-BuildBuddy prebuild gate concluded after 94.7 minutes). When it finds one, the tag run
+BuildBuddy prebuild gate concluded after 94.7 minutes), unless a job the gate
+needs (the request check, a critical build, the Web SDK package or the
+critical binary build gate) already failed, timed out or was cancelled, so
+the gate can no longer pass. When it finds one, the tag run
 skips every build job and publishes that run's artifacts after the same
 verification as an `--assets-run-id` recovery
 (`verify-release-asset-provenance --source-run`: every archive and its stamp

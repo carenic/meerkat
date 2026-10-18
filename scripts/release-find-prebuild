@@ -23,7 +23,9 @@
 # MEERKAT_PREBUILD_WAIT_SECONDS (default 8400) have passed since the run
 # started: a prebuild already under way finishes no later than a fresh build.
 # The default leaves about 45 minutes over the slowest gate measured on the
-# backend tags select (v0.9.2's BuildBuddy prebuild: 94.7 minutes).
+# backend tags select (v0.9.2's BuildBuddy prebuild: 94.7 minutes). A run one
+# of whose CRITICAL_JOBS (the jobs the gate needs) failed, timed out or was
+# cancelled is given up at once: its gate can no longer pass.
 #
 # The id is only a pointer, pinned to the attempt examined here: the
 # publishing jobs verify every archive and the Web SDK package against their
@@ -36,6 +38,14 @@ shopt -s inherit_errexit
 PREBUILD_GATE_JOB="Release prebuild gate"
 CRITICAL_TARGETS=(x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu aarch64-apple-darwin)
 WEB_SDK_ARTIFACT="rkat-web-package"
+# Display names, a glob for the matrix legs.
+CRITICAL_JOBS=(
+  "Require green CI"
+  "Build and package surface binaries with GitHub-hosted runners (*)"
+  "Build and package surface binaries via BuildBuddy"
+  "Build Web SDK package"
+  "Release critical binary build gate"
+)
 
 usage() {
   sed -n '2,/^$/s/^# \{0,1\}//p' "$0" >&2
@@ -86,13 +96,30 @@ candidate_runs() {
 }
 
 # The prebuild gate's conclusion: success, failure, ..., "pending" while it
-# has not concluded, or "absent" when the run has no such job.
+# has not concluded, "absent" when the run has no such job, or "doomed" when
+# it has not concluded but one of the CRITICAL_JOBS failed, timed out or was
+# cancelled.
 prebuild_gate_state() {
-  local run_id="$1" state
-  state="$(gh api --paginate "repos/${repository}/actions/runs/${run_id}/jobs?per_page=100" \
-    --jq ".jobs[] | select(.name == \"${PREBUILD_GATE_JOB}\") | (.conclusion // \"pending\")")" ||
+  local run_id="$1" listing name conclusion critical gate="absent" doomed=""
+  listing="$(gh api --paginate "repos/${repository}/actions/runs/${run_id}/jobs?per_page=100" \
+    --jq '.jobs[] | [.name, (.conclusion // "pending")] | @tsv')" ||
     { log "cannot list the jobs of run ${run_id}"; exit 1; }
-  printf '%s\n' "${state:-absent}"
+  while IFS=$'\t' read -r name conclusion; do
+    if [[ "${name}" == "${PREBUILD_GATE_JOB}" ]]; then
+      gate="${conclusion}"
+    fi
+    for critical in "${CRITICAL_JOBS[@]}"; do
+      # shellcheck disable=SC2053 # a glob
+      if [[ "${name}" == ${critical} && "${conclusion}" =~ ^(failure|timed_out|cancelled)$ ]]; then
+        doomed="${name}: ${conclusion}"
+      fi
+    done
+  done <<<"${listing}"
+  if [[ -n "${doomed}" && ( "${gate}" == "pending" || "${gate}" == "absent" ) ]]; then
+    log "run ${run_id}: ${doomed}, so its ${PREBUILD_GATE_JOB} cannot pass; not waiting for it"
+    gate="doomed"
+  fi
+  printf '%s\n' "${gate}"
 }
 
 artifacts_downloadable() {
