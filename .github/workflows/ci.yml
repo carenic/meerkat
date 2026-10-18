@@ -77,7 +77,9 @@ name: CI
 #                     step's expected list names, on Rust changes
 #   mcp-confinement-positive - exactly the Linux positive confinement cases
 #                     of `make test-mcp-confinement-positive` (its
-#                     CONFINEMENT_* filters and counts), on Rust changes
+#                     CONFINEMENT_* filters and counts), on Rust changes;
+#                     both also run in a PR that touches their inputs or
+#                     changes their definition
 #
 # Release projections: a push or pull request whose diff from its first
 # parent is only the forward patch projection scripts/release-hook.sh writes
@@ -1106,8 +1108,9 @@ jobs:
     # Native dependency changes must retain this positive non-MCP profile.
     # The push runs it on every Rust change; a pull request leaves it there
     # (it compiles meerkat-rpc's lib test and the meerkat-mob chain: 866 s on
-    # run 38859112297) unless it touches the lane's own inputs
-    # (GUARD_LANE_INPUTS in scripts/ci-cargo-lanes.mjs).
+    # run 38859112297) unless it touches the lane's own inputs or changes its
+    # definition (GUARD_LANE_INPUTS, GUARD_LANE_DEFINITIONS in
+    # scripts/ci-cargo-lanes.mjs).
     if: ${{ needs.changes.outputs.governed_jsonl == 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 40
@@ -1250,7 +1253,8 @@ jobs:
     # The push runs it on every Rust change; a pull request leaves it there
     # (the command-hook suite compiles the facade's lib test under every
     # feature: 863 s on run 38859112297) unless it touches the lane's own
-    # inputs (GUARD_LANE_INPUTS in scripts/ci-cargo-lanes.mjs).
+    # inputs or changes its definition (GUARD_LANE_INPUTS,
+    # GUARD_LANE_DEFINITIONS in scripts/ci-cargo-lanes.mjs).
     if: ${{ needs.changes.outputs.mcp_confinement_positive == 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 40

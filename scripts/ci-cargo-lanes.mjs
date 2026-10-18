@@ -21,7 +21,7 @@
 //                      [--workspace-shards N] [--closure-test-rows N]
 //                      [--lib-row-runner LABEL]
 //                      [--event pull_request|push|workflow_dispatch]
-//                      [--base-lock FILE]
+//                      [--base-lock FILE] [--base-tree DIR]
 //                      [--reuse-release-evidence <commit>:<run id>:<attempt>]
 //                      [--format json|github] [--] [changed-path ...]
 //   ci-cargo-lanes.mjs --paths-from-stdin [...]
@@ -41,7 +41,8 @@
 // sweep: the closure-tests rows, the closure check, the feature-combination
 // checks, the integration suites whose package compiles meerkat-mob, the
 // governed JSONL and confinement-positive lanes (unless it touches their own
-// inputs, GUARD_LANE_INPUTS), the feature suites marked
+// inputs, GUARD_LANE_INPUTS, or changes their definition,
+// GUARD_LANE_DEFINITIONS, or its diff is unknown), the feature suites marked
 // `pullRequest: false`, the test targets of the mob-chain packages (their
 // pull-request Clippy lints lib and bin targets only; their tests run on
 // main), the whole Clippy of the chain heads in MOB_CHAIN_CLIPPY_HEADS when
@@ -638,6 +639,88 @@ export function touchesGuardLane(lane, paths) {
   );
 }
 
+// The two lanes' definitions, beside their inputs: each lane's job in ci.yml,
+// the confinement lane's CONFINEMENT_* assignments and recipe in the
+// Makefile, and the module declarations (the `mod` item and its attributes)
+// that compile the selected cases in. A pull request that changes one
+// between its base and head runs that lane. [path, extract]: extract(text) is
+// the part of the file that defines the lane.
+// scripts/ci-guard-lane-inputs-selftest.mjs reads the selections from these
+// extracts and pins the declarations.
+export const GUARD_LANE_DEFINITIONS = {
+  governed_jsonl: [
+    [".github/workflows/ci.yml", (text) => workflowJob(text, "governed-jsonl")],
+    ["crates/meerkat-rpc/src/lib.rs", (text) => moduleDeclarations(text, "governed_jsonl")],
+  ],
+  mcp_confinement_positive: [
+    [".github/workflows/ci.yml", (text) => workflowJob(text, "mcp-confinement-positive")],
+    ["Makefile", confinementMakeDefinition],
+    ["crates/meerkat-mcp/src/connection.rs", (text) => moduleDeclarations(text, "process_confinement_tests")],
+    ["crates/meerkat-tools/src/builtin/shell/mod.rs", (text) => moduleDeclarations(text, "confinement_tests")],
+    ["crates/meerkat/src/lib.rs", (text) => moduleDeclarations(text, "process_custody")],
+  ],
+};
+
+// A workflow job: its `  id:` line up to the next job or top-level key.
+export function workflowJob(text, id) {
+  const lines = text.split("\n");
+  const start = lines.indexOf(`  ${id}:`);
+  if (start < 0) return null;
+  const end = lines.findIndex((line, index) => index > start && /^ {0,2}\S/.test(line));
+  return lines.slice(start, end < 0 ? lines.length : end).join("\n").trimEnd();
+}
+
+// The confinement lane in the Makefile: every CONFINEMENT_* assignment and
+// the test-mcp-confinement-positive rule with its recipe.
+export function confinementMakeDefinition(text) {
+  const lines = text.split("\n");
+  const start = lines.findIndex((line) => line.startsWith("test-mcp-confinement-positive:"));
+  if (start < 0) return null;
+  const end = lines.findIndex((line, index) => index > start && !line.startsWith("\t"));
+  const assignments = lines.filter((line) => /^CONFINEMENT_\w+\s*[:?+]?=/.test(line));
+  return [...assignments, ...lines.slice(start, end < 0 ? lines.length : end)].join("\n");
+}
+
+// Every declaration of module `name` in a Rust source: the `mod` line and the
+// attribute lines directly above it (up to a blank or comment line, or a line
+// that ends an item or opens a block).
+export function moduleDeclarations(text, name) {
+  const lines = text.split("\n");
+  const item = new RegExp(`^\\s*(pub(\\([^)]*\\))?\\s+)?mod\\s+${name}\\b`);
+  return lines
+    .flatMap((line, at) => {
+      if (!item.test(line)) return [];
+      let start = at;
+      while (start > 0 && !/^\s*(\/\/.*)?$|[;{}]\s*$/.test(lines[start - 1])) start -= 1;
+      return [lines.slice(start, at + 1).join("\n")];
+    })
+    .join("\n");
+}
+
+// The exact-profile lanes whose definition differs between the diff's base
+// and head; a side that cannot be read differs. An explicit path list
+// compares --base-tree's copy (without one, every listed definition file
+// differs) with the working tree.
+function changedGuardDefinitions(args, changedPaths) {
+  const read = (side, path) => {
+    if (args.explicitPaths) {
+      const file = side === "head" ? resolve(root, path) : args.baseTree && resolve(args.baseTree, path);
+      return file && existsSync(file) ? readFileSync(file, "utf8") : null;
+    }
+    const result = spawnSync("git", ["show", `${args[side]}:${path}`], { cwd: root, encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
+    return result.status === 0 ? result.stdout : null;
+  };
+  return Object.entries(GUARD_LANE_DEFINITIONS)
+    .filter(([, parts]) =>
+      parts.some(([path, extract]) => {
+        if (!changedPaths.includes(path)) return false;
+        const [base, head] = [read("base", path), read("head", path)];
+        return base === null || head === null || extract(base) !== extract(head);
+      }),
+    )
+    .map(([lane]) => lane);
+}
+
 function parseBazelFeatureSets(pkg) {
   const buildPath = resolve(root, packageDir(pkg), "BUILD.bazel");
   if (!existsSync(buildPath)) {
@@ -805,6 +888,7 @@ function parseArgs(argv) {
     workspacePlanRequested: false,
     event: "push",
     baseLock: "",
+    baseTree: "",
     rowDurations: "",
   };
   for (let i = 0; i < argv.length; i += 1) {
@@ -827,6 +911,9 @@ function parseArgs(argv) {
     } else if (arg === "--base-lock") {
       args.baseLock = argv[++i] ?? "";
       if (!args.baseLock) throw new Error("--base-lock requires a file");
+    } else if (arg === "--base-tree") {
+      args.baseTree = argv[++i] ?? "";
+      if (!args.baseTree) throw new Error("--base-tree requires a directory");
     } else if (arg === "--max-shards") {
       args.maxShards = Number.parseInt(argv[++i] ?? "", 10);
       if (!Number.isInteger(args.maxShards) || args.maxShards < 1) {
@@ -868,7 +955,7 @@ function parseArgs(argv) {
       break;
     } else if (arg === "--help" || arg === "-h") {
       process.stdout.write(
-        "usage: ci-cargo-lanes.mjs [--base <rev> --head <rev>] [--max-shards N] [--workspace-shards N] [--closure-test-rows N] [--lib-row-runner LABEL] [--event pull_request|push|workflow_dispatch] [--base-lock FILE] [--reuse-release-evidence <commit>:<run id>:<attempt>] [--workspace-plan-requested] [--format json|github] [--paths-from-stdin] [--changed-paths-only] [--] [changed-path ...]\n",
+        "usage: ci-cargo-lanes.mjs [--base <rev> --head <rev>] [--max-shards N] [--workspace-shards N] [--closure-test-rows N] [--lib-row-runner LABEL] [--event pull_request|push|workflow_dispatch] [--base-lock FILE] [--base-tree DIR] [--reuse-release-evidence <commit>:<run id>:<attempt>] [--workspace-plan-requested] [--format json|github] [--paths-from-stdin] [--changed-paths-only] [--] [changed-path ...]\n",
       );
       process.exit(0);
     } else if (arg.startsWith("-")) {
@@ -2314,14 +2401,21 @@ function plan(args) {
   // (governed JSONL compiles meerkat-rpc's lib test, the confinement lane
   // the facade's lib test under every feature: 866 and 863 s on run
   // 38859112297), run on the push. A pull request also runs an exact-profile
-  // lane when it touches that lane's own inputs (GUARD_LANE_INPUTS), so a
-  // case added or removed there meets the lane's exact selection before the
-  // merge rather than on the push after it.
-  const guardTouched = (lane) => touchesGuardLane(lane, changedPaths);
+  // lane when it touches that lane's own inputs (GUARD_LANE_INPUTS) or
+  // changes its definition (GUARD_LANE_DEFINITIONS), so a case added or
+  // removed there meets the lane's exact selection before the merge rather
+  // than on the push after it. Without a diff every definition may have
+  // changed.
+  result.guard_definitions_changed = !deferToPush
+    ? []
+    : changed === null
+      ? Object.keys(GUARD_LANE_DEFINITIONS)
+      : changedGuardDefinitions(args, changedPaths);
+  const guardRuns = (lane) =>
+    !deferToPush || touchesGuardLane(lane, changedPaths) || result.guard_definitions_changed.includes(lane);
   result.closure_check = result.rust_changed && !deferToPush;
-  result.governed_jsonl = result.rust_changed && (!deferToPush || guardTouched("governed_jsonl"));
-  result.mcp_confinement_positive =
-    result.rust_changed && (!deferToPush || guardTouched("mcp_confinement_positive"));
+  result.governed_jsonl = result.rust_changed && guardRuns("governed_jsonl");
+  result.mcp_confinement_positive = result.rust_changed && guardRuns("mcp_confinement_positive");
   deferred.closure_check = result.rust_changed && deferToPush;
   deferred.governed_jsonl = result.rust_changed && !result.governed_jsonl;
   deferred.mcp_confinement_positive = result.rust_changed && !result.mcp_confinement_positive;

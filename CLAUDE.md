@@ -378,7 +378,7 @@ and its CI must be green before a release tag (`require_ci_green`):
   reverse-dependency closure to the push and names it (`deferred_to_push`,
   printed by the gate): the `closure-tests` rows, `closure-check`,
   `feature-check`, `governed-jsonl` and `mcp-confinement-positive` (unless
-  it touches their own inputs, `GUARD_LANE_INPUTS`), the
+  it touches their own inputs or changes their definition), the
   integration suites whose package compiles meerkat-mob, the feature suites
   marked `pullRequest: false`, the mob-chain packages' test-target Clippy,
   and the whole Clippy of the chain heads rkat, meerkat-integration-tests and
@@ -528,10 +528,14 @@ and its CI must be green before a release tag (`require_ci_green`):
 - `closure-check` (push only): `cargo check --all-features` (lib and bin
   targets) over the reverse-dependency closure of the changed packages.
 - `governed-jsonl` and `mcp-confinement-positive` (push; a pull request
-  that touches a lane's own inputs, `GUARD_LANE_INPUTS` in
-  `scripts/ci-cargo-lanes.mjs`, runs that lane, and
-  `scripts/ci-guard-lane-inputs-selftest.mjs` keeps those inputs covering
-  every case the lanes select): exactly the non-MCP governed JSONL tests
+  runs a lane when it touches the lane's inputs, `GUARD_LANE_INPUTS` in
+  `scripts/ci-cargo-lanes.mjs` (the files that define its selected cases,
+  and their manifests), when it changes the lane's definition between its
+  base and head, `GUARD_LANE_DEFINITIONS` (its ci.yml job, the Makefile's
+  CONFINEMENT_* assignments and recipe, the selected modules'
+  declarations), and when its diff is unknown;
+  `scripts/ci-guard-lane-inputs-selftest.mjs` fails when a selected case is
+  defined outside the inputs): exactly the non-MCP governed JSONL tests
   of meerkat-rpc that the step's expected list names, and exactly the
   Linux positive confinement cases of `make test-mcp-confinement-positive`
   (its CONFINEMENT_* filters and counts), on every Rust change.

@@ -1,10 +1,12 @@
 #!/usr/bin/env node
 // Every case an exact-profile lane selects must be defined in a file whose
 // change runs that lane on a pull request (GUARD_LANE_INPUTS in
-// scripts/ci-cargo-lanes.mjs). The selections are read from the lanes' own
-// definitions: the expected list and command of the governed JSONL step in
-// .github/workflows/ci.yml, and the suites and CONFINEMENT_* filters of
-// `make test-mcp-confinement-positive`. Each selected test name or module is
+// scripts/ci-cargo-lanes.mjs). The selections are read from the same extracts
+// of the lanes' definitions that the planner compares between a pull
+// request's base and head (GUARD_LANE_DEFINITIONS): the expected list and
+// command of the governed-jsonl job in .github/workflows/ci.yml, and the
+// suites and CONFINEMENT_* filters of `make test-mcp-confinement-positive`.
+// Each selected test name or module is
 // resolved to the Rust files of its target that define it; a selection that
 // resolves to no file, a defining file outside the lane's inputs, a selected
 // package whose manifest is not an input, or an input that no longer exists
@@ -14,10 +16,18 @@ import assert from "node:assert/strict";
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { GUARD_LANE_INPUTS, touchesGuardLane } from "./ci-cargo-lanes.mjs";
+import { GUARD_LANE_DEFINITIONS, GUARD_LANE_INPUTS, touchesGuardLane } from "./ci-cargo-lanes.mjs";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const read = (path) => readFileSync(join(root, path), "utf8");
+// The extract of `path` that defines `lane`.
+function definition(lane, path) {
+  const entry = GUARD_LANE_DEFINITIONS[lane].find(([file]) => file === path);
+  assert.ok(entry, `GUARD_LANE_DEFINITIONS.${lane} has no ${path}`);
+  const text = entry[1](read(path));
+  assert.ok(text, `${path} does not define ${lane}`);
+  return text;
+}
 
 function rustFiles(dir) {
   const absolute = join(root, dir);
@@ -93,10 +103,9 @@ function filterAtoms(expression) {
 
 const selections = { governed_jsonl: [], mcp_confinement_positive: [] };
 
-// Governed JSONL: the step's expected list over its command's target.
+// Governed JSONL: the job's expected list over its command's target.
 {
-  const ci = read(".github/workflows/ci.yml");
-  const step = ci.slice(ci.indexOf("- name: Governed JSONL exact selection and execution"));
+  const step = definition("governed_jsonl", ".github/workflows/ci.yml");
   const list = step.match(/expected = sorted\(\[([\s\S]*?)\]\)/)?.[1];
   assert.ok(list, "ci.yml: the governed JSONL step has no expected list");
   const names = [...list.matchAll(/"([^"]+)"/g)].map((match) => match[1]);
@@ -112,12 +121,11 @@ const selections = { governed_jsonl: [], mcp_confinement_positive: [] };
 
 // MCP confinement positive: each suite of the Make target over its filter.
 {
-  const make = read("Makefile");
+  const make = definition("mcp_confinement_positive", "Makefile");
   const filters = new Map(
     [...make.matchAll(/^(CONFINEMENT_[A-Z_]+_POSITIVE) := (.+)$/gm)].map((match) => [match[1], match[2]]),
   );
-  const recipe = make.slice(make.indexOf("test-mcp-confinement-positive:"));
-  const suites = [...recipe.matchAll(/^\tsuite "([^"]+)" '\$\((CONFINEMENT_[A-Z_]+_POSITIVE)\)'/gm)];
+  const suites = [...make.matchAll(/^\tsuite "([^"]+)" '\$\((CONFINEMENT_[A-Z_]+_POSITIVE)\)'/gm)];
   assert.ok(suites.length > 0, "Makefile: test-mcp-confinement-positive runs no suite");
   for (const [, args, variable] of suites) {
     assert.ok(filters.has(variable), `Makefile: ${variable} is not defined`);
