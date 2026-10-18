@@ -97,3 +97,50 @@ fn poisoned_custody_owner_never_reopens_execution() {
         Err(RuntimeStoreExecutionCustodyError::Unavailable)
     ));
 }
+
+/// The in-memory owner lock guards only O(1) counter updates, and a claim
+/// released on another thread (a dropped machine's ops worker) holds it for
+/// that update. An acquire or upgrade waits for the update instead of
+/// reporting the contention as a custody conflict.
+#[test]
+fn a_counter_update_on_another_thread_is_not_a_custody_conflict() {
+    let owner = RuntimeStoreExecutionCustody::new();
+    let mut shared = with_counter_update_on_another_thread(&owner, || owner.try_acquire_shared())
+        .expect("a shared acquire waits out a counter update");
+    with_counter_update_on_another_thread(&owner, || shared.try_upgrade_to_governed())
+        .expect("the only shared claim upgrades after a counter update");
+    assert!(shared.is_governed());
+    drop(shared);
+    let governed = with_counter_update_on_another_thread(&owner, || owner.try_acquire_governed())
+        .expect("a governed acquire waits out a counter update");
+    assert!(governed.is_governed());
+}
+
+/// Run `attempt` while another thread holds the in-memory owner lock, as a
+/// claim's drop does for its counter update. The holder releases once the
+/// attempt answers, or after a bound, so an attempt that waits completes and
+/// one that refuses is observed while the lock is held.
+fn with_counter_update_on_another_thread<T>(
+    owner: &RuntimeStoreExecutionCustody,
+    attempt: impl FnOnce() -> T,
+) -> T {
+    let inner = match &owner.inner {
+        ExecutionCustodyOwner::Memory(inner) => Arc::clone(inner),
+        #[cfg(feature = "sqlite-store")]
+        ExecutionCustodyOwner::Physical(_) => {
+            panic!("this fixture owns the in-memory backend");
+        }
+    };
+    let (held_tx, held_rx) = std::sync::mpsc::channel();
+    let (answered_tx, answered_rx) = std::sync::mpsc::channel::<()>();
+    let holder = std::thread::spawn(move || {
+        let _update = inner.lock().unwrap();
+        held_tx.send(()).unwrap();
+        let _ = answered_rx.recv_timeout(std::time::Duration::from_millis(200));
+    });
+    held_rx.recv().unwrap();
+    let answer = attempt();
+    let _ = answered_tx.send(());
+    holder.join().unwrap();
+    answer
+}

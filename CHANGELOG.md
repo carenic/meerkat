@@ -35,6 +35,15 @@ them.
 
 ## [Unreleased]
 
+### Fixed
+
+- `meerkat-runtime`: in-memory runtime store execution custody no longer
+  refuses with `RuntimeStoreExecutionCustodyError::Busy` because its counter
+  lock was briefly held, for example while a claim released on another
+  thread (a dropped machine's ops worker) updated the counters. An acquire or
+  upgrade now waits for that update, so `Busy` means only a real governed or
+  shared conflict; a poisoned owner is still `Unavailable` (#1736).
+
 ## [0.9.3] - 2026-10-18
 
 ### Breaking

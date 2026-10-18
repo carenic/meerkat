@@ -4,7 +4,7 @@
 //! excludes a second execution owner while a governed machine owns this store.
 //! Backend clones and decorators must expose the same owner, and every actual
 //! machine or independently constructed persistent driver retains its claim.
-use std::sync::{Arc, Mutex, TryLockError};
+use std::sync::{Arc, Mutex, PoisonError};
 
 #[cfg(feature = "sqlite-store")]
 mod physical;
@@ -12,7 +12,7 @@ mod physical;
 /// A bounded custody attempt could not establish the requested store scope.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum RuntimeStoreExecutionCustodyError {
-    /// Another execution owner is active, or the short owner lock is busy.
+    /// Another execution owner is active.
     #[error("runtime store execution custody is busy")]
     Busy,
     /// This backend does not implement execution-lifetime custody.
@@ -133,7 +133,7 @@ impl RuntimeStoreExecutionCustody {
         };
         #[cfg(not(feature = "sqlite-store"))]
         let ExecutionCustodyOwner::Memory(inner) = &self.inner;
-        let mut current = inner.try_lock().map_err(custody_lock_error)?;
+        let mut current = inner.lock().map_err(custody_poisoned)?;
         if current.governed {
             return Err(RuntimeStoreExecutionCustodyError::Busy);
         }
@@ -170,7 +170,7 @@ impl RuntimeStoreExecutionCustody {
         };
         #[cfg(not(feature = "sqlite-store"))]
         let ExecutionCustodyOwner::Memory(inner) = &self.inner;
-        let mut current = inner.try_lock().map_err(custody_lock_error)?;
+        let mut current = inner.lock().map_err(custody_poisoned)?;
         if current.governed || current.shared != 0 {
             return Err(RuntimeStoreExecutionCustodyError::Busy);
         }
@@ -185,11 +185,11 @@ impl RuntimeStoreExecutionCustody {
     }
 }
 
-fn custody_lock_error<T>(error: TryLockError<T>) -> RuntimeStoreExecutionCustodyError {
-    match error {
-        TryLockError::WouldBlock => RuntimeStoreExecutionCustodyError::Busy,
-        TryLockError::Poisoned(_) => RuntimeStoreExecutionCustodyError::Unavailable,
-    }
+/// The in-memory owner lock guards only O(1) counter updates, so an attempt
+/// waits for a concurrent update (a claim released on another thread) rather
+/// than reporting it as a conflict. Only a poisoned owner is unavailable.
+fn custody_poisoned<T>(_: PoisonError<T>) -> RuntimeStoreExecutionCustodyError {
+    RuntimeStoreExecutionCustodyError::Unavailable
 }
 
 /// One real execution owner's retained claim. Share its lifetime through Arc,
@@ -224,7 +224,7 @@ impl RuntimeStoreExecutionClaim {
             #[cfg(feature = "sqlite-store")]
             ExecutionClaimOwner::Physical(claim) => return claim.try_upgrade(),
         };
-        let mut current = inner.try_lock().map_err(custody_lock_error)?;
+        let mut current = inner.lock().map_err(custody_poisoned)?;
         if *governed {
             return Ok(());
         }
