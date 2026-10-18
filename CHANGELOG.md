@@ -69,9 +69,10 @@ them.
   (deprecated) and the archived unsafe-libyaml it brought in
   (RUSTSEC-2024-0449, unmaintained) are gone with the move to serde-saphyr,
   including from the `@rkat/web` wasm module, and `deny.toml` no longer
-  ignores that advisory. serde-saphyr and its parser granit-parser are
-  pinned exactly, and Renovate never automerges an update of them
-  (`scripts/ci-action-pins.mjs` fails a configuration that could).
+  ignores that advisory. serde-saphyr is pinned exactly; its parser
+  granit-parser is held at 2.0.0 by Cargo.lock; Renovate never automerges
+  an update of either (`scripts/ci-action-pins.mjs` fails a configuration
+  that could).
 
 ### Changed
 
@@ -84,7 +85,9 @@ them.
   resolve as YAML values: `1_000` is `1000`, `017` is `17.0`, an integer past
   u64 is a float, `1e999` is `.inf`, `tRUE` is `true`, and a `!!binary`
   value is decoded. Other scalars keep serde_yaml's text (`1.10` is `1.1`,
-  `0x1F` is `31`, `~` is `null`).
+  `0x1F` is `31`, `~` is `null`). Quote a value with leading zeros, such as
+  a file mode (`'0755'`), to keep it as text: unquoted, `0755` is `755.0`
+  (upstream serde-saphyr issue #225).
 
 ### Fixed
 

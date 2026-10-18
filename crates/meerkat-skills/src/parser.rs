@@ -146,6 +146,10 @@ impl Serialize for ExtensionValue {
 /// - `<<` is an ordinary key, never a merge.
 /// - A duplicated key, at any level, and an unrecognized tag are refused.
 /// - `.inf`, `-.inf` and `.nan` stay floats.
+/// - An untyped number with leading zeros, such as `0755`, resolves as the
+///   decimal `755.0`: upstream issue #225
+///   (<https://github.com/bourumir-wyngs/serde-saphyr/issues/225>), open. The
+///   skills guide tells authors to quote such values.
 /// - The parser's default budget bounds nesting depth (64), nodes, events and
 ///   alias expansion.
 fn yaml_options() -> serde_saphyr::Options {

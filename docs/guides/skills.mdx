@@ -134,7 +134,9 @@ at any level, a null (`~` or an empty value) where text is expected, an
 unrecognized tag, a `...` document end marker, nesting deeper than 64 levels,
 and 100 or more aliases that outnumber their anchors more than ten to one. A
 block scalar keeps its line breaks as YAML specifies, also at the end of the
-frontmatter.
+frontmatter. In an extension value, quote a number with leading zeros, such as
+a file mode (`mode: '0755'`): unquoted, `0755` resolves as the decimal
+`755.0`.
 
 ## Capability gating
 
