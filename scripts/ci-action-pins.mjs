@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 // Supply-chain guard for GitHub Actions: every third-party action is pinned
 // to a full commit SHA, every container image the workflows and the Bazel
-// execution platforms name is pinned by digest, and Renovate never
-// automerges an action update.
+// execution platforms name is pinned by digest, Renovate never automerges
+// an action update, and it automerges nothing younger than a week.
 //
 // usage: ci-action-pins.mjs [--root DIR]
 //   Reads every .github/**/*.yml and *.yaml under DIR (default: the
@@ -22,7 +22,9 @@
 //   after every rule that could turn it on for them; a custom.regex rule
 //   does the same for what its customManagers pin; nothing outside
 //   packageRules may turn automerge on (vulnerabilityAlerts, an update
-//   type's settings). A `docker://` action, a `container:` or `image:`
+//   type's settings); a packageRule that turns automerge on sets the 7-day
+//   minimumReleaseAge itself, and no later rule shortens or clears it. A
+//   `docker://` action, a `container:` or `image:`
 //   value in .github, and a `docker://` reference in the Bazel files under
 //   tools/bazel/ (and .bazelrc) must name its image by `@sha256:` digest;
 //   UNPINNED_IMAGES lists the exceptions, each with its reason. A step
@@ -285,6 +287,40 @@ function coversAllDigests(rule) {
   );
 }
 
+// The days a minimumReleaseAge of "N day(s)" or "N week(s)" holds a release
+// back; null for any other spelling (hours, null), which this check cannot
+// prove is a week.
+function ageDays(value) {
+  const match = /^\s*(\d+)\s*(day|week)s?\s*$/.exec(String(value));
+  return match ? Number(match[1]) * (match[2] === "week" ? 7 : 1) : null;
+}
+
+// An automerged update is merged without a review, so it waits until its
+// release is a week old: every packageRule that turns automerge on sets
+// that age itself, and no later rule (the last matching rule wins) sets a
+// shorter one or clears it for updates it leaves automerged (a rule that
+// turns automerge off for its own updates may).
+function automergeAgeProblems(rules) {
+  const problems = [];
+  let firstOn = -1;
+  rules.forEach((rule, index) => {
+    if (rule.automerge === true) {
+      if (firstOn < 0) firstOn = index;
+      if (rule.minimumReleaseAge !== MINIMUM_RELEASE_AGE) {
+        problems.push(`renovate.json: packageRules[${index}] turns automerge on without a minimumReleaseAge of "${MINIMUM_RELEASE_AGE}"`);
+      }
+    } else if (
+      firstOn >= 0 &&
+      rule.automerge !== false &&
+      Object.hasOwn(rule, "minimumReleaseAge") &&
+      !(ageDays(rule.minimumReleaseAge) >= 7)
+    ) {
+      problems.push(`renovate.json: packageRules[${index}] can shorten the release age of updates packageRules[${firstOn}] automerges`);
+    }
+  });
+  return problems;
+}
+
 // A manager's updates are never automerged: a rule for all of them turns
 // automerge off after every rule that could turn it on for some, and one
 // for all of them sets the release age.
@@ -323,6 +359,7 @@ export function renovateProblems(config) {
     problems.push(`renovate.json: ${path} turns automerge on outside packageRules`);
   }
   const rules = config.packageRules ?? [];
+  problems.push(...automergeAgeProblems(rules));
   problems.push(...managerRuleProblems(rules, MANAGER));
   // What the customManagers pin (container digests, a tool release) is
   // never automerged either.
@@ -368,7 +405,7 @@ function main(argv) {
     return 1;
   }
   process.stdout.write(
-    "ci-action-pins: every third-party action is SHA-pinned, every container image digest-pinned, every sccache-action step names an exact release, and Renovate never automerges an action or what a customManager pins\n",
+    "ci-action-pins: every third-party action is SHA-pinned, every container image digest-pinned, every sccache-action step names an exact release, and Renovate never automerges an action or what a customManager pins, nor anything younger than a week\n",
   );
   return 0;
 }

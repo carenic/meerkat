@@ -35,8 +35,10 @@
       "groupSlug": "routine-dependencies"
     },
     {
+      "description": "Patch updates automerge without a review, so each waits until its release is a week old (scripts/ci-action-pins.mjs requires the age on every automerge rule): a version without a release date is held (minimumReleaseAgeBehaviour defaults to timestamp-required), a version still within the week is skipped for the newest one past it (internalChecksFilter defaults to strict), and vulnerability fixes are not held (vulnerabilityAlerts sets no minimumReleaseAge).",
       "matchUpdateTypes": ["patch"],
-      "automerge": true
+      "automerge": true,
+      "minimumReleaseAge": "7 days"
     },
     {
       "description": "A digest update of a pinned action (its tag now names another commit) waits for approval on the dependency dashboard: minimumReleaseAge holds back new versions only, and a moved tag keeps its original date.",
