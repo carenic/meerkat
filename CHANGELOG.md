@@ -44,6 +44,13 @@ them.
   as a `completed` (or `unavailable`) answer. A search cut at its output cap or
   paused by the provider's server-tool loop still reports its answer under the
   rules of a natural end.
+- A Gemini prompt blocked before any candidate (`promptFeedback.blockReason`
+  and so no `finishReason`) now ends the response as a content filter
+  (#1888). The run fails as `content_filtered` after one provider call,
+  instead of being retried as an incomplete response and failing as
+  `ProviderError(IncompleteResponse)`. Every block reason reads this way,
+  `OTHER` and one the adapter does not know included: a blocked prompt is
+  blocked again on every retry.
 
 ## [0.9.3] - 2026-10-18
 

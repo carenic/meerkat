@@ -2276,6 +2276,11 @@ impl GeminiClient {
                     buffer.drain(..=newline_pos);
 
                     if let Some(resp) = parsed_response {
+                        // Read before the candidates are consumed (#1888).
+                        let prompt_blocked = gemini_prompt_blocked(
+                            resp.prompt_feedback.as_ref(),
+                            resp.candidates.as_deref(),
+                        );
                         if let Some(usage) = resp.usage_metadata {
                             chunk_yielded.set(true);
                             yield LlmEvent::UsageUpdate {
@@ -2361,6 +2366,14 @@ impl GeminiClient {
                                 }
                             }
                         }
+                        if prompt_blocked {
+                            chunk_yielded.set(true);
+                            yield LlmEvent::Done {
+                                outcome: LlmDoneOutcome::Success {
+                                    stop_reason: StopReason::ContentFilter,
+                                },
+                            };
+                        }
                     }
                 }
                 // A chunk whose lines produced no semantic event is still wire
@@ -2375,6 +2388,23 @@ impl GeminiClient {
 
         streaming::ensure_terminal_done(inner)
     }
+}
+
+/// Whether one streamed chunk is a prompt Gemini blocked before any
+/// candidate: `promptFeedback.blockReason` and no candidate, so no
+/// `finishReason` follows (#1888). Every block reason reads as a content
+/// filter, `OTHER` and one this adapter does not know included: the prompt
+/// is refused as a whole and the same prompt is blocked again, so it is
+/// never an incomplete response to retry. A chunk that still carries a
+/// candidate leaves the outcome to that candidate's `finishReason`.
+fn gemini_prompt_blocked(
+    feedback: Option<&PromptFeedback>,
+    candidates: Option<&[Candidate]>,
+) -> bool {
+    let blocked = feedback
+        .and_then(|feedback| feedback.block_reason.as_deref())
+        .is_some_and(|reason| !reason.is_empty());
+    blocked && candidates.is_none_or(<[Candidate]>::is_empty)
 }
 
 /// Map one Gemini `finishReason`.
@@ -4457,6 +4487,81 @@ mod tests {
                     },
             }) => assert!(message.contains("'MALFORMED_FUNCTION_CALL'"), "{message}"),
             other => panic!("expected Done{{Error{{IncompleteResponse}}}}, got {other:?}"),
+        }
+    }
+
+    /// One stubbed stream through the real client: every event it yields.
+    async fn gemini_stream_events(payload: String) -> Vec<LlmEvent> {
+        let (base_url, handle) = spawn_gemini_stream_stub(
+            "gemini-3.5-flash",
+            payload,
+            Arc::new(Mutex::new(Vec::new())),
+        )
+        .await;
+        let client = GeminiClient::new_with_base_url("test-key".to_string(), base_url);
+        let request = LlmRequest::new(
+            "gemini-3.5-flash",
+            vec![Message::User(UserMessage::text("hello".to_string()))],
+        );
+        let events: Vec<LlmEvent> = client
+            .stream(&request)
+            .map(|event| event.expect("stream wrapper should convert errors to Done"))
+            .collect()
+            .await;
+        handle.abort();
+        events
+    }
+
+    /// #1888: a prompt blocked by `promptFeedback.blockReason` streams no
+    /// candidate and so no `finishReason`. Every block reason, `OTHER` and
+    /// one this adapter does not know included, ends the response as a
+    /// content filter, never as an incomplete stream that is retried.
+    #[tokio::test]
+    async fn gemini_stream_with_prompt_block_ends_as_content_filter() {
+        for block_reason in [
+            "SAFETY",
+            "BLOCKLIST",
+            "PROHIBITED_CONTENT",
+            "IMAGE_SAFETY",
+            "OTHER",
+            "SOMETHING_NEW",
+        ] {
+            let payload = format!(
+                "data: {{\"promptFeedback\":{{\"blockReason\":\"{block_reason}\"}},\"usageMetadata\":{{\"promptTokenCount\":3,\"totalTokenCount\":3}}}}\n"
+            );
+            let events = gemini_stream_events(payload).await;
+            match events.last() {
+                Some(LlmEvent::Done {
+                    outcome:
+                        LlmDoneOutcome::Success {
+                            stop_reason: StopReason::ContentFilter,
+                        },
+                }) => {}
+                other => panic!(
+                    "{block_reason}: expected Done{{Success{{ContentFilter}}}}, got {other:?}"
+                ),
+            }
+        }
+    }
+
+    /// Prompt feedback without a block reason (safety ratings only) leaves
+    /// the candidate's `finishReason` in charge.
+    #[tokio::test]
+    async fn gemini_prompt_feedback_without_block_reason_keeps_the_finish_reason() {
+        let payload = [
+            r#"data: {"promptFeedback":{"safetyRatings":[{"category":"HARM_CATEGORY_HARASSMENT","probability":"NEGLIGIBLE"}]},"candidates":[{"content":{"parts":[{"text":"hello"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":3,"candidatesTokenCount":1}}"#,
+            "",
+        ]
+        .join("\n");
+        let events = gemini_stream_events(payload).await;
+        match events.last() {
+            Some(LlmEvent::Done {
+                outcome:
+                    LlmDoneOutcome::Success {
+                        stop_reason: StopReason::EndTurn,
+                    },
+            }) => {}
+            other => panic!("expected Done{{Success{{EndTurn}}}}, got {other:?}"),
         }
     }
 

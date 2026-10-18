@@ -950,6 +950,7 @@ test_suite(
         "//crates/meerkat:credential_command_routes_test",
         "//crates/meerkat:embedded_skill_registration_test",
         "//crates/meerkat:factory_build_agent_test",
+        "//crates/meerkat:gemini_stop_reasons_test",
         "//crates/meerkat:governed_realm_account_binding_test",
         "//crates/meerkat:governed_realm_test",
         "//crates/meerkat:host_confinement_test",
