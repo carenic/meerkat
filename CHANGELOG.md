@@ -61,14 +61,19 @@ them.
 ### Fixed
 
 - The `meerkat-contracts`, `meerkat-runtime` and `rkat` packages build their
-  tests standalone again. Their tests embedded fixtures from other crates'
-  directories (meerkat-core's compiled-policy v1 fixtures and its synthetic
-  0.8.10 recovery-migration session, and meerkat-runtime's released-realm
-  `config.toml`), which no published package contains, so `cargo test` in an
-  unpacked crate failed to compile. Each crate now embeds its own
-  byte-identical copy, pinned to the original's SHA-256. rkat's mobpack
-  help-versus-docs contract test reads the repository's `docs/`, so it stays
-  out of the rkat package and runs in the repository only.
+  tests standalone. From rkat 0.8.1, meerkat-runtime 0.8.11 and
+  meerkat-contracts 0.8.26 through 0.9.3, their tests embedded files from
+  outside their own package, which no published package contains, so
+  `cargo test` in the unpacked published crate failed to compile
+  (meerkat-runtime's with the `sqlite-store` feature, meerkat-contracts'
+  with `schema`). rkat's mobpack help-versus-docs contract test embedded the
+  repository's `docs/`, and from 0.8.43 rkat's binary tests also embedded
+  meerkat-runtime's released-realm `config.toml`. meerkat-runtime's tests
+  embedded meerkat-core's synthetic 0.8.10 recovery-migration session, and
+  meerkat-contracts' tests meerkat-core's compiled-policy v1 fixtures. Each
+  crate now embeds its own byte-identical copy, pinned to the original's
+  SHA-256. The mobpack help test still reads `docs/`, so it stays out of the
+  rkat package and runs in the repository only.
 
 ## [0.9.3] - 2026-10-18
 
