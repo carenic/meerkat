@@ -1104,7 +1104,8 @@ jobs:
     # Native dependency changes must retain this positive non-MCP profile.
     # The push runs it on every Rust change; a pull request leaves it there
     # (it compiles meerkat-rpc's lib test and the meerkat-mob chain: 866 s on
-    # run 38859112297).
+    # run 38859112297) unless it touches the lane's own inputs
+    # (GUARD_LANE_INPUTS in scripts/ci-cargo-lanes.mjs).
     if: ${{ needs.changes.outputs.governed_jsonl == 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 40
@@ -1244,7 +1245,8 @@ jobs:
     # probe; an always() step after the tests restores the recorded value.
     # The push runs it on every Rust change; a pull request leaves it there
     # (the command-hook suite compiles the facade's lib test under every
-    # feature: 863 s on run 38859112297).
+    # feature: 863 s on run 38859112297) unless it touches the lane's own
+    # inputs (GUARD_LANE_INPUTS in scripts/ci-cargo-lanes.mjs).
     if: ${{ needs.changes.outputs.mcp_confinement_positive == 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 40
@@ -2842,8 +2844,9 @@ jobs:
               failed=1
             fi
             require_ran "Clippy" "${CLIPPY_RESULT}"
-            # The push runs every lane; a pull request leaves these to it.
-            # A push plan that deferred one cannot be trusted.
+            # The push runs every lane; a pull request leaves these to it
+            # (an exact-profile lane runs when it touches that lane's own
+            # inputs). A push plan that deferred one cannot be trusted.
             push_plan_whole=true
             for flag in "${CLOSURE_CHECK}" "${GOVERNED_JSONL}" "${MCP_CONFINEMENT_POSITIVE}"; do
               [[ "${flag}" == "true" ]] || push_plan_whole=false

@@ -235,7 +235,7 @@ the exact-tree attestation; nightly and the release tag carry the rest):
 | `closure-tests`: the deterministic workspace test lanes (`scripts/pre-push-unit.sh`) for the test scope: integration-fast, HeadCanonical and `e2e-fast` rows | deferred | yes | `make test-int`, `make e2e-fast` | Bazel integration lanes |
 | `closure-check`: `cargo check --all-features` (lib and bin targets) over the reverse-dependency closure | deferred | yes | - | - |
 | `feature-check`: the changed packages' Bazel feature sets and the Make feature-matrix check rows | deferred | yes | feature matrix | Bazel graph |
-| `governed-jsonl`, `mcp-confinement-positive`: the non-MCP governed JSONL tests and the Linux positive confinement cases | deferred | yes | - | - |
+| `governed-jsonl`, `mcp-confinement-positive`: the non-MCP governed JSONL tests and the Linux positive confinement cases | when the pull request touches the lane's own inputs (`GUARD_LANE_INPUTS`: the files defining the selected cases and their crates' manifests), deferred otherwise | yes | - | - |
 | `wasm-check` | when the web runtime, the contracts or the CLI web template change | yes | browser contract suite | Bazel wasm-check |
 | `sdk-host`: Python + TypeScript SDK suites | deferred | yes | yes, plus Web SDK | Bazel SDK suites |
 | `example-web`: build the `sdks/web` wasm runtime once (wasm-pack 0.13.1, no wasm-opt), then run examples 031, 032 and 033 in Playwright Chromium | when `sdks/web/`, `crates/meerkat-web-runtime/`, `crates/meerkat-contracts/` or those examples change | yes | - | - |

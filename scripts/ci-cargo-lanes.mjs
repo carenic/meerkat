@@ -40,7 +40,8 @@
 // tag) every lane that needs the meerkat-mob chain or a reverse-dependency
 // sweep: the closure-tests rows, the closure check, the feature-combination
 // checks, the integration suites whose package compiles meerkat-mob, the
-// governed JSONL and confinement-positive lanes, the feature suites marked
+// governed JSONL and confinement-positive lanes (unless it touches their own
+// inputs, GUARD_LANE_INPUTS), the feature suites marked
 // `pullRequest: false`, the test targets of the mob-chain packages (their
 // pull-request Clippy lints lib and bin targets only; their tests run on
 // main), the whole Clippy of the chain heads in MOB_CHAIN_CLIPPY_HEADS when
@@ -598,6 +599,44 @@ export const CLIPPY_HEAD_SHARDS = [
 export const MOB_CHAIN_CLIPPY_HEADS = ["rkat", "meerkat-integration-tests", "meerkat-rpc"];
 export const MOB_CHAIN_INVALIDATED = "mob chain invalidated";
 export const CLIPPY_PACKED_SHARDS = 5;
+
+// The inputs of the two exact-profile lanes, which select exact lists of
+// tests (the governed JSONL step in ci.yml, the CONFINEMENT_* filters and
+// counts of `make test-mcp-confinement-positive`): the files that define the
+// selected cases and the manifests whose features compile them in or out.
+// A pull request that touches one runs that lane, so an added or removed
+// case fails its exact selection there, not on the push after the merge (the
+// v0.9.3 release merge added cases both push-only guards then refused). An
+// entry ending in "/" is a directory. scripts/ci-guard-lane-inputs-selftest.mjs
+// maps every selected case to the file defining it and fails when that file
+// is missing here.
+export const GUARD_LANE_INPUTS = {
+  governed_jsonl: [
+    "crates/meerkat-rpc/Cargo.toml",
+    "crates/meerkat-rpc/src/governed_jsonl.rs",
+    "crates/meerkat-rpc/src/governed_jsonl/",
+  ],
+  mcp_confinement_positive: [
+    "crates/meerkat-mcp/Cargo.toml",
+    "crates/meerkat-mcp/src/process_confinement_tests.rs",
+    "crates/meerkat-sandbox/Cargo.toml",
+    "crates/meerkat-sandbox/tests/compiled_confinement.rs",
+    "crates/meerkat-sandbox/tests/process_confinement.rs",
+    "crates/meerkat-tools/Cargo.toml",
+    "crates/meerkat-tools/src/builtin/shell/confinement_tests.rs",
+    "crates/meerkat/Cargo.toml",
+    "crates/meerkat/src/process_custody.rs",
+    "crates/meerkat/tests/command_hook_confinement.rs",
+  ],
+};
+
+export function touchesGuardLane(lane, paths) {
+  const inputs = GUARD_LANE_INPUTS[lane];
+  if (!inputs) throw new Error(`unknown exact-profile lane ${lane}`);
+  return paths.some((path) =>
+    inputs.some((input) => (input.endsWith("/") ? path.startsWith(input) : path === input)),
+  );
+}
 
 function parseBazelFeatureSets(pkg) {
   const buildPath = resolve(root, packageDir(pkg), "BUILD.bazel");
@@ -2274,13 +2313,18 @@ function plan(args) {
   // The compile-only checks of the closure, and the two exact-profile lanes
   // (governed JSONL compiles meerkat-rpc's lib test, the confinement lane
   // the facade's lib test under every feature: 866 and 863 s on run
-  // 38859112297), run on the push only.
+  // 38859112297), run on the push. A pull request also runs an exact-profile
+  // lane when it touches that lane's own inputs (GUARD_LANE_INPUTS), so a
+  // case added or removed there meets the lane's exact selection before the
+  // merge rather than on the push after it.
+  const guardTouched = (lane) => touchesGuardLane(lane, changedPaths);
   result.closure_check = result.rust_changed && !deferToPush;
-  result.governed_jsonl = result.rust_changed && !deferToPush;
-  result.mcp_confinement_positive = result.rust_changed && !deferToPush;
+  result.governed_jsonl = result.rust_changed && (!deferToPush || guardTouched("governed_jsonl"));
+  result.mcp_confinement_positive =
+    result.rust_changed && (!deferToPush || guardTouched("mcp_confinement_positive"));
   deferred.closure_check = result.rust_changed && deferToPush;
-  deferred.governed_jsonl = result.rust_changed && deferToPush;
-  deferred.mcp_confinement_positive = result.rust_changed && deferToPush;
+  deferred.governed_jsonl = result.rust_changed && !result.governed_jsonl;
+  deferred.mcp_confinement_positive = result.rust_changed && !result.mcp_confinement_positive;
 
   // Hook-parity rows for the test scope. scripts/ci-hook-coverage.mjs checks
   // them against the hook's own selection; a gap fails the plan.

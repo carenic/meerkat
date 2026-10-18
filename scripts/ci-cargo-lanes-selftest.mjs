@@ -5,7 +5,7 @@
 // BuildBuddy mode violated: a build-relevant change always yields lanes.
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { dirname, join, resolve } from "node:path";
@@ -23,6 +23,7 @@ import {
 } from "./ci-hook-coverage.mjs";
 import {
   GOVERNANCE_DOC_PATTERNS,
+  GUARD_LANE_INPUTS,
   MOB_CHAIN_CLIPPY_HEADS,
   MOB_CHAIN_INVALIDATED,
   ROW_DURATIONS,
@@ -34,6 +35,7 @@ import {
   readRowDurations,
   compiledInDocKeys,
   readerRows,
+  touchesGuardLane,
 } from "./ci-cargo-lanes.mjs";
 import { readMetadata, workspacePackages } from "./rust-test-selector.mjs";
 import { durationsOf, rowOf } from "./ci-row-durations.mjs";
@@ -241,11 +243,14 @@ function assertEventSplit(plan, label) {
   assert.deepEqual(plan.closure_test_rows, [], `${label}: no closure-tests row in a pull request`);
   assert.deepEqual(plan.feature_check_jobs, [], `${label}: no feature-combination job in a pull request`);
   assert.equal(plan.closure_check, false, `${label}: no closure check in a pull request`);
-  assert.equal(plan.governed_jsonl, false, `${label}: no governed JSONL lane in a pull request`);
-  assert.equal(plan.mcp_confinement_positive, false, `${label}: no confinement lane in a pull request`);
+  // An exact-profile lane runs in a pull request exactly when it touches
+  // that lane's own inputs; otherwise the push runs it.
+  for (const lane of ["governed_jsonl", "mcp_confinement_positive"]) {
+    const touched = plan.rust_changed && touchesGuardLane(lane, plan.changed_paths);
+    assert.equal(plan[lane], touched, `${label}: ${lane} runs in a pull request only on its own inputs`);
+    assert.equal(deferred[lane], plan.rust_changed && !touched, `${label}: ${lane} deferral`);
+  }
   assert.equal(deferred.closure_check, plan.rust_changed);
-  assert.equal(deferred.governed_jsonl, plan.rust_changed);
-  assert.equal(deferred.mcp_confinement_positive, plan.rust_changed);
   for (const suite of plan.integration_suites) {
     assert.equal(chain(suite.packages[0]), false, `${label}: integration suite ${suite.name} compiles meerkat-mob`);
   }
@@ -523,6 +528,42 @@ function assertArchivedLanes(plan, label) {
     "the matrix carries each canary row's partition, and only theirs",
   );
   assertLanes(plan, "workspace with exceptions");
+}
+
+// Exact-profile lanes on a pull request: a change to one of a lane's inputs
+// runs that lane (and the other only on its own inputs); a change elsewhere
+// in the same crates leaves both to the push, which runs them on every Rust
+// change.
+{
+  for (const [lane, inputs] of Object.entries(GUARD_LANE_INPUTS)) {
+    for (const input of inputs) {
+      const path = input.endsWith("/")
+        ? join(input, readdirSync(resolve(root, input)).filter((name) => name.endsWith(".rs")).sort()[0])
+        : input;
+      const plan = planFor([path], ["--event", "pull_request"]);
+      assert.equal(plan[lane], true, `a pull request touching ${path} runs ${lane}`);
+      assert.equal(plan.deferred_to_push[lane], false, `a pull request touching ${path} leaves ${lane} to no push`);
+      for (const other of Object.keys(GUARD_LANE_INPUTS).filter((name) => name !== lane)) {
+        assert.equal(plan[other], touchesGuardLane(other, [path]), `a pull request touching ${path} runs ${other} only on its inputs`);
+      }
+    }
+  }
+  for (const path of [
+    "crates/meerkat-rpc/src/lib.rs",
+    "crates/meerkat-mcp/src/connection.rs",
+    "crates/meerkat-sandbox/src/lib.rs",
+    "crates/meerkat-tools/src/builtin/shell/mod.rs",
+  ]) {
+    const plan = planFor([path], ["--event", "pull_request"]);
+    for (const lane of Object.keys(GUARD_LANE_INPUTS)) {
+      assert.equal(plan[lane], false, `a pull request touching only ${path} leaves ${lane} to the push`);
+      assert.equal(plan.deferred_to_push[lane], true, `a pull request touching only ${path} names ${lane} as deferred`);
+    }
+    const push = planFor([path]);
+    for (const lane of Object.keys(GUARD_LANE_INPUTS)) {
+      assert.equal(push[lane], true, `the push of ${path} runs ${lane}`);
+    }
+  }
 }
 
 // No chain exception: meerkat-rpc's default-feature unit row (its MCP restart

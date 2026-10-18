@@ -377,7 +377,8 @@ and its CI must be green before a release tag (`require_ci_green`):
   every lane that compiles the meerkat-mob chain or sweeps the
   reverse-dependency closure to the push and names it (`deferred_to_push`,
   printed by the gate): the `closure-tests` rows, `closure-check`,
-  `feature-check`, `governed-jsonl`, `mcp-confinement-positive`, the
+  `feature-check`, `governed-jsonl` and `mcp-confinement-positive` (unless
+  it touches their own inputs, `GUARD_LANE_INPUTS`), the
   integration suites whose package compiles meerkat-mob, the feature suites
   marked `pullRequest: false`, the mob-chain packages' test-target Clippy,
   and the whole Clippy of the chain heads rkat, meerkat-integration-tests and
@@ -526,7 +527,11 @@ and its CI must be green before a release tag (`require_ci_green`):
   an input or the stack), and credits only whole-workspace rows.
 - `closure-check` (push only): `cargo check --all-features` (lib and bin
   targets) over the reverse-dependency closure of the changed packages.
-- `governed-jsonl` and `mcp-confinement-positive` (push only): the three
+- `governed-jsonl` and `mcp-confinement-positive` (push; a pull request
+  that touches a lane's own inputs, `GUARD_LANE_INPUTS` in
+  `scripts/ci-cargo-lanes.mjs`, runs that lane, and
+  `scripts/ci-guard-lane-inputs-selftest.mjs` keeps those inputs covering
+  every case the lanes select): the three
   non-MCP governed JSONL tests of meerkat-rpc, and the Linux positive
   confinement cases (`make test-mcp-confinement-positive`), on every Rust
   change.
