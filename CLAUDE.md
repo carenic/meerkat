@@ -933,10 +933,12 @@ release crate depends on one listed after it, and
 bounded overlap, the skip of a published version, the stop at the first
 failure and the server-error retry.
 crates.io's own publish rate limit for new versions (a burst, then about one
-per minute) still bounds a full release. A crates.io server error (5xx) is
-retried after each delay of `MEERKAT_CRATE_PUBLISH_SERVER_ERROR_BACKOFF`
-(default `30 60 120 240` seconds), on a budget separate from the rate
-limit's; an upload that landed despite the error is skipped as published.
+per minute) still bounds a full release. A crates.io server error (5xx, or
+cargo's "Request timed out after 30 seconds", its report of a 503 that
+arrives late in an upload) is retried after each delay of
+`MEERKAT_CRATE_PUBLISH_SERVER_ERROR_BACKOFF` (default `30 60 120 240`
+seconds), on a budget separate from the rate limit's; an upload that landed
+despite the error is skipped as published.
 
 ### Key Rules for AI Agents
 

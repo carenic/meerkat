@@ -129,8 +129,11 @@ publish_one() {
       [[ $rc -eq 0 ]] && break
 
       # cargo reports a JSON API error as "(status 5NN ...)" and any other
-      # body as "got 5NN".
-      if grep -Eq "failed to get a 200 OK response, got 5[0-9][0-9]|\(status 5[0-9][0-9][ )]" "$output_file"; then
+      # body as "got 5NN", except a non-JSON 503 that arrives 29 s or more
+      # into the upload (the crates.io router's 30 s timeout, after which
+      # the upload most likely landed): that one reads "Request timed out
+      # after 30 seconds".
+      if grep -Eq "failed to get a 200 OK response, got 5[0-9][0-9]|\(status 5[0-9][0-9][ )]|Request timed out after 30 seconds" "$output_file"; then
         ((server_errors < ${#SERVER_ERROR_BACKOFF[@]})) || break
         local backoff="${SERVER_ERROR_BACKOFF[$server_errors]}"
         server_errors=$((server_errors + 1))
