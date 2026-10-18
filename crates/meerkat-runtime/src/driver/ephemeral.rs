@@ -1300,11 +1300,18 @@ impl EphemeralRuntimeDriver {
     /// so the runtime loop's `take_post_admission_signal` / `take_wake_requested`
     /// observe exactly what the machine authorized.
     ///
-    /// Every transition this driver commits passes its effects through here,
-    /// which makes this the single commit point of the input lifecycle: a
-    /// transition that associates an input with a run, steps its phase or
-    /// records its terminal emits one of the lifecycle effects below, and
-    /// waiters for an input's next step are told once per such commit.
+    /// Every input-lifecycle input this driver commits either applies through
+    /// `dsl_apply` or hands its effects here (admission through
+    /// `absorb_post_admission_effects`, the terminal archive), which makes
+    /// this the single commit point of the input lifecycle: a transition that
+    /// associates an input with a run, steps its phase or records its
+    /// terminal emits one of the lifecycle effects below, and waiters for an
+    /// input's next step are told once per such commit. Other transitions
+    /// (run, binding, comms and handle inputs) apply on the shared authority
+    /// without passing here. An input-lifecycle input applied that way would
+    /// skip the step signal, and each waiter would then sit out its settle
+    /// bound before it reads the input again: keep every such input on this
+    /// path.
     fn absorb_dsl_effects(&mut self, effects: &[mm_dsl::MeerkatMachineEffect]) {
         let mut input_transition = false;
         for effect in effects {

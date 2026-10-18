@@ -17695,14 +17695,18 @@ impl MeerkatMachine {
                 }
                 Action::Retry => drop(authority),
             }
-            // Park without the driver, so teardown can drop it and close the
-            // step signal.
-            drop(driver);
-            if !Self::await_input_transition(&mut input_transitions, deadline).await {
+            // Only a read that still finds the input between steps reports
+            // the settle bound: a wait that reaches it falls through to one
+            // more read.
+            if Instant::now() >= deadline {
                 return Err(RuntimeDriverError::Internal(format!(
                     "tracked input '{idempotency_key}' did not reach a runtime terminal before the cancellation settle deadline"
                 )));
             }
+            // Park without the driver, so teardown can drop it and close the
+            // step signal.
+            drop(driver);
+            Self::await_input_transition(&mut input_transitions, deadline).await;
         }
     }
 
@@ -17759,7 +17763,7 @@ impl MeerkatMachine {
         .await
     }
 
-    async fn cancel_input_if_present_owned_before(
+    pub(super) async fn cancel_input_if_present_owned_before(
         &self,
         session_id: &SessionId,
         input_id: &meerkat_core::lifecycle::InputId,
@@ -17781,6 +17785,7 @@ impl MeerkatMachine {
         loop {
             enum Action {
                 Missing,
+                Settled,
                 DrainTerminal {
                     completions: crate::meerkat_machine::driver::SharedCompletionRegistry,
                     publication_handle: Option<
@@ -17840,9 +17845,21 @@ impl MeerkatMachine {
                 let action = match driver_guard.as_driver().stored_input_state(input_id) {
                     None => Action::Missing,
                     Some(stored) if stored.seed.terminal_outcome.is_some() => {
-                        Action::DrainTerminal {
-                            completions,
-                            publication_handle,
+                        // A read that starts after the settle deadline (the
+                        // one after a wait that reached it) waits for
+                        // nothing: a terminal input answers at once unless a
+                        // runless terminal is still owed its publication,
+                        // which only the drain can wait for.
+                        if Instant::now() >= deadline
+                            && !self.runless_terminal_publication_dispatch_pending(&driver)
+                            && !Self::owes_runless_runtime_termination(&driver_guard).await?
+                        {
+                            Action::Settled
+                        } else {
+                            Action::DrainTerminal {
+                                completions,
+                                publication_handle,
+                            }
                         }
                     }
                     Some(stored) if stored.seed.phase == InputLifecycleState::Queued => {
@@ -17877,6 +17894,7 @@ impl MeerkatMachine {
 
             match action {
                 Action::Missing => return Ok(false),
+                Action::Settled => return Ok(true),
                 Action::DrainTerminal {
                     completions,
                     publication_handle,
@@ -18005,12 +18023,16 @@ impl MeerkatMachine {
                 }
             }
 
-            drop(driver);
-            if !Self::await_input_transition(&mut input_transitions, deadline).await {
+            // Only a read that still finds the input between steps reports
+            // the settle bound: a wait that reaches it falls through to one
+            // more read.
+            if Instant::now() >= deadline {
                 return Err(RuntimeDriverError::Internal(format!(
                     "input '{input_id}' did not reach a runtime terminal before the cancellation settle deadline"
                 )));
             }
+            drop(driver);
+            Self::await_input_transition(&mut input_transitions, deadline).await;
         }
     }
 
@@ -18019,18 +18041,50 @@ impl MeerkatMachine {
     /// of an input caught between steps. Callers subscribe under the driver
     /// lock before they read the input. The publisher bumps from
     /// `EphemeralRuntimeDriver::absorb_dsl_effects` while it holds that lock,
-    /// so no bump can fall between the read and the subscribe. `deadline`
-    /// only bounds a step that never commits (`false`). A closed signal (the
-    /// driver was torn down or rebuilt) is also an answer: the next read
-    /// resolves the session again.
+    /// so no bump can fall between the read and the subscribe. A closed
+    /// signal (the driver was torn down or rebuilt) also ends the wait: the
+    /// next read resolves the session again. So does `deadline`, and a wait
+    /// that reaches it is no answer either: the caller reads once more and
+    /// reports the settle bound only if that read still finds the input
+    /// between steps. A step committed without the signal therefore costs at
+    /// most the bound, never a false settle error.
     async fn await_input_transition(
         input_transitions: &mut crate::tokio::sync::watch::Receiver<u64>,
         deadline: Instant,
-    ) -> bool {
+    ) {
         let remaining = deadline.saturating_duration_since(Instant::now());
-        crate::tokio::time::timeout(remaining, input_transitions.changed())
-            .await
-            .is_ok()
+        // A step, a closed signal and the deadline all send the caller back
+        // to read the input.
+        let _ = crate::tokio::time::timeout(remaining, input_transitions.changed()).await;
+    }
+
+    /// Whether a committed runless runtime-termination carrier on this driver
+    /// still waits for its publication: what the terminal drain of an exact
+    /// cancellation publishes before it answers. The same row predicate as
+    /// `control_plane::has_committed_runless_recovery_carrier`, without its
+    /// stop-only runtime phase gate, since a queued-input abandon commits its
+    /// carrier while the runtime runs.
+    async fn owes_runless_runtime_termination(
+        driver: &crate::meerkat_machine::driver::DriverEntry,
+    ) -> Result<bool, RuntimeDriverError> {
+        Ok(driver
+            .pending_terminal_input_states()
+            .await?
+            .into_iter()
+            .any(|stored| {
+                stored
+                    .state
+                    .interaction_terminal_outbox
+                    .is_some_and(|outbox| {
+                        matches!(
+                            outbox.batch_key,
+                            crate::input_state::InteractionTerminalBatchKey::RuntimeTermination { .. }
+                        ) && !matches!(
+                            outbox.phase,
+                            crate::input_state::InteractionTerminalOutboxPhase::Published { .. }
+                        )
+                    })
+            }))
     }
 
     pub fn accept_input_with_completion_boxed<'a>(

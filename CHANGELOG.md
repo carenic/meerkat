@@ -43,7 +43,8 @@ them.
   yet) every 25 ms. They wait for that input's next committed lifecycle step
   (its run association, a phase step or its terminal), which the runtime
   driver signals at its single commit point, and re-read then; the
-  5-second settle bound remains only as a hang guard (#1655).
+  5-second settle bound remains only as a hang guard, and a cancellation
+  reads the input once more before it reports that bound (#1655).
 
 ### Fixed
 
