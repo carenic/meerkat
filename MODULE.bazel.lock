@@ -550,7 +550,7 @@
           "FILE:@@//crates/meerkat-session/Cargo.toml 262bd082af13ff6169d38e1f777a920d4300a845cb80423cedcbaf2e6f1dbc58",
           "FILE:@@//crates/meerkat-providers/Cargo.toml 915dd74bf31a725925a9866f771c48d51593d9dd720fb67ce41b6b4b8bce3783",
           "FILE:@@//crates/meerkat-agent-build-authority/Cargo.toml 60ea4aff0eab73a475d3e58856bde5eb49f855fa2068df3f9cdda23768f68261",
-          "FILE:@@//crates/meerkat-cli/Cargo.toml f3b372db1db942dbaf2cafd2d5199c001808b652a4d5a472b88e6a67c94e241d",
+          "FILE:@@//crates/meerkat-cli/Cargo.toml 34c08c0dcdce79096874e05a820e91541a68755e58ea4f99be534f91e7c4dbaf",
           "FILE:@@//crates/meerkat-mob/Cargo.toml 40cfcd5e62ba18d8d53fb74b46842afbcf2d9486a35045b13224ca18e3123be0",
           "FILE:@@//crates/meerkat-mob-mcp/Cargo.toml a6aa62bb6e58c0007f325324caad0de29df919441d881c9a2486b08c09152f9d",
           "FILE:@@//crates/meerkat-mob-pack/Cargo.toml 9ac2462d05c859e5b4ab523d6bebe65fe1940f619796a2356b6cd7d00ef68965",

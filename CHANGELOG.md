@@ -35,6 +35,18 @@ them.
 
 ## [Unreleased]
 
+### Fixed
+
+- The `meerkat-contracts`, `meerkat-runtime` and `rkat` packages build their
+  tests standalone again. Their tests embedded fixtures from other crates'
+  directories (meerkat-core's compiled-policy v1 fixtures and its synthetic
+  0.8.10 recovery-migration session, and meerkat-runtime's released-realm
+  `config.toml`), which no published package contains, so `cargo test` in an
+  unpacked crate failed to compile. Each crate now embeds its own
+  byte-identical copy, pinned to the original's SHA-256. rkat's mobpack
+  help-versus-docs contract test reads the repository's `docs/`, so it stays
+  out of the rkat package and runs in the repository only.
+
 ## [0.9.3] - 2026-10-18
 
 ### Breaking

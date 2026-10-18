@@ -18307,9 +18307,19 @@ ORDER BY runtime_id";
             let mut conn = Connection::open_in_memory().unwrap();
             let tx = conn.transaction().unwrap();
             migration_0001_runtime_schema(&tx).unwrap();
-            let released_session = include_bytes!(
-                "../../../meerkat-core/tests/fixtures/v0_8_10_recovery_migration_session.json"
-            );
+            // This crate's own copy of meerkat-core's synthetic 0.8.10
+            // recovery-migration session (so the test builds from the
+            // published package), pinned to the original's provenance digest.
+            let released_session =
+                include_bytes!("../../tests/fixtures/v0_8_10_recovery_migration_session.json");
+            {
+                use sha2::Digest as _;
+                assert_eq!(
+                    format!("{:x}", sha2::Sha256::digest(released_session)),
+                    "3a1ba2e6ff8889c913dc0801c540c81a38bae7b54269259d8e370d1275a12c8a",
+                    "the copy differs from meerkat-core's 0.8.10 recovery-migration fixture"
+                );
+            }
             let imported = meerkat_core::import_released_0810_session(released_session).unwrap();
             let runtime_id = LogicalRuntimeId::for_session(imported.receipt().session_id());
             let expected_session = imported.session().clone();
