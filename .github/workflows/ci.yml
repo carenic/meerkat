@@ -1097,7 +1097,10 @@ jobs:
   governed-jsonl:
     name: Governed JSONL
     needs: [changes, stagger]
-    # Default RPC features enable MCP and compile these three cases away.
+    # Default RPC features enable MCP and compile the three governed JSONL
+    # cases away; this profile runs them with the two schedule-composition
+    # cases of the same test module (which the default-feature unit lane
+    # also runs), five tests in all.
     # Native dependency changes must retain this positive non-MCP profile.
     # The push runs it on every Rust change; a pull request leaves it there
     # (it compiles meerkat-rpc's lib test and the meerkat-mob chain: 866 s on
@@ -1160,6 +1163,8 @@ jobs:
               "governed_jsonl::tests::governed_jsonl_public_entry_preserves_refusal_sibling_feedback_and_completed_native_run",
               "governed_jsonl::tests::governed_jsonl_refusal_retains_actor_seed_and_context_then_same_run_read_finishes",
               "governed_jsonl::tests::governed_jsonl_rejects_ungoverned_bundle_and_unsupported_wire_before_setup",
+              "governed_jsonl::tests::ordinary_rpc_host_materializes_a_scheduled_fire_past_the_mandate_gate",
+              "governed_jsonl::tests::rpc_runtimes_compose_the_realms_own_schedule_service",
           ])
           command = [
               "./scripts/repo-cargo", "test", "--locked", "-p", "meerkat-rpc", "--lib",
@@ -1188,8 +1193,8 @@ jobs:
           names = re.findall(r"^(\S+): test$", listing, re.MULTILINE)
           if sorted(names) != expected or re.findall(
               r"^\d+ tests?, \d+ benchmarks?$", listing, re.MULTILINE
-          ) != ["3 tests, 0 benchmarks"]:
-              sys.exit(f"governed JSONL list must contain exactly the three required tests: {names!r}")
+          ) != ["5 tests, 0 benchmarks"]:
+              sys.exit(f"governed JSONL list must contain exactly the five required tests: {names!r}")
 
           result = run("run", ["--nocapture", "--test-threads=1", "--color", "never"])
           outcomes = re.findall(r"^test (\S+) \.\.\. (ok|FAILED|ignored)$", result, re.MULTILINE)
@@ -1199,8 +1204,8 @@ jobs:
               r"^test result: (\w+)\. (\d+) passed; (\d+) failed; (\d+) ignored; "
               r"(\d+) measured; \d+ filtered out; finished in .+$", result, re.MULTILINE,
           )
-          if summaries != [("ok", "3", "0", "0", "0")]:
-              sys.exit(f"governed JSONL requires exactly 3 passed, 0 failed, 0 ignored: {summaries!r}")
+          if summaries != [("ok", "5", "0", "0", "0")]:
+              sys.exit(f"governed JSONL requires exactly 5 passed, 0 failed, 0 ignored: {summaries!r}")
           PYTHON
 
       - name: Upload governed JSONL logs
@@ -1225,7 +1230,7 @@ jobs:
   mcp-confinement-positive:
     name: MCP confinement positive (Linux)
     needs: changes
-    # The Linux positive confinement cases (6 MCP supported-native, 2
+    # The Linux positive confinement cases (7 MCP supported-native, 2
     # command-hook, 21 sandbox and 4 shell) are ignored on Linux in the unit
     # lanes; this lane selects exactly them. A backend refusal fails it,
     # and so does a selection of zero tests. On ubuntu-24.04 the native
