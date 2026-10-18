@@ -691,7 +691,8 @@ artifacts and package metadata to the selected existing tag.
 
 **Pre-tag prebuild** (`make release-prebuild VERSION=vX.Y.Z`, dry run with
 `RELEASE_WORKFLOW_DRY_RUN=true`): once the release commit is on `main`,
-dispatch `release.yml` with `prebuild_release_artifacts=true` on `main`. It
+dispatch `release.yml` with `prebuild_release_artifacts=true` on `main`, on
+the backend its tag run will select (the request refuses another). It
 builds, stamps, attests and uploads every release binary and the Web SDK
 package of that commit while CI and semver readiness run, and publishes
 nothing. The tag run of exactly that commit then skips every build and

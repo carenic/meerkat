@@ -137,7 +137,8 @@ lookup() {
   local label="$1" expected="$2" expected_status="$3" output status
   set +e
   output="$(PATH="${TEST_ROOT}/bin:${PATH}" FIXTURES="${FIXTURES}" GITHUB_REPOSITORY="${REPO}" \
-    MEERKAT_PREBUILD_POLL_SECONDS=0 MEERKAT_PREBUILD_WAIT_SECONDS="${WAIT_SECONDS:-600}" \
+    MEERKAT_PREBUILD_POLL_SECONDS=0 \
+    MEERKAT_PREBUILD_WAIT_SECONDS="$([[ "${WAIT_SECONDS:-}" == default ]] || echo "${WAIT_SECONDS:-600}")" \
     "${LOOKUP}" "${SHA}" 2>"${TEST_ROOT}/${label}.err")"
   status=$?
   set -e
@@ -255,6 +256,23 @@ runs "" "$(run_json 501 in_progress .github/workflows/release.yml workflow_dispa
   "$(date -u -d '-3 hours' +%Y-%m-%dT%H:%M:%SZ)")"
 jobs 501 pending
 WAIT_SECONDS=600 lookup stale-running "" 0
+
+# 9b. The default budget outlasts the slowest measured prebuild gate on the
+#     tag's backend (v0.9.2's BuildBuddy gate concluded after 94.7 minutes,
+#     past v0.9.3's former 100-minute default): a run 110 minutes old is still
+#     waited for, and one 145 minutes old is not.
+reset
+runs "" "$(run_json 502 in_progress .github/workflows/release.yml workflow_dispatch main "${SHA}" "${REPO}" \
+  "$(date -u -d '-110 minutes' +%Y-%m-%dT%H:%M:%SZ)")"
+jobs 502 pending ".1"
+jobs 502 success ".2"
+complete_artifacts 502
+WAIT_SECONDS=default lookup default-budget-waits "502 2" 0
+reset
+runs "" "$(run_json 503 in_progress .github/workflows/release.yml workflow_dispatch main "${SHA}" "${REPO}" \
+  "$(date -u -d '-145 minutes' +%Y-%m-%dT%H:%M:%SZ)")"
+jobs 503 pending
+WAIT_SECONDS=default lookup default-budget-ends "" 0
 
 # 10. An API failure fails the lookup instead of reading as "no prebuild".
 reset

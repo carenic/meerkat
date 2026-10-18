@@ -20,8 +20,10 @@
 #     rkat-web-package.
 # A matching run whose gate has not concluded yet is waited for, polling every
 # MEERKAT_PREBUILD_POLL_SECONDS (default 60), until the gate concludes or
-# MEERKAT_PREBUILD_WAIT_SECONDS (default 6000) have passed since the run
+# MEERKAT_PREBUILD_WAIT_SECONDS (default 8400) have passed since the run
 # started: a prebuild already under way finishes no later than a fresh build.
+# The default leaves about 45 minutes over the slowest gate measured on the
+# backend tags select (v0.9.2's BuildBuddy prebuild: 94.7 minutes).
 #
 # The id is only a pointer, pinned to the attempt examined here: the
 # publishing jobs verify every archive and the Web SDK package against their
@@ -48,7 +50,7 @@ release_sha="$1"
 }
 repository="${GITHUB_REPOSITORY:?GITHUB_REPOSITORY must name the repository}"
 poll_seconds="${MEERKAT_PREBUILD_POLL_SECONDS:-60}"
-wait_seconds="${MEERKAT_PREBUILD_WAIT_SECONDS:-6000}"
+wait_seconds="${MEERKAT_PREBUILD_WAIT_SECONDS:-8400}"
 [[ "${poll_seconds}" =~ ^[0-9]+$ && "${wait_seconds}" =~ ^[0-9]+$ ]] || {
   echo "release-find-prebuild: poll and wait seconds must be integers" >&2
   exit 2
