@@ -341,7 +341,7 @@ fn the_selection_file_reads_the_legacy_forms_and_selects_per_server() {
     assert_eq!(
         older.prompt_selection().map(|(basis, _)| basis),
         Some(WorkAuthorityBasis::GrantLineage {
-            lineage: vec![operation.clone()]
+            lineage: vec![operation]
         })
     );
 
@@ -361,7 +361,7 @@ fn the_selection_file_reads_the_legacy_forms_and_selects_per_server() {
     assert!(matches!(
         current.prompt_selection(),
         Some((WorkAuthorityBasis::TargetedGrantLineages { base: Some(base), .. }, _))
-            if base == vec![catalog.clone()]
+            if base == std::slice::from_ref(&catalog)
     ));
     current.replace(&bundle_slot("mail", "read_mail"), alpha.clone());
     assert_eq!(current.get(&bundle_slot("mail", "read_mail")), Some(&alpha));
