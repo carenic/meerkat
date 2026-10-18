@@ -15,15 +15,15 @@ use meerkat_contracts::{
     ErrorCode, MobAdoptMemberIdentityDeclarationParams, MobAdoptMemberIdentityDeclarationResult,
     MobAppendSystemContextResult, MobApplyMemberToolDeclarationParams,
     MobApplyMemberToolDeclarationResult, MobCancelAllWorkResult, MobCancelWorkResult,
-    MobClaimCallbackRouteResult, MobConcludeObjectiveParams, MobConcludeObjectiveResult,
-    MobCreateParams, MobCreateResult, MobDestroyResult, MobEventsResult, MobFlowCancelResult,
-    MobFlowRunResult, MobFlowsResult, MobForceCancelResult, MobHelperResult, MobLifecycleResult,
-    MobListResult, MobMemberListEntryWire, MobMemberToolDeclarationParams,
-    MobMemberToolDeclarationResult, MobMembersResult, MobProfileDeleteResult,
-    MobResolveIdentityConvergenceBlockParams, MobResolveIdentityConvergenceBlockResult,
-    MobRespawnReceipt, MobRespawnResult, MobRetireResult, MobRotateSupervisorResult, MobRunParams,
-    MobRunResult, MobRunResultParams, MobSnapshotResult, MobSpawnManyResult,
-    MobSpawnManyResultEntry, MobSpawnResult, MobStatusResult, MobUnwireResult,
+    MobClaimCallbackRouteParams, MobClaimCallbackRouteResult, MobConcludeObjectiveParams,
+    MobConcludeObjectiveResult, MobCreateParams, MobCreateResult, MobDestroyResult,
+    MobEventsResult, MobFlowCancelResult, MobFlowRunResult, MobFlowsResult, MobForceCancelResult,
+    MobHelperResult, MobLifecycleResult, MobListResult, MobMemberListEntryWire,
+    MobMemberToolDeclarationParams, MobMemberToolDeclarationResult, MobMembersResult,
+    MobProfileDeleteResult, MobResolveIdentityConvergenceBlockParams,
+    MobResolveIdentityConvergenceBlockResult, MobRespawnReceipt, MobRespawnResult, MobRetireResult,
+    MobRotateSupervisorResult, MobRunParams, MobRunResult, MobRunResultParams, MobSnapshotResult,
+    MobSpawnManyResult, MobSpawnManyResultEntry, MobSpawnResult, MobStatusResult, MobUnwireResult,
     MobWaitMembersResult, MobWireMembersBatchEdge, MobWireMembersBatchParams,
     MobWireMembersBatchResult, MobWireResult, SupervisorRotationIncompleteDataWire,
     SupervisorRotationIncompleteDetailsWire, SupervisorRotationReportWire,
@@ -412,14 +412,21 @@ pub(crate) async fn handle_create_with_member_external_tools(
         Err(error) => return invalid_params(id, format!("invalid mob definition: {error}")),
     };
 
-    let result = match member_external_tools {
-        Some(member_external_tools) => {
-            state
-                .mob_create_definition_with_member_external_tools(definition, member_external_tools)
-                .await
+    // The creator's claim token: the mob keeps only its verifier, written
+    // before the mob is managed, and the token is returned once, here.
+    let claim_token = match meerkat_mob::MobClaimToken::mint() {
+        Ok(token) => token,
+        Err(minting) => {
+            return RpcResponse::error(id, error::INTERNAL_ERROR, minting.to_string());
         }
-        None => state.mob_create_definition(definition).await,
     };
+    let result = state
+        .mob_create_definition_with_claim_verifier(
+            definition,
+            member_external_tools,
+            claim_token.verifier(),
+        )
+        .await;
 
     match result {
         Ok(mob_id) => {
@@ -428,6 +435,7 @@ pub(crate) async fn handle_create_with_member_external_tools(
                 id,
                 MobCreateResult {
                     mob_id: mob_id.to_string(),
+                    claim_token: claim_token.expose_secret().to_owned(),
                 },
             )
         }
@@ -2095,24 +2103,46 @@ pub async fn handle_rotate_supervisor(
 // mob/claim_callback_route
 // ---------------------------------------------------------------------------
 
-/// `data` of a `mob/claim_callback_route` refused (`-32002`) because
-/// another open connection holds the route.
+/// `data` of a `mob/claim_callback_route` refused (`-32002`).
 #[derive(Debug, serde::Serialize)]
 struct MobCallbackRouteClaimRefusedData {
     mob_id: String,
-    /// Why the claim was refused: `held_by_open_connection`.
+    /// Why the claim was refused: `claim_token_mismatch` (the token is not
+    /// the mob's), `not_claimable` (the mob has no claim token) or
+    /// `held_by_open_connection` (another open connection holds the route).
     reason: &'static str,
+}
+
+/// A refused claim as `-32002` with its typed reason.
+fn claim_callback_route_refused(
+    id: Option<RpcId>,
+    mob_id: &MobId,
+    reason: &'static str,
+    refusal: impl std::fmt::Display,
+) -> RpcResponse {
+    let message = format!("mob '{mob_id}': {refusal}");
+    match serde_json::to_value(MobCallbackRouteClaimRefusedData {
+        mob_id: mob_id.to_string(),
+        reason,
+    }) {
+        Ok(data) => RpcResponse::error_with_data(id, error::SESSION_BUSY, message, data),
+        Err(_) => RpcResponse::error(id, error::SESSION_BUSY, message),
+    }
 }
 
 /// Handle `mob/claim_callback_route`: bind the mob's member callback route
 /// to the calling connection's `route`, so the mob's live and future
-/// members call the callback tools that connection registered.
+/// members call the callback tools that connection registered, when the
+/// connection presents the mob's claim token.
 ///
 /// Needs the console owner and the mob state's admission; the host's create
-/// hook is not asked, since a claim creates nothing. A mob whose route no
-/// open connection holds (one restored after a restart, or one whose
-/// connection closed) is claimed; while another open connection holds it,
-/// the claim is refused with `-32002`.
+/// hook is not asked, since a claim creates nothing. The token is checked
+/// first: one that is not the mob's is refused (`claim_token_mismatch`),
+/// and so is any token for a mob created without one (`not_claimable`). A
+/// mob whose route no open connection holds (one restored after a restart,
+/// or one whose connection closed) is then claimed; while another open
+/// connection holds it, the claim is refused (`held_by_open_connection`).
+/// Each refusal is `-32002` with its reason in `data.reason`.
 pub(crate) async fn handle_claim_callback_route(
     id: Option<RpcId>,
     params: Option<&RawValue>,
@@ -2120,13 +2150,17 @@ pub(crate) async fn handle_claim_callback_route(
     runtime: &Arc<SessionRuntime>,
     route: Option<crate::callback_dispatcher::CallbackRoute>,
 ) -> RpcResponse {
-    let params: MobIdParams = match parse_params(params) {
+    let params: MobClaimCallbackRouteParams = match parse_params(params) {
         Ok(p) => p,
         Err(resp) => return resp.with_id(id),
     };
     let mob_id = match parse_mob_id(id.clone(), &params.mob_id) {
         Ok(m) => m,
         Err(resp) => return resp,
+    };
+    let claim_token = match meerkat_mob::MobClaimToken::parse(&params.claim_token) {
+        Ok(token) => token,
+        Err(error) => return invalid_params(id, error.to_string()),
     };
     let Some(route) = route else {
         return RpcResponse::error(
@@ -2136,39 +2170,34 @@ pub(crate) async fn handle_claim_callback_route(
         );
     };
     let claimed = state
-        .mob_claim_member_external_tools(&mob_id, || {
+        .mob_claim_member_external_tools(&mob_id, &claim_token, || {
             runtime
                 .mob_callback_route_slot(&mob_id)
                 .map(|slot| slot.claim(&route))
         })
         .await;
     match claimed {
-        Ok(Some(Ok(()))) => RpcResponse::success(
+        Ok(Ok(Some(Ok(())))) => RpcResponse::success(
             id,
             MobClaimCallbackRouteResult {
                 mob_id: mob_id.to_string(),
             },
         ),
-        Ok(Some(Err(refused))) => {
-            let message = format!("mob '{mob_id}': {refused}");
-            let reason = match refused {
-                crate::callback_dispatcher::MobCallbackRouteClaimRefused::HeldByOpenConnection => {
-                    "held_by_open_connection"
-                }
-            };
-            match serde_json::to_value(MobCallbackRouteClaimRefusedData {
-                mob_id: mob_id.to_string(),
-                reason,
-            }) {
-                Ok(data) => RpcResponse::error_with_data(id, error::SESSION_BUSY, message, data),
-                Err(_) => RpcResponse::error(id, error::SESSION_BUSY, message),
-            }
-        }
-        Ok(None) => RpcResponse::error(
+        Ok(Ok(Some(Err(
+            refused
+            @ crate::callback_dispatcher::MobCallbackRouteClaimRefused::HeldByOpenConnection,
+        )))) => claim_callback_route_refused(id, &mob_id, "held_by_open_connection", refused),
+        Ok(Ok(None)) => RpcResponse::error(
             id,
             error::INVALID_REQUEST,
             format!("mob '{mob_id}' has no callback route a connection can claim"),
         ),
+        Ok(Err(refused @ meerkat_mob_mcp::CallbackRouteClaimTokenRefused::Mismatch)) => {
+            claim_callback_route_refused(id, &mob_id, "claim_token_mismatch", refused)
+        }
+        Ok(Err(refused @ meerkat_mob_mcp::CallbackRouteClaimTokenRefused::NotClaimable)) => {
+            claim_callback_route_refused(id, &mob_id, "not_claimable", refused)
+        }
         Err(err) => mob_call_error(id, &err),
     }
 }

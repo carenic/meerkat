@@ -20,7 +20,8 @@
     clippy::expect_used,
     clippy::panic,
     clippy::unwrap_used,
-    clippy::large_futures
+    clippy::large_futures,
+    clippy::disallowed_methods
 )]
 
 use std::path::{Path, PathBuf};

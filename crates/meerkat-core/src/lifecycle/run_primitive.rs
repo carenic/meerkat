@@ -461,6 +461,11 @@ pub enum AnthropicThinkingConfig {
     /// catalog row admits it (Claude Sonnet 5.5), accepted at `high` effort
     /// or below; wire shape `{"type": "between_tools"}`.
     BetweenTools,
+    /// Thinking turned off: the model answers without thinking blocks.
+    /// Accepted only on models whose catalog row admits it (its
+    /// `anthropic_disabled_thinking`), on some of them only at `high`
+    /// effort or below; wire shape `{"type": "disabled"}`.
+    Disabled,
 }
 
 impl AnthropicThinkingConfig {
@@ -470,6 +475,7 @@ impl AnthropicThinkingConfig {
             Self::Adaptive => "adaptive",
             Self::Enabled { .. } => "enabled",
             Self::BetweenTools => "between_tools",
+            Self::Disabled => "disabled",
         }
     }
 }

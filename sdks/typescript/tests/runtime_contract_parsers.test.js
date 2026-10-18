@@ -183,6 +183,30 @@ function parseHistoryMessage(message) {
   });
 }
 
+describe("history stop reasons", () => {
+  it("accepts every wire stop reason on an assistant row", () => {
+    for (const stopReason of [
+      "end_turn",
+      "tool_use",
+      "max_tokens",
+      "stop_sequence",
+      "content_filter",
+      "cancelled",
+      "refusal",
+      "pause_turn",
+      "context_window_exceeded",
+    ]) {
+      const history = parseHistoryMessage({
+        role: "block_assistant",
+        created_at: "2026-10-17T10:00:00Z",
+        blocks: [{ block_type: "text", data: { text: "partial" } }],
+        stop_reason: stopReason,
+      });
+      assert.equal(history.messages.length, 1, stopReason);
+    }
+  });
+});
+
 describe("recursive generated history validation", () => {
   it("accepts valid nested system-notice, assistant, and tool-result payloads", () => {
     const wireContent = [

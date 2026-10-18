@@ -391,6 +391,43 @@ fn combine_prepared_session_unregister_result(
     }
 }
 
+/// A rollback that keeps the turn-finalization boundary must run before any
+/// actor is published (see `rollback_prepared_session_after_failure`). Debug
+/// builds fail here, instead of risking a deadlock, if a change publishes
+/// the actor earlier; [`published_actor_rollback_refusal`] is the release
+/// build's check.
+fn debug_assert_no_published_actor(
+    actor_witness_slot: &meerkat_session::LiveSessionActorWitnessSlot,
+) {
+    debug_assert!(
+        actor_witness_slot.witness().is_none(),
+        "a rollback that keeps the turn-finalization boundary ran after actor publication"
+    );
+}
+
+/// The release-build check before a rollback that keeps the
+/// turn-finalization boundary: one read of the witness slot. With an actor
+/// published, that rollback could wait forever on a concurrent raw
+/// unregister (#1814), so the caller skips it and returns this typed error
+/// instead. The error fail-stops the serving actor, and the prepared
+/// registration is left to its drop-time abort, which never holds B.
+pub(super) fn published_actor_rollback_refusal(
+    session_id: &SessionId,
+    actor_witness_slot: &meerkat_session::LiveSessionActorWitnessSlot,
+    original: impl std::fmt::Display,
+) -> Option<MaterializeServeError> {
+    if actor_witness_slot.witness().is_none() {
+        return None;
+    }
+    Some(MaterializeServeError::UnrecordedSessionCleanup {
+        session_id: session_id.to_string(),
+        original: original.to_string(),
+        cleanup: "rollback refused: an actor was published before a rollback that keeps the \
+                  turn-finalization boundary"
+            .to_string(),
+    })
+}
+
 /// Validate every deterministic conversion in a portable member spec without
 /// consulting host-local secret values. A missing environment value is an
 /// availability fact, not durable corruption; supplying inert placeholders
@@ -1681,12 +1718,28 @@ impl HostMemberMaterializer {
         }
     }
 
+    /// Roll a pre-actor materialization back while still holding B.
+    ///
+    /// Keeping B here is safe only while no actor witness is published: a
+    /// concurrent raw unregister's surface cleanup
+    /// (`MobPreparedSessionActorCleanupHandle`) then returns without taking
+    /// B, so it never waits on the B this rollback holds while the rollback
+    /// waits for that saga's live lifecycle lease (#1814). Actor-owning
+    /// cleanups release B before they roll back
+    /// (`PreparedServiceActorTransaction`).
     async fn rollback_prepared_session_after_failure(
         &self,
         prepared: &mut meerkat_runtime::PreparedSessionMaterialization,
+        actor_witness_slot: &meerkat_session::LiveSessionActorWitnessSlot,
         original: MaterializeServeError,
     ) -> MaterializeServeError {
+        debug_assert_no_published_actor(actor_witness_slot);
         let session_id = prepared.session_id().clone();
+        if let Some(refusal) =
+            published_actor_rollback_refusal(&session_id, actor_witness_slot, &original)
+        {
+            return refusal;
+        }
         let rollback_result = prepared
             .rollback_now_under_turn_finalization_boundary()
             .await;
@@ -1868,6 +1921,17 @@ impl HostMemberMaterializer {
             )
             .await
         {
+            // Pre-actor: keeping B is safe (see
+            // `rollback_prepared_session_after_failure`).
+            debug_assert_no_published_actor(&actor_witness_slot);
+            let refusal = published_actor_rollback_refusal(
+                &session_id,
+                &actor_witness_slot,
+                format_args!("failed to install prepared session handles: {error}"),
+            );
+            if let Some(refusal) = refusal {
+                return Err(refusal);
+            }
             let rollback_error = prepared
                 .rollback_now_under_turn_finalization_boundary()
                 .await
@@ -1896,7 +1960,11 @@ impl HostMemberMaterializer {
             Ok(live) => live,
             Err(error) => {
                 return Err(self
-                    .rollback_prepared_session_after_failure(&mut prepared, error)
+                    .rollback_prepared_session_after_failure(
+                        &mut prepared,
+                        &actor_witness_slot,
+                        error,
+                    )
                     .await);
             }
         };
@@ -1911,7 +1979,11 @@ impl HostMemberMaterializer {
         if let Err(detail) = bindings.install_peer_comms_on(member_runtime.as_ref()) {
             let original = MaterializeServeError::Comms { detail };
             return Err(self
-                .rollback_prepared_session_after_failure(&mut prepared, original)
+                .rollback_prepared_session_after_failure(
+                    &mut prepared,
+                    &actor_witness_slot,
+                    original,
+                )
                 .await);
         }
         config.runtime_build_mode =
@@ -1933,7 +2005,11 @@ impl HostMemberMaterializer {
                 };
             if let Some(original) = revalidation_error {
                 return Err(self
-                    .rollback_prepared_session_after_failure(&mut prepared, original)
+                    .rollback_prepared_session_after_failure(
+                        &mut prepared,
+                        &actor_witness_slot,
+                        original,
+                    )
                     .await);
             }
         }
@@ -1958,6 +2034,7 @@ impl HostMemberMaterializer {
                         return Err(self
                             .rollback_prepared_session_after_failure(
                                 &mut prepared,
+                                &actor_witness_slot,
                                 MaterializeServeError::Bindings {
                                     detail: format!(
                                         "failed to mint archived-resume authority for '{session_id}': {error}"
@@ -1989,6 +2066,7 @@ impl HostMemberMaterializer {
                 return Err(self
                     .rollback_prepared_session_after_failure(
                         &mut prepared,
+                        &actor_witness_slot,
                         MaterializeServeError::SessionService(error),
                     )
                     .await);
@@ -2431,6 +2509,20 @@ impl HostMemberMaterializer {
             )
             .await
         {
+            // Pre-actor: keeping B is safe (see
+            // `rollback_prepared_session_after_failure`).
+            debug_assert_no_published_actor(&actor_witness_slot);
+            let refusal = published_actor_rollback_refusal(
+                &session_id,
+                &actor_witness_slot,
+                format_args!("failed to install prepared session handles: {error}"),
+            );
+            if let Some(refusal) = refusal {
+                drop(materialization_boundary.take());
+                return Err(self
+                    .preserve_snapshot_after_revival_failure(&session_id, refusal)
+                    .await);
+            }
             let rollback_error = prepared
                 .rollback_now_under_turn_finalization_boundary()
                 .await
@@ -2460,7 +2552,11 @@ impl HostMemberMaterializer {
             Ok(live) => live,
             Err(error) => {
                 let error = self
-                    .rollback_prepared_session_after_failure(&mut prepared, error)
+                    .rollback_prepared_session_after_failure(
+                        &mut prepared,
+                        &actor_witness_slot,
+                        error,
+                    )
                     .await;
                 drop(materialization_boundary.take());
                 return Err(self
@@ -2480,7 +2576,11 @@ impl HostMemberMaterializer {
             drop(member_runtime);
             drop(live);
             let original = self
-                .rollback_prepared_session_after_failure(&mut prepared, original)
+                .rollback_prepared_session_after_failure(
+                    &mut prepared,
+                    &actor_witness_slot,
+                    original,
+                )
                 .await;
             drop(materialization_boundary.take());
             return Err(self
@@ -2497,6 +2597,7 @@ impl HostMemberMaterializer {
             let original = self
                 .rollback_prepared_session_after_failure(
                     &mut prepared,
+                    &actor_witness_slot,
                     MaterializeServeError::Comms { detail },
                 )
                 .await;
@@ -2525,7 +2626,11 @@ impl HostMemberMaterializer {
             drop(member_runtime);
             drop(live);
             let original = self
-                .rollback_prepared_session_after_failure(&mut prepared, original)
+                .rollback_prepared_session_after_failure(
+                    &mut prepared,
+                    &actor_witness_slot,
+                    original,
+                )
                 .await;
             drop(materialization_boundary.take());
             return Err(self
@@ -2549,6 +2654,7 @@ impl HostMemberMaterializer {
                         let original = self
                             .rollback_prepared_session_after_failure(
                                 &mut prepared,
+                                &actor_witness_slot,
                                 MaterializeServeError::Bindings {
                                     detail: format!(
                                         "failed to mint archived-resume authority for '{session_id}': {error}"
@@ -2580,6 +2686,7 @@ impl HostMemberMaterializer {
                 let original = self
                     .rollback_prepared_session_after_failure(
                         &mut prepared,
+                        &actor_witness_slot,
                         MaterializeServeError::SessionService(error),
                     )
                     .await;
@@ -2794,6 +2901,10 @@ impl HostMemberMaterializer {
             // host-local process env; nothing to inject per-member.
             shell_env: None,
             mob_tool_authority_context: decompiled.mob_tool_authority_context.clone(),
+            // This host does not run the controlling mob: no incarnation to
+            // bind a default spawn-profile scope to. The member's operator
+            // calls go through the upcall lane, re-minted controlling-side.
+            mob_incarnation: None,
             // Inherited tool filters are hard-deny superseded for remote
             // spawns (ADJ-6) — structurally absent from the spec.
             inherited_tool_filter: None,

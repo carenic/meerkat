@@ -101,7 +101,8 @@ jobs:
     needs: machine-verify
     if: ${{ !cancelled() && !inputs.graph_only }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    # Measured ~91 min on 4 vCPU: make test-unit ~58 (38 compile + 20 run) + rpc all-features ~31.
+    timeout-minutes: 150
     env:
       RUSTC_WRAPPER: sccache
     steps:
@@ -151,9 +152,17 @@ jobs:
     needs: feature-matrix
     if: ${{ !cancelled() && !inputs.graph_only }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 120
+    # Two Cargo jobs build for up to about twice as long as four.
+    timeout-minutes: 180
     env:
       RUSTC_WRAPPER: sccache
+      # At four Cargo jobs the 16 GB runner lost this job mid-build (exit 143
+      # after the log went silent, 2026-10-14 and 10-16). A cold `make
+      # test-int` reached 15.0 GiB of rustc memory within two minutes (the
+      # schema catalog's library and test harness beside the kernels and
+      # contracts), and single meerkat-core and meerkat-runtime rustc
+      # processes reach 6-7 GiB. Two jobs keep at most two rustc alive.
+      CARGO_BUILD_JOBS: "2"
     steps:
       - name: Checkout
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -736,6 +745,13 @@ jobs:
     runs-on: ubuntu-24.04
     env:
       RUSTC_WRAPPER: sccache
+      # Four slots of four Cargo jobs ran up to 16 rustc processes, each slot
+      # building its own copy of the heavy crates in its own target
+      # directory, and the 16 GB runner lost the job every night from
+      # 2026-10-05 (at about 70 minutes from 10-13, when the mob-family
+      # slots overlapped). Two slots of two jobs keep at most four alive.
+      MEERKAT_RELEASE_PACKAGING_JOBS: "2"
+      CARGO_BUILD_JOBS: "2"
     steps:
       - name: Checkout
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -812,3 +828,32 @@ jobs:
             --manifest docs/mobkit/_source.json \
             --compare "${compare}" \
             --max-lag 0
+
+  # A red nightly on main opens one tracking issue, or comments on it while
+  # it stays open (#1673). It follows the last chain and waits for the
+  # others there, since a nightly job may need only one job.
+  failure-issue:
+    name: Nightly failure issue
+    needs: wasm-contract
+    if: ${{ !cancelled() && !inputs.graph_only }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    permissions:
+      actions: read
+      issues: write
+    steps:
+      - name: Open or update the tracking issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          JOBS: repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/jobs?per_page=100
+        run: |
+          set -euo pipefail
+          others='[.jobs[] | select(.name != "Nightly failure issue")]'
+          until [[ "$(gh api "${JOBS}" --jq "${others} | map(select(.status != \"completed\")) | length")" == 0 ]]; do sleep 60; done
+          failed="$(gh api "${JOBS}" --jq "${others} | map(select(.conclusion == \"failure\" or .conclusion == \"timed_out\" or .conclusion == \"cancelled\") | .name) | join(\", \")")"
+          echo "failed jobs: ${failed:-none}"
+          [[ -n "${failed}" && "${GITHUB_REF}" == refs/heads/main ]] || exit 0
+          body="Run ${GITHUB_SERVER_URL}/${GH_REPO}/actions/runs/${GITHUB_RUN_ID} failed: ${failed}"
+          issue="$(gh issue list --state open --search 'in:title "Nightly failures"' --json number,title --jq '[.[] | select(.title == "Nightly failures")][0].number // empty')"
+          if [[ -n "${issue}" ]]; then gh issue comment "${issue}" --body "${body}"; else gh issue create --title "Nightly failures" --body "${body}"; fi

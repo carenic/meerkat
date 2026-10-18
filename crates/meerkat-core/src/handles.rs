@@ -38,8 +38,9 @@ use crate::lifecycle::run_primitive::ModelId;
 use crate::lifecycle::{InputId, RunId};
 use crate::ops::{AsyncOpRef, OperationId};
 use crate::peer_correlation::{
-    InboundPeerRequestState, InteractionStreamAbandonReason, InteractionStreamState,
-    OutboundPeerRequestState, PeerCorrelationId,
+    InboundIdClaim, InboundPeerRequestState, InteractionStreamAbandonReason,
+    InteractionStreamState, OutboundPeerRequestState, PeerCorrelationId,
+    PeerResponseAddresseeVerdict, PeerResponseSenderVerdict,
 };
 use crate::retry::LlmRetrySchedule;
 use crate::tool_scope::{
@@ -1706,6 +1707,24 @@ pub trait PeerCommsHandle: Send + Sync {
         facts: PeerIngressDequeueFacts,
     ) -> Result<PeerIngressDequeueAuthority, DslTransitionError>;
 
+    /// Fire the read-only `ResolvePeerResponseSender` signal: judge whether a
+    /// response frame, progress or terminal, to the outbound request
+    /// `corr_id` may be accepted from `responder`, the canonical peer id of
+    /// the frame's verified signer as classification admitted it. Only the
+    /// peer the request was sent to may answer it
+    /// ([`PeerInteractionHandle::request_sent`]). Ingress asks before the
+    /// frame is queued and drops a frame judged `NotAddressee`, so it is never
+    /// applied and the request stays open for its addressee.
+    ///
+    /// Production handles implement this through generated MeerkatMachine
+    /// authority; a handle that cannot judge must return an error, which
+    /// ingress treats as a refusal.
+    fn resolve_peer_response_sender(
+        &self,
+        corr_id: PeerCorrelationId,
+        responder: crate::comms::PeerId,
+    ) -> Result<PeerResponseSenderVerdict, DslTransitionError>;
+
     /// Validate the opaque, runtime-private receipt for one exact queue claim.
     /// Production comms installs only the generated runtime handle; arbitrary
     /// callers cannot construct the private receipt type it accepts.
@@ -2614,38 +2633,69 @@ pub enum PeerTerminalDisposition {
 /// are strict projections of DSL state, with the invariant "channel live
 /// iff `corr_id ∈ pending ∧ state ≠ terminal`" enforced by the effect.
 pub trait PeerInteractionHandle: Send + Sync {
-    /// Fire `PeerRequestSent { corr_id }`.
+    /// Fire `PeerRequestSent { corr_id, addressee }`.
+    ///
+    /// `addressee` is the canonical peer id the request is routed to (the
+    /// trust entry the transport resolves, keyed by the id of its signing
+    /// key). Fire it before the request frame can leave, so every response
+    /// to the request finds its addressee recorded. Only the addressee may
+    /// answer the request: a response frame from any other peer is dropped
+    /// at ingress
+    /// ([`PeerCommsHandle::resolve_peer_response_sender`]) and refused by the
+    /// guarded response transitions below.
     ///
     /// Guard: `corr_id` is not already in `pending_peer_requests`.
-    fn request_sent(&self, corr_id: PeerCorrelationId) -> Result<(), DslTransitionError>;
+    fn request_sent(
+        &self,
+        corr_id: PeerCorrelationId,
+        addressee: crate::comms::PeerId,
+    ) -> Result<(), DslTransitionError>;
 
-    /// Fire `PeerResponseProgressArrived { corr_id }`.
+    /// Fire `PeerResponseProgressArrived { corr_id, responder }`.
     ///
-    /// Guard: `corr_id` is in `pending_peer_requests`. Progress after
-    /// progress is admitted as a self-loop (the DSL overwrites the state
-    /// slot). Rejects on unknown corr_id.
-    fn response_progress(&self, corr_id: PeerCorrelationId) -> Result<(), DslTransitionError>;
+    /// `responder` is the canonical peer id of the response frame's verified
+    /// signer as ingress admitted it
+    /// ([`crate::interaction::PeerInputCandidate::from_peer_id`]), never a
+    /// payload field.
+    ///
+    /// Guard: `corr_id` is in `pending_peer_requests` and `responder` is the
+    /// addressee recorded by [`Self::request_sent`]. Progress after progress
+    /// is admitted as a self-loop (the DSL overwrites the state slot).
+    /// Rejects on unknown corr_id and on any other responder.
+    fn response_progress(
+        &self,
+        corr_id: PeerCorrelationId,
+        responder: crate::comms::PeerId,
+    ) -> Result<(), DslTransitionError>;
 
-    /// Fire `PeerResponseTerminalArrived { corr_id, disposition }`.
+    /// Fire `PeerResponseTerminalArrived { corr_id, disposition, responder }`.
     ///
-    /// Guard: `corr_id` is in `pending_peer_requests`. Terminal transitions
-    /// remove the map entry and emit the `PeerInteractionCleanup` effect,
-    /// so any second terminal on the same corr_id is rejected at the
+    /// Guard: `corr_id` is in `pending_peer_requests` and `responder` (as for
+    /// [`Self::response_progress`]) is its recorded addressee. Terminal
+    /// transitions remove the map entry and emit the `PeerInteractionCleanup`
+    /// effect, so any second terminal on the same corr_id is rejected at the
     /// `pending_exists` guard by construction.
     fn response_terminal(
         &self,
         corr_id: PeerCorrelationId,
         disposition: PeerTerminalDisposition,
+        responder: crate::comms::PeerId,
     ) -> Result<(), DslTransitionError>;
 
-    /// Fire `PeerResponseRejected { corr_id }`.
+    /// Fire `PeerResponseRejected { corr_id, responder }`.
     ///
-    /// Guard: `corr_id` is in `pending_peer_requests`. This is used when
-    /// peer ingress produced a response observation that cannot be admitted
-    /// as progress or terminal because the generated terminality feedback is
-    /// missing or inconsistent. The DSL owns the terminal cleanup; callers do
-    /// not substitute a response disposition.
-    fn response_rejected(&self, corr_id: PeerCorrelationId) -> Result<(), DslTransitionError>;
+    /// Guard: `corr_id` is in `pending_peer_requests` and `responder` (as for
+    /// [`Self::response_progress`]) is its recorded addressee, so a response
+    /// observation from any other peer cannot cancel the request. This is
+    /// used when peer ingress produced a response observation that cannot be
+    /// admitted as progress or terminal because the generated terminality
+    /// feedback is missing or inconsistent. The DSL owns the terminal
+    /// cleanup; callers do not substitute a response disposition.
+    fn response_rejected(
+        &self,
+        corr_id: PeerCorrelationId,
+        responder: crate::comms::PeerId,
+    ) -> Result<(), DslTransitionError>;
 
     /// Fire `PeerRequestTimedOut { corr_id }`.
     ///
@@ -2662,14 +2712,94 @@ pub trait PeerInteractionHandle: Send + Sync {
     /// mirroring the `PeerResponseRejected` failure disposition.
     fn request_send_failed(&self, corr_id: PeerCorrelationId) -> Result<(), DslTransitionError>;
 
-    /// Fire `PeerRequestReceived { corr_id, handling_mode }` (inbound).
+    /// Fire `PeerRequestReceived { corr_id, handling_mode, requester }`
+    /// (inbound).
+    ///
+    /// `requester` is the request's sender as ingress admitted it: the
+    /// canonical peer id of its envelope's signing key
+    /// ([`crate::interaction::PeerInputCandidate::from_peer_id`]), never a
+    /// field of the request's payload. Ingress verifies the signature when
+    /// peer auth is required; under open auth the requester is the declared
+    /// key, the same identity trust and routing use in that mode. A response
+    /// to the request goes only to this peer
+    /// ([`Self::resolve_response_addressee`]).
     ///
     /// Guard: `corr_id` is not already in `inbound_peer_requests`.
     fn request_received(
         &self,
         corr_id: PeerCorrelationId,
         handling_mode: HandlingMode,
+        requester: crate::comms::PeerId,
     ) -> Result<(), DslTransitionError>;
+
+    /// Record `candidate`, an admitted inbound peer request, through
+    /// [`Self::request_received`] with the requester ingress verified for it:
+    /// [`crate::interaction::PeerInputCandidate::from_peer_id`], the
+    /// machine-echoed canonical id of the signed envelope's sender. Never its
+    /// display label, `from_route` or a payload field. A request candidate
+    /// without an admitted sender cannot be answered, so it is refused.
+    fn request_received_from_ingress(
+        &self,
+        candidate: &crate::interaction::PeerInputCandidate,
+    ) -> Result<(), DslTransitionError> {
+        let requester = candidate.from_peer_id().ok_or_else(|| {
+            DslTransitionError::guard_rejected(
+                "PeerInteractionHandle::request_received",
+                "inbound peer request has no admitted sender identity",
+            )
+        })?;
+        self.request_received(
+            PeerCorrelationId::from_uuid(candidate.interaction.id.0),
+            candidate.interaction.handling_mode,
+            requester,
+        )
+    }
+
+    /// Who holds `candidate`'s interaction id among the inbound requests this
+    /// handle records, judged for the candidate's admitted sender
+    /// ([`crate::interaction::PeerInputCandidate::from_peer_id`]) by
+    /// [`Self::resolve_response_addressee`]. Ingress admits any candidate,
+    /// request or not, only while the id is [`InboundIdClaim::Unclaimed`] or
+    /// [`InboundIdClaim::ClaimedBySender`]. A request answered between the
+    /// two reads leaves the id unclaimed.
+    fn inbound_id_claim(
+        &self,
+        candidate: &crate::interaction::PeerInputCandidate,
+    ) -> InboundIdClaim {
+        let corr_id = PeerCorrelationId::from_uuid(candidate.interaction.id.0);
+        if self.inbound_state(corr_id).is_none() {
+            return InboundIdClaim::Unclaimed;
+        }
+        let Some(sender) = candidate.from_peer_id() else {
+            return InboundIdClaim::ClaimedByAnother;
+        };
+        match self.resolve_response_addressee(corr_id, sender) {
+            Ok(PeerResponseAddresseeVerdict::Requester) => InboundIdClaim::ClaimedBySender,
+            Ok(PeerResponseAddresseeVerdict::UnknownRequest) => InboundIdClaim::Unclaimed,
+            _ => InboundIdClaim::ClaimedByAnother,
+        }
+    }
+
+    /// Ask the generated machine authority whether a response to the inbound
+    /// request `corr_id`, progress or terminal, may be addressed to
+    /// `addressee`. Read-only. Callers ask before any transport, so a refused
+    /// response reaches no one and the request stays answerable.
+    ///
+    /// Contract for implementations: keep the `requester` given to
+    /// [`Self::request_received`] for each inbound request, unchanged, until
+    /// [`Self::response_replied`] answers it, and answer
+    /// [`PeerResponseAddresseeVerdict::Requester`] only when `addressee` is
+    /// that requester. Any other peer is
+    /// [`PeerResponseAddresseeVerdict::NotRequester`], and an id with no
+    /// recorded request is [`PeerResponseAddresseeVerdict::UnknownRequest`].
+    /// A handle that cannot judge must return an error, which callers treat
+    /// as a refusal. Production handles implement this through generated
+    /// MeerkatMachine authority.
+    fn resolve_response_addressee(
+        &self,
+        corr_id: PeerCorrelationId,
+        addressee: crate::comms::PeerId,
+    ) -> Result<PeerResponseAddresseeVerdict, DslTransitionError>;
 
     /// Ask the generated machine authority to classify a typed outbound reply
     /// status before shell transport send/cleanup code consumes terminality.

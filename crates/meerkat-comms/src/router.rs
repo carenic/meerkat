@@ -156,6 +156,27 @@ pub struct DeclaredReplyEndpoint {
     pub address: String,
 }
 
+/// A declared reply endpoint is staged only under `dest`'s own signing key.
+/// The router addresses a Response sent through the endpoint to that key, so
+/// a key that derives another peer id would carry a response meant for `dest`
+/// to that other peer.
+///
+/// # Errors
+/// [`meerkat_core::comms::SendError::Validation`] when `signer` does not
+/// derive `dest`.
+pub(crate) fn validate_declared_reply_signer(
+    dest: PeerId,
+    signer: &crate::identity::PubKey,
+) -> Result<(), meerkat_core::comms::SendError> {
+    let signer_peer_id = signer.to_peer_id();
+    if signer_peer_id != dest {
+        return Err(meerkat_core::comms::SendError::Validation(format!(
+            "declared reply signer derives peer id {signer_peer_id}, not destination {dest}"
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 fn declared_reply_timeout_error(address: &str) -> std::io::Error {
     std::io::Error::new(
@@ -540,7 +561,23 @@ impl Router {
     /// must never call this legacy uncorrelated seam. Trust-store entries
     /// always win at send time; a staged entry for a peer that is (or later
     /// becomes) trusted is simply never consulted.
-    pub fn stage_reply_endpoint(&self, dest: PeerId, endpoint: DeclaredReplyEndpoint) {
+    ///
+    /// # Errors
+    /// [`meerkat_core::comms::SendError::Validation`], with nothing staged,
+    /// when the endpoint's key does not derive `dest`.
+    pub fn stage_reply_endpoint(
+        &self,
+        dest: PeerId,
+        endpoint: DeclaredReplyEndpoint,
+    ) -> Result<(), meerkat_core::comms::SendError> {
+        validate_declared_reply_signer(dest, &endpoint.pubkey)?;
+        self.restage_reply_endpoint(dest, endpoint);
+        Ok(())
+    }
+
+    /// Put back the endpoint a failed send took from the stage. It passed
+    /// [`validate_declared_reply_signer`] when it was staged.
+    fn restage_reply_endpoint(&self, dest: PeerId, endpoint: DeclaredReplyEndpoint) {
         self.staged_reply_endpoints.write().insert(dest, endpoint);
     }
 
@@ -771,6 +808,10 @@ impl Router {
     /// at the boundary and handle the typed
     /// [`TrustResolveError::Ambiguous`](crate::trust::TrustResolveError::Ambiguous)
     /// case explicitly — the router will not guess.
+    ///
+    /// This raw transport is outside the runtime's guarantee that a response
+    /// goes only to the request's requester: a Response sent here is not
+    /// checked against it, as one sent through `CommsRuntime::send` is.
     pub async fn send(&self, dest: PeerId, kind: MessageKind) -> Result<SendOutcome, SendError> {
         self.send_with_id(dest, Uuid::new_v4(), kind, None).await
     }
@@ -792,6 +833,9 @@ impl Router {
     /// proved by the selected transport. Meerkat peer transports require a
     /// signed durable-resolution fact for runtime-bound peer input. Response
     /// retains its legacy queued/no-ack semantics.
+    ///
+    /// Like [`Router::send`], this raw transport is outside the runtime's
+    /// guarantee that a response goes only to the request's requester.
     pub async fn send_with_id(
         &self,
         dest: PeerId,
@@ -944,7 +988,7 @@ impl Router {
                     self.stage_correlated_reply_endpoint(dest, in_reply_to, endpoint);
                 }
             } else {
-                self.stage_reply_endpoint(dest, endpoint);
+                self.restage_reply_endpoint(dest, endpoint);
             }
         }
 
@@ -1890,13 +1934,15 @@ mod tests {
         let address = format!("tcp://{}", listener.local_addr().expect("listener addr"));
         let received = accept_one_envelope(listener, sender_kp.clone()).await;
 
-        router.stage_reply_endpoint(
-            dest,
-            DeclaredReplyEndpoint {
-                pubkey: sender_pubkey,
-                address,
-            },
-        );
+        router
+            .stage_reply_endpoint(
+                dest,
+                DeclaredReplyEndpoint {
+                    pubkey: sender_pubkey,
+                    address,
+                },
+            )
+            .expect("the sender's own key stages a reply endpoint");
         let outcome = router
             .send_with_id(dest, Uuid::new_v4(), response_kind("reject"), None)
             .await
@@ -1944,13 +1990,15 @@ mod tests {
         let address = format!("tcp://{}", listener.local_addr().expect("listener addr"));
         let received = accept_one_envelope(listener, sender_kp.clone()).await;
 
-        router.stage_reply_endpoint(
-            dest,
-            DeclaredReplyEndpoint {
-                pubkey: sender_pubkey,
-                address,
-            },
-        );
+        router
+            .stage_reply_endpoint(
+                dest,
+                DeclaredReplyEndpoint {
+                    pubkey: sender_pubkey,
+                    address,
+                },
+            )
+            .expect("the sender's own key stages a reply endpoint");
         let message = router
             .send_with_id(
                 dest,
@@ -1978,6 +2026,73 @@ mod tests {
             .expect("the staged endpoint survives non-response sends");
         let envelope = received.await.expect("receiver task");
         assert_eq!(envelope.to, sender_pubkey);
+    }
+
+    /// A reply endpoint is staged only under the destination's own key: any
+    /// other key is refused with nothing staged, so a Response to the
+    /// destination still has no route.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    async fn staged_reply_endpoint_refuses_a_key_that_does_not_derive_the_destination() {
+        let router = test_router();
+        let dest = Keypair::generate().public_key().to_peer_id();
+        let other_key = Keypair::generate().public_key();
+
+        let refused = router.stage_reply_endpoint(
+            dest,
+            DeclaredReplyEndpoint {
+                pubkey: other_key,
+                address: "tcp://127.0.0.1:9".to_string(),
+            },
+        );
+        assert!(
+            matches!(refused, Err(meerkat_core::comms::SendError::Validation(_))),
+            "got {refused:?}"
+        );
+        let response = router
+            .send_with_id(dest, Uuid::new_v4(), response_kind("refused"), None)
+            .await;
+        assert!(
+            matches!(response, Err(SendError::PeerNotFound(peer)) if peer == dest),
+            "a refused staging leaves no endpoint behind, got {response:?}"
+        );
+    }
+
+    /// A send that fails to reach a staged endpoint puts it back, so a retry
+    /// dials it again instead of finding no route.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    async fn staged_reply_endpoint_is_restaged_after_a_failed_send() {
+        let router = test_router();
+        let sender_pubkey = Keypair::generate().public_key();
+        let dest = sender_pubkey.to_peer_id();
+        let closed = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a port to close");
+        let address = format!("tcp://{}", closed.local_addr().expect("listener addr"));
+        drop(closed);
+
+        router
+            .stage_reply_endpoint(
+                dest,
+                DeclaredReplyEndpoint {
+                    pubkey: sender_pubkey,
+                    address,
+                },
+            )
+            .expect("the destination's own key stages a reply endpoint");
+        for attempt in ["first", "retry"] {
+            let failed = router
+                .send_with_id(dest, Uuid::new_v4(), response_kind(attempt), None)
+                .await;
+            assert!(
+                matches!(
+                    failed,
+                    Err(SendError::PeerOffline | SendError::Transport(_) | SendError::Io(_))
+                ),
+                "the {attempt} send must dial the staged endpoint and fail to connect, got {failed:?}"
+            );
+        }
     }
 
     /// Trust-store entries are the send authority: when the destination is
@@ -2009,13 +2124,15 @@ mod tests {
                 false,
             )
             .expect("install trusted entry");
-        router.stage_reply_endpoint(
-            dest,
-            DeclaredReplyEndpoint {
-                pubkey: sender_pubkey,
-                address: staged_address,
-            },
-        );
+        router
+            .stage_reply_endpoint(
+                dest,
+                DeclaredReplyEndpoint {
+                    pubkey: sender_pubkey,
+                    address: staged_address,
+                },
+            )
+            .expect("the sender's own key stages a reply endpoint");
 
         router
             .send_with_id(dest, Uuid::new_v4(), response_kind("via-trust"), None)

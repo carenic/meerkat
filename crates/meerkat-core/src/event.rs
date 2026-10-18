@@ -302,7 +302,14 @@ pub enum AgentErrorReason {
         retry_after_ms: Option<u64>,
     },
     LlmContextExceeded {
+        /// The context limit the failure reported, in tokens: the model's
+        /// window or input ceiling, or 0 when a provider error named none.
         max: u32,
+        /// The token count the failure reported. A refusal before dispatch
+        /// reports the request's estimate, above `max`. After dispatch it is
+        /// the provider's count and can be at or below `max`: a response the
+        /// provider stopped because the window filled reports the call's own
+        /// tokens. Do not compute an overflow from `max` and `requested`.
         requested: u32,
     },
     LlmAuthError,

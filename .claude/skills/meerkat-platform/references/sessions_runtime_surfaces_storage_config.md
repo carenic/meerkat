@@ -199,6 +199,9 @@ rkat storage prune [--apply] [--older-than-days 30] [--json] [--root PATH]...
   model-loop iterations per run, and `0` stops before the first request.
 - `RKAT_WORKER_STACK_BYTES` overrides the 8 MiB host worker stack (minimum
   64 KiB) for stack-overflow diagnosis only.
+- `RKAT_WORKER_THREADS` sets the host's Tokio worker count (default: one per
+  available CPU; `TOKIO_WORKER_THREADS` is read when it is unset). Set it
+  below a container's pids limit, which counts threads.
 
 ## WorkGraph
 

@@ -1204,6 +1204,8 @@ fn mob_failure_class_for_delivery_reason(failure_reason: DeliveryFailureReason) 
         DeliveryFailureReason::RuntimeRejected => MobFailureClass::RuntimeRejected,
         DeliveryFailureReason::MobRejected => MobFailureClass::MobRejected,
         DeliveryFailureReason::TransportError => MobFailureClass::Transport,
+        // The host refused to run the schedule's work under its mandate.
+        DeliveryFailureReason::ScheduleMandateUnavailable => MobFailureClass::RuntimeRejected,
     }
 }
 

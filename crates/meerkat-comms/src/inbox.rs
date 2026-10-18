@@ -1830,6 +1830,18 @@ mod tests {
             self.delegate.resolve_peer_ingress_dequeue(facts)
         }
 
+        fn resolve_peer_response_sender(
+            &self,
+            corr_id: meerkat_core::PeerCorrelationId,
+            responder: meerkat_core::comms::PeerId,
+        ) -> Result<
+            meerkat_core::PeerResponseSenderVerdict,
+            meerkat_core::handles::DslTransitionError,
+        > {
+            self.delegate
+                .resolve_peer_response_sender(corr_id, responder)
+        }
+
         fn set_peer_ingress_context(
             &self,
             keep_alive: bool,

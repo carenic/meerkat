@@ -4,23 +4,28 @@
 //! with `Debug`, so a storage refusal at startup read
 //! `Error: Store(UnledgeredDomainObjects { domain: "session-store", .. })` and
 //! the remedy sentence that only the `Display` form carries was never shown.
-//! The binaries (`rkat-rpc`, `rkat-rest`, `rkat-mcp`) render through this
-//! module instead: the `Display` chain (the error, then each `source()`),
-//! every line prefixed with the binary name, and exit status 1.
+//! The binaries (`rkat-rpc`, `rkat-rest`, `rkat-mcp`, `rkat-mob-mcp`) render
+//! through this module instead: the `Display` chain (the error, then each
+//! `source()`), every line prefixed with the binary name, and exit status 1.
+//! When an [`std::io::Error`] of kind `WouldBlock` (EAGAIN) is in the chain,
+//! the OS refused a thread or process, and a last line says what usually
+//! causes that and which knob lowers the worker count
+//! ([`meerkat_runtime::host_stack::thread_limit_hint`]).
 
 use std::error::Error;
 use std::fmt;
 use std::process::ExitCode;
 
 /// `Display` chain of a fatal error, one line per link, each prefixed with
-/// `<binary>: `. Sources follow the head error as `caused by:` lines.
+/// `<binary>: `. Sources follow the head error as `caused by:` lines, and a
+/// refused thread or process spawn adds a `hint:` line.
 pub struct FatalErrorReport<'a> {
     binary: &'a str,
-    error: &'a dyn Error,
+    error: &'a (dyn Error + 'static),
 }
 
 impl<'a> FatalErrorReport<'a> {
-    pub fn new(binary: &'a str, error: &'a dyn Error) -> Self {
+    pub fn new(binary: &'a str, error: &'a (dyn Error + 'static)) -> Self {
         Self { binary, error }
     }
 }
@@ -33,13 +38,17 @@ impl fmt::Display for FatalErrorReport<'_> {
             write!(f, "\n{}: caused by: {cause}", self.binary)?;
             source = cause.source();
         }
+        let chain = std::iter::successors(Some(self.error), |&link| link.source());
+        if let Some(hint) = meerkat_runtime::host_stack::thread_limit_hint(chain) {
+            write!(f, "\n{}: {hint}", self.binary)?;
+        }
         Ok(())
     }
 }
 
 /// Print the `Display` chain of `error` to stderr and return the failure exit
 /// status (1), the same status a `Result`-returning `main` produced.
-pub fn report_fatal_error(binary: &str, error: &dyn Error) -> ExitCode {
+pub fn report_fatal_error(binary: &str, error: &(dyn Error + 'static)) -> ExitCode {
     eprintln!("{}", FatalErrorReport::new(binary, error));
     ExitCode::FAILURE
 }
@@ -96,6 +105,30 @@ mod tests {
             rendered,
             "rkat-rest: internal error: live host missing for --live-ws"
         );
+    }
+
+    #[test]
+    fn a_refused_thread_spawn_in_the_chain_adds_the_thread_limit_hint() {
+        #[derive(Debug, thiserror::Error)]
+        #[error("I/O error: {0}")]
+        struct Io(#[source] std::io::Error);
+
+        let err = Io(std::io::Error::from(std::io::ErrorKind::WouldBlock));
+        let rendered = FatalErrorReport::new("rkat-rpc", &err).to_string();
+        let lines: Vec<&str> = rendered.lines().collect();
+
+        assert_eq!(lines.len(), 3, "{rendered}");
+        assert_eq!(lines[0], format!("rkat-rpc: {err}"));
+        assert!(lines[1].starts_with("rkat-rpc: caused by: "), "{rendered}");
+        assert!(
+            lines[2].starts_with("rkat-rpc: hint: the OS refused a new thread or process"),
+            "{rendered}"
+        );
+        assert!(lines[2].contains("worker thread"), "{rendered}");
+
+        let other = Io(std::io::Error::other("disk says no"));
+        let rendered = FatalErrorReport::new("rkat-rpc", &other).to_string();
+        assert!(!rendered.contains("hint:"), "{rendered}");
     }
 
     #[test]

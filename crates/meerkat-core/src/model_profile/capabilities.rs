@@ -261,6 +261,12 @@ pub struct ModelCapabilities {
     // ── Reasoning ─────────────────────────────────────────────────────
     /// Thinking/reasoning support mode, provider-specific.
     pub thinking: ThinkingSupport,
+    /// Whether, and at which effort, the Anthropic API accepts
+    /// `thinking: {"type": "disabled"}` for this model: a per-row fact kept
+    /// apart from [`Self::thinking`]. `Refused` on every non-Anthropic row
+    /// and on any row whose provider documentation does not show it
+    /// accepted.
+    pub anthropic_disabled_thinking: AnthropicDisabledThinking,
     /// Whether the model supports explicit reasoning effort control
     /// (OpenAI's `reasoning.effort`, distinct from Anthropic `output_config.effort`).
     pub supports_reasoning: bool,
@@ -328,33 +334,38 @@ impl ModelCapabilities {
     ///
     /// Covers what the Anthropic lowering would actually send: the
     /// `thinking` type, the legacy flat `thinking_budget_tokens` (sent as
-    /// `enabled` when `thinking` is unset), `top_k`, and `between_tools` at
-    /// an effort above `high`. Generic `temperature` is not refused here: the
-    /// lowering omits it for models without temperature support.
+    /// `enabled` when `thinking` is unset), `top_k`, and a thinking type the
+    /// model accepts only at `high` effort or below (`between_tools`, and
+    /// `disabled` on some rows) with an effort above `high`. Generic
+    /// `temperature` is not refused here: the lowering omits it for models
+    /// without temperature support.
     pub fn anthropic_provider_tag_rejection(
         &self,
         tag: &crate::lifecycle::run_primitive::AnthropicProviderTag,
     ) -> Option<String> {
         use crate::lifecycle::run_primitive::{AnthropicEffort, AnthropicThinkingConfig};
         let model = self.id;
-        let accepted = || self.thinking.anthropic_thinking_wire_types().join(", ");
+        let accepted = || self.anthropic_thinking_wire_types().join(", ");
         match tag.thinking.as_ref() {
-            Some(thinking) if !self.thinking.accepts_anthropic_thinking(thinking) => {
+            Some(thinking) if !self.accepts_anthropic_thinking(thinking) => {
                 return Some(format!(
                     "Anthropic model '{model}' does not accept thinking type '{}'; accepted: [{}]",
                     thinking.wire_type(),
                     accepted()
                 ));
             }
-            Some(AnthropicThinkingConfig::BetweenTools)
-                if matches!(
-                    tag.effort,
-                    Some(AnthropicEffort::XHigh | AnthropicEffort::Max)
-                ) =>
+            Some(thinking)
+                if self.anthropic_thinking_capped_at_high_effort(thinking)
+                    && matches!(
+                        tag.effort,
+                        Some(AnthropicEffort::XHigh | AnthropicEffort::Max)
+                    ) =>
             {
                 return Some(format!(
-                    "Anthropic model '{model}' accepts thinking type 'between_tools' only at \
-                     'high' effort or below; use adaptive thinking for effort '{}'",
+                    "Anthropic model '{model}' accepts thinking type '{}' only at \
+                     'high' effort or below; lower the effort to 'high' or use adaptive \
+                     thinking for effort '{}'",
+                    thinking.wire_type(),
                     tag.effort
                         .map(AnthropicEffort::as_legacy_str)
                         .unwrap_or_default()
@@ -379,6 +390,53 @@ impl ModelCapabilities {
             return Some(format!("Anthropic model '{model}' does not accept top_k"));
         }
         None
+    }
+
+    /// Whether an Anthropic request may carry `thinking` = `config` for this
+    /// model at some effort: what [`Self::thinking`] admits, plus `disabled`
+    /// where [`Self::anthropic_disabled_thinking`] admits it.
+    pub fn accepts_anthropic_thinking(
+        &self,
+        config: &crate::lifecycle::run_primitive::AnthropicThinkingConfig,
+    ) -> bool {
+        use crate::lifecycle::run_primitive::AnthropicThinkingConfig as Thinking;
+        match config {
+            Thinking::Disabled => {
+                self.anthropic_disabled_thinking != AnthropicDisabledThinking::Refused
+            }
+            Thinking::Adaptive | Thinking::Enabled { .. } | Thinking::BetweenTools => {
+                self.thinking.accepts_anthropic_thinking(config)
+            }
+        }
+    }
+
+    /// Whether this model accepts thinking `config` only at `high` effort or
+    /// below, answering 400 for `xhigh` and `max`: `between_tools`, and
+    /// `disabled` on rows that record that ceiling.
+    pub fn anthropic_thinking_capped_at_high_effort(
+        &self,
+        config: &crate::lifecycle::run_primitive::AnthropicThinkingConfig,
+    ) -> bool {
+        use crate::lifecycle::run_primitive::AnthropicThinkingConfig as Thinking;
+        match config {
+            Thinking::BetweenTools => true,
+            Thinking::Disabled => {
+                self.anthropic_disabled_thinking == AnthropicDisabledThinking::AtOrBelowHighEffort
+            }
+            Thinking::Adaptive | Thinking::Enabled { .. } => false,
+        }
+    }
+
+    /// The Anthropic thinking `type` values this model accepts, for messages
+    /// and parameter schemas.
+    pub fn anthropic_thinking_wire_types(&self) -> Vec<&'static str> {
+        let mut types = self.thinking.anthropic_thinking_wire_types().to_vec();
+        if self.anthropic_disabled_thinking != AnthropicDisabledThinking::Refused {
+            types.push(
+                crate::lifecycle::run_primitive::AnthropicThinkingConfig::Disabled.wire_type(),
+            );
+        }
+        types
     }
 
     /// Why this Gemini row refuses the thinking level in `tag`, or `None`
@@ -491,7 +549,10 @@ pub enum ThinkingSupport {
 
 impl ThinkingSupport {
     /// Whether an Anthropic request may carry `thinking` = `config` for a
-    /// model with this support mode.
+    /// model with this support mode. `disabled` is a per-row fact
+    /// ([`ModelCapabilities::anthropic_disabled_thinking`]) that this
+    /// mode-level check never admits; use
+    /// [`ModelCapabilities::accepts_anthropic_thinking`] for a model.
     pub fn accepts_anthropic_thinking(
         self,
         config: &crate::lifecycle::run_primitive::AnthropicThinkingConfig,
@@ -518,6 +579,8 @@ impl ThinkingSupport {
     }
 
     /// The Anthropic thinking `type` values this mode accepts, for messages.
+    /// Leaves out `disabled`, a per-row fact; see
+    /// [`ModelCapabilities::anthropic_thinking_wire_types`].
     pub const fn anthropic_thinking_wire_types(self) -> &'static [&'static str] {
         match self {
             Self::AnthropicEnabledOnly => &["enabled"],
@@ -527,6 +590,23 @@ impl ThinkingSupport {
             Self::None | Self::GeminiThinkingLevel => &[],
         }
     }
+}
+
+/// Whether an Anthropic model accepts `thinking: {"type": "disabled"}`, and
+/// at which effort. Recorded per catalog row from the provider's per-model
+/// thinking table; a row the documentation does not cover stays `Refused`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnthropicDisabledThinking {
+    /// `disabled` returns 400: thinking cannot be turned off, or the row is
+    /// not an Anthropic model.
+    Refused,
+    /// `disabled` is accepted at `high` effort or below; with `xhigh` or
+    /// `max` it returns 400. A request that sets no effort runs at the
+    /// model's default, so a row records this only when that default is
+    /// `high` or below.
+    AtOrBelowHighEffort,
+    /// `disabled` is accepted at every effort the model supports.
+    AnyEffort,
 }
 
 /// Reasoning/effort control level, the shared typed vocabulary behind both
@@ -703,5 +783,105 @@ mod tests {
                 .gemini_provider_tag_rejection(&flat(GeminiThinkingLevel::Minimal))
                 .is_none()
         );
+    }
+
+    #[test]
+    fn anthropic_disabled_thinking_follows_the_row_and_its_effort_ceiling() {
+        use crate::lifecycle::run_primitive::{
+            AnthropicEffort, AnthropicProviderTag, AnthropicThinkingConfig,
+        };
+        use crate::model_profile::test_catalog::{ANTHROPIC_MODEL, TEST_CATALOG};
+        let row = *TEST_CATALOG
+            .capabilities_for(crate::Provider::Anthropic, ANTHROPIC_MODEL)
+            .expect("test Anthropic row");
+        let with = |disabled| ModelCapabilities {
+            anthropic_disabled_thinking: disabled,
+            ..row
+        };
+        let disabled_at = |effort| AnthropicProviderTag {
+            thinking: Some(AnthropicThinkingConfig::Disabled),
+            effort,
+            ..Default::default()
+        };
+        let every_effort = [
+            None,
+            Some(AnthropicEffort::Low),
+            Some(AnthropicEffort::Medium),
+            Some(AnthropicEffort::High),
+            Some(AnthropicEffort::XHigh),
+            Some(AnthropicEffort::Max),
+        ];
+
+        let refused = with(AnthropicDisabledThinking::Refused);
+        for effort in every_effort {
+            let refusal = refused
+                .anthropic_provider_tag_rejection(&disabled_at(effort))
+                .expect("a refusing row refuses disabled at every effort");
+            assert!(
+                refusal.contains("does not accept thinking type 'disabled'; accepted: [adaptive]"),
+                "{refusal}"
+            );
+        }
+        assert_eq!(refused.anthropic_thinking_wire_types(), ["adaptive"]);
+
+        let capped = with(AnthropicDisabledThinking::AtOrBelowHighEffort);
+        for effort in &every_effort[..4] {
+            assert_eq!(
+                capped.anthropic_provider_tag_rejection(&disabled_at(*effort)),
+                None,
+                "{effort:?}"
+            );
+        }
+        for effort in [AnthropicEffort::XHigh, AnthropicEffort::Max] {
+            let refusal = capped
+                .anthropic_provider_tag_rejection(&disabled_at(Some(effort)))
+                .expect("disabled above high effort is refused");
+            assert!(
+                refusal.contains("accepts thinking type 'disabled' only at 'high' effort or below"),
+                "{refusal}"
+            );
+            assert!(
+                refusal.contains(&format!(
+                    "lower the effort to 'high' or use adaptive thinking for effort '{}'",
+                    effort.as_legacy_str()
+                )),
+                "{refusal}"
+            );
+        }
+        assert_eq!(
+            capped.anthropic_thinking_wire_types(),
+            ["adaptive", "disabled"]
+        );
+
+        let any = with(AnthropicDisabledThinking::AnyEffort);
+        for effort in every_effort {
+            assert_eq!(
+                any.anthropic_provider_tag_rejection(&disabled_at(effort)),
+                None,
+                "{effort:?}"
+            );
+        }
+        assert!(!any.anthropic_thinking_capped_at_high_effort(&AnthropicThinkingConfig::Disabled));
+        // The mode-level check never admits disabled; the row does.
+        assert!(
+            !any.thinking
+                .accepts_anthropic_thinking(&AnthropicThinkingConfig::Disabled)
+        );
+        assert!(any.accepts_anthropic_thinking(&AnthropicThinkingConfig::Disabled));
+        // Disabled thinking changes nothing for the other thinking types.
+        for disabled in [
+            AnthropicDisabledThinking::Refused,
+            AnthropicDisabledThinking::AtOrBelowHighEffort,
+            AnthropicDisabledThinking::AnyEffort,
+        ] {
+            let caps = with(disabled);
+            assert!(caps.accepts_anthropic_thinking(&AnthropicThinkingConfig::Adaptive));
+            assert!(!caps.accepts_anthropic_thinking(&AnthropicThinkingConfig::BetweenTools));
+            assert!(
+                !caps.accepts_anthropic_thinking(&AnthropicThinkingConfig::Enabled {
+                    budget_tokens: 1024
+                })
+            );
+        }
     }
 }

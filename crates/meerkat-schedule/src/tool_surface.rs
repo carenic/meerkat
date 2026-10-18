@@ -6,7 +6,8 @@ use meerkat_core::error::ToolError;
 use meerkat_core::types::{ToolCallView, ToolDef, ToolProvenance, ToolResult, ToolSourceKind};
 use serde_json::Value;
 
-use crate::{ScheduleService, handle_schedule_tools_call, schedule_tools_list};
+use crate::tools::run_schedule_tools_call;
+use crate::{ScheduleService, schedule_tools_list};
 
 /// Reusable tool dispatcher that exposes the built-in schedule tool surface.
 pub struct ScheduleToolSurface {
@@ -51,10 +52,17 @@ impl AgentToolDispatcher for ScheduleToolSurface {
                 format!("invalid schedule tool-call arguments JSON: {error}"),
             )
         })?;
-        let result = handle_schedule_tools_call(&self.service, call.name, &args)
+        let result = run_schedule_tools_call(&self.service, call.name, &args)
             .await
-            .map_err(|error| ToolError::ExecutionFailed {
-                message: format!("{} (code {})", error.message, error.code),
+            .map_err(|failure| {
+                failure
+                    .unavailable_tool_error(call.name)
+                    .unwrap_or_else(|| {
+                        let error = failure.into_wire_error();
+                        ToolError::ExecutionFailed {
+                            message: format!("{} (code {})", error.message, error.code),
+                        }
+                    })
             })?;
         Ok(ToolResult::new(call.id.to_string(), result.to_string(), false).into())
     }

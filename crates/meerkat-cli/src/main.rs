@@ -39,7 +39,7 @@ use meerkat::surface::{
     spawn_schedule_host,
 };
 use meerkat::{
-    AgentFactory, EphemeralSessionService, FactoryAgentBuilder, PersistenceBundle, ScheduleService,
+    AgentFactory, EphemeralSessionService, FactoryAgentBuilder, PersistenceBundle,
     ScheduleToolDispatcher,
 };
 use meerkat_contracts::{SessionLocator, SessionLocatorError, format_session_ref};
@@ -531,11 +531,7 @@ fn open_html_artifact_in_browser(
     // cannot reach. Under confinement the opener, and every program it
     // starts by name, come from a `PATH` without the directories a confined
     // process could change.
-    match untrusted {
-        Some(untrusted) => meerkat::open_system_browser_trusting(&url, untrusted),
-        None => meerkat::open_system_browser(&url),
-    }
-    .map_err(|e| e.to_string())
+    meerkat::open_system_browser_guarded(&url, untrusted).map_err(|e| e.to_string())
 }
 
 async fn print_completed_run_result(
@@ -2661,8 +2657,8 @@ fn read_connector_client_secret(
     use std::io::IsTerminal;
     let stdin = std::io::stdin();
     let terminal = stdin.is_terminal();
-    // A host launch exemption: `stty`, by absolute path, sets the mode of the
-    // operator's own terminal.
+    // A host launch exemption: `stty` (by absolute path, else from the
+    // trusted `PATH`) sets the mode of the operator's own terminal.
     #[cfg(unix)]
     let echo_off = terminal
         && meerkat_core::HostLaunchExemption::terminal_control(untrusted)
@@ -3532,6 +3528,18 @@ enum McpCommands {
         #[arg(long, value_name = "ACCOUNT_ID")]
         oauth_account: Option<String>,
 
+        /// OAuth account binding without an --oauth-account (streamable HTTP
+        /// only): discover binds the account the provider verifies at the
+        /// first login, unverified is resource-bound access with no account
+        /// evidence
+        #[arg(
+            long,
+            value_enum,
+            value_name = "MODE",
+            conflicts_with = "oauth_account"
+        )]
+        oauth_account_selection: Option<CliOAuthAccountSelection>,
+
         /// Environment variable (KEY=VALUE). Can be repeated. (for stdio transport)
         #[arg(short = 'e', long = "env", value_name = "KEY=VALUE")]
         env: Vec<String>,
@@ -4221,6 +4229,26 @@ impl From<CliMcpScope> for meerkat_core::McpServerSource {
     }
 }
 
+/// `rkat mcp add --oauth-account-selection` (maps to McpOAuthAccountSelection)
+#[cfg(feature = "mcp")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum CliOAuthAccountSelection {
+    /// Bind the account the provider verifies at the first login
+    Discover,
+    /// Resource-bound access with no account evidence; no account is verified
+    Unverified,
+}
+
+#[cfg(feature = "mcp")]
+impl From<CliOAuthAccountSelection> for meerkat_core::mcp_config::McpOAuthAccountSelection {
+    fn from(selection: CliOAuthAccountSelection) -> Self {
+        match selection {
+            CliOAuthAccountSelection::Discover => Self::Discover,
+            CliOAuthAccountSelection::Unverified => Self::Unverified,
+        }
+    }
+}
+
 fn cli_enables_verbose_tracing(cli: &Cli) -> bool {
     matches!(&cli.command, Some(Commands::Run { verbose: true, .. }))
 }
@@ -4248,6 +4276,16 @@ fn main() -> anyhow::Result<ExitCode> {
     // future runs on a budgeted thread too, not the platform main thread
     // (1 MiB on Windows).
     match meerkat_runtime::host_stack::run_host("rkat", cli_main) {
+        // A refused thread or process spawn: the report a returned error
+        // gets (`Error: {:?}`, status 1), then what usually causes it.
+        Ok(Err(err)) => match meerkat_runtime::host_stack::thread_limit_hint(err.chain()) {
+            Some(hint) => {
+                eprintln!("Error: {err:?}");
+                eprintln!("rkat: {hint}");
+                Ok(ExitCode::FAILURE)
+            }
+            None => Err(err),
+        },
         Ok(result) => result,
         Err(err) => {
             eprintln!("rkat: {err}");
@@ -8676,11 +8714,9 @@ async fn interactive_login(
     // The opener, and every program it starts by name, come from a `PATH`
     // without the directories this host's confined processes could change.
     let untrusted = cli_scope_launch_guard(scope).await;
-    let browser_ok =
-        launch_provider_authorize_url(&login_start.authorize_url, |url| match &untrusted {
-            Some(untrusted) => meerkat::open_system_browser_trusting(url, untrusted.as_ref()),
-            None => meerkat::open_system_browser(url),
-        });
+    let browser_ok = launch_provider_authorize_url(&login_start.authorize_url, |url| {
+        meerkat::open_system_browser_guarded(url, untrusted.as_deref())
+    });
     if browser_ok {
         print_ok("Browser launched. Complete the sign-in there.");
     } else {
@@ -11222,7 +11258,9 @@ impl meerkat_mcp::McpAuthResolver for CliMcpHostAuthResolver {
         www_authenticate: Option<&str>,
     ) -> Result<String, meerkat::McpOAuthError> {
         use std::io::IsTerminal;
-        if target.expected_account().is_none() {
+        // Any selection (Known, Discover or Unverified) logs in, exactly as
+        // `rkat mcp login` does; only an unselected server is refused.
+        if !target.is_selected() {
             return Err(meerkat::McpOAuthError::AccountSelectionRequired);
         }
         if self.mode != CliMcpAuthMode::Interactive || !std::io::stderr().is_terminal() {
@@ -11230,7 +11268,7 @@ impl meerkat_mcp::McpAuthResolver for CliMcpHostAuthResolver {
                 server_name: target.server_name().to_owned(),
             });
         }
-        cli_mcp_browser_login(
+        let completed = cli_mcp_browser_login(
             &self.service,
             target,
             www_authenticate,
@@ -11244,6 +11282,8 @@ impl meerkat_mcp::McpAuthResolver for CliMcpHostAuthResolver {
                 reason: other.to_string(),
             },
         })?;
+        // The same line `rkat mcp login` prints, on stderr beside the run.
+        eprintln!("{}", mcp_login_outcome(target, &completed));
         self.authority.require_stored_bearer_token(target).await
     }
 
@@ -11282,22 +11322,17 @@ async fn cli_mcp_browser_login(
     www_authenticate: Option<&str>,
     untrusted: Option<Arc<meerkat_core::confinement::UntrustedPathFn>>,
 ) -> Result<meerkat::McpOAuthLoginComplete, meerkat::HostAuthError> {
-    cli_mcp_browser_login_with(
-        service,
-        target,
-        www_authenticate,
-        move |url| match &untrusted {
-            Some(untrusted) => meerkat::open_system_browser_trusting(&url, untrusted.as_ref()),
-            None => meerkat::open_system_browser(&url),
-        },
-    )
+    cli_mcp_browser_login_with(service, target, www_authenticate, move |url| {
+        meerkat::open_system_browser_guarded(&url, untrusted.as_deref())
+    })
     .await
 }
 
 /// Open a provider's authorize URL in the user's browser through `launch`.
-/// Production passes [`meerkat::open_system_browser_trusting`], which never
-/// logs: the URL carries the one-time `state` and the PKCE challenge, and
-/// `webbrowser::open` logged the spawned command (URL included) at debug.
+/// Production passes [`meerkat::open_system_browser_guarded`] with the host's
+/// launch guard, which never logs: the URL carries the one-time `state` and
+/// the PKCE challenge, and `webbrowser::open` logged the spawned command (URL
+/// included) at debug.
 /// The launcher runs on the caller's thread, so a test capturing this
 /// thread's logs sees everything it emits.
 #[cfg(any(
@@ -11556,6 +11591,7 @@ async fn create_mcp_tools(
     mcp_auth: CliMcpAuthMode,
     external_surface_handle: Option<Arc<dyn meerkat_core::ExternalToolSurfaceHandle>>,
     stdio_profile: CliMcpStdioProfile,
+    owner: Option<&CliMcpRouterOwner>,
 ) -> anyhow::Result<Option<McpRouterAdapter>> {
     use meerkat_core::mcp_config::{McpConfig, McpScope, McpServerSource};
     use meerkat_mcp::{McpConnection, McpRouter};
@@ -11566,6 +11602,7 @@ async fn create_mcp_tools(
     let CliMcpStdioProfile {
         profile: stdio_profile,
         host_confinement,
+        attempt_guards,
     } = stdio_profile;
     let effective = McpConfig::effective_servers_from_roots_trusting(
         realm_servers,
@@ -11634,6 +11671,17 @@ async fn create_mcp_tools(
         stdio_profile,
     )
     .with_mcp_auth(mcp_auth.into(), mcp_auth_resolver);
+    // A guarded factory's attempt guards guard this router too, for the
+    // session it serves.
+    if let Some(guards) = attempt_guards {
+        let Some(owner) = owner else {
+            anyhow::bail!("MCP attempt guards require the session the router serves");
+        };
+        router = router.with_attempt_guards(
+            guards,
+            meerkat::McpConstructionOwner::new(owner.session_id.clone(), owner.member.clone()),
+        );
+    }
     for s in &servers_with_scope {
         tracing::info!("Staging MCP server: {}", s.server.name);
         router
@@ -11761,6 +11809,7 @@ async fn load_mcp_external_tools(
     mcp_auth: CliMcpAuthMode,
     external_surface_handle: Option<Arc<dyn meerkat_core::ExternalToolSurfaceHandle>>,
     stdio_profile: CliMcpStdioProfile,
+    owner: Option<&CliMcpRouterOwner>,
 ) -> anyhow::Result<(
     Option<Arc<dyn AgentToolDispatcher>>,
     Option<Arc<McpRouterAdapter>>,
@@ -11774,6 +11823,7 @@ async fn load_mcp_external_tools(
             mcp_auth,
             external_surface_handle,
             stdio_profile,
+            owner,
         )
         .await
         {
@@ -11796,6 +11846,7 @@ async fn load_mcp_external_tools(
         let _ = mcp_auth;
         let _ = external_surface_handle;
         let _ = stdio_profile;
+        let _ = owner;
         Ok((None, None))
     }
 }
@@ -11803,14 +11854,42 @@ async fn load_mcp_external_tools(
 #[cfg(not(feature = "mcp"))]
 type McpRouterAdapter = ();
 
-/// The local MCP launch boundary of a CLI factory and the host confinement
-/// that decides which `mcp.toml` files it trusts, for the routers the CLI
-/// builds itself (the `rkat run` loader).
+/// The session a CLI-built MCP router serves, and its mob member when it is
+/// one: the owner the factory's attempt guards are scoped to.
+#[cfg_attr(not(feature = "mcp"), allow(dead_code))]
+struct CliMcpRouterOwner {
+    session_id: SessionId,
+    member: Option<meerkat_core::MobMemberBinding>,
+}
+
+impl CliMcpRouterOwner {
+    /// A session `rkat run` creates: never a mob member.
+    fn fresh(session_id: &SessionId) -> Self {
+        Self {
+            session_id: session_id.clone(),
+            member: None,
+        }
+    }
+
+    /// A resumed session keeps its persisted mob member, as the factory
+    /// adopts it for the session's own routers.
+    fn resumed(session_id: &SessionId, metadata: &meerkat_core::SessionMetadata) -> Self {
+        Self {
+            session_id: session_id.clone(),
+            member: metadata.mob_member_binding.clone(),
+        }
+    }
+}
+
+/// The local MCP launch boundary of a CLI factory, the host confinement that
+/// decides which `mcp.toml` files it trusts, and its MCP attempt guards, for
+/// the routers the CLI builds itself (the `rkat run` loader).
 #[cfg(feature = "mcp")]
 #[derive(Clone)]
 struct CliMcpStdioProfile {
     profile: meerkat::McpStdioLaunchProfile,
     host_confinement: meerkat::HostConfinement,
+    attempt_guards: Option<meerkat::McpAttemptGuards>,
 }
 #[cfg(not(feature = "mcp"))]
 type CliMcpStdioProfile = ();
@@ -11823,6 +11902,7 @@ fn cli_mcp_stdio_profile(factory: &AgentFactory) -> CliMcpStdioProfile {
     CliMcpStdioProfile {
         profile: factory.mcp_stdio_launch_profile().clone(),
         host_confinement: factory.host_confinement().cloned().unwrap_or_default(),
+        attempt_guards: factory.mcp_attempt_guards().cloned(),
     }
 }
 
@@ -14254,7 +14334,7 @@ async fn run_agent(
         // surface. CLI one-shots must leave the runtime snapshot as durable
         // authority so shared RPC/REST realms can read them without trusting
         // the compatibility SessionStore projection.
-        let schedule_service = ScheduleService::new(persistence.schedule_store());
+        let schedule_service = persistence.schedule_service();
         let default_schedule_tools =
             Some(Arc::new(ScheduleToolDispatcher::new(schedule_service))
                 as Arc<dyn AgentToolDispatcher>);
@@ -14338,6 +14418,7 @@ async fn run_agent(
                 mcp_auth,
                 Some(Arc::clone(bindings.external_tool_surface())),
                 mcp_stdio_profile,
+                Some(&CliMcpRouterOwner::fresh(&session_id)),
             )
             .await?
         };
@@ -15067,7 +15148,7 @@ async fn resume_session_with_llm_override(
         // resumed session would accept the call, commit the request, and never
         // realize it. Routing through the shared CLI builder is what keeps
         // resume identical to a fresh run.
-        let schedule_service = ScheduleService::new(persistence.schedule_store());
+        let schedule_service = persistence.schedule_service();
         let default_schedule_tools =
             Some(Arc::new(ScheduleToolDispatcher::new(schedule_service))
                 as Arc<dyn AgentToolDispatcher>);
@@ -15138,6 +15219,7 @@ async fn resume_session_with_llm_override(
                 mcp_auth,
                 Some(Arc::clone(resume_bindings.external_tool_surface())),
                 mcp_stdio_profile,
+                Some(&CliMcpRouterOwner::resumed(&session_id, &stored_metadata)),
             )
             .await?
         };
@@ -15585,7 +15667,7 @@ async fn get_or_create_cli_persistent_surface_from_bundle(
     }
     let factory = with_cli_confinement(factory, &config, scope, &project_root)?;
 
-    let schedule_service = ScheduleService::new(persistence.schedule_store());
+    let schedule_service = persistence.schedule_service();
     let default_schedule_tools = Some(Arc::new(ScheduleToolDispatcher::new(
         schedule_service.clone(),
     )) as Arc<dyn AgentToolDispatcher>);
@@ -18429,6 +18511,7 @@ async fn handle_mcp_command(command: McpCommands, cli_scope: &RuntimeScope) -> a
             url,
             headers,
             oauth_account,
+            oauth_account_selection,
             env,
             expected_generation,
             allowed_operations,
@@ -18446,6 +18529,7 @@ async fn handle_mcp_command(command: McpCommands, cli_scope: &RuntimeScope) -> a
                 positional_url,
                 headers,
                 oauth_account,
+                oauth_account_selection: oauth_account_selection.map(Into::into),
                 command,
                 env,
                 allowed_operations,
@@ -18727,6 +18811,185 @@ fn require_mcp_login_terminal(allow_headless: bool, is_terminal: bool) -> anyhow
     )
 }
 
+/// What a refused `rkat mcp login` names: the server, the scope that
+/// configures it and its URL, so each remedy is a command to run as shown.
+#[cfg(feature = "mcp")]
+struct McpLoginRemedy<'a> {
+    server: &'a str,
+    scope: meerkat_core::McpServerSource,
+    url: &'a str,
+}
+
+/// `value` as one POSIX shell word: single-quoted, each `'` closed, escaped
+/// and reopened, so a printed command pastes as shown into sh, bash or zsh.
+#[cfg(feature = "mcp")]
+fn shell_word(value: &str) -> String {
+    format!("'{}'", value.replace('\'', r"'\''"))
+}
+
+/// How an MCP credential this login may not replace is removed: there is no
+/// `rkat` command for it.
+#[cfg(feature = "mcp")]
+const MCP_DISCONNECT_ROUTE: &str = "`rkat` has no disconnect command: use the RPC `auth/logout` method with this MCP target in the same realm (`rkat-rpc`), or the SDK helpers `auth_mcp_logout` (Python) or `authMcpLogout` (TypeScript)";
+
+#[cfg(feature = "mcp")]
+impl McpLoginRemedy<'_> {
+    fn login(&self) -> String {
+        format!(
+            "rkat mcp login {} --scope {}",
+            shell_word(self.server),
+            self.scope
+        )
+    }
+
+    fn remove(&self) -> String {
+        format!(
+            "rkat mcp remove {} --scope {}",
+            shell_word(self.server),
+            self.scope
+        )
+    }
+
+    fn add(&self, selection: &str) -> String {
+        format!(
+            "rkat mcp add {} --scope {} --url {} {selection}",
+            shell_word(self.server),
+            self.scope,
+            shell_word(self.url)
+        )
+    }
+
+    /// The server names no account selection, so no login can bind its
+    /// credential to an account.
+    fn missing_selection(&self) -> String {
+        format!(
+            "MCP server '{server}' has no OAuth account selection, so `rkat mcp login` cannot bind its credential to an account. Add it again with one (`{remove}` first; repeat any other options):\n  --oauth-account-selection discover    bind the account the provider verifies at the first login (needs OpenID Connect UserInfo)\n  --oauth-account <SUBJECT_ID>          the provider subject ID the login must prove (not an email or display name)\n  --oauth-account-selection unverified  resource-bound access with no account evidence\nFor example: {example}",
+            server = self.server,
+            remove = self.remove(),
+            example = self.add("--oauth-account-selection discover"),
+        )
+    }
+
+    /// A Known or Discover selection found no account evidence it can
+    /// verify. The refusal does not say why (no UserInfo, an unreachable
+    /// issuer or no usable egress client are one typed reason), so a retry
+    /// comes first; unverified is named as the deliberate alternative,
+    /// never taken.
+    fn no_account_evidence(&self, known: bool) -> String {
+        let outcome = if known {
+            "Its --oauth-account subject cannot be verified; no credential was stored."
+        } else {
+            "Its `discover` selection cannot bind an account; no credential was stored."
+        };
+        format!(
+            "MCP server '{server}' gave no account evidence this host can verify: its authorization server publishes no usable OpenID Connect UserInfo endpoint, or it could not be reached.\n{outcome}\nIf the authorization server could not be reached or failed temporarily, retry first:\n  {login}\nIf it publishes no OpenID Connect UserInfo and resource-bound access without account evidence is acceptable for this server, select it deliberately:\n  {remove}\n  {add}\nAn unverified credential is bound to the server, issuer and client only: no account is verified, stored or reported, and it acts as whichever account signs in.",
+            server = self.server,
+            login = self.login(),
+            remove = self.remove(),
+            add = self.add("--oauth-account-selection unverified"),
+        )
+    }
+
+    /// The signed-in account is not the one the selection requires.
+    fn account_mismatch(&self, known: bool) -> String {
+        if known {
+            format!(
+                "The account signed in for MCP server '{}' is not the subject its --oauth-account names; no credential was stored. Sign in with that account, or add the server again with the right subject ID.",
+                self.server
+            )
+        } else {
+            format!(
+                "The account signed in for MCP server '{}' is not the account its credential is bound to; no credential was stored. Sign in with that account. To bind another account, disconnect the stored credential first, then log in again. {MCP_DISCONNECT_ROUTE}.",
+                self.server
+            )
+        }
+    }
+
+    /// The server's credential slot holds a credential this login may not
+    /// replace.
+    fn disconnect_required(&self) -> String {
+        format!(
+            "MCP server '{}' already has a credential this login cannot replace; disconnect it first. It holds another account, another authorization server or client, or an unverified credential, and this login stored nothing. {MCP_DISCONNECT_ROUTE}, then log in again.",
+            self.server
+        )
+    }
+
+    /// `error` as the operator sees it: a refusal they can act on names
+    /// this server and its remedy, with the typed error kept in the chain;
+    /// anything else keeps its own text.
+    fn failure(
+        &self,
+        target: &meerkat::McpServerIdentity,
+        error: meerkat::HostAuthError,
+    ) -> anyhow::Error {
+        use meerkat_auth_core::McpAccountSelection;
+        use meerkat_auth_core::connector_oauth::ConnectorOAuthRefusal;
+        let known = match target.selection() {
+            McpAccountSelection::Known(_) => Some(true),
+            McpAccountSelection::Discover => Some(false),
+            McpAccountSelection::Legacy | McpAccountSelection::Unverified => None,
+        };
+        let message = match (&error, known) {
+            (
+                meerkat::HostAuthError::McpOAuth(meerkat::McpOAuthError::AccountSelectionRequired),
+                _,
+            ) => Some(self.missing_selection()),
+            (
+                meerkat::HostAuthError::McpOAuth(meerkat::McpOAuthError::DisconnectRequired {
+                    ..
+                }),
+                _,
+            ) => Some(self.disconnect_required()),
+            (
+                meerkat::HostAuthError::McpOAuth(meerkat::McpOAuthError::Verification(
+                    ConnectorOAuthRefusal::VerificationUnavailable,
+                )),
+                Some(known),
+            ) => Some(self.no_account_evidence(known)),
+            (
+                meerkat::HostAuthError::McpOAuth(meerkat::McpOAuthError::Verification(
+                    ConnectorOAuthRefusal::AccountMismatch,
+                )),
+                Some(known),
+            ) => Some(self.account_mismatch(known)),
+            _ => None,
+        };
+        match message {
+            Some(message) => exit_status::typed_failure(error, |_| message),
+            None => anyhow::anyhow!("{error}"),
+        }
+    }
+}
+
+/// The one line a completed MCP login reports, for `rkat mcp login` and an
+/// in-session login alike: the account it bound, or that the credential
+/// carries no account verification.
+#[cfg(feature = "mcp")]
+fn mcp_login_outcome(
+    target: &meerkat::McpServerIdentity,
+    completed: &meerkat::McpOAuthLoginComplete,
+) -> String {
+    let logged_in = format!(
+        "Logged in MCP server '{}' ({})",
+        target.server_name(),
+        target.server_url()
+    );
+    if completed.account_verification
+        == meerkat_auth_core::connector_oauth::AccountVerification::Unverified
+    {
+        return format!(
+            "{logged_in} without account verification (unverified, resource-bound access)"
+        );
+    }
+    match (completed.account_id.as_deref(), target.selection()) {
+        (Some(account), meerkat_auth_core::McpAccountSelection::Discover) => {
+            format!("{logged_in} as {account} (bound by discovery)")
+        }
+        (Some(account), _) => format!("{logged_in} as {account}"),
+        (None, _) => logged_in,
+    }
+}
+
 #[cfg(feature = "mcp")]
 async fn login_mcp_server(
     name: String,
@@ -18747,11 +19010,8 @@ async fn login_mcp_server(
             "MCP server '{name}' exists in multiple scopes. Specify --scope user, --scope project or --scope realm."
         );
     }
-    let server = servers
-        .into_iter()
-        .next()
-        .expect("non-empty checked")
-        .server;
+    let meerkat_core::McpServerWithSource { server, source } =
+        servers.into_iter().next().expect("non-empty checked");
     let McpTransportConfig::Http(http) = &server.transport else {
         anyhow::bail!("MCP OAuth login supports streamable HTTP servers only");
     };
@@ -18769,8 +19029,21 @@ async fn login_mcp_server(
         );
     }
 
-    let service = open_cli_mcp_host_auth_service(cli_scope)?;
+    let remedy = McpLoginRemedy {
+        server: &server.name,
+        scope: source,
+        url: &http.url,
+    };
     let target = meerkat::McpServerIdentity::from_config(&server)?;
+    // Refused before any credential store or network effect: only host
+    // configuration selects the account binding.
+    if !target.is_selected() {
+        return Err(exit_status::typed_failure(
+            meerkat::McpOAuthError::AccountSelectionRequired,
+            |_| remedy.missing_selection(),
+        ));
+    }
+    let service = open_cli_mcp_host_auth_service(cli_scope)?;
     service
         .mcp_oauth_authority()?
         .validate_interactive_selection(&target)?;
@@ -18782,14 +19055,8 @@ async fn login_mcp_server(
         cli_scope_launch_guard(cli_scope).await,
     )
     .await
-    .map_err(|error| anyhow::anyhow!("{error}"))?;
-    match completed.account_id.as_deref() {
-        Some(account) => println!(
-            "Logged in MCP server '{}' ({}) as {account}",
-            server.name, http.url
-        ),
-        None => println!("Logged in MCP server '{}' ({})", server.name, http.url),
-    }
+    .map_err(|error| remedy.failure(&target, error))?;
+    println!("{}", mcp_login_outcome(&target, &completed));
     Ok(())
 }
 
@@ -21084,13 +21351,14 @@ async fn execute_mob_run_pack(
 
     let params = parse_mob_run_params(invocation.raw_params, invocation.prompt)?;
     validate_mobpack_input_params(&archive, &params)?;
-    let mut effective_config = load_deploy_runtime_config(scope, CliOverrides::default()).await?;
-    apply_pack_deploy_policy(
-        &mut effective_config,
+    let mut effective_config = load_deploy_realm_config(scope).await?;
+    let layers = DeployConfigLayers::resolve(
         &archive.manifest,
         &archive.deploy_policy,
         DeploySurfaceArg::Cli,
+        CliOverrides::default(),
     )?;
+    meerkat::HostConfigLayer::apply(&layers, &mut effective_config);
     let flow_id = choose_mobpack_flow(&archive, invocation.flow)?;
     if invocation.detach && flow_id.is_none() {
         // Refuse before the durable mob-create side effect below.
@@ -21315,13 +21583,14 @@ async fn execute_mob_deploy_internal(
     .await?;
     validate_required_capabilities(&archive.manifest, &runtime_capabilities(invocation.surface))
         .map_err(|err| anyhow::anyhow!("mob deploy failed: {err}"))?;
-    let mut effective_config = load_deploy_runtime_config(scope, invocation.cli_overrides).await?;
-    apply_pack_deploy_policy(
-        &mut effective_config,
+    let mut effective_config = load_deploy_realm_config(scope).await?;
+    let layers = DeployConfigLayers::resolve(
         &archive.manifest,
         &archive.deploy_policy,
         invocation.surface,
+        invocation.cli_overrides,
     )?;
+    meerkat::HostConfigLayer::apply(&layers, &mut effective_config);
     if let Some(observer) = invocation.config_observer.as_ref() {
         observer(&effective_config);
     }
@@ -21341,6 +21610,7 @@ async fn execute_mob_deploy_internal(
             let result = Box::pin(run_rpc_surface(
                 scope,
                 effective_config,
+                layers,
                 &archive,
                 prompt,
                 reader,
@@ -21483,19 +21753,14 @@ fn read_config_trust_policy(scope: &RuntimeScope) -> anyhow::Result<Option<Trust
         .map(Some)
 }
 
-/// Build the operator-owned deploy config: realm config file, then environment
-/// secrets, then CLI overrides.
+/// Compose the realm config a mobpack deploy builds on: the head realm's own
+/// document, then its parent chain and the implicit `global` tail, then
+/// environment secrets.
 ///
-/// The pack contributes nothing here. Pack-authored deploy defaults are applied
-/// separately and only through the typed, capability-gated
-/// [`meerkat_mob_pack::deploy_policy::MobpackDeployPolicy`] layered *after* this
-/// config (see [`apply_pack_deploy_policy`]). A pack may never override
-/// operator-owned realm/env/CLI truth or set out-of-allow-list fields.
+/// The deploy's own settings are not applied here: [`DeployConfigLayers`]
+/// layers the deploy flags and the pack's deploy defaults over this config.
 #[cfg(feature = "mob")]
-async fn load_deploy_runtime_config(
-    scope: &RuntimeScope,
-    cli_overrides: CliOverrides,
-) -> anyhow::Result<Config> {
+async fn load_deploy_realm_config(scope: &RuntimeScope) -> anyhow::Result<Config> {
     // A direct `rkat mob run/deploy` can be the first credential-reading
     // command after an upgrade. Finish the dev->global compatibility bootstrap
     // before composing the global config tail used by member builds.
@@ -21531,110 +21796,139 @@ async fn load_deploy_runtime_config(
     config
         .apply_env_overrides()
         .map_err(|err| anyhow::anyhow!("failed applying env overrides: {err}"))?;
-    config.apply_cli_overrides(cli_overrides);
     Ok(config)
 }
 
-/// Resolve a pack's typed deploy policy through the same capability allow-list
-/// as the manifest `[requires]` gate, then apply only the validated
-/// allow-listed knobs onto `config`.
+/// The settings a mobpack deploy layers over the realm's composed config, in
+/// the one order every deploy surface applies them: the operator's deploy
+/// flags, then the pack's deploy defaults.
 ///
-/// `config` already carries realm/env/CLI truth, so the pack contributes deploy
-/// *defaults* over operator config without ever overriding it: only fields a
-/// realm config left at its default are moved, and gated knobs apply solely
-/// when the manifest declared and the runtime provides the backing capability.
+/// [`Self::resolve`] runs the pack's capability gate once per deploy. The
+/// `cli` surface and `rkat mob run <pack>` apply the layers to their config
+/// snapshot; the `rpc` surface installs them as its host's config layer, so
+/// every read of the realm's live config on that host applies them as well.
+/// A pack may never override operator-owned realm/env/flag truth or set
+/// out-of-allow-list fields.
 #[cfg(feature = "mob")]
-fn apply_pack_deploy_policy(
-    config: &mut Config,
-    manifest: &meerkat_mob_pack::manifest::MobpackManifest,
-    policy: &meerkat_mob_pack::deploy_policy::MobpackDeployPolicy,
-    surface: DeploySurfaceArg,
-) -> anyhow::Result<()> {
-    use meerkat_contracts::capability::CapabilityId;
+#[derive(Clone, Debug)]
+struct DeployConfigLayers {
+    flags: CliOverrides,
+    pack_defaults: meerkat_mob_pack::deploy_policy::MobpackDeployPolicy,
+}
 
-    let manifest_declares = |capability: CapabilityId| {
-        manifest.requires.as_ref().is_some_and(|requires| {
-            requires.capability_ids().any(|id| {
-                matches!(
-                    id,
-                    meerkat_contracts::capability::MobpackCapabilityId::Known(known)
-                        if known == capability
-                )
+#[cfg(feature = "mob")]
+impl DeployConfigLayers {
+    /// Resolve a pack's typed deploy policy through the same capability
+    /// allow-list as the manifest `[requires]` gate: a gated knob is kept only
+    /// when the manifest declared and the runtime provides its capability.
+    fn resolve(
+        manifest: &meerkat_mob_pack::manifest::MobpackManifest,
+        policy: &meerkat_mob_pack::deploy_policy::MobpackDeployPolicy,
+        surface: DeploySurfaceArg,
+        flags: CliOverrides,
+    ) -> anyhow::Result<Self> {
+        use meerkat_contracts::capability::CapabilityId;
+
+        let manifest_declares = |capability: CapabilityId| {
+            manifest.requires.as_ref().is_some_and(|requires| {
+                requires.capability_ids().any(|id| {
+                    matches!(
+                        id,
+                        meerkat_contracts::capability::MobpackCapabilityId::Known(known)
+                            if known == capability
+                    )
+                })
             })
+        };
+        let runtime_provides =
+            |capability: CapabilityId| deploy_runtime_provides_capability(capability, surface);
+
+        policy
+            .validate(manifest_declares, runtime_provides)
+            .map_err(|err| anyhow::anyhow!("mob deploy failed: {err}"))?;
+        Ok(Self {
+            flags,
+            pack_defaults: policy.clone(),
         })
-    };
-    let runtime_provides =
-        |capability: CapabilityId| deploy_runtime_provides_capability(capability, surface);
+    }
+}
 
-    policy
-        .validate(manifest_declares, runtime_provides)
-        .map_err(|err| anyhow::anyhow!("mob deploy failed: {err}"))?;
+/// The flags win over everything they set. The pack then contributes deploy
+/// *defaults* without ever overriding operator truth: only fields the realm
+/// config and the flags left at their default are moved, and gated knobs were
+/// admitted by [`DeployConfigLayers::resolve`].
+#[cfg(feature = "mob")]
+impl meerkat::HostConfigLayer for DeployConfigLayers {
+    fn apply(&self, config: &mut Config) {
+        config.apply_cli_overrides(self.flags.clone());
 
-    let baseline = Config::default();
-    if let Some(max_tokens) = policy.max_tokens
-        && config.max_tokens == baseline.max_tokens
-    {
-        config.max_tokens = Some(max_tokens);
+        let policy = &self.pack_defaults;
+        let baseline = Config::default();
+        if let Some(max_tokens) = policy.max_tokens
+            && config.max_tokens == baseline.max_tokens
+        {
+            config.max_tokens = Some(max_tokens);
+        }
+        if let Some(model) = policy.models.anthropic.as_ref()
+            && config.models.anthropic == baseline.models.anthropic
+        {
+            config.models.anthropic = model.as_str().to_string();
+        }
+        if let Some(model) = policy.models.openai.as_ref()
+            && config.models.openai == baseline.models.openai
+        {
+            config.models.openai = model.as_str().to_string();
+        }
+        if let Some(model) = policy.models.gemini.as_ref()
+            && config.models.gemini == baseline.models.gemini
+        {
+            config.models.gemini = model.as_str().to_string();
+        }
+        // The pack's `[budget]` fills the enforced `[limits]` dimensions that
+        // `Config::budget_limits` gives every member built from this config. The
+        // legacy `[budget]` table is not enforced, so it neither receives these
+        // values nor blocks them. Precedence per dimension: a
+        // `rkat mob deploy --max-*` flag (applied above) > the operator's realm
+        // `[limits]` chain > the pack default.
+        if let Some(max_tokens) = policy.budget.max_tokens
+            && config.limits.budget.is_none()
+        {
+            config.limits.budget = Some(max_tokens);
+        }
+        if let Some(secs) = policy.budget.max_duration_secs
+            && config.limits.max_duration.is_none()
+        {
+            config.limits.max_duration = Some(std::time::Duration::from_secs(secs));
+        }
+        if let Some(calls) = policy.budget.max_tool_calls
+            && config.limits.max_tool_calls.is_none()
+        {
+            config.limits.max_tool_calls = Some(calls);
+        }
+        if let Some(threshold) = policy.compaction.auto_compact_threshold
+            && config.compaction.auto_compact_threshold
+                == baseline.compaction.auto_compact_threshold
+        {
+            config.compaction.auto_compact_threshold = threshold;
+            config.compaction.auto_compact_threshold_explicit = true;
+        }
+        if let Some(budget) = policy.compaction.recent_turn_budget
+            && config.compaction.recent_turn_budget == baseline.compaction.recent_turn_budget
+        {
+            config.compaction.recent_turn_budget = budget;
+        }
+        if let Some(tokens) = policy.compaction.max_summary_tokens
+            && config.compaction.max_summary_tokens == baseline.compaction.max_summary_tokens
+        {
+            config.compaction.max_summary_tokens = tokens;
+        }
+        if let Some(turns) = policy.compaction.min_turns_between_compactions
+            && config.compaction.min_turns_between_compactions
+                == baseline.compaction.min_turns_between_compactions
+        {
+            config.compaction.min_turns_between_compactions = turns;
+        }
     }
-    if let Some(model) = policy.models.anthropic.as_ref()
-        && config.models.anthropic == baseline.models.anthropic
-    {
-        config.models.anthropic = model.as_str().to_string();
-    }
-    if let Some(model) = policy.models.openai.as_ref()
-        && config.models.openai == baseline.models.openai
-    {
-        config.models.openai = model.as_str().to_string();
-    }
-    if let Some(model) = policy.models.gemini.as_ref()
-        && config.models.gemini == baseline.models.gemini
-    {
-        config.models.gemini = model.as_str().to_string();
-    }
-    // The pack's `[budget]` fills the enforced `[limits]` dimensions that
-    // `Config::budget_limits` gives every member built from this config. The
-    // legacy `[budget]` table is not enforced, so it neither receives these
-    // values nor blocks them. Precedence per dimension: a
-    // `rkat mob deploy --max-*` flag (applied by `load_deploy_runtime_config`)
-    // > the operator's realm `[limits]` chain > the pack default.
-    if let Some(max_tokens) = policy.budget.max_tokens
-        && config.limits.budget.is_none()
-    {
-        config.limits.budget = Some(max_tokens);
-    }
-    if let Some(secs) = policy.budget.max_duration_secs
-        && config.limits.max_duration.is_none()
-    {
-        config.limits.max_duration = Some(std::time::Duration::from_secs(secs));
-    }
-    if let Some(calls) = policy.budget.max_tool_calls
-        && config.limits.max_tool_calls.is_none()
-    {
-        config.limits.max_tool_calls = Some(calls);
-    }
-    if let Some(threshold) = policy.compaction.auto_compact_threshold
-        && config.compaction.auto_compact_threshold == baseline.compaction.auto_compact_threshold
-    {
-        config.compaction.auto_compact_threshold = threshold;
-        config.compaction.auto_compact_threshold_explicit = true;
-    }
-    if let Some(budget) = policy.compaction.recent_turn_budget
-        && config.compaction.recent_turn_budget == baseline.compaction.recent_turn_budget
-    {
-        config.compaction.recent_turn_budget = budget;
-    }
-    if let Some(tokens) = policy.compaction.max_summary_tokens
-        && config.compaction.max_summary_tokens == baseline.compaction.max_summary_tokens
-    {
-        config.compaction.max_summary_tokens = tokens;
-    }
-    if let Some(turns) = policy.compaction.min_turns_between_compactions
-        && config.compaction.min_turns_between_compactions
-            == baseline.compaction.min_turns_between_compactions
-    {
-        config.compaction.min_turns_between_compactions = turns;
-    }
-    Ok(())
 }
 
 /// Whether the deploy runtime provides a typed capability that gates a pack
@@ -21745,6 +22039,7 @@ fn validate_required_capabilities(
 async fn run_rpc_surface<R, W>(
     scope: &RuntimeScope,
     config: Config,
+    layers: DeployConfigLayers,
     archive: &MobpackArchive,
     prompt: &str,
     reader: R,
@@ -21760,6 +22055,11 @@ where
     W: meerkat_rpc::transport::TransportWriter,
 {
     let (manifest, persistence) = create_persistence_bundle(scope).await?;
+    // #1813: a realm that declares multi-process hosting refuses to start
+    // when its stores cannot provide it, as on the cli surface.
+    persistence
+        .require_hosting_mode(config.storage.hosting_mode())
+        .map_err(|error| anyhow::anyhow!(error))?;
     let session_store = persistence.session_store();
     let paths =
         meerkat_store::realm_paths_in(&scope.locator.state_root, scope.locator.realm.as_str());
@@ -21869,7 +22169,12 @@ where
     // Attach the realm source AFTER realm context so the agent-BUILD path
     // composes this realm's parent chain (→ `global`) into the effective config,
     // matching REST/RPC. `set_realm_config_source` reads `realm_id()` for the head.
-    runtime.set_realm_config_source(cli_realm_config_source(scope));
+    // The deploy's own layers (its flags, then the pack's deploy defaults) apply
+    // over that chain on every read of it (agent builds, model resolution and
+    // hot-swap), so this host builds from the deploy config as the cli surface
+    // does, while config get/set keep the realm's raw document.
+    runtime
+        .set_realm_config_source_with_host_layer(cli_realm_config_source(scope), Arc::new(layers));
     let runtime = Arc::new(runtime);
 
     // Pre-initialize the callback channel so the ExternalToolsProvider closure
@@ -21885,6 +22190,7 @@ where
         CliMcpAuthMode::Stored,
         None,
         mcp_stdio_profile,
+        None,
     )
     .await?;
 
@@ -23229,6 +23535,135 @@ mod tests {
         );
     }
 
+    /// A schedule fire in a stock-governed realm through rkat's own schedule
+    /// host: the realm's runtime admits only work bound to an authenticated
+    /// original, which a fire does not carry, so the host refuses it typed
+    /// (`schedule_mandate_unavailable`) before materializing a session.
+    #[cfg(all(feature = "local-authorization", feature = "session-store"))]
+    #[tokio::test]
+    async fn a_governed_realm_refuses_a_scheduled_fire_before_materializing_its_session() {
+        let state_root = tempfile::tempdir().expect("tempdir");
+        let scope = test_scope(state_root.path().to_path_buf(), "governed-schedule");
+        let (_, persistence) = create_persistence_bundle(&scope)
+            .await
+            .expect("an ordinary first open materializes the realm");
+        drop(persistence);
+        govern_realm(&scope, "governed-schedule")
+            .await
+            .expect("the operator governs the realm");
+        let (manifest, persistence) = create_persistence_bundle(&scope)
+            .await
+            .expect("a governed realm opens governed");
+        assert!(persistence.stock_governance().is_some());
+        let schedules = meerkat::ScheduleService::new(persistence.schedule_store());
+        let sessions = persistence.session_store();
+        let _surface = get_or_create_cli_persistent_surface_from_bundle(
+            &scope,
+            Config::default(),
+            manifest,
+            persistence,
+        )
+        .await
+        .expect("the persistent surface starts its schedule host");
+
+        let schedule = schedules
+            .create(meerkat::CreateScheduleRequest {
+                name: Some("governed-fire".to_string()),
+                description: None,
+                trigger: meerkat::TriggerSpec::Once {
+                    due_at_utc: chrono::Utc::now() - chrono::Duration::seconds(1),
+                },
+                target: meerkat::TargetBinding::session(
+                    meerkat::SessionTargetBinding::materialize_on_demand(
+                        meerkat::SessionMaterializationSpec {
+                            model: "claude-sonnet-4-6".to_string(),
+                            system_prompt: None,
+                            max_tokens: None,
+                            provider: None,
+                            output_schema: None,
+                            structured_output_retries: None,
+                            provider_params: None,
+                            comms_name: None,
+                            peer_meta: None,
+                            labels: std::collections::BTreeMap::new(),
+                            preload_skills: Vec::new(),
+                            additional_instructions: Vec::new(),
+                            realm_id: None,
+                            instance_id: None,
+                            backend: None,
+                            config_generation: None,
+                            keep_alive: false,
+                            app_context: None,
+                        },
+                        meerkat::ScheduledSessionAction::Prompt {
+                            prompt: meerkat_core::ContentInput::Text("scheduled check".to_string()),
+                            system_prompt: None,
+                            render_metadata: None,
+                            skill_refs: Vec::new(),
+                            additional_instructions: Vec::new(),
+                        },
+                    ),
+                ),
+                misfire_policy: meerkat::MisfirePolicy::Skip,
+                overlap_policy: meerkat::OverlapPolicy::AllowConcurrent,
+                missing_target_policy: meerkat::MissingTargetPolicy::Skip,
+                labels: std::collections::BTreeMap::new(),
+                planning_horizon_days: Some(1),
+                planning_horizon_occurrences: Some(1),
+            })
+            .await
+            .expect("the schedule is created");
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+        let occurrence = loop {
+            let occurrence = schedules
+                .list_occurrences(&schedule.schedule_id)
+                .await
+                .expect("occurrences")
+                .into_iter()
+                .next()
+                .expect("the planned occurrence");
+            if !matches!(
+                occurrence.phase,
+                meerkat::OccurrencePhase::Pending
+                    | meerkat::OccurrencePhase::Claimed
+                    | meerkat::OccurrencePhase::Dispatching
+                    | meerkat::OccurrencePhase::AwaitingCompletion
+            ) {
+                break occurrence;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the fire never terminalized: {occurrence:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        };
+        let materialized =
+            meerkat::SessionStore::load(sessions.as_ref(), &occurrence.materialized_session_id())
+                .await
+                .expect("session store read")
+                .is_some();
+        let observed = (
+            occurrence.phase,
+            serde_json::to_value(occurrence.failure_class).expect("failure class"),
+            materialized,
+        );
+        eprintln!(
+            "governed fire: phase={:?} failure_class={} materialized={} detail={:?}",
+            observed.0, observed.1, observed.2, occurrence.failure_detail
+        );
+        assert_eq!(
+            observed,
+            (
+                meerkat::OccurrencePhase::DeliveryFailed,
+                serde_json::json!("schedule_mandate_unavailable"),
+                false,
+            ),
+            "detail: {:?}",
+            occurrence.failure_detail
+        );
+    }
+
     #[test]
     fn fresh_run_storage_fallback_is_workspace_only_and_forces_durable_sqlite() {
         let state_root = tempfile::tempdir().expect("tempdir");
@@ -24316,10 +24751,7 @@ mod tests {
         );
 
         let config = TEST_CREDENTIAL_READ_PERSISTENCE
-            .scope(
-                persistence,
-                load_deploy_runtime_config(&scope, CliOverrides::default()),
-            )
+            .scope(persistence, load_deploy_realm_config(&scope))
             .await
             .expect("direct mob config load through production wrapper");
 
@@ -24384,7 +24816,7 @@ mod tests {
         let config = TEST_CREDENTIAL_READ_PERSISTENCE
             .scope(
                 test_provider_auth_persistence(store),
-                load_deploy_runtime_config(&scope, CliOverrides::default()),
+                load_deploy_realm_config(&scope),
             )
             .await
             .expect("legacy docs must not brick the mob deploy config loader");
@@ -29067,6 +29499,275 @@ default_model = "gemma"
         ));
     }
 
+    /// `--oauth-account-selection` takes `discover` or `unverified` and
+    /// conflicts with `--oauth-account`: a server names one selection.
+    #[cfg(feature = "mcp")]
+    #[test]
+    fn mcp_add_oauth_account_selection_parses_and_conflicts_with_oauth_account() {
+        let add = |extra: &[&str]| {
+            let mut args = vec![
+                "rkat",
+                "mcp",
+                "add",
+                "remote",
+                "--url",
+                "https://mcp.example.com/api",
+            ];
+            args.extend_from_slice(extra);
+            Cli::try_parse_from(args)
+        };
+        for mode in ["discover", "unverified"] {
+            if let Err(error) = add(&["--oauth-account-selection", mode]) {
+                panic!("--oauth-account-selection {mode} should parse: {error}");
+            }
+        }
+        for (extra, kind) in [
+            (
+                &[
+                    "--oauth-account",
+                    "subject-7",
+                    "--oauth-account-selection",
+                    "discover",
+                ][..],
+                clap::error::ErrorKind::ArgumentConflict,
+            ),
+            (
+                &["--oauth-account-selection", "anonymous"][..],
+                clap::error::ErrorKind::InvalidValue,
+            ),
+        ] {
+            match add(extra) {
+                Ok(_) => panic!("{extra:?} must not parse"),
+                Err(error) => assert_eq!(error.kind(), kind, "{extra:?}: {error}"),
+            }
+        }
+    }
+
+    /// The CLI's in-session login (`rkat run --mcp-auth interactive`) admits
+    /// every selected server, as `rkat mcp login` does: a discover or
+    /// unverified server is never refused for lacking a selection. Stored
+    /// mode answers the typed human-authorization status here, so no
+    /// terminal or browser is involved; only a server without a selection
+    /// is refused for it.
+    #[cfg(feature = "mcp")]
+    #[tokio::test]
+    async fn cli_session_login_admits_discover_and_unverified_selections() {
+        use meerkat_core::mcp_config::McpOAuthAccountSelection;
+        let runtime = meerkat_runtime::MeerkatMachine::ephemeral();
+        let service = meerkat::HostAuthService::new(
+            meerkat_providers::auth_store::ProviderAuthPersistence::new(
+                Arc::new(meerkat_providers::auth_store::EphemeralTokenStore::new()),
+                Arc::new(meerkat_providers::auth_store::InMemoryCoordinator::new()),
+            ),
+            runtime.provider_auth_runtime_authority(),
+        );
+        let resolver = CliMcpHostAuthResolver {
+            authority: service.mcp_oauth_authority().unwrap(),
+            service: service.clone(),
+            mode: CliMcpAuthMode::Stored,
+            untrusted: None,
+        };
+        let target = |selection: Option<McpOAuthAccountSelection>| {
+            let mut server = meerkat_core::McpServerConfig::streamable_http(
+                "tracker",
+                "https://mcp.example.test/mcp",
+                HashMap::new(),
+            );
+            if let McpTransportConfig::Http(http) = &mut server.transport {
+                http.oauth_account_selection = selection;
+            }
+            meerkat::McpServerIdentity::from_config(&server).expect("the server's OAuth target")
+        };
+        for selection in [
+            McpOAuthAccountSelection::Discover,
+            McpOAuthAccountSelection::Unverified,
+        ] {
+            let outcome = meerkat_mcp::McpAuthResolver::interactive_login(
+                &resolver,
+                &target(Some(selection)),
+                None,
+            )
+            .await;
+            assert!(
+                matches!(
+                    outcome,
+                    Err(meerkat::McpOAuthError::HumanAuthorizationRequired { .. })
+                ),
+                "{selection:?}: {outcome:?}"
+            );
+        }
+        let legacy =
+            meerkat_mcp::McpAuthResolver::interactive_login(&resolver, &target(None), None).await;
+        assert!(
+            matches!(
+                legacy,
+                Err(meerkat::McpOAuthError::AccountSelectionRequired)
+            ),
+            "{legacy:?}"
+        );
+    }
+
+    /// `rkat mcp login` remedies paste into a POSIX shell as one word per
+    /// argument (a name with a space, a URL with `?`, `&` and `'`), retry
+    /// before naming unverified for a missing account evidence, and name the
+    /// real disconnect route, which `rkat` itself does not have.
+    #[cfg(all(unix, feature = "mcp"))]
+    #[allow(clippy::disallowed_methods)]
+    #[test]
+    fn mcp_login_remedies_quote_for_the_shell_and_name_the_way_out() {
+        use meerkat_auth_core::connector_oauth::ConnectorOAuthRefusal;
+        let url = "https://mcp.example.test/mcp?tenant=a&note=it's";
+        let remedy = McpLoginRemedy {
+            server: "team tracker",
+            scope: meerkat_core::McpServerSource::File(McpScope::User),
+            url,
+        };
+        let words = |command: &str| -> Vec<String> {
+            let output = std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg(format!("printf '%s\\n' {command}"))
+                .output()
+                .expect("run /bin/sh");
+            assert!(output.status.success(), "{command}");
+            String::from_utf8(output.stdout)
+                .expect("UTF-8 words")
+                .lines()
+                .map(str::to_owned)
+                .collect()
+        };
+        assert_eq!(
+            words(&remedy.add("--oauth-account-selection unverified")),
+            [
+                "rkat",
+                "mcp",
+                "add",
+                "team tracker",
+                "--scope",
+                "user",
+                "--url",
+                url,
+                "--oauth-account-selection",
+                "unverified",
+            ]
+        );
+        assert_eq!(
+            words(&remedy.remove()),
+            ["rkat", "mcp", "remove", "team tracker", "--scope", "user"]
+        );
+        assert_eq!(
+            words(&remedy.login()),
+            ["rkat", "mcp", "login", "team tracker", "--scope", "user"]
+        );
+
+        let evidence = remedy.no_account_evidence(false);
+        let retry = evidence.find("retry first").expect("a retry comes first");
+        let unverified = evidence
+            .find("--oauth-account-selection unverified")
+            .expect("unverified is named");
+        assert!(retry < unverified, "{evidence}");
+
+        let discover = {
+            let mut server =
+                meerkat_core::McpServerConfig::streamable_http("team tracker", url, HashMap::new());
+            if let McpTransportConfig::Http(http) = &mut server.transport {
+                http.oauth_account_selection =
+                    Some(meerkat_core::mcp_config::McpOAuthAccountSelection::Discover);
+            }
+            meerkat::McpServerIdentity::from_config(&server).expect("the server's OAuth target")
+        };
+        let disconnect = remedy
+            .failure(
+                &discover,
+                meerkat::HostAuthError::McpOAuth(meerkat::McpOAuthError::DisconnectRequired {
+                    server_name: "team tracker".into(),
+                }),
+            )
+            .to_string();
+        for needle in [
+            "MCP server 'team tracker' already has a credential this login cannot replace",
+            "this login stored nothing",
+            "`rkat` has no disconnect command",
+            "RPC `auth/logout` method with this MCP target in the same realm",
+            "`auth_mcp_logout` (Python)",
+            "`authMcpLogout` (TypeScript)",
+        ] {
+            assert!(disconnect.contains(needle), "{needle}: {disconnect}");
+        }
+        let rebind = remedy
+            .failure(
+                &discover,
+                meerkat::HostAuthError::McpOAuth(meerkat::McpOAuthError::Verification(
+                    ConnectorOAuthRefusal::AccountMismatch,
+                )),
+            )
+            .to_string();
+        for needle in [
+            "is not the account its credential is bound to",
+            "To bind another account, disconnect the stored credential first",
+            "RPC `auth/logout` method",
+        ] {
+            assert!(rebind.contains(needle), "{needle}: {rebind}");
+        }
+    }
+
+    /// `rkat mcp login` and an in-session login report a completed login
+    /// with one shared line: the bound account, labelled when discovery
+    /// bound it, or that an unverified credential carries no account
+    /// verification.
+    #[cfg(feature = "mcp")]
+    #[test]
+    fn mcp_login_outcome_labels_discovered_and_unverified_logins() {
+        use meerkat_auth_core::connector_oauth::AccountVerification;
+        use meerkat_core::mcp_config::McpOAuthAccountSelection;
+        let target = |selection: Option<McpOAuthAccountSelection>, account: Option<&str>| {
+            let mut server = meerkat_core::McpServerConfig::streamable_http(
+                "tracker",
+                "https://mcp.example.test/mcp",
+                HashMap::new(),
+            );
+            if let McpTransportConfig::Http(http) = &mut server.transport {
+                http.oauth_account_selection = selection;
+                http.oauth_account = account.map(str::to_owned);
+            }
+            meerkat::McpServerIdentity::from_config(&server).expect("the server's OAuth target")
+        };
+        let completed =
+            |target: &meerkat::McpServerIdentity, account: Option<&str>, account_verification| {
+                meerkat::McpOAuthLoginComplete {
+                    target: target.clone(),
+                    account_id: account.map(str::to_owned),
+                    account_verification,
+                    expires_at: None,
+                    has_refresh_token: true,
+                    scopes: Vec::new(),
+                }
+            };
+        let unverified = target(Some(McpOAuthAccountSelection::Unverified), None);
+        assert_eq!(
+            mcp_login_outcome(
+                &unverified,
+                &completed(&unverified, None, AccountVerification::Unverified)
+            ),
+            "Logged in MCP server 'tracker' (https://mcp.example.test/mcp) without account verification (unverified, resource-bound access)"
+        );
+        let discover = target(Some(McpOAuthAccountSelection::Discover), None);
+        assert_eq!(
+            mcp_login_outcome(
+                &discover,
+                &completed(&discover, Some("subject-7"), AccountVerification::Verified)
+            ),
+            "Logged in MCP server 'tracker' (https://mcp.example.test/mcp) as subject-7 (bound by discovery)"
+        );
+        let known = target(None, Some("subject-7"));
+        assert_eq!(
+            mcp_login_outcome(
+                &known,
+                &completed(&known, Some("subject-7"), AccountVerification::Verified)
+            ),
+            "Logged in MCP server 'tracker' (https://mcp.example.test/mcp) as subject-7"
+        );
+    }
+
     #[derive(Clone, Default)]
     struct CanaryLogBuffer(Arc<std::sync::Mutex<Vec<u8>>>);
 
@@ -29197,7 +29898,7 @@ default_model = "gemma"
     /// it, its `state` or its PKCE challenge to any log. Positive control: a
     /// launcher that logs the URL, as `webbrowser::open` did with the spawned
     /// command, is caught by the same capture. The production launcher is
-    /// `meerkat::open_system_browser_trusting`, a plain
+    /// `meerkat::open_system_browser_guarded`, a plain
     /// `std::process::Command` with null stdio and no logging, so no
     /// `log`-crate record exists to bridge.
     #[test]
@@ -29556,6 +30257,7 @@ url = "https://user.example/mcp"
                 meerkat_runtime::handles::RuntimeExternalToolSurfaceHandle::ephemeral(),
             )),
             cli_mcp_stdio_profile(&factory),
+            Some(&CliMcpRouterOwner::fresh(&SessionId::new())),
         )
         .await
         .expect("the loader stages the realm server")
@@ -29578,6 +30280,144 @@ url = "https://user.example/mcp"
             "a refused server never starts its process"
         );
         adapter.shutdown().await;
+    }
+
+    /// Run the CLI loader for one stdio server under a factory whose MCP
+    /// attempt guard refuses everything, for `owner`; assert the server was
+    /// refused before its process started and return what the guard was
+    /// asked.
+    #[cfg(all(feature = "mcp", unix))]
+    async fn cli_loader_guard_request(
+        owner: &CliMcpRouterOwner,
+    ) -> meerkat::McpAttemptGuardRequest {
+        #[derive(Default)]
+        struct Refusing(std::sync::Mutex<Vec<meerkat::McpAttemptGuardRequest>>);
+        #[async_trait::async_trait]
+        impl meerkat::McpAttemptGuardFactory for Refusing {
+            async fn begin(
+                &self,
+                request: meerkat::McpAttemptGuardRequest,
+                _cancel: meerkat::McpAttemptCancellation,
+            ) -> Result<
+                Option<Box<dyn meerkat::McpAttemptGuard>>,
+                meerkat_core::mcp_attachment::McpAttachmentRefusal,
+            > {
+                self.0.lock().unwrap().push(request);
+                Err(meerkat_core::mcp_attachment::McpAttachmentRefusal::Denied)
+            }
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let marker = root.join("guarded-loader-marker");
+        let scope = test_scope(root.join("realms"), "guarded-loader-realm");
+        let refusing = Arc::new(Refusing::default());
+        let guards = meerkat::McpAttemptGuards::new(
+            Arc::clone(&refusing) as Arc<dyn meerkat::McpAttemptGuardFactory>,
+            meerkat::McpAttemptGuardBounds::DEFAULT,
+        );
+        let factory =
+            AgentFactory::new(root.join("sessions")).with_mcp_attempt_guards(guards.clone());
+        let server = meerkat_core::McpServerConfig::stdio(
+            "guarded-realm-server",
+            "/bin/sh",
+            vec!["-c".into(), "printf entered > \"$MARKER\"".into()],
+            HashMap::from([("MARKER".into(), marker.display().to_string())]),
+        );
+
+        let adapter = create_mcp_tools(
+            &scope,
+            &[server],
+            false,
+            CliMcpAuthMode::Stored,
+            Some(Arc::new(
+                meerkat_runtime::handles::RuntimeExternalToolSurfaceHandle::ephemeral(),
+            )),
+            cli_mcp_stdio_profile(&factory),
+            Some(owner),
+        )
+        .await
+        .expect("the loader stages the realm server")
+        .expect("one configured server");
+        let deltas = adapter
+            .wait_until_ready(std::time::Duration::from_secs(15))
+            .await
+            .unwrap();
+
+        assert!(
+            deltas.iter().any(|delta| {
+                delta.target == "guarded-realm-server"
+                    && delta.phase == meerkat_core::ExternalToolDeltaPhase::Failed
+            }),
+            "the host's guard refuses the loader's server: {deltas:?}"
+        );
+        assert!(
+            !marker.exists(),
+            "a refused server never starts its process"
+        );
+        let requests = refusing.0.lock().unwrap().clone();
+        assert_eq!(requests.len(), 1, "the guard began once: {requests:?}");
+        assert_eq!(requests[0].key.server, "guarded-realm-server");
+        assert_eq!(requests[0].key.construction, adapter.construction_id());
+        adapter.shutdown().await;
+        let _ = guards
+            .close_and_join(tokio::time::Instant::now() + std::time::Duration::from_secs(10))
+            .await;
+        requests[0].clone()
+    }
+
+    /// The `rkat run` loader installs its factory's MCP attempt guards, for
+    /// the session it serves: a stdio server begins the host's guard before
+    /// anything of it runs, and a refusing host's server never starts.
+    #[cfg(all(feature = "mcp", unix))]
+    #[tokio::test]
+    async fn test_cli_mcp_loader_begins_the_factory_attempt_guard() {
+        let session_id = SessionId::new();
+        let request = cli_loader_guard_request(&CliMcpRouterOwner::fresh(&session_id)).await;
+        assert_eq!(request.owner.session_id, session_id);
+        assert_eq!(request.owner.member, None);
+    }
+
+    /// `rkat resume` of a mob member's session builds its loader router with
+    /// the member's guard scope, from the session's persisted metadata, as
+    /// the factory adopts it.
+    #[cfg(all(feature = "mcp", unix))]
+    #[tokio::test]
+    async fn test_cli_mcp_loader_begins_the_guard_for_a_resumed_member() {
+        let member = meerkat_core::MobMemberBinding {
+            mob_id: "mob".into(),
+            role: "worker".into(),
+            member: "worker-1".into(),
+        };
+        let metadata = meerkat_core::SessionMetadata {
+            model_fallback: None,
+            schema_version: meerkat_core::SESSION_METADATA_SCHEMA_VERSION,
+            model: "claude-sonnet-4-5".to_string(),
+            max_tokens: 4096,
+            structured_output_retries: 2,
+            provider: meerkat_core::Provider::Anthropic,
+            self_hosted_server_id: None,
+            provider_params: None,
+            tooling: meerkat_core::SessionTooling::default(),
+            keep_alive: false,
+            comms_name: None,
+            peer_meta: None,
+            realm_id: None,
+            instance_id: None,
+            backend: None,
+            config_generation: None,
+            auth_binding: None,
+            mob_member_binding: Some(member.clone()),
+        };
+        let session_id = SessionId::new();
+        let request =
+            cli_loader_guard_request(&CliMcpRouterOwner::resumed(&session_id, &metadata)).await;
+        assert_eq!(request.owner.session_id, session_id);
+        assert_eq!(
+            request.owner.member,
+            Some(member),
+            "a resumed member's loader guard is scoped to its member"
+        );
     }
 
     /// A project `mcp.toml` that a confined process can write is not trusted:
@@ -29649,6 +30489,7 @@ url = "https://user.example/mcp"
                 meerkat_runtime::handles::RuntimeExternalToolSurfaceHandle::ephemeral(),
             )),
             cli_mcp_stdio_profile(&factory),
+            Some(&CliMcpRouterOwner::fresh(&SessionId::new())),
         )
         .await
         .expect("an untrusted file is refused, not an error")
@@ -29740,6 +30581,7 @@ url = "https://user.example/mcp"
                 meerkat_runtime::handles::RuntimeExternalToolSurfaceHandle::ephemeral(),
             )),
             cli_mcp_stdio_profile(&factory),
+            Some(&CliMcpRouterOwner::fresh(&SessionId::new())),
         )
         .await
         .expect("an untrusted file is refused, not an error")
@@ -30789,13 +31631,14 @@ capabilities = ["core", "skills", "hooks", "adaptive_flow"]
         ))
         .expect("valid policy");
 
-        apply_pack_deploy_policy(
-            &mut config,
+        let layers = DeployConfigLayers::resolve(
             &empty_deploy_manifest(),
             &policy,
             DeploySurfaceArg::Cli,
+            CliOverrides::default(),
         )
         .expect("ungated knobs apply");
+        meerkat::HostConfigLayer::apply(&layers, &mut config);
 
         assert_eq!(
             config.models.openai, "operator-openai",
@@ -30823,13 +31666,14 @@ capabilities = ["core", "skills", "hooks", "adaptive_flow"]
         ))
         .expect("valid policy");
 
-        apply_pack_deploy_policy(
-            &mut config,
+        let layers = DeployConfigLayers::resolve(
             &empty_deploy_manifest(),
             &policy,
             DeploySurfaceArg::Cli,
+            CliOverrides::default(),
         )
         .expect("ungated budget knobs apply");
+        meerkat::HostConfigLayer::apply(&layers, &mut config);
 
         assert_eq!(
             config.budget_limits(),
@@ -30853,22 +31697,22 @@ capabilities = ["core", "skills", "hooks", "adaptive_flow"]
         config
             .merge_toml_str("[limits]\nbudget = 1000\n\n[budget]\nmax_duration = \"30m\"\n")
             .expect("realm config merge");
-        config.apply_cli_overrides(CliOverrides {
-            max_tool_calls: Some(7),
-            ..CliOverrides::default()
-        });
         let policy = meerkat_mob_pack::deploy_policy::MobpackDeployPolicy::parse(Some(
             b"[budget]\nmax_tokens = 200000\nmax_duration_secs = 900\nmax_tool_calls = 50\n",
         ))
         .expect("valid policy");
 
-        apply_pack_deploy_policy(
-            &mut config,
+        let layers = DeployConfigLayers::resolve(
             &empty_deploy_manifest(),
             &policy,
             DeploySurfaceArg::Cli,
+            CliOverrides {
+                max_tool_calls: Some(7),
+                ..CliOverrides::default()
+            },
         )
         .expect("ungated budget knobs apply");
+        meerkat::HostConfigLayer::apply(&layers, &mut config);
 
         assert_eq!(
             config.budget_limits(),
@@ -30903,17 +31747,16 @@ capabilities = ["core", "skills", "hooks", "adaptive_flow"]
     fn test_pack_deploy_policy_gated_knob_requires_declared_capability() {
         // The compaction knob is gated by session_compaction; a pack that does
         // not declare that capability cannot tune compaction.
-        let mut config = Config::default();
         let policy = meerkat_mob_pack::deploy_policy::MobpackDeployPolicy::parse(Some(
             b"[compaction]\nrecent_turn_budget = 9\n",
         ))
         .expect("valid policy");
 
-        let err = apply_pack_deploy_policy(
-            &mut config,
+        let err = DeployConfigLayers::resolve(
             &empty_deploy_manifest(),
             &policy,
             DeploySurfaceArg::Cli,
+            CliOverrides::default(),
         )
         .expect_err("undeclared gating capability must reject");
         assert!(
@@ -31190,6 +32033,295 @@ capabilities = ["rpc"]
             output.contains("surface=rpc"),
             "unexpected output: {output}"
         );
+    }
+
+    /// Send one JSON-RPC request to a deploy host and return the response with
+    /// the same id, skipping any notification written before it.
+    #[cfg(all(feature = "mob", feature = "rpc-surface"))]
+    async fn deploy_rpc_call<W, R>(
+        input: &mut W,
+        output: &mut tokio::io::Lines<R>,
+        id: u64,
+        method: &str,
+        params: serde_json::Value,
+    ) -> serde_json::Value
+    where
+        W: AsyncWrite + Unpin,
+        R: AsyncBufRead + Unpin,
+    {
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+            "params": params,
+        });
+        let mut line = serde_json::to_vec(&request).expect("encode request");
+        line.push(b'\n');
+        input.write_all(&line).await.expect("write request");
+        input.flush().await.expect("flush request");
+        loop {
+            let line = output
+                .next_line()
+                .await
+                .expect("read deploy host output")
+                .expect("deploy host closed its output before answering");
+            let message: serde_json::Value =
+                serde_json::from_str(&line).expect("deploy host writes JSON lines");
+            if message["id"] == serde_json::json!(id) {
+                return message;
+            }
+        }
+    }
+
+    /// The `--surface rpc` host builds from the deploy config, as the cli
+    /// surface does: the `--model` flag outranks the realm's `[agent] model`
+    /// when the host resolves a session's default model, and the pack's
+    /// `max_tokens` deploy default fills what the realm left unset for a
+    /// member spawned over JSON-RPC.
+    #[cfg(all(feature = "mob", feature = "rpc-surface", feature = "openai"))]
+    #[tokio::test]
+    async fn test_mob_deploy_rpc_surface_builds_from_the_deploy_config() {
+        use tokio::io::AsyncBufReadExt;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut scope = test_scope_with_context(temp.path().to_path_buf());
+        scope.user_config_root = Some(temp.path().to_path_buf());
+        // An inline-secret binding lets the host build OpenAI agents offline.
+        let user_doc = cli_global_config_path(&scope);
+        std::fs::create_dir_all(user_doc.parent().expect("user doc parent"))
+            .expect("mkdir user doc");
+        std::fs::write(
+            &user_doc,
+            r#"[realm.global]
+default_binding = "openai_inline"
+
+[realm.global.backend.openai]
+provider = "openai"
+backend_kind = "openai_api"
+
+[realm.global.auth.inline]
+provider = "openai"
+auth_method = "api_key"
+source = { kind = "inline_secret", secret = "provider-free-test-secret" }
+
+[realm.global.binding.openai_inline]
+backend_profile = "openai"
+auth_profile = "inline"
+"#,
+        )
+        .expect("write user doc");
+        let realm_doc =
+            meerkat_store::realm_paths_in(&scope.locator.state_root, scope.locator.realm.as_str())
+                .config_path;
+        std::fs::create_dir_all(realm_doc.parent().expect("realm doc parent"))
+            .expect("mkdir realm doc");
+        std::fs::write(&realm_doc, "[agent]\nmodel = \"gpt-5.4\"\n").expect("write realm doc");
+
+        let mob_id = unique_test_mob_id("rpc-deploy-config");
+        let mob_dir = write_mobpack_fixture_dir(
+            temp.path(),
+            "rpc-deploy-config",
+            &serde_json::json!({
+                "id": mob_id,
+                "profiles": {
+                    "lead": {
+                        "model": "gpt-5.5",
+                        "skills": [],
+                        "tools": {"comms": true},
+                        "peer_description": "Lead",
+                        "external_addressable": true
+                    }
+                },
+                "skills": {}
+            }),
+            false,
+        );
+        std::fs::create_dir_all(mob_dir.join("config")).expect("config dir");
+        std::fs::write(
+            mob_dir.join("config").join("defaults.toml"),
+            "max_tokens = 4321\n",
+        )
+        .expect("write pack defaults");
+        let pack_out = temp.path().join("rpc-deploy-config.mobpack");
+        execute_mob_pack(&mob_dir, &pack_out, None)
+            .await
+            .expect("pack succeeds");
+
+        let (mut client_in, server_in) = tokio::io::duplex(64 * 1024);
+        let (server_out, client_out) = tokio::io::duplex(4 * 1024 * 1024);
+        let mut responses = BufReader::new(client_out).lines();
+        let scope_for_deploy = scope.clone();
+        let pack_for_deploy = pack_out.clone();
+        let deploy_task = tokio::spawn(async move {
+            let deployment: std::pin::Pin<
+                Box<dyn std::future::Future<Output = anyhow::Result<String>> + Send + '_>,
+            > = Box::pin(execute_mob_deploy_internal(
+                &scope_for_deploy,
+                &pack_for_deploy,
+                "hello",
+                DeployInvocation {
+                    cli_trust_policy: Some(TrustPolicyArg::Permissive),
+                    surface: DeploySurfaceArg::Rpc,
+                    cli_overrides: CliOverrides {
+                        model: Some("gpt-5.5".to_string()),
+                        ..CliOverrides::default()
+                    },
+                    rpc_io: Some((Box::new(BufReader::new(server_in)), Box::new(server_out))),
+                    config_observer: None,
+                },
+            ));
+            deployment.await
+        });
+
+        let exchange = async {
+            let created = deploy_rpc_call(
+                &mut client_in,
+                &mut responses,
+                1,
+                "session/create",
+                serde_json::json!({"prompt": "hello", "initial_turn": "deferred"}),
+            )
+            .await;
+            let session_id = created["result"]["session_id"]
+                .as_str()
+                .unwrap_or_else(|| panic!("session/create failed: {created}"))
+                .to_string();
+            let read = deploy_rpc_call(
+                &mut client_in,
+                &mut responses,
+                2,
+                "session/read",
+                serde_json::json!({"session_id": session_id}),
+            )
+            .await;
+            let spawned = deploy_rpc_call(
+                &mut client_in,
+                &mut responses,
+                3,
+                "mob/spawn",
+                serde_json::json!({
+                    "mob_id": mob_id,
+                    "profile": "lead",
+                    "agent_identity": "lead-1",
+                    "runtime_mode": "turn_driven"
+                }),
+            )
+            .await;
+            (read, spawned)
+        };
+        let (read, spawned) = tokio::time::timeout(Duration::from_mins(1), exchange)
+            .await
+            .expect("the deploy host answers within a minute");
+        client_in.shutdown().await.expect("close deploy input");
+        let output = deploy_task
+            .await
+            .expect("deploy task join")
+            .expect("deploy exits after its input closes");
+        assert!(
+            output.contains("surface=rpc"),
+            "unexpected output: {output}"
+        );
+        assert!(spawned["error"].is_null(), "mob/spawn failed: {spawned}");
+
+        let (_manifest, persistence) = create_persistence_bundle(&scope)
+            .await
+            .expect("reopen the realm");
+        let store = persistence.session_store();
+        let mut member_max_tokens = Vec::new();
+        for meta in store
+            .list(meerkat_core::SessionFilter::default())
+            .await
+            .expect("list sessions")
+        {
+            let Some(session) = store.load(&meta.id).await.expect("load session") else {
+                continue;
+            };
+            let Some(metadata) = session.try_session_metadata().expect("typed metadata") else {
+                continue;
+            };
+            if metadata
+                .mob_member_binding
+                .as_ref()
+                .is_some_and(|binding| binding.mob_id == mob_id && binding.member == "lead-1")
+            {
+                member_max_tokens.push(metadata.max_tokens);
+            }
+        }
+        assert_eq!(
+            (
+                read["result"]["model"].as_str(),
+                member_max_tokens.as_slice()
+            ),
+            (Some("gpt-5.5"), [4321].as_slice()),
+            "the rpc deploy host resolves a session's default model from the --model flag over \
+             the realm [agent] model, and builds a spawned member with the pack's max_tokens \
+             deploy default: {read}"
+        );
+    }
+
+    /// A realm that declares multi-process hosting its stores cannot provide
+    /// is refused by `rkat mob deploy` on both surfaces. The `--surface rpc`
+    /// host refuses before it composes a runtime or reads its input, so it
+    /// builds no member: a host that had started serving would wait on that
+    /// still-open input instead of returning.
+    #[cfg(all(feature = "mob", feature = "rpc-surface"))]
+    #[tokio::test]
+    async fn test_mob_deploy_refuses_unavailable_multiprocess_hosting_on_both_surfaces() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut scope = test_scope_with_context(temp.path().to_path_buf());
+        scope.user_config_root = Some(temp.path().to_path_buf());
+        // A memory realm's runtime store has no cross-process hosting claims.
+        scope.backend_hint = Some(RealmBackend::Memory);
+        let realm_doc =
+            meerkat_store::realm_paths_in(&scope.locator.state_root, scope.locator.realm.as_str())
+                .config_path;
+        std::fs::create_dir_all(realm_doc.parent().expect("realm doc parent"))
+            .expect("mkdir realm doc");
+        std::fs::write(&realm_doc, "[storage]\nhosting = \"multiprocess\"\n")
+            .expect("write realm doc");
+        let mob_dir = create_mobpack_fixture_dir(temp.path());
+        let pack_out = temp.path().join("hosting.mobpack");
+        execute_mob_pack(&mob_dir, &pack_out, None)
+            .await
+            .expect("pack succeeds");
+
+        let cli_err = execute_mob_deploy(
+            &scope,
+            &pack_out,
+            "hello",
+            Some(TrustPolicyArg::Permissive),
+            DeploySurfaceArg::Cli,
+            CliOverrides::default(),
+        )
+        .await
+        .expect_err("the cli surface refuses the realm");
+
+        let (_client_in, server_in) = tokio::io::duplex(1024);
+        let (server_out, _client_out) = tokio::io::duplex(1024);
+        let rpc_deploy = Box::pin(execute_mob_deploy_internal(
+            &scope,
+            &pack_out,
+            "hello",
+            DeployInvocation {
+                cli_trust_policy: Some(TrustPolicyArg::Permissive),
+                surface: DeploySurfaceArg::Rpc,
+                cli_overrides: CliOverrides::default(),
+                rpc_io: Some((Box::new(BufReader::new(server_in)), Box::new(server_out))),
+                config_observer: None,
+            },
+        ));
+        let rpc_err = tokio::time::timeout(Duration::from_secs(20), rpc_deploy)
+            .await
+            .expect("the rpc host refuses the realm instead of serving it")
+            .expect_err("the rpc surface refuses the realm");
+
+        for err in [&cli_err, &rpc_err] {
+            assert!(
+                err.to_string()
+                    .contains("multi-process hosting is unavailable for this realm"),
+                "unexpected error: {err}"
+            );
+        }
     }
 
     #[cfg(feature = "mob")]
@@ -33135,7 +34267,7 @@ default_model = "gpt-5.4"
             .builtins(true)
             .schedule(true);
         let schedule_service =
-            ScheduleService::new(Arc::new(meerkat::MemoryScheduleStore::default()));
+            meerkat::ScheduleService::new(Arc::new(meerkat::MemoryScheduleStore::default()));
         let default_schedule_tools =
             Some(Arc::new(ScheduleToolDispatcher::new(schedule_service))
                 as Arc<dyn AgentToolDispatcher>);

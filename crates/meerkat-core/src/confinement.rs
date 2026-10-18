@@ -261,8 +261,9 @@ pub enum HostLaunchExemption {
     /// `rundll32`) showing a URL, an OAuth authorization page or an HTML
     /// artifact, in the user's desktop session.
     BrowserOpener,
-    /// `stty` by absolute path (`/bin/stty`, else `/usr/bin/stty`), which
-    /// the CLI runs on its own terminal to hide a secret typed at it.
+    /// `stty` (`/bin/stty`, else `/usr/bin/stty`, else the one the trusted
+    /// `PATH` finds), which the CLI runs on its own terminal to hide a
+    /// secret typed at it.
     TerminalControl,
     /// `wasm-pack`, whose version `rkat doctor` reports.
     DeveloperBuildTooling,
@@ -308,8 +309,9 @@ impl HostLaunchExemption {
                  reach; the platform opener gets the URL as one argument"
             }
             Self::TerminalControl => {
-                "host terminal control: stty, by absolute path, sets the mode of the terminal \
-                 the operator runs the CLI on"
+                "host terminal control: stty (by absolute path where the system keeps it there, \
+                 else from the trusted PATH) sets the mode of the terminal the operator runs the \
+                 CLI on"
             }
             Self::DeveloperBuildTooling => {
                 "developer build tooling: rkat doctor reports the version of wasm-pack"
@@ -367,16 +369,32 @@ impl HostLaunchExemption {
         command
     }
 
-    /// `stty` by absolute path (`/bin/stty`, else `/usr/bin/stty`): no
-    /// `PATH` lookup finds it, and it starts no program of its own.
+    /// `stty`: `/bin/stty`, else `/usr/bin/stty`, else (where neither
+    /// exists, as on NixOS) the `stty` the launch's `PATH` finds, which under
+    /// a host that confines its launches holds no relative directory and no
+    /// directory a confined process could change. It starts no program of
+    /// its own.
     #[cfg(not(target_arch = "wasm32"))]
     #[must_use]
     pub fn terminal_control(untrusted: Option<&UntrustedPathFn>) -> std::process::Command {
-        let program = ["/bin/stty", "/usr/bin/stty"]
-            .into_iter()
-            .find(|program| Path::new(program).is_file())
-            .unwrap_or("/bin/stty");
-        Self::TerminalControl.launch(program, untrusted)
+        Self::terminal_control_in(
+            &[Path::new("/bin/stty"), Path::new("/usr/bin/stty")],
+            std::env::vars_os(),
+            untrusted,
+        )
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn terminal_control_in(
+        installed: &[&Path],
+        environment: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+        untrusted: Option<&UntrustedPathFn>,
+    ) -> std::process::Command {
+        let program = installed
+            .iter()
+            .find(|program| program.is_file())
+            .map_or(std::ffi::OsStr::new("stty"), |program| program.as_os_str());
+        Self::TerminalControl.launch_in(program, environment, untrusted)
     }
 
     /// `wasm-pack`.
@@ -411,6 +429,8 @@ impl HostLaunchExemption {
         untrusted: Option<&UntrustedPathFn>,
     ) -> std::process::Command {
         let _ = self;
+        // The one command every exemption's fixed-program constructor builds.
+        #[allow(clippy::disallowed_methods)]
         let mut command = std::process::Command::new(program);
         command.env_clear();
         match untrusted {
@@ -934,6 +954,64 @@ mod tests {
             "a program only an untrusted directory holds is not found"
         );
         assert!(!markers[2].exists());
+    }
+
+    /// Where neither `/bin/stty` nor `/usr/bin/stty` exists (NixOS keeps
+    /// `stty` only on `PATH`), terminal control finds `stty` on the launch's
+    /// `PATH`, so a secret typed at the terminal can still be hidden. Under
+    /// confinement that `PATH` is the trusted one: a `stty` planted in a
+    /// directory a confined process can write, ahead of the trusted one,
+    /// never runs.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn terminal_control_finds_stty_on_the_path_where_no_fixed_path_holds_it() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().canonicalize().unwrap();
+        let writable = base.join("writable");
+        let trusted = base.join("trusted");
+        let mut markers = Vec::new();
+        for dir in [&writable, &trusted] {
+            std::fs::create_dir_all(dir).unwrap();
+            let marker = base.join(format!(
+                "{}-stty-ran",
+                dir.file_name().unwrap().to_string_lossy()
+            ));
+            let program = dir.join("stty");
+            std::fs::write(
+                &program,
+                format!("#!/bin/sh\nprintf ran > '{}'\n", marker.display()),
+            )
+            .unwrap();
+            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+            markers.push(marker);
+        }
+        let absent = [base.join("bin/stty"), base.join("usr/bin/stty")];
+        let installed = [absent[0].as_path(), absent[1].as_path()];
+
+        let environment = vec![(
+            std::ffi::OsString::from("PATH"),
+            trusted.clone().into_os_string(),
+        )];
+        let status = HostLaunchExemption::terminal_control_in(&installed, environment, None)
+            .status()
+            .unwrap();
+        assert!(status.success(), "the stty on the PATH ran: {status}");
+        assert!(markers[1].exists(), "the stty on the PATH ran");
+        std::fs::remove_file(&markers[1]).unwrap();
+
+        let environment = vec![(
+            std::ffi::OsString::from("PATH"),
+            std::env::join_paths([&writable, &trusted]).unwrap(),
+        )];
+        let untrusted = move |path: &Path, _: bool| path.starts_with(&writable);
+        let status =
+            HostLaunchExemption::terminal_control_in(&installed, environment, Some(&untrusted))
+                .status()
+                .unwrap();
+        assert!(status.success(), "the trusted stty ran: {status}");
+        assert!(!markers[0].exists(), "the planted stty never ran");
+        assert!(markers[1].exists(), "the trusted stty ran");
     }
 
     /// A host launch exemption inherits no variable that makes a program

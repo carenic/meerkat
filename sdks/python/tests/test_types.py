@@ -2730,6 +2730,39 @@ def test_parse_turn_completed_with_no_usage_at_all_is_a_completed_turn():
     assert event.stop_reason == "end_turn"
 
 
+_WIRE_STOP_REASONS = (
+    "end_turn",
+    "tool_use",
+    "max_tokens",
+    "stop_sequence",
+    "content_filter",
+    "cancelled",
+    "refusal",
+    "pause_turn",
+    "context_window_exceeded",
+)
+
+
+def test_parse_turn_completed_accepts_every_wire_stop_reason():
+    for stop_reason in _WIRE_STOP_REASONS:
+        event = parse_event({"type": "turn_completed", "stop_reason": stop_reason})
+        assert isinstance(event, TurnCompleted), stop_reason
+        assert event.stop_reason == stop_reason
+
+
+def test_parse_session_history_accepts_every_wire_stop_reason():
+    for stop_reason in _WIRE_STOP_REASONS:
+        message = MeerkatClient._parse_session_message(
+            {
+                "role": "block_assistant",
+                "created_at": "2026-10-17T10:00:00Z",
+                "blocks": [{"block_type": "text", "data": {"text": "partial"}}],
+                "stop_reason": stop_reason,
+            }
+        )
+        assert message.role == "block_assistant", stop_reason
+
+
 def test_parse_interaction_complete_structured_output():
     raw = {
         "type": "interaction_complete",
@@ -5215,7 +5248,7 @@ async def test_client_mob_lifecycle_and_send_methods_use_explicit_rpc_methods():
     async def fake_request(method, params):
         calls.append((method, params))
         if method == "mob/create":
-            return {"mob_id": "mob-1"}
+            return {"mob_id": "mob-1", "claim_token": "mct_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}
         if method == "mob/list":
             return {"mobs": [{"mob_id": "mob-1"}]}
         if method == "mob/status":
@@ -8701,3 +8734,16 @@ def test_hook_failed_public_reason_exports_keep_generated_known_causes_and_unkno
     assert UnknownHookFailureReason in get_args(HookFailureReason)
     assert UnknownHookFailureReason in get_args(get_type_hints(HookFailed)["reason"])
     assert {"HookFailureReason", "UnknownHookFailureReason", "ConfinementRefusal"} <= set(meerkat.__all__)
+
+
+def test_generated_claim_token_fields_stay_out_of_repr():
+    from meerkat.generated.types import MobClaimCallbackRouteParams, MobCreateResult
+
+    token = "mct_" + "A" * 43
+    created = MobCreateResult(claim_token=token, mob_id="m1")
+    params = MobClaimCallbackRouteParams(claim_token=token, mob_id="m1")
+    assert created.claim_token == token
+    assert params.claim_token == token
+    assert token not in repr(created)
+    assert token not in repr(params)
+    assert "m1" in repr(created)

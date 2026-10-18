@@ -617,11 +617,12 @@ impl MobUpcallSeams {
         tool_name: &str,
     ) -> Result<(), ToolError> {
         let mob_id = self.handle.mob_id().as_str();
+        let incarnation = self.handle.incarnation();
         let admission = self
             .handle
             .resolve_spawn_tool_admission(
-                context.can_manage_mob(mob_id),
-                context.spawn_profile_scope_present(mob_id),
+                context.can_manage_mob(mob_id, incarnation),
+                context.spawn_profile_scope_present(mob_id, incarnation),
             )
             .await
             .map_err(|error| {
@@ -646,9 +647,14 @@ impl MobUpcallSeams {
         spec: &MemberOperatorSpawnSpec,
     ) -> Result<(), ToolError> {
         let mob_id = self.handle.mob_id().as_str();
+        let incarnation = self.handle.incarnation();
         let observations = SpawnMemberAdmissionObservations {
-            manage_scope_present: context.can_manage_mob(mob_id),
-            profile_scope_contains: context.spawn_profile_scope_contains(mob_id, &spec.profile),
+            manage_scope_present: context.can_manage_mob(mob_id, incarnation),
+            profile_scope_contains: context.spawn_profile_scope_contains(
+                mob_id,
+                incarnation,
+                &spec.profile,
+            ),
             runtime_mode_present: spec.runtime_mode.is_some(),
             launch_mode_present: spec.launch_mode.is_some(),
             tool_access_policy_present: spec.requested_tool_access_policy_present,
@@ -930,8 +936,16 @@ impl UpcallServeSeams for MobUpcallSeams {
         let provenance = MobToolCallerProvenance::default()
             .with_mob_id(fenced.handle.mob_id().as_str())
             .with_member_id(requester.as_str());
-        let context = mint_mob_operator_authority_from_facts(&facts, provenance, request_id)
-            .map_err(UpcallExecuteError::AuthorityRemint)?;
+        // The record is this mob's own: its scope binds to the incarnation
+        // of the mob that holds it, never to a later mob under the same id.
+        let context = mint_mob_operator_authority_from_facts(
+            &facts,
+            fenced.handle.mob_id().as_str(),
+            fenced.handle.incarnation(),
+            provenance,
+            request_id,
+        )
+        .map_err(UpcallExecuteError::AuthorityRemint)?;
 
         Ok(match op {
             MemberOperatorOp::SpawnMember(spec) => {
@@ -1343,8 +1357,9 @@ async fn serve_candidate(
 }
 
 /// Record the inbound request on the generated peer-interaction authority.
-/// `false` means the candidate was completed and must not be decoded or
-/// served (host_actor twin).
+/// `false` means the candidate must not be decoded or served: it was
+/// completed, or another requester's outstanding request holds its id
+/// (host_actor twin).
 fn record_inbound_request(
     runtime: &Arc<dyn CoreCommsRuntime>,
     candidate: &PeerInputCandidate,
@@ -1358,10 +1373,22 @@ fn record_inbound_request(
         return false;
     };
     let corr_id = meerkat_core::PeerCorrelationId::from_uuid(candidate.interaction.id.0);
-    if handle.inbound_state(corr_id).is_some() {
-        return true;
+    // Only the outstanding request's own requester may send its id again.
+    // Another peer's bridge request under the id is dropped before decode or
+    // dispatch, and the outstanding request's interaction stays open.
+    match handle.inbound_id_claim(candidate) {
+        meerkat_core::InboundIdClaim::Unclaimed => {}
+        meerkat_core::InboundIdClaim::ClaimedBySender => return true,
+        _ => {
+            tracing::warn!(
+                corr_id = %corr_id,
+                sender = ?candidate.from_peer_id(),
+                "upcall responder: dropped a bridge request under another requester's outstanding id"
+            );
+            return false;
+        }
     }
-    if let Err(error) = handle.request_received(corr_id, candidate.interaction.handling_mode) {
+    if let Err(error) = handle.request_received_from_ingress(candidate) {
         tracing::warn!(
             error = %error,
             corr_id = %corr_id,
@@ -1537,6 +1564,49 @@ async fn resolve_peer_route(
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A bridge request under the id of another requester's outstanding
+    /// request is dropped before decode or dispatch, without completing that
+    /// request's interaction; the recorded requester's redelivery is served.
+    #[test]
+    fn upcall_bridge_request_under_another_requesters_outstanding_id_is_dropped() {
+        use crate::runtime::bridge_request_claim_test_support::{
+            ClaimRecordingRuntime, bridge_request_from, registered_peer_handle,
+        };
+        use meerkat_core::handles::PeerInteractionHandle as _;
+
+        let handle = registered_peer_handle();
+        let id = meerkat_core::interaction::InteractionId(uuid::Uuid::new_v4());
+        let corr_id = meerkat_core::PeerCorrelationId::from_uuid(id.0);
+        let requester = meerkat_core::comms::PeerId::from_ed25519_pubkey(&[3u8; 32]);
+        let bystander = meerkat_core::comms::PeerId::from_ed25519_pubkey(&[4u8; 32]);
+        handle
+            .request_received(corr_id, meerkat_core::types::HandlingMode::Queue, requester)
+            .expect("the outstanding request is recorded");
+        let recording = Arc::new(ClaimRecordingRuntime::new(handle.clone()));
+        let runtime: Arc<dyn meerkat_core::agent::CommsRuntime> = recording.clone();
+
+        assert!(
+            !record_inbound_request(&runtime, &bridge_request_from(bystander, id)),
+            "another peer's bridge request under the outstanding id is not served"
+        );
+        assert_eq!(
+            recording.completed(),
+            0,
+            "the outstanding request's interaction is not completed"
+        );
+        assert!(
+            record_inbound_request(&runtime, &bridge_request_from(requester, id)),
+            "the recorded requester's redelivery is served"
+        );
+        assert_eq!(
+            handle
+                .resolve_response_addressee(corr_id, requester)
+                .expect("the machine judges the addressee"),
+            meerkat_core::PeerResponseAddresseeVerdict::Requester,
+            "the outstanding request keeps its requester"
+        );
+    }
 
     #[cfg(not(target_arch = "wasm32"))]
     #[tokio::test]
@@ -2060,15 +2130,27 @@ mod tests {
         let provenance = MobToolCallerProvenance::default()
             .with_mob_id("mob-a")
             .with_member_id("b2");
-        let context = mint_mob_operator_authority_from_facts(&facts, provenance, "req-1")
-            .expect("facts re-mint through the generated ladder");
+        let incarnation = meerkat_core::service::MobIncarnationId::mint();
+        let context = mint_mob_operator_authority_from_facts(
+            &facts,
+            "mob-a",
+            incarnation,
+            provenance,
+            "req-1",
+        )
+        .expect("facts re-mint through the generated ladder");
         assert!(
             context.is_generated_authority_context(),
             "sealed generated context"
         );
-        assert!(context.can_manage_mob("mob-a"));
-        assert!(context.spawn_profile_scope_contains("mob-a", "worker"));
-        assert!(!context.can_manage_mob("mob-other"));
+        assert!(context.can_manage_mob("mob-a", incarnation));
+        assert!(context.spawn_profile_scope_contains("mob-a", incarnation, "worker"));
+        assert!(!context.can_manage_mob("mob-other", incarnation));
+        // The record binds to the holder's live incarnation only: a later
+        // mob under the same id is not in scope.
+        let later = meerkat_core::service::MobIncarnationId::mint();
+        assert!(!context.can_manage_mob("mob-a", later));
+        assert!(!context.spawn_profile_scope_present("mob-a", later));
     }
 
     /// A recovered Pending for every high-risk mutator terminalizes

@@ -58,6 +58,7 @@
           {
             "properties": {
               "max": {
+                "description": "The context limit the failure reported, in tokens: the model's\nwindow or input ceiling, or 0 when a provider error named none.",
                 "format": "uint32",
                 "minimum": 0,
                 "type": "integer"
@@ -67,6 +68,7 @@
                 "type": "string"
               },
               "requested": {
+                "description": "The token count the failure reported. A refusal before dispatch\nreports the request's estimate, above `max`. After dispatch it is\nthe provider's count and can be at or below `max`: a response the\nprovider stopped because the window filled reports the call's own\ntokens. Do not compute an overflow from `max` and `requested`.",
                 "format": "uint32",
                 "minimum": 0,
                 "type": "integer"
@@ -2123,6 +2125,19 @@
             "properties": {
               "type": {
                 "const": "between_tools",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Thinking turned off: the model answers without thinking blocks.\nAccepted only on models whose catalog row admits it (its\n`anthropic_disabled_thinking`), on some of them only at `high`\neffort or below; wire shape `{\"type\": \"disabled\"}`.",
+            "properties": {
+              "type": {
+                "const": "disabled",
                 "type": "string"
               }
             },
@@ -13441,7 +13456,8 @@
           "mob_rejected",
           "lease_lost",
           "transport_error",
-          "internal_error"
+          "internal_error",
+          "schedule_mandate_unavailable"
         ],
         "type": "string"
       },
@@ -14554,6 +14570,112 @@
             "type": "string"
           }
         ]
+      },
+      "PrincipalId": {
+        "description": "Stable, caller-visible principal id.\n\nLegacy deserialization preserves previously persisted strings, including\nthose rejected by [`Self::new`]. Qualified [`PrincipalRef`] deserialization\nvalidates the id; migrating unqualified persisted ids is a separate step.",
+        "type": "string"
+      },
+      "PrincipalKind": {
+        "description": "Generic principal categories. Product-specific role names belong outside\ncore and may be mapped to these typed categories by clients.",
+        "enum": [
+          "human",
+          "personal_agent",
+          "shared_agent",
+          "runtime_host",
+          "service_account"
+        ],
+        "type": "string"
+      },
+      "PrincipalQualification": {
+        "description": "Whether an identity has an explicit trust-domain namespace.\n\nUnqualified identity preserves trusted-embedded and legacy wire contracts;\nit must not be silently assigned a domain for governed use. Qualification\nis identity vocabulary, not proof of authentication or authorization.",
+        "oneOf": [
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "unqualified",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "qualified",
+                "type": "string"
+              },
+              "trust_domain_id": {
+                "$ref": "#/components/schemas/TrustDomainId"
+              }
+            },
+            "required": [
+              "kind",
+              "trust_domain_id"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "PrincipalRef": {
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "qualification": {
+                  "properties": {
+                    "kind": {
+                      "const": "qualified"
+                    }
+                  },
+                  "required": [
+                    "kind"
+                  ]
+                }
+              },
+              "required": [
+                "qualification"
+              ]
+            },
+            "then": {
+              "properties": {
+                "id": {
+                  "allOf": [
+                    {
+                      "pattern": "[^\\u0009\\u000a\\u000b\\u000c\\u000d\\u0020\\u0085\\u00a0\\u1680\\u2000\\u2001\\u2002\\u2003\\u2004\\u2005\\u2006\\u2007\\u2008\\u2009\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000]"
+                    },
+                    {
+                      "not": {
+                        "pattern": "[\\u0000\\u0001\\u0002\\u0003\\u0004\\u0005\\u0006\\u0007\\u0008\\u0009\\u000a\\u000b\\u000c\\u000d\\u000e\\u000f\\u0010\\u0011\\u0012\\u0013\\u0014\\u0015\\u0016\\u0017\\u0018\\u0019\\u001a\\u001b\\u001c\\u001d\\u001e\\u001f\\u007f\\u0080\\u0081\\u0082\\u0083\\u0084\\u0085\\u0086\\u0087\\u0088\\u0089\\u008a\\u008b\\u008c\\u008d\\u008e\\u008f\\u0090\\u0091\\u0092\\u0093\\u0094\\u0095\\u0096\\u0097\\u0098\\u0099\\u009a\\u009b\\u009c\\u009d\\u009e\\u009f]"
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        ],
+        "description": "Typed principal reference.\n\nPublic fields preserve the existing data contract, so an in-memory value\nis not proof of valid or authenticated identity. Governed admission must\ncall [`Self::validate_qualified`] and separately establish caller authority.",
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/PrincipalId"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/PrincipalKind"
+          },
+          "qualification": {
+            "$ref": "#/components/schemas/PrincipalQualification"
+          }
+        },
+        "required": [
+          "kind",
+          "id"
+        ],
+        "type": "object"
       },
       "ProfileId": {
         "description": "Opaque slug identifying an auth profile override on a connection.",
@@ -17034,6 +17156,17 @@
       "Schedule": {
         "description": "Canonical public projection returned by every `schedule/*` RPC method.\n\nThe durable schedule domain object has a custom persistence serializer\nwhich includes generated machine authority state. That persistence shape\nmust not double as the public contract. This projection deliberately keeps\nthe existing flattened schedule configuration while excluding the private\nmachine state, and it is the single source for both production responses\nand generated SDK schemas.",
         "properties": {
+          "commissioning_agent": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PrincipalRef"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The agent whose mandate commissioned this schedule. The schedule\nservice records the agent its composition commissions for (a governed\nrealm's opened agent, never a request value) each time the schedule is\ncreated or redefined. `None` in an ungoverned realm and for schedules\nrecorded before this field existed; a governed realm fires the\nschedule only under the agent recorded here."
+          },
           "created_at_utc": {
             "format": "date-time",
             "type": "string"
@@ -18434,6 +18567,21 @@
           {
             "const": "cancelled",
             "description": "Request was cancelled",
+            "type": "string"
+          },
+          {
+            "const": "refusal",
+            "description": "The model declined the response (Anthropic `refusal`). The agent loop\ncommits nothing of a refused turn and never runs its tool calls.",
+            "type": "string"
+          },
+          {
+            "const": "pause_turn",
+            "description": "The provider paused a long-running server-tool turn (Anthropic\n`pause_turn`). The turn is committed as it stands; sending it back\nlets the model continue.",
+            "type": "string"
+          },
+          {
+            "const": "context_window_exceeded",
+            "description": "Generation stopped because the model's context window filled\n(Anthropic `model_context_window_exceeded`). The agent loop commits\nnothing of the turn and fails the run as context exceeded.",
             "type": "string"
           }
         ]
@@ -20436,6 +20584,20 @@
           }
         ]
       },
+      "TrustDomainId": {
+        "allOf": [
+          {
+            "pattern": "[^\\u0009\\u000a\\u000b\\u000c\\u000d\\u0020\\u0085\\u00a0\\u1680\\u2000\\u2001\\u2002\\u2003\\u2004\\u2005\\u2006\\u2007\\u2008\\u2009\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000]"
+          },
+          {
+            "not": {
+              "pattern": "[\\u0000\\u0001\\u0002\\u0003\\u0004\\u0005\\u0006\\u0007\\u0008\\u0009\\u000a\\u000b\\u000c\\u000d\\u000e\\u000f\\u0010\\u0011\\u0012\\u0013\\u0014\\u0015\\u0016\\u0017\\u0018\\u0019\\u001a\\u001b\\u001c\\u001d\\u001e\\u001f\\u007f\\u0080\\u0081\\u0082\\u0083\\u0084\\u0085\\u0086\\u0087\\u0088\\u0089\\u008a\\u008b\\u008c\\u008d\\u008e\\u008f\\u0090\\u0091\\u0092\\u0093\\u0094\\u0095\\u0096\\u0097\\u0098\\u0099\\u009a\\u009b\\u009c\\u009d\\u009e\\u009f]"
+            }
+          }
+        ],
+        "description": "Exact, opaque trust-domain namespace for a qualified principal id.\n\nDomain ids are not inferred from hostnames or normalized. Constructing one\nvalidates its syntax, not the caller's authority to assert that domain.",
+        "type": "string"
+      },
       "TurnRequestContext": {
         "description": "Exact host-generated context projected into provider requests for one\nruntime-owned logical turn.\n\nThis is deliberately not a [`crate::types::Message`]: it cannot be appended\nto a [`crate::Session`] or acquire durable transcript semantics. Runtime\ninput persistence owns the bytes until the input reaches a terminal state;\nthe agent only borrows this clone-cheap value while composing foreground\nprovider requests for that turn.",
         "minLength": 1,
@@ -20851,6 +21013,19 @@
             "properties": {
               "type": {
                 "const": "between_tools",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Thinking turned off; accepted only by models whose catalog row admits\nit.",
+            "properties": {
+              "type": {
+                "const": "disabled",
                 "type": "string"
               }
             },
@@ -25807,7 +25982,10 @@
           "max_tokens",
           "stop_sequence",
           "content_filter",
-          "cancelled"
+          "cancelled",
+          "refusal",
+          "pause_turn",
+          "context_window_exceeded"
         ],
         "type": "string"
       },
@@ -27100,7 +27278,7 @@
   },
   "info": {
     "title": "Meerkat REST API",
-    "version": "0.9.2"
+    "version": "0.9.3"
   },
   "openapi": "3.1.0",
   "paths": {

@@ -308,6 +308,20 @@ pub fn spawn_comms_drain(
                         commit_non_runtime_claim(claim, "silent peer lifecycle handled");
                     }
                     PeerInputClass::ResponseProgress | PeerInputClass::ResponseTerminal => {
+                        // The frame's verified signer as ingress admitted it.
+                        // Ingress already dropped frames from any peer but the
+                        // request's addressee; the generated response
+                        // transitions take the signer and refuse any other
+                        // peer again. A frame without an admitted signer is
+                        // never applied.
+                        let Some(responder) = candidate.from_peer_id() else {
+                            tracing::warn!(
+                                interaction_id = %candidate.interaction.id,
+                                "comms_drain: rejected peer response without an admitted sender identity"
+                            );
+                            commit_non_runtime_claim(claim, "sender-less peer response rejected");
+                            continue;
+                        };
                         // Response progress/terminal status is fixed by the
                         // ingress classifier and carried on the candidate. Do
                         // not re-match raw `ResponseStatus` here.
@@ -415,7 +429,9 @@ pub fn spawn_comms_drain(
                             {
                                 let corr_id =
                                     meerkat_core::PeerCorrelationId::from_uuid(interaction_id.0);
-                                if let Err(err) = handle.response_terminal(corr_id, disposition) {
+                                if let Err(err) =
+                                    handle.response_terminal(corr_id, disposition, responder)
+                                {
                                     tracing::warn!(
                                         error = %err,
                                         corr_id = %corr_id,
@@ -529,7 +545,7 @@ pub fn spawn_comms_drain(
                             {
                                 let corr_id =
                                     meerkat_core::PeerCorrelationId::from_uuid(in_reply_to.0);
-                                if let Err(err) = handle.response_progress(corr_id) {
+                                if let Err(err) = handle.response_progress(corr_id, responder) {
                                     tracing::warn!(
                                         error = %err,
                                         corr_id = %corr_id,
@@ -641,10 +657,50 @@ pub fn spawn_comms_drain(
                             candidate_class,
                             PeerInputClass::SilentRequest | PeerInputClass::ActionableRequest
                         );
+                        // An outstanding inbound request's id is that
+                        // interaction's identity: only its recorded requester
+                        // may send under it again (a redelivery, which runtime
+                        // admission deduplicates). Another peer's candidate
+                        // under the id, request or not, is refused before
+                        // admission, and the outstanding request keeps its
+                        // interaction.
+                        let corr_id = meerkat_core::PeerCorrelationId::from_uuid(interaction_id.0);
+                        let request_authority =
+                            comms_runtime.peer_request_response_authority_handle();
+                        let id_claim = request_authority
+                            .as_ref()
+                            .map_or(meerkat_core::InboundIdClaim::Unclaimed, |handle| {
+                                handle.inbound_id_claim(&candidate)
+                            });
+                        if !matches!(
+                            id_claim,
+                            meerkat_core::InboundIdClaim::Unclaimed
+                                | meerkat_core::InboundIdClaim::ClaimedBySender
+                        ) {
+                            tracing::warn!(
+                                corr_id = %corr_id,
+                                class = ?candidate_class,
+                                sender = ?candidate.from_peer_id(),
+                                "comms_drain: refused a candidate under another requester's outstanding request id"
+                            );
+                            if let Err(error) = refuse_peer_ingress_before_admission(
+                                &adapter,
+                                claim,
+                                format!(
+                                    "interaction id {corr_id} is another requester's outstanding request"
+                                ),
+                            ) {
+                                tracing::warn!(
+                                    %error,
+                                    "comms_drain: failed to refuse a candidate under an outstanding request id"
+                                );
+                                notify_claim_mechanism_failure(&adapter, &session_id).await;
+                                return;
+                            }
+                            continue;
+                        }
                         if is_inbound_peer_request {
-                            let Some(handle) =
-                                comms_runtime.peer_request_response_authority_handle()
-                            else {
+                            let Some(handle) = request_authority else {
                                 tracing::warn!(
                                     interaction_id = %interaction_id,
                                     class = ?candidate_class,
@@ -661,11 +717,13 @@ pub fn spawn_comms_drain(
                                 notify_claim_mechanism_failure(&adapter, &session_id).await;
                                 return;
                             };
-                            let corr_id =
-                                meerkat_core::PeerCorrelationId::from_uuid(interaction_id.0);
-                            if handle.inbound_state(corr_id).is_none()
-                                && let Err(err) = handle
-                                    .request_received(corr_id, candidate.interaction.handling_mode)
+                            // A new request records its verified requester,
+                            // the sender ingress admitted for the signed
+                            // envelope; a response to it goes only to that
+                            // peer. The requester's redelivery is already
+                            // recorded.
+                            if id_claim == meerkat_core::InboundIdClaim::Unclaimed
+                                && let Err(err) = handle.request_received_from_ingress(&candidate)
                             {
                                 tracing::warn!(
                                     error = %err,
@@ -831,6 +889,31 @@ async fn accept_routed_peer_ingress(
     }
 }
 
+/// Terminalize a claim the drain refused before admission as `Rejected`:
+/// nothing reaches the session, and the sender of a durable delivery learns of
+/// the refusal. A volatile claim was handed off when it was routed, so
+/// refusing it only admits nothing.
+fn refuse_peer_ingress_before_admission(
+    adapter: &MeerkatMachine,
+    claim: RoutedPeerIngressClaim,
+    reason: String,
+) -> Result<(), crate::RuntimeDriverError> {
+    let RoutedPeerIngressClaim::Durable(claim) = claim else {
+        return Ok(());
+    };
+    let facts = PeerIngressClaimCommitFacts {
+        claim_id: claim.claim_id(),
+        raw_item_id: claim.raw_item_id(),
+        class: claim.class(),
+    };
+    match adapter.reject_peer_ingress_before_admission(facts, reason) {
+        crate::meerkat_machine::PeerIngressAcceptFinalization::Finalized { receipt, .. } => {
+            finalize_peer_ingress_claim(RoutedPeerIngressClaim::Durable(claim), receipt)
+        }
+        crate::meerkat_machine::PeerIngressAcceptFinalization::MechanismError(error) => Err(error),
+    }
+}
+
 fn commit_non_runtime_claim(claim: RoutedPeerIngressClaim, handled_as: &'static str) {
     if matches!(claim, RoutedPeerIngressClaim::Durable(_)) {
         tracing::error!(
@@ -934,7 +1017,16 @@ fn reject_peer_response_observation_via_authority(
         );
         return;
     };
-    if let Err(err) = handle.response_rejected(corr_id) {
+    let Some(responder) = candidate.from_peer_id() else {
+        tracing::warn!(
+            reason = reason,
+            corr_id = %corr_id,
+            interaction_id = %candidate.interaction.id,
+            "comms_drain: peer response observation has no admitted sender identity"
+        );
+        return;
+    };
+    if let Err(err) = handle.response_rejected(corr_id, responder) {
         tracing::warn!(
             error = %err,
             reason = reason,
@@ -2807,10 +2899,22 @@ fn record_bridge_inbound_peer_request(
         return false;
     };
     let corr_id = meerkat_core::PeerCorrelationId::from_uuid(candidate.interaction.id.0);
-    if handle.inbound_state(corr_id).is_some() {
-        return true;
+    // Only the outstanding request's own requester may send its id again.
+    // Another peer's bridge request under the id is dropped before decode or
+    // dispatch, and the outstanding request's interaction stays open.
+    match handle.inbound_id_claim(candidate) {
+        meerkat_core::InboundIdClaim::Unclaimed => {}
+        meerkat_core::InboundIdClaim::ClaimedBySender => return true,
+        _ => {
+            tracing::warn!(
+                corr_id = %corr_id,
+                sender = ?candidate.from_peer_id(),
+                "comms_drain: dropped a supervisor bridge request under another requester's outstanding id"
+            );
+            return false;
+        }
     }
-    if let Err(err) = handle.request_received(corr_id, candidate.interaction.handling_mode) {
+    if let Err(err) = handle.request_received_from_ingress(candidate) {
         tracing::warn!(
             error = %err,
             corr_id = %corr_id,
@@ -7721,6 +7825,12 @@ mod tests {
     struct TestPeerIngressQueue {
         candidates: std::sync::Mutex<VecDeque<PeerInputCandidate>>,
         outstanding: std::sync::Mutex<Option<(PeerIngressClaimId, InteractionId)>>,
+        committed: std::sync::Mutex<
+            Vec<(
+                PeerIngressClaimCommitFacts,
+                Arc<dyn std::any::Any + Send + Sync>,
+            )>,
+        >,
     }
 
     impl TestPeerIngressQueue {
@@ -7728,11 +7838,30 @@ mod tests {
             Arc::new(Self {
                 candidates: std::sync::Mutex::new(candidates.into_iter().collect()),
                 outstanding: std::sync::Mutex::new(None),
+                committed: std::sync::Mutex::new(Vec::new()),
             })
         }
 
         fn remaining(&self) -> usize {
             self.candidates.lock().expect("candidate mutex").len()
+        }
+
+        /// The terminal outcome the runtime receipt of each durable commit
+        /// carries, in commit order.
+        fn committed_outcomes(
+            &self,
+        ) -> Vec<Option<meerkat_core::interaction::PeerIngressClaimTerminalOutcome>> {
+            self.committed
+                .lock()
+                .expect("committed mutex")
+                .iter()
+                .map(|(facts, receipt)| {
+                    receipt
+                        .downcast_ref::<crate::meerkat_machine::DurablePeerIngressAdmissionReceipt>(
+                        )
+                        .and_then(|receipt| receipt.validate(*facts))
+                })
+                .collect()
         }
 
         fn claim(self: &Arc<Self>) -> Option<PeerIngressQueueClaim> {
@@ -7775,7 +7904,7 @@ mod tests {
         fn commit(
             &self,
             claim_id: PeerIngressClaimId,
-            _receipt: Arc<dyn std::any::Any + Send + Sync>,
+            receipt: Arc<dyn std::any::Any + Send + Sync>,
         ) -> Result<(), PeerIngressClaimCommitError> {
             let mut outstanding = self.outstanding.lock().expect("outstanding claim mutex");
             let Some((current_claim_id, raw_item_id)) = *outstanding else {
@@ -7788,7 +7917,16 @@ mod tests {
             if candidates.front().map(|candidate| candidate.interaction.id) != Some(raw_item_id) {
                 return Err(PeerIngressClaimCommitError::HeadMismatch);
             }
-            candidates.pop_front();
+            if let Some(committed) = candidates.pop_front() {
+                self.committed.lock().expect("committed mutex").push((
+                    PeerIngressClaimCommitFacts {
+                        claim_id,
+                        raw_item_id,
+                        class: committed.ingress.class,
+                    },
+                    receipt,
+                ));
+            }
             *outstanding = None;
             Ok(())
         }
@@ -8677,6 +8815,7 @@ mod tests {
     struct CountingPeerInteractionHandle {
         inbound: std::sync::Mutex<HashSet<meerkat_core::PeerCorrelationId>>,
         inbound_modes: std::sync::Mutex<HashMap<meerkat_core::PeerCorrelationId, HandlingMode>>,
+        inbound_requesters: std::sync::Mutex<HashMap<meerkat_core::PeerCorrelationId, PeerId>>,
         request_received_count: std::sync::atomic::AtomicUsize,
         response_rejected_count: std::sync::atomic::AtomicUsize,
         response_replied_count: std::sync::atomic::AtomicUsize,
@@ -8725,6 +8864,14 @@ mod tests {
                 .load(std::sync::atomic::Ordering::SeqCst)
         }
 
+        fn recorded_requester(&self, corr_id: meerkat_core::PeerCorrelationId) -> Option<PeerId> {
+            self.inbound_requesters
+                .lock()
+                .expect("inbound requesters mutex")
+                .get(&corr_id)
+                .copied()
+        }
+
         fn response_replied_count(&self) -> usize {
             self.response_replied_count
                 .load(std::sync::atomic::Ordering::SeqCst)
@@ -8740,6 +8887,7 @@ mod tests {
         fn request_sent(
             &self,
             _corr_id: meerkat_core::PeerCorrelationId,
+            _addressee: PeerId,
         ) -> Result<(), meerkat_core::handles::DslTransitionError> {
             Ok(())
         }
@@ -8747,6 +8895,7 @@ mod tests {
         fn response_progress(
             &self,
             corr_id: meerkat_core::PeerCorrelationId,
+            _responder: PeerId,
         ) -> Result<(), meerkat_core::handles::DslTransitionError> {
             if self
                 .reject_response_progress
@@ -8764,6 +8913,7 @@ mod tests {
             &self,
             corr_id: meerkat_core::PeerCorrelationId,
             _disposition: meerkat_core::handles::PeerTerminalDisposition,
+            _responder: PeerId,
         ) -> Result<(), meerkat_core::handles::DslTransitionError> {
             if self
                 .reject_response_terminal
@@ -8780,6 +8930,7 @@ mod tests {
         fn response_rejected(
             &self,
             _corr_id: meerkat_core::PeerCorrelationId,
+            _responder: PeerId,
         ) -> Result<(), meerkat_core::handles::DslTransitionError> {
             self.response_rejected_count
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -8815,6 +8966,7 @@ mod tests {
             &self,
             corr_id: meerkat_core::PeerCorrelationId,
             handling_mode: HandlingMode,
+            requester: PeerId,
         ) -> Result<(), meerkat_core::handles::DslTransitionError> {
             if self
                 .reject_request_received
@@ -8836,6 +8988,10 @@ mod tests {
                 .lock()
                 .expect("inbound modes mutex")
                 .insert(corr_id, handling_mode);
+            self.inbound_requesters
+                .lock()
+                .expect("inbound requesters mutex")
+                .insert(corr_id, requester);
             self.request_received_count
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(())
@@ -8856,9 +9012,37 @@ mod tests {
                 .lock()
                 .expect("inbound modes mutex")
                 .remove(&corr_id);
+            self.inbound_requesters
+                .lock()
+                .expect("inbound requesters mutex")
+                .remove(&corr_id);
             self.response_replied_count
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(())
+        }
+
+        fn resolve_response_addressee(
+            &self,
+            corr_id: meerkat_core::PeerCorrelationId,
+            addressee: PeerId,
+        ) -> Result<
+            meerkat_core::PeerResponseAddresseeVerdict,
+            meerkat_core::handles::DslTransitionError,
+        > {
+            Ok(
+                match self
+                    .inbound_requesters
+                    .lock()
+                    .expect("inbound requesters mutex")
+                    .get(&corr_id)
+                {
+                    Some(requester) if *requester == addressee => {
+                        meerkat_core::PeerResponseAddresseeVerdict::Requester
+                    }
+                    Some(_) => meerkat_core::PeerResponseAddresseeVerdict::NotRequester,
+                    None => meerkat_core::PeerResponseAddresseeVerdict::UnknownRequest,
+                },
+            )
         }
 
         fn outbound_state(
@@ -9173,6 +9357,35 @@ mod tests {
                     .push(candidate.interaction.id);
             }
             Ok(claim)
+        }
+    }
+
+    /// A plain event a host injected under `id`: it has no peer sender.
+    fn host_event_candidate(id: InteractionId) -> PeerInputCandidate {
+        PeerInputCandidate {
+            interaction: InboxInteraction {
+                objective_id: None,
+                sender_taint: None,
+                id,
+                from_route: None,
+                from: "event:webhook".to_string(),
+                content: InteractionContent::Message {
+                    body: "build failed".to_string(),
+                    blocks: None,
+                },
+                rendered_text: "External event via webhook: build failed".to_string(),
+                handling_mode: HandlingMode::Queue,
+                render_metadata: None,
+            },
+            ingress: PeerIngressFact::plain_event(
+                id,
+                "webhook",
+                PeerInputClass::PlainEvent,
+                meerkat_core::PeerIngressKind::PlainEvent,
+                None,
+            ),
+            lifecycle_peer: None,
+            response_terminality: None,
         }
     }
 
@@ -9711,6 +9924,406 @@ mod tests {
                 "rejected {class:?} must use the typed abandonment path"
             );
         }
+    }
+
+    /// Records `requester` as the requester of `candidate`'s id, as the drain
+    /// did when an earlier request with that id was admitted.
+    fn record_outstanding_request(
+        peer_handle: &CountingPeerInteractionHandle,
+        candidate: &PeerInputCandidate,
+        requester: PeerId,
+    ) -> meerkat_core::PeerCorrelationId {
+        let corr_id = meerkat_core::PeerCorrelationId::from_uuid(candidate.interaction.id.0);
+        meerkat_core::handles::PeerInteractionHandle::request_received(
+            peer_handle,
+            corr_id,
+            HandlingMode::Queue,
+            requester,
+        )
+        .expect("the outstanding request is recorded");
+        corr_id
+    }
+
+    /// A request reusing the id of another requester's outstanding request is
+    /// refused before admission: none of its content enters the session's
+    /// work, the outstanding request keeps its requester, and that request's
+    /// interaction stream is neither abandoned nor completed.
+    #[tokio::test]
+    async fn request_reusing_another_requesters_outstanding_id_is_refused_before_admission() {
+        for class in [
+            PeerInputClass::SilentRequest,
+            PeerInputClass::ActionableRequest,
+        ] {
+            let adapter = Arc::new(MeerkatMachine::ephemeral());
+            let session_id = SessionId::new();
+            adapter
+                .register_session(session_id.clone())
+                .await
+                .expect("register session");
+
+            let candidate = inbound_peer_request_candidate(class);
+            let peer_handle = Arc::new(CountingPeerInteractionHandle::default());
+            let first_requester = PeerId::new();
+            let corr_id = record_outstanding_request(&peer_handle, &candidate, first_requester);
+            let peer_authority: Arc<dyn meerkat_core::handles::PeerInteractionHandle> =
+                peer_handle.clone();
+            let runtime = Arc::new(OneShotPeerRequestRuntime::with_complete_authority(
+                candidate,
+                peer_authority,
+            ));
+            let drain = spawn_authorized_test_comms_drain(
+                adapter.clone(),
+                session_id.clone(),
+                runtime.clone(),
+                Duration::from_millis(10),
+            )
+            .await;
+
+            tokio::time::timeout(Duration::from_secs(1), drain)
+                .await
+                .expect("drain should exit after one candidate")
+                .expect("drain task should not panic");
+
+            let snapshot = adapter
+                .meerkat_machine_spine_snapshot(&session_id)
+                .await
+                .expect("registered session snapshot");
+            assert_eq!(
+                snapshot.ledger.input_count, 0,
+                "a {class:?} reusing another requester's id must not enter the session's work"
+            );
+            assert_eq!(
+                peer_handle.recorded_requester(corr_id),
+                Some(first_requester),
+                "the outstanding request keeps its requester"
+            );
+            assert_eq!(peer_handle.request_received_count(), 1);
+            assert!(
+                runtime.abandonment_reasons().is_empty(),
+                "the refusal must leave the outstanding {class:?}'s interaction stream alone"
+            );
+            assert_eq!(runtime.completed_count(), 0);
+        }
+    }
+
+    /// A volatile request (handed off when it is routed) under the id of
+    /// another requester's outstanding request is dropped without admission:
+    /// nothing reaches the session, and no rejection reaches its sender.
+    #[tokio::test]
+    async fn volatile_request_reusing_another_requesters_id_is_dropped_without_admission() {
+        let adapter = Arc::new(MeerkatMachine::ephemeral());
+        let session_id = SessionId::new();
+        adapter
+            .register_session(session_id.clone())
+            .await
+            .expect("register session");
+
+        // SilentRequest is a VolatileControl delivery in this queue.
+        let candidate = inbound_peer_request_candidate(PeerInputClass::SilentRequest);
+        let peer_handle = Arc::new(CountingPeerInteractionHandle::default());
+        let first_requester = PeerId::new();
+        let corr_id = record_outstanding_request(&peer_handle, &candidate, first_requester);
+        let peer_authority: Arc<dyn meerkat_core::handles::PeerInteractionHandle> =
+            peer_handle.clone();
+        let runtime = Arc::new(OneShotPeerRequestRuntime::with_complete_authority(
+            candidate,
+            peer_authority,
+        ));
+        let drain = spawn_authorized_test_comms_drain(
+            adapter.clone(),
+            session_id.clone(),
+            runtime.clone(),
+            Duration::from_millis(10),
+        )
+        .await;
+
+        tokio::time::timeout(Duration::from_secs(1), drain)
+            .await
+            .expect("drain should exit after one candidate")
+            .expect("drain task should not panic");
+
+        let snapshot = adapter
+            .meerkat_machine_spine_snapshot(&session_id)
+            .await
+            .expect("registered session snapshot");
+        assert_eq!(snapshot.ledger.input_count, 0);
+        assert_eq!(
+            runtime.queue.remaining(),
+            0,
+            "the volatile claim was handed off, not left at the queue head"
+        );
+        assert_eq!(
+            peer_handle.recorded_requester(corr_id),
+            Some(first_requester)
+        );
+        assert!(runtime.abandonment_reasons().is_empty());
+        assert_eq!(runtime.completed_count(), 0);
+    }
+
+    /// Any candidate with an admitted sender, request or not, under the id of
+    /// another requester's outstanding request is refused before admission:
+    /// a peer message cannot reach the session under that request's
+    /// interaction. The same message under an id no request holds is
+    /// admitted.
+    #[tokio::test]
+    async fn message_reusing_another_requesters_outstanding_id_is_refused_before_admission() {
+        for held_by_another in [true, false] {
+            let adapter = Arc::new(MeerkatMachine::ephemeral());
+            let session_id = SessionId::new();
+            adapter
+                .register_session(session_id.clone())
+                .await
+                .expect("register session");
+
+            let candidate = actionable_message_candidate(0);
+            let peer_handle = Arc::new(CountingPeerInteractionHandle::default());
+            let first_requester = PeerId::new();
+            let corr_id = held_by_another
+                .then(|| record_outstanding_request(&peer_handle, &candidate, first_requester));
+            let peer_authority: Arc<dyn meerkat_core::handles::PeerInteractionHandle> =
+                peer_handle.clone();
+            let runtime = Arc::new(OneShotPeerRequestRuntime::with_complete_authority(
+                candidate,
+                peer_authority,
+            ));
+            let drain = spawn_authorized_test_comms_drain(
+                adapter.clone(),
+                session_id.clone(),
+                runtime.clone(),
+                Duration::from_millis(10),
+            )
+            .await;
+
+            tokio::time::timeout(Duration::from_secs(1), drain)
+                .await
+                .expect("drain should exit after one candidate")
+                .expect("drain task should not panic");
+
+            let snapshot = adapter
+                .meerkat_machine_spine_snapshot(&session_id)
+                .await
+                .expect("registered session snapshot");
+            if let Some(corr_id) = corr_id {
+                assert_eq!(
+                    snapshot.ledger.input_count, 0,
+                    "a message under another requester's outstanding id must not enter the session's work"
+                );
+                assert_eq!(
+                    runtime.queue.remaining(),
+                    0,
+                    "the durable claim is terminalized as rejected, not retained"
+                );
+                assert_eq!(
+                    peer_handle.recorded_requester(corr_id),
+                    Some(first_requester)
+                );
+            } else {
+                assert_eq!(
+                    snapshot.ledger.input_count, 1,
+                    "a message under an id no request holds is admitted"
+                );
+            }
+            assert_eq!(
+                peer_handle.request_received_count(),
+                usize::from(held_by_another)
+            );
+            assert!(runtime.abandonment_reasons().is_empty());
+        }
+    }
+
+    /// A host event, which has no peer sender, under the id of a request the
+    /// session has not answered is refused before admission: its durable
+    /// claim ends `Rejected`, nothing reaches the session, and the open
+    /// request keeps its requester. The same event under an id no request
+    /// holds is admitted.
+    #[tokio::test]
+    async fn host_event_under_an_outstanding_request_id_is_refused_before_admission() {
+        use meerkat_core::interaction::PeerIngressClaimTerminalOutcome;
+        for held in [true, false] {
+            let adapter = Arc::new(MeerkatMachine::ephemeral());
+            let session_id = SessionId::new();
+            adapter
+                .register_session(session_id.clone())
+                .await
+                .expect("register session");
+
+            let candidate = host_event_candidate(InteractionId(Uuid::new_v4()));
+            assert_eq!(candidate.from_peer_id(), None);
+            let peer_handle = Arc::new(CountingPeerInteractionHandle::default());
+            let requester = PeerId::new();
+            let corr_id =
+                held.then(|| record_outstanding_request(&peer_handle, &candidate, requester));
+            let peer_authority: Arc<dyn meerkat_core::handles::PeerInteractionHandle> =
+                peer_handle.clone();
+            let runtime = Arc::new(OneShotPeerRequestRuntime::with_complete_authority(
+                candidate,
+                peer_authority,
+            ));
+            let drain = spawn_authorized_test_comms_drain(
+                adapter.clone(),
+                session_id.clone(),
+                runtime.clone(),
+                Duration::from_millis(10),
+            )
+            .await;
+
+            tokio::time::timeout(Duration::from_secs(1), drain)
+                .await
+                .expect("drain should exit after one candidate")
+                .expect("drain task should not panic");
+
+            let snapshot = adapter
+                .meerkat_machine_spine_snapshot(&session_id)
+                .await
+                .expect("registered session snapshot");
+            let outcomes = runtime.queue.committed_outcomes();
+            if let Some(corr_id) = corr_id {
+                assert_eq!(
+                    snapshot.ledger.input_count, 0,
+                    "a host event under an open request's id must not enter the session's work"
+                );
+                assert!(
+                    matches!(
+                        outcomes.as_slice(),
+                        [Some(
+                            PeerIngressClaimTerminalOutcome::RuntimeRejected { .. }
+                        )]
+                    ),
+                    "the event's durable claim ends Rejected: {outcomes:?}"
+                );
+                assert_eq!(peer_handle.recorded_requester(corr_id), Some(requester));
+                assert_eq!(runtime.completed_count(), 0);
+            } else {
+                assert_eq!(
+                    snapshot.ledger.input_count, 1,
+                    "a host event under an id no request holds is admitted"
+                );
+                assert!(
+                    matches!(
+                        outcomes.as_slice(),
+                        [Some(
+                            PeerIngressClaimTerminalOutcome::RuntimeAccepted { .. }
+                        )]
+                    ),
+                    "the event's durable claim ends Accepted: {outcomes:?}"
+                );
+            }
+            assert_eq!(runtime.queue.remaining(), 0);
+            assert_eq!(peer_handle.request_received_count(), usize::from(held));
+            assert!(runtime.abandonment_reasons().is_empty());
+        }
+    }
+
+    /// The same request redelivered by the peer the drain recorded as its
+    /// requester is admitted as before: the runtime deduplicates by sender
+    /// and id.
+    #[tokio::test]
+    async fn request_redelivered_by_its_recorded_requester_is_admitted() {
+        for class in [
+            PeerInputClass::SilentRequest,
+            PeerInputClass::ActionableRequest,
+        ] {
+            let adapter = Arc::new(MeerkatMachine::ephemeral());
+            let session_id = SessionId::new();
+            adapter
+                .register_session(session_id.clone())
+                .await
+                .expect("register session");
+
+            let candidate = inbound_peer_request_candidate(class);
+            let sender = candidate
+                .from_peer_id()
+                .expect("the test request has an admitted sender");
+            let peer_handle = Arc::new(CountingPeerInteractionHandle::default());
+            record_outstanding_request(&peer_handle, &candidate, sender);
+            let peer_authority: Arc<dyn meerkat_core::handles::PeerInteractionHandle> =
+                peer_handle.clone();
+            let runtime = Arc::new(OneShotPeerRequestRuntime::with_complete_authority(
+                candidate,
+                peer_authority,
+            ));
+            let drain = spawn_authorized_test_comms_drain(
+                adapter.clone(),
+                session_id.clone(),
+                runtime.clone(),
+                Duration::from_millis(10),
+            )
+            .await;
+
+            tokio::time::timeout(Duration::from_secs(1), drain)
+                .await
+                .expect("drain should exit after one candidate")
+                .expect("drain task should not panic");
+
+            let snapshot = adapter
+                .meerkat_machine_spine_snapshot(&session_id)
+                .await
+                .expect("registered session snapshot");
+            assert_eq!(
+                snapshot.ledger.input_count, 1,
+                "a {class:?} redelivered by its recorded requester is admitted"
+            );
+            assert_eq!(peer_handle.request_received_count(), 1);
+            assert!(runtime.abandonment_reasons().is_empty());
+        }
+    }
+
+    /// The drain records an inbound request's requester from its admitted
+    /// ingress fact, the verified sender of the signed envelope. The display
+    /// label, `from_route` and payload fields that name another peer change
+    /// nothing, so a response can only go back to the sender.
+    #[tokio::test]
+    async fn inbound_request_records_its_ingress_sender_as_requester() {
+        let adapter = Arc::new(MeerkatMachine::ephemeral());
+        let session_id = SessionId::new();
+        adapter
+            .register_session(session_id.clone())
+            .await
+            .expect("register session");
+
+        let mut candidate = inbound_peer_request_candidate(PeerInputClass::ActionableRequest);
+        let sender = candidate
+            .ingress
+            .canonical_peer_id
+            .expect("the helper admits a sender");
+        let claimed = PeerId::new();
+        candidate.interaction.from = "claimed-requester".to_string();
+        candidate.interaction.from_route = Some(claimed);
+        if let InteractionContent::Request { params, .. } = &mut candidate.interaction.content {
+            *params = json!({
+                "requester": claimed.to_string(),
+                "from": claimed.to_string(),
+                "peer_id": claimed.to_string(),
+            });
+        }
+        let corr_id = meerkat_core::PeerCorrelationId::from_uuid(candidate.interaction.id.0);
+
+        let peer_handle = Arc::new(CountingPeerInteractionHandle::default());
+        let peer_authority: Arc<dyn meerkat_core::handles::PeerInteractionHandle> =
+            peer_handle.clone();
+        let runtime = Arc::new(OneShotPeerRequestRuntime::with_complete_authority(
+            candidate,
+            peer_authority,
+        ));
+        let drain = spawn_authorized_test_comms_drain(
+            adapter.clone(),
+            session_id.clone(),
+            runtime.clone(),
+            Duration::from_millis(10),
+        )
+        .await;
+        tokio::time::timeout(Duration::from_secs(1), drain)
+            .await
+            .expect("drain should exit after one candidate")
+            .expect("drain task should not panic");
+
+        assert_eq!(peer_handle.request_received_count(), 1);
+        assert_eq!(
+            peer_handle.recorded_requester(corr_id),
+            Some(sender),
+            "the requester is the ingress-admitted sender"
+        );
+        assert!(runtime.abandonment_reasons().is_empty());
     }
 
     /// #1608: a member-kickoff lifecycle notice is admitted as visible runtime
@@ -13229,6 +13842,54 @@ mod tests {
             completed_count.load(std::sync::atomic::Ordering::SeqCst),
             1,
             "bridge request rejected by peer authority should be marked complete"
+        );
+    }
+
+    /// A bridge request reusing the id of another requester's outstanding
+    /// request is dropped before decode or dispatch, and the outstanding
+    /// request's interaction is not marked complete.
+    #[tokio::test]
+    async fn bridge_request_reusing_another_requesters_id_is_dropped_before_dispatch() {
+        let payload = sample_bind_payload();
+        let sender = payload.supervisor.peer_id.clone();
+        let mut runtime_impl = bootstrap_runtime(
+            PEER_ID_RECEIVER,
+            "inproc://receiver",
+            Some("expected-token"),
+        );
+        let counting = Arc::new(CountingPeerInteractionHandle::default());
+        let candidate = bridge_candidate(&sender, &BridgeCommand::BindMember(payload));
+        let first_requester = PeerId::new();
+        let corr_id = record_outstanding_request(&counting, &candidate, first_requester);
+        let peer_handle: Arc<dyn meerkat_core::handles::PeerInteractionHandle> = counting.clone();
+        runtime_impl.peer_handle = Some(peer_handle.clone());
+        runtime_impl.peer_request_response_handle = Some(peer_handle);
+        let completed_count = runtime_impl.completed_count.clone();
+        let runtime: Arc<dyn CommsRuntime> = Arc::new(runtime_impl);
+        let adapter = Arc::new(MeerkatMachine::ephemeral());
+        let session_id = SessionId::new();
+        adapter
+            .register_session(session_id.clone())
+            .await
+            .expect("register session");
+
+        assert!(
+            try_handle_supervisor_bridge_command(&adapter, &session_id, &runtime, &candidate).await,
+            "bridge handler must own bridge requests it refuses"
+        );
+        assert!(
+            matches!(
+                adapter.supervisor_binding(&session_id).await,
+                SupervisorBinding::Unbound
+            ),
+            "a bridge request reusing another requester's id must not bind a supervisor"
+        );
+        assert_eq!(counting.recorded_requester(corr_id), Some(first_requester));
+        assert_eq!(counting.request_received_count(), 1);
+        assert_eq!(
+            completed_count.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the outstanding request's interaction must not be marked complete"
         );
     }
 

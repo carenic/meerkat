@@ -174,6 +174,11 @@ const ALLOWED: &[(&str, &str, Reason)] = &[
     ),
     (
         "OccurrenceLifecycleMachine",
+        "DeliveryFailureScheduleMandateUnavailable",
+        Reason::OutcomeConvergence,
+    ),
+    (
+        "OccurrenceLifecycleMachine",
         "DeliveryFailureTargetBusy",
         Reason::OutcomeConvergence,
     ),

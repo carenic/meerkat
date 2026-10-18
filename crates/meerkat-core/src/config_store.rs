@@ -142,6 +142,20 @@ pub trait RealmConfigSource: Send + Sync {
     ) -> Result<Option<toml::Value>, ConfigError> {
         Ok(None)
     }
+
+    /// The file a store that guards its writes against these documents
+    /// ([`FileConfigStore::with_realm_chain`]) holds an exclusive advisory
+    /// lock on from before it reads its own document, through its
+    /// composition check, to after its write. Writers of documents one host
+    /// composes then take turns, in one process and across processes, so no
+    /// check reads a document another writer is about to replace.
+    ///
+    /// Default: `None`, and such writes stay unserialized. The filesystem
+    /// source returns one file under its state root, which every guarded
+    /// store over that root locks (the user document's included).
+    fn composition_lock_path(&self) -> Option<PathBuf> {
+        None
+    }
 }
 
 /// Read-only reader that composes a realm's parent chain into the effective
@@ -502,6 +516,7 @@ fn compose_reporting_chain_warnings(
 ) -> Result<(Config, Vec<RealmConfigWarning>), ConfigError> {
     let (config, chain) = crate::config::compose_effective_config_with_chain(docs, raw_docs, head)?;
     crate::config::check_composed_confinement(docs, &chain)?;
+    crate::config::check_composed_command_servers(docs, &chain, &config)?;
     warnings.retain(|warning| chain.realms().contains(&warning.realm));
     Ok((config, warnings))
 }
@@ -671,7 +686,10 @@ impl FileConfigStore {
     /// compose either differently: a realm whose own document states no
     /// parent and no `[realm.global]` (the user document's `[realm.global]`
     /// decides whether `global` is on its chain), and each realm the user
-    /// document states a section for. Nothing is written.
+    /// document states a section for, both from its own document in
+    /// `documents` and as if it had none (on another state root that shares
+    /// the user document, it takes the user document's section). Nothing is
+    /// written.
     ///
     /// Only a store declared this way guards the realm's composition. A
     /// store built with [`Self::new`] alone, and a [`MemoryConfigStore`],
@@ -693,6 +711,22 @@ impl FileConfigStore {
     /// Return the config file path.
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// The composition lock a store declared with a realm chain holds
+    /// across a write ([`RealmConfigSource::composition_lock_path`]), or
+    /// `None` when there is no chain or its documents name no lock. Lock
+    /// order: a caller's own lock first (such as `ConfigRuntime`'s), then
+    /// this one; nothing takes them the other way round.
+    async fn composition_lock(&self) -> Result<Option<CompositionLock>, ConfigError> {
+        match self
+            .realm_chain
+            .as_ref()
+            .and_then(|chain| chain.documents.composition_lock_path())
+        {
+            Some(path) => CompositionLock::acquire(path).await.map(Some),
+            None => Ok(None),
+        }
     }
 
     /// The document text as persisted; empty when the file does not exist.
@@ -797,6 +831,8 @@ impl ConfigStore for FileConfigStore {
         &self,
         delta: ConfigDelta,
     ) -> Result<(Config, Vec<ConfigWarning>), ConfigError> {
+        // Held from before the read to after the write.
+        let _composition = self.composition_lock().await?;
         let content = self.read_content().await?;
         let patched = PersistedConfigDocument::patch_content(&content, delta.0)?;
         // The patch already parsed this content strictly, so this parse
@@ -828,6 +864,8 @@ impl ConfigStore for FileConfigStore {
     /// document each one then overrides the parent realm, so callers that
     /// change individual keys of a realm document patch it instead.
     async fn set(&self, config: Config) -> Result<(), ConfigError> {
+        // Held from before the read to after the write.
+        let _composition = self.composition_lock().await?;
         let content = self.read_content().await?;
         let governance = persisted_governance(&content)?;
         keep_governance(&governance, &config.governance)?;
@@ -853,6 +891,56 @@ impl ConfigStore for FileConfigStore {
         let (updated, warnings) = self.patch_with_warnings(delta).await?;
         report_config_load_warnings_once(&self.path, &warnings);
         Ok(updated)
+    }
+}
+
+/// An exclusive advisory lock on a realm config root's composition lock
+/// file ([`RealmConfigSource::composition_lock_path`]), released when
+/// dropped. The lock is taken on the blocking pool and waits for the
+/// writer that holds it.
+struct CompositionLock {
+    #[cfg(not(target_arch = "wasm32"))]
+    file: std::fs::File,
+}
+
+impl CompositionLock {
+    #[cfg(not(target_arch = "wasm32"))]
+    async fn acquire(path: PathBuf) -> Result<Self, ConfigError> {
+        tokio::task::spawn_blocking(move || -> Result<Self, ConfigError> {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .open(&path)?;
+            fs4::fs_std::FileExt::lock_exclusive(&file)?;
+            Ok(Self { file })
+        })
+        .await
+        .map_err(|error| {
+            ConfigError::InternalError(format!(
+                "realm config composition lock task failed: {error}"
+            ))
+        })?
+    }
+
+    /// wasm32 has no advisory file lock, and no source there names a lock
+    /// file.
+    #[cfg(target_arch = "wasm32")]
+    async fn acquire(_path: PathBuf) -> Result<Self, ConfigError> {
+        Ok(Self {})
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Drop for CompositionLock {
+    fn drop(&mut self) {
+        // An explicit unlock, so a copy of the descriptor a concurrently
+        // spawned process holds until its exec cannot keep the lock.
+        let _ = fs4::fs_std::FileExt::unlock(&self.file);
     }
 }
 
@@ -930,18 +1018,63 @@ fn persisted_confinement(content: &str) -> Result<crate::ConfinementConfig, Conf
     }
 }
 
-/// What each credential command of a document runs, by realm and auth
-/// profile: its program, arguments, environment and working directory
-/// (its timeout and caching are ordinary config).
-type CredentialCommands = std::collections::BTreeMap<
-    (String, String),
-    (
+/// The credential commands a document states, by realm section and auth
+/// profile.
+type CredentialCommands = std::collections::BTreeMap<(String, String), CredentialCommand>;
+
+/// A credential command as its document states it: what it runs (its
+/// program, arguments, environment and working directory; its timeout and
+/// caching are ordinary config), the provider and auth method of its auth
+/// profile, and where its token goes: each binding of the same realm section
+/// that names the profile as its auth profile, by id
+/// ([`CredentialCommandRoute`]). A binding resolves its backend and auth
+/// profile within its own section, and a composed section is one document's
+/// section whole, so these are all of the document's routes for the token.
+#[derive(PartialEq)]
+struct CredentialCommand {
+    runs: (
         PathBuf,
         Vec<String>,
         std::collections::BTreeMap<String, String>,
         Option<PathBuf>,
     ),
->;
+    provider: String,
+    auth_method: String,
+    routes: std::collections::BTreeMap<String, CredentialCommandRoute>,
+}
+
+/// Where a binding sends a credential command's token: the id of its
+/// backend profile, that backend as the section states it (`None` when it
+/// states none by that id), the `[self_hosted.servers]` entry the backend
+/// names as the document states it (`None` when it names none, or the
+/// document states none by that id; a composition takes the entry only from
+/// the command's document, and refuses a self-hosted backend that names
+/// none, see [`crate::config::check_composed_command_servers`]), and the
+/// binding's default model, which decides the model, and so the server, of
+/// a request through the binding that names none.
+#[derive(PartialEq)]
+struct CredentialCommandRoute {
+    backend_profile: String,
+    backend: Option<crate::connection::BackendProfileConfig>,
+    server: Option<crate::config::SelfHostedServerConfig>,
+    default_model: Option<String>,
+}
+
+impl CredentialCommand {
+    /// Whether `written` keeps this command: it runs the same thing for the
+    /// same provider and auth method, and each binding that uses it is one
+    /// that already did, sending the token where it did. Removing a binding
+    /// is ordinary config.
+    fn kept_by(&self, written: &Self) -> bool {
+        self.runs == written.runs
+            && self.provider == written.provider
+            && self.auth_method == written.auth_method
+            && written
+                .routes
+                .iter()
+                .all(|(binding, route)| self.routes.get(binding) == Some(route))
+    }
+}
 
 /// The credential commands `config` states.
 fn credential_commands(config: &Config) -> CredentialCommands {
@@ -960,9 +1093,36 @@ fn credential_commands(config: &Config) -> CredentialCommands {
                 else {
                     return None;
                 };
+                let routes = section
+                    .binding
+                    .iter()
+                    .filter(|(_, binding)| &binding.auth_profile == profile)
+                    .map(|(id, binding)| {
+                        let backend = section.backend.get(&binding.backend_profile).cloned();
+                        let server = backend
+                            .as_ref()
+                            .and_then(|backend| backend.server.as_ref())
+                            .and_then(|server| config.self_hosted.servers.get(server))
+                            .cloned();
+                        (
+                            id.clone(),
+                            CredentialCommandRoute {
+                                backend_profile: binding.backend_profile.clone(),
+                                backend,
+                                server,
+                                default_model: binding.default_model.clone(),
+                            },
+                        )
+                    })
+                    .collect();
                 Some((
                     (realm.clone(), profile.clone()),
-                    (program.clone(), args.clone(), env.clone(), cwd.clone()),
+                    CredentialCommand {
+                        runs: (program.clone(), args.clone(), env.clone(), cwd.clone()),
+                        provider: auth.provider.clone(),
+                        auth_method: auth.auth_method.clone(),
+                        routes,
+                    },
                 ))
             })
         })
@@ -978,20 +1138,25 @@ fn persisted_credential_commands(content: &str) -> CredentialCommands {
         .unwrap_or_default()
 }
 
-/// Refuse a write that adds a credential command or changes what one runs
-/// ([`ConfigError::CredentialCommandAdministration`], naming the auth
-/// profile): the host runs it as itself, outside its OS process
-/// confinement, so ordinary config write permission is not its
-/// administration. The host adds or changes one by editing the document
-/// itself. A write that keeps each command the document states, changes
-/// only a command's timeout or caching, or removes one is ordinary config.
+/// Refuse a write that adds a credential command, changes what one runs, or
+/// changes where its token goes ([`ConfigError::CredentialCommandAdministration`],
+/// naming the auth profile): the host runs it as itself, outside its OS
+/// process confinement, so ordinary config write permission is not its
+/// administration. Where the token goes is the profile's provider and auth
+/// method and each binding of the section that uses the profile: such a
+/// binding added, re-pointed at the profile, moved to another backend or
+/// given another default model, and a change to the backend it names or to
+/// the `[self_hosted.servers]` entry that backend names, are all refused. The host adds or changes any
+/// of them by editing the document itself. A write that keeps each command
+/// and its routes, changes only a command's timeout or caching, or removes a
+/// command or a binding is ordinary config.
 fn keep_credential_commands(
     committed: &CredentialCommands,
     written: &Config,
 ) -> Result<(), ConfigError> {
     match credential_commands(written)
         .into_iter()
-        .find(|(key, command)| committed.get(key) != Some(command))
+        .find(|(key, command)| committed.get(key).is_none_or(|kept| !kept.kept_by(command)))
     {
         Some(((realm, profile), _)) => {
             Err(ConfigError::CredentialCommandAdministration { realm, profile })
@@ -1083,10 +1248,13 @@ fn keep_composition(
 
 /// `documents` with the user document (the `global` realm's own) replaced
 /// by `user`: the documents a realm composes from after a write to the user
-/// document.
+/// document. With `without`, that realm's own document is left out too: the
+/// documents it composes from on a state root that holds no document of its
+/// own for it, where it takes the section the user document states for it.
 struct WithUserDocument {
     documents: Arc<dyn RealmConfigSource>,
     user: Config,
+    without: Option<crate::connection::RealmId>,
 }
 
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
@@ -1099,6 +1267,9 @@ impl RealmConfigSource for WithUserDocument {
         if realm.is_global() {
             return Ok(Some(self.user.clone()));
         }
+        if self.without.as_ref() == Some(realm) {
+            return Ok(None);
+        }
         self.documents.config_for_realm(realm).await
     }
 
@@ -1109,6 +1280,9 @@ impl RealmConfigSource for WithUserDocument {
         if realm.is_global() {
             return Ok(Some((self.user.clone(), Vec::new())));
         }
+        if self.without.as_ref() == Some(realm) {
+            return Ok(None);
+        }
         self.documents.config_for_realm_with_warnings(realm).await
     }
 
@@ -1116,10 +1290,14 @@ impl RealmConfigSource for WithUserDocument {
         &self,
         realm: &crate::connection::RealmId,
     ) -> Result<Option<toml::Value>, ConfigError> {
-        if realm.is_global() {
+        if realm.is_global() || self.without.as_ref() == Some(realm) {
             return Ok(None);
         }
         self.documents.raw_config_for_realm(realm).await
+    }
+
+    fn composition_lock_path(&self) -> Option<PathBuf> {
+        self.documents.composition_lock_path()
     }
 }
 
@@ -1240,7 +1418,12 @@ impl RealmChainGuard {
     /// Composed over the persisted and over the written user document: a
     /// realm with no document (for every realm whose own document states no
     /// parent and no `[realm.global]`), and each realm the user document
-    /// states a section for, from its own document as the host has it.
+    /// states a section for, from its own document as the host has it and
+    /// as if it had none. Several state roots can share one user document,
+    /// and one that holds no document of its own for a stated realm composes
+    /// that realm from the user document's section; a stated realm whose
+    /// chain resolves on no such state root, before or after the write,
+    /// composes nothing there either way.
     async fn keep_compositions_over_user_document(
         &self,
         change: &str,
@@ -1258,6 +1441,7 @@ impl RealmChainGuard {
         let mut composers = vec![(
             probe,
             "a realm whose own document states no parent and no [realm.global]".to_owned(),
+            false,
         )];
         let stated: std::collections::BTreeSet<&String> =
             persisted.keys().chain(written.keys()).collect();
@@ -1268,24 +1452,49 @@ impl RealmChainGuard {
             };
             if !realm.is_global() {
                 let composer = format!("realm '{}'", realm.as_str());
-                composers.push((realm, composer));
+                let without_document = format!(
+                    "realm '{}' (on a state root without its own document)",
+                    realm.as_str()
+                );
+                composers.push((realm.clone(), composer, false));
+                composers.push((realm, without_document, true));
             }
         }
-        let over = |realms: &RealmEdges| {
+        let over = |realms: &RealmEdges, without: Option<&RealmId>| {
             EffectiveConfigReader::new(Arc::new(WithUserDocument {
                 documents: Arc::clone(&self.documents),
                 user: administration_document(realms, confinement, governance),
+                without: without.cloned(),
             }))
         };
-        let (before_reader, after_reader) = (over(persisted), over(written));
-        for (realm, composer) in composers {
-            let before = before_reader.administered(&realm).await?;
-            let after = after_reader.administered(&realm).await.map_err(|error| {
-                ConfigError::Validation(format!(
-                    "the realm sections do not compose for {composer}: {error}"
-                ))
-            })?;
-            keep_composition(change, &composer, &before, &after)?;
+        for (realm, composer, without_document) in composers {
+            let without = without_document.then_some(&realm);
+            let before = over(persisted, without).administered(&realm).await;
+            let after = over(written, without).administered(&realm).await;
+            match (before, after) {
+                (Ok(before), Ok(after)) => keep_composition(change, &composer, &before, &after)?,
+                // A stated realm whose chain resolves on no state root
+                // without its own document, before or after, composes
+                // nothing there: chain discovery follows no user-document
+                // edge for a realm without its own document.
+                (Err(ConfigError::RealmChain(_)), Err(ConfigError::RealmChain(_)))
+                    if without_document => {}
+                // The user document states a section for the realm that
+                // does not compose where the realm has no document, and the
+                // write would make it compose: what it would compose there
+                // cannot be checked against what it composed before.
+                (Err(error), _) if without_document => {
+                    return Err(ConfigError::Validation(format!(
+                        "the realm sections do not compose for {composer} before this write ({error}), so {change} cannot be checked against what it composes there; the host edits the user document instead"
+                    )));
+                }
+                (Err(error), _) => return Err(error),
+                (Ok(_), Err(error)) => {
+                    return Err(ConfigError::Validation(format!(
+                        "the realm sections do not compose for {composer}: {error}"
+                    )));
+                }
+            }
         }
         Ok(())
     }
@@ -2045,6 +2254,238 @@ mod tests {
             .expect("an unrelated edit of the user document commits");
     }
 
+    /// Several state roots can share one user document. On a host whose
+    /// state root holds no document of its own for a realm the user
+    /// document states a section for, that realm takes the user document's
+    /// section, so a write to the user document is refused when such a
+    /// realm would compose differently, even on a host whose state root
+    /// holds the realm's own document, and nothing is written. A write
+    /// after which such a realm composes the same commits, and so does one
+    /// beside a stated realm that composes on no such host before or after
+    /// the write.
+    #[tokio::test]
+    async fn a_user_document_write_keeps_what_a_stated_realm_without_its_own_document_composes() {
+        use crate::connection::RealmId;
+
+        // On this host `team` has its own document, which states
+        // `[realm.global]`: it composes the user document's governance
+        // whatever the user document says about `team`. On a host whose
+        // state root holds no document for `team`, `team` takes the user
+        // document's `[realm.team]`, whose edge alone puts `global`, and
+        // with it the governance, on its chain.
+        let team_document = confinement_document("[realm.team]\n\n[realm.global]\n");
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("config.toml");
+        let store = FileConfigStore::new(
+            path.clone(),
+            *crate::model_profile::test_catalog::TEST_CATALOG,
+        )
+        .with_realm_chain(
+            RealmId::global(),
+            Arc::new(MapSource {
+                docs: std::iter::once(("team".to_string(), team_document)).collect(),
+            }),
+        );
+
+        let user = format!("[realm.team]\nparent = \"global\"\n\n{REVIEW_RULE}");
+        tokio::fs::write(&path, &user).await.unwrap();
+        let refused = store
+            .patch(ConfigDelta(serde_json::json!({"realm": {"team": null}})))
+            .await
+            .expect_err("team would lose the governance where it has no document of its own");
+        assert!(
+            matches!(
+                refused,
+                ConfigError::CompositionAdministration {
+                    administered: crate::config::AdministeredSection::Governance,
+                    ..
+                }
+            ) && refused.to_string().contains("realm 'team'"),
+            "{refused}"
+        );
+        assert_eq!(tokio::fs::read_to_string(&path).await.unwrap(), user);
+
+        // With `[realm.global]` in the user document, `team` composes
+        // `global` with or without its section there.
+        let user = format!("[realm.global]\n\n[realm.team]\nparent = \"global\"\n\n{REVIEW_RULE}");
+        tokio::fs::write(&path, &user).await.unwrap();
+        store
+            .patch(ConfigDelta(serde_json::json!({"realm": {"team": null}})))
+            .await
+            .expect("team composes the same governance without its section");
+
+        // A stated realm whose edge resolves on no host where it has no
+        // document of its own composes nothing there, before or after, so it
+        // does not refuse a write that changes other realm sections.
+        let user = format!("[realm.global]\n\n[realm.team]\nparent = \"org\"\n\n{REVIEW_RULE}");
+        tokio::fs::write(&path, &user).await.unwrap();
+        store
+            .patch(ConfigDelta(serde_json::json!({"realm": {"other": {}}})))
+            .await
+            .expect("no realm composes differently");
+    }
+
+    /// A user document section for a realm that does not compose where the
+    /// realm has no document of its own (its edge names a realm with no
+    /// document) cannot be checked against what a write would make it
+    /// compose there: removing it is refused, and the refusal names the
+    /// composition it could not check (the realm on a state root without
+    /// its own document, not this host's) with the chain error. Nothing is
+    /// written; the host edits the user document instead.
+    #[tokio::test]
+    async fn removing_a_user_section_that_composes_nowhere_names_the_state_root_it_is_about() {
+        use crate::connection::RealmId;
+
+        let team_document = confinement_document("[realm.team]\n\n[realm.global]\n");
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("config.toml");
+        let store = FileConfigStore::new(
+            path.clone(),
+            *crate::model_profile::test_catalog::TEST_CATALOG,
+        )
+        .with_realm_chain(
+            RealmId::global(),
+            Arc::new(MapSource {
+                docs: std::iter::once(("team".to_string(), team_document)).collect(),
+            }),
+        );
+
+        let user = format!("[realm.team]\nparent = \"org\"\n\n{REVIEW_RULE}");
+        tokio::fs::write(&path, &user).await.unwrap();
+        let refused = store
+            .patch(ConfigDelta(serde_json::json!({"realm": {"team": null}})))
+            .await
+            .expect_err("what team would compose without its document cannot be checked");
+        let message = refused.to_string();
+        assert!(
+            matches!(refused, ConfigError::Validation(_))
+                && message.contains("removing [realm.team]")
+                && message.contains("realm 'team' (on a state root without its own document)")
+                && message.contains("org"),
+            "{message}"
+        );
+        assert_eq!(tokio::fs::read_to_string(&path).await.unwrap(), user);
+    }
+
+    /// The view a user document write checks a stated realm in (as if the
+    /// realm had no document of its own) is what a host on another state
+    /// root that shares the user document, and holds no document for the
+    /// realm, composes at run time. Chain discovery follows no user document
+    /// edge for a realm without its own document, so an edge to a realm
+    /// that has a document on that root does not compose there either: the
+    /// guard may skip a stated realm whose chain resolves neither before nor
+    /// after a write.
+    #[tokio::test]
+    async fn the_as_if_view_is_what_another_state_root_composes() {
+        use crate::connection::RealmId;
+
+        /// A state root's documents, as the filesystem source maps them:
+        /// `global` to the user document, every other realm to
+        /// `<root>/<realm>/config.toml`.
+        struct StateRoot {
+            root: PathBuf,
+            user: PathBuf,
+        }
+
+        #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+        #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+        impl RealmConfigSource for StateRoot {
+            async fn config_for_realm(
+                &self,
+                realm: &crate::connection::RealmId,
+            ) -> Result<Option<Config>, ConfigError> {
+                let path = if realm.is_global() {
+                    self.user.clone()
+                } else {
+                    self.root.join(realm.as_str()).join("config.toml")
+                };
+                if !tokio::fs::try_exists(&path).await? {
+                    return Ok(None);
+                }
+                FileConfigStore::new(path, *crate::model_profile::test_catalog::TEST_CATALOG)
+                    .get()
+                    .await
+                    .map(Some)
+            }
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let user = temp.path().join("user.toml");
+        // Root A, where a user document write is checked, holds `team`'s
+        // document; root B holds none for `team`, and one for `org` that
+        // states governance.
+        let write = |relative: &str, text: String| {
+            let path = temp.path().join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        };
+        write(
+            "a/team/config.toml",
+            "[realm.team]\n\n[realm.global]\n".to_owned(),
+        );
+        write("b/org/config.toml", format!("[realm.org]\n\n{REVIEW_RULE}"));
+        let root_a = Arc::new(StateRoot {
+            root: temp.path().join("a"),
+            user: user.clone(),
+        });
+        let root_b = Arc::new(StateRoot {
+            root: temp.path().join("b"),
+            user: user.clone(),
+        });
+        let team = RealmId::parse("team").unwrap();
+
+        for (stated, composes) in [
+            (
+                format!("[realm.team]\nparent = \"global\"\n\n{REVIEW_RULE}"),
+                true,
+            ),
+            ("[realm.team]\nparent = \"org\"\n".to_owned(), false),
+        ] {
+            std::fs::write(&user, &stated).unwrap();
+            let run_time =
+                EffectiveConfigReader::new(Arc::clone(&root_b) as Arc<dyn RealmConfigSource>)
+                    .administered(&team)
+                    .await;
+            let user_config = FileConfigStore::new(
+                user.clone(),
+                *crate::model_profile::test_catalog::TEST_CATALOG,
+            )
+            .get()
+            .await
+            .unwrap();
+            let as_if = EffectiveConfigReader::new(Arc::new(WithUserDocument {
+                documents: Arc::clone(&root_a) as Arc<dyn RealmConfigSource>,
+                user: administration_document(
+                    &realm_edges(&user_config),
+                    &user_config.confinement,
+                    &user_config.governance,
+                ),
+                without: Some(team.clone()),
+            }))
+            .administered(&team)
+            .await;
+            match (&run_time, &as_if) {
+                (Ok(run_time), Ok(as_if)) => assert!(
+                    composes
+                        && run_time.1 == as_if.1
+                        && run_time.1.is_some()
+                        && composes_the_same(&run_time.0, &as_if.0),
+                    "{stated}"
+                ),
+                (Err(ConfigError::RealmChain(_)), Err(ConfigError::RealmChain(_))) => {
+                    assert!(!composes, "{stated}");
+                }
+                other => panic!(
+                    "{stated}: root B at run time and root A's as-if view differ: {:?}",
+                    (
+                        other.0.as_ref().map(|composed| composed.1.is_some()),
+                        other.1.as_ref().map(|composed| composed.1.is_some())
+                    )
+                ),
+            }
+        }
+    }
+
     /// A store keeps the auto traits it had before it could declare a realm
     /// chain.
     #[test]
@@ -2412,6 +2853,178 @@ parent = "global"
             eff.skills.enabled,
             "child must re-enable an inherited-disabled skills toggle via presence-aware merge"
         );
+    }
+
+    /// A binding whose auth profile runs a credential command sends the token
+    /// to the `[self_hosted.servers]` entry its backend names. Server entries
+    /// compose field by field across the documents on a chain, so the
+    /// composition refuses one that another document states or changes: a
+    /// realm document cannot point the user document's command at its own
+    /// endpoint. The same document may change an entry that only a binding
+    /// without a command uses, and a chain whose entry is the command
+    /// document's own composes.
+    #[tokio::test]
+    async fn a_composition_takes_a_command_bindings_server_only_from_its_document() {
+        use crate::connection::RealmId;
+
+        const USER: &str = r#"[realm.global]
+
+[self_hosted.servers.box]
+base_url = "http://127.0.0.1:9/v1"
+
+[self_hosted.servers.open]
+base_url = "http://127.0.0.1:10/v1"
+
+[realm.team.backend.boxed]
+provider = "self_hosted"
+backend_kind = "self_hosted"
+server = "box"
+
+[realm.team.backend.opened]
+provider = "self_hosted"
+backend_kind = "self_hosted"
+server = "open"
+
+[realm.team.auth.helper]
+provider = "self_hosted"
+auth_method = "api_key"
+source = { kind = "command", program = "/usr/bin/helper" }
+
+[realm.team.auth.anonymous]
+provider = "self_hosted"
+auth_method = "none"
+source = { kind = "platform_default" }
+
+[realm.team.binding.main]
+backend_profile = "boxed"
+auth_profile = "helper"
+
+[realm.team.binding.public]
+backend_profile = "opened"
+auth_profile = "anonymous"
+"#;
+        let team = RealmId::parse("team").unwrap();
+        let compose = |team_document: &'static str| {
+            let source = RawMapSource {
+                docs: [("global", USER), ("team", team_document)]
+                    .into_iter()
+                    .map(|(realm, text)| {
+                        (
+                            realm.to_owned(),
+                            Config::from_persisted_toml(text).unwrap().0,
+                        )
+                    })
+                    .collect(),
+                raw: [("global", USER), ("team", team_document)]
+                    .into_iter()
+                    .map(|(realm, text)| (realm.to_owned(), toml::from_str(text).unwrap()))
+                    .collect(),
+            };
+            let team = team.clone();
+            async move {
+                EffectiveConfigReader::new(Arc::new(source))
+                    .effective_config(&team)
+                    .await
+            }
+        };
+
+        for redirect in [
+            "[self_hosted.servers.box]\nbase_url = \"https://attacker.example/v1\"\n",
+            "[self_hosted.servers.box]\napi_style = \"responses\"\n",
+        ] {
+            match compose(redirect).await {
+                Err(ConfigError::CredentialCommandServer {
+                    realm,
+                    binding,
+                    profile,
+                    server,
+                }) => assert_eq!(
+                    (
+                        realm.as_str(),
+                        binding.as_str(),
+                        profile.as_str(),
+                        server.as_str()
+                    ),
+                    ("team", "main", "helper", "box"),
+                    "{redirect}"
+                ),
+                other => panic!("{redirect} is refused: {:?}", other.map(|_| ())),
+            }
+        }
+
+        let composed = compose("").await.unwrap();
+        assert_eq!(
+            composed.self_hosted.servers["box"].base_url,
+            "http://127.0.0.1:9/v1"
+        );
+        let moved =
+            compose("[self_hosted.servers.open]\nbase_url = \"https://moved.example/v1\"\n")
+                .await
+                .unwrap();
+        assert_eq!(
+            moved.self_hosted.servers["open"].base_url,
+            "https://moved.example/v1"
+        );
+    }
+
+    /// A binding whose auth profile runs a credential command on a
+    /// self-hosted backend must declare that backend's server: without one,
+    /// the binding would authenticate whatever server a request's model is
+    /// served by (or the one its default model names), so the composition is
+    /// refused, naming the binding and the remedy. A declared one composes.
+    #[tokio::test]
+    async fn a_command_binding_on_a_self_hosted_backend_must_declare_its_server() {
+        use crate::connection::RealmId;
+
+        let document = |server_line: &str| {
+            format!(
+                "[realm.global]\n\n\
+                 [self_hosted.servers.box]\nbase_url = \"http://127.0.0.1:9/v1\"\n\n\
+                 [realm.team.backend.boxed]\nprovider = \"self_hosted\"\nbackend_kind = \"self_hosted\"\n{server_line}\n\
+                 [realm.team.auth.helper]\nprovider = \"self_hosted\"\nauth_method = \"api_key\"\n\
+                 source = {{ kind = \"command\", program = \"/usr/bin/helper\" }}\n\n\
+                 [realm.team.binding.main]\nbackend_profile = \"boxed\"\nauth_profile = \"helper\"\n"
+            )
+        };
+        let compose = |user_document: String| {
+            let documents = [("global", user_document), ("team", String::new())];
+            let source = RawMapSource {
+                docs: documents
+                    .iter()
+                    .map(|(realm, text)| {
+                        (
+                            (*realm).to_owned(),
+                            Config::from_persisted_toml(text).unwrap().0,
+                        )
+                    })
+                    .collect(),
+                raw: documents
+                    .iter()
+                    .map(|(realm, text)| ((*realm).to_owned(), toml::from_str(text).unwrap()))
+                    .collect(),
+            };
+            async move {
+                EffectiveConfigReader::new(Arc::new(source))
+                    .effective_config(&RealmId::parse("team").unwrap())
+                    .await
+            }
+        };
+
+        let refused = compose(document(""))
+            .await
+            .expect_err("a command binding with no declared server does not compose");
+        let message = refused.to_string();
+        assert!(
+            message.contains("binding 'main'")
+                && message.contains("credential command")
+                && message.contains("[realm.team.backend.boxed]")
+                && message.contains("declares no server")
+                && message.contains("server = \""),
+            "{message}"
+        );
+        compose(document("server = \"box\""))
+            .await
+            .expect("a command binding that declares its server composes");
     }
 
     const LEGACY_MODEL_FALLBACK_DOC: &str = "[model_fallback]\nenabled = true\n";

@@ -7,10 +7,10 @@ use crate::peer_types::ContentShape as PeerContentShape;
 use crate::trust::TrustStore;
 use crate::types::{InboxItem, MessageKind};
 use meerkat_core::{
-    InteractionId, PeerIngressAdmission, PeerIngressAuthDecision, PeerIngressConvention,
-    PeerIngressEnvelopeFacts, PeerIngressEnvelopeKind, PeerIngressFact, PeerIngressIdentity,
-    PeerIngressKind, PeerIngressPlainEventFacts, PeerInputClass, TerminalityClass,
-    handles::PeerCommsHandle,
+    InteractionId, PeerCorrelationId, PeerIngressAdmission, PeerIngressAuthDecision,
+    PeerIngressConvention, PeerIngressEnvelopeFacts, PeerIngressEnvelopeKind, PeerIngressFact,
+    PeerIngressIdentity, PeerIngressKind, PeerIngressPlainEventFacts, PeerInputClass,
+    PeerResponseSenderVerdict, TerminalityClass, handles::PeerCommsHandle,
 };
 use std::net::{SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::sync::Arc;
@@ -179,6 +179,55 @@ impl IngressClassificationContext {
         }
     }
 
+    /// Whether a response frame to the outbound request `in_reply_to` may be
+    /// queued from `responder`, the machine-echoed canonical id of its
+    /// verified signer. Only the peer the request was sent to may answer it;
+    /// an id with no pending request keeps its existing path (the drain
+    /// refuses it). Fails closed when the machine cannot judge.
+    fn machine_admits_response_sender(
+        &self,
+        in_reply_to: Uuid,
+        responder: meerkat_core::comms::PeerId,
+    ) -> bool {
+        let handle = self.peer_comms_handle.read().clone();
+        let Some(handle) = handle else {
+            tracing::warn!(
+                "classified peer ingress has no machine authority; rejecting response envelope"
+            );
+            return false;
+        };
+        let corr_id = PeerCorrelationId::from_uuid(in_reply_to);
+        match handle.resolve_peer_response_sender(corr_id, responder) {
+            Ok(
+                PeerResponseSenderVerdict::Addressee | PeerResponseSenderVerdict::UnknownRequest,
+            ) => true,
+            Ok(PeerResponseSenderVerdict::NotAddressee) => {
+                tracing::warn!(
+                    corr_id = %corr_id,
+                    responder = %responder,
+                    "peer response from a peer the request was not sent to; rejecting ingress"
+                );
+                false
+            }
+            Ok(verdict) => {
+                tracing::warn!(
+                    corr_id = %corr_id,
+                    verdict = ?verdict,
+                    "unrecognized peer response sender verdict; rejecting ingress"
+                );
+                false
+            }
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    corr_id = %corr_id,
+                    "machine authority could not judge the peer response sender; rejecting ingress"
+                );
+                false
+            }
+        }
+    }
+
     fn machine_classify_plain_event(
         &self,
         facts: PeerIngressPlainEventFacts,
@@ -293,6 +342,24 @@ impl IngressClassificationContext {
                     return None;
                 };
                 let request_id = parse_admission_interaction_id(admission.request_id.as_deref());
+                // A response frame, progress or terminal, is accepted only
+                // from the peer its request was sent to. A frame signed by any
+                // other peer is dropped here, before it is queued: it never
+                // reaches a consumer, so it is never applied and the request
+                // stays open for its addressee. The request is the one the
+                // machine echoed for this frame (R084, as for the sender), not
+                // the shell's copy of the envelope field.
+                if matches!(&envelope.kind, MessageKind::Response { .. }) {
+                    let Some(in_reply_to) = request_id else {
+                        tracing::warn!(
+                            "machine classified peer response without request id; rejecting ingress"
+                        );
+                        return None;
+                    };
+                    if !self.machine_admits_response_sender(in_reply_to.0, canonical_from_peer_id) {
+                        return None;
+                    }
+                }
                 let classification = admission.classification;
                 let lifecycle_peer = admission.lifecycle_peer.clone();
                 let convention = match &envelope.kind {
@@ -626,6 +693,17 @@ mod tests {
             self.inner.resolve_peer_ingress_dequeue(facts)
         }
 
+        fn resolve_peer_response_sender(
+            &self,
+            corr_id: meerkat_core::PeerCorrelationId,
+            responder: meerkat_core::comms::PeerId,
+        ) -> Result<
+            meerkat_core::PeerResponseSenderVerdict,
+            meerkat_core::handles::DslTransitionError,
+        > {
+            self.inner.resolve_peer_response_sender(corr_id, responder)
+        }
+
         fn set_peer_ingress_context(
             &self,
             keep_alive: bool,
@@ -705,6 +783,18 @@ mod tests {
             meerkat_core::handles::DslTransitionError,
         > {
             self.delegate.resolve_peer_ingress_dequeue(facts)
+        }
+
+        fn resolve_peer_response_sender(
+            &self,
+            corr_id: meerkat_core::PeerCorrelationId,
+            responder: meerkat_core::comms::PeerId,
+        ) -> Result<
+            meerkat_core::PeerResponseSenderVerdict,
+            meerkat_core::handles::DslTransitionError,
+        > {
+            self.delegate
+                .resolve_peer_response_sender(corr_id, responder)
         }
 
         fn set_peer_ingress_context(
@@ -1130,6 +1220,215 @@ mod tests {
                 disposition: meerkat_core::TerminalDisposition::Completed
             })
         );
+    }
+
+    /// The request id a test classification echoes for a response frame.
+    #[derive(Clone, Copy)]
+    enum RequestIdEcho {
+        /// What the runtime machine echoes: the envelope's `in_reply_to`.
+        Machine,
+        /// Another id, so a test can tell the echoed id from the raw one.
+        Other(Uuid),
+        /// No request id.
+        Missing,
+    }
+
+    /// Classifies like the runtime handle and answers every response-sender
+    /// question with one fixed answer, recording what it was asked.
+    struct FixedResponseSenderHandle {
+        answer: Option<meerkat_core::PeerResponseSenderVerdict>,
+        asked: parking_lot::Mutex<Vec<(PeerCorrelationId, meerkat_core::comms::PeerId)>>,
+        delegate: Arc<dyn meerkat_core::handles::PeerCommsHandle>,
+        echo: RequestIdEcho,
+    }
+
+    impl meerkat_core::handles::PeerCommsHandle for FixedResponseSenderHandle {
+        fn classify_external_envelope(
+            &self,
+            facts: PeerIngressEnvelopeFacts,
+        ) -> Result<PeerIngressAdmission, meerkat_core::handles::DslTransitionError> {
+            let mut admission = self.delegate.classify_external_envelope(facts)?;
+            match self.echo {
+                RequestIdEcho::Machine => {}
+                RequestIdEcho::Other(id) => admission.request_id = Some(id.to_string()),
+                RequestIdEcho::Missing => admission.request_id = None,
+            }
+            Ok(admission)
+        }
+
+        fn classify_plain_event(
+            &self,
+            facts: PeerIngressPlainEventFacts,
+        ) -> Result<PeerIngressAdmission, meerkat_core::handles::DslTransitionError> {
+            self.delegate.classify_plain_event(facts)
+        }
+
+        fn resolve_peer_ingress_receive(
+            &self,
+            facts: meerkat_core::PeerIngressReceiveFacts,
+        ) -> Result<
+            meerkat_core::PeerIngressReceiveAuthority,
+            meerkat_core::handles::DslTransitionError,
+        > {
+            self.delegate.resolve_peer_ingress_receive(facts)
+        }
+
+        fn resolve_peer_ingress_dequeue(
+            &self,
+            facts: meerkat_core::PeerIngressDequeueFacts,
+        ) -> Result<
+            meerkat_core::PeerIngressDequeueAuthority,
+            meerkat_core::handles::DslTransitionError,
+        > {
+            self.delegate.resolve_peer_ingress_dequeue(facts)
+        }
+
+        fn resolve_peer_response_sender(
+            &self,
+            corr_id: PeerCorrelationId,
+            responder: meerkat_core::comms::PeerId,
+        ) -> Result<
+            meerkat_core::PeerResponseSenderVerdict,
+            meerkat_core::handles::DslTransitionError,
+        > {
+            self.asked.lock().push((corr_id, responder));
+            self.answer.ok_or_else(|| {
+                meerkat_core::handles::DslTransitionError::guard_rejected(
+                    "test_peer_comms::resolve_peer_response_sender",
+                    "machine could not judge the response sender",
+                )
+            })
+        }
+
+        fn set_peer_ingress_context(
+            &self,
+            keep_alive: bool,
+        ) -> Result<(), meerkat_core::handles::DslTransitionError> {
+            self.delegate.set_peer_ingress_context(keep_alive)
+        }
+    }
+
+    /// A response frame (progress or terminal) is queued only when the
+    /// machine judges its verified signer the request's addressee or does not
+    /// hold the request; a frame signed by any other peer, or one the machine
+    /// cannot judge, is rejected before it is queued. The machine is asked
+    /// with the request id and the canonical id of the envelope's signer.
+    #[test]
+    fn a_response_is_queued_only_when_its_signer_is_admitted() {
+        use meerkat_core::PeerResponseSenderVerdict;
+
+        for status in [
+            crate::types::Status::Accepted,
+            crate::types::Status::Completed,
+        ] {
+            for (answer, queued) in [
+                (Some(PeerResponseSenderVerdict::Addressee), true),
+                (Some(PeerResponseSenderVerdict::UnknownRequest), true),
+                (Some(PeerResponseSenderVerdict::NotAddressee), false),
+                (None, false),
+            ] {
+                let sender = make_keypair();
+                let handle = Arc::new(FixedResponseSenderHandle {
+                    answer,
+                    asked: parking_lot::Mutex::new(Vec::new()),
+                    delegate: test_support::runtime_peer_comms_handle(),
+                    echo: RequestIdEcho::Machine,
+                });
+                let ctx = make_context_with_machine_and_namespace(
+                    true,
+                    make_trusted_peers("responder", &sender.public_key()),
+                    vec![],
+                    Some(handle.clone()),
+                    None,
+                );
+                let in_reply_to = Uuid::new_v4();
+                let envelope = make_envelope(
+                    &sender,
+                    MessageKind::Response {
+                        objective_id: None,
+                        in_reply_to,
+                        status,
+                        result: serde_json::json!({}),
+                        blocks: None,
+                        content_taint: None,
+                        handling_mode: None,
+                    },
+                );
+                let prepared = ctx.prepare(InboxItem::External { envelope });
+                assert_eq!(
+                    prepared.is_some(),
+                    queued,
+                    "a {status:?} response judged {answer:?} must be queued: {queued}"
+                );
+                assert_eq!(
+                    handle.asked.lock().clone(),
+                    vec![(
+                        PeerCorrelationId::from_uuid(in_reply_to),
+                        sender.public_key().to_peer_id()
+                    )],
+                    "the machine judges the request id and the envelope's signer"
+                );
+            }
+        }
+    }
+
+    /// The response sender is judged on the request id the machine echoed
+    /// for the frame, as the sender identity is (R084), never on the shell's
+    /// copy of the envelope field. A response the machine echoes no request
+    /// id for is rejected before the question is asked.
+    #[test]
+    fn a_response_sender_is_judged_on_the_machine_echoed_request_id() {
+        let sender = make_keypair();
+        let raw = Uuid::new_v4();
+        let echoed = Uuid::new_v4();
+        for (echo, asked, queued_as) in [
+            (
+                RequestIdEcho::Other(echoed),
+                vec![(
+                    PeerCorrelationId::from_uuid(echoed),
+                    sender.public_key().to_peer_id(),
+                )],
+                Some(InteractionId(echoed)),
+            ),
+            (RequestIdEcho::Missing, Vec::new(), None),
+        ] {
+            let handle = Arc::new(FixedResponseSenderHandle {
+                answer: Some(meerkat_core::PeerResponseSenderVerdict::Addressee),
+                asked: parking_lot::Mutex::new(Vec::new()),
+                delegate: test_support::runtime_peer_comms_handle(),
+                echo,
+            });
+            let ctx = make_context_with_machine_and_namespace(
+                true,
+                make_trusted_peers("responder", &sender.public_key()),
+                vec![],
+                Some(handle.clone()),
+                None,
+            );
+            let envelope = make_envelope(
+                &sender,
+                MessageKind::Response {
+                    objective_id: None,
+                    in_reply_to: raw,
+                    status: crate::types::Status::Completed,
+                    result: serde_json::json!({}),
+                    blocks: None,
+                    content_taint: None,
+                    handling_mode: None,
+                },
+            );
+            let prepared = ctx.prepare(InboxItem::External { envelope });
+            assert_eq!(
+                prepared.as_ref().map(|prepared| prepared.request_id),
+                queued_as.map(Some),
+                "the response is queued under the echoed request id, or not at all"
+            );
+            assert_eq!(
+                handle.asked.lock().clone(),
+                asked,
+                "the machine judges the echoed request id and the envelope's signer"
+            );
+        }
     }
 
     #[test]

@@ -5714,6 +5714,65 @@ mod live_context_mirror_tests {
         );
     }
 
+    /// #1821: a deferred close settlement holds a closed channel's outputs
+    /// while it replays rows that need them. A retirement requested meanwhile
+    /// waits for the last hold, then runs; nothing becomes reservable.
+    #[tokio::test]
+    async fn a_retirement_requested_under_a_hold_runs_when_the_last_hold_ends() {
+        let (machine, session_id, channel_id) = bound_experimental_live_machine(0).await;
+        let current = machine
+            .live_delegation_runtime_binding(&session_id, &channel_id)
+            .await
+            .expect("read exact current execution binding");
+        insert_test_assistant_output_handle(&machine, current, "assistant-held", "output-held");
+
+        let first = machine.hold_live_assistant_output_handles(&session_id, &channel_id);
+        let second = machine.hold_live_assistant_output_handles(&session_id, &channel_id);
+        machine.retire_live_assistant_output_handles(&session_id, &channel_id);
+        assert!(
+            machine
+                .live_assistant_output_handle_for_turn(&session_id, &channel_id, "assistant-held")
+                .is_some(),
+            "a held channel keeps its outputs addressable"
+        );
+        drop(first);
+        assert!(
+            machine
+                .live_assistant_output_handle("output-held")
+                .is_some(),
+            "the retirement waits for the last hold"
+        );
+        drop(second);
+        assert!(
+            machine
+                .live_assistant_output_handle("output-held")
+                .is_none(),
+            "the last hold runs the retirement requested under it"
+        );
+        assert!(
+            machine
+                .live_assistant_output_handle_for_turn(&session_id, &channel_id, "assistant-held")
+                .is_none()
+        );
+
+        // A hold that ends with no retirement requested leaves the outputs.
+        insert_test_assistant_output_handle(
+            &machine,
+            machine
+                .live_delegation_runtime_binding(&session_id, &channel_id)
+                .await
+                .expect("read exact current execution binding"),
+            "assistant-kept",
+            "output-kept",
+        );
+        drop(machine.hold_live_assistant_output_handles(&session_id, &channel_id));
+        assert!(
+            machine
+                .live_assistant_output_handle("output-kept")
+                .is_some()
+        );
+    }
+
     #[tokio::test]
     async fn exact_publication_custody_holds_lifecycle_and_stale_binding_is_rejected() {
         let (machine, session_id, channel_id) = bound_experimental_live_machine(0).await;
@@ -10322,8 +10381,85 @@ impl MeerkatMachine {
             })
     }
 
+    /// Retire every generated assistant-output handle of `channel_id`. While
+    /// a [`LiveAssistantOutputRetirementHold`] exists for the channel the
+    /// retirement waits, and runs when the last hold ends.
     #[cfg(feature = "live")]
     pub fn retire_live_assistant_output_handles(
+        &self,
+        session_id: &meerkat_core::SessionId,
+        channel_id: &meerkat_core::LiveChannelId,
+    ) {
+        let held = {
+            let mut holds = self
+                .live_assistant_output_retirement_holds
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match holds.get_mut(&(session_id.clone(), channel_id.clone())) {
+                Some(entry) => {
+                    entry.retirement_requested = true;
+                    true
+                }
+                None => false,
+            }
+        };
+        if !held {
+            self.retire_live_assistant_output_handles_now(session_id, channel_id);
+        }
+    }
+
+    /// Keep `channel_id`'s generated assistant-output handles addressable
+    /// until the returned hold ends (see [`LiveAssistantOutputRetirementHold`]).
+    #[cfg(feature = "live")]
+    pub fn hold_live_assistant_output_handles(
+        &self,
+        session_id: &meerkat_core::SessionId,
+        channel_id: &meerkat_core::LiveChannelId,
+    ) -> LiveAssistantOutputRetirementHold {
+        self.live_assistant_output_retirement_holds
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry((session_id.clone(), channel_id.clone()))
+            .or_default()
+            .holds += 1;
+        LiveAssistantOutputRetirementHold {
+            machine: self.clone(),
+            session_id: session_id.clone(),
+            channel_id: channel_id.clone(),
+        }
+    }
+
+    /// One hold ended; the last one runs a retirement requested meanwhile.
+    #[cfg(feature = "live")]
+    pub(super) fn end_live_assistant_output_retirement_hold(
+        &self,
+        session_id: &meerkat_core::SessionId,
+        channel_id: &meerkat_core::LiveChannelId,
+    ) {
+        let retire = {
+            let mut holds = self
+                .live_assistant_output_retirement_holds
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let key = (session_id.clone(), channel_id.clone());
+            match holds.get_mut(&key) {
+                Some(entry) if entry.holds > 1 => {
+                    entry.holds -= 1;
+                    false
+                }
+                Some(_) => holds
+                    .remove(&key)
+                    .is_some_and(|entry| entry.retirement_requested),
+                None => false,
+            }
+        };
+        if retire {
+            self.retire_live_assistant_output_handles_now(session_id, channel_id);
+        }
+    }
+
+    #[cfg(feature = "live")]
+    fn retire_live_assistant_output_handles_now(
         &self,
         session_id: &meerkat_core::SessionId,
         channel_id: &meerkat_core::LiveChannelId,
@@ -15136,10 +15272,28 @@ impl MeerkatMachine {
         )
         .await
         .map_err(|reason| RuntimeDriverError::ValidationFailed { reason })?;
+        #[cfg(any(test, feature = "test-support"))]
+        if self
+            .test_fail_next_live_close_settlement_deferral
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+        {
+            return Err(RuntimeDriverError::Internal(
+                "injected failure persisting the deferred live close settlement".to_string(),
+            ));
+        }
         #[cfg(feature = "live")]
         self.persist_live_bridge_recovery_state(session_id, "DeferLiveCloseSettlement")
             .await?;
         Ok(())
+    }
+
+    /// Fail the next [`Self::defer_live_close_settlement`] after its machine
+    /// transition, as a failed recovery-state persist does (test support).
+    #[cfg(all(feature = "live", any(test, feature = "test-support")))]
+    #[doc(hidden)]
+    pub fn __fail_next_live_close_settlement_deferral_for_test(&self) {
+        self.test_fail_next_live_close_settlement_deferral
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 
     #[cfg(feature = "live")]
@@ -16548,6 +16702,38 @@ impl MeerkatMachine {
         }
     }
 
+    /// Withdraw a staged boundary-cancel dispatch after a failure that follows
+    /// the staging. An exact-run cancel is recorded by then, so the
+    /// withdrawal's own failure is reported as owned by that recorded cancel
+    /// too: after staging, an exact-run cancel never fails with a bare error.
+    fn abort_staged_boundary_cancel_dispatch(
+        &self,
+        authority: &Arc<std::sync::Mutex<crate::meerkat_machine::dsl::MeerkatMachineAuthority>>,
+        dispatch_generation: u64,
+        requested_run_id: Option<&meerkat_core::RunId>,
+    ) -> Result<(), RuntimeDriverError> {
+        self.abort_boundary_cancel_dispatch(authority, dispatch_generation)
+            .map(|_| ())
+            .map_err(|error| Self::accepted_exact_cancel_failure(requested_run_id, error))
+    }
+
+    fn abort_boundary_cancel_dispatch(
+        &self,
+        authority: &Arc<std::sync::Mutex<crate::meerkat_machine::dsl::MeerkatMachineAuthority>>,
+        dispatch_generation: u64,
+    ) -> Result<bool, RuntimeDriverError> {
+        #[cfg(test)]
+        if self
+            .test_fail_next_boundary_cancel_dispatch_abort
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+        {
+            return Err(RuntimeDriverError::Internal(
+                "injected boundary-cancel dispatch abort failure".to_string(),
+            ));
+        }
+        Self::abort_dsl_boundary_cancel_dispatch_if_current(authority, dispatch_generation)
+    }
+
     pub(super) async fn cancel_after_boundary_inner_for_incarnation(
         &self,
         session_id: &SessionId,
@@ -16739,23 +16925,35 @@ impl MeerkatMachine {
                     return Err(RuntimeDriverError::NotReady { state });
                 }
             };
-            let projected_effect =
-                match crate::effect::runtime_effect_projection_optional_from_dsl_effects(
-                    &staged.effects,
-                ) {
-                    Ok(projected_effect) => projected_effect,
-                    Err(error) => {
-                        let dispatch_generation = staged
-                            .committed_snapshot
-                            .state()
-                            .boundary_cancel_dispatch_generation;
-                        Self::abort_dsl_boundary_cancel_dispatch_if_current(
-                            &captured_dsl_authority,
-                            dispatch_generation,
-                        )?;
-                        return Err(RuntimeDriverError::Internal(error));
-                    }
-                };
+            let projection =
+                crate::effect::runtime_effect_projection_optional_from_dsl_effects(&staged.effects);
+            #[cfg(test)]
+            let projection = if self
+                .test_fail_next_boundary_cancel_effect_projection
+                .swap(false, std::sync::atomic::Ordering::AcqRel)
+            {
+                Err("injected boundary-cancel effect projection failure".to_string())
+            } else {
+                projection
+            };
+            let projected_effect = match projection {
+                Ok(projected_effect) => projected_effect,
+                Err(error) => {
+                    let dispatch_generation = staged
+                        .committed_snapshot
+                        .state()
+                        .boundary_cancel_dispatch_generation;
+                    self.abort_staged_boundary_cancel_dispatch(
+                        &captured_dsl_authority,
+                        dispatch_generation,
+                        requested_run_id,
+                    )?;
+                    return Err(Self::accepted_exact_cancel_failure(
+                        requested_run_id,
+                        RuntimeDriverError::Internal(error),
+                    ));
+                }
+            };
             let Some(projected_effect) = projected_effect else {
                 // Machine-owned convergence: a boundary-cancel dispatch is
                 // already outstanding, so the machine took the typed
@@ -16799,9 +16997,10 @@ impl MeerkatMachine {
             let sessions = self.sessions.read().await;
             let Some(entry) = sessions.get(session_id) else {
                 drop(sessions);
-                Self::abort_dsl_boundary_cancel_dispatch_if_current(
+                self.abort_staged_boundary_cancel_dispatch(
                     &captured_dsl_authority,
                     dispatch_generation,
+                    requested_run_id,
                 )?;
                 return Err(Self::accepted_exact_cancel_failure(
                     requested_run_id,
@@ -16814,9 +17013,10 @@ impl MeerkatMachine {
                 || !Arc::ptr_eq(&entry.dsl_authority, &captured_dsl_authority)
             {
                 drop(sessions);
-                Self::abort_dsl_boundary_cancel_dispatch_if_current(
+                self.abort_staged_boundary_cancel_dispatch(
                     &captured_dsl_authority,
                     dispatch_generation,
+                    requested_run_id,
                 )?;
                 return Err(Self::accepted_exact_cancel_failure(
                     requested_run_id,
@@ -16828,9 +17028,10 @@ impl MeerkatMachine {
             }
             let Some(attachment_id) = entry.live_attachment_id() else {
                 drop(sessions);
-                Self::abort_dsl_boundary_cancel_dispatch_if_current(
+                self.abort_staged_boundary_cancel_dispatch(
                     &captured_dsl_authority,
                     dispatch_generation,
+                    requested_run_id,
                 )?;
                 return Err(Self::accepted_exact_cancel_failure(
                     requested_run_id,
@@ -16841,9 +17042,10 @@ impl MeerkatMachine {
             };
             let Some(effect_tx) = entry.effect_sender() else {
                 drop(sessions);
-                Self::abort_dsl_boundary_cancel_dispatch_if_current(
+                self.abort_staged_boundary_cancel_dispatch(
                     &captured_dsl_authority,
                     dispatch_generation,
+                    requested_run_id,
                 )?;
                 return Err(Self::accepted_exact_cancel_failure(
                     requested_run_id,
@@ -17049,6 +17251,21 @@ impl MeerkatMachine {
             other => other,
         };
         self.finalize_peer_ingress_accept(facts, submitted_input_id, result)
+    }
+
+    /// Terminalize a peer-ingress claim the drain refused before admission as
+    /// `Rejected`, admitting nothing, so the sender learns of a definite
+    /// refusal rather than an ambiguous delivery.
+    pub(crate) fn reject_peer_ingress_before_admission(
+        &self,
+        facts: meerkat_core::interaction::PeerIngressClaimCommitFacts,
+        reason: String,
+    ) -> super::PeerIngressAcceptFinalization {
+        self.finalize_peer_ingress_accept(
+            facts,
+            meerkat_core::lifecycle::InputId::new(),
+            Err(RuntimeDriverError::ValidationFailed { reason }),
+        )
     }
 
     fn finalize_peer_ingress_accept(

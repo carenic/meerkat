@@ -25,7 +25,12 @@
 //! process writes and exits, then a fresh process reopens, reads, and
 //! continues the session with all process memos absent.
 
-#![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
+#![allow(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    clippy::panic,
+    clippy::disallowed_methods
+)]
 
 #[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
 mod tests {

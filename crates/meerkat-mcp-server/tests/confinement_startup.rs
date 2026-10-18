@@ -4,7 +4,12 @@
 //! even when that directory was removed.
 
 #![cfg(unix)]
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::disallowed_methods
+)]
 
 use serde_json::{Value, json};
 use std::path::PathBuf;

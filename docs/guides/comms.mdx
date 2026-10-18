@@ -80,7 +80,7 @@ graph TD
 | Crate | Role |
 |-------|------|
 | `meerkat-comms` | Core comms: identity, trust, transport, router, inbox, runtime, MCP tools, agent integration |
-| `meerkat-tools` (`builtin::comms`) | `CommsToolSurface`, `CommsToolSet`, individual `BuiltinTool` implementations |
+| `meerkat-tools` (`builtin::comms`) | `CommsToolSurface`, the comms tools' dispatcher |
 | `meerkat-core` | `CommsRuntime` trait, `CommsRuntimeConfig`, `CommsRuntimeMode` enum, substrate integration points |
 | `meerkat` (facade) | `build_comms_runtime_from_config()`, `compose_tools_with_comms()`, factory wiring |
 
@@ -473,6 +473,24 @@ Send a structured ask to a peer when you want explicit `intent + params` and a c
 
 **Response**: `{"status": "sent", "kind": "peer_request", "receipt": {...}}`
 
+Only the peer the request was sent to can answer it. Before the request
+leaves, the runtime's machine authority records its addressee: the canonical
+peer ID of the trusted peer it is routed to. A response, progress or terminal,
+is accepted only when the key that signed its envelope is that peer's. A
+response signed by any other peer, even one that knows the request ID, is
+dropped at ingress before it is queued: nothing reaches the session, a
+pending stream or a waiting tool, and the request stays open for its
+addressee's answer. A response to a request ID this session never sent, has
+already completed or timed out, or sent before a restart is refused as
+before. Under open auth (`require_peer_auth = false`), ingress does not verify
+signatures, so the check compares the key the response envelope declares.
+A sender whose response is dropped learns little: over TCP no response frame
+is acknowledged, so its send succeeds as for an accepted response; in process
+its send fails with `AdmissionDropped`, which tells a sender holding the
+request ID that this session holds the request for another peer. The ID is
+only ever sent to the addressee, so a sender that holds it already sees the
+exchange.
+
 <Note>
 Use `send_message` by default for ordinary collaboration. `send_request` is for structured ask/reply semantics only. It is not task tracking, a stronger delivery mode, or a reserved response channel.
 </Note>
@@ -482,7 +500,7 @@ Use `send_message` by default for ordinary collaboration. `send_request` is for 
 Send a response to a previously received request. Requires a runtime-bound command authority, like `send_request`.
 
 <ParamField path="peer_id" type="string" required>
-  Canonical peer ID (from the `peers` tool) to send the response to.
+  Canonical peer ID of the peer that sent the request. Any other peer is refused (see below).
 </ParamField>
 
 <ParamField path="display_name" type="string">
@@ -510,6 +528,40 @@ Send a response to a previously received request. Requires a runtime-bound comma
 </ParamField>
 
 **Response**: `{"status": "sent", "kind": "peer_response", "receipt": {...}}`
+
+A response, progress or terminal, goes only to the request's requester. When a
+request arrives, the runtime's machine authority records its requester: the
+canonical peer ID of the key that signed the request's envelope, as ingress
+admitted it, never a field of the request's payload. A response addressed to
+any other peer ID is refused before anything is sent. The tool reports it as
+`invalid_arguments`, and the host `comms/send` command as `send_failed`. The
+request stays open, so the response can still be sent to the requester. Only
+the canonical `peer_id` addresses the response; `display_name` is diagnostic
+and does not change who receives it. A response to a request ID the session
+did not receive, has already answered, or received before a restart is
+refused as before (`execution_failed` from the tool).
+
+With peer authentication required, ingress verifies the envelope's signature,
+so the recorded requester is the peer that holds that key. Under open auth
+(`require_peer_auth = false`), ingress does not verify signatures, and the
+recorded requester is the key the envelope declares: the same identity that
+trust and routing use in that mode.
+
+A request ID belongs to one request while that request is open. A request,
+message or event from another peer (a host event, which has no peer sender,
+too) that reuses the ID of a request the session has not yet answered is
+refused before the session sees it, and the open request keeps its
+requester. A durable peer delivery's sender gets a rejection
+(`DurableAdmissionRejected`); a volatile delivery is dropped without a
+signal, and so is a host event, whose injecting call returned when the
+event was queued. The request that first used an ID keeps it; the request
+IDs Meerkat generates are random UUIDs, so another peer can only reuse one
+it has learned. The requester record lasts for the responder process: after a
+restart, an ID whose request is still queued can be claimed by another peer
+until it is answered. A host that mints its own request IDs
+(`send_peer_request_with_id`, `Router::send_with_id`) must keep them
+unguessable; a predicted ID can be claimed first, and the host's own
+request is then refused.
 
 <Note>
 The LLM-facing comms tools return lightweight tool receipts. Host-side `comms/send` returns richer typed receipts such as `peer_message_sent`, `peer_request_sent`, and `peer_response_sent`, with identifiers and ACK-related data for application code.

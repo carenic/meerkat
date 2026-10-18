@@ -1935,6 +1935,12 @@ pub struct MobDestroyReport {
     /// Human-readable cleanup errors captured while destroying.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub errors: Vec<String>,
+    /// Members whose runtime required a durability reload (a boundary commit
+    /// failed after their run consumed its input in memory). The destroy
+    /// reloaded each one from its durable store before retiring it, so the
+    /// retirement recorded what became of that input.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reloaded_members: Vec<AgentIdentity>,
 }
 
 impl MobDestroyReport {
@@ -5510,6 +5516,9 @@ pub struct MobHandle {
     /// actor is the sole writer.
     pub(super) admission_closed_rx:
         tokio::sync::watch::Receiver<Option<super::admission_close::MobAdmissionCloseReason>>,
+    /// The incarnation this mob's runtime minted when it started; see
+    /// [`MobHandle::incarnation`].
+    pub(super) incarnation: meerkat_core::service::MobIncarnationId,
 }
 
 /// Per-member retained per-spawn tool overlays (`SpawnMemberSpec::external_tools`)
@@ -8218,9 +8227,50 @@ impl MobHandle {
         })
     }
 
+    /// Answer a presented callback claim token with the verifier this mob's
+    /// store keeps ([`crate::CallbackClaimCheck`]).
+    pub async fn check_callback_claim_token(
+        &self,
+        token: &crate::MobClaimToken,
+    ) -> Result<crate::CallbackClaimCheck, MobError> {
+        Ok(
+            match self
+                .runtime_metadata
+                .load_callback_claim_verifier(&self.definition.id)
+                .await?
+            {
+                None => crate::CallbackClaimCheck::NotClaimable,
+                Some(verifier) if verifier.verifies(token) => crate::CallbackClaimCheck::Verified,
+                Some(_) => crate::CallbackClaimCheck::Mismatch,
+            },
+        )
+    }
+
+    /// Keep `verifier` as this mob's callback claim verifier when it has
+    /// none. Returns `false`, keeping the one it has, when it has one.
+    pub async fn record_callback_claim_verifier_if_absent(
+        &self,
+        verifier: &crate::MobClaimVerifier,
+    ) -> Result<bool, MobError> {
+        Ok(self
+            .runtime_metadata
+            .put_callback_claim_verifier_if_absent(&self.definition.id, verifier)
+            .await?)
+    }
+
     /// Mob ID.
     pub fn mob_id(&self) -> &MobId {
         &self.definition.id
+    }
+
+    /// The incarnation of this mob: minted once when its runtime started
+    /// (create, or resume in a new process) and shared by every clone. A mob
+    /// destroyed and created again under the same id is a new incarnation,
+    /// so mob operator scope granted for this mob
+    /// (`meerkat_runtime::mob_operator_authority::grant_manage_mob`) never
+    /// reaches a later one.
+    pub fn incarnation(&self) -> meerkat_core::service::MobIncarnationId {
+        self.incarnation
     }
 
     /// Change-notification seam over the actor-published machine state.

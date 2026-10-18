@@ -119,6 +119,14 @@ filegroup(
     visibility = ["//visibility:public"],
 )
 
+# The workspace Clippy configuration, for tests that read what it
+# disallows (the process launch site inventory).
+filegroup(
+    name = "clippy_config",
+    srcs = ["clippy.toml"],
+    visibility = ["//visibility:public"],
+)
+
 filegroup(
     name = "workspace_runfiles",
     srcs = ["BUILD.bazel"] + glob(
@@ -613,6 +621,7 @@ test_suite(
         "//crates/meerkat-cli:help_mobpack_contract_test",
         "//crates/meerkat-cli:help_without_skills_test",
         "//crates/meerkat-cli:mcp_convention_roots_test",
+        "//crates/meerkat-cli:mcp_oauth_first_login_test",
         "//crates/meerkat-cli:runtime_backed_ingress_test",
         "//crates/meerkat-cli:slim_feature_graph_test",
         "//crates/meerkat-cli:sqlite_tools_full_reuse_test",
@@ -716,6 +725,7 @@ test_suite(
         "//crates/meerkat-machine-schema:grant_tlc_model_test",
         "//crates/meerkat-machine-schema:identity_roundtrip_test",
         "//crates/meerkat-machine-schema:input_field_domains_test",
+        "//crates/meerkat-machine-schema:live_context_readiness_guard_contract_test",
         "//crates/meerkat-machine-schema:meerkat_machine_schema_unit_test",
         "//crates/meerkat-machine-schema:model_routing_handoff_lifecycle_test",
         "//crates/meerkat-machine-schema:named_type_binding_covers_catalog_test",
@@ -728,6 +738,7 @@ test_suite(
         "//crates/meerkat-machine-schema:stopped_phase_revival_lattice_test",
         "//crates/meerkat-machine-schema:strict_guard_map_reads_test",
         "//crates/meerkat-machine-schema:temporary_council_lifecycle_machine_test",
+        "//crates/meerkat-machine-schema:transition_arm_exclusivity_test",
         "//crates/meerkat-mcp-server:binary_fatal_error_display_test",
         "//crates/meerkat-mcp-server:binary_tracing_stderr_test",
         "//crates/meerkat-mcp-server:confinement_startup_test",
@@ -757,6 +768,7 @@ test_suite(
         "//crates/meerkat-mob-mcp:stop_cancels_a_staged_run_test",
         "//crates/meerkat-mob-mcp:temporary_council_test",
         "//crates/meerkat-mob-pack:meerkat_mob_pack_unit_test",
+        "//crates/meerkat-mob:adaptive_disabled_thinking_test",
         "//crates/meerkat-mob:cold_restart_mob_resume_test",
         "//crates/meerkat-mob:cold_resume_digest_cost_test",
         "//crates/meerkat-mob:cross_host_events_test",
@@ -884,6 +896,7 @@ test_suite(
         "//crates/meerkat-session:persistence_compat_test",
         "//crates/meerkat-session:planned_identity_fork_test",
         "//crates/meerkat-session:regression_lifecycle_test",
+        "//crates/meerkat-skills:git_https_token_test",
         "//crates/meerkat-skills:meerkat_skills_unit_test",
         "//crates/meerkat-skills:resolver_precedence_test",
         "//crates/meerkat-skills:transport_sources_test",
@@ -919,6 +932,7 @@ test_suite(
         "//crates/meerkat-workgraph:meerkat_workgraph_unit_test",
         "//crates/meerkat:agent_builder_policy_canary_test",
         "//crates/meerkat:agent_factory_auth_binding_test",
+        "//crates/meerkat:anthropic_stop_reasons_test",
         "//crates/meerkat:anthropic_structured_output_bounds_test",
         "//crates/meerkat:atif_reexport_test",
         "//crates/meerkat:brain_swap_history_read_classification_test",
@@ -933,6 +947,7 @@ test_suite(
         "//crates/meerkat:consent_notice_delivery_test",
         "//crates/meerkat:continuation_delivery_test",
         "//crates/meerkat:continuation_submit_test",
+        "//crates/meerkat:credential_command_routes_test",
         "//crates/meerkat:embedded_skill_registration_test",
         "//crates/meerkat:factory_build_agent_test",
         "//crates/meerkat:governed_realm_account_binding_test",
@@ -948,6 +963,7 @@ test_suite(
         "//crates/meerkat:meerkat_unit_test",
         "//crates/meerkat:persistence_contract_test",
         "//crates/meerkat:predicate_schedule_test",
+        "//crates/meerkat:realm_config_write_lock_test",
         "//crates/meerkat:runtime_delivery_callback_hold_test",
         "//crates/meerkat:runtime_delivery_hosting_test",
         "//crates/meerkat:runtime_delivery_owner_test",

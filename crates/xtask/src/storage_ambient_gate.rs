@@ -78,7 +78,7 @@ type AllowEntry = (&'static str, AllowScope, &'static str);
 /// Files/functions allowed to resolve ambient roots, with the sanctioned
 /// reason. Everything here is either the layout/bootstrap authority itself
 /// or a documented storage convention the plan preserves in place.
-const AMBIENT_ALLOWLIST: [AllowEntry; 10] = [
+const AMBIENT_ALLOWLIST: [AllowEntry; 11] = [
     // The path authority and the bootstrap resolver: where ambient inputs
     // are turned into the immutable layout. The only whole-file entries.
     (
@@ -161,6 +161,14 @@ const AMBIENT_ALLOWLIST: [AllowEntry; 10] = [
         "crates/meerkat-rpc/src/main.rs",
         AllowScope::Functions(&["async_main"]),
         "RPC bootstrap inputs",
+    ),
+    // Not storage: the directory of a Git skill invocation's credential
+    // socket, which lives for that one invocation. The system temporary
+    // directory is first because its short path fits a Unix socket address.
+    (
+        "crates/meerkat-skills/src/source/git/credential.rs",
+        AllowScope::Functions(&["socket_parents"]),
+        "per-invocation Git credential socket directory",
     ),
 ];
 

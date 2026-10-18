@@ -2384,6 +2384,18 @@ pub enum SendError {
     /// policy refused.
     #[error("peer dropped at admission: {reason:?}")]
     AdmissionDropped { reason: AdmissionDropReason },
+    /// A peer response, progress or terminal, was addressed to a peer that
+    /// did not send the request it answers. A response goes only to the
+    /// request's verified requester, so it is refused before any transport:
+    /// nothing reached anyone, and the request stays answerable. Names only
+    /// the caller's addressee, never the recorded requester.
+    #[error(
+        "peer {addressee} is not the requester of request {in_reply_to}; a response goes only to the peer that sent the request"
+    )]
+    ResponseAddresseeNotRequester {
+        in_reply_to: crate::interaction::InteractionId,
+        addressee: PeerId,
+    },
 }
 
 #[derive(Debug, Clone, thiserror::Error)]

@@ -1029,6 +1029,36 @@ impl StockGovernance {
     }
 }
 
+/// A stock-governed host fires schedules for, and binds onto each session it
+/// materializes or revives for a fire, the agent the realm was opened for
+/// (its executor), exactly as [`StockGovernance::bind_session_agent`] binds
+/// an interactive session.
+#[async_trait::async_trait]
+impl crate::surface::ScheduledSessionAgentBinding for StockGovernance {
+    fn agent(&self) -> &PrincipalRef {
+        &self.principals.executor
+    }
+
+    async fn bind_scheduled_session(
+        &self,
+        machine: &MeerkatMachine,
+        session_id: &SessionId,
+        configured_servers: &[meerkat_core::McpServerConfig],
+    ) -> Result<(), meerkat_schedule::ScheduleDomainError> {
+        self.bind_session_agent(
+            machine,
+            session_id,
+            configured_servers.iter().map(|server| server.name.as_str()),
+        )
+        .await
+        .map_err(|error| {
+            meerkat_schedule::ScheduleDomainError::Internal(format!(
+                "governed scheduled session agent: {error}"
+            ))
+        })
+    }
+}
+
 /// Whose input [`StockGovernance::bind_original`] binds.
 enum Requesting<'a> {
     /// The local operator, authenticated by this process.

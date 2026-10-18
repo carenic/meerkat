@@ -1206,12 +1206,8 @@ impl OpenAiCompatibleClient {
                                 }
 
                                 if let Some(finish_reason) = choice.finish_reason {
-                                    let stop_reason = match finish_reason.as_str() {
-                                        "tool_calls" => StopReason::ToolUse,
-                                        "length" => StopReason::MaxTokens,
-                                        "content_filter" => StopReason::ContentFilter,
-                                        _ => StopReason::EndTurn,
-                                    };
+                                    let stop_reason =
+                                        chat_finish_reason_stop(finish_reason.as_str())?;
                                     if matches!(stop_reason, StopReason::ToolUse) {
                                         for buffer in tool_buffers.values() {
                                             if let Some(tool_call) = buffer.try_complete()? {
@@ -1547,6 +1543,27 @@ struct ChatUsage {
     prompt_tokens_details: Option<ChatPromptTokensDetails>,
     #[serde(default)]
     completion_tokens_details: Option<ChatCompletionTokensDetails>,
+}
+
+/// Map one Chat Completions `finish_reason`.
+///
+/// An unrecognised reason refuses the response instead of reading it as a
+/// natural end of turn: `IncompleteResponse` is retried with nothing
+/// committed, as the Responses adapter does for an unknown incomplete reason.
+/// `eos`/`eos_token` and `stop_sequence` are the natural-stop names some
+/// self-hosted servers (text-generation-inference among them) send.
+fn chat_finish_reason_stop(finish_reason: &str) -> Result<StopReason, LlmError> {
+    match finish_reason {
+        "stop" | "eos" | "eos_token" => Ok(StopReason::EndTurn),
+        "stop_sequence" => Ok(StopReason::StopSequence),
+        "length" => Ok(StopReason::MaxTokens),
+        // `function_call` is the legacy single-function form.
+        "tool_calls" | "function_call" => Ok(StopReason::ToolUse),
+        "content_filter" => Ok(StopReason::ContentFilter),
+        other => Err(LlmError::IncompleteResponse {
+            message: format!("chat completions response finished for unsupported reason '{other}'"),
+        }),
+    }
 }
 
 /// Output and reasoning for one Chat Completions usage row, with reasoning a
@@ -2685,6 +2702,42 @@ mod tests {
             ),
             "the deferred Done must carry the remembered finish reason, got {events:?}"
         );
+    }
+
+    #[test]
+    fn chat_finish_reasons_map_to_typed_stops() {
+        for (raw, expected) in [
+            ("stop", StopReason::EndTurn),
+            ("eos", StopReason::EndTurn),
+            ("eos_token", StopReason::EndTurn),
+            ("stop_sequence", StopReason::StopSequence),
+            ("length", StopReason::MaxTokens),
+            ("tool_calls", StopReason::ToolUse),
+            ("function_call", StopReason::ToolUse),
+            ("content_filter", StopReason::ContentFilter),
+        ] {
+            assert_eq!(chat_finish_reason_stop(raw).expect(raw), expected, "{raw}");
+        }
+    }
+
+    /// An unknown finish reason is not a natural end of turn: the response
+    /// fails as incomplete (retried, nothing committed) and names the reason.
+    #[tokio::test]
+    async fn chat_completions_unknown_finish_reason_fails_the_response() {
+        let events = collect_chat_stream_events(concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"abort\"}],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":1}}\n\n",
+            "data: [DONE]\n\n"
+        ))
+        .await;
+
+        assert_eq!(done_count(&events), 1, "{events:?}");
+        match observed_done_outcome(&events) {
+            Some(LlmDoneOutcome::Error {
+                error: LlmError::IncompleteResponse { message },
+            }) => assert!(message.contains("'abort'"), "{message}"),
+            other => panic!("expected Done{{Error{{IncompleteResponse}}}}, got {other:?}"),
+        }
     }
 
     #[tokio::test]

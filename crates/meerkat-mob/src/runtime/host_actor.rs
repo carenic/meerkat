@@ -7342,7 +7342,7 @@ impl MobHostActor {
         // Record the inbound peer request under complete request/response
         // authority BEFORE any decode or side effect (the member drain's
         // boundary discipline).
-        if !self.record_inbound_request(candidate) {
+        if !record_inbound_request(&self.host_comms, candidate) {
             return;
         }
 
@@ -11438,36 +11438,6 @@ impl MobHostActor {
         Ok(())
     }
 
-    /// Record the inbound request on the generated peer-interaction
-    /// authority. `false` means the candidate was completed and must not be
-    /// decoded or served.
-    fn record_inbound_request(&self, candidate: &PeerInputCandidate) -> bool {
-        let Some(handle) = self.host_comms.peer_request_response_authority_handle() else {
-            tracing::warn!(
-                interaction_id = %candidate.interaction.id,
-                "mob host: rejected bridge request without complete peer request authority"
-            );
-            self.host_comms
-                .mark_interaction_complete(&candidate.interaction.id);
-            return false;
-        };
-        let corr_id = meerkat_core::PeerCorrelationId::from_uuid(candidate.interaction.id.0);
-        if handle.inbound_state(corr_id).is_some() {
-            return true;
-        }
-        if let Err(err) = handle.request_received(corr_id, candidate.interaction.handling_mode) {
-            tracing::warn!(
-                error = %err,
-                corr_id = %corr_id,
-                "mob host: PeerInteractionHandle::request_received rejected bridge command"
-            );
-            self.host_comms
-                .mark_interaction_complete(&candidate.interaction.id);
-            return false;
-        }
-        true
-    }
-
     /// Install the bound supervisor as a trusted direct peer on the host
     /// runtime, machine-gated through the host's `HandleDslAuthority` and
     /// realized via the generated trust-reconcile obligation (the
@@ -11736,6 +11706,50 @@ impl MobHostActor {
     }
 }
 
+/// Record the inbound request on the generated peer-interaction
+/// authority. `false` means the candidate must not be decoded or served:
+/// it was completed, or another requester's outstanding request holds its
+/// id.
+fn record_inbound_request(
+    host_comms: &Arc<dyn CoreCommsRuntime>,
+    candidate: &PeerInputCandidate,
+) -> bool {
+    let Some(handle) = host_comms.peer_request_response_authority_handle() else {
+        tracing::warn!(
+            interaction_id = %candidate.interaction.id,
+            "mob host: rejected bridge request without complete peer request authority"
+        );
+        host_comms.mark_interaction_complete(&candidate.interaction.id);
+        return false;
+    };
+    let corr_id = meerkat_core::PeerCorrelationId::from_uuid(candidate.interaction.id.0);
+    // Only the outstanding request's own requester may send its id again.
+    // Another peer's bridge request under the id is dropped before decode
+    // or dispatch, and the outstanding request's interaction stays open.
+    match handle.inbound_id_claim(candidate) {
+        meerkat_core::InboundIdClaim::Unclaimed => {}
+        meerkat_core::InboundIdClaim::ClaimedBySender => return true,
+        _ => {
+            tracing::warn!(
+                corr_id = %corr_id,
+                sender = ?candidate.from_peer_id(),
+                "mob host: dropped a bridge request under another requester's outstanding id"
+            );
+            return false;
+        }
+    }
+    if let Err(err) = handle.request_received_from_ingress(candidate) {
+        tracing::warn!(
+            error = %err,
+            corr_id = %corr_id,
+            "mob host: PeerInteractionHandle::request_received rejected bridge command"
+        );
+        host_comms.mark_interaction_complete(&candidate.interaction.id);
+        return false;
+    }
+    true
+}
+
 /// Stage transport for this exact host-bridge response. Only the signed
 /// Request envelope's correlation-bound reply endpoint is eligible. A
 /// payload-declared supervisor address is domain data and must never mint
@@ -11837,6 +11851,49 @@ fn sender_matches_recorded_host_supervisor(
 mod tests {
     use super::*;
     use meerkat_core::HandlingMode;
+
+    /// A bridge request under the id of another requester's outstanding
+    /// request is dropped before decode or dispatch, without completing that
+    /// request's interaction; the recorded requester's redelivery is served.
+    #[test]
+    fn host_bridge_request_under_another_requesters_outstanding_id_is_dropped() {
+        use crate::runtime::bridge_request_claim_test_support::{
+            ClaimRecordingRuntime, bridge_request_from, registered_peer_handle,
+        };
+        use meerkat_core::handles::PeerInteractionHandle as _;
+
+        let handle = registered_peer_handle();
+        let id = meerkat_core::interaction::InteractionId(uuid::Uuid::new_v4());
+        let corr_id = meerkat_core::PeerCorrelationId::from_uuid(id.0);
+        let requester = meerkat_core::comms::PeerId::from_ed25519_pubkey(&[3u8; 32]);
+        let bystander = meerkat_core::comms::PeerId::from_ed25519_pubkey(&[4u8; 32]);
+        handle
+            .request_received(corr_id, meerkat_core::types::HandlingMode::Queue, requester)
+            .expect("the outstanding request is recorded");
+        let recording = Arc::new(ClaimRecordingRuntime::new(handle.clone()));
+        let runtime: Arc<dyn meerkat_core::agent::CommsRuntime> = recording.clone();
+
+        assert!(
+            !record_inbound_request(&runtime, &bridge_request_from(bystander, id)),
+            "another peer's bridge request under the outstanding id is not served"
+        );
+        assert_eq!(
+            recording.completed(),
+            0,
+            "the outstanding request's interaction is not completed"
+        );
+        assert!(
+            record_inbound_request(&runtime, &bridge_request_from(requester, id)),
+            "the recorded requester's redelivery is served"
+        );
+        assert_eq!(
+            handle
+                .resolve_response_addressee(corr_id, requester)
+                .expect("the machine judges the addressee"),
+            meerkat_core::PeerResponseAddresseeVerdict::Requester,
+            "the outstanding request keeps its requester"
+        );
+    }
     use meerkat_core::interaction::{
         InboxInteraction, InteractionId, PeerIngressAuthDecision, PeerIngressAuthExemption,
         PeerIngressIdentity, PeerIngressKind, PeerInputClass,

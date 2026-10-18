@@ -8564,6 +8564,24 @@ async fn await_successful_completion(
     );
 }
 
+/// Wait until `session_id`'s runtime loop parks. A resolved completion does
+/// not mean the loop is idle: it resolves a run's completions and then
+/// checks its queue again in the same lap, so an input admitted without a
+/// wake before the park can still run on that lap. The park is published
+/// only with no wake, effect or feed advance pending, and the lap that ran
+/// the input cleared it, so a park observed after the completion means a
+/// queued input stays queued until something wakes the loop.
+async fn await_runtime_loop_parked(machine: &MeerkatMachine, session_id: &SessionId) {
+    let mut parked = machine.runtime_loop_parked();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        parked.wait_for(|sessions| sessions.contains(session_id)),
+    )
+    .await
+    .expect("the runtime loop parks once the run settled")
+    .expect("park signal stays open while the machine lives");
+}
+
 async fn await_input_consumed(
     machine: &MeerkatMachine,
     session_id: &SessionId,
@@ -9510,6 +9528,9 @@ async fn quiescent_close_of_a_settled_owner_resumes_the_same_session_without_rep
         .expect("input is admitted");
     assert!(outcome.is_accepted());
     await_successful_completion(completion, "the first input").await;
+    // Queue only once the loop is idle: until it parks, its lap after the
+    // first run can still take an input admitted without a wake.
+    await_runtime_loop_parked(&adapter, &session_id).await;
 
     // Retained queued work makes the close busy; it then settles.
     let queued = make_prompt("queued before the close");
@@ -23327,6 +23348,97 @@ async fn exact_run_boundary_cancel_delivery_failure_keeps_the_recorded_cancel() 
         !state.boundary_cancel_dispatch_pending,
         "the failed dispatch is withdrawn"
     );
+
+    race.first_apply_release
+        .take()
+        .expect("race should expose its first-apply release")
+        .send(())
+        .expect("first apply should still be blocked");
+}
+
+/// A failure inside the runtime after the exact-run cancel was staged (its
+/// runtime-effect projection) withdraws the dispatch, keeps the run's
+/// recorded cancel, and reports the outcome as owned by that cancel, never as
+/// a bare internal error. Nothing reaches the live boundary handle.
+#[tokio::test]
+async fn exact_run_boundary_cancel_projection_failure_keeps_the_recorded_cancel() {
+    let (mut race, run_id) = persistent_boundary_cancel_race(false).await;
+    race.adapter
+        .test_fail_next_boundary_cancel_effect_projection
+        .store(true, std::sync::atomic::Ordering::Release);
+    let result = tokio::time::timeout(
+        Duration::from_secs(1),
+        race.adapter
+            .cancel_after_boundary_run_if_current(&race.session_id, &run_id),
+    )
+    .await
+    .expect("the exact cancellation completes");
+    assert!(
+        matches!(
+            &result,
+            Err(RuntimeDriverError::InterruptDispatchOutcomeUnknown { run_id: failed, .. })
+                if failed == &run_id
+        ),
+        "a failure after the cancel was staged is outcome-unknown for that run: {result:?}"
+    );
+    let state = race
+        .adapter
+        .session_dsl_state(&race.session_id)
+        .await
+        .expect("running session should retain DSL authority");
+    assert!(
+        state.cancel_after_boundary,
+        "the withdrawal never erases the staged cancel"
+    );
+    assert!(
+        !state.boundary_cancel_dispatch_pending,
+        "the dispatch is withdrawn"
+    );
+    assert_eq!(race.handle_calls.load(Ordering::SeqCst), 0);
+
+    race.first_apply_release
+        .take()
+        .expect("race should expose its first-apply release")
+        .send(())
+        .expect("first apply should still be blocked");
+}
+
+/// When withdrawing the staged dispatch fails as well, that error is also
+/// reported as owned by the recorded cancel: after staging, an exact-run
+/// cancel never returns a bare error.
+#[tokio::test]
+async fn exact_run_boundary_cancel_dispatch_withdrawal_failure_keeps_the_recorded_cancel() {
+    let (mut race, run_id) = persistent_boundary_cancel_race(false).await;
+    race.adapter
+        .test_fail_next_boundary_cancel_effect_projection
+        .store(true, std::sync::atomic::Ordering::Release);
+    race.adapter
+        .test_fail_next_boundary_cancel_dispatch_abort
+        .store(true, std::sync::atomic::Ordering::Release);
+    let result = tokio::time::timeout(
+        Duration::from_secs(1),
+        race.adapter
+            .cancel_after_boundary_run_if_current(&race.session_id, &run_id),
+    )
+    .await
+    .expect("the exact cancellation completes");
+    assert!(
+        matches!(
+            &result,
+            Err(RuntimeDriverError::InterruptDispatchOutcomeUnknown { run_id: failed, .. })
+                if failed == &run_id
+        ),
+        "a failed withdrawal after the cancel was staged is outcome-unknown for that run: {result:?}"
+    );
+    assert!(
+        race.adapter
+            .session_dsl_state(&race.session_id)
+            .await
+            .expect("running session should retain DSL authority")
+            .cancel_after_boundary,
+        "the staged cancel stays recorded"
+    );
+    assert_eq!(race.handle_calls.load(Ordering::SeqCst), 0);
 
     race.first_apply_release
         .take()
@@ -41400,11 +41512,42 @@ async fn recovered_predecessor_inputs_are_silently_abandoned_before_attachment_s
 /// mutation gate was free when told. Install it before the step that takes
 /// the announcement: an announcement tells the hint that was installed when
 /// it was taken.
+///
+/// A tell counts as after M when M is free at the tell. That cannot
+/// distinguish the owner under test from a waiter queued on M at its release,
+/// which tokio hands M inside the release. A step whose release can find such
+/// a waiter (a runtime loop it lets serve) queues a [`GateReleaseWitness`]
+/// first, and its tells are then classified by that witness's grant instead.
 struct RunlessTerminalTells {
     gate: Arc<tokio::sync::Mutex<()>>,
     with_gate_free: Arc<AtomicUsize>,
     under_gate: Arc<AtomicUsize>,
     told: Arc<Notify>,
+    witness_queued: Arc<AtomicBool>,
+    witness_granted: Arc<AtomicBool>,
+}
+
+type GateWaiter =
+    std::pin::Pin<Box<dyn std::future::Future<Output = tokio::sync::OwnedMutexGuard<()>> + Send>>;
+
+/// A waiter queued on M while the owner under test holds it.
+///
+/// Tokio's mutex is FIFO: the owner's release grants M to this first waiter,
+/// and wakes it, inside the release, before any waiter that queued later can
+/// take M. The grant therefore marks exactly the owner's release, whoever
+/// takes M after it. Once granted it holds M until dropped.
+struct GateReleaseWitness {
+    _waiter: GateWaiter,
+}
+
+/// The waker of a [`GateReleaseWitness`]: tokio wakes it when it grants the
+/// witness M.
+struct GrantFlag(Arc<AtomicBool>);
+
+impl std::task::Wake for GrantFlag {
+    fn wake(self: Arc<Self>) {
+        self.0.store(true, Ordering::SeqCst);
+    }
 }
 
 impl RunlessTerminalTells {
@@ -41416,13 +41559,22 @@ impl RunlessTerminalTells {
         let with_gate_free = Arc::new(AtomicUsize::new(0));
         let under_gate = Arc::new(AtomicUsize::new(0));
         let told = Arc::new(Notify::new());
+        let witness_queued = Arc::new(AtomicBool::new(false));
+        let witness_granted = Arc::new(AtomicBool::new(false));
         machine.set_runless_input_terminal_hint(Arc::new({
             let gate = Arc::clone(&gate);
             let with_gate_free = Arc::clone(&with_gate_free);
             let under_gate = Arc::clone(&under_gate);
             let told = Arc::clone(&told);
+            let witness_queued = Arc::clone(&witness_queued);
+            let witness_granted = Arc::clone(&witness_granted);
             move || {
-                if gate.try_lock().is_ok() {
+                let released = if witness_queued.load(Ordering::SeqCst) {
+                    witness_granted.load(Ordering::SeqCst)
+                } else {
+                    gate.try_lock().is_ok()
+                };
+                if released {
                     with_gate_free.fetch_add(1, Ordering::SeqCst);
                 } else {
                     under_gate.fetch_add(1, Ordering::SeqCst);
@@ -41435,7 +41587,34 @@ impl RunlessTerminalTells {
             with_gate_free,
             under_gate,
             told,
+            witness_queued,
+            witness_granted,
         }
+    }
+
+    /// Queue a [`GateReleaseWitness`] on M, which the owner under test must
+    /// hold now with no other waiter queued, and classify every later tell by
+    /// whether that owner's release has granted the witness M.
+    fn queue_release_witness(&self) -> GateReleaseWitness {
+        // Unconstrained: an exhausted coop budget would return Pending
+        // without queueing, and wake the flag.
+        let mut waiter: GateWaiter = Box::pin(tokio::task::unconstrained(
+            Arc::clone(&self.gate).lock_owned(),
+        ));
+        let waker = std::task::Waker::from(Arc::new(GrantFlag(Arc::clone(&self.witness_granted))));
+        let queued =
+            std::future::Future::poll(waiter.as_mut(), &mut std::task::Context::from_waker(&waker))
+                .is_pending();
+        assert!(
+            queued,
+            "the release witness queues behind the owner holding M"
+        );
+        assert!(
+            !self.witness_granted.load(Ordering::SeqCst),
+            "nothing grants the witness M while it queues"
+        );
+        self.witness_queued.store(true, Ordering::SeqCst);
+        GateReleaseWitness { _waiter: waiter }
     }
 
     fn total(&self) -> usize {
@@ -41574,6 +41753,11 @@ async fn recovered_predecessor_abandonment_is_told_once_its_lease_releases_m() {
         .try_commit_with_retained_publication_lease_under_runtime_turn_finalization_boundary()
         .await
         .expect("retain replacement publication boundary");
+    // The commit lets the replacement's runtime loop serve and wakes it while
+    // the lease still holds M, so the loop can queue on M before the release
+    // and take M inside it. Queued first, the witness is what that release
+    // grants M to.
+    let release_witness = tells.queue_release_witness();
     assert_eq!(
         publication
             .abandon_recovered_predecessor_inputs()
@@ -41591,6 +41775,8 @@ async fn recovered_predecessor_abandonment_is_told_once_its_lease_releases_m() {
         .await
         .expect("publish replacement after predecessor abandonment");
     tells.assert_told_once_after_the_gate("recovered predecessor abandonment");
+    // Hand M on to whatever queued behind the witness.
+    drop(release_witness);
     let stored = machine
         .input_state(&session_id, &input_id)
         .await
@@ -41634,6 +41820,357 @@ async fn a_replacing_commit_tells_its_predecessor_terminals_once_after_releasing
         .unregister_executor_attachment_if_current(&witness)
         .await
         .expect("clean replacement attachment");
+}
+
+/// Interrupted-run evidence owing one notice for a run that is no longer in
+/// flight: its shell tool process had already exited.
+struct OneOwedNoticeEvidence {
+    calls: StdMutex<Vec<meerkat_core::tool_process::InterruptedToolCall>>,
+}
+
+#[async_trait::async_trait]
+impl meerkat_core::tool_process::InterruptedToolEvidence for OneOwedNoticeEvidence {
+    async fn interrupted_calls(
+        &self,
+    ) -> Result<
+        Vec<meerkat_core::tool_process::InterruptedToolCall>,
+        meerkat_core::tool_process::InterruptedToolEvidenceError,
+    > {
+        Ok(self
+            .calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone())
+    }
+
+    async fn mark_inputs_settled(
+        &self,
+        _entry_ids: &[uuid::Uuid],
+        _inputs: &meerkat_core::tool_process::InterruptedRunInputs,
+    ) -> Result<(), meerkat_core::tool_process::InterruptedToolEvidenceError> {
+        Ok(())
+    }
+
+    async fn acknowledge(
+        &self,
+        entry_ids: &[uuid::Uuid],
+    ) -> Result<(), meerkat_core::tool_process::InterruptedToolEvidenceError> {
+        self.calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|call| !entry_ids.contains(&call.entry_id));
+        Ok(())
+    }
+
+    async fn run_ended(
+        &self,
+        _run_id: &RunId,
+    ) -> Result<(), meerkat_core::tool_process::InterruptedToolEvidenceError> {
+        Ok(())
+    }
+}
+
+/// Hands one owed notice's evidence to the session's first settlement only,
+/// so a later attachment of the same session owes nothing.
+struct OnceOwedNoticeSource {
+    evidence: StdMutex<Option<Arc<dyn meerkat_core::tool_process::InterruptedToolEvidence>>>,
+}
+
+impl OnceOwedNoticeSource {
+    fn owing_one_notice() -> Self {
+        let call = meerkat_core::tool_process::InterruptedToolCall {
+            entry_id: uuid::Uuid::new_v4(),
+            run_id: RunId::new(),
+            tool_call_id: None,
+            spawner: meerkat_core::tool_process::ToolProcessSpawner::ShellCall,
+            cessation: meerkat_core::tool_process::ToolProcessCessation::AlreadyExited,
+            settlement: meerkat_core::tool_process::InterruptedToolSettlement::Pending,
+        };
+        Self {
+            evidence: StdMutex::new(Some(Arc::new(OneOwedNoticeEvidence {
+                calls: StdMutex::new(vec![call]),
+            }))),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl meerkat_core::tool_process::InterruptedToolEvidenceSource for OnceOwedNoticeSource {
+    async fn settle_session(
+        &self,
+        _session_id: &SessionId,
+    ) -> Result<
+        Option<Arc<dyn meerkat_core::tool_process::InterruptedToolEvidence>>,
+        meerkat_core::tool_process::InterruptedToolEvidenceError,
+    > {
+        Ok(self
+            .evidence
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take())
+    }
+}
+
+/// Counts the notices a runtime loop records through its executor's
+/// transcript-notice endpoint.
+struct CountingNoticeHandle {
+    recorded: tokio::sync::watch::Sender<usize>,
+}
+
+#[async_trait::async_trait]
+impl meerkat_core::lifecycle::core_executor::CoreExecutorTranscriptNoticeHandle
+    for CountingNoticeHandle
+{
+    async fn append_system_notice_under_turn_finalization_boundary(
+        &self,
+        _record: meerkat_core::types::SystemNoticeRecord,
+    ) -> Result<(), CoreExecutorError> {
+        self.recorded.send_modify(|count| *count += 1);
+        Ok(())
+    }
+}
+
+/// An executor whose transcript-notice endpoint counts recorded notices.
+struct NoticeCountingExecutor {
+    handle: Arc<dyn meerkat_core::lifecycle::core_executor::CoreExecutorTranscriptNoticeHandle>,
+}
+
+impl NoticeCountingExecutor {
+    fn new() -> (Self, tokio::sync::watch::Receiver<usize>) {
+        let (recorded, count) = tokio::sync::watch::channel(0);
+        (
+            Self {
+                handle: Arc::new(CountingNoticeHandle { recorded }),
+            },
+            count,
+        )
+    }
+}
+
+#[async_trait::async_trait]
+impl CoreExecutor for NoticeCountingExecutor {
+    async fn apply(
+        &mut self,
+        run_id: RunId,
+        primitive: RunPrimitive,
+    ) -> Result<CoreApplyOutput, CoreExecutorError> {
+        ColdTerminalRecoveryExecutor.apply(run_id, primitive).await
+    }
+
+    async fn cancel_after_boundary(&mut self, _reason: String) -> Result<(), CoreExecutorError> {
+        Ok(())
+    }
+
+    async fn stop_runtime_executor(&mut self, _reason: String) -> Result<(), CoreExecutorError> {
+        Ok(())
+    }
+
+    fn transcript_notice_handle(
+        &self,
+    ) -> Option<Arc<dyn meerkat_core::lifecycle::core_executor::CoreExecutorTranscriptNoticeHandle>>
+    {
+        Some(Arc::clone(&self.handle))
+    }
+}
+
+/// A session whose first attachment owes one interrupted-run notice, and that
+/// pending attachment, whose executor counts the notices its loop records.
+/// With `queued_input`, an input is queued first, which a replacing commit
+/// fences.
+async fn pending_attachment_owing_a_notice(
+    queued_input: bool,
+) -> (
+    Arc<MeerkatMachine>,
+    SessionId,
+    tokio::sync::watch::Receiver<usize>,
+    PendingRuntimeExecutorAttachment,
+) {
+    let machine = Arc::new(MeerkatMachine::ephemeral());
+    let session_id = SessionId::new();
+    machine
+        .register_session(session_id.clone())
+        .await
+        .expect("register the session");
+    machine
+        .set_interrupted_tool_evidence_source(Arc::new(OnceOwedNoticeSource::owing_one_notice()));
+    if queued_input {
+        let (accepted, _waiter) = machine
+            .accept_input_with_completion(&session_id, make_prompt("queued before the attachment"))
+            .await
+            .expect("queue an input before the attachment");
+        assert!(accepted.is_accepted(), "the input is queued");
+    }
+    let (executor, recorded) = NoticeCountingExecutor::new();
+    let pending = match machine
+        .ensure_session_with_executor_factory(session_id.clone(), move |_| Box::new(executor))
+        .await
+        .expect("prepare the attachment")
+    {
+        EnsureRuntimeExecutorAttachment::Pending(pending) => pending,
+        EnsureRuntimeExecutorAttachment::Existing(witness) => {
+            panic!("expected a pending attachment, found {witness:?}")
+        }
+    };
+    (machine, session_id, recorded, pending)
+}
+
+/// Wait up to `within` for `recorded` to count at least one notice.
+async fn notice_recorded_within(
+    recorded: &mut tokio::sync::watch::Receiver<usize>,
+    within: Duration,
+) -> bool {
+    tokio::time::timeout(within, recorded.wait_for(|count| *count >= 1))
+        .await
+        .is_ok_and(|changed| changed.is_ok())
+}
+
+/// A replacement that owes interrupted-run notices and fences its
+/// predecessor's queued input publishes without a wake: the fenced input was
+/// its only queued work. The notices it hands over afterwards must still
+/// wake the loop, so the idle session records them without new input.
+#[tokio::test]
+async fn a_replacing_commit_wakes_its_loop_for_the_notices_it_hands_over() {
+    let (machine, session_id, mut recorded, pending) =
+        pending_attachment_owing_a_notice(true).await;
+    let (handoff_reached, release_handoff) =
+        machine.arm_attachment_interrupted_notice_handoff_test_hook(session_id.clone());
+    let mut parked = machine.runtime_loop_parked();
+    let interleave = async {
+        tokio::time::timeout(Duration::from_secs(10), handoff_reached)
+            .await
+            .expect("the replacement reaches its notice hand-off")
+            .expect("hand-off gate");
+        // Nothing woke the published loop, so it parks before the hand-off.
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            parked.wait_for(|sessions| sessions.contains(&session_id)),
+        )
+        .await
+        .expect("the replacement's loop parks")
+        .expect("park watch");
+        drop(release_handoff);
+    };
+    let (committed, ()) = tokio::join!(pending.commit_replacing_predecessor(), interleave);
+    let witness = committed.expect("commit the replacement attachment");
+
+    assert!(
+        notice_recorded_within(&mut recorded, Duration::from_secs(5)).await,
+        "the replacement's notice waited for new input after its hand-off"
+    );
+    machine
+        .unregister_executor_attachment_if_current(&witness)
+        .await
+        .expect("clean replacement attachment");
+}
+
+/// The hand-off wakes only the exact attachment it committed. When another
+/// attachment of the session serves by the time of the hand-off, the notices
+/// stay owed to the session and that attachment's loop is not woken for them.
+#[tokio::test]
+async fn a_notice_handoff_does_not_wake_a_different_attachment() {
+    let (machine, session_id, _first_recorded, first) =
+        pending_attachment_owing_a_notice(false).await;
+    let first_witness = first.witness().clone();
+    let (handoff_reached, release_handoff) =
+        machine.arm_attachment_interrupted_notice_handoff_test_hook(session_id.clone());
+    let (second_witness, mut second_recorded) = {
+        let machine = Arc::clone(&machine);
+        let session_id = session_id.clone();
+        let replace = async move {
+            tokio::time::timeout(Duration::from_secs(10), handoff_reached)
+                .await
+                .expect("the first attachment reaches its notice hand-off")
+                .expect("hand-off gate");
+            // Retire the first attachment before its hand-off and serve a
+            // second one, which owes nothing and is not woken at commit.
+            assert!(
+                machine
+                    .unregister_executor_attachment_if_current(&first_witness)
+                    .await
+                    .expect("retire the first attachment"),
+                "the first attachment was current"
+            );
+            if !machine.contains_session(&session_id).await {
+                machine
+                    .register_session(session_id.clone())
+                    .await
+                    .expect("register the session again");
+            }
+            let (executor, second_recorded) = NoticeCountingExecutor::new();
+            let second = match machine
+                .ensure_session_with_executor_factory(session_id.clone(), move |_| {
+                    Box::new(executor)
+                })
+                .await
+                .expect("prepare the second attachment")
+            {
+                EnsureRuntimeExecutorAttachment::Pending(pending) => pending,
+                EnsureRuntimeExecutorAttachment::Existing(witness) => {
+                    panic!("expected a second pending attachment, found {witness:?}")
+                }
+            };
+            let mut parked = machine.runtime_loop_parked();
+            let second_witness = second.commit().await.expect("serve the second attachment");
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                parked.wait_for(|sessions| sessions.contains(&session_id)),
+            )
+            .await
+            .expect("the second attachment's loop parks")
+            .expect("park watch");
+            drop(release_handoff);
+            (second_witness, second_recorded)
+        };
+        let (committed, replaced) = tokio::join!(first.commit(), replace);
+        committed.expect("the first commit completes after its hand-off");
+        replaced
+    };
+
+    assert!(
+        !notice_recorded_within(&mut second_recorded, Duration::from_millis(300)).await,
+        "the hand-off woke an attachment it did not commit"
+    );
+    assert!(
+        machine
+            .take_interrupted_tool_notices(&session_id)
+            .await
+            .is_some(),
+        "the handed-over notices stay owed to the session"
+    );
+    machine
+        .unregister_executor_attachment_if_current(&second_witness)
+        .await
+        .expect("clean the second attachment");
+}
+
+/// A retained publication hands its notices over while its slot is still
+/// pending; the lease's commit, which follows the hand-off, wakes the loop
+/// that records them.
+#[tokio::test]
+async fn a_retained_publication_lease_wakes_its_loop_after_the_notice_handoff() {
+    let (machine, _session_id, mut recorded, mut pending) =
+        pending_attachment_owing_a_notice(false).await;
+    let lease = pending
+        .try_commit_with_retained_publication_lease_under_runtime_turn_finalization_boundary()
+        .await
+        .expect("retain the publication");
+    assert!(
+        !notice_recorded_within(&mut recorded, Duration::from_millis(100)).await,
+        "the loop records nothing before it serves"
+    );
+    let witness = lease
+        .commit_with(|_| Ok(()))
+        .await
+        .expect("publish the attachment");
+
+    assert!(
+        notice_recorded_within(&mut recorded, Duration::from_secs(5)).await,
+        "the retained publication's notice waited for new input"
+    );
+    machine
+        .unregister_executor_attachment_if_current(&witness)
+        .await
+        .expect("clean the attachment");
 }
 
 /// A pending replacement whose publication was rejected after it abandoned
@@ -55674,5 +56211,76 @@ async fn a_runtime_owner_identity_names_every_handle_of_its_owner_and_holds_none
     assert!(
         !identity.is_owner_of(&later),
         "once every handle of its owner is gone the identity names no new machine"
+    );
+}
+
+/// A restored interrupted request carries the transcript identity its run
+/// stamped: a plain prompt's own input id, a correlated prompt's correlation.
+/// A row without stored semantics keeps the prompt's own metadata.
+#[test]
+fn interrupted_request_identity_is_the_one_its_run_stamped() {
+    let prompt = |correlation: Option<uuid::Uuid>| {
+        crate::input::Input::Prompt(crate::input::PromptInput {
+            injected_context: Vec::new(),
+            header: crate::input::InputHeader {
+                ingress_context: None,
+                retained_resume: None,
+                authority_association: None,
+                id: InputId::new(),
+                timestamp: Utc::now(),
+                source: crate::input::InputOrigin::Operator,
+                durability: crate::input::InputDurability::Durable,
+                visibility: crate::input::InputVisibility::default(),
+                idempotency_key: None,
+                supersession_key: None,
+                correlation_id: correlation.map(crate::CorrelationId::from_uuid),
+            },
+            content: "interrupted request".into(),
+            typed_turn_appends: Vec::new(),
+            turn_metadata: None,
+        })
+    };
+    let stored = |input: crate::input::Input, with_semantics: bool| {
+        let mut state = crate::input_state::InputState::new_accepted(input.id().clone());
+        state.runtime_semantics = with_semantics.then(|| {
+            crate::ingress_types::RuntimeInputSemantics::try_from_generated_admission(&input, true)
+                .expect("generated prompt semantics")
+        });
+        state.persisted_input = Some(input);
+        state
+    };
+    let run_stamped = |state: &crate::input_state::InputState| {
+        let input = state.persisted_input.clone().expect("persisted input");
+        let semantics = state.runtime_semantics.expect("stored semantics");
+        crate::runtime_loop::merge_batch_turn_metadata(&[(input.id().clone(), input)], &[semantics])
+            .expect("the batch merges")
+            .expect("the batch carries metadata")
+            .transcript_identity
+    };
+
+    let plain = stored(prompt(None), true);
+    let restored = stamped_turn_metadata(&plain)
+        .expect("stored semantics")
+        .transcript_identity;
+    assert_eq!(restored, run_stamped(&plain));
+    assert_eq!(
+        restored.interaction_id,
+        Some(meerkat_core::interaction::InteractionId(plain.input_id.0))
+    );
+
+    let correlation = uuid::Uuid::from_u128(0xC0);
+    let correlated = stored(prompt(Some(correlation)), true);
+    let restored = stamped_turn_metadata(&correlated)
+        .expect("stored semantics")
+        .transcript_identity;
+    assert_eq!(restored, run_stamped(&correlated));
+    assert_eq!(
+        restored.interaction_id,
+        Some(meerkat_core::interaction::InteractionId(correlation))
+    );
+
+    assert!(
+        stamped_turn_metadata(&stored(prompt(None), false)).is_none(),
+        "a row without stored semantics keeps the prompt's own metadata"
     );
 }

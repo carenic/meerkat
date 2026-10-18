@@ -974,6 +974,46 @@ impl From<InboundPeerRequestState> for meerkat_core::InboundPeerRequestState {
     }
 }
 
+/// Machine-owned verdict on the addressee of a response to an inbound peer
+/// request, mirroring [`meerkat_core::PeerResponseAddresseeVerdict`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum PeerResponseAddresseeVerdict {
+    #[default]
+    UnknownRequest,
+    Requester,
+    NotRequester,
+}
+
+impl From<PeerResponseAddresseeVerdict> for meerkat_core::PeerResponseAddresseeVerdict {
+    fn from(verdict: PeerResponseAddresseeVerdict) -> Self {
+        match verdict {
+            PeerResponseAddresseeVerdict::Requester => Self::Requester,
+            PeerResponseAddresseeVerdict::NotRequester => Self::NotRequester,
+            PeerResponseAddresseeVerdict::UnknownRequest => Self::UnknownRequest,
+        }
+    }
+}
+
+/// Machine-owned verdict on the sender of a response to an outbound peer
+/// request, mirroring [`meerkat_core::PeerResponseSenderVerdict`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum PeerResponseSenderVerdict {
+    #[default]
+    UnknownRequest,
+    Addressee,
+    NotAddressee,
+}
+
+impl From<PeerResponseSenderVerdict> for meerkat_core::PeerResponseSenderVerdict {
+    fn from(verdict: PeerResponseSenderVerdict) -> Self {
+        match verdict {
+            PeerResponseSenderVerdict::Addressee => Self::Addressee,
+            PeerResponseSenderVerdict::NotAddressee => Self::NotAddressee,
+            PeerResponseSenderVerdict::UnknownRequest => Self::UnknownRequest,
+        }
+    }
+}
+
 /// Typed terminal disposition carried on `PeerResponseTerminalArrived`.
 /// Mirror of [`meerkat_core::handles::PeerTerminalDisposition`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
@@ -4830,6 +4870,7 @@ impl PeerAddress {
 // outside this macro invocation; canonical semantics live in the catalog DSL.
 meerkat_machine_schema::meerkat_catalog_machine_dsl!("meerkat-runtime", "meerkat_machine::dsl");
 
+pub type MobIncarnationId = meerkat_core::service::MobIncarnationId;
 pub type MobToolCallerProvenance = meerkat_core::service::MobToolCallerProvenance;
 pub type OpaquePrincipalToken = meerkat_core::service::OpaquePrincipalToken;
 

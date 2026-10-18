@@ -32,8 +32,8 @@ use meerkat_core::{
 use meerkat_llm_core::{LlmClient, LlmDoneOutcome, LlmError, LlmEvent, LlmRequest, LlmStream};
 
 use oai_rt_rs::protocol::models::{
-    ContentPart, ConversationMode, Item, MaxTokens, OutputModalities, ResponseConfig, Role,
-    SessionUpdate, SessionUpdateConfig, Temperature, Tool, Usage as OaiUsage,
+    ContentPart, ConversationMode, Item, MaxTokens, OutputModalities, Response, ResponseConfig,
+    ResponseStatus, Role, SessionUpdate, SessionUpdateConfig, Temperature, Tool, Usage as OaiUsage,
 };
 use oai_rt_rs::{ClientEvent, RealtimeClient, ServerEvent};
 
@@ -283,12 +283,22 @@ impl LlmClient for OpenAiRealtimeTextAdapter {
                             };
                         }
                         yield LlmEvent::Done {
-                            outcome: LlmDoneOutcome::Success { stop_reason },
+                            outcome: text_turn_done_outcome(&response, stop_reason),
                         };
                         break;
                     }
                     ServerEvent::Error { error, .. } => {
                         Err(map_server_error(error))?;
+                    }
+                    // A response.done this client cannot read (a status the
+                    // protocol does not know) arrives as Unknown. It still
+                    // ends the turn: fail it now instead of waiting for the
+                    // stream to stall.
+                    ServerEvent::Unknown(event) => {
+                        if let Some(outcome) = unreadable_response_done(&event) {
+                            yield LlmEvent::Done { outcome };
+                            break;
+                        }
                     }
                     _ => {
                         // Other event types (session.*, conversation.item.*,
@@ -479,6 +489,70 @@ fn build_tools(request: &LlmRequest) -> Result<Vec<Tool>, LlmError> {
         .collect()
 }
 
+/// The terminal outcome of one text turn's `response.done`.
+///
+/// Read as the Responses adapter reads it: an incomplete response names its
+/// reason (`max_output_tokens`, `content_filter`) and a cancelled one ends as
+/// cancelled. A failed response, an incomplete one with any other reason, and
+/// one still in progress refuse the turn with the retryable
+/// `IncompleteResponse` instead of reading it as a finished turn.
+fn text_turn_done_outcome(response: &Response, completed_stop: StopReason) -> LlmDoneOutcome {
+    let details = response.status_details.as_ref();
+    let stop_reason = match response.status {
+        ResponseStatus::Completed => completed_stop,
+        ResponseStatus::Cancelled => StopReason::Cancelled,
+        ResponseStatus::Incomplete => match details.and_then(|details| details.reason.as_deref()) {
+            Some("max_output_tokens") => StopReason::MaxTokens,
+            Some("content_filter") => StopReason::ContentFilter,
+            other => {
+                return LlmDoneOutcome::Error {
+                    error: LlmError::IncompleteResponse {
+                        message: format!(
+                            "OpenAI realtime response was incomplete for unsupported reason '{}'",
+                            other.unwrap_or("none")
+                        ),
+                    },
+                };
+            }
+        },
+        ResponseStatus::Failed | ResponseStatus::InProgress => {
+            let detail = details
+                .and_then(|details| details.error.as_ref())
+                .map(|error| format!(": {}", error.message))
+                .unwrap_or_default();
+            return LlmDoneOutcome::Error {
+                error: LlmError::IncompleteResponse {
+                    message: format!(
+                        "OpenAI realtime response ended with status {:?}{detail}",
+                        response.status
+                    ),
+                },
+            };
+        }
+    };
+    LlmDoneOutcome::Success { stop_reason }
+}
+
+/// The outcome of a `response.done` that did not parse, usually because its
+/// status is one this client does not know: the turn fails with the
+/// retryable `IncompleteResponse` naming that status. `None` for any other
+/// unparsed event, which stays informational.
+fn unreadable_response_done(event: &serde_json::Value) -> Option<LlmDoneOutcome> {
+    if event.get("type").and_then(serde_json::Value::as_str) != Some("response.done") {
+        return None;
+    }
+    let status = match event.pointer("/response/status") {
+        Some(serde_json::Value::String(status)) => status.clone(),
+        Some(other) => other.to_string(),
+        None => "missing".to_string(),
+    };
+    Some(LlmDoneOutcome::Error {
+        error: LlmError::IncompleteResponse {
+            message: format!("OpenAI realtime response.done did not parse (status '{status}')"),
+        },
+    })
+}
+
 fn map_usage(u: &OaiUsage, model: &str) -> Usage {
     let cache_read_tokens = u
         .input_token_details
@@ -585,6 +659,130 @@ mod structured_output_tests;
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    fn done_response(status: ResponseStatus, reason: Option<&str>) -> Response {
+        Response {
+            id: "resp_text_turn".to_string(),
+            object: "response".to_string(),
+            conversation_id: None,
+            status,
+            status_details: reason.map(|reason| {
+                oai_rt_rs::protocol::models::ResponseStatusDetails {
+                    reason: Some(reason.to_string()),
+                    error: None,
+                }
+            }),
+            output: None,
+            output_modalities: None,
+            max_output_tokens: None,
+            audio: None,
+            metadata: None,
+            usage: None,
+        }
+    }
+
+    #[test]
+    fn response_done_status_gives_the_turn_its_typed_stop() {
+        for (status, reason, completed_stop, expected) in [
+            (
+                ResponseStatus::Completed,
+                None,
+                StopReason::EndTurn,
+                StopReason::EndTurn,
+            ),
+            (
+                ResponseStatus::Completed,
+                None,
+                StopReason::ToolUse,
+                StopReason::ToolUse,
+            ),
+            (
+                ResponseStatus::Incomplete,
+                Some("max_output_tokens"),
+                StopReason::EndTurn,
+                StopReason::MaxTokens,
+            ),
+            (
+                ResponseStatus::Incomplete,
+                Some("content_filter"),
+                StopReason::EndTurn,
+                StopReason::ContentFilter,
+            ),
+            (
+                ResponseStatus::Cancelled,
+                None,
+                StopReason::EndTurn,
+                StopReason::Cancelled,
+            ),
+        ] {
+            match text_turn_done_outcome(&done_response(status, reason), completed_stop) {
+                LlmDoneOutcome::Success { stop_reason } => {
+                    assert_eq!(stop_reason, expected, "{status:?} {reason:?}");
+                }
+                other => panic!("{status:?} {reason:?}: expected Success, got {other:?}"),
+            }
+        }
+    }
+
+    /// A failed response, an incomplete one with an unknown or missing reason,
+    /// and one still in progress at `response.done` are not a finished turn.
+    #[test]
+    fn failed_or_unknown_incomplete_response_done_fails_the_turn() {
+        for (status, reason) in [
+            (ResponseStatus::Failed, None),
+            (ResponseStatus::Incomplete, Some("brand_new_reason")),
+            (ResponseStatus::Incomplete, None),
+            (ResponseStatus::InProgress, None),
+        ] {
+            match text_turn_done_outcome(&done_response(status, reason), StopReason::EndTurn) {
+                LlmDoneOutcome::Error {
+                    error: LlmError::IncompleteResponse { message },
+                } => {
+                    if let Some(reason) = reason {
+                        assert!(message.contains(reason), "{message}");
+                    }
+                }
+                other => {
+                    panic!("{status:?} {reason:?}: expected IncompleteResponse, got {other:?}")
+                }
+            }
+        }
+    }
+
+    /// A `response.done` with a status this client does not know does not
+    /// parse as `ResponseDone`. It still ends the turn, as a typed failure
+    /// naming the status, instead of being ignored until the stream stalls.
+    #[test]
+    fn unreadable_response_done_fails_the_turn() {
+        let event: ServerEvent = serde_json::from_value(serde_json::json!({
+            "type": "response.done",
+            "event_id": "event_1",
+            "response": {
+                "id": "resp_text_turn",
+                "object": "realtime.response",
+                "status": "paused",
+                "output": []
+            }
+        }))
+        .expect("an unparsed server event still deserializes, as Unknown");
+        let event = match event {
+            ServerEvent::Unknown(event) => event,
+            other => {
+                panic!("a response.done with an unknown status is not a ResponseDone: {other:?}")
+            }
+        };
+        match unreadable_response_done(&event) {
+            Some(LlmDoneOutcome::Error {
+                error: LlmError::IncompleteResponse { message },
+            }) => assert!(message.contains("'paused'"), "{message}"),
+            other => panic!("expected an IncompleteResponse failure, got {other:?}"),
+        }
+        assert!(
+            unreadable_response_done(&serde_json::json!({ "type": "response.unheard_of" }))
+                .is_none(),
+            "any other unparsed event stays informational"
+        );
+    }
 
     #[test]
     fn realtime_text_adapter_debug_redacts_api_key() {

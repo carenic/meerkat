@@ -134,6 +134,17 @@ impl ScheduleLifecycleMutator {
         &self.schedule
     }
 
+    /// Record the agent whose mandate commissions the schedule this create
+    /// or update writes. The agent is not lifecycle state: like the name and
+    /// labels it is a config fact of the write, so it is set on the mutated
+    /// schedule before planning reads it.
+    pub(crate) fn record_commissioning_agent(
+        &mut self,
+        commissioning_agent: Option<meerkat_core::PrincipalRef>,
+    ) {
+        self.schedule.config.commissioning_agent = commissioning_agent;
+    }
+
     pub fn effects(&self) -> &[ScheduleLifecycleEffect] {
         &self.effects
     }
@@ -2006,6 +2017,9 @@ fn to_dsl_delivery_failure_reason(reason: DeliveryFailureReason) -> occ_dsl::Del
         DeliveryFailureReason::MobRejected => occ_dsl::DeliveryFailureReason::MobRejected,
         DeliveryFailureReason::TransportError => occ_dsl::DeliveryFailureReason::TransportError,
         DeliveryFailureReason::InternalError => occ_dsl::DeliveryFailureReason::InternalError,
+        DeliveryFailureReason::ScheduleMandateUnavailable => {
+            occ_dsl::DeliveryFailureReason::ScheduleMandateUnavailable
+        }
     }
 }
 
@@ -2460,6 +2474,7 @@ fn create_schedule_via_dsl(
             created_at_utc: now,
             updated_at_utc: now,
             deleted_at_utc: None,
+            commissioning_agent: None,
         },
     };
     let effects = map_schedule_effects(&transition)?;
@@ -3154,6 +3169,9 @@ fn from_dsl_failure_class(fc: occ_dsl::FailureClass) -> OccurrenceFailureClass {
         occ_dsl::FailureClass::LeaseLost => OccurrenceFailureClass::LeaseLost,
         occ_dsl::FailureClass::TransportError => OccurrenceFailureClass::TransportError,
         occ_dsl::FailureClass::InternalError => OccurrenceFailureClass::InternalError,
+        occ_dsl::FailureClass::ScheduleMandateUnavailable => {
+            OccurrenceFailureClass::ScheduleMandateUnavailable
+        }
     }
 }
 
@@ -4766,6 +4784,186 @@ mod tests {
         assert!(
             matches!(error, OccurrenceLifecycleError::NotLiveForTerminal),
             "got {error:?}"
+        );
+    }
+
+    fn materializing_target() -> TargetBinding {
+        TargetBinding::session(SessionTargetBinding::materialize_on_demand(
+            crate::types::SessionMaterializationSpec {
+                model: "claude-sonnet-4-6".into(),
+                system_prompt: None,
+                max_tokens: None,
+                provider: None,
+                output_schema: None,
+                structured_output_retries: None,
+                provider_params: None,
+                comms_name: None,
+                peer_meta: None,
+                labels: BTreeMap::new(),
+                preload_skills: Vec::new(),
+                additional_instructions: Vec::new(),
+                realm_id: None,
+                instance_id: None,
+                backend: None,
+                config_generation: None,
+                keep_alive: false,
+                app_context: None,
+            },
+            ScheduledSessionAction::Prompt {
+                prompt: ContentInput::from("scheduled prompt"),
+                system_prompt: None,
+                render_metadata: None,
+                skill_refs: Vec::new(),
+                additional_instructions: Vec::new(),
+            },
+        ))
+    }
+
+    /// A planned occurrence of a schedule with `target`, claimed and
+    /// dispatching.
+    fn dispatching_occurrence(target: TargetBinding) -> Occurrence {
+        let schedule = Schedule::new(CreateScheduleRequest {
+            name: Some("dispatching".into()),
+            description: None,
+            trigger: TriggerSpec::Once {
+                due_at_utc: Utc::now() + Duration::minutes(1),
+            },
+            target,
+            misfire_policy: MisfirePolicy::Skip,
+            overlap_policy: OverlapPolicy::AllowConcurrent,
+            missing_target_policy: MissingTargetPolicy::Skip,
+            labels: BTreeMap::new(),
+            planning_horizon_days: Some(1),
+            planning_horizon_occurrences: Some(1),
+        })
+        .expect("schedule");
+        Occurrence::planned_from_schedule(&schedule, crate::OccurrenceOrdinal(0), Utc::now())
+            .expect("plan")
+            .apply(OccurrenceLifecycleInput::Claim {
+                owner_id: "owner".into(),
+                at_utc: Utc::now(),
+                lease_expires_at_utc: Utc::now() + Duration::seconds(30),
+                claim_token: Uuid::now_v7(),
+            })
+            .expect("claim")
+            .into_occurrence()
+            .apply(OccurrenceLifecycleInput::DispatchStarted {
+                correlation_id: Some("corr-1".into()),
+                at_utc: Utc::now(),
+            })
+            .expect("dispatch")
+            .into_occurrence()
+    }
+
+    /// `target` with its materialize-on-demand binding set to `session_id`,
+    /// whatever it was bound to before.
+    fn bound_to(target: &TargetBinding, session_id: &meerkat_core::SessionId) -> TargetBinding {
+        let mut target = target.clone();
+        if let TargetBinding::Session(binding) = &mut target
+            && let SessionTargetBinding::MaterializeOnDemandSession {
+                bound_session_id, ..
+            } = binding.as_mut()
+        {
+            *bound_session_id = Some(session_id.clone());
+        }
+        target
+    }
+
+    /// Generated occurrence authority lets a dispatching occurrence record the
+    /// session its dispatch materialized once, accepts an exact replay, and
+    /// refuses a rebinding.
+    #[test]
+    fn a_dispatching_occurrence_records_its_materialized_session_once() {
+        let dispatching = dispatching_occurrence(materializing_target());
+        assert_eq!(dispatching.phase, crate::OccurrencePhase::Dispatching);
+        let materialized = meerkat_core::SessionId::new();
+        let recorded = dispatching
+            .clone()
+            .apply(OccurrenceLifecycleInput::SyncTargetSnapshot {
+                target_snapshot: bound_to(&dispatching.target_snapshot, &materialized),
+            })
+            .expect("a dispatching occurrence records the session it materialized")
+            .into_occurrence();
+        assert_eq!(recorded.phase, crate::OccurrencePhase::Dispatching);
+        assert_eq!(
+            crate::types::target_materialized_session_id(&recorded.target_snapshot),
+            Some(materialized)
+        );
+
+        recorded
+            .clone()
+            .apply(OccurrenceLifecycleInput::SyncTargetSnapshot {
+                target_snapshot: recorded.target_snapshot.clone(),
+            })
+            .expect("an exact replay of the recorded binding is accepted");
+
+        let rebind = recorded
+            .clone()
+            .apply(OccurrenceLifecycleInput::SyncTargetSnapshot {
+                target_snapshot: bound_to(
+                    &recorded.target_snapshot,
+                    &meerkat_core::SessionId::new(),
+                ),
+            })
+            .map(|_| ());
+        assert!(
+            matches!(
+                rebind,
+                Err(crate::OccurrenceLifecycleError::TargetSyncRejected)
+            ),
+            "a dispatching occurrence never rebinds: {rebind:?}"
+        );
+    }
+
+    /// The shell records exactly the delivered session on the occurrence's
+    /// own target: an already-bound occurrence never takes another session,
+    /// an exact replay is a no-op, and a target that does not materialize a
+    /// session records nothing.
+    #[tokio::test]
+    async fn recording_a_dispatch_materialization_never_rebinds_or_retargets() {
+        let service =
+            crate::ScheduleService::new(std::sync::Arc::new(crate::MemoryScheduleStore::new()));
+        let dispatching = dispatching_occurrence(materializing_target());
+        let materialized = meerkat_core::SessionId::new();
+        let recorded = dispatching
+            .clone()
+            .apply(OccurrenceLifecycleInput::SyncTargetSnapshot {
+                target_snapshot: bound_to(&dispatching.target_snapshot, &materialized),
+            })
+            .expect("record")
+            .into_occurrence();
+
+        let replayed = service
+            .record_dispatch_materialization(recorded.clone(), &materialized)
+            .await
+            .expect("an exact replay is a no-op");
+        assert_eq!(replayed, recorded);
+
+        let rebind = service
+            .record_dispatch_materialization(recorded, &meerkat_core::SessionId::new())
+            .await;
+        assert!(
+            matches!(rebind, Err(crate::ScheduleDomainError::Internal(_))),
+            "an already-bound occurrence never takes another session: {rebind:?}"
+        );
+
+        let exact =
+            dispatching_occurrence(TargetBinding::session(SessionTargetBinding::ExactSession {
+                session_id: meerkat_core::SessionId::new(),
+                action: ScheduledSessionAction::Prompt {
+                    prompt: ContentInput::from("scheduled prompt"),
+                    system_prompt: None,
+                    render_metadata: None,
+                    skill_refs: Vec::new(),
+                    additional_instructions: Vec::new(),
+                },
+            }));
+        let retarget = service
+            .record_dispatch_materialization(exact, &meerkat_core::SessionId::new())
+            .await;
+        assert!(
+            matches!(retarget, Err(crate::ScheduleDomainError::Internal(_))),
+            "a target that materializes no session records none: {retarget:?}"
         );
     }
 }

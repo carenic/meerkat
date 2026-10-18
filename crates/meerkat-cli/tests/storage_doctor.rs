@@ -6,7 +6,12 @@
 //! data dir is never read.
 
 #![cfg(feature = "session-store")]
-#![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
+#![allow(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    clippy::panic,
+    clippy::disallowed_methods
+)]
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};

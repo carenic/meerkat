@@ -1075,6 +1075,7 @@ impl AnthropicClient {
                     AnthropicThinkingConfig::BetweenTools => {
                         serde_json::json!({"type": "between_tools"})
                     }
+                    AnthropicThinkingConfig::Disabled => serde_json::json!({"type": "disabled"}),
                     AnthropicThinkingConfig::Enabled { budget_tokens } => serde_json::json!({
                         "type": "enabled",
                         "budget_tokens": budget_tokens,
@@ -1485,14 +1486,64 @@ impl AnthropicClient {
             .map(str::trim_start)
     }
 
-    fn map_stop_reason(reason: &str) -> StopReason {
+    /// Map an Anthropic `stop_reason`.
+    ///
+    /// An unrecognised reason refuses the response instead of reading it as
+    /// a natural end of turn: `IncompleteResponse` is retried with nothing
+    /// committed, as the OpenAI Responses adapter does for an unknown
+    /// incomplete reason.
+    fn map_stop_reason(reason: &str) -> Result<StopReason, LlmError> {
         match reason {
-            "tool_use" => StopReason::ToolUse,
-            "max_tokens" => StopReason::MaxTokens,
-            "stop_sequence" => StopReason::StopSequence,
-            "content_filter" => StopReason::ContentFilter,
-            // "end_turn" and any unrecognized reason default to EndTurn
-            _ => StopReason::EndTurn,
+            "end_turn" => Ok(StopReason::EndTurn),
+            "tool_use" => Ok(StopReason::ToolUse),
+            "max_tokens" => Ok(StopReason::MaxTokens),
+            "stop_sequence" => Ok(StopReason::StopSequence),
+            "pause_turn" => Ok(StopReason::PauseTurn),
+            "refusal" => Ok(StopReason::Refusal),
+            "model_context_window_exceeded" => Ok(StopReason::ContextWindowExceeded),
+            // Not an Anthropic reason; kept for compatible proxies that send it.
+            "content_filter" => Ok(StopReason::ContentFilter),
+            other => Err(LlmError::IncompleteResponse {
+                message: format!("Anthropic response stopped for unsupported reason '{other}'"),
+            }),
+        }
+    }
+
+    /// The terminal outcome of a stream whose stop reason arrived.
+    ///
+    /// A tool call whose streamed input did not parse waits here: a stop that
+    /// refuses the whole response (refusal, content filter, a filled context
+    /// window) explains the cut and wins, since nothing of such a response is
+    /// committed; any other stop surfaces the parse failure.
+    fn stop_outcome(reason: &str, deferred_tool_args_error: Option<LlmError>) -> LlmDoneOutcome {
+        match (Self::map_stop_reason(reason), deferred_tool_args_error) {
+            (Err(error), _) => LlmDoneOutcome::Error { error },
+            (
+                Ok(
+                    stop_reason @ (StopReason::Refusal
+                    | StopReason::ContentFilter
+                    | StopReason::ContextWindowExceeded),
+                ),
+                _,
+            )
+            | (Ok(stop_reason), None) => LlmDoneOutcome::Success { stop_reason },
+            (Ok(_), Some(error)) => LlmDoneOutcome::Error { error },
+        }
+    }
+
+    /// The terminal outcome of a stream that ended without any stop reason.
+    ///
+    /// A missing reason is not an unknown one: a proxy may omit it, so the
+    /// turn ends as `end_turn` unless a tool call's input failed to parse.
+    fn missing_stop_outcome(
+        last_stop_reason: Option<StopReason>,
+        deferred_tool_args_error: Option<LlmError>,
+    ) -> LlmDoneOutcome {
+        match deferred_tool_args_error {
+            Some(error) => LlmDoneOutcome::Error { error },
+            None => LlmDoneOutcome::Success {
+                stop_reason: last_stop_reason.unwrap_or(StopReason::EndTurn),
+            },
         }
     }
 }
@@ -1698,6 +1749,10 @@ impl AnthropicClient {
             let mut current_block_type: Option<String> = None;
             let mut current_thinking_signature: Option<String> = None;
             let mut last_stop_reason: Option<StopReason> = None;
+            // A refusal or a filled context window can cut a tool call
+            // mid-input; its parse failure waits for the stop reason that
+            // says why (`stop_outcome`).
+            let mut deferred_tool_args_error: Option<LlmError> = None;
             let mut usage = Usage::default();
             let mut saw_done = false;
             // Set by handle_event!/handle_line! at every yield; reset per
@@ -1878,12 +1933,8 @@ impl AnthropicClient {
                                                 };
                                             }
                                             Err(error) => {
-                                                if !saw_done {
-                                                    chunk_yielded.set(true);
-                                                    yield LlmEvent::Done {
-                                                        outcome: LlmDoneOutcome::Error { error },
-                                                    };
-                                                    saw_done = true;
+                                                if deferred_tool_args_error.is_none() {
+                                                    deferred_tool_args_error = Some(error);
                                                 }
                                             }
                                         }
@@ -1940,13 +1991,16 @@ impl AnthropicClient {
                                 };
                             }
                             if let Some(finish_reason) = $event.delta.and_then(|d| d.stop_reason) {
-                                let reason = Self::map_stop_reason(finish_reason.as_str());
-                                last_stop_reason = Some(reason);
+                                let outcome = Self::stop_outcome(
+                                    finish_reason.as_str(),
+                                    deferred_tool_args_error.take(),
+                                );
+                                if let LlmDoneOutcome::Success { stop_reason } = &outcome {
+                                    last_stop_reason = Some(*stop_reason);
+                                }
                                 if !saw_done {
                                     chunk_yielded.set(true);
-                                    yield LlmEvent::Done {
-                                        outcome: LlmDoneOutcome::Success { stop_reason: reason },
-                                    };
+                                    yield LlmEvent::Done { outcome };
                                     saw_done = true;
                                 }
                             }
@@ -1967,16 +2021,21 @@ impl AnthropicClient {
                         "message_stop" => {
                             if !saw_done {
                                 let finish_reason = $event.delta.and_then(|d| d.stop_reason);
-                                let reason = finish_reason
-                                    .as_deref()
-                                    .map(Self::map_stop_reason)
-                                    .or(last_stop_reason)
-                                    .unwrap_or(StopReason::EndTurn);
-                                last_stop_reason = Some(reason);
-                                chunk_yielded.set(true);
-                                yield LlmEvent::Done {
-                                    outcome: LlmDoneOutcome::Success { stop_reason: reason },
+                                let outcome = match finish_reason.as_deref() {
+                                    Some(reason) => Self::stop_outcome(
+                                        reason,
+                                        deferred_tool_args_error.take(),
+                                    ),
+                                    None => Self::missing_stop_outcome(
+                                        last_stop_reason,
+                                        deferred_tool_args_error.take(),
+                                    ),
                                 };
+                                if let LlmDoneOutcome::Success { stop_reason } = &outcome {
+                                    last_stop_reason = Some(*stop_reason);
+                                }
+                                chunk_yielded.set(true);
+                                yield LlmEvent::Done { outcome };
                                 saw_done = true;
                             }
                         }
@@ -2061,12 +2120,12 @@ impl AnthropicClient {
                         if let Some(data) = Self::strip_data_prefix($line) {
                             if data == "[DONE]" {
                                 if !saw_done {
-                                    let reason =
-                                        last_stop_reason.unwrap_or(StopReason::EndTurn);
+                                    let outcome = Self::missing_stop_outcome(
+                                        last_stop_reason,
+                                        deferred_tool_args_error.take(),
+                                    );
                                     chunk_yielded.set(true);
-                                    yield LlmEvent::Done {
-                                        outcome: LlmDoneOutcome::Success { stop_reason: reason },
-                                    };
+                                    yield LlmEvent::Done { outcome };
                                     saw_done = true;
                                 }
                             } else {
@@ -2121,6 +2180,11 @@ impl AnthropicClient {
                 if trailing_consumed_line && !chunk_yielded.get() {
                     yield LlmEvent::WireLiveness;
                 }
+            }
+            if !saw_done && let Some(error) = deferred_tool_args_error.take() {
+                yield LlmEvent::Done {
+                    outcome: LlmDoneOutcome::Error { error },
+                };
             }
 
         });
@@ -5507,6 +5571,170 @@ mod tests {
                 .to_string()
                 .contains("invalid Anthropic tool call arguments JSON"),
             "error should name invalid Anthropic tool args: {error}"
+        );
+    }
+
+    /// Every event one fixture stream yields, up to and including its
+    /// terminal `Done`.
+    async fn stop_reason_fixture_events(lines: &[&str]) -> Vec<LlmEvent> {
+        let mut payload = lines.join("\n");
+        payload.push('\n');
+        let (base_url, server) = spawn_anthropic_stub_server(payload).await;
+        let client = AnthropicClient::builder("test-key".to_string())
+            .base_url(base_url)
+            .build()
+            .unwrap();
+        let request = LlmRequest::new(
+            "claude-sonnet-4-5",
+            vec![Message::User(UserMessage::text("hello".to_string()))],
+        );
+        let mut stream = client.stream(&request);
+        let mut events = Vec::new();
+        while let Some(event) = stream.next().await {
+            let event = event.expect("stream wrapper should convert errors to Done");
+            let done = matches!(event, LlmEvent::Done { .. });
+            events.push(event);
+            if done {
+                break;
+            }
+        }
+        server.abort();
+        events
+    }
+
+    fn fixture_done(events: &[LlmEvent]) -> &LlmDoneOutcome {
+        match events.last() {
+            Some(LlmEvent::Done { outcome }) => outcome,
+            other => panic!("fixture stream must end with Done, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn every_documented_anthropic_stop_reason_maps_to_its_own_variant() {
+        for (raw, expected) in [
+            ("end_turn", StopReason::EndTurn),
+            ("tool_use", StopReason::ToolUse),
+            ("max_tokens", StopReason::MaxTokens),
+            ("stop_sequence", StopReason::StopSequence),
+            ("pause_turn", StopReason::PauseTurn),
+            ("refusal", StopReason::Refusal),
+            (
+                "model_context_window_exceeded",
+                StopReason::ContextWindowExceeded,
+            ),
+        ] {
+            assert_eq!(
+                AnthropicClient::map_stop_reason(raw).expect(raw),
+                expected,
+                "{raw}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn context_window_stop_reaches_the_caller_as_its_own_reason() {
+        let events = stop_reason_fixture_events(&[
+            r#"data: {"type":"message_start","message":{"usage":{"input_tokens":10,"output_tokens":0}}}"#,
+            r#"data: {"type":"content_block_start","content_block":{"type":"text","text":""}}"#,
+            r#"data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"The summary so"}}"#,
+            r#"data: {"type":"content_block_stop"}"#,
+            r#"data: {"type":"message_delta","usage":{"output_tokens":4},"delta":{"stop_reason":"model_context_window_exceeded"}}"#,
+            r#"data: {"type":"message_stop"}"#,
+        ])
+        .await;
+        assert!(
+            matches!(
+                fixture_done(&events),
+                LlmDoneOutcome::Success {
+                    stop_reason: StopReason::ContextWindowExceeded
+                }
+            ),
+            "{events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_stop_reason_fails_the_response_instead_of_ending_the_turn() {
+        let events = stop_reason_fixture_events(&[
+            r#"data: {"type":"message_start","message":{"usage":{"input_tokens":10,"output_tokens":0}}}"#,
+            r#"data: {"type":"content_block_start","content_block":{"type":"text","text":""}}"#,
+            r#"data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"Hi"}}"#,
+            r#"data: {"type":"content_block_stop"}"#,
+            r#"data: {"type":"message_delta","usage":{"output_tokens":1},"delta":{"stop_reason":"brand_new_reason"}}"#,
+            r#"data: {"type":"message_stop"}"#,
+        ])
+        .await;
+        match fixture_done(&events) {
+            LlmDoneOutcome::Error {
+                error: LlmError::IncompleteResponse { message },
+            } => assert!(message.contains("'brand_new_reason'"), "{message}"),
+            other => panic!("expected Done{{Error{{IncompleteResponse}}}}, got {other:?}"),
+        }
+    }
+
+    /// A refusal can cut a tool call mid-input, with or without closing its
+    /// block. Either way the call never completes and the stream ends with
+    /// the refusal itself, not with a parse failure of the cut input.
+    #[tokio::test]
+    async fn refusal_cutting_a_tool_call_ends_as_a_refusal_without_the_call() {
+        let opened = [
+            r#"data: {"type":"message_start","message":{"usage":{"input_tokens":10,"output_tokens":0}}}"#,
+            r#"data: {"type":"content_block_start","content_block":{"type":"text","text":""}}"#,
+            r#"data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"Sure, reading"}}"#,
+            r#"data: {"type":"content_block_stop"}"#,
+            r#"data: {"type":"content_block_start","content_block":{"type":"tool_use","id":"toolu_cut","name":"read_file"}}"#,
+            r#"data: {"type":"content_block_delta","delta":{"type":"input_json_delta","partial_json":"{\"path\":\"/et"}}"#,
+        ];
+        let refusal = [
+            r#"data: {"type":"message_delta","usage":{"output_tokens":6},"delta":{"stop_reason":"refusal"}}"#,
+            r#"data: {"type":"message_stop"}"#,
+        ];
+        for close_block in [false, true] {
+            let mut lines = opened.to_vec();
+            if close_block {
+                lines.push(r#"data: {"type":"content_block_stop"}"#);
+            }
+            lines.extend(refusal);
+            let events = stop_reason_fixture_events(&lines).await;
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| matches!(event, LlmEvent::ToolCallComplete { .. })),
+                "close_block={close_block}: {events:?}"
+            );
+            assert!(
+                matches!(
+                    fixture_done(&events),
+                    LlmDoneOutcome::Success {
+                        stop_reason: StopReason::Refusal
+                    }
+                ),
+                "close_block={close_block}: {events:?}"
+            );
+        }
+    }
+
+    /// Only a stop that refuses the whole response explains a cut tool call.
+    /// Under any other stop the parse failure is the terminal, as before.
+    #[tokio::test]
+    async fn malformed_tool_args_still_fail_under_an_ordinary_stop() {
+        let events = stop_reason_fixture_events(&[
+            r#"data: {"type":"message_start","message":{"usage":{"input_tokens":10,"output_tokens":0}}}"#,
+            r#"data: {"type":"content_block_start","content_block":{"type":"tool_use","id":"tool_bad","name":"read_file"}}"#,
+            r#"data: {"type":"content_block_delta","delta":{"type":"input_json_delta","partial_json":"{\"path\":"}}"#,
+            r#"data: {"type":"content_block_stop"}"#,
+            r#"data: {"type":"message_delta","usage":{"output_tokens":6},"delta":{"stop_reason":"tool_use"}}"#,
+            r#"data: {"type":"message_stop"}"#,
+        ])
+        .await;
+        assert!(
+            matches!(
+                fixture_done(&events),
+                LlmDoneOutcome::Error {
+                    error: LlmError::StreamParseError { .. }
+                }
+            ),
+            "{events:?}"
         );
     }
 

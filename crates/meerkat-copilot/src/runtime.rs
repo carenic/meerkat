@@ -1034,7 +1034,8 @@ impl CopilotCapabilityGatedClient {
                 ) => Some(budget_tokens),
                 Some(
                     meerkat_core::lifecycle::run_primitive::AnthropicThinkingConfig::Adaptive
-                    | meerkat_core::lifecycle::run_primitive::AnthropicThinkingConfig::BetweenTools,
+                    | meerkat_core::lifecycle::run_primitive::AnthropicThinkingConfig::BetweenTools
+                    | meerkat_core::lifecycle::run_primitive::AnthropicThinkingConfig::Disabled,
                 ) => None,
                 None => tag.thinking_budget_tokens,
             };

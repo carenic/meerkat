@@ -251,6 +251,57 @@ fn forced_choice_is_refused_under_explicit_thinking_never_switched_off() {
 }
 
 #[test]
+fn forced_choice_is_sent_with_thinking_disabled_and_refused_with_thinking_on() {
+    // Disabled thinking is no thinking, so a forced call is compatible; a
+    // stale legacy budget beside it is not sent either. The same request
+    // with thinking on is still refused locally.
+    for model in [FORCEABLE, "claude-haiku-5-5"] {
+        for choice in forced() {
+            let disabled = request(model, choice.clone()).with_anthropic_tag_merge(|tag| {
+                tag.thinking = Some(AnthropicThinkingConfig::Disabled);
+                tag.thinking_budget_tokens = Some(2048);
+            });
+            let sent = body(&disabled).unwrap();
+            assert_eq!(sent["thinking"], json!({"type": "disabled"}), "{model}");
+            let expected = match &choice {
+                ToolChoice::Tool { name } => json!({"type": "tool", "name": name}),
+                _ => json!({"type": "any"}),
+            };
+            assert_eq!(sent["tool_choice"], expected, "{model} {choice:?}");
+
+            let thinking_on = request(model, choice.clone()).with_anthropic_tag_merge(|tag| {
+                tag.thinking = Some(AnthropicThinkingConfig::Adaptive);
+            });
+            assert_eq!(
+                refusal(body(&thinking_on)),
+                ToolChoiceRefusal::ForcedToolWithThinking,
+                "{model} {choice:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn forced_choice_with_disabled_thinking_on_a_model_that_refuses_it_is_the_thinking_refusal() {
+    // The model refuses `disabled`, so the request fails on that, typed and
+    // before any body exists: the forced choice is never judged or sent.
+    for model in ["claude-opus-5-5", "claude-sonnet-5-5", "claude-fable-5-1"] {
+        for choice in forced() {
+            let disabled = request(model, choice.clone()).with_anthropic_tag_merge(|tag| {
+                tag.thinking = Some(AnthropicThinkingConfig::Disabled);
+            });
+            match body(&disabled) {
+                Err(LlmError::InvalidRequest { message }) => assert!(
+                    message.contains("does not accept thinking type 'disabled'"),
+                    "{model} {choice:?}: {message}"
+                ),
+                other => panic!("{model} {choice:?}: expected the thinking refusal, got {other:?}"),
+            }
+        }
+    }
+}
+
+#[test]
 fn uncatalogued_models_pass_the_forced_choice_through() {
     let body = body(&request("claude-future-9", ToolChoice::Required)).unwrap();
     assert_eq!(body["tool_choice"], json!({"type": "any"}));

@@ -67,6 +67,18 @@
 //! are removed by the realm sweep. Only a changed boot proves an environment
 //! ended without a lock.
 //!
+//! **The host's own procfs.** Recorded pids come from the host's own
+//! syscalls (`getpid`, the spawned child's pid), and `pidfd_open`, `kill`
+//! and `getsid` take pids of the host's pid namespace, but `/proc` numbers
+//! processes in the pid namespace it was mounted for. A host started in a
+//! new pid namespace without a procfs of its own (for example under
+//! `unshare --pid --fork` without `--mount-proc`) would read other
+//! processes' entries for its own pids. On Linux every process read
+//! therefore goes through a procfs proven, at the start of each operation,
+//! to show the host's own pid namespace; any other procfs fails closed with
+//! [`ProcessCustodyError::ForeignProcfs`] before anything is captured,
+//! compared or signalled.
+//!
 //! **Durability.** Records must survive the death of the host *process*, and
 //! the page cache already guarantees that: a file written and renamed by a
 //! process that is then SIGKILLed stays visible to every later process. The
@@ -115,9 +127,9 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 pub use super::custody_types::{
-    ForeignIncarnationLiveness, ProcessCustodyError, ProcessCustodyRecoveryReport,
-    ProcessCustodySweepReport, RecoveredToolProcess, ScopeSweep, ToolProcessCessation,
-    ToolProcessSpawner,
+    ForeignIncarnationLiveness, ForeignProcfsView, ProcessCustodyError,
+    ProcessCustodyRecoveryReport, ProcessCustodySweepReport, RecoveredToolProcess, ScopeSweep,
+    ToolProcessCessation, ToolProcessSpawner,
 };
 
 /// Directory, under a realm runtime root, that holds custody records.
@@ -833,7 +845,7 @@ pub fn sweep_process_custody_once(root: PathBuf) {
         .spawn(move || match sweep_blocking(&root) {
             Ok(report) => log_sweep(&report),
             Err(error) => {
-                tracing::warn!(%error, "process custody sweep could not list its root");
+                tracing::warn!(%error, "process custody sweep failed");
             }
         });
     if let Err(error) = spawned {
@@ -1074,8 +1086,9 @@ impl ProcessCustody {
     }
 
     /// Settle every scope under `root` (a realm's custody root), including
-    /// sessions that are never resumed. Only listing `root` itself can fail;
-    /// each scope carries its own outcome.
+    /// sessions that are never resumed. Only establishing this host
+    /// incarnation (for example [`ProcessCustodyError::ForeignProcfs`]) or
+    /// listing `root` itself can fail; each scope carries its own outcome.
     pub async fn sweep(root: &Path) -> Result<ProcessCustodySweepReport, ProcessCustodyError> {
         let root = root.to_path_buf();
         tokio::task::spawn_blocking(move || sweep_blocking(&root))

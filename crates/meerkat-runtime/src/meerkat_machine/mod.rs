@@ -2718,6 +2718,20 @@ pub(crate) struct OwedInterruptedToolNotice {
 /// its evidence. Requests past it are not restored; the notice names them.
 const INTERRUPTED_REQUEST_CONTENT_BOUND: usize = 64 * 1024;
 
+/// The transcript facts `for_input` stamps on a recovered input from its
+/// admitted semantics, its interaction id included. They match what its run
+/// stamped only when that run held this one input: a run that merged several
+/// inputs stamped their merged identity, which can differ from this input's
+/// own (possibly none). `None` for a row without stored semantics, which
+/// keeps the prompt's own.
+fn stamped_turn_metadata(
+    state: &crate::input_state::InputState,
+) -> Option<meerkat_core::lifecycle::run_primitive::RuntimeTurnMetadata> {
+    let input = state.persisted_input.as_ref()?;
+    let semantics = state.runtime_semantics?;
+    Some(crate::runtime_loop::for_input(input, semantics))
+}
+
 impl MeerkatMachine {
     /// Install trusted native ingress/policy composition on a storeless machine.
     /// Persistent profiles must be selected during fallible construction.
@@ -3233,6 +3247,7 @@ impl PendingRuntimeExecutorAttachment {
             .into_iter()
             .map(|(_, run_id, stored)| {
                 let applied = stored.seed.last_boundary_sequence.is_some();
+                let stamped = stamped_turn_metadata(&stored.state);
                 let (kind, request) = match stored.state.persisted_input {
                     Some(crate::input::Input::Prompt(prompt)) => {
                         let bytes = serde_json::to_vec(&prompt.content)
@@ -3250,7 +3265,8 @@ impl PendingRuntimeExecutorAttachment {
                                 Some((_, used)) => *used += bytes,
                                 None => copied.push((run_id.clone(), bytes)),
                             }
-                            let metadata = prompt.turn_metadata.unwrap_or_default();
+                            let metadata =
+                                stamped.unwrap_or_else(|| prompt.turn_metadata.unwrap_or_default());
                             InterruptedRequest {
                                 content: prompt.content,
                                 created_at: prompt.header.timestamp,
@@ -3705,6 +3721,12 @@ impl PendingRuntimeExecutorAttachment {
         let witness = self
             .try_commit_publication(on_committed, retain_mutation_guard, replaces_predecessor)
             .await?;
+        #[cfg(any(test, feature = "test-support"))]
+        if self.interrupted_tool_notices.is_some() {
+            self.machine
+                .run_attachment_interrupted_notice_handoff_test_hook(witness.session_id())
+                .await;
+        }
         if let Some(notices) = self.interrupted_tool_notices.take() {
             // Owed to the model, recorded at the loop's next pre-dequeue
             // position so the notice joins the next real turn's transcript
@@ -3715,6 +3737,21 @@ impl PendingRuntimeExecutorAttachment {
                     .interrupted_tool_notices
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(notices);
+                // The publication may have woken the loop, which runs on its
+                // own runtime and can spend that wake on a pre-dequeue check
+                // made before this hand-off, or not woken it at all: a
+                // replacement that fenced its predecessor's inputs has no
+                // queued work to wake for. Wake the exact attached loop now
+                // that the notices are in place, so an idle session records
+                // them now, not at its next input. A retained publication's
+                // slot is still pending here; its lease wakes the loop when it
+                // commits, after this hand-off.
+                if entry.epoch_id == witness.epoch_id
+                    && let RuntimeLoopAttachmentSlot::Attached(attachment) = &entry.attachment_slot
+                    && attachment.id == witness.attachment_id
+                {
+                    let _ = attachment.wake_tx.try_send(());
+                }
             }
         }
         Ok(witness)
@@ -5141,6 +5178,12 @@ impl PreparedSessionMaterialization {
 
     /// Exact rollback for a caller that already owns the persistent service's
     /// turn-finalization boundary.
+    ///
+    /// This takes the session's live lifecycle lease while the caller holds
+    /// that boundary. A concurrent raw unregister's saga holds the lease
+    /// into a surface cleanup that may take the boundary, so a caller whose
+    /// cleanup handle can do that (one with a published actor) must release
+    /// the boundary and call [`Self::rollback_now`] instead.
     pub async fn rollback_now_under_turn_finalization_boundary(
         &mut self,
     ) -> Result<bool, RuntimeDriverError> {
@@ -6726,6 +6769,113 @@ impl MeerkatMachine {
         }
     }
 
+    /// Deterministically pause the next executor attachment commit of
+    /// `session_id` that owes interrupted-run notices, after its publication
+    /// (the runtime loop serves and was woken) and before the notices are
+    /// handed to the session. The first receiver resolves when the commit
+    /// reaches the gate; sending on (or dropping) the returned sender lets it
+    /// go on. Exposed only by test builds.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn arm_attachment_interrupted_notice_handoff_test_hook(
+        &self,
+        session_id: SessionId,
+    ) -> (
+        crate::tokio::sync::oneshot::Receiver<()>,
+        crate::tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (entered_tx, entered_rx) = crate::tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = crate::tokio::sync::oneshot::channel();
+        let mut hook = self
+            .test_attachment_interrupted_notice_handoff
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(
+            hook.is_none(),
+            "attachment interrupted-notice hand-off test hook already armed"
+        );
+        *hook = Some((session_id, entered_tx, release_rx));
+        (entered_rx, release_tx)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) async fn run_attachment_interrupted_notice_handoff_test_hook(
+        &self,
+        session_id: &SessionId,
+    ) {
+        let armed = {
+            let mut hook = self
+                .test_attachment_interrupted_notice_handoff
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if hook
+                .as_ref()
+                .is_some_and(|(armed_session_id, _, _)| armed_session_id == session_id)
+            {
+                hook.take()
+            } else {
+                None
+            }
+        };
+        if let Some((_, entered_tx, release_rx)) = armed {
+            let _ = entered_tx.send(());
+            let _ = release_rx.await;
+        }
+    }
+
+    /// Deterministically pause `session_id`'s runtime loop at its next
+    /// pre-dequeue check that finds no owed interrupted-run notice, with the
+    /// turn-finalization boundary held. The first receiver resolves when the
+    /// loop reaches the gate; sending on (or dropping) the returned sender
+    /// lets it go on. Exposed only by test builds.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn arm_runtime_loop_after_empty_interrupted_notice_check_test_hook(
+        &self,
+        session_id: SessionId,
+    ) -> (
+        crate::tokio::sync::oneshot::Receiver<()>,
+        crate::tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (entered_tx, entered_rx) = crate::tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = crate::tokio::sync::oneshot::channel();
+        let mut hook = self
+            .test_runtime_loop_after_empty_interrupted_notice_check
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(
+            hook.is_none(),
+            "runtime-loop empty interrupted-notice check test hook already armed"
+        );
+        *hook = Some((session_id, entered_tx, release_rx));
+        (entered_rx, release_tx)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) async fn run_runtime_loop_after_empty_interrupted_notice_check_test_hook(
+        &self,
+        session_id: &SessionId,
+    ) {
+        let armed = {
+            let mut hook = self
+                .test_runtime_loop_after_empty_interrupted_notice_check
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if hook
+                .as_ref()
+                .is_some_and(|(armed_session_id, _, _)| armed_session_id == session_id)
+            {
+                hook.take()
+            } else {
+                None
+            }
+        };
+        if let Some((_, entered_tx, release_rx)) = armed {
+            let _ = entered_tx.send(());
+            let _ = release_rx.await;
+        }
+    }
+
     /// Runtime-loop parks on held run starts (#1500). Test support: wait for
     /// the park as a positive event instead of a quiet period.
     #[cfg(any(test, feature = "test-support"))]
@@ -6799,6 +6949,71 @@ impl MeerkatMachine {
                 .and_then(|entry| entry.wake_sender())
         };
         wake_tx.is_some_and(|wake_tx| wake_tx.try_send(()).is_ok())
+    }
+
+    /// Delay every [`Self::hold_run_starts`] by `delay` before it takes the
+    /// session's mutation gate, standing in for a hold that waits on a busy
+    /// session (a running turn's commit holds that gate); `None` clears it.
+    /// Test builds only.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn delay_hold_run_starts_for_test(&self, delay: Option<std::time::Duration>) {
+        self.run_start_holds_for_test().delay = delay;
+    }
+
+    /// Fail every [`Self::hold_run_starts`] of `session_id`, after its delay,
+    /// as a member's hold can fail; `None` clears it. Test builds only.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn fail_hold_run_starts_for_test(&self, session_id: Option<SessionId>) {
+        self.run_start_holds_for_test().failing_session = session_id;
+    }
+
+    /// The most [`Self::hold_run_starts`] calls in flight at once since the
+    /// last take, which restarts the count. Test builds only.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn take_max_in_flight_hold_run_starts_for_test(&self) -> usize {
+        let mut seam = self.run_start_holds_for_test();
+        let in_flight = seam.in_flight;
+        std::mem::replace(&mut seam.max_in_flight, in_flight)
+    }
+
+    /// Enter [`Self::hold_run_starts`]'s test seam: the hold counts as in
+    /// flight until the returned guard drops, waits the delay
+    /// [`Self::delay_hold_run_starts_for_test`] set, and fails when
+    /// [`Self::fail_hold_run_starts_for_test`] named its session.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) async fn enter_hold_run_starts_for_test(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<RunStartHoldInFlightForTest<'_>, RuntimeDriverError> {
+        let (delay, fails) = {
+            let mut seam = self.run_start_holds_for_test();
+            seam.in_flight += 1;
+            seam.max_in_flight = seam.max_in_flight.max(seam.in_flight);
+            (
+                seam.delay,
+                seam.failing_session.as_ref() == Some(session_id),
+            )
+        };
+        let in_flight = RunStartHoldInFlightForTest { machine: self };
+        if let Some(delay) = delay {
+            crate::tokio::time::sleep(delay).await;
+        }
+        if fails {
+            return Err(RuntimeDriverError::Internal(format!(
+                "injected run-start hold failure for session {session_id}"
+            )));
+        }
+        Ok(in_flight)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn run_start_holds_for_test(&self) -> std::sync::MutexGuard<'_, RunStartHoldsForTest> {
+        self.test_run_start_holds
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Deterministically pause the runtime loop after its ready-effect drain
@@ -8778,6 +8993,50 @@ pub struct LiveAssistantOutputTerminalReservation {
     _lifecycle_lease: crate::member_live::MemberLiveLifecycleLease,
 }
 
+/// Keeps one closed channel's generated assistant-output handles addressable
+/// while the close's deferred settlement replays rows that need them: an
+/// output start that the member turn's held session boundary parked until
+/// after the close still finds its generated handle.
+///
+/// A retirement requested while a hold exists
+/// ([`MeerkatMachine::retire_live_assistant_output_handles`]) runs when the
+/// last hold ends. A held handle never becomes reservable: reservation still
+/// requires the channel's current generated binding, which the close removed.
+#[cfg(feature = "live")]
+#[must_use = "dropping the hold ends it at once"]
+pub struct LiveAssistantOutputRetirementHold {
+    machine: MeerkatMachine,
+    session_id: SessionId,
+    channel_id: meerkat_core::LiveChannelId,
+}
+
+#[cfg(feature = "live")]
+impl std::fmt::Debug for LiveAssistantOutputRetirementHold {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LiveAssistantOutputRetirementHold")
+            .field("session_id", &self.session_id)
+            .field("channel_id", &self.channel_id)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(feature = "live")]
+impl Drop for LiveAssistantOutputRetirementHold {
+    fn drop(&mut self) {
+        self.machine
+            .end_live_assistant_output_retirement_hold(&self.session_id, &self.channel_id);
+    }
+}
+
+/// The holds on one channel's output handles, and whether a retirement waits
+/// for the last of them to end.
+#[cfg(feature = "live")]
+#[derive(Debug, Default)]
+struct LiveAssistantOutputRetirementHolds {
+    holds: usize,
+    retirement_requested: bool,
+}
+
 /// Opaque custody proving one exact provider binding is still current while
 /// its public observation is written and flushed.
 ///
@@ -9480,6 +9739,33 @@ impl Drop for RunlessTerminalAnnouncement {
     }
 }
 
+/// [`MeerkatMachine::hold_run_starts`]'s seam in test builds: the delay every
+/// hold waits before it takes the session's mutation gate, the session whose
+/// holds fail, and the holds in flight (now and at most at once).
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Debug, Default)]
+struct RunStartHoldsForTest {
+    delay: Option<std::time::Duration>,
+    failing_session: Option<SessionId>,
+    in_flight: usize,
+    max_in_flight: usize,
+}
+
+/// A [`MeerkatMachine::hold_run_starts`] in flight, counted by the test seam
+/// until it drops.
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) struct RunStartHoldInFlightForTest<'a> {
+    machine: &'a MeerkatMachine,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl Drop for RunStartHoldInFlightForTest<'_> {
+    fn drop(&mut self) {
+        let mut seam = self.machine.run_start_holds_for_test();
+        seam.in_flight = seam.in_flight.saturating_sub(1);
+    }
+}
+
 /// Session-scoped execution kernel for the Meerkat runtime.
 ///
 /// Owns per-session runtime state (driver, ops registry, completion waiters,
@@ -9625,6 +9911,12 @@ pub struct MeerkatMachineShared {
     >,
     #[cfg(feature = "live")]
     live_assistant_output_by_id: StdMutex<HashMap<String, LiveAssistantOutputHandle>>,
+    /// Channels whose output handles a deferred close settlement still
+    /// replays rows against; see [`LiveAssistantOutputRetirementHold`].
+    #[cfg(feature = "live")]
+    live_assistant_output_retirement_holds: StdMutex<
+        HashMap<(SessionId, meerkat_core::LiveChannelId), LiveAssistantOutputRetirementHolds>,
+    >,
     /// Count of live bridge commands that reached this member's drain arms
     /// (ADJ-P6B seam S3b). Deterministic lanes pin zero-bridge-traffic
     /// gates against it; mechanical observability, not machine state.
@@ -9699,6 +9991,11 @@ pub struct MeerkatMachineShared {
     #[cfg(feature = "test-support")]
     test_unregister_wait_witness:
         StdMutex<Option<crate::tokio::sync::oneshot::Sender<UnregisterTeardownWaitWitness>>>,
+    /// One-shot signal armed by a test: the next unregister teardown saga
+    /// reports once it holds its session's live lifecycle lease.
+    #[cfg(feature = "test-support")]
+    test_unregister_saga_live_lease_signal:
+        StdMutex<Option<crate::tokio::sync::oneshot::Sender<()>>>,
     /// This machine's user-interrupt acknowledgement bound. Tests scope it
     /// per machine: a short bound would make every success-path interrupt
     /// race the process-global cleanup dispatcher that all in-process tests
@@ -9750,6 +10047,20 @@ pub struct MeerkatMachineShared {
     /// reconcile a committed transition after a recoverable dispatch error.
     #[cfg(test)]
     test_fail_next_typed_dsl_post_commit_dispatch: std::sync::atomic::AtomicBool,
+    /// One-shot fault after an exact-run boundary cancel is staged: its
+    /// runtime-effect projection fails. Proves a failure after staging is
+    /// reported as owned by the recorded cancel.
+    #[cfg(test)]
+    test_fail_next_boundary_cancel_effect_projection: std::sync::atomic::AtomicBool,
+    /// One-shot fault in the withdrawal of a staged boundary-cancel dispatch
+    /// after a later failure. Proves the withdrawal's own error is reported
+    /// as owned by the recorded cancel too.
+    #[cfg(test)]
+    test_fail_next_boundary_cancel_dispatch_abort: std::sync::atomic::AtomicBool,
+    /// Fail the next record of a deferred close-time playback settlement
+    /// after its machine transition, as a failed recovery-state persist does.
+    #[cfg(any(test, feature = "test-support"))]
+    test_fail_next_live_close_settlement_deferral: std::sync::atomic::AtomicBool,
     /// One-shot deterministic gate before the runtime loop's terminal run
     /// commit takes the session driver. The turn is terminal in its live
     /// agent while its run input is still applied and unconsumed, and the
@@ -9781,6 +10092,28 @@ pub struct MeerkatMachineShared {
             crate::tokio::sync::oneshot::Receiver<()>,
         )>,
     >,
+    /// One-shot deterministic gate in an executor attachment commit that
+    /// owes interrupted-run notices: after its publication (the loop serves
+    /// and was woken), before the notices are handed to the session.
+    #[cfg(any(test, feature = "test-support"))]
+    test_attachment_interrupted_notice_handoff: StdMutex<
+        Option<(
+            SessionId,
+            crate::tokio::sync::oneshot::Sender<()>,
+            crate::tokio::sync::oneshot::Receiver<()>,
+        )>,
+    >,
+    /// One-shot deterministic gate at the runtime loop's next pre-dequeue
+    /// check that finds no owed interrupted-run notice (the
+    /// turn-finalization boundary is held).
+    #[cfg(any(test, feature = "test-support"))]
+    test_runtime_loop_after_empty_interrupted_notice_check: StdMutex<
+        Option<(
+            SessionId,
+            crate::tokio::sync::oneshot::Sender<()>,
+            crate::tokio::sync::oneshot::Receiver<()>,
+        )>,
+    >,
     /// Runtime-loop parks on held run starts (#1500), counted so tests can
     /// wait for the park as a positive event.
     #[cfg(any(test, feature = "test-support"))]
@@ -9795,6 +10128,9 @@ pub struct MeerkatMachineShared {
     /// counted so tests can wait for the dispatch as a positive event.
     #[cfg(any(test, feature = "test-support"))]
     test_boundary_cancel_dispatches: crate::tokio::sync::watch::Sender<u64>,
+    /// The run-start hold seam ([`RunStartHoldsForTest`]).
+    #[cfg(any(test, feature = "test-support"))]
+    test_run_start_holds: StdMutex<RunStartHoldsForTest>,
     /// One-shot deterministic gate after the runtime loop's first ready-effect
     /// drain but before it acquires queue authority. Tests publish an executor
     /// effect in this exact gap and prove the consumed wake is retained.
@@ -11546,6 +11882,8 @@ impl MeerkatMachine {
                 live_assistant_output_by_turn: StdMutex::new(HashMap::new()),
                 #[cfg(feature = "live")]
                 live_assistant_output_by_id: StdMutex::new(HashMap::new()),
+                #[cfg(feature = "live")]
+                live_assistant_output_retirement_holds: StdMutex::new(HashMap::new()),
                 live_commands_served: std::sync::atomic::AtomicU64::new(0),
                 member_incarnation_slots: StdRwLock::new(HashMap::new()),
                 auth_lease: StdRwLock::new(auth_lease),
@@ -11569,6 +11907,8 @@ impl MeerkatMachine {
                 #[cfg(feature = "test-support")]
                 test_unregister_wait_witness: StdMutex::new(None),
                 #[cfg(feature = "test-support")]
+                test_unregister_saga_live_lease_signal: StdMutex::new(None),
+                #[cfg(feature = "test-support")]
                 test_unregister_caller_wait_grace: StdMutex::new(None),
                 #[cfg(any(test, feature = "test-support"))]
                 test_user_interrupt_ack_timeout: StdMutex::new(USER_INTERRUPT_ACK_TIMEOUT),
@@ -11586,10 +11926,27 @@ impl MeerkatMachine {
                 test_fail_next_typed_dsl_post_commit_dispatch: std::sync::atomic::AtomicBool::new(
                     false,
                 ),
+                #[cfg(test)]
+                test_fail_next_boundary_cancel_effect_projection:
+                    std::sync::atomic::AtomicBool::new(false),
+                #[cfg(test)]
+                test_fail_next_boundary_cancel_dispatch_abort: std::sync::atomic::AtomicBool::new(
+                    false,
+                ),
+                #[cfg(any(test, feature = "test-support"))]
+                test_fail_next_live_close_settlement_deferral: std::sync::atomic::AtomicBool::new(
+                    false,
+                ),
                 #[cfg(any(test, feature = "test-support"))]
                 test_runtime_loop_before_terminal_commit: StdMutex::new(None),
                 #[cfg(any(test, feature = "test-support"))]
                 test_runtime_loop_before_boundary_acknowledgement: StdMutex::new(None),
+                #[cfg(any(test, feature = "test-support"))]
+                test_attachment_interrupted_notice_handoff: StdMutex::new(None),
+                #[cfg(any(test, feature = "test-support"))]
+                test_runtime_loop_after_empty_interrupted_notice_check: StdMutex::new(None),
+                #[cfg(any(test, feature = "test-support"))]
+                test_run_start_holds: StdMutex::new(RunStartHoldsForTest::default()),
                 #[cfg(any(test, feature = "test-support"))]
                 test_runtime_loop_before_queue_authority: StdMutex::new(None),
                 registration_run_start_holds: std::sync::Mutex::new(HashMap::new()),
@@ -11759,6 +12116,8 @@ impl MeerkatMachine {
                 live_assistant_output_by_turn: StdMutex::new(HashMap::new()),
                 #[cfg(feature = "live")]
                 live_assistant_output_by_id: StdMutex::new(HashMap::new()),
+                #[cfg(feature = "live")]
+                live_assistant_output_retirement_holds: StdMutex::new(HashMap::new()),
                 live_commands_served: std::sync::atomic::AtomicU64::new(0),
                 member_incarnation_slots: StdRwLock::new(HashMap::new()),
                 auth_lease: StdRwLock::new(auth_lease),
@@ -11782,6 +12141,8 @@ impl MeerkatMachine {
                 #[cfg(feature = "test-support")]
                 test_unregister_wait_witness: StdMutex::new(None),
                 #[cfg(feature = "test-support")]
+                test_unregister_saga_live_lease_signal: StdMutex::new(None),
+                #[cfg(feature = "test-support")]
                 test_unregister_caller_wait_grace: StdMutex::new(None),
                 #[cfg(any(test, feature = "test-support"))]
                 test_user_interrupt_ack_timeout: StdMutex::new(USER_INTERRUPT_ACK_TIMEOUT),
@@ -11799,10 +12160,27 @@ impl MeerkatMachine {
                 test_fail_next_typed_dsl_post_commit_dispatch: std::sync::atomic::AtomicBool::new(
                     false,
                 ),
+                #[cfg(test)]
+                test_fail_next_boundary_cancel_effect_projection:
+                    std::sync::atomic::AtomicBool::new(false),
+                #[cfg(test)]
+                test_fail_next_boundary_cancel_dispatch_abort: std::sync::atomic::AtomicBool::new(
+                    false,
+                ),
+                #[cfg(any(test, feature = "test-support"))]
+                test_fail_next_live_close_settlement_deferral: std::sync::atomic::AtomicBool::new(
+                    false,
+                ),
                 #[cfg(any(test, feature = "test-support"))]
                 test_runtime_loop_before_terminal_commit: StdMutex::new(None),
                 #[cfg(any(test, feature = "test-support"))]
                 test_runtime_loop_before_boundary_acknowledgement: StdMutex::new(None),
+                #[cfg(any(test, feature = "test-support"))]
+                test_attachment_interrupted_notice_handoff: StdMutex::new(None),
+                #[cfg(any(test, feature = "test-support"))]
+                test_runtime_loop_after_empty_interrupted_notice_check: StdMutex::new(None),
+                #[cfg(any(test, feature = "test-support"))]
+                test_run_start_holds: StdMutex::new(RunStartHoldsForTest::default()),
                 #[cfg(any(test, feature = "test-support"))]
                 test_runtime_loop_before_queue_authority: StdMutex::new(None),
                 registration_run_start_holds: std::sync::Mutex::new(HashMap::new()),

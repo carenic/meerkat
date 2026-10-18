@@ -32,7 +32,7 @@
 //! compaction-rewrite resume contract here, so the post-compaction cold
 //! decode is also proven without process memos.
 
-#![allow(clippy::expect_used, clippy::unwrap_used)]
+#![allow(clippy::expect_used, clippy::unwrap_used, clippy::disallowed_methods)]
 
 #[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
 mod tests {

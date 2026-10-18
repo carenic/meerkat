@@ -85,9 +85,10 @@ type AgentOperationFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 type AgentOperationFuture<'a, T> = Pin<Box<dyn Future<Output = T> + 'a>>;
 
 #[cfg(not(target_arch = "wasm32"))]
-type MobCreateFuture = Pin<Box<dyn Future<Output = Result<MobId, MobError>> + Send + 'static>>;
+type MobCreateFuture =
+    Pin<Box<dyn Future<Output = Result<crate::CreatedMob, MobError>> + Send + 'static>>;
 #[cfg(target_arch = "wasm32")]
-type MobCreateFuture = Pin<Box<dyn Future<Output = Result<MobId, MobError>> + 'static>>;
+type MobCreateFuture = Pin<Box<dyn Future<Output = Result<crate::CreatedMob, MobError>> + 'static>>;
 
 // Construct each large concrete async state machine behind an inline-resistant
 // heap boundary. `Box::pin(self.dispatch_...)` inside the dispatch match still
@@ -119,7 +120,7 @@ fn mob_create_with_owner_bridge_boxed(
     Box::pin(meerkat_runtime::stack_relief::relieve_caller_stack(
         move || async move {
             state
-                .mob_create_definition_with_owner_bridge_session(
+                .create_mob_for_owner_bridge_session(
                     definition,
                     owner_bridge_session_id,
                     true,
@@ -548,22 +549,15 @@ impl AgentMobToolSurface {
             .await
     }
 
-    /// The member this surface's session is bound to, when it belongs to
-    /// `mob_id`. Resolved from the session binding, never from arguments.
-    async fn caller_identity_in_mob(
-        &self,
-        mob_id: &MobId,
-    ) -> Result<Option<AgentIdentity>, ToolError> {
-        let bound = self
-            .state
-            .member_for_bridge_session(&self.owner_bridge_session_id)
+    /// The member this surface's session is bound to in the mob `handle`
+    /// serves, if any. Resolved from that mob's roster and the session
+    /// binding, never from arguments or from the mob id again.
+    async fn caller_identity_in(&self, handle: &MobHandle) -> Option<AgentIdentity> {
+        handle
+            .roster()
             .await
-            .map_err(|error| {
-                ToolError::execution_failed(format!(
-                    "resolving the calling member's session binding failed: {error}"
-                ))
-            })?;
-        Ok(bound.and_then(|(bound_mob, identity)| (&bound_mob == mob_id).then_some(identity)))
+            .find_by_bridge_session_id(&self.owner_bridge_session_id)
+            .map(|entry| entry.agent_identity.clone())
     }
 
     /// Admission to observe or retire one member: manage scope over the mob,
@@ -574,25 +568,31 @@ impl AgentMobToolSurface {
     /// entry is typed `member_retired` (durable retirement record) or
     /// `member_not_found` for every caller, so access_denied only ever means
     /// a present member the caller does not own.
+    ///
+    /// Answers the handle the call was admitted against: the call acts
+    /// through it and never resolves the mob id again, so a mob created
+    /// under the id after this admission is never touched.
     async fn ensure_owned_member_authority(
         &self,
         tool_name: &str,
         mob_id: &MobId,
         target: &AgentIdentity,
-    ) -> Result<(), ToolError> {
-        let can_manage_mob = self
-            .authority_context_snapshot()
-            .can_manage_mob(mob_id.as_str());
-        let caller = if can_manage_mob {
-            None
-        } else {
-            self.caller_identity_in_mob(mob_id).await?
-        };
+    ) -> Result<MobHandle, ToolError> {
+        // Manage scope is observed for the incarnation of the mob this call
+        // resolved: a grant for an earlier mob under the id does not match.
         let handle = self.bound_handle(mob_id).await.map_err(|error| {
             ToolError::execution_failed(format!(
                 "tool '{tool_name}' member admission failed: {error}"
             ))
         })?;
+        let can_manage_mob = self
+            .authority_context_snapshot()
+            .can_manage_mob(mob_id.as_str(), handle.incarnation());
+        let caller = if can_manage_mob {
+            None
+        } else {
+            self.caller_identity_in(&handle).await
+        };
         match handle
             .resolve_owned_member_target_admission(can_manage_mob, caller.as_ref(), target)
             .await
@@ -601,7 +601,7 @@ impl AgentMobToolSurface {
                     "tool '{tool_name}' member admission failed: {error}"
                 ))
             })? {
-            meerkat_mob::OwnedMemberTargetAdmission::Allowed => Ok(()),
+            meerkat_mob::OwnedMemberTargetAdmission::Allowed => Ok(handle),
             meerkat_mob::OwnedMemberTargetAdmission::Denied => {
                 Err(ToolError::access_denied(tool_name))
             }
@@ -611,22 +611,44 @@ impl AgentMobToolSurface {
         }
     }
 
+    /// Resolve the mob once and admit the call against it. Answers the
+    /// admitted handle: the call acts through it and never resolves the mob
+    /// id again, so a mob created under the id after this admission is
+    /// never touched.
     async fn ensure_mob_scope_authority(
         &self,
         tool_name: &str,
         mob_id: &MobId,
-    ) -> Result<(), ToolError> {
-        // Pure observation extracted from the machine-owned operator-scope
-        // projection. MobMachine — not this surface — decides the Allow/Deny
-        // verdict; we mirror it (Denied -> access_denied). Fails closed.
-        let can_manage_mob = self
-            .authority_context_snapshot()
-            .can_manage_mob(mob_id.as_str());
+    ) -> Result<MobHandle, ToolError> {
         let handle = self.bound_handle(mob_id).await.map_err(|error| {
             ToolError::execution_failed(format!(
                 "tool '{tool_name}' current-mob admission failed: {error}"
             ))
         })?;
+        if self
+            .current_mob_admission(tool_name, mob_id, &handle)
+            .await?
+        {
+            Ok(handle)
+        } else {
+            Err(ToolError::access_denied(tool_name))
+        }
+    }
+
+    /// Whether the operator may manage the mob `handle` serves.
+    async fn current_mob_admission(
+        &self,
+        tool_name: &str,
+        mob_id: &MobId,
+        handle: &MobHandle,
+    ) -> Result<bool, ToolError> {
+        // Pure observation extracted from the machine-owned operator-scope
+        // projection, for the incarnation of the mob this call resolved.
+        // MobMachine - not this surface - decides the Allow/Deny verdict; we
+        // mirror it (Denied -> access_denied). Fails closed.
+        let can_manage_mob = self
+            .authority_context_snapshot()
+            .can_manage_mob(mob_id.as_str(), handle.incarnation());
         let admission = handle
             .resolve_current_mob_admission(can_manage_mob)
             .await
@@ -635,18 +657,20 @@ impl AgentMobToolSurface {
                     "tool '{tool_name}' current-mob admission failed: {error}"
                 ))
             })?;
-        match admission {
-            meerkat_mob::CurrentMobAdmission::Allowed => Ok(()),
-            meerkat_mob::CurrentMobAdmission::Denied => Err(ToolError::access_denied(tool_name)),
-        }
+        Ok(matches!(
+            admission,
+            meerkat_mob::CurrentMobAdmission::Allowed
+        ))
     }
 
+    /// Answers the handle the spawn was admitted against: the spawn acts
+    /// through it and never resolves the mob id again.
     async fn ensure_spawn_member_scope(
         &self,
         tool_name: &str,
         mob_id: &MobId,
         args: &SpawnMemberArgs,
-    ) -> Result<(), ToolError> {
+    ) -> Result<MobHandle, ToolError> {
         // RAW, atomic observations extracted from the machine-owned
         // operator-scope projection and the typed spawn args, fed WITHOUT
         // pre-composing them. MobMachine — not this surface — owns the
@@ -656,22 +680,26 @@ impl AgentMobToolSurface {
         // each arg's pure `.is_some()` presence and the raw per-profile scope
         // set membership; args this surface's spawn tool does not accept stay
         // `false`.
+        let handle = self.bound_handle(mob_id).await.map_err(|error| {
+            ToolError::execution_failed(format!(
+                "tool '{tool_name}' spawn-member admission failed: {error}"
+            ))
+        })?;
+        let incarnation = handle.incarnation();
         let authority = self.authority_context_snapshot();
         let observations = meerkat_mob::SpawnMemberAdmissionObservations {
-            manage_scope_present: authority.can_manage_mob(mob_id.as_str()),
-            profile_scope_contains: authority
-                .spawn_profile_scope_contains(mob_id.as_str(), &args.profile),
+            manage_scope_present: authority.can_manage_mob(mob_id.as_str(), incarnation),
+            profile_scope_contains: authority.spawn_profile_scope_contains(
+                mob_id.as_str(),
+                incarnation,
+                &args.profile,
+            ),
             runtime_mode_present: args.runtime_mode.is_some(),
             backend_present: args.backend.is_some(),
             tooling_present: args.tooling.is_some(),
             auth_binding_present: args.auth_binding.is_some(),
             ..meerkat_mob::SpawnMemberAdmissionObservations::default()
         };
-        let handle = self.bound_handle(mob_id).await.map_err(|error| {
-            ToolError::execution_failed(format!(
-                "tool '{tool_name}' spawn-member admission failed: {error}"
-            ))
-        })?;
         let admission = handle
             .resolve_spawn_member_admission(observations)
             .await
@@ -681,7 +709,7 @@ impl AgentMobToolSurface {
                 ))
             })?;
         match admission {
-            meerkat_mob::SpawnMemberAdmission::Allowed => Ok(()),
+            meerkat_mob::SpawnMemberAdmission::Allowed => Ok(handle),
             meerkat_mob::SpawnMemberAdmission::Denied => Err(ToolError::access_denied(tool_name)),
         }
     }
@@ -974,6 +1002,58 @@ impl AgentMobToolSurface {
         Ok((mob_id, first_delegate))
     }
 
+    /// The authority grant a delegate returns for its session's implicit mob
+    /// `handle` (already checked to be that session's own): a typed effect
+    /// for the turn owner to merge and commit, with no re-entrant session
+    /// service call. It names the incarnation the implicit mob runs at now,
+    /// and is emitted whenever that incarnation is not in scope already, not
+    /// only when the delegate created the mob: a prior failed delegate may
+    /// have created it without the grant being applied, a resumed session
+    /// holds no grant from before, and a model change replaces the mob with a
+    /// new incarnation.
+    fn implicit_mob_grant_effects(
+        &self,
+        tool_name: &str,
+        mob_id: &MobId,
+        handle: &MobHandle,
+    ) -> Result<Vec<meerkat_core::SessionEffect>, ToolError> {
+        let incarnation = handle.incarnation();
+        let authority_context = self.authority_context_snapshot();
+        if authority_context.can_manage_mob(mob_id.as_str(), incarnation) {
+            return Ok(Vec::new());
+        }
+        let authority_context = meerkat_runtime::mob_operator_authority::grant_manage_mob(
+            &authority_context,
+            mob_id.as_str(),
+            incarnation,
+        )
+        .map_err(|error| {
+            ToolError::execution_failed(format!(
+                "{tool_name}: generated mob operator authority rejected implicit mob grant: {error}"
+            ))
+        })?;
+        Ok(vec![
+            meerkat_core::SessionEffect::ReplaceMobToolAuthorityContext { authority_context },
+        ])
+    }
+
+    /// Whether `handle` serves the implicit delegation mob of
+    /// `owner_bridge_session_id`: its owner-bridge record marks it implicit
+    /// and names that session. Only the implicit-mob create writes such a
+    /// record (an agent's `mob_create` never does), so a mob another caller
+    /// registered under the implicit id is not the session's own.
+    pub(crate) fn is_implicit_mob_of(
+        handle: &MobHandle,
+        owner_bridge_session_id: &SessionId,
+    ) -> bool {
+        handle
+            .owner_bridge_session_lifecycle_authority()
+            .is_some_and(|authority| {
+                authority.implicit_delegation_mob
+                    && authority.bridge_session_id == *owner_bridge_session_id
+            })
+    }
+
     async fn dispatch_delegate(
         &self,
         call: ToolCallView<'_>,
@@ -1017,41 +1097,27 @@ impl AgentMobToolSurface {
             .ensure_implicit_mob()
             .await
             .map_err(|e| Self::map_mob_error(call, e))?;
+        self.state.pause_agent_call().await;
+
+        // The mob under the implicit id must still be this session's own
+        // implicit mob when the delegate acts on it: a mob registered under
+        // the id since (after a destroy) is refused before anything touches
+        // it or any grant names it.
+        let handle = self
+            .bound_handle(&mob_id)
+            .await
+            .map_err(|error| Self::map_mob_error(call, error))?;
+        if !Self::is_implicit_mob_of(&handle, &self.owner_bridge_session_id) {
+            return Err(ToolError::access_denied(call.name));
+        }
 
         if let Some(objective_id) = objective_id {
-            let owner_identity = self
-                .state
-                .objective_principal_for_mob_owner_session(&mob_id, &self.owner_bridge_session_id)
-                .await
-                .map_err(|error| Self::map_mob_error(call, error))?;
-            self.state
-                .mob_bind_objective_owner(&mob_id, owner_identity, objective_id)
+            self.bind_objective_owner_boxed(&handle, objective_id)
                 .await
                 .map_err(|error| Self::map_mob_error(call, error))?;
         }
 
-        // Authority grant is returned as a typed effect for the turn owner
-        // to merge and commit — no re-entrant session service call.
-        // Emit the grant whenever the mob isn't already in scope, not just
-        // on first_delegate — a prior failed delegate may have created the
-        // implicit mob without the grant effect being applied.
-        let mut session_effects = Vec::new();
-        let authority_context = self.authority_context_snapshot();
-        if !authority_context.can_manage_mob(mob_id.as_str()) {
-            let authority_context = meerkat_runtime::mob_operator_authority::grant_manage_mob(
-                &authority_context,
-                mob_id.as_str(),
-            )
-            .map_err(|error| {
-                ToolError::execution_failed(format!(
-                    "{}: generated mob operator authority rejected implicit mob grant: {error}",
-                    call.name
-                ))
-            })?;
-            session_effects.push(
-                meerkat_core::SessionEffect::ReplaceMobToolAuthorityContext { authority_context },
-            );
-        }
+        let session_effects = self.implicit_mob_grant_effects(call.name, &mob_id, &handle)?;
 
         let resolved = self.resolve_spawn_tooling(&tooling).await?;
 
@@ -1062,10 +1128,6 @@ impl AgentMobToolSurface {
             .resolve_child_tool_access_policy_boxed(call.name, None)
             .await?;
 
-        let handle = self
-            .bound_handle(&mob_id)
-            .await
-            .map_err(|error| Self::map_mob_error(call, error))?;
         let parent = match (
             self.comms_name.as_ref(),
             self.comms_peer_id,
@@ -1196,15 +1258,25 @@ impl AgentMobToolSurface {
             .admit_child_tool_policy()
             .map_err(Self::child_policy_denial)?;
 
-        // Compute the operator grant from the *intended* mob id (the definition
-        // carries the id) BEFORE the durable create mutation lands, so the
-        // create outcome and the grant effect are produced together (row #211).
-        // If the generated authority rejects the intended scope, we fail before
-        // any mutation lands — there is no "mob created but grant absent" window.
-        let intended_mob_id = definition.id.clone();
+        // The operator grant names the incarnation this create started, so it
+        // is minted from the create's own answer, never from a lookup under
+        // the id: a mob another caller registers under the id is another
+        // incarnation. The sealed generated authority it extends is the one
+        // `ensure_create_authority` admitted before anything was created, so
+        // minting it cannot newly fail; the create outcome and the grant leave
+        // as one effect bundle for the turn owner to commit (row #211).
+        let authority_context = self.authority_context_snapshot();
+        let created = mob_create_with_owner_bridge_boxed(
+            Arc::clone(&self.state),
+            definition,
+            self.owner_bridge_session_id.clone(),
+        )
+        .await
+        .map_err(|e| Self::map_mob_error(call, e))?;
         let authority_context = meerkat_runtime::mob_operator_authority::grant_manage_mob(
-            &self.authority_context_snapshot(),
-            intended_mob_id.as_str(),
+            &authority_context,
+            created.mob_id.as_str(),
+            created.incarnation,
         )
         .map_err(|error| {
             ToolError::execution_failed(format!(
@@ -1214,20 +1286,17 @@ impl AgentMobToolSurface {
         })?;
         let session_effects =
             vec![meerkat_core::SessionEffect::ReplaceMobToolAuthorityContext { authority_context }];
-
-        let mob_id = mob_create_with_owner_bridge_boxed(
-            Arc::clone(&self.state),
-            definition,
-            self.owner_bridge_session_id.clone(),
-        )
-        .await
-        .map_err(|e| Self::map_mob_error(call, e))?;
-        if let Ok(handle) = self.bound_handle(&mob_id).await {
+        let mob_id = created.mob_id;
+        self.state.pause_agent_call().await;
+        // The provenance record goes to the mob this create started: a mob
+        // registered under the id since then is another incarnation and
+        // gets none.
+        if let Ok(handle) = self.bound_handle(&mob_id).await
+            && handle.incarnation() == created.incarnation
+        {
             self.record_successful_operator_action_boxed(&handle, call.name)
                 .await;
         }
-        // The outcome and the grant computed from the same intended mob id are
-        // returned as a single atomic effect bundle for the turn owner to commit.
         Self::encode_result_with_effects(call, json!({"mob_id": mob_id}), session_effects)
     }
 
@@ -1263,7 +1332,7 @@ impl AgentMobToolSurface {
             crate::RetiredDestroyLookup::Caller(retired) => {
                 if !self
                     .authority_context_snapshot()
-                    .can_manage_mob(mob_id.as_str())
+                    .can_manage_mob(mob_id.as_str(), retired.incarnation)
                 {
                     return Err(ToolError::access_denied(call.name));
                 }
@@ -1276,15 +1345,26 @@ impl AgentMobToolSurface {
             }
         }
 
-        self.ensure_mob_scope_authority(call.name, &mob_id).await?;
         // The admitted destroy owns the mob's handles: this surface holds
-        // none across it and appends no operator provenance after it, since
-        // that append would go to the destroyed mob's store.
+        // none across it (only the admitted incarnation) and appends no
+        // operator provenance after it, since that append would go to the
+        // destroyed mob's store. The destroy is refused unless the mob it
+        // reaches is the incarnation admitted here.
+        let incarnation = self
+            .ensure_mob_scope_authority(call.name, &mob_id)
+            .await?
+            .incarnation();
+        self.state.pause_agent_call().await;
         let report = self
             .state
-            .mob_destroy_for(&mob_id, caller)
+            .mob_destroy_for(&mob_id, caller, Some(incarnation))
             .await
-            .map_err(|e| Self::map_destroy_error(call, e))?;
+            .map_err(|error| match error {
+                crate::MobMcpDestroyError::Mob(MobError::ScopeDenied(_)) => {
+                    ToolError::access_denied(call.name)
+                }
+                error => Self::map_destroy_error(call, error),
+            })?;
         Self::encode_destroy_report(call, &report)
     }
 
@@ -1341,14 +1421,13 @@ impl AgentMobToolSurface {
             .transpose()
             .map_err(|e| ToolError::invalid_arguments(call.name, e))?;
 
-        self.ensure_spawn_member_scope_boxed(call.name, &mob_id, &args)
-            .await?;
+        // The spawn acts through the handle it was admitted against.
         let audit_handle = self
-            .bound_handle(&mob_id)
-            .await
-            .map_err(|e| Self::map_mob_error(call, e))?;
+            .ensure_spawn_member_scope_boxed(call.name, &mob_id, &args)
+            .await?;
+        self.state.pause_agent_call().await;
         if let Some(objective_id) = objective_id {
-            self.bind_spawn_objective_owner_boxed(&mob_id, objective_id)
+            self.bind_objective_owner_boxed(&audit_handle, objective_id)
                 .await
                 .map_err(|error| Self::map_mob_error(call, error))?;
         }
@@ -1424,10 +1503,14 @@ impl AgentMobToolSurface {
                 )
             })?;
         let authority = self.authority_context_snapshot();
+        let incarnation = audit_handle.incarnation();
         let observations = meerkat_mob::SpawnMemberAdmissionObservations {
-            manage_scope_present: authority.can_manage_mob(mob_id.as_str()),
-            profile_scope_contains: authority
-                .spawn_profile_scope_contains(mob_id.as_str(), source_entry.role.as_str()),
+            manage_scope_present: authority.can_manage_mob(mob_id.as_str(), incarnation),
+            profile_scope_contains: authority.spawn_profile_scope_contains(
+                mob_id.as_str(),
+                incarnation,
+                source_entry.role.as_str(),
+            ),
             ..meerkat_mob::SpawnMemberAdmissionObservations::default()
         };
         let admission = audit_handle
@@ -1654,15 +1737,16 @@ impl AgentMobToolSurface {
         let mut definition = MobDefinition::explicit(MobId::from("agent-council-template"));
         let mut participants = Vec::with_capacity(args.participants.len());
         let mut target_identities = Vec::with_capacity(args.participants.len());
+        // The incarnation each source mob was admitted at: seating refuses a
+        // source mob id that names another mob by then.
+        let mut admitted_sources =
+            crate::temporary_council::TemporaryCouncilAdmittedSources::default();
 
         for (index, participant) in args.participants.into_iter().enumerate() {
             let source_mob_id = MobId::from(participant.mob_id);
-            self.ensure_mob_scope_authority(call.name, &source_mob_id)
-                .await?;
             let source = self
-                .bound_handle(&source_mob_id)
-                .await
-                .map_err(|error| Self::map_mob_error(call, error))?;
+                .ensure_mob_scope_authority(call.name, &source_mob_id)
+                .await?;
             let source_identity = AgentIdentity::from(participant.member_id);
             let source_profile = source
                 .effective_member_profile(&source_identity)
@@ -1674,6 +1758,7 @@ impl AgentMobToolSurface {
             let order = u32::try_from(index).map_err(|_| {
                 ToolError::invalid_arguments(call.name, "too many council participants")
             })?;
+            admitted_sources.admit(order, source.incarnation());
             let target_profile = ProfileName::from(format!("council_p{order}"));
             definition.profiles.insert(
                 target_profile.clone(),
@@ -1756,7 +1841,7 @@ impl AgentMobToolSurface {
                 let outcome = self
                     .state
                     .temporary_council()
-                    .run(request)
+                    .run_admitted(request, admitted_sources)
                     .await
                     .map_err(|error| Self::map_council_error(call, error))?;
                 let mut value = council_outcome_json(&outcome);
@@ -1783,7 +1868,10 @@ impl AgentMobToolSurface {
             crate::state_tasks::StateTaskKind::Owned,
             "detached council run",
             async move {
-                let outcome = match council.run_detached(request, job).await {
+                let outcome = match council
+                    .run_detached_admitted(request, job, admitted_sources)
+                    .await
+                {
                     // A council that ran but failed (e.g. participant seating)
                     // is delivered as failed; the record keeps the full typed
                     // outcome either way.
@@ -1860,23 +1948,24 @@ impl AgentMobToolSurface {
         tool_name: &'a str,
         mob_id: &'a MobId,
         args: &'a SpawnMemberArgs,
-    ) -> AgentOperationFuture<'a, Result<(), ToolError>> {
+    ) -> AgentOperationFuture<'a, Result<MobHandle, ToolError>> {
         Box::pin(self.ensure_spawn_member_scope(tool_name, mob_id, args))
     }
 
+    /// Bind `objective_id` to this session's objective principal in the mob
+    /// `handle` serves (the one the call was admitted against).
     #[inline(never)]
-    fn bind_spawn_objective_owner_boxed<'a>(
+    fn bind_objective_owner_boxed<'a>(
         &'a self,
-        mob_id: &'a MobId,
+        handle: &'a MobHandle,
         objective_id: meerkat_core::interaction::ObjectiveId,
     ) -> AgentOperationFuture<'a, Result<(), MobError>> {
         Box::pin(async move {
-            let owner_identity = self
-                .state
-                .objective_principal_for_mob_owner_session(mob_id, &self.owner_bridge_session_id)
-                .await?;
-            self.state
-                .mob_bind_objective_owner(mob_id, owner_identity, objective_id)
+            let owner_identity =
+                crate::MobMcpState::objective_principal_on(handle, &self.owner_bridge_session_id)
+                    .await?;
+            handle
+                .bind_objective_owner(owner_identity, objective_id)
                 .await
         })
     }
@@ -1968,15 +2057,12 @@ impl AgentMobToolSurface {
 
         let mob_id = MobId::from(args.mob_id);
         let identity = AgentIdentity::from(args.member_id);
-        self.ensure_owned_member_authority(call.name, &mob_id, &identity)
-            .await?;
         let audit_handle = self
-            .bound_handle(&mob_id)
-            .await
-            .map_err(|e| Self::map_mob_error(call, e))?;
+            .ensure_owned_member_authority(call.name, &mob_id, &identity)
+            .await?;
+        self.state.pause_agent_call().await;
 
-        self.state
-            .mob_retire(&mob_id, identity)
+        crate::MobMcpState::mob_retire_on(&audit_handle, identity)
             .await
             .map_err(|e| Self::map_mob_error(call, e))?;
 
@@ -1996,12 +2082,12 @@ impl AgentMobToolSurface {
 
         let mob_id = MobId::from(args.mob_id);
         let identity = AgentIdentity::from(args.member_id);
-        self.ensure_owned_member_authority(call.name, &mob_id, &identity)
+        let handle = self
+            .ensure_owned_member_authority(call.name, &mob_id, &identity)
             .await?;
+        self.state.pause_agent_call().await;
 
-        let snapshot = self
-            .state
-            .mob_member_status(&mob_id, &identity)
+        let snapshot = crate::MobMcpState::mob_member_status_on(&handle, &identity)
             .await
             .map_err(|e| Self::map_mob_error(call, e))?;
 
@@ -2027,27 +2113,35 @@ impl AgentMobToolSurface {
             .map_err(|e| ToolError::invalid_arguments(call.name, e.to_string()))?;
 
         let mob_id = MobId::from(args.mob_id);
-        let manage = self.ensure_mob_scope_authority(call.name, &mob_id).await;
-        let owner_view = match manage {
-            Ok(()) => None,
+        // One resolution: the admission, the owner view and the list all
+        // read the mob this handle serves.
+        let handle = self.bound_handle(&mob_id).await.map_err(|error| {
+            ToolError::execution_failed(format!(
+                "tool '{}' current-mob admission failed: {error}",
+                call.name
+            ))
+        })?;
+        let manage = self
+            .current_mob_admission(call.name, &mob_id, &handle)
+            .await?;
+        self.state.pause_agent_call().await;
+        let owner_view = if manage {
+            None
+        } else {
             // Without manage scope a member of this mob still sees the
             // members it spawned (e.g. its fork_off children), and only those.
-            Err(denied) => match self.caller_identity_in_mob(&mob_id).await? {
+            match self.caller_identity_in(&handle).await {
                 Some(caller) => Some(caller),
-                None => return Err(denied),
-            },
+                None => return Err(ToolError::access_denied(call.name)),
+            }
         };
 
         let mut members = self
             .state
-            .mob_list_members(&mob_id)
+            .mob_list_members_on(&handle)
             .await
             .map_err(|e| Self::map_mob_error(call, e))?;
         if let Some(caller) = owner_view {
-            let handle = self
-                .bound_handle(&mob_id)
-                .await
-                .map_err(|e| Self::map_mob_error(call, e))?;
             let mut owned = Vec::with_capacity(members.len());
             for member in members {
                 let admission = handle
@@ -2082,10 +2176,11 @@ impl AgentMobToolSurface {
         // admission errors or is Denied, is omitted.
         let mut mob_list: Vec<serde_json::Value> = Vec::new();
         for (id, status) in mobs {
-            let can_manage_mob = authority_context.can_manage_mob(id.as_str());
             let Ok(handle) = self.bound_handle(&id).await else {
                 continue;
             };
+            let can_manage_mob =
+                authority_context.can_manage_mob(id.as_str(), handle.incarnation());
             match handle.resolve_current_mob_admission(can_manage_mob).await {
                 Ok(meerkat_mob::CurrentMobAdmission::Allowed) => {
                     mob_list.push(json!({
@@ -2110,16 +2205,13 @@ impl AgentMobToolSurface {
             .parse_args()
             .map_err(|e| ToolError::invalid_arguments(call.name, e.to_string()))?;
         let mob_id = meerkat_mob::MobId::from(args.mob_id.as_str());
-        self.ensure_mob_scope_authority(call.name, &mob_id).await?;
-        let audit_handle = self
-            .bound_handle(&mob_id)
-            .await
-            .map_err(|e| Self::map_mob_error(call, e))?;
+        let audit_handle = self.ensure_mob_scope_authority(call.name, &mob_id).await?;
+        self.state.pause_agent_call().await;
 
         let local = AgentIdentity::from(args.member_id.as_str());
         let target = wire_peer_target_from_args(args.peer);
-        self.state
-            .mob_wire(&mob_id, local, target)
+        audit_handle
+            .wire(local, target)
             .await
             .map_err(|e| Self::map_mob_error(call, e))?;
         self.record_successful_operator_action(&audit_handle, call.name)
@@ -2135,16 +2227,13 @@ impl AgentMobToolSurface {
             .parse_args()
             .map_err(|e| ToolError::invalid_arguments(call.name, e.to_string()))?;
         let mob_id = meerkat_mob::MobId::from(args.mob_id.as_str());
-        self.ensure_mob_scope_authority(call.name, &mob_id).await?;
-        let audit_handle = self
-            .bound_handle(&mob_id)
-            .await
-            .map_err(|e| Self::map_mob_error(call, e))?;
+        let audit_handle = self.ensure_mob_scope_authority(call.name, &mob_id).await?;
+        self.state.pause_agent_call().await;
 
         let local = AgentIdentity::from(args.member_id.as_str());
         let target = unwire_peer_target_from_args(args.peer)?;
-        self.state
-            .mob_unwire(&mob_id, local, target)
+        audit_handle
+            .unwire(local, target)
             .await
             .map_err(|e| Self::map_mob_error(call, e))?;
         self.record_successful_operator_action(&audit_handle, call.name)
@@ -5605,24 +5694,47 @@ mod tests {
             .expect("generated create-only mob authority should be accepted")
     }
 
-    fn scope_only_authority(mob_id: &str) -> MobToolAuthorityContext {
+    /// The incarnation the live mob `mob_id` runs at: the binding a grant
+    /// over that mob names.
+    async fn live_incarnation(
+        state: &MobMcpState,
+        mob_id: &MobId,
+    ) -> meerkat_core::service::MobIncarnationId {
+        state
+            .handle_for(mob_id)
+            .await
+            .expect("live mob handle")
+            .incarnation()
+    }
+
+    fn scope_only_authority(
+        mob_id: &str,
+        incarnation: meerkat_core::service::MobIncarnationId,
+    ) -> MobToolAuthorityContext {
         let authority = meerkat_runtime::mob_operator_authority::set_create_authority(
             &create_only_authority(),
             false,
         )
         .expect("generated mob authority should disable create scope");
-        meerkat_runtime::mob_operator_authority::grant_manage_mob(&authority, mob_id)
+        meerkat_runtime::mob_operator_authority::grant_manage_mob(&authority, mob_id, incarnation)
             .expect("generated mob authority should grant managed mob scope")
     }
 
-    fn spawn_profile_authority(mob_id: &str, profile: &str) -> MobToolAuthorityContext {
+    fn spawn_profile_authority(
+        mob_id: &str,
+        incarnation: meerkat_core::service::MobIncarnationId,
+        profile: &str,
+    ) -> MobToolAuthorityContext {
         let authority = meerkat_runtime::mob_operator_authority::set_create_authority(
             &create_only_authority(),
             false,
         )
         .expect("generated mob authority should disable create scope");
         meerkat_runtime::mob_operator_authority::grant_spawn_profile_in_mob(
-            &authority, mob_id, profile,
+            &authority,
+            mob_id,
+            incarnation,
+            profile,
         )
         .expect("generated mob authority should grant spawn profile scope")
     }
@@ -6329,7 +6441,7 @@ mod tests {
         match &create_result.session_effects[0] {
             meerkat_core::SessionEffect::ReplaceMobToolAuthorityContext { authority_context } => {
                 assert!(
-                    authority_context.can_manage_mob(&mob_id),
+                    authority_context.can_manage_mob(&mob_id, created_handle.incarnation()),
                     "mob_create replacement authority should manage the created mob_id"
                 );
             }
@@ -6406,9 +6518,10 @@ mod tests {
 
     /// Gate for remediation row #211: `mob_create` must produce the durable
     /// create outcome and the operator grant as a single atomic effect bundle,
-    /// with the grant keyed on the *intended* definition id. There must be no
-    /// split where the mob exists in storage but no grant effect is present, or
-    /// where the grant manages a different id than the one created.
+    /// with the grant bound to the mob the create built (the intended
+    /// definition id at the incarnation it started). There must be no split
+    /// where the mob exists in storage but no grant effect is present, or
+    /// where the grant manages a different mob than the one created.
     #[tokio::test]
     async fn mob_create_grant_is_atomic_with_create_outcome() {
         let state = MobMcpState::new_in_memory();
@@ -6474,11 +6587,260 @@ mod tests {
         match &create_result.session_effects[0] {
             meerkat_core::SessionEffect::ReplaceMobToolAuthorityContext { authority_context } => {
                 assert!(
-                    authority_context.can_manage_mob(intended_id),
-                    "the atomic grant must manage the same id that was created"
+                    authority_context.can_manage_mob(
+                        intended_id,
+                        live_incarnation(&state, &MobId::from(intended_id)).await
+                    ),
+                    "the atomic grant must manage the same mob that was created"
                 );
             }
             other => panic!("unexpected mob_create session effect: {other:?}"),
+        }
+    }
+
+    /// The delegate acts on, and grants over, only its session's own
+    /// implicit mob: the mob whose owner-bridge record marks it implicit and
+    /// names the session. A mob created under another session's implicit id,
+    /// a session's explicit mob and a host mob are none of that.
+    #[tokio::test]
+    async fn the_delegate_guard_accepts_only_the_sessions_own_implicit_mob() {
+        let state = MobMcpState::new_in_memory();
+        let owner = SessionId::new();
+        let other = SessionId::new();
+
+        let (implicit_id, created) = state
+            .ensure_implicit_mob_for_model(&owner.to_string(), "claude-sonnet-4-5", None)
+            .await
+            .expect("create the implicit mob");
+        assert!(created);
+        let implicit = state
+            .handle_for(&implicit_id)
+            .await
+            .expect("implicit mob handle");
+        assert!(AgentMobToolSurface::is_implicit_mob_of(&implicit, &owner));
+        assert!(!AgentMobToolSurface::is_implicit_mob_of(&implicit, &other));
+
+        // Another session's create under a third session's implicit id.
+        let squatted_session = SessionId::new();
+        let squatted_id = state
+            .mob_create_definition_with_owner_bridge_session(
+                sample_definition(&format!("implicit-{squatted_session}")),
+                other.clone(),
+                true,
+                false,
+            )
+            .await
+            .expect("create a mob under another session's implicit id");
+        let squatted = state
+            .handle_for(&squatted_id)
+            .await
+            .expect("squatted mob handle");
+        assert!(!AgentMobToolSurface::is_implicit_mob_of(
+            &squatted,
+            &squatted_session
+        ));
+        assert!(!AgentMobToolSurface::is_implicit_mob_of(&squatted, &other));
+
+        let explicit_id = state
+            .mob_create_definition_with_owner_bridge_session(
+                sample_definition("owner-explicit"),
+                owner.clone(),
+                true,
+                false,
+            )
+            .await
+            .expect("create the owner's explicit mob");
+        let explicit = state
+            .handle_for(&explicit_id)
+            .await
+            .expect("explicit mob handle");
+        assert!(!AgentMobToolSurface::is_implicit_mob_of(&explicit, &owner));
+
+        let host_id = state
+            .mob_create_definition(sample_definition("host-mob"))
+            .await
+            .expect("create a host mob");
+        let host = state.handle_for(&host_id).await.expect("host mob handle");
+        assert!(!AgentMobToolSurface::is_implicit_mob_of(&host, &owner));
+    }
+
+    fn apply_authority_effects(
+        authority: &std::sync::RwLock<MobToolAuthorityContext>,
+        effects: Vec<meerkat_core::SessionEffect>,
+    ) {
+        for effect in effects {
+            if let meerkat_core::SessionEffect::ReplaceMobToolAuthorityContext {
+                authority_context,
+            } = effect
+            {
+                *authority
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = authority_context;
+            }
+        }
+    }
+
+    /// A model change replaces the session's implicit mob with a new
+    /// incarnation, and the delegate grant moves to it: the replaced
+    /// incarnation leaves scope.
+    #[tokio::test]
+    async fn a_model_change_rebinds_the_delegate_grant_to_the_replacement_implicit_mob() {
+        let state = MobMcpState::new_in_memory();
+        let session_id = SessionId::new();
+        let authority = Arc::new(std::sync::RwLock::new(create_only_authority()));
+        let surface = |model: &str| {
+            AgentMobToolSurface::new_with_effective_authority(
+                Arc::clone(&state),
+                None,
+                Arc::clone(&authority),
+                model.to_string(),
+                session_id.clone(),
+                None,
+                None,
+                None,
+                meerkat_core::service::MobToolSnapshotContext::Standalone,
+            )
+        };
+
+        let first = surface("claude-sonnet-4-5");
+        let (mob_id, created) = first
+            .ensure_implicit_mob()
+            .await
+            .expect("the first delegate creates the implicit mob");
+        assert!(created);
+        let first_handle = first
+            .bound_handle(&mob_id)
+            .await
+            .expect("implicit mob handle");
+        assert!(AgentMobToolSurface::is_implicit_mob_of(
+            &first_handle,
+            &session_id
+        ));
+        let first_incarnation = first_handle.incarnation();
+        apply_authority_effects(
+            &authority,
+            first
+                .implicit_mob_grant_effects("delegate", &mob_id, &first_handle)
+                .expect("the first grant"),
+        );
+        drop(first_handle);
+        assert!(
+            authority
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .can_manage_mob(mob_id.as_str(), first_incarnation)
+        );
+
+        let replacing = surface("gpt-5.4");
+        let (replaced_id, created) = replacing
+            .ensure_implicit_mob()
+            .await
+            .expect("a model change replaces the implicit mob");
+        assert!(created, "the replacement is a new implicit mob");
+        assert_eq!(replaced_id, mob_id);
+        let replacement = replacing
+            .bound_handle(&mob_id)
+            .await
+            .expect("replacement implicit mob handle");
+        let replacement_incarnation = replacement.incarnation();
+        assert!(replacement_incarnation != first_incarnation);
+        apply_authority_effects(
+            &authority,
+            replacing
+                .implicit_mob_grant_effects("delegate", &mob_id, &replacement)
+                .expect("the replacement grant"),
+        );
+
+        let authority = authority
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(authority.can_manage_mob(mob_id.as_str(), replacement_incarnation));
+        assert!(!authority.can_manage_mob(mob_id.as_str(), first_incarnation));
+        assert!(
+            authority.mob_incarnations().get(mob_id.as_str()) == Some(&replacement_incarnation)
+        );
+    }
+
+    /// A delegate returns manage scope over exactly its session's implicit
+    /// mob at the incarnation it runs at: when the delegate creates the mob,
+    /// and when a rebuilt surface of the session (whose authority holds no
+    /// grant from before) finds the mob in place.
+    #[tokio::test]
+    async fn delegate_grants_manage_scope_over_the_sessions_implicit_mob_as_it_runs() {
+        let service = Arc::new(RealCommsSessionSvc::new());
+        let state = Arc::new(
+            MobMcpState::new(service.clone(), meerkat_mob::MobControlPrincipal::Owner)
+                .expect("construct runtime authority"),
+        );
+        let parent_name = "parent/lead/l-grant".to_string();
+        let parent_comms = service.register_external_comms(&parent_name).await;
+        let parent_peer_id = parent_comms.peer_id().expect("parent peer id");
+        let snapshot_context = parent_snapshot_context_for_tools(vec![Arc::new(ToolDef {
+            audience: Default::default(),
+            name: "read_file".into(),
+            description: "read_file tool".to_string(),
+            input_schema: json!({"type": "object"}),
+            provenance: Some(ToolProvenance {
+                kind: ToolSourceKind::Builtin,
+                source_id: "test-read-file".into(),
+                artifact: None,
+            }),
+        })])
+        .await;
+        let session_id = SessionId::new();
+        let surface = || {
+            AgentMobToolSurface::new_with_effective_authority(
+                Arc::clone(&state),
+                None,
+                Arc::new(std::sync::RwLock::new(create_only_authority())),
+                "claude-sonnet-4-5".to_string(),
+                session_id.clone(),
+                Some(parent_name.clone()),
+                Some(parent_peer_id),
+                Some(parent_comms.clone() as Arc<dyn CoreCommsRuntime>),
+                snapshot_context.clone(),
+            )
+        };
+
+        for (round, member_id) in ["helper-grant-1", "helper-grant-2"].into_iter().enumerate() {
+            let delegate_args = serde_json::value::RawValue::from_string(
+                json!({
+                    "member_id": member_id,
+                    "task": "report back",
+                    "result_label": "delegate_result",
+                    "max_text_bytes": 4096
+                })
+                .to_string(),
+            )
+            .unwrap();
+            let outcome = surface()
+                .dispatch(ToolCallView {
+                    id: "delegate-grant",
+                    name: "delegate",
+                    args: &delegate_args,
+                })
+                .await
+                .expect("delegate should spawn the helper");
+            let parsed: serde_json::Value =
+                serde_json::from_str(&outcome.result.text_content()).expect("delegate JSON");
+            assert_eq!(
+                parsed.get("system_notice").is_some(),
+                round == 0,
+                "only the first delegate creates the implicit mob: {parsed}"
+            );
+            let mob_id = parsed["mob_id"].as_str().expect("mob id");
+            let incarnation = live_incarnation(&state, &MobId::from(mob_id)).await;
+            match outcome.session_effects.as_slice() {
+                [
+                    meerkat_core::SessionEffect::ReplaceMobToolAuthorityContext {
+                        authority_context,
+                    },
+                ] => {
+                    assert!(authority_context.can_manage_mob(mob_id, incarnation));
+                    assert!(authority_context.mob_incarnations().get(mob_id) == Some(&incarnation));
+                }
+                other => panic!("unexpected delegate session effects: {other:?}"),
+            }
         }
     }
 
@@ -6635,7 +6997,7 @@ mod tests {
         let surface = AgentMobToolSurface::new(
             Arc::clone(&state),
             None,
-            scope_only_authority(mob_id.as_str()),
+            scope_only_authority(mob_id.as_str(), live_incarnation(&state, &mob_id).await),
             "claude-sonnet-4-5".to_string(),
             SessionId::new(),
             None,
@@ -6748,7 +7110,7 @@ mod tests {
             .await
             .expect("create mob");
         let authority = meerkat_runtime::mob_operator_authority::with_audit_invocation_id(
-            &scope_only_authority(mob_id.as_str()),
+            &scope_only_authority(mob_id.as_str(), live_incarnation(&state, &mob_id).await),
             "audit-scope",
         )
         .expect("generated mob authority should attach scope audit id");
@@ -6854,7 +7216,11 @@ mod tests {
         let surface = AgentMobToolSurface::new(
             Arc::clone(&state),
             None,
-            spawn_profile_authority(mob_id.as_str(), "worker"),
+            spawn_profile_authority(
+                mob_id.as_str(),
+                live_incarnation(&state, &mob_id).await,
+                "worker",
+            ),
             "claude-sonnet-4-5".to_string(),
             SessionId::new(),
             None,
@@ -6996,7 +7362,11 @@ mod tests {
         let surface: Arc<dyn AgentToolDispatcher> = Arc::new(AgentMobToolSurface::new(
             Arc::clone(&state),
             None,
-            spawn_profile_authority(mob_id.as_str(), "worker"),
+            spawn_profile_authority(
+                mob_id.as_str(),
+                live_incarnation(&state, &mob_id).await,
+                "worker",
+            ),
             "claude-sonnet-4-5".to_string(),
             parent_session.clone(),
             None,
@@ -7066,7 +7436,11 @@ mod tests {
         let surface: Arc<dyn AgentToolDispatcher> = Arc::new(AgentMobToolSurface::new(
             Arc::clone(&state),
             None,
-            spawn_profile_authority(mob_id.as_str(), "worker"),
+            spawn_profile_authority(
+                mob_id.as_str(),
+                live_incarnation(&state, &mob_id).await,
+                "worker",
+            ),
             "claude-sonnet-4-5".to_string(),
             parent_bridge_session_id.clone(),
             None,

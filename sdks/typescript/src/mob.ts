@@ -253,11 +253,23 @@ export class Member {
 export class Mob {
   private readonly client: MeerkatClient;
   readonly mobId: string;
+  /**
+   * The mob's callback claim token when this handle came from `createMob`
+   * (`undefined` otherwise): what a claim of the mob's callback route
+   * presents (see `MeerkatClient.mobClaimCallbackRoute`). Keep it secret
+   * and out of logs; it is not enumerable, so inspecting, spreading or
+   * serializing the handle leaves it out. The server returns it only from
+   * `mob/create` and cannot mint a lost one again: a creator that must
+   * claim the route after a restart persists it, and destroying and
+   * creating the mob again is the only recovery.
+   */
+  declare readonly claimToken: string | undefined;
 
   /** @internal */
-  constructor(client: MeerkatClient, mobId: string) {
+  constructor(client: MeerkatClient, mobId: string, claimToken?: string) {
     this.client = client;
     this.mobId = mobId;
+    Object.defineProperty(this, "claimToken", { value: claimToken, enumerable: false });
   }
 
   async status(): Promise<MobStatus> {

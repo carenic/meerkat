@@ -2,7 +2,7 @@ from __future__ import annotations
 
 """Generated wire types for Meerkat SDK.
 
-Contract version: 0.9.2
+Contract version: 0.9.3
 """
 
 import sys
@@ -17,7 +17,7 @@ else:
 from .errors import MeerkatError
 
 
-CONTRACT_VERSION = "0.9.2"
+CONTRACT_VERSION = "0.9.3"
 
 
 Value = Any
@@ -1697,6 +1697,7 @@ and generated SDK schemas."""
     target: dict[str, Any]
     trigger: dict[str, Any]
     updated_at_utc: str
+    commissioning_agent: Optional[PrincipalRef] = None
     deleted_at_utc: Optional[str] = None
     description: Optional[str] = None
     labels: Optional[dict[str, str]] = None
@@ -2206,6 +2207,7 @@ class MobCreateParams:
 @dataclass
 class MobCreateResult:
     """Response payload for `mob/create`."""
+    claim_token: str = field(repr=False)
     mob_id: str
 
 
@@ -2986,6 +2988,13 @@ class MobRotateSupervisorResult:
     mob_id: str
     ok: bool
     report: SupervisorRotationReportWire
+
+
+@dataclass
+class MobClaimCallbackRouteParams:
+    """Request payload for `mob/claim_callback_route`."""
+    claim_token: str = field(repr=False)
+    mob_id: str
 
 
 @dataclass
@@ -5669,7 +5678,7 @@ class RealtimeTranscriptEventAssistantTranscriptFinalText(TypedDict, total=False
 
 class RealtimeTranscriptEventAssistantTurnCompleted(TypedDict, total=False):
     response_id: Required[str]
-    stop_reason: Required[Literal['end_turn', 'tool_use', 'max_tokens', 'stop_sequence', 'content_filter', 'cancelled']]
+    stop_reason: Required[Literal['end_turn', 'tool_use', 'max_tokens', 'stop_sequence', 'content_filter', 'cancelled', 'refusal', 'pause_turn', 'context_window_exceeded']]
     type: Required[Literal['assistant_turn_completed']]
     usage: Required[dict[str, Any]]
 
@@ -5954,7 +5963,7 @@ class WireLiveAdapterObservationAssistantTranscriptFinal(TypedDict, total=False)
     previous_item_id: NotRequired[Optional[str]]
     provider_item_id: Required[str]
     response_id: NotRequired[Optional[str]]
-    stop_reason: Required[Literal['end_turn', 'tool_use', 'max_tokens', 'stop_sequence', 'content_filter', 'cancelled']]
+    stop_reason: Required[Literal['end_turn', 'tool_use', 'max_tokens', 'stop_sequence', 'content_filter', 'cancelled', 'refusal', 'pause_turn', 'context_window_exceeded']]
     text: Required[str]
     usage: Required[WireUsage]
 
@@ -5992,7 +6001,7 @@ class WireLiveAdapterObservationTurnInterrupted(TypedDict, total=False):
 class WireLiveAdapterObservationTurnCompleted(TypedDict, total=False):
     observation: Required[Literal['turn_completed']]
     response_id: NotRequired[Optional[str]]
-    stop_reason: Required[Literal['end_turn', 'tool_use', 'max_tokens', 'stop_sequence', 'content_filter', 'cancelled']]
+    stop_reason: Required[Literal['end_turn', 'tool_use', 'max_tokens', 'stop_sequence', 'content_filter', 'cancelled', 'refusal', 'pause_turn', 'context_window_exceeded']]
     usage: Required[dict[str, Any]]
 
 class WireLiveAdapterObservationStatusChanged(TypedDict, total=False):
@@ -7208,7 +7217,10 @@ class WireAnthropicThinkingConfigEnabled(TypedDict, total=False):
 class WireAnthropicThinkingConfigBetweenTools(TypedDict, total=False):
     type: Required[Literal['between_tools']]
 
-WireAnthropicThinkingConfig = WireAnthropicThinkingConfigAdaptive | WireAnthropicThinkingConfigEnabled | WireAnthropicThinkingConfigBetweenTools
+class WireAnthropicThinkingConfigDisabled(TypedDict, total=False):
+    type: Required[Literal['disabled']]
+
+WireAnthropicThinkingConfig = WireAnthropicThinkingConfigAdaptive | WireAnthropicThinkingConfigEnabled | WireAnthropicThinkingConfigBetweenTools | WireAnthropicThinkingConfigDisabled
 
 # Mob RPC helper wire type for WireGeminiThinkingLevel.
 WireGeminiThinkingLevel = Literal['minimal', 'low', 'medium', 'high']
@@ -7524,7 +7536,7 @@ RuntimeAcceptOutcomeType = Literal['accepted', 'deduplicated', 'rejected']
 WireInputLifecycleState = Literal['accepted', 'queued', 'staged', 'applied', 'applied_pending_consumption', 'consumed', 'superseded', 'coalesced', 'abandoned']
 
 # Canonical stop reason for transcript messages.
-WireStopReason = Literal['end_turn', 'tool_use', 'max_tokens', 'stop_sequence', 'content_filter', 'cancelled']
+WireStopReason = Literal['end_turn', 'tool_use', 'max_tokens', 'stop_sequence', 'content_filter', 'cancelled', 'refusal', 'pause_turn', 'context_window_exceeded']
 
 # Wire-safe tool result content that handles both legacy string and array formats.
 WireToolResultContent = str | list[WireContentBlock]

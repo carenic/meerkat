@@ -1877,6 +1877,14 @@ mod tcp_callback_ownership {
                 9 => mob_claim_refused_while_owner_connected_case(&mut h).await,
                 #[cfg(feature = "mob")]
                 10 => mob_claim_after_owner_disconnect_case(&mut h).await,
+                #[cfg(feature = "mob")]
+                11 => mob_claim_needs_the_creators_token_case(&mut h).await,
+                #[cfg(feature = "mob")]
+                12 => mob_claim_token_of_a_destroyed_mob_is_refused_case(&mut h).await,
+                #[cfg(feature = "mob")]
+                13 => mob_created_in_process_is_not_claimable_case(&mut h).await,
+                #[cfg(feature = "mob")]
+                14 => host_mints_a_claim_token_for_a_tokenless_mob_case(&mut h).await,
                 _ => unreachable!(),
             }
             h.exhausted();
@@ -2165,6 +2173,229 @@ mod tcp_callback_ownership {
         run_case(3).await;
     }
 
+    /// The `durable` detached callback tool as a connection registers it:
+    /// one runner and contract, and the description that tells two
+    /// declarations apart.
+    fn durable_tool(description: &str) -> Value {
+        json!([{
+            "name": "durable",
+            "description": description,
+            "input_schema": {"type": "object", "properties": {}},
+            "execution": {
+                "mode": "detached",
+                "runner": {"name": "host.durable", "version": "v1"},
+                "restart_class": "adoptable",
+                "idempotency_scope": "tool_call",
+                "submission_timeout_ms": 5000
+            }
+        }])
+    }
+
+    impl Connection {
+        /// Register `tools`. A registration reconciles the detached callback
+        /// jobs its tools serve concurrently with its response: the server
+        /// requests that arrive before the response are returned.
+        async fn register_tools_and_collect_requests(
+            &mut self,
+            id: u64,
+            tools: Value,
+        ) -> Vec<Value> {
+            self.send(
+                json!({"jsonrpc":"2.0","id":id,"method":"tools/register","params":{"tools":tools}}),
+            )
+            .await;
+            let mut requests = Vec::new();
+            loop {
+                let frame = self.next_significant().await;
+                if frame["method"].is_string() {
+                    requests.push(frame);
+                    continue;
+                }
+                assert_eq!(frame["id"], json!(id), "{frame}");
+                assert!(frame["error"].is_null(), "RPC error: {frame}");
+                assert!(
+                    frame["result"]["registered"].as_u64().unwrap() > 0,
+                    "{frame}"
+                );
+                return requests;
+            }
+        }
+
+        /// The job's `jobs/get` summary, or the server request that arrived
+        /// before the response.
+        async fn get_job(&mut self, id: u64, job_id: &str) -> Result<Value, Value> {
+            self.send(
+                json!({"jsonrpc":"2.0","id":id,"method":"jobs/get","params":{"job_id":job_id}}),
+            )
+            .await;
+            let frame = self.next_significant().await;
+            if frame["method"].is_string() {
+                return Err(frame);
+            }
+            assert_eq!(frame["id"], json!(id), "{frame}");
+            assert!(frame["error"].is_null(), "RPC error: {frame}");
+            Ok(frame["result"]["job"].clone())
+        }
+    }
+
+    /// RED 5 (#222) over real connections: a detached callback job whose
+    /// submitting connection closed is reconciled only by a connection whose
+    /// tool declares what the job recorded. The creator's second turn calls
+    /// its detached `durable` tool (the turn's caller context gives it the
+    /// runtime-owned interaction lineage a detached call records); the
+    /// creator takes the attempt's start and closes without answering it,
+    /// and the attempt was claimed (with a 120 s lease) before its start was
+    /// sent, so the job stays running until a
+    /// connection serving the tool reconciles it. A connection registering
+    /// the creator's declaration is offered the job, and it keeps running
+    /// once reported live; one registering the same name and runner with
+    /// another description is offered nothing, and the job goes to
+    /// needs_attention (`callback_binding_changed`).
+    #[tokio::test]
+    async fn tcp_detached_callback_job_is_reconciled_only_under_the_declaration_it_recorded() {
+        let mut h = Harness::new();
+        h.runtime.set_realm_context(
+            Some(meerkat_core::connection::RealmId::global()),
+            None,
+            None,
+        );
+        let result = AssertUnwindSafe(tokio::time::timeout(Duration::from_secs(50), async {
+            h.provider.plan("warm-durable", [finish()]);
+            h.provider.plan(
+                "submit-durable",
+                [
+                    Step::Load {
+                        tool: "durable",
+                        call_id: "load-durable",
+                    },
+                    Step::Call {
+                        tool: "durable",
+                        call_id: "call-durable",
+                    },
+                    finish(),
+                ],
+            );
+            let (creator_index, mut creator) = h.connect().await;
+            let offered = creator
+                .register_tools_and_collect_requests(2, durable_tool("the creator's durable tool"))
+                .await;
+            assert!(offered.is_empty(), "{offered:?}");
+            let session = creator.create().await;
+            creator.start(&session, "warm-durable").await;
+            creator.response(4).await;
+            h.seen("warm-durable").await;
+            creator
+                .send(json!({"jsonrpc":"2.0","id":5,"method":"turn/start","params":{"session_id":session,"prompt":"submit-durable","transient_turn_context":"submit-durable"}}))
+                .await;
+            h.seen("submit-durable").await;
+            assert_catalog_load(
+                &h.seen("submit-durable").await,
+                "load-durable",
+                "durable",
+            );
+            let submitted = h.seen("submit-durable").await;
+            let results: Vec<_> = submitted
+                .results
+                .iter()
+                .filter(|result| result.tool_use_id == "call-durable")
+                .collect();
+            assert_eq!(results.len(), 1, "{submitted:?}");
+            assert!(!results[0].is_error, "{submitted:?}");
+            let receipt: Value = serde_json::from_str(&results[0].text_content()).unwrap();
+            let job_id = receipt["job_id"].as_str().unwrap().to_owned();
+            let mut start = None;
+            let mut turn_done = false;
+            while start.is_none() || !turn_done {
+                let frame = creator.next_significant().await;
+                if frame["method"] == "callback/job/start" {
+                    assert!(start.is_none(), "a second attempt start: {frame}");
+                    start = Some(frame);
+                } else {
+                    assert_eq!(frame["id"], json!(5), "{frame}");
+                    assert!(frame["error"].is_null(), "RPC error: {frame}");
+                    turn_done = true;
+                }
+            }
+            let start = start.unwrap();
+            assert_eq!(
+                start["params"]["authority"]["job_id"],
+                json!(job_id),
+                "{start}"
+            );
+            drop(creator);
+            h.disconnected(creator_index).await;
+
+            // The creator's declaration on another connection: the job is
+            // offered to it and keeps running once reported live.
+            let (unchanged_index, mut unchanged) = h.connect().await;
+            let mut offered = unchanged
+                .register_tools_and_collect_requests(2, durable_tool("the creator's durable tool"))
+                .await;
+            if offered.is_empty() {
+                offered.push(unchanged.next_significant().await);
+            }
+            assert_eq!(offered.len(), 1, "{offered:?}");
+            let reconcile = &offered[0];
+            assert_eq!(reconcile["method"], "callback/job/reconcile", "{reconcile}");
+            let attempts = reconcile["params"]["attempts"].as_array().unwrap();
+            assert_eq!(attempts.len(), 1, "{reconcile}");
+            assert_eq!(
+                attempts[0]["authority"],
+                start["params"]["authority"],
+                "{reconcile}"
+            );
+            unchanged
+                .send(json!({"jsonrpc":"2.0","id":reconcile["id"],"result":{"live_attempts":[attempts[0]["authority"]]}}))
+                .await;
+            let job = unchanged
+                .get_job(3, &job_id)
+                .await
+                .unwrap_or_else(|request| panic!("a second request: {request}"));
+            assert_eq!(job["phase"], "running", "{job}");
+            drop(unchanged);
+            h.disconnected(unchanged_index).await;
+
+            // The same name and runner under another description.
+            let (_, mut changed) = h.connect().await;
+            let offered = changed
+                .register_tools_and_collect_requests(2, durable_tool("another connection's durable tool"))
+                .await;
+            assert!(
+                offered.is_empty(),
+                "the job is offered to a connection declaring another tool: {offered:?}"
+            );
+            let job = tokio::time::timeout(LIMIT, async {
+                let mut id = 2;
+                loop {
+                    id += 1;
+                    let job = changed.get_job(id, &job_id).await.unwrap_or_else(|request| {
+                        panic!("the job is offered to a connection declaring another tool: {request}")
+                    });
+                    if job["phase"] != "running" {
+                        break job;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .expect("the job leaves running");
+            assert_eq!(job["phase"], "needs_attention", "{job}");
+            assert_eq!(
+                job["terminal_result"],
+                json!({"kind": "needs_attention", "reason": "callback_binding_changed"}),
+                "{job}"
+            );
+            h.exhausted();
+        }))
+        .catch_unwind()
+        .await;
+        h.clean().await;
+        match result {
+            Ok(result) => result.expect("bounded complete scenario"),
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
+    }
+
     /// A mob member's callback tools are the tools registered on the
     /// connection that created its mob: the member sees the tool, loads it
     /// and its call reaches that connection, whether the tool was registered
@@ -2447,17 +2678,47 @@ mod tcp_callback_ownership {
         json!({"jsonrpc":"2.0","id":id,"method":"mob/turn_start","params":{"mob_id":mob_id,"agent_identity":"w1","prompt":prompt}})
     }
 
+    /// The claim token `mob/create` returned for a mob.
+    #[cfg(feature = "mob")]
+    fn claim_token(created: &Value) -> Value {
+        created["claim_token"].clone()
+    }
+
+    #[cfg(feature = "mob")]
+    fn claim_params(mob_id: &str, token: &Value) -> Value {
+        json!({"mob_id": mob_id, "claim_token": token})
+    }
+
+    /// A claim refused with `-32002` for `reason`.
+    #[cfg(feature = "mob")]
+    fn assert_claim_refused(refused: &Value, id: u64, mob_id: &str, reason: &str) {
+        assert_eq!(refused["id"], json!(id), "{refused}");
+        assert_eq!(
+            refused["error"]["code"],
+            json!(meerkat_rpc::error::SESSION_BUSY),
+            "the claim is refused: {refused}"
+        );
+        assert_eq!(
+            refused["error"]["data"],
+            json!({"mob_id": mob_id, "reason": reason}),
+            "the refusal carries its typed data: {refused}"
+        );
+    }
+
     /// A connection cannot take a mob's callback route from an owner whose
-    /// connection is still open: B's claim of A's mob is refused with a typed
-    /// error, while A's own claim of the route it holds is accepted.
+    /// connection is still open, even with the mob's claim token: B's claim
+    /// of A's mob is refused with a typed error, while A's own claim of the
+    /// route it holds is accepted.
     #[cfg(feature = "mob")]
     async fn mob_claim_refused_while_owner_connected_case(h: &mut Harness) {
         let (_, mut a) = h.connect().await;
         let (_, mut b) = h.connect().await;
         a.register("a_lookup").await;
-        a.request(5, "mob/create", claim_mob_definition("held_mob"))
+        let created = a
+            .request(5, "mob/create", claim_mob_definition("held_mob"))
             .await;
-        b.send(json!({"jsonrpc":"2.0","id":6,"method":"mob/claim_callback_route","params":{"mob_id":"held_mob"}}))
+        let token = claim_token(&created);
+        b.send(json!({"jsonrpc":"2.0","id":6,"method":"mob/claim_callback_route","params":claim_params("held_mob", &token)}))
             .await;
         let refused = b.next_significant().await;
         assert_eq!(refused["id"], json!(6), "{refused}");
@@ -2472,7 +2733,11 @@ mod tcp_callback_ownership {
             "the refusal carries its typed data: {refused}"
         );
         let held = a
-            .request(7, "mob/claim_callback_route", json!({"mob_id":"held_mob"}))
+            .request(
+                7,
+                "mob/claim_callback_route",
+                claim_params("held_mob", &token),
+            )
             .await;
         assert_eq!(held["mob_id"], "held_mob", "{held}");
     }
@@ -2530,8 +2795,10 @@ mod tcp_callback_ownership {
         );
         let (a_index, mut a) = h.connect().await;
         a.register("a_lookup").await;
-        a.request(5, "mob/create", claim_mob_definition("handoff_mob"))
-            .await;
+        let token = claim_token(
+            &a.request(5, "mob/create", claim_mob_definition("handoff_mob"))
+                .await,
+        );
         a.request(
             6,
             "mob/spawn",
@@ -2574,12 +2841,13 @@ mod tcp_callback_ownership {
         );
         b.response(8).await;
 
-        // B claims the route; the same live member now reaches B.
+        // B claims the route with the mob's claim token; the same live
+        // member now reaches B.
         let claimed = b
             .request(
                 9,
                 "mob/claim_callback_route",
-                json!({"mob_id":"handoff_mob"}),
+                claim_params("handoff_mob", &token),
             )
             .await;
         assert_eq!(claimed["mob_id"], "handoff_mob", "{claimed}");
@@ -2604,12 +2872,211 @@ mod tcp_callback_ownership {
         run_case(10).await;
     }
 
+    /// Once a mob's creator has closed its connection, only a connection
+    /// presenting the mob's claim token takes the mob's callback route: a
+    /// claim without a token or with a malformed one is invalid, and one
+    /// with another well-formed token is refused, typed; the creator's token
+    /// claims it.
+    #[cfg(feature = "mob")]
+    async fn mob_claim_needs_the_creators_token_case(h: &mut Harness) {
+        let (a_index, mut a) = h.connect().await;
+        a.register("a_lookup").await;
+        let token = claim_token(
+            &a.request(5, "mob/create", claim_mob_definition("token_mob"))
+                .await,
+        );
+        drop(a);
+        h.disconnected(a_index).await;
+
+        let (_, mut b) = h.connect().await;
+        b.register("b_lookup").await;
+        let presented = token
+            .as_str()
+            .expect("mob/create returns the mob's claim token")
+            .to_owned();
+        for (id, params) in [
+            (6, json!({"mob_id": "token_mob"})),
+            (7, claim_params("token_mob", &json!("not-a-token"))),
+            // The creator's token with a stray character.
+            (
+                10,
+                claim_params("token_mob", &json!(format!("{presented} "))),
+            ),
+        ] {
+            b.send(json!({"jsonrpc":"2.0","id":id,"method":"mob/claim_callback_route","params":params}))
+                .await;
+            let refused = b.next_significant().await;
+            assert!(
+                !refused.to_string().contains(&presented),
+                "an invalid claim never echoes the token it was given (id {id})"
+            );
+            assert_eq!(refused["id"], json!(id), "{refused}");
+            assert_eq!(
+                refused["error"]["code"],
+                json!(-32602),
+                "a claim needs a well-formed claim token: {refused}"
+            );
+        }
+        assert!(
+            token
+                .as_str()
+                .is_some_and(|token| token.starts_with("mct_") && token.len() == 47),
+            "mob/create returns the mob's claim token: {token}"
+        );
+        b.send(json!({"jsonrpc":"2.0","id":8,"method":"mob/claim_callback_route","params":claim_params("token_mob", &json!(format!("mct_{}", "A".repeat(43))))}))
+            .await;
+        assert_claim_refused(
+            &b.next_significant().await,
+            8,
+            "token_mob",
+            "claim_token_mismatch",
+        );
+        let claimed = b
+            .request(
+                9,
+                "mob/claim_callback_route",
+                claim_params("token_mob", &token),
+            )
+            .await;
+        assert_eq!(claimed["mob_id"], "token_mob", "{claimed}");
+    }
+    #[cfg(feature = "mob")]
+    #[tokio::test]
+    async fn tcp_callback_route_claim_needs_the_creators_token() {
+        run_case(11).await;
+    }
+
+    /// A mob destroyed and created again under its id gets a new claim
+    /// token, and the destroyed mob's token claims nothing.
+    #[cfg(feature = "mob")]
+    async fn mob_claim_token_of_a_destroyed_mob_is_refused_case(h: &mut Harness) {
+        let (a_index, mut a) = h.connect().await;
+        a.register("a_lookup").await;
+        let destroyed = claim_token(
+            &a.request(5, "mob/create", claim_mob_definition("recreated_mob"))
+                .await,
+        );
+        a.request(6, "mob/destroy", json!({"mob_id": "recreated_mob"}))
+            .await;
+        let current = claim_token(
+            &a.request(7, "mob/create", claim_mob_definition("recreated_mob"))
+                .await,
+        );
+        assert_ne!(destroyed, current, "a new mob gets a new claim token");
+        drop(a);
+        h.disconnected(a_index).await;
+
+        let (_, mut b) = h.connect().await;
+        b.register("b_lookup").await;
+        b.send(json!({"jsonrpc":"2.0","id":8,"method":"mob/claim_callback_route","params":claim_params("recreated_mob", &destroyed)}))
+            .await;
+        assert_claim_refused(
+            &b.next_significant().await,
+            8,
+            "recreated_mob",
+            "claim_token_mismatch",
+        );
+        let claimed = b
+            .request(
+                9,
+                "mob/claim_callback_route",
+                claim_params("recreated_mob", &current),
+            )
+            .await;
+        assert_eq!(claimed["mob_id"], "recreated_mob", "{claimed}");
+    }
+    #[cfg(feature = "mob")]
+    #[tokio::test]
+    async fn tcp_callback_route_claim_refuses_a_destroyed_mobs_token() {
+        run_case(12).await;
+    }
+
+    /// A mob created other than by `mob/create` has no claim token, so no
+    /// token claims its callback route: the claim is refused as
+    /// `not_claimable`.
+    #[cfg(feature = "mob")]
+    async fn mob_created_in_process_is_not_claimable_case(h: &mut Harness) {
+        // The router composes the runtime's mob state when it serves its
+        // first connection.
+        let (_, mut b) = h.connect().await;
+        b.register("b_lookup").await;
+        h.runtime
+            .mob_state()
+            .expect("the RPC mob state")
+            .mob_create_definition(meerkat_mob::MobDefinition::implicit(
+                "tokenless",
+                "claude-sonnet-4-6",
+            ))
+            .await
+            .expect("created in-process");
+        b.send(json!({"jsonrpc":"2.0","id":6,"method":"mob/claim_callback_route","params":claim_params("implicit-tokenless", &json!(format!("mct_{}", "A".repeat(43))))}))
+            .await;
+        assert_claim_refused(
+            &b.next_significant().await,
+            6,
+            "implicit-tokenless",
+            "not_claimable",
+        );
+    }
+    #[cfg(feature = "mob")]
+    #[tokio::test]
+    async fn tcp_callback_route_of_a_mob_created_in_process_is_not_claimable() {
+        run_case(13).await;
+    }
+
+    /// The host mints a claim token for a mob that has none, once, through
+    /// its Rust API (no wire method mints one): the connection it hands the
+    /// token to claims the route, and a second mint yields nothing, keeping
+    /// the first token.
+    #[cfg(feature = "mob")]
+    async fn host_mints_a_claim_token_for_a_tokenless_mob_case(h: &mut Harness) {
+        // The router composes the runtime's mob state when it serves its
+        // first connection.
+        let (_, mut b) = h.connect().await;
+        b.register("b_lookup").await;
+        let state = h.runtime.mob_state().expect("the RPC mob state");
+        let mob_id = state
+            .mob_create_definition(meerkat_mob::MobDefinition::implicit(
+                "minted",
+                "claude-sonnet-4-6",
+            ))
+            .await
+            .expect("created in-process");
+        let token = state
+            .mint_callback_claim_token(&mob_id)
+            .await
+            .expect("mint")
+            .expect("a mob without a claim token takes one");
+        assert!(
+            state
+                .mint_callback_claim_token(&mob_id)
+                .await
+                .expect("mint")
+                .is_none(),
+            "a mob's claim token is minted once"
+        );
+        let claimed = b
+            .request(
+                6,
+                "mob/claim_callback_route",
+                claim_params(mob_id.as_str(), &json!(token.expose_secret())),
+            )
+            .await;
+        assert_eq!(claimed["mob_id"], json!(mob_id.as_str()), "{claimed}");
+    }
+    #[cfg(feature = "mob")]
+    #[tokio::test]
+    async fn tcp_callback_route_takes_a_claim_token_the_host_minted() {
+        run_case(14).await;
+    }
+
     /// A mob restored after a restart has no callback route until a
-    /// connection claims it, and the claim reaches its restored member. A
-    /// creates the mob and spawns its member; the runtime restarts over the
-    /// same stores and restores the mob; B registers its tool and claims the
-    /// restored mob's route; the restored member then loads and calls B's
-    /// tool, whose call reaches B.
+    /// connection claims it with the claim token its creator received before
+    /// the restart, and the claim reaches its restored member. A creates the
+    /// mob and spawns its member; the runtime restarts over the same stores
+    /// and restores the mob; B registers its tool, is refused with another
+    /// token, and claims the restored mob's route with A's; the restored
+    /// member then loads and calls B's tool, whose call reaches B.
     #[cfg(feature = "mob")]
     #[tokio::test]
     async fn tcp_callback_restored_mob_member_reaches_the_connection_that_claims_it() {
@@ -2631,8 +3098,10 @@ mod tcp_callback_ownership {
             );
             let (a_index, mut a) = h.connect().await;
             a.register("a_lookup").await;
-            a.request(5, "mob/create", claim_mob_definition("restored_mob"))
-                .await;
+            let token = claim_token(
+                &a.request(5, "mob/create", claim_mob_definition("restored_mob"))
+                    .await,
+            );
             a.request(
                 6,
                 "mob/spawn",
@@ -2645,11 +3114,19 @@ mod tcp_callback_ownership {
 
             let (_, mut b) = h.connect().await;
             b.register("b_lookup").await;
+            b.send(json!({"jsonrpc":"2.0","id":17,"method":"mob/claim_callback_route","params":claim_params("restored_mob", &json!(format!("mct_{}", "A".repeat(43))))}))
+                .await;
+            assert_claim_refused(
+                &b.next_significant().await,
+                17,
+                "restored_mob",
+                "claim_token_mismatch",
+            );
             let claimed = b
                 .request(
                     7,
                     "mob/claim_callback_route",
-                    json!({"mob_id":"restored_mob"}),
+                    claim_params("restored_mob", &token),
                 )
                 .await;
             assert_eq!(claimed["mob_id"], "restored_mob", "{claimed}");
@@ -2671,6 +3148,249 @@ mod tcp_callback_ownership {
                 "call-restored",
                 "restored-result",
             );
+            h.exhausted();
+        }))
+        .catch_unwind()
+        .await;
+        h.clean().await;
+        match result {
+            Ok(result) => result.expect("bounded complete scenario"),
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
+    }
+
+    /// The detached callback tool `name` a connection registers. Each case
+    /// registers its own name and runner, so a job one case queues never
+    /// routes to another case's connection.
+    fn detached_tool(name: &str) -> Value {
+        json!([{
+            "name": name,
+            "description": "connection-owned detached callback",
+            "input_schema": {"type": "object", "properties": {}},
+            "execution": {
+                "mode": "detached",
+                "runner": {"name": format!("host.{name}"), "version": "v1"},
+                "restart_class": "adoptable",
+                "idempotency_scope": "tool_call",
+                "submission_timeout_ms": 5000
+            }
+        }])
+    }
+
+    /// Plan the turn keyed `key`: load the deferred `tool`, call it once,
+    /// finish.
+    fn detached_plan(
+        h: &Harness,
+        key: &str,
+        tool: &'static str,
+        load: &'static str,
+        call: &'static str,
+    ) {
+        h.provider.plan(
+            key,
+            [
+                Step::Load {
+                    tool,
+                    call_id: load,
+                },
+                Step::Call {
+                    tool,
+                    call_id: call,
+                },
+                finish(),
+            ],
+        );
+    }
+
+    /// The result the turn keyed `key` got for its call `call`, as the model
+    /// request after the call carries it.
+    async fn detached_call_result(h: &mut Harness, key: &str, call: &str) -> ToolResult {
+        h.seen(key).await;
+        h.seen(key).await;
+        let seen = h.seen(key).await;
+        let mut results = seen
+            .results
+            .iter()
+            .filter(|result| result.tool_use_id == call)
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(results.len(), 1, "{seen:?}");
+        results.remove(0)
+    }
+
+    /// Whether `result` is a detached call's receipt: its job was queued.
+    fn queued(result: &ToolResult) -> bool {
+        !result.is_error
+            && serde_json::from_str::<Value>(&result.text_content())
+                .is_ok_and(|receipt| receipt["status"] == "queued" && receipt["job_id"].is_string())
+    }
+
+    /// The user row `session/history` shows for `prompt`, once an assistant
+    /// row of the same turn carries its interaction id too (a row without one
+    /// is returned at once). Read on a connection of its own: no callback
+    /// ever routes to it.
+    async fn history_user_row(h: &mut Harness, session: &str, prompt: &str) -> Value {
+        let (_, mut reader) = h.connect().await;
+        let mut last = Value::Null;
+        for id in 100..400 {
+            let history = reader
+                .request(id, "session/history", json!({ "session_id": session }))
+                .await;
+            let messages = history["messages"].as_array().cloned().unwrap_or_default();
+            if let Some(user) = messages.iter().position(|message| {
+                message["role"] == "user" && message["content"].to_string().contains(prompt)
+            }) {
+                last = messages[user].clone();
+                let interaction = &last["interaction_id"];
+                let answered = messages[user + 1..].iter().any(|message| {
+                    message["role"] == "block_assistant"
+                        && message["interaction_id"] == *interaction
+                });
+                if interaction.is_null() || answered {
+                    return last;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("no answered user row {prompt:?} in session {session}: last {last}");
+    }
+
+    impl Connection {
+        async fn register_tools(&mut self, id: u64, tools: Value) {
+            let result = self
+                .request(id, "tools/register", json!({ "tools": tools }))
+                .await;
+            assert!(result["registered"].as_u64().unwrap() > 0, "{result}");
+        }
+    }
+
+    /// A detached callback call queues its job in every RPC turn, not only in
+    /// a turn whose caller context gives it an interaction lineage: the
+    /// deferred first turn (A), a plain turn/start on a live session (B), the
+    /// immediate turn of session/create (C) and a mob member's turn (E). A
+    /// turn/start with a transient turn context (D) is the control.
+    #[tokio::test]
+    async fn tcp_callback_detached_call_queues_its_job_in_every_rpc_turn() {
+        let mut h = Harness::new();
+        h.runtime.set_realm_context(
+            Some(meerkat_core::connection::RealmId::global()),
+            None,
+            None,
+        );
+        let result = AssertUnwindSafe(tokio::time::timeout(Duration::from_secs(50), async {
+            let mut outcomes: Vec<(&str, ToolResult)> = Vec::new();
+            detached_plan(&h, "lineage-deferred", "durable_a", "load-a", "call-a");
+            detached_plan(&h, "lineage-plain", "durable_b", "load-b", "call-b");
+            detached_plan(&h, "lineage-immediate", "durable_c", "load-c", "call-c");
+            detached_plan(&h, "lineage-context", "durable_d", "load-d", "call-d");
+            h.provider.plan("lineage-warm-b", [finish()]);
+            h.provider.plan("lineage-warm-d", [finish()]);
+
+            let (_, mut deferred) = h.connect().await;
+            deferred.register_tools(2, detached_tool("durable_a")).await;
+            let session = deferred.create().await;
+            deferred.start(&session, "lineage-deferred").await;
+            outcomes.push((
+                "A deferred first turn",
+                detached_call_result(&mut h, "lineage-deferred", "call-a").await,
+            ));
+            let mut history = vec![(
+                "A deferred first turn",
+                history_user_row(&mut h, &session, "lineage-deferred").await,
+            )];
+
+            let (_, mut plain) = h.connect().await;
+            plain.register_tools(2, detached_tool("durable_b")).await;
+            let session = plain.create().await;
+            plain.start(&session, "lineage-warm-b").await;
+            plain.response(4).await;
+            h.seen("lineage-warm-b").await;
+            plain.send(json!({"jsonrpc":"2.0","id":5,"method":"turn/start","params":{"session_id":session,"prompt":"lineage-plain"}}))
+                .await;
+            outcomes.push((
+                "B plain turn/start",
+                detached_call_result(&mut h, "lineage-plain", "call-b").await,
+            ));
+            history.push((
+                "B plain turn/start",
+                history_user_row(&mut h, &session, "lineage-plain").await,
+            ));
+
+            let (_, mut immediate) = h.connect().await;
+            immediate.register_tools(2, detached_tool("durable_c")).await;
+            immediate.send(json!({"jsonrpc":"2.0","id":3,"method":"session/create","params":{"prompt":"lineage-immediate","enable_builtins":false,"enable_shell":false,"enable_memory":false,"enable_mob":false}}))
+                .await;
+            outcomes.push((
+                "C session/create immediate turn",
+                detached_call_result(&mut h, "lineage-immediate", "call-c").await,
+            ));
+
+            let (_, mut context) = h.connect().await;
+            context.register_tools(2, detached_tool("durable_d")).await;
+            let session = context.create().await;
+            context.start(&session, "lineage-warm-d").await;
+            context.response(4).await;
+            h.seen("lineage-warm-d").await;
+            context.send(json!({"jsonrpc":"2.0","id":5,"method":"turn/start","params":{"session_id":session,"prompt":"lineage-context","transient_turn_context":"lineage-context"}}))
+                .await;
+            outcomes.push((
+                "D turn/start with transient_turn_context (control)",
+                detached_call_result(&mut h, "lineage-context", "call-d").await,
+            ));
+
+            #[cfg(feature = "mob")]
+            {
+                detached_plan(&h, "lineage-mob", "durable_e", "load-e", "call-e");
+                let (_, mut member) = h.connect().await;
+                member.register_tools(2, detached_tool("durable_e")).await;
+                member.request(5, "mob/create", claim_mob_definition("lineage_mob"))
+                    .await;
+                member.request(
+                    6,
+                    "mob/spawn",
+                    json!({"mob_id":"lineage_mob","profile":"worker","agent_identity":"w1","runtime_mode":"turn_driven"}),
+                )
+                .await;
+                member.send(member_turn(7, "lineage_mob", "lineage-mob")).await;
+                outcomes.push((
+                    "E mob/turn_start member turn",
+                    detached_call_result(&mut h, "lineage-mob", "call-e").await,
+                ));
+            }
+
+            for (case, result) in &outcomes {
+                eprintln!(
+                    "LINEAGE {case}: queued={} is_error={} {}",
+                    queued(result),
+                    result.is_error,
+                    result.text_content()
+                );
+            }
+            for (case, row) in &history {
+                eprintln!(
+                    "HISTORY {case}: interaction_id={} run_id={}",
+                    row["interaction_id"], row["run_id"]
+                );
+            }
+            let refused = outcomes
+                .iter()
+                .filter(|(_, result)| !queued(result))
+                .map(|(case, result)| format!("{case}: {}", result.text_content()))
+                .collect::<Vec<_>>();
+            assert!(
+                refused.is_empty(),
+                "detached callback calls that did not queue their job:\n{}",
+                refused.join("\n")
+            );
+            // The plain prompt's rows carry its interaction in history.
+            for (case, row) in &history {
+                assert!(
+                    row["interaction_id"]
+                        .as_str()
+                        .is_some_and(|id| uuid::Uuid::parse_str(id).is_ok()),
+                    "{case}: history shows no interaction id: {row}"
+                );
+            }
             h.exhausted();
         }))
         .catch_unwind()

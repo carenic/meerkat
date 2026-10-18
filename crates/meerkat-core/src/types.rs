@@ -3608,6 +3608,17 @@ pub enum StopReason {
     ContentFilter,
     /// Request was cancelled
     Cancelled,
+    /// The model declined the response (Anthropic `refusal`). The agent loop
+    /// commits nothing of a refused turn and never runs its tool calls.
+    Refusal,
+    /// The provider paused a long-running server-tool turn (Anthropic
+    /// `pause_turn`). The turn is committed as it stands; sending it back
+    /// lets the model continue.
+    PauseTurn,
+    /// Generation stopped because the model's context window filled
+    /// (Anthropic `model_context_window_exceeded`). The agent loop commits
+    /// nothing of the turn and fails the run as context exceeded.
+    ContextWindowExceeded,
 }
 
 /// Security mode for tool execution (e.g. shell)
@@ -4016,6 +4027,12 @@ pub enum ToolSourceKind {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolProvenance {
     pub kind: ToolSourceKind,
+    /// The source instance: an MCP server name, a bundle name, a host's
+    /// callback surface. Visibility witnesses (an inherited tool ceiling, a
+    /// filter) match a tool by `kind` and this id, so a host that rebuilds an
+    /// agent must give one surface the same id in every build. An id minted
+    /// per build makes every witness recorded against an earlier build miss
+    /// the rebuilt tool.
     pub source_id: ToolSourceId,
     /// The installed artifact this tool's implementation came from, set only
     /// after its host verified the reference against the artifacts it

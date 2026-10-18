@@ -141,7 +141,10 @@ lost.
     `login_cancel`, the `HostAuthService::mcp_login_*` methods, the
     `auth/login/*` RPC and REST methods with an MCP target, or
     `rkat mcp login` (see [Authentication](/guides/auth));
-  - give each server that needs interactive login an `oauth_account`;
+  - give each server that needs interactive login an account selection:
+    `oauth_account`, or `oauth_account_selection = "discover"` or
+    `"unverified"` (`rkat mcp add --oauth-account` or
+    `--oauth-account-selection`);
   - update `McpOAuthAuthority::new(persistence, auth_lease)` and
     `with_http(persistence, http, auth_lease)` calls, which no longer take a
     browser;

@@ -188,8 +188,8 @@ rkat mcp add filesystem -- npx -y @modelcontextprotocol/server-filesystem /tmp
 # Add a streamable HTTP server
 rkat mcp add remote-api --url https://mcp.example.com/api
 
-# Add an OAuth-protected streamable HTTP server and log in
-rkat mcp add --transport http knowledge https://mcp.example.com/v1
+# Add an OAuth-protected streamable HTTP server with its account selection, and log in
+rkat mcp add --transport http knowledge https://mcp.example.com/v1 --oauth-account-selection discover
 rkat mcp login knowledge
 
 # List all registered servers

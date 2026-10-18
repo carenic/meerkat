@@ -149,8 +149,9 @@ pub enum IdentityTargetDeliverability {
 /// Unlike [`ScheduleTargetProbe`] this is binding-level (no occurrence
 /// exists yet): it judges whether the identity form is deliverable at all on
 /// this surface, not whether the target is ready right now. Attached to a
-/// [`crate::ScheduleService`] via `attach_identity_target_probe`, it lets
-/// create/update refuse schedules whose every occurrence would misfire.
+/// [`crate::ScheduleService`] via `attach_identity_target_probe`, which holds
+/// it weakly while the attaching surface owns it, it lets create/update
+/// refuse schedules whose every occurrence would misfire.
 #[async_trait]
 pub trait ScheduleIdentityTargetProbe: Send + Sync {
     async fn probe_identity_target(
@@ -521,6 +522,12 @@ impl ScheduleDriver {
             .await?;
         report.occurrence_row_faults = claimed.row_faults;
 
+        // One claimed occurrence's fault must not strand the rest of the
+        // batch, claimed but undelivered until their leases expire: every
+        // claimed occurrence is handled, then the tick fails with the first
+        // fault. Only a claim scan that breaks the store contract still fails
+        // the tick at once.
+        let mut first_fault = None;
         for commit in claimed.transitions {
             let successor = commit.successor();
             match successor.phase {
@@ -530,17 +537,25 @@ impl ScheduleDriver {
                         .iter()
                         .any(|effect| matches!(effect, OccurrenceLifecycleEffect::Claimed))
                     {
-                        return Err(ScheduleDomainError::Internal(
+                        return Err(claim_scan_contract_violation(
                             "claim scan committed a Claimed successor without a Claimed effect"
                                 .to_string(),
+                            first_fault.as_ref(),
                         ));
                     }
                     report.claimed_occurrences += 1;
-                    if self
+                    match self
                         .handle_claimed_occurrence(successor.clone(), claimed.store_now_utc)
-                        .await?
+                        .await
                     {
-                        report.terminalized_occurrences += 1;
+                        Ok(true) => report.terminalized_occurrences += 1,
+                        Ok(false) => {}
+                        Err(error) if first_fault.is_none() => first_fault = Some(error),
+                        Err(error) => tracing::error!(
+                            occurrence_id = %successor.occurrence_id,
+                            %error,
+                            "claimed occurrence failed after an earlier fault in the same tick"
+                        ),
                     }
                 }
                 OccurrencePhase::Misfired => {
@@ -549,9 +564,10 @@ impl ScheduleDriver {
                         .iter()
                         .any(|effect| matches!(effect, OccurrenceLifecycleEffect::Misfired))
                     {
-                        return Err(ScheduleDomainError::Internal(
+                        return Err(claim_scan_contract_violation(
                             "claim scan committed a Misfired successor without a Misfired effect"
                                 .to_string(),
+                            first_fault.as_ref(),
                         ));
                     }
                 }
@@ -561,21 +577,28 @@ impl ScheduleDriver {
                         .iter()
                         .any(|effect| matches!(effect, OccurrenceLifecycleEffect::LeaseExpired))
                     {
-                        return Err(ScheduleDomainError::Internal(
+                        return Err(claim_scan_contract_violation(
                             "claim scan committed a Pending lease-expiry successor without a LeaseExpired effect"
                                 .to_string(),
+                            first_fault.as_ref(),
                         ));
                     }
                 }
                 phase => {
-                    return Err(ScheduleDomainError::Internal(format!(
-                        "claim scan returned unsupported committed occurrence phase {phase:?}"
-                    )));
+                    return Err(claim_scan_contract_violation(
+                        format!(
+                            "claim scan returned unsupported committed occurrence phase {phase:?}"
+                        ),
+                        first_fault.as_ref(),
+                    ));
                 }
             }
         }
 
-        Ok(report)
+        match first_fault {
+            Some(error) => Err(error),
+            None => Ok(report),
+        }
     }
 
     async fn handle_claimed_occurrence(
@@ -713,7 +736,7 @@ impl ScheduleDriver {
                 .await?;
             dispatching = self
                 .service
-                .sync_occurrence_target_with_schedule(dispatching)
+                .record_dispatch_materialization(dispatching, &materialized_session_id)
                 .await?;
         }
 
@@ -1042,6 +1065,22 @@ impl ScheduleDriver {
             }
         });
     }
+}
+
+/// A claim scan that breaks the store contract fails the tick at once. The
+/// tick returns the violation, so a fault an earlier claimed occurrence of the
+/// same tick hit is logged rather than dropped.
+fn claim_scan_contract_violation(
+    detail: String,
+    earlier_fault: Option<&ScheduleDomainError>,
+) -> ScheduleDomainError {
+    if let Some(earlier) = earlier_fault {
+        tracing::error!(
+            error = %earlier,
+            "claimed occurrence fault superseded by a claim scan contract violation in the same tick"
+        );
+    }
+    ScheduleDomainError::Internal(detail)
 }
 
 fn validate_dispatch_receipt(
@@ -1850,6 +1889,119 @@ mod tests {
         }
     }
 
+    /// A delivery that materializes the occurrence's deterministic session, as
+    /// the surface adapter does for a materialize-on-demand target, and
+    /// completes at once.
+    #[derive(Default)]
+    struct MaterializingDelivery;
+
+    #[async_trait]
+    impl ScheduleTargetDelivery for MaterializingDelivery {
+        async fn deliver_occurrence(
+            &self,
+            occurrence: &Occurrence,
+            identity: &ScheduleDeliveryIdentity,
+        ) -> Result<DeliveryDispatch, ScheduleDomainError> {
+            let session_id = occurrence.materialized_session_id();
+            let mut receipt = DeliveryReceipt::new(
+                occurrence.occurrence_id.clone(),
+                occurrence.attempt_count,
+                DeliveryReceiptStage::DispatchAccepted,
+            );
+            receipt.correlation_id = Some(identity.correlation_id.clone());
+            receipt.materialized_session_id = Some(session_id.clone());
+            receipt.runtime_outcome = Some(RuntimeDeliveryOutcome::AdmissionAccepted);
+            Ok(DeliveryDispatch {
+                receipt,
+                correlation_id: Some(identity.correlation_id.clone()),
+                materialized_session_id: Some(session_id),
+                completion: Box::pin(async { Ok(DeliveryTerminal::completed(None)) }),
+            })
+        }
+    }
+
+    /// The first fire of a materialize-on-demand schedule binds the session it
+    /// materialized and completes.
+    #[tokio::test]
+    async fn a_materializing_first_fire_binds_its_session_and_completes() {
+        let store = Arc::new(MemoryScheduleStore::new());
+        let shared_store: Arc<dyn ScheduleStore> = store.clone();
+        let service = ScheduleService::new(Arc::clone(&shared_store));
+        let schedule = service
+            .create(CreateScheduleRequest {
+                name: Some("materializing".into()),
+                description: None,
+                trigger: TriggerSpec::Once {
+                    due_at_utc: Utc::now() - Duration::seconds(1),
+                },
+                target: materialize_on_demand_target("scheduled prompt"),
+                misfire_policy: MisfirePolicy::Skip,
+                overlap_policy: OverlapPolicy::AllowConcurrent,
+                missing_target_policy: MissingTargetPolicy::Skip,
+                labels: BTreeMap::new(),
+                planning_horizon_days: Some(1),
+                planning_horizon_occurrences: Some(1),
+            })
+            .await
+            .expect("create schedule");
+        let driver = ScheduleDriver::new(
+            service.clone(),
+            shared_store,
+            Arc::new(ReadyProbe),
+            Arc::new(MaterializingDelivery),
+            "driver-owner",
+            ScheduleDriverConfig {
+                claim_limit: 8,
+                lease_duration: Duration::seconds(30),
+            },
+        );
+        let tick = driver.tick_once().await;
+        assert!(tick.is_ok(), "the tick must succeed: {tick:?}");
+        let occurrence =
+            wait_for_occurrence_phase(&service, &schedule.schedule_id, OccurrencePhase::Completed)
+                .await
+                .expect("the first fire completes");
+        let materialized = occurrence.materialized_session_id();
+        assert_eq!(
+            crate::types::target_materialized_session_id(&occurrence.target_snapshot),
+            Some(materialized.clone()),
+            "the occurrence records the session its dispatch materialized"
+        );
+        let schedule = service.get(&schedule.schedule_id).await.expect("schedule");
+        assert_eq!(
+            crate::types::target_materialized_session_id(&schedule.target),
+            Some(materialized),
+            "later fires reuse the materialized session"
+        );
+    }
+
+    /// Completes like [`CompletingDelivery`], except that the dispatch for an
+    /// occurrence of `faulty_schedule` rewrites the stable correlation
+    /// identity: an adapter fault the driver refuses.
+    struct CorrelationRewritingDelivery {
+        faulty_schedule: crate::ScheduleId,
+        completing: CompletingDelivery,
+    }
+
+    #[async_trait]
+    impl ScheduleTargetDelivery for CorrelationRewritingDelivery {
+        async fn deliver_occurrence(
+            &self,
+            occurrence: &Occurrence,
+            identity: &ScheduleDeliveryIdentity,
+        ) -> Result<DeliveryDispatch, ScheduleDomainError> {
+            let mut dispatch = self
+                .completing
+                .deliver_occurrence(occurrence, identity)
+                .await?;
+            if occurrence.schedule_id == self.faulty_schedule {
+                dispatch.receipt.correlation_id = Some("rewritten".into());
+                dispatch.correlation_id = Some("rewritten".into());
+            }
+            Ok(dispatch)
+        }
+    }
+
     #[tokio::test]
     async fn cancellation_waits_for_executor_lease_witness_before_stopping_tick() {
         let store = Arc::new(MemoryScheduleStore::new());
@@ -2431,6 +2583,83 @@ mod tests {
         );
         assert!(report.fault_count() == 3);
         assert!(!report.fault_fingerprint().is_empty());
+    }
+
+    /// A delivery adapter fault on one claimed occurrence fails the tick only
+    /// after the rest of the claimed batch is delivered: the other due
+    /// occurrence still fires, and the tick returns the fault.
+    #[tokio::test]
+    async fn adapter_fault_on_one_claimed_occurrence_still_delivers_the_rest_of_the_batch()
+    -> Result<(), ScheduleDomainError> {
+        let store = Arc::new(MemoryScheduleStore::new()) as Arc<dyn ScheduleStore>;
+        let service = ScheduleService::new(store.clone());
+        let once = |name: &str, due_at_utc| CreateScheduleRequest {
+            name: Some(name.into()),
+            description: None,
+            trigger: TriggerSpec::Once { due_at_utc },
+            target: materialize_on_demand_target("scheduled prompt"),
+            misfire_policy: MisfirePolicy::Skip,
+            overlap_policy: OverlapPolicy::AllowConcurrent,
+            missing_target_policy: MissingTargetPolicy::MarkMisfired,
+            labels: BTreeMap::new(),
+            planning_horizon_days: Some(1),
+            planning_horizon_occurrences: Some(1),
+        };
+        // Due first, so claimed first.
+        let faulty = service
+            .create(once("faulty", Utc::now() - Duration::seconds(10)))
+            .await?;
+        let healthy = service
+            .create(once("healthy", Utc::now() - Duration::seconds(1)))
+            .await?;
+        let faulty_occurrence = service
+            .list_occurrences(&faulty.schedule_id)
+            .await?
+            .into_iter()
+            .next()
+            .expect("planned faulty occurrence");
+        let delivery = Arc::new(CorrelationRewritingDelivery {
+            faulty_schedule: faulty.schedule_id.clone(),
+            completing: CompletingDelivery::default(),
+        });
+        let driver = ScheduleDriver::new(
+            service.clone(),
+            store,
+            Arc::new(ReadyProbe),
+            delivery.clone(),
+            "driver-owner",
+            ScheduleDriverConfig {
+                claim_limit: 8,
+                lease_duration: Duration::seconds(30),
+            },
+        );
+
+        let tick = driver.tick_once().await;
+
+        let dispatched = delivery
+            .completing
+            .dispatched_occurrences
+            .lock()
+            .await
+            .clone();
+        assert_eq!(
+            dispatched.len(),
+            2,
+            "both claimed occurrences reach delivery: {dispatched:?}"
+        );
+        assert_eq!(dispatched[0], faulty_occurrence.occurrence_id);
+        let fired =
+            wait_for_occurrence_phase(&service, &healthy.schedule_id, OccurrencePhase::Completed)
+                .await?;
+        assert_eq!(dispatched[1], fired.occurrence_id);
+        match tick {
+            Err(ScheduleDomainError::Internal(detail)) => assert!(
+                detail.contains(&faulty_occurrence.occurrence_id.to_string()),
+                "the tick fails with the faulty occurrence's error: {detail}"
+            ),
+            other => panic!("the adapter fault must still fail the tick: {other:?}"),
+        }
+        Ok(())
     }
 
     /// Full diagnostic fingerprints remain deterministic for callers that

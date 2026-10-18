@@ -690,7 +690,9 @@ the committed authority is preserved.
 - Anything else — including any tail carrying a dangling `tool_use` — is held
   intact for reconciliation. A dangling call proves intent, not execution;
   its external side effect may already have fired, so recovery never closes
-  it with synthetic results.
+  it with synthetic results. A tail whose last turn stopped for a reason
+  other than `EndTurn` or `ToolUse` (for example `MaxTokens` or `PauseTurn`)
+  is held the same way: that turn did not reach a natural end.
 
 A committed strict descendant wins over a stale live runtime snapshot
 regardless of local actor liveness, and projection convergence requires

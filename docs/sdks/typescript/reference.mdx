@@ -638,7 +638,10 @@ type StopReason =
   | "max_tokens"
   | "stop_sequence"
   | "content_filter"
-  | "cancelled";
+  | "cancelled"
+  | "refusal"
+  | "pause_turn"
+  | "context_window_exceeded";
 ```
 
 ### Tool execution events
@@ -840,6 +843,12 @@ class MeerkatError extends Error {
 class CapabilityUnavailableError extends MeerkatError {}
 class SessionNotFoundError extends MeerkatError {}
 class SkillNotFoundError extends MeerkatError {}
+class BinaryIntegrityError extends MeerkatError {
+  readonly asset: string;
+  readonly path: string | null;
+  readonly expectedSha256: string;
+  readonly actualSha256: string;
+}
 ```
 
 | Class | When thrown |
@@ -848,6 +857,7 @@ class SkillNotFoundError extends MeerkatError {}
 | `CapabilityUnavailableError` | `client.requireCapability()` or `session.invokeSkill()` when the required capability is not available |
 | `SessionNotFoundError` | Server reports that the requested session does not exist |
 | `SkillNotFoundError` | Server reports that a skill reference cannot be resolved |
+| `BinaryIntegrityError` | The auto-downloaded `rkat-rpc` archive, the binary inside it or its cached copy does not match the sha256 the package pins ([The rkat-rpc binary](/sdks/typescript/overview#the-rkat-rpc-binary)) |
 
 ### Common error codes
 
@@ -859,6 +869,10 @@ class SkillNotFoundError extends MeerkatError {}
 | `CLIENT_CLOSED` | Method called after `close()` |
 | `STREAM_NOT_CONSUMED` | `stream.result` accessed before iteration completed |
 | `BINARY_NOT_FOUND` | `rkat-rpc` not found and auto-download failed |
+| `BINARY_DIGEST_UNAVAILABLE` | The package pins no `rkat-rpc` digest for its version and platform (a source or git install), so it will not download one |
+| `BINARY_INTEGRITY_MISMATCH` | `BinaryIntegrityError`: a downloaded or cached `rkat-rpc` does not match its pinned digest |
+| `BINARY_DOWNLOAD_FAILED` | The release download failed (a transport fault or a cut-off body), or redirected to a non-HTTPS URL |
+| `BINARY_DOWNLOAD_TOO_LARGE` | The release archive is over 256 MiB, far above any `rkat-rpc` release archive |
 | `UNKNOWN_EVENT_TYPE` | Streamed event `type` not in the generated known-event inventory |
 
 ### Typed comms/send errors
@@ -935,7 +949,7 @@ source UUID explicitly when multiple sources provide that name.
 
 ```typescript
 import { CONTRACT_VERSION } from "@rkat/sdk";
-console.log(CONTRACT_VERSION);  // "0.9.2"
+console.log(CONTRACT_VERSION);  // "0.9.3"
 ```
 
 - While the major version is `0`, minor versions must match exactly between SDK and server.

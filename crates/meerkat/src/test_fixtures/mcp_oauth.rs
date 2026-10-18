@@ -6,9 +6,11 @@
 //! metadata, RFC 8414 authorization-server metadata, dynamic client
 //! registration, an authorize endpoint that redirects straight back to the
 //! registered loopback redirect, a token endpoint, and OpenID Connect
-//! discovery plus UserInfo. Every secret it issues is a fixed canary, so
-//! tests can assert those values never reach agent-visible channels or logs.
-//! It is hand-written on tokio so it adds no dependency.
+//! discovery plus UserInfo. [`AccountEvidence::NoUserInfo`] serves an
+//! authorization server without account evidence instead. Every secret it
+//! issues is a fixed canary, so tests can assert those values never reach
+//! agent-visible channels or logs. It is hand-written on tokio so it adds no
+//! dependency.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -42,8 +44,23 @@ pub const ISSUED_SECRET_CANARIES: [&str; 5] = [
     DCR_SECRET_CANARY,
 ];
 
+/// The account evidence the fixture's authorization server publishes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AccountEvidence {
+    /// OpenID Connect discovery naming a UserInfo endpoint that reports
+    /// [`SUBJECT`].
+    #[default]
+    OidcUserInfo,
+    /// Only OAuth metadata: protected-resource and authorization-server
+    /// metadata naming a `jwks_uri`, and that JWKS. No OpenID Connect
+    /// discovery, no UserInfo endpoint, and no ID token or scope in the
+    /// token response.
+    NoUserInfo,
+}
+
 #[derive(Default)]
 struct FixtureState {
+    evidence: AccountEvidence,
     redirect_uri: Mutex<Option<String>>,
     request_paths: Mutex<Vec<String>>,
     fail_token_exchange: AtomicBool,
@@ -59,9 +76,18 @@ pub struct McpOAuthFixture {
 impl McpOAuthFixture {
     /// Bind a loopback listener and serve until the process exits.
     pub async fn spawn() -> std::io::Result<Self> {
+        Self::spawn_with(AccountEvidence::OidcUserInfo).await
+    }
+
+    /// [`Self::spawn`] with an authorization server that publishes
+    /// `evidence`.
+    pub async fn spawn_with(evidence: AccountEvidence) -> std::io::Result<Self> {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let base = format!("http://{}", listener.local_addr()?);
-        let state = Arc::new(FixtureState::default());
+        let state = Arc::new(FixtureState {
+            evidence,
+            ..FixtureState::default()
+        });
         let served = Arc::clone(&state);
         let served_base = base.clone();
         tokio::spawn(async move {
@@ -275,21 +301,41 @@ fn route(request: &Request, base: &str, state: &FixtureState) -> Response {
                 "authorization_servers": [origin],
             }),
         ),
-        ("GET", "/.well-known/oauth-authorization-server") => Response::json(
-            200,
-            &json!({
+        ("GET", "/.well-known/oauth-authorization-server") => {
+            let mut metadata = json!({
                 "issuer": origin,
                 "code_challenge_methods_supported": ["S256"],
                 "authorization_endpoint": "/authorize",
                 "token_endpoint": "/token",
                 "registration_endpoint": "/register",
-            }),
-        ),
-        ("GET", "/.well-known/openid-configuration") => Response::json(
+            });
+            if state.evidence == AccountEvidence::NoUserInfo {
+                metadata["jwks_uri"] = json!(format!("{origin}/jwks"));
+            }
+            Response::json(200, &metadata)
+        }
+        ("GET", "/.well-known/openid-configuration")
+            if state.evidence == AccountEvidence::OidcUserInfo =>
+        {
+            Response::json(
+                200,
+                &json!({
+                    "issuer": origin,
+                    "userinfo_endpoint": format!("{origin}/userinfo"),
+                }),
+            )
+        }
+        ("GET", "/jwks") if state.evidence == AccountEvidence::NoUserInfo => Response::json(
             200,
             &json!({
-                "issuer": origin,
-                "userinfo_endpoint": format!("{origin}/userinfo"),
+                "keys": [{
+                    "kty": "RSA",
+                    "kid": "fixture-signing-key",
+                    "use": "sig",
+                    "alg": "RS256",
+                    "n": "Zml4dHVyZS1wdWJsaWMtbW9kdWx1cw",
+                    "e": "AQAB",
+                }]
             }),
         ),
         ("POST", "/register") => {
@@ -337,19 +383,19 @@ fn route(request: &Request, base: &str, state: &FixtureState) -> Response {
             {
                 return Response::json(400, &json!({ "error": "invalid_grant" }));
             }
-            Response::json(
-                200,
-                &json!({
-                    "access_token": ACCESS_CANARY,
-                    "refresh_token": REFRESH_CANARY,
-                    "id_token": ID_TOKEN_CANARY,
-                    "expires_in": 3600,
-                    "scope": "openid",
-                    "token_type": "Bearer",
-                }),
-            )
+            let mut token = json!({
+                "access_token": ACCESS_CANARY,
+                "refresh_token": REFRESH_CANARY,
+                "expires_in": 3600,
+                "token_type": "Bearer",
+            });
+            if state.evidence == AccountEvidence::OidcUserInfo {
+                token["id_token"] = json!(ID_TOKEN_CANARY);
+                token["scope"] = json!("openid");
+            }
+            Response::json(200, &token)
         }
-        ("GET", "/userinfo") => {
+        ("GET", "/userinfo") if state.evidence == AccountEvidence::OidcUserInfo => {
             if bearer != Some(ACCESS_CANARY) {
                 return Response::empty(401);
             }

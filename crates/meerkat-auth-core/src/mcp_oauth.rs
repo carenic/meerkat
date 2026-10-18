@@ -687,34 +687,62 @@ pub enum McpOAuthBrowserLaunch {
     Failed,
 }
 
-/// Open `url` in the system browser without logging it.
+/// Open `url` in the system browser without logging it, naming no host
+/// judgement: the opener runs with the host's environment as it is, as for a
+/// host that confines no launch kind.
+///
+/// Deprecated: a host that confines its agents' launches must not open a
+/// browser this way, since a confined process could have planted the opener
+/// on the host's `PATH`. Open with [`open_system_browser_guarded`] and the
+/// host's launch guard (`HostConfinement::launch_guard`, `None` for a host
+/// that confines nothing), or with [`open_system_browser_trusting`].
+///
+/// ```compile_fail
+/// #![deny(deprecated)]
+/// let _ = meerkat_auth_core::mcp_oauth::open_system_browser("https://example.invalid");
+/// ```
+#[deprecated(
+    since = "0.9.3",
+    note = "names no host judgement, so a host that confines its launches could run an opener a confined process planted on PATH; use `open_system_browser_guarded` with the host's launch guard (`HostConfinement::launch_guard`), or `open_system_browser_trusting`"
+)]
+pub fn open_system_browser(url: &str) -> std::io::Result<()> {
+    open_system_browser_guarded(url, None)
+}
+
+/// Open `url` in the system browser without logging it, under the host's
+/// launch guard.
 ///
 /// The URL is passed as one process argument (no shell) to the platform
 /// opener (`/usr/bin/open`, `xdg-open`, or the system `rundll32.exe
-/// url.dll,FileProtocolHandler`), whose output is discarded, run with the
-/// host's environment ([`meerkat_core::HostLaunchExemption::browser_opener`]).
-/// Nothing here logs the command line, so the authorize URL and state never
-/// reach `log` or `tracing` records. A host that confines its agents'
-/// launches opens with [`open_system_browser_trusting`].
-pub fn open_system_browser(url: &str) -> std::io::Result<()> {
+/// url.dll,FileProtocolHandler`), whose output is discarded
+/// ([`meerkat_core::HostLaunchExemption::browser_opener`]). Nothing here
+/// logs the command line, so the authorize URL and state never reach `log`
+/// or `tracing` records. `launch_guard` is the host's judgement of the paths
+/// its confined processes could change (`HostConfinement::launch_guard`):
+/// with one, the opener and every program it starts by name come from a
+/// `PATH` without relative directories or the directories it names
+/// ([`meerkat_core::confinement::trusted_search_path`]), so none is one a
+/// confined process planted; `None`, for a host that confines no launch kind,
+/// runs the opener with the host's environment as it is.
+pub fn open_system_browser_guarded(
+    url: &str,
+    launch_guard: Option<&meerkat_core::confinement::UntrustedPathFn>,
+) -> std::io::Result<()> {
     // A host launch exemption: the opener must reach the user's desktop
     // session, which a confined process cannot.
-    run_browser_opener(meerkat_core::HostLaunchExemption::browser_opener(url, None))
+    run_browser_opener(meerkat_core::HostLaunchExemption::browser_opener(
+        url,
+        launch_guard,
+    ))
 }
 
-/// [`open_system_browser`] for a host that confines its agents' launches:
-/// the opener, and every program it starts by name, come from a `PATH`
-/// without relative directories or the directories `untrusted` names
-/// ([`meerkat_core::confinement::trusted_search_path`]), so none is one a
-/// confined process planted.
+/// [`open_system_browser_guarded`] for a host that confines its agents'
+/// launches, with its judgement `untrusted`.
 pub fn open_system_browser_trusting(
     url: &str,
     untrusted: &meerkat_core::confinement::UntrustedPathFn,
 ) -> std::io::Result<()> {
-    run_browser_opener(meerkat_core::HostLaunchExemption::browser_opener(
-        url,
-        Some(untrusted),
-    ))
+    open_system_browser_guarded(url, Some(untrusted))
 }
 
 /// Run a browser opener without logging its URL, discarding its output.
@@ -870,11 +898,26 @@ impl McpOAuthPendingLogin {
         }
     }
 
-    /// [`launch_browser`](Self::launch_browser) with
-    /// [`open_system_browser`]. A host that confines its agents' launches
-    /// passes [`open_system_browser_trusting`] to `launch_browser`.
+    /// [`launch_browser`](Self::launch_browser) with the opener of a host
+    /// that names no judgement ([`open_system_browser`]).
+    ///
+    /// Deprecated: pass [`open_system_browser_guarded`] with the host's
+    /// launch guard to `launch_browser` instead, as a host that confines its
+    /// agents' launches must.
+    ///
+    /// ```compile_fail
+    /// #![deny(deprecated)]
+    /// async fn open(pending: &meerkat_auth_core::McpOAuthPendingLogin) {
+    ///     let _ = pending.launch_system_browser().await;
+    /// }
+    /// ```
+    #[deprecated(
+        since = "0.9.3",
+        note = "names no host judgement; pass `open_system_browser_guarded` with the host's launch guard (`HostConfinement::launch_guard`) to `launch_browser`"
+    )]
     pub async fn launch_system_browser(&self) -> McpOAuthBrowserLaunch {
-        self.launch_browser(|url| open_system_browser(&url)).await
+        self.launch_browser(|url| open_system_browser_guarded(&url, None))
+            .await
     }
 
     /// Wait for the loopback callback, bounded by both `timeout` and the
@@ -1268,7 +1311,9 @@ pub enum McpOAuthError {
     /// never share or reach each other's MCP credentials.
     #[error("MCP server '{server_name}' belongs to another realm than this host serves")]
     RealmMismatch { server_name: String },
-    #[error("MCP OAuth interactive login requires an explicit expected account")]
+    #[error(
+        "MCP OAuth interactive login requires an account selection: oauth_account (a provider subject ID) or oauth_account_selection (discover or unverified)"
+    )]
     AccountSelectionRequired,
     #[error(
         "MCP OAuth account selection requires its OAuth resolver and streamable HTTP without static Authorization"

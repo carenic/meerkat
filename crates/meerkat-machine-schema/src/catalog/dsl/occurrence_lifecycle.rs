@@ -1138,6 +1138,29 @@ machine! {
             to Claimed
         }
 
+        // A dispatch that materialized its session target records that
+        // session, once: only while the occurrence is still unbound, or as an
+        // exact replay of the recorded binding. Rebinding a dispatching
+        // occurrence is refused. The shell builds the recorded snapshot from
+        // the occurrence's own target, so a dispatch never retargets.
+        transition SyncTargetSnapshotDispatching {
+            on input SyncTargetSnapshot { target_binding_key, target_materialized_session_id }
+            guard { self.lifecycle_phase == Phase::Dispatching }
+            guard "binds_a_materialized_session" { target_materialized_session_id != None }
+            guard "records_once_or_replays" {
+                self.target_materialized_session_id == None
+                || (
+                    self.target_materialized_session_id == target_materialized_session_id
+                    && self.target_binding_key == target_binding_key
+                )
+            }
+            update {
+                self.target_binding_key = target_binding_key;
+                self.target_materialized_session_id = target_materialized_session_id;
+            }
+            to Dispatching
+        }
+
         // --- Receipt/result projection ---
 
         transition RecordReceiptPending {
@@ -1717,6 +1740,25 @@ machine! {
             emit DeliveryFailed
         }
 
+        // A governed host fires a schedule only under the agent whose mandate
+        // commissioned it; any other host refuses the fire before delivery.
+        transition DeliveryFailureScheduleMandateUnavailable {
+            on input ResolveDeliveryFailure { reason, detail, at_utc_ms }
+            guard { self.lifecycle_phase == Phase::Claimed || self.lifecycle_phase == Phase::Dispatching || self.lifecycle_phase == Phase::AwaitingCompletion }
+            guard "schedule_mandate_unavailable" { reason == DeliveryFailureReason::ScheduleMandateUnavailable }
+            update {
+                self.failure_class = Some(OccurrenceFailureClass::ScheduleMandateUnavailable);
+                self.failure_detail = detail;
+                self.completed_at_utc_ms = Some(at_utc_ms);
+                self.receipt_recorded_at_utc_ms = Some(at_utc_ms);
+                self.receipt_stage = Some(DeliveryReceiptStage::DeliveryFailed);
+                self.receipt_failure_class = Some(OccurrenceFailureClass::ScheduleMandateUnavailable);
+                self.receipt_detail = detail;
+            }
+            to DeliveryFailed
+            emit DeliveryFailed
+        }
+
         // --- Target probe resolution ---
         //
         // Shells report typed target observations; occurrence authority owns
@@ -2267,6 +2309,7 @@ pub enum OccurrenceFailureClass {
     LeaseLost,
     TransportError,
     InternalError,
+    ScheduleMandateUnavailable,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2302,6 +2345,7 @@ pub enum DeliveryFailureReason {
     MobRejected,
     TransportError,
     InternalError,
+    ScheduleMandateUnavailable,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

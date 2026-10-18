@@ -7,15 +7,11 @@ use crate::{AgentFactory, FactoryAgentBuilder};
 
 /// Set the default scheduler tools on a factory-backed builder.
 ///
-/// Schedule tools hold a clone of their `ScheduleService`. Once a schedule
-/// host is spawned for that service, the service keeps the host's session
-/// and mob hosts attached, and the session service owns this builder, so
-/// the slot keeps the session service and the mob state alive. An embedder
-/// that tears them down while its process keeps running clears the slot
-/// again after teardown succeeds: pass `None` here while the builder is
-/// still yours, or write `None` through a clone of the builder's
-/// `default_schedule_tools` taken before it moved into the session service.
-/// See [`crate::surface::spawn_schedule_host`].
+/// Schedule tools hold a clone of their `ScheduleService`, which holds a
+/// spawned schedule host's session and mob hosts only weakly, so the slot
+/// keeps neither the session service that owns this builder nor any mob
+/// state alive after that host stops; teardown needs no clear here. See
+/// [`crate::surface::spawn_schedule_host`].
 pub fn set_default_schedule_tools(
     builder: &FactoryAgentBuilder,
     default_schedule_tools: Option<Arc<dyn AgentToolDispatcher>>,

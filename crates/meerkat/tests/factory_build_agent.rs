@@ -864,8 +864,12 @@ async fn restricted_without_enable_offers_no_web_search() {
 fn create_test_authority() -> MobToolAuthorityContext {
     let authority = meerkat_runtime::mob_operator_authority::create_only_mob_operator_authority()
         .expect("generated create-only mob authority should be accepted");
-    meerkat_runtime::mob_operator_authority::grant_manage_mob(&authority, "mob-a")
-        .expect("generated mob authority should grant managed mob scope")
+    meerkat_runtime::mob_operator_authority::grant_manage_mob(
+        &authority,
+        "mob-a",
+        meerkat_core::service::MobIncarnationId::mint(),
+    )
+    .expect("generated mob authority should grant managed mob scope")
 }
 
 fn assert_generated_create_only_authority(authority: Option<&MobToolAuthorityContext>) {
@@ -3799,6 +3803,7 @@ async fn explicit_mob_authority_persists_only_non_authoritative_projection() {
         ..AgentBuildConfig::new("claude-sonnet-4-5")
     };
     let expected_authority = create_test_authority();
+    let incarnation = expected_authority.mob_incarnations()["mob-a"];
     build_config.mob_tool_authority_context = Some(expected_authority.clone());
 
     let agent = factory.build_agent(build_config, &config).await.unwrap();
@@ -3809,7 +3814,7 @@ async fn explicit_mob_authority_persists_only_non_authoritative_projection() {
         .and_then(|state| state.mob_tool_authority_context)
         .expect("mob authority projection should be stored");
     assert!(!persisted.is_generated_authority_context());
-    assert!(!persisted.can_manage_mob("mob-a"));
+    assert!(!persisted.can_manage_mob("mob-a", incarnation));
 }
 
 #[tokio::test]

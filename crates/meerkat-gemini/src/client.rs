@@ -2352,18 +2352,12 @@ impl GeminiClient {
                                     };
                                 }
                                 if let Some(reason) = cand.finish_reason {
-                                    let stop = match reason.as_str() {
-                                        "MAX_TOKENS" => StopReason::MaxTokens,
-                                        "SAFETY" | "RECITATION" => StopReason::ContentFilter,
-                                        // Gemini uses various names for tool calls
-                                        "TOOL_CALL" | "FUNCTION_CALL" => StopReason::ToolUse,
-                                        // "STOP" and any unrecognized reason default to EndTurn
-                                        _ => StopReason::EndTurn,
+                                    let outcome = match gemini_finish_reason_stop(&reason) {
+                                        Ok(stop_reason) => LlmDoneOutcome::Success { stop_reason },
+                                        Err(error) => LlmDoneOutcome::Error { error },
                                     };
                                     chunk_yielded.set(true);
-                                    yield LlmEvent::Done {
-                                        outcome: LlmDoneOutcome::Success { stop_reason: stop },
-                                    };
+                                    yield LlmEvent::Done { outcome };
                                 }
                             }
                         }
@@ -2380,6 +2374,37 @@ impl GeminiClient {
         });
 
         streaming::ensure_terminal_done(inner)
+    }
+}
+
+/// Map one Gemini `finishReason`.
+///
+/// The safety family (the candidate was blocked or flagged for safety,
+/// recitation, a blocklisted term or sensitive data) is a content filter.
+/// `LANGUAGE` (the candidate was flagged for an unsupported language) is not
+/// a safety stop, but it is as terminal as one, so it fails the turn the same
+/// way. A malformed or unexpected tool call, `OTHER`, and any reason this
+/// adapter does not know refuse the response instead of reading it as a
+/// natural end of turn: `IncompleteResponse` is retried with nothing committed.
+fn gemini_finish_reason_stop(reason: &str) -> Result<StopReason, LlmError> {
+    match reason {
+        "STOP" => Ok(StopReason::EndTurn),
+        "MAX_TOKENS" => Ok(StopReason::MaxTokens),
+        "SAFETY"
+        | "RECITATION"
+        | "BLOCKLIST"
+        | "PROHIBITED_CONTENT"
+        | "SPII"
+        | "IMAGE_SAFETY"
+        | "IMAGE_PROHIBITED_CONTENT"
+        | "IMAGE_RECITATION" => Ok(StopReason::ContentFilter),
+        // Not safety: an unsupported language. Terminal all the same.
+        "LANGUAGE" => Ok(StopReason::ContentFilter),
+        // Legacy tool-call names some Gemini-shaped endpoints send.
+        "TOOL_CALL" | "FUNCTION_CALL" => Ok(StopReason::ToolUse),
+        other => Err(LlmError::IncompleteResponse {
+            message: format!("Gemini response finished for unsupported reason '{other}'"),
+        }),
     }
 }
 
@@ -4332,37 +4357,107 @@ mod tests {
     /// Previously TOOL_CALL and FUNCTION_CALL mapped to EndTurn incorrectly.
     #[test]
     fn test_regression_gemini_finish_reason_tool_call_maps_to_tool_use() {
-        // Test the finish reason mapping logic directly
-        let finish_reasons = ["TOOL_CALL", "FUNCTION_CALL"];
-
-        for reason in finish_reasons {
-            let stop = match reason {
-                "MAX_TOKENS" => StopReason::MaxTokens,
-                "SAFETY" | "RECITATION" => StopReason::ContentFilter,
-                "TOOL_CALL" | "FUNCTION_CALL" => StopReason::ToolUse,
-                // "STOP" and any unrecognized reason default to EndTurn
-                _ => StopReason::EndTurn,
-            };
+        for reason in ["TOOL_CALL", "FUNCTION_CALL"] {
             assert_eq!(
-                stop,
+                gemini_finish_reason_stop(reason).expect(reason),
                 StopReason::ToolUse,
                 "finish_reason '{reason}' should map to ToolUse"
             );
         }
     }
 
-    /// Regression: Gemini RECITATION finish reason must map to ContentFilter.
+    /// Regression: every Gemini safety-family finish reason (the candidate
+    /// was blocked or flagged for safety) maps to ContentFilter, and so does
+    /// `LANGUAGE`, which is not safety but just as terminal.
     #[test]
-    fn test_regression_gemini_finish_reason_recitation_maps_to_content_filter() {
-        let reason = "RECITATION";
-        let stop = match reason {
-            "MAX_TOKENS" => StopReason::MaxTokens,
-            "SAFETY" | "RECITATION" => StopReason::ContentFilter,
-            "TOOL_CALL" | "FUNCTION_CALL" => StopReason::ToolUse,
-            // "STOP" and any unrecognized reason default to EndTurn
-            _ => StopReason::EndTurn,
-        };
-        assert_eq!(stop, StopReason::ContentFilter);
+    fn test_regression_gemini_safety_family_maps_to_content_filter() {
+        for reason in [
+            "SAFETY",
+            "RECITATION",
+            "BLOCKLIST",
+            "PROHIBITED_CONTENT",
+            "SPII",
+            "IMAGE_SAFETY",
+            "IMAGE_PROHIBITED_CONTENT",
+            "IMAGE_RECITATION",
+        ] {
+            assert_eq!(
+                gemini_finish_reason_stop(reason).expect(reason),
+                StopReason::ContentFilter,
+                "{reason}"
+            );
+        }
+        assert_eq!(
+            gemini_finish_reason_stop("LANGUAGE").expect("LANGUAGE"),
+            StopReason::ContentFilter,
+            "an unsupported language fails the turn instead of being retried"
+        );
+        assert_eq!(
+            gemini_finish_reason_stop("STOP").expect("STOP"),
+            StopReason::EndTurn
+        );
+        assert_eq!(
+            gemini_finish_reason_stop("MAX_TOKENS").expect("MAX_TOKENS"),
+            StopReason::MaxTokens
+        );
+    }
+
+    /// A malformed or unexpected tool call, OTHER, and any unknown reason are
+    /// not a natural end of turn: the response fails as incomplete.
+    #[test]
+    fn gemini_unexpected_finish_reasons_fail_as_incomplete() {
+        for reason in [
+            "MALFORMED_FUNCTION_CALL",
+            "UNEXPECTED_TOOL_CALL",
+            "TOO_MANY_TOOL_CALLS",
+            "OTHER",
+            "IMAGE_OTHER",
+            "NO_IMAGE",
+            "FINISH_REASON_UNSPECIFIED",
+            "SOMETHING_NEW",
+        ] {
+            match gemini_finish_reason_stop(reason) {
+                Err(LlmError::IncompleteResponse { message }) => {
+                    assert!(message.contains(&format!("'{reason}'")), "{message}");
+                }
+                other => panic!("{reason}: expected IncompleteResponse, got {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn gemini_stream_with_malformed_tool_call_finish_fails_the_response() {
+        let payload = [
+            r#"data: {"candidates":[{"content":{"parts":[{"text":"Calling"}]},"finishReason":"MALFORMED_FUNCTION_CALL"}],"usageMetadata":{"promptTokenCount":3,"candidatesTokenCount":1}}"#,
+            "",
+        ]
+        .join("\n");
+        let (base_url, handle) = spawn_gemini_stream_stub(
+            "gemini-3.5-flash",
+            payload,
+            Arc::new(Mutex::new(Vec::new())),
+        )
+        .await;
+        let client = GeminiClient::new_with_base_url("test-key".to_string(), base_url);
+        let request = LlmRequest::new(
+            "gemini-3.5-flash",
+            vec![Message::User(UserMessage::text("hello".to_string()))],
+        );
+        let events: Vec<LlmEvent> = client
+            .stream(&request)
+            .map(|event| event.expect("stream wrapper should convert errors to Done"))
+            .collect()
+            .await;
+        handle.abort();
+        match events.last() {
+            Some(LlmEvent::Done {
+                outcome:
+                    LlmDoneOutcome::Error {
+                        error: LlmError::IncompleteResponse { message },
+                    },
+            }) => assert!(message.contains("'MALFORMED_FUNCTION_CALL'"), "{message}"),
+            other => panic!("expected Done{{Error{{IncompleteResponse}}}}, got {other:?}"),
+        }
     }
 
     /// Regression: Multiple tool calls to the same tool must get unique IDs.

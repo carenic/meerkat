@@ -19,7 +19,12 @@
 //! model but before it acknowledged the evidence: the final incarnation must
 //! still record exactly one notice and never replay the input.
 
-#![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
+#![allow(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    clippy::panic,
+    clippy::disallowed_methods
+)]
 
 #[cfg(all(
     feature = "session-store",
@@ -653,6 +658,79 @@ mod tests {
             runless_terminal_tells.load(Ordering::SeqCst),
             1,
             "settling the interrupted run tells the host once"
+        );
+    }
+
+    /// The attach wakes its runtime loop when it publishes, and hands the
+    /// owed notices to the session just after. The loop runs on its own
+    /// runtime, so it can spend that wake on a pre-dequeue check that finds
+    /// nothing yet and park. The idle session must still record its notice
+    /// without new input.
+    #[tokio::test]
+    async fn an_idle_session_records_the_notice_when_its_loop_checked_before_the_handoff() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path();
+        let (session_id, _input_id) = crash_gateway_mid_tool(root).await;
+
+        let client = Arc::new(ScriptedShellClient::new(tool_command(root)));
+        let (service, adapter) = build_service(root, Arc::clone(&client)).await;
+        // Hold the attach between its publication and the notice hand-off,
+        // and the loop at its first check that finds no notice.
+        let (handoff_reached, release_handoff) =
+            adapter.arm_attachment_interrupted_notice_handoff_test_hook(session_id.clone());
+        let (check_reached, release_check) = adapter
+            .arm_runtime_loop_after_empty_interrupted_notice_check_test_hook(session_id.clone());
+        let mut parked = adapter.runtime_loop_parked();
+        let resume = service
+            .load_authoritative_session(&session_id)
+            .await
+            .expect("load after restart")
+            .expect("session survives the gateway");
+        let interleave = async {
+            tokio::time::timeout(Duration::from_secs(30), handoff_reached)
+                .await
+                .expect("the attach reaches its notice hand-off")
+                .expect("hand-off gate");
+            tokio::time::timeout(Duration::from_secs(30), check_reached)
+                .await
+                .expect("the loop checks for notices before the hand-off")
+                .expect("check gate");
+            // The gate holds the loop mid-lap, so the next park comes after
+            // that lap, with every wake (the attach's included) spent.
+            drop(release_check);
+            tokio::time::timeout(
+                Duration::from_secs(30),
+                parked.wait_for(|sessions| sessions.contains(&session_id)),
+            )
+            .await
+            .expect("the loop parks")
+            .expect("park watch");
+            drop(release_handoff);
+        };
+        tokio::join!(materialize(&service, &adapter, resume), interleave);
+
+        let recorded = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let session = service
+                    .load_authoritative_session(&session_id)
+                    .await
+                    .expect("load")
+                    .expect("session");
+                if !interrupted_notice_blocks(&session).is_empty() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(
+            recorded.is_ok(),
+            "the idle session's notice waited for new input after a late hand-off"
+        );
+        assert_eq!(
+            client.requests.load(Ordering::SeqCst),
+            0,
+            "recovery must not start a model turn"
         );
     }
 

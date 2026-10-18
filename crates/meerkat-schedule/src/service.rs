@@ -16,7 +16,7 @@ use crate::types::{
 use chrono::{Duration, Utc};
 use meerkat_core::SessionId;
 use std::collections::BTreeSet;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Weak};
 
 #[cfg(target_arch = "wasm32")]
 use crate::tokio::sync::{Mutex, watch};
@@ -25,13 +25,20 @@ use tokio::sync::{Mutex, watch};
 
 #[derive(Clone)]
 pub struct ScheduleService {
+    /// The agent whose mandate commissions the schedules this service
+    /// creates or redefines: a governed realm's opened agent, supplied by the
+    /// trusted composition ([`Self::new_commissioned`]), never by a request.
+    /// `None` in an ungoverned realm.
+    commissioning_agent: Option<meerkat_core::PrincipalRef>,
     store: Arc<dyn ScheduleStore>,
     planning_lock: Arc<Mutex<()>>,
     mutation_generation: watch::Sender<u64>,
-    /// Surface-attached create-time identity-target probe, shared across all
-    /// clones of this service (the tool dispatcher and the delivery host
-    /// hold clones of the same instance).
-    identity_target_probe: Arc<OnceLock<Arc<dyn ScheduleIdentityTargetProbe>>>,
+    /// Surface-attached create-time identity-target probes, in attach order,
+    /// shared across all clones of this service (the tool dispatcher and the
+    /// delivery host hold clones of the same instance). Held weakly: each
+    /// probe's attaching surface owns it, so no clone of this service keeps
+    /// a stopped surface's hosts alive.
+    identity_target_probes: Arc<std::sync::Mutex<Vec<Weak<dyn ScheduleIdentityTargetProbe>>>>,
 }
 
 struct ExpectedScheduleTransition {
@@ -199,36 +206,87 @@ impl ScheduleService {
         Self::observe_schedule_transition(schedule_commit, expected)
     }
 
-    pub fn new(store: Arc<dyn ScheduleStore>) -> Self {
-        let (mutation_generation, _) = watch::channel(0);
+    /// A service whose creates and updates record `commissioning_agent` as
+    /// the agent whose mandate commissions the schedule (see
+    /// [`crate::ScheduleConfig::commissioning_agent`]). Only a trusted
+    /// composition supplies it: a governed realm's opened agent.
+    pub fn new_commissioned(
+        store: Arc<dyn ScheduleStore>,
+        commissioning_agent: meerkat_core::PrincipalRef,
+    ) -> Self {
         Self {
-            store,
-            planning_lock: Arc::new(Mutex::new(())),
-            mutation_generation,
-            identity_target_probe: Arc::new(OnceLock::new()),
+            commissioning_agent: Some(commissioning_agent),
+            ..Self::new(store)
         }
     }
 
-    /// Attach the surface's create-time identity-target deliverability probe.
+    /// The agent this service commissions schedules for, when its composition
+    /// supplied one.
+    pub fn commissioning_agent(&self) -> Option<&meerkat_core::PrincipalRef> {
+        self.commissioning_agent.as_ref()
+    }
+
+    pub fn new(store: Arc<dyn ScheduleStore>) -> Self {
+        let (mutation_generation, _) = watch::channel(0);
+        Self {
+            commissioning_agent: None,
+            store,
+            planning_lock: Arc::new(Mutex::new(())),
+            mutation_generation,
+            identity_target_probes: Arc::new(std::sync::Mutex::new(Vec::new())),
+        }
+    }
+
+    /// Attach a surface's create-time identity-target deliverability probe.
     ///
-    /// The first attach wins across every clone of this service; later
-    /// attaches are ignored so a replacement host cannot silently swap the
-    /// deliverability authority mid-flight. Without an attached probe the
-    /// service cannot judge identity deliverability and keeps accepting
-    /// identity targets (the fire-time probe and `missing_target_policy`
-    /// remain the delivery-time authority).
+    /// The service holds the probe weakly: the caller owns it, and it judges
+    /// for as long as the caller keeps it (a surface keeps it for the life of
+    /// its schedule host), so no clone of this service, such as the one
+    /// inside agent schedule tools installed on a session builder, keeps the
+    /// surface's session and mob hosts alive after teardown.
     ///
-    /// The probe is never detached: it, and whatever it holds (a surface's
-    /// session and mob hosts), lives as long as any clone of this service. A
-    /// host that tears its surface down while its process keeps running drops
-    /// every clone it still holds once teardown has succeeded, including the
-    /// clone inside agent schedule tools installed on a session builder.
-    pub fn attach_identity_target_probe(&self, probe: Arc<dyn ScheduleIdentityTargetProbe>) {
-        let _ = self.identity_target_probe.set(probe);
+    /// The earliest attached probe that is still alive judges, so a later
+    /// attach cannot swap a live deliverability authority mid-flight; once
+    /// its owner drops it, the next live one (such as a host started after
+    /// teardown) judges. Without any attached probe the service cannot judge
+    /// identity deliverability and keeps accepting identity targets (the
+    /// fire-time probe and `missing_target_policy` remain the delivery-time
+    /// authority). Once every attached probe is gone, the surface that
+    /// declared the authority has stopped, and identity targets are refused
+    /// with [`ScheduleDomainError::DriverStopped`] until a new probe attaches.
+    pub fn attach_identity_target_probe(&self, probe: &Arc<dyn ScheduleIdentityTargetProbe>) {
+        let mut probes = self
+            .identity_target_probes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        probes.retain(|attached| attached.strong_count() > 0);
+        probes.push(Arc::downgrade(probe));
+    }
+
+    /// The probe that judges identity deliverability now: `None` when no
+    /// probe was ever attached, the earliest live one otherwise, and
+    /// [`ScheduleDomainError::DriverStopped`] when every attached probe is
+    /// gone.
+    fn identity_target_probe(
+        &self,
+    ) -> Result<Option<Arc<dyn ScheduleIdentityTargetProbe>>, ScheduleDomainError> {
+        let probes = self
+            .identity_target_probes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if probes.is_empty() {
+            return Ok(None);
+        }
+        probes
+            .iter()
+            .find_map(Weak::upgrade)
+            .map(Some)
+            .ok_or(ScheduleDomainError::DriverStopped)
     }
 
     /// Fail closed at create/update when the composed surface hosts declare
-    /// an identity target permanently undeliverable.
+    /// an identity target permanently undeliverable, or when the surface
+    /// that judged identity targets has stopped.
     async fn refuse_undeliverable_identity_target(
         &self,
         target: &TargetBinding,
@@ -236,7 +294,7 @@ impl ScheduleService {
         let TargetBinding::Identity(binding) = target else {
             return Ok(());
         };
-        let Some(probe) = self.identity_target_probe.get() else {
+        let Some(probe) = self.identity_target_probe()? else {
             return Ok(());
         };
         match probe.probe_identity_target(binding).await? {
@@ -299,6 +357,7 @@ impl ScheduleService {
         let _planning_guard = self.planning_lock.lock().await;
         let mut mutator = Schedule::apply(None, ScheduleLifecycleInput::Create(request))
             .map_err(|error| ScheduleDomainError::InvalidSchedule(error.to_string()))?;
+        mutator.record_commissioning_agent(self.commissioning_agent.clone());
         let store_now = self.store.get_store_time_utc().await?;
         let planned = self
             .plan_schedule_occurrences(mutator.schedule(), store_now)
@@ -384,6 +443,10 @@ impl ScheduleService {
             },
         )
         .map_err(|error| ScheduleDomainError::InvalidSchedule(error.to_string()))?;
+        // A redefinition is commissioned by the mandate that made it: a
+        // schedule never fires another agent's redefinition under the
+        // mandate it was first created with.
+        mutator.record_commissioning_agent(self.commissioning_agent.clone());
 
         let planned = self
             .plan_schedule_occurrences(mutator.schedule(), store_now)
@@ -663,6 +726,42 @@ impl ScheduleService {
         }
 
         Ok(())
+    }
+
+    /// Record the session a dispatching occurrence materialized: its own
+    /// target snapshot with exactly `materialized_session_id` bound. Generated
+    /// occurrence authority accepts this once, while the occurrence is still
+    /// unbound (a replay of the same binding is a no-op here), and refuses a
+    /// rebinding; building the snapshot from the occurrence's own target means
+    /// a dispatch never retargets.
+    pub async fn record_dispatch_materialization(
+        &self,
+        occurrence: Occurrence,
+        materialized_session_id: &SessionId,
+    ) -> Result<Occurrence, ScheduleDomainError> {
+        if crate::types::target_materialized_session_id(&occurrence.target_snapshot).as_ref()
+            == Some(materialized_session_id)
+        {
+            return Ok(occurrence);
+        }
+        let mut target_snapshot = occurrence.target_snapshot.clone();
+        if !target_snapshot.bind_materialized_session(materialized_session_id) {
+            return Err(ScheduleDomainError::Internal(format!(
+                "occurrence {} cannot record materialized session {materialized_session_id}: \
+                 its target is not an unbound materialize-on-demand session",
+                occurrence.occurrence_id
+            )));
+        }
+        let mutator = occurrence
+            .apply(crate::OccurrenceLifecycleInput::SyncTargetSnapshot { target_snapshot })
+            .map_err(|error| ScheduleDomainError::Internal(error.to_string()))?;
+        let commit = self
+            .store
+            .commit_occurrence_write(mutator.into_authorized_write())
+            .await?;
+        let occurrence = Self::observe_effectless_occurrence_commit(commit)?;
+        self.notify_mutation();
+        Ok(occurrence)
     }
 
     async fn plan_schedule_occurrences(
@@ -1823,5 +1922,151 @@ mod tests {
         };
 
         assert_eq!(spec.model, "claude-sonnet-4-6");
+    }
+
+    /// A create-time identity judgement a test fixes.
+    struct FixedIdentityProbe(IdentityTargetDeliverability);
+
+    #[async_trait::async_trait]
+    impl ScheduleIdentityTargetProbe for FixedIdentityProbe {
+        async fn probe_identity_target(
+            &self,
+            _binding: &crate::IdentityTargetBinding,
+        ) -> Result<IdentityTargetDeliverability, ScheduleDomainError> {
+            Ok(self.0.clone())
+        }
+    }
+
+    /// The service holds attached probes weakly: the earliest live one
+    /// judges, the next one judges once the first owner drops its probe, and
+    /// with every probe gone identity targets are refused as `DriverStopped`
+    /// while other targets are still never judged.
+    #[tokio::test]
+    async fn identity_targets_are_judged_by_the_earliest_live_attached_probe() {
+        let service = ScheduleService::new(Arc::new(MemoryScheduleStore::new()));
+        service
+            .create(identity_create_request("domain:ops", plain_prompt_action()))
+            .await
+            .expect("without an attached probe identity targets are not judged");
+
+        let refusing: Arc<dyn ScheduleIdentityTargetProbe> = Arc::new(FixedIdentityProbe(
+            IdentityTargetDeliverability::NeverDeliverable {
+                detail: Some("refused by the first probe".into()),
+            },
+        ));
+        let vouching: Arc<dyn ScheduleIdentityTargetProbe> = Arc::new(FixedIdentityProbe(
+            IdentityTargetDeliverability::Deliverable,
+        ));
+        service.attach_identity_target_probe(&refusing);
+        // Clones share the attached probes.
+        service.clone().attach_identity_target_probe(&vouching);
+        let refused = service
+            .create(identity_create_request("domain:ops", plain_prompt_action()))
+            .await
+            .expect_err("the earliest live probe judges");
+        assert!(
+            matches!(
+                &refused,
+                ScheduleDomainError::InvalidSchedule(reason)
+                    if reason.contains("refused by the first probe")
+            ),
+            "expected the first probe's refusal, found {refused:?}"
+        );
+
+        drop(refusing);
+        service
+            .create(identity_create_request("domain:ops", plain_prompt_action()))
+            .await
+            .expect("the next live probe judges once the first is gone");
+
+        drop(vouching);
+        let stopped = service
+            .create(identity_create_request("domain:ops", plain_prompt_action()))
+            .await
+            .expect_err("no live probe is left to judge identity targets");
+        assert!(
+            matches!(stopped, ScheduleDomainError::DriverStopped),
+            "expected DriverStopped, found {stopped:?}"
+        );
+        service
+            .create(CreateScheduleRequest {
+                target: materialize_on_demand_target("still stored"),
+                ..identity_create_request("domain:ops", plain_prompt_action())
+            })
+            .await
+            .expect("session targets are never judged");
+    }
+
+    fn agent(name: &str) -> meerkat_core::PrincipalRef {
+        meerkat_core::PrincipalRef::new(meerkat_core::PrincipalKind::PersonalAgent, name)
+            .expect("agent principal")
+    }
+
+    /// A commissioned service records its agent on every create and
+    /// redefinition, never a request value, and an uncommissioned one records
+    /// none. The record survives the store's JSON, and a row written before
+    /// the field existed reads as uncommissioned.
+    #[tokio::test]
+    async fn creates_and_updates_record_the_commissioning_agent() {
+        let store: Arc<dyn ScheduleStore> = Arc::new(MemoryScheduleStore::new());
+        let agent_a = ScheduleService::new_commissioned(Arc::clone(&store), agent("agent-a"));
+        assert_eq!(agent_a.commissioning_agent(), Some(&agent("agent-a")));
+        let created = agent_a
+            .create(identity_create_request("domain:ops", plain_prompt_action()))
+            .await
+            .expect("create");
+        assert_eq!(created.config.commissioning_agent, Some(agent("agent-a")));
+
+        // Another agent's redefinition is commissioned by that agent.
+        let agent_b = ScheduleService::new_commissioned(Arc::clone(&store), agent("agent-b"));
+        let updated = agent_b
+            .update(
+                &created.schedule_id,
+                UpdateScheduleRequest {
+                    name: Some("redefined".into()),
+                    ..UpdateScheduleRequest::default()
+                },
+            )
+            .await
+            .expect("update");
+        assert_eq!(updated.config.commissioning_agent, Some(agent("agent-b")));
+        let stored = agent_a.get(&created.schedule_id).await.expect("get");
+        assert_eq!(stored.config.commissioning_agent, Some(agent("agent-b")));
+        let round_trip: Schedule =
+            serde_json::from_value(serde_json::to_value(&stored).expect("encode schedule"))
+                .expect("decode schedule");
+        assert_eq!(
+            round_trip.config.commissioning_agent,
+            Some(agent("agent-b"))
+        );
+
+        // A writer that commissions no agent records none on its
+        // redefinition: the schedule's agent is cleared, not kept.
+        let cleared = ScheduleService::new(Arc::clone(&store))
+            .update(
+                &created.schedule_id,
+                UpdateScheduleRequest {
+                    name: Some("rewritten".into()),
+                    ..UpdateScheduleRequest::default()
+                },
+            )
+            .await
+            .expect("update");
+        assert_eq!(cleared.config.commissioning_agent, None);
+        let stored = agent_a.get(&created.schedule_id).await.expect("get");
+        assert_eq!(stored.config.commissioning_agent, None);
+
+        let ungoverned = ScheduleService::new(store)
+            .create(identity_create_request("domain:ops", plain_prompt_action()))
+            .await
+            .expect("create");
+        assert_eq!(ungoverned.config.commissioning_agent, None);
+        let encoded = serde_json::to_value(&ungoverned).expect("encode schedule");
+        assert!(
+            encoded.get("commissioning_agent").is_none(),
+            "an uncommissioned schedule writes no agent, as rows did before the field"
+        );
+        let decoded: Schedule = serde_json::from_value(encoded).expect("decode schedule");
+        assert_eq!(decoded.config.commissioning_agent, None);
     }
 }

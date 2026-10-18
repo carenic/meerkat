@@ -254,7 +254,7 @@ A realm server and an `mcp.toml` server with the same name must be defined ident
 Command forms:
 
 ```bash
-rkat mcp add <NAME> [--transport stdio|http|sse] [--scope project|user|local|realm] [--expected-generation <N>] [-H KEY:VALUE...] [-e KEY=VALUE...] [--oauth-account <ACCOUNT_ID>] [--allow-operation <OP>...] [--url <URL> | <URL> | -- <CMD...>]
+rkat mcp add <NAME> [--transport stdio|http|sse] [--scope project|user|local|realm] [--expected-generation <N>] [-H KEY:VALUE...] [-e KEY=VALUE...] [--oauth-account <ACCOUNT_ID> | --oauth-account-selection discover|unverified] [--allow-operation <OP>...] [--url <URL> | <URL> | -- <CMD...>]
 rkat mcp login <NAME> [--scope project|user|local|realm] [--allow-headless]
 rkat mcp remove <NAME> [--scope project|user|local|realm] [--expected-generation <N>]
 rkat mcp list [--scope project|user|local|realm] [--json]
@@ -269,7 +269,7 @@ rkat mcp add filesystem -- npx -y @modelcontextprotocol/server-filesystem .
 
 # HTTP server
 rkat mcp add linear --url https://mcp.example.com
-rkat mcp add --transport http remote-tools https://mcp.example.com/api
+rkat mcp add --transport http remote-tools https://mcp.example.com/api --oauth-account-selection discover
 rkat mcp login remote-tools
 
 # User-wide server with environment passed to the stdio process
@@ -283,7 +283,7 @@ Notes:
 
 - Use `--transport http` for streamable HTTP and `--transport sse` for legacy SSE.
 - `-H KEY:VALUE` is for HTTP/SSE headers; `-e KEY=VALUE` is for stdio process environment.
-- OAuth for HTTP MCP servers is discovered at connect/login time; do not add an auth schema. Interactive login needs an account selection on the server entry: `oauth_account` (`rkat mcp add --oauth-account <ACCOUNT_ID>`, HTTP only) or `oauth_account_selection = "discover"` / `"unverified"`. `rkat mcp login <name>` runs the login explicitly (`--allow-headless` without a terminal). `rkat run` defaults to `--mcp-auth stored`; use `--mcp-auth interactive` for first-use browser auth in a TTY run (needs `oauth_account`; for `discover` or `unverified` servers run `rkat mcp login` first). MCP OAuth credentials are per realm (0.9): each realm logs in for itself.
+- OAuth for HTTP MCP servers is discovered at connect/login time; do not add an auth schema. Interactive login needs an account selection on the server entry, written by `rkat mcp add` (HTTP only; the flags conflict): `--oauth-account <ACCOUNT_ID>` (`oauth_account`, a provider subject ID, not an email), `--oauth-account-selection discover` (bind the account the provider verifies at the first login) or `--oauth-account-selection unverified` (resource-bound access with no account evidence). `rkat mcp login <name>` runs the login explicitly (`--allow-headless` without a terminal); it never sets a selection, and without one it refuses before any network request with the `rkat mcp remove`/`rkat mcp add` commands for each choice. A `discover` (or `--oauth-account`) server whose issuer publishes no OpenID Connect UserInfo is refused before client registration, nothing stored, naming `unverified` as the deliberate alternative. `rkat run` defaults to `--mcp-auth stored`; use `--mcp-auth interactive` for first-use browser auth in a TTY run (any account selection). MCP OAuth credentials are per realm (0.9): each realm logs in for itself.
 - `--allow-operation <OP>` (repeatable) writes an access ceiling, `access = { allowed_operations = [...] }`: every other raw MCP operation is neither published nor callable. Sessions started after the write enforce it; a live session keeps its definition until that server reloads. A ceiling narrows access only; it does not make the allowed operations read-only.
 - A stdio server can name secret environment variables in `secret_env` (names only). Only servers defined in a realm's own config document have custody: that realm's credential store holds the values (set by a Rust host with `meerkat::set_mcp_service_secret`), they are read at launch for that exact definition, never from the host environment, and an `mcp.toml` or live-added server that declares `secret_env` is refused.
 - `rkat mcp` is a config surface. Live mutation of a running session uses JSON-RPC `mcp/add|remove|reload`, REST `POST /sessions/{id}/mcp/*`, MCP-server tools, or SDK helpers. After an RPC or REST `auth/login/complete` for an MCP target, live sessions awaiting that exact server (name, URL and account) re-add it at their next turn boundary; an RPC `auth/logout` releases it from the sessions connected with it the same way. No host `mcp/reload` is needed.
@@ -1187,13 +1187,13 @@ tools.
 
 ```toml
 # Default: three providers + Copilot backend; no persistent realm/comms/MCP/skills/memory/live activation
-meerkat = "=0.9.2"
+meerkat = "=0.9.3"
 
 # Single provider, minimal
-meerkat = { version = "=0.9.2", default-features = false, features = ["anthropic"] }
+meerkat = { version = "=0.9.3", default-features = false, features = ["anthropic"] }
 
 # Add persistence + memory + comms + live channels
-meerkat = { version = "=0.9.2", features = [
+meerkat = { version = "=0.9.3", features = [
     "jsonl-store", "session-store", "session-compaction",
     "memory-store-session", "comms", "mcp", "skills",
     "openai-realtime", "live", "live-webrtc"
@@ -1224,7 +1224,7 @@ surfaces. The default `rkat` feature set includes `memory-store` and
 builds:
 
 ```bash
-cargo install rkat --version "=0.9.2" --no-default-features --features "anthropic,openai,session-store,mcp"
+cargo install rkat --version "=0.9.3" --no-default-features --features "anthropic,openai,session-store,mcp"
 ```
 
 Disabled features return typed errors (e.g. `SessionError::PersistenceDisabled`) — no panics.
@@ -1577,7 +1577,7 @@ names) and `read_only`, but no `allow`; the `[tools]` config section has no
   its fallback restore is restricted to non-runtime-owner builds.
 - **Per-turn overlay** - `turn_tool_overlay {allowed_tools?, blocked_tools?, tool_choice_plan?}` on RPC `turn/start`, REST `POST /sessions/{id}/messages`, `mob/turn_start`, Python `turn_tool_overlay=` and TypeScript `turnToolOverlay` (Rust: `TurnToolOverlay` on `StartTurnRequest.runtime.turn_tool_overlay`, also used by mob flow steps). Ephemeral, not sticky session visibility. `tool_choice_plan` entries (`{"mode": "auto"|"required"|"none"}` or `{"mode": "tool", "name": ...}`) apply to the run's k-th model call.
 - **Configured MCP servers** - CLI `rkat mcp add/remove/list/get` edits `.rkat/mcp.toml`, `~/.rkat/mcp.toml`, or (`--scope realm`) the realm's own `[[tools.mcp_servers]]`. New `rkat run` and `rkat run --resume` sessions load that config.
-- **MCP HTTP OAuth** - streamable HTTP servers can require OAuth without any auth schema in MCP config; interactive login needs the server's account selection (`oauth_account` or `oauth_account_selection`), and credentials are per realm. Stored mode (`rkat run --mcp-auth stored`, the default) uses persisted tokens only and reports `rkat mcp login <server>` when auth is missing. Interactive mode (`--mcp-auth interactive`) may open a browser from a TTY, store tokens, reconnect, and continue the run; it needs an `oauth_account` on the server (for `oauth_account_selection = "discover"` or `"unverified"` run `rkat mcp login <server>` first).
+- **MCP HTTP OAuth** - streamable HTTP servers can require OAuth without any auth schema in MCP config; interactive login needs the server's account selection (`oauth_account` or `oauth_account_selection`), and credentials are per realm. Stored mode (`rkat run --mcp-auth stored`, the default) uses persisted tokens only and reports `rkat mcp login <server>` when auth is missing. Interactive mode (`--mcp-auth interactive`) may open a browser from a TTY, store tokens, reconnect, and continue the run, for any server with an account selection (`rkat mcp add --oauth-account` or `--oauth-account-selection discover|unverified`).
 - **MCP access ceilings** - `access = { allowed_operations = [...] }` on a server entry (`rkat mcp add --allow-operation`) unpublishes every other raw operation; a call that still reaches one is refused as an `access_denied` tool result.
 - **Live MCP mutation** — JSON-RPC `mcp/add`, `mcp/remove`, `mcp/reload`, REST `POST /sessions/{id}/mcp/*`, MCP-server tools, and SDK helpers stage server changes on the `McpRouter`. Applied at next turn boundary. Removals drain in-flight calls before finalizing.
 - **Async MCP loading** - At startup, MCP servers connect in parallel in the background. The agent loop polls `poll_external_updates()` at each `CallingLlm` boundary, and servers become available as each completes its handshake. While any is connecting the model sees a pending notice (`Servers connecting: <names>. Tools will appear when ready.`).

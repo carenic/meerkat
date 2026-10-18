@@ -7431,6 +7431,27 @@ impl MobRuntimeMetadataStore for FaultInjectedRuntimeMetadataStore {
             .delete_member_live_cleanup_record(mob_id, expected)
             .await
     }
+
+    async fn put_callback_claim_verifier_if_absent(
+        &self,
+        mob_id: &MobId,
+        verifier: &crate::MobClaimVerifier,
+    ) -> Result<bool, MobStoreError> {
+        self.inner
+            .put_callback_claim_verifier_if_absent(mob_id, verifier)
+            .await
+    }
+
+    async fn load_callback_claim_verifier(
+        &self,
+        mob_id: &MobId,
+    ) -> Result<Option<crate::MobClaimVerifier>, MobStoreError> {
+        self.inner.load_callback_claim_verifier(mob_id).await
+    }
+
+    async fn delete_callback_claim_verifier(&self, mob_id: &MobId) -> Result<bool, MobStoreError> {
+        self.inner.delete_callback_claim_verifier(mob_id).await
+    }
 }
 
 // -----------------------------------------------------------------------
@@ -7578,18 +7599,20 @@ fn sample_definition_with_mob_tools() -> MobDefinition {
 
 fn generated_mob_operator_authority_with_scope(
     mob_id: &str,
+    incarnation: meerkat_core::service::MobIncarnationId,
 ) -> meerkat_core::service::MobToolAuthorityContext {
     let authority = meerkat_runtime::mob_operator_authority::create_only_mob_operator_authority()
         .expect("generated create-only mob authority should be accepted");
     let authority =
         meerkat_runtime::mob_operator_authority::set_create_authority(&authority, false)
             .expect("generated mob authority should disable create scope");
-    meerkat_runtime::mob_operator_authority::grant_manage_mob(&authority, mob_id)
+    meerkat_runtime::mob_operator_authority::grant_manage_mob(&authority, mob_id, incarnation)
         .expect("generated mob authority should grant managed mob scope")
 }
 
 fn generated_mob_operator_authority_with_spawn_profile(
     mob_id: &str,
+    incarnation: meerkat_core::service::MobIncarnationId,
     profile: &str,
 ) -> meerkat_core::service::MobToolAuthorityContext {
     // Create-only authority with NO manage scope on the target mob, granted a
@@ -7602,8 +7625,58 @@ fn generated_mob_operator_authority_with_spawn_profile(
     let authority =
         meerkat_runtime::mob_operator_authority::set_create_authority(&authority, false)
             .expect("generated mob authority should disable create scope");
-    meerkat_runtime::mob_operator_authority::grant_spawn_profile_in_mob(&authority, mob_id, profile)
-        .expect("generated mob authority should grant a spawnable profile")
+    meerkat_runtime::mob_operator_authority::grant_spawn_profile_in_mob(
+        &authority,
+        mob_id,
+        incarnation,
+        profile,
+    )
+    .expect("generated mob authority should grant a spawnable profile")
+}
+
+/// A mob runtime start mints one incarnation that every handle clone shares.
+/// A mob created again under the same id, or resumed after a shutdown, is
+/// another incarnation, so operator scope granted for the first never
+/// reaches it.
+#[tokio::test]
+async fn each_mob_runtime_start_mints_a_new_incarnation() {
+    let service = Arc::new(MockSessionService::new());
+    let _ = service.enable_runtime_adapter();
+    let storage = MobStorage::in_memory();
+    let created = MobBuilder::new(sample_definition(), storage.clone())
+        .with_session_service(service.clone())
+        .create()
+        .await
+        .expect("create mob");
+    let incarnation = created.incarnation();
+    assert_eq!(created.clone().incarnation(), incarnation);
+    assert_eq!(created.observer().incarnation(), incarnation);
+    let mob_id = created.mob_id().clone();
+    created.shutdown().await.expect("stop the first runtime");
+
+    // A mob created again under the same id is another incarnation, and a
+    // grant for the first does not reach it.
+    let (recreated, _recreated_service) = create_test_mob(sample_definition()).await;
+    assert_eq!(recreated.mob_id(), &mob_id);
+    assert_ne!(recreated.incarnation(), incarnation);
+    let authority = generated_mob_operator_authority_with_scope(mob_id.as_str(), incarnation);
+    assert!(authority.can_manage_mob(mob_id.as_str(), incarnation));
+    assert!(!authority.can_manage_mob(mob_id.as_str(), recreated.incarnation()));
+    recreated
+        .shutdown()
+        .await
+        .expect("stop the recreated runtime");
+
+    // The first mob resumed by a later runtime is another incarnation too.
+    let resumed_service = Arc::new(MockSessionService::new());
+    let _ = resumed_service.enable_runtime_adapter();
+    let resumed = MobBuilder::for_resume(storage)
+        .with_session_service(resumed_service)
+        .resume()
+        .await
+        .expect("resume the mob");
+    assert_ne!(resumed.incarnation(), incarnation);
+    assert_ne!(resumed.incarnation(), recreated.incarnation());
 }
 
 fn sample_definition_with_external_backend() -> MobDefinition {
@@ -8821,10 +8894,7 @@ async fn spawn_live_external_peer_with_transport(
                         responder_runtime
                             .peer_interaction_handle()
                             .expect("live external peer semantic authority")
-                            .request_received(
-                                PeerCorrelationId::from_uuid(candidate.interaction.id.0),
-                                candidate.interaction.handling_mode,
-                            )
+                            .request_received_from_ingress(&candidate)
                             .expect("record inbound peer request before response");
                         let bridge_parse: Result<super::bridge_protocol::BridgeCommand, _> =
                             serde_json::from_value(params.clone());
@@ -15217,6 +15287,222 @@ async fn test_mob_builder_allows_ephemeral_session_service_when_opted_in() {
         .await
         .expect("create should allow ephemeral sessions when explicitly enabled");
     assert_eq!(handle.status().await.unwrap(), MobState::Running);
+}
+
+/// A mob created with a callback claim verifier answers its creator's token
+/// and no other; a mob created without one answers none until the host
+/// records one, which is never replaced. A store that already holds a
+/// verifier for the mob's id (an earlier mob's) fails the create.
+#[tokio::test]
+async fn a_created_mob_answers_only_its_own_callback_claim_token() {
+    use crate::CallbackClaimCheck;
+
+    let token = crate::MobClaimToken::mint().expect("entropy");
+    let other = crate::MobClaimToken::mint().expect("entropy");
+    let service = Arc::new(MockSessionService::new());
+    let _ = service.enable_runtime_adapter();
+    let handle = MobBuilder::new(sample_definition(), MobStorage::in_memory())
+        .with_session_service(service.clone())
+        .with_callback_claim_verifier(token.verifier())
+        .create()
+        .await
+        .expect("create mob");
+    assert_eq!(
+        handle.check_callback_claim_token(&token).await.unwrap(),
+        CallbackClaimCheck::Verified
+    );
+    assert_eq!(
+        handle.check_callback_claim_token(&other).await.unwrap(),
+        CallbackClaimCheck::Mismatch
+    );
+
+    // Each mob here has its own id: a live mob holds its id's supervisor
+    // participant name.
+    let mut tokenless = sample_definition();
+    tokenless.id = MobId::from(format!("{}-tokenless", tokenless.id));
+    let (unclaimable, _service) = create_test_mob(tokenless).await;
+    assert_eq!(
+        unclaimable
+            .check_callback_claim_token(&token)
+            .await
+            .unwrap(),
+        CallbackClaimCheck::NotClaimable
+    );
+    assert!(
+        unclaimable
+            .record_callback_claim_verifier_if_absent(&other.verifier())
+            .await
+            .unwrap()
+    );
+    assert!(
+        !unclaimable
+            .record_callback_claim_verifier_if_absent(&token.verifier())
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        unclaimable
+            .check_callback_claim_token(&other)
+            .await
+            .unwrap(),
+        CallbackClaimCheck::Verified
+    );
+
+    let mut earlier = sample_definition();
+    earlier.id = MobId::from(format!("{}-earlier", earlier.id));
+    let kept = MobStorage::in_memory();
+    assert!(
+        kept.runtime_metadata
+            .put_callback_claim_verifier_if_absent(&earlier.id, &other.verifier())
+            .await
+            .unwrap()
+    );
+    let refused = MobBuilder::new(earlier.clone(), kept.clone())
+        .with_session_service(service)
+        .with_callback_claim_verifier(token.verifier())
+        .create()
+        .await;
+    assert!(
+        matches!(
+            &refused,
+            Err(MobError::Internal(message)) if message.contains("already holds a callback claim verifier")
+        ),
+        "{:?}",
+        refused.map(|_| ())
+    );
+    assert!(
+        kept.events.replay_all().await.unwrap().is_empty(),
+        "a refused create writes no event"
+    );
+    assert!(
+        kept.runtime_metadata
+            .load_callback_claim_verifier(&earlier.id)
+            .await
+            .unwrap()
+            .is_some_and(|found| found.verifies(&other)),
+        "a refused create keeps the verifier it found"
+    );
+}
+
+/// Destroy deletes the mob's callback claim verifier with the rest of its
+/// runtime metadata: a mob created again under the id on the store the host
+/// kept never answers the destroyed mob's token, and the host can mint the
+/// new mob one of its own.
+#[tokio::test]
+async fn a_destroyed_mobs_claim_token_never_claims_a_mob_created_again_on_a_kept_store() {
+    use crate::CallbackClaimCheck;
+
+    let token = crate::MobClaimToken::mint().expect("entropy");
+    let service = Arc::new(MockSessionService::new());
+    let _ = service.enable_runtime_adapter();
+    let definition = with_unique_mob_id(sample_definition(), "claim-recreated");
+    let kept = MobStorage::in_memory();
+    let destroyed = MobBuilder::new(definition.clone(), kept.clone())
+        .with_session_service(service.clone())
+        .with_callback_claim_verifier(token.verifier())
+        .create()
+        .await
+        .expect("create mob");
+    assert_eq!(
+        destroyed.check_callback_claim_token(&token).await.unwrap(),
+        CallbackClaimCheck::Verified
+    );
+    destroyed.destroy().await.expect("destroy");
+    drop(destroyed);
+    await_supervisor_route_release(&definition.id).await;
+
+    let again = MobBuilder::new(definition, kept)
+        .with_session_service(service)
+        .create()
+        .await
+        .expect("create the mob again under its id on the kept store");
+    assert_eq!(
+        again.check_callback_claim_token(&token).await.unwrap(),
+        CallbackClaimCheck::NotClaimable,
+        "the destroyed mob's token claims nothing"
+    );
+    let minted = crate::MobClaimToken::mint().expect("entropy");
+    assert!(
+        again
+            .record_callback_claim_verifier_if_absent(&minted.verifier())
+            .await
+            .unwrap(),
+        "the host mints the new mob a token of its own"
+    );
+    assert_eq!(
+        again.check_callback_claim_token(&token).await.unwrap(),
+        CallbackClaimCheck::Mismatch
+    );
+    assert_eq!(
+        again.check_callback_claim_token(&minted).await.unwrap(),
+        CallbackClaimCheck::Verified
+    );
+}
+
+/// A create that fails after it wrote the creator's claim verifier deletes
+/// that verifier again: a retry of the mob's id on the same store records its
+/// own, and the mob answers only the retry's token.
+#[tokio::test]
+async fn a_create_that_fails_after_writing_its_claim_verifier_leaves_the_id_creatable() {
+    use crate::CallbackClaimCheck;
+
+    let events = Arc::new(FaultInjectedMobEventStore::new());
+    let storage = MobStorage::with_events_and_runtime_metadata(
+        events.clone(),
+        Arc::new(InMemoryMobRuntimeMetadataStore::new()),
+    );
+    let service = Arc::new(MockSessionService::new());
+    let _ = service.enable_runtime_adapter();
+    let definition = with_unique_mob_id(sample_definition(), "claim-failed-create");
+    let failed_token = crate::MobClaimToken::mint().expect("entropy");
+    events.fail_appends_for("MobCreated").await;
+    let failed = MobBuilder::new(definition.clone(), storage.clone())
+        .with_session_service(service.clone())
+        .with_callback_claim_verifier(failed_token.verifier())
+        .create()
+        .await;
+    let error = match failed {
+        Ok(_) => panic!("the create fails at its first event"),
+        Err(error) => error,
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("fault-injected append failure for MobCreated"),
+        "{error}"
+    );
+    assert!(
+        storage
+            .runtime_metadata
+            .load_callback_claim_verifier(&definition.id)
+            .await
+            .unwrap()
+            .is_none(),
+        "the failed create deleted the verifier it wrote"
+    );
+
+    events.allow_appends_for("MobCreated").await;
+    let retry_token = crate::MobClaimToken::mint().expect("entropy");
+    let retried = MobBuilder::new(definition, storage)
+        .with_session_service(service)
+        .with_callback_claim_verifier(retry_token.verifier())
+        .create()
+        .await
+        .expect("a retry of the id on the same store creates the mob");
+    assert_eq!(
+        retried
+            .check_callback_claim_token(&retry_token)
+            .await
+            .unwrap(),
+        CallbackClaimCheck::Verified
+    );
+    assert_eq!(
+        retried
+            .check_callback_claim_token(&failed_token)
+            .await
+            .unwrap(),
+        CallbackClaimCheck::Mismatch
+    );
 }
 
 #[tokio::test]
@@ -24993,6 +25279,7 @@ async fn profile_tools_mob_true_rejects_deserialized_operator_authority_projecti
         serde_json::from_value(
             serde_json::to_value(generated_mob_operator_authority_with_scope(
                 handle.definition().id.as_str(),
+                handle.incarnation(),
             ))
             .unwrap(),
         )
@@ -25033,7 +25320,10 @@ async fn test_visible_mob_operator_reads_still_require_exact_scope() {
         handle.clone(),
         None,
         None,
-        Some(generated_mob_operator_authority_with_scope("different-mob")),
+        Some(generated_mob_operator_authority_with_scope(
+            "different-mob",
+            meerkat_core::service::MobIncarnationId::mint(),
+        )),
     )
     .expect("compose dispatcher")
     .expect("operator dispatcher should be visible when authority is injected");
@@ -25076,7 +25366,10 @@ async fn test_visible_mob_operator_tools_deny_before_arg_validation_when_scope_m
         handle.clone(),
         None,
         None,
-        Some(generated_mob_operator_authority_with_scope("different-mob")),
+        Some(generated_mob_operator_authority_with_scope(
+            "different-mob",
+            meerkat_core::service::MobIncarnationId::mint(),
+        )),
     )
     .expect("compose dispatcher")
     .expect("operator dispatcher should be visible when authority is injected");
@@ -25121,7 +25414,10 @@ async fn test_coarse_spawn_tool_admission_is_machine_routed() {
         handle.clone(),
         None,
         None,
-        Some(generated_mob_operator_authority_with_scope("different-mob")),
+        Some(generated_mob_operator_authority_with_scope(
+            "different-mob",
+            meerkat_core::service::MobIncarnationId::mint(),
+        )),
     )
     .expect("compose dispatcher")
     .expect("operator dispatcher should be visible when authority is injected");
@@ -25169,6 +25465,7 @@ async fn test_coarse_spawn_tool_admission_is_machine_routed() {
         None,
         Some(generated_mob_operator_authority_with_spawn_profile(
             mob_id.as_str(),
+            handle.incarnation(),
             "worker",
         )),
     )
@@ -25245,7 +25542,9 @@ async fn forker_without_manage_scope_observes_and_retires_only_its_own_children(
         None,
         None,
         Some(generated_mob_operator_authority_with_spawn_profile(
-            &mob_id, "worker",
+            &mob_id,
+            handle.incarnation(),
+            "worker",
         )),
     )
     .expect("compose dispatcher")
@@ -25361,7 +25660,9 @@ async fn forker_force_cancels_only_running_members_it_owns() {
         None,
         None,
         Some(generated_mob_operator_authority_with_spawn_profile(
-            &mob_id, "worker",
+            &mob_id,
+            handle.incarnation(),
+            "worker",
         )),
     )
     .expect("compose dispatcher")
@@ -25620,13 +25921,17 @@ async fn owned_member_tools_report_absent_targets_as_typed_not_found() {
     let forker_tools = owned_member_tool_dispatcher(
         &handle,
         &forker,
-        generated_mob_operator_authority_with_spawn_profile(&mob_id, "worker"),
+        generated_mob_operator_authority_with_spawn_profile(
+            &mob_id,
+            handle.incarnation(),
+            "worker",
+        ),
     )
     .await;
     let manager_tools = owned_member_tool_dispatcher(
         &handle,
         &bystander,
-        generated_mob_operator_authority_with_scope(&mob_id),
+        generated_mob_operator_authority_with_scope(&mob_id, handle.incarnation()),
     )
     .await;
 
@@ -26357,7 +26662,10 @@ async fn test_visible_mob_operator_tools_emit_identity_native_member_payloads() 
         handle.clone(),
         None,
         None,
-        Some(generated_mob_operator_authority_with_scope(mob_id.as_str())),
+        Some(generated_mob_operator_authority_with_scope(
+            mob_id.as_str(),
+            handle.incarnation(),
+        )),
     )
     .expect("compose dispatcher")
     .expect("operator dispatcher should be visible when authority is injected");
@@ -35944,6 +36252,7 @@ async fn test_build_resumed_agent_config_rejects_mismatched_session_identity() {
                 additional_instructions: None,
                 shell_env: None,
                 mob_tool_authority_context: None,
+                mob_incarnation: Some(meerkat_core::service::MobIncarnationId::mint()),
                 tool_access_policy: None,
                 inherited_tool_filter: None,
                 system_prompt_override: None,
@@ -48611,8 +48920,14 @@ async fn test_cancel_all_work_abandons_admitted_unstarted_work_and_spares_later_
     assert_cancel_verb_covers_admitted_unstarted_work(true).await;
 }
 
+/// The runtime records a runtime-backed member's exact-run cancel before it
+/// delivers it live. When the session service cannot take the live boundary
+/// cancel, the runtime reports the outcome as owned by that recorded cancel
+/// (`InterruptDispatchOutcomeUnknown`), and cancel-all-work reads it as
+/// cancelled, as a member stop does: one live boundary-cancel attempt, no
+/// fallback to a hard interrupt.
 #[tokio::test]
-async fn test_runtime_adapter_cancel_all_work_rejects_unsupported_boundary_cancel() {
+async fn test_runtime_adapter_cancel_all_work_reports_recorded_cancel_on_unsupported_delivery() {
     let (handle, service) = create_test_mob(sample_definition()).await;
     let member_id = AgentIdentity::from("runtime-unsupported-boundary");
     let session_id = handle
@@ -48661,15 +48976,11 @@ async fn test_runtime_adapter_cancel_all_work_rejects_unsupported_boundary_cance
     let baseline_boundary = service.cancel_after_boundary_call_count();
     let baseline_interrupts = service.interrupt_call_count();
 
-    let error = handle
+    handle
         .cancel_all_work(entry.agent_runtime_id.clone(), entry.fence_token)
         .await
-        .expect_err("unsupported runtime-backed boundary cancel must not report success");
+        .expect("the runtime recorded the exact-run cancel; its live delivery is not the outcome");
 
-    assert!(
-        matches!(&error, MobError::Internal(message) if message.contains("cancel_after_boundary")),
-        "runtime-backed unsupported boundary cancel should surface through the adapter path, got {error:?}"
-    );
     assert_eq!(
         service.cancel_after_boundary_call_count(),
         baseline_boundary + 1,
@@ -85728,10 +86039,7 @@ async fn spawn_host_daemon_stub(label: &str, live_endpoint: Option<String>) -> H
                 responder_runtime
                     .peer_interaction_handle()
                     .expect("host stub semantic authority")
-                    .request_received(
-                        PeerCorrelationId::from_uuid(candidate.interaction.id.0),
-                        candidate.interaction.handling_mode,
-                    )
+                    .request_received_from_ingress(&candidate)
                     .expect("record inbound host stub request before response");
                 let to =
                     trust_candidate_sender_for_reply(responder_runtime.as_ref(), &candidate).await;
@@ -86783,7 +87091,10 @@ async fn dispatch_handles_bind_their_authority_lanes() {
     let dispatcher = super::tools::MobOperatorToolDispatcher::new(
         handle.clone(),
         false,
-        generated_mob_operator_authority_with_scope(handle.definition().id.as_str()),
+        generated_mob_operator_authority_with_scope(
+            handle.definition().id.as_str(),
+            handle.incarnation(),
+        ),
     );
     assert!(
         matches!(
@@ -86807,7 +87118,10 @@ async fn dispatch_handles_bind_their_authority_lanes() {
             ),
         ),
         false,
-        generated_mob_operator_authority_with_scope(handle.definition().id.as_str()),
+        generated_mob_operator_authority_with_scope(
+            handle.definition().id.as_str(),
+            handle.incarnation(),
+        ),
     );
     assert!(
         fenced_dispatcher.has_member_operator_execution_fence(),
@@ -86859,6 +87173,65 @@ fn a_stop_cancel_that_finds_its_run_over_reports_it_ended() {
         )
         .is_err(),
         "a real cancel failure stays an error"
+    );
+}
+
+/// A force cancel or cancel-all-work whose exact-run cancel the runtime
+/// recorded, but whose live delivery failed (`InterruptDispatchOutcomeUnknown`:
+/// the run crossed its boundary during the delivery), reports the run
+/// cancelled, as a member stop does: the recorded cancel ends the run at its
+/// next boundary, so it is not a failed cancel.
+#[test]
+fn a_member_cancel_whose_delivery_outcome_is_unknown_reports_the_recorded_cancel() {
+    use super::provisioner::{
+        MemberRunCancelOutcome, classify_member_run_cancel, classify_stop_member_cancel,
+    };
+    use crate::MemberStopRun;
+    let run_id = meerkat_core::lifecycle::RunId::new();
+    let unknown = || meerkat_runtime::RuntimeDriverError::InterruptDispatchOutcomeUnknown {
+        run_id: run_id.clone(),
+        reason: "the run's boundary cancel is recorded in its turn state; its live delivery \
+                 failed"
+            .to_string(),
+    };
+    for cancelled in [Ok(true), Err(unknown())] {
+        assert_eq!(
+            classify_member_run_cancel(cancelled, run_id.clone()).unwrap(),
+            MemberRunCancelOutcome::Cancelled {
+                run_id: run_id.clone()
+            }
+        );
+    }
+    for ended in [
+        Ok(false),
+        Err(meerkat_runtime::RuntimeDriverError::StaleAuthority {
+            reason: "attachment replaced".to_string(),
+        }),
+        Err(meerkat_runtime::RuntimeDriverError::NotReady {
+            state: meerkat_runtime::RuntimeState::Idle,
+        }),
+    ] {
+        assert_eq!(
+            classify_member_run_cancel(ended, run_id.clone()).unwrap(),
+            MemberRunCancelOutcome::RunEndedBeforeCancel {
+                run_id: run_id.clone()
+            }
+        );
+    }
+    assert!(
+        classify_member_run_cancel(
+            Err(meerkat_runtime::RuntimeDriverError::Internal(
+                "boom".to_string()
+            )),
+            run_id.clone(),
+        )
+        .is_err(),
+        "a real cancel failure stays an error"
+    );
+    // The member stop reads the same outcome as its recorded cancel.
+    assert_eq!(
+        classify_stop_member_cancel(Err(unknown()), run_id.clone()).unwrap(),
+        MemberStopRun::CancelledAtBoundary { run_id }
     );
 }
 
@@ -86925,6 +87298,154 @@ async fn test_stop_reports_a_turn_driven_members_running_turn_left_running() {
     tokio::time::timeout(Duration::from_secs(30), turn.wait())
         .await
         .expect("the running turn finishes")
+        .expect("its turn completes");
+}
+
+/// A mob Stop holds its members' run starts concurrently. Each hold waits on
+/// its own member's runtime (the session's mutation gate, which a running
+/// turn's commit holds), so a Stop of many busy members lasts about one hold
+/// instead of all of them one after another, and the actor's inline Stop
+/// step stays short.
+#[tokio::test]
+async fn test_stop_holds_member_run_starts_concurrently() {
+    const MEMBERS: usize = 8;
+    const HOLD: Duration = Duration::from_millis(250);
+    let mut definition = sample_definition();
+    definition
+        .profiles
+        .get_mut(&ProfileName::from("worker"))
+        .expect("worker profile")
+        .as_inline_mut()
+        .unwrap()
+        .runtime_mode = crate::MobRuntimeMode::TurnDriven;
+    let (handle, service) = create_test_mob_with_runtime_backed_real_comms(definition).await;
+    for index in 0..MEMBERS {
+        handle
+            .spawn(
+                ProfileName::from("worker"),
+                AgentIdentity::from(format!("worker-held-{index}")),
+                None,
+            )
+            .await
+            .expect("spawn turn-driven worker");
+    }
+
+    service
+        .runtime_adapter
+        .delay_hold_run_starts_for_test(Some(HOLD));
+    service
+        .runtime_adapter
+        .take_max_in_flight_hold_run_starts_for_test();
+    let report = handle.stop().await.expect("stop the mob");
+    let max_in_flight = service
+        .runtime_adapter
+        .take_max_in_flight_hold_run_starts_for_test();
+    service.runtime_adapter.delay_hold_run_starts_for_test(None);
+
+    assert_eq!(report.members.len(), MEMBERS, "{report:?}");
+    assert!(
+        report
+            .members
+            .values()
+            .all(|outcome| outcome.starts == crate::MemberRunStarts::Held),
+        "every member is held: {report:?}"
+    );
+    assert!(
+        max_in_flight >= MEMBERS.min(super::actor::STOP_RUN_START_HOLD_CONCURRENCY),
+        "a Stop of {MEMBERS} members had at most {max_in_flight} run-start holds in \
+         flight at once: the holds ran one after another"
+    );
+}
+
+/// A Stop whose hold fails for one member still holds every other member,
+/// then, having failed, releases them all: the mob keeps running and input a
+/// member queued before the Stop starts (#1500: Stop is a pause, and a Stop
+/// that did not happen pauses nothing).
+#[tokio::test]
+async fn test_failed_stop_releases_every_member_it_held() {
+    let mut definition = sample_definition();
+    for profile in ["lead", "worker"] {
+        definition
+            .profiles
+            .get_mut(&ProfileName::from(profile))
+            .expect("profile")
+            .as_inline_mut()
+            .unwrap()
+            .runtime_mode = crate::MobRuntimeMode::TurnDriven;
+    }
+    let (handle, service) = create_test_mob_with_runtime_backed_real_comms(definition).await;
+    // The lead takes external input; the workers sit on either side of it.
+    let mut members = Vec::new();
+    for (profile, identity) in [
+        ("worker", "worker-released-0"),
+        ("lead", "lead-released"),
+        ("worker", "worker-released-2"),
+    ] {
+        let identity = AgentIdentity::from(identity);
+        let session_id = handle
+            .spawn(ProfileName::from(profile), identity.clone(), None)
+            .await
+            .expect("spawn turn-driven member")
+            .bridge_session_id()
+            .expect("session-backed")
+            .clone();
+        members.push((identity, session_id));
+    }
+
+    // Admit an input to the lead, then hold its runtime loop before it takes
+    // the input into a run: the input is queued when the Stop holds the lead.
+    let (queue_gap_entered, queue_gap_release) = service
+        .runtime_adapter
+        .arm_runtime_loop_before_queue_authority_test_hook(members[1].1.clone());
+    let member = handle.member(&members[1].0).await.expect("member handle");
+    let turn = member
+        .start_turn(
+            ContentInput::Text("admitted before the failed stop".into()),
+            HandlingMode::Queue,
+            crate::MemberTurnOptions::default(),
+            None,
+        )
+        .await
+        .expect("admit the input");
+    tokio::time::timeout(Duration::from_secs(30), queue_gap_entered)
+        .await
+        .expect("the runtime loop reaches the queue gap")
+        .expect("queue-authority hook armed");
+
+    // The first member's hold fails; every other member's hold is taken.
+    service
+        .runtime_adapter
+        .fail_hold_run_starts_for_test(Some(members[0].1.clone()));
+    let error = handle
+        .stop()
+        .await
+        .expect_err("the failed hold fails the stop");
+    service.runtime_adapter.fail_hold_run_starts_for_test(None);
+    assert!(
+        error
+            .to_string()
+            .contains("injected run-start hold failure"),
+        "the stop reports the failed hold: {error:?}"
+    );
+    assert_eq!(handle.status().await.unwrap(), MobState::Running);
+    for (identity, session_id) in &members {
+        assert_eq!(
+            service
+                .runtime_adapter
+                .run_starts_held_for_test(session_id)
+                .await,
+            Some(false),
+            "{identity} is released after the failed stop"
+        );
+    }
+
+    // The released lead's queued input runs.
+    queue_gap_release
+        .send(())
+        .expect("release the runtime loop");
+    tokio::time::timeout(Duration::from_secs(30), turn.wait())
+        .await
+        .expect("the queued input runs")
         .expect("its turn completes");
 }
 
@@ -89678,6 +90199,10 @@ mod owned_retirement;
 #[cfg(all(feature = "runtime-adapter", not(target_arch = "wasm32")))]
 mod resume_bind_custody;
 mod retirement_isolation;
+/// #1814 owned rollbacks release the turn-finalization boundary before they
+/// take the lease a concurrent raw unregister holds into its cleanup.
+#[cfg(all(feature = "runtime-adapter", not(target_arch = "wasm32")))]
+mod rollback_boundary_order;
 /// #1105 spawn-activation isolation: a parked activation must not stall the
 /// loop, a failed one must compensate exactly, and a stale one must be
 /// declined instead of touching its successor.

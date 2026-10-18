@@ -90,6 +90,11 @@ pub const PROVIDER_DEGRADED_EXCHANGE_LAG_MS: i64 = 10_000;
 /// Turbo S provider-degradation rule: a run whose speech end to input final
 /// lag p90 exceeds this is provider-degraded evidence.
 pub const PROVIDER_DEGRADED_P90_LAG_MS: i64 = 2_000;
+/// The p90 rule applies only to a run that measured at least this many
+/// exchanges. Up to ten, the p90 rank is the slowest exchange itself, so one
+/// slow exchange would void a small scenario (S98 measures at most five); a
+/// small run is judged by the single-exchange and backlog rules alone.
+pub const PROVIDER_DEGRADED_P90_MIN_EXCHANGES: usize = 11;
 
 /// Why a run was classified provider-degraded.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -98,7 +103,8 @@ pub enum ProviderDegradationCause {
     /// One exchange's speech end to input final lag reached
     /// [`PROVIDER_DEGRADED_EXCHANGE_LAG_MS`].
     ExchangeLag { lag_ms: i64 },
-    /// The run's lag p90 exceeded [`PROVIDER_DEGRADED_P90_LAG_MS`].
+    /// The run's lag p90 exceeded [`PROVIDER_DEGRADED_P90_LAG_MS`] over at
+    /// least [`PROVIDER_DEGRADED_P90_MIN_EXCHANGES`] exchanges.
     LagP90 { p90_ms: i64 },
     /// An exchange never reached its input final while the provider's own
     /// measured input backlog was at least
@@ -141,17 +147,24 @@ pub struct ProviderDegradation {
     pub provider_input_backlog_ms: Option<u64>,
 }
 
-/// Classify a run from its own evidence: the speech end to input final lag
-/// of every exchange that reached its final, plus the exchange that timed
-/// out before its final (if any) with the provider input backlog read at
-/// that moment. `None` is a valid (healthy) run.
-/// Lag p90 over the exchanges that reached an input final.
+/// Lag p90 over the exchanges that reached an input final (the slowest
+/// exchange when there are ten or fewer).
 fn lag_p90_ms(lags: &[(String, i64)]) -> Option<i64> {
     let mut sorted: Vec<i64> = lags.iter().map(|(_, lag)| *lag).collect();
     sorted.sort_unstable();
     (!sorted.is_empty()).then(|| sorted[((sorted.len() * 9) / 10).min(sorted.len() - 1)])
 }
 
+/// Classify a run from its own evidence: the speech end to input final lag
+/// of every exchange that reached its final, plus the exchange that timed
+/// out before its final (if any) with the provider input backlog read at
+/// that moment. `None` is a valid (healthy) run.
+///
+/// The lag is measured end to end in the browser, from the fixture's speech
+/// end to the input final arriving there. A delay on Meerkat's own uplink
+/// therefore reads the same as a provider delay: no provider-side clock
+/// corroborates the lag rules. Only the timeout rule is corroborated, by the
+/// provider's own measured input backlog.
 pub fn provider_degradation_verdict(
     lags: &[(String, i64)],
     timed_out: Option<(&str, Option<u64>)>,
@@ -169,7 +182,9 @@ pub fn provider_degradation_verdict(
             provider_input_backlog_ms: backlog_ms,
         });
     }
-    if let Some(p90) = p90_ms.filter(|p90| *p90 > PROVIDER_DEGRADED_P90_LAG_MS) {
+    if let Some(p90) = p90_ms.filter(|p90| {
+        lags.len() >= PROVIDER_DEGRADED_P90_MIN_EXCHANGES && *p90 > PROVIDER_DEGRADED_P90_LAG_MS
+    }) {
         let exchange = lags
             .iter()
             .find(|(_, lag)| *lag == p90)
@@ -2521,13 +2536,54 @@ mod tests {
             ("e3", 2_800),
             ("e4", 3_100),
             ("e5", 1_000),
+            ("e6", 950),
+            ("e7", 1_050),
+            ("e8", 1_200),
+            ("e9", 980),
+            ("e10", 1_100),
+            ("e11", 1_000),
         ]);
         let verdict = provider_degradation_verdict(&run, None).expect("degraded");
         assert_eq!(
             verdict.cause,
-            ProviderDegradationCause::LagP90 { p90_ms: 3_100 }
+            ProviderDegradationCause::LagP90 { p90_ms: 2_800 }
         );
-        assert_eq!(verdict.exchange, "e4");
+        assert_eq!(verdict.exchange, "e3");
+    }
+
+    /// Up to ten exchanges the p90 rank is the slowest exchange, so the p90
+    /// rule would void a small scenario over one slow exchange. S98 measures
+    /// at most five: one 2.5 s exchange among them is not degradation, and
+    /// neither is one in ten.
+    #[test]
+    fn one_slow_exchange_in_a_small_scenario_is_not_degraded() {
+        let s98 = lags(&[
+            ("remember", 900),
+            ("greeting", 2_500),
+            ("recall", 1_100),
+            ("delegation", 1_000),
+            ("recall_now", 950),
+        ]);
+        assert_eq!(provider_degradation_verdict(&s98, None), None);
+        let ten = lags(&[
+            ("e1", 900),
+            ("e2", 2_500),
+            ("e3", 1_100),
+            ("e4", 1_000),
+            ("e5", 950),
+            ("e6", 1_050),
+            ("e7", 1_200),
+            ("e8", 980),
+            ("e9", 1_100),
+            ("e10", 1_000),
+        ]);
+        assert_eq!(provider_degradation_verdict(&ten, None), None);
+        // The single-exchange rule still holds for a small scenario.
+        let stalled = lags(&[("remember", 900), ("greeting", 12_000)]);
+        assert_eq!(
+            provider_degradation_verdict(&stalled, None).map(|verdict| verdict.cause),
+            Some(ProviderDegradationCause::ExchangeLag { lag_ms: 12_000 })
+        );
     }
 
     /// A timeout is degradation only with the provider's own evidence that it

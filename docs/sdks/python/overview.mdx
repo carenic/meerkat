@@ -9,7 +9,7 @@ and automation. Create and resume sessions, stream results, use tools, schedule
 work or coordinate teams through async Python APIs. The SDK connects through
 `rkat-rpc` to the same runtime used by the CLI and other service surfaces.
 
-- **Contract version:** `0.9.2`
+- **Contract version:** `0.9.3`
 - **Python:** `>=3.10`
 - **Runtime dependencies:** `websockets>=12,<16`, plus `typing_extensions>=4.1` on Python 3.10
 
@@ -24,6 +24,32 @@ For local development:
 ```bash
 pip install -e "sdks/python[dev]"
 ```
+
+## The rkat-rpc binary
+
+`MeerkatClient` starts the first `rkat-rpc` it finds: `MEERKAT_BIN_PATH` when
+set, then an explicit `MeerkatClient(rkat_path=...)`, then `rkat-rpc` on
+`PATH`. The SDK runs those as they are: trusting a binary you chose is your
+decision. Otherwise it downloads the release binary of its own version and
+caches it under `~/.cache/meerkat/bin/rkat-rpc/v<version>/<target>/`.
+
+Only that download is verified. A published `meerkat-sdk` package pins the
+sha256 of every release archive it may download and of the `rkat-rpc` inside
+it: pinned when the package is built, from the release's manifest, with each
+archive's build attestation verified, and never fetched at download time. The download uses HTTPS only, redirects
+included, and refuses an archive over 256 MiB (`BINARY_DOWNLOAD_TOO_LARGE`). The archive is checked before anything is
+extracted, the binary before it is installed, and the cached binary again each
+time it is reused. A mismatch raises `BinaryIntegrityError` (code
+`BINARY_INTEGRITY_MISMATCH`, with `asset`, `path`, `expected_sha256` and
+`actual_sha256`): the SDK deletes what failed, runs nothing and does not fall
+back to another binary.
+
+<Note>
+A source or git install of the SDK (`pip install -e "sdks/python[dev]"`) pins
+no digests and refuses to download, raising `MeerkatError` with code
+`BINARY_DIGEST_UNAVAILABLE`. Build or install `rkat-rpc` yourself and put it on
+`PATH`, or set `MEERKAT_BIN_PATH` or `rkat_path` to a binary you trust.
+</Note>
 
 ## Quick start
 

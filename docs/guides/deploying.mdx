@@ -259,9 +259,9 @@ package pin goes through `--config`; repeat the flag with
 
 ## Worker Stack Budget
 
-Every host binary (`rkat`, `rkat-rpc`, `rkat-rest`, `rkat-mcp`) runs its Tokio
-workers, blocking threads, and its own main future on one documented stack
-budget: 8 MiB per thread, the constant
+Every host binary (`rkat`, `rkat-rpc`, `rkat-rest`, `rkat-mcp`,
+`rkat-mob-mcp`) runs its Tokio workers, blocking threads, and its own main
+future on one documented stack budget: 8 MiB per thread, the constant
 `meerkat_runtime::host_stack::HOST_WORKER_STACK_BUDGET`. The main future runs
 on a budgeted thread as well, so the platform main thread (1 MiB on Windows)
 never bounds a host.
@@ -282,6 +282,21 @@ value, passes above) from unbounded recursion (fails at every value). Values
 below 65536 or that are not a byte count are refused with exit code 2 rather
 than guessed at. `rkat-rpc` still honours its older `RKAT_RPC_WORKER_STACK_BYTES`
 when the shared variable is unset.
+
+## Worker Threads
+
+A host binary's Tokio runtime starts one worker thread per available CPU, as
+`std::thread::available_parallelism` counts them: a cpuset or a cgroup CPU
+quota (`docker run --cpus`, a Kubernetes CPU limit) lowers the count, a pids
+limit does not. `RKAT_WORKER_THREADS=<n>` sets the count for every host
+binary; when it is unset, Tokio's own `TOKIO_WORKER_THREADS` is read in its
+place. A value that is not a whole number of at least 1 is refused with exit
+code 2 rather than guessed at. Two small internal runtimes (the runtime-loop
+serving runtime and the machine cleanup runtime) always run two workers each.
+
+A Rust host that builds its own Tokio runtime can apply the same setting:
+`meerkat_runtime::host_stack::worker_threads_from_env()` returns the validated
+count, or `None` for the default.
 
 ## Containerizing The Binaries
 
@@ -365,6 +380,44 @@ in production.
 Not covered by the prebuilt binaries: Alpine and other musl-based images. No
 musl target is published, and the glibc binaries are not tested under
 `gcompat`. Build from source on such a base or use a Debian-family image.
+
+### Thread and process limits
+
+A container's pids limit (`docker run --pids-limit`, the cgroup's `pids.max`,
+the kubelet's pod PID limit) counts threads as well as processes, and so does
+`RLIMIT_NPROC` (`ulimit -u`) across all of a user's processes. A host started
+on a machine with more CPUs than its limit allows cannot start one worker per
+CPU (see [Worker Threads](#worker-threads)), and fails at startup:
+
+```text
+rkat-rpc: failed to spawn the rkat-rpc main thread: Resource temporarily unavailable (os error 11). The OS refuses new threads, usually because the process is at its thread limit; the runtime asks for 192 worker threads (one per available CPU). Observed limits: cgroup pids.max 128, RLIMIT_NPROC 2801400. Set RKAT_WORKER_THREADS to fewer workers, or raise the limit.
+```
+
+Releases before 0.9.3 print only the text up to `(os error 11)`. Set the
+worker count well below the limit, for example
+`docker run --pids-limit 256 -e RKAT_WORKER_THREADS=8 ...`; on releases before
+0.9.3, `TOKIO_WORKER_THREADS=8` has the same effect.
+
+Size the limit for everything the host runs, not only its workers:
+
+- An idle `rkat-rpc` runs about ten threads beyond its workers: its main
+  threads, the stdin reader, a file watcher, scheduler and delivery threads,
+  and a few blocking-pool threads.
+- Each live session with a persistent store adds one thread.
+- Blocking work (file and SQLite I/O, DNS lookups) runs on Tokio's blocking
+  pool, which can grow to 512 threads per runtime under load; idle ones exit
+  after 10 seconds. A blocking-pool spawn the limit refuses is queued until
+  one of the pool's threads is free, but only while the pool has a thread:
+  in a pool with none, Tokio panics instead (`OS can't spawn worker thread`).
+- Every MCP stdio server and shell command is a process inside the same
+  limit, with threads of its own.
+
+Near the limit, other thread spawns are refused too, later in startup or
+while serving, and what happens depends on which one. Usually the operation
+that needed the thread fails, and a refusal that ends the process as an I/O
+error gets a `hint:` line naming the usual causes and `RKAT_WORKER_THREADS`;
+a library that does not handle the refusal can abort the process instead.
+Leave headroom rather than sizing the limit to the worker count.
 
 ## Where The Prebuilt Binaries Come From
 

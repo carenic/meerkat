@@ -131,6 +131,8 @@ pub(crate) fn spawn(
                 | libc::POSIX_SPAWN_SETSIGDEF) as _,
         ))?;
         let mut pid = 0;
+        // A launch site of the confinement backend: the confined launch.
+        #[allow(clippy::disallowed_methods)]
         check(libc::posix_spawn(
             std::ptr::addr_of_mut!(pid),
             executable.as_ptr(),

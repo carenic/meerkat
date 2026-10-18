@@ -791,6 +791,7 @@ terminal_requires_delivery == (IF ((phase # "Succeeded") /\ (phase # "Failed") /
 notification_identity_and_sequence_cardinality_match == ((Cardinality(notification_ids) = Cardinality(notification_idempotency_keys)) /\ (DOMAIN notification_id_by_key = notification_idempotency_keys) /\ (DOMAIN notification_delivery_ids = notification_ids) /\ (DOMAIN notification_sequences = notification_ids))
 applied_notifications_are_committed == (Cardinality(notification_applied) <= Cardinality(notification_ids))
 nonterminal_has_no_terminal_delivery == (IF (phase = "Succeeded") THEN TRUE ELSE (IF (phase = "Failed") THEN TRUE ELSE (IF (phase = "Cancelled") THEN TRUE ELSE (IF (phase = "WorkerLost") THEN TRUE ELSE (IF (phase = "NeedsAttention") THEN TRUE ELSE ((terminal_kind = None) /\ (terminal_delivery_sequence = 0) /\ (terminal_delivery_applied = FALSE)))))))
+terminal_delivery_follows_every_notification == (IF (terminal_kind = None) THEN TRUE ELSE (\A id \in DOMAIN notification_sequences : ((IF "value" \in DOMAIN (IF (id \in DOMAIN notification_sequences) THEN Some((IF id \in DOMAIN notification_sequences THEN notification_sequences[id] ELSE 0)) ELSE None) THEN (IF (id \in DOMAIN notification_sequences) THEN Some((IF id \in DOMAIN notification_sequences THEN notification_sequences[id] ELSE 0)) ELSE None)["value"] ELSE None) < terminal_delivery_sequence)))
 
 CiStateConstraint == /\ model_step_count <= 6 /\ Cardinality(notification_ids) <= 1 /\ Cardinality(notification_idempotency_keys) <= 1 /\ Cardinality(DOMAIN notification_id_by_key) <= 1 /\ Cardinality(DOMAIN notification_delivery_ids) <= 1 /\ Cardinality(DOMAIN notification_sequences) <= 1 /\ Cardinality(notification_applied) <= 1
 DeepStateConstraint == /\ model_step_count <= 8 /\ Cardinality(notification_ids) <= 2 /\ Cardinality(notification_idempotency_keys) <= 2 /\ Cardinality(DOMAIN notification_id_by_key) <= 2 /\ Cardinality(DOMAIN notification_delivery_ids) <= 2 /\ Cardinality(DOMAIN notification_sequences) <= 2 /\ Cardinality(notification_applied) <= 2
@@ -805,5 +806,6 @@ THEOREM Spec => []terminal_requires_delivery
 THEOREM Spec => []notification_identity_and_sequence_cardinality_match
 THEOREM Spec => []applied_notifications_are_committed
 THEOREM Spec => []nonterminal_has_no_terminal_delivery
+THEOREM Spec => []terminal_delivery_follows_every_notification
 
 =============================================================================

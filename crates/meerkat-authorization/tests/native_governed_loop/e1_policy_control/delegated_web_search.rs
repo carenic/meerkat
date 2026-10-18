@@ -10,7 +10,10 @@ use meerkat_authorization::grant_policy::single_tool_operation_target;
 use meerkat_authorization_contracts::audit::{AuditDelegateAttribution, AuditDelegateRole};
 use meerkat_authorization_contracts::work_association::{GrantTarget, TargetGrantLineage};
 use meerkat_core::authorization::{ToolAuthorizationFacts, ToolDelegateRole};
-use meerkat_core::{BuiltinToolOperation, OperationId, ServerToolKind, ToolOperationTarget};
+use meerkat_core::{
+    BuiltinToolOperation, OperationId, ReviewUnavailableKind, ReviewUnsatisfiedKind,
+    ServerToolKind, ToolOperationTarget,
+};
 
 const SEARCH_CALL: &str = "governed-search";
 const SECOND_SEARCH_CALL: &str = "governed-search-again";
@@ -38,10 +41,15 @@ enum Case {
     DelegateRevokedAfterPrepare,
     /// The owner rates the helper's inference R2 while a reviewer is
     /// installed. A model request carries no operation review, so it settles
-    /// at its model entry as `unsupported_entry` and reaches the model as
-    /// authorization-unavailable feedback: nothing is sent and the reviewer
-    /// is never asked.
+    /// at its model entry as `unsupported_entry` and reaches the model as the
+    /// same typed `review_unavailable` feedback any other tool gives: nothing
+    /// is sent and the reviewer is never asked.
     HelperReviewRequired,
+    /// The owner rates the helper's inference R3 while a reviewer is
+    /// installed: it settles at its model entry as `human_consent_required`
+    /// and reaches the model as typed `review_unsatisfied` feedback, with
+    /// nothing sent and the reviewer never asked.
+    HelperConsentRequired,
     /// A host tool merely named web_search: no typed target, no delegate.
     HostToolNamedWebSearch,
 }
@@ -559,10 +567,10 @@ async fn exercise_search(controller_server: &Server, helper_server: &Server, cas
         },
         helper_route: helper_route.clone(),
         helper_unavailable: case == Case::OwnerUnavailable,
-        helper_review_tier: if case == Case::HelperReviewRequired {
-            meerkat_core::authorization::OperationReviewTier::R2
-        } else {
-            meerkat_core::authorization::OperationReviewTier::R1
+        helper_review_tier: match case {
+            Case::HelperReviewRequired => meerkat_core::authorization::OperationReviewTier::R2,
+            Case::HelperConsentRequired => meerkat_core::authorization::OperationReviewTier::R3,
+            _ => meerkat_core::authorization::OperationReviewTier::R1,
         },
         helper_seen: AtomicUsize::new(0),
         calls: Mutex::new(Vec::new()),
@@ -663,7 +671,10 @@ async fn exercise_search(controller_server: &Server, helper_server: &Server, cas
 
     let sessions = Arc::new(RecordingStore::default());
     let reviewer = Arc::new(CountingReviewer::default());
-    let factory = if case == Case::HelperReviewRequired {
+    let factory = if matches!(
+        case,
+        Case::HelperReviewRequired | Case::HelperConsentRequired
+    ) {
         AgentFactory::minimal().with_operation_review(Arc::new(
             meerkat_core::approval::review::BoundOperationReview::new(
                 reviewer.clone(),
@@ -941,17 +952,25 @@ async fn exercise_search(controller_server: &Server, helper_server: &Server, cas
                         | AuditObservation::Outcome { .. }
                 )));
             }
-            Case::HelperReviewRequired => {
-                // The model entry settles R2 as unsupported_entry; the
-                // executor seam carries it to the tool as authorization
-                // unavailable (the review settlement stays in the provider
-                // error's details).
+            Case::HelperReviewRequired | Case::HelperConsentRequired => {
+                // The model entry settles the required review locally; the
+                // executor seam keeps that typed settlement, so the model
+                // gets exactly the review feedback any other tool gives.
                 assert_refusal_feedback(
                     &bodies[1],
                     SEARCH_CALL,
-                    ToolError::OperationAuthorizationUnavailable,
+                    if case == Case::HelperReviewRequired {
+                        ToolError::ReviewUnavailable {
+                            kind: ReviewUnavailableKind::UnsupportedEntry,
+                        }
+                    } else {
+                        ToolError::ReviewUnsatisfied {
+                            kind: ReviewUnsatisfiedKind::HumanConsentRequired,
+                            approval_id: None,
+                        }
+                    },
                 );
-                assert_eq!(helper_sends, 0, "nothing is sent at R2");
+                assert_eq!(helper_sends, 0, "nothing is sent at R2 or R3");
                 assert_eq!(
                     reviewer.0.load(Ordering::SeqCst),
                     0,
@@ -1082,6 +1101,11 @@ async fn delegate_revocation_after_its_preparation_prevents_its_send() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_helper_rated_r2_settles_at_its_model_entry_without_a_send_or_review() {
     run_case(Case::HelperReviewRequired).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_helper_rated_r3_settles_at_its_model_entry_without_a_send_or_review() {
+    run_case(Case::HelperConsentRequired).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

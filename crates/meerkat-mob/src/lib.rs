@@ -63,6 +63,7 @@ pub mod tokio {
 pub mod adaptive;
 pub mod backend;
 mod build;
+pub mod claim_token;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod continuation;
 pub mod control_policy;
@@ -103,6 +104,7 @@ pub use member_creation::{
 
 // Re-exports for convenience
 pub use backend::{MobBackendKind, RuntimeBinding};
+pub use claim_token::{CallbackClaimCheck, MobClaimToken, MobClaimTokenError, MobClaimVerifier};
 pub use control_policy::{
     CommandAuthority, CommandAuthorityKind, ControlScope, MobControlPrincipal, OperatorGrant,
     ResolvedControlPolicy, ScopeDenial,
@@ -363,6 +365,12 @@ pub use runtime::{
 pub use runtime::{MobBeforeActivation, MobReadHandle};
 pub use runtime::{MobpackCallableConfig, MobpackRunOutcome, MobpackRunSpec};
 pub use runtime::{SpawnBasePromptSource, StaticSpawnBasePromptSource};
+#[cfg(all(any(test, feature = "test-support"), feature = "runtime-adapter"))]
+#[doc(hidden)]
+pub use runtime::{
+    arm_owned_actor_cleanup_released_boundary_pause_for_test,
+    arm_owned_actor_cleanup_rollback_pause_for_test,
+};
 pub use runtime_mode::MobRuntimeMode;
 pub use spec::SpecValidator;
 pub use store::{

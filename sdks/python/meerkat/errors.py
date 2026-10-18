@@ -88,3 +88,39 @@ def comms_send_error(error: BaseException) -> CommsSendErrorData | None:
     if isinstance(code, str) and code in COMMS_SEND_ERROR_CODES:
         return details  # type: ignore[return-value]
     return None
+
+
+class BinaryIntegrityError(MeerkatError):
+    """A downloaded or cached ``rkat-rpc`` does not match its release digest.
+
+    Raised with code ``BINARY_INTEGRITY_MISMATCH`` when the auto-downloaded
+    release archive, the binary inside it, or the cached binary does not match
+    the sha256 this package pins (stamped at release time). The SDK removes
+    what failed, never runs it and never falls back to another binary.
+    ``path`` names the cached binary, or is ``None`` for a download;
+    ``details`` carries the same fields.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        asset: str,
+        path: str | None,
+        expected_sha256: str,
+        actual_sha256: str,
+    ) -> None:
+        super().__init__(
+            "BINARY_INTEGRITY_MISMATCH",
+            message,
+            details={
+                "asset": asset,
+                "path": path,
+                "expected_sha256": expected_sha256,
+                "actual_sha256": actual_sha256,
+            },
+        )
+        self.asset = asset
+        self.path = path
+        self.expected_sha256 = expected_sha256
+        self.actual_sha256 = actual_sha256

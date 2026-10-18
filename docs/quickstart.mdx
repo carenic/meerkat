@@ -43,9 +43,9 @@ icon: "bolt"
 
     ```toml
     [dependencies]
-    meerkat = { version = "=0.9.2", features = ["sqlite-store", "session-store"] }
-    meerkat-store = "=0.9.2"
-    meerkat-tools = "=0.9.2"
+    meerkat = { version = "=0.9.3", features = ["sqlite-store", "session-store"] }
+    meerkat-store = "=0.9.3"
+    meerkat-tools = "=0.9.3"
     tokio = { version = "1", features = ["full"] }
     ```
 
@@ -226,11 +226,13 @@ Config changes apply to newly built/resumed agents. MCP servers normally
 connect in the background and tools appear as each server becomes ready;
 `--wait-for-mcp` makes the first prompt wait for configured servers.
 
-For a remote streamable-HTTP server (replace the example URL with the service
-you use):
+For a remote streamable-HTTP server that signs in with OAuth (replace the
+example URL with the service you use). `discover` binds the account the
+service verifies at the first login; use `--oauth-account-selection unverified`
+only for a server that cannot prove an account:
 
 ```bash
-rkat mcp add --transport http knowledge https://mcp.example.com
+rkat mcp add --transport http knowledge https://mcp.example.com --oauth-account-selection discover
 rkat mcp login knowledge
 rkat run --wait-for-mcp "Search the knowledge base for onboarding docs"
 ```

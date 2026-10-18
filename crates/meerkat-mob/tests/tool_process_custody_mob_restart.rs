@@ -11,7 +11,12 @@
 //! next turn sees both exactly once.
 
 #![cfg(any(target_os = "linux", target_os = "macos"))]
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::disallowed_methods
+)]
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};

@@ -2111,13 +2111,8 @@ fn apply_assistant_turn_completed(
     let response_discarded = response_id
         .as_ref()
         .is_some_and(|id| state.discarded_assistant_response_ids.contains(id));
-    let decision = resolve_realtime_event(|authority| {
-        authority.resolve_realtime_assistant_turn_completed(
-            response_id.is_some(),
-            response_discarded,
-            stop_reason_kind(stop_reason),
-        )
-    })?;
+    let decision =
+        resolve_assistant_turn_completed(response_id.is_some(), response_discarded, stop_reason)?;
 
     if let Some(response_id) = response_id {
         if decision.discard_response {
@@ -2774,6 +2769,58 @@ fn stop_reason_kind(stop_reason: StopReason) -> RealtimeTranscriptStopReasonKind
         StopReason::Cancelled => RealtimeTranscriptStopReasonKind::Cancelled,
         StopReason::ToolUse => RealtimeTranscriptStopReasonKind::ToolUse,
         _ => RealtimeTranscriptStopReasonKind::Other,
+    }
+}
+
+/// The session document's decision for a completion of a realtime assistant
+/// response.
+fn resolve_assistant_turn_completed(
+    response_id_valid: bool,
+    response_discarded: bool,
+    stop_reason: StopReason,
+) -> Result<RealtimeTranscriptEventDecision, RealtimeTranscriptShellError> {
+    resolve_realtime_event(|authority| {
+        authority.resolve_realtime_assistant_turn_completed(
+            response_id_valid,
+            response_discarded,
+            stop_reason_kind(stop_reason),
+        )
+    })
+}
+
+/// Whether a completion with `stop_reason` records the transcript text its
+/// response staged. It reads the decision the session applies to a
+/// completion of a response that was not discarded: the response is marked
+/// ready only for a completion that is neither cancelled (which discards the
+/// response) nor a tool call (which removes the completion).
+#[doc(hidden)]
+#[must_use]
+pub fn realtime_completion_records_staged_text(stop_reason: StopReason) -> bool {
+    resolve_assistant_turn_completed(true, false, stop_reason)
+        .is_ok_and(|decision| decision.mark_response_ready)
+}
+
+#[cfg(test)]
+mod completion_records_staged_text_tests {
+    use super::realtime_completion_records_staged_text;
+    use crate::types::StopReason;
+
+    #[test]
+    fn only_completions_that_are_neither_cancelled_nor_tool_calls_record_staged_text() {
+        for (stop_reason, records) in [
+            (StopReason::EndTurn, true),
+            (StopReason::MaxTokens, true),
+            (StopReason::StopSequence, true),
+            (StopReason::ContentFilter, true),
+            (StopReason::ToolUse, false),
+            (StopReason::Cancelled, false),
+        ] {
+            assert_eq!(
+                realtime_completion_records_staged_text(stop_reason),
+                records,
+                "{stop_reason:?}"
+            );
+        }
     }
 }
 

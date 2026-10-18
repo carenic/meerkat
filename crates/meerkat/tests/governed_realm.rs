@@ -887,6 +887,67 @@ async fn an_ordinary_open_of_a_governed_realm_is_refused_under_custody() {
     );
 }
 
+/// `rkat-rest` and `rkat-mcp` open their realm only through
+/// `storage_provider::open_realm_persistence_with_layout`, so neither hosts a
+/// stock-governed realm's schedules: that open refuses a governed realm, and
+/// their startup fails. The control opens the same realm while it is
+/// ungoverned. A host given a governed open would have to build its schedule
+/// service with `PersistenceBundle::schedule_service()` for its fires to be
+/// refused typed and early.
+#[tokio::test]
+async fn the_rest_and_mcp_hosts_open_refuses_a_governed_realm() {
+    use meerkat::governed_realm::stock::{StockPrincipals, govern_stock_realm};
+    let tmp = tempfile::tempdir().unwrap();
+    let layout = || {
+        let realm = meerkat_core::RealmConfig {
+            selection: meerkat_core::RealmSelection::Explicit {
+                realm_id: "governed".to_string(),
+            },
+            state_root: Some(tmp.path().to_path_buf()),
+            ..meerkat_core::RealmConfig::default()
+        };
+        let inputs = meerkat_core::StorageLayoutInputs {
+            invocation_context: tmp.path().to_path_buf(),
+            ..meerkat_core::StorageLayoutInputs::default()
+        };
+        meerkat_core::StorageLayout::resolve(inputs, &realm)
+            .expect("layout")
+            .layout
+    };
+
+    let (_, ungoverned) = meerkat::storage_provider::open_realm_persistence_with_layout(
+        layout(),
+        "governed",
+        Some(RealmBackend::Sqlite),
+        None,
+    )
+    .await
+    .expect("the hosts' open opens an ungoverned realm");
+    assert!(ungoverned.stock_governance().is_none());
+    drop(ungoverned);
+
+    let realm = meerkat_core::connection::RealmId::parse("governed").unwrap();
+    govern_stock_realm(
+        tmp.path(),
+        "governed",
+        &StockPrincipals::for_user(&realm, 4242).unwrap(),
+    )
+    .await
+    .expect("governed");
+
+    let refused = meerkat::storage_provider::open_realm_persistence_with_layout(
+        layout(),
+        "governed",
+        Some(RealmBackend::Sqlite),
+        None,
+    )
+    .await;
+    assert!(matches!(
+        refused,
+        Err(meerkat::PersistenceError::RealmGoverned { .. })
+    ));
+}
+
 /// One realm installation is not a grant for every agent. With the reader
 /// installed (ceiling `echo`) and the operator's grant for it issued to agent
 /// A only, A's session admits it once A is bound; agent B, granted only its

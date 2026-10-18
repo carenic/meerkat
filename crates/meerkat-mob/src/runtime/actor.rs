@@ -3150,6 +3150,48 @@ impl SpawnInlineStage {
     }
 }
 
+/// Typed stages of the inline `Stop` command step. A Stop's inline work grows
+/// with the mob's member count, so the watchdog names the running stage and,
+/// for a Stop that exceeds its budget, reports every stage's elapsed time: a
+/// slow Stop names its slow phase.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum StopInlineStage {
+    /// Placed completion lifecycle quiesce and cancellation requests.
+    PlacedCompletionCleanup,
+    /// Pending spawns failed with the stop reason.
+    PendingSpawns,
+    /// Pending peer deliveries cancelled.
+    PeerDeliveries,
+    /// Every member session's checkpoint gate cancelled.
+    CheckpointerCancel,
+    /// Every member's run starts held (#1500).
+    RunStartHolds,
+    /// Autonomous members' kickoff stops and interrupt dispatch.
+    AutonomousStops,
+    /// The orchestrator transition and the durable `MobStopped` commit.
+    StoppedCommit,
+}
+
+impl StopInlineStage {
+    pub(super) const fn as_str(self) -> &'static str {
+        match self {
+            Self::PlacedCompletionCleanup => "stop_placed_completion_cleanup",
+            Self::PendingSpawns => "stop_pending_spawns",
+            Self::PeerDeliveries => "stop_peer_deliveries",
+            Self::CheckpointerCancel => "stop_checkpointer_cancel",
+            Self::RunStartHolds => "stop_run_start_holds",
+            Self::AutonomousStops => "stop_autonomous_stops",
+            Self::StoppedCommit => "stop_stopped_commit",
+        }
+    }
+}
+
+/// Run-start holds a Stop keeps in flight at once. Each waits on its own
+/// member's runtime, so a Stop holds its members concurrently, bounded so a
+/// large mob does not contend every session gate (or, for placed members,
+/// every host) at the same moment.
+pub(super) const STOP_RUN_START_HOLD_CONCURRENCY: usize = 32;
+
 /// Inline-step watchdog (#1102 observability). The loop marks the start of
 /// every command dispatch and the arms refine the current step name; a
 /// checker task warns once when the running step exceeds
@@ -3236,6 +3278,11 @@ impl ActorInlineStepWatchdog {
 
     /// Enter one typed `Spawn` stage (#1249).
     pub(super) fn set_spawn_stage(&self, stage: SpawnInlineStage) {
+        self.set_step(stage.as_str());
+    }
+
+    /// Enter one typed `Stop` stage.
+    pub(super) fn set_stop_stage(&self, stage: StopInlineStage) {
         self.set_step(stage.as_str());
     }
 
@@ -5521,6 +5568,8 @@ enum SpawnProvisionInput {
 #[derive(Clone)]
 struct DeferredResumeProvision {
     definition: Arc<MobDefinition>,
+    /// The incarnation of the mob the member is rebuilt in.
+    mob_incarnation: meerkat_core::service::MobIncarnationId,
     realm_profile_store: Option<Arc<dyn crate::store::RealmProfileStore>>,
     profile_name: ProfileName,
     agent_identity: AgentIdentity,
@@ -5628,6 +5677,7 @@ impl DeferredResumeProvision {
     ) -> Result<ProvisionMemberRequest, MobError> {
         let Self {
             definition,
+            mob_incarnation,
             realm_profile_store,
             profile_name,
             agent_identity,
@@ -5684,6 +5734,7 @@ impl DeferredResumeProvision {
                 additional_instructions,
                 shell_env,
                 mob_tool_authority_context: None,
+                mob_incarnation: Some(mob_incarnation),
                 inherited_tool_filter,
                 tool_access_policy,
                 system_prompt_override,
@@ -6406,6 +6457,7 @@ struct RuntimeMetadataSnapshot {
     supervisor: Option<crate::store::SupervisorAuthorityRecord>,
     external_binding_overlays: Vec<crate::store::ExternalBindingOverlayRecord>,
     member_operator_requests: Vec<crate::store::MobMemberOperatorRequestRecord>,
+    callback_claim_verifier: Option<crate::MobClaimVerifier>,
 }
 
 // Not `Copy`: `BridgeRejectionCause` carries payload variants since V4.
@@ -7274,6 +7326,10 @@ pub(super) enum ResumePostCommitMemberOutcome {
 
 pub(super) struct MobActor {
     pub(super) definition: Arc<MobDefinition>,
+    /// The incarnation this runtime start minted (see
+    /// [`super::MobHandle::incarnation`]). Mob operator scope minted for
+    /// members of this mob is bound to it.
+    pub(super) incarnation: meerkat_core::service::MobIncarnationId,
     pub(super) roster: Arc<RwLock<RosterAuthority>>,
     pub(super) events: Arc<dyn MobEventStore>,
     pub(super) placed_completion_durable_index: Arc<std::sync::Mutex<PlacedCompletionDurableIndex>>,
@@ -14008,6 +14064,7 @@ impl MobActor {
             public_owner: None,
             ownership: Arc::clone(&self.ownership),
             admission_closed_rx: self.admission_closed_tx.subscribe(),
+            incarnation: self.incarnation,
         }
     }
 
@@ -18063,12 +18120,12 @@ impl MobActor {
         }
     }
 
-    /// Hold roster members' run starts (#1500), returning each member's
-    /// outcome. Shared by Stop, which holds every member and records the
-    /// outcomes in its report, and Shutdown, which holds only the
-    /// members whose runtime this mob hosts (`local_only`): a remote member's
-    /// host is not contacted during Shutdown, which never probes a placed
-    /// member it has no live channel to.
+    /// Hold roster members' run starts (#1500) for a Shutdown, returning each
+    /// member's outcome: it holds only the members whose runtime this mob
+    /// hosts (`local_only`), one after another. A remote member's host is not
+    /// contacted during Shutdown, which never probes a placed member it has no
+    /// live channel to. A Stop holds every member concurrently instead
+    /// ([`Self::hold_every_member_run_starts_concurrently`]).
     async fn hold_all_member_run_starts(
         &mut self,
         local_only: bool,
@@ -18119,7 +18176,7 @@ impl MobActor {
     /// before the stop. Each autonomous member is held again with its exact
     /// cancel by its interrupt task, whose outcome then replaces this one.
     async fn hold_all_member_run_starts_for_stop(&mut self) -> Result<(), MobError> {
-        let mut outcomes = self.hold_all_member_run_starts(false).await?;
+        let mut outcomes = self.hold_every_member_run_starts_concurrently().await?;
         // A retried Stop keeps the outcomes of interrupts that already
         // completed for the same incarnation.
         for (identity, completed) in &self.autonomous_stop_interrupted {
@@ -18127,6 +18184,88 @@ impl MobActor {
         }
         self.stop_member_outcomes = outcomes;
         Ok(())
+    }
+
+    /// Hold every roster member's run starts for a Stop (#1500), the holds
+    /// running concurrently. Each hold waits on its own member's runtime (its
+    /// session's mutation gate, which a running turn's commit holds, or its
+    /// host for a placed member), so one busy member does not delay the
+    /// others, and the inline Stop lasts about one hold rather than all of
+    /// them in turn. The per-member decisions stay synchronous and in roster
+    /// order. Every member that can be held is held, and the first failure in
+    /// roster order is returned; holds are idempotent per reason, so a retried
+    /// Stop holds again.
+    async fn hold_every_member_run_starts_concurrently(
+        &mut self,
+    ) -> Result<BTreeMap<AgentIdentity, super::stop_report::MemberStopOutcome>, MobError> {
+        let entries = {
+            let roster = self.roster.read().await;
+            roster.list().cloned().collect::<Vec<_>>()
+        };
+        let mut outcomes = BTreeMap::new();
+        let mut first_error: Option<(usize, MobError)> = None;
+        let mut holds = Vec::with_capacity(entries.len());
+        for (position, entry) in entries.iter().enumerate() {
+            if self.placed_member_carrier_dormant(&entry.agent_identity) {
+                outcomes.insert(
+                    entry.agent_identity.clone(),
+                    super::stop_report::MemberStopOutcome {
+                        run: super::stop_report::MemberStopRun::NoRun,
+                        starts: super::stop_report::MemberRunStarts::NotBound,
+                    },
+                );
+                continue;
+            }
+            match self.autonomous_stop_interrupt_incarnation(entry) {
+                Ok(incarnation) => {
+                    holds.push((position, entry.agent_identity.clone(), incarnation));
+                }
+                Err(error) => {
+                    if first_error.is_none() {
+                        first_error = Some((position, error));
+                    }
+                }
+            }
+        }
+        let provisioner = Arc::clone(&self.provisioner);
+        let held =
+            futures::stream::iter(holds.into_iter().map(|(position, identity, incarnation)| {
+                let provisioner = Arc::clone(&provisioner);
+                async move {
+                    let result = converge_autonomous_stop_member_result(
+                        provisioner
+                            .stop_member_runtime(
+                                &incarnation.member_ref,
+                                incarnation.expected_member.as_ref(),
+                                false,
+                            )
+                            .await,
+                    );
+                    (position, identity, result)
+                }
+            }))
+            .buffer_unordered(STOP_RUN_START_HOLD_CONCURRENCY)
+            .collect::<Vec<_>>()
+            .await;
+        for (position, identity, result) in held {
+            match result {
+                Ok(outcome) => {
+                    outcomes.insert(identity, outcome);
+                }
+                Err(error) => {
+                    if first_error
+                        .as_ref()
+                        .is_none_or(|(first, _)| position < *first)
+                    {
+                        first_error = Some((position, error));
+                    }
+                }
+            }
+        }
+        match first_error {
+            Some((_, error)) => Err(error),
+            None => Ok(outcomes),
+        }
     }
 
     async fn prepare_all_autonomous_member_stops(
@@ -18758,6 +18897,21 @@ impl MobActor {
         }
         if stop_result.is_err() {
             self.provisioner.rearm_all_checkpointers().await;
+            // A Stop that did not happen leaves the mob running (#1500: Stop
+            // is a pause), so it releases the holds it took: a member left
+            // held would keep its queued input waiting while the mob runs.
+            // The Stop's error stays the reported one. An actor
+            // fail-stopping for cold recovery releases none: cold replay
+            // alone decides whether work can start.
+            if !self.durable_uncertainty_fail_stop
+                && let Err(error) = self.release_all_member_run_starts().await
+            {
+                tracing::warn!(
+                    mob_id = %self.definition.id,
+                    error = %error,
+                    "a failed stop could not release every member's run-start hold"
+                );
+            }
         }
         stop_result
     }
@@ -27598,6 +27752,8 @@ impl MobActor {
                         reply_tx.send(Ok(self.machine_projection_for_identity(&agent_identity)));
                 }
                 MobCommand::Stop { reply_tx } => {
+                    self.inline_step_watchdog
+                        .set_stop_stage(StopInlineStage::PlacedCompletionCleanup);
                     let result = if self.state() == MobState::Destroyed {
                         Err(self.invalid_transition_to(MobState::Stopped))
                     } else if let Err(error) = self
@@ -27616,9 +27772,13 @@ impl MobActor {
                             "stop_command_admission",
                         ) {
                             Ok(()) => {
+                                self.inline_step_watchdog
+                                    .set_stop_stage(StopInlineStage::PendingSpawns);
                                 let mut stop_result =
                                     self.fail_all_pending_spawns("mob is stopping").await;
                                 if stop_result.is_ok() {
+                                    self.inline_step_watchdog
+                                        .set_stop_stage(StopInlineStage::PeerDeliveries);
                                     if let Err(error) =
                                         self.cancel_pending_peer_deliveries("mob is stopping").await
                                     {
@@ -27633,19 +27793,26 @@ impl MobActor {
                                     // in-flight saves that complete after the loop stops don't
                                     // race with subsequent external cleanup (e.g. DML deletes).
                                     if stop_result.is_ok() {
+                                        self.inline_step_watchdog
+                                            .set_stop_stage(StopInlineStage::CheckpointerCancel);
                                         self.provisioner.cancel_all_checkpointers().await;
                                     }
                                 }
                                 // Hold every member's run starts before any
                                 // interrupt (#1500): input admitted before the
                                 // stop runs only after Resume.
-                                if stop_result.is_ok()
-                                    && let Err(error) =
+                                if stop_result.is_ok() {
+                                    self.inline_step_watchdog
+                                        .set_stop_stage(StopInlineStage::RunStartHolds);
+                                    if let Err(error) =
                                         self.hold_all_member_run_starts_for_stop().await
-                                {
-                                    stop_result = Err(error);
+                                    {
+                                        stop_result = Err(error);
+                                    }
                                 }
                                 if stop_result.is_ok() {
+                                    self.inline_step_watchdog
+                                        .set_stop_stage(StopInlineStage::AutonomousStops);
                                     match Box::pin(self.prepare_all_autonomous_member_stops(
                                         PendingAutonomousStopKind::Stop,
                                     ))
@@ -27687,6 +27854,8 @@ impl MobActor {
                                         }
                                     }
                                 }
+                                self.inline_step_watchdog
+                                    .set_stop_stage(StopInlineStage::StoppedCommit);
                                 Box::pin(self.complete_stop_after_member_stops(stop_result))
                                     .await
                             }
@@ -30879,6 +31048,7 @@ impl MobActor {
                         let external_tools = precomputed_external_tools?;
                         let deferred = DeferredResumeProvision {
                             definition: preparation_context.definition.clone(),
+                            mob_incarnation: preparation_context.incarnation,
                             realm_profile_store: preparation_context.realm_profile_store.clone(),
                             profile_name: profile_name.clone(),
                             agent_identity: agent_identity.clone(),
@@ -30968,6 +31138,7 @@ impl MobActor {
                                 additional_instructions,
                                 shell_env,
                                 mob_tool_authority_context: None,
+                                mob_incarnation: Some(preparation_context.incarnation),
                                 inherited_tool_filter: inherited_tool_filter.clone(),
                                 tool_access_policy: tool_access_policy.clone(),
                                 system_prompt_override: system_prompt_override.clone(),
@@ -31076,6 +31247,7 @@ impl MobActor {
                 additional_instructions,
                 shell_env,
                 mob_tool_authority_context: None,
+                mob_incarnation: Some(preparation_context.incarnation),
                 inherited_tool_filter,
                 tool_access_policy,
                 system_prompt_override,
@@ -32776,6 +32948,7 @@ impl MobActor {
         let compiled = match super::spec_compiler::compile_portable_member_spec(
             super::spec_compiler::CompileMemberSpecParams {
                 mob_id: &self.definition.id,
+                mob_incarnation: self.incarnation,
                 profile_name: &profile_name,
                 agent_identity: &agent_identity,
                 profile: &profile,
@@ -34169,6 +34342,7 @@ impl MobActor {
             additional_instructions,
             shell_env,
             mob_tool_authority_context: None,
+            mob_incarnation: Some(self.incarnation),
             inherited_tool_filter,
             tool_access_policy,
             system_prompt_override,
@@ -47374,6 +47548,10 @@ impl MobActor {
                 .runtime_metadata
                 .list_member_operator_requests(&self.definition.id)
                 .await?,
+            callback_claim_verifier: self
+                .runtime_metadata
+                .load_callback_claim_verifier(&self.definition.id)
+                .await?,
         })
     }
 
@@ -47490,6 +47668,27 @@ impl MobActor {
                         ),
                     )));
                 }
+            }
+        }
+        if let Some(verifier) = &snapshot.callback_claim_verifier {
+            let restored = self
+                .runtime_metadata
+                .put_callback_claim_verifier_if_absent(&self.definition.id, verifier)
+                .await?;
+            if !restored
+                && self
+                    .runtime_metadata
+                    .load_callback_claim_verifier(&self.definition.id)
+                    .await?
+                    .as_ref()
+                    != Some(verifier)
+            {
+                return Err(MobError::from(crate::store::MobStoreError::CasConflict(
+                    format!(
+                        "callback claim verifier changed while restoring metadata for mob '{}'",
+                        self.definition.id
+                    ),
+                )));
             }
         }
         Ok(())
@@ -47974,15 +48173,169 @@ impl MobActor {
     async fn handle_destroy(
         &mut self,
     ) -> Result<super::handle::MobDestroyReport, super::handle::MobDestroyError> {
+        // A member whose runtime requires a durability reload would hold the
+        // destroy in its ingress detach forever. Reload each such member
+        // before any destroy write, so a reload that fails leaves nothing to
+        // undo and the destroy can simply be retried.
+        let reloaded =
+            boxed_arm_future(|| self.reload_durability_degraded_members_for_destroy()).await?;
         // Both phases are built in their own frames: at opt-level 0 each
         // awaited future reserved twice its size in this poll frame, beneath
         // the whole destroy.
-        boxed_arm_future(|| self.destroy_preflight_and_quiesce()).await?;
+        if let Err(error) = boxed_arm_future(|| self.destroy_preflight_and_quiesce()).await {
+            return Self::with_destroy_reloaded_members(Err(error), reloaded);
+        }
         let was_active = self.destroy_cleanup_active;
         self.destroy_cleanup_active = true;
         let result = boxed_arm_future(|| self.handle_destroy_inner()).await;
         self.destroy_cleanup_active = was_active;
-        result
+        Self::with_destroy_reloaded_members(result, reloaded)
+    }
+
+    /// Report the members the destroy reloaded before it started (`reloaded`,
+    /// first) together with any it reloaded later, before their ingress
+    /// detach, on the report `result` carries.
+    fn with_destroy_reloaded_members(
+        result: Result<super::handle::MobDestroyReport, super::handle::MobDestroyError>,
+        reloaded: Vec<AgentIdentity>,
+    ) -> Result<super::handle::MobDestroyReport, super::handle::MobDestroyError> {
+        let merge = |report: &mut super::handle::MobDestroyReport| {
+            let later = std::mem::replace(&mut report.reloaded_members, reloaded);
+            for identity in later {
+                if !report.reloaded_members.contains(&identity) {
+                    report.reloaded_members.push(identity);
+                }
+            }
+        };
+        match result {
+            Ok(mut report) => {
+                merge(&mut report);
+                Ok(report)
+            }
+            Err(super::handle::MobDestroyError::Incomplete { mut report }) => {
+                merge(&mut report);
+                Err(super::handle::MobDestroyError::Incomplete { report })
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Reload every local member whose runtime requires a durability reload
+    /// (see [`Self::reload_member_if_durability_degraded`]) before the
+    /// destroy writes anything. A reload that fails stops the destroy with a
+    /// typed incomplete report naming the member; the mob is unchanged.
+    #[cfg(feature = "runtime-adapter")]
+    async fn reload_durability_degraded_members_for_destroy(
+        &self,
+    ) -> Result<Vec<AgentIdentity>, super::handle::MobDestroyError> {
+        let entries = {
+            let roster = self.roster.read().await;
+            roster.list_all().cloned().collect::<Vec<_>>()
+        };
+        let mut reloaded = Vec::new();
+        for entry in &entries {
+            match boxed_arm_future(|| self.reload_member_if_durability_degraded(entry)).await {
+                Ok(true) => reloaded.push(entry.agent_identity.clone()),
+                Ok(false) => {}
+                Err(error) => {
+                    let mut report = super::handle::MobDestroyReport {
+                        reloaded_members: reloaded,
+                        ..Default::default()
+                    };
+                    report.push_error(error);
+                    return Err(super::handle::MobDestroyError::Incomplete { report });
+                }
+            }
+        }
+        Ok(reloaded)
+    }
+
+    #[cfg(not(feature = "runtime-adapter"))]
+    async fn reload_durability_degraded_members_for_destroy(
+        &self,
+    ) -> Result<Vec<AgentIdentity>, super::handle::MobDestroyError> {
+        Ok(Vec::new())
+    }
+
+    /// Reload `entry`'s runtime from its durable store when its persistent
+    /// shell is durability-degraded: a boundary commit failed after its run
+    /// consumed its input in memory.
+    ///
+    /// Until that reload, the member's exited runtime loop keeps the
+    /// session's mutation gate, so the destroy's ingress detach would wait on
+    /// it forever. The reload is the one retirement already performs: the
+    /// degraded shell is replaced by a cold successor recovered from the
+    /// durable store, where the consumed input is pending again, and the
+    /// member's retirement then records what became of it. Bounded by the
+    /// member retire budget. Returns whether the member was reloaded; `Err`
+    /// is the destroy report's entry for a reload that failed, or for a
+    /// member still degraded after it.
+    #[cfg(feature = "runtime-adapter")]
+    async fn reload_member_if_durability_degraded(
+        &self,
+        entry: &RosterEntry,
+    ) -> Result<bool, String> {
+        let Some(adapter) = self.runtime_adapter.as_ref() else {
+            return Ok(false);
+        };
+        if Self::runtime_binding_for_entry(entry).is_some()
+            || super::member_runtime_is_host_owned(
+                self.dsl_authority.state(),
+                &entry.agent_identity,
+            )
+        {
+            return Ok(false);
+        }
+        let Some(session_id) = entry.member_ref.bridge_session_id() else {
+            return Ok(false);
+        };
+        let Some(required) = adapter.durability_reload_required(session_id).await else {
+            return Ok(false);
+        };
+        let Some(registration) = adapter
+            .current_session_registration_witness(session_id)
+            .await
+        else {
+            return Err(format!(
+                "{}: {required}; the runtime has no current registration the destroy can reload",
+                entry.agent_identity
+            ));
+        };
+        tracing::warn!(
+            mob_id = %self.definition.id,
+            agent_identity = %entry.agent_identity,
+            session_id = %session_id,
+            operation = %required.operation,
+            "destroy reloads a member runtime that requires a durability reload before retiring it"
+        );
+        let disposition =
+            super::provisioner::MemberSessionDisposalArc::reload_durability_degraded_registration_until(
+                adapter,
+                Some(&self.session_ops_adapter),
+                &registration,
+                session_id,
+                Instant::now() + super::provisioner::MEMBER_RETIRE_TOTAL_TIMEOUT,
+            )
+            .await
+            .map_err(|error| {
+                format!(
+                    "{}: {required}; reloading it before the destroy failed: {error}",
+                    entry.agent_identity
+                )
+            })?;
+        if matches!(
+            disposition,
+            meerkat_runtime::ReloadRequiredRegistrationDisposition::Discarded
+        ) {
+            return Ok(true);
+        }
+        match adapter.durability_reload_required(session_id).await {
+            None => Ok(false),
+            Some(still) => Err(format!(
+                "{}: {still}; the runtime still requires a durability reload after the destroy's reload attempt",
+                entry.agent_identity
+            )),
+        }
     }
 
     /// Admit this mob's destroy before the actor starts any work, for a host
@@ -48237,6 +48590,19 @@ impl MobActor {
         }
         if destroy_input_needed {
             for entry in &entries {
+                // A member can lose a boundary commit after the destroy's
+                // reload pass (a turn it was already running). Its ingress
+                // detach would then wait on the mutation gate its exited
+                // runtime loop keeps, so reload it here too.
+                #[cfg(feature = "runtime-adapter")]
+                match boxed_arm_future(|| self.reload_member_if_durability_degraded(entry)).await {
+                    Ok(true) => report.reloaded_members.push(entry.agent_identity.clone()),
+                    Ok(false) => {}
+                    Err(error) => {
+                        report.push_error(error);
+                        return Err(MobDestroyError::Incomplete { report });
+                    }
+                }
                 if let Err(error) =
                     boxed_arm_future(|| self.admit_member_retire_for_destroy(entry)).await
                 {
@@ -48520,6 +48886,25 @@ impl MobActor {
         if let Err(error) = boxed_arm_future(|| {
             self.runtime_metadata
                 .delete_member_event_cursors(&self.definition.id)
+        })
+        .await
+        {
+            return Err(boxed_arm_future(|| {
+                self.incomplete_after_metadata_scrub_error(
+                    report,
+                    &runtime_metadata_snapshot,
+                    error,
+                )
+            })
+            .await);
+        }
+        // The callback claim verifier answers the mob's claim token: a mob
+        // created again under the id in a store the host kept must not take
+        // it. The snapshot above restores it if this destroy stays
+        // incomplete.
+        if let Err(error) = boxed_arm_future(|| {
+            self.runtime_metadata
+                .delete_callback_claim_verifier(&self.definition.id)
         })
         .await
         {

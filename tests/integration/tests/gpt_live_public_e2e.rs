@@ -702,27 +702,135 @@ impl PublicLiveHarness {
         Ok(())
     }
 
-    /// Settle one exchange's provider health evidence after its waits: the
-    /// speech end to input final lag when the final arrived, otherwise a
-    /// timeout carrying the provider input latency read now.
-    async fn settle_exchange_evidence(
+    /// Settle one scheduled exchange's provider health evidence after its
+    /// wait (see [`Self::journal_exchange_evidence`]). A failed wait's own
+    /// error stays primary ([`settle_after_wait`]).
+    async fn settle_exchange_evidence<T, E>(
         &mut self,
+        scenario: &str,
         label: &str,
         schedule_id: u64,
+        waited: &Result<T, E>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let settled = self
+            .journal_exchange_evidence(label, waited.is_err(), |timeline| {
+                SpokenTurn::from_timeline(timeline, schedule_id).and_then(|turn| {
+                    turn.input_final_ms
+                        .map(|final_ms| final_ms as i64 - turn.speech_end_ms as i64)
+                })
+            })
+            .await;
+        settle_after_wait(scenario, label, waited, settled)
+    }
+
+    /// Record one exchange's provider health evidence once its wait is over,
+    /// from `lag` read off the timeline ([`exchange_evidence`]): the speech
+    /// end to input final lag when the final arrived, a timeout carrying the
+    /// provider input latency read now only when the wait itself failed, and
+    /// nothing otherwise. After a good wait the input final gets
+    /// [`INPUT_FINAL_GRACE`] to reach the browser.
+    async fn journal_exchange_evidence(
+        &mut self,
+        label: &str,
+        wait_failed: bool,
+        lag: impl Fn(&[TimelineEntry]) -> Option<i64>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let Some(journal) = self.evidence.clone() else {
             return Ok(());
         };
-        let timeline = self.peer.timeline().await?;
-        let heard = SpokenTurn::from_timeline(&timeline, schedule_id).and_then(|turn| {
-            turn.input_final_ms
-                .map(|final_ms| final_ms as i64 - turn.speech_end_ms as i64)
-        });
-        match heard {
-            Some(lag_ms) => journal.exchange_heard(label, lag_ms)?,
-            None => {
+        let lag_ms = if wait_failed {
+            lag(&self.peer.timeline().await?)
+        } else {
+            self.poll_timeline(INPUT_FINAL_GRACE, &lag).await?
+        };
+        match exchange_evidence(lag_ms, wait_failed) {
+            ExchangeEvidence::Heard(lag_ms) => journal.exchange_heard(label, lag_ms)?,
+            ExchangeEvidence::TimedOut => {
                 let latency = self.provider_input_latency().await;
                 journal.exchange_timed_out(latency)?;
+            }
+            ExchangeEvidence::Unrecorded => {}
+        }
+        Ok(())
+    }
+
+    /// Poll the timeline for `predicate` for at most `bound`, `None` once it
+    /// passes. Not a failure bound: it lets evidence that trails a good wait
+    /// arrive.
+    async fn poll_timeline<T>(
+        &mut self,
+        bound: Duration,
+        predicate: impl Fn(&[TimelineEntry]) -> Option<T>,
+    ) -> Result<Option<T>, Box<dyn std::error::Error>> {
+        let deadline = Instant::now() + bound;
+        loop {
+            if let Some(value) = predicate(&self.peer.timeline().await?) {
+                return Ok(Some(value));
+            }
+            if Instant::now() >= deadline {
+                return Ok(None);
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    /// Play `fixture` directly as exchange `label`, which then awaits its
+    /// input final (provider health evidence). Returns the browser's play
+    /// result and the timeline length before the play, for
+    /// [`Self::settle_direct_play`].
+    async fn play_direct(
+        &mut self,
+        label: &str,
+        fixture: &str,
+    ) -> Result<(Value, usize), Box<dyn std::error::Error>> {
+        let timeline_before = self.peer.timeline().await?.len();
+        self.exchange_started(label)?;
+        let sent = self
+            .peer
+            .call(json!({"type": "play", "name": fixture}))
+            .await?;
+        Ok((sent, timeline_before))
+    }
+
+    /// Settle a direct-play exchange's provider health evidence after its
+    /// wait, as [`Self::settle_exchange_evidence`] settles a scheduled one,
+    /// so a provider stall scores the run void instead of red. A failed wait
+    /// also prints the uplink evidence, and its own error stays primary.
+    async fn settle_direct_play<T, E>(
+        &mut self,
+        scenario: &str,
+        label: &str,
+        fixture: &str,
+        timeline_before: usize,
+        waited: &Result<T, E>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let settled = self
+            .direct_play_evidence(scenario, label, fixture, timeline_before, waited.is_err())
+            .await;
+        settle_after_wait(scenario, label, waited, settled)
+    }
+
+    async fn direct_play_evidence(
+        &mut self,
+        scenario: &str,
+        label: &str,
+        fixture: &str,
+        timeline_before: usize,
+        wait_failed: bool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        self.journal_exchange_evidence(label, wait_failed, |timeline| {
+            direct_play_reading(timeline, fixture, timeline_before).and_then(|(_, lag_ms)| lag_ms)
+        })
+        .await?;
+        if wait_failed {
+            let timeline = self.peer.timeline().await?;
+            match direct_play_reading(&timeline, fixture, timeline_before) {
+                Some((fixture_start_ms, _)) => {
+                    print_no_audio_evidence(self, scenario, label, fixture_start_ms).await;
+                }
+                None => {
+                    println!("GPT_LIVE_{scenario}_NO_FIXTURE_START label={label} fixture={fixture}")
+                }
             }
         }
         Ok(())
@@ -4266,7 +4374,8 @@ async fn native_question_once(
             },
         )
         .await;
-    live.settle_exchange_evidence(label, schedule_id).await?;
+    live.settle_exchange_evidence(scenario, label, schedule_id, &waited)
+        .await?;
     if waited.is_err() {
         print_no_audio_evidence(live, scenario, label, fixture_start_ms).await;
     }
@@ -5968,6 +6077,93 @@ fn timeline_find(
         .find(|entry| entry.kind == kind && entry.t_ms >= not_before_ms)
 }
 
+/// One direct `play` exchange read off the browser timeline: the start of
+/// the first `fixture` play after the first `timeline_before` entries, and
+/// its speech end to input final lag when the final arrived. A direct play
+/// carries no schedule id, so it is found by name; the lag is read as
+/// [`SpokenTurn::from_timeline`] reads a scheduled turn's.
+fn direct_play_reading(
+    timeline: &[TimelineEntry],
+    fixture: &str,
+    timeline_before: usize,
+) -> Option<(u64, Option<i64>)> {
+    let start = timeline.iter().skip(timeline_before).find(|entry| {
+        entry.kind == TimelineKind::FixtureStart && entry.detail_str("name") == Some(fixture)
+    })?;
+    let speech_end_ms = start.t_ms + start.detail_u64("speech_ms").unwrap_or(0);
+    let lag_ms = timeline
+        .iter()
+        .find(|entry| entry.kind == TimelineKind::InputFinal && entry.t_ms > start.t_ms)
+        .map(|entry| entry.detail_u64("t_ms").unwrap_or(entry.t_ms) as i64 - speech_end_ms as i64);
+    Some((start.t_ms, lag_ms))
+}
+
+/// How long a good wait gives its exchange's input final to reach the
+/// browser before the exchange settles without a lag (never as a timeout).
+const INPUT_FINAL_GRACE: Duration = Duration::from_secs(5);
+
+/// What one exchange's provider health evidence records once its wait is
+/// over.
+#[derive(Debug, PartialEq, Eq)]
+enum ExchangeEvidence {
+    /// The input final arrived: the speech end to input final lag.
+    Heard(i64),
+    /// The wait failed with no input final: a timeout, scored against the
+    /// provider input latency read then.
+    TimedOut,
+    /// The wait succeeded but its input final did not show: a healthy
+    /// exchange is no timeout, so nothing is recorded.
+    Unrecorded,
+}
+
+fn exchange_evidence(lag_ms: Option<i64>, wait_failed: bool) -> ExchangeEvidence {
+    match (lag_ms, wait_failed) {
+        (Some(lag_ms), _) => ExchangeEvidence::Heard(lag_ms),
+        (None, true) => ExchangeEvidence::TimedOut,
+        (None, false) => ExchangeEvidence::Unrecorded,
+    }
+}
+
+/// Keep a failed wait's own error primary: a settle error after it is
+/// printed and dropped, so the caller returns the wait's error; after a good
+/// wait the settle error is returned.
+fn settle_after_wait<T, E>(
+    scenario: &str,
+    label: &str,
+    waited: &Result<T, E>,
+    settled: Result<(), Box<dyn std::error::Error>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match settled {
+        Err(error) if waited.is_err() => {
+            println!("GPT_LIVE_{scenario}_SETTLE_ERROR label={label} error={error}");
+            Ok(())
+        }
+        settled => settled,
+    }
+}
+
+/// The rows a session history holds after its first `skip` messages, as
+/// `role: text` with the text cut to 400 characters (diagnostics only).
+fn history_rows_after(history: &Value, skip: usize) -> Vec<String> {
+    history["messages"]
+        .as_array()
+        .map(|messages| {
+            messages
+                .iter()
+                .skip(skip)
+                .map(|message| {
+                    let text = history_text(&json!({ "messages": [message] }));
+                    format!(
+                        "{}: {}",
+                        message["role"].as_str().unwrap_or("?"),
+                        text.chars().take(400).collect::<String>()
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn fixture_start_entry(timeline: &[TimelineEntry], schedule_id: u64) -> Option<&TimelineEntry> {
     timeline.iter().find(|entry| {
         entry.kind == TimelineKind::FixtureStart && entry.schedule_id() == Some(schedule_id)
@@ -6441,7 +6637,8 @@ async fn delegated_request(
             |t| timeline_find(t, TimelineKind::DelegationCreated, fixture_start_ms).map(|e| e.t_ms),
         )
         .await;
-    live.settle_exchange_evidence(label, schedule_id).await?;
+    live.settle_exchange_evidence(scenario, label, schedule_id, &delegation_wait)
+        .await?;
     let delegation_created_ms = match delegation_wait {
         Ok(ms) => ms,
         Err(error) => {
@@ -7608,7 +7805,9 @@ fn s102_premature_claims(
 /// fragment of that token has its `session.thinking.appended`. A typed turn
 /// is text-chat context, never voiced: a `session.commentary.append`
 /// carrying either row fails. A question asked before the rows are
-/// acknowledged races them (verdict tree fb94711f S105 run 3).
+/// acknowledged races them (verdict tree fb94711f S105 run 3). On timeout
+/// it journals one `GPT_LIVE_PUBLIC_QUIET_LANE_TIMEOUT` line
+/// ([`QuietLaneTimeout`]) before failing.
 async fn wait_typed_turn_mirrored(
     live: &mut PublicLiveHarness,
     evidence: &Journal,
@@ -7630,6 +7829,14 @@ async fn wait_typed_turn_mirrored(
         .find(|text| !text.trim().is_empty())
         .ok_or_else(|| format!("{scenario}: the typed turn committed no assistant reply"))?;
     let probes = [typed_row_probe(prompt), typed_row_probe(&reply)];
+    // The journal's clock as the wait starts, just after the typed turn
+    // committed: a timeout journals the provider output that came after it.
+    let wait_started_ms = evidence
+        .provider_stream_lines()?
+        .iter()
+        .map(|line| line.elapsed_ms)
+        .max()
+        .unwrap_or(0);
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         let lines = evidence.provider_stream_lines()?;
@@ -7665,6 +7872,13 @@ async fn wait_typed_turn_mirrored(
             return Ok(());
         }
         if Instant::now() >= deadline {
+            // Journal what the quiet lane and the provider's output did
+            // before failing, so a red says which side stalled.
+            println!(
+                "{}",
+                quiet_lane_timeout(&lines, channel, &probes, wait_started_ms)
+                    .evidence_line(scenario, channel)
+            );
             return Err(format!(
                 "{scenario}: the typed turn's rows were not acknowledged on the quiet lane within 60 s: {pending:?}"
             )
@@ -7735,6 +7949,215 @@ fn thinking_tokens(lines: &[provider_recording::Line], channel: u32) -> Vec<Thin
             }
         })
         .collect()
+}
+
+/// The product's floor for an audible model (dBFS, frame RMS of PCM16):
+/// `meerkat-openai`'s public Live holds text-chat context while fewer than
+/// 1600 ms of provider output audio have followed the last frame at or above
+/// it, and releases it once 1600 ms have (`USER_FLOOR_SPEECH_DBFS`,
+/// `OUTPUT_SILENCE_RELEASE_MS`). Evidence only; the test's own voiced
+/// threshold is [`VOICED_FRAME_RMS`].
+const PRODUCT_OUTPUT_FLOOR_DBFS: f64 = -50.0;
+
+/// Output audio below [`PRODUCT_OUTPUT_FLOOR_DBFS`] after which the product
+/// releases held text-chat context, and its below-floor run when a channel
+/// opens: the model starts silent (`OUTPUT_SILENCE_RELEASE_MS`).
+const PRODUCT_OUTPUT_SILENCE_RELEASE_MS: i64 = 1600;
+
+/// Characters of the voice's output transcript a quiet-lane timeout
+/// journals, from its end.
+const QUIET_LANE_TRANSCRIPT_TAIL_CHARS: usize = 200;
+
+/// What a typed turn's quiet-lane wait saw when it timed out, read from the
+/// journal for its channel. Times are journal milliseconds after the wait
+/// started, just after the typed turn committed (negative before it); runs
+/// are provider output audio time, counted as the product counts its own.
+///
+/// The outbox sends a typed turn's rows one at a time, and its admission can
+/// defer the head row (an open provider user turn, the row's own pending
+/// append, a late summary), so read the first row not sent: later rows queue
+/// behind it. A 1600 ms below-floor run counts when a frame since the wait
+/// started reached it, or when the run was already there as the wait started
+/// (`below_floor_at_wait_start_ms` of 1600 or more: the product was not
+/// holding then, whatever frames followed). That row at (0, 0) with no such
+/// run is explained by the audible hold: the provider's output never went
+/// quiet long enough to release it, and with no output frame since the wait
+/// started, provider audio stopped, so the product's clock stopped and the
+/// hold cannot release. At (0, 0) with such a run, something other than an
+/// audible response held it: either the hold did not release or the row
+/// never reached it, and the product's `text-chat context held ... token=N`
+/// log line tells which. A row sent but not acknowledged is a provider
+/// acknowledgement stall. S98 on Live gate run 39043475436 timed out with
+/// neither row sent.
+#[derive(Debug)]
+struct QuietLaneTimeout {
+    /// Per probe, in order: the thinking tokens carrying it, and how many of
+    /// them were acknowledged.
+    rows_sent_acked: Vec<(usize, usize)>,
+    /// Provider output audio frames since the wait started.
+    output_frames: usize,
+    /// The below-floor run when the wait started.
+    below_floor_at_wait_start_ms: i64,
+    /// The last frame since the wait started at or above
+    /// [`PRODUCT_OUTPUT_FLOOR_DBFS`].
+    last_at_floor_ms: Option<i64>,
+    /// The last frame since the wait started above [`VOICED_FRAME_RMS`].
+    last_voiced_ms: Option<i64>,
+    /// The longest the below-floor run was at a frame since the wait
+    /// started.
+    longest_below_floor_ms: i64,
+    /// The same for the run at or below the voiced threshold.
+    longest_below_voiced_ms: i64,
+    /// The below-floor run at the timeout, after the last frame.
+    below_floor_at_timeout_ms: i64,
+    /// Characters of the channel's whole output transcript.
+    transcript_chars: usize,
+    /// Characters of it that arrived since the wait started.
+    transcript_chars_since_wait: usize,
+    /// The channel's last output transcript delta.
+    last_transcript_ms: Option<i64>,
+    /// The output transcript's last [`QUIET_LANE_TRANSCRIPT_TAIL_CHARS`].
+    transcript_tail: String,
+}
+
+impl QuietLaneTimeout {
+    /// One `GPT_LIVE_PUBLIC_QUIET_LANE_TIMEOUT` evidence line.
+    fn evidence_line(&self, scenario: &str, channel: u32) -> String {
+        format!(
+            "GPT_LIVE_PUBLIC_QUIET_LANE_TIMEOUT scenario={scenario} channel={channel} rows_sent_acked={:?} output_frames={} below_floor_at_wait_start_ms={} last_at_floor_ms={:?} last_voiced_ms={:?} longest_below_floor_ms={} longest_below_voiced_ms={} below_floor_at_timeout_ms={} transcript_chars={} transcript_chars_since_wait={} last_transcript_ms={:?} transcript_tail={:?}",
+            self.rows_sent_acked,
+            self.output_frames,
+            self.below_floor_at_wait_start_ms,
+            self.last_at_floor_ms,
+            self.last_voiced_ms,
+            self.longest_below_floor_ms,
+            self.longest_below_voiced_ms,
+            self.below_floor_at_timeout_ms,
+            self.transcript_chars,
+            self.transcript_chars_since_wait,
+            self.last_transcript_ms,
+            self.transcript_tail,
+        )
+    }
+}
+
+/// Audio time of one provider output frame as the product reads it: PCM16
+/// samples at 24 kHz counted from the base64 payload's length, decodable or
+/// not (`reflected_pcm16_samples` in `meerkat-openai`'s public Live).
+fn product_frame_ms(audio: &str) -> i64 {
+    let encoded = audio.trim_end_matches('=').len() as i64;
+    let bytes = encoded / 4 * 3
+        + match encoded % 4 {
+            2 => 1,
+            3 => 2,
+            _ => 0,
+        };
+    bytes / 2 * 1000 / PROVIDER_PCM_RATE_HZ as i64
+}
+
+/// Summarise a timed-out quiet-lane wait on `channel` (see
+/// [`QuietLaneTimeout`]): `probes` are the typed rows' probes, and
+/// `wait_started_ms` the journal clock when the wait started.
+fn quiet_lane_timeout(
+    lines: &[provider_recording::Line],
+    channel: u32,
+    probes: &[String],
+    wait_started_ms: u64,
+) -> QuietLaneTimeout {
+    let tokens = thinking_tokens(lines, channel);
+    let rows_sent_acked = probes
+        .iter()
+        .map(|probe| {
+            let carrying: Vec<&ThinkingToken> = tokens
+                .iter()
+                .filter(|token| carries_row(&token.text, probe))
+                .collect();
+            let acked = carrying.iter().filter(|token| token.acknowledged).count();
+            (carrying.len(), acked)
+        })
+        .collect();
+    let after_wait_start = |elapsed_ms: u64| elapsed_ms as i64 - wait_started_ms as i64;
+    let mut summary = QuietLaneTimeout {
+        rows_sent_acked,
+        output_frames: 0,
+        below_floor_at_wait_start_ms: PRODUCT_OUTPUT_SILENCE_RELEASE_MS,
+        last_at_floor_ms: None,
+        last_voiced_ms: None,
+        longest_below_floor_ms: 0,
+        longest_below_voiced_ms: 0,
+        below_floor_at_timeout_ms: 0,
+        transcript_chars: 0,
+        transcript_chars_since_wait: 0,
+        last_transcript_ms: None,
+        transcript_tail: String::new(),
+    };
+    // Both runs are counted as the product counts its own: over the
+    // channel's output frames from the first, starting at 1600 ms (the model
+    // starts silent), growing by each frame's audio time and reset by a frame
+    // at or above the threshold. Frames before the wait started only carry
+    // the run into it.
+    let (mut below_floor_ms, mut below_voiced_ms) = (
+        PRODUCT_OUTPUT_SILENCE_RELEASE_MS,
+        PRODUCT_OUTPUT_SILENCE_RELEASE_MS,
+    );
+    for (elapsed_ms, raw) in sideband_server_frames(lines, channel, "session.output_audio.delta") {
+        // An undecodable frame is below every threshold, as the product
+        // reads it, for its length's audio time.
+        let rms = pcm16_frame(&raw["delta"]).ok().map(|(rms, _)| rms);
+        let at_floor = rms.is_some_and(|rms| {
+            rms > 0.0 && 20.0 * (rms / 32768.0).log10() >= PRODUCT_OUTPUT_FLOOR_DBFS
+        });
+        let voiced = rms.is_some_and(|rms| rms > VOICED_FRAME_RMS);
+        let frame_ms = product_frame_ms(raw["delta"].as_str().unwrap_or_default());
+        below_floor_ms = if at_floor {
+            0
+        } else {
+            below_floor_ms + frame_ms
+        };
+        below_voiced_ms = if voiced {
+            0
+        } else {
+            below_voiced_ms + frame_ms
+        };
+        if elapsed_ms < wait_started_ms {
+            summary.below_floor_at_wait_start_ms = below_floor_ms;
+            continue;
+        }
+        summary.output_frames += 1;
+        if at_floor {
+            summary.last_at_floor_ms = Some(after_wait_start(elapsed_ms));
+        }
+        if voiced {
+            summary.last_voiced_ms = Some(after_wait_start(elapsed_ms));
+        }
+        summary.longest_below_floor_ms = summary.longest_below_floor_ms.max(below_floor_ms);
+        summary.longest_below_voiced_ms = summary.longest_below_voiced_ms.max(below_voiced_ms);
+    }
+    summary.below_floor_at_timeout_ms = below_floor_ms;
+    let mut transcript = String::new();
+    for (elapsed_ms, raw) in
+        sideband_server_frames(lines, channel, "session.output_transcript.delta")
+    {
+        let Some(delta) = raw["delta"].as_str() else {
+            continue;
+        };
+        let chars = delta.chars().count();
+        summary.transcript_chars += chars;
+        if elapsed_ms >= wait_started_ms {
+            summary.transcript_chars_since_wait += chars;
+        }
+        summary.last_transcript_ms = Some(after_wait_start(elapsed_ms));
+        transcript.push_str(delta);
+    }
+    summary.transcript_tail = transcript
+        .chars()
+        .skip(
+            summary
+                .transcript_chars
+                .saturating_sub(QUIET_LANE_TRANSCRIPT_TAIL_CHARS),
+        )
+        .collect();
+    summary
 }
 
 /// Waits until the assistant has said "done" in output that started (provider
@@ -9394,6 +9817,12 @@ async fn run_s104_handoff_voice_typed_voice(
             late_channels.push(channel2);
         }
         evidence.stage(EvidenceStage::HandoffBack)?;
+        let messages_before_back = live
+            .rpc
+            .session_history(json!(live.session_id), 30)
+            .await?["messages"]
+            .as_array()
+            .map_or(0, Vec::len);
         let events_before_back = live.peer.events().await?.len();
         let (back, answer_back, _, back_start) = native_question(
             &mut live,
@@ -9499,6 +9928,24 @@ async fn run_s104_handoff_voice_typed_voice(
             "S104",
             "post_reopen_answer",
             format!("token={S104_RESULT_TOKEN:?} answer={:?}", answer_back.trim()),
+        )?;
+        // The delegated result as the session committed it: the rows added
+        // since the reopen question (the executor's input and reply, the
+        // spoken rows). A spoken answer without the token then reads as
+        // never delivered (absent from these rows) or delivered but not said.
+        let rows_after_back = history_rows_after(
+            &live
+                .rpc
+                .session_history(json!(live.session_id), 30)
+                .await?,
+            messages_before_back,
+        );
+        record_metric(
+            &evidence,
+            channel2,
+            "S104",
+            "post_reopen_rows",
+            format!("token={S104_RESULT_TOKEN:?} rows={rows_after_back:?}"),
         )?;
         // The typed note was committed while the call was closed, so by the
         // reopen contract it rides the reopen's startup input verbatim. That
@@ -11708,6 +12155,13 @@ const S98_TYPED_UPDATE: &str = "A delayed background update changes the code wor
 ///    told to it before the close.
 /// 5. Spoken delegation executes real tools on the existing ordinary text
 ///    member and returns a completed generated operation without a fork.
+///
+/// Each spoken exchange records provider health evidence, so a provider
+/// stall scores the run void (provider-degraded) instead of red. The lag
+/// rules read the lag end to end in the browser, so a stall on Meerkat's own
+/// uplink would read as provider-degraded too; only a timeout is
+/// corroborated, by the provider's measured input backlog. With at most five
+/// measured exchanges the p90 rule does not apply here.
 #[tokio::test]
 #[ignore = "lane:e2e-smoke"]
 async fn e2e_scenario_98_gpt_live_public_playback_settlement_and_reopen()
@@ -11768,12 +12222,21 @@ async fn run_s98_real_audio_and_context(
     live.assert_existing_text_identity().await?;
 
     // Phase A: tell the model a code word and confirm playback of its reply.
+    // Each spoken exchange records provider health evidence, so a provider
+    // stall scores the run void (provider-degraded) instead of red.
     let before = live.peer.events().await?.len();
     let audio_baseline = live.peer.audio_evidence().await?;
-    live.peer
-        .call(json!({"type":"play","name":"remember"}))
-        .await?;
-    let first_output = live.output().await?;
+    let (_, timeline_before) = live.play_direct("remember", "remember").await?;
+    let first_output = live.output().await;
+    live.settle_direct_play(
+        "S98",
+        "remember",
+        "remember",
+        timeline_before,
+        &first_output,
+    )
+    .await?;
+    let first_output = first_output?;
     assert_eq!(first_output["channel_id"], live.channel_id);
     let remember_audio = wait_for_spoken_output(&mut live.peer, audio_baseline, 45).await?;
     println!("GPT_LIVE_PUBLIC_AUDIO phase=remember evidence={remember_audio:?}");
@@ -11837,10 +12300,17 @@ async fn run_s98_real_audio_and_context(
     // Phase B: later output in the same interaction gets a fresh handle.
     let before_second = events.len();
     let audio_baseline = live.peer.audio_evidence().await?;
-    live.peer
-        .call(json!({"type":"play","name":"greeting"}))
-        .await?;
-    let second_output = live.output().await?;
+    let (_, timeline_before) = live.play_direct("greeting", "greeting").await?;
+    let second_output = live.output().await;
+    live.settle_direct_play(
+        "S98",
+        "greeting",
+        "greeting",
+        timeline_before,
+        &second_output,
+    )
+    .await?;
+    let second_output = second_output?;
     assert_eq!(second_output["channel_id"], live.channel_id);
     assert_ne!(
         second_output["output_id"], first_output["output_id"],
@@ -11875,10 +12345,11 @@ async fn run_s98_real_audio_and_context(
     live.assert_existing_text_identity().await?;
     let before_recall = live.peer.events().await?.len();
     let audio_baseline = live.peer.audio_evidence().await?;
-    live.peer
-        .call(json!({"type":"play","name":"recall"}))
+    let (_, timeline_before) = live.play_direct("recall", "recall").await?;
+    let recall_output = live.output().await;
+    live.settle_direct_play("S98", "recall", "recall", timeline_before, &recall_output)
         .await?;
-    let recall_output = live.output().await?;
+    let recall_output = recall_output?;
     assert_eq!(recall_output["channel_id"], live.channel_id);
     let recalled = wait_for_events(&mut live.peer, 60, |events| {
         output_transcript_text(events, before_recall)
@@ -11928,10 +12399,7 @@ async fn run_s98_real_audio_and_context(
         .len();
     let before_work = live.peer.events().await?.len();
     let audio_baseline = live.peer.audio_evidence().await?;
-    let sent = live
-        .peer
-        .call(json!({"type":"play","name":"delegation"}))
-        .await?;
+    let (sent, timeline_before) = live.play_direct("delegation", "delegation").await?;
     assert!(
         sent["input"]["bytes_sent"]
             .as_u64()
@@ -11941,10 +12409,19 @@ async fn run_s98_real_audio_and_context(
         "GPT_LIVE_PUBLIC_INPUT phase=existing_member evidence={}",
         sent["input"]
     );
-    wait_for_events(&mut live.peer, 120, |events| {
+    let delegated = wait_for_events(&mut live.peer, 120, |events| {
         events[before_work..].iter().any(is_client_delegation)
     })
+    .await;
+    live.settle_direct_play(
+        "S98",
+        "delegation",
+        "delegation",
+        timeline_before,
+        &delegated,
+    )
     .await?;
+    delegated?;
     let deadline = Instant::now() + Duration::from_secs(300);
     let operation = loop {
         if let Some(output) = live.poll_output(Duration::from_millis(500)).await? {
@@ -12045,16 +12522,22 @@ async fn run_s98_real_audio_and_context(
     let audio_baseline = live.peer.audio_evidence().await?;
     // `recall` asks for the word the user asked to remember, which stays
     // Tangerine after the update; `recall_now` asks for the current word.
-    live.peer
-        .call(json!({"type":"play","name":"recall_now"}))
-        .await?;
+    let (_, timeline_before) = live.play_direct("recall_now", "recall_now").await?;
     let recalled_update = wait_for_events(&mut live.peer, 90, |events| {
         output_transcript_text(events, before_updated_recall)
             .to_lowercase()
             .contains("violet")
     })
-    .await
-    .map_err(|error| {
+    .await;
+    live.settle_direct_play(
+        "S98",
+        "recall_now",
+        "recall_now",
+        timeline_before,
+        &recalled_update,
+    )
+    .await?;
+    let recalled_update = recalled_update.map_err(|error| {
         format!("Live did not recall the later canonical background update: {error}")
     })?;
     let update_audio = wait_for_spoken_output(&mut live.peer, audio_baseline, 45).await?;
@@ -12121,6 +12604,101 @@ fn delegated_worker_lifecycle(events: &Value) -> DelegatedWorkerLifecycle {
 mod config_tests {
     use super::{API_KEY_ENV, BINDING, REALM, scenario_config};
     use meerkat_core::CredentialSourceSpec;
+
+    /// A direct `play` carries no schedule id: its exchange reading is the
+    /// first start of the fixture after the baseline, and its lag runs from
+    /// that play's speech end to the next input final's own arrival time. A
+    /// start with no later final reads as no lag.
+    #[test]
+    fn direct_play_reading_takes_the_play_after_the_baseline() {
+        use super::support::{TimelineEntry, TimelineKind};
+        let entry = |t_ms: u64, kind: TimelineKind, detail: serde_json::Value| TimelineEntry {
+            t_ms,
+            kind,
+            detail,
+        };
+        let timeline = vec![
+            entry(
+                100,
+                TimelineKind::FixtureStart,
+                serde_json::json!({"id": "play-1", "name": "remember", "speech_ms": 1500}),
+            ),
+            entry(
+                1800,
+                TimelineKind::InputFinal,
+                serde_json::json!({"t_ms": 1750}),
+            ),
+            entry(
+                5000,
+                TimelineKind::FixtureStart,
+                serde_json::json!({"id": "play-2", "name": "remember", "speech_ms": 1500}),
+            ),
+            entry(
+                6900,
+                TimelineKind::InputFinal,
+                serde_json::json!({"t_ms": 6850}),
+            ),
+            entry(
+                9000,
+                TimelineKind::FixtureStart,
+                serde_json::json!({"id": "play-3", "name": "greeting", "speech_ms": 900}),
+            ),
+        ];
+        assert_eq!(
+            super::direct_play_reading(&timeline, "remember", 0),
+            Some((100, Some(150)))
+        );
+        assert_eq!(
+            super::direct_play_reading(&timeline, "remember", 2),
+            Some((5000, Some(350)))
+        );
+        assert_eq!(
+            super::direct_play_reading(&timeline, "greeting", 4),
+            Some((9000, None))
+        );
+        assert_eq!(super::direct_play_reading(&timeline, "recall", 0), None);
+    }
+
+    /// An exchange with no input final is a timeout only when its wait
+    /// failed. A good wait whose final has not shown records nothing, so a
+    /// healthy exchange never journals a timeout.
+    #[test]
+    fn exchange_evidence_times_out_only_a_failed_wait() {
+        use super::{ExchangeEvidence, exchange_evidence};
+        assert_eq!(
+            exchange_evidence(Some(900), false),
+            ExchangeEvidence::Heard(900)
+        );
+        assert_eq!(
+            exchange_evidence(Some(900), true),
+            ExchangeEvidence::Heard(900)
+        );
+        assert_eq!(exchange_evidence(None, true), ExchangeEvidence::TimedOut);
+        assert_eq!(exchange_evidence(None, false), ExchangeEvidence::Unrecorded);
+    }
+
+    /// A failed wait's own error stays primary: a settle error after it is
+    /// not returned (the caller returns the wait's error), while after a
+    /// good wait the settle error is the error.
+    #[test]
+    fn settle_error_never_replaces_a_failed_wait_error() {
+        let failed: Result<(), &str> = Err("timed out waiting for the reply");
+        assert!(
+            super::settle_after_wait(
+                "S98",
+                "remember",
+                &failed,
+                Err("timeline unreadable".into())
+            )
+            .is_ok()
+        );
+        let good: Result<(), &str> = Ok(());
+        let error =
+            super::settle_after_wait("S98", "remember", &good, Err("timeline unreadable".into()))
+                .expect_err("a settle error after a good wait is the error");
+        assert_eq!(error.to_string(), "timeline unreadable");
+        assert!(super::settle_after_wait("S98", "remember", &failed, Ok(())).is_ok());
+    }
 
     fn strings(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_owned()).collect()
@@ -13620,6 +14198,193 @@ mod config_tests {
         lines.push(ack(4, "meerkat-thinking-7-1"));
         assert!(super::thinking_tokens(&lines, 1)[0].acknowledged);
         assert!(super::thinking_tokens(&lines, 2).is_empty());
+    }
+
+    /// A timed-out quiet-lane wait journals, per typed row, the thinking
+    /// tokens that carried it and how many were acknowledged: none sent
+    /// (the product still holds them), or sent and not acknowledged (a
+    /// provider acknowledgement stall). Acks on another channel do not count.
+    #[test]
+    fn a_quiet_lane_timeout_counts_each_rows_sent_and_acknowledged_tokens() {
+        let line = |seq: u64, channel_ordinal: u32, entry: super::provider_recording::Entry| {
+            super::provider_recording::Line {
+                seq,
+                channel_ordinal,
+                elapsed_ms: seq * 100,
+                entry,
+            }
+        };
+        let append = |seq: u64, id: &str, content: &str| {
+            line(
+                seq,
+                1,
+                super::provider_recording::Entry::ClientEvent {
+                    event: serde_json::json!({"type": "session.thinking.append", "event_id": id, "content": content}),
+                },
+            )
+        };
+        let ack = |seq: u64, channel: u32, id: &str| {
+            line(
+                seq,
+                channel,
+                super::provider_recording::Entry::ServerFrame {
+                    raw: serde_json::json!({"type": "session.thinking.appended", "client_event_id": id}),
+                },
+            )
+        };
+        let probes = [
+            super::typed_row_probe("A delayed background update changes the code word."),
+            super::typed_row_probe("Okay, Violet."),
+        ];
+        let unsent = super::quiet_lane_timeout(&[], 1, &probes, 0);
+        assert_eq!(unsent.rows_sent_acked, vec![(0, 0), (0, 0)]);
+        let lines = vec![
+            append(
+                1,
+                "meerkat-thinking-4-0",
+                "From the text chat during this call: ...\n{\"role\":\"user\",\"text\":\"A delayed background update changes the code word.\"}",
+            ),
+            ack(2, 1, "meerkat-thinking-4-0"),
+            append(
+                3,
+                "meerkat-thinking-5-0",
+                "From the text chat during this call: ...\n{\"role\":\"assistant\",\"text\":\"Okay, Violet.\"}",
+            ),
+            ack(4, 2, "meerkat-thinking-5-0"),
+        ];
+        let timeout = super::quiet_lane_timeout(&lines, 1, &probes, 0);
+        assert_eq!(timeout.rows_sent_acked, vec![(1, 1), (1, 0)]);
+        let evidence = timeout.evidence_line("S98", 1);
+        assert!(
+            evidence.starts_with(
+                "GPT_LIVE_PUBLIC_QUIET_LANE_TIMEOUT scenario=S98 channel=1 rows_sent_acked=[(1, 1), (1, 0)] output_frames=0 "
+            ),
+            "{evidence}"
+        );
+    }
+
+    /// The output a timed-out quiet-lane wait journals: its channel's frames
+    /// since the wait started, against the product's floor (-50 dBFS) and
+    /// the test's voiced threshold. Energy at the floor every 1.6 s keeps the
+    /// product's 1600 ms release from coming although the voiced threshold
+    /// sees 3.2 s of silence; 1.6 s of digital silence is a run the product
+    /// releases on.
+    #[test]
+    fn a_quiet_lane_timeout_measures_output_runs_against_the_product_floor() {
+        let frame = |seq: u64, elapsed_ms: u64, amplitude: i16| {
+            server_frame(
+                seq,
+                elapsed_ms,
+                serde_json::json!({"type": "session.output_audio.delta", "delta": pcm(amplitude)}),
+            )
+        };
+        let summary = |amplitudes: &[i16]| {
+            let mut lines = vec![
+                // Before the wait started at 1000, and on another channel.
+                frame(1, 800, 5),
+                super::provider_recording::Line {
+                    channel_ordinal: 2,
+                    ..frame(2, 1100, 5)
+                },
+            ];
+            lines.extend(
+                amplitudes
+                    .iter()
+                    .enumerate()
+                    .map(|(i, amplitude)| frame(10 + i as u64, 1000 + 200 * i as u64, *amplitude)),
+            );
+            super::quiet_lane_timeout(&lines, 1, &[], 1000)
+        };
+        // RMS 150 is at the floor (-46.8 dBFS) and below the voiced RMS 300.
+        let floor_level = summary(&[1500, 5, 5, 5, 5, 5, 5, 5, 150, 5, 5, 5, 5, 5, 5, 5, 150]);
+        assert_eq!(floor_level.output_frames, 17);
+        // The frame at 800 carried the run from 1600 to 1800 into the wait.
+        assert_eq!(floor_level.below_floor_at_wait_start_ms, 1800);
+        assert_eq!(floor_level.below_floor_at_timeout_ms, 0);
+        assert_eq!(floor_level.longest_below_floor_ms, 1400);
+        assert_eq!(floor_level.longest_below_voiced_ms, 3200);
+        assert_eq!(floor_level.last_at_floor_ms, Some(3200));
+        assert_eq!(floor_level.last_voiced_ms, Some(0));
+        let silent_run = summary(&[1500, 5, 5, 5, 5, 5, 5, 5, 5, 1500]);
+        assert_eq!(silent_run.output_frames, 10);
+        assert_eq!(silent_run.longest_below_floor_ms, 1600);
+        assert_eq!(silent_run.longest_below_voiced_ms, 1600);
+        assert_eq!(silent_run.last_voiced_ms, Some(1800));
+    }
+
+    /// A timed-out quiet-lane wait counts the below-floor run as the product
+    /// does: from the channel's first output frame, starting at 1600 ms (the
+    /// model starts silent) and carried across the wait start; an undecodable
+    /// frame is below the floor for its length's audio time.
+    #[test]
+    fn a_quiet_lane_timeout_counts_the_floor_run_as_the_product_does() {
+        let frame = |seq: u64, elapsed_ms: u64, delta: String| {
+            server_frame(
+                seq,
+                elapsed_ms,
+                serde_json::json!({"type": "session.output_audio.delta", "delta": delta}),
+            )
+        };
+        // At the floor at 0, then 200 ms frames below it: five before the
+        // wait starts at 1200 and three after, so the run reaches 1600 ms.
+        let mut carried = vec![frame(1, 0, pcm(1500))];
+        carried.extend((1..=8).map(|i| frame(1 + i, 200 * i, pcm(5))));
+        let timeout = super::quiet_lane_timeout(&carried, 1, &[], 1200);
+        assert_eq!(timeout.longest_below_floor_ms, 1600);
+        assert_eq!(timeout.output_frames, 3);
+        assert_eq!(timeout.below_floor_at_wait_start_ms, 1000);
+        assert_eq!(timeout.below_floor_at_timeout_ms, 1600);
+        assert_eq!(timeout.last_at_floor_ms, None);
+        // No frame before the wait: the run starts at 1600 ms.
+        let seeded: Vec<_> = (0..3)
+            .map(|i| frame(1 + i, 1000 + 200 * i, pcm(5)))
+            .collect();
+        let timeout = super::quiet_lane_timeout(&seeded, 1, &[], 1000);
+        assert_eq!(timeout.below_floor_at_wait_start_ms, 1600);
+        assert_eq!(timeout.longest_below_floor_ms, 2200);
+        // Not base64: 6400 characters read as 100 ms below every threshold.
+        let undecodable = vec![frame(1, 0, pcm(1500)), frame(2, 200, "*".repeat(6400))];
+        let timeout = super::quiet_lane_timeout(&undecodable, 1, &[], 0);
+        assert_eq!(timeout.output_frames, 2);
+        assert_eq!(timeout.last_at_floor_ms, Some(0));
+        assert_eq!(timeout.longest_below_floor_ms, 100);
+        assert_eq!(timeout.longest_below_voiced_ms, 100);
+    }
+
+    /// The voice's output transcript a timed-out quiet-lane wait journals:
+    /// the channel's whole length, the part since the wait started, the last
+    /// delta's time, and a 200-character tail kept on the one line.
+    #[test]
+    fn a_quiet_lane_timeout_journals_the_voices_transcript_tail() {
+        let delta = |seq: u64, elapsed_ms: u64, text: &str| {
+            server_frame(
+                seq,
+                elapsed_ms,
+                serde_json::json!({"type": "session.output_transcript.delta", "delta": text}),
+            )
+        };
+        let early = "The working directory is\n";
+        let late = "slash ".repeat(50);
+        let lines = vec![
+            delta(1, 500, early),
+            super::provider_recording::Line {
+                channel_ordinal: 2,
+                ..delta(2, 1500, "elsewhere")
+            },
+            delta(3, 2500, late.as_str()),
+        ];
+        let timeout = super::quiet_lane_timeout(&lines, 1, &[], 1000);
+        let whole = format!("{early}{late}");
+        assert_eq!(timeout.transcript_chars, whole.chars().count());
+        assert_eq!(timeout.transcript_chars_since_wait, late.chars().count());
+        assert_eq!(timeout.last_transcript_ms, Some(1500));
+        assert_eq!(timeout.transcript_tail.chars().count(), 200);
+        assert!(whole.ends_with(&timeout.transcript_tail));
+        let before_wait = super::quiet_lane_timeout(&lines[..1], 1, &[], 1000);
+        assert_eq!(before_wait.transcript_chars_since_wait, 0);
+        assert_eq!(before_wait.last_transcript_ms, Some(-500));
+        assert_eq!(before_wait.transcript_tail, early);
+        assert!(!before_wait.evidence_line("S98", 1).contains('\n'));
     }
 
     /// Two slow jobs as S101 starts them (job 1 sleeps 25 s, job 2 sleeps

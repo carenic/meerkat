@@ -932,8 +932,17 @@ class AnthropicThinkingConfigBetweenTools(TypedDict, total=False):
     type: Required[Literal['between_tools']]
 
 
+class AnthropicThinkingConfigDisabled(TypedDict, total=False):
+    """Thinking turned off: the model answers without thinking blocks.
+    Accepted only on models whose catalog row admits it (its
+    `anthropic_disabled_thinking`), on some of them only at `high`
+    effort or below; wire shape `{"type": "disabled"}`.
+    """
+    type: Required[Literal['disabled']]
+
+
 # Typed shape of Anthropic's extended-thinking knob.
-AnthropicThinkingConfig = AnthropicThinkingConfigAdaptive | AnthropicThinkingConfigEnabled | AnthropicThinkingConfigBetweenTools
+AnthropicThinkingConfig = AnthropicThinkingConfigAdaptive | AnthropicThinkingConfigEnabled | AnthropicThinkingConfigBetweenTools | AnthropicThinkingConfigDisabled
 
 
 # Gemini 3 reasoning levels accepted by the API.
@@ -1408,7 +1417,7 @@ SkillResolutionFailureReason = SkillResolutionFailureReasonNotFound | SkillResol
 
 
 # Why the model stopped generating
-StopReason = Literal['end_turn', 'tool_use', 'max_tokens', 'stop_sequence', 'content_filter', 'cancelled']
+StopReason = Literal['end_turn', 'tool_use', 'max_tokens', 'stop_sequence', 'content_filter', 'cancelled', 'refusal', 'pause_turn', 'context_window_exceeded']
 
 
 class StreamTruncationReasonChannelFull(TypedDict, total=False):

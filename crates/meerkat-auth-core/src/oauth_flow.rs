@@ -3063,7 +3063,7 @@ mod tests {
 }
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
-#[allow(clippy::expect_used)]
+#[allow(clippy::expect_used, clippy::disallowed_methods)]
 mod fixture_endpoint_override_tests {
     use super::*;
 

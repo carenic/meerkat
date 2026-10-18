@@ -27,11 +27,17 @@
 
 import { spawn, type ChildProcess } from "node:child_process";
 import type { SpawnOptions } from "node:child_process";
+import { createHash } from "node:crypto";
 import { once } from "node:events";
 import {
   chmodSync,
+  createReadStream,
   existsSync,
+  lstatSync,
   mkdirSync,
+  mkdtempSync,
+  renameSync,
+  rmSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -45,6 +51,8 @@ import {
   CapabilityUnavailableError,
   meerkatErrorFromJsonRpcCode,
 } from "./generated/errors.js";
+import { BinaryIntegrityError } from "./binary-errors.js";
+import { RKAT_RPC_DIGESTS, type RkatRpcDigests } from "./rkat-rpc-digests.js";
 import { isCompatibleWith } from "./generated/version_compat.js";
 import type {
   RpcMethodContracts,
@@ -594,6 +602,17 @@ const MEERKAT_BINARY_CACHE_ROOT = path.join(
   "bin",
   MEERKAT_RELEASE_BINARY,
 );
+// A GitHub release download redirects once, to its asset host.
+const RELEASE_DOWNLOAD_MAX_REDIRECTS = 5;
+// The rkat-rpc release archives are about 100 MB; a far larger body is not one.
+const RELEASE_ARCHIVE_MAX_BYTES = 256 * 1024 * 1024;
+const SHA256_HEX = /^[0-9a-f]{64}$/;
+
+async function sha256File(file: string): Promise<string> {
+  const hash = createHash("sha256");
+  for await (const chunk of createReadStream(file)) hash.update(chunk as Buffer);
+  return hash.digest("hex");
+}
 const MOB_SPAWN_MANY_FAILURE_CAUSES = new Set<string>([
   "profile_not_found",
   "member_not_found",
@@ -2205,6 +2224,11 @@ export class MeerkatClient {
         "mob_id",
         "Invalid mob/create response",
       ),
+      MeerkatClient.requireStringField(
+        result,
+        "claim_token",
+        "Invalid mob/create response",
+      ),
     );
   }
 
@@ -3243,12 +3267,24 @@ export class MeerkatClient {
    * Wraps the `mob/claim_callback_route` RPC. A mob restored after a restart,
    * or one whose owning connection closed, has no callback route: its
    * members' callback tools fail `tool_unavailable` until a connection claims
-   * it. After the claim, its live and future members call the tools this
-   * connection registered. A claim while the connection that holds the route
-   * is still open is refused with `-32002`.
+   * it with the mob's claim token, the one `createMob` returned to its
+   * creator (`Mob.claimToken`); a lost token cannot be minted again, so a
+   * creator that must claim after a restart persists it (destroying and
+   * creating the mob again is the only recovery). After the claim, its live
+   * and future members call the tools this connection registered. A claim is refused with
+   * `-32002`, its reason in `data.reason`: `claim_token_mismatch` for another
+   * token, `not_claimable` for a mob created without one, and
+   * `held_by_open_connection` while the connection that holds the route is
+   * still open.
    */
-  async mobClaimCallbackRoute(mobId: string): Promise<MobClaimCallbackRouteResult> {
-    const result = await this.request("mob/claim_callback_route", { mob_id: mobId });
+  async mobClaimCallbackRoute(
+    mobId: string,
+    claimToken: string,
+  ): Promise<MobClaimCallbackRouteResult> {
+    const result = await this.request("mob/claim_callback_route", {
+      mob_id: mobId,
+      claim_token: claimToken,
+    });
     MeerkatClient.requireStringField(
       result,
       "mob_id",
@@ -5683,6 +5719,9 @@ export class MeerkatClient {
           "stop_sequence",
           "content_filter",
           "cancelled",
+          "refusal",
+          "pause_turn",
+          "context_window_exceeded",
         ].includes(stopReason)
       ) {
         throw new MeerkatError(
@@ -8430,7 +8469,11 @@ export class MeerkatClient {
     archiveExt: PlatformTarget["archiveExt"],
   ): { asset: string; url: string } {
     const asset = `${MEERKAT_RELEASE_BINARY}-${version}-${target}.${archiveExt}`;
-    return { asset, url: `https://github.com/${MEERKAT_REPO}/releases/download/v${version}/${asset}` };
+    return { asset, url: MeerkatClient.releaseUrl(version, asset) };
+  }
+
+  private static releaseUrl(version: string, asset: string): string {
+    return `https://github.com/${MEERKAT_REPO}/releases/download/v${version}/${asset}`;
   }
 
   private static async runCommand(command: string, args: string[]): Promise<void> {
@@ -8458,39 +8501,235 @@ export class MeerkatClient {
     }
   }
 
+  /** The download cache root; a static seam so tests can redirect it. */
+  private static binaryCacheRoot(): string {
+    return MEERKAT_BINARY_CACHE_ROOT;
+  }
+
+  /** The release digests this package pins (stamped at release time). */
+  private static pinnedDigests(): RkatRpcDigests {
+    return RKAT_RPC_DIGESTS;
+  }
+
+  /**
+   * The pinned archive and binary sha256 of one release asset. Only a package
+   * built by the release workflow pins them (see `rkat-rpc-digests.ts`);
+   * without them the SDK refuses to download anything.
+   */
+  private static pinnedArchive(
+    version: string,
+    target: string,
+    asset: string,
+  ): { archiveSha256: string; binarySha256: string } {
+    const digests = MeerkatClient.pinnedDigests();
+    const entry =
+      digests.version === version && Object.prototype.hasOwnProperty.call(digests.archives, target)
+        ? digests.archives[target]
+        : undefined;
+    if (
+      !entry ||
+      entry.asset !== asset ||
+      !SHA256_HEX.test(entry.archive_sha256) ||
+      !SHA256_HEX.test(entry.binary_sha256)
+    ) {
+      throw new MeerkatError(
+        "BINARY_DIGEST_UNAVAILABLE",
+        `This @rkat/sdk package pins no release digest for ${asset}, so it will not download ` +
+          `${MEERKAT_RELEASE_BINARY}: only packages built by the release workflow pin one, and ` +
+          `source or git installs do not. Install ${MEERKAT_RELEASE_BINARY} ${version} yourself (the ` +
+          `release archive is ${MeerkatClient.releaseUrl(version, asset)}) and put it on PATH, or pass ` +
+          "its path to new MeerkatClient(path) or set MEERKAT_BIN_PATH to a binary you trust.",
+      );
+    }
+    return { archiveSha256: entry.archive_sha256, binarySha256: entry.binary_sha256 };
+  }
+
+  /** Download one release archive over HTTPS only, redirects included. */
+  private static async fetchReleaseArchive(url: string): Promise<Buffer> {
+    let current = url;
+    for (let hop = 0; hop <= RELEASE_DOWNLOAD_MAX_REDIRECTS; hop += 1) {
+      if (new URL(current).protocol !== "https:") {
+        throw new MeerkatError(
+          "BINARY_DOWNLOAD_FAILED",
+          `Refusing to download ${MEERKAT_RELEASE_BINARY} over a non-HTTPS URL: ${current}`,
+        );
+      }
+      let response: Response;
+      try {
+        response = await fetch(current, { redirect: "manual" });
+      } catch (error) {
+        throw new MeerkatError(
+          "BINARY_DOWNLOAD_FAILED",
+          `Failed to download ${MEERKAT_RELEASE_BINARY} from ${current}: ${String(error)}`,
+        );
+      }
+      const location = response.headers.get("location");
+      if (response.status >= 300 && response.status < 400 && location) {
+        await response.body?.cancel();
+        current = new URL(location, current).toString();
+        continue;
+      }
+      if (!response.ok) {
+        throw new MeerkatError(
+          "BINARY_DOWNLOAD_FAILED",
+          `Failed to download binary from ${current} (HTTP ${response.status})`,
+        );
+      }
+      try {
+        return await MeerkatClient.readReleaseArchive(response, current);
+      } catch (error) {
+        // A transport fault while reading the body is a download failure;
+        // it never reaches the digest check as tamper.
+        if (error instanceof MeerkatError) throw error;
+        throw new MeerkatError(
+          "BINARY_DOWNLOAD_FAILED",
+          `Failed to download ${MEERKAT_RELEASE_BINARY} from ${current}: ${String(error)}`,
+        );
+      }
+    }
+    throw new MeerkatError(
+      "BINARY_DOWNLOAD_FAILED",
+      `Too many redirects while downloading ${MEERKAT_RELEASE_BINARY} from ${url}`,
+    );
+  }
+
+  /** The largest release archive the SDK downloads; a seam for tests. */
+  private static releaseArchiveMaxBytes(): number {
+    return RELEASE_ARCHIVE_MAX_BYTES;
+  }
+
+  /**
+   * Read a release archive body, refusing one over the size cap: by its
+   * declared length before anything is read, else once the stream passes it.
+   */
+  private static async readReleaseArchive(response: Response, url: string): Promise<Buffer> {
+    const limit = MeerkatClient.releaseArchiveMaxBytes();
+    const tooLarge = () =>
+      new MeerkatError(
+        "BINARY_DOWNLOAD_TOO_LARGE",
+        `Refusing to download ${url}: it is larger than ${RELEASE_ARCHIVE_MAX_BYTES / (1024 * 1024)} MiB, ` +
+          `far above any ${MEERKAT_RELEASE_BINARY} release archive.`,
+      );
+    const declared = Number(response.headers.get("content-length") ?? Number.NaN);
+    if (Number.isFinite(declared) && declared > limit) {
+      await response.body?.cancel();
+      throw tooLarge();
+    }
+    if (!response.body) return Buffer.alloc(0);
+    const reader = response.body.getReader();
+    const chunks: Buffer[] = [];
+    let total = 0;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > limit) {
+        await reader.cancel();
+        throw tooLarge();
+      }
+      chunks.push(Buffer.from(value));
+    }
+    if (Number.isFinite(declared) && total !== declared) {
+      throw new MeerkatError(
+        "BINARY_DOWNLOAD_FAILED",
+        `Failed to download ${MEERKAT_RELEASE_BINARY} from ${url}: the connection closed after ` +
+          `${total} of ${declared} bytes`,
+      );
+    }
+    return Buffer.concat(chunks, total);
+  }
+
+  /** Re-verify a cached binary; delete and refuse one that does not match. */
+  private static async verifyCachedBinary(
+    cached: string,
+    asset: string,
+    binarySha256: string,
+  ): Promise<void> {
+    const actual = await sha256File(cached);
+    if (actual === binarySha256) return;
+    let outcome: string;
+    try {
+      unlinkSync(cached);
+      outcome = "it was removed, and the next connect downloads a verified copy";
+    } catch (error) {
+      outcome = `it could not be removed (${String(error)}); delete it before retrying`;
+    }
+    throw new BinaryIntegrityError(
+      `The cached ${cached} does not match the sha256 this SDK pins for the ` +
+        `${path.basename(cached)} in ${asset}; ${outcome}.`,
+      { asset, path: cached, expectedSha256: binarySha256, actualSha256: actual },
+    );
+  }
+
+  /**
+   * This SDK version's release `rkat-rpc`, verified before it can run. The
+   * downloaded archive must match its pinned sha256 before anything is
+   * written or extracted, and the binary inside it must match its own pin
+   * before it is installed. A cached binary is re-verified on every reuse.
+   */
   private static async ensureDownloadedBinary(): Promise<string> {
     const { target, archiveExt, binaryName } = MeerkatClient.platformTarget();
     const version = CONTRACT_VERSION;
     const { asset, url } = MeerkatClient.releaseAsset(version, target, archiveExt);
-    const baseDir = path.join(MEERKAT_BINARY_CACHE_ROOT, `v${version}`, target);
-    mkdirSync(baseDir, { recursive: true });
+    const pinned = MeerkatClient.pinnedArchive(version, target, asset);
+    const baseDir = path.join(MeerkatClient.binaryCacheRoot(), `v${version}`, target);
     const cached = path.join(baseDir, binaryName);
-    if (existsSync(cached)) return cached;
-
-    const response = await fetch(url);
-    if (!response.ok) {
-      throw new MeerkatError("BINARY_DOWNLOAD_FAILED", `Failed to download binary from ${url} (HTTP ${response.status})`);
+    if (existsSync(cached)) {
+      await MeerkatClient.verifyCachedBinary(cached, asset, pinned.binarySha256);
+      return cached;
     }
-    const arrayBuffer = await response.arrayBuffer();
-    const archivePath = path.join(baseDir, asset);
-    writeFileSync(archivePath, Buffer.from(arrayBuffer));
 
+    const archive = await MeerkatClient.fetchReleaseArchive(url);
+    const archiveSha256 = createHash("sha256").update(archive).digest("hex");
+    if (archiveSha256 !== pinned.archiveSha256) {
+      throw new BinaryIntegrityError(
+        `The downloaded ${asset} does not match the sha256 this SDK pins for it; ` +
+          "it was discarded without being extracted.",
+        { asset, path: null, expectedSha256: pinned.archiveSha256, actualSha256: archiveSha256 },
+      );
+    }
+
+    // Extract beside the cache entry, check the binary against its own pin,
+    // then move it into place in one rename.
+    mkdirSync(baseDir, { recursive: true });
+    const staging = mkdtempSync(path.join(baseDir, ".download-"));
     try {
-      if (archiveExt === "tar.gz") {
-        await MeerkatClient.runCommand("tar", ["-xzf", archivePath, "-C", baseDir]);
-      } else {
-        await MeerkatClient.extractZip(archivePath, baseDir);
+      const archivePath = path.join(staging, asset);
+      const extracted = path.join(staging, "extracted");
+      writeFileSync(archivePath, archive);
+      mkdirSync(extracted);
+      try {
+        if (archiveExt === "tar.gz") {
+          await MeerkatClient.runCommand("tar", ["-xzf", archivePath, "-C", extracted]);
+        } else {
+          await MeerkatClient.extractZip(archivePath, extracted);
+        }
+      } catch (error) {
+        throw new MeerkatError("BINARY_DOWNLOAD_EXTRACT_FAILED", `Failed to extract ${asset}: ${String(error)}`);
       }
-    } catch (error) {
-      throw new MeerkatError("BINARY_DOWNLOAD_EXTRACT_FAILED", `Failed to extract ${archivePath}: ${String(error)}`);
+      const staged = path.join(extracted, binaryName);
+      if (!existsSync(staged) || !lstatSync(staged).isFile()) {
+        throw new MeerkatError("BINARY_DOWNLOAD_EXTRACT_FAILED", `${asset} does not contain '${binaryName}'.`);
+      }
+      const binarySha256 = await sha256File(staged);
+      if (binarySha256 !== pinned.binarySha256) {
+        throw new BinaryIntegrityError(
+          `The ${binaryName} in ${asset} does not match the sha256 this SDK pins for it; ` +
+            "it was not installed.",
+          { asset, path: null, expectedSha256: pinned.binarySha256, actualSha256: binarySha256 },
+        );
+      }
+      if (process.platform !== "win32") chmodSync(staged, 0o755);
+      renameSync(staged, cached);
     } finally {
-      try { unlinkSync(archivePath); } catch { /* best-effort cleanup */ }
+      rmSync(staging, { recursive: true, force: true });
     }
-
-    if (process.platform !== "win32") chmodSync(cached, 0o755);
     return cached;
   }
 
+  // MEERKAT_BIN_PATH, an explicit rkatPath and rkat-rpc on PATH are the
+  // caller's own binaries and run as given. Only the auto-downloaded release
+  // binary is verified, against the digests this package pins.
   private static async resolveBinaryPath(requestedPath: string): Promise<ResolvedBinary> {
     const overridden = process.env.MEERKAT_BIN_PATH?.trim();
     if (overridden) {
@@ -8516,6 +8755,9 @@ export class MeerkatClient {
       const downloaded = await MeerkatClient.ensureDownloadedBinary();
       return { command: downloaded, useLegacySubcommand: false };
     } catch (error) {
+      // A digest mismatch is a tamper signal: surface it instead of quietly
+      // running another binary in its place.
+      if (error instanceof BinaryIntegrityError) throw error;
       const legacy = MeerkatClient.commandPath("rkat");
       if (legacy) return { command: legacy, useLegacySubcommand: true };
       if (error instanceof MeerkatError) throw error;

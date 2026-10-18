@@ -316,6 +316,9 @@ pub struct JobRuntimeDeliveryApplier {
     /// Whether this process applies cold deliveries (recipients no process
     /// hosts): it is the store's cold-delivery owner, or the only process.
     applies_cold_deliveries: bool,
+    /// The session serving the drained runtime's member address now, when
+    /// the owner resolved one ([`Self::with_address_session`]).
+    address_session: Option<meerkat_core::SessionId>,
     #[cfg(not(target_arch = "wasm32"))]
     continuations: Option<(
         Arc<dyn crate::ContinuationDeliverySink>,
@@ -341,6 +344,7 @@ impl JobRuntimeDeliveryApplier {
                 owner: meerkat_runtime::HostingOwner::mint(),
             }),
             applies_cold_deliveries: true,
+            address_session: None,
             #[cfg(not(target_arch = "wasm32"))]
             continuations: None,
         }
@@ -360,9 +364,30 @@ impl JobRuntimeDeliveryApplier {
             runtime_inbox,
             router,
             applies_cold_deliveries,
+            address_session: None,
             #[cfg(not(target_arch = "wasm32"))]
             continuations: None,
         }
+    }
+
+    /// The session serving the drained runtime's member delivery address
+    /// now (#1790): a member-addressed job row's applications that the
+    /// job's origin session subscribed are applied in this session, the
+    /// member's current one after a repoint. Rows of other runtimes, and
+    /// other subscribers' applications, are unchanged.
+    #[must_use]
+    pub fn with_address_session(mut self, session: meerkat_core::SessionId) -> Self {
+        self.address_session = Some(session);
+        self
+    }
+
+    /// The session a row of `runtime_id` applies its origin session's
+    /// subscriptions in: the resolved serving session, when `runtime_id` is
+    /// a member delivery address.
+    fn member_session(&self, runtime_id: &LogicalRuntimeId) -> Option<&meerkat_core::SessionId> {
+        self.address_session
+            .as_ref()
+            .filter(|_| matches!(runtime_id.member_address(), Ok(Some(_))))
     }
 
     /// Also admit continuation rows, into `session` through `sink`.
@@ -597,7 +622,7 @@ impl JobRuntimeDeliveryApplier {
         runtime_id: &LogicalRuntimeId,
         record: &RuntimeDeliveryRecord,
     ) -> Result<RecordProgress, JobOutboxProjectionError> {
-        let applications = match record.submission.kind() {
+        let (applications, origin_session_id) = match record.submission.kind() {
             RuntimeDeliveryKind::JobNotification => {
                 let payload: JobNotificationDeliveryPayload =
                     serde_json::from_slice(record.submission.payload()).map_err(|error| {
@@ -606,14 +631,16 @@ impl JobRuntimeDeliveryApplier {
                             record.submission.delivery_id()
                         ))
                     })?;
-                subscription_applications(
+                let origin_session_id = payload.origin_session_id.clone();
+                let applications = subscription_applications(
                     payload.job_id,
                     payload.delivery_sequence,
                     payload.origin_session_id,
                     payload.interaction_lineage_id,
                     payload.targets,
                     JobDeliveryContent::Notification(payload.notification),
-                )?
+                )?;
+                (applications, origin_session_id)
             }
             RuntimeDeliveryKind::JobTerminal => {
                 let payload: JobTerminalDeliveryPayload =
@@ -623,14 +650,16 @@ impl JobRuntimeDeliveryApplier {
                             record.submission.delivery_id()
                         ))
                     })?;
-                subscription_applications(
+                let origin_session_id = payload.origin_session_id.clone();
+                let applications = subscription_applications(
                     payload.job_id,
                     payload.delivery_sequence,
                     payload.origin_session_id,
                     payload.interaction_lineage_id,
                     payload.targets,
                     JobDeliveryContent::Terminal(payload.terminal_result),
-                )?
+                )?;
+                (applications, origin_session_id)
             }
             _ => {
                 return Err(JobOutboxProjectionError::UnsupportedKind(
@@ -656,6 +685,19 @@ impl JobRuntimeDeliveryApplier {
                 )?)
             })
             .collect::<Result<Vec<_>, JobOutboxProjectionError>>()?;
+        // #1790: a member's job rows are addressed to the member. What the
+        // job's origin session subscribed is applied in the session serving
+        // the member now; the bound manifest keeps the recorded
+        // subscriptions.
+        let applications = match self.member_session(runtime_id) {
+            Some(serving) => applications
+                .into_iter()
+                .map(|application| {
+                    retarget_origin_application(application, &origin_session_id, serving)
+                })
+                .collect(),
+            None => applications,
+        };
         // #1813: route every recipient by ITS session's hosting, and take
         // the claim of every cold recipient this process applies, before any
         // delivery-authority input. A row with nothing this process may apply
@@ -761,6 +803,77 @@ impl JobRuntimeDeliveryApplier {
             .await?;
         Ok(RecordProgress::Completed(outcome, states))
     }
+}
+
+/// `application` with its subscription moved to `serving` when the job's
+/// origin session holds it; another subscriber's application as it is.
+fn retarget_origin_application(
+    application: JobDeliveryApplication,
+    origin_session_id: &meerkat_core::SessionId,
+    serving: &meerkat_core::SessionId,
+) -> JobDeliveryApplication {
+    let retarget = |subscription: JobSubscription| {
+        if subscription.session_id() == origin_session_id {
+            JobSubscription::new(
+                subscription.subscription_id().clone(),
+                serving.clone(),
+                subscription.delivery().clone(),
+            )
+        } else {
+            subscription
+        }
+    };
+    match application {
+        JobDeliveryApplication::Record {
+            job_id,
+            delivery_sequence,
+            subscription,
+            content,
+        } => JobDeliveryApplication::Record {
+            job_id,
+            delivery_sequence,
+            subscription: retarget(subscription),
+            content,
+        },
+        JobDeliveryApplication::Notification {
+            job_id,
+            delivery_sequence,
+            subscription,
+            content,
+        } => JobDeliveryApplication::Notification {
+            job_id,
+            delivery_sequence,
+            subscription: retarget(subscription),
+            content,
+        },
+        JobDeliveryApplication::Event {
+            job_id,
+            delivery_sequence,
+            subscription,
+            interaction_lineage_id,
+            handling_mode,
+            content,
+        } => JobDeliveryApplication::Event {
+            job_id,
+            delivery_sequence,
+            subscription: retarget(subscription),
+            interaction_lineage_id,
+            handling_mode,
+            content,
+        },
+    }
+}
+
+/// The runtime a job's deliveries are addressed to (#1790): the member
+/// delivery address its submission recorded as its origin member, which
+/// follows the member across a repoint, or else its origin session's
+/// runtime.
+fn job_delivery_runtime_id(spec: &meerkat_jobs::JobSpec) -> LogicalRuntimeId {
+    spec.origin_member_id
+        .as_ref()
+        .map(|member| LogicalRuntimeId::new(member.as_str()))
+        .filter(|address| matches!(address.member_address(), Ok(Some(_))))
+        .unwrap_or_else(|| LogicalRuntimeId::for_session(&spec.origin_session_id))
 }
 
 /// The session one application is delivered to.
@@ -1126,6 +1239,8 @@ impl JobOutboxProjector {
             let Some((job_id, origin_session_id)) = pending_delivery_provenance(&first)? else {
                 continue;
             };
+            // A member-addressed runtime (#1790) has no provenance session:
+            // the delivery owner resolves the session serving its member.
             if &LogicalRuntimeId::for_session(&origin_session_id) != runtime_id {
                 continue;
             }
@@ -1241,7 +1356,7 @@ impl JobOutboxProjector {
             payload,
         )?;
         let prepared = PreparedJobDelivery {
-            runtime_id: LogicalRuntimeId::for_session(&job.spec.origin_session_id),
+            runtime_id: job_delivery_runtime_id(&job.spec),
             submission,
             // Interim routing choice until the generated driver declares it
             // (#1762): reads only immutable admission data (the job spec).
@@ -1405,7 +1520,7 @@ impl meerkat_tools::builtin::shell::ShellJobDeliveryProjector for JobOutboxProje
                 self.realm_id.as_deref().unwrap_or("<unscoped>")
             ));
         }
-        let runtime_id = LogicalRuntimeId::for_session(&job.spec.origin_session_id);
+        let runtime_id = job_delivery_runtime_id(&job.spec);
         let pending = self
             .runtime_inbox
             .list_pending(&runtime_id, usize::MAX)

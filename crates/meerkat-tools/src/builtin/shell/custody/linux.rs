@@ -13,26 +13,133 @@
 //! never an I/O error. Ownership is the effective uid from the `Uid` key of
 //! `/proc/<pid>/status`, which (unlike the `/proc/<pid>` owner) does not
 //! depend on the process being dumpable.
+//!
+//! Every `/proc/<pid>` read goes through a [`Procfs`] opened once per
+//! operation, which refuses a procfs that does not show this host's own
+//! pid namespace with a typed [`ForeignProcfsView`] error: there a pid
+//! would name another process than the host's own syscalls do.
 
 #![allow(unsafe_code)]
 
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::fs::MetadataExt;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use uuid::Uuid;
 
 use super::{
-    ExitWaitOutcome, HostEnvironment, ProcessIdentity, ProcessProbe, ProcessSnapshot,
-    ProcessStartStamp,
+    ExitWaitOutcome, ForeignProcfsView, HostEnvironment, ProcessIdentity, ProcessProbe,
+    ProcessSnapshot, ProcessStartStamp,
 };
 
 const BOOT_ID_PATH: &str = "/proc/sys/kernel/random/boot_id";
+/// Mount point of the procfs process facts are read from.
+const PROC_ROOT: &str = "/proc";
 
 fn boot_id() -> io::Result<Uuid> {
     let raw = std::fs::read_to_string(BOOT_ID_PATH)?;
     Uuid::parse_str(raw.trim()).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+}
+
+/// A procfs whose pid entries name the processes this host's own syscalls
+/// (`pidfd_open`, `kill`, `getsid`) name. Every `/proc/<pid>` read takes
+/// one, and [`Procfs::open`] is the only way to obtain one, once per
+/// operation, so no read skips its check and a procfs mounted over `/proc`
+/// later is checked again.
+#[derive(Debug)]
+struct Procfs<'a> {
+    root: &'a Path,
+}
+
+impl<'a> Procfs<'a> {
+    /// Open the procfs at `root` for a host whose own pid is `host_pid`,
+    /// refusing one that does not show the host's own pid namespace with a
+    /// typed [`ForeignProcfsView`] error (see [`foreign_view`]).
+    fn open(root: &'a Path, host_pid: i32) -> io::Result<Self> {
+        let status = match std::fs::read_to_string(root.join("self/status")) {
+            Ok(status) => Some(status),
+            // `self` exists only in a procfs whose pid namespace contains
+            // this process.
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error),
+        };
+        match foreign_view(status.as_deref(), host_pid)? {
+            None => Ok(Self { root }),
+            Some(view) => Err(io::Error::other(view)),
+        }
+    }
+
+    /// The directory of process `pid`.
+    fn entry(&self, pid: i32) -> PathBuf {
+        self.root.join(pid.to_string())
+    }
+
+    /// Read the record `leaf` (for example `stat`) of process `pid`.
+    fn read(&self, pid: i32, leaf: &str) -> io::Result<String> {
+        std::fs::read_to_string(self.entry(pid).join(leaf))
+    }
+}
+
+/// The procfs at `/proc`, opened for this process.
+fn procfs() -> io::Result<Procfs<'static>> {
+    Procfs::open(Path::new(PROC_ROOT), own_pid()?)
+}
+
+/// What a procfs shows instead of the host's own pid namespace, from the
+/// host's own status record there (`status`, `None` when it has none);
+/// `None` when the procfs is the host's own.
+///
+/// `NSpid` (Linux 4.1 and later) lists the host's pid in every pid namespace
+/// from the procfs's down to the host's own, so the procfs is the host's
+/// own exactly when it lists one pid, the host's, and its `Tgid` (the pid
+/// the procfs shows the host as) is the host's too. Without `NSpid` (earlier
+/// kernels, or gVisor, which prints `Tgid` in the procfs's namespace) the
+/// host's own pid as `Tgid` is the only evidence: an ancestor namespace's
+/// procfs in which the host's pid happens to be the same number passes,
+/// the one mismatch this cannot see.
+fn foreign_view(status: Option<&str>, host_pid: i32) -> io::Result<Option<ForeignProcfsView>> {
+    let Some(status) = status else {
+        return Ok(Some(ForeignProcfsView {
+            host_pid,
+            procfs_pid: None,
+            namespace_levels_above: None,
+        }));
+    };
+    let invalid = || io::Error::new(io::ErrorKind::InvalidData, "malformed /proc status record");
+    let field = |key: &str| status.lines().find_map(|line| line.strip_prefix(key));
+    let procfs_pid = field("Tgid:")
+        .and_then(|value| value.trim().parse::<i32>().ok())
+        .ok_or_else(invalid)?;
+    let levels = field("NSpid:")
+        .map(|value| {
+            value
+                .split_ascii_whitespace()
+                .map(|pid| pid.parse::<i32>().map_err(|_| invalid()))
+                .collect::<io::Result<Vec<_>>>()
+        })
+        .transpose()?;
+    // A record whose `Tgid` and one `NSpid` level disagree is not the host's.
+    let own = procfs_pid == host_pid
+        && levels
+            .as_deref()
+            .is_none_or(|pids| matches!(pids, [pid] if *pid == host_pid));
+    if own {
+        return Ok(None);
+    }
+    Ok(Some(ForeignProcfsView {
+        host_pid,
+        procfs_pid: Some(procfs_pid),
+        namespace_levels_above: levels
+            .and_then(|pids| u32::try_from(pids.len().saturating_sub(1)).ok())
+            .filter(|levels| *levels > 0),
+    }))
+}
+
+/// This process's pid in its own pid namespace.
+fn own_pid() -> io::Result<i32> {
+    i32::try_from(std::process::id()).map_err(|_| io::Error::other("own pid out of range"))
 }
 
 /// Parsed fields of `/proc/<pid>/stat` that custody needs.
@@ -97,8 +204,8 @@ fn classify_stat_read(read: io::Result<String>) -> io::Result<StatRead> {
     }
 }
 
-fn read_stat(pid: i32) -> io::Result<StatRead> {
-    classify_stat_read(std::fs::read_to_string(format!("/proc/{pid}/stat")))
+fn read_stat(procfs: &Procfs<'_>, pid: i32) -> io::Result<StatRead> {
+    classify_stat_read(procfs.read(pid, "stat"))
 }
 
 /// This process's effective uid.
@@ -140,20 +247,17 @@ fn classify_owner(read: io::Result<String>, own_uid: u32) -> io::Result<OwnerRea
     }
 }
 
-fn read_owner(pid: i32) -> io::Result<OwnerRead> {
-    classify_owner(
-        std::fs::read_to_string(format!("/proc/{pid}/status")),
-        own_effective_uid(),
-    )
+fn read_owner(procfs: &Procfs<'_>, pid: i32) -> io::Result<OwnerRead> {
+    classify_owner(procfs.read(pid, "status"), own_effective_uid())
 }
 
 /// Stat plus ownership: a readable process of another user is foreign.
-fn read_own_stat(pid: i32) -> io::Result<StatRead> {
-    let stat = read_stat(pid)?;
+fn read_own_stat(procfs: &Procfs<'_>, pid: i32) -> io::Result<StatRead> {
+    let stat = read_stat(procfs, pid)?;
     if !matches!(stat, StatRead::Stat(_)) {
         return Ok(stat);
     }
-    Ok(match read_owner(pid)? {
+    Ok(match read_owner(procfs, pid)? {
         OwnerRead::Ours => stat,
         OwnerRead::Absent => StatRead::Absent,
         OwnerRead::Foreign => StatRead::Foreign,
@@ -171,8 +275,12 @@ fn snapshot_from_stat(stat: &ProcStat, boot_id: Uuid) -> ProcessSnapshot {
 }
 
 pub(super) fn probe(pid: i32) -> io::Result<ProcessProbe> {
+    probe_in(&procfs()?, pid)
+}
+
+fn probe_in(procfs: &Procfs<'_>, pid: i32) -> io::Result<ProcessProbe> {
     let boot_id = boot_id()?;
-    Ok(match read_own_stat(pid)? {
+    Ok(match read_own_stat(procfs, pid)? {
         StatRead::Absent => ProcessProbe::Absent,
         StatRead::Foreign => ProcessProbe::Foreign,
         StatRead::Stat(stat) => ProcessProbe::Observed(snapshot_from_stat(&stat, boot_id)),
@@ -189,9 +297,13 @@ pub(super) const EMPTY_LISTING_IS_AUTHORITATIVE: bool = false;
 /// [`ProcessProbe::Foreign`]. Callers cross-check an empty result against
 /// `kill(-pgid, 0)`.
 pub(super) fn group_members(pgid: i32) -> io::Result<Vec<(i32, ProcessProbe)>> {
+    group_members_in(&procfs()?, pgid)
+}
+
+fn group_members_in(procfs: &Procfs<'_>, pgid: i32) -> io::Result<Vec<(i32, ProcessProbe)>> {
     let boot_id = boot_id()?;
     let mut members = Vec::new();
-    for entry in std::fs::read_dir("/proc")? {
+    for entry in std::fs::read_dir(procfs.root)? {
         let entry = entry?;
         let Some(pid) = entry
             .file_name()
@@ -200,10 +312,10 @@ pub(super) fn group_members(pgid: i32) -> io::Result<Vec<(i32, ProcessProbe)>> {
         else {
             continue;
         };
-        if let StatRead::Stat(stat) = read_stat(pid)?
+        if let StatRead::Stat(stat) = read_stat(procfs, pid)?
             && stat.pgrp == pgid
         {
-            match read_owner(pid)? {
+            match read_owner(procfs, pid)? {
                 OwnerRead::Absent => {}
                 OwnerRead::Foreign => members.push((pid, ProcessProbe::Foreign)),
                 OwnerRead::Ours => members.push((
@@ -262,9 +374,9 @@ fn pidfd_open(pid: i32) -> io::Result<PidfdOpen> {
     Ok(PidfdOpen::Opened(unsafe { OwnedFd::from_raw_fd(fd) }))
 }
 
-fn stamp_matches(identity: &ProcessIdentity) -> io::Result<bool> {
+fn stamp_matches(procfs: &Procfs<'_>, identity: &ProcessIdentity) -> io::Result<bool> {
     Ok(matches!(
-        probe(identity.pid)?,
+        probe_in(procfs, identity.pid)?,
         ProcessProbe::Observed(current) if current.start == identity.start
     ))
 }
@@ -272,8 +384,8 @@ fn stamp_matches(identity: &ProcessIdentity) -> io::Result<bool> {
 /// Whether `pid` is a thread-group leader (a process), from the `Tgid` key
 /// of `/proc/<pid>/status`. Used only without pidfd support, where EINVAL is
 /// not available to reject thread ids.
-fn is_thread_group_leader(pid: i32) -> io::Result<bool> {
-    let status = match std::fs::read_to_string(format!("/proc/{pid}/status")) {
+fn is_thread_group_leader(procfs: &Procfs<'_>, pid: i32) -> io::Result<bool> {
+    let status = match procfs.read(pid, "status") {
         Ok(status) => status,
         Err(error) => {
             return match classify_stat_read(Err(error))? {
@@ -301,18 +413,18 @@ enum Pinned {
 /// Pin `identity`: compare stamps from `/proc` first (so a foreign or absent
 /// pid is classified before any pidfd call), then open a pidfd and re-check
 /// the stamp, which the pidfd now pins.
-fn pin(identity: &ProcessIdentity) -> io::Result<Pinned> {
-    if !stamp_matches(identity)? {
+fn pin(procfs: &Procfs<'_>, identity: &ProcessIdentity) -> io::Result<Pinned> {
+    if !stamp_matches(procfs, identity)? {
         return Ok(Pinned::NotRunning);
     }
     match pidfd_open(identity.pid)? {
-        PidfdOpen::Opened(pidfd) => Ok(if stamp_matches(identity)? {
+        PidfdOpen::Opened(pidfd) => Ok(if stamp_matches(procfs, identity)? {
             Pinned::Pidfd(pidfd)
         } else {
             Pinned::NotRunning
         }),
         PidfdOpen::Gone | PidfdOpen::NotAProcess => Ok(Pinned::NotRunning),
-        PidfdOpen::Unsupported => Ok(if is_thread_group_leader(identity.pid)? {
+        PidfdOpen::Unsupported => Ok(if is_thread_group_leader(procfs, identity.pid)? {
             Pinned::StampOnly
         } else {
             Pinned::NotRunning
@@ -349,14 +461,14 @@ fn poll_until(pollfds: &mut [nix::libc::pollfd], deadline: Option<Instant>) -> i
 
 /// Fallback liveness from `/proc` when pidfds are unavailable: a zombie
 /// thread-group leader still runs while it has other live threads.
-fn running_from_proc(pid: i32) -> io::Result<bool> {
-    let StatRead::Stat(stat) = read_stat(pid)? else {
+fn running_from_proc(procfs: &Procfs<'_>, pid: i32) -> io::Result<bool> {
+    let StatRead::Stat(stat) = read_stat(procfs, pid)? else {
         return Ok(false);
     };
     if !matches!(stat.state, b'Z' | b'X') {
         return Ok(true);
     }
-    match std::fs::read_dir(format!("/proc/{pid}/task")) {
+    match std::fs::read_dir(procfs.entry(pid).join("task")) {
         Ok(tasks) => Ok(tasks.count() > 1),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
         Err(error) => Err(error),
@@ -389,9 +501,10 @@ pub(super) fn lock_filesystem_is_local(path: &std::path::Path) -> io::Result<boo
 }
 
 pub(super) fn is_running(identity: &ProcessIdentity) -> io::Result<bool> {
-    match pin(identity)? {
+    let procfs = procfs()?;
+    match pin(&procfs, identity)? {
         Pinned::NotRunning => Ok(false),
-        Pinned::StampOnly => running_from_proc(identity.pid),
+        Pinned::StampOnly => running_from_proc(&procfs, identity.pid),
         Pinned::Pidfd(pidfd) => {
             let mut pollfd = [nix::libc::pollfd {
                 fd: pidfd.as_raw_fd(),
@@ -406,9 +519,7 @@ pub(super) fn is_running(identity: &ProcessIdentity) -> io::Result<bool> {
 
 /// Whether kernel exit notification (pidfds) is available to this process.
 pub(super) fn exit_notification_available() -> io::Result<bool> {
-    let pid =
-        i32::try_from(std::process::id()).map_err(|_| io::Error::other("own pid out of range"))?;
-    Ok(match pidfd_open(pid)? {
+    Ok(match pidfd_open(own_pid()?)? {
         PidfdOpen::Opened(_) => true,
         PidfdOpen::Unsupported => false,
         PidfdOpen::Gone | PidfdOpen::NotAProcess => {
@@ -455,9 +566,10 @@ impl ExitWatch {
     }
 
     pub(super) fn new(members: &[ProcessIdentity]) -> io::Result<Self> {
+        let procfs = procfs()?;
         let mut pidfds = Vec::with_capacity(members.len());
         for member in members {
-            match pin(member)? {
+            match pin(&procfs, member)? {
                 Pinned::Pidfd(pidfd) => pidfds.push(pidfd),
                 Pinned::NotRunning => {}
                 Pinned::StampOnly => {
@@ -597,8 +709,9 @@ mod tests {
             start: first.start,
         };
         assert!(is_running(&identity).unwrap());
-        assert!(running_from_proc(pid).unwrap());
-        assert!(is_thread_group_leader(pid).unwrap());
+        let procfs = procfs().unwrap();
+        assert!(running_from_proc(&procfs, pid).unwrap());
+        assert!(is_thread_group_leader(&procfs, pid).unwrap());
     }
 
     #[test]
@@ -621,7 +734,7 @@ mod tests {
             start: thread_stat.start,
         };
         assert!(!is_running(&as_recorded).unwrap());
-        assert!(!is_thread_group_leader(tid).unwrap());
+        assert!(!is_thread_group_leader(&procfs().unwrap(), tid).unwrap());
         let watch = ExitWatch::new(&[as_recorded]).unwrap();
         assert_eq!(watch.kill(tid).unwrap(), 0);
         assert!(
@@ -630,5 +743,226 @@ mod tests {
         );
         release.send(()).unwrap();
         thread.join().unwrap();
+    }
+
+    /// The host's pid in its own pid namespace, in the fake procfs trees.
+    const HOST: i32 = 7;
+    /// The host's pid in the pid namespace above its own.
+    const OUTER: i32 = 4242;
+    /// A child of the host, by its pid in the host's pid namespace.
+    const CHILD: i32 = 9;
+
+    /// A fake procfs root holding `entries` (path below the root, contents).
+    fn fake_procfs(entries: &[(String, String)]) -> tempfile::TempDir {
+        let root = tempfile::TempDir::new().unwrap();
+        for (path, contents) in entries {
+            let path = root.path().join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, contents).unwrap();
+        }
+        root
+    }
+
+    /// A `status` record of `tgid` owned by `uid`, listing `nspid` as its
+    /// `NSpid` levels when given.
+    fn status_record(tgid: i32, nspid: Option<&[i32]>, uid: u32) -> String {
+        let levels = nspid.map_or_else(String::new, |pids| {
+            let pids: Vec<String> = pids.iter().map(i32::to_string).collect();
+            format!("NSpid:\t{}\n", pids.join("\t"))
+        });
+        format!(
+            "Name:\tsh\nTgid:\t{tgid}\nPid:\t{tgid}\nUid:\t{uid}\t{uid}\t{uid}\t{uid}\n{levels}"
+        )
+    }
+
+    /// A `stat` record of process `pid` in group `pgrp`, started at
+    /// `start_ticks`.
+    fn stat_record(pid: i32, pgrp: i32, start_ticks: u64) -> String {
+        format!(
+            "{pid} (sh) S 1 {pgrp} {pgrp} 0 -1 4194560 100 0 0 0 1 2 0 0 20 0 1 0 {start_ticks} 1 2 3"
+        )
+    }
+
+    fn self_status(tgid: i32, nspid: Option<&[i32]>) -> (String, String) {
+        (
+            "self/status".to_owned(),
+            status_record(tgid, nspid, own_effective_uid()),
+        )
+    }
+
+    #[test]
+    fn a_procfs_of_another_pid_namespace_is_refused() {
+        let refused = [
+            // An ancestor pid namespace's procfs: `NSpid` lists the host's
+            // pid from that namespace down to its own.
+            vec![self_status(OUTER, Some(&[OUTER, HOST]))],
+            vec![self_status(5000, Some(&[5000, OUTER, HOST]))],
+            // No `NSpid` (Linux before 4.1, gVisor), and the host shows under
+            // another pid.
+            vec![self_status(OUTER, None)],
+            // A record that contradicts itself.
+            vec![self_status(OUTER, Some(&[OUTER]))],
+            // One `NSpid` level naming the host, but another `Tgid`.
+            vec![self_status(OUTER, Some(&[HOST]))],
+            // A procfs that does not show the host at all.
+            Vec::new(),
+        ];
+        for entries in refused {
+            let root = fake_procfs(&entries);
+            assert!(
+                Procfs::open(root.path(), HOST).is_err(),
+                "a procfs of another pid namespace was opened: {entries:?}"
+            );
+        }
+        // The host's own: one `NSpid` level, or without `NSpid` its own pid.
+        for entries in [
+            vec![self_status(HOST, Some(&[HOST]))],
+            vec![self_status(HOST, None)],
+        ] {
+            let root = fake_procfs(&entries);
+            assert!(Procfs::open(root.path(), HOST).is_ok(), "{entries:?}");
+        }
+    }
+
+    #[test]
+    fn a_refused_procfs_reports_how_it_shows_the_host() {
+        let view = |entries: Vec<(String, String)>| {
+            let root = fake_procfs(&entries);
+            let error = Procfs::open(root.path(), HOST).unwrap_err();
+            error
+                .get_ref()
+                .and_then(|inner| inner.downcast_ref::<ForeignProcfsView>())
+                .copied()
+                .unwrap()
+        };
+        let expected = |procfs_pid, namespace_levels_above| ForeignProcfsView {
+            host_pid: HOST,
+            procfs_pid,
+            namespace_levels_above,
+        };
+        assert_eq!(
+            view(vec![self_status(OUTER, Some(&[OUTER, HOST]))]),
+            expected(Some(OUTER), Some(1))
+        );
+        assert_eq!(
+            view(vec![self_status(5000, Some(&[5000, OUTER, HOST]))]),
+            expected(Some(5000), Some(2))
+        );
+        assert_eq!(
+            view(vec![self_status(OUTER, None)]),
+            expected(Some(OUTER), None)
+        );
+        assert_eq!(
+            view(vec![self_status(OUTER, Some(&[OUTER]))]),
+            expected(Some(OUTER), None)
+        );
+        assert_eq!(
+            view(vec![self_status(OUTER, Some(&[HOST]))]),
+            expected(Some(OUTER), None)
+        );
+        assert_eq!(view(Vec::new()), expected(None, None));
+        // A record without `Tgid`, or with an unparsable `NSpid`, is an
+        // error, never a pass.
+        for record in [
+            "Name:\tsh\nNSpid:\t7\n",
+            "Name:\tsh\nTgid:\t7\nNSpid:\t7\tx\n",
+        ] {
+            let root = fake_procfs(&[("self/status".to_owned(), record.to_owned())]);
+            assert_eq!(
+                Procfs::open(root.path(), HOST).unwrap_err().kind(),
+                io::ErrorKind::InvalidData,
+                "{record:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_same_user_process_holding_the_hosts_pid_numbers_is_never_captured() {
+        let uid = own_effective_uid();
+        // An ancestor namespace's procfs in which other processes of this
+        // user hold the pid numbers the host and its child have at home.
+        let root = fake_procfs(&[
+            self_status(OUTER, Some(&[OUTER, HOST])),
+            (format!("{HOST}/stat"), stat_record(HOST, HOST, 111)),
+            (format!("{HOST}/status"), status_record(HOST, None, uid)),
+            (format!("{CHILD}/stat"), stat_record(CHILD, CHILD, 222)),
+            (format!("{CHILD}/status"), status_record(CHILD, None, uid)),
+        ]);
+        for pid in [HOST, CHILD] {
+            let probed = Procfs::open(root.path(), HOST).and_then(|procfs| probe_in(&procfs, pid));
+            assert!(
+                !matches!(probed, Ok(ProcessProbe::Observed(_))),
+                "pid {pid} was captured from another pid namespace's procfs"
+            );
+            assert!(
+                probed.is_err(),
+                "pid {pid} was classified from another pid namespace's procfs"
+            );
+        }
+        let listed =
+            Procfs::open(root.path(), HOST).and_then(|procfs| group_members_in(&procfs, CHILD));
+        assert!(
+            listed.is_err(),
+            "group {CHILD} was listed from another pid namespace's procfs: {:?}",
+            listed.map(|members| members.len())
+        );
+    }
+
+    #[test]
+    fn the_hosts_own_procfs_reads_the_entry_of_the_pid_asked_for() {
+        const MEMBER: i32 = 11;
+        const STRANGER: i32 = 12;
+        let uid = own_effective_uid();
+        let root = fake_procfs(&[
+            self_status(HOST, Some(&[HOST])),
+            (format!("{CHILD}/stat"), stat_record(CHILD, CHILD, 333)),
+            (format!("{CHILD}/status"), status_record(CHILD, None, uid)),
+            // Another member of the child's group, and one of another user.
+            (format!("{MEMBER}/stat"), stat_record(MEMBER, CHILD, 444)),
+            (format!("{MEMBER}/status"), status_record(MEMBER, None, uid)),
+            (
+                format!("{STRANGER}/stat"),
+                stat_record(STRANGER, CHILD, 555),
+            ),
+            (
+                format!("{STRANGER}/status"),
+                status_record(STRANGER, None, uid.wrapping_add(1)),
+            ),
+        ]);
+        let procfs = Procfs::open(root.path(), HOST).unwrap();
+        let ProcessProbe::Observed(child) = probe_in(&procfs, CHILD).unwrap() else {
+            panic!("the child's own entry is observed");
+        };
+        assert_eq!(child.pgid, CHILD);
+        assert!(matches!(
+            child.start,
+            ProcessStartStamp::LinuxBoot {
+                start_ticks: 333,
+                ..
+            }
+        ));
+        let mut members = group_members_in(&procfs, CHILD).unwrap();
+        members.sort_by_key(|(pid, _)| *pid);
+        // Observed members by start ticks; `None` for another user's.
+        let listed: Vec<(i32, Option<u64>)> = members
+            .iter()
+            .map(|(pid, probe)| {
+                let start = match probe {
+                    ProcessProbe::Observed(ProcessSnapshot {
+                        start: ProcessStartStamp::LinuxBoot { start_ticks, .. },
+                        ..
+                    }) => Some(*start_ticks),
+                    ProcessProbe::Foreign => None,
+                    ProcessProbe::Observed(_) | ProcessProbe::Absent => {
+                        panic!("member {pid} is neither a Linux snapshot nor foreign")
+                    }
+                };
+                (*pid, start)
+            })
+            .collect();
+        assert_eq!(
+            listed,
+            [(CHILD, Some(333)), (MEMBER, Some(444)), (STRANGER, None)]
+        );
     }
 }

@@ -7,7 +7,8 @@
 
 use meerkat_core::Provider;
 use meerkat_core::model_profile::capabilities::{
-    BetaFeature, BetaHeader, BetaValue, EffortLevel, ModelCapabilities, ThinkingSupport,
+    AnthropicDisabledThinking, BetaFeature, BetaHeader, BetaValue, EffortLevel, ModelCapabilities,
+    ThinkingSupport,
 };
 use meerkat_core::model_profile::catalog::{ModelReleaseStage, ModelTier};
 
@@ -81,6 +82,18 @@ const OPUS_45_EFFORT: &[EffortLevel] = &[EffortLevel::Low, EffortLevel::Medium, 
 
 // ── Catalog rows ─────────────────────────────────────────────────────────
 
+// Disabled thinking: `anthropic_disabled_thinking` on every row follows the
+// per-model table "Thinking support, defaults, and rejected configurations by
+// model" (a thinking type a row does not list as rejected is accepted):
+// https://platform.claude.com/docs/en/build-with-claude/thinking-troubleshooting
+//   - Refused: Fable 5.1, Fable 5 and Opus 5.5 (thinking is always on), and
+//     Sonnet 5.5 (`between_tools` replaces `disabled`).
+//   - AtOrBelowHighEffort: Opus 5 and Haiku 5.5 (`disabled` with effort
+//     `xhigh` or `max` returns 400; their default efforts, `high` and
+//     `medium`, are within that ceiling).
+//   - AnyEffort: Opus 4.8, Opus 4.7, Sonnet 5, Sonnet 4.6, Sonnet 4.5,
+//     Haiku 4.5 and Opus 4.5.
+
 /// Capability rows for Anthropic catalog models.
 pub const CAPABILITIES: &[ModelCapabilities] = &[
     // Claude Fable 5.1
@@ -131,6 +144,7 @@ pub const CAPABILITIES: &[ModelCapabilities] = &[
         supports_top_p: false,
         supports_top_k: false,
         thinking: ThinkingSupport::AnthropicAdaptiveOnly,
+        anthropic_disabled_thinking: AnthropicDisabledThinking::Refused,
         supports_reasoning: false,
         effort_levels: CLAUDE_5_OPUS_48_47_EFFORT,
         openai_responses_params: None,
@@ -161,10 +175,9 @@ pub const CAPABILITIES: &[ModelCapabilities] = &[
     //     (adaptive thinking is the only mode and applies whenever `thinking`
     //      is unset; an explicit thinking: {"type": "disabled"} is NOT
     //      supported — unlike Opus 4.8/4.7, which accept it. Meerkat's
-    //      `AnthropicThinkingConfig` has no disabled variant, so
-    //      `AnthropicAdaptiveOnly` is an exact description of the wire shapes
-    //      Meerkat can emit. Supported at launch: effort, compaction, vision,
-    //      memory tool. Refusals surface as stop_reason: "refusal".)
+    //      catalog row records it as `anthropic_disabled_thinking: Refused`
+    //      and refuses it locally. Supported at launch: effort, compaction,
+    //      vision, memory tool. Refusals surface as stop_reason: "refusal".)
     //   - Effort:
     //     https://platform.claude.com/docs/en/build-with-claude/effort
     //     (supported; low/medium/high/xhigh/max — same ladder as Opus 4.8/4.7)
@@ -212,6 +225,7 @@ pub const CAPABILITIES: &[ModelCapabilities] = &[
         supports_top_p: false,
         supports_top_k: false,
         thinking: ThinkingSupport::AnthropicAdaptiveOnly,
+        anthropic_disabled_thinking: AnthropicDisabledThinking::Refused,
         supports_reasoning: false,
         effort_levels: CLAUDE_5_OPUS_48_47_EFFORT,
         openai_responses_params: None,
@@ -242,9 +256,10 @@ pub const CAPABILITIES: &[ModelCapabilities] = &[
     //   - Effort: https://platform.claude.com/docs/en/build-with-claude/effort
     //     (low/medium/high/xhigh/max)
     //
-    // The row mirrors claude-opus-5: adaptive-only thinking (meerkat never
-    // emits `{type: "disabled"}`, so the 400 cannot be triggered from the
-    // catalog surface), the full low..max effort ladder, compaction +
+    // The row mirrors claude-opus-5 except for disabled thinking, which it
+    // refuses at every effort (Opus 5 accepts it at `high` or below), so
+    // Meerkat refuses it locally: adaptive-only thinking, the full
+    // low..max effort ladder, compaction +
     // structured outputs + web search, sampling parameters removed,
     // budget_tokens removed. Meerkat-owned operational default: Opus-tier
     // 300s call timeout. Default Anthropic model since 0.8.42.
@@ -274,6 +289,7 @@ pub const CAPABILITIES: &[ModelCapabilities] = &[
         supports_top_p: false,
         supports_top_k: false,
         thinking: ThinkingSupport::AnthropicAdaptiveOnly,
+        anthropic_disabled_thinking: AnthropicDisabledThinking::Refused,
         supports_reasoning: false,
         effort_levels: CLAUDE_5_OPUS_48_47_EFFORT,
         openai_responses_params: None,
@@ -302,7 +318,9 @@ pub const CAPABILITIES: &[ModelCapabilities] = &[
     // sampling parameters removed, budget_tokens removed. Like Fable 5 it is
     // not listed in the output-300k-2026-03-24 batch-beta note, hence no
     // extended-output beta. Meerkat-owned operational default: Opus-tier
-    // 300s call timeout.
+    // 300s call timeout. Unlike Fable 5 it accepts `{type: "disabled"}`, at
+    // `high` effort or below (see the disabled-thinking note above
+    // CAPABILITIES).
     ModelCapabilities {
         id: "claude-opus-5",
         provider: Provider::Anthropic,
@@ -329,6 +347,7 @@ pub const CAPABILITIES: &[ModelCapabilities] = &[
         supports_top_p: false,
         supports_top_k: false,
         thinking: ThinkingSupport::AnthropicAdaptiveOnly,
+        anthropic_disabled_thinking: AnthropicDisabledThinking::AtOrBelowHighEffort,
         supports_reasoning: false,
         effort_levels: CLAUDE_5_OPUS_48_47_EFFORT,
         openai_responses_params: None,
@@ -389,6 +408,7 @@ pub const CAPABILITIES: &[ModelCapabilities] = &[
         supports_top_p: false,
         supports_top_k: false,
         thinking: ThinkingSupport::AnthropicAdaptiveOnly,
+        anthropic_disabled_thinking: AnthropicDisabledThinking::AnyEffort,
         supports_reasoning: false,
         effort_levels: CLAUDE_5_OPUS_48_47_EFFORT,
         openai_responses_params: None,
@@ -448,6 +468,7 @@ pub const CAPABILITIES: &[ModelCapabilities] = &[
         supports_top_p: false,
         supports_top_k: false,
         thinking: ThinkingSupport::AnthropicAdaptiveOnly,
+        anthropic_disabled_thinking: AnthropicDisabledThinking::AnyEffort,
         supports_reasoning: false,
         effort_levels: CLAUDE_5_OPUS_48_47_EFFORT,
         openai_responses_params: None,
@@ -519,6 +540,7 @@ pub const CAPABILITIES: &[ModelCapabilities] = &[
         supports_top_p: false,
         supports_top_k: false,
         thinking: ThinkingSupport::AnthropicAdaptiveOrBetweenTools,
+        anthropic_disabled_thinking: AnthropicDisabledThinking::Refused,
         supports_reasoning: false,
         effort_levels: CLAUDE_5_OPUS_48_47_EFFORT,
         openai_responses_params: None,
@@ -572,9 +594,10 @@ pub const CAPABILITIES: &[ModelCapabilities] = &[
     //   - Pricing (`inference_geo` applies to Claude 4.6 and later models):
     //     https://platform.claude.com/docs/en/about-claude/pricing
     //
-    // Thinking is `AnthropicAdaptiveOnly`: adaptive is the default and the
-    // only mode Meerkat sends; upstream `disabled` has no Meerkat config, as
-    // for the claude-opus-5 row. ASSUMED from the claude-sonnet-5-5 row:
+    // Thinking is `AnthropicAdaptiveOnly` (adaptive is the default) plus
+    // `disabled` at every effort: neither the migration guide above nor the
+    // disabled-thinking table records an effort ceiling for Sonnet 5.
+    // ASSUMED from the claude-sonnet-5-5 row:
     //   - image_tool_results (vision and tool use are documented)
     //   - supports_web_search (family-conservative default)
     // Meerkat-owned operational default: Sonnet-tier 120s call timeout.
@@ -604,6 +627,7 @@ pub const CAPABILITIES: &[ModelCapabilities] = &[
         supports_top_p: false,
         supports_top_k: false,
         thinking: ThinkingSupport::AnthropicAdaptiveOnly,
+        anthropic_disabled_thinking: AnthropicDisabledThinking::AnyEffort,
         supports_reasoning: false,
         effort_levels: CLAUDE_5_OPUS_48_47_EFFORT,
         openai_responses_params: None,
@@ -660,6 +684,7 @@ pub const CAPABILITIES: &[ModelCapabilities] = &[
         supports_top_p: true,
         supports_top_k: true,
         thinking: ThinkingSupport::AnthropicAdaptiveAndEnabled,
+        anthropic_disabled_thinking: AnthropicDisabledThinking::AnyEffort,
         supports_reasoning: false,
         effort_levels: SONNET_46_EFFORT,
         openai_responses_params: None,
@@ -720,6 +745,7 @@ pub const CAPABILITIES: &[ModelCapabilities] = &[
         supports_top_p: true,
         supports_top_k: true,
         thinking: ThinkingSupport::AnthropicEnabledOnly,
+        anthropic_disabled_thinking: AnthropicDisabledThinking::AnyEffort,
         supports_reasoning: false,
         effort_levels: &[],
         openai_responses_params: None,
@@ -766,9 +792,9 @@ pub const CAPABILITIES: &[ModelCapabilities] = &[
     //     models, Haiku 5.5 included):
     //     https://platform.claude.com/docs/en/manage-claude/data-residency
     //
-    // Thinking is `AnthropicAdaptiveOnly`: adaptive is the default and the
-    // only mode Meerkat sends; upstream `disabled` has no Meerkat config, as
-    // for the claude-sonnet-5 row.
+    // Thinking is `AnthropicAdaptiveOnly` (adaptive is the default) plus
+    // `disabled` at `high` effort or below, per the What's new page above;
+    // the default effort, `medium`, is within that ceiling.
     //
     // ASSUMED (not stated for this model on the pages above):
     //   - image_tool_results: taken from the claude-sonnet-5-5 row (vision
@@ -805,6 +831,7 @@ pub const CAPABILITIES: &[ModelCapabilities] = &[
         supports_top_p: false,
         supports_top_k: false,
         thinking: ThinkingSupport::AnthropicAdaptiveOnly,
+        anthropic_disabled_thinking: AnthropicDisabledThinking::AtOrBelowHighEffort,
         supports_reasoning: false,
         effort_levels: CLAUDE_5_OPUS_48_47_EFFORT,
         openai_responses_params: None,
@@ -856,6 +883,7 @@ pub const CAPABILITIES: &[ModelCapabilities] = &[
         supports_top_p: true,
         supports_top_k: true,
         thinking: ThinkingSupport::AnthropicEnabledOnly,
+        anthropic_disabled_thinking: AnthropicDisabledThinking::AnyEffort,
         supports_reasoning: false,
         effort_levels: &[],
         openai_responses_params: None,
@@ -901,6 +929,7 @@ pub const CAPABILITIES: &[ModelCapabilities] = &[
         supports_top_p: true,
         supports_top_k: true,
         thinking: ThinkingSupport::AnthropicEnabledOnly,
+        anthropic_disabled_thinking: AnthropicDisabledThinking::AnyEffort,
         supports_reasoning: false,
         effort_levels: &[],
         openai_responses_params: None,
@@ -958,6 +987,7 @@ pub const CAPABILITIES: &[ModelCapabilities] = &[
         supports_top_p: true,
         supports_top_k: true,
         thinking: ThinkingSupport::AnthropicEnabledOnly,
+        anthropic_disabled_thinking: AnthropicDisabledThinking::AnyEffort,
         supports_reasoning: false,
         effort_levels: OPUS_45_EFFORT,
         openai_responses_params: None,

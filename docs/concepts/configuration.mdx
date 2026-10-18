@@ -727,20 +727,53 @@ stating the same requirement, is ordinary config. Re-parent a confined or
 governed realm by editing its document as its host.
 
 A credential command (an auth profile's `source = { kind = "command" }`)
-runs as the host, outside confinement, so it is administered the same way:
-a config write that adds one, or changes its program, arguments,
-environment or working directory, is refused with
-`confinement_administration_required`, naming the auth profile, on every
-config write surface. Its timeout and caching, and removing it, are
-ordinary config.
+runs as the host, outside confinement, so it is administered the same way,
+and so is where its token goes. A config write that adds one, changes its
+program, arguments, environment or working directory, or changes where its
+token is sent is refused with `confinement_administration_required`, naming
+the auth profile, on every config write surface. Where the token is sent is
+the profile's `provider` and `auth_method` and each binding of the same
+realm section that names the profile as its `auth_profile`: adding such a
+binding, re-pointing one at the profile, moving one to another backend or
+changing its `default_model`, and changing the backend it names (its
+provider, kind, `base_url`, `options` or `server`) or the
+`[self_hosted.servers]` entry that backend names are all refused. Its
+timeout and caching, removing it, and removing a binding are ordinary
+config.
+
+Three more rules keep the token where its document sends it. A self-hosted
+backend's endpoint is otherwise the server that serves a request's model,
+so a binding that uses a credential command on a self-hosted backend must
+name that backend's server (`server = "<id>"`): a realm with one that does
+not is refused when it composes, naming the binding and the backend. A host
+that builds its config without composing it still never sends such a
+binding's token to a server it does not declare: the binding is never
+chosen for another server, by its `default_model` or as the one
+unconstrained self-hosted binding, and naming it explicitly for one is
+refused. A request may override a binding's auth profile
+(`auth_binding.profile`), but not with a credential command profile other
+than the binding's own: that is refused before anything resolves
+(`credential_command_profile_override`). And a realm section composes whole
+from one document, but `[self_hosted.servers]`
+entries compose field by field across the documents on a realm's chain, so
+a composition in which a credential command binding's server entry differs
+from the one the command's own document states is refused, naming the
+binding, the profile and the server; state the whole entry in the command's
+document and nowhere else on the chain. Credentials that do not come from a
+command (the managed store, credential accounts, environment variables,
+platform defaults, external resolvers, file descriptors) are outside these
+rules: where they are sent stays ordinary config.
 
 The user document decides for other realms too: its `[realm.global]`
 section puts `global`, and with it the user document's `[governance]`, on
 the chain of every realm whose own documents state none, and a realm with no
 document of its own takes the section the user document states for it. A
 write to the user document is also refused when such a realm would compose
-a different section afterwards. Each refusal names the change and the realm,
-for example
+a different section afterwards. Several state roots can share one user
+document, so a realm the user document states a section for is checked both
+with its own document from the writing host's state root and as if it had
+none, as on a state root that holds no document for it. Each refusal names
+the change and the realm, for example
 `removing [realm.global] would change the [governance] section a realm whose own document states no parent and no [realm.global] composes`,
 and says what to do instead. The user document a host creates from its
 template states `[realm.global]`. One that states `[governance]` but no
@@ -748,12 +781,46 @@ template states `[realm.global]`. One that states `[governance]` but no
 through a sign-in that provisions credentials under it: add `[realm.global]`
 to it by hand.
 
+A section the user document states for a realm whose chain does not
+resolve where the realm has no document of its own (say, an edge to a realm
+with no document there) cannot be removed or changed by a config write
+either. Hosts on such state roots refuse to compose the realm, and a write
+that would have them compose it from the user document alone, possibly
+with weaker requirements than intended, is refused, naming the realm on a
+state root without its own document. Edit the user document by hand as its
+host.
+
 Only a store that declares the realm's chain enforces this, as the stock
 hosts' stores do (`FileConfigStore::with_realm_chain`,
 `SdkConfigStore::with_realm_document`). A store built with
 `FileConfigStore::new` or `SdkConfigStore::with_path` alone, and an
 in-memory store, keep the document's own `[confinement]` and `[governance]`
 sections but not the realm sections that compose an ancestor's.
+
+Such writes over one state root take turns: each store holds an exclusive
+advisory lock on `<state_root>/.realm-config.lock` from before it reads its
+own document, through its composition check, to after its write, in one
+process and across processes, so no check reads a document another writer
+is about to replace. A `RealmConfigSource` names the file with
+`composition_lock_path`; one that names none (the default) leaves such
+writes unserialized. Hosts on different state roots take different locks;
+the user document's own check composes each realm it states as if that
+realm had no document, so it depends on no document only another state
+root holds.
+
+The lock orders the stores that take it, nothing else. `rkat realm create`,
+`delete` and `prune` do not take it. Creating a realm writes no config
+document. Deleting or pruning one checks that no realm's own document names
+it as a parent and then removes its document, so a write that makes a
+document name it in between leaves that realm with a missing parent: its
+chain does not resolve, and it composes nothing (each use is refused) until
+its document names another parent. The lock is an advisory file lock
+(`flock` on Unix), so on a network filesystem it holds only as far as the
+filesystem carries it: an NFS client emulates it with a byte-range lock
+that other machines see only when the mount's locking reaches the server
+(not with `nolock` or `local_lock=flock`). Hosts on different machines that
+share one state root over such a mount may not take turns; give each
+machine its own state root.
 
 A realm composes only from the documents on its chain, each from its own:
 an ancestor whose own document is missing fails the composition (a missing
@@ -769,10 +836,10 @@ constructor per program):
 
 | Launch | Why it runs as the host |
 |---|---|
-| `git` for a Git skill repository | It fetches with the host's own Git credentials and network. A repository is not loaded when a confined process could change the skill cache, and a skill that a link leads out of the checkout to is not read. |
+| `git` for a Git skill repository | It fetches with the host's own Git credentials and network. A repository is not loaded when a confined process could change the skill cache, and a skill that a link leads out of the checkout to is not read. A repository's HTTPS token reaches git only for the repository: on Unix through git's `credential-cache` client and a socket the host serves for each invocation, for the repository's host alone, never on a command line or in a file; on Windows as a header option on each invocation's own command line, for the configured repository URL alone and with redirects not followed, so processes of the same user can read it for that invocation only, and never in a file. No credential helper of the host's git configuration is asked for or sent it. |
 | A credential command (an auth profile's `source = { kind = "command" }`) | It produces the host's own provider credentials, which no confined process may read. Without a `cwd` it runs from the user's home directory, never from the host's working directory. It is refused before it runs when a confined process could change its program, the interpreter its `#!` line names by path, or its working directory (when it names none, the home directory itself, not what is under it). A refused command ends the binding's resolution with the refusal: no other credential (another realm's binding, the global realm's, the environment's) stands in for it. The host administers a credential command in the config document: add one or change what it runs by editing the document as its host. |
 | The browser opener (`/usr/bin/open` on macOS, `xdg-open` on Linux, the system `rundll32.exe` on Windows) | It shows an OAuth authorization page or an HTML artifact in the user's desktop session, which a confined process cannot reach. The URL is one argument. |
-| `stty`, by absolute path (`/bin/stty`, else `/usr/bin/stty`) | Host terminal control: `rkat` hides a client secret typed at its own terminal. |
+| `stty`: `/bin/stty`, else `/usr/bin/stty`, else the `stty` on the trusted `PATH` (NixOS) | Host terminal control: `rkat` hides a client secret typed at its own terminal. Without any `stty` it refuses to read a secret typed at the terminal; pipe the secret on stdin instead. |
 | `wasm-pack` | Developer build tooling: `rkat doctor` reports its version. |
 
 Under a host that confines any launch kind, each of these runs, with every
@@ -796,7 +863,12 @@ no launch kind has no confined process to plant anything, and runs them
 with its own environment as it is.
 
 A test of the source enumerates every process launch in shipped code and
-fails on one that is neither confined nor in this list.
+fails on one that is neither confined nor in this list. Clippy enforces it
+too: the workspace `clippy.toml` disallows every API that starts a process
+(`Command::new`, `exec`, `fork`, `posix_spawn`, `system`, `popen` and the
+like), and shipped code allows that lint only at the launch sites the test
+lists, so a launch the text scan cannot see, such as one through an aliased
+import, still fails the build's lint.
 
 ### Operator flags
 

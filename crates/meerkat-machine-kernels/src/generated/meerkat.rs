@@ -6043,6 +6043,7 @@ impl std::fmt::Display for MobId {
         f.write_str(&self.0)
     }
 }
+pub type MobIncarnationId = meerkat_core::service::MobIncarnationId;
 #[allow(non_camel_case_types)]
 #[derive(
     Debug,
@@ -7679,6 +7680,116 @@ impl std::convert::TryFrom<String> for PeerIngressResponseTerminality {
     }
 }
 impl std::fmt::Display for PeerIngressResponseTerminality {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+#[allow(non_camel_case_types)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+pub enum PeerResponseAddresseeVerdict {
+    #[default]
+    #[serde(rename = "UnknownRequest")]
+    UnknownRequest,
+    #[serde(rename = "Requester")]
+    Requester,
+    #[serde(rename = "NotRequester")]
+    NotRequester,
+}
+impl PeerResponseAddresseeVerdict {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::UnknownRequest => "UnknownRequest",
+            Self::Requester => "Requester",
+            Self::NotRequester => "NotRequester",
+        }
+    }
+}
+impl std::convert::TryFrom<&str> for PeerResponseAddresseeVerdict {
+    type Error = String;
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "UnknownRequest" => Ok(Self::UnknownRequest),
+            "Requester" => Ok(Self::Requester),
+            "NotRequester" => Ok(Self::NotRequester),
+            other => Err(format!(
+                "invalid PeerResponseAddresseeVerdict value `{other}`"
+            )),
+        }
+    }
+}
+impl std::convert::TryFrom<String> for PeerResponseAddresseeVerdict {
+    type Error = String;
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::try_from(value.as_str())
+    }
+}
+impl std::fmt::Display for PeerResponseAddresseeVerdict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+#[allow(non_camel_case_types)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+pub enum PeerResponseSenderVerdict {
+    #[default]
+    #[serde(rename = "UnknownRequest")]
+    UnknownRequest,
+    #[serde(rename = "Addressee")]
+    Addressee,
+    #[serde(rename = "NotAddressee")]
+    NotAddressee,
+}
+impl PeerResponseSenderVerdict {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::UnknownRequest => "UnknownRequest",
+            Self::Addressee => "Addressee",
+            Self::NotAddressee => "NotAddressee",
+        }
+    }
+}
+impl std::convert::TryFrom<&str> for PeerResponseSenderVerdict {
+    type Error = String;
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "UnknownRequest" => Ok(Self::UnknownRequest),
+            "Addressee" => Ok(Self::Addressee),
+            "NotAddressee" => Ok(Self::NotAddressee),
+            other => Err(format!("invalid PeerResponseSenderVerdict value `{other}`")),
+        }
+    }
+}
+impl std::convert::TryFrom<String> for PeerResponseSenderVerdict {
+    type Error = String;
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::try_from(value.as_str())
+    }
+}
+impl std::fmt::Display for PeerResponseSenderVerdict {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())
     }
@@ -13746,6 +13857,7 @@ pub struct State {
     pub mob_operator_managed_mob_scope: std::collections::BTreeSet<String>,
     pub mob_operator_spawn_profile_scope:
         std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
+    pub mob_operator_mob_incarnations: std::collections::BTreeMap<String, MobIncarnationId>,
     pub mob_operator_caller_provenance: Option<MobToolCallerProvenance>,
     pub mob_operator_audit_invocation_id: Option<String>,
     pub drain_phase: DrainPhase,
@@ -14106,9 +14218,11 @@ pub struct State {
     pub mcp_server_states: std::collections::BTreeMap<McpServerId, McpServerState>,
     pub pending_peer_requests:
         std::collections::BTreeMap<PeerCorrelationId, OutboundPeerRequestState>,
+    pub pending_peer_request_addressees: std::collections::BTreeMap<PeerCorrelationId, PeerId>,
     pub inbound_peer_requests:
         std::collections::BTreeMap<PeerCorrelationId, InboundPeerRequestState>,
     pub inbound_peer_request_lanes: std::collections::BTreeMap<PeerCorrelationId, InputLane>,
+    pub inbound_peer_request_requesters: std::collections::BTreeMap<PeerCorrelationId, PeerId>,
     pub last_session_context_updated_at_ms: u64,
     pub reserved_interaction_streams: std::collections::BTreeSet<PeerCorrelationId>,
     pub attached_interaction_streams: std::collections::BTreeSet<PeerCorrelationId>,
@@ -14478,6 +14592,13 @@ impl std::fmt::Debug for State {
             .field(
                 "mob_operator_spawn_profile_scope",
                 &self.mob_operator_spawn_profile_scope,
+            )
+            .field(
+                "mob_operator_mob_incarnations",
+                &format_args!(
+                    "<redacted; {} entries>",
+                    self.mob_operator_mob_incarnations.len()
+                ),
             )
             .field(
                 "mob_operator_caller_provenance",
@@ -15523,10 +15644,18 @@ impl std::fmt::Debug for State {
             .field("removal_timeout_ms", &self.removal_timeout_ms)
             .field("mcp_server_states", &self.mcp_server_states)
             .field("pending_peer_requests", &self.pending_peer_requests)
+            .field(
+                "pending_peer_request_addressees",
+                &self.pending_peer_request_addressees,
+            )
             .field("inbound_peer_requests", &self.inbound_peer_requests)
             .field(
                 "inbound_peer_request_lanes",
                 &self.inbound_peer_request_lanes,
+            )
+            .field(
+                "inbound_peer_request_requesters",
+                &self.inbound_peer_request_requesters,
             )
             .field(
                 "last_session_context_updated_at_ms",
@@ -15994,7 +16123,7 @@ pub mod inputs {
         pub caller_provenance: Option<MobToolCallerProvenance>,
         pub audit_invocation_id: Option<String>,
     }
-    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    #[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct RestoreMobOperatorAuthority {
         pub principal_token: OpaquePrincipalToken,
         pub can_create_mobs: bool,
@@ -16002,8 +16131,26 @@ pub mod inputs {
         pub managed_mob_scope: std::collections::BTreeSet<String>,
         pub spawn_profile_scope:
             std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
+        pub mob_incarnations: std::collections::BTreeMap<String, MobIncarnationId>,
         pub caller_provenance: Option<MobToolCallerProvenance>,
         pub audit_invocation_id: Option<String>,
+    }
+    impl std::fmt::Debug for RestoreMobOperatorAuthority {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("RestoreMobOperatorAuthority")
+                .field("principal_token", &self.principal_token)
+                .field("can_create_mobs", &self.can_create_mobs)
+                .field("can_mutate_profiles", &self.can_mutate_profiles)
+                .field("managed_mob_scope", &self.managed_mob_scope)
+                .field("spawn_profile_scope", &self.spawn_profile_scope)
+                .field(
+                    "mob_incarnations",
+                    &format_args!("<redacted; {} entries>", self.mob_incarnations.len()),
+                )
+                .field("caller_provenance", &self.caller_provenance)
+                .field("audit_invocation_id", &self.audit_invocation_id)
+                .finish()
+        }
     }
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct SetMobOperatorProfileMutation {
@@ -16013,14 +16160,33 @@ pub mod inputs {
     pub struct SetMobOperatorCreateAuthority {
         pub allowed: bool,
     }
-    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    #[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct GrantMobOperatorManageMob {
         pub mob_id: String,
+        pub mob_incarnation: MobIncarnationId,
     }
-    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    impl std::fmt::Debug for GrantMobOperatorManageMob {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("GrantMobOperatorManageMob")
+                .field("mob_id", &self.mob_id)
+                .field("mob_incarnation", &"<redacted>")
+                .finish()
+        }
+    }
+    #[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct SetMobOperatorSpawnProfilesInMob {
         pub mob_id: String,
+        pub mob_incarnation: MobIncarnationId,
         pub profiles: std::collections::BTreeSet<String>,
+    }
+    impl std::fmt::Debug for SetMobOperatorSpawnProfilesInMob {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("SetMobOperatorSpawnProfilesInMob")
+                .field("mob_id", &self.mob_id)
+                .field("mob_incarnation", &"<redacted>")
+                .field("profiles", &self.profiles)
+                .finish()
+        }
     }
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct Reset {}
@@ -18141,19 +18307,23 @@ pub mod inputs {
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct PeerRequestSent {
         pub corr_id: PeerCorrelationId,
+        pub addressee: PeerId,
     }
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct PeerResponseProgressArrived {
         pub corr_id: PeerCorrelationId,
+        pub responder: PeerId,
     }
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct PeerResponseTerminalArrived {
         pub corr_id: PeerCorrelationId,
         pub disposition: PeerTerminalDisposition,
+        pub responder: PeerId,
     }
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct PeerResponseRejected {
         pub corr_id: PeerCorrelationId,
+        pub responder: PeerId,
     }
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct PeerRequestTimedOut {
@@ -18167,6 +18337,7 @@ pub mod inputs {
     pub struct PeerRequestReceived {
         pub corr_id: PeerCorrelationId,
         pub handling_mode: InputLane,
+        pub requester: PeerId,
     }
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct PeerResponseReplied {
@@ -19884,6 +20055,16 @@ pub mod signals {
         pub status: PeerIngressResponseStatus,
     }
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct ResolvePeerResponseAddressee {
+        pub corr_id: PeerCorrelationId,
+        pub addressee: PeerId,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct ResolvePeerResponseSender {
+        pub corr_id: PeerCorrelationId,
+        pub responder: PeerId,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct ClassifyPlainEvent {
         pub source_name: String,
     }
@@ -19898,6 +20079,8 @@ pub enum Signal {
     DrainQueuedRun(signals::DrainQueuedRun),
     ClassifyExternalEnvelope(signals::ClassifyExternalEnvelope),
     ClassifyPeerResponseReply(signals::ClassifyPeerResponseReply),
+    ResolvePeerResponseAddressee(signals::ResolvePeerResponseAddressee),
+    ResolvePeerResponseSender(signals::ResolvePeerResponseSender),
     ClassifyPlainEvent(signals::ClassifyPlainEvent),
     EnsureDrainRunning(signals::EnsureDrainRunning),
 }
@@ -19909,6 +20092,8 @@ impl Signal {
             Self::DrainQueuedRun(_) => SignalKind::DrainQueuedRun,
             Self::ClassifyExternalEnvelope(_) => SignalKind::ClassifyExternalEnvelope,
             Self::ClassifyPeerResponseReply(_) => SignalKind::ClassifyPeerResponseReply,
+            Self::ResolvePeerResponseAddressee(_) => SignalKind::ResolvePeerResponseAddressee,
+            Self::ResolvePeerResponseSender(_) => SignalKind::ResolvePeerResponseSender,
             Self::ClassifyPlainEvent(_) => SignalKind::ClassifyPlainEvent,
             Self::EnsureDrainRunning(_) => SignalKind::EnsureDrainRunning,
         }
@@ -19921,6 +20106,8 @@ pub enum SignalKind {
     DrainQueuedRun,
     ClassifyExternalEnvelope,
     ClassifyPeerResponseReply,
+    ResolvePeerResponseAddressee,
+    ResolvePeerResponseSender,
     ClassifyPlainEvent,
     EnsureDrainRunning,
 }
@@ -21317,6 +21504,14 @@ pub mod effects {
         pub response_terminality: PeerIngressResponseTerminality,
     }
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct PeerResponseAddresseeResolved {
+        pub verdict: PeerResponseAddresseeVerdict,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct PeerResponseSenderResolved {
+        pub verdict: PeerResponseSenderVerdict,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct PeerIngressReceiveResolved {
         pub outcome: PeerIngressReceiveOutcomeClass,
         pub admission_diagnostic: Option<PeerIngressAdmissionDiagnosticClass>,
@@ -21790,6 +21985,8 @@ pub enum Effect {
     RealtimeTranscriptAppended(effects::RealtimeTranscriptAppended),
     PeerIngressClassified(effects::PeerIngressClassified),
     PeerResponseReplyClassified(effects::PeerResponseReplyClassified),
+    PeerResponseAddresseeResolved(effects::PeerResponseAddresseeResolved),
+    PeerResponseSenderResolved(effects::PeerResponseSenderResolved),
     PeerIngressReceiveResolved(effects::PeerIngressReceiveResolved),
     PeerIngressDequeueResolved(effects::PeerIngressDequeueResolved),
     SpawnDrainTask(effects::SpawnDrainTask),
@@ -22050,6 +22247,8 @@ pub enum EffectKind {
     RealtimeTranscriptAppended,
     PeerIngressClassified,
     PeerResponseReplyClassified,
+    PeerResponseAddresseeResolved,
+    PeerResponseSenderResolved,
     PeerIngressReceiveResolved,
     PeerIngressDequeueResolved,
     SpawnDrainTask,
@@ -22572,7 +22771,9 @@ pub enum TransitionId {
     SetMobOperatorProfileMutation,
     SetMobOperatorCreateAuthority,
     GrantMobOperatorManageMob,
+    RebindMobOperatorManageMob,
     SetMobOperatorSpawnProfilesInMob,
+    RebindMobOperatorSpawnProfilesInMob,
     BeginUnregisterSessionIdle,
     BeginUnregisterSessionAttached,
     BeginUnregisterSessionRunning,
@@ -24568,6 +24769,24 @@ pub enum TransitionId {
     PeerRequestSendFailedRunning,
     PeerRequestSendFailedRetired,
     PeerRequestSendFailedStopped,
+    ResolvePeerResponseSenderAddresseeIdle,
+    ResolvePeerResponseSenderAddresseeAttached,
+    ResolvePeerResponseSenderAddresseeRunning,
+    ResolvePeerResponseSenderAddresseeRetired,
+    ResolvePeerResponseSenderAddresseeStopped,
+    ResolvePeerResponseSenderAddresseeDestroyed,
+    ResolvePeerResponseSenderNotAddresseeIdle,
+    ResolvePeerResponseSenderNotAddresseeAttached,
+    ResolvePeerResponseSenderNotAddresseeRunning,
+    ResolvePeerResponseSenderNotAddresseeRetired,
+    ResolvePeerResponseSenderNotAddresseeStopped,
+    ResolvePeerResponseSenderNotAddresseeDestroyed,
+    ResolvePeerResponseSenderUnknownRequestIdle,
+    ResolvePeerResponseSenderUnknownRequestAttached,
+    ResolvePeerResponseSenderUnknownRequestRunning,
+    ResolvePeerResponseSenderUnknownRequestRetired,
+    ResolvePeerResponseSenderUnknownRequestStopped,
+    ResolvePeerResponseSenderUnknownRequestDestroyed,
     PeerRequestReceivedIdle,
     PeerRequestReceivedAttached,
     PeerRequestReceivedRunning,
@@ -24580,6 +24799,24 @@ pub enum TransitionId {
     PeerResponseRepliedRetired,
     PeerResponseRepliedStopped,
     PeerResponseRepliedDestroyed,
+    ResolvePeerResponseAddresseeRequesterIdle,
+    ResolvePeerResponseAddresseeRequesterAttached,
+    ResolvePeerResponseAddresseeRequesterRunning,
+    ResolvePeerResponseAddresseeRequesterRetired,
+    ResolvePeerResponseAddresseeRequesterStopped,
+    ResolvePeerResponseAddresseeRequesterDestroyed,
+    ResolvePeerResponseAddresseeNotRequesterIdle,
+    ResolvePeerResponseAddresseeNotRequesterAttached,
+    ResolvePeerResponseAddresseeNotRequesterRunning,
+    ResolvePeerResponseAddresseeNotRequesterRetired,
+    ResolvePeerResponseAddresseeNotRequesterStopped,
+    ResolvePeerResponseAddresseeNotRequesterDestroyed,
+    ResolvePeerResponseAddresseeUnknownRequestIdle,
+    ResolvePeerResponseAddresseeUnknownRequestAttached,
+    ResolvePeerResponseAddresseeUnknownRequestRunning,
+    ResolvePeerResponseAddresseeUnknownRequestRetired,
+    ResolvePeerResponseAddresseeUnknownRequestStopped,
+    ResolvePeerResponseAddresseeUnknownRequestDestroyed,
     AdvanceSessionContextIdle,
     AdvanceSessionContextAttached,
     AdvanceSessionContextRunning,
@@ -25262,6 +25499,7 @@ pub fn initial_state() -> State {
         mob_operator_can_mutate_profiles: false,
         mob_operator_managed_mob_scope: Default::default(),
         mob_operator_spawn_profile_scope: Default::default(),
+        mob_operator_mob_incarnations: Default::default(),
         mob_operator_caller_provenance: None,
         mob_operator_audit_invocation_id: None,
         drain_phase: DrainPhase::Inactive,
@@ -25568,8 +25806,10 @@ pub fn initial_state() -> State {
         removal_timeout_ms: 30000,
         mcp_server_states: Default::default(),
         pending_peer_requests: Default::default(),
+        pending_peer_request_addressees: Default::default(),
         inbound_peer_requests: Default::default(),
         inbound_peer_request_lanes: Default::default(),
+        inbound_peer_request_requesters: Default::default(),
         last_session_context_updated_at_ms: 0,
         reserved_interaction_streams: Default::default(),
         attached_interaction_streams: Default::default(),

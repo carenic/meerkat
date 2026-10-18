@@ -46,8 +46,11 @@ impl meerkat_core::RealmConfigSource for Documents {
 /// `[realm.<id>]` section whose parent is `global` from a user document that
 /// states `[governance]` would drop the governance that realm composes: the
 /// write is refused, naming the section and the realm, and nothing is
-/// written. A realm whose own document states its own section decides its
-/// own chain, so the same edit is then ordinary config.
+/// written. The realm's own document on this state root does not make the
+/// edit ordinary config: another state root sharing the user document may
+/// hold no document for the realm, and the realm composes the user's
+/// section there. With `[realm.global]` stated, a realm without a section
+/// still composes `global`, so the same edit is then ordinary config.
 #[tokio::test]
 async fn a_user_document_write_cannot_drop_a_stand_in_section_a_realm_composes_through() {
     const USER: &str = "[realm.team]\nparent = \"global\"\n\n\
@@ -79,16 +82,35 @@ async fn a_user_document_write_cannot_drop_a_stand_in_section_a_realm_composes_t
     );
     assert_eq!(std::fs::read_to_string(&path).unwrap(), USER);
 
-    let mut own = meerkat::Config::default();
-    own.realm.insert(
-        "team".to_string(),
-        meerkat_core::RealmConfigSection::default(),
+    let own = || {
+        let mut own = meerkat::Config::default();
+        own.realm.insert(
+            "team".to_string(),
+            meerkat_core::RealmConfigSection::default(),
+        );
+        Documents(std::collections::BTreeMap::from([(
+            "team".to_string(),
+            own,
+        )]))
+    };
+    let refused = store(own())
+        .patch(remove_team())
+        .await
+        .expect_err("on a state root without the realm's document it composes the user's section");
+    let message = refused.to_string();
+    assert!(
+        refused.administered_section() == Some(meerkat_core::AdministeredSection::Governance)
+            && message.contains("removing [realm.team]")
+            && message.contains("realm 'team' (on a state root without its own document)"),
+        "{message}"
     );
-    store(Documents(std::collections::BTreeMap::from([(
-        "team".to_string(),
-        own,
-    )])))
-    .patch(remove_team())
-    .await
-    .expect("a realm stating its own section does not compose the user's section for it");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), USER);
+
+    let with_global = format!("[realm.global]\n\n{USER}");
+    for documents in [Documents::default(), own()] {
+        std::fs::write(&path, &with_global).unwrap();
+        store(documents).patch(remove_team()).await.expect(
+            "a realm without a section still composes the user's governance through global",
+        );
+    }
 }

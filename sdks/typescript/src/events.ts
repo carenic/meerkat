@@ -121,7 +121,10 @@ export type StopReason =
   | "max_tokens"
   | "stop_sequence"
   | "content_filter"
-  | "cancelled";
+  | "cancelled"
+  | "refusal"
+  | "pause_turn"
+  | "context_window_exceeded";
 
 export type ToolCallArguments = Readonly<Record<string, unknown>>;
 
@@ -1326,6 +1329,9 @@ const STOP_REASONS = new Set<StopReason>([
   "stop_sequence",
   "content_filter",
   "cancelled",
+  "refusal",
+  "pause_turn",
+  "context_window_exceeded",
 ]);
 
 function parseStopReason(raw: unknown): StopReason | undefined {
@@ -1745,7 +1751,17 @@ export function parseCoreEvent(raw: Record<string, unknown>): AgentEvent {
         stopReason: requireOneOf(
           requireStringField(raw, "stop_reason"),
           "stop_reason",
-          ["end_turn", "tool_use", "max_tokens", "stop_sequence", "content_filter", "cancelled"] as const,
+          [
+            "end_turn",
+            "tool_use",
+            "max_tokens",
+            "stop_sequence",
+            "content_filter",
+            "cancelled",
+            "refusal",
+            "pause_turn",
+            "context_window_exceeded",
+          ] as const,
         ),
         // An unaccounted turn omits `usage` entirely. Parsing it as a zero row
         // would turn "no measurement" into a wrong measurement that looks

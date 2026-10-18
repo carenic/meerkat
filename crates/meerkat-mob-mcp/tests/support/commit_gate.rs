@@ -17,9 +17,12 @@
 //!
 //! It can also fail a runtime's reads until restored: its resume-authority
 //! observation ([`CommitGateRuntimeStore::fail_resume_observations`]), so the
-//! session owner's lifecycle cannot be observed, or the bounded identity read
+//! session owner's lifecycle cannot be observed, the bounded identity read
 //! a session read consults ([`CommitGateRuntimeStore::fail_session_reads`]),
-//! so the session cannot be read.
+//! so the session cannot be read, or the versioned input snapshot a cold
+//! registration recovers from
+//! ([`CommitGateRuntimeStore::fail_input_recovery_reads`]), so the runtime
+//! cannot reload the session from its durable store.
 
 use std::sync::{Arc, Mutex};
 
@@ -42,6 +45,7 @@ pub struct CommitGateRuntimeStore {
     hold: watch::Sender<CommitHold>,
     failing_observations: Mutex<Option<LogicalRuntimeId>>,
     failing_reads: Mutex<Option<LogicalRuntimeId>>,
+    failing_recovery_reads: Mutex<Option<LogicalRuntimeId>>,
 }
 
 impl Default for CommitGateRuntimeStore {
@@ -60,6 +64,7 @@ impl CommitGateRuntimeStore {
             hold: watch::channel(CommitHold::Idle).0,
             failing_observations: Mutex::new(None),
             failing_reads: Mutex::new(None),
+            failing_recovery_reads: Mutex::new(None),
         }
     }
 
@@ -83,6 +88,24 @@ impl CommitGateRuntimeStore {
     /// Let committed-identity reads through again.
     pub fn restore_session_reads(&self) {
         *self.failing_reads.lock().expect("commit gate lock") = None;
+    }
+
+    /// Fail every versioned input snapshot read of `runtime_id` (the read a
+    /// cold registration recovers its inputs from) until
+    /// [`Self::restore_input_recovery_reads`].
+    pub fn fail_input_recovery_reads(&self, runtime_id: LogicalRuntimeId) {
+        *self
+            .failing_recovery_reads
+            .lock()
+            .expect("commit gate lock") = Some(runtime_id);
+    }
+
+    /// Let versioned input snapshot reads through again.
+    pub fn restore_input_recovery_reads(&self) {
+        *self
+            .failing_recovery_reads
+            .lock()
+            .expect("commit gate lock") = None;
     }
 
     fn read_fails(
@@ -500,6 +523,11 @@ impl meerkat_runtime::RuntimeStore for CommitGateRuntimeStore {
         meerkat_runtime::store::PreparedRecoveryInputSnapshot,
         meerkat_runtime::RuntimeStoreError,
     > {
+        Self::read_fails(
+            &self.failing_recovery_reads,
+            runtime_id,
+            "input recovery read",
+        )?;
         self.inner.load_input_states_with_versions(runtime_id).await
     }
 

@@ -1,6 +1,12 @@
 //! Actual OS probes. Backend/setup failure is a test failure, never a skip.
 #![cfg(any(target_os = "linux", target_os = "macos"))]
-#![allow(unsafe_code, clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![allow(
+    unsafe_code,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::disallowed_methods
+)]
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;

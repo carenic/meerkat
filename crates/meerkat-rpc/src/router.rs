@@ -9850,12 +9850,16 @@ mod tests {
         operator_comms
             .peer_interaction_handle()
             .expect("worker peer request authority")
-            .request_sent(corr_id)
+            .request_sent(corr_id, sender.public_key().to_peer_id())
             .expect("seed outbound request before terminal peer response");
         sender
             .peer_interaction_handle()
             .expect("sender peer response authority")
-            .request_received(corr_id, meerkat_core::types::HandlingMode::Queue)
+            .request_received(
+                corr_id,
+                meerkat_core::types::HandlingMode::Queue,
+                operator_pubkey.to_peer_id(),
+            )
             .expect("seed inbound request before terminal peer response");
 
         CoreCommsRuntime::send(

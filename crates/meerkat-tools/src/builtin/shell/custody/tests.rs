@@ -1,4 +1,9 @@
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::disallowed_methods
+)]
 
 use super::*;
 use crate::builtin::shell::{SecurityMode, ShellConfig, ShellTool};
@@ -1451,16 +1456,19 @@ async fn the_sweep_reaps_only_ended_unreferenced_incarnation_locks() {
     assert!(incarnation_lock_path(root.path(), current.id).exists());
 }
 
-// The foreign-namespace fixture below is Linux-only: it needs unshare(1)
+// The foreign-namespace fixtures below are Linux-only: they need unshare(1)
 // and a read-write FIFO receiver (tokio::net::unix::pipe::OpenOptions::
 // read_write), which exists only on Linux and Android.
 
-/// New user, pid and mount namespaces with a procfs for the new pid namespace.
-/// Without `--mount-proc` the host would still see the outer `/proc`, where
-/// its children's namespace-local pids name other processes or none, so
-/// custody could not capture the identity of the leader it just spawned.
+/// New user, pid and mount namespaces with a procfs for the new pid
+/// namespace, so the host there reads a procfs of its own pid namespace.
 #[cfg(target_os = "linux")]
 const UNSHARE_ARGS: [&str; 3] = ["-Urpf", "--mount-proc", "--kill-child"];
+/// New user and pid namespaces that keep the outer procfs: the host there
+/// reads a procfs of an ancestor pid namespace, where its own pids name other
+/// processes or none.
+#[cfg(target_os = "linux")]
+const UNSHARE_KEEP_PROC_ARGS: [&str; 2] = ["-Urpf", "--kill-child"];
 #[cfg(target_os = "linux")]
 const UNSHARE_ROOT_ENV: &str = "MEERKAT_TEST_CUSTODY_UNSHARE_ROOT";
 #[cfg(target_os = "linux")]
@@ -1468,6 +1476,169 @@ const UNSHARE_SCOPE_ENV: &str = "MEERKAT_TEST_CUSTODY_UNSHARE_SCOPE";
 #[cfg(target_os = "linux")]
 const UNSHARE_CHILD_TEST: &str =
     "builtin::shell::custody::tests::custody_foreign_namespace_host_role";
+#[cfg(target_os = "linux")]
+const UNSHARE_PROCFS_CHILD_TEST: &str =
+    "builtin::shell::custody::tests::custody_foreign_procfs_host_role";
+
+/// unshare(1)'s (util-linux) messages for namespace setup it was refused,
+/// printed before it executes anything.
+#[cfg(target_os = "linux")]
+const UNSHARE_SETUP_REFUSALS: [&str; 5] = [
+    "unshare: unshare failed:",
+    "unshare: write failed /proc/self/",
+    "unshare: cannot open /proc/self/",
+    "unshare: mount /proc failed:",
+    "unshare: cannot change root filesystem propagation:",
+];
+
+/// Why an unshare(1) run ended before the host it started became ready.
+#[cfg(target_os = "linux")]
+#[derive(Debug, PartialEq, Eq)]
+enum UnshareFailure {
+    /// unshare(1) was refused the namespace setup itself: there is nothing
+    /// to exercise.
+    NamespacesUnavailable,
+    /// Anything else, including a failure to execute the host: a test
+    /// failure.
+    HostFailed,
+}
+
+/// Classify unshare(1)'s stderr after it failed.
+#[cfg(target_os = "linux")]
+fn classify_unshare_failure(stderr: &str) -> UnshareFailure {
+    if UNSHARE_SETUP_REFUSALS
+        .iter()
+        .any(|refusal| stderr.starts_with(refusal))
+    {
+        UnshareFailure::NamespacesUnavailable
+    } else {
+        UnshareFailure::HostFailed
+    }
+}
+
+/// A host role running under unshare(1), and the first line it reported.
+#[cfg(target_os = "linux")]
+struct UnsharedHost {
+    child: tokio::process::Child,
+    line: String,
+}
+
+/// Run test role `role` under `unshare <args>` with custody root `root` and
+/// `scope`, and wait for the first line it writes to `<root>/ready.fifo`.
+/// `None`, after saying why, only when unshare(1) is not installed or is
+/// refused the namespace setup itself (`namespaces` names them); any other
+/// failure, including one to execute the host, fails the test.
+#[cfg(target_os = "linux")]
+async fn start_unshared_host(
+    args: &[&str],
+    namespaces: &str,
+    role: &str,
+    root: &Path,
+    scope: &ProcessCustodyScope,
+) -> Option<UnsharedHost> {
+    // Unprivileged user and pid namespaces (and a procfs mount in them) may
+    // be unavailable, for example restricted by AppArmor; the test then has
+    // nothing to exercise, and says why. util-linux translates its messages,
+    // so both unshare runs use the C locale the refusal list is written in.
+    match Command::new("unshare")
+        .env("LC_ALL", "C")
+        .args(args)
+        .arg("true")
+        .output()
+    {
+        Ok(output) if output.status.success() => {}
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(
+                classify_unshare_failure(&stderr),
+                UnshareFailure::NamespacesUnavailable,
+                "the unshare probe failed ({}): {}",
+                output.status,
+                stderr.trim()
+            );
+            eprintln!(
+                "skipped: {namespaces} namespaces unavailable: unshare probe ({}): {}",
+                output.status,
+                stderr.trim()
+            );
+            return None;
+        }
+        Err(error) => {
+            eprintln!("skipped: {namespaces} namespaces unavailable: unshare probe: {error}");
+            return None;
+        }
+    }
+    let fifo_path = root.join("ready.fifo");
+    let status = Command::new("mkfifo").arg(&fifo_path).status().unwrap();
+    assert!(status.success());
+    // Read-write and non-blocking: opening never waits for a writer, so no
+    // blocking thread outlives a failed start (a blocked FIFO open used to
+    // keep the test runtime from shutting down after the readiness timeout).
+    let fifo = tokio::net::unix::pipe::OpenOptions::new()
+        .read_write(true)
+        .open_receiver(&fifo_path)
+        .unwrap();
+    let mut host = tokio::process::Command::new("unshare")
+        .env("LC_ALL", "C")
+        .args(args)
+        .arg(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            role,
+            "--ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(UNSHARE_ROOT_ENV, root)
+        .env(UNSHARE_SCOPE_ENV, scope.as_str())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let mut host_stderr = host.stderr.take().unwrap();
+    let stderr_task = tokio::spawn(async move {
+        let mut text = String::new();
+        let _ = tokio::io::AsyncReadExt::read_to_string(&mut host_stderr, &mut text).await;
+        text
+    });
+    // The host's stderr once it has ended (bounded: a lingering descendant
+    // holding the pipe must not hang the failure report).
+    let collect_stderr = |task: tokio::task::JoinHandle<String>| async move {
+        tokio::time::timeout(std::time::Duration::from_secs(10), task)
+            .await
+            .map_or_else(
+                |_| "<stderr still open after 10 s>".to_owned(),
+                |joined| joined.unwrap(),
+            )
+    };
+    let mut ready_lines = tokio::io::AsyncBufReadExt::lines(tokio::io::BufReader::new(fifo));
+    tokio::select! {
+        line = ready_lines.next_line() => {
+            let line = line.unwrap().expect("the read-write FIFO never reaches end of file");
+            Some(UnsharedHost { child: host, line: line.trim().to_owned() })
+        }
+        exited = host.wait() => {
+            let status = exited.unwrap();
+            let stderr = collect_stderr(stderr_task).await;
+            if classify_unshare_failure(&stderr) == UnshareFailure::NamespacesUnavailable {
+                eprintln!(
+                    "skipped: {namespaces} namespaces unavailable: unshare failed before the host started ({status}): {}",
+                    stderr.trim()
+                );
+                return None;
+            }
+            panic!("host role {role} exited before it reported ({status}); stderr:\n{stderr}");
+        }
+        () = tokio::time::sleep(std::time::Duration::from_secs(120)) => {
+            let _ = host.start_kill();
+            let _ = host.wait().await;
+            let stderr = collect_stderr(stderr_task).await;
+            panic!("host role {role} never reported within 120 s; stderr:\n{stderr}");
+        }
+    }
+}
 
 /// Host role run inside a new pid namespace by
 /// [`a_host_in_another_pid_namespace_is_proven_ended_by_its_lock`]: open
@@ -1505,103 +1676,22 @@ async fn custody_foreign_namespace_host_role() {
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn a_host_in_another_pid_namespace_is_proven_ended_by_its_lock() {
-    // Unprivileged user, pid and mount namespaces (and a procfs mount in
-    // them) may be unavailable, for example restricted by AppArmor; the test
-    // then has nothing to exercise, and says why.
-    match Command::new("unshare")
-        .args(UNSHARE_ARGS)
-        .arg("true")
-        .output()
-    {
-        Ok(output) if output.status.success() => {}
-        Ok(output) => {
-            eprintln!(
-                "skipped: user+pid+mount namespaces unavailable: unshare probe ({}): {}",
-                output.status,
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
-            return;
-        }
-        Err(error) => {
-            eprintln!("skipped: user+pid+mount namespaces unavailable: unshare probe: {error}");
-            return;
-        }
-    }
     let root = TempDir::new().unwrap();
     let scope = scope();
-    let fifo_path = root.path().join("ready.fifo");
-    let status = Command::new("mkfifo").arg(&fifo_path).status().unwrap();
-    assert!(status.success());
-    // Read-write and non-blocking: opening never waits for a writer, so no
-    // blocking thread outlives a failed start (a blocked FIFO open used to
-    // keep the test runtime from shutting down after the readiness timeout).
-    let fifo = tokio::net::unix::pipe::OpenOptions::new()
-        .read_write(true)
-        .open_receiver(&fifo_path)
-        .unwrap();
-    let mut host = tokio::process::Command::new("unshare")
-        .args(UNSHARE_ARGS)
-        .arg(std::env::current_exe().unwrap())
-        .args([
-            "--exact",
-            UNSHARE_CHILD_TEST,
-            "--ignored",
-            "--nocapture",
-            "--test-threads=1",
-        ])
-        .env(UNSHARE_ROOT_ENV, root.path())
-        .env(UNSHARE_SCOPE_ENV, scope.as_str())
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .unwrap();
-    let mut host_stderr = host.stderr.take().unwrap();
-    let stderr_task = tokio::spawn(async move {
-        let mut text = String::new();
-        let _ = tokio::io::AsyncReadExt::read_to_string(&mut host_stderr, &mut text).await;
-        text
-    });
-    // The host's stderr once it has ended (bounded: a lingering descendant
-    // holding the pipe must not hang the failure report).
-    let collect_stderr = |task: tokio::task::JoinHandle<String>| async move {
-        tokio::time::timeout(std::time::Duration::from_secs(10), task)
-            .await
-            .map_or_else(
-                |_| "<stderr still open after 10 s>".to_owned(),
-                |joined| joined.unwrap(),
-            )
+    let Some(mut host) = start_unshared_host(
+        &UNSHARE_ARGS,
+        "user+pid+mount",
+        UNSHARE_CHILD_TEST,
+        root.path(),
+        &scope,
+    )
+    .await
+    else {
+        return;
     };
-    let mut ready_lines = tokio::io::AsyncBufReadExt::lines(tokio::io::BufReader::new(fifo));
-    tokio::select! {
-        line = ready_lines.next_line() => {
-            let line = line.unwrap().expect("the read-write FIFO never reaches end of file");
-            assert_eq!(line.trim(), "ready");
-            // A green run of this test is never mistaken for a skipped one.
-            eprintln!("exercised: foreign-namespace host ready");
-        }
-        exited = host.wait() => {
-            let status = exited.unwrap();
-            let stderr = collect_stderr(stderr_task).await;
-            // Only unshare's own setup failure, before it execs the host,
-            // means the namespaces are unavailable here.
-            if stderr.starts_with("unshare:") {
-                eprintln!(
-                    "skipped: user+pid+mount namespaces unavailable: unshare failed before the host started ({status}): {}",
-                    stderr.trim()
-                );
-                return;
-            }
-            panic!("the foreign-namespace host exited before it became ready ({status}); stderr:\n{stderr}");
-        }
-        () = tokio::time::sleep(std::time::Duration::from_secs(120)) => {
-            let _ = host.start_kill();
-            let _ = host.wait().await;
-            let stderr = collect_stderr(stderr_task).await;
-            panic!("the foreign-namespace host never became ready within 120 s; stderr:\n{stderr}");
-        }
-    }
+    assert_eq!(host.line, "ready");
+    // A green run of this test is never mistaken for a skipped one.
+    eprintln!("exercised: foreign-namespace host ready");
 
     // Alive in its own namespace: its lock is held.
     let error = ProcessCustody::recover_and_open(root.path(), scope.clone())
@@ -1619,7 +1709,7 @@ async fn a_host_in_another_pid_namespace_is_proven_ended_by_its_lock() {
     );
 
     // Tear the namespace down with its host.
-    host.kill().await.unwrap();
+    host.child.kill().await.unwrap();
     let (_custody, report) = ProcessCustody::recover_and_open(root.path(), scope)
         .await
         .unwrap();
@@ -1628,6 +1718,133 @@ async fn a_host_in_another_pid_namespace_is_proven_ended_by_its_lock() {
         report.recovered[0].cessation,
         ToolProcessCessation::ForeignIncarnationEnded
     );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn only_unshares_own_namespace_setup_refusals_skip_the_namespace_tests() {
+    for refusal in [
+        "unshare: write failed /proc/self/uid_map: Operation not permitted",
+        "unshare: write failed /proc/self/setgroups: Operation not permitted",
+        "unshare: cannot open /proc/self/setgroups: Permission denied",
+        "unshare: unshare failed: Operation not permitted",
+        "unshare: mount /proc failed: Operation not permitted",
+        "unshare: cannot change root filesystem propagation: Permission denied",
+    ] {
+        assert_eq!(
+            classify_unshare_failure(refusal),
+            UnshareFailure::NamespacesUnavailable,
+            "{refusal}"
+        );
+    }
+    for failure in [
+        "unshare: failed to execute /tmp/meerkat_tools-0123456789abcdef: No such file or directory",
+        "unshare: failed to execute true: Permission denied",
+        "unshare: fork failed: Resource temporarily unavailable",
+        "thread 'main' panicked at src/lib.rs:1:1",
+        "",
+    ] {
+        assert_eq!(
+            classify_unshare_failure(failure),
+            UnshareFailure::HostFailed,
+            "{failure}"
+        );
+    }
+}
+
+/// Host role run by [`a_host_reading_an_ancestor_namespaces_procfs_is_refused`]
+/// in new user and pid namespaces that keep the outer procfs: open custody,
+/// report what that did, and wait to be killed with its namespace.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[ignore = "helper role executed only inside a new pid namespace"]
+async fn custody_foreign_procfs_host_role() {
+    let (Some(root), Some(scope)) = (
+        std::env::var_os(UNSHARE_ROOT_ENV).map(PathBuf::from),
+        std::env::var(UNSHARE_SCOPE_ENV).ok(),
+    ) else {
+        return;
+    };
+    // A kernel without `NSpid` (gVisor) reports no namespace levels; any
+    // refusal of the outer procfs is then the expected outcome.
+    let nspid_listed = std::fs::read_to_string("/proc/self/status")
+        .is_ok_and(|status| status.lines().any(|line| line.starts_with("NSpid:")));
+    let outcome = match ProcessCustody::recover_and_open(&root, ProcessCustodyScope(scope)).await {
+        Err(ProcessCustodyError::ForeignProcfs { view, .. })
+            if !nspid_listed
+                || view
+                    .namespace_levels_above
+                    .is_some_and(|levels| levels >= 1) =>
+        {
+            "refused".to_owned()
+        }
+        Err(error) => format!("unexpected error: {error}"),
+        Ok(_) => "unexpected: custody opened".to_owned(),
+    };
+    std::fs::write(root.join("ready.fifo"), format!("{outcome}\n")).unwrap();
+    std::future::pending::<()>().await;
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_host_reading_an_ancestor_namespaces_procfs_is_refused() {
+    let root = TempDir::new().unwrap();
+    let scope = scope();
+    let Some(mut host) = start_unshared_host(
+        &UNSHARE_KEEP_PROC_ARGS,
+        "user+pid",
+        UNSHARE_PROCFS_CHILD_TEST,
+        root.path(),
+        &scope,
+    )
+    .await
+    else {
+        return;
+    };
+    // A green run of this test is never mistaken for a skipped one.
+    eprintln!(
+        "exercised: host reading an ancestor namespace's procfs: {}",
+        host.line
+    );
+    assert_eq!(host.line, "refused");
+    // Refused before any incarnation lock or record was written.
+    assert!(!root.path().join(INCARNATIONS_DIR).exists());
+    assert!(!root.path().join(scope.as_str()).exists());
+    host.child.kill().await.unwrap();
+}
+
+#[test]
+fn a_foreign_procfs_surfaces_as_its_own_custody_error() {
+    let view = ForeignProcfsView {
+        host_pid: 1,
+        procfs_pid: Some(4242),
+        namespace_levels_above: Some(1),
+    };
+    let error =
+        ProcessCustodyError::io("capture tool leader identity", std::io::Error::other(view));
+    assert!(
+        matches!(
+            &error,
+            ProcessCustodyError::ForeignProcfs { context, view: lifted }
+                if *context == "capture tool leader identity" && *lifted == view
+        ),
+        "{error:?}"
+    );
+    assert_eq!(
+        error.to_string(),
+        "process custody refused (capture tool leader identity): /proc shows this host (pid 1) as pid 4242, 1 pid namespace level(s) up; custody needs a procfs of this host's own pid namespace"
+    );
+    // Every other I/O failure stays an I/O failure.
+    assert!(matches!(
+        ProcessCustodyError::io(
+            "write custody record",
+            std::io::Error::from(std::io::ErrorKind::NotFound)
+        ),
+        ProcessCustodyError::Io {
+            context: "write custody record",
+            ..
+        }
+    ));
 }
 
 #[tokio::test]

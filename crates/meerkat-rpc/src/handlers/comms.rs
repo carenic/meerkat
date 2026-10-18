@@ -364,6 +364,30 @@ mod tests {
         assert_eq!(json["envelope_id"], envelope_id.to_string());
     }
 
+    // A peer response addressed to a peer that did not send the request is
+    // refused before any transport and reaches the host as the catch-all
+    // `send_failed`, naming only the caller's addressee and the request.
+    #[test]
+    fn normalize_send_error_reports_a_response_to_a_non_requester_as_send_failed() {
+        let addressee = PeerId::new();
+        let in_reply_to = meerkat_core::interaction::InteractionId(uuid::Uuid::new_v4());
+        let data = normalize_send_error(
+            Some("peer-a"),
+            &meerkat_core::comms::SendError::ResponseAddresseeNotRequester {
+                in_reply_to,
+                addressee,
+            },
+        );
+
+        let message = data.message().to_string();
+        assert!(message.contains(&addressee.to_string()), "{message}");
+        assert!(message.contains(&in_reply_to.to_string()), "{message}");
+        assert_eq!(
+            serde_json::to_value(data).unwrap(),
+            serde_json::json!({ "code": "send_failed", "message": message })
+        );
+    }
+
     // An ambiguous delivery may already have landed, so it must reach the
     // caller as `send_ambiguous` with its envelope id, never as `send_failed`:
     // a caller told "failed" retries, and the retry can duplicate the delivery.

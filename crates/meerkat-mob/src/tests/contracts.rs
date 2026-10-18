@@ -12,7 +12,6 @@
 
 use async_trait::async_trait;
 use meerkat_comms::{CommsRuntime, PeerRequestResponseAuthority};
-use meerkat_core::PeerCorrelationId;
 use meerkat_core::Provider;
 use meerkat_core::agent::CommsRuntime as CoreCommsRuntime;
 use meerkat_core::comms::{
@@ -565,10 +564,7 @@ async fn contract_mob_002_peer_request_response_round_trip() {
     receiver
         .peer_interaction_handle()
         .expect("receiver should have peer interaction authority")
-        .request_received(
-            PeerCorrelationId::from_uuid(request_id.0),
-            request_interaction.handling_mode,
-        )
+        .request_received_from_ingress(&request_candidate)
         .expect("direct comms-drain bypass must seed inbound request state");
 
     // Receiver sends PeerResponse back
@@ -747,7 +743,11 @@ async fn contract_mob_002b_terminal_transition_drives_registry_cleanup_via_effec
     // projection only. It must not destroy the independent stream reservation:
     // a response is allowed to win the race with caller attachment.
     handle
-        .response_terminal(corr_id, PeerTerminalDisposition::Completed)
+        .response_terminal(
+            corr_id,
+            PeerTerminalDisposition::Completed,
+            receiver.public_key().to_peer_id(),
+        )
         .expect("terminal transition must succeed");
 
     // DSL map entry is gone (removed on terminal).
@@ -846,13 +846,16 @@ async fn contract_mob_002c_dsl_reject_refuses_shell_commit() {
 
     // Seed the DSL with a `Sent` entry for a specific corr_id.
     let corr_id = meerkat_core::PeerCorrelationId::new();
-    handle.request_sent(corr_id).expect("initial request_sent");
+    let addressee = receiver.public_key().to_peer_id();
+    handle
+        .request_sent(corr_id, addressee)
+        .expect("initial request_sent");
 
     // Now call the handle again for the same corr_id — DSL must reject
     // (duplicate), matching the behavior the comms runtime's send path
     // would observe.
     let err = handle
-        .request_sent(corr_id)
+        .request_sent(corr_id, addressee)
         .expect_err("duplicate request_sent must reject");
     assert_eq!(err.context, "PeerInteractionHandle::request_sent");
 
@@ -979,7 +982,11 @@ async fn contract_mob_002d_inbound_terminal_reply_closes_lifecycle_via_send() {
     // fire on classified ActionableRequest admission.
     let request_corr_id = meerkat_core::PeerCorrelationId::new();
     handle
-        .request_received(request_corr_id, meerkat_core::types::HandlingMode::Queue)
+        .request_received(
+            request_corr_id,
+            meerkat_core::types::HandlingMode::Queue,
+            originator.public_key().to_peer_id(),
+        )
         .expect("inbound request_received must advance DSL");
     assert_eq!(
         handle.inbound_state(request_corr_id),

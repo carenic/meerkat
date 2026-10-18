@@ -40,11 +40,11 @@ use super::fixture_mob as meerkat_mob;
 // (`send`, `handoff_volatile_peer_input_candidates`) and on `Arc<MeerkatMachine>`
 // (`list_active_inputs`) — the crates/meerkat-mob/src/runtime/tests.rs and
 // smoke_mob_flow_runtime.rs import discipline.
+use meerkat_core::CommsCommand;
 use meerkat_core::agent::CommsRuntime as _;
 use meerkat_core::comms::TrustedPeerDescriptor;
 use meerkat_core::interaction::InteractionContent;
 use meerkat_core::service::SessionService as _;
-use meerkat_core::{CommsCommand, PeerCorrelationId};
 use meerkat_runtime::SessionServiceRuntimeExt as _;
 use meerkat_runtime::meerkat_machine::MeerkatMachine;
 use meerkat_runtime::meerkat_machine::dsl as machine_dsl;
@@ -414,6 +414,10 @@ pub struct HostFixtureOptions {
     /// different SessionId from the live session the service actually built.
     /// Exercises the materializer's two-identity rollback fence.
     pub corrupt_first_create_session_result_identity: bool,
+    /// Corrupt one selected one-based `create_session` result the same way,
+    /// for example a later revival's create. Overrides the first-call
+    /// shorthand above.
+    pub corrupt_create_session_result_identity_call: Option<u64>,
     /// Fail this many initial mob-authorized archive calls before delegating.
     /// Used with a corrupted create result to exercise retryable and sticky
     /// unrecorded-session cleanup failures.
@@ -471,6 +475,7 @@ impl HostFixtureOptions {
             failing_first_create_session: false,
             failing_create_session_call: None,
             corrupt_first_create_session_result_identity: false,
+            corrupt_create_session_result_identity_call: None,
             failing_archive_with_mob_lifecycle_authority_calls: 0,
             failing_first_projection_drain: false,
             stop_first_executor_after_ensure: false,
@@ -2135,9 +2140,10 @@ pub async fn spawn_host_daemon_fixture(
             let fail_create_call = opts
                 .failing_create_session_call
                 .or(opts.failing_first_create_session.then_some(1));
-            let corrupt_create_result_call = opts
-                .corrupt_first_create_session_result_identity
-                .then_some(1);
+            let corrupt_create_result_call =
+                opts.corrupt_create_session_result_identity_call.or(opts
+                    .corrupt_first_create_session_result_identity
+                    .then_some(1));
             let mob_service: Arc<dyn meerkat_mob::MobSessionService> = if fail_create_call.is_some()
                 || corrupt_create_result_call.is_some()
                 || opts.failing_archive_with_mob_lifecycle_authority_calls > 0
@@ -3032,10 +3038,7 @@ pub async fn spawn_scripted_host_peer(name: &str) -> ScriptedHostPeer {
                 runtime
                     .peer_interaction_handle()
                     .expect("scripted host peer interaction authority")
-                    .request_received(
-                        PeerCorrelationId::from_uuid(candidate.interaction.id.0),
-                        candidate.interaction.handling_mode,
-                    )
+                    .request_received_from_ingress(&candidate)
                     .expect("record inbound peer request before response");
 
                 let command: Result<BridgeCommand, _> = serde_json::from_value(params.clone());
@@ -5682,10 +5685,7 @@ pub fn spawn_scripted_member_turn_responder(
                 runtime
                     .peer_interaction_handle()
                     .expect("scripted member peer interaction authority")
-                    .request_received(
-                        PeerCorrelationId::from_uuid(candidate.interaction.id.0),
-                        candidate.interaction.handling_mode,
-                    )
+                    .request_received_from_ingress(&candidate)
                     .expect("record inbound peer request before response");
 
                 let command: Result<BridgeCommand, _> = serde_json::from_value(params.clone());

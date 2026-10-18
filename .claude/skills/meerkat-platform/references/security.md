@@ -143,7 +143,15 @@ requirement = { baseline = "command_runtime_v1", read = { kind = "paths", paths 
   stores, `FileConfigStore::with_realm_chain` and
   `SdkConfigStore::with_realm_document`; a `FileConfigStore::new`,
   `SdkConfigStore::with_path` or in-memory store keeps only the document's
-  own sections. Each ancestor composes from its own document alone, so a
+  own sections. Such writes over one state root take turns: each holds an
+  exclusive lock on `<state_root>/.realm-config.lock` from before its read
+  to after its write (`RealmConfigSource::composition_lock_path`; a source
+  that names none leaves them unserialized). `rkat realm create`, `delete`
+  and `prune` do not take it (a delete racing a write that names the realm
+  as a parent leaves that realm's chain unresolved, so it does not
+  compose), and an NFS mount that keeps locks on each machine (`nolock`,
+  `local_lock=flock`) does not carry it between machines. Each ancestor composes from
+  its own document alone, so a
   chain through a missing ancestor fails (a missing parent), and `rkat realm
   delete` and `rkat realm prune` keep a realm another realm names as its
   parent.
@@ -270,7 +278,14 @@ except these, which it runs as itself (`meerkat_core::HostLaunchExemption`):
 - Git skill source (`HostLaunchExemption::git`): fetches with the host's
   Git credentials and network; a repository is not loaded when a confined
   process could change the skill cache, and a skill linked out of the
-  checkout is not read.
+  checkout is not read. A repository's HTTPS token reaches git only for the
+  repository: on Unix through git's `credential-cache` client and a socket
+  the host serves for each invocation (for the repository's host; never on
+  a command line or in a file; a git without `credential-cache` fails with
+  the remedies instead of prompting), on Windows as a header option on that
+  invocation's command line (for the configured URL, redirects not
+  followed, never in a file). No credential helper of the host's git
+  configuration is asked for or sent it.
 - Credential command (auth profile `source = { kind = "command" }`,
   `HostLaunchExemption::credential_command`): produces the host's provider
   credentials; without `cwd` it runs from the user's home directory; it is
@@ -278,13 +293,31 @@ except these, which it runs as itself (`meerkat_core::HostLaunchExemption`):
   confined process could change its program, the interpreter its `#!` line
   names by path, or its working directory, and the refusal ends the
   binding's resolution (no other credential stands in for it). A config
-  write cannot add one or change what it runs
+  write cannot add one, change what it runs, or change where its token goes
+  (the profile's provider or auth method, a binding of the section that
+  uses it, that binding's backend or default model, or the
+  `[self_hosted.servers]` entry the backend names)
   (`confinement_administration_required`, naming the auth profile); the
-  host edits the document.
+  host edits the document. A command binding on a self-hosted backend must
+  declare the server (`server = "<id>"`), so a request's model never
+  decides where its token goes: a realm with one that declares none does
+  not compose (`ConfigError::CredentialCommandServerUndeclared`), and such
+  a binding is never chosen for, or explicitly sent to, a server it does
+  not declare (`SelfHostedConnectionError::CredentialCommandServerUndeclared`).
+  A request cannot override a binding's auth profile with another binding's
+  command profile (`ProviderBindingError::CredentialCommandProfileOverride`),
+  and a realm whose command binding takes its server entry from another
+  document does not compose (`ConfigError::CredentialCommandServer`).
+  Credentials that do not come from a command are outside these rules.
 - Browser opener (`HostLaunchExemption::browser_opener`: `/usr/bin/open`,
   `xdg-open`, the system `rundll32.exe`; OAuth logins and the CLI's HTML
   artifact): must reach the user's desktop session; the URL is one argument.
-- `stty` by absolute path (`HostLaunchExemption::terminal_control`): host
+  Embedders open with `meerkat::open_system_browser_guarded(url,
+  host_confinement.launch_guard().as_deref())`; the unguarded
+  `open_system_browser` and `McpOAuthPendingLogin::launch_system_browser`
+  are deprecated (0.9.3).
+- `stty` (`HostLaunchExemption::terminal_control`: `/bin/stty`, else
+  `/usr/bin/stty`, else the `stty` on the trusted `PATH`, as on NixOS): host
   terminal control (hiding a client secret typed at `rkat`).
 - `wasm-pack` (`HostLaunchExemption::wasm_pack`): developer build tooling
   (`rkat doctor`).
@@ -306,7 +339,9 @@ confinement they run with the host's environment as it is
 (`HostConfinement::launch_guard` is `None`).
 
 A source test fails on any process launch in shipped code that is neither
-confined nor in this list.
+confined nor in this list, and Clippy (`disallowed_methods` in the workspace
+`clippy.toml`) refuses every process-launch API outside the sites that test
+lists.
 
 ### Platforms
 

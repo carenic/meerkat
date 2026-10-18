@@ -194,6 +194,7 @@ pub fn emit_all_schemas(output_dir: &std::path::Path) -> Result<(), Box<dyn std:
         "MobSnapshotResult": schema_for!(crate::wire::MobSnapshotResult),
         "MobDestroyResult": schema_for!(crate::wire::MobDestroyResult),
         "MobRotateSupervisorResult": schema_for!(crate::wire::MobRotateSupervisorResult),
+        "MobClaimCallbackRouteParams": schema_for!(crate::wire::MobClaimCallbackRouteParams),
         "MobClaimCallbackRouteResult": schema_for!(crate::wire::MobClaimCallbackRouteResult),
         "SupervisorRotationReportWire": schema_for!(crate::wire::SupervisorRotationReportWire),
         "SupervisorRotationIncompleteDataWire": schema_for!(crate::wire::SupervisorRotationIncompleteDataWire),
@@ -1693,6 +1694,7 @@ mod tests {
                 created_at_utc: now,
                 updated_at_utc: now,
                 deleted_at_utc: None,
+                commissioning_agent: None,
             },
         };
         let public_value = serde_json::to_value(public_schedule).expect("serialize schedule");

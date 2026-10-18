@@ -1444,7 +1444,7 @@ struct MemberWorkCancelOutcome {
 
 /// What a force cancel or cancel-all-work did to the member's run.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum MemberRunCancelOutcome {
+pub(super) enum MemberRunCancelOutcome {
     /// The member had no run.
     NoRun,
     /// The run current when the cancel was taken is cancelled at its next
@@ -1459,12 +1459,23 @@ enum MemberRunCancelOutcome {
 }
 
 /// Classify an exact-run cancel's result for the cancel verbs, by type.
-fn classify_member_run_cancel(
+///
+/// `InterruptDispatchOutcomeUnknown` is a cancel the runtime accepted and
+/// recorded for the exact run, and whose live delivery then failed, for
+/// example because the run crossed a boundary during the delivery. The
+/// recorded cancel still ends the run at its next boundary (meerkat-runtime's
+/// `exact_run_boundary_cancel_delivery_failure_keeps_the_recorded_cancel`),
+/// so it is `Cancelled`, as the member stop's `classify_stop_member_cancel`
+/// reads it.
+pub(super) fn classify_member_run_cancel(
     cancelled: Result<bool, meerkat_runtime::RuntimeDriverError>,
     run_id: meerkat_core::lifecycle::RunId,
 ) -> Result<MemberRunCancelOutcome, meerkat_runtime::RuntimeDriverError> {
     match cancelled {
-        Ok(true) => Ok(MemberRunCancelOutcome::Cancelled { run_id }),
+        Ok(true)
+        | Err(meerkat_runtime::RuntimeDriverError::InterruptDispatchOutcomeUnknown { .. }) => {
+            Ok(MemberRunCancelOutcome::Cancelled { run_id })
+        }
         Ok(false)
         | Err(
             meerkat_runtime::RuntimeDriverError::StaleAuthority { .. }
@@ -2353,6 +2364,79 @@ pub(super) fn arm_owned_create_abort_failure_for_test(session_id: SessionId) {
             .expect("owned create abort failure hook")
             .insert(session_id)
     );
+}
+
+/// Where a test pauses an owned actor transaction's cleanup.
+#[cfg(all(any(test, feature = "test-support"), feature = "runtime-adapter"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum OwnedCleanupPause {
+    /// Right after the exact live actor discard, still holding the
+    /// turn-finalization boundary.
+    ActorDiscardedUnderBoundary,
+    /// Right after the boundary was released, before the prepared
+    /// materialization is rolled back.
+    BoundaryReleased,
+}
+
+/// Test seam: pauses an owned actor transaction's cleanup at one point
+/// (entered, release). Inert unless armed for the session and point.
+#[cfg(all(any(test, feature = "test-support"), feature = "runtime-adapter"))]
+static OWNED_CLEANUP_PAUSES: std::sync::LazyLock<
+    StdMutex<HashMap<(SessionId, OwnedCleanupPause), (oneshot::Sender<()>, oneshot::Receiver<()>)>>,
+> = std::sync::LazyLock::new(|| StdMutex::new(HashMap::new()));
+
+#[cfg(all(any(test, feature = "test-support"), feature = "runtime-adapter"))]
+fn arm_owned_cleanup_pause(
+    session_id: SessionId,
+    point: OwnedCleanupPause,
+) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+    let (paused_tx, paused_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
+    let replaced = OWNED_CLEANUP_PAUSES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert((session_id, point), (paused_tx, release_rx));
+    assert!(
+        replaced.is_none(),
+        "owned actor cleanup pause already armed"
+    );
+    (paused_rx, release_tx)
+}
+
+/// Pause the next owned actor cleanup of `session_id` after its actor
+/// discard, while it still holds the turn-finalization boundary. Returns the
+/// paused signal and the release sender; sending on or dropping it lets the
+/// cleanup go on.
+#[cfg(all(any(test, feature = "test-support"), feature = "runtime-adapter"))]
+#[doc(hidden)]
+pub fn arm_owned_actor_cleanup_rollback_pause_for_test(
+    session_id: SessionId,
+) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+    arm_owned_cleanup_pause(session_id, OwnedCleanupPause::ActorDiscardedUnderBoundary)
+}
+
+/// Pause the next owned actor cleanup of `session_id` after it released the
+/// turn-finalization boundary, before it rolls back its prepared
+/// materialization. Same signals as
+/// [`arm_owned_actor_cleanup_rollback_pause_for_test`].
+#[cfg(all(any(test, feature = "test-support"), feature = "runtime-adapter"))]
+#[doc(hidden)]
+pub fn arm_owned_actor_cleanup_released_boundary_pause_for_test(
+    session_id: SessionId,
+) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+    arm_owned_cleanup_pause(session_id, OwnedCleanupPause::BoundaryReleased)
+}
+
+#[cfg(all(any(test, feature = "test-support"), feature = "runtime-adapter"))]
+async fn run_owned_cleanup_pause(session_id: &SessionId, point: OwnedCleanupPause) {
+    let pause = OWNED_CLEANUP_PAUSES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(&(session_id.clone(), point));
+    if let Some((paused_tx, release_rx)) = pause {
+        let _ = paused_tx.send(());
+        let _ = release_rx.await;
+    }
 }
 
 /// Fault seam: runs in a held member's final serving commit, right after its
@@ -3949,6 +4033,50 @@ impl MemberSessionDisposalArc {
         .await
     }
 
+    /// Reload `registration`, `session_id`'s current registration, from
+    /// durable authority when its persistent shell is durability-degraded,
+    /// bounded by `deadline`.
+    ///
+    /// The reload-required discard replaces the degraded process shell, and
+    /// the mutation fence its exited runtime loop retained, with a cold
+    /// successor recovered from the durable store. Input that a failed
+    /// boundary commit consumed only in memory is pending there again, so the
+    /// retirement that follows records its fate instead of losing it with
+    /// the in-memory run. A registration that is not degraded, or no longer
+    /// current, is left untouched (`NotDegraded`, `NotCurrent`).
+    pub(super) async fn reload_durability_degraded_registration_until(
+        adapter: &Arc<MeerkatMachine>,
+        ops_adapter: Option<&Arc<super::ops_adapter::MobOpsAdapter>>,
+        registration: &RuntimeSessionRegistrationWitness,
+        session_id: &SessionId,
+        deadline: Instant,
+    ) -> Result<meerkat_runtime::ReloadRequiredRegistrationDisposition, SessionError> {
+        // A reload-required discard atomically replaces the registration
+        // with a cold successor. The exact bound operation identity must
+        // ride that replacement as a durable retention request so the
+        // later finalization-boundary rebind finds it in the successor
+        // registry instead of failing closed on a stripped operation.
+        let prior_ops_binding = Self::recoverable_ops_binding_witness(ops_adapter, session_id)?;
+        let remaining =
+            Self::retirement_remaining(session_id, deadline, "durability_reload_discard")?;
+        tokio::time::timeout(
+            remaining,
+            adapter.recover_or_discard_reload_required_registration_with_operation_if_current(
+                registration,
+                prior_ops_binding
+                    .as_ref()
+                    .map(|witness| witness.retention_request()),
+            ),
+        )
+        .await
+        .map_err(|_| Self::runtime_retirement_in_progress(session_id, "durability_reload_discard"))?
+        .map_err(|error| {
+            Self::runtime_archive_error(format!(
+                "durability-reload disposal failed for {session_id}: {error}"
+            ))
+        })
+    }
+
     pub(super) async fn cancel_active_runtime_turn_before_retire_with_adapter_until(
         runtime_adapter: Option<&Arc<MeerkatMachine>>,
         ops_adapter: Option<&Arc<super::ops_adapter::MobOpsAdapter>>,
@@ -3968,32 +4096,14 @@ impl MemberSessionDisposalArc {
             {
                 return Ok(());
             }
-            // A reload-required discard atomically replaces the registration
-            // with a cold successor. The exact bound operation identity must
-            // ride that replacement as a durable retention request so the
-            // later finalization-boundary rebind finds it in the successor
-            // registry instead of failing closed on a stripped operation.
-            let prior_ops_binding = Self::recoverable_ops_binding_witness(ops_adapter, session_id)?;
-            let remaining =
-                Self::retirement_remaining(session_id, deadline, "durability_reload_discard")?;
-            let disposition = tokio::time::timeout(
-                remaining,
-                adapter.recover_or_discard_reload_required_registration_with_operation_if_current(
-                    &registration,
-                    prior_ops_binding
-                        .as_ref()
-                        .map(|witness| witness.retention_request()),
-                ),
+            let disposition = Self::reload_durability_degraded_registration_until(
+                adapter,
+                ops_adapter,
+                &registration,
+                session_id,
+                deadline,
             )
-            .await
-            .map_err(|_| {
-                Self::runtime_retirement_in_progress(session_id, "durability_reload_discard")
-            })?
-            .map_err(|error| {
-                Self::runtime_archive_error(format!(
-                    "durability-reload disposal failed for {session_id}: {error}"
-                ))
-            })?;
+            .await?;
             if matches!(
                 disposition,
                 meerkat_runtime::ReloadRequiredRegistrationDisposition::Discarded
@@ -8350,7 +8460,6 @@ impl PreparedServiceActorTransaction {
             .as_ref()
             .expect("boundary inserted above")
             .require_session(&session_id)?;
-        let mut errors = Vec::new();
         if let Some((adapter, state)) = committed_runtime_attachment {
             let attachment_witness = state.witness().clone();
             // Every failure below leaves this exact attachment retained. Hand
@@ -8449,6 +8558,46 @@ impl PreparedServiceActorTransaction {
                 }
             }
         }
+        let errors = Self::discard_actor_then_roll_back_after_boundary(
+            &session_id,
+            session_service.as_ref(),
+            &actor_witness_slot,
+            boundary.take(),
+            prepared.as_mut(),
+        )
+        .await;
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(MobError::Internal(format!(
+                "actor transaction cleanup for '{session_id}' failed: {}",
+                errors.join("; ")
+            )))
+        }
+    }
+
+    /// Settle the transaction's exact live actor and prepared materialization
+    /// in the lock order a concurrent raw unregister also takes: discard the
+    /// actor while still holding the turn-finalization boundary (B), release
+    /// B, then roll back through the ordinary rollback. That rollback takes
+    /// the session's live lifecycle lease and mutation gate, and its
+    /// canonical unregister saga takes B in its surface cleanup.
+    ///
+    /// Rolling back while still holding B would wait for that lease while a
+    /// raw unregister's saga holds it into its own surface cleanup, waiting
+    /// for B. Between the release and the rollback the prepared claim is
+    /// still the session's current claim, so no other materialization is
+    /// admitted. A raw unregister that removed the registration meanwhile,
+    /// or a re-registration after it, is not this claim's: the rollback then
+    /// answers `Ok(false)`, which is no rollback effect, not a failure.
+    async fn discard_actor_then_roll_back_after_boundary(
+        session_id: &SessionId,
+        session_service: &dyn MobSessionService,
+        actor_witness_slot: &meerkat_session::LiveSessionActorWitnessSlot,
+        boundary: Option<RuntimeTurnFinalizationBoundaryLease>,
+        prepared: Option<&mut PreparedSessionMaterialization>,
+    ) -> Vec<String> {
+        let mut errors = Vec::new();
         if let Some(actor_witness) = actor_witness_slot.witness() {
             match session_service
                 .discard_live_session_actor_under_runtime_turn_boundary(&actor_witness)
@@ -8458,22 +8607,22 @@ impl PreparedServiceActorTransaction {
                 Err(error) => errors.push(format!("exact live actor discard: {error}")),
             }
         }
-        if let Some(prepared) = prepared.as_mut()
-            && let Err(error) = prepared
-                .rollback_now_under_turn_finalization_boundary()
-                .await
-        {
-            errors.push(format!("prepared materialization rollback: {error}"));
+        #[cfg(any(test, feature = "test-support"))]
+        run_owned_cleanup_pause(session_id, OwnedCleanupPause::ActorDiscardedUnderBoundary).await;
+        drop(boundary);
+        #[cfg(any(test, feature = "test-support"))]
+        run_owned_cleanup_pause(session_id, OwnedCleanupPause::BoundaryReleased).await;
+        if let Some(prepared) = prepared {
+            match prepared.rollback_now().await {
+                Ok(true) => {}
+                Ok(false) => tracing::debug!(
+                    %session_id,
+                    "no current claim: raw unregister or re-registration in the released window"
+                ),
+                Err(error) => errors.push(format!("prepared materialization rollback: {error}")),
+            }
         }
-        drop(boundary.take());
-        if errors.is_empty() {
-            Ok(())
-        } else {
-            Err(MobError::Internal(format!(
-                "actor transaction cleanup for '{session_id}' failed: {}",
-                errors.join("; ")
-            )))
-        }
+        errors
     }
 
     /// Await the exact owner-side cleanup of every part this transaction still

@@ -10,7 +10,12 @@
 //! that booted on defaults answers the `initialize` request written to its
 //! stdin, and that answer fails the test immediately.
 
-#![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
+#![allow(
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unwrap_used,
+    clippy::disallowed_methods
+)]
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};

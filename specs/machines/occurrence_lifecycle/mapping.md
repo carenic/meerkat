@@ -473,6 +473,9 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
 - `SyncTargetSnapshotClaimed`
   - anchors: `occurrence_lifecycle`
   - scenarios: `occurrence_claim_dispatch_completion`
+- `SyncTargetSnapshotDispatching`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
 - `RecordReceiptPending`
   - anchors: `occurrence_lifecycle`
   - scenarios: `occurrence_claim_dispatch_completion`
@@ -558,6 +561,9 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
 - `DeliveryFailureInternalError`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `DeliveryFailureScheduleMandateUnavailable`
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
 - `TargetProbeReadyClaimed`

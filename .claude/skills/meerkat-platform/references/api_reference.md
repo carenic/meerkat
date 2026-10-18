@@ -189,7 +189,7 @@ read-only observability surface.
 `rkat mcp` edits project, user, or realm MCP server config; it is not the live mutation surface for an already-running session.
 
 ```bash
-rkat mcp add <NAME> [--transport stdio|http|sse] [--scope project|user|local|realm] [-H KEY:VALUE...] [-e KEY=VALUE...] [--oauth-account <ACCOUNT_ID>] [--allow-operation <OP>...] [--expected-generation <N>] [--url <URL> | <URL> | -- <CMD...>]
+rkat mcp add <NAME> [--transport stdio|http|sse] [--scope project|user|local|realm] [-H KEY:VALUE...] [-e KEY=VALUE...] [--oauth-account <ACCOUNT_ID> | --oauth-account-selection discover|unverified] [--allow-operation <OP>...] [--expected-generation <N>] [--url <URL> | <URL> | -- <CMD...>]
 rkat mcp login <NAME> [--scope project|user|local|realm] [--allow-headless]
 rkat mcp remove <NAME> [--scope project|user|local|realm] [--expected-generation <N>]
 rkat mcp list [--scope project|user|local|realm] [--json]
@@ -207,12 +207,12 @@ Examples:
 ```bash
 rkat mcp add filesystem -- npx -y @modelcontextprotocol/server-filesystem .
 rkat mcp add linear --url https://mcp.example.com
-rkat mcp add --transport http remote-tools https://mcp.example.com/api
+rkat mcp add --transport http remote-tools https://mcp.example.com/api --oauth-account-selection discover
 rkat mcp login remote-tools
 rkat mcp list
 ```
 
-HTTP OAuth endpoints are discovered at connect or login time; no auth schema is stored. An `mcp.toml` entry has `name`, then `command`/`args`/`env` (stdio) or `url`/`headers`/`transport` (HTTP), and optionally `connect_timeout_secs`, `tool_names`, `access`, `oauth_account` or `oauth_account_selection` ("discover" | "unverified"). `rkat mcp login <name>` performs explicit browser login and needs a streamable HTTP server without a static `Authorization` header and with an account selection; without one it refuses (`MCP OAuth interactive login requires an explicit expected account`). `rkat run` defaults to `--mcp-auth stored`; `--mcp-auth interactive` lets a TTY run authenticate and retry when the server has an `oauth_account`.
+HTTP OAuth endpoints are discovered at connect or login time; no auth schema is stored. An `mcp.toml` entry has `name`, then `command`/`args`/`env` (stdio) or `url`/`headers`/`transport` (HTTP), and optionally `connect_timeout_secs`, `tool_names`, `access`, `oauth_account` or `oauth_account_selection` ("discover" | "unverified"). `rkat mcp add` writes the account selection: `--oauth-account <ACCOUNT_ID>` (a provider subject ID, not an email), `--oauth-account-selection discover` (bind the account the provider verifies at the first login) or `--oauth-account-selection unverified` (resource-bound access with no account evidence); the flags conflict. `rkat mcp login <name>` performs explicit browser login and needs a streamable HTTP server without a static `Authorization` header and with an account selection; without one it refuses before any network request (`MCP server '<name>' has no OAuth account selection...`) and prints the `rkat mcp remove`/`rkat mcp add` commands for each choice. A `discover` or `oauth_account` server whose issuer publishes no OpenID Connect UserInfo is refused before client registration, nothing stored, naming `unverified` as the deliberate alternative; login never changes the selection. RPC and REST hosts see these refusals as the auth reasons `account_selection_required` and `verification_unavailable`. `rkat run` defaults to `--mcp-auth stored`; `--mcp-auth interactive` lets a TTY run authenticate and retry when the server has any account selection.
 
 ### Mob CLI surface
 
@@ -241,7 +241,7 @@ Primary CLI mob usage is tool-driven from `run`/`run --resume` prompts using `mo
 | `pack <dir> -o <pack> [--sign <key> --signer-id <id>]` | Pack a mob directory into a `.mobpack` archive |
 | `inspect <pack>` | Inspect a `.mobpack` archive |
 | `validate <pack> [--trust-policy permissive\|strict]` | Validate a `.mobpack` archive |
-| `deploy <pack> <prompt> [--model] [--max-total-tokens] [--max-duration] [--max-tool-calls] [--trust-policy] [--surface cli\|rpc]` | Validate a `.mobpack`, build its mob in memory and queue the prompt to the orchestrator. `--surface cli` (default) returns at once and the mob ends with the command; `--surface rpc` serves JSON-RPC on stdin/stdout until EOF. Orchestrator-less packs warn that prompts are not delivered and flows are not started. Since 0.9.1 the budget flags and a pack's `[budget]` set the members' `[limits]` (a flag wins over the realm's `[limits]`, which wins over the pack default). Known issue: with `--surface rpc` members are built from the realm config store, so deploy flags and pack overlays do not apply |
+| `deploy <pack> <prompt> [--model] [--max-total-tokens] [--max-duration] [--max-tool-calls] [--trust-policy] [--surface cli\|rpc]` | Validate a `.mobpack`, build its mob in memory and queue the prompt to the orchestrator. `--surface cli` (default) returns at once and the mob ends with the command; `--surface rpc` serves JSON-RPC on stdin/stdout until EOF. Orchestrator-less packs warn that prompts are not delivered and flows are not started. Since 0.9.1 the budget flags and a pack's `[budget]` set the members' `[limits]` (a flag wins over the realm's `[limits]`, which wins over the pack default). Since 0.9.3 the `--surface rpc` host builds every member and session from the same deploy config, so deploy flags and pack overlays apply there too, as defaults that an explicit `session/create` or mob spawn parameter replaces |
 | `web build <pack> -o <dir> --wasm <PKG_DIR\|name_bg.wasm> [--trust-policy]` | Build a browser-deployable WASM bundle from required prebuilt wasm-pack output |
 
 Lifecycle verbs that used to live on the CLI (`create`, `spawn`, `retire`, `wire`, `unwire`, `turn`, `stop`, `resume`, `complete`, `events`, `destroy`) are reached through the agent tools (`mob_create`, `mob_spawn_member`, `mob_wire`, ...) or through the RPC `mob/*` methods listed below.
@@ -555,7 +555,7 @@ Lifecycle and identity:
 - `mob/ensure_member`, `mob/reconcile`
 - `mob/retire`, `mob/respawn`, `mob/force_cancel`, `mob/stop_member_run` (stop one exact member run)
 - `mob/wire`, `mob/wire_members_batch`, `mob/unwire`, `mob/rotate_supervisor`
-- `mob/claim_callback_route` (bind the mob's member callback route to this connection)
+- `mob/claim_callback_route` (bind the mob's member callback route to this connection with the mob's claim token from `mob/create`)
 - `mob/member_tool_declaration`, `mob/apply_member_tool_declaration` (revision-fenced), `mob/adopt_member_identity_declaration`, `mob/resolve_identity_convergence_block` - durable member tool/identity declarations
 
 Member interaction and context:

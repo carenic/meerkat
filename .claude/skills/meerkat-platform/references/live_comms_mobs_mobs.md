@@ -19,8 +19,8 @@ live_comms_mobs_live.md and comms in live_comms_mobs_comms.md.
   id. `rkat mob run --detach` does not keep executing after the CLI exits.
 - `rkat mob deploy` builds the mob in memory: it lives only as long as the
   command (`--surface cli`) or the JSON-RPC stream (`--surface rpc`). Its
-  budget flags are enforced since 0.9.1, except with `--surface rpc` (see
-  Mobpacks).
+  budget flags are enforced since 0.9.1, and with `--surface rpc` since
+  0.9.3 (see Mobpacks).
 
 ## Stop, resume, shutdown, destroy
 
@@ -122,10 +122,12 @@ and `observer()` are not owners. Use `acquire_owner()` for a temporary lease,
   `mob_member_runtime_detached` (Rust `MobError::MemberRuntimeDetached`).
 - In `rkat-rpc`, members reach the callback tools of the connection that
   holds the mob's callback route: the one whose `mob/create` created it, or
-  the one that claimed it with `mob/claim_callback_route`. A mob restored
-  after a restart, or whose connection closed, has no route until a
-  connection claims it. A claim while the holding connection is open is
-  refused (`-32002`).
+  the one that claimed it with `mob/claim_callback_route` and the mob's claim
+  token (`mob/create` returns it once, to the creator). A mob restored after
+  a restart, or whose connection closed, has no route until a connection
+  claims it. A claim with another token (`claim_token_mismatch`), for a mob
+  created without one (`not_claimable`), or while the holding connection is
+  open (`held_by_open_connection`) is refused (`-32002`).
 
 ## Helpers, forks and councils
 
@@ -304,9 +306,10 @@ rkat mob web build ./dist/triage.mobpack -o ./dist/web --wasm <PKG_DIR|name_bg.w
   on the default `--surface cli` and for `rkat mob run`; a flag wins over the
   realm's `[limits]`, which wins over the pack default. 0.9.0 recorded them
   but did not enforce them.
-- Known issue: with `rkat mob deploy --surface rpc`, members are built from
-  the realm config store, so deploy flags and pack overlays (budget, models,
-  `max_tokens`, compaction, `--model`) do not apply.
+- Since 0.9.3 the `rkat mob deploy --surface rpc` host builds every member
+  and session from the same deploy config, so deploy flags and pack overlays
+  (budget, models, `max_tokens`, compaction, `--model`) apply there too, as
+  defaults: an explicit `session/create` or mob spawn parameter replaces them.
 - `rkat mob web build` needs prebuilt wasm-pack `--target web` output via
   `--wasm` and writes `index.html`, `meerkat-bootstrap.js` (`bootMobpack`),
   `mobpack.bin`, `manifest.web.toml` and the wasm files. Booting initializes

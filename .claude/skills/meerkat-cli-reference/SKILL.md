@@ -295,7 +295,7 @@ rkat blob get <BLOB-ID> [--output <FILE>] [--json]
 ## MCP
 
 ```bash
-rkat mcp add <NAME> [-t|--transport stdio|http|sse] [--scope project|user|local|realm] [--expected-generation <N>] [-H|--header KEY:VALUE...] [-e|--env KEY=VALUE...] [--oauth-account <ACCOUNT_ID>] [--allow-operation <OPERATION>...] [-u|--url <URL> | <URL> | -- <CMD...>]
+rkat mcp add <NAME> [-t|--transport stdio|http|sse] [--scope project|user|local|realm] [--expected-generation <N>] [-H|--header KEY:VALUE...] [-e|--env KEY=VALUE...] [--oauth-account <ACCOUNT_ID> | --oauth-account-selection discover|unverified] [--allow-operation <OPERATION>...] [-u|--url <URL> | <URL> | -- <CMD...>]
 rkat mcp login <NAME> [--scope project|user|local|realm] [--allow-headless]
 rkat mcp remove <NAME> [--scope project|user|local|realm] [--expected-generation <N>]
 rkat mcp list [--scope project|user|local|realm] [--json]
@@ -327,15 +327,24 @@ with the stored values and refuses `secret_env` on `mcp.toml` servers.
 
 For streamable HTTP OAuth, endpoints are discovered when connecting; no auth
 schema is stored in MCP config. Interactive login needs an account selection on
-the server entry: `oauth_account` (written by `rkat mcp add --oauth-account
-<ACCOUNT_ID>`, HTTP servers only) or `oauth_account_selection = "discover"` /
-`"unverified"` in `mcp.toml`; `rkat mcp get` shows them. Use
-`rkat mcp login <name>` for explicit browser login; it refuses to run without a
-terminal unless `--allow-headless` is given (the authorize URL may then be
-printed to stderr). `rkat run` defaults to stored MCP OAuth tokens; use
-`--mcp-auth interactive` to allow first-use browser auth and reconnect in a TTY
-run (only for servers with `oauth_account`; for `discover` or `unverified`
-servers run `rkat mcp login <name>` first). MCP OAuth credentials are per realm, so each realm needs its own login.
+the server entry, written by `rkat mcp add` (HTTP servers only; the flags
+conflict): `--oauth-account <ACCOUNT_ID>` (`oauth_account`, the provider
+subject ID the login must prove, not an email or display name),
+`--oauth-account-selection discover` (bind the account the provider verifies
+at the first login) or `--oauth-account-selection unverified` (resource-bound
+access with no account evidence). `rkat mcp get` shows them; `add` prints the
+selection, and for a streamable HTTP server without one or a static
+`Authorization` header it names these choices. `rkat mcp login` never sets a
+selection: without one it refuses before any network request and prints the
+`rkat mcp remove`/`rkat mcp add` commands for each choice; a `discover` or
+`--oauth-account` server whose issuer has no OpenID Connect UserInfo is
+refused before client registration with nothing stored, naming `unverified`
+as the deliberate alternative. Use `rkat mcp login <name>` for explicit
+browser login; it refuses to run without a terminal unless `--allow-headless`
+is given (the authorize URL may then be printed to stderr). `rkat run`
+defaults to stored MCP OAuth tokens; use `--mcp-auth interactive` to allow
+first-use browser auth and reconnect in a TTY run (any account selection).
+MCP OAuth credentials are per realm, so each realm needs its own login.
 
 ## Realm
 
@@ -451,9 +460,11 @@ Since 0.9.1 `rkat mob deploy
 set each member's `[limits]` (`budget`, `max_duration`, `max_tool_calls`) on
 the default `--surface cli` and for `rkat mob run`; a flag wins over the
 realm's `[limits]`, which wins over the pack default (0.9.0 recorded them but
-did not enforce them). Known issue: with `rkat mob deploy --surface rpc`,
-members are built from the realm config store, so deploy flags and pack
-overlays (budget, models, `max_tokens`, compaction, `--model`) do not apply.
+did not enforce them). Since 0.9.3 the `rkat mob deploy --surface rpc` host
+builds every member and session from the same deploy config, so deploy flags
+and pack overlays (budget, models, `max_tokens`, compaction, `--model`) apply
+there too, as defaults: an explicit `session/create` or mob spawn parameter
+replaces them.
 
 The parser accepts `--transport websocket|webrtc` on `rkat mob live open`, but
 the current member-live family rejects WebRTC for both local and placed

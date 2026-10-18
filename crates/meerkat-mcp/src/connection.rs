@@ -20,7 +20,7 @@ use meerkat_auth_core::{McpAuthMode, McpOAuthError, McpServerIdentity};
 use meerkat_core::McpServerConfig;
 use meerkat_core::ToolDef;
 use meerkat_core::auth::{McpServiceSecretRefusal, McpServiceSecretValues};
-use meerkat_core::mcp_attachment::McpAttachmentAuthority;
+use meerkat_core::mcp_attachment::{McpAttachmentAuthority, McpStdioSetupFailureClass};
 use meerkat_core::mcp_config::{McpHttpTransport, McpTransportConfig};
 use meerkat_core::types::ContentBlock;
 use rmcp::model::{CallToolRequest, CallToolRequestParams, CallToolResult, ServerResult};
@@ -299,6 +299,15 @@ pub struct McpStdioCloseReceipt {
 pub(crate) struct StdioChildCustody {
     slot: Arc<std::sync::Mutex<CustodySlot>>,
     bounds: McpStdioCloseBounds,
+    /// The setup diagnostics of the attempt this custody was admitted for,
+    /// held weakly: its router owns them, so a process or a clone of this
+    /// custody never keeps them alive.
+    diagnostics: std::sync::Weak<crate::stdio_diagnostics::StdioAttemptRecord>,
+    /// The attempt's guard record while its process end is unknown, shared
+    /// with a running close. Declared after `slot`: when the last holder of
+    /// a held process drops, its group is killed before the guard learns it
+    /// was abandoned.
+    guard: Arc<GuardHolder>,
     /// Bumped whenever a close's state changes after its task started, so
     /// its waiters recheck the slot.
     close_progress: Arc<tokio::sync::watch::Sender<u64>>,
@@ -360,6 +369,10 @@ type StdoutWitness = Box<dyn tokio::io::AsyncRead + Send + Unpin>;
 
 struct StdioChild {
     child: meerkat_sandbox::ProcessChild,
+    /// The drain of the server's stderr. Dropped with this process holder
+    /// (after its close, or by the fallback), which starts the drain's
+    /// bounded grace for the last bytes.
+    _stderr_drain: Option<crate::stdio_diagnostics::StderrDrain>,
     /// The server's process group, while it may still need signalling.
     /// Cleared after the final group signal and before the leader's reap (the
     /// unreaped leader keeps the id from being reused), so a reused id is
@@ -397,23 +410,86 @@ impl Drop for StdioChild {
 struct ClosingOwner {
     slot: Arc<std::sync::Mutex<CustodySlot>>,
     close_progress: Arc<tokio::sync::watch::Sender<u64>>,
+    guard: Arc<GuardHolder>,
     finished: bool,
 }
 
 impl ClosingOwner {
     fn finish(mut self, receipt: McpStdioCloseReceipt) {
         self.finished = true;
-        *lock_slot(&self.slot) = CustodySlot::Closed(Arc::new(receipt));
+        let receipt = Arc::new(receipt);
+        let record = {
+            let mut slot = lock_slot(&self.slot);
+            *slot = CustodySlot::Closed(Arc::clone(&receipt));
+            self.guard.take()
+        };
+        // Outside the slot lock: the guard learns the close's own receipt.
+        if let Some(record) = record {
+            record.process_ended(crate::McpAttemptProcessEnd::Closed(receipt));
+        }
     }
 }
 
 impl Drop for ClosingOwner {
     fn drop(&mut self) {
         if !self.finished {
-            *lock_slot(&self.slot) = CustodySlot::Abandoned;
+            let record = {
+                let mut slot = lock_slot(&self.slot);
+                *slot = CustodySlot::Abandoned;
+                self.guard.take()
+            };
+            if let Some(record) = record {
+                record.process_ended(crate::McpAttemptProcessEnd::Abandoned);
+            }
         }
         self.close_progress
             .send_modify(|seen| *seen = seen.wrapping_add(1));
+    }
+}
+
+/// An attempt's guard record, held with its process custody until the
+/// process end is known. Taken and set only under the custody's slot lock;
+/// the record is told outside it.
+#[derive(Default)]
+pub(crate) struct GuardHolder {
+    record: std::sync::Mutex<Option<Arc<crate::attempt_guard::AttemptGuardRecord>>>,
+    /// Whether a process was spawned under this custody.
+    spawned: std::sync::atomic::AtomicBool,
+}
+
+impl GuardHolder {
+    fn take(&self) -> Option<Arc<crate::attempt_guard::AttemptGuardRecord>> {
+        self.record
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    }
+
+    fn hold(&self, record: Arc<crate::attempt_guard::AttemptGuardRecord>) {
+        *self
+            .record
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(record);
+    }
+}
+
+impl Drop for GuardHolder {
+    /// The last holder is gone with the process end still unknown: a spawned
+    /// process was killed by its holder's drop (abandoned), or nothing was
+    /// spawned.
+    fn drop(&mut self) {
+        let record = self
+            .record
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(record) = record {
+            record.process_ended(if *self.spawned.get_mut() {
+                crate::McpAttemptProcessEnd::Abandoned
+            } else {
+                crate::McpAttemptProcessEnd::NotSpawned
+            });
+        }
     }
 }
 
@@ -471,6 +547,66 @@ impl StdioChildCustody {
         }
     }
 
+    /// This custody, recording its attempt's setup diagnostics in `record`
+    /// (held weakly).
+    #[must_use]
+    pub(crate) fn with_diagnostics(
+        mut self,
+        record: std::sync::Weak<crate::stdio_diagnostics::StdioAttemptRecord>,
+    ) -> Self {
+        self.diagnostics = record;
+        self
+    }
+
+    /// The attempt's diagnostics record while its router still holds it.
+    /// Callers use it in a short scope and never hold it across an await.
+    pub(crate) fn diagnostics_record(
+        &self,
+    ) -> Option<Arc<crate::stdio_diagnostics::StdioAttemptRecord>> {
+        self.diagnostics.upgrade()
+    }
+
+    pub(crate) fn diagnostics_handle(
+        &self,
+    ) -> std::sync::Weak<crate::stdio_diagnostics::StdioAttemptRecord> {
+        self.diagnostics.clone()
+    }
+
+    /// Hold the attempt's guard record until the process end is known: told
+    /// `NotSpawned` when the custody is retired before a spawn, the close's
+    /// receipt when its close finishes, `Abandoned` when that close is
+    /// dropped or the last holder of a spawned process drops.
+    pub(crate) fn hold_guard(&self, record: Arc<crate::attempt_guard::AttemptGuardRecord>) {
+        let known = {
+            let slot = lock_slot(&self.slot);
+            match &*slot {
+                CustodySlot::Retired => Some(crate::McpAttemptProcessEnd::NotSpawned),
+                CustodySlot::Closed(receipt) => {
+                    Some(crate::McpAttemptProcessEnd::Closed(Arc::clone(receipt)))
+                }
+                CustodySlot::Abandoned => Some(crate::McpAttemptProcessEnd::Abandoned),
+                CustodySlot::Vacant | CustodySlot::Held(_) | CustodySlot::Closing { .. } => {
+                    self.guard.hold(Arc::clone(&record));
+                    None
+                }
+            }
+        };
+        if let Some(end) = known {
+            record.process_ended(end);
+        }
+    }
+
+    /// The guard record taken out of the custody when its process end
+    /// becomes known, told outside the slot lock.
+    fn tell_guard(
+        record: Option<Arc<crate::attempt_guard::AttemptGuardRecord>>,
+        end: crate::McpAttemptProcessEnd,
+    ) {
+        if let Some(record) = record {
+            record.process_ended(end);
+        }
+    }
+
     /// Spawn the server and take custody of it; returns its stdout and stdin
     /// for the MCP transport.
     async fn spawn(
@@ -489,9 +625,26 @@ impl StdioChildCustody {
         // Binding validates the exact launch and retained backend before any
         // process exists. Required isolation has no Command fallback.
         let prepared = profile.prepare(stdio)?;
+        // The attempt's diagnostics keep a keyed digest of each launch value
+        // (never the value) to redact it from the server's stderr tail:
+        // resolved secrets and the connector binding first.
+        let diagnostics = self.diagnostics_record();
+        if let Some(record) = &diagnostics {
+            record.track_launch_values(crate::stdio_diagnostics::launch_values_by_priority(stdio));
+        }
         // Physical entry: after custody and launch preparation, before the
         // process exists.
         entry.enter()?;
+        // A trusted-host server's drained stderr is also written to this
+        // process's own stderr, as its inherited stderr was. A confined
+        // server's never is: its stderr is a fresh pipe, never a host
+        // descriptor.
+        let forward_stderr = prepared.is_none();
+        let spawn_failed = || {
+            if let Some(record) = &diagnostics {
+                record.classify(McpStdioSetupFailureClass::SpawnFailed);
+            }
+        };
         let mut child: meerkat_sandbox::ProcessChild = match prepared {
             Some(prepared) => {
                 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -500,9 +653,15 @@ impl StdioChildCustody {
                         .spawn_with_io(meerkat_sandbox::SpawnIo {
                             stdin: meerkat_sandbox::StdioMode::Piped,
                             stdout: meerkat_sandbox::StdioMode::Piped,
-                            stderr: meerkat_sandbox::StdioMode::Null,
+                            stderr: meerkat_sandbox::StdioMode::Piped,
                         })
-                        .map_err(confined_stdio_spawn_error)?
+                        .map_err(|error| {
+                            let error = confined_stdio_spawn_error(error);
+                            if matches!(error, McpError::Io(_)) {
+                                spawn_failed();
+                            }
+                            error
+                        })?
                         .into()
                 }
                 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
@@ -515,6 +674,9 @@ impl StdioChildCustody {
                 }
             }
             None => {
+                // A launch site: the trusted-host branch of an unconfined
+                // `mcp_stdio` launch.
+                #[allow(clippy::disallowed_methods)]
                 let mut cmd = Command::new(&stdio.command);
                 cmd.args(&stdio.args);
                 for (key, value) in &stdio.env {
@@ -522,23 +684,40 @@ impl StdioChildCustody {
                 }
                 cmd.stdin(std::process::Stdio::piped())
                     .stdout(std::process::Stdio::piped())
-                    .stderr(std::process::Stdio::inherit())
+                    .stderr(std::process::Stdio::piped())
                     // Fallback only: the owner path is `terminate`.
                     .kill_on_drop(true);
                 #[cfg(unix)]
                 cmd.process_group(0);
                 cmd.spawn()
-                    .map_err(|e| McpError::ConnectionFailed {
-                        reason: format!("Failed to spawn process: {e}"),
+                    .map_err(|e| {
+                        spawn_failed();
+                        McpError::ConnectionFailed {
+                            reason: format!("Failed to spawn process: {e}"),
+                        }
                     })?
                     .into()
             }
         };
         let (Some(stdin), Some(stdout)) = (child.take_stdin(), child.take_stdout()) else {
+            spawn_failed();
             return Err(McpError::ConnectionFailed {
                 reason: "spawned MCP server has no piped stdin/stdout".to_string(),
             });
         };
+        // Drained from now on, before anything awaits, so the server never
+        // blocks on a full stderr pipe; the newest bytes go to the
+        // attempt's tail while its router holds it.
+        if let Some(record) = &diagnostics {
+            record.mark_spawned();
+        }
+        let stderr_drain = child.take_stderr().map(|stderr| {
+            crate::stdio_diagnostics::start_stderr_drain(
+                stderr,
+                self.diagnostics_handle(),
+                forward_stderr,
+            )
+        });
         #[cfg(unix)]
         let stdout_witness = {
             use std::os::fd::AsFd as _;
@@ -560,6 +739,7 @@ impl StdioChildCustody {
             &mut *slot,
             CustodySlot::Held(StdioChild {
                 child,
+                _stderr_drain: stderr_drain,
                 #[cfg(unix)]
                 process_group,
                 #[cfg(unix)]
@@ -572,6 +752,9 @@ impl StdioChildCustody {
                 direct_kill_requests: Arc::clone(&self.direct_kill_requests),
             }),
         );
+        self.guard
+            .spawned
+            .store(true, std::sync::atomic::Ordering::Release);
         // One custody holds one process; a replaced one is killed by its drop.
         drop(replaced);
         Ok((stdout, stdin))
@@ -667,6 +850,7 @@ impl StdioChildCustody {
         T: Send + 'static,
         F: std::future::Future<Output = T> + Send + 'static,
     {
+        let mut never_spawned = None;
         let held = {
             let mut slot = lock_slot(&self.slot);
             match std::mem::replace(&mut *slot, CustodySlot::Closing { started }) {
@@ -674,6 +858,7 @@ impl StdioChildCustody {
                 // Closed before any spawn: no process may start after it.
                 CustodySlot::Vacant | CustodySlot::Retired => {
                     *slot = CustodySlot::Retired;
+                    never_spawned = self.guard.take();
                     Err(CustodyNotHeld::NeverSpawned)
                 }
                 other => {
@@ -690,6 +875,7 @@ impl StdioChildCustody {
                 }
             }
         };
+        Self::tell_guard(never_spawned, crate::McpAttemptProcessEnd::NotSpawned);
         let held = match held {
             Ok(held) => held,
             Err(not_held) => return Err((first, not_held)),
@@ -697,6 +883,7 @@ impl StdioChildCustody {
         let owner = ClosingOwner {
             slot: Arc::clone(&self.slot),
             close_progress: Arc::clone(&self.close_progress),
+            guard: Arc::clone(&self.guard),
             finished: false,
         };
         let bounds = self.bounds;
@@ -753,10 +940,16 @@ impl StdioChildCustody {
 
     /// Retire a custody whose process was never spawned, so none ever is.
     fn retire_if_vacant(&self) {
-        let mut slot = lock_slot(&self.slot);
-        if matches!(*slot, CustodySlot::Vacant) {
-            *slot = CustodySlot::Retired;
-        }
+        let never_spawned = {
+            let mut slot = lock_slot(&self.slot);
+            if matches!(*slot, CustodySlot::Vacant) {
+                *slot = CustodySlot::Retired;
+                self.guard.take()
+            } else {
+                None
+            }
+        };
+        Self::tell_guard(never_spawned, crate::McpAttemptProcessEnd::NotSpawned);
     }
 
     /// [`Self::terminate`], or, when another call already started the close,
@@ -1641,14 +1834,16 @@ impl McpConnection {
                 drop(launch);
                 let (stdout, stdin) = spawned?;
                 match client
-                    .serve(ProtectedStdioTransport::new(
-                        stdout,
-                        stdin,
-                        protected_metadata.clone(),
-                    ))
+                    .serve(
+                        ProtectedStdioTransport::new(stdout, stdin, protected_metadata.clone())
+                            .with_end_record(custody.diagnostics_handle()),
+                    )
                     .await
                 {
                     Ok(service) => {
+                        if let Some(record) = custody.diagnostics_record() {
+                            record.mark_initialized();
+                        }
                         match client_custody.deposit(service, custody.bounds.eof_grace()) {
                             Ok(service) => {
                                 stdio_child = Some(custody);
@@ -1666,8 +1861,17 @@ impl McpConnection {
                         }
                     }
                     Err(e) => {
+                        if let Some(record) = custody.diagnostics_record() {
+                            record.classify(crate::stdio_diagnostics::classify_initialize_error(
+                                &e,
+                                record.transport_end(),
+                            ));
+                        }
                         if let Ok(receipt) = custody.terminate().await {
                             trace_close_receipt(&config.name, &receipt);
+                            if let Some(record) = custody.diagnostics_record() {
+                                record.attach_exit(&receipt);
+                            }
                         }
                         return Err(McpError::ConnectionFailed {
                             reason: format!("Failed to establish MCP connection: {e}"),
@@ -2306,7 +2510,7 @@ impl McpConnection {
         }
 
         let server_name = config.name.clone();
-        let attempt = tokio::time::timeout(timeout, async {
+        let connected = tokio::time::timeout(timeout, async {
             let conn = Self::connect_with_custody(
                 config,
                 auth_mode,
@@ -2342,14 +2546,24 @@ impl McpConnection {
             }
             Ok((conn, tools))
         })
-        .await
-        .map_err(|_| McpError::ConnectionFailed {
-            reason: format!(
-                "Timed out connecting to '{}' ({timeout_secs}s)",
-                config.name
-            ),
-        })
-        .flatten();
+        .await;
+        let timed_out = connected.is_err();
+        let attempt = connected
+            .map_err(|_| McpError::ConnectionFailed {
+                reason: format!(
+                    "Timed out connecting to '{}' ({timeout_secs}s)",
+                    config.name
+                ),
+            })
+            .flatten();
+        if timed_out
+            && let Some(record) = stdio_custody
+                .as_ref()
+                .and_then(StdioChildCustody::diagnostics_record)
+        {
+            // The deadline expired in the phase the attempt had reached.
+            record.classify(McpStdioSetupFailureClass::TimedOut);
+        }
         if attempt.is_err()
             && let Some(custody) = &stdio_custody
         {
@@ -2357,6 +2571,12 @@ impl McpConnection {
             // process it spawned is not until its owner observes the exit.
             if let Ok(receipt) = custody.terminate().await {
                 trace_close_receipt(&server_name, &receipt);
+            }
+            if let Some(record) = custody.diagnostics_record() {
+                if let Some(receipt) = custody.closed_receipt() {
+                    record.attach_exit(&receipt);
+                }
+                record.finish_failed();
             }
         }
         attempt
@@ -2405,6 +2625,7 @@ impl McpConnection {
     pub async fn list_tools(&self, server_name: &str) -> Result<Vec<ToolDef>, McpError> {
         let standard =
             crate::protocol::list_all_standard_tools_with(&self.service, server_name, |error| {
+                self.record_discovery_failure(error);
                 self.authorization_required(error)
                     .unwrap_or_else(|| crate::protocol::list_tools_failed(error))
             })
@@ -2428,6 +2649,22 @@ impl McpConnection {
         let mut matches = tools.iter().filter(|tool| tool.name == name);
         let first = matches.next()?;
         matches.all(|tool| tool == first).then(|| first.clone())
+    }
+
+    /// While this connection's attempt is still being set up (its router
+    /// holds the attempt's diagnostics), what a failed tool listing
+    /// established; afterwards nothing is recorded.
+    fn record_discovery_failure(&self, error: &rmcp::ServiceError) {
+        if let Some(record) = self
+            .stdio_child
+            .as_ref()
+            .and_then(StdioChildCustody::diagnostics_record)
+        {
+            record.classify(crate::stdio_diagnostics::classify_service_error(
+                error,
+                record.transport_end(),
+            ));
+        }
     }
 
     /// The typed host status for a request that this OAuth connection's
@@ -3119,6 +3356,9 @@ struct CloseIndexShared {
     state: std::sync::Mutex<CloseIndexState>,
     /// Becomes `true` when the close begins, so admitted attempts stop.
     closing: tokio::sync::watch::Sender<bool>,
+    /// The router's attempt guards, cancelled with `RouterClosed` when the
+    /// close begins, before any attempt is stopped.
+    guards: std::sync::OnceLock<std::sync::Weak<crate::attempt_guard::RouterGuards>>,
 }
 
 #[derive(Default)]
@@ -3158,7 +3398,14 @@ impl CloseIndex {
         server: &str,
         stdio_bounds: Option<McpStdioCloseBounds>,
     ) -> AdmittedAttempt {
-        let process = stdio_bounds.map(StdioChildCustody::with_bounds);
+        let diagnostics = stdio_bounds.map(|_| crate::stdio_diagnostics::StdioAttemptRecord::new());
+        let process = stdio_bounds.map(|bounds| {
+            let custody = StdioChildCustody::with_bounds(bounds);
+            match &diagnostics {
+                Some(record) => custody.with_diagnostics(Arc::downgrade(record)),
+                None => custody,
+            }
+        });
         let client = ClientCustody::default();
         let mut state = self.state();
         if state.closing {
@@ -3183,7 +3430,13 @@ impl CloseIndex {
             },
             process,
             client,
+            diagnostics,
         }
+    }
+
+    /// Install the router's attempt guards, cancelled when the close begins.
+    pub(crate) fn set_attempt_guards(&self, guards: &Arc<crate::attempt_guard::RouterGuards>) {
+        let _ = self.0.guards.set(Arc::downgrade(guards));
     }
 
     /// Freeze admission and start, now, every close this index covers that
@@ -3196,6 +3449,11 @@ impl CloseIndex {
     /// once). A close already running is joined. A later call returns a
     /// ticket over the same closes. Call it within a Tokio runtime.
     pub(crate) fn begin_close(&self) -> McpCloseTicket {
+        // The router is closing: its attempts' guards learn it first, so an
+        // attempt stopped below is cancelled as `RouterClosed`.
+        if let Some(guards) = self.0.guards.get().and_then(std::sync::Weak::upgrade) {
+            guards.close(crate::McpAttemptCancelCause::RouterClosed);
+        }
         let now = tokio::time::Instant::now();
         let closes = {
             let mut state = self.state();
@@ -3321,6 +3579,9 @@ pub(crate) struct AdmittedAttempt {
     pub(crate) client: ClientCustody,
     pub(crate) stop: AttemptStop,
     pub(crate) end: AttemptEnd,
+    /// A stdio attempt's setup diagnostics: the only strong reference, for
+    /// the router to hold (its custody holds them weakly).
+    pub(crate) diagnostics: Option<Arc<crate::stdio_diagnostics::StdioAttemptRecord>>,
 }
 
 /// Resolves once its index begins its close: the attempt stops there,

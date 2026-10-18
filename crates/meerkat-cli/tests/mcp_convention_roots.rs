@@ -1,7 +1,7 @@
 //! External contract for offline MCP commands and CLI convention roots.
 
 #![cfg(feature = "mcp")]
-#![allow(clippy::expect_used, clippy::unwrap_used)]
+#![allow(clippy::expect_used, clippy::unwrap_used, clippy::disallowed_methods)]
 
 use std::path::PathBuf;
 use std::process::{Command, Output};

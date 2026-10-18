@@ -18,8 +18,8 @@ structured output, retries, timeouts, model fallback and model switching.
   `terminal_cause_kind: "budget_exhausted"`; a time budget is a hard failure.
 - The legacy `[budget]` config table is recorded but not enforced; use
   `[limits]` or per-session `budget_limits`. Since 0.9.1 the `rkat mob deploy`
-  budget flags and a mobpack's `[budget]` set the members' `[limits]` (not
-  with `--surface rpc`).
+  budget flags and a mobpack's `[budget]` set the members' `[limits]` (with
+  `--surface rpc` since 0.9.3).
 - RPC `turn/start` refuses `max_tokens`, `output_schema` and
   `structured_output_retries` (-32602). Set them on `session/create`.
 - No surface has a manual "compact now" command.
@@ -107,7 +107,7 @@ Example JSON-RPC `session/create` params with limits and a schema:
   --max-total-tokens`, `--max-duration` and `--max-tool-calls` and a
   mobpack's `[budget]` write the enforced `[limits]` instead (`budget`,
   `max_duration` and the new `[limits] max_tool_calls`); with `--surface rpc`
-  they do not apply. In 0.9.0 they landed in `[budget]`.
+  they apply since 0.9.3. In 0.9.0 they landed in `[budget]`.
 - Usage fields: `input_tokens`, `output_tokens`, `cache_creation_tokens`,
   `cache_read_tokens`, `reasoning_tokens`. Results carry `usage`
   (session-cumulative: take the latest value, never sum it), `run_usage` (this

@@ -26,6 +26,7 @@ use meerkat_core::comms::{
     PeerDirectoryEntry, PeerDirectorySource, PeerId, PeerName, PeerReplyCapability,
     PeerReplyDispatchContext, PeerRoute, PeerSendability, SendError, SendReceipt,
 };
+use meerkat_core::error::ToolError;
 use meerkat_core::interaction::{InteractionId, ResponseStatus};
 use meerkat_core::tool_catalog::ToolUnavailableReason;
 use meerkat_core::types::{ContentBlock, HandlingMode, ImageData};
@@ -310,7 +311,7 @@ pub fn tools_list() -> Vec<Value> {
         }),
         json!({
             "name": "send_response",
-            "description": format!("{}{}{}", "Send a typed response to a previous peer request. The in_reply_to field must match the request ID from the original send_request message you received.\n\nWhen to use: Use send_response after receiving a typed comms request from a peer. The requester is waiting for a correlated reply.\n\nstatus values:\n- \"accepted\": Acknowledge receipt; you will send a \"completed\" or \"failed\" response later. Do not include handling_mode on accepted progress responses.\n- \"completed\": The request succeeded. Include a typed result when the request contract requires one.\n- \"failed\": The request could not be fulfilled. Include a typed rejection result when the request contract requires one.\n\nhandling_mode (optional): Override how the requester processes this terminal response. Defaults to the original request's mode. Use \"steer\" only for urgent preemption, or \"queue\" to deliver at the requester's next turn boundary.", SEND_RESPONSE_CONTRACTS_DESCRIPTION, "\n\nExamples:\n1. Completed checksum_token response with a generated image receipt:\n   {\"peer_id\":\"<peer-id-from-peers>\",\"display_name\":\"requester\",\"in_reply_to\":\"<request-id>\",\"status\":\"completed\",\"result\":{\"request_intent\":\"checksum_token\",\"request_subject\":\"image_receipt_check\",\"token\":\"generated-image-response-ok\"},\"blocks\":[{\"type\":\"image_ref\",\"source\":\"blob\",\"blob_id\":\"sha256:receipt-image\",\"media_type\":\"image/png\"}],\"handling_mode\":\"queue\"}\n2. Acceptance then later completion:\n   {\"peer_id\": \"<peer-id-from-peers>\", \"in_reply_to\": \"<request-id>\", \"status\": \"accepted\"}\n   ...later...\n   {\"peer_id\": \"<peer-id-from-peers>\", \"in_reply_to\": \"<request-id>\", \"status\": \"completed\", \"result\": {\"result\": \"ack\", \"ok\": true}}\n3. Failure response:\n   {\"peer_id\": \"<peer-id-from-peers>\", \"in_reply_to\": \"<request-id>\", \"status\": \"failed\", \"result\": {\"result\": \"rejected\", \"cause\": \"unsupported\", \"reason\": \"unsupported command\"}}\n\nFailure handling:\n- peer_not_found_or_not_trusted / peer_unreachable: Same as send_message. The requester will not receive your response - they may re-send the request.\n- Invalid in_reply_to: If the ID is not a valid UUID or does not match a known request, the call fails with a validation error."),
+            "description": format!("{}{}{}", "Send a typed response to a previous peer request. The in_reply_to field must match the request ID from the original send_request message you received, and peer_id must be the peer that sent that request.\n\nWhen to use: Use send_response after receiving a typed comms request from a peer. The requester is waiting for a correlated reply.\n\nstatus values:\n- \"accepted\": Acknowledge receipt; you will send a \"completed\" or \"failed\" response later. Do not include handling_mode on accepted progress responses.\n- \"completed\": The request succeeded. Include a typed result when the request contract requires one.\n- \"failed\": The request could not be fulfilled. Include a typed rejection result when the request contract requires one.\n\nhandling_mode (optional): Override how the requester processes this terminal response. Defaults to the original request's mode. Use \"steer\" only for urgent preemption, or \"queue\" to deliver at the requester's next turn boundary.", SEND_RESPONSE_CONTRACTS_DESCRIPTION, "\n\nExamples:\n1. Completed checksum_token response with a generated image receipt:\n   {\"peer_id\":\"<peer-id-from-peers>\",\"display_name\":\"requester\",\"in_reply_to\":\"<request-id>\",\"status\":\"completed\",\"result\":{\"request_intent\":\"checksum_token\",\"request_subject\":\"image_receipt_check\",\"token\":\"generated-image-response-ok\"},\"blocks\":[{\"type\":\"image_ref\",\"source\":\"blob\",\"blob_id\":\"sha256:receipt-image\",\"media_type\":\"image/png\"}],\"handling_mode\":\"queue\"}\n2. Acceptance then later completion:\n   {\"peer_id\": \"<peer-id-from-peers>\", \"in_reply_to\": \"<request-id>\", \"status\": \"accepted\"}\n   ...later...\n   {\"peer_id\": \"<peer-id-from-peers>\", \"in_reply_to\": \"<request-id>\", \"status\": \"completed\", \"result\": {\"result\": \"ack\", \"ok\": true}}\n3. Failure response:\n   {\"peer_id\": \"<peer-id-from-peers>\", \"in_reply_to\": \"<request-id>\", \"status\": \"failed\", \"result\": {\"result\": \"rejected\", \"cause\": \"unsupported\", \"reason\": \"unsupported command\"}}\n\nFailure handling:\n- peer_not_found_or_not_trusted / peer_unreachable: Same as send_message. The requester will not receive your response - they may re-send the request.\n- Invalid in_reply_to: If the ID is not a valid UUID or does not match a known request, the call fails with a validation error.\n- invalid_arguments (not the requester): The peer_id is not the peer that sent the request. Nothing was sent and the request is still open: send the response to the requester's peer_id."),
             "inputSchema": schema_for::<SendResponseInput>()
         }),
         json!({
@@ -337,8 +338,60 @@ pub async fn handle_tools_call_with_context(
     args: &Value,
     dispatch_context: &ToolDispatchContext,
 ) -> Result<Value, String> {
+    handle_tools_call_typed(ctx, name, args, dispatch_context)
+        .await
+        .map_err(CommsToolCallError::into_message)
+}
+
+/// Why a comms tool call was refused, by the tool error class a dispatcher
+/// reports for it.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum CommsToolCallError {
+    /// The arguments name a delivery the runtime refuses for this session:
+    /// a `send_response` addressed to a peer that did not send the request
+    /// (`invalid_arguments`).
+    #[error("{0}")]
+    InvalidArguments(String),
+    /// Any other refusal or failure (`execution_failed`).
+    #[error("{0}")]
+    Failed(String),
+}
+
+impl CommsToolCallError {
+    /// The refusal as the dispatcher of `tool_name` reports it.
+    pub fn into_tool_error(self, tool_name: &str) -> ToolError {
+        match self {
+            Self::InvalidArguments(reason) => ToolError::invalid_arguments(tool_name, reason),
+            Self::Failed(message) => ToolError::ExecutionFailed { message },
+        }
+    }
+
+    /// The refusal's message, without its class.
+    pub fn into_message(self) -> String {
+        match self {
+            Self::InvalidArguments(message) | Self::Failed(message) => message,
+        }
+    }
+}
+
+impl From<String> for CommsToolCallError {
+    fn from(message: String) -> Self {
+        Self::Failed(message)
+    }
+}
+
+/// Handle a comms tool call with dispatch-time turn context; a refusal keeps
+/// its tool error class ([`CommsToolCallError`]). The comms tool dispatchers
+/// report through this.
+pub async fn handle_tools_call_typed(
+    ctx: &ToolContext,
+    name: &str,
+    args: &Value,
+    dispatch_context: &ToolDispatchContext,
+) -> Result<Value, CommsToolCallError> {
     if comms_tool_unavailable_reason(ctx, name).is_some() {
-        return Err(runtime_command_authority_unavailable_message());
+        return Err(runtime_command_authority_unavailable_message().into());
     }
 
     match name {
@@ -443,9 +496,9 @@ pub async fn handle_tools_call_with_context(
         "peers" => {
             let _input: PeersInput = serde_json::from_value(args.clone())
                 .map_err(|e| format!("Invalid arguments: {e}"))?;
-            handle_peers(ctx).await
+            Ok(handle_peers(ctx).await?)
         }
-        _ => Err(format!("Unknown tool: {name}")),
+        _ => Err(format!("Unknown tool: {name}").into()),
     }
 }
 
@@ -456,9 +509,9 @@ pub async fn handle_tools_call_with_context(
 /// message the reply selects), or the session's trusted-peer directory for
 /// `peers`. It is a fact for an operation policy owner, never a permission:
 /// the handler still checks trust, runtime command authority and delivery.
-/// The `send_response` addressee is the caller's own `peer_id`: the runtime
-/// checks that the request id names a request this session received and
-/// can still answer, but not that the addressed peer sent it.
+/// The `send_response` addressee is the caller's own `peer_id`; at send the
+/// runtime delivers it only when that peer is the recorded requester of a
+/// request this session received and can still answer.
 ///
 /// # Errors
 /// The reason the call names no single addressee: arguments that do not
@@ -775,7 +828,7 @@ fn peer_route(
     }
 }
 
-async fn dispatch(ctx: &ToolContext, command: CommsCommand) -> Result<Value, String> {
+async fn dispatch(ctx: &ToolContext, command: CommsCommand) -> Result<Value, CommsToolCallError> {
     // Capture peer display label for error normalization before consuming the command.
     let peer_for_errors = match &command {
         CommsCommand::PeerMessage { to, .. }
@@ -789,35 +842,52 @@ async fn dispatch(ctx: &ToolContext, command: CommsCommand) -> Result<Value, Str
 
     if let Some(runtime) = &ctx.runtime {
         let receipt = runtime.send(command).await.map_err(|error| match error {
+            // The runtime refused a response addressed to a peer that did not
+            // send the request: the call's `peer_id` is the invalid argument.
+            error @ SendError::ResponseAddresseeNotRequester { .. } => {
+                CommsToolCallError::InvalidArguments(error.to_string())
+            }
             SendError::PeerNotFound(p) => {
                 format!("peer_not_found_or_not_trusted: peer '{p}' is not found or not trusted")
+                    .into()
             }
             SendError::PeerOffline => format!(
                 "peer_unreachable: peer '{}' is unreachable: offline_or_no_ack",
                 peer_for_errors.as_deref().unwrap_or("<unknown>")
-            ),
-            SendError::Transport(inner) => {
-                format!(
-                    "peer_unreachable: peer '{}' is unreachable: transport_error ({inner})",
-                    peer_for_errors.as_deref().unwrap_or("<unknown>")
-                )
-            }
-            SendError::AdmissionDropped { reason } => {
-                format!(
-                    "peer_admission_dropped: peer '{}' rejected envelope at ingress: {}",
-                    peer_for_errors.as_deref().unwrap_or("<unknown>"),
-                    reason.as_code()
-                )
-            }
+            )
+            .into(),
+            SendError::Transport(inner) => format!(
+                "peer_unreachable: peer '{}' is unreachable: transport_error ({inner})",
+                peer_for_errors.as_deref().unwrap_or("<unknown>")
+            )
+            .into(),
+            SendError::AdmissionDropped { reason } => format!(
+                "peer_admission_dropped: peer '{}' rejected envelope at ingress: {}",
+                peer_for_errors.as_deref().unwrap_or("<unknown>"),
+                reason.as_code()
+            )
+            .into(),
             SendError::DurableAdmissionRejected { envelope_id } => format!(
                 "peer_input_rejected: peer '{}' durably rejected envelope {envelope_id}",
                 peer_for_errors.as_deref().unwrap_or("<unknown>")
-            ),
-            other => other.to_string(),
+            )
+            .into(),
+            other => other.to_string().into(),
         })?;
         return Ok(sent_result(&cmd_kind, receipt));
     }
 
+    Ok(dispatch_without_runtime(ctx, command, peer_for_errors, cmd_kind).await?)
+}
+
+/// Transport-only dispatch for a tool context without runtime command
+/// authority.
+async fn dispatch_without_runtime(
+    ctx: &ToolContext,
+    command: CommsCommand,
+    peer_for_errors: Option<String>,
+    cmd_kind: String,
+) -> Result<Value, String> {
     if matches!(
         command,
         CommsCommand::PeerRequest { .. } | CommsCommand::PeerResponse { .. }
@@ -3012,7 +3082,10 @@ mod tests {
         .await
         .expect_err("runtime-less fenced send should surface durable rejection");
 
-        assert!(error.starts_with("peer_input_rejected:"), "{error}");
+        assert!(
+            matches!(&error, CommsToolCallError::Failed(message) if message.starts_with("peer_input_rejected:")),
+            "{error}"
+        );
         finalize
             .await
             .expect("fenced tool-send finalization task must complete");

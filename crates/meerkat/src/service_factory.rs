@@ -1126,6 +1126,22 @@ impl SessionAgent for FactoryAgent {
 pub struct RealmInheritance {
     source: Arc<dyn meerkat_core::RealmConfigSource>,
     head: meerkat_core::connection::RealmId,
+    host_layer: Option<Arc<dyn HostConfigLayer>>,
+}
+
+/// A host's own final layer over a realm's composed effective config.
+///
+/// The settings a host process owns rather than any realm document: for
+/// example the flags of `rkat mob deploy` and a mobpack's deploy defaults.
+/// [`RealmInheritance::compose_over`] applies it after folding the realm
+/// chain, so every read of the effective config through that inheritance
+/// sees it: agent builds, model resolution and model hot-swap. Nothing writes
+/// the layered config back: config writes stay on the raw head document, so
+/// the layer never reaches a realm document.
+#[cfg(not(target_arch = "wasm32"))]
+pub trait HostConfigLayer: Send + Sync {
+    /// Apply this layer to a realm's composed config.
+    fn apply(&self, config: &mut Config);
 }
 
 /// Why a builder's effective config could not be read.
@@ -1160,9 +1176,10 @@ impl EffectiveConfigView {
     /// masked behind a stale snapshot), otherwise the in-memory snapshot.
     /// When realm inheritance is configured, the head realm's config is
     /// folded with its ancestor chain so top-level fields (models, mcp, hooks,
-    /// skills, limits) inherit on every build. Inheritance only ADDS ancestor
-    /// docs, so an inherited entry is never durably flattened into the child
-    /// realm's document.
+    /// skills, limits) inherit on every build, and the inheritance's host
+    /// layer is applied over the fold. Inheritance only ADDS ancestor docs, so
+    /// an inherited entry is never durably flattened into the child realm's
+    /// document.
     pub(crate) async fn read(
         &self,
     ) -> Result<(Config, Option<meerkat_core::connection::RealmId>), EffectiveConfigReadError> {
@@ -1178,9 +1195,8 @@ impl EffectiveConfigView {
         let Some(inheritance) = inheritance else {
             return Ok((head_config, None));
         };
-        let reader = meerkat_core::EffectiveConfigReader::new(inheritance.source.clone());
-        let config = reader
-            .effective_config_over_head(&inheritance.head, head_config)
+        let config = inheritance
+            .compose_over(head_config)
             .await
             .map_err(|error| EffectiveConfigReadError::Compose {
                 realm: inheritance.head.clone(),
@@ -1237,7 +1253,18 @@ impl RealmInheritance {
         source: Arc<dyn meerkat_core::RealmConfigSource>,
         head: meerkat_core::connection::RealmId,
     ) -> Self {
-        Self { source, head }
+        Self {
+            source,
+            head,
+            host_layer: None,
+        }
+    }
+
+    /// Apply `layer` over every composition of this chain
+    /// ([`Self::compose_over`]), after the chain is folded.
+    pub fn with_host_layer(mut self, layer: Arc<dyn HostConfigLayer>) -> Self {
+        self.host_layer = Some(layer);
+        self
     }
 
     /// Head realm whose durable document this inheritance chain composes.
@@ -1246,17 +1273,22 @@ impl RealmInheritance {
     }
 
     /// Compose the parent chain + `global` tail over `head_config` (the surface's
-    /// authoritative head config), producing the effective config the agent
-    /// build AND the model hot-swap / reconfigure path consume.
+    /// authoritative head config), then apply the host layer, if any, producing
+    /// the effective config the agent build AND the model hot-swap / reconfigure
+    /// path consume.
     ///
     /// Fail-closed: a compose error is returned, never masked behind the raw head.
     pub async fn compose_over(
         &self,
         head_config: Config,
     ) -> Result<Config, meerkat_core::ConfigError> {
-        meerkat_core::EffectiveConfigReader::new(self.source.clone())
+        let mut config = meerkat_core::EffectiveConfigReader::new(self.source.clone())
             .effective_config_over_head(&self.head, head_config)
-            .await
+            .await?;
+        if let Some(layer) = &self.host_layer {
+            layer.apply(&mut config);
+        }
+        Ok(config)
     }
 }
 
@@ -1303,12 +1335,11 @@ pub struct FactoryAgentBuilder {
     /// visibility after the builder is consumed into a session service, while
     /// keeping runtime/service ownership in the surface.
     ///
-    /// The tools hold their `ScheduleService`, which keeps a spawned schedule
-    /// host's session and mob hosts attached, and the session service owns
-    /// this builder, so the slot keeps the session service and the mob state
-    /// alive. An embedder that tears them down while its process keeps
-    /// running keeps a clone of this `Arc` and writes `None` through it once
-    /// teardown has succeeded; see [`crate::surface::spawn_schedule_host`].
+    /// The tools hold their `ScheduleService`, which holds a spawned schedule
+    /// host's session and mob hosts only weakly, so this slot keeps neither
+    /// the session service that owns this builder nor any mob state alive
+    /// after that host stops; teardown needs no clear here. See
+    /// [`crate::surface::spawn_schedule_host`].
     pub default_schedule_tools:
         Arc<std::sync::RwLock<Option<Arc<dyn meerkat_core::AgentToolDispatcher>>>>,
     /// Default WorkGraph tools injected into all builds.
@@ -1584,6 +1615,17 @@ impl FactoryAgentBuilder {
                 .await
         })
         .await
+    }
+}
+
+/// The factory's MCP attempt guards ([`AgentFactory::mcp_attempt_guards`]),
+/// for the session routers a surface builds around this builder's service.
+#[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
+impl meerkat_session::McpAttemptGuardSource for FactoryAgentBuilder {
+    type Guards = meerkat_mcp::McpAttemptGuards;
+
+    fn mcp_attempt_guards(&self) -> Option<&Self::Guards> {
+        self.factory.mcp_attempt_guards()
     }
 }
 
@@ -2572,6 +2614,146 @@ mod tests {
             err.to_string()
                 .contains("failed to read latest config from store"),
             "expected a typed config-store error, got: {err}"
+        );
+    }
+
+    /// In-memory realm documents for inheritance tests.
+    #[cfg(not(target_arch = "wasm32"))]
+    struct RealmDocs(std::collections::BTreeMap<String, Config>);
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[async_trait]
+    impl meerkat_core::RealmConfigSource for RealmDocs {
+        async fn config_for_realm(
+            &self,
+            realm: &meerkat_core::connection::RealmId,
+        ) -> Result<Option<Config>, meerkat_core::ConfigError> {
+            Ok(self.0.get(realm.as_str()).cloned())
+        }
+    }
+
+    /// A host layer shaped like a deploy's: it sets the default model, and
+    /// fills token and tool-call budgets only where the composed config left
+    /// them unset.
+    #[cfg(not(target_arch = "wasm32"))]
+    struct DeployLikeLayer;
+
+    #[cfg(not(target_arch = "wasm32"))]
+    impl HostConfigLayer for DeployLikeLayer {
+        fn apply(&self, config: &mut Config) {
+            config.agent.model = "layer-model".to_string();
+            if config.limits.budget.is_none() {
+                config.limits.budget = Some(9);
+            }
+            if config.limits.max_tool_calls.is_none() {
+                config.limits.max_tool_calls = Some(7);
+            }
+        }
+    }
+
+    /// The `child` realm's head document under a `global` document that sets
+    /// the chain's default model and token budget.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn child_realm_under_global() -> (RealmInheritance, Config) {
+        use meerkat_core::connection::{RealmConfigSection, RealmId};
+
+        let mut global = Config::default();
+        global.agent.model = "chain-model".to_string();
+        global.limits.budget = Some(1000);
+        global
+            .realm
+            .insert("global".to_string(), RealmConfigSection::default());
+        let mut head = Config::default();
+        head.realm.insert(
+            "child".to_string(),
+            RealmConfigSection {
+                parent: Some(RealmId::global()),
+                ..Default::default()
+            },
+        );
+        let inheritance = RealmInheritance::new(
+            Arc::new(RealmDocs(std::collections::BTreeMap::from([(
+                "global".to_string(),
+                global,
+            )]))),
+            RealmId::parse("child").expect("valid realm"),
+        );
+        (inheritance, head)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    async fn realm_inheritance_applies_its_host_layer_after_the_chain_fold() {
+        let (inheritance, head) = child_realm_under_global();
+        let plain = inheritance
+            .compose_over(head.clone())
+            .await
+            .expect("compose the chain");
+        assert_eq!(
+            (
+                plain.agent.model.as_str(),
+                plain.limits.budget,
+                plain.limits.max_tool_calls
+            ),
+            ("chain-model", Some(1000), None)
+        );
+
+        let layered = inheritance
+            .with_host_layer(Arc::new(DeployLikeLayer))
+            .compose_over(head)
+            .await
+            .expect("compose the chain, then the layer");
+        assert_eq!(
+            (
+                layered.agent.model.as_str(),
+                layered.limits.budget,
+                layered.limits.max_tool_calls
+            ),
+            ("layer-model", Some(1000), Some(7)),
+            "the layer overrides what it sets, sees the folded chain, and fills only what the \
+             chain left unset"
+        );
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    async fn builder_config_reads_apply_the_host_layer_and_never_write_it() {
+        let (inheritance, head) = child_realm_under_global();
+        let store: Arc<dyn meerkat_core::ConfigStore> = Arc::new(
+            meerkat_core::MemoryConfigStore::new(head, meerkat_models::canonical()),
+        );
+        let builder = FactoryAgentBuilder::new_with_config_store(
+            AgentFactory::minimal(),
+            Config::default(),
+            Arc::clone(&store),
+        );
+        *builder
+            .realm_inheritance
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(inheritance.with_host_layer(Arc::new(DeployLikeLayer)));
+
+        let built = builder
+            .resolve_config()
+            .await
+            .expect("the config an agent build reads");
+        assert_eq!(
+            (
+                built.agent.model.as_str(),
+                built.limits.budget,
+                built.limits.max_tool_calls
+            ),
+            ("layer-model", Some(1000), Some(7))
+        );
+        let raw = store.get().await.expect("the raw head document");
+        assert_eq!(
+            (
+                raw.agent.model.as_str(),
+                raw.limits.budget,
+                raw.limits.max_tool_calls
+            ),
+            (Config::default().agent.model.as_str(), None, None),
+            "the layer is never written to the head document"
         );
     }
 

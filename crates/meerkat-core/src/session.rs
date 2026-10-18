@@ -16173,6 +16173,7 @@ mod tests {
             None,
             Some("audit-1".to_string()),
         );
+        let incarnation = authority.mob_incarnations()["mob-a"];
 
         session
             .set_mob_tool_authority_context(Some(authority))
@@ -16183,7 +16184,7 @@ mod tests {
             .and_then(|state| state.mob_tool_authority_context)
             .expect("stored projection should deserialize");
         assert!(!stored.is_generated_authority_context());
-        assert!(!stored.can_manage_mob("mob-a"));
+        assert!(!stored.can_manage_mob("mob-a", incarnation));
 
         session
             .set_mob_tool_authority_context(None)

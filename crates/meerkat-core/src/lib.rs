@@ -430,8 +430,9 @@ pub use ops_lifecycle::{
     OpsLifecycleRegistry, OpsOwnerAdmission, WaitAllResult, WaitAllSatisfied,
 };
 pub use peer_correlation::{
-    InboundPeerRequestState, InteractionStreamAbandonReason, InteractionStreamState,
-    OutboundPeerRequestState, PeerCorrelationId,
+    InboundIdClaim, InboundPeerRequestState, InteractionStreamAbandonReason,
+    InteractionStreamState, OutboundPeerRequestState, PeerCorrelationId,
+    PeerResponseAddresseeVerdict, PeerResponseSenderVerdict,
 };
 pub use peer_meta::PeerMeta;
 pub use persistence_contract::{
@@ -612,11 +613,11 @@ pub use tool_execution::{
     DeadlineChainExtensionError, DetachedToolExecutionPolicy, EphemeralToolBindingFingerprint,
     IdempotencyScope, MemoryOperation, PeerSendKind, ResolvedExecutionKind,
     ResolvedToolExecutionPlan, RestartClass, RunnerIdentity, StreamingToolExecutionPolicy,
-    ToolCredentialContextRef, ToolDeadlineChain, ToolDeadlineContributor, ToolDeadlineOwner,
-    ToolDeadlineSource, ToolExecutionApplicability, ToolExecutionContract,
-    ToolExecutionContractError, ToolExecutionDeclarationError, ToolExecutionMode,
-    ToolExecutionOwnerWitness, ToolExecutionResolutionContext, ToolExecutionResolutionError,
-    ToolOperationTarget, ToolOutputPolicy, ToolProgressPolicy,
+    ToolBindingDigest, ToolBindingDigestParseError, ToolCredentialContextRef, ToolDeadlineChain,
+    ToolDeadlineContributor, ToolDeadlineOwner, ToolDeadlineSource, ToolExecutionApplicability,
+    ToolExecutionContract, ToolExecutionContractError, ToolExecutionDeclarationError,
+    ToolExecutionMode, ToolExecutionOwnerWitness, ToolExecutionResolutionContext,
+    ToolExecutionResolutionError, ToolOperationTarget, ToolOutputPolicy, ToolProgressPolicy,
     ephemeral_tool_catalog_binding_fingerprint,
 };
 pub use tool_execution_policy::{

@@ -293,11 +293,11 @@ Rust applications can select only the provider adapters they use:
 <CodeGroup>
 
 ```toml Anthropic-only feature selection
-meerkat = { version = "=0.9.2", default-features = false, features = ["anthropic", "jsonl-store"] }
+meerkat = { version = "=0.9.3", default-features = false, features = ["anthropic", "jsonl-store"] }
 ```
 
 ```toml All providers
-meerkat = { version = "=0.9.2", features = ["all-providers", "jsonl-store"] }
+meerkat = { version = "=0.9.3", features = ["all-providers", "jsonl-store"] }
 ```
 
 </CodeGroup>
@@ -337,12 +337,16 @@ typed `provider_params.provider_tag` envelope for provider-specific fields:
     Thinking is typed per model: `{"type": "adaptive"}`,
     `{"type": "enabled", "budget_tokens": N}`, or, on Claude Sonnet 5.5,
     `{"type": "between_tools"}`, which turns off up-front thinking and is
-    accepted only at `high` effort or below. A thinking type or budget
-    (`thinking_budget_tokens`) the model does not accept, `top_k` on a model
-    without top-k support, and `between_tools` above `high` effort are refused
-    when the agent is built and again before each request, never sent to
-    Anthropic. A generic `temperature` is omitted for models that reject
-    sampling parameters.
+    accepted only at `high` effort or below. `{"type": "disabled"}` turns
+    thinking off on the models that accept it: Claude Opus 4.8, Opus 4.7,
+    Sonnet 5, Sonnet 4.6, Sonnet 4.5, Haiku 4.5 and Opus 4.5 at any effort,
+    and Claude Opus 5 and Haiku 5.5 at `high` effort or below; Claude
+    Fable 5.1, Fable 5, Opus 5.5 and Sonnet 5.5 refuse it. A thinking type or
+    budget (`thinking_budget_tokens`) the model does not accept, `top_k` on a
+    model without top-k support, and `between_tools` or a capped `disabled`
+    above `high` effort are refused when the agent is built and again before
+    each request, never sent to Anthropic. A generic `temperature` is omitted
+    for models that reject sampling parameters.
 
     Anthropic also supports `top_k` and the prompt-cache policies `automatic`
     (the default on the Anthropic API, Vertex, and Foundry), `system_prefix`,
@@ -482,7 +486,7 @@ current REST router does not expose a blob-byte fetch route. See
 
 ```toml
 # Exactly pin the pre-1.0 Meerkat crate family.
-meerkat = { version = "=0.9.2", features = ["sqlite-store", "session-store"] }
+meerkat = { version = "=0.9.3", features = ["sqlite-store", "session-store"] }
 ```
 
 The `meerkat` facade enables `anthropic`, `openai`, and `gemini` by

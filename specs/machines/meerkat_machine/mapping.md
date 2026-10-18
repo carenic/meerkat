@@ -209,7 +209,13 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
 - `GrantMobOperatorManageMob`
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
+- `RebindMobOperatorManageMob`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
 - `SetMobOperatorSpawnProfilesInMob`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `RebindMobOperatorSpawnProfilesInMob`
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
 - `BeginUnregisterSessionIdle`
@@ -6278,6 +6284,60 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
 - `PeerRequestSendFailedStopped`
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
+- `ResolvePeerResponseSenderAddresseeIdle`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolvePeerResponseSenderAddresseeAttached`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolvePeerResponseSenderAddresseeRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolvePeerResponseSenderAddresseeRetired`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolvePeerResponseSenderAddresseeStopped`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolvePeerResponseSenderAddresseeDestroyed`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolvePeerResponseSenderNotAddresseeIdle`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolvePeerResponseSenderNotAddresseeAttached`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolvePeerResponseSenderNotAddresseeRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolvePeerResponseSenderNotAddresseeRetired`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolvePeerResponseSenderNotAddresseeStopped`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolvePeerResponseSenderNotAddresseeDestroyed`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolvePeerResponseSenderUnknownRequestIdle`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolvePeerResponseSenderUnknownRequestAttached`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolvePeerResponseSenderUnknownRequestRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolvePeerResponseSenderUnknownRequestRetired`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolvePeerResponseSenderUnknownRequestStopped`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolvePeerResponseSenderUnknownRequestDestroyed`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
 - `PeerRequestReceivedIdle`
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
@@ -6312,6 +6372,60 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
 - `PeerResponseRepliedDestroyed`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolvePeerResponseAddresseeRequesterIdle`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolvePeerResponseAddresseeRequesterAttached`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolvePeerResponseAddresseeRequesterRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolvePeerResponseAddresseeRequesterRetired`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolvePeerResponseAddresseeRequesterStopped`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolvePeerResponseAddresseeRequesterDestroyed`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolvePeerResponseAddresseeNotRequesterIdle`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolvePeerResponseAddresseeNotRequesterAttached`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolvePeerResponseAddresseeNotRequesterRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolvePeerResponseAddresseeNotRequesterRetired`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolvePeerResponseAddresseeNotRequesterStopped`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolvePeerResponseAddresseeNotRequesterDestroyed`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolvePeerResponseAddresseeUnknownRequestIdle`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolvePeerResponseAddresseeUnknownRequestAttached`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolvePeerResponseAddresseeUnknownRequestRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolvePeerResponseAddresseeUnknownRequestRetired`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolvePeerResponseAddresseeUnknownRequestStopped`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolvePeerResponseAddresseeUnknownRequestDestroyed`
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
 - `AdvanceSessionContextIdle`
@@ -8380,6 +8494,12 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
 - `PeerResponseReplyClassified`
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
+- `PeerResponseAddresseeResolved`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `PeerResponseSenderResolved`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
 - `PeerIngressReceiveResolved`
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
@@ -8509,6 +8629,9 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
 - `runtime_generation_requires_bound_runtime`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `mob_operator_scopes_are_bound_to_an_incarnation`
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
 - `live_execution_binding_is_complete_and_channel_scoped`
@@ -8668,6 +8791,12 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
 - `peer_ingress_owner_consistency`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `inbound_peer_request_requesters_match_requests`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `pending_peer_request_addressees_match_requests`
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
 - `supervisor_binding_consistency`

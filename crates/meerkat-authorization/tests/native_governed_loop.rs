@@ -2,7 +2,12 @@
 //! Only the transport/model responses and application resource semantics are
 //! fixtures. No test WorkAuthorization or substitute grant policy is installed.
 #![cfg(not(target_arch = "wasm32"))]
-#![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
+#![allow(
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unwrap_used,
+    clippy::disallowed_methods
+)]
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};

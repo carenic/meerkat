@@ -283,6 +283,9 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
 - `nonterminal_has_no_terminal_delivery`
   - anchors: `detached_job_authority`
   - scenarios: (unclaimed)
+- `terminal_delivery_follows_every_notification`
+  - anchors: `detached_job_authority`
+  - scenarios: (unclaimed)
 
 
 <!-- GENERATED_COVERAGE_END -->

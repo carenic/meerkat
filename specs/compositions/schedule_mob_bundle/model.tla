@@ -3256,6 +3256,29 @@ occurrence_SyncTargetSnapshotClaimed(arg_target_binding_key, arg_target_material
        /\ model_step_count' = model_step_count + 1
 
 
+occurrence_SyncTargetSnapshotDispatching(arg_target_binding_key, arg_target_materialized_session_id) ==
+    /\ \E packet \in SeqElements(pending_inputs) :
+       /\ packet.machine = "occurrence"
+       /\ packet.variant = "SyncTargetSnapshot"
+       /\ packet.payload.target_binding_key = arg_target_binding_key
+       /\ packet.payload.target_materialized_session_id = arg_target_materialized_session_id
+       /\ ~HigherPriorityReady("occurrence_authority")
+       /\ occurrence_phase = "Dispatching"
+       /\ (packet.payload.target_materialized_session_id # None)
+       /\ (IF (occurrence_target_materialized_session_id = None) THEN TRUE ELSE ((occurrence_target_materialized_session_id = packet.payload.target_materialized_session_id) /\ (occurrence_target_binding_key = packet.payload.target_binding_key)))
+       /\ occurrence_phase' = "Dispatching"
+       /\ occurrence_target_binding_key' = packet.payload.target_binding_key
+       /\ occurrence_target_materialized_session_id' = packet.payload.target_materialized_session_id
+       /\ UnchangedFrame_7550c7a0a4cb7792
+       /\ pending_inputs' = SeqRemove(pending_inputs, packet)
+       /\ observed_inputs' = observed_inputs
+       /\ pending_routes' = pending_routes
+       /\ delivered_routes' = delivered_routes
+       /\ emitted_effects' = emitted_effects
+       /\ observed_transitions' = observed_transitions \cup {[machine |-> "occurrence", transition |-> "SyncTargetSnapshotDispatching", actor |-> "occurrence_authority", step |-> (model_step_count + 1), from_phase |-> occurrence_phase, to_phase |-> "Dispatching"]}
+       /\ model_step_count' = model_step_count + 1
+
+
 occurrence_RecordReceiptPending(arg_correlation_id, arg_detail, arg_materialized_session_id, arg_runtime_outcome_key) ==
     /\ \E packet \in SeqElements(pending_inputs) :
        /\ packet.machine = "occurrence"
@@ -4065,6 +4088,34 @@ occurrence_DeliveryFailureInternalError(arg_reason, arg_detail, arg_at_utc_ms) =
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "occurrence", variant |-> "DeliveryFailed", payload |-> [tag |-> "unit"], effect_id |-> (model_step_count + 1), source_transition |-> "DeliveryFailureInternalError"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "occurrence", transition |-> "DeliveryFailureInternalError", actor |-> "occurrence_authority", step |-> (model_step_count + 1), from_phase |-> occurrence_phase, to_phase |-> "DeliveryFailed"]}
+       /\ model_step_count' = model_step_count + 1
+
+
+occurrence_DeliveryFailureScheduleMandateUnavailable(arg_reason, arg_detail, arg_at_utc_ms) ==
+    /\ \E packet \in SeqElements(pending_inputs) :
+       /\ packet.machine = "occurrence"
+       /\ packet.variant = "ResolveDeliveryFailure"
+       /\ packet.payload.reason = arg_reason
+       /\ packet.payload.detail = arg_detail
+       /\ packet.payload.at_utc_ms = arg_at_utc_ms
+       /\ ~HigherPriorityReady("occurrence_authority")
+       /\ occurrence_phase = "Claimed" \/ occurrence_phase = "Dispatching" \/ occurrence_phase = "AwaitingCompletion"
+       /\ (packet.payload.reason = "ScheduleMandateUnavailable")
+       /\ occurrence_phase' = "DeliveryFailed"
+       /\ occurrence_receipt_recorded_at_utc_ms' = Some(packet.payload.at_utc_ms)
+       /\ occurrence_receipt_stage' = Some("DeliveryFailed")
+       /\ occurrence_receipt_failure_class' = Some("ScheduleMandateUnavailable")
+       /\ occurrence_receipt_detail' = packet.payload.detail
+       /\ occurrence_failure_class' = Some("ScheduleMandateUnavailable")
+       /\ occurrence_failure_detail' = packet.payload.detail
+       /\ occurrence_completed_at_utc_ms' = Some(packet.payload.at_utc_ms)
+       /\ UnchangedFrame_082b16d063426bc5
+       /\ pending_inputs' = SeqRemove(pending_inputs, packet)
+       /\ observed_inputs' = observed_inputs
+       /\ pending_routes' = pending_routes
+       /\ delivered_routes' = delivered_routes
+       /\ emitted_effects' = emitted_effects \cup { [machine |-> "occurrence", variant |-> "DeliveryFailed", payload |-> [tag |-> "unit"], effect_id |-> (model_step_count + 1), source_transition |-> "DeliveryFailureScheduleMandateUnavailable"] }
+       /\ observed_transitions' = observed_transitions \cup {[machine |-> "occurrence", transition |-> "DeliveryFailureScheduleMandateUnavailable", actor |-> "occurrence_authority", step |-> (model_step_count + 1), from_phase |-> occurrence_phase, to_phase |-> "DeliveryFailed"]}
        /\ model_step_count' = model_step_count + 1
 
 
@@ -5206,6 +5257,7 @@ EntryPacketAdmissible_occurrence(packet) ==
     \/ /\ (packet.variant = "ClassifyCompletionSupersession") /\ (occurrence_phase = "Superseded")
     \/ /\ (packet.variant = "SyncTargetSnapshot") /\ (occurrence_phase = "Pending")
     \/ /\ (packet.variant = "SyncTargetSnapshot") /\ (occurrence_phase = "Claimed")
+    \/ /\ (packet.variant = "SyncTargetSnapshot") /\ (occurrence_phase = "Dispatching") /\ ((packet.payload.target_materialized_session_id # None)) /\ ((IF (occurrence_target_materialized_session_id = None) THEN TRUE ELSE ((occurrence_target_materialized_session_id = packet.payload.target_materialized_session_id) /\ (occurrence_target_binding_key = packet.payload.target_binding_key))))
     \/ /\ (packet.variant = "RecordReceipt") /\ (occurrence_phase = "Pending") /\ (((occurrence_receipt_stage # None) /\ (occurrence_receipt_recorded_at_utc_ms # None) /\ (occurrence_receipt_detail = packet.payload.detail) /\ (occurrence_delivery_correlation_id = packet.payload.correlation_id) /\ (occurrence_target_materialized_session_id = packet.payload.materialized_session_id)))
     \/ /\ (packet.variant = "RecordReceipt") /\ (occurrence_phase = "Claimed") /\ (((occurrence_receipt_stage # None) /\ (occurrence_receipt_recorded_at_utc_ms # None) /\ (occurrence_receipt_detail = packet.payload.detail) /\ (occurrence_delivery_correlation_id = packet.payload.correlation_id) /\ (occurrence_target_materialized_session_id = packet.payload.materialized_session_id)))
     \/ /\ (packet.variant = "RecordReceipt") /\ (occurrence_phase = "Dispatching") /\ (((occurrence_receipt_stage # None) /\ (occurrence_receipt_recorded_at_utc_ms # None) /\ (occurrence_receipt_detail = packet.payload.detail) /\ (occurrence_delivery_correlation_id = packet.payload.correlation_id) /\ (occurrence_target_materialized_session_id = packet.payload.materialized_session_id)))
@@ -5235,6 +5287,7 @@ EntryPacketAdmissible_occurrence(packet) ==
     \/ /\ (packet.variant = "ResolveDeliveryFailure") /\ (occurrence_phase = "Claimed" \/ occurrence_phase = "Dispatching" \/ occurrence_phase = "AwaitingCompletion") /\ ((packet.payload.reason = "MobRejected"))
     \/ /\ (packet.variant = "ResolveDeliveryFailure") /\ (occurrence_phase = "Claimed" \/ occurrence_phase = "Dispatching" \/ occurrence_phase = "AwaitingCompletion") /\ ((packet.payload.reason = "TransportError"))
     \/ /\ (packet.variant = "ResolveDeliveryFailure") /\ (occurrence_phase = "Claimed" \/ occurrence_phase = "Dispatching" \/ occurrence_phase = "AwaitingCompletion") /\ ((packet.payload.reason = "InternalError"))
+    \/ /\ (packet.variant = "ResolveDeliveryFailure") /\ (occurrence_phase = "Claimed" \/ occurrence_phase = "Dispatching" \/ occurrence_phase = "AwaitingCompletion") /\ ((packet.payload.reason = "ScheduleMandateUnavailable"))
     \/ /\ (packet.variant = "ResolveTargetProbe") /\ (occurrence_phase = "Claimed") /\ ((packet.payload.outcome = "Ready"))
     \/ /\ (packet.variant = "ResolveTargetProbe") /\ (occurrence_phase = "Claimed") /\ ((packet.payload.outcome = "Busy")) /\ ((occurrence_overlap_policy = "AllowConcurrent"))
     \/ /\ (packet.variant = "ResolveTargetProbe") /\ (occurrence_phase = "Claimed") /\ ((packet.payload.outcome = "Busy")) /\ ((occurrence_overlap_policy = "SkipIfRunning"))
@@ -5493,6 +5546,7 @@ CoreNext ==
     \/ \E arg_schedule_phase \in ClaimedDispatchSchedulePhaseValues : \E arg_current_schedule_revision \in 0..2 : occurrence_ClassifyCompletionSupersessionAlreadySuperseded(arg_schedule_phase, arg_current_schedule_revision)
     \/ \E arg_target_binding_key \in TargetBindingIdValues : \E arg_target_materialized_session_id \in OptionSessionIdValues : occurrence_SyncTargetSnapshotPending(arg_target_binding_key, arg_target_materialized_session_id)
     \/ \E arg_target_binding_key \in TargetBindingIdValues : \E arg_target_materialized_session_id \in OptionSessionIdValues : occurrence_SyncTargetSnapshotClaimed(arg_target_binding_key, arg_target_materialized_session_id)
+    \/ \E arg_target_binding_key \in TargetBindingIdValues : \E arg_target_materialized_session_id \in OptionSessionIdValues : occurrence_SyncTargetSnapshotDispatching(arg_target_binding_key, arg_target_materialized_session_id)
     \/ \E arg_correlation_id \in OptionCorrelationIdValues : \E arg_detail \in OptionStringValues : \E arg_materialized_session_id \in OptionSessionIdValues : \E arg_runtime_outcome_key \in OptionRuntimeOutcomeKeyValues : occurrence_RecordReceiptPending(arg_correlation_id, arg_detail, arg_materialized_session_id, arg_runtime_outcome_key)
     \/ \E arg_correlation_id \in OptionCorrelationIdValues : \E arg_detail \in OptionStringValues : \E arg_materialized_session_id \in OptionSessionIdValues : \E arg_runtime_outcome_key \in OptionRuntimeOutcomeKeyValues : occurrence_RecordReceiptClaimed(arg_correlation_id, arg_detail, arg_materialized_session_id, arg_runtime_outcome_key)
     \/ \E arg_correlation_id \in OptionCorrelationIdValues : \E arg_detail \in OptionStringValues : \E arg_materialized_session_id \in OptionSessionIdValues : \E arg_runtime_outcome_key \in OptionRuntimeOutcomeKeyValues : occurrence_RecordReceiptDispatching(arg_correlation_id, arg_detail, arg_materialized_session_id, arg_runtime_outcome_key)
@@ -5522,6 +5576,7 @@ CoreNext ==
     \/ \E arg_reason \in DeliveryFailureReasonValues : \E arg_detail \in OptionStringValues : \E arg_at_utc_ms \in 0..2 : occurrence_DeliveryFailureMobRejected(arg_reason, arg_detail, arg_at_utc_ms)
     \/ \E arg_reason \in DeliveryFailureReasonValues : \E arg_detail \in OptionStringValues : \E arg_at_utc_ms \in 0..2 : occurrence_DeliveryFailureTransportError(arg_reason, arg_detail, arg_at_utc_ms)
     \/ \E arg_reason \in DeliveryFailureReasonValues : \E arg_detail \in OptionStringValues : \E arg_at_utc_ms \in 0..2 : occurrence_DeliveryFailureInternalError(arg_reason, arg_detail, arg_at_utc_ms)
+    \/ \E arg_reason \in DeliveryFailureReasonValues : \E arg_detail \in OptionStringValues : \E arg_at_utc_ms \in 0..2 : occurrence_DeliveryFailureScheduleMandateUnavailable(arg_reason, arg_detail, arg_at_utc_ms)
     \/ \E arg_outcome \in OccurrenceTargetProbeOutcomeValues : \E arg_detail \in OptionStringValues : \E arg_at_utc_ms \in 0..2 : occurrence_TargetProbeReadyClaimed(arg_outcome, arg_detail, arg_at_utc_ms)
     \/ \E arg_outcome \in OccurrenceTargetProbeOutcomeValues : \E arg_detail \in OptionStringValues : \E arg_at_utc_ms \in 0..2 : occurrence_TargetProbeBusyAllowedByPolicy(arg_outcome, arg_detail, arg_at_utc_ms)
     \/ \E arg_outcome \in OccurrenceTargetProbeOutcomeValues : \E arg_detail \in OptionStringValues : \E arg_at_utc_ms \in 0..2 : occurrence_TargetProbeBusySkipByPolicy(arg_outcome, arg_detail, arg_at_utc_ms)

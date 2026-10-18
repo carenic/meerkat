@@ -542,6 +542,26 @@ pub enum InboundPeerRequestState {
     Replied,
 }
 
+/// Machine-owned verdict on the addressee of a response to an inbound peer
+/// request, mirroring [`meerkat_core::PeerResponseAddresseeVerdict`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum PeerResponseAddresseeVerdict {
+    #[default]
+    UnknownRequest,
+    Requester,
+    NotRequester,
+}
+
+/// Machine-owned verdict on the sender of a response to an outbound peer
+/// request, mirroring [`meerkat_core::PeerResponseSenderVerdict`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum PeerResponseSenderVerdict {
+    #[default]
+    UnknownRequest,
+    Addressee,
+    NotAddressee,
+}
+
 /// Typed terminal disposition carried on `PeerResponseTerminalArrived`.
 /// Mirror of [`meerkat_core::handles::PeerTerminalDisposition`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
@@ -3784,6 +3804,11 @@ macro_rules! meerkat_catalog_machine_dsl {
             mob_operator_can_mutate_profiles: bool,
             mob_operator_managed_mob_scope: Set<String>,
             mob_operator_spawn_profile_scope: Map<String, Set<String>>,
+            // The mob incarnation each scoped mob id is bound to. A grant
+            // names the incarnation the mob runtime minted when it started,
+            // so it never reaches a later mob created under the same id.
+            #[redacted]
+            mob_operator_mob_incarnations: Map<String, MobIncarnationId>,
             mob_operator_caller_provenance: Option<MobToolCallerProvenance>,
             mob_operator_audit_invocation_id: Option<String>,
 
@@ -4321,6 +4346,15 @@ macro_rules! meerkat_catalog_machine_dsl {
             // project off this map: channel live iff
             // `corr_id ∈ pending_peer_requests ∧ state ≠ terminal`.
             pending_peer_requests: Map<PeerCorrelationId, OutboundPeerRequestState>,
+            // Machine-owned addressee of each outbound peer request: the
+            // canonical peer id the request was routed to, recorded by the
+            // generated transition that records the send (before the request
+            // frame leaves) and removed with the pending entry. A response
+            // frame, progress or terminal, moves the request only when its
+            // envelope's verified signer is this peer
+            // (`ResolvePeerResponseSender` at ingress, and the guarded
+            // response inputs).
+            pending_peer_request_addressees: Map<PeerCorrelationId, PeerId>,
             // Inbound request lifecycle: mirror of the outbound map for
             // responses we owe back to remote peers. Receiver-side guard
             // prevents duplicate replies on the same correlation id.
@@ -4332,6 +4366,15 @@ macro_rules! meerkat_catalog_machine_dsl {
             // this value when the caller omits an explicit terminal response
             // handling-mode override.
             inbound_peer_request_lanes: Map<PeerCorrelationId, Enum<InputLane>>,
+            // Machine-owned requester of each inbound peer request: the
+            // canonical peer id of the envelope's signing key that ingress
+            // admitted (signature-verified when peer auth is required, the
+            // declared key under open auth), never a field of the request
+            // payload. Recorded at the same generated transition that admits
+            // the request and removed when the reply terminalizes. A response
+            // to the request goes only to this peer
+            // (`ResolvePeerResponseAddressee`).
+            inbound_peer_request_requesters: Map<PeerCorrelationId, PeerId>,
 
             // --- Session-context advancement (W2-E / issue #264) ---
             //
@@ -4582,6 +4625,7 @@ macro_rules! meerkat_catalog_machine_dsl {
             mob_operator_can_mutate_profiles = false,
             mob_operator_managed_mob_scope = EmptySet,
             mob_operator_spawn_profile_scope = EmptyMap,
+            mob_operator_mob_incarnations = EmptyMap,
             mob_operator_caller_provenance = None,
             mob_operator_audit_invocation_id = None,
             // Comms drain substate
@@ -4896,8 +4940,10 @@ macro_rules! meerkat_catalog_machine_dsl {
             removal_timeout_ms = 30000,
             mcp_server_states = EmptyMap,
             pending_peer_requests = EmptyMap,
+            pending_peer_request_addressees = EmptyMap,
             inbound_peer_requests = EmptyMap,
             inbound_peer_request_lanes = EmptyMap,
+            inbound_peer_request_requesters = EmptyMap,
             last_session_context_updated_at_ms = 0,
             reserved_interaction_streams = EmptySet,
             attached_interaction_streams = EmptySet,
@@ -5197,6 +5243,8 @@ macro_rules! meerkat_catalog_machine_dsl {
                 can_mutate_profiles: bool,
                 managed_mob_scope: Set<String>,
                 spawn_profile_scope: Map<String, Set<String>>,
+                #[redacted]
+                mob_incarnations: Map<String, MobIncarnationId>,
                 caller_provenance: Option<MobToolCallerProvenance>,
                 audit_invocation_id: Option<String>,
             },
@@ -5208,9 +5256,13 @@ macro_rules! meerkat_catalog_machine_dsl {
             },
             GrantMobOperatorManageMob {
                 mob_id: String,
+                #[redacted]
+                mob_incarnation: MobIncarnationId,
             },
             SetMobOperatorSpawnProfilesInMob {
                 mob_id: String,
+                #[redacted]
+                mob_incarnation: MobIncarnationId,
                 profiles: Set<String>,
             },
             Reset,
@@ -6690,10 +6742,17 @@ macro_rules! meerkat_catalog_machine_dsl {
             // Peer interaction lifecycle inputs (W1-A). Shell fires these on
             // outbound send, response arrival (progress or terminal),
             // timeout, inbound request arrival, and inbound reply completion.
-            PeerRequestSent { corr_id: PeerCorrelationId },
-            PeerResponseProgressArrived { corr_id: PeerCorrelationId },
-            PeerResponseTerminalArrived { corr_id: PeerCorrelationId, disposition: PeerTerminalDisposition },
-            PeerResponseRejected { corr_id: PeerCorrelationId },
+            // `addressee` is the canonical peer id the request is routed to;
+            // `responder` is the verified signer of the response frame's
+            // envelope as ingress admitted it, never a payload field.
+            PeerRequestSent { corr_id: PeerCorrelationId, addressee: PeerId },
+            PeerResponseProgressArrived { corr_id: PeerCorrelationId, responder: PeerId },
+            PeerResponseTerminalArrived {
+                corr_id: PeerCorrelationId,
+                disposition: PeerTerminalDisposition,
+                responder: PeerId,
+            },
+            PeerResponseRejected { corr_id: PeerCorrelationId, responder: PeerId },
             PeerRequestTimedOut { corr_id: PeerCorrelationId },
             // Outbound peer request failed to be sent (transport rejected the
             // dispatch, e.g. PeerOffline). Distinct from `PeerRequestTimedOut`:
@@ -6702,7 +6761,14 @@ macro_rules! meerkat_catalog_machine_dsl {
             // (was previously laundered through `request_timed_out`) so the
             // outbound state advances to the typed `Failed` terminal.
             PeerRequestSendFailed { corr_id: PeerCorrelationId },
-            PeerRequestReceived { corr_id: PeerCorrelationId, handling_mode: Enum<InputLane> },
+            // `requester` is the verified sender ingress admitted for the
+            // request's signed envelope; the shell never reads it from the
+            // payload.
+            PeerRequestReceived {
+                corr_id: PeerCorrelationId,
+                handling_mode: Enum<InputLane>,
+                requester: PeerId,
+            },
             PeerResponseReplied { corr_id: PeerCorrelationId },
             // Session-context advancement input (W2-E). Shell fires this at every
             // site that mutates canonical session truth (ordinary System append,
@@ -7020,6 +7086,14 @@ macro_rules! meerkat_catalog_machine_dsl {
                 in_reply_to: String,
             },
             ClassifyPeerResponseReply { status: Enum<PeerIngressResponseStatus> },
+            // Read-only judgment of an outbound response's addressee against
+            // the verified requester recorded for the inbound request it
+            // answers. The shell asks before any transport.
+            ResolvePeerResponseAddressee { corr_id: PeerCorrelationId, addressee: PeerId },
+            // Read-only judgment, at ingress, of an inbound response's
+            // verified signer against the addressee recorded for the outbound
+            // request it answers. The shell asks before the frame is queued.
+            ResolvePeerResponseSender { corr_id: PeerCorrelationId, responder: PeerId },
             ClassifyPlainEvent { source_name: String },
             EnsureDrainRunning,
         }
@@ -8112,6 +8186,12 @@ macro_rules! meerkat_catalog_machine_dsl {
             PeerResponseReplyClassified {
                 response_terminality: Enum<PeerIngressResponseTerminality>,
             },
+            PeerResponseAddresseeResolved {
+                verdict: Enum<PeerResponseAddresseeVerdict>,
+            },
+            PeerResponseSenderResolved {
+                verdict: Enum<PeerResponseSenderVerdict>,
+            },
             PeerIngressReceiveResolved {
                 outcome: Enum<PeerIngressReceiveOutcomeClass>,
                 admission_diagnostic: Option<Enum<PeerIngressAdmissionDiagnosticClass>>,
@@ -8537,6 +8617,8 @@ macro_rules! meerkat_catalog_machine_dsl {
         disposition RealtimeTranscriptAppended => local seam SurfaceResultAlignment,
         disposition PeerIngressClassified => local seam NoOwnerRealization,
         disposition PeerResponseReplyClassified => local seam NoOwnerRealization,
+        disposition PeerResponseAddresseeResolved => local seam NoOwnerRealization,
+        disposition PeerResponseSenderResolved => local seam NoOwnerRealization,
         disposition PeerIngressReceiveResolved => local seam NoOwnerRealization,
         disposition PeerIngressDequeueResolved => local seam NoOwnerRealization,
         disposition SpawnDrainTask => local seam NoOwnerRealization,
@@ -9150,6 +9232,13 @@ macro_rules! meerkat_catalog_machine_dsl {
 
         invariant runtime_generation_requires_bound_runtime {
             self.active_runtime_generation == None || self.active_runtime_id != None
+        }
+
+        invariant mob_operator_scopes_are_bound_to_an_incarnation {
+            for_all(mob_id in self.mob_operator_managed_mob_scope,
+                self.mob_operator_mob_incarnations.contains_key(mob_id))
+            && for_all(mob_id in self.mob_operator_spawn_profile_scope.keys(),
+                self.mob_operator_mob_incarnations.contains_key(mob_id))
         }
 
         invariant live_execution_binding_is_complete_and_channel_scoped {
@@ -9985,6 +10074,21 @@ macro_rules! meerkat_catalog_machine_dsl {
             || (self.peer_ingress_owner_kind == PeerIngressOwnerKind::MobOwned
                 && self.peer_ingress_comms_runtime_id != None
                 && self.peer_ingress_mob_id != None)
+        }
+
+        // Every admitted inbound peer request records its verified
+        // requester, and a requester exists only for an admitted request, so
+        // `ResolvePeerResponseAddressee` never judges a request without one.
+        invariant inbound_peer_request_requesters_match_requests {
+            self.inbound_peer_request_requesters.keys() == self.inbound_peer_requests.keys()
+        }
+
+        // Every recorded outbound peer request records the peer it was sent
+        // to, and an addressee exists only for a pending request, so the
+        // guarded response inputs and `ResolvePeerResponseSender` never judge
+        // a pending request without one.
+        invariant pending_peer_request_addressees_match_requests {
+            self.pending_peer_request_addressees.keys() == self.pending_peer_requests.keys()
         }
 
         // Supervisor-binding tagged-union discipline (Wave 3 D Row 21).
@@ -11100,6 +11204,7 @@ macro_rules! meerkat_catalog_machine_dsl {
                 self.mob_operator_can_mutate_profiles = true;
                 self.mob_operator_managed_mob_scope = EmptySet;
                 self.mob_operator_spawn_profile_scope = EmptyMap;
+                self.mob_operator_mob_incarnations = EmptyMap;
                 self.mob_operator_caller_provenance = caller_provenance;
                 self.mob_operator_audit_invocation_id = audit_invocation_id;
             }
@@ -11119,6 +11224,7 @@ macro_rules! meerkat_catalog_machine_dsl {
                 self.mob_operator_can_mutate_profiles = false;
                 self.mob_operator_managed_mob_scope = EmptySet;
                 self.mob_operator_spawn_profile_scope = EmptyMap;
+                self.mob_operator_mob_incarnations = EmptyMap;
                 self.mob_operator_caller_provenance = None;
                 self.mob_operator_audit_invocation_id = None;
             }
@@ -11128,10 +11234,15 @@ macro_rules! meerkat_catalog_machine_dsl {
         transition RestoreMobOperatorAuthority {
             on input RestoreMobOperatorAuthority {
                 principal_token, can_create_mobs, can_mutate_profiles,
-                managed_mob_scope, spawn_profile_scope, caller_provenance,
-                audit_invocation_id
+                managed_mob_scope, spawn_profile_scope, mob_incarnations,
+                caller_provenance, audit_invocation_id
             }
             guard { self.lifecycle_phase == Phase::Initializing }
+            guard "scoped_mobs_are_bound" {
+                for_all(mob_id in managed_mob_scope, mob_incarnations.contains_key(mob_id))
+                && for_all(mob_id in spawn_profile_scope.keys(),
+                    mob_incarnations.contains_key(mob_id))
+            }
             update {
                 self.mob_operator_authority_present = true;
                 self.mob_operator_principal_token = Some(principal_token);
@@ -11139,6 +11250,7 @@ macro_rules! meerkat_catalog_machine_dsl {
                 self.mob_operator_can_mutate_profiles = can_mutate_profiles;
                 self.mob_operator_managed_mob_scope = managed_mob_scope;
                 self.mob_operator_spawn_profile_scope = spawn_profile_scope;
+                self.mob_operator_mob_incarnations = mob_incarnations;
                 self.mob_operator_caller_provenance = caller_provenance;
                 self.mob_operator_audit_invocation_id = audit_invocation_id;
             }
@@ -11165,22 +11277,73 @@ macro_rules! meerkat_catalog_machine_dsl {
             to Initializing
         }
 
+        // A grant names one incarnation of the mob: the one the mob runtime
+        // minted when it started. Scope held for an earlier incarnation of
+        // the same id never reaches a later one.
         transition GrantMobOperatorManageMob {
-            on input GrantMobOperatorManageMob { mob_id }
+            on input GrantMobOperatorManageMob { mob_id, mob_incarnation }
             guard { self.lifecycle_phase == Phase::Initializing }
             guard "authority_present" { self.mob_operator_authority_present }
+            guard "mob_unbound_or_same_incarnation" {
+                !self.mob_operator_mob_incarnations.contains_key(mob_id)
+                || self.mob_operator_mob_incarnations.get_cloned(mob_id) == Some(mob_incarnation)
+            }
             update {
                 self.mob_operator_managed_mob_scope.insert(mob_id);
+                self.mob_operator_mob_incarnations.insert(mob_id, mob_incarnation);
+            }
+            to Initializing
+        }
+
+        // A manage grant for a new incarnation of a mob id replaces the old
+        // binding. Spawn-profile scope held for the old incarnation is
+        // dropped: it never carries over to the new mob.
+        transition RebindMobOperatorManageMob {
+            on input GrantMobOperatorManageMob { mob_id, mob_incarnation }
+            guard { self.lifecycle_phase == Phase::Initializing }
+            guard "authority_present" { self.mob_operator_authority_present }
+            guard "mob_bound_to_another_incarnation" {
+                self.mob_operator_mob_incarnations.contains_key(mob_id)
+                && self.mob_operator_mob_incarnations.get_cloned(mob_id) != Some(mob_incarnation)
+            }
+            update {
+                self.mob_operator_managed_mob_scope.insert(mob_id);
+                self.mob_operator_spawn_profile_scope.remove(mob_id);
+                self.mob_operator_mob_incarnations.insert(mob_id, mob_incarnation);
             }
             to Initializing
         }
 
         transition SetMobOperatorSpawnProfilesInMob {
-            on input SetMobOperatorSpawnProfilesInMob { mob_id, profiles }
+            on input SetMobOperatorSpawnProfilesInMob { mob_id, mob_incarnation, profiles }
             guard { self.lifecycle_phase == Phase::Initializing }
             guard "authority_present" { self.mob_operator_authority_present }
+            guard "mob_unbound_or_same_incarnation" {
+                !self.mob_operator_mob_incarnations.contains_key(mob_id)
+                || self.mob_operator_mob_incarnations.get_cloned(mob_id) == Some(mob_incarnation)
+            }
             update {
                 self.mob_operator_spawn_profile_scope.insert(mob_id, profiles);
+                self.mob_operator_mob_incarnations.insert(mob_id, mob_incarnation);
+            }
+            to Initializing
+        }
+
+        // A spawn-profile grant for a new incarnation of a mob id replaces
+        // the old binding. Manage scope held for the old incarnation is
+        // dropped: a spawn grant for the new mob never revives it.
+        transition RebindMobOperatorSpawnProfilesInMob {
+            on input SetMobOperatorSpawnProfilesInMob { mob_id, mob_incarnation, profiles }
+            guard { self.lifecycle_phase == Phase::Initializing }
+            guard "authority_present" { self.mob_operator_authority_present }
+            guard "mob_bound_to_another_incarnation" {
+                self.mob_operator_mob_incarnations.contains_key(mob_id)
+                && self.mob_operator_mob_incarnations.get_cloned(mob_id) != Some(mob_incarnation)
+            }
+            update {
+                self.mob_operator_managed_mob_scope.remove(mob_id);
+                self.mob_operator_spawn_profile_scope.insert(mob_id, profiles);
+                self.mob_operator_mob_incarnations.insert(mob_id, mob_incarnation);
             }
             to Initializing
         }
@@ -34698,21 +34861,30 @@ macro_rules! meerkat_catalog_machine_dsl {
 
         transition PeerRequestSent {
             per_phase [Idle, Attached, Running, Retired, Stopped]
-            on input PeerRequestSent { corr_id }
+            on input PeerRequestSent { corr_id, addressee }
             guard "session_registered" { self.session_id != None }
             guard "not_already_pending" { !self.pending_peer_requests.contains_key(corr_id) }
             update {
                 self.pending_peer_requests.insert(corr_id, OutboundPeerRequestState::Sent);
+                self.pending_peer_request_addressees.insert(corr_id, addressee);
             }
             to Idle
             emit PeerInteractionStateChanged { corr_id: corr_id, new_state: OutboundPeerRequestState::Sent }
         }
 
+        // Response frames move an outbound request only when their verified
+        // signer is the peer the request was sent to. A frame from any other
+        // peer enables no transition here, so it is never applied and the
+        // request stays open for its addressee.
         transition PeerResponseProgressArrived {
             per_phase [Idle, Attached, Running, Retired, Stopped]
-            on input PeerResponseProgressArrived { corr_id }
+            on input PeerResponseProgressArrived { corr_id, responder }
             guard "session_registered" { self.session_id != None }
             guard "pending_exists" { self.pending_peer_requests.contains_key(corr_id) }
+            guard "responder_is_addressee" {
+                self.pending_peer_request_addressees.contains_key(corr_id)
+                && self.pending_peer_request_addressees.get(corr_id).get("value") == responder
+            }
             update {
                 self.pending_peer_requests.insert(corr_id, OutboundPeerRequestState::AcceptedProgress);
             }
@@ -34722,12 +34894,17 @@ macro_rules! meerkat_catalog_machine_dsl {
 
         transition PeerResponseTerminalArrivedCompleted {
             per_phase [Idle, Attached, Running, Retired, Stopped]
-            on input PeerResponseTerminalArrived { corr_id, disposition }
+            on input PeerResponseTerminalArrived { corr_id, disposition, responder }
             guard "session_registered" { self.session_id != None }
             guard "pending_exists" { self.pending_peer_requests.contains_key(corr_id) }
+            guard "responder_is_addressee" {
+                self.pending_peer_request_addressees.contains_key(corr_id)
+                && self.pending_peer_request_addressees.get(corr_id).get("value") == responder
+            }
             guard "completed" { disposition == PeerTerminalDisposition::Completed }
             update {
                 self.pending_peer_requests.remove(corr_id);
+                self.pending_peer_request_addressees.remove(corr_id);
             }
             to Idle
             emit PeerInteractionStateChanged { corr_id: corr_id, new_state: OutboundPeerRequestState::Completed }
@@ -34736,12 +34913,17 @@ macro_rules! meerkat_catalog_machine_dsl {
 
         transition PeerResponseTerminalArrivedFailed {
             per_phase [Idle, Attached, Running, Retired, Stopped]
-            on input PeerResponseTerminalArrived { corr_id, disposition }
+            on input PeerResponseTerminalArrived { corr_id, disposition, responder }
             guard "session_registered" { self.session_id != None }
             guard "pending_exists" { self.pending_peer_requests.contains_key(corr_id) }
+            guard "responder_is_addressee" {
+                self.pending_peer_request_addressees.contains_key(corr_id)
+                && self.pending_peer_request_addressees.get(corr_id).get("value") == responder
+            }
             guard "failed" { disposition == PeerTerminalDisposition::Failed }
             update {
                 self.pending_peer_requests.remove(corr_id);
+                self.pending_peer_request_addressees.remove(corr_id);
             }
             to Idle
             emit PeerInteractionStateChanged { corr_id: corr_id, new_state: OutboundPeerRequestState::Failed }
@@ -34750,11 +34932,16 @@ macro_rules! meerkat_catalog_machine_dsl {
 
         transition PeerResponseRejected {
             per_phase [Idle, Attached, Running, Retired, Stopped]
-            on input PeerResponseRejected { corr_id }
+            on input PeerResponseRejected { corr_id, responder }
             guard "session_registered" { self.session_id != None }
             guard "pending_exists" { self.pending_peer_requests.contains_key(corr_id) }
+            guard "responder_is_addressee" {
+                self.pending_peer_request_addressees.contains_key(corr_id)
+                && self.pending_peer_request_addressees.get(corr_id).get("value") == responder
+            }
             update {
                 self.pending_peer_requests.remove(corr_id);
+                self.pending_peer_request_addressees.remove(corr_id);
             }
             to Idle
             emit PeerInteractionStateChanged { corr_id: corr_id, new_state: OutboundPeerRequestState::Failed }
@@ -34768,6 +34955,7 @@ macro_rules! meerkat_catalog_machine_dsl {
             guard "pending_exists" { self.pending_peer_requests.contains_key(corr_id) }
             update {
                 self.pending_peer_requests.remove(corr_id);
+                self.pending_peer_request_addressees.remove(corr_id);
             }
             to Idle
             emit PeerInteractionStateChanged { corr_id: corr_id, new_state: OutboundPeerRequestState::TimedOut }
@@ -34781,10 +34969,53 @@ macro_rules! meerkat_catalog_machine_dsl {
             guard "pending_exists" { self.pending_peer_requests.contains_key(corr_id) }
             update {
                 self.pending_peer_requests.remove(corr_id);
+                self.pending_peer_request_addressees.remove(corr_id);
             }
             to Idle
             emit PeerInteractionStateChanged { corr_id: corr_id, new_state: OutboundPeerRequestState::Failed }
             emit PeerInteractionCleanup { corr_id: corr_id }
+        }
+
+        // Response sender authority. Ingress asks before it queues a response
+        // frame (progress or terminal): only the addressee recorded when the
+        // request was sent may answer it. Read-only, so a refused frame is
+        // dropped at ingress and the request stays open for its addressee. An
+        // id with no recorded request is judged `UnknownRequest` and keeps
+        // its existing path. Same phases as the response addressee authority.
+        transition ResolvePeerResponseSenderAddressee {
+            per_phase [Idle, Attached, Running, Retired, Stopped, Destroyed]
+            on signal ResolvePeerResponseSender { corr_id, responder }
+            guard "session_registered" { self.session_id != None }
+            guard "responder_is_addressee" {
+                self.pending_peer_request_addressees.contains_key(corr_id)
+                && self.pending_peer_request_addressees.get(corr_id).get("value") == responder
+            }
+            update {}
+            to Idle
+            emit PeerResponseSenderResolved { verdict: PeerResponseSenderVerdict::Addressee }
+        }
+
+        transition ResolvePeerResponseSenderNotAddressee {
+            per_phase [Idle, Attached, Running, Retired, Stopped, Destroyed]
+            on signal ResolvePeerResponseSender { corr_id, responder }
+            guard "session_registered" { self.session_id != None }
+            guard "responder_is_not_addressee" {
+                self.pending_peer_request_addressees.contains_key(corr_id)
+                && self.pending_peer_request_addressees.get(corr_id).get("value") != responder
+            }
+            update {}
+            to Idle
+            emit PeerResponseSenderResolved { verdict: PeerResponseSenderVerdict::NotAddressee }
+        }
+
+        transition ResolvePeerResponseSenderUnknownRequest {
+            per_phase [Idle, Attached, Running, Retired, Stopped, Destroyed]
+            on signal ResolvePeerResponseSender { corr_id, responder }
+            guard "session_registered" { self.session_id != None }
+            guard "request_unknown" { !self.pending_peer_request_addressees.contains_key(corr_id) }
+            update {}
+            to Idle
+            emit PeerResponseSenderResolved { verdict: PeerResponseSenderVerdict::UnknownRequest }
         }
 
         // Destroyed remains open only for the bookkeeping surrounding the
@@ -34792,12 +35023,13 @@ macro_rules! meerkat_catalog_machine_dsl {
         // admission still decides which payloads may execute.
         transition PeerRequestReceived {
             per_phase [Idle, Attached, Running, Retired, Stopped, Destroyed]
-            on input PeerRequestReceived { corr_id, handling_mode }
+            on input PeerRequestReceived { corr_id, handling_mode, requester }
             guard "session_registered" { self.session_id != None }
             guard "not_already_inbound" { !self.inbound_peer_requests.contains_key(corr_id) }
             update {
                 self.inbound_peer_requests.insert(corr_id, InboundPeerRequestState::Received);
                 self.inbound_peer_request_lanes.insert(corr_id, handling_mode);
+                self.inbound_peer_request_requesters.insert(corr_id, requester);
             }
             to Idle
             emit InboundPeerInteractionStateChanged { corr_id: corr_id, new_state: InboundPeerRequestState::Received }
@@ -34811,9 +35043,52 @@ macro_rules! meerkat_catalog_machine_dsl {
             update {
                 self.inbound_peer_requests.remove(corr_id);
                 self.inbound_peer_request_lanes.remove(corr_id);
+                self.inbound_peer_request_requesters.remove(corr_id);
             }
             to Idle
             emit InboundPeerInteractionStateChanged { corr_id: corr_id, new_state: InboundPeerRequestState::Replied }
+        }
+
+        // Response addressee authority. A response (progress or terminal) to
+        // an inbound request goes only to the requester recorded when the
+        // request was received. Read-only: the shell asks before any
+        // transport, so a refused response reaches no one and the request
+        // stays answerable. An id with no recorded request is judged
+        // `UnknownRequest`. Same phases as the inbound map it reads.
+        transition ResolvePeerResponseAddresseeRequester {
+            per_phase [Idle, Attached, Running, Retired, Stopped, Destroyed]
+            on signal ResolvePeerResponseAddressee { corr_id, addressee }
+            guard "session_registered" { self.session_id != None }
+            guard "addressee_is_requester" {
+                self.inbound_peer_request_requesters.contains_key(corr_id)
+                && self.inbound_peer_request_requesters.get(corr_id).get("value") == addressee
+            }
+            update {}
+            to Idle
+            emit PeerResponseAddresseeResolved { verdict: PeerResponseAddresseeVerdict::Requester }
+        }
+
+        transition ResolvePeerResponseAddresseeNotRequester {
+            per_phase [Idle, Attached, Running, Retired, Stopped, Destroyed]
+            on signal ResolvePeerResponseAddressee { corr_id, addressee }
+            guard "session_registered" { self.session_id != None }
+            guard "addressee_is_not_requester" {
+                self.inbound_peer_request_requesters.contains_key(corr_id)
+                && self.inbound_peer_request_requesters.get(corr_id).get("value") != addressee
+            }
+            update {}
+            to Idle
+            emit PeerResponseAddresseeResolved { verdict: PeerResponseAddresseeVerdict::NotRequester }
+        }
+
+        transition ResolvePeerResponseAddresseeUnknownRequest {
+            per_phase [Idle, Attached, Running, Retired, Stopped, Destroyed]
+            on signal ResolvePeerResponseAddressee { corr_id, addressee }
+            guard "session_registered" { self.session_id != None }
+            guard "request_unknown" { !self.inbound_peer_request_requesters.contains_key(corr_id) }
+            update {}
+            to Idle
+            emit PeerResponseAddresseeResolved { verdict: PeerResponseAddresseeVerdict::UnknownRequest }
         }
 
         // Session-context advancement transition (W2-E / issue #264).
@@ -35007,7 +35282,7 @@ macro_rules! meerkat_catalog_machine_dsl {
         }
 
         transition PeerRequestSentAfterUnregister {
-            on input PeerRequestSent { corr_id }
+            on input PeerRequestSent { corr_id, addressee }
             guard { self.lifecycle_phase == Phase::Idle }
             guard "session_unregistered" { self.session_id == None }
             update {}
@@ -35015,7 +35290,7 @@ macro_rules! meerkat_catalog_machine_dsl {
         }
 
         transition PeerResponseProgressArrivedAfterUnregister {
-            on input PeerResponseProgressArrived { corr_id }
+            on input PeerResponseProgressArrived { corr_id, responder }
             guard { self.lifecycle_phase == Phase::Idle }
             guard "session_unregistered" { self.session_id == None }
             update {}
@@ -35023,7 +35298,7 @@ macro_rules! meerkat_catalog_machine_dsl {
         }
 
         transition PeerResponseTerminalArrivedAfterUnregister {
-            on input PeerResponseTerminalArrived { corr_id, disposition }
+            on input PeerResponseTerminalArrived { corr_id, disposition, responder }
             guard { self.lifecycle_phase == Phase::Idle }
             guard "session_unregistered" { self.session_id == None }
             update {}
@@ -35031,7 +35306,7 @@ macro_rules! meerkat_catalog_machine_dsl {
         }
 
         transition PeerResponseRejectedAfterUnregister {
-            on input PeerResponseRejected { corr_id }
+            on input PeerResponseRejected { corr_id, responder }
             guard { self.lifecycle_phase == Phase::Idle }
             guard "session_unregistered" { self.session_id == None }
             update {}
@@ -35055,7 +35330,7 @@ macro_rules! meerkat_catalog_machine_dsl {
         }
 
         transition PeerRequestReceivedAfterUnregister {
-            on input PeerRequestReceived { corr_id, handling_mode }
+            on input PeerRequestReceived { corr_id, handling_mode, requester }
             guard { self.lifecycle_phase == Phase::Idle }
             guard "session_unregistered" { self.session_id == None }
             update {}
@@ -38370,6 +38645,7 @@ macro_rules! meerkat_catalog_machine_dsl {
 
 crate::meerkat_catalog_machine_dsl!("self", "catalog::dsl::meerkat_machine");
 
+pub type MobIncarnationId = meerkat_core::service::MobIncarnationId;
 pub type MobToolCallerProvenance = meerkat_core::service::MobToolCallerProvenance;
 pub type OpaquePrincipalToken = meerkat_core::service::OpaquePrincipalToken;
 

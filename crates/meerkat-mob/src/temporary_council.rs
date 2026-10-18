@@ -695,6 +695,16 @@ pub enum TemporaryCouncilExitReason {
     /// Recovery commits this reason rather than silently re-executing: a
     /// re-run would duplicate model work and result delivery.
     CoordinatorInterrupted,
+    /// One participant's source mob id names a different mob from the one
+    /// the convener was admitted to: that mob was destroyed and another
+    /// created under its id before the participant was seated. Nothing of
+    /// the new mob is forked.
+    ParticipantSourceReplaced {
+        /// Slot that was refused.
+        participant_order: u32,
+        /// The source mob id, which now names the other mob.
+        source_mob_id: MobId,
+    },
 }
 
 impl TemporaryCouncilExitReason {
@@ -716,6 +726,7 @@ impl TemporaryCouncilExitReason {
                 | Self::WiringIncomplete { .. }
                 | Self::ExchangeFailed { .. }
                 | Self::CoordinatorInterrupted
+                | Self::ParticipantSourceReplaced { .. }
         )
     }
 }

@@ -1,7 +1,7 @@
 //! Cross-process contract for the MCP configuration mutation lock.
 
 #![cfg(not(target_arch = "wasm32"))]
-#![allow(clippy::expect_used, clippy::unwrap_used)]
+#![allow(clippy::expect_used, clippy::unwrap_used, clippy::disallowed_methods)]
 
 use std::collections::HashMap;
 use std::path::PathBuf;

@@ -437,13 +437,16 @@ pub use meerkat_providers::connector_login::{
     clear_connector_client_secret, load_connector_client_secret, save_connector_client_secret,
 };
 #[cfg(not(target_arch = "wasm32"))]
+#[allow(deprecated)]
+pub use meerkat_providers::mcp_oauth::open_system_browser;
+#[cfg(not(target_arch = "wasm32"))]
 pub use meerkat_providers::mcp_oauth::{
     MCP_INTERACTIVE_LOGIN_TIMEOUT, MCP_OAUTH_CALLBACK_PATH, McpAuthMode, McpOAuthAccountStrategy,
     McpOAuthAttemptCleanup, McpOAuthAuthority, McpOAuthBrowserLaunch, McpOAuthCallback,
     McpOAuthCancelHandle, McpOAuthCeremonyContext, McpOAuthError, McpOAuthListenerCleanup,
     McpOAuthLoginComplete, McpOAuthLoginDisposition, McpOAuthLoginStart, McpOAuthLoopbackBegin,
     McpOAuthPendingAttempt, McpOAuthPendingClose, McpOAuthPendingLogin, McpServerIdentity,
-    OidcUserInfoAccountStrategy, open_system_browser, open_system_browser_trusting,
+    OidcUserInfoAccountStrategy, open_system_browser_guarded, open_system_browser_trusting,
 };
 
 pub mod help;
@@ -458,6 +461,8 @@ mod approval_issuer;
 pub mod governed_realm;
 #[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
 pub use approval_issuer::{ApprovalIssuerSelection, ApprovalIssuerSelectionError};
+#[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
+mod job_origin;
 mod persistence;
 #[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
 pub mod storage_provider;
@@ -481,9 +486,9 @@ mod meerkat_machine;
 // Factory-backed SessionService wiring (substrate — testing/embedded use).
 // Production surfaces use runtime-backed paths (see meerkat-rpc, meerkat-rest).
 mod service_factory;
-#[cfg(not(target_arch = "wasm32"))]
-pub use service_factory::RealmInheritance;
 pub use service_factory::{FactoryAgent, FactoryAgentBuilder, build_ephemeral_service};
+#[cfg(not(target_arch = "wasm32"))]
+pub use service_factory::{HostConfigLayer, RealmInheritance};
 #[cfg(feature = "session-store")]
 pub use service_factory::{
     build_persistent_service, build_persistent_service_with_runtime_adapter,
@@ -683,6 +688,16 @@ pub use meerkat_mcp::{
     McpConnectAttempt, McpConnection, McpError, McpLifecycleAction, McpLifecyclePhase,
     McpLocalTermination, McpReloadTarget, McpRemoteSession, McpRouter, McpRouterAdapter,
     McpServerLifecycleState, McpStdioLaunchProfile, ReleasedCredential,
+};
+// The host's MCP attempt guards ([`AgentFactory::with_mcp_attempt_guards`]).
+#[cfg(feature = "mcp")]
+pub use meerkat_mcp::{
+    McpAttemptCancelCause, McpAttemptCancellation, McpAttemptDisposition, McpAttemptGuard,
+    McpAttemptGuardBound, McpAttemptGuardBounds, McpAttemptGuardBoundsError,
+    McpAttemptGuardFactory, McpAttemptGuardRequest, McpAttemptGuards, McpAttemptKey,
+    McpAttemptNotInstalled, McpAttemptOpenOutcome, McpAttemptOperation, McpAttemptProcessEnd,
+    McpAttemptRefusal, McpConstructionId, McpConstructionOwner, McpGuardCompletion,
+    McpGuardCompletionRecord, McpGuardFinishError, McpGuardStage,
 };
 #[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
 mod connector_mcp;

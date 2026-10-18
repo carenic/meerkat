@@ -2202,6 +2202,14 @@ pub fn meerkat_machine_schema_metadata() -> MachineSchemaMetadata {
                 "PeerIngressResponseTerminality",
                 &["Progress", "TerminalCompleted", "TerminalFailed"],
             ),
+            NamedTypeBinding::string_enum(
+                "PeerResponseAddresseeVerdict",
+                &["UnknownRequest", "Requester", "NotRequester"],
+            ),
+            NamedTypeBinding::string_enum(
+                "PeerResponseSenderVerdict",
+                &["UnknownRequest", "Addressee", "NotAddressee"],
+            ),
             NamedTypeBinding::string_enum("PeerTerminalDisposition", &["Completed", "Failed"]),
             NamedTypeBinding::string_enum(
                 "PostAdmissionSignalKind",
@@ -2219,6 +2227,10 @@ pub fn meerkat_machine_schema_metadata() -> MachineSchemaMetadata {
             NamedTypeBinding::string_enum(
                 "MobOperatorAccessRequestKind",
                 &["Inherit", "Enable", "Disable"],
+            ),
+            NamedTypeBinding::type_path(
+                "MobIncarnationId",
+                "meerkat_core::service::MobIncarnationId",
             ),
             NamedTypeBinding::type_path(
                 "MobToolCallerProvenance",
@@ -4667,6 +4679,7 @@ pub fn occurrence_lifecycle_schema_metadata() -> MachineSchemaMetadata {
                     "MobRejected",
                     "TransportError",
                     "InternalError",
+                    "ScheduleMandateUnavailable",
                 ],
             ),
             NamedTypeBinding::string_enum("MisfirePolicy", &["Skip", "CatchUpWithin"]),
@@ -4682,6 +4695,7 @@ pub fn occurrence_lifecycle_schema_metadata() -> MachineSchemaMetadata {
                     "LeaseLost",
                     "TransportError",
                     "InternalError",
+                    "ScheduleMandateUnavailable",
                 ],
             ),
             NamedTypeBinding::string_enum(

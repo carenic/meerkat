@@ -6,7 +6,7 @@
 //! protocol files (or vice versa), this test fails with a precise
 //! file + diff preview.
 
-#![allow(clippy::expect_used, clippy::panic)]
+#![allow(clippy::expect_used, clippy::panic, clippy::disallowed_methods)]
 
 use std::path::PathBuf;
 use std::process::Command;

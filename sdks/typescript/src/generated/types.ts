@@ -1,9 +1,9 @@
 // Generated wire types for Meerkat SDK
-// Contract version: 0.9.2
+// Contract version: 0.9.3
 
 import { MeerkatError } from "./errors.js";
 
-export const CONTRACT_VERSION = "0.9.2";
+export const CONTRACT_VERSION = "0.9.3";
 
 export type Value = unknown;
 
@@ -1296,6 +1296,7 @@ export interface RuntimeHostInfo {
 }
 
 export interface Schedule {
+  commissioning_agent?: PrincipalRef | null;
   created_at_utc: string;
   deleted_at_utc?: string | null;
   description?: string | null;
@@ -1697,6 +1698,7 @@ export interface MobCreateParams {
 }
 
 export interface MobCreateResult {
+  claim_token: string;
   mob_id: string;
 }
 
@@ -2275,6 +2277,11 @@ export interface MobRotateSupervisorResult {
   mob_id: string;
   ok: boolean;
   report: SupervisorRotationReportWire;
+}
+
+export interface MobClaimCallbackRouteParams {
+  claim_token: string;
+  mob_id: string;
 }
 
 export interface MobClaimCallbackRouteResult {
@@ -4171,7 +4178,11 @@ export interface WireAnthropicThinkingConfigBetweenTools {
   type: "between_tools";
 }
 
-export type WireAnthropicThinkingConfig = WireAnthropicThinkingConfigAdaptive | WireAnthropicThinkingConfigEnabled | WireAnthropicThinkingConfigBetweenTools;
+export interface WireAnthropicThinkingConfigDisabled {
+  type: "disabled";
+}
+
+export type WireAnthropicThinkingConfig = WireAnthropicThinkingConfigAdaptive | WireAnthropicThinkingConfigEnabled | WireAnthropicThinkingConfigBetweenTools | WireAnthropicThinkingConfigDisabled;
 
 export type WireGeminiThinkingLevel = "minimal" | "low" | "medium" | "high";
 
@@ -4430,7 +4441,7 @@ export type RuntimeAcceptOutcomeType = "accepted" | "deduplicated" | "rejected";
 
 export type WireInputLifecycleState = "accepted" | "queued" | "staged" | "applied" | "applied_pending_consumption" | "consumed" | "superseded" | "coalesced" | "abandoned";
 
-export type WireStopReason = "end_turn" | "tool_use" | "max_tokens" | "stop_sequence" | "content_filter" | "cancelled";
+export type WireStopReason = "end_turn" | "tool_use" | "max_tokens" | "stop_sequence" | "content_filter" | "cancelled" | "refusal" | "pause_turn" | "context_window_exceeded";
 
 export type WireToolResultContent = string | WireContentBlock[];
 
@@ -5849,7 +5860,7 @@ export interface RealtimeTranscriptEventAssistantTranscriptFinalText {
 
 export interface RealtimeTranscriptEventAssistantTurnCompleted {
   response_id: string;
-  stop_reason: "end_turn" | "tool_use" | "max_tokens" | "stop_sequence" | "content_filter" | "cancelled";
+  stop_reason: "end_turn" | "tool_use" | "max_tokens" | "stop_sequence" | "content_filter" | "cancelled" | "refusal" | "pause_turn" | "context_window_exceeded";
   type: "assistant_turn_completed";
   usage: Record<string, unknown>;
 }

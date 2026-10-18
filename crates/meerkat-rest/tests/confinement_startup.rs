@@ -10,7 +10,12 @@
 //! confined processes, not only the warnings.
 
 #![cfg(unix)]
-#![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
+#![allow(
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unwrap_used,
+    clippy::disallowed_methods
+)]
 
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};

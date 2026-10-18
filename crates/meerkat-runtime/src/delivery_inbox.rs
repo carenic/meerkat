@@ -737,6 +737,64 @@ impl Drop for RuntimeDeliveryOwnership {
 #[error("runtime delivery inbox already has a delivery owner")]
 pub struct RuntimeDeliveryOwnerAlreadyArmed;
 
+/// Test holds before an `Applied` recipient settlement, one per runtime and
+/// recipient id: that settlement acknowledges and waits for the release
+/// before it writes anything. Others pass, and holds for other recipients
+/// are kept.
+#[cfg(feature = "test-support")]
+type AppliedSettlementHold = (
+    LogicalRuntimeId,
+    String,
+    crate::tokio::sync::oneshot::Sender<()>,
+    crate::tokio::sync::oneshot::Receiver<()>,
+);
+
+#[cfg(feature = "test-support")]
+static APPLIED_SETTLEMENT_HOLDS: Mutex<Vec<AppliedSettlementHold>> = Mutex::new(Vec::new());
+
+/// Hold the next `Applied` settlement of `recipient_id` in `runtime_id`'s
+/// inbox (#1813): the recipient's sink effect has returned and nothing
+/// records it yet. The first receiver resolves when a settlement reaches
+/// the hold; sending on (or dropping) the returned sender lets it go on. A
+/// process killed while held leaves the effect applied and the recipient
+/// unsettled.
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub fn test_hold_next_applied_settlement(
+    runtime_id: LogicalRuntimeId,
+    recipient_id: impl Into<String>,
+) -> (
+    crate::tokio::sync::oneshot::Receiver<()>,
+    crate::tokio::sync::oneshot::Sender<()>,
+) {
+    let (entered_tx, entered_rx) = crate::tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = crate::tokio::sync::oneshot::channel();
+    APPLIED_SETTLEMENT_HOLDS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push((runtime_id, recipient_id.into(), entered_tx, release_rx));
+    (entered_rx, release_tx)
+}
+
+#[cfg(feature = "test-support")]
+async fn held_applied_settlement(runtime_id: &LogicalRuntimeId, recipient_id: &str) {
+    let hold = {
+        let mut holds = APPLIED_SETTLEMENT_HOLDS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        holds
+            .iter()
+            .position(|(runtime, recipient, _, _)| {
+                runtime == runtime_id && recipient == recipient_id
+            })
+            .map(|index| holds.swap_remove(index))
+    };
+    if let Some((_, _, entered, release)) = hold {
+        let _ = entered.send(());
+        let _ = release.await;
+    }
+}
+
 impl std::fmt::Debug for RuntimeDeliveryInbox {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RuntimeDeliveryInbox")
@@ -1181,6 +1239,10 @@ impl RuntimeDeliveryInbox {
         recipient: &RuntimeDeliveryRecipient,
         outcome: RuntimeDeliveryRecipientOutcome,
     ) -> Result<RuntimeDeliveryRecipientState, RuntimeDeliveryError> {
+        #[cfg(feature = "test-support")]
+        if outcome == RuntimeDeliveryRecipientOutcome::Applied {
+            held_applied_settlement(runtime_id, &recipient.id).await;
+        }
         self.apply_recipient_transition(
             runtime_id,
             record,

@@ -2587,12 +2587,15 @@ pub struct SessionRuntime {
     /// connection) are never written here: a connection's callbacks are never
     /// borrowed by another connection while it is open. The one hand-over is
     /// a mob's callback route slot
-    /// ([`crate::callback_dispatcher::MobCallbackRouteSlot`]): once the
-    /// connection holding it closes, the first connection to claim it
+    /// ([`crate::callback_dispatcher::MobCallbackRouteSlot`]), to a
+    /// connection presenting the mob's claim token (`mob/create` returns it
+    /// to the mob's creator; the mob keeps only its verifier), once the
+    /// connection holding it closed: the first such connection to claim it
     /// (`mob/claim_callback_route`) takes over the mob's member callbacks,
     /// including the pending detached callback jobs the closed connection's
-    /// tools started, when it registers tools of the same name and runner:
-    /// it then reconciles and cancels those jobs.
+    /// tools started, when it registers tools of the same name and runner
+    /// whose declaration each job recorded: it then reconciles and cancels
+    /// those jobs.
     default_callback_route: StdRwLock<Option<crate::callback_dispatcher::CallbackRoute>>,
     /// The callback route each session was created on. Recovery and live
     /// orchestration rebuild a session's callback tools from its own route;
@@ -3241,6 +3244,25 @@ impl SessionRuntime {
         Ok(metadata.keep_alive)
     }
 
+    /// The keep-alive policy of a session that work reaches outside
+    /// `turn/start`, without a request override: a staged session
+    /// (materialized, no first turn yet, #1225) carries it in its staged
+    /// build config, any other session in its persisted metadata. This is
+    /// `start_turn`'s precedence after the override. `live/open` needs no
+    /// such fallback: it promotes a staged session
+    /// (`materialize_staged_session_for_realtime_open`) before it reconciles
+    /// peer ingress.
+    #[cfg(feature = "comms")]
+    async fn staged_or_persisted_keep_alive(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<bool, RpcError> {
+        if let Some(keep_alive) = self.staged_sessions.keep_alive(session_id).await {
+            return Ok(keep_alive);
+        }
+        self.persisted_keep_alive(session_id).await
+    }
+
     async fn live_session_is_stale(
         &self,
         session_id: &SessionId,
@@ -3404,10 +3426,10 @@ impl SessionRuntime {
         persistence: PersistenceBundle,
         notification_sink: crate::router::NotificationSink,
     ) -> Result<Self, meerkat::surface::RuntimeBackedCompositionError> {
-        let job_store = persistence.job_store();
+        let job_store = persistence.producer_job_store();
         let runtime_delivery_inbox = persistence.runtime_delivery_inbox();
         let continuation_bindings = persistence.continuation_bindings();
-        let schedule_service = ScheduleService::new(persistence.schedule_store());
+        let schedule_service = persistence.schedule_service();
         let workgraph_store = persistence.workgraph_store();
         let artifact_store = persistence.artifact_store();
         let factory_clone = factory.clone();
@@ -3576,10 +3598,10 @@ impl SessionRuntime {
         persistence: PersistenceBundle,
         notification_sink: crate::router::NotificationSink,
     ) -> Result<Self, meerkat::surface::RuntimeBackedCompositionError> {
-        let job_store = persistence.job_store();
+        let job_store = persistence.producer_job_store();
         let runtime_delivery_inbox = persistence.runtime_delivery_inbox();
         let continuation_bindings = persistence.continuation_bindings();
-        let schedule_service = ScheduleService::new(persistence.schedule_store());
+        let schedule_service = persistence.schedule_service();
         let workgraph_store = persistence.workgraph_store();
         let artifact_store = persistence.artifact_store();
         let factory_clone = factory.clone();
@@ -3914,6 +3936,27 @@ impl SessionRuntime {
     ///
     /// Writes never compose — `config get/set` stay on the raw `config_runtime`.
     pub fn set_realm_config_source(&self, source: Arc<dyn meerkat_core::RealmConfigSource>) {
+        self.install_realm_config_source(source, None);
+    }
+
+    /// [`Self::set_realm_config_source`], with `layer` applied over the
+    /// composed chain on every read of the effective config: agent builds,
+    /// model resolution ([`Self::effective_config`]) and model hot-swap.
+    /// `config get/set` stay on the raw `config_runtime`, so the layer is never
+    /// written to a realm document.
+    pub fn set_realm_config_source_with_host_layer(
+        &self,
+        source: Arc<dyn meerkat_core::RealmConfigSource>,
+        layer: Arc<dyn meerkat::HostConfigLayer>,
+    ) {
+        self.install_realm_config_source(source, Some(layer));
+    }
+
+    fn install_realm_config_source(
+        &self,
+        source: Arc<dyn meerkat_core::RealmConfigSource>,
+        host_layer: Option<Arc<dyn meerkat::HostConfigLayer>>,
+    ) {
         let head = self
             .realm_id()
             .unwrap_or_else(meerkat_core::connection::RealmId::global);
@@ -3921,11 +3964,14 @@ impl SessionRuntime {
             .realm_config_source
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::clone(&source));
+        let inheritance = meerkat::RealmInheritance::new(source, head);
         *self
             .builder_realm_inheritance
             .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) =
-            Some(meerkat::RealmInheritance::new(source, head));
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(match host_layer {
+            Some(layer) => inheritance.with_host_layer(layer),
+            None => inheritance,
+        });
     }
 
     /// Per-realm config-document source for inheritance composition, if attached.
@@ -13274,6 +13320,26 @@ impl SessionRuntime {
             meerkat::McpAuthMode::Interactive,
             self.default_mcp_auth_resolver(),
         );
+        // A guarded host's live router is guarded as its factory's own
+        // routers are: each stdio attempt begins the host's guard first, for
+        // this session and its mob member. A resumed session's persisted
+        // member stands when the build names none, as the factory adopts it.
+        let router = match self.factory.mcp_attempt_guards() {
+            Some(guards) => {
+                let member = build_config.mob_member_binding.clone().or_else(|| {
+                    build_config
+                        .resume_session
+                        .as_ref()
+                        .and_then(Session::session_metadata)
+                        .and_then(|metadata| metadata.mob_member_binding)
+                });
+                router.with_attempt_guards(
+                    guards.clone(),
+                    meerkat::McpConstructionOwner::new(session_id.clone(), member),
+                )
+            }
+            None => router,
+        };
         let adapter = Arc::new(McpRouterAdapter::new(router));
         let adapter_dispatcher: Arc<dyn AgentToolDispatcher> = adapter.clone();
         let combined = match build_config.external_tools.clone() {
@@ -17842,6 +17908,117 @@ mod tests {
             )
             .expect("compose the RPC session runtime"),
         )
+    }
+
+    /// In-memory realm documents for realm-inheritance tests.
+    struct RealmDocs(BTreeMap<String, Config>);
+
+    #[async_trait]
+    impl meerkat_core::RealmConfigSource for RealmDocs {
+        async fn config_for_realm(
+            &self,
+            realm: &meerkat_core::connection::RealmId,
+        ) -> Result<Option<Config>, meerkat_core::ConfigError> {
+            Ok(self.0.get(realm.as_str()).cloned())
+        }
+    }
+
+    /// A host layer shaped like a deploy's: it sets the default model, and
+    /// fills the token budget and the per-turn output limit only where the
+    /// realm chain left them unset.
+    struct DeployLikeLayer;
+
+    impl meerkat::HostConfigLayer for DeployLikeLayer {
+        fn apply(&self, config: &mut Config) {
+            config.agent.model = "layer-model".to_string();
+            if config.limits.budget.is_none() {
+                config.limits.budget = Some(9);
+            }
+            if config.max_tokens.is_none() {
+                config.max_tokens = Some(4321);
+            }
+        }
+    }
+
+    /// An RPC host given a host layer reads its effective config (the read
+    /// model resolution shares with agent builds and hot-swap) through it,
+    /// while `config get` keeps reading the raw head document, which never
+    /// carries the layer.
+    #[tokio::test]
+    async fn host_layer_reaches_the_effective_config_but_not_the_raw_config() {
+        use meerkat_core::connection::{RealmConfigSection, RealmId};
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut global = Config::default();
+        global.agent.model = "chain-model".to_string();
+        global.limits.budget = Some(1000);
+        global
+            .realm
+            .insert("global".to_string(), RealmConfigSection::default());
+        let mut head = Config::default();
+        head.realm.insert(
+            "deploy".to_string(),
+            RealmConfigSection {
+                parent: Some(RealmId::global()),
+                ..Default::default()
+            },
+        );
+        let config_store: Arc<dyn meerkat_core::ConfigStore> = Arc::new(
+            meerkat_core::MemoryConfigStore::new(head, meerkat_models::canonical()),
+        );
+        let runtime = SessionRuntime::new_with_config_store(
+            temp_factory(&temp),
+            Config::default(),
+            Arc::clone(&config_store),
+            1,
+            meerkat::PersistenceBundle::new(
+                Arc::new(meerkat::MemoryStore::new()),
+                Arc::new(meerkat_runtime::InMemoryRuntimeStore::new()),
+                Arc::new(meerkat_store::MemoryBlobStore::new()),
+            )
+            .expect("construct runtime authority"),
+            crate::router::NotificationSink::noop(),
+        )
+        .expect("compose the RPC session runtime");
+        runtime.set_realm_context(
+            Some(RealmId::parse("deploy").expect("valid realm")),
+            None,
+            None,
+        );
+        runtime.set_config_runtime(Arc::new(meerkat_core::ConfigRuntime::new(
+            Arc::clone(&config_store),
+            temp.path().join("config_state.json"),
+        )));
+        runtime.set_realm_config_source_with_host_layer(
+            Arc::new(RealmDocs(BTreeMap::from([("global".to_string(), global)]))),
+            Arc::new(DeployLikeLayer),
+        );
+
+        let effective = runtime
+            .effective_config()
+            .await
+            .expect("the effective config");
+        assert_eq!(
+            (
+                effective.agent.model.as_str(),
+                effective.limits.budget,
+                effective.max_tokens
+            ),
+            ("layer-model", Some(1000), Some(4321)),
+            "the layer applies over the folded chain and fills only what the chain left unset"
+        );
+        let raw = runtime
+            .config_runtime()
+            .expect("config runtime")
+            .get()
+            .await
+            .expect("the raw head document")
+            .config;
+        assert_eq!(
+            (raw.agent.model.as_str(), raw.limits.budget, raw.max_tokens),
+            (Config::default().agent.model.as_str(), None, None),
+            "config get reads the raw head document, which never carries the layer"
+        );
     }
 
     fn make_runtime_with_session_store(
@@ -23214,12 +23391,16 @@ mod tests {
         operator_comms
             .peer_interaction_handle()
             .expect("operator peer request authority")
-            .request_sent(corr_id)
+            .request_sent(corr_id, sender_public_key.to_peer_id())
             .expect("seed outbound request before terminal peer response");
         sender
             .peer_interaction_handle()
             .expect("sender peer response authority")
-            .request_received(corr_id, meerkat_core::types::HandlingMode::Queue)
+            .request_received(
+                corr_id,
+                meerkat_core::types::HandlingMode::Queue,
+                operator_pubkey.to_peer_id(),
+            )
             .expect("seed inbound request before terminal peer response");
 
         CoreCommsRuntime::send(
@@ -23567,6 +23748,209 @@ mod tests {
              schedule tools bind to this runtime's store, so an in-process \
              firing authority is mandatory even when the embedder never \
              constructs the RPC router"
+        );
+    }
+
+    /// Fire one materialize-on-demand schedule through the runtime's schedule
+    /// host and return its terminal occurrence. The first fire stages its
+    /// session (#1225): until its first turn the session has no durable
+    /// document.
+    async fn fire_scheduled_action_on_a_new_session(
+        runtime: &Arc<SessionRuntime>,
+        action: meerkat::ScheduledSessionAction,
+        keep_alive: bool,
+        comms_name: Option<&str>,
+    ) -> meerkat::Occurrence {
+        let schedule = runtime
+            .schedule_service()
+            .create(meerkat::CreateScheduleRequest {
+                name: Some("scheduled-delivery".to_string()),
+                description: None,
+                trigger: meerkat::TriggerSpec::Once {
+                    due_at_utc: chrono::Utc::now() - chrono::Duration::seconds(1),
+                },
+                target: meerkat::TargetBinding::session(
+                    meerkat::SessionTargetBinding::materialize_on_demand(
+                        meerkat::SessionMaterializationSpec {
+                            model: "claude-sonnet-4-5".to_string(),
+                            system_prompt: None,
+                            max_tokens: None,
+                            provider: None,
+                            output_schema: None,
+                            structured_output_retries: None,
+                            provider_params: None,
+                            comms_name: comms_name.map(str::to_string),
+                            peer_meta: None,
+                            labels: Default::default(),
+                            preload_skills: Vec::new(),
+                            additional_instructions: Vec::new(),
+                            realm_id: None,
+                            instance_id: None,
+                            backend: None,
+                            config_generation: None,
+                            keep_alive,
+                            app_context: None,
+                        },
+                        action,
+                    ),
+                ),
+                misfire_policy: meerkat::MisfirePolicy::Skip,
+                overlap_policy: meerkat::OverlapPolicy::AllowConcurrent,
+                missing_target_policy: meerkat::MissingTargetPolicy::Skip,
+                labels: Default::default(),
+                planning_horizon_days: Some(1),
+                planning_horizon_occurrences: Some(1),
+            })
+            .await
+            .expect("create the schedule");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        loop {
+            let occurrence = runtime
+                .schedule_service()
+                .list_occurrences(&schedule.schedule_id)
+                .await
+                .expect("occurrences")
+                .into_iter()
+                .next()
+                .expect("the planned occurrence");
+            if !matches!(
+                occurrence.phase,
+                meerkat::OccurrencePhase::Pending
+                    | meerkat::OccurrencePhase::Claimed
+                    | meerkat::OccurrencePhase::Dispatching
+                    | meerkat::OccurrencePhase::AwaitingCompletion
+            ) {
+                return occurrence;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the fire never terminalized: {occurrence:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// An RPC runtime over an ordinary sqlite realm, with a test LLM and its
+    /// schedule host started.
+    async fn scheduled_delivery_runtime() -> (tempfile::TempDir, Arc<SessionRuntime>) {
+        let temp = tempfile::tempdir().unwrap();
+        let (_, persistence) = meerkat::open_realm_persistence_in(
+            temp.path(),
+            "scheduled-delivery",
+            Some(meerkat_store::RealmBackend::Sqlite),
+            None,
+        )
+        .await
+        .unwrap();
+        let runtime = Arc::new(
+            SessionRuntime::new(
+                temp_factory(&temp),
+                Config::default(),
+                4,
+                persistence,
+                crate::router::NotificationSink::noop(),
+            )
+            .expect("compose the RPC session runtime"),
+        );
+        runtime.set_default_llm_client(Some(Arc::new(MockLlmClient)));
+        runtime.ensure_schedule_host_started().await.unwrap();
+        (temp, runtime)
+    }
+
+    fn scheduled_prompt() -> meerkat::ScheduledSessionAction {
+        meerkat::ScheduledSessionAction::Prompt {
+            prompt: meerkat_core::ContentInput::Text("scheduled check".to_string()),
+            system_prompt: None,
+            render_metadata: None,
+            skill_refs: Vec::new(),
+            additional_instructions: Vec::new(),
+        }
+    }
+
+    /// A scheduled prompt and a scheduled event each reach Completed on the
+    /// session their fire materialized, in an ordinary sqlite realm.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_scheduled_fire_runs_on_its_freshly_materialized_session() {
+        let (_temp, runtime) = scheduled_delivery_runtime().await;
+
+        for action in [
+            scheduled_prompt(),
+            meerkat::ScheduledSessionAction::Event {
+                event_type: "scheduled.check".to_string(),
+                payload: serde_json::json!({ "check": true }),
+                render_metadata: None,
+            },
+        ] {
+            let kind = match &action {
+                meerkat::ScheduledSessionAction::Prompt { .. } => "prompt",
+                meerkat::ScheduledSessionAction::Event { .. } => "event",
+            };
+            let occurrence =
+                fire_scheduled_action_on_a_new_session(&runtime, action, false, None).await;
+            let session_id = occurrence.materialized_session_id();
+            if occurrence.phase != meerkat::OccurrencePhase::Completed {
+                eprintln!(
+                    "scheduled {kind} on {session_id}: staged={} persisted={}",
+                    runtime.staged_sessions.contains(&session_id).await,
+                    runtime
+                        .load_persisted_session(&session_id)
+                        .await
+                        .expect("load persisted session")
+                        .is_some(),
+                );
+            }
+            assert_eq!(
+                occurrence.phase,
+                meerkat::OccurrencePhase::Completed,
+                "the scheduled {kind} must complete on its new session: {occurrence:?}"
+            );
+        }
+    }
+
+    /// The fire's turn honours the materialized session's own keep-alive
+    /// policy, read from its staged build config before the first turn: a
+    /// keep-alive session with a comms name keeps session-owned peer ingress
+    /// after the scheduled turn, and its persisted metadata records the
+    /// policy.
+    #[cfg(feature = "comms")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_scheduled_fire_honours_its_sessions_keep_alive() {
+        let (_temp, runtime) = scheduled_delivery_runtime().await;
+        let occurrence = fire_scheduled_action_on_a_new_session(
+            &runtime,
+            scheduled_prompt(),
+            true,
+            Some("scheduled-keep-alive"),
+        )
+        .await;
+        assert_eq!(
+            occurrence.phase,
+            meerkat::OccurrencePhase::Completed,
+            "the scheduled prompt must complete on its keep-alive session: {occurrence:?}"
+        );
+        let session_id = occurrence.materialized_session_id();
+        let persisted = runtime
+            .load_persisted_session(&session_id)
+            .await
+            .expect("load persisted session")
+            .expect("the first turn persisted the session");
+        assert!(
+            persisted
+                .session_metadata()
+                .expect("session metadata")
+                .keep_alive,
+            "the materialized session keeps its keep-alive policy"
+        );
+        let owner = runtime
+            .runtime_adapter
+            .peer_ingress_owner(&session_id)
+            .await;
+        assert!(
+            matches!(
+                owner,
+                meerkat_runtime::PeerIngressOwner::SessionOwned { .. }
+            ),
+            "a keep-alive session keeps session-owned peer ingress: {owner:?}"
         );
     }
 
@@ -33255,6 +33639,87 @@ mod tests {
             "a refused live add never starts the server process"
         );
         adapter.shutdown().await;
+    }
+
+    /// A live `mcp/add` on a guarded host begins the factory's attempt guard
+    /// before anything of the attempt runs, for this session: a refusing
+    /// host refuses the add, and its process never starts.
+    #[cfg(all(feature = "mcp", unix))]
+    #[tokio::test]
+    async fn live_mcp_add_begins_the_factory_attempt_guard() {
+        #[derive(Default)]
+        struct Refusing(std::sync::Mutex<Vec<meerkat::McpAttemptGuardRequest>>);
+        #[async_trait::async_trait]
+        impl meerkat::McpAttemptGuardFactory for Refusing {
+            async fn begin(
+                &self,
+                request: meerkat::McpAttemptGuardRequest,
+                _cancel: meerkat::McpAttemptCancellation,
+            ) -> Result<
+                Option<Box<dyn meerkat::McpAttemptGuard>>,
+                meerkat_core::mcp_attachment::McpAttachmentRefusal,
+            > {
+                self.0.lock().unwrap().push(request);
+                Err(meerkat_core::mcp_attachment::McpAttachmentRefusal::Denied)
+            }
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let marker = temp.path().join("guarded-live-add-marker");
+        let refusing = Arc::new(Refusing::default());
+        let guards = meerkat::McpAttemptGuards::new(
+            Arc::clone(&refusing) as Arc<dyn meerkat::McpAttemptGuardFactory>,
+            meerkat::McpAttemptGuardBounds::DEFAULT,
+        );
+        let factory = temp_factory(&temp).with_mcp_attempt_guards(guards.clone());
+        let runtime = make_runtime(factory, 10);
+        let session_id = runtime
+            .create_session(mock_build_config(), None, None, Vec::new())
+            .await
+            .unwrap();
+        let adapter = runtime
+            .mcp_sessions
+            .read()
+            .await
+            .get(&session_id)
+            .map(|state| Arc::clone(&state.adapter))
+            .expect("the session's live MCP adapter");
+
+        adapter
+            .stage_add(McpServerConfig::stdio(
+                "guarded-live-add",
+                "/bin/sh",
+                vec!["-c".into(), "printf entered > \"$MARKER\"".into()],
+                HashMap::from([("MARKER".into(), marker.display().to_string())]),
+            ))
+            .await
+            .unwrap();
+        adapter.apply_staged().await.unwrap();
+        let deltas = adapter
+            .wait_until_ready(Duration::from_secs(15))
+            .await
+            .unwrap();
+
+        assert!(
+            deltas.iter().any(|delta| {
+                delta.target == "guarded-live-add"
+                    && delta.phase == meerkat_core::ExternalToolDeltaPhase::Failed
+            }),
+            "the host's guard refuses the live add: {deltas:?}"
+        );
+        assert!(
+            !marker.exists(),
+            "a refused live add never starts the server process"
+        );
+        let requests = refusing.0.lock().unwrap().clone();
+        assert_eq!(requests.len(), 1, "the guard began once: {requests:?}");
+        assert_eq!(requests[0].key.server, "guarded-live-add");
+        assert_eq!(requests[0].key.construction, adapter.construction_id());
+        assert_eq!(requests[0].owner.session_id, session_id);
+        adapter.shutdown().await;
+        let _ = guards
+            .close_and_join(tokio::time::Instant::now() + Duration::from_secs(10))
+            .await;
     }
 
     #[cfg(feature = "mcp")]

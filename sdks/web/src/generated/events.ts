@@ -110,6 +110,8 @@ export type AnthropicThinkingConfig = {
   type: "enabled";
 } | {
   type: "between_tools";
+} | {
+  type: "disabled";
 };
 
 export interface AssistantImageEvent {
@@ -731,7 +733,7 @@ export type SkillResolutionFailureReason = {
 
 export type SourceUuid = string;
 
-export type StopReason = "end_turn" | "tool_use" | "max_tokens" | "stop_sequence" | "content_filter" | "cancelled";
+export type StopReason = "end_turn" | "tool_use" | "max_tokens" | "stop_sequence" | "content_filter" | "cancelled" | "refusal" | "pause_turn" | "context_window_exceeded";
 
 export type StreamScopeFrame = {
   scope: "primary";

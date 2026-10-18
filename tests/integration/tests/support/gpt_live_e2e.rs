@@ -7,7 +7,7 @@
 //!
 //! This file is `#[path]`-included by both test targets, so every item is
 //! public and unused items in one target are expected.
-#![allow(dead_code)]
+#![allow(dead_code, clippy::disallowed_methods)]
 
 #[path = "gpt_live_evidence.rs"]
 pub mod evidence;

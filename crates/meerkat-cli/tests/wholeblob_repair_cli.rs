@@ -3,7 +3,12 @@
 //! An operator diagnose must leave the realm directory as it found it: no
 //! realm manifest, no session/jobs/workgraph stores, and a typed refusal when
 //! the database is missing or the realm id is not a directory name.
-#![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
+#![allow(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    clippy::panic,
+    clippy::disallowed_methods
+)]
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};

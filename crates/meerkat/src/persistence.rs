@@ -471,12 +471,72 @@ impl PersistenceBundle {
         self.schedule_store.clone()
     }
 
+    /// A schedule service over this realm's schedule store. A stock-governed
+    /// realm's service records the realm's opened agent as the agent whose
+    /// mandate commissions each schedule it creates or redefines
+    /// ([`meerkat_schedule::ScheduleService::new_commissioned`]); every other
+    /// realm's records none.
+    pub fn schedule_service(&self) -> meerkat_schedule::ScheduleService {
+        #[cfg(all(
+            feature = "session-store",
+            feature = "local-authorization",
+            not(target_arch = "wasm32")
+        ))]
+        if let Some(stock) = self.stock_governance() {
+            return meerkat_schedule::ScheduleService::new_commissioned(
+                self.schedule_store(),
+                stock.principals().executor.clone(),
+            );
+        }
+        meerkat_schedule::ScheduleService::new(self.schedule_store())
+    }
+
+    /// The binding a schedule host of this realm composes
+    /// ([`crate::surface::SharedScheduleTargetAdapter::with_session_agent_binding`])
+    /// and its session host calls on each session it materializes or revives
+    /// for a fire: a stock-governed realm's opened agent, the agent its
+    /// [`Self::schedule_service`] commissions schedules for. `None` for every
+    /// other realm.
+    pub fn scheduled_session_agent_binding(
+        &self,
+    ) -> Option<Arc<dyn crate::surface::ScheduledSessionAgentBinding>> {
+        #[cfg(all(
+            feature = "session-store",
+            feature = "local-authorization",
+            not(target_arch = "wasm32")
+        ))]
+        if let Some(stock) = self.stock_governance() {
+            return Some(Arc::clone(stock) as Arc<dyn crate::surface::ScheduledSessionAgentBinding>);
+        }
+        None
+    }
+
     pub fn workgraph_store(&self) -> Arc<dyn WorkGraphStore> {
         self.workgraph_store.clone()
     }
 
     pub fn job_store(&self) -> Arc<dyn meerkat_jobs::DetachedJobStore> {
         self.job_store.clone()
+    }
+
+    /// The bundle's detached job store as the producers that submit jobs
+    /// use it (#1790): a job a mob member's current session submits records
+    /// the member's delivery address
+    /// ([`crate::ContinuationAddressResolver::member_address_of_session`]),
+    /// so its deliveries follow the member across a repoint. Every other
+    /// operation is [`Self::job_store`]'s.
+    pub fn producer_job_store(&self) -> Arc<dyn meerkat_jobs::DetachedJobStore> {
+        #[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
+        {
+            Arc::new(crate::job_origin::MemberOriginJobStore::new(
+                self.job_store.clone(),
+                Arc::clone(&self.continuation_bindings),
+            ))
+        }
+        #[cfg(not(all(feature = "session-store", not(target_arch = "wasm32"))))]
+        {
+            self.job_store.clone()
+        }
     }
 
     #[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]

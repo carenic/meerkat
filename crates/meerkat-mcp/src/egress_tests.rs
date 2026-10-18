@@ -5,7 +5,12 @@
 //! an unbound credential owner, the ambient proxy), and the per-call outcome
 //! of a refused credential operation. Every refusal is local and typed, and
 //! the alternate destination records zero arrivals.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::disallowed_methods
+)]
 
 use std::collections::HashMap;
 use std::net::IpAddr;

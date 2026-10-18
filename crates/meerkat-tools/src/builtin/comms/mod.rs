@@ -21,11 +21,5 @@
 //! ```
 
 mod surface;
-mod tool_set;
-mod tools;
 
 pub use surface::CommsToolSurface;
-#[allow(deprecated)]
-pub use tool_set::CommsToolSet;
-#[allow(deprecated)]
-pub use tools::{PeersTool, SendTool};

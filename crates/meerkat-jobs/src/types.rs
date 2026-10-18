@@ -8,7 +8,8 @@ use crate::DetachedJobError;
 use crate::machines::detached_job as dsl;
 
 macro_rules! string_id {
-    ($name:ident, $label:literal) => {
+    ($(#[$meta:meta])* $name:ident, $label:literal) => {
+        $(#[$meta])*
         #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
         #[serde(transparent)]
         pub struct $name(String);
@@ -49,7 +50,16 @@ string_id!(RunnerHandleRef, "runner handle reference");
 string_id!(RunnerSpecificationRef, "runner specification reference");
 string_id!(JobResultRef, "job result reference");
 string_id!(JobFailureCode, "job failure code");
-string_id!(OriginMemberId, "origin member id");
+string_id!(
+    /// The mob member a detached job was started for
+    /// ([`JobSpec::origin_member_id`]). A host that runs mobs records the
+    /// member delivery address `rt:member:{mob}:{identity}:{generation}` of
+    /// the member whose current session submitted the job, and the job's
+    /// runtime deliveries then follow that member incarnation across a
+    /// repoint to a successor session. Any other value is an opaque id.
+    OriginMemberId,
+    "origin member id"
+);
 string_id!(NotificationId, "notification id");
 string_id!(NotificationIdempotencyKey, "notification idempotency key");
 string_id!(
@@ -328,6 +338,14 @@ pub enum JobTerminalApplication {
 pub struct JobSpec {
     pub realm_id: String,
     pub origin_session_id: SessionId,
+    /// The mob member the job was started for. A host that runs mobs
+    /// records here the member delivery address
+    /// (`rt:member:{mob}:{identity}:{generation}`) of the member whose
+    /// current session submitted the job: the job's runtime deliveries are
+    /// then addressed to that member incarnation, which survives a repoint
+    /// to a successor session, instead of to the origin session. Any other
+    /// value is an opaque id and leaves deliveries on the origin session's
+    /// runtime. Part of the submission's replay identity.
     pub origin_member_id: Option<OriginMemberId>,
     pub execution_intent_id: ExecutionIntentId,
     pub interaction_lineage_id: InteractionLineageId,
@@ -379,6 +397,8 @@ impl JobSpec {
         self
     }
 
+    /// Record the mob member the job was started for
+    /// ([`Self::origin_member_id`]).
     pub fn with_origin_member_id(mut self, origin_member_id: OriginMemberId) -> Self {
         self.origin_member_id = Some(origin_member_id);
         self

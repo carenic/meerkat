@@ -144,6 +144,71 @@ impl InboundPeerRequestState {
     }
 }
 
+/// Machine-owned verdict on the addressee of a response to an inbound peer
+/// request (local is receiver).
+///
+/// A response, progress or terminal, goes only to the request's requester:
+/// the verified sender recorded when the request was received
+/// ([`crate::handles::PeerInteractionHandle::request_received`]). The
+/// generated authority judges the addressee
+/// ([`crate::handles::PeerInteractionHandle::resolve_response_addressee`])
+/// before any transport, so a refused response reaches no one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum PeerResponseAddresseeVerdict {
+    /// No inbound request with this id is recorded: never received, already
+    /// answered, or received before this session's authority was created.
+    UnknownRequest,
+    /// The addressee is the request's recorded requester.
+    Requester,
+    /// The addressee did not send the request.
+    NotRequester,
+}
+
+/// Machine-owned verdict on the sender of a response to an outbound peer
+/// request (local is requester).
+///
+/// A response frame, progress or terminal, is accepted only from the peer the
+/// request was sent to: the addressee recorded when the request was sent
+/// ([`crate::handles::PeerInteractionHandle::request_sent`]). Ingress asks
+/// the generated authority
+/// ([`crate::handles::PeerCommsHandle::resolve_peer_response_sender`]) with
+/// the canonical peer id of the frame's verified signer before the frame is
+/// queued, so a frame from any other peer is dropped and the request stays
+/// open for its addressee.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum PeerResponseSenderVerdict {
+    /// No outbound request with this id is pending: never sent, already
+    /// answered, timed out, or sent before this session's authority was
+    /// created.
+    UnknownRequest,
+    /// The signer is the peer the request was sent to.
+    Addressee,
+    /// The signer is not the peer the request was sent to.
+    NotAddressee,
+}
+
+/// Who holds an inbound peer interaction's id, as seen by another candidate
+/// that arrives under the same id
+/// ([`crate::handles::PeerInteractionHandle::inbound_id_claim`]).
+///
+/// An inbound request's id is that interaction's identity on both sides while
+/// the request is outstanding, so only its recorded requester may send under
+/// the id again (a redelivery). The first request to use an id keeps it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum InboundIdClaim {
+    /// No inbound request is outstanding under the id.
+    Unclaimed,
+    /// The candidate's sender is the outstanding request's recorded requester.
+    ClaimedBySender,
+    /// Another peer's outstanding request holds the id, or the candidate has
+    /// no admitted sender, or the machine could not judge it: the candidate
+    /// must not be admitted.
+    ClaimedByAnother,
+}
+
 /// Typed lifecycle state of an interaction stream reservation (U6 / dogma #5).
 ///
 /// Authoritative truth for whether a reserved stream channel is still

@@ -119,12 +119,15 @@ impl RetainedJobSource for ConsentNoticeJobSource {
 }
 
 /// Answers the consent namespace from the approval owner and every other
-/// job from the host's bound job source.
+/// job from the host's bound job source. Built only by the session-store
+/// runtime delivery host, so it is compiled with it.
+#[cfg(feature = "session-store")]
 pub(crate) struct ConsentAwareJobSource {
     pub(crate) consent: ConsentNoticeJobSource,
     pub(crate) others: Option<Arc<dyn RetainedJobSource>>,
 }
 
+#[cfg(feature = "session-store")]
 #[async_trait::async_trait]
 impl RetainedJobSource for ConsentAwareJobSource {
     async fn retained_job(

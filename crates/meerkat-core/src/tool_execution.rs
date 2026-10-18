@@ -470,6 +470,303 @@ impl EphemeralToolBindingFingerprint {
     }
 }
 
+/// Durable identity of what one tool catalog entry declares: a SHA-256 digest
+/// over a canonical encoding of its tool's name, description, input schema,
+/// provenance and audience, its plane, its deferred eligibility and its
+/// execution contract (supported and default modes, the streaming policy, the
+/// detached policy with its runner, restart class, idempotency scope,
+/// submission deadline and credential scopes, and the core deadline).
+/// Nothing of the live authorities serving the entry is in it, and neither is
+/// its current callability, which is a moment's availability rather than
+/// part of the declaration.
+///
+/// Unlike [`EphemeralToolBindingFingerprint`], it is meant to be kept: a
+/// durable record (such as a detached job's runner specification) keeps it to
+/// tell, after a restart or once another authority serves the tool, whether
+/// the tool it would now reach declares what it was recorded against. Equal
+/// digests mean equal declarations, never the same live authority. Its text
+/// form is `sha256:` and 64 lowercase hex digits.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ToolBindingDigest([u8; 32]);
+
+/// Domain separation for [`ToolBindingDigest`]: the encoding's name and
+/// version, hashed before any field.
+const TOOL_BINDING_DIGEST_DOMAIN: &[u8] = b"meerkat.tool-binding-digest.v1\0";
+
+/// A text that is not a [`ToolBindingDigest`].
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("not a tool binding digest: expected `sha256:` and 64 lowercase hex digits")]
+pub struct ToolBindingDigestParseError;
+
+impl ToolBindingDigest {
+    /// The digest of what `entry` declares.
+    #[must_use]
+    pub fn of_catalog_entry(entry: &crate::ToolCatalogEntry) -> Self {
+        let mut encoder = BindingDigestEncoder::new();
+        encoder.text("tool.name", entry.tool.name.as_str());
+        encoder.text("tool.description", &entry.tool.description);
+        encoder.text(
+            "tool.input_schema",
+            &canonical_json_text(&entry.tool.input_schema),
+        );
+        encoder.provenance("tool.provenance", entry.tool.provenance.as_ref());
+        encoder.text(
+            "tool.audience",
+            match entry.tool.audience {
+                crate::ToolAudience::Model => "model",
+                crate::ToolAudience::App => "app",
+                crate::ToolAudience::ModelAndApp => "model_and_app",
+                crate::ToolAudience::Hidden => "hidden",
+            },
+        );
+        encoder.text(
+            "plane",
+            match entry.plane {
+                crate::ToolPlaneClass::Session => "session",
+                crate::ToolPlaneClass::Control => "control",
+            },
+        );
+        match &entry.deferred_eligibility {
+            crate::ToolCatalogDeferredEligibility::InlineOnly => {
+                encoder.text("deferred_eligibility", "inline_only");
+            }
+            crate::ToolCatalogDeferredEligibility::DeferredEligible { provenance } => {
+                encoder.text("deferred_eligibility", "deferred_eligible");
+                encoder.provenance("deferred_eligibility.provenance", Some(provenance));
+            }
+        }
+        encoder.execution(&entry.execution);
+        Self(encoder.finish())
+    }
+
+    /// The digest's bytes.
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for ToolBindingDigest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("sha256:")?;
+        for byte in self.0 {
+            write!(formatter, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::fmt::Debug for ToolBindingDigest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "ToolBindingDigest({self})")
+    }
+}
+
+impl std::str::FromStr for ToolBindingDigest {
+    type Err = ToolBindingDigestParseError;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        let hex = text
+            .strip_prefix("sha256:")
+            .filter(|hex| hex.len() == 64)
+            .ok_or(ToolBindingDigestParseError)?;
+        let mut bytes = [0_u8; 32];
+        for (byte, pair) in bytes.iter_mut().zip(hex.as_bytes().chunks_exact(2)) {
+            let digit = |value: u8| match value {
+                b'0'..=b'9' => Ok(value - b'0'),
+                b'a'..=b'f' => Ok(value - b'a' + 10),
+                _ => Err(ToolBindingDigestParseError),
+            };
+            *byte = (digit(pair[0])? << 4) | digit(pair[1])?;
+        }
+        Ok(Self(bytes))
+    }
+}
+
+impl serde::Serialize for ToolBindingDigest {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for ToolBindingDigest {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        text.parse().map_err(serde::de::Error::custom)
+    }
+}
+
+/// The canonical encoding [`ToolBindingDigest`] hashes: the domain, then each
+/// field as its label and its value, both length-prefixed (big-endian
+/// `u64`), in a fixed order. A list is its length (as a field) and then its
+/// items; an absent optional value is the field's own `none` marker.
+struct BindingDigestEncoder(Sha256);
+
+impl BindingDigestEncoder {
+    fn new() -> Self {
+        let mut hasher = Sha256::new();
+        hasher.update(TOOL_BINDING_DIGEST_DOMAIN);
+        Self(hasher)
+    }
+
+    fn bytes(&mut self, label: &str, value: &[u8]) {
+        for part in [label.as_bytes(), value] {
+            self.0
+                .update(u64::try_from(part.len()).unwrap_or(u64::MAX).to_be_bytes());
+            self.0.update(part);
+        }
+    }
+
+    fn text(&mut self, label: &str, value: &str) {
+        self.bytes(label, value.as_bytes());
+    }
+
+    fn count(&mut self, label: &str, count: usize) {
+        self.bytes(
+            label,
+            &u64::try_from(count).unwrap_or(u64::MAX).to_be_bytes(),
+        );
+    }
+
+    fn duration(&mut self, label: &str, duration: Duration) {
+        self.bytes(label, &duration.as_nanos().to_be_bytes());
+    }
+
+    fn provenance(&mut self, label: &str, provenance: Option<&crate::ToolProvenance>) {
+        let Some(provenance) = provenance else {
+            self.text(label, "none");
+            return;
+        };
+        self.text(
+            label,
+            match provenance.kind {
+                crate::ToolSourceKind::Builtin => "builtin",
+                crate::ToolSourceKind::Shell => "shell",
+                crate::ToolSourceKind::Comms => "comms",
+                crate::ToolSourceKind::Memory => "memory",
+                crate::ToolSourceKind::Schedule => "schedule",
+                crate::ToolSourceKind::WorkGraph => "work_graph",
+                crate::ToolSourceKind::Mob => "mob",
+                crate::ToolSourceKind::Callback => "callback",
+                crate::ToolSourceKind::Mcp => "mcp",
+                crate::ToolSourceKind::RustBundle => "rust_bundle",
+            },
+        );
+        self.text("source_id", provenance.source_id.as_str());
+        match &provenance.artifact {
+            None => self.text("artifact", "none"),
+            Some(artifact) => {
+                self.text("artifact", "some");
+                self.text("artifact.id", artifact.artifact_id());
+                self.text("artifact.digest", artifact.digest());
+            }
+        }
+    }
+
+    fn mode(&mut self, label: &str, mode: ToolExecutionMode) {
+        self.text(
+            label,
+            match mode {
+                ToolExecutionMode::Fast => "fast",
+                ToolExecutionMode::Streaming => "streaming",
+                ToolExecutionMode::Detached => "detached",
+            },
+        );
+    }
+
+    fn restart_class(&mut self, label: &str, restart_class: RestartClass) {
+        self.text(
+            label,
+            match restart_class {
+                RestartClass::Adoptable => "adoptable",
+                RestartClass::CheckpointResumable => "checkpoint_resumable",
+                RestartClass::Replayable => "replayable",
+                RestartClass::NonResumable => "non_resumable",
+            },
+        );
+    }
+
+    fn execution(&mut self, execution: &ToolExecutionContract) {
+        self.count("execution.supported_modes", execution.supported_modes.len());
+        for mode in &execution.supported_modes {
+            self.mode("execution.supported_mode", *mode);
+        }
+        self.mode("execution.default_mode", execution.default_mode);
+        match &execution.streaming_policy {
+            None => self.text("execution.streaming_policy", "none"),
+            Some(policy) => {
+                self.text("execution.streaming_policy", "some");
+                self.duration("streaming.inactivity_timeout", policy.inactivity_timeout);
+                self.duration("streaming.absolute_timeout", policy.absolute_timeout);
+            }
+        }
+        match &execution.detached_policy {
+            None => self.text("execution.detached_policy", "none"),
+            Some(policy) => {
+                self.text("execution.detached_policy", "some");
+                self.text("detached.runner.name", policy.runner.name());
+                self.text("detached.runner.version", policy.runner.version());
+                self.restart_class("detached.restart_class", policy.restart_class);
+                self.text(
+                    "detached.idempotency_scope",
+                    match policy.idempotency_scope {
+                        IdempotencyScope::ToolCall => "tool_call",
+                        IdempotencyScope::InteractionAndArguments => "interaction_and_arguments",
+                        IdempotencyScope::HostSemanticKey => "host_semantic_key",
+                    },
+                );
+                self.duration("detached.submission_timeout", policy.submission_timeout);
+                self.count("detached.credential_scopes", policy.credential_scopes.len());
+                for scope in &policy.credential_scopes {
+                    self.text("detached.credential_scope", scope);
+                }
+            }
+        }
+        self.count(
+            "execution.detached_restart_classes",
+            execution.detached_restart_classes.len(),
+        );
+        for restart_class in &execution.detached_restart_classes {
+            self.restart_class("execution.detached_restart_class", *restart_class);
+        }
+        self.text(
+            "execution.core_deadline",
+            match execution.core_deadline {
+                CoreDispatchDeadline::Applies => "applies",
+                CoreDispatchDeadline::ToolOwned => "tool_owned",
+            },
+        );
+    }
+
+    fn finish(self) -> [u8; 32] {
+        self.0.finalize().into()
+    }
+}
+
+/// `value` as JSON text with every object's keys in sorted order, so the
+/// same value always has the same text however its objects were built.
+fn canonical_json_text(value: &serde_json::Value) -> String {
+    fn sorted(value: &serde_json::Value) -> serde_json::Value {
+        match value {
+            serde_json::Value::Object(object) => {
+                let mut entries: Vec<_> = object.iter().collect();
+                entries.sort_unstable_by(|left, right| left.0.cmp(right.0));
+                serde_json::Value::Object(
+                    entries
+                        .into_iter()
+                        .map(|(key, value)| (key.clone(), sorted(value)))
+                        .collect(),
+                )
+            }
+            serde_json::Value::Array(items) => {
+                serde_json::Value::Array(items.iter().map(sorted).collect())
+            }
+            scalar => scalar.clone(),
+        }
+    }
+    sorted(value).to_string()
+}
+
 /// Opaque, non-provider-facing witness for the dispatcher owner selected
 /// during plan resolution.
 ///
@@ -559,8 +856,8 @@ pub enum ToolOperationTarget {
     /// [`Self::PeerDirectoryRead`] for `peers`): other tools that reach
     /// agents, such as `delegate`, `council`, `mob_spawn_member` and a mob
     /// member's calls up to its mob's operator, carry no peer target. `kind`
-    /// is the delivery the tool makes; a response's addressee is not
-    /// verified against its request (see [`PeerSendKind::Response`]).
+    /// is the delivery the tool makes; a response goes only to the requester
+    /// of the request it answers (see [`PeerSendKind::Response`]).
     PeerSend {
         peer: crate::comms::PeerId,
         kind: PeerSendKind,
@@ -643,12 +940,12 @@ pub enum PeerSendKind {
     Message,
     /// A typed request that expects a correlated response (`send_request`).
     Request,
-    /// A typed response to a request (`send_response`). Its addressee is
-    /// the caller's assertion, not verified against the request: the
-    /// runtime checks that the request id names a request this session
-    /// received and can still answer, but records no requester for it, so
-    /// nothing checks that the addressed peer sent that request. The
-    /// delivery still reaches only the addressed peer.
+    /// A typed response to a request (`send_response`). Its addressee must
+    /// be the request's requester: the runtime records the sender ingress
+    /// admitted for each request this session receives and refuses, before
+    /// any transport, a response (progress or terminal) addressed to any
+    /// other peer, as it refuses one to a request it cannot answer. The
+    /// delivery reaches only the addressed peer.
     Response,
 }
 
@@ -2427,5 +2724,228 @@ mod tests {
                 attempted: Box::new(attempted),
             })
         );
+    }
+
+    fn callback_provenance() -> crate::ToolProvenance {
+        crate::ToolProvenance::new(crate::ToolSourceKind::Callback, "conn-1")
+    }
+
+    fn detached_contract(
+        version: &str,
+        restart_class: RestartClass,
+        submission_timeout: Duration,
+        scopes: &[&str],
+    ) -> ToolExecutionContract {
+        let policy = DetachedToolExecutionPolicy::new(
+            RunnerIdentity::new("host-runner", version).expect("valid runner"),
+            restart_class,
+            IdempotencyScope::ToolCall,
+            submission_timeout,
+        )
+        .expect("valid detached policy")
+        .with_credential_scopes(scopes.iter().copied());
+        ToolExecutionContract::new(
+            BTreeSet::from([ToolExecutionMode::Detached]),
+            ToolExecutionMode::Detached,
+            None,
+            Some(policy),
+        )
+        .expect("valid detached contract")
+    }
+
+    /// The detached callback tool the digest tests vary one facet of.
+    fn deploy_entry(
+        tool: crate::ToolDef,
+        execution: ToolExecutionContract,
+    ) -> crate::ToolCatalogEntry {
+        crate::ToolCatalogEntry::session_deferred(Arc::new(tool), true, callback_provenance())
+            .with_execution_contract(execution)
+    }
+
+    fn deploy_tool() -> crate::ToolDef {
+        crate::ToolDef::new(
+            "deploy",
+            "Deploy a build",
+            serde_json::json!({"type": "object"}),
+        )
+        .with_provenance(callback_provenance())
+    }
+
+    fn deploy_contract() -> ToolExecutionContract {
+        detached_contract(
+            "1",
+            RestartClass::Replayable,
+            Duration::from_secs(30),
+            &["repo:read"],
+        )
+    }
+
+    /// The encoding is durable: these digests were computed independently
+    /// from the documented encoding, so a change to it (which would turn
+    /// every recorded digest into a mismatch) fails here first.
+    #[test]
+    fn tool_binding_digest_pins_its_encoding() {
+        let inline = crate::ToolCatalogEntry::session_inline(
+            Arc::new(crate::ToolDef::new(
+                "lookup",
+                "Look a record up",
+                serde_json::json!({"type": "object", "properties": {"id": {"type": "string"}}}),
+            )),
+            true,
+        );
+        assert_eq!(
+            ToolBindingDigest::of_catalog_entry(&inline).to_string(),
+            "sha256:d558471f05d8b17d8364510e48e72f145a50e26917dad850470b136f4e042e03"
+        );
+        assert_eq!(
+            ToolBindingDigest::of_catalog_entry(&deploy_entry(deploy_tool(), deploy_contract()))
+                .to_string(),
+            "sha256:61b859a56f10ace3c438bddd666deecec4d3288f5ed7fca4f5a4e78900d564e8"
+        );
+    }
+
+    /// Equal declarations have equal digests, however their values were
+    /// built (object key order, allocations) and whether the tool can be
+    /// called right now; every declared facet changes it.
+    #[test]
+    fn tool_binding_digest_follows_the_declaration_only() {
+        let digest = |entry: &crate::ToolCatalogEntry| ToolBindingDigest::of_catalog_entry(entry);
+        let base = digest(&deploy_entry(deploy_tool(), deploy_contract()));
+
+        assert_eq!(
+            digest(&deploy_entry(deploy_tool(), deploy_contract())),
+            base
+        );
+        let keyed = |text: &str| {
+            let mut tool = deploy_tool();
+            tool.input_schema = serde_json::from_str(text).expect("json");
+            digest(&deploy_entry(tool, deploy_contract()))
+        };
+        assert_eq!(
+            keyed(r#"{"type":"object","required":["id"]}"#),
+            keyed(r#"{"required":["id"],"type":"object"}"#)
+        );
+        let mut unavailable = deploy_entry(deploy_tool(), deploy_contract());
+        unavailable.callability = crate::ToolCallability::unavailable(
+            crate::ToolUnavailableReason::CallbackRouteUnclaimed,
+        );
+        assert_eq!(digest(&unavailable), base);
+
+        let mut described = deploy_tool();
+        described.description = "Deploy a build somewhere else".into();
+        let mut schema = deploy_tool();
+        schema.input_schema = serde_json::json!({"type": "object", "required": ["id"]});
+        let mut audience = deploy_tool();
+        audience.audience = crate::ToolAudience::ModelAndApp;
+        let mut source = deploy_tool();
+        source.provenance = Some(crate::ToolProvenance::new(
+            crate::ToolSourceKind::Callback,
+            "conn-2",
+        ));
+        let mut control = deploy_entry(deploy_tool(), deploy_contract());
+        control.plane = crate::ToolPlaneClass::Control;
+        let mut inline_only = deploy_entry(deploy_tool(), deploy_contract());
+        inline_only.deferred_eligibility = crate::ToolCatalogDeferredEligibility::InlineOnly;
+        let mut renamed = deploy_tool();
+        renamed.name = "deploy_v2".into();
+        let changed = [
+            ("name", deploy_entry(renamed, deploy_contract())),
+            ("description", deploy_entry(described, deploy_contract())),
+            ("input schema", deploy_entry(schema, deploy_contract())),
+            ("audience", deploy_entry(audience, deploy_contract())),
+            ("provenance", deploy_entry(source, deploy_contract())),
+            ("plane", control),
+            ("deferred eligibility", inline_only),
+            (
+                "runner version",
+                deploy_entry(
+                    deploy_tool(),
+                    detached_contract(
+                        "2",
+                        RestartClass::Replayable,
+                        Duration::from_secs(30),
+                        &["repo:read"],
+                    ),
+                ),
+            ),
+            (
+                "restart class",
+                deploy_entry(
+                    deploy_tool(),
+                    detached_contract(
+                        "1",
+                        RestartClass::NonResumable,
+                        Duration::from_secs(30),
+                        &["repo:read"],
+                    ),
+                ),
+            ),
+            (
+                "submission deadline",
+                deploy_entry(
+                    deploy_tool(),
+                    detached_contract(
+                        "1",
+                        RestartClass::Replayable,
+                        Duration::from_secs(31),
+                        &["repo:read"],
+                    ),
+                ),
+            ),
+            (
+                "credential scopes",
+                deploy_entry(
+                    deploy_tool(),
+                    detached_contract(
+                        "1",
+                        RestartClass::Replayable,
+                        Duration::from_secs(30),
+                        &["repo:write"],
+                    ),
+                ),
+            ),
+            (
+                "core deadline",
+                deploy_entry(deploy_tool(), deploy_contract().with_tool_owned_deadline()),
+            ),
+            (
+                "execution mode",
+                deploy_entry(deploy_tool(), ToolExecutionContract::default()),
+            ),
+        ];
+        for (facet, entry) in changed {
+            assert_ne!(digest(&entry), base, "a changed {facet} changes the digest");
+        }
+    }
+
+    #[test]
+    fn tool_binding_digest_text_round_trips_and_rejects_other_text() {
+        let digest =
+            ToolBindingDigest::of_catalog_entry(&deploy_entry(deploy_tool(), deploy_contract()));
+        let text = digest.to_string();
+        assert_eq!(text.parse::<ToolBindingDigest>(), Ok(digest));
+        assert_eq!(
+            serde_json::from_value::<ToolBindingDigest>(
+                serde_json::to_value(digest).expect("serializes")
+            )
+            .expect("deserializes"),
+            digest
+        );
+        let hex = &text["sha256:".len()..];
+        for other in [
+            format!("sha256:{}", hex.to_uppercase()),
+            format!("sha512:{hex}"),
+            format!("sha256:{}", &hex[..hex.len() - 2]),
+            format!("{text}00"),
+            format!("sha256:{}", "g".repeat(64)),
+            hex.to_string(),
+            String::new(),
+        ] {
+            assert_eq!(
+                other.parse::<ToolBindingDigest>(),
+                Err(ToolBindingDigestParseError),
+                "{other}"
+            );
+        }
     }
 }

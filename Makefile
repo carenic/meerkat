@@ -239,7 +239,9 @@ test-feature-matrix-lib:
 	$(CARGO) check -p meerkat --no-default-features --features session-store,meerkat-store/jsonl
 	$(CARGO) check -p meerkat-mob --no-default-features
 	$(CARGO) check -p meerkat-mob --no-default-features --features runtime-adapter
-	$(CARGO) nextest run -p meerkat --features all-providers,comms,mcp
+	MEERKAT_MCP_TEST_SERVER="$$(scripts/mcp-test-server-fixture)" && \
+		export MEERKAT_MCP_TEST_SERVER && \
+		$(CARGO) nextest run -p meerkat --features all-providers,comms,mcp
 
 # Surface crate feature combinations
 test-feature-matrix-surface:
@@ -846,6 +848,7 @@ release-doctor:
 	@scripts/test-release-doctor-workflow-contract.sh
 	@scripts/test-release-find-prebuild.sh
 	@scripts/test-verify-release-asset-provenance.sh
+	@$(PYTHON) scripts/test_release_stamp_sdk_binary_digests.py
 	@scripts/test-check-macos-x86-release-binary.sh
 	@scripts/test-gcp-buildbuddy-workflow-gate.sh
 	@scripts/release-doctor

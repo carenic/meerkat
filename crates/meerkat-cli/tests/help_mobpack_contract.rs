@@ -1,4 +1,5 @@
 #![cfg(feature = "mob")]
+#![allow(clippy::disallowed_methods)]
 
 use std::process::{Command, Output};
 
