@@ -68,8 +68,11 @@ them.
   `OperationRefusalKind::ReprepareRequired` and rebuilds once, for the
   work's own grant and for the contributor ceilings of work that names
   other originals (a helper's source); controller admission refuses it as
-  `ReprepareRequired`. A review read, which reads its material once by
-  design, is not rebuilt: when the stock governed realm's review mandate or
+  `ReprepareRequired`, which the runtime driver reports as
+  `RuntimeDriverError::ControllerReadinessUnavailable` with reason
+  `ControllerReadinessFailure::PolicyChanged`. A review read, which reads
+  its material once by design, is not rebuilt: when the stock governed
+  realm's review mandate or
   a contributor ceiling meets such a change, the review now refuses as
   stale (`ToolError::AuthorizationRefused` with `ReprepareRequired`)
   instead of reporting an unavailable review context, and a fresh attempt
