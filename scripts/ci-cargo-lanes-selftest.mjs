@@ -1625,6 +1625,13 @@ for (const path of [
     "only the changed package's suites join the pull request",
   );
   assert.ok(unitOf(facade).suites.some((suite) => suite.features.includes("openai-live")), "the facade touch runs its GPT Live suite in the pull request");
+  // meerkat-openai's realtime adapter (live.rs, text_adapter.rs) is behind
+  // `realtime`, which neither its default features nor its `live` suite
+  // enable: its own suite runs those tests in the pull request and on main.
+  const openai = planFor(["crates/meerkat-openai/src/live.rs"], ["--event", "pull_request"]);
+  const realtime = (suites) => suites.filter((suite) => suite.packages[0] === "meerkat-openai" && suite.features.includes("realtime"));
+  assert.equal(realtime(unitOf(openai).suites).length, 1, "a pull request that changes meerkat-openai runs its realtime suite");
+  assert.equal(realtime(facade.main_feature_unit_shards).length, 1, "main runs meerkat-openai's realtime suite");
   for (const suite of unitOf(facade).suites) {
     assert.ok(suite.estimated_minutes <= facade.pr_unit_budget_minutes, `${suite.name} fits the pull-request budget`);
   }
