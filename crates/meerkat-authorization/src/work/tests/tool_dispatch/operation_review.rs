@@ -11,6 +11,11 @@
 //!   or refused while retained, or during entry staging, settles only its own
 //!   operation with typed local feedback and zero physical entry; a permitted
 //!   sibling still enters;
+//! - a model review superseded by one completed owner change before any
+//!   dispatcher code ran, with its tier and review material unchanged, is
+//!   reviewed once more from the start (never by reusing its verdict); a
+//!   second change, a negative verdict, a changed tier or material, expiry
+//!   or too little tool time settles it as before;
 //! - an absolute deadline is checked at the verdict and at the spend;
 //! - the `Used` projection is delivered only after the effect;
 //! - a dispatcher that cannot carry review refuses required review locally;
@@ -21,8 +26,12 @@
 //! Reviewer disposal is proven by an explicit drop witness on the reviewer
 //! future, never by yielding.
 
+use std::collections::VecDeque;
 use std::sync::atomic::AtomicBool;
 
+use meerkat_authorization_contracts::audit::{
+    AuditObservation, AuthorizationAuditObservation, AuthorizationAuditSink,
+};
 use meerkat_core::approval::review::{
     BoundOperationReview, OperationReviewObserver, OperationReviewTier, OperationReviewer,
     ReviewAttemptRef, ReviewAttemptStatus, ReviewCandidate, ReviewEntrySupport, ReviewObservation,
@@ -91,6 +100,26 @@ impl Drop for DropWitness {
 
 type OwnerEdit = Box<dyn FnOnce() + Send>;
 
+/// One scripted review answer: an owner edit run just before it returns,
+/// and the result it returns.
+struct ReviewStep {
+    edit: Option<OwnerEdit>,
+    result: Result<ReviewVerdict, ReviewerFailure>,
+}
+
+impl ReviewStep {
+    fn answer(result: Result<ReviewVerdict, ReviewerFailure>) -> Self {
+        Self { edit: None, result }
+    }
+
+    fn after(edit: OwnerEdit, result: Result<ReviewVerdict, ReviewerFailure>) -> Self {
+        Self {
+            edit: Some(edit),
+            result,
+        }
+    }
+}
+
 /// Controlled reviewer: announces entry, waits for release (or a virtual-time
 /// delay), then returns its verdict. It can run an owner edit just before
 /// returning, or never return.
@@ -106,6 +135,9 @@ struct PausedReviewer {
     never_returns: bool,
     /// Return after exactly this virtual delay instead of waiting for release.
     returns_after: Option<Duration>,
+    /// Per-call answers, consumed in call order; once empty, a call returns
+    /// `verdict` after the one-shot `on_return`.
+    script: Mutex<VecDeque<ReviewStep>>,
 }
 
 impl PausedReviewer {
@@ -120,7 +152,15 @@ impl PausedReviewer {
             seen_contexts: Mutex::new(Vec::new()),
             never_returns: false,
             returns_after: None,
+            script: Mutex::new(VecDeque::new()),
         }
+    }
+
+    /// A reviewer answering call by call from `steps`.
+    fn scripted(steps: impl IntoIterator<Item = ReviewStep>) -> Self {
+        let reviewer = Self::new(ReviewVerdict::Allow);
+        *reviewer.script.lock().expect("review script") = steps.into_iter().collect();
+        reviewer
     }
 
     async fn wait_entered(&self) {
@@ -178,12 +218,19 @@ impl OperationReviewer for PausedReviewer {
             Some(delay) => tokio::time::sleep(delay).await,
             None => self.release.notified().await,
         }
-        let edit = self.on_return.lock().expect("on return").take();
+        let step = self.script.lock().expect("review script").pop_front();
+        let (edit, result) = match step {
+            Some(ReviewStep { edit, result }) => (edit, result),
+            None => (
+                self.on_return.lock().expect("on return").take(),
+                Ok(self.verdict),
+            ),
+        };
         if let Some(edit) = edit {
             edit();
         }
         witness.completed = true;
-        Ok(self.verdict)
+        result
     }
 }
 
@@ -243,6 +290,25 @@ impl RecordingObserver {
             "exactly one retained attempt for one candidate"
         );
         first.attempt.clone()
+    }
+
+    /// The distinct owner-issued attempts in the order they began, every one
+    /// for the tool call `tool_call_id`.
+    fn attempts(&self, tool_call_id: &str) -> Vec<ReviewAttemptRef> {
+        let observations = self.observations.lock().expect("review observations");
+        assert!(
+            observations
+                .iter()
+                .all(|observation| observation.tool_call_id.as_ref() == tool_call_id),
+            "every attempt reviews the same tool call"
+        );
+        let mut attempts: Vec<ReviewAttemptRef> = Vec::new();
+        for observation in observations.iter() {
+            if !attempts.contains(&observation.attempt) {
+                attempts.push(observation.attempt.clone());
+            }
+        }
+        attempts
     }
 }
 
@@ -305,6 +371,9 @@ struct LeafBehavior {
 struct ReviewedLeaf {
     body: Arc<RecordingDispatcher>,
     behavior: LeafBehavior,
+    /// Runs once immediately before the entry step: an owner edit landing
+    /// after every pre-entry point the fenced dispatch owns.
+    before_entry: Mutex<Option<OwnerEdit>>,
 }
 
 impl ReviewedLeaf {
@@ -313,7 +382,19 @@ impl ReviewedLeaf {
     }
 
     fn with(body: Arc<RecordingDispatcher>, behavior: LeafBehavior) -> Arc<Self> {
-        Arc::new(Self { body, behavior })
+        Arc::new(Self {
+            body,
+            behavior,
+            before_entry: Mutex::new(None),
+        })
+    }
+
+    fn editing_before_entry(body: Arc<RecordingDispatcher>, edit: OwnerEdit) -> Arc<Self> {
+        Arc::new(Self {
+            body,
+            behavior: LeafBehavior::default(),
+            before_entry: Mutex::new(Some(edit)),
+        })
     }
 }
 
@@ -344,6 +425,10 @@ impl AgentToolDispatcher for ReviewedLeaf {
         if self.behavior.fail_before_entry {
             return Err(ToolError::execution_failed("leaf preparation failed"));
         }
+        let edit = self.before_entry.lock().expect("before entry").take();
+        if let Some(edit) = edit {
+            edit();
+        }
         let entered = context.enter_reviewed_effect(call, None)?;
         let outcome = self
             .body
@@ -362,6 +447,16 @@ async fn fenced<T: AgentToolDispatcher + ?Sized + 'static>(
     call: &Call,
     context: &ToolDispatchContext,
 ) -> Result<ToolDispatchOutcome, ToolError> {
+    fenced_within(dispatcher, call, context, Duration::from_secs(600)).await
+}
+
+/// [`fenced`] under the direct caller deadline `caller_deadline`.
+async fn fenced_within<T: AgentToolDispatcher + ?Sized + 'static>(
+    dispatcher: &Arc<T>,
+    call: &Call,
+    context: &ToolDispatchContext,
+    caller_deadline: Duration,
+) -> Result<ToolDispatchOutcome, ToolError> {
     let plan = resolve_tool_execution_plan_fenced(
         dispatcher,
         call.view(),
@@ -370,7 +465,7 @@ async fn fenced<T: AgentToolDispatcher + ?Sized + 'static>(
             meerkat_core::ToolDeadlineChain::new(vec![
                 meerkat_core::ToolDeadlineContributor::finite(
                     meerkat_core::ToolDeadlineOwner::DirectCaller,
-                    Duration::from_secs(600),
+                    caller_deadline,
                 ),
             ])
             .expect("finite caller deadline"),
@@ -477,6 +572,49 @@ fn entry_hook_context(world: &ReviewWorld, work: &ToolWork, edit: bool) -> ToolD
     ToolDispatchContext::default()
         .with_work_authorization(Some(hooked))
         .with_operation_review(Some(world.review.clone()))
+}
+
+/// An owner edit that publishes a change keeping every permission and tier.
+fn republishing(work: &Arc<ToolWork>) -> OwnerEdit {
+    let edited = Arc::clone(work);
+    Box::new(move || edited.republish())
+}
+
+/// An owner edit that begins one change on `work`'s own publication on
+/// another thread and returns once it is in progress; the change completes
+/// after `hold` of real time.
+fn hold_owner_change_for(work: &ToolWork, hold: Duration) -> OwnerEdit {
+    let publication = work.publication.clone();
+    Box::new(move || {
+        let (in_progress, began) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let change = publication.begin_owner_change().expect("owner publication");
+            in_progress.send(()).expect("change began");
+            std::thread::sleep(hold);
+            drop(change);
+        });
+        began
+            .recv_timeout(BOUND)
+            .expect("the change is in progress before the verdict returns");
+    })
+}
+
+/// As [`hold_owner_change_for`], completing only once `release` is signalled
+/// or dropped (at most `BOUND` of real time).
+fn hold_owner_change_until(work: &ToolWork, release: std::sync::mpsc::Receiver<()>) -> OwnerEdit {
+    let publication = work.publication.clone();
+    Box::new(move || {
+        let (in_progress, began) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let change = publication.begin_owner_change().expect("owner publication");
+            in_progress.send(()).expect("change began");
+            let _ = release.recv_timeout(BOUND);
+            drop(change);
+        });
+        began
+            .recv_timeout(BOUND)
+            .expect("the change is in progress before the verdict returns");
+    })
 }
 
 fn reviewed_call(id: &str) -> Call {
@@ -1142,6 +1280,10 @@ async fn changed_review_context_retires_only_that_operation_and_sibling_enters()
         assert_eq!(body_ids(&body), vec!["sibling".to_string()]);
         work.republish();
         world.reviewer.release.notify_one();
+        // The one re-review of the superseded operation changes again.
+        world.reviewer.wait_entered().await;
+        work.republish();
+        world.reviewer.release.notify_one();
     };
     let (reviewed_result, sibling_result, ()) = tokio::join!(
         fenced(&leaf, &reviewed, &context),
@@ -1158,16 +1300,21 @@ async fn changed_review_context_retires_only_that_operation_and_sibling_enters()
     );
     assert_eq!(
         world.reviewer.calls.load(Ordering::SeqCst),
-        1,
-        "R1 sibling unreviewed"
+        2,
+        "one re-review and never a third; the R1 sibling is unreviewed"
     );
-    // Currentness is validated before the verdict is accepted: the stale
-    // allow is never recorded.
+    // Currentness is validated before each verdict is accepted: neither
+    // stale allow is ever recorded.
     assert_eq!(
         world.observer.statuses(),
-        vec![pending(), retired(ReviewRetirementReason::ContextChanged)]
+        vec![
+            pending(),
+            retired(ReviewRetirementReason::ContextChanged),
+            pending(),
+            retired(ReviewRetirementReason::ContextChanged)
+        ]
     );
-    world.observer.single_attempt();
+    assert_eq!(world.observer.attempts("reviewed").len(), 2);
 }
 
 fn held(account: &str, mandate: &str) -> ReviewMaterial {
@@ -1234,8 +1381,9 @@ async fn changed_owner_material_rejects_the_stale_allow_and_a_fresh_attempt_revi
     );
     assert_eq!(
         work.review_context_calls(),
-        2,
-        "read once per reviewed attempt and never for the R1 sibling"
+        3,
+        "read once per reviewed attempt, once by the decision that refused a \
+         second review of changed material, and never for the R1 sibling"
     );
 }
 
@@ -1335,9 +1483,12 @@ async fn review_context_outcomes_are_typed_before_any_attempt() {
 #[tokio::test]
 async fn owner_edit_racing_the_verdict_still_prevents_entry() {
     let work = Arc::new(reviewed_work(OperationReviewTier::R2));
-    let reviewer = PausedReviewer::new(ReviewVerdict::Allow);
-    let edited = Arc::clone(&work);
-    *reviewer.on_return.lock().expect("on return") = Some(Box::new(move || edited.republish()));
+    // An owner edit races each attempt's verdict, so the one re-review of
+    // the superseded operation is superseded too.
+    let reviewer = PausedReviewer::scripted([
+        ReviewStep::after(republishing(&work), Ok(ReviewVerdict::Allow)),
+        ReviewStep::after(republishing(&work), Ok(ReviewVerdict::Allow)),
+    ]);
     let world = ReviewWorld::with_reviewer(reviewer);
     let body = Arc::new(RecordingDispatcher::default());
     let leaf = ReviewedLeaf::new(Arc::clone(&body));
@@ -1347,14 +1498,22 @@ async fn owner_edit_racing_the_verdict_still_prevents_entry() {
     let controller = async {
         world.reviewer.wait_entered().await;
         world.reviewer.release.notify_one();
+        world.reviewer.wait_entered().await;
+        world.reviewer.release.notify_one();
     };
     let (result, ()) = tokio::join!(fenced(&leaf, &reviewed, &context), controller);
 
     assert_unsatisfied(result, ReviewUnsatisfiedKind::ContextChanged);
     assert!(body_ids(&body).is_empty());
+    assert_eq!(world.reviewer.calls.load(Ordering::SeqCst), 2);
     assert_eq!(
         world.observer.statuses(),
-        vec![pending(), retired(ReviewRetirementReason::ContextChanged)]
+        vec![
+            pending(),
+            retired(ReviewRetirementReason::ContextChanged),
+            pending(),
+            retired(ReviewRetirementReason::ContextChanged)
+        ]
     );
 }
 
@@ -1611,6 +1770,603 @@ async fn dropped_dispatch_is_abandoned_and_disposes_the_reviewer() {
 }
 
 // ---------------------------------------------------------------------------
+// Supersession: one more model review when only the owner publication moved.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn superseded_review_is_reviewed_once_more_and_enters() {
+    let work = reviewed_work(OperationReviewTier::R2);
+    let world = ReviewWorld::new();
+    let body = Arc::new(RecordingDispatcher::default());
+    *world.observer.body.lock().expect("body") = Some(Arc::clone(&body));
+    let leaf = ReviewedLeaf::new(Arc::clone(&body));
+    let context = world.context(&work);
+    let reviewed = reviewed_call("reviewed");
+
+    let controller = async {
+        world.reviewer.wait_entered().await;
+        // A completed owner change that keeps permission, tier and material.
+        work.republish();
+        world.reviewer.release.notify_one();
+        // The same operation is reviewed from the start under its current
+        // decision; the superseded allow is never used.
+        world.reviewer.wait_entered().await;
+        assert!(
+            body_ids(&body).is_empty(),
+            "no entry before the second verdict"
+        );
+        world.reviewer.release.notify_one();
+    };
+    let (result, ()) = tokio::join!(fenced(&leaf, &reviewed, &context), controller);
+
+    assert!(
+        !result
+            .expect("reviewed once more, then entered")
+            .result
+            .is_error
+    );
+    assert_eq!(body_ids(&body), vec!["reviewed".to_string()]);
+    assert_eq!(world.reviewer.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        world.observer.statuses(),
+        vec![
+            pending(),
+            retired(ReviewRetirementReason::ContextChanged),
+            pending(),
+            allowed(),
+            used()
+        ]
+    );
+    assert_eq!(
+        world.observer.attempts("reviewed").len(),
+        2,
+        "a second owner-issued attempt, never the first one reused"
+    );
+    assert_eq!(
+        *world
+            .observer
+            .bodies_at_used
+            .lock()
+            .expect("bodies at used"),
+        Some(1)
+    );
+}
+
+/// Every record the real audit adapter appends for one work.
+#[derive(Default)]
+struct RecordingAudit(Mutex<Vec<AuthorizationAuditObservation>>);
+
+impl AuthorizationAuditSink for RecordingAudit {
+    fn append(
+        &self,
+        observation: AuthorizationAuditObservation,
+    ) -> Result<(), OperationObservationError> {
+        self.0.lock().expect("audit records").push(observation);
+        Ok(())
+    }
+}
+
+/// `work`'s own owner behind the audit adapter a native row records through.
+fn audited(work: &ToolWork, audit: &Arc<RecordingAudit>) -> WorkAuthorizationContext {
+    WorkAuthorizationContext::new(
+        Arc::new(crate::audit::AuditedWorkAuthorization {
+            inner: Arc::clone(work.context.authorization()),
+            associations: Vec::new().into(),
+            publication: work.publication.clone(),
+            clock: Arc::new(FixtureClock::new()),
+            sink: audit.clone(),
+        }),
+        work.context.execution_scope().clone(),
+    )
+}
+
+#[tokio::test]
+async fn the_audit_joins_both_attempts_through_the_successor_preparation() {
+    let work = reviewed_work(OperationReviewTier::R2);
+    let audit = Arc::new(RecordingAudit::default());
+    let world = ReviewWorld::new();
+    let body = Arc::new(RecordingDispatcher::default());
+    let leaf = ReviewedLeaf::new(Arc::clone(&body));
+    let context = ToolDispatchContext::default()
+        .with_work_authorization(Some(audited(&work, &audit)))
+        .with_operation_review(Some(world.review.clone()));
+    let reviewed = reviewed_call("reviewed");
+
+    let controller = async {
+        world.reviewer.wait_entered().await;
+        work.republish();
+        world.reviewer.release.notify_one();
+        world.reviewer.wait_entered().await;
+        world.reviewer.release.notify_one();
+    };
+    let (result, ()) = tokio::join!(fenced(&leaf, &reviewed, &context), controller);
+    assert!(!result.expect("reviewed once more").result.is_error);
+    assert_eq!(body_ids(&body), vec!["reviewed".to_string()]);
+
+    // One operation: the reviewed call (the fixture reviewer reads nothing).
+    let records = audit.0.lock().expect("audit records").clone();
+    let operation = records
+        .first()
+        .expect("audited records")
+        .operation_id
+        .clone();
+    assert!(
+        records
+            .iter()
+            .all(|record| record.operation_id == operation),
+        "both attempts review the same operation"
+    );
+    let observations: Vec<&AuditObservation> =
+        records.iter().map(|record| &record.observation).collect();
+    let starts: Vec<(usize, &str)> = observations
+        .iter()
+        .enumerate()
+        .filter_map(|(at, observation)| match observation {
+            AuditObservation::ReviewAttemptStarted { attempt_ref } => {
+                Some((at, attempt_ref.as_str()))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(starts.len(), 2, "exactly two review attempts started");
+    let observed: Vec<String> = world
+        .observer
+        .attempts("reviewed")
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    assert_eq!(
+        starts
+            .iter()
+            .map(|(_, attempt)| *attempt)
+            .collect::<Vec<_>>(),
+        observed.iter().map(String::as_str).collect::<Vec<_>>(),
+        "the audit names the observer's two attempts, in order"
+    );
+    let prepared: Vec<(usize, u64)> = observations
+        .iter()
+        .enumerate()
+        .filter_map(|(at, observation)| match observation {
+            AuditObservation::Prepared { policy, .. } => Some((at, policy.publication_sequence)),
+            _ => None,
+        })
+        .collect();
+    let (first_at, first_sequence) = prepared[0];
+    assert!(
+        first_at < starts[0].0,
+        "the dispatch prepared before review"
+    );
+    let joins: Vec<&(usize, u64)> = prepared
+        .iter()
+        .filter(|(at, _)| starts[0].0 < *at && *at < starts[1].0)
+        .collect();
+    assert_eq!(
+        joins.len(),
+        1,
+        "one successor preparation joins the two attempts"
+    );
+    assert!(
+        joins[0].1 > first_sequence,
+        "the successor was prepared under the newer publication"
+    );
+    assert!(
+        observations.iter().all(|observation| match observation {
+            AuditObservation::Refused { reason, .. } => {
+                *reason == OperationRefusalKind::ReprepareRequired
+            }
+            AuditObservation::AuthorizationUnavailable { .. } => false,
+            _ => true,
+        }),
+        "under one completed change only re-preparation is refused, and authorization \
+         is never unavailable"
+    );
+    assert!(
+        observations
+            .iter()
+            .enumerate()
+            .all(
+                |(at, observation)| !matches!(observation, AuditObservation::Entry { .. })
+                    || at > starts[1].0
+            ),
+        "nothing entered before the second attempt"
+    );
+}
+
+#[tokio::test]
+async fn owner_change_in_progress_at_the_verdict_is_waited_out_then_reviewed_once_more() {
+    let work = reviewed_work(OperationReviewTier::R2);
+    // The change is still in progress when the first verdict returns.
+    let world = ReviewWorld::with_reviewer(PausedReviewer::scripted([ReviewStep::after(
+        hold_owner_change_for(&work, Duration::from_millis(50)),
+        Ok(ReviewVerdict::Allow),
+    )]));
+    let body = Arc::new(RecordingDispatcher::default());
+    let leaf = ReviewedLeaf::new(Arc::clone(&body));
+    let context = world.context(&work);
+    let reviewed = reviewed_call("reviewed");
+
+    let controller = async {
+        world.reviewer.wait_entered().await;
+        world.reviewer.release.notify_one();
+        world.reviewer.wait_entered().await;
+        world.reviewer.release.notify_one();
+    };
+    let (result, ()) = tokio::join!(fenced(&leaf, &reviewed, &context), controller);
+
+    // Without the wait the check after the verdict reads the change half
+    // published and settles as changed authority.
+    assert!(
+        !result
+            .expect("waited out, reviewed once more, then entered")
+            .result
+            .is_error
+    );
+    assert_eq!(body_ids(&body), vec!["reviewed".to_string()]);
+    assert_eq!(world.reviewer.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        world.observer.statuses(),
+        vec![
+            pending(),
+            retired(ReviewRetirementReason::ContextChanged),
+            pending(),
+            allowed(),
+            used()
+        ]
+    );
+}
+
+#[tokio::test]
+async fn the_second_review_never_reuses_the_superseded_allow() {
+    let work = reviewed_work(OperationReviewTier::R2);
+    let world = ReviewWorld::with_reviewer(PausedReviewer::scripted([
+        ReviewStep::answer(Ok(ReviewVerdict::Allow)),
+        ReviewStep::answer(Ok(ReviewVerdict::Deny)),
+    ]));
+    let body = Arc::new(RecordingDispatcher::default());
+    let leaf = ReviewedLeaf::new(Arc::clone(&body));
+    let context = world.context(&work);
+    let reviewed = reviewed_call("reviewed");
+
+    let controller = async {
+        world.reviewer.wait_entered().await;
+        work.republish();
+        world.reviewer.release.notify_one();
+        world.reviewer.wait_entered().await;
+        world.reviewer.release.notify_one();
+    };
+    let (result, ()) = tokio::join!(fenced(&leaf, &reviewed, &context), controller);
+
+    assert_unsatisfied(result, ReviewUnsatisfiedKind::Denied);
+    assert!(body_ids(&body).is_empty(), "zero entry");
+    assert_eq!(world.reviewer.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        world.observer.statuses(),
+        vec![
+            pending(),
+            retired(ReviewRetirementReason::ContextChanged),
+            pending(),
+            (ReviewAttemptStatus::Denied, None)
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_reviewer_failure_superseded_by_an_owner_change_is_reviewed_once_more() {
+    let work = reviewed_work(OperationReviewTier::R2);
+    // Under churn the reviewer's own request can fail: no verdict.
+    let world = ReviewWorld::with_reviewer(PausedReviewer::scripted([
+        ReviewStep::answer(Err(ReviewerFailure::Unavailable)),
+        ReviewStep::answer(Ok(ReviewVerdict::Allow)),
+    ]));
+    let body = Arc::new(RecordingDispatcher::default());
+    let leaf = ReviewedLeaf::new(Arc::clone(&body));
+    let context = world.context(&work);
+    let reviewed = reviewed_call("reviewed");
+
+    let controller = async {
+        world.reviewer.wait_entered().await;
+        work.republish();
+        world.reviewer.release.notify_one();
+        world.reviewer.wait_entered().await;
+        world.reviewer.release.notify_one();
+    };
+    let (result, ()) = tokio::join!(fenced(&leaf, &reviewed, &context), controller);
+
+    assert!(!result.expect("reviewed once more").result.is_error);
+    assert_eq!(body_ids(&body), vec!["reviewed".to_string()]);
+    assert_eq!(world.reviewer.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        world.observer.statuses(),
+        vec![
+            pending(),
+            retired(ReviewRetirementReason::ContextChanged),
+            pending(),
+            allowed(),
+            used()
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_changed_tier_is_never_reviewed_again() {
+    for tier in [OperationReviewTier::R3, OperationReviewTier::R1] {
+        let work = reviewed_work(OperationReviewTier::R2);
+        let world = ReviewWorld::new();
+        let body = Arc::new(RecordingDispatcher::default());
+        let leaf = ReviewedLeaf::new(Arc::clone(&body));
+        let context = world.context(&work);
+        let reviewed = reviewed_call("reviewed");
+
+        let controller = async {
+            world.reviewer.wait_entered().await;
+            work.set_write_tier(tier);
+            world.reviewer.release.notify_one();
+        };
+        let (result, ()) = tokio::join!(fenced(&leaf, &reviewed, &context), controller);
+
+        assert_unsatisfied(result, ReviewUnsatisfiedKind::ContextChanged);
+        assert!(body_ids(&body).is_empty(), "zero entry at {tier:?}");
+        assert_eq!(world.reviewer.calls.load(Ordering::SeqCst), 1, "{tier:?}");
+        assert_eq!(
+            world.observer.statuses(),
+            vec![pending(), retired(ReviewRetirementReason::ContextChanged)]
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_negative_verdict_is_never_asked_again_after_an_owner_change() {
+    for verdict in [ReviewVerdict::Deny, ReviewVerdict::Escalate] {
+        let work = Arc::new(reviewed_work(OperationReviewTier::R2));
+        // The negative verdict races an owner edit; any later call would
+        // answer with an allow.
+        let mut reviewer =
+            PausedReviewer::scripted([ReviewStep::after(republishing(&work), Ok(verdict))]);
+        reviewer.returns_after = Some(Duration::from_secs(1));
+        let world = ReviewWorld::with_reviewer(reviewer);
+        let body = Arc::new(RecordingDispatcher::default());
+        let leaf = ReviewedLeaf::new(Arc::clone(&body));
+        let context = world.context(&work);
+
+        let result = fenced(&leaf, &reviewed_call("reviewed"), &context).await;
+
+        assert_unsatisfied(result, ReviewUnsatisfiedKind::ContextChanged);
+        assert!(body_ids(&body).is_empty());
+        assert_eq!(
+            world.reviewer.calls.load(Ordering::SeqCst),
+            1,
+            "{verdict:?}"
+        );
+        assert_eq!(
+            world.observer.statuses(),
+            vec![pending(), retired(ReviewRetirementReason::ContextChanged)]
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_expired_review_is_never_asked_again_after_an_owner_change() {
+    let work = reviewed_work(OperationReviewTier::R2);
+    let mut reviewer = PausedReviewer::new(ReviewVerdict::Allow);
+    reviewer.returns_after = Some(REVIEW_DEADLINE);
+    let world = ReviewWorld::with_reviewer(reviewer);
+    let body = Arc::new(RecordingDispatcher::default());
+    let leaf = ReviewedLeaf::new(Arc::clone(&body));
+    let context = world.context(&work);
+    let reviewed = reviewed_call("reviewed");
+
+    let controller = async {
+        world.reviewer.wait_entered().await;
+        work.republish();
+    };
+    let (result, ()) = tokio::join!(fenced(&leaf, &reviewed, &context), controller);
+
+    assert_unavailable(result, ReviewUnavailableKind::DeadlineExpired);
+    assert!(body_ids(&body).is_empty());
+    assert_eq!(world.reviewer.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        world.observer.statuses(),
+        vec![pending(), retired(ReviewRetirementReason::DeadlineExpired)]
+    );
+}
+
+#[tokio::test]
+async fn an_owner_change_at_the_leaf_entry_is_never_reviewed_again() {
+    let work = Arc::new(reviewed_work(OperationReviewTier::R2));
+    let world = ReviewWorld::new();
+    let body = Arc::new(RecordingDispatcher::default());
+    // Dispatcher code already ran: the leaf's own preparation is over.
+    let leaf = ReviewedLeaf::editing_before_entry(Arc::clone(&body), republishing(&work));
+    let context = world.context(&work);
+    let reviewed = reviewed_call("reviewed");
+
+    let controller = async {
+        world.reviewer.wait_entered().await;
+        world.reviewer.release.notify_one();
+    };
+    let (result, ()) = tokio::join!(fenced(&leaf, &reviewed, &context), controller);
+
+    assert_unsatisfied(result, ReviewUnsatisfiedKind::ContextChanged);
+    assert!(body_ids(&body).is_empty(), "zero physical body entry");
+    assert_eq!(world.reviewer.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        world.observer.statuses(),
+        vec![
+            pending(),
+            allowed(),
+            retired(ReviewRetirementReason::ContextChanged)
+        ]
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn no_second_review_without_tool_time_for_a_whole_review() {
+    // The first review takes 15 s of the caller's deadline; a second one
+    // needs the whole 30 s review deadline.
+    for (caller_deadline, reviewed_again) in [
+        (Duration::from_secs(40), false),
+        (Duration::from_secs(60), true),
+    ] {
+        let work = reviewed_work(OperationReviewTier::R2);
+        let mut reviewer = PausedReviewer::new(ReviewVerdict::Allow);
+        reviewer.returns_after = Some(Duration::from_secs(15));
+        let world = ReviewWorld::with_reviewer(reviewer);
+        let body = Arc::new(RecordingDispatcher::default());
+        let leaf = ReviewedLeaf::new(Arc::clone(&body));
+        let context = world.context(&work);
+        let reviewed = reviewed_call("reviewed");
+
+        let controller = async {
+            world.reviewer.wait_entered().await;
+            work.republish();
+        };
+        let (result, ()) = tokio::join!(
+            fenced_within(&leaf, &reviewed, &context, caller_deadline),
+            controller
+        );
+
+        if reviewed_again {
+            assert!(
+                !result
+                    .expect("time for a whole review: reviewed once more")
+                    .result
+                    .is_error
+            );
+            assert_eq!(world.reviewer.calls.load(Ordering::SeqCst), 2);
+            assert_eq!(body_ids(&body), vec!["reviewed".to_string()]);
+        } else {
+            assert_unsatisfied(result, ReviewUnsatisfiedKind::ContextChanged);
+            assert_eq!(world.reviewer.calls.load(Ordering::SeqCst), 1);
+            assert!(body_ids(&body).is_empty());
+            assert_eq!(
+                world.observer.statuses(),
+                vec![pending(), retired(ReviewRetirementReason::ContextChanged)]
+            );
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_stuck_owner_change_at_the_verdict_settles_after_the_wait_bound() {
+    let bound = meerkat_core::authorization::OWNER_CHANGE_WAIT_BOUND;
+    // (when the verdict returns, how long the dispatch takes in all): the
+    // wait is the bound, and never outlasts the attempt's own deadline.
+    for (verdict_at, settles_at) in [
+        (Duration::ZERO, bound),
+        (
+            REVIEW_DEADLINE.saturating_sub(Duration::from_secs(1)),
+            REVIEW_DEADLINE,
+        ),
+    ] {
+        let work = reviewed_work(OperationReviewTier::R2);
+        let (release_change, change_released) = std::sync::mpsc::channel();
+        let mut reviewer = PausedReviewer::scripted([ReviewStep::after(
+            hold_owner_change_until(&work, change_released),
+            Ok(ReviewVerdict::Allow),
+        )]);
+        reviewer.returns_after = Some(verdict_at);
+        let world = ReviewWorld::with_reviewer(reviewer);
+        let body = Arc::new(RecordingDispatcher::default());
+        let leaf = ReviewedLeaf::new(Arc::clone(&body));
+        let context = world.context(&work);
+        let reviewed = reviewed_call("reviewed");
+
+        let started = tokio::time::Instant::now();
+        let result = fenced(&leaf, &reviewed, &context).await;
+        let took = started.elapsed();
+        let _ = release_change.send(());
+
+        // The refusal takes its ordinary path once the bounded wait is over.
+        assert_tool_refused(result, OperationRefusalKind::ReprepareRequired);
+        assert!(
+            took >= settles_at && took < settles_at + Duration::from_millis(100),
+            "settled after {took:?}, not at {settles_at:?}"
+        );
+        assert!(body_ids(&body).is_empty());
+        assert_eq!(world.reviewer.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            world.observer.statuses(),
+            vec![pending(), retired(ReviewRetirementReason::AuthorityChanged)]
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_dispatch_never_reviews_a_superseded_call_a_third_time() {
+    let work = Arc::new(reviewed_work(OperationReviewTier::R2));
+    // Every verdict races an owner edit, for as many attempts as run.
+    let mut reviewer = PausedReviewer::scripted([
+        ReviewStep::after(republishing(&work), Ok(ReviewVerdict::Allow)),
+        ReviewStep::after(republishing(&work), Ok(ReviewVerdict::Allow)),
+        ReviewStep::after(republishing(&work), Ok(ReviewVerdict::Allow)),
+    ]);
+    reviewer.returns_after = Some(Duration::from_secs(1));
+    let world = ReviewWorld::with_reviewer(reviewer);
+    let body = Arc::new(RecordingDispatcher::default());
+    let leaf = ReviewedLeaf::new(Arc::clone(&body));
+    let context = world.context(&work);
+
+    let result = fenced(&leaf, &reviewed_call("reviewed"), &context).await;
+
+    assert_unsatisfied(result, ReviewUnsatisfiedKind::ContextChanged);
+    assert!(body_ids(&body).is_empty());
+    assert_eq!(
+        world.reviewer.calls.load(Ordering::SeqCst),
+        2,
+        "one re-review per dispatch, never a third"
+    );
+    assert_eq!(
+        world.observer.statuses(),
+        vec![
+            pending(),
+            retired(ReviewRetirementReason::ContextChanged),
+            pending(),
+            retired(ReviewRetirementReason::ContextChanged)
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_dropped_dispatch_abandons_the_second_review() {
+    let work = reviewed_work(OperationReviewTier::R2);
+    let world = ReviewWorld::new();
+    let body = Arc::new(RecordingDispatcher::default());
+    let leaf = ReviewedLeaf::new(Arc::clone(&body));
+    let context = world.context(&work);
+    let reviewed = reviewed_call("reviewed");
+
+    let finished = tokio::select! {
+        result = fenced(&leaf, &reviewed, &context) => Some(result),
+        () = async {
+            world.reviewer.wait_entered().await;
+            work.republish();
+            world.reviewer.release.notify_one();
+            world.reviewer.wait_entered().await;
+        } => None,
+    };
+
+    assert!(
+        finished.is_none(),
+        "a drop must not synthesize a tool result"
+    );
+    assert!(
+        world.reviewer.fate.dropped.load(Ordering::SeqCst),
+        "the second review future was disposed"
+    );
+    assert!(body_ids(&body).is_empty());
+    assert_eq!(world.reviewer.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        world.observer.statuses(),
+        vec![
+            pending(),
+            retired(ReviewRetirementReason::ContextChanged),
+            pending(),
+            retired(ReviewRetirementReason::Abandoned)
+        ]
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Agent level: real factory agent; one batch with a natively allowed reviewed
 // call and an R1 sibling; model continuation after local settlement.
 // ---------------------------------------------------------------------------
@@ -1853,6 +2609,10 @@ async fn factory_agent_settles_stale_review_locally_and_continues_with_sibling()
         wait_for_body(&body, "sibling").await;
         work.republish();
         world.reviewer.release.notify_one();
+        // The one re-review of the superseded call changes again.
+        world.reviewer.wait_entered().await;
+        work.republish();
+        world.reviewer.release.notify_one();
     };
     let (result, ()) = tokio::join!(run_batch(&mut agent, &work, events), controller);
     let result = result.expect("stale review is not a run failure");
@@ -1874,7 +2634,59 @@ async fn factory_agent_settles_stale_review_locally_and_continues_with_sibling()
     );
     assert_eq!(
         world.observer.statuses(),
-        vec![pending(), retired(ReviewRetirementReason::ContextChanged)]
+        vec![
+            pending(),
+            retired(ReviewRetirementReason::ContextChanged),
+            pending(),
+            retired(ReviewRetirementReason::ContextChanged)
+        ]
+    );
+    assert_single_completion(&mut received);
+}
+
+#[tokio::test]
+async fn factory_agent_reviews_a_superseded_call_once_more_and_enters() {
+    let world = ReviewWorld::new();
+    let client = Arc::new(ReviewBatchClient::default());
+    let body = Arc::new(RecordingDispatcher::default());
+    let mut agent = review_agent(
+        Some(world.review.clone()),
+        client.clone(),
+        body.clone(),
+        &Config::default(),
+    )
+    .await;
+    let work = ToolWork::for_session(agent.session().id());
+    work.set_write_tier(OperationReviewTier::R2);
+    let (events, mut received) = mpsc::channel(256);
+
+    let controller = async {
+        world.reviewer.wait_entered().await;
+        wait_for_body(&body, "sibling").await;
+        work.republish();
+        world.reviewer.release.notify_one();
+        world.reviewer.wait_entered().await;
+        world.reviewer.release.notify_one();
+    };
+    let (result, ()) = tokio::join!(run_batch(&mut agent, &work, events), controller);
+    let result = result.expect("a superseded review is not a run failure");
+
+    // The second review settles inside the same tool call: no extra turn.
+    assert_eq!(result.turns, 2);
+    let results = second_request_results(&client);
+    assert!(results.iter().all(|result| !result.is_error));
+    let mut entered = body_ids(&body);
+    entered.sort();
+    assert_eq!(entered, vec!["reviewed".to_string(), "sibling".to_string()]);
+    assert_eq!(
+        world.observer.statuses(),
+        vec![
+            pending(),
+            retired(ReviewRetirementReason::ContextChanged),
+            pending(),
+            allowed(),
+            used()
+        ]
     );
     assert_single_completion(&mut received);
 }

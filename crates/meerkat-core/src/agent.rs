@@ -2435,6 +2435,9 @@ pub async fn dispatch_tool_execution_plan_fenced<T: AgentToolDispatcher + ?Sized
     context: &ToolDispatchContext,
     plan: &crate::ResolvedToolExecutionPlan,
 ) -> Result<crate::ops::ToolDispatchOutcome, crate::error::ToolError> {
+    // The plan's tool time left is measured from here; the plan resolution
+    // before this call is not counted.
+    let dispatch_started = crate::time_compat::DeadlineInstant::now();
     validate_fenced_root_dispatch(dispatcher, call, context, plan)?;
     // Retain one binding with the actual resolved call. Its generation is
     // checked here after the dispatch queue, and again by adapters after any
@@ -2465,21 +2468,49 @@ pub async fn dispatch_tool_execution_plan_fenced<T: AgentToolDispatcher + ?Sized
         // Review admission at the common prepared entry: the owner tier is
         // enforced here for every dispatcher, wrapper or not. An allow is
         // retained for the effect leaf; nothing is spent here.
-        let (review_call, _) = prepared.tool_dispatch_parts().ok_or_else(|| {
-            crate::ToolError::AuthorizationRefused {
-                refusal: crate::authorization::OperationRefused::new(
-                    crate::authorization::OperationRefusalKind::MalformedFacts,
-                ),
+        // A model review that a completed owner publication change superseded
+        // before any dispatcher code ran is admitted again at most once, for
+        // the current decision; `ReviewSupersession::readmit` alone decides.
+        let mut prepared = prepared;
+        let mut supersession = crate::approval::review::ReviewSupersession::new();
+        let mut material = None;
+        let review_entry = loop {
+            let (review_call, _) = prepared.tool_dispatch_parts().ok_or_else(|| {
+                crate::ToolError::AuthorizationRefused {
+                    refusal: crate::authorization::OperationRefused::new(
+                        crate::authorization::OperationRefusalKind::MalformedFacts,
+                    ),
+                }
+            })?;
+            // Each review attempt has its own owner-change wait state.
+            let mut owner_change_churn = crate::authorization::OwnerChangeChurn::new();
+            let admitted = crate::approval::review::admit_operation_review_attempt(
+                context.operation_review(),
+                dispatcher.review_entry_support(call.name),
+                review_call,
+                &prepared,
+                work,
+                material.take(),
+                &mut owner_change_churn,
+            )
+            .await;
+            match admitted {
+                Ok(entry) => break entry,
+                Err(crate::approval::review::ReviewAdmissionRefusal::Settled(error)) => {
+                    return Err(error);
+                }
+                Err(crate::approval::review::ReviewAdmissionRefusal::Superseded(superseded)) => {
+                    let readmission = supersession.readmit(
+                        context.operation_review(),
+                        *superseded,
+                        plan.effective_timeout()
+                            .map(|timeout| timeout.saturating_sub(dispatch_started.elapsed())),
+                    )?;
+                    prepared = readmission.successor;
+                    material = Some(readmission.material);
+                }
             }
-        })?;
-        let review_entry = crate::approval::review::admit_operation_review(
-            context.operation_review(),
-            dispatcher.review_entry_support(call.name),
-            review_call,
-            &prepared,
-            work,
-        )
-        .await?;
+        };
         Some(
             context
                 .clone()

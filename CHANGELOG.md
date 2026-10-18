@@ -67,6 +67,24 @@ them.
   not a refusal. Each refused attempt keeps its own audit record, and a
   `debug` event `meerkat::authz::owner_change_wait` (operation id,
   `waited_ms`, `settled`) marks each wait.
+- A model-reviewed (R2) tool call no longer fails with `review_unsatisfied`
+  (`context_changed`) when one owner publication change lands during its
+  review or at its verdict's commit. When the operation is still permitted at
+  R2 with the same review material, the fenced dispatch re-prepares it and
+  reviews it once more from the start, as a second review attempt for the
+  same `tool_call_id`; the earlier verdict is never used. A review observer
+  can therefore see a `ContextChanged` retirement followed by that second
+  attempt: a host must not treat the retirement as the call's final outcome.
+  At most one re-review runs per call, only after an allow or a reviewer
+  failure, and only with enough tool time left for a whole review deadline.
+  A second change, a denial or escalation, an expired review, a changed tier
+  (human consent included), changed or unreadable review material, and a
+  change once the tool's dispatcher is running still settle as before. An
+  owner change still in progress when the verdict is checked is now waited
+  out (within the attempt's own review deadline, 2 s at most) instead of
+  settling at once as changed authority; past that bound it settles as
+  before. The re-review adds no record type: the audit shows a second
+  `ReviewAttemptStarted` after the successor's `Prepared` record.
 
 ## [0.9.3] - 2026-10-18
 
