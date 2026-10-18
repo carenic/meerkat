@@ -2050,12 +2050,13 @@ BAZEL_REPOSITORY_CACHE = ("key", "buildbuddy-bazel-repository-*")
 # its inputs choose, saves no cache: it would save into the scope the next
 # trusted run restores from.
 TAG_TRUSTED_WORKFLOWS = ("ci.yml", "release-semver-readiness.yml", "release.yml")
-# The one release.yml job that restores a cache: the semver gate's dispatch
-# measurement, whose family release-semver-readiness.yml's push to main
-# writes. Every other release job restores none, on a tag or a dispatch
-# (a prebuild or a recovery): nothing on main saves their keys, so a
-# restore could only return an entry some other run wrote.
-RELEASE_RESTORE_JOBS = ("release_semver_gate",)
+# The release.yml jobs that may restore a cache: none. No release job
+# restores one, on a tag or a dispatch (a prebuild, a recovery or the
+# semver gate's measurement): nothing on main saves their keys, so a
+# restore could only return an entry some other run wrote. The semver
+# measurement builds through repo-cargo in a per-run target directory, so a
+# target cache never reached it.
+RELEASE_RESTORE_JOBS: tuple[str, ...] = ()
 # The sccache setup every CI lane runs: the GCS objects it writes are what
 # the push to main compiles from before it attests, so only push and
 # schedule runs set the sccache client to write them (a client-side
@@ -2677,8 +2678,8 @@ def check_release_caches(text: str) -> list[str]:
     dispatch; no rust-cache caches ~/.cargo/bin, so a restored binary cannot
     shadow a tool on PATH; a job holding a registry or publish token (or
     `contents: write`) runs no cache step; no release job restores a cache,
-    on a tag or a dispatch, but the semver gate's dispatch measurement
-    (RELEASE_RESTORE_JOBS); and a job that mints OIDC tokens or attests
+    on a tag or a dispatch (RELEASE_RESTORE_JOBS is empty); and a job that
+    mints OIDC tokens or attests
     artifacts
     (`id-token` or `attestations: write`) restores only caches that no
     workflow in the repository saves on a dispatch-like run (any trigger but
