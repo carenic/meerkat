@@ -35,6 +35,16 @@ them.
 
 ## [Unreleased]
 
+### Fixed
+
+- The `web_search` tool's native search call now reads its stop reason
+  (#1887). A search the provider refused or filtered, one whose context window
+  filled and a cancelled one come back `failed`, naming the stop reason, with
+  no answer, evidence or native events: the refusal text is no longer reported
+  as a `completed` (or `unavailable`) answer. A search cut at its output cap or
+  paused by the provider's server-tool loop still reports its answer under the
+  rules of a natural end.
+
 ## [0.9.3] - 2026-10-18
 
 ### Breaking

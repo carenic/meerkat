@@ -10,6 +10,8 @@
 //! - an unknown stop reason is retried, then fails typed;
 //! - a paused server-tool turn is committed, and the next request replays its
 //!   server-tool blocks.
+//! - a native web search the provider refused comes back from the
+//!   `web_search` executor failed, without its text as the answer (#1887).
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -366,4 +368,57 @@ async fn paused_server_tool_turn_commits_and_the_next_request_replays_it() {
     assert_eq!(replayed["id"], "srvtoolu_paused");
     assert_eq!(replayed["name"], "web_search");
     assert_eq!(replayed["input"], json!({"query": "meerkat release"}));
+}
+
+/// #1887: a native search the provider refused comes back from the
+/// `web_search` executor failed, naming the stop reason, and without the
+/// refusal text as its answer, also after the search ran.
+#[tokio::test]
+async fn refused_native_search_fails_without_its_answer() {
+    use meerkat_core::web_search::{WebSearchRequest, WebSearchStatus};
+    use meerkat_llm_core::WebSearchExecutor;
+
+    let refused = sse(&[
+        MESSAGE_START,
+        r#"data: {"type":"content_block_start","content_block":{"type":"server_tool_use","id":"srvtoolu_search","name":"web_search"}}"#,
+        r#"data: {"type":"content_block_delta","delta":{"type":"input_json_delta","partial_json":"{\"query\":\"meerkat\"}"}}"#,
+        r#"data: {"type":"content_block_stop"}"#,
+        r#"data: {"type":"content_block_start","content_block":{"type":"web_search_tool_result","tool_use_id":"srvtoolu_search","content":[{"type":"web_search_result","url":"https://example.com/meerkat","title":"Meerkat"}]}}"#,
+        r#"data: {"type":"content_block_stop"}"#,
+        r#"data: {"type":"content_block_start","content_block":{"type":"text","text":""}}"#,
+        r#"data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"I can't help with that."}}"#,
+        r#"data: {"type":"content_block_stop"}"#,
+        r#"data: {"type":"message_delta","usage":{"output_tokens":9},"delta":{"stop_reason":"refusal"}}"#,
+        MESSAGE_STOP,
+    ]);
+    let (base_url, requests, server) = spawn_messages_stub(vec![refused]).await;
+    let client = AnthropicClient::builder("test-key".to_string())
+        .base_url(base_url)
+        .build()
+        .expect("anthropic client");
+    let adapter = AgentFactory::new(".rkat/sessions")
+        .build_llm_adapter(Arc::new(client), MODEL)
+        .await;
+    let result =
+        meerkat_anthropic::AnthropicWebSearchExecutor::new(MODEL.to_string(), Arc::new(adapter))
+            .execute_web_search(WebSearchRequest {
+                query: "meerkat".to_string(),
+                provider: None,
+                provider_params: None,
+                context: None,
+            })
+            .await
+            .expect("a refused search resolves to a typed result");
+    server.abort();
+
+    assert_eq!(requests.lock().unwrap().len(), 1);
+    assert_eq!(result.status, WebSearchStatus::Failed, "{result:?}");
+    assert_eq!(result.answer, None, "{result:?}");
+    assert!(
+        result
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("`refusal`")),
+        "{result:?}"
+    );
 }

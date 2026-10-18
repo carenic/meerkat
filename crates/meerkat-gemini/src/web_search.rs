@@ -7,7 +7,9 @@ use meerkat_core::lifecycle::run_primitive::{
 use meerkat_core::web_search::{
     WebSearchEvidence, WebSearchNativeEvent, WebSearchRequest, WebSearchResult, WebSearchStatus,
 };
-use meerkat_core::{AgentLlmClient, AssistantBlock, Message, Provider, SystemMessage, UserMessage};
+use meerkat_core::{
+    AgentLlmClient, AssistantBlock, Message, Provider, StopReason, SystemMessage, UserMessage,
+};
 use meerkat_llm_core::{LlmError, WebSearchExecutor};
 use std::sync::Arc;
 
@@ -112,6 +114,26 @@ async fn execute_native_web_search(
         .await
         .map_err(map_agent_error_to_llm_error)?;
 
+    // A call that stopped on a refusal, a content filter, a filled context
+    // window or a cancellation produced no answer, even when a native search
+    // ran first: report it failed with the reason, never its text as the
+    // answer (#1887).
+    if let Some(stop) = unanswered_stop(result.stop_reason()) {
+        return Ok(WebSearchResult {
+            status: WebSearchStatus::Failed,
+            query: request.query,
+            provider: Some(provider),
+            model: Some(ModelId::new(model.to_string())),
+            answer: None,
+            evidence: Vec::new(),
+            native_events: Vec::new(),
+            error: Some(format!(
+                "the native web-search call stopped with `{stop}` and produced no answer"
+            )),
+            checked_at: chrono::Utc::now(),
+        });
+    }
+
     let mut answer_parts = Vec::new();
     let mut native_events = Vec::new();
     let mut evidence = Vec::new();
@@ -168,6 +190,25 @@ async fn execute_native_web_search(
         error: None,
         checked_at: chrono::Utc::now(),
     })
+}
+
+/// The wire name of a stop reason that ends a native search call without an
+/// answer: a refusal, a content filter, a filled context window or a
+/// cancellation (#1887). `None` for a call that answered, also one cut at its
+/// output cap or paused by the provider's server-tool loop. The match is
+/// exhaustive, so a new stop reason has to be placed here.
+fn unanswered_stop(stop_reason: StopReason) -> Option<&'static str> {
+    match stop_reason {
+        StopReason::Refusal => Some("refusal"),
+        StopReason::ContentFilter => Some("content_filter"),
+        StopReason::ContextWindowExceeded => Some("context_window_exceeded"),
+        StopReason::Cancelled => Some("cancelled"),
+        StopReason::EndTurn
+        | StopReason::ToolUse
+        | StopReason::MaxTokens
+        | StopReason::StopSequence
+        | StopReason::PauseTurn => None,
+    }
 }
 
 /// Translate the agent-loop [`AgentError`](meerkat_core::AgentError) returned
@@ -497,6 +538,19 @@ mod tests {
             })
         }
 
+        fn stopped(
+            blocks: Vec<AssistantBlock>,
+            stop_reason: StopReason,
+        ) -> Arc<dyn AgentLlmClient> {
+            Arc::new(Self {
+                outcome: Mutex::new(Some(Ok(LlmStreamResult::new(
+                    blocks,
+                    stop_reason,
+                    Usage::default(),
+                )))),
+            })
+        }
+
         fn err(err: AgentError) -> Arc<dyn AgentLlmClient> {
             Arc::new(Self {
                 outcome: Mutex::new(Some(Err(err))),
@@ -598,6 +652,72 @@ mod tests {
             !result.native_events.is_empty(),
             "the native-search witness must be retained"
         );
+    }
+
+    /// #1887: a search call that stopped on a refusal, a content filter, a
+    /// filled context window or a cancellation produced no answer. It
+    /// reports `failed` naming the stop reason, with none of its text,
+    /// evidence or native events, even after a native search ran.
+    #[tokio::test]
+    async fn a_search_call_stopped_without_an_answer_fails_with_its_reason() {
+        for (stop_reason, wire) in [
+            (StopReason::Refusal, "refusal"),
+            (StopReason::ContentFilter, "content_filter"),
+            (StopReason::ContextWindowExceeded, "context_window_exceeded"),
+            (StopReason::Cancelled, "cancelled"),
+        ] {
+            let client = FakeClient::stopped(
+                vec![
+                    server_tool_block(),
+                    text_block("I can't help with that search."),
+                ],
+                stop_reason,
+            );
+            let executor = GeminiWebSearchExecutor::new("gemini-3.5-flash".to_string(), client);
+            let result = executor
+                .execute_web_search(request())
+                .await
+                .expect("a stopped search still resolves to a typed result");
+            assert_eq!(result.status, WebSearchStatus::Failed, "{wire}");
+            assert_eq!(result.answer, None, "{wire}");
+            assert!(result.evidence.is_empty(), "{wire}: {:?}", result.evidence);
+            assert!(
+                result.native_events.is_empty(),
+                "{wire}: {:?}",
+                result.native_events
+            );
+            let error = result.error.expect("a failed search names its reason");
+            assert!(error.contains(&format!("`{wire}`")), "{error}");
+        }
+    }
+
+    /// A search answer cut at the call's output cap or paused by the
+    /// provider's server-tool loop still answers: it keeps the rules of a
+    /// natural end, completed with its answer once a native search ran.
+    #[tokio::test]
+    async fn a_search_cut_at_its_output_cap_or_paused_keeps_its_answer() {
+        for stop_reason in [
+            StopReason::EndTurn,
+            StopReason::MaxTokens,
+            StopReason::PauseTurn,
+        ] {
+            let client = FakeClient::stopped(
+                vec![text_block("Meerkats are small."), server_tool_block()],
+                stop_reason,
+            );
+            let executor = GeminiWebSearchExecutor::new("gemini-3.5-flash".to_string(), client);
+            let result = executor
+                .execute_web_search(request())
+                .await
+                .expect("an answered search resolves to a typed result");
+            assert_eq!(result.status, WebSearchStatus::Completed, "{stop_reason:?}");
+            assert_eq!(
+                result.answer.as_deref(),
+                Some("Meerkats are small."),
+                "{stop_reason:?}"
+            );
+            assert_eq!(result.error, None, "{stop_reason:?}");
+        }
     }
 
     // Row #355: a stream error must propagate the typed failure class, not be
