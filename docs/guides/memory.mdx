@@ -77,20 +77,22 @@ Controls when and how compaction runs.
 | `max_request_bytes` | `Option<u64>` | `None` | Optional host request-body cap. Byte compaction triggers at four-fifths of the stricter available cap: this value or an exact provider-reported cap. |
 | `recent_turn_budget` | `usize` | `4` | Maximum number of recent complete conversational turns to retain. A turn starts only at a conversational User message; typed injected context stays attached to that turn. Capacity recovery may retain fewer turns. |
 | `max_summary_tokens` | `u32` | `4096` | Maximum tokens the LLM may produce for the compaction summary. |
-| `min_turns_between_compactions` | `u32` | `3` | Minimum turns that must elapse between consecutive compactions (loop guard to prevent runaway compaction). |
+| `min_turns_between_compactions` | `u32` | `3` | Minimum pre-LLM boundaries between an ordinary compaction and the last compaction or failed attempt (loop guard to prevent runaway compaction). Every LLM call is a boundary, including each call of a tool loop, and the session keeps the count across runs. Capacity recovery bypasses it. |
 
 ## How compaction triggers
 
-Compaction is checked at every turn boundary, just before the next LLM call.
+Compaction is checked at every pre-LLM boundary: just before each LLM call,
+including each call of a tool loop.
 
 The decision flow:
 
 <Steps>
-  <Step title="Skip turn 0">
-    The first turn always skips compaction.
+  <Step title="Skip the first boundary">
+    The session's first LLM call never compacts.
   </Step>
   <Step title="Cadence check">
-    Ordinary compaction attempts respect `min_turns_between_compactions`.
+    Ordinary compaction attempts respect `min_turns_between_compactions`,
+    counted in pre-LLM boundaries since the last compaction or failed attempt.
     Current-history or request-byte capacity recovery bypasses this cost guard.
   </Step>
   <Step title="Threshold evaluation">
