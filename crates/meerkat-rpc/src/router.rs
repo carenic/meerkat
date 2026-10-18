@@ -15189,10 +15189,14 @@ provider_params = { provider_tag = { provider = "anthropic", cache_control = "di
     }
 
     /// #1883: through the production RPC sink, a failed response commits
-    /// nothing it staged and records its accounting, and the next response
-    /// on the same channel commits normally.
+    /// nothing it staged (spoken transcript or buffered display text),
+    /// leaves the in-flight set a barge-in targets, and records its
+    /// accounting: measured usage on the session, or the routed unmeasured
+    /// fact. The next response on the same channel commits normally.
     #[tokio::test]
     async fn live_host_failed_response_commits_nothing_through_the_rpc_sink() {
+        use meerkat_live::LiveProjectionSink as _;
+
         let (router, _notif_rx) = test_router().await;
         let create = router
             .dispatch(make_request(
@@ -15209,11 +15213,14 @@ provider_params = { provider_tag = { provider = "anthropic", cache_control = "di
         )
         .expect("canonical session id");
 
-        let host = meerkat_live::LiveAdapterHost::new(Arc::new(
+        let sink = Arc::new(
             crate::live_projection_sink::SessionServiceProjectionSink::new(Arc::clone(
                 &router.runtime,
             )),
-        ));
+        );
+        let host = meerkat_live::LiveAdapterHost::new(
+            Arc::clone(&sink) as Arc<dyn meerkat_live::LiveProjectionSink>
+        );
         let channel_id = meerkat_live::LiveChannelId::random_uuid();
         let identity = meerkat_core::SessionLlmIdentity {
             model: "gpt-realtime-2".to_string(),
@@ -15234,6 +15241,11 @@ provider_params = { provider_tag = { provider = "anthropic", cache_control = "di
         )
         .await
         .expect("open live channel");
+        let mut events = router
+            .runtime
+            .subscribe_session_events(&session_id)
+            .await
+            .expect("subscribe to session events");
 
         let spoken = |response_id: &str, item_id: &str, delta: &str| {
             meerkat_core::live_adapter::LiveAdapterObservation::AssistantTranscriptDelta {
@@ -15245,22 +15257,88 @@ provider_params = { provider_tag = { provider = "anthropic", cache_control = "di
                 delta: delta.to_string(),
             }
         };
+        let failure = meerkat_core::live_adapter::LiveResponseFailure {
+            status: meerkat_core::live_adapter::LiveResponseFailureStatus::Incomplete,
+            reason: Some("provider_reason".to_string()),
+            code: None,
+            message: None,
+        };
         host.apply_observation(
             &channel_id,
             &spoken("resp_failed", "item_failed", "partial speech"),
         )
         .await
         .expect("spoken delta applies");
+        sink.append_assistant_text_final(
+            &session_id,
+            "partial display text",
+            meerkat_live::LiveTranscriptIdentity::default(),
+            meerkat_core::types::StopReason::EndTurn,
+            meerkat_core::types::Usage::default(),
+            Some("resp_failed"),
+        )
+        .await
+        .expect("display final buffers");
+        assert_eq!(
+            router
+                .runtime
+                .in_flight_realtime_assistant_response_ids(&session_id)
+                .await
+                .expect("in-flight ids read"),
+            vec!["resp_failed".to_string()]
+        );
+        let usage_before = router
+            .runtime
+            .read_session(&session_id)
+            .await
+            .expect("session reads")
+            .billing
+            .usage;
+
         host.apply_observation(
             &channel_id,
             &meerkat_core::live_adapter::LiveAdapterObservation::TurnFailed {
                 response_id: Some("resp_failed".to_string()),
-                failure: meerkat_core::live_adapter::LiveResponseFailure {
-                    status: meerkat_core::live_adapter::LiveResponseFailureStatus::Incomplete,
-                    reason: Some("provider_reason".to_string()),
-                    code: None,
-                    message: None,
+                failure: failure.clone(),
+                accounting: meerkat_core::live_adapter::LiveResponseAccounting::Measured {
+                    usage: meerkat_core::TurnUsage::host_declared(
+                        meerkat_core::Provider::OpenAI,
+                        "gpt-realtime-2",
+                        meerkat_core::types::Usage {
+                            input_tokens: 17,
+                            output_tokens: 23,
+                            ..meerkat_core::types::Usage::default()
+                        },
+                    ),
                 },
+            },
+        )
+        .await
+        .expect("a failed response projects through the RPC sink");
+        assert!(
+            router
+                .runtime
+                .in_flight_realtime_assistant_response_ids(&session_id)
+                .await
+                .expect("in-flight ids read")
+                .is_empty(),
+            "a failed response leaves the in-flight set a barge-in targets"
+        );
+        let usage_after = router
+            .runtime
+            .read_session(&session_id)
+            .await
+            .expect("session reads")
+            .billing
+            .usage;
+        assert_eq!(usage_after.input_tokens, usage_before.input_tokens + 17);
+        assert_eq!(usage_after.output_tokens, usage_before.output_tokens + 23);
+
+        host.apply_observation(
+            &channel_id,
+            &meerkat_core::live_adapter::LiveAdapterObservation::TurnFailed {
+                response_id: Some("resp_unmeasured".to_string()),
+                failure,
                 accounting: meerkat_core::live_adapter::LiveResponseAccounting::Unmeasured {
                     unmeasured: meerkat_core::UnmeasuredTurnUsageAccounting::new(
                         meerkat_core::Provider::OpenAI,
@@ -15270,7 +15348,27 @@ provider_params = { provider_tag = { provider = "anthropic", cache_control = "di
             },
         )
         .await
-        .expect("a failed response projects through the RPC sink");
+        .expect("an unmeasured failed response projects through the RPC sink");
+        let unmeasured = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let envelope = futures::StreamExt::next(&mut events)
+                    .await
+                    .expect("session event stream stays open");
+                match envelope.payload {
+                    meerkat_core::AgentEvent::TurnUsageAccountingUnmeasured {
+                        unmeasured, ..
+                    } => break unmeasured,
+                    meerkat_core::AgentEvent::TurnCompleted { .. } => {
+                        panic!("a failed response publishes no turn terminal")
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("the unmeasured fact is published");
+        assert_eq!(unmeasured.model, "gpt-realtime-2");
+
         host.apply_observation(
             &channel_id,
             &spoken("resp_next", "item_next", "next answer"),
@@ -15306,7 +15404,7 @@ provider_params = { provider_tag = { provider = "anthropic", cache_control = "di
             .expect("session exists");
         let rendered = serde_json::to_string(&history.messages).expect("history serializes");
         assert!(
-            !rendered.contains("partial speech"),
+            !rendered.contains("partial speech") && !rendered.contains("partial display text"),
             "nothing of the failed response is committed: {rendered}"
         );
         assert!(
