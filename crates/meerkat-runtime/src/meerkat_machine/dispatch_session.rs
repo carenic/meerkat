@@ -1411,6 +1411,7 @@ impl MeerkatMachine {
         )>,
         allow_late_compaction_binding: bool,
         runtime_authority: Arc<dyn std::any::Any + Send + Sync>,
+        registration: RuntimeSessionRegistrationWitness,
         agent_binding: super::SessionAgentBinding,
         tool_surface_gate: meerkat_core::ToolSurfaceGateSlot,
         mcp_observation: meerkat_core::McpObservationSlot,
@@ -1439,7 +1440,7 @@ impl MeerkatMachine {
             self.native_work_authorization_host.get().map(|attachment| {
                 attachment
                     .host()
-                    .configured_mcp_attachment_for_agent(&session_id, agent_binding.clone())
+                    .configured_mcp_attachment_for_agent(&registration, agent_binding.clone())
             });
         let bindings = meerkat_core::SessionRuntimeBindings::__from_runtime_authority(
             session_id.clone(),
@@ -1527,6 +1528,7 @@ impl MeerkatMachine {
             cached,
             durability_health,
             post_commit_hooks,
+            registration,
             agent_binding,
             tool_surface_gate,
             mcp_observation,
@@ -1554,6 +1556,19 @@ impl MeerkatMachine {
                 entry.canonical_runtime_bindings.clone(),
                 entry.durability_health.clone(),
                 Arc::clone(&entry.post_commit_hooks),
+                // The exact registration these bindings are assembled for:
+                // this entry's epoch and its own mutation gate, read under the
+                // sessions lock that just matched the entry to the caller's
+                // epoch and owners, and minted as registration mints it
+                // (`session_management.rs`). A later registration of the same
+                // session has another mutation gate, so a host's
+                // configured-server decision for this one never answers it.
+                RuntimeSessionRegistrationWitness::new(
+                    Arc::downgrade(&self.shared),
+                    session_id.clone(),
+                    entry.epoch_id.clone(),
+                    Arc::downgrade(&entry.mutation_gate),
+                ),
                 entry.agent_binding.clone(),
                 entry.tool_surface_gate.clone(),
                 entry.mcp_observation.clone(),
@@ -1576,6 +1591,7 @@ impl MeerkatMachine {
             compaction_runtime_binding,
             allow_late_compaction_binding,
             Arc::clone(&runtime_authority),
+            registration,
             agent_binding,
             tool_surface_gate,
             mcp_observation,

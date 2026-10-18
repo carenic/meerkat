@@ -35,6 +35,16 @@ them.
 
 ## [Unreleased]
 
+### Breaking
+
+- `meerkat-runtime`: `ConfiguredMcpAttachmentProvider::configured` and
+  `NativeWorkAuthorizationHost::configured_mcp_attachment_for_agent` take the
+  session's exact `RuntimeSessionRegistrationWitness` instead of its
+  `SessionId`, so a provider decides for one exact registration, not for
+  whichever registration of that session asks. Read the id with
+  `registration.session_id()`; a closure provider is
+  `Fn(&RuntimeSessionRegistrationWitness, SessionAgentBinding) -> Option<..>`.
+
 ### Added
 
 - `meerkat-mob`: `MemberRuntimeBuildIdentity::registration()` returns the
