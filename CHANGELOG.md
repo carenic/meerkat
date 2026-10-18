@@ -35,6 +35,24 @@ them.
 
 ## [Unreleased]
 
+### Added
+
+- `meerkat-runtime`: `MeerkatMachine::durable_admitted_original`, the durable
+  sibling of `with_admitted_original`. It reads the historical admission of a
+  keyed governed original from the session's durable runtime store alone, so a
+  source owner can resolve it after the session retired, with no registration,
+  attachment or actor. It derives the runtime-qualified key from the expected
+  original, reads the store-owned key index, and returns the actual input id,
+  the retained association and the durable phase, terminal outcome, last run
+  and attempt count (`DurableAdmittedOriginal`) only for the exact admission:
+  one own contributor with that association and the exact replay of the
+  expected original. `DurableAdmittedOriginalRefusal` (`Conflict`,
+  `NotAdmitted`, `UnknownRuntime`, `Unavailable`; non-exhaustive) keeps a
+  mismatch, absence under the key, an unknown session and unreadable evidence
+  apart. The read consults no live state, revives nothing, and submits,
+  replays or releases nothing. `SessionServiceRuntimeExt::durable_admitted_original`
+  forwards it; its default answers `Unavailable`.
+
 ## [0.9.3] - 2026-10-18
 
 ### Breaking
