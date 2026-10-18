@@ -35,6 +35,8 @@ them.
 
 ## [Unreleased]
 
+## [0.9.3] - 2026-10-18
+
 ### Breaking
 
 - `meerkat-core`: `PeerInteractionHandle::request_received` takes a third
@@ -28685,7 +28687,8 @@ tag, so its comparison link uses v0.3.0 as the exact ancestry base.
 
 Initial development release.
 
-[Unreleased]: https://github.com/lukacf/meerkat/compare/v0.9.2...HEAD
+[Unreleased]: https://github.com/lukacf/meerkat/compare/v0.9.3...HEAD
+[0.9.3]: https://github.com/lukacf/meerkat/compare/v0.9.2...v0.9.3
 [0.9.2]: https://github.com/lukacf/meerkat/compare/v0.9.1...v0.9.2
 [0.9.1]: https://github.com/lukacf/meerkat/compare/v0.9.0...v0.9.1
 [0.9.0]: https://github.com/lukacf/meerkat/compare/v0.8.52...v0.9.0

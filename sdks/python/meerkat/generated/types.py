@@ -2,7 +2,7 @@ from __future__ import annotations
 
 """Generated wire types for Meerkat SDK.
 
-Contract version: 0.9.2
+Contract version: 0.9.3
 """
 
 import sys
@@ -17,7 +17,7 @@ else:
 from .errors import MeerkatError
 
 
-CONTRACT_VERSION = "0.9.2"
+CONTRACT_VERSION = "0.9.3"
 
 
 Value = Any
