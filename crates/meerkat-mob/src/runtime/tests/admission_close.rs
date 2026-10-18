@@ -450,6 +450,157 @@ async fn close_admission_closes_a_busy_mob_without_stopping_its_work() {
     );
 }
 
+/// After `shutdown()` the actor takes no more commands, so the mob grants no
+/// owner lease either: the admitted Shutdown closes admission with its own
+/// reason, which every handle observes.
+#[tokio::test]
+async fn shutdown_closes_admission_and_refuses_later_owners() {
+    let (handle, _service) = create_test_mob(sample_definition()).await;
+    let observer = handle.observer();
+    assert!(observer.admission_closed().borrow().is_none());
+
+    handle.shutdown().await.expect("shutdown");
+    assert_eq!(
+        *observer.admission_closed().borrow(),
+        Some(MobAdmissionCloseReason::Shutdown)
+    );
+    assert_eq!(
+        *handle.admission_closed().borrow(),
+        Some(MobAdmissionCloseReason::Shutdown)
+    );
+    for acquirer in [&observer, &handle] {
+        match acquirer.acquire_owner() {
+            Ok(_) => panic!("a shut-down mob grants no owner"),
+            Err(error) => assert_admission_closed(error, MobAdmissionCloseReason::Shutdown),
+        }
+    }
+}
+
+/// A Shutdown after an earlier close keeps the first reason (D67).
+#[tokio::test]
+async fn shutdown_keeps_an_earlier_close_reason() {
+    let (handle, _service) = create_test_mob(sample_definition()).await;
+    assert_eq!(
+        handle
+            .close_admission(MobAdmissionCloseReason::StandDown)
+            .await
+            .expect("close admission"),
+        None
+    );
+
+    handle.shutdown().await.expect("shutdown");
+    assert_eq!(
+        *handle.admission_closed().borrow(),
+        Some(MobAdmissionCloseReason::StandDown)
+    );
+    match handle.acquire_owner() {
+        Ok(_) => panic!("a closed mob grants no owner"),
+        Err(error) => assert_admission_closed(error, MobAdmissionCloseReason::StandDown),
+    }
+}
+
+/// Control: a Stop, the resumable pause, leaves admission open.
+#[tokio::test]
+async fn stop_leaves_admission_open() {
+    let (handle, _service) = create_test_mob(sample_definition()).await;
+    handle.stop().await.expect("stop");
+    actor_round_trip(&handle).await;
+    assert!(
+        handle.admission_closed().borrow().is_none(),
+        "a stopped mob keeps admission open"
+    );
+    let lease = match handle.acquire_owner() {
+        Ok(lease) => lease,
+        Err(error) => panic!("a stopped mob grants a foreground owner: {error}"),
+    };
+    assert!(lease.is_public_owner());
+}
+
+/// The admitted Shutdown closes admission before its teardown: while the
+/// teardown still waits on a held session, the mob grants no owner lease and
+/// refuses new work with the Shutdown reason.
+#[cfg(all(feature = "runtime-adapter", not(target_arch = "wasm32")))]
+#[tokio::test]
+async fn shutdown_closes_admission_before_its_teardown() {
+    let mut definition = sample_definition();
+    definition
+        .profiles
+        .get_mut(&ProfileName::from("lead"))
+        .expect("lead profile")
+        .as_inline_mut()
+        .expect("inline lead profile")
+        .runtime_mode = crate::MobRuntimeMode::TurnDriven;
+    let (handle, service) = create_test_mob_with_runtime_backed_real_comms(definition).await;
+    let held_session = handle
+        .spawn(
+            ProfileName::from("lead"),
+            AgentIdentity::from("d67-shutdown-held"),
+            None,
+        )
+        .await
+        .expect("spawn member")
+        .bridge_session_id()
+        .expect("session-backed member")
+        .clone();
+    let guard = service
+        .runtime_adapter
+        .hold_session_registration_transaction_for_test(&held_session)
+        .await;
+    let mut parked = handle
+        .lifecycle_observations
+        .shutdown_teardown_parked
+        .subscribe();
+    assert!(handle.admission_closed().borrow().is_none());
+
+    let shutdown_handle = handle.clone();
+    let shutdown = tokio::spawn(async move {
+        shutdown_handle
+            .shutdown_with_report(
+                crate::runtime::ShutdownOptions::default()
+                    .with_deadline(Instant::now() + Duration::from_secs(3)),
+            )
+            .await
+    });
+    tokio::time::timeout(STEP, parked.wait_for(|parked| *parked))
+        .await
+        .expect("the shutdown parks on its teardown")
+        .expect("the probe outlives the test");
+    assert_eq!(
+        *handle.admission_closed().borrow(),
+        Some(MobAdmissionCloseReason::Shutdown),
+        "admission closed before the teardown"
+    );
+    match handle.acquire_owner() {
+        Ok(_) => panic!("a shutting-down mob grants no owner"),
+        Err(error) => assert_admission_closed(error, MobAdmissionCloseReason::Shutdown),
+    }
+    let late = tokio::time::timeout(
+        STEP,
+        handle.spawn(
+            ProfileName::from("lead"),
+            AgentIdentity::from("d67-shutdown-late"),
+            None,
+        ),
+    )
+    .await
+    .expect("the actor answers a spawn during the teardown");
+    match late {
+        Ok(_) => panic!("a shutting-down mob admits no new member"),
+        Err(error) => assert_admission_closed(error, MobAdmissionCloseReason::Shutdown),
+    }
+    assert!(
+        !shutdown.is_finished(),
+        "the teardown is still waiting on the held session"
+    );
+
+    drop(guard);
+    tokio::time::timeout(STEP, shutdown)
+        .await
+        .expect("shutdown returns")
+        .expect("join")
+        .expect("shutdown succeeds");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn acquire_owner_racing_the_close_is_owned_or_refused_never_both() {
     for round in 0..16 {

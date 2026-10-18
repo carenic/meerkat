@@ -16,7 +16,8 @@
 //! with owners and admitted work present, by design) and an acquisition after
 //! any close is refused. Closing never stops
 //! admitted work: the ordinary Stop, Shutdown and Destroy remain the teardown
-//! path.
+//! path. An admitted Shutdown closes admission itself, before its teardown;
+//! a Stop leaves it open.
 
 use std::sync::{Arc, Mutex};
 
@@ -32,6 +33,10 @@ pub enum MobAdmissionCloseReason {
     LastOwnerReleased,
     /// The embedder closed admission unconditionally to stand the mob down.
     StandDown,
+    /// The mob admitted a Shutdown: [`MobHandle::shutdown`](super::MobHandle::shutdown)
+    /// closes admission before its teardown, and the actor accepts no more
+    /// commands once the Shutdown completes.
+    Shutdown,
 }
 
 impl std::fmt::Display for MobAdmissionCloseReason {
@@ -40,6 +45,7 @@ impl std::fmt::Display for MobAdmissionCloseReason {
             Self::IdleClose => f.write_str("idle close"),
             Self::LastOwnerReleased => f.write_str("last public owner released"),
             Self::StandDown => f.write_str("stand down"),
+            Self::Shutdown => f.write_str("shutdown"),
         }
     }
 }

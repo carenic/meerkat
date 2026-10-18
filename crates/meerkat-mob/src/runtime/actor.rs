@@ -18517,6 +18517,24 @@ impl MobActor {
         }
     }
 
+    /// Close admission because the actor is about to take no more commands:
+    /// an admitted Shutdown, before its teardown.
+    ///
+    /// Nothing is then handed an owner lease on an actor that will take no
+    /// further command. Unconditional, keeping the first reason (D67); it
+    /// answers nobody, so it takes no busy snapshot. A Stop, the resumable
+    /// pause, never calls this.
+    #[inline(never)]
+    fn close_admission_for_exit(&mut self, reason: MobAdmissionCloseReason) {
+        use super::admission_close::{CloseDecision, CloseRequest};
+        if let CloseDecision::Closed { reason, .. } = self
+            .ownership
+            .decide(CloseRequest::Unconditional(reason), MobBusy::default)
+        {
+            self.enter_admission_closed(reason);
+        }
+    }
+
     /// The latched last-owner release: close once no owner is present and
     /// the mob is idle. An owner present again clears the latch; its own
     /// release signals anew.
@@ -28382,6 +28400,10 @@ impl MobActor {
                         let _ = reply_tx.send(Err(error));
                         return ActorLoopControl::SkipBoundary;
                     }
+                    // The admitted Shutdown closes admission before any
+                    // teardown step: from here on no owner lease is handed
+                    // out and no new work is admitted.
+                    self.close_admission_for_exit(MobAdmissionCloseReason::Shutdown);
                     self.log_shutdown_admitted();
                     #[cfg(test)]
                     self.lifecycle_observations

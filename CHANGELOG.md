@@ -35,6 +35,35 @@ them.
 
 ## [Unreleased]
 
+### Breaking
+
+- Behaviour-only (not measured by the gate): an admitted `MobHandle::shutdown`
+  or `MobHandle::shutdown_with_report` closes the mob's admission before its
+  teardown (see Fixed). While that Shutdown is parked on its members' stops or
+  on its runtime teardown, a command the Closing state refuses is refused with
+  `MobError::AdmissionClosed` (reason `MobAdmissionCloseReason::Shutdown`): a
+  spawn, respawn, work submission or flow run got
+  `MobError::ActorCommandChannelClosed` there, and the other refused commands
+  (for example wiring, a host bind, a live commit, resume, reset or reload)
+  waited for the Shutdown or ran. `MobHandle::acquire_owner` after the
+  Shutdown's admission is refused the same way where it granted an owner
+  lease.
+
+### Fixed
+
+- `MobHandle::shutdown` closes the mob's admission, as its contract says
+  ("After this, no more commands are accepted"). The actor closes it on its
+  serialized admission path when it admits the Shutdown, before any teardown
+  step, with the new `MobAdmissionCloseReason::Shutdown` (appended to the
+  `#[non_exhaustive]` enum; it displays as "shutdown"); an earlier close keeps
+  its reason. Before, admission closed only through `close_if_idle`, the last
+  owner's release or `close_admission`: after a Shutdown, `acquire_owner`
+  handed out an owner lease on an actor that would take no further command,
+  and `admission_closed()` stayed `None`, so an embedding host that treats a
+  closed mob as gone kept treating the shut-down mob as live. A Shutdown that
+  fails after its admission leaves admission closed; Stop, Shutdown and
+  Destroy stay available. A Stop, the resumable pause, leaves admission open.
+
 ## [0.9.3] - 2026-10-18
 
 ### Breaking

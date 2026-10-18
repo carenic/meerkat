@@ -14496,6 +14496,16 @@ impl MobHandle {
 
     /// Shut down the actor. After this, no more commands are accepted.
     ///
+    /// The admitted Shutdown closes admission first, before any teardown
+    /// (D67; the reason is
+    /// [`MobAdmissionCloseReason::Shutdown`](crate::runtime::MobAdmissionCloseReason::Shutdown)
+    /// unless admission had already closed): from then on
+    /// [`Self::acquire_owner`] and every command the Closing state refuses
+    /// fail with [`MobError::AdmissionClosed`], and [`Self::admission_closed`]
+    /// reports the reason. A Shutdown that fails after its admission leaves
+    /// admission closed: the mob can still be torn down (Shutdown again, or
+    /// Destroy) but admits no new work. A Stop leaves admission open.
+    ///
     /// Shutdown makes progress past members it cannot settle instead of
     /// waiting on them:
     /// - an in-flight member retirement is interrupted cooperatively;
