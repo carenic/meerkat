@@ -37,62 +37,6 @@ them.
 
 ### Breaking
 
-- Behaviour-only (not measured by the gate): `meerkat-mcp` closes a stdio
-  MCP server's stderr shortly after its process is gone. A descendant that
-  outlives the server and still writes to stderr then gets `EPIPE` (or
-  `SIGPIPE`); on a trusted-host launch it used to inherit the host's stderr
-  and could keep writing there (see Changed).
-- Behaviour-only (not measured by the gate): for a governed web_search
-  helper whose owner rates its model request R2 or R3, the tool error code
-  changes from `operation_authorization_unavailable` to `review_unavailable`
-  (R2) or `review_unsatisfied` (R3), and the Anthropic, OpenAI and Gemini
-  web_search executors return `LlmError::OperationReviewRefused` instead of
-  `LlmError::OperationAuthorizationUnavailable` for them (see Fixed). A host
-  that branched on the old code or variant for these settlements must branch
-  on the review ones.
-- Behaviour-only (not measured by the gate): a live tool call that its
-  session fails with a model request's settled review now reaches the live
-  model as `review_unavailable` (R2) or `review_unsatisfied` (R3) instead of
-  `operation_authorization_unavailable`, and
-  `LiveToolDispatchError::from_session_error` classifies it as
-  `LiveToolDispatchError::Tool` with `ToolError::ReviewUnavailable` or
-  `ToolError::ReviewUnsatisfied` (see Fixed).
-- Behaviour-only (not measured by the gate): a live tool call that its
-  session fails with a model request's settled review, authority
-  unavailability or observation unavailability together with settlement
-  diagnostics is classified like the same failure without them:
-  `LiveToolDispatchError::Tool` instead of `LiveToolDispatchError::Session`
-  with code `AGENT_ERROR` (see Fixed). Through `LiveAdapterHost`, the review
-  and authority cases now reach the live model as typed tool feedback instead
-  of a prose tool error, and in the observation case `apply_observation`
-  returns `LiveAdapterHostError::OperationObservationUnavailable` instead of
-  submitting a prose tool error.
-- `meerkat_schedule::ScheduleService::attach_identity_target_probe` takes
-  `&Arc<dyn ScheduleIdentityTargetProbe>` instead of
-  `Arc<dyn ScheduleIdentityTargetProbe>` and holds the probe weakly: the
-  caller owns it, and it judges identity targets only while the caller keeps
-  it (see Fixed).
-- Behaviour-only (not measured by the gate): the earliest attached
-  identity-target probe that is still alive judges, instead of the first one
-  ever attached. Once every attached probe is gone, an identity-target create,
-  or an update that sets an identity target, fails with
-  `ScheduleDomainError::DriverStopped`; `handle_schedule_tools_call` returns
-  it as `CAPABILITY_UNAVAILABLE` (-32001), and `ScheduleToolDispatcher` and
-  `ScheduleToolSurface` return `ToolError::Unavailable` with
-  `ToolUnavailableReason::TemporarilyUnavailable`. The RPC `schedule/*`
-  methods return it as capability unavailable (-32020), and the REST
-  `/schedules` endpoints as 503 `SERVICE_UNAVAILABLE`, as for an
-  unsupported schedule backend. A service that never had a
-  probe attached still accepts identity targets unjudged.
-- Behaviour-only (not measured by the gate): Linux shell process custody
-  refuses a host whose `/proc` is not a procfs of its own pid namespace (see
-  Fixed). A host started in a new pid namespace without a procfs mounted for
-  it (for example under `unshare --pid --fork` without `--mount-proc`), whose
-  own pid number named a process of the same user in the outer procfs
-  (typically a host running as root), used to run custody on the identities
-  of other processes. Its session builds under a realm runtime root now fail
-  with `ProcessCustodyError::ForeignProcfs` until it has a procfs of its own
-  pid namespace.
 - `meerkat-core`: `PeerInteractionHandle::request_received` takes a third
   parameter, `requester: PeerId`: the canonical peer id of the inbound
   request's sender as ingress admitted it, never a field of the request's
@@ -104,11 +48,24 @@ them.
   implementor answers, from the requester it recorded, whether a response to
   that inbound request may go to `addressee`. A handle that cannot judge
   returns an error, which `CommsRuntime::send` treats as a refusal (see
-  Fixed).
-- `meerkat-machine-kernels`: generated machine-authority enums whose variants
-  were added, so their implicit discriminants change (`EffectKind::*`,
-  `SignalKind::*` and `TransitionId::*`); match them by variant name, not by
-  numeric cast or position.
+  Security).
+- `meerkat-core`: `PeerInteractionHandle::request_sent` takes a second
+  parameter, `addressee: PeerId`: the canonical peer id the request is routed
+  to. `PeerInteractionHandle::response_progress`, `response_terminal` and
+  `response_rejected` take one more parameter, `responder: PeerId`: the
+  canonical peer id of the response frame's verified signer as ingress
+  admitted it (`PeerInputCandidate::from_peer_id`), never a payload field.
+  `PeerCommsHandle` gains the required method
+  `resolve_peer_response_sender(corr_id, responder) ->
+  Result<PeerResponseSenderVerdict, DslTransitionError>`: an implementor
+  answers, from the addressee it recorded, whether a response frame to that
+  outbound request may be accepted from `responder`. A handle that cannot
+  judge returns an error, which ingress treats as a refusal (see Security).
+- `meerkat-machine-kernels`: generated MeerkatMachine enums
+  (`generated::meerkat`) whose variants were added, so their implicit
+  discriminants change (`EffectKind::*`, `SignalKind::*` and
+  `TransitionId::*`); match them by variant name, not by numeric cast or
+  position.
 - `meerkat-machine-kernels`: new public fields on exhaustively constructible
   structs (struct literals need them): `State` gains
   `inbound_peer_request_requesters`; `inputs::PeerRequestReceived` gains
@@ -136,47 +93,6 @@ them.
   `ResolvePeerResponseAddresseeUnknownRequestRetired`,
   `ResolvePeerResponseAddresseeUnknownRequestStopped` and
   `ResolvePeerResponseAddresseeUnknownRequestDestroyed`.
-- `meerkat-machine-schema` and `meerkat-runtime` (`meerkat_machine::dsl`):
-  generated machine-authority enums whose variants were added, so their
-  implicit discriminants change (`MeerkatMachineEffect::*`,
-  `MeerkatMachineEffectVariant::*`, `MeerkatMachineSignal::*` and
-  `MeerkatMachineSignalVariant::*`) and so does the `PartialOrd` order of
-  `MeerkatMachineEffectVariant::*` and `MeerkatMachineSignalVariant::*`;
-  match them by variant name, not by numeric cast or position.
-- `meerkat-machine-schema` and `meerkat-runtime`: a new public field on an
-  exhaustively constructible struct (struct literals need it):
-  `MeerkatMachineState` gains `inbound_peer_request_requesters`.
-- `meerkat-machine-schema` and `meerkat-runtime`: a new field on an enum
-  struct variant (literals and patterns without `..` need it):
-  `MeerkatMachineInput::PeerRequestReceived` gains `requester`.
-- `meerkat-machine-schema` and `meerkat-runtime`: new variants on exhaustive
-  enums (exhaustive matches need arms for them): `MeerkatMachineEffect` gains
-  `PeerResponseAddresseeResolved`; `MeerkatMachineEffectVariant` gains
-  `PeerResponseAddresseeResolved`; `MeerkatMachineSignal` gains
-  `ResolvePeerResponseAddressee`; `MeerkatMachineSignalVariant` gains
-  `ResolvePeerResponseAddressee`.
-- Behaviour-only (not measured by the gate): `CommsRuntime::send` refuses a
-  `PeerResponse` whose `to` is not the recorded requester; host `comms/send`
-  fails with `send_failed` and `send_response` with `invalid_arguments` where
-  they delivered (see Fixed).
-- `meerkat-comms`: `Router::stage_reply_endpoint` returns
-  `Result<(), meerkat_core::comms::SendError>` instead of `()`, and refuses
-  with `SendError::Validation`, staging nothing, an endpoint whose key does not
-  derive `dest`. Behaviour-only (not measured by the gate):
-  `CommsRuntime::stage_declared_reply_endpoint` refuses the same case where it
-  staged the endpoint (see Fixed).
-- `meerkat-core`: `PeerInteractionHandle::request_sent` takes a second
-  parameter, `addressee: PeerId`: the canonical peer id the request is routed
-  to. `PeerInteractionHandle::response_progress`, `response_terminal` and
-  `response_rejected` take one more parameter, `responder: PeerId`: the
-  canonical peer id of the response frame's verified signer as ingress
-  admitted it (`PeerInputCandidate::from_peer_id`), never a payload field.
-  `PeerCommsHandle` gains the required method
-  `resolve_peer_response_sender(corr_id, responder) ->
-  Result<PeerResponseSenderVerdict, DslTransitionError>`: an implementor
-  answers, from the addressee it recorded, whether a response frame to that
-  outbound request may be accepted from `responder`. A handle that cannot
-  judge returns an error, which ingress treats as a refusal (see Fixed).
 - `meerkat-machine-kernels`: new public fields on exhaustively constructible
   structs (struct literals need them): `State` gains
   `pending_peer_request_addressees`; `inputs::PeerRequestSent` gains
@@ -207,6 +123,25 @@ them.
   `ResolvePeerResponseSenderUnknownRequestStopped` and
   `ResolvePeerResponseSenderUnknownRequestDestroyed`.
 - `meerkat-machine-schema` and `meerkat-runtime` (`meerkat_machine::dsl`):
+  generated machine-authority enums whose variants were added, so their
+  implicit discriminants change (`MeerkatMachineEffect::*`,
+  `MeerkatMachineEffectVariant::*`, `MeerkatMachineSignal::*` and
+  `MeerkatMachineSignalVariant::*`) and so does the `PartialOrd` order of
+  `MeerkatMachineEffectVariant::*` and `MeerkatMachineSignalVariant::*`;
+  match them by variant name, not by numeric cast or position.
+- `meerkat-machine-schema` and `meerkat-runtime`: a new public field on an
+  exhaustively constructible struct (struct literals need it):
+  `MeerkatMachineState` gains `inbound_peer_request_requesters`.
+- `meerkat-machine-schema` and `meerkat-runtime`: a new field on an enum
+  struct variant (literals and patterns without `..` need it):
+  `MeerkatMachineInput::PeerRequestReceived` gains `requester`.
+- `meerkat-machine-schema` and `meerkat-runtime`: new variants on exhaustive
+  enums (exhaustive matches need arms for them): `MeerkatMachineEffect` gains
+  `PeerResponseAddresseeResolved`; `MeerkatMachineEffectVariant` gains
+  `PeerResponseAddresseeResolved`; `MeerkatMachineSignal` gains
+  `ResolvePeerResponseAddressee`; `MeerkatMachineSignalVariant` gains
+  `ResolvePeerResponseAddressee`.
+- `meerkat-machine-schema` and `meerkat-runtime` (`meerkat_machine::dsl`):
   `MeerkatMachineState` gains `pending_peer_request_addressees` (struct
   literals need it); `MeerkatMachineInput::PeerRequestSent` gains `addressee`
   and `MeerkatMachineInput::PeerResponseProgressArrived`,
@@ -217,103 +152,30 @@ them.
   `ResolvePeerResponseSender` (exhaustive matches need arms for them; the
   implicit discriminants and the `PartialOrd` order of the variant enums
   change, so match them by variant name).
+- Not measured by the gate (a return type change): `meerkat-comms`:
+  `Router::stage_reply_endpoint` returns
+  `Result<(), meerkat_core::comms::SendError>` instead of `()`, and refuses
+  with `SendError::Validation`, staging nothing, an endpoint whose key does
+  not derive `dest`. Behaviour-only (not measured by the gate):
+  `CommsRuntime::stage_declared_reply_endpoint` refuses the same case where it
+  staged the endpoint (see Security).
+- Behaviour-only (not measured by the gate): `CommsRuntime::send` refuses a
+  `PeerResponse` whose `to` is not the recorded requester; host `comms/send`
+  fails with `send_failed` and `send_response` with `invalid_arguments` where
+  they delivered (see Security).
 - Behaviour-only (not measured by the gate): a response to an outbound peer
   request is accepted only from the peer the request was sent to (see
-  Fixed). A relay or forwarding pattern in which another peer answers a
+  Security). A relay or forwarding pattern in which another peer answers a
   request worked in 0.9.2; its responses are now dropped at the requester's
   ingress, and an in-process sender's send fails with
   `SendError::AdmissionDropped`. Have the addressee send the answer itself.
-- Behaviour-only (not measured by the gate): `rkat mob deploy --surface rpc`
-  now refuses to start when the realm declares
-  `[storage] hosting = "multiprocess"` and its stores cannot provide trusted
-  cross-process hosting, as the `cli` surface already did (see Fixed). 0.9.2
-  served such a deploy and built its members anyway.
 - Behaviour-only (not measured by the gate): a peer request, message or
   event under the id of another peer's request that the session has not yet
   answered is refused where it was admitted: a durable delivery's sender
   gets `SendError::DurableAdmissionRejected`, a volatile one is dropped
   without a signal, and a supervisor bridge request under such an id is
   dropped before dispatch, also on the mob host and the mob supervisor
-  inbox (see Fixed).
-- Schedules record the agent whose mandate commissioned them (see Added),
-  which adds the public `commissioning_agent: Option<PrincipalRef>` field to
-  a constructible struct; struct literals must set it (`None` records no
-  agent):
-  - `meerkat_schedule::ScheduleConfig::commissioning_agent`
-
-  The field is written only when set, so existing schedule rows and wire
-  documents keep their bytes and read back as `None`.
-- A governed host refuses a schedule its agent did not commission (see
-  Security) with the new failure class `ScheduleMandateUnavailable`, which
-  adds a variant to these exhaustive public enums (matches must handle it):
-  - `meerkat_schedule::OccurrenceFailureClass::ScheduleMandateUnavailable`
-  - `meerkat_schedule::DeliveryFailureReason::ScheduleMandateUnavailable`
-  - `meerkat_machine_schema::catalog::dsl::occurrence_lifecycle::OccurrenceFailureClass::ScheduleMandateUnavailable`
-  - `meerkat_machine_schema::catalog::dsl::occurrence_lifecycle::DeliveryFailureReason::ScheduleMandateUnavailable`
-  - `meerkat_machine_kernels::generated::occurrence_lifecycle::OccurrenceFailureClass::ScheduleMandateUnavailable`
-  - `meerkat_machine_kernels::generated::occurrence_lifecycle::DeliveryFailureReason::ScheduleMandateUnavailable`
-
-  Wire: an occurrence's and a delivery receipt's `failure_class`
-  (`OccurrenceFailureClass`) can be `schedule_mandate_unavailable`; a client
-  that rejects unknown values must accept it. The occurrence lifecycle
-  machine gains the transition `DeliveryFailureScheduleMandateUnavailable`
-  (to `DeliveryFailed`).
-- Behaviour-only (not measured by the gate): a `SharedScheduleTargetAdapter`
-  over a schedule service that commissions schedules for an agent
-  (`ScheduleService::commissioning_agent` is set, as
-  `PersistenceBundle::schedule_service` builds it in a stock-governed realm)
-  and composed without a session agent binding fires no occurrence: each
-  fails as `schedule_mandate_unavailable` when it is delivered, before a
-  session is materialized. rkat's and rkat-rpc's schedule hosts compose no
-  binding, so in a stock-governed realm every fire now fails this way. Such
-  a fire used to materialize its session and then fail late, as
-  `transport_error` (see Known issues).
-- Behaviour-only (not measured by the gate): rkat-rpc composes its realm's
-  own schedule service. Both `SessionRuntime` constructors take
-  `PersistenceBundle::schedule_service` where they built
-  `ScheduleService::new` over the realm's schedule store. In a
-  stock-governed realm rkat-rpc therefore records the realm's opened agent
-  on each schedule it creates or redefines (a redefinition through rkat-rpc
-  no longer erases the agent another host recorded), and its schedule host
-  refuses each fire as described above. Ordinary realms are unchanged.
-- Behaviour-only (not measured by the gate): a write to the user document is
-  also refused when a realm the user document states a section for would
-  compose a different `[confinement]` or `[governance]` on a state root that
-  holds no document of its own for that realm (see Fixed).
-- `meerkat_core::ConfigError` has two new variants:
-  `CredentialCommandServer { realm, binding, profile, server }`, a
-  composition in which a binding whose auth profile runs a credential
-  command takes the `[self_hosted.servers]` entry its backend names from
-  another config document, and
-  `CredentialCommandServerUndeclared { realm, binding, backend }`,
-  one in which such a binding's self-hosted backend declares no server (see
-  Security); an exhaustive match must handle them.
-- `meerkat_core::SelfHostedConnectionError` has a new variant
-  `CredentialCommandServerUndeclared { realm, binding, server, model }`: an
-  explicitly selected binding whose auth profile runs a credential command
-  and whose self-hosted backend declares no server (see Security); an
-  exhaustive match must handle it.
-- Behaviour-only (not measured by the gate): a binding whose auth profile
-  runs a credential command on a self-hosted backend must declare the
-  backend's server. Add `server = "<id>"` to its
-  `[realm.<realm>.backend.<backend>]`, naming the `[self_hosted.servers]`
-  entry the command's token is for. Without it the realm does not compose,
-  and the binding is no longer the one unconstrained self-hosted binding,
-  nor chosen for the server its `default_model` is served by, nor usable
-  when named explicitly for a self-hosted model (see Security).
-- `meerkat_core::ProviderBindingError` has a new variant
-  `CredentialCommandProfileOverride { binding, profile }`: an auth binding
-  reference whose `profile` override names a credential command profile
-  other than the binding's own (see Security); an exhaustive match must
-  handle it.
-- Behaviour-only (not measured by the gate): a config write that changes
-  where a credential command's token goes is refused with
-  `confinement_administration_required` on every config write surface, as
-  one that changes what the command runs already was; a request whose auth
-  binding overrides its profile with another binding's credential command
-  is refused; and a realm whose credential command binding would take its
-  self-hosted server entry from another document does not compose (see
-  Security).
+  inbox (see Security).
 - Mob operator grants name the mob incarnation they were granted for (see
   Security). The scope readers and the grant functions take a
   `meerkat_core::service::MobIncarnationId`:
@@ -345,14 +207,129 @@ them.
   `RebindMobOperatorSpawnProfilesInMob`, so the implicit discriminants of the
   variants after them change (`TransitionId::*`); match them by variant name,
   not by numeric cast or position.
+- `meerkat_mob_mcp::fork_relink`: `ForkRelinkReport` gains the field
+  `child_retirement` (a new `ChildRetirement`: `NotRequired`, `Retired`,
+  `InProgress`, or `Failed` with the error). Not measured by the gate (a
+  return type change): `relink_child` and `relink_child_within` return the
+  new `ForkRelinkOutcome` (`action` and `child_retirement`) instead of a
+  `ForkRelinkAction`.
+- `meerkat-contracts`: `MobCreateResult` (the `mob/create` result) gains the
+  public field `claim_token` (constructible struct adds field); struct
+  literals must set it. Its `Debug` redacts the token.
+- `meerkat-mob-mcp`: `MobMcpState::mob_claim_member_external_tools` takes
+  the presented `&MobClaimToken`. Not measured by the gate (a return type
+  change): it answers
+  `Result<Result<T, CallbackRouteClaimTokenRefused>, MobError>`.
 - Behaviour-only (not measured by the gate): an agent's `delegate` refuses
   with the ordinary access denial when the mob registered under its
   session's implicit delegation mob id is not that session's implicit mob
   (its owner-bridge record does not mark it implicit for the session); it
   used to act on that mob.
+- Behaviour-only (not measured by the gate): `mob/claim_callback_route` takes
+  `MobClaimCallbackRouteParams { mob_id, claim_token }` (unknown fields
+  refused) instead of `MobIdParams`, and refuses a claim without the claim
+  token its `mob/create` returned (see Changed). SDKs: Python
+  `MeerkatClient.mob_claim_callback_route(mob_id, claim_token)` and
+  `Mob.claim_token`; TypeScript
+  `MeerkatClient.mobClaimCallbackRoute(mobId, claimToken)` and
+  `Mob.claimToken`.
+- Behaviour-only (not measured by the gate): mob destroy loads and deletes
+  the mob's callback claim verifier through its `MobRuntimeMetadataStore`,
+  so a store implementation that keeps the refusing defaults of
+  `load_callback_claim_verifier` or `delete_callback_claim_verifier` cannot
+  complete a destroy (it ends `Incomplete`). The in-memory and SQLite stores
+  implement both.
+- Behaviour-only (not measured by the gate): 0.9.3 migrates a mob's SQLite
+  store to schema version 11 (a table for the mob's callback claim
+  verifier) when it opens it, and 0.9.2 refuses a store at version 11 with
+  its typed future-schema error. Downgrading after the migration is not
+  supported: keep a copy of the mob stores from before the upgrade to roll
+  back.
+- Behaviour-only (not measured by the gate): a detached callback job
+  submitted before 0.9.3 recorded neither its tool's declaration nor the
+  route that submitted it, so its first start, reconcile or cancel moves it
+  to `needs_attention` with the reason `callback_binding_changed` instead of
+  running it through the route that serves the tool (see Changed). Remedy:
+  resolve each such job from `needs_attention`, and submit the call again
+  once the upgraded server serves the tool; jobs 0.9.3 submits keep running
+  on the connection that submitted them, and on any other route while its
+  tool declares what they recorded.
+- Schedules record the agent whose mandate commissioned them (see Added),
+  which adds the public `commissioning_agent: Option<PrincipalRef>` field to
+  a constructible struct; struct literals must set it (`None` records no
+  agent):
+  - `meerkat_schedule::ScheduleConfig::commissioning_agent`
+
+  The field is written only when set, so existing schedule rows and wire
+  documents keep their bytes and read back as `None`.
+- A governed host refuses a schedule its agent did not commission (see
+  Security) with the new failure class `ScheduleMandateUnavailable`, which
+  adds a variant to these exhaustive public enums (matches must handle it):
+  - `meerkat_schedule::OccurrenceFailureClass::ScheduleMandateUnavailable`
+  - `meerkat_schedule::DeliveryFailureReason::ScheduleMandateUnavailable`
+  - `meerkat_machine_schema::catalog::dsl::occurrence_lifecycle::OccurrenceFailureClass::ScheduleMandateUnavailable`
+  - `meerkat_machine_schema::catalog::dsl::occurrence_lifecycle::DeliveryFailureReason::ScheduleMandateUnavailable`
+  - `meerkat_machine_kernels::generated::occurrence_lifecycle::OccurrenceFailureClass::ScheduleMandateUnavailable`
+  - `meerkat_machine_kernels::generated::occurrence_lifecycle::DeliveryFailureReason::ScheduleMandateUnavailable`
+
+  Wire: an occurrence's and a delivery receipt's `failure_class`
+  (`OccurrenceFailureClass`) can be `schedule_mandate_unavailable`; a client
+  that rejects unknown values must accept it. The occurrence lifecycle
+  machine gains the transition `DeliveryFailureScheduleMandateUnavailable`
+  (to `DeliveryFailed`).
+- `meerkat-machine-kernels`: the generated occurrence lifecycle's
+  `TransitionId` (`generated::occurrence_lifecycle::TransitionId`) gains
+  `DeliveryFailureScheduleMandateUnavailable` (above) and
+  `SyncTargetSnapshotDispatching` (a dispatching occurrence records the
+  session its dispatch materialized; see Fixed). An exhaustive match needs
+  arms for them, and the implicit discriminants of the variants after each
+  change (`TransitionId::*`); match them by variant name, not by numeric cast
+  or position.
+- Not measured by the gate (a parameter type change):
+  `meerkat_schedule::ScheduleService::attach_identity_target_probe` takes
+  `&Arc<dyn ScheduleIdentityTargetProbe>` instead of
+  `Arc<dyn ScheduleIdentityTargetProbe>` and holds the probe weakly: the
+  caller owns it, and it judges identity targets only while the caller keeps
+  it (see Fixed).
+- Behaviour-only (not measured by the gate): the earliest attached
+  identity-target probe that is still alive judges, instead of the first one
+  ever attached. Once every attached probe is gone, an identity-target create,
+  or an update that sets an identity target, fails with
+  `ScheduleDomainError::DriverStopped`. A service that never had a probe
+  attached still accepts identity targets unjudged.
+- Behaviour-only (not measured by the gate): every
+  `ScheduleDomainError::DriverStopped`, the one above and the one a stopped
+  schedule driver returns alike, is now reported as capability unavailable, as
+  for an unsupported schedule backend, where it was an internal error:
+  `handle_schedule_tools_call` returns `CAPABILITY_UNAVAILABLE` (-32001)
+  instead of an internal error (-32000); `ScheduleToolDispatcher` and
+  `ScheduleToolSurface` return `ToolError::Unavailable` with
+  `ToolUnavailableReason::TemporarilyUnavailable` instead of an execution
+  failure; the RPC `schedule/*` methods return capability unavailable (-32020)
+  instead of internal error (-32603); and the REST `/schedules` endpoints
+  return 503 `SERVICE_UNAVAILABLE` instead of 500.
+- Behaviour-only (not measured by the gate): a `SharedScheduleTargetAdapter`
+  over a schedule service that commissions schedules for an agent
+  (`ScheduleService::commissioning_agent` is set, as
+  `PersistenceBundle::schedule_service` builds it in a stock-governed realm)
+  and composed without a session agent binding fires no occurrence: each
+  fails as `schedule_mandate_unavailable` when it is delivered, before a
+  session is materialized. rkat's and rkat-rpc's schedule hosts compose no
+  binding, so in a stock-governed realm every fire now fails this way. Such
+  a fire used to materialize its session and then fail late, as
+  `transport_error` (see Known limitations).
+- Behaviour-only (not measured by the gate): rkat-rpc composes its realm's
+  own schedule service. Both `SessionRuntime` constructors take
+  `PersistenceBundle::schedule_service` where they built
+  `ScheduleService::new` over the realm's schedule store. In a
+  stock-governed realm rkat-rpc therefore records the realm's opened agent
+  on each schedule it creates or redefines (a redefinition through rkat-rpc
+  no longer erases the agent another host recorded), and its schedule host
+  refuses each fire as described above. Ordinary realms are unchanged.
 - `meerkat_core::types::StopReason` (re-exported as `meerkat_core::StopReason`)
-  and `meerkat_contracts::WireStopReason` (`meerkat_contracts::wire::WireStopReason`)
-  gain the variants `Refusal`, `PauseTurn` and `ContextWindowExceeded` (wire
+  and `meerkat_contracts::WireStopReason`
+  (`meerkat_contracts::wire::WireStopReason`) gain the variants `Refusal`,
+  `PauseTurn` and `ContextWindowExceeded` (wire
   `refusal`, `pause_turn`, `context_window_exceeded`; see Fixed). Neither enum
   is `#[non_exhaustive]`, so a `match` over one must handle the three new
   variants. The generated schemas and the Python, TypeScript and Web SDK types
@@ -414,25 +391,6 @@ them.
   know at all (it does not parse) now fails as incomplete at once, naming the
   status; before, it was skipped and the turn failed later as a stalled or
   reset stream.
-- Behaviour-only (not measured by the gate): the Python and TypeScript SDKs
-  refuse to auto-download `rkat-rpc` when the package pins no digest for its
-  version and platform, raising `MeerkatError` with code
-  `BINARY_DIGEST_UNAVAILABLE` instead (see Security). Only packages the
-  release workflow builds pin digests; a source or git install pins none.
-  Install `rkat-rpc` yourself and put it on `PATH`, or set `MEERKAT_BIN_PATH`
-  or the client's binary path (`rkat_path`, `new MeerkatClient(path)`); a
-  legacy `rkat` on `PATH` is still used through its `rpc` subcommand.
-- Behaviour-only: a cached auto-downloaded `rkat-rpc` that does not match its
-  pinned digest is deleted and refused with `BinaryIntegrityError` (it used to
-  run as found), an integrity failure no longer falls back to a legacy `rkat`
-  on `PATH`, and the download no longer follows a redirect to a non-HTTPS URL.
-- `meerkat-machine-kernels`: the generated occurrence lifecycle's
-  `TransitionId` (`generated::occurrence_lifecycle::TransitionId`) gains
-  `SyncTargetSnapshotDispatching` (a dispatching occurrence records the
-  session its dispatch materialized; see Fixed). An exhaustive match needs an
-  arm for it, and the implicit discriminants of the variants after it change
-  (`TransitionId::*`); match them by variant name, not by numeric cast or
-  position.
 - `meerkat_core::lifecycle::run_primitive::AnthropicThinkingConfig` gains the
   variant `AnthropicThinkingConfig::Disabled`, and its wire mirror
   `meerkat_contracts::wire::runtime::WireAnthropicThinkingConfig` gains
@@ -448,10 +406,90 @@ them.
   property; for the budget-only models (Claude Sonnet 4.5, Haiku 4.5 and
   Opus 4.5) that property becomes a `oneOf` of the budget form and
   `{"type": "disabled"}`.
+- Behaviour-only (not measured by the gate): `rkat mob deploy --surface rpc`
+  now refuses to start when the realm declares
+  `[storage] hosting = "multiprocess"` and its stores cannot provide trusted
+  cross-process hosting, as the `cli` surface already did (see Fixed). 0.9.2
+  served such a deploy and built its members anyway.
+- Behaviour-only (not measured by the gate): a write to the user document is
+  also refused when a realm the user document states a section for would
+  compose a different `[confinement]` or `[governance]` on a state root that
+  holds no document of its own for that realm (see Fixed).
+- `meerkat_core::ConfigError` has two new variants:
+  `CredentialCommandServer { realm, binding, profile, server }`, a
+  composition in which a binding whose auth profile runs a credential
+  command takes the `[self_hosted.servers]` entry its backend names from
+  another config document, and
+  `CredentialCommandServerUndeclared { realm, binding, backend }`,
+  one in which such a binding's self-hosted backend declares no server (see
+  Security); an exhaustive match must handle them.
+- `meerkat_core::SelfHostedConnectionError` has a new variant
+  `CredentialCommandServerUndeclared { realm, binding, server, model }`: an
+  explicitly selected binding whose auth profile runs a credential command
+  and whose self-hosted backend declares no server (see Security); an
+  exhaustive match must handle it.
+- Behaviour-only (not measured by the gate): a binding whose auth profile
+  runs a credential command on a self-hosted backend must declare the
+  backend's server. Add `server = "<id>"` to its
+  `[realm.<realm>.backend.<backend>]`, naming the `[self_hosted.servers]`
+  entry the command's token is for. Without it the realm does not compose,
+  and the binding is no longer the one unconstrained self-hosted binding,
+  nor chosen for the server its `default_model` is served by, nor usable
+  when named explicitly for a self-hosted model (see Security).
+- `meerkat_core::ProviderBindingError` has a new variant
+  `CredentialCommandProfileOverride { binding, profile }`: an auth binding
+  reference whose `profile` override names a credential command profile
+  other than the binding's own (see Security); an exhaustive match must
+  handle it.
+- Behaviour-only (not measured by the gate): a config write that changes
+  where a credential command's token goes is refused with
+  `confinement_administration_required` on every config write surface, as
+  one that changes what the command runs already was; a request whose auth
+  binding overrides its profile with another binding's credential command
+  is refused; and a realm whose credential command binding would take its
+  self-hosted server entry from another document does not compose (see
+  Security).
+- Behaviour-only (not measured by the gate): `meerkat-mcp` closes a stdio
+  MCP server's stderr shortly after its process is gone. A descendant that
+  outlives the server and still writes to stderr then gets `EPIPE` (or
+  `SIGPIPE`); on a trusted-host launch it used to inherit the host's stderr
+  and could keep writing there (see Changed).
 - `meerkat_tools::builtin::comms::{CommsToolSet, SendTool, PeersTool}`,
   deprecated in 0.9.2, are removed. Use `CommsToolSurface`: it dispatches the
   comms tools with the dispatch context and a typed operation target, which
   the removed tools did not carry.
+- Behaviour-only (not measured by the gate): for a governed web_search
+  helper whose owner rates its model request R2 or R3, the tool error code
+  changes from `operation_authorization_unavailable` to `review_unavailable`
+  (R2) or `review_unsatisfied` (R3), and the Anthropic, OpenAI and Gemini
+  web_search executors return `LlmError::OperationReviewRefused` instead of
+  `LlmError::OperationAuthorizationUnavailable` for them (see Fixed). A host
+  that branched on the old code or variant for these settlements must branch
+  on the review ones.
+- Behaviour-only (not measured by the gate): a live tool call that its session
+  fails with a model request's settled review now reaches the live model as
+  `review_unavailable` (R2) or `review_unsatisfied` (R3) instead of
+  `operation_authorization_unavailable`:
+  `LiveToolDispatchError::from_session_error` classifies it as
+  `LiveToolDispatchError::Tool` with `ToolError::ReviewUnavailable` or
+  `ToolError::ReviewUnsatisfied`. The same failures reported together with
+  settlement diagnostics (a settled review, authority unavailability or
+  observation unavailability) are classified like the failure without them,
+  where they were `LiveToolDispatchError::Session` with code `AGENT_ERROR`:
+  through `LiveAdapterHost` the review and authority cases reach the live
+  model as typed tool feedback instead of a prose tool error, and in the
+  observation case `apply_observation` returns
+  `LiveAdapterHostError::OperationObservationUnavailable` instead of
+  submitting a prose tool error (see Fixed).
+- Behaviour-only (not measured by the gate): Linux shell process custody
+  refuses a host whose `/proc` is not a procfs of its own pid namespace (see
+  Security). A host started in a new pid namespace without a procfs mounted for
+  it (for example under `unshare --pid --fork` without `--mount-proc`), whose
+  own pid number named a process of the same user in the outer procfs
+  (typically a host running as root), used to run custody on the identities
+  of other processes. Its session builds under a realm runtime root now fail
+  with `ProcessCustodyError::ForeignProcfs` until it has a procfs of its own
+  pid namespace.
 - `meerkat_runtime::host_stack::HostStackError` is now `#[non_exhaustive]`
   and has two new variants, `InvalidWorkerThreads { name, raw }` and
   `ThreadLimit { name, workers, workers_set_by, stack_bytes,
@@ -476,56 +514,140 @@ them.
   thread, `RKAT_WORKER_STACK_BYTES` and `RKAT_WORKER_THREADS` apply to it, and
   a fatal error prints its `Display` chain prefixed with `rkat-mob-mcp:`
   (exit code 1) instead of `Error:` and its `Debug` form.
-- `meerkat_mob_mcp::fork_relink`: `ForkRelinkReport` gains the field
-  `child_retirement` (a new `ChildRetirement`: `NotRequired`, `Retired`,
-  `InProgress`, or `Failed` with the error); `relink_child` and
-  `relink_child_within` return the new `ForkRelinkOutcome` (`action` and
-  `child_retirement`) instead of a `ForkRelinkAction`.
+- Behaviour-only (not measured by the gate): the Python and TypeScript SDKs
+  refuse to auto-download `rkat-rpc` when the package pins no digest for its
+  version and platform, raising `MeerkatError` with code
+  `BINARY_DIGEST_UNAVAILABLE` instead (see Security). Only packages the
+  release workflow builds pin digests; a source or git install pins none.
+  Install `rkat-rpc` yourself and put it on `PATH`, or set `MEERKAT_BIN_PATH`
+  or the client's binary path (`rkat_path`, `new MeerkatClient(path)`); a
+  legacy `rkat` on `PATH` is still used through its `rpc` subcommand.
+- Behaviour-only (not measured by the gate): a cached auto-downloaded
+  `rkat-rpc` that does not match its pinned digest is deleted and refused with
+  `BinaryIntegrityError` (it used to run as found), an integrity failure no
+  longer falls back to a legacy `rkat` on `PATH`, and the download no longer
+  follows a redirect to a non-HTTPS URL.
 - Behaviour-only (not measured by the gate): `@rkat/sdk` declares its Node
   floor, `engines.node` `^20.19.0 || >=22.12.0`. The package ships only an ES
   module (its `import` and `default` exports both name it), so `require()`
   from CommonJS needs Node's `require(esm)`, enabled by default from 20.19 and
   22.12. Installing on a Node outside that range now warns, and package
   managers that enforce `engines` (yarn classic, or npm with `engine-strict`)
-  refuse it.
-- `meerkat-contracts`: `MobCreateResult` (the `mob/create` result) gains the
-  public field `claim_token` (constructible struct adds field); struct
-  literals must set it. Its `Debug` redacts the token.
-- `meerkat-mob-mcp`: `MobMcpState::mob_claim_member_external_tools` takes
-  the presented `&MobClaimToken` and answers
-  `Result<Result<T, CallbackRouteClaimTokenRefused>, MobError>`.
-- Behaviour-only (not measured by the gate): `mob/claim_callback_route` takes
-  `MobClaimCallbackRouteParams { mob_id, claim_token }` (unknown fields
-  refused) instead of `MobIdParams`, and refuses a claim without the claim
-  token its `mob/create` returned (see Changed). SDKs: Python
-  `MeerkatClient.mob_claim_callback_route(mob_id, claim_token)` and
-  `Mob.claim_token`; TypeScript
-  `MeerkatClient.mobClaimCallbackRoute(mobId, claimToken)` and
-  `Mob.claimToken`.
-- Behaviour-only (not measured by the gate): mob destroy loads and deletes
-  the mob's callback claim verifier through its `MobRuntimeMetadataStore`,
-  so a store implementation that keeps the refusing defaults of
-  `load_callback_claim_verifier` or `delete_callback_claim_verifier` cannot
-  complete a destroy (it ends `Incomplete`). The in-memory and SQLite stores
-  implement both.
-- Behaviour-only (not measured by the gate): 0.9.3 migrates a mob's SQLite
-  store to schema version 11 (a table for the mob's callback claim
-  verifier) when it opens it, and 0.9.2 refuses a store at version 11 with
-  its typed future-schema error. Downgrading after the migration is not
-  supported: keep a copy of the mob stores from before the upgrade to roll
-  back.
-- Behaviour-only (not measured by the gate): a detached callback job
-  submitted before 0.9.3 recorded neither its tool's declaration nor the
-  route that submitted it, so its first start, reconcile or cancel moves it
-  to `needs_attention` with the reason `callback_binding_changed` instead of
-  running it through the route that serves the tool (see Changed). Remedy:
-  resolve each such job from `needs_attention`, and submit the call again
-  once the upgraded server serves the tool; jobs 0.9.3 submits keep running
-  on the connection that submitted them, and on any other route while its
-  tool declares what they recorded.
+  refuse it. (#1753)
 
 ### Security
 
+- A peer response, progress or terminal, goes only to the peer that sent the
+  request it answers. MeerkatMachine records each inbound request's
+  requester, the canonical peer id of the envelope's signing key that
+  ingress admitted (never a payload field, display label or `from_route`),
+  at the generated transition that admits the request, and removes it with
+  the terminal reply. `CommsRuntime::send` asks the machine
+  (`ResolvePeerResponseAddressee`) before any transport and refuses a
+  `PeerResponse` addressed to any other peer with
+  `SendError::ResponseAddresseeNotRequester`: nothing is sent and the
+  request stays answerable, so a response to the requester still goes
+  through. This covers the agent `send_response` tool, host `comms/send`
+  (`peer_response`) and the mob responders. The tool reports the refusal as
+  `invalid_arguments` (its other refusals stay `execution_failed`); host
+  `comms/send` reports it as `send_failed`, with no wire change. The
+  addressee is compared as the canonical `PeerId` the transport routes by;
+  `display_name` never addresses a response. A response to a request id
+  this session never received, already answered, or received before a
+  restart keeps its unchanged refusal (`SendError::Validation`;
+  `execution_failed` from the tool, `send_failed` from `comms/send`). The
+  record is not persisted, as the inbound request map it belongs to is not:
+  after a restart no earlier request is answerable. With peer auth required,
+  ingress verifies the envelope's signature, so the requester is the holder
+  of that key; under open auth (`require_peer_auth = false`) it is the key
+  the envelope declares, the same identity trust and routing use in that
+  mode. Before, the runtime checked only that the request id named a request
+  this session had received and could still answer.
+- `CommsRuntime::stage_declared_reply_endpoint` and
+  `Router::stage_reply_endpoint` refuse, with `SendError::Validation`, a
+  signing key that does not derive the destination peer id, as
+  `stage_correlated_reply_endpoint` already did, and stage nothing. The router
+  addresses a Response sent through a staged endpoint to that key, so a
+  mismatched key would have carried a response meant for one peer to another.
+- A response to an outbound peer request, progress or terminal, is accepted
+  only from the peer the request was sent to. Before, a trusted peer that
+  learned a pending request id could complete it, or send progress on it,
+  with its own content: the requester's drain applied a response frame by its
+  correlation id alone, handed it to a waiting tool or stream, and injected
+  it into the session, and a later answer from the real addressee was then
+  refused as unknown. MeerkatMachine now records each outbound request's
+  addressee, the canonical peer id the request is routed to, at the
+  generated transition that records the send, before the request frame
+  leaves, and removes it when the request ends (answered, rejected, timed
+  out or failed to send). Peer ingress asks the machine
+  (`ResolvePeerResponseSender`) about every response frame, for the request
+  id the machine echoed when it classified the frame, before it is queued,
+  and drops one signed by any other peer with the inbox's existing
+  `ClassificationRejected` drop reason (an in-process sender's send fails
+  with `SendError::AdmissionDropped`; over TCP, where no response frame is
+  acknowledged, the send succeeds as for an accepted response); the drop
+  names no peer. Such a frame never reaches the drain, a waiting tool, a
+  stream or the session, and the request stays open for its addressee. The
+  generated progress, terminal and rejection transitions also take the
+  frame's signer and refuse any other peer, so a response observation from
+  another peer can no longer cancel the request either. A response to a
+  request id this session never sent, already completed, timed out, or sent
+  before a restart keeps its existing path: it is queued and the drain
+  refuses it as unknown. The addressee's own progress and terminal responses
+  are applied as before, and the supervisor bridge, which already matched
+  the responder, behaves as before. The record is not persisted, as the
+  pending request map it belongs to is not. Under open auth
+  (`require_peer_auth = false`) ingress does not verify signatures, so the
+  check compares the key the response envelope declares.
+- A peer request, message or event that reuses the id of another peer's
+  request the session has not yet answered is refused before admission.
+  Before, the comms drain recorded no second requester for the id but still
+  admitted the candidate, so its content reached the session under the
+  first request's interaction (the answer still went only to the first
+  requester). Now only the recorded requester may send under an outstanding
+  id again (a redelivery, which runtime admission deduplicates). Another
+  peer's candidate, or one without an admitted sender, is refused: a
+  durable delivery is terminalized as rejected and its sender gets
+  `SendError::DurableAdmissionRejected`; a volatile one is dropped without
+  a signal. The outstanding request keeps its requester and interaction. A
+  supervisor bridge request under such an id is dropped before it is
+  decoded or dispatched, on the session's comms drain, the mob host and
+  the mob supervisor inbox. The first request to use an id keeps it; the
+  ids Meerkat's senders generate are random (`Uuid::new_v4`), so another
+  peer can only claim one it has learned. The requester record lasts for
+  the responder process: after a restart, an id whose request is still
+  queued can be claimed by another peer until it is answered. A host that
+  mints its own request ids (`send_peer_request_with_id`,
+  `Router::send_with_id`) must keep them unguessable; a predicted id can be
+  claimed first, and the host's own request is then refused.
+- Mob operator grants no longer reach a later mob created under the same
+  id. A session's manage and spawn-profile scope used to name a mob only by
+  id, so a session that created and destroyed mob `X` could list, spawn
+  into and destroy a mob `X` that another session created later. Each mob
+  runtime now mints an opaque `MobIncarnationId` when it starts (a create,
+  or a resume by a later process); a grant names that incarnation, and
+  every scope check compares it with the incarnation of the mob the call
+  acts on. A grant for a new incarnation of an id replaces the binding and
+  drops the other scope held for the old one. An agent's `mob_create`
+  grants the incarnation its own create started; `delegate` grants the
+  incarnation its session's implicit mob runs at, and only when the mob's
+  owner-bridge record marks it as that session's implicit mob. Every agent
+  mob tool acts through the mob it was admitted against and never resolves
+  the id again, so a mob destroyed and created again under the id while a
+  call is in flight is never touched by that call (a destroy re-checks the
+  admitted incarnation and refuses with the ordinary access denial). A
+  `council` seats forks only of the source mobs its convener was admitted
+  to: a participant whose source mob id names another incarnation by its
+  seating is refused with the new typed exit reason
+  `participant_source_replaced`
+  (`TemporaryCouncilExitReason::ParticipantSourceReplaced`), and nothing of
+  that mob is forked; a council is never run again after a restart, so no
+  seating outlives its admission. `mob_create` records its operator
+  provenance only in the mob its own create started.
+  Incarnations are never decoded from input: `Deserialize` always refuses
+  and `Debug` and `Serialize` render them redacted. Grants are still not
+  persisted, so no grant survives a restart; a member's operator facts
+  re-bind to the incarnation of the mob that holds them on each upcall.
 - A stock-governed realm's schedules no longer fire outside the mandate of
   the agent that commissioned them. Every fire there, including each
   schedule recorded before commissioning agents existed or bound to a
@@ -543,7 +665,8 @@ them.
   (`open_stock_realm_persistence*`) refuses early only when its schedule
   service comes from `PersistenceBundle::schedule_service()`; one built with
   `ScheduleService::new` over the realm's store is not gated: it fires, and
-  the fire fails later, after materializing its session (see Known issues).
+  the fire fails later, after materializing its session (see Known
+  limitations).
   Ungoverned realms are unchanged.
 - A Git skill repository's HTTPS token no longer reaches git's command line
   or the checkout's `.git/config`. On Unix git asks for it through its own
@@ -600,34 +723,38 @@ them.
   command (the managed store, credential accounts, environment variables,
   platform defaults, external resolvers, file descriptors) are outside this
   guard: their routes stay ordinary config.
-- Mob operator grants no longer reach a later mob created under the same
-  id. A session's manage and spawn-profile scope used to name a mob only by
-  id, so a session that created and destroyed mob `X` could list, spawn
-  into and destroy a mob `X` that another session created later. Each mob
-  runtime now mints an opaque `MobIncarnationId` when it starts (a create,
-  or a resume by a later process); a grant names that incarnation, and
-  every scope check compares it with the incarnation of the mob the call
-  acts on. A grant for a new incarnation of an id replaces the binding and
-  drops the other scope held for the old one. An agent's `mob_create`
-  grants the incarnation its own create started; `delegate` grants the
-  incarnation its session's implicit mob runs at, and only when the mob's
-  owner-bridge record marks it as that session's implicit mob. Every agent
-  mob tool acts through the mob it was admitted against and never resolves
-  the id again, so a mob destroyed and created again under the id while a
-  call is in flight is never touched by that call (a destroy re-checks the
-  admitted incarnation and refuses with the ordinary access denial). A
-  `council` seats forks only of the source mobs its convener was admitted
-  to: a participant whose source mob id names another incarnation by its
-  seating is refused with the new typed exit reason
-  `participant_source_replaced`
-  (`TemporaryCouncilExitReason::ParticipantSourceReplaced`), and nothing of
-  that mob is forked; a council is never run again after a restart, so no
-  seating outlives its admission. `mob_create` records its operator
-  provenance only in the mob its own create started.
-  Incarnations are never decoded from input: `Deserialize` always refuses
-  and `Debug` and `Serialize` render them redacted. Grants are still not
-  persisted, so no grant survives a restart; a member's operator facts
-  re-bind to the incarnation of the mob that holds them on each upcall.
+- Linux shell process custody (`meerkat-tools`) no longer captures, compares
+  or signals processes through a procfs of another pid namespace. Custody
+  records pids from the host's own syscalls, but `/proc` numbers processes in
+  the pid namespace it was mounted for, so a host in a new pid namespace
+  without a procfs of its own read other processes' entries. Capturing the
+  host's or a tool leader's identity then failed (`Io { context: "capture
+  tool leader identity", .. }` with `NotFound`), or captured a process of the
+  same user that held that number there; recovery could then compare the
+  start stamps of other processes, and pin and SIGKILL pids taken from the
+  procfs's numbering. Every custody read of `/proc/<pid>` now goes through a
+  procfs proven, at the start of each operation, to show the host's own pid
+  namespace: the host's own status record there shows its pid as `Tgid` and,
+  where the kernel lists `NSpid` (Linux 4.1 and later; not gVisor), lists
+  exactly that pid in `NSpid`. Any other procfs fails closed before a lock,
+  record or spawn gate is touched, with the new
+  `ProcessCustodyError::ForeignProcfs { context, view: ForeignProcfsView }`
+  (the host's pid, the pid the procfs shows it as, and the pid namespace
+  levels between them); a session build under a realm runtime root reports
+  it as `CompositeDispatcherError::ProcessCustody`. Operator action: give the
+  host a procfs of its own pid namespace (`unshare --pid --fork --mount-proc`,
+  or the container runtime's own `/proc`). Residuals: on kernels without
+  `NSpid`, an ancestor namespace's procfs in which the host's pid happens to
+  be the same number is not detected. Custody records written before this
+  fix by a host whose procfs was not its own can carry another process's
+  start stamp. Such a host now refuses before recovery, and a reboot or a
+  host in a new pid namespace settles them, but a host later given its own
+  procfs in the same pid namespace reads them as written and may settle one
+  as `GroupReassigned` while its tool group still runs. The custody namespace
+  tests now also run a host that keeps its parent's procfs wherever
+  unprivileged user and pid namespaces exist, and skip only on unshare(1)'s
+  own namespace setup refusals: a failure to execute the host fails them.
+  (#1738)
 - The Python and TypeScript SDKs verify the `rkat-rpc` binary they
   auto-download (#1739). Each published package pins the sha256 of every
   release archive it may download and of the `rkat-rpc` inside it: pinned
@@ -643,30 +770,211 @@ them.
   names a label that is not a GitHub-hosted Ubuntu label; it checks the
   label, not where the runner is hosted, so the stamp's
   `--deny-self-hosted-runners` stays the enforcement. If any check fails
-  nothing is stamped and neither SDK package publishes. The download uses HTTPS only,
-  redirects
-  included, and refuses an archive over 256 MiB. The archive is checked
-  before anything is written or extracted, the binary before it is
-  installed, and the cached binary every time it is reused. A mismatch
-  raises `BinaryIntegrityError` (code `BINARY_INTEGRITY_MISMATCH`, naming the
-  asset and the expected and actual digests): the SDK deletes what failed,
-  runs nothing and does not fall back to another binary. A transport fault,
-  a detected cut-off body included, is `BINARY_DOWNLOAD_FAILED`: a transport
-  fault the SDK can detect is never reported as tamper. `MEERKAT_BIN_PATH`,
-  an explicit binary path and `rkat-rpc` on
-  `PATH` still run as given: they are the user's own trust decision.
+  nothing is stamped and neither SDK package publishes. The download uses
+  HTTPS only, redirects included, and refuses an archive over 256 MiB. The
+  archive is checked before anything is written or extracted, the binary
+  before it is installed, and the cached binary every time it is reused. A
+  mismatch raises `BinaryIntegrityError` (code `BINARY_INTEGRITY_MISMATCH`,
+  naming the asset and the expected and actual digests): the SDK deletes what
+  failed, runs nothing and does not fall back to another binary. A transport
+  fault, a detected cut-off body included, is `BINARY_DOWNLOAD_FAILED`: a
+  transport fault the SDK can detect is never reported as tamper.
+  `MEERKAT_BIN_PATH`, an explicit binary path and `rkat-rpc` on `PATH` still
+  run as given: they are the user's own trust decision.
   Residual: the pins are only as trustworthy as the release that produced
   them. The attested identity names the workflow and its ref, and `main`
   names no commit: the release version is bound by the attested subject
   name. The GitHub-hosted runner is the job that attested; on a BuildBuddy
   release the Linux (x86_64 and arm64) and macOS arm64 binaries are compiled
   by BuildBuddy remote execution, so BuildBuddy's executors and cache are part
-  of what the pins trust. Anyone able to run this repository's release workflow can
-  produce attested archives, and a package whose own files were replaced
-  after it was built pins whatever digests it then carries.
+  of what the pins trust. Anyone able to run this repository's release
+  workflow can produce attested archives, and a package whose own files were
+  replaced after it was built pins whatever digests it then carries.
 
 ### Added
 
+- `meerkat-core`: `PeerResponseAddresseeVerdict` (`UnknownRequest`,
+  `Requester`, `NotRequester`; non-exhaustive), the machine's verdict on a
+  response's addressee; `PeerInteractionHandle::request_received_from_ingress`;
+  and `SendError::ResponseAddresseeNotRequester { in_reply_to, addressee }`
+  (`SendError` is non-exhaustive).
+- `meerkat-comms`: `handle_tools_call_typed`, the comms tool handler that
+  keeps a refusal's tool error class as `CommsToolCallError`
+  (`InvalidArguments`, `Failed`, with `into_tool_error`); the comms tool
+  dispatchers report through it. `handle_tools_call` and
+  `handle_tools_call_with_context` keep their `String` errors.
+- `meerkat-machine-schema`, `meerkat-runtime` and `meerkat-machine-kernels`:
+  the MeerkatMachine `inbound_peer_request_requesters` state map, the
+  read-only `ResolvePeerResponseAddressee` signal, its
+  `PeerResponseAddresseeResolved` effect, the `PeerResponseAddresseeVerdict`
+  machine enum, and the invariant
+  `inbound_peer_request_requesters_match_requests` (the requesters map has
+  exactly the keys of the inbound requests map).
+- `meerkat-core`: `PeerResponseSenderVerdict` (`UnknownRequest`, `Addressee`,
+  `NotAddressee`; non-exhaustive), the machine's verdict on the sender of a
+  response to an outbound peer request.
+- `meerkat-machine-schema`, `meerkat-runtime` and `meerkat-machine-kernels`:
+  the MeerkatMachine `pending_peer_request_addressees` state map, the
+  read-only `ResolvePeerResponseSender` signal, its
+  `PeerResponseSenderResolved` effect, the `PeerResponseSenderVerdict`
+  machine enum, and the invariant
+  `pending_peer_request_addressees_match_requests` (the addressees map has
+  exactly the keys of the pending outbound requests map).
+- `specs/machines/meerkat_machine/peer_request_maps_audit.{tla,sh}`, run in
+  audit shard B of the canonical TLC lane: a bounded audit over the generated
+  MeerkatMachine model with one correlation id and two peers. The generated
+  ci sweep sets both value sets to `{}`, so it never records a peer request
+  and the peer maps' guards and invariants held there only vacuously. The
+  audit checks `pending_peer_request_addressees` and
+  `inbound_peer_request_requesters` under every generated invariant plus:
+  exactly one response-sender verdict and one response-addressee verdict is
+  enabled, a progress, terminal or rejection step is taken only for the
+  recorded addressee, and each verdict matches the record. Six reachability
+  witnesses and five seeded defects keep it from passing vacuously.
+- `meerkat-core`: `InboundIdClaim` (`Unclaimed`, `ClaimedBySender`,
+  `ClaimedByAnother`; non-exhaustive) and the provided method
+  `PeerInteractionHandle::inbound_id_claim`: who holds a candidate's
+  interaction id among the inbound requests a handle records.
+- `meerkat_core::service::MobIncarnationId`, `meerkat_mob::MobHandle::incarnation`
+  and `meerkat_core::service::MobToolAuthorityContext::mob_incarnations` (see
+  Security).
+- `meerkat_mob::MobDestroyReport` gains `reloaded_members`: the members whose
+  runtime required a durability reload, which the destroy reloaded from their
+  durable store before retiring them. The field is left out of the
+  serialized report when it is empty, so the `mob/destroy` result of any
+  other destroy is unchanged.
+- `meerkat_core::ToolBindingDigest` and `ToolBindingDigestParseError`: a
+  durable SHA-256 digest of what a tool catalog entry declares (never its
+  live authorities or current callability), with the text form
+  `sha256:<64 hex digits>`.
+- `meerkat_mob::MobClaimToken`, `MobClaimVerifier`, `MobClaimTokenError`
+  and `CallbackClaimCheck`; `MobBuilder::with_callback_claim_verifier`;
+  `MobHandle::check_callback_claim_token` and
+  `record_callback_claim_verifier_if_absent`;
+  `MobRuntimeMetadataStore::put_callback_claim_verifier_if_absent`,
+  `load_callback_claim_verifier` and `delete_callback_claim_verifier`,
+  provided methods that refuse by default (the in-memory and SQLite stores
+  implement them).
+- `meerkat_mob_mcp::MobMcpState::mob_create_definition_with_claim_verifier`
+  and `mint_callback_claim_token`, and
+  `meerkat_mob_mcp::CallbackRouteClaimTokenRefused`.
+- `meerkat_contracts::MobClaimCallbackRouteParams`.
+- Schedules record the agent whose mandate commissioned them.
+  `ScheduleService::new_commissioned(store, agent)` builds a service that
+  records `agent` on every schedule it creates or redefines (a redefinition
+  is commissioned by the agent that made it); the agent comes only from the
+  trusted composition, never from a request. `ScheduleService::new` records
+  none, and `ScheduleService::commissioning_agent` reads the service's agent.
+  `PersistenceBundle::schedule_service` builds a stock-governed realm's
+  service commissioned for the realm's opened agent (`rkat` and `rkat-rpc`
+  use it for their schedule tools and hosts) and an ordinary realm's
+  service with none. The wire `Schedule` and the generated SDK types carry
+  `commissioning_agent` when it is set.
+- Governed schedule hosts. `meerkat::surface::ScheduledSessionAgentBinding`
+  is the agent a governed host's scheduled sessions act as (`agent`) and its
+  binding onto a session the host materializes or revives for a fire
+  (`bind_scheduled_session(machine, session_id, configured_servers)`, called
+  after the session's registration and before its agent is built).
+  `SharedScheduleTargetAdapter::with_session_agent_binding` composes one into
+  a host's delivery adapter, which then fires a schedule only when its
+  recorded `commissioning_agent` is the binding's agent.
+  `PersistenceBundle::scheduled_session_agent_binding` returns a
+  stock-governed realm's binding (`StockGovernance` implements the trait for
+  the realm's opened agent) and `None` for every other realm. The adapter
+  only gates: no session host in this release (rkat's, rkat-rpc's, the MCP
+  server's or the facade's runtime-backed host) calls
+  `bind_scheduled_session` yet, so a host composing a binding must bind its
+  own scheduled sessions, or they run unbound.
+- `meerkat-sqlite`: `OperationGuard::admit_missing_database`, the
+  maintenance-fence admission for an operation that finds its database file
+  missing and answers without touching it. It creates nothing (an absent lock
+  file holds no fence) and fails with `SqliteStoreError::MaintenanceFenceHeld`
+  under another holder's exclusive fence, as `OperationGuard::for_database`
+  does.
+- `meerkat::ContinuationAddressResolver::member_address_of_session` and
+  `meerkat_mob::continuation::MobHandleLookup::mob_handles`, provided
+  methods (the defaults know of no members and hold no mobs): a host that
+  resolves member delivery addresses reports the mob member a session serves
+  now. `meerkat::ContinuationHostBindings::member_address_of_session` asks
+  the bound resolver. `meerkat::JobRuntimeDeliveryApplier::with_address_session`
+  names the session serving a drained member address.
+  `meerkat::PersistenceBundle::producer_job_store` is the bundle's job store
+  as job producers use it (see Fixed); `job_store` stays the host's own store.
+- Anthropic `thinking: {"type": "disabled"}`
+  (`AnthropicThinkingConfig::Disabled`) turns thinking off. Each catalog row
+  records whether its model accepts it
+  (`ModelCapabilities::anthropic_disabled_thinking`, from Anthropic's
+  per-model thinking table): Claude Opus 4.8, Opus 4.7, Sonnet 5, Sonnet 4.6,
+  Sonnet 4.5, Haiku 4.5 and Opus 4.5 at every effort, and Claude Opus 5 and
+  Haiku 5.5 at `high` effort or below. Claude Fable 5.1, Fable 5, Opus 5.5
+  and Sonnet 5.5 (whose lowest setting is `between_tools`) refuse it, so
+  Meerkat refuses it there with a typed local error when the agent is built
+  and before each request, as it does above `high` effort on Opus 5 and
+  Haiku 5.5. A per-turn reasoning preference above `high` is not applied
+  with disabled thinking on Opus 5 and Haiku 5.5 (`ThinkingModeConflict`).
+  A forced tool choice is sent with thinking disabled. The adaptive pack's
+  layer-decision schema stays the released one, so packs keep loading across
+  host versions, and it does not offer disabled thinking to an adaptive
+  flowmaster's inline layer profiles until pack schemas are versioned; a
+  layer decision that carries it anyway is honoured as `Disabled`, and
+  refused with the same typed error where the model refuses it.
+- `meerkat::HostConfigLayer`: a host's own final layer over a realm's
+  composed config, for settings the host process owns rather than any realm
+  document. `meerkat::RealmInheritance::with_host_layer` attaches one, and
+  `RealmInheritance::compose_over` applies it after folding the realm chain,
+  so the agent builds, model resolution and model hot-swaps that read through
+  that inheritance all see it. Config writes stay on the raw realm document,
+  so the layer is never written there.
+  `meerkat_rpc::session_runtime::SessionRuntime::set_realm_config_source_with_host_layer`
+  installs one on an RPC host.
+- `rkat mcp add --oauth-account-selection discover|unverified` writes the
+  OAuth account selection of a streamable HTTP server that names no
+  `--oauth-account` (it conflicts with that flag and has the same checks:
+  streamable HTTP, no static `Authorization` header). `discover` binds the
+  account the provider verifies at the first login; `unverified` is the
+  explicit opt-in to resource-bound access with no account evidence. Before,
+  `oauth_account_selection` could only be set by editing `mcp.toml`, so
+  `rkat mcp add <name> --url <url>` followed by `rkat mcp login <name>`
+  could not log in without a manual edit. `rkat mcp add` now prints the
+  selection it wrote, and for a streamable HTTP server without a selection
+  or a static `Authorization` header one line naming the three choices.
+  `rkat mcp login` itself never sets or changes a selection, and no default
+  changed.
+- `meerkat_core::RealmConfigSource::composition_lock_path` (provided,
+  default `None`): the file a store declared with
+  `FileConfigStore::with_realm_chain` locks across its read, its
+  composition check and its write. `meerkat_store::FilesystemRealmConfigSource`
+  returns `<state_root>/.realm-config.lock` (see Fixed); a source that
+  wraps it forwards it.
+- `meerkat::open_system_browser_guarded`
+  (`meerkat_auth_core::mcp_oauth::open_system_browser_guarded`) opens a URL
+  with the platform browser opener under the host's launch guard
+  (`HostConfinement::launch_guard`), `None` for a host that confines no launch
+  kind. `rkat` opens every browser with it.
+- `meerkat_authorization::publication::LocalAuthorizationPublication::poison`
+  permanently poisons a publication without taking its writer, so an owner
+  that shares the publication can call it from a callback that runs under a
+  held reservation. Every retained stamp, prepared final entry and grant check
+  then answers `Unavailable`, retained consent eligibility is no longer
+  current, and no new observation or owner change is admitted until the owners
+  are reconstructed under a new publication. The poison stands until then: one
+  that lands while an owner change holds the publication's writer stays when
+  that change publishes or completes, and `begin_owner_change` and
+  `try_begin_owner_change` return `Unavailable` when the publication was
+  poisoned before the change published. `LocalGrantAuthority::reconstruct`
+  returns `ReplacementPublicationUnavailable`, installing nothing, when its
+  replacement publication is poisoned during the reconstruction. A child grant
+  issuance under exclusion refuses (`Unavailable`, appending nothing) when the
+  publication was poisoned after its reservation and before its pre-append
+  check (always so for its own conjunct's poison). Effects that already passed
+  their final entry keep their outcomes. A revocation refused while the
+  publication is poisoned did not happen; retry it after reconstruction.
+- `LocalAuthorizationPublication::poison_on_unwind` returns an
+  `OwnerPoisonSentinel` that poisons the publication when it is dropped during
+  an unwind. An owner creates it right after acquiring its own entry lock, in
+  the same scope, and holds it as long as that lock, reads included: the panic
+  that poisons the lock then poisons the publication before any outer
+  `catch_unwind` can swallow it.
 - `meerkat-core`, `meerkat-mcp`: typed host diagnostics for a stdio MCP
   server whose setup failed. They name the exact server and attempt, the
   phase (`Launch`, `Initialize`, `ToolDiscovery`) and a fixed class that the
@@ -675,8 +983,9 @@ them.
   (a JSON-RPC error answer, so a missing method is told apart from a crash),
   `ProtocolError`, `TimedOut` or `Unknown`. They also give the newest 16 KiB
   of the server's stderr.
-  - Read them through the attempt observer: `McpAttachmentAttempt::setup_failure`
-    and `stderr_tail`, provided methods on `McpAttachmentAttemptObserver`.
+  - Read them through the attempt observer:
+    `McpAttachmentAttempt::setup_failure` and `stderr_tail`, provided methods
+    on `McpAttachmentAttemptObserver`.
   - For configured servers, read them through the inherent
     `McpRouterAdapter::stdio_setup_failure` and `stdio_stderr_tail`. These
     return the latest retained failure.
@@ -700,16 +1009,15 @@ them.
   - The model's setup-failure notice is unchanged and carries no class.
   - `meerkat_core::redact::redact_secret_shapes` is the line-preserving
     redaction helper. `panic_safe_detail` output is unchanged.
-- `meerkat-mcp`, `meerkat`: host attempt guards for stdio MCP servers. A
-  host builds one `McpAttemptGuards` installation around its
+- `meerkat-mcp`, `meerkat`: host attempt guards for stdio MCP servers. A host
+  builds one `McpAttemptGuards` installation around its
   `McpAttemptGuardFactory` and passes it to the routers it builds
-  (`McpRouter::with_attempt_guards`; a second call on one router is
-  refused), or installs it on its factory
+  (`McpRouter::with_attempt_guards`; a second call on one router keeps the
+  first installation and logs a warning), or installs it on its factory
   (`AgentFactory::with_mcp_attempt_guards`, read back with
   `AgentFactory::mcp_attempt_guards`). Each construction's own router is
-  guarded, owned by its session and mob member, and so is every session
-  router Core's surfaces build themselves. The facade re-exports the guard
-  types.
+  guarded, owned by its session and mob member, and so is every session router
+  Core's surfaces build themselves. The facade re-exports the guard types.
   - The RPC session runtime's live routers (`mcp/add` and restored
     attachments), REST session routers and the `rkat run` loader install
     the guards of the factory their sessions are built with. An embedding
@@ -757,141 +1065,14 @@ them.
   - Bounds default to 10 s to begin and 5 s to cancel or settle. A zero
     bound, or one above 60 s, is refused.
   - Without an installation nothing changes.
-- `meerkat-core`: `PeerResponseAddresseeVerdict` (`UnknownRequest`,
-  `Requester`, `NotRequester`; non-exhaustive), the machine's verdict on a
-  response's addressee; `PeerInteractionHandle::request_received_from_ingress`;
-  and `SendError::ResponseAddresseeNotRequester { in_reply_to, addressee }`
-  (`SendError` is non-exhaustive).
-- `meerkat-comms`: `handle_tools_call_typed`, the comms tool handler that
-  keeps a refusal's tool error class as `CommsToolCallError`
-  (`InvalidArguments`, `Failed`, with `into_tool_error`); the comms tool
-  dispatchers report through it. `handle_tools_call` and
-  `handle_tools_call_with_context` keep their `String` errors.
-- `meerkat-machine-schema`, `meerkat-runtime` and `meerkat-machine-kernels`:
-  the MeerkatMachine `inbound_peer_request_requesters` state map, the
-  read-only `ResolvePeerResponseAddressee` signal, its
-  `PeerResponseAddresseeResolved` effect, the `PeerResponseAddresseeVerdict`
-  machine enum, and the invariant
-  `inbound_peer_request_requesters_match_requests` (the requesters map has
-  exactly the keys of the inbound requests map).
-- `meerkat-core`: `PeerResponseSenderVerdict` (`UnknownRequest`, `Addressee`,
-  `NotAddressee`; non-exhaustive), the machine's verdict on the sender of a
-  response to an outbound peer request.
-- `meerkat-machine-schema`, `meerkat-runtime` and `meerkat-machine-kernels`:
-  the MeerkatMachine `pending_peer_request_addressees` state map, the
-  read-only `ResolvePeerResponseSender` signal, its
-  `PeerResponseSenderResolved` effect, the `PeerResponseSenderVerdict`
-  machine enum, and the invariant
-  `pending_peer_request_addressees_match_requests` (the addressees map has
-  exactly the keys of the pending outbound requests map).
-- `specs/machines/meerkat_machine/peer_request_maps_audit.{tla,sh}`, run in
-  audit shard B of the canonical TLC lane: a bounded audit over the generated
-  MeerkatMachine model with one correlation id and two peers. The generated
-  ci sweep sets both value sets to `{}`, so it never records a peer request
-  and the peer maps' guards and invariants held there only vacuously. The
-  audit checks `pending_peer_request_addressees` and
-  `inbound_peer_request_requesters` under every generated invariant plus:
-  exactly one response-sender verdict and one response-addressee verdict is
-  enabled, a progress, terminal or rejection step is taken only for the
-  recorded addressee, and each verdict matches the record. Six reachability
-  witnesses and five seeded defects keep it from passing vacuously.
-- `meerkat::HostConfigLayer`: a host's own final layer over a realm's
-  composed config, for settings the host process owns rather than any realm
-  document. `meerkat::RealmInheritance::with_host_layer` attaches one, and
-  `RealmInheritance::compose_over` applies it after folding the realm chain,
-  so the agent builds, model resolution and model hot-swaps that read through
-  that inheritance all see it. Config writes stay on the raw realm document,
-  so the layer is never written there.
-  `meerkat_rpc::session_runtime::SessionRuntime::set_realm_config_source_with_host_layer`
-  installs one on an RPC host.
-- `rkat mcp add --oauth-account-selection discover|unverified` writes the
-  OAuth account selection of a streamable HTTP server that names no
-  `--oauth-account` (it conflicts with that flag and has the same checks:
-  streamable HTTP, no static `Authorization` header). `discover` binds the
-  account the provider verifies at the first login; `unverified` is the
-  explicit opt-in to resource-bound access with no account evidence. Before,
-  `oauth_account_selection` could only be set by editing `mcp.toml`, so
-  `rkat mcp add <name> --url <url>` followed by `rkat mcp login <name>`
-  could not log in without a manual edit. `rkat mcp add` now prints the
-  selection it wrote, and for a streamable HTTP server without a selection
-  or a static `Authorization` header one line naming the three choices.
-  `rkat mcp login` itself never sets or changes a selection, and no default
-  changed.
-- `meerkat-core`: `InboundIdClaim` (`Unclaimed`, `ClaimedBySender`,
-  `ClaimedByAnother`; non-exhaustive) and the provided method
-  `PeerInteractionHandle::inbound_id_claim`: who holds a candidate's
-  interaction id among the inbound requests a handle records.
-- Schedules record the agent whose mandate commissioned them.
-  `ScheduleService::new_commissioned(store, agent)` builds a service that
-  records `agent` on every schedule it creates or redefines (a redefinition
-  is commissioned by the agent that made it); the agent comes only from the
-  trusted composition, never from a request. `ScheduleService::new` records
-  none, and `ScheduleService::commissioning_agent` reads the service's agent.
-  `PersistenceBundle::schedule_service` builds a stock-governed realm's
-  service commissioned for the realm's opened agent (`rkat` and `rkat-rpc`
-  use it for their schedule tools and hosts) and an ordinary realm's
-  service with none. The wire `Schedule` and the generated SDK types carry
-  `commissioning_agent` when it is set.
-- Governed schedule hosts. `meerkat::surface::ScheduledSessionAgentBinding`
-  is the agent a governed host's scheduled sessions act as (`agent`) and its
-  binding onto a session the host materializes or revives for a fire
-  (`bind_scheduled_session(machine, session_id, configured_servers)`, called
-  after the session's registration and before its agent is built).
-  `SharedScheduleTargetAdapter::with_session_agent_binding` composes one into
-  a host's delivery adapter, which then fires a schedule only when its
-  recorded `commissioning_agent` is the binding's agent.
-  `PersistenceBundle::scheduled_session_agent_binding` returns a
-  stock-governed realm's binding (`StockGovernance` implements the trait for
-  the realm's opened agent) and `None` for every other realm. The adapter
-  only gates: no session host in this release (rkat's, rkat-rpc's, the MCP
-  server's or the facade's runtime-backed host) calls
-  `bind_scheduled_session` yet, so a host composing a binding must bind its
-  own scheduled sessions, or they run unbound.
-- `meerkat_core::RealmConfigSource::composition_lock_path` (provided,
-  default `None`): the file a store declared with
-  `FileConfigStore::with_realm_chain` locks across its read, its
-  composition check and its write. `meerkat_store::FilesystemRealmConfigSource`
-  returns `<state_root>/.realm-config.lock` (see Fixed); a source that
-  wraps it forwards it.
-- `meerkat::open_system_browser_guarded`
-  (`meerkat_auth_core::mcp_oauth::open_system_browser_guarded`) opens a URL
-  with the platform browser opener under the host's launch guard
-  (`HostConfinement::launch_guard`), `None` for a host that confines no launch
-  kind. `rkat` opens every browser with it.
-- `meerkat_core::service::MobIncarnationId`, `meerkat_mob::MobHandle::incarnation`
-  and `meerkat_core::service::MobToolAuthorityContext::mob_incarnations` (see
-  Security).
-- `BinaryIntegrityError`, a `MeerkatError` subclass exported by both SDKs
-  (`meerkat.BinaryIntegrityError` with `asset`, `path`, `expected_sha256` and
-  `actual_sha256`; `BinaryIntegrityError` from `@rkat/sdk` with `asset`,
-  `path`, `expectedSha256` and `actualSha256`), and the SDK error codes
-  `BINARY_INTEGRITY_MISMATCH`, `BINARY_DIGEST_UNAVAILABLE` (whose message
-  names the exact release asset URL for a manual install) and
-  `BINARY_DOWNLOAD_TOO_LARGE` (an auto-download archive over 256 MiB).
-- Anthropic `thinking: {"type": "disabled"}`
-  (`AnthropicThinkingConfig::Disabled`) turns thinking off. Each catalog row
-  records whether its model accepts it
-  (`ModelCapabilities::anthropic_disabled_thinking`, from Anthropic's
-  per-model thinking table): Claude Opus 4.8, Opus 4.7, Sonnet 5, Sonnet 4.6,
-  Sonnet 4.5, Haiku 4.5 and Opus 4.5 at every effort, and Claude Opus 5 and
-  Haiku 5.5 at `high` effort or below. Claude Fable 5.1, Fable 5, Opus 5.5
-  and Sonnet 5.5 (whose lowest setting is `between_tools`) refuse it, so
-  Meerkat refuses it there with a typed local error when the agent is built
-  and before each request, as it does above `high` effort on Opus 5 and
-  Haiku 5.5. A per-turn reasoning preference above `high` is not applied
-  with disabled thinking on Opus 5 and Haiku 5.5 (`ThinkingModeConflict`).
-  A forced tool choice is sent with thinking disabled. The adaptive pack's
-  layer-decision schema stays the released one, so packs keep loading across
-  host versions, and it does not offer disabled thinking to an adaptive
-  flowmaster's inline layer profiles until pack schemas are versioned; a
-  layer decision that carries it anyway is honoured as `Disabled`, and
-  refused with the same typed error where the model refuses it.
-- `meerkat-sqlite`: `OperationGuard::admit_missing_database`, the
-  maintenance-fence admission for an operation that finds its database file
-  missing and answers without touching it. It creates nothing (an absent lock
-  file holds no fence) and fails with `SqliteStoreError::MaintenanceFenceHeld`
-  under another holder's exclusive fence, as `OperationGuard::for_database`
-  does.
+- `MeerkatMachine::hold_live_assistant_output_handles` and
+  `LiveAssistantOutputRetirementHold` (`meerkat-runtime`, `live` feature):
+  keep a closed live channel's generated assistant outputs addressable while
+  its deferred close settlement replays rows that need them. A retirement
+  requested meanwhile runs when the last hold ends; a held output never
+  becomes reservable. Both are additive public API.
+  `retire_live_assistant_output_handles` keeps its signature but now defers
+  the retirement while a hold exists. (#1821)
 - `RKAT_WORKER_THREADS=<n>` sets the Tokio worker count of `rkat`,
   `rkat-rpc`, `rkat-rest`, `rkat-mcp` and `rkat-mob-mcp` (#1799). Unset, the
   runtime still starts one worker per available CPU, and Tokio's own
@@ -902,65 +1083,91 @@ them.
   the resolved one. The deployment guide's Worker Threads section and its
   container thread-limit notes describe the default and how to size a pids
   limit.
-- `meerkat_mob::MobDestroyReport` gains `reloaded_members`: the members whose
-  runtime required a durability reload, which the destroy reloaded from their
-  durable store before retiring them. The field is left out of the
-  serialized report when it is empty, so the `mob/destroy` result of any
-  other destroy is unchanged.
-- `meerkat::ContinuationAddressResolver::member_address_of_session` and
-  `meerkat_mob::continuation::MobHandleLookup::mob_handles`, provided
-  methods (the defaults know of no members and hold no mobs): a host that
-  resolves member delivery addresses reports the mob member a session serves
-  now. `meerkat::ContinuationHostBindings::member_address_of_session` asks
-  the bound resolver. `meerkat::JobRuntimeDeliveryApplier::with_address_session`
-  names the session serving a drained member address.
-  `meerkat::PersistenceBundle::producer_job_store` is the bundle's job store
-  as job producers use it (see Fixed); `job_store` stays the host's own store.
-- `meerkat_core::ToolBindingDigest` and `ToolBindingDigestParseError`: a
-  durable SHA-256 digest of what a tool catalog entry declares (never its
-  live authorities or current callability), with the text form
-  `sha256:<64 hex digits>`.
-- `meerkat_mob::MobClaimToken`, `MobClaimVerifier`, `MobClaimTokenError`
-  and `CallbackClaimCheck`; `MobBuilder::with_callback_claim_verifier`;
-  `MobHandle::check_callback_claim_token` and
-  `record_callback_claim_verifier_if_absent`;
-  `MobRuntimeMetadataStore::put_callback_claim_verifier_if_absent`,
-  `load_callback_claim_verifier` and `delete_callback_claim_verifier`,
-  provided methods that refuse by default (the in-memory and SQLite stores
-  implement them).
-- `meerkat_mob_mcp::MobMcpState::mob_create_definition_with_claim_verifier`
-  and `mint_callback_claim_token`, and
-  `meerkat_mob_mcp::CallbackRouteClaimTokenRefused`.
-- `meerkat_contracts::MobClaimCallbackRouteParams`.
-- `MeerkatMachine::hold_live_assistant_output_handles` and
-  `LiveAssistantOutputRetirementHold` (`meerkat-runtime`, `live` feature):
-  keep a closed live channel's generated assistant outputs addressable while
-  its deferred close settlement replays rows that need them. A retirement
-  requested meanwhile runs when the last hold ends; a held output never
-  becomes reservable. Both are additive public API.
-  `retire_live_assistant_output_handles` keeps its signature but now defers
-  the retirement while a hold exists. (#1821)
-- `meerkat_authorization::publication::LocalAuthorizationPublication::poison`
-  permanently poisons a publication without taking its writer, so an owner
-  that shares the publication can call it from a callback that runs under a
-  held reservation. Every retained stamp, prepared final entry and grant check
-  then answers `Unavailable`, retained consent eligibility is no longer
-  current, and no new observation or owner change is admitted until the
-  owners are reconstructed under a new publication. A child grant issuance
-  under exclusion refuses (`Unavailable`, appending nothing) when the
-  publication was poisoned after its reservation and before its pre-append
-  check (always so for its own conjunct's poison). Effects that already
-  passed their final entry keep their outcomes. A revocation refused while
-  the publication is poisoned did not happen; retry it after reconstruction.
-- `LocalAuthorizationPublication::poison_on_unwind` returns an
-  `OwnerPoisonSentinel` that poisons the publication when it is dropped during
-  an unwind. An owner creates it right after acquiring its own entry lock, in
-  the same scope, and holds it as long as that lock, reads included: the panic
-  that poisons the lock then poisons the publication before any outer
-  `catch_unwind` can swallow it.
+- `BinaryIntegrityError`, a `MeerkatError` subclass exported by both SDKs
+  (`meerkat.BinaryIntegrityError` with `asset`, `path`, `expected_sha256` and
+  `actual_sha256`; `BinaryIntegrityError` from `@rkat/sdk` with `asset`,
+  `path`, `expectedSha256` and `actualSha256`), and the SDK error codes
+  `BINARY_INTEGRITY_MISMATCH`, `BINARY_DIGEST_UNAVAILABLE` (whose message
+  names the exact release asset URL for a manual install) and
+  `BINARY_DOWNLOAD_TOO_LARGE` (an auto-download archive over 256 MiB).
 
 ### Changed
 
+- A mob's callback route is claimed with the mob's claim token. `mob/create`
+  returns the token (`mct_` and the unpadded base64url of 32 bytes of OS
+  entropy) once, to the creating connection, and the mob keeps only its
+  SHA-256, in its own store, written before anything else the create keeps: a
+  create refused because the store already holds one for the id writes
+  nothing, and a create that fails after writing it deletes it again (best
+  effort: if that delete fails, a warning is logged and the id stays refused
+  on that store until a destroy or the store's removal), so the id can be
+  created again. `mob/claim_callback_route` compares the presented token in
+  constant time before anything else: another token is refused (`-32002`,
+  `claim_token_mismatch`), and a mob created without one (by an agent's
+  `mob_create`, implicitly, or by a host's Rust create) is not claimable
+  (`not_claimable`) unless its host mints it one
+  (`MobMcpState::mint_callback_claim_token`, a Rust API with no wire method).
+  Destroy deletes the stored hash, so a mob destroyed and created again under
+  its id, even on a store the host kept, never answers the old token. A lost
+  token cannot be minted again (the host mint refuses a mob that keeps a
+  verifier): destroying and creating the mob again is the only recovery over
+  the wire, so a creator that must claim the route after a restart persists
+  the token. The SDKs do not print it: Python's `Mob` and the generated
+  `MobCreateResult` and `MobClaimCallbackRouteParams` leave it out of their
+  reprs, and TypeScript's `Mob.claimToken` is not enumerable. The token
+  decides which connection a route claim follows and nothing else: every
+  connection to one `rkat-rpc` host keeps the same owner authority. (#1459)
+- Upgrading: a mob created over RPC before 0.9.3 keeps no claim token
+  verifier, so after the upgrade no connection can claim its callback
+  route over the wire. Destroy it and create it again (the new
+  `mob/create` returns its token), or have the host mint it a token through
+  `MobMcpState::mint_callback_claim_token` (a Rust API with no wire
+  method).
+- A detached callback job records the declaration of the tool that took it
+  (`meerkat_core::ToolBindingDigest`: its description, input schema,
+  provenance, audience, plane, deferred eligibility and execution contract,
+  runner included) and the route that submitted it. Any other route that
+  starts, reconciles or cancels it (one that took over the mob's callback
+  route or registered a tool of the same name and runner, and every route
+  after a restart) must register a tool that declares exactly that, compared
+  on every use, before any attempt is claimed or any callback is sent. A
+  running job such a route may not act on goes to `needs_attention`
+  (`callback_binding_changed`); a queued one is left queued, unchanged, for
+  a route that may (nothing expires it: it waits until such a route or its
+  submitter starts it, or `jobs/cancel` cancels it). The submitting
+  connection itself is not checked. A job whose recorded
+  specification no longer decodes goes to `needs_attention`
+  (`callback_specification_unreadable`) instead of being skipped on every
+  pass. In 0.9.2 any route that registered a tool of the same name and
+  runner took the job.
+- A plain prompt is its own interaction. When a prompt names no interaction
+  (no correlation id, no caller-supplied interaction id, no caller context),
+  its transcript rows (the user message and the turn's assistant rows), its
+  run events and the work its run owns now carry an `interaction_id`: the
+  prompt's input id. RPC `session/create`, `turn/start` and `rkat run` carry
+  the prompt's input id; a surface that runs the prompt as a direct service
+  turn instead (the MCP server's `meerkat_run` and `meerkat_resume`, a mob
+  member's eager initial turn, RPC's non-runtime `SessionRuntime::start_turn`)
+  carries an id minted for that turn. On a persistent session those rows now
+  also carry their `run_id`. Before, the rows carried neither and the run
+  events no `interaction_id`. A correlation id or a caller-supplied id still
+  wins, and a transient steer still joins the active turn without an id of its
+  own. A turn whose batch merges inputs naming different interactions still
+  carries none, a plain prompt's own id never displaces an interaction another
+  input in its batch names, and a batch of several plain prompts carries none.
+  A user request restored after an interrupted run carries the prompt's own
+  id, as a run of that prompt alone stamps it.
+- `DetachedJobMachine` declares the generated invariant
+  `terminal_delivery_follows_every_notification`: every notification is
+  sequenced before the job's terminal delivery. It is why the terminal and
+  notification `MarkDeliveryApplied` arms never both match, even for a
+  notification whose id is `terminal` (#1811). TLC checks it, and the job
+  stores refuse a row that breaks it, on write and on every read, as
+  `DetachedJobError::Store` naming the invariant
+  (`DetachedJobMachineAuthority::recover_from_state` itself returns
+  `RecoveredStateInvariantRejected`). No state written by any release breaks
+  it (the sequence rules are unchanged since the machine first shipped in
+  0.8.8), so existing stores load unchanged.
 - `meerkat-mcp`: `McpRouterAdapter::shutdown_with_report` releases its
   router lock once it has taken the router, so a reader (an attempt guard's
   finish among them) no longer waits for the shutdown to finish; it finds
@@ -974,51 +1181,53 @@ them.
     not block on a full stderr pipe. A blocked host stderr can still hold a
     trusted-host server, as an inherited stderr did.
   - Shortly after the process is gone, the drain stops, forwarding
-    included, and closes its end. A descendant still writing to stderr then
-    gets `EPIPE` (or `SIGPIPE`).
-- **Pull-request CI and the pre-push hook do less, to fit 20 minutes from
-  the start of the hook to a green `CI gate`.** The lane classifier
-  (`scripts/ci-cargo-lanes.mjs --event`) plans a pull request without the
-  lanes that compile the meerkat-mob chain or sweep the reverse-dependency
-  closure, and the push to `main` (or a `release/**` branch), whose CI must
-  be green before a release tag, runs them: the `closure-tests` rows,
-  `closure-check`, `feature-check`, `governed-jsonl`,
-  `mcp-confinement-positive`, the integration suites whose package compiles
-  meerkat-mob, the facade's two GPT Live feature suites, the test targets of
-  the mob-chain packages' Clippy (a pull request lints their lib and bin
-  targets), the Clippy of rkat, meerkat-integration-tests and meerkat-rpc
-  when the change invalidates meerkat-mob's build (workspace mode, or a
-  change to meerkat-mob or a crate its library compiles; a pull request that
-  leaves meerkat-mob's build alone lints them), and the wasm lanes that only
-  the reverse-dependency closure selected. The plan names what a pull request left to the push
-  (`deferred_to_push`), the gate prints it, and the gate refuses a push plan
-  that left anything. meerkat-rpc's default-feature unit row no longer runs
-  in the pull request (`PR_UNIT_CHAIN_EXCEPTIONS` is gone; `main-unit` runs
-  it). A `Cargo.lock` change that is the only global path is scoped to the
-  members that resolve a changed lock entry instead of the whole workspace,
-  falling back to the workspace on anything the scoping cannot read. The TLC
-  audits run in three shards instead of two, xtask's unit tests (5-7
-  minutes) run in a lane of their own, and a `governance-gates` job
-  runs the typed governance gates (`rmat-audit`, `seam-inventory`,
-  `runtime-authority-bypass`, `machine-authority-docs-gate`) when machine
-  authority or a dogma document changes. The pre-push hook no longer runs the
-  changed-path ratchets, the machine codegen drift check, the canonical TLC
-  lane or the deterministic workspace test gate (they are manual hooks; CI
-  runs each before merge or on the push a release tag requires green,
-  except the gate's lib tests under the workspace's unified features, which
-  only nightly's workspace unit lane runs: the push runs every member's lib
-  tests with that member's own features), skips the release
-  contract tests CI already runs on every pull request, and runs its two
-  slow harness contracts only when a push changes what they exercise. The
-  `CI gate`'s pull-request budgets drop to 1080 s of lane execution and
-  1200 s push-to-terminal (runner queue still excluded), from 1500 s and
-  2700 s. A push to `main` now diffs against the last main commit whose CI
-  run completed green with its attestation instead of the push's payload
-  base, so the changes of a cancelled, superseded or failed main run still
-  run the push-only lanes; it plans the whole workspace when no such commit
-  is found, when the push carries more than one commit (the finder runs from
-  HEAD's first parent only when that parent is the push's payload base), or
-  when the finder's answer is not a full sha of an ancestor of HEAD.
+    included, and closes its end (see Breaking).
+- **Pull-request CI and the pre-push hook do less, to fit 20 minutes from the
+  start of the hook to a green `CI gate`.** CI and pre-push hook only.
+  - The lane classifier (`scripts/ci-cargo-lanes.mjs --event`) plans a pull
+    request without the lanes that compile the meerkat-mob chain or sweep the
+    reverse-dependency closure, and the push to `main` (or a `release/**`
+    branch), whose CI must be green before a release tag, runs them: the
+    `closure-tests` rows, `closure-check`, `feature-check`, `governed-jsonl`,
+    `mcp-confinement-positive`, the integration suites whose package compiles
+    meerkat-mob, the facade's two GPT Live feature suites, the test targets of
+    the mob-chain packages' Clippy (a pull request lints their lib and bin
+    targets), the Clippy of rkat, meerkat-integration-tests and meerkat-rpc
+    when the change invalidates meerkat-mob's build (workspace mode, or a
+    change to meerkat-mob or a crate its library compiles; a pull request that
+    leaves meerkat-mob's build alone lints them), and the wasm lanes that only
+    the reverse-dependency closure selected. The plan names what a pull
+    request left to the push (`deferred_to_push`), the gate prints it, and the
+    gate refuses a push plan that left anything. meerkat-rpc's default-feature
+    unit row no longer runs in the pull request (`PR_UNIT_CHAIN_EXCEPTIONS` is
+    gone; `main-unit` runs it).
+  - A `Cargo.lock` change that is the only global path is scoped to the
+    members that resolve a changed lock entry instead of the whole workspace,
+    falling back to the workspace on anything the scoping cannot read.
+  - The TLC audits run in three shards instead of two, xtask's unit tests
+    (5-7 minutes) run in a lane of their own, and a `governance-gates` job
+    runs the typed governance gates (`rmat-audit`, `seam-inventory`,
+    `runtime-authority-bypass`, `machine-authority-docs-gate`) when machine
+    authority or a dogma document changes.
+  - The pre-push hook no longer runs the changed-path ratchets, the machine
+    codegen drift check, the canonical TLC lane or the deterministic workspace
+    test gate (they are manual hooks; CI runs each before merge or on the push
+    a release tag requires green, except the gate's lib tests under the
+    workspace's unified features, which only nightly's workspace unit lane
+    runs: the push runs every member's lib tests with that member's own
+    features), skips the release contract tests CI already runs on every pull
+    request, and runs its two slow harness contracts only when a push changes
+    what they exercise.
+  - The `CI gate`'s pull-request budgets drop to 1080 s of lane execution and
+    1200 s push-to-terminal (runner queue still excluded), from 1500 s and
+    2700 s.
+  - A push to `main` now diffs against the last main commit whose CI run
+    completed green with its attestation instead of the push's payload base,
+    so the changes of a cancelled, superseded or failed main run still run the
+    push-only lanes; it plans the whole workspace when no such commit is
+    found, when the push carries more than one commit (the finder runs from
+    HEAD's first parent only when that parent is the push's payload base), or
+    when the finder's answer is not a full sha of an ancestor of HEAD.
 - A push to `main` runs the payload base's own copy of
   `scripts/ci-push-plan-base.mjs`, which decides the push's diff base, so a
   pushed commit cannot change that decision for its own push; without that
@@ -1157,7 +1366,7 @@ them.
   whole-workspace push runs 13 fewer jobs. Each unit row runs only the
   target kinds its packages have (`--bins` for the binary-only rkat and
   surface-build-fixtures, which a push runs in rows of their own). CI only.
-- Clippy refuses every API that starts a process: the new workspace
+- Clippy refuses the APIs that start a process: the new workspace
   `clippy.toml` disallows `std::process::Command::new`,
   `tokio::process::Command::new`, `CommandExt::exec`, the `libc` `fork`,
   `vfork`, `clone`, `exec*`, `posix_spawn*`, `system` and `popen` functions,
@@ -1214,80 +1423,6 @@ them.
   its version. The job's token gains `attestations: read`, and its timeout is
   240 minutes, up from 180. Crate publication and the publication SLO do not
   wait for it.
-- A plain prompt is its own interaction. When a prompt names no interaction
-  (no correlation id, no caller-supplied interaction id, no caller context),
-  its transcript rows (the user message and the turn's assistant rows), its
-  run events and the work its run owns now carry an `interaction_id`: the
-  prompt's input id. RPC `session/create`, `turn/start` and `rkat run` carry
-  the prompt's input id; a surface that runs the prompt as a direct service
-  turn instead (the MCP server's `meerkat_run` and `meerkat_resume`, a mob
-  member's eager initial turn, RPC's non-runtime `SessionRuntime::start_turn`)
-  carries an id minted for that turn. On a persistent session those rows now
-  also carry their `run_id`. Before, the rows carried neither and the run
-  events no `interaction_id`. A correlation id or a caller-supplied id still
-  wins, and a transient steer still joins the active turn without an id of its
-  own. A turn whose batch merges inputs naming different interactions still
-  carries none, a plain prompt's own id never displaces an interaction another
-  input in its batch names, and a batch of several plain prompts carries none.
-  A user request restored after an interrupted run carries the prompt's own
-  id, as a run of that prompt alone stamps it.
-- A mob's callback route is claimed with the mob's claim token.
-  `mob/create` returns the token (`mct_` and the unpadded base64url of 32
-  bytes of OS entropy) once, to the creating connection, and the mob keeps
-  only its SHA-256, in its own store, written before anything else the
-  create keeps: a create refused because the store already holds one for
-  the id writes nothing, and a create that fails after writing it deletes
-  it again, so the id can be created again. `mob/claim_callback_route`
-  compares the presented token in constant time before anything else:
-  another token is refused (`-32002`, `claim_token_mismatch`), and a mob
-  created without one (by an agent's `mob_create`, implicitly, or by a
-  host's Rust create) is not claimable (`not_claimable`) unless its host
-  mints it one (`MobMcpState::mint_callback_claim_token`, a Rust API with
-  no wire method). Destroy deletes the stored hash, so a mob destroyed and
-  created again under its id, even on a store the host kept, never answers
-  the old token. A lost token cannot be minted again (the host mint
-  refuses a mob that keeps a verifier): destroying and creating the mob
-  again is the only recovery, so a creator that must claim the route after
-  a restart persists the token. The SDKs do not print it: Python's `Mob`
-  and the generated `MobCreateResult` and `MobClaimCallbackRouteParams`
-  leave it out of their reprs, and TypeScript's `Mob.claimToken` is not
-  enumerable. The token decides which connection a route claim follows
-  and nothing else: every connection to one `rkat-rpc` host keeps the same
-  owner authority.
-- Upgrading: a mob created over RPC before 0.9.3 keeps no claim token
-  verifier, so after the upgrade no connection can claim its callback
-  route over the wire. Destroy it and create it again (the new
-  `mob/create` returns its token), or have the host mint it a token through
-  `MobMcpState::mint_callback_claim_token` (a Rust API with no wire
-  method).
-- A detached callback job records the declaration of the tool that took it
-  (`meerkat_core::ToolBindingDigest`: its description, input schema,
-  provenance, audience, plane, deferred eligibility and execution contract,
-  runner included) and the route that submitted it. Any other route that
-  starts, reconciles or cancels it (one that took over the mob's callback
-  route or registered a tool of the same name and runner, and every route
-  after a restart) must register a tool that declares exactly that, compared
-  on every use, before any attempt is claimed or any callback is sent. A
-  running job such a route may not act on goes to `needs_attention`
-  (`callback_binding_changed`); a queued one is left queued, unchanged, for
-  a route that may (nothing expires it: it waits until such a route or its
-  submitter starts it, or `jobs/cancel` cancels it). The submitting
-  connection itself is not checked. A job whose recorded
-  specification no longer decodes goes to `needs_attention`
-  (`callback_specification_unreadable`) instead of being skipped on every
-  pass. In 0.9.2 any route that registered a tool of the same name and
-  runner took the job.
-- `DetachedJobMachine` declares the generated invariant
-  `terminal_delivery_follows_every_notification`: every notification is
-  sequenced before the job's terminal delivery. It is why the terminal and
-  notification `MarkDeliveryApplied` arms never both match, even for a
-  notification whose id is `terminal` (#1811). TLC checks it, and the job
-  stores refuse a row that breaks it, on write and on every read, as
-  `DetachedJobError::Store` naming the invariant
-  (`DetachedJobMachineAuthority::recover_from_state` itself returns
-  `RecoveredStateInvariantRejected`). No state written by any release breaks
-  it (the sequence rules are unchanged since the machine first shipped in
-  0.8.8), so existing stores load unchanged.
 
 ### Deprecated
 
@@ -1302,104 +1437,92 @@ them.
 
 ### Fixed
 
-- A governed web_search helper whose owner rates its model request R2 or R3
-  now gives the model the same typed review feedback as any other tool:
-  `review_unavailable` with kind `unsupported_entry` (R2) or
-  `review_unsatisfied` with kind `human_consent_required` (R3), carrying only
-  that `kind`. The request still settles at its model entry with nothing
-  sent, but the Anthropic, OpenAI and Gemini web_search executors
-  (`AnthropicWebSearchExecutor`, `OpenAiWebSearchExecutor`,
-  `GeminiWebSearchExecutor`) dropped the typed settlement at their provider
-  seam and returned `LlmError::OperationAuthorizationUnavailable`, so the
-  model saw `operation_authorization_unavailable` (as the 0.9.2 notes
-  described). They now return `LlmError::OperationReviewRefused`, which the
-  builtin web_search tool already reports as review feedback. web_search
-  gains no review support: its review entry stays unsupported and the
-  installed reviewer is never asked. An owner that cannot decide the helper
-  still gives `operation_authorization_unavailable`.
-- The live host gives the live model the same typed review feedback when a
-  session fails a live tool call with a model request's settled review (R2
-  `unsupported_entry`, R3 `human_consent_required`, carried in the
-  authority-unavailable model error's details).
-  `LiveToolDispatchError::from_session_error` classified every such error as
-  `ToolError::OperationAuthorizationUnavailable`; it now decodes the
-  settlement with core's `AgentError::operation_review_refusal` and gives
-  `ToolError::ReviewUnavailable` or `ToolError::ReviewUnsatisfied`. Plain
-  authority unavailability, and a review detail that does not decode, still
-  give `operation_authorization_unavailable`.
-- `LiveToolDispatchError::from_session_error` now also classifies a model
-  failure that its session reports with settlement diagnostics. Core keeps
-  such a failure inside `AgentError::WithSettlementFailures`, and the
-  classifier matched only an unwrapped model error, so a settled review,
-  authority unavailability or observation unavailability with diagnostics
-  fell through to `LiveToolDispatchError::Session` (code `AGENT_ERROR`) and
-  reached the live model as a prose tool error. The classifier now reads the
-  primary error: a settled review and authority unavailability give the same
-  typed tool feedback as without diagnostics, and the diagnostics travel in
-  the live tool result's `settlement_failures`; observation unavailability
-  leaves the tool feedback path as
-  `LiveAdapterHostError::OperationObservationUnavailable` carrying them. An
-  operation refusal keeps its classification and is never read as review
-  feedback, also when its details carry a review.
-- `meerkat` built without its `session-store` feature (its default feature
-  set included) no longer warns that `ConsentAwareJobSource` is never
-  constructed. The crate-private consent-aware job source is now compiled
-  only with the session-store runtime delivery host that builds it.
-- An idle session recovered after an abrupt host stop records its typed
-  interrupted-run notice at attach even when its runtime loop checks for
-  owed notices before the attachment hands them over. The attach woke the
-  loop when it published and handed the notices to the session just after;
-  the loop runs on its own runtime, so it could spend that wake on a check
-  that found nothing and wait for the next input (the notice still reached
-  the model on that turn). The attachment now wakes the exact attached loop
-  again after the hand-off. `tool_process_custody_restart` forces that order
-  with two test-support gates (meerkat-runtime
-  `MeerkatMachine::arm_attachment_interrupted_notice_handoff_test_hook` and
-  `MeerkatMachine::arm_runtime_loop_after_empty_interrupted_notice_check_test_hook`,
-  doc-hidden).
-- The same notice is recorded at attach when the attachment replaces a
-  predecessor whose queued inputs it fences. Fencing them left the
-  replacement no queued work, so it published without waking its loop and
-  skipped the wake after the hand-off as well; the hand-off now wakes the
-  exact attached loop whenever it hands notices over.
-- The meerkat-runtime test
-  `quiescent_close_of_a_settled_owner_resumes_the_same_session_without_replay`
-  no longer races its runtime loop. It admitted an input without a wake as
-  soon as the first input's completion resolved, while the loop's lap after
-  that run could still check its queue, take the input and finish it before
-  the close looked, so the close answered `Closed` instead of `Busy` under
-  load. The test now waits for the loop to park before it queues the input.
-  Test-only: the close never answers `Closed` while a non-terminal input
-  exists.
-- A GPT Live barge-in duck (`live/assistant_playback_hint`) over an answer
-  now ends once the user has been quiet for 1.6 s, the floor guard's release
-  length, even while the answer is still talking. Since 0.8.51 every duck
-  waited for a 600 ms gap in the assistant's output after the user went
-  quiet, so an answer that started into the user's speech and never paused
-  stayed muted until it ended: in Turbo S S107 the duck ran from 3289 ms to
-  19205 ms over a 12.8 s answer, and the user heard none of it. The broker
-  now keys the restore on what the duck covers, by onset order on the
-  provider audio clock (gpt-live-1 output frames carry no response id). A
-  burst the assistant was voicing when the user started speaking is the one
-  the user interrupted: it keeps the 0.8.51 rule (once the user is quiet,
-  ducked to its next 600 ms output pause or its end, so the stale tail of
-  Turbo S S103 R3 stays silent), and it ends at its first 600 ms pause.
-  Audio after that pause, and any response that starts into or after the
-  user's speech, is an answer and restores on the user's quiet, mid-sentence
-  if need be. So does an answer that follows an early yield within the 1.6 s
-  that would end the interrupted response, and one that follows a user onset
-  within 1.6 s of an answer that had ended at least 600 ms before. The duck
-  still holds
-  while the user speaks, and pauses inside the user's speech (under 1.6 s)
-  never restore it. By design, an answer spoken entirely while the user is
-  still talking stays ducked to its end (Turbo S S106): the user held the
-  floor for all of it. Known limitation: without a response id the broker
-  cannot tell a resumed interrupted response from a new answer. If the
-  interrupted response pauses for 600 ms or more while the user is still
-  talking and then resumes, or the user starts speaking inside a 600 ms to
-  1.6 s pause of a response that then resumes, the resumed audio counts as
-  an answer: it stays ducked while the user speaks and is restored once the
-  user has been quiet for 1.6 s, mid-sentence if need be.
+- A mob member's failed provisioning cleanup no longer deadlocks with a
+  concurrent raw unregister of the same session (`meerkat-mob`). An owned
+  actor transaction (a member create or revival whose create failed after
+  the session service published its actor, or one cancelled after that)
+  rolled its prepared materialization back while still holding the
+  session's turn-finalization boundary. That rollback takes the session's
+  live lifecycle lease, which a concurrent
+  `MeerkatMachine::unregister_session` saga holds into its surface cleanup,
+  and that cleanup waits for the boundary. The cleanup now discards the
+  exact live actor under the boundary, releases it, and then rolls back
+  through the ordinary path, in the saga's own lock order. If a raw
+  unregister removes the registration while the boundary is released, or
+  the session id is registered again, the rollback leaves it alone. The
+  host materializer's rollbacks before any actor is published keep the
+  boundary, since no surface cleanup waits on it there. Debug builds assert
+  that no actor is published at those points; release builds check it too,
+  and refuse such a rollback with a typed
+  `MaterializeServeError::UnrecordedSessionCleanup`, which fail-stops the
+  serving actor, instead of risking the deadlock. (#1814)
+- A member force cancel (`MobHandle::force_cancel_member`, `mob/force_cancel`,
+  the `force_cancel_member` tool) and `mob/cancel_all_work` no longer fail
+  with an internal error ("cancelling the current run of '...' failed:
+  Interrupt outcome is not settled ...") when the member's run crosses a
+  boundary while the cancel is delivered. The runtime has recorded the
+  cancel for that exact run by then, and the run ends at its next boundary;
+  without live delivery the run's work continues until the runtime next
+  observes a boundary (for a service that reports none, the turn's end).
+  The verb now succeeds, as a member stop already did: its success means
+  the cancel is recorded. The same holds when the member's session service
+  does not support the live boundary cancel
+  (`SessionService::cancel_after_boundary`): the runtime has recorded the
+  cancel first, and the verbs report it instead of an internal error.
+  `MeerkatMachine::cancel_after_boundary_run_if_current` also reports
+  `InterruptDispatchOutcomeUnknown` rather than a bare `Internal` for the
+  other failures that follow the recorded cancel (its effect projection, the
+  withdrawal of its dispatch), so the verbs report the recorded cancel there
+  too. This was the intermittent
+  `member_creation_some_origin_authority_matrix` failure in meerkat-mob's
+  tests.
+- A mob Stop no longer holds up every later mob command for one session wait
+  per member. It cancelled every member session's checkpoint gate, then held
+  every member's run starts, one member after another, and each of those
+  steps can wait on that member's session: an in-flight checkpoint save holds
+  its gate, and a running turn's commit holds the session's mutation gate. A
+  Stop of a large busy mob blocked its actor for seconds. Both phases now run
+  concurrently per member (run-start holds 32 at a time) and keep their order
+  (every hold before any interrupt); a failed Stop still reports its first
+  failure in roster order. Every member that can be held is now held even
+  when another member's hold fails (before, the members after the first
+  failure were not held), and a failed Stop now releases every member's
+  hold again (before, they stayed held), except while the actor is
+  fail-stopping for cold recovery, where cold replay decides. After a
+  failed Stop the mob stays Running and input queued before the Stop runs,
+  but the Stop's lifecycle intent stays pending: new member input is
+  refused with `LifecycleOperationPending { intent: "stop" }` until a
+  retried Stop completes and the mob is resumed, or a Reset takes the
+  intent over (Resume alone does not clear it: it resumes only a Stopped
+  mob). The actor's inline-step watchdog now names each Stop stage
+  (`stop_checkpointer_cancel`, `stop_run_start_holds`, and so on) in its
+  `stage_timings_ms`.
+- The fork_off re-link after a restart no longer only logs a failed
+  retirement of a child whose settled outcome retires it (its own turn
+  failed, or it ran past its `max_run`). It retries the retirement for up to
+  about ten seconds, in that child's own settlement, and reports the result
+  typed (`ChildRetirement`) in each report and outcome; a child whose
+  retirement still fails is reported `Failed`, logged, and retired by the
+  next pass (a restart, or `MobMcpState::relink_restored_fork_children`).
+  (#1391)
+- Destroying a mob no longer hangs when one of its members lost a boundary
+  commit: the commit failed after the member's run consumed its input in
+  memory, so the member's runtime requires a durability reload. The member's
+  exited runtime loop keeps the session's mutation gate until a reload
+  releases it, and the destroy waited on that gate in the member's ingress
+  detach forever, because nothing performed the reload. The destroy now
+  reloads such a member first, as retirement already did: its runtime is
+  replaced by one recovered from the durable store, where the consumed input
+  is pending again, and the member's retirement records that input as
+  abandoned (`Retired`) instead of losing it with the in-memory run. The
+  reload runs before the destroy writes anything, and again just before each
+  member's ingress detach. A reload that fails or overruns the member retire
+  budget makes the destroy a typed `MobDestroyError::Incomplete` whose report
+  names the member and the reload error. When that happens before the destroy
+  started, the destroy has written nothing and can be retried, but the
+  members it reloaded before the failing one stay reloaded (their degraded
+  shells were replaced and their consumed inputs are pending again), and the
+  report lists them in `reloaded_members`. (#1222)
 - Agent schedule tools no longer keep a stopped schedule host's session and
   mob hosts alive. `SharedScheduleTargetAdapter` now owns the create-time
   identity-target probe it attaches and the `ScheduleService` holds it
@@ -1412,115 +1535,99 @@ them.
   schedule host spawners, `SharedScheduleTargetAdapter::new`,
   `set_default_schedule_tools`, `FactoryAgentBuilder::default_schedule_tools`
   and the scheduling guide now say so. A schedule host started after
-  teardown for the same service judges identity targets itself instead of
-  being ignored because the first attach won, and store-only schedule tool
-  calls (get, list, pause and the rest) keep working after teardown.
-- Linux shell process custody (`meerkat-tools`) no longer captures, compares
-  or signals processes through a procfs of another pid namespace. Custody
-  records pids from the host's own syscalls, but `/proc` numbers processes in
-  the pid namespace it was mounted for, so a host in a new pid namespace
-  without a procfs of its own read other processes' entries. Capturing the
-  host's or a tool leader's identity then failed (`Io { context: "capture
-  tool leader identity", .. }` with `NotFound`), or captured a process of the
-  same user that held that number there; recovery could then compare the
-  start stamps of other processes, and pin and SIGKILL pids taken from the
-  procfs's numbering. Every custody read of `/proc/<pid>` now goes through a
-  procfs proven, at the start of each operation, to show the host's own pid
-  namespace: the host's own status record there shows its pid as `Tgid` and,
-  where the kernel lists `NSpid` (Linux 4.1 and later; not gVisor), lists
-  exactly that pid in `NSpid`. Any other procfs fails closed before a lock,
-  record or spawn gate is touched, with the new
-  `ProcessCustodyError::ForeignProcfs { context, view: ForeignProcfsView }`
-  (the host's pid, the pid the procfs shows it as, and the pid namespace
-  levels between them); a session build under a realm runtime root reports
-  it as `CompositeDispatcherError::ProcessCustody`. Operator action: give the
-  host a procfs of its own pid namespace (`unshare --pid --fork --mount-proc`,
-  or the container runtime's own `/proc`). Residuals: on kernels without
-  `NSpid`, an ancestor namespace's procfs in which the host's pid happens to
-  be the same number is not detected. Custody records written before this
-  fix by a host whose procfs was not its own can carry another process's
-  start stamp. Such a host now refuses before recovery, and a reboot or a
-  host in a new pid namespace settles them, but a host later given its own
-  procfs in the same pid namespace reads them as written and may settle one
-  as `GroupReassigned` while its tool group still runs. The custody namespace
-  tests now also run a host that keeps its parent's procfs wherever
-  unprivileged user and pid namespaces exist, and skip only on unshare(1)'s
-  own namespace setup refusals: a failure to execute the host fails them.
-- A peer response, progress or terminal, goes only to the peer that sent the
-  request it answers. MeerkatMachine records each inbound request's
-  requester, the canonical peer id of the envelope's signing key that
-  ingress admitted (never a payload field, display label or `from_route`),
-  at the generated transition that admits the request, and removes it with
-  the terminal reply. `CommsRuntime::send` asks the machine
-  (`ResolvePeerResponseAddressee`) before any transport and refuses a
-  `PeerResponse` addressed to any other peer with
-  `SendError::ResponseAddresseeNotRequester`: nothing is sent and the
-  request stays answerable, so a response to the requester still goes
-  through. This covers the agent `send_response` tool, host `comms/send`
-  (`peer_response`) and the mob responders. The tool reports the refusal as
-  `invalid_arguments` (its other refusals stay `execution_failed`); host
-  `comms/send` reports it as `send_failed`, with no wire change. The
-  addressee is compared as the canonical `PeerId` the transport routes by;
-  `display_name` never addresses a response. A response to a request id
-  this session never received, already answered, or received before a
-  restart keeps its unchanged refusal (`SendError::Validation`;
-  `execution_failed` from the tool, `send_failed` from `comms/send`). The
-  record is not persisted, as the inbound request map it belongs to is not:
-  after a restart no earlier request is answerable. With peer auth required,
-  ingress verifies the envelope's signature, so the requester is the holder
-  of that key; under open auth (`require_peer_auth = false`) it is the key
-  the envelope declares, the same identity trust and routing use in that
-  mode. Before, the runtime checked only that the request id named a request
-  this session had received and could still answer.
-- `CommsRuntime::stage_declared_reply_endpoint` and
-  `Router::stage_reply_endpoint` refuse, with `SendError::Validation`, a
-  signing key that does not derive the destination peer id, as
-  `stage_correlated_reply_endpoint` already did, and stage nothing. The router
-  addresses a Response sent through a staged endpoint to that key, so a
-  mismatched key would have carried a response meant for one peer to another.
-- A response to an outbound peer request, progress or terminal, is accepted
-  only from the peer the request was sent to. Before, a trusted peer that
-  learned a pending request id could complete it, or send progress on it,
-  with its own content: the requester's drain applied a response frame by its
-  correlation id alone, handed it to a waiting tool or stream, and injected
-  it into the session, and a later answer from the real addressee was then
-  refused as unknown. MeerkatMachine now records each outbound request's
-  addressee, the canonical peer id the request is routed to, at the
-  generated transition that records the send, before the request frame
-  leaves, and removes it when the request ends (answered, rejected, timed
-  out or failed to send). Peer ingress asks the machine
-  (`ResolvePeerResponseSender`) about every response frame, for the request
-  id the machine echoed when it classified the frame, before it is queued,
-  and drops one signed by any other peer with the inbox's existing
-  `ClassificationRejected` drop reason (an in-process sender's send fails
-  with `SendError::AdmissionDropped`; over TCP, where no response frame is
-  acknowledged, the send succeeds as for an accepted response); the drop
-  names no peer. Such a frame never reaches the drain, a waiting tool, a
-  stream or the session, and the request stays open for its addressee. The
-  generated progress, terminal and rejection transitions also take the
-  frame's signer and refuse any other peer, so a response observation from
-  another peer can no longer cancel the request either. A response to a
-  request id this session never sent, already completed, timed out, or sent
-  before a restart keeps its existing path: it is queued and the drain
-  refuses it as unknown. The addressee's own progress and terminal responses
-  are applied as before, and the supervisor bridge, which already matched
-  the responder, behaves as before. The record is not persisted, as the
-  pending request map it belongs to is not. Under open auth
-  (`require_peer_auth = false`) ingress does not verify signatures, so the
-  check compares the key the response envelope declares. Known limitation:
-  an in-process sender that holds a request id can tell from its send result
-  whether this session holds that request for another peer (dropped) or
-  does not hold it (admitted, then refused); the id is only ever sent to the
-  addressee, so a sender that holds it already sees the exchange.
+  teardown for the same service judges identity targets itself (see
+  Breaking), and store-only schedule tool calls (get, list, pause and the
+  rest) keep working after teardown.
+- The first fire of a materialize-on-demand schedule completes, in every
+  schedule host (a stock-governed realm refuses the fire before it
+  materializes a session; see Security). After the dispatch materialized its
+  session, the schedule
+  driver synced the in-flight occurrence's target to the newly bound session,
+  and generated occurrence authority refused that sync while the occurrence
+  was dispatching: the driver tick failed, and the occurrence never completed
+  and was retried after each lease expiry. A dispatching occurrence now
+  records the session its dispatch materialized, once; rebinding it stays
+  refused.
+- `rkat-rpc`'s schedule host delivers a scheduled prompt or event to the
+  session its fire has just materialized. That session is staged until its
+  first turn, and the delivery read its keep-alive policy from the persisted
+  session, so every materialize-on-demand fire failed as `transport_error`
+  ("session not found"). The policy now comes from the staged session, as it
+  does for `turn/start`.
+- One failing delivery no longer holds back the rest of a schedule driver
+  tick. When handling one claimed occurrence failed with an error (for
+  example, a delivery adapter returned a dispatch inconsistent with its
+  occurrence), a `ScheduleDriver` tick returned that error at once. Every
+  occurrence the tick had claimed after it stayed claimed and undelivered
+  until its lease expired (60 seconds in the schedule host), then fired late
+  or misfired. The tick now handles every occurrence it claimed, unless the
+  claim scan breaks the store contract, which still fails the tick at once.
+  It returns the first handling error, or that contract violation, and logs
+  every error it does not return, so the schedule host still records the
+  failed tick.
+- A read of runtime delivery state no longer creates the state directory or
+  an empty runtime store. The SQLite runtime store's delivery reads (delivery
+  authorities and inbox records, continuation key bindings and admissions,
+  and the delivery generation) opened a create-capable connection, so a read
+  over a store whose file or directory was gone (a released, moved or removed
+  state directory, read by a delivery owner or a health tick that outlived
+  it) re-created the directory and an empty `runtime.sqlite`. They now open
+  an existing file without create and answer "not provisioned" when it is
+  missing, unless another holder's maintenance fence covers the missing file
+  (an archive by rename), which still fails typed; among delivery
+  operations, only a write creates the store. No schema change.
+- Detached callback tools work in ordinary RPC turns. A callback tool
+  registered with `execution.mode: "detached"` refused every call with
+  "requires runtime-owned interaction lineage" unless the turn carried a
+  transient turn context: a plain `turn/start`, the first turn of a
+  deferred session, the immediate turn of `session/create` and a mob
+  member's `mob/turn_start` gave the turn no interaction. Such a call now
+  queues its job. A turn that merges inputs of several interactions, or
+  whose input names none (for example a flow step without a correlation
+  id), still refuses typed, and the refusal now says so.
+- A detached job a mob member's session submitted delivered its
+  notifications and terminal to that session's runtime, and an
+  explicit-resume repoint moves the member to a successor session without
+  migrating delivery rows, so after a repoint they stranded on the
+  superseded session (#1790). The job store the persistence bundle hands
+  producers (`PersistenceBundle::producer_job_store`, which the RPC host and
+  the runtime-backed surfaces use) now records the delivery address of the
+  member whose current session submits a job
+  (`rt:member:{mob}:{identity}:{generation}`, as the host's continuation
+  resolver reports it) as the job's origin member (`JobSpec::origin_member_id`),
+  and the delivery owner applies such a job's rows in the session serving the
+  member when they are delivered; other sessions' subscriptions are
+  unchanged. A replay of the same call from the superseded session joins the
+  admitted job: the callback and shell producers adopt its origin member. A
+  member respawned under its identity is a new generation that never receives
+  an earlier generation's rows, which stay pending. Jobs submitted before
+  0.9.3, and jobs of sessions no member serves, keep their session's
+  address; a replay keeps what its admitted job recorded. A host that builds
+  its own job producers from `PersistenceBundle::job_store()` keeps session
+  addressing; give them `producer_job_store()` for member addressing.
+- An Anthropic `pause_turn` stop (a server-tool loop reached its iteration
+  limit) is reported as `pause_turn` instead of `end_turn`. The paused turn
+  commits like an end of turn, even when it holds only server-tool blocks, and
+  its `server_tool_use` blocks go back to the provider as history with the
+  next request. That replay has been checked against a stub server only, not
+  against the live API (#1881). Recovery of a durable tail left by a shutdown
+  race classifies a tail that ends in a `pause_turn` turn as `Ambiguous` and
+  holds it, as it does a `max_tokens` tail. Before, such a tail read as
+  `end_turn` and could be recovered as a completed run.
+- A tool call whose streamed input a refusal or a filled context window cut
+  off now ends the Anthropic stream with that stop reason instead of a stream
+  parse error. Under any other stop reason a tool input that does not parse
+  still fails the response as before.
 - `rkat mob deploy --surface rpc` now builds from the deploy config, as the
   default `cli` surface does. The deploy flags (`--model`,
   `--max-total-tokens`, `--max-duration`, `--max-tool-calls`) and the pack's
   deploy defaults (`max_tokens`, `[models]`, `[budget]`, `[compaction]`)
   apply, as defaults, to every member and session the RPC host builds, and
   to its model resolution and model hot-swaps; an explicit `session/create`
-  or mob spawn parameter replaces them for that session. A flag wins over
-  the realm config, which wins over the pack default. The host used to build from the realm's config
-  documents alone (a known issue since 0.9.1). The deploy values are not
+  or mob spawn parameter replaces them for that session. A flag wins over the
+  realm config, which wins over the pack default. The host used to build from
+  the realm's config documents alone (a known issue since 0.9.1). The deploy
+  values are not
   written to the realm document: `config/get` and `config/set` on the host
   still read and write the realm's own document. The host now also refuses
   to start when the realm declares multi-process hosting its stores cannot
@@ -1563,66 +1670,6 @@ them.
   host's token store (the slot key includes the realm the host serves), as
   the CLI reference and the 0.9 migration notes say; the reference now says
   so.
-- A peer request, message or event that reuses the id of another peer's
-  request the session has not yet answered is refused before admission.
-  Before, the comms drain recorded no second requester for the id but still
-  admitted the candidate, so its content reached the session under the
-  first request's interaction (the answer still went only to the first
-  requester). Now only the recorded requester may send under an outstanding
-  id again (a redelivery, which runtime admission deduplicates). Another
-  peer's candidate, or one without an admitted sender, is refused: a
-  durable delivery is terminalized as rejected and its sender gets
-  `SendError::DurableAdmissionRejected`; a volatile one is dropped without
-  a signal. The outstanding request keeps its requester and interaction. A
-  supervisor bridge request under such an id is dropped before it is
-  decoded or dispatched, on the session's comms drain, the mob host and
-  the mob supervisor inbox. The first request to use an id keeps it; the
-  ids Meerkat's senders generate are random (`Uuid::new_v4`), so another
-  peer can only claim one it has learned. The requester record lasts for
-  the responder process: after a restart, an id whose request is still
-  queued can be claimed by another peer until it is answered. A host that
-  mints its own request ids (`send_peer_request_with_id`,
-  `Router::send_with_id`) must keep them unguessable; a predicted id can be
-  claimed first, and the host's own request is then refused.
-- A mob member's failed provisioning cleanup no longer deadlocks with a
-  concurrent raw unregister of the same session (`meerkat-mob`). An owned
-  actor transaction (a member create or revival whose create failed after
-  the session service published its actor, or one cancelled after that)
-  rolled its prepared materialization back while still holding the
-  session's turn-finalization boundary. That rollback takes the session's
-  live lifecycle lease, which a concurrent
-  `MeerkatMachine::unregister_session` saga holds into its surface cleanup,
-  and that cleanup waits for the boundary. The cleanup now discards the
-  exact live actor under the boundary, releases it, and then rolls back
-  through the ordinary path, in the saga's own lock order. If a raw
-  unregister removes the registration while the boundary is released, or
-  the session id is registered again, the rollback leaves it alone. The
-  host materializer's rollbacks before any actor is published keep the
-  boundary, since no surface cleanup waits on it there. Debug builds assert
-  that no actor is published at those points; release builds check it too,
-  and refuse such a rollback with a typed
-  `MaterializeServeError::UnrecordedSessionCleanup`, which fail-stops the
-  serving actor, instead of risking the deadlock.
-- A member force cancel (`MobHandle::force_cancel_member`, `mob/force_cancel`,
-  the `force_cancel_member` tool) and `mob/cancel_all_work` no longer fail
-  with an internal error ("cancelling the current run of '...' failed:
-  Interrupt outcome is not settled ...") when the member's run crosses a
-  boundary while the cancel is delivered. The runtime has recorded the
-  cancel for that exact run by then, and the run ends at its next boundary;
-  without live delivery the run's work continues until the runtime next
-  observes a boundary (for a service that reports none, the turn's end).
-  The verb now succeeds, as a member stop already did: its success means
-  the cancel is recorded. The same holds when the member's session service
-  does not support the live boundary cancel
-  (`SessionService::cancel_after_boundary`): the runtime has recorded the
-  cancel first, and the verbs report it instead of an internal error.
-  `MeerkatMachine::cancel_after_boundary_run_if_current` also reports
-  `InterruptDispatchOutcomeUnknown` rather than a bare `Internal` for the
-  other failures that follow the recorded cancel (its effect projection, the
-  withdrawal of its dispatch), so the verbs report the recorded cancel there
-  too. This was the intermittent
-  `member_creation_some_origin_authority_matrix` failure in meerkat-mob's
-  tests.
 - Guarded config writes over one state root take turns. Every store
   declared with its realm chain (`FileConfigStore::with_realm_chain`, as the
   stock hosts' stores are, and `SdkConfigStore::with_realm_document`) holds
@@ -1664,142 +1711,70 @@ them.
   no relative directory and no directory a confined process could change. In
   0.9.2 it ran `/bin/stty` regardless, so on such a host `rkat` refused to
   read a secret typed at the terminal (the 0.9.2 known limitation).
-- A mob Stop no longer holds up every later mob command for one session wait
-  per member. It cancelled every member session's checkpoint gate, then held
-  every member's run starts, one member after another, and each of those
-  steps can wait on that member's session: an in-flight checkpoint save holds
-  its gate, and a running turn's commit holds the session's mutation gate. A
-  Stop of a large busy mob blocked its actor for seconds. Both phases now run
-  concurrently per member (run-start holds 32 at a time) and keep their order
-  (every hold before any interrupt); a failed Stop still reports its first
-  failure in roster order. Every member that can be held is now held even
-  when another member's hold fails (before, the members after the first
-  failure were not held), and a failed Stop now releases every member's
-  hold again (before, they stayed held), except while the actor is
-  fail-stopping for cold recovery, where cold replay decides. After a
-  failed Stop the mob stays Running and input queued before the Stop runs,
-  but the Stop's lifecycle intent stays pending: new member input is
-  refused with `LifecycleOperationPending { intent: "stop" }` until a
-  retried Stop completes and the mob is resumed, or a Reset takes the
-  intent over (Resume alone does not clear it: it resumes only a Stopped
-  mob). The actor's inline-step watchdog now names each Stop stage
-  (`stop_checkpointer_cancel`, `stop_run_start_holds`, and so on) in its
-  `stage_timings_ms`.
-- An Anthropic `pause_turn` stop (a server-tool loop reached its iteration
-  limit) is reported as `pause_turn` instead of `end_turn`. The paused turn
-  commits like an end of turn, even when it holds only server-tool blocks, and
-  its `server_tool_use` blocks go back to the provider as history with the
-  next request. That replay has been checked against a stub server only, not
-  against the live API (#1881). Recovery of a durable tail left by a shutdown
-  race classifies a tail that ends in a `pause_turn` turn as `Ambiguous` and
-  holds it, as it does a `max_tokens` tail. Before, such a tail read as
-  `end_turn` and could be recovered as a completed run.
-- A tool call whose streamed input a refusal or a filled context window cut
-  off now ends the Anthropic stream with that stop reason instead of a stream
-  parse error. Under any other stop reason a tool input that does not parse
-  still fails the response as before.
-- The first fire of a materialize-on-demand schedule completes, in every
-  schedule host. After the dispatch materialized its session, the schedule
-  driver synced the in-flight occurrence's target to the newly bound session,
-  and generated occurrence authority refused that sync while the occurrence
-  was dispatching: the driver tick failed, and the occurrence never completed
-  and was retried after each lease expiry. A dispatching occurrence now
-  records the session its dispatch materialized, once; rebinding it stays
-  refused.
-- `rkat-rpc`'s schedule host delivers a scheduled prompt or event to the
-  session its fire has just materialized. That session is staged until its
-  first turn, and the delivery read its keep-alive policy from the persisted
-  session, so every materialize-on-demand fire failed as `transport_error`
-  ("session not found"). The policy now comes from the staged session, as it
-  does for `turn/start`.
-- A read of runtime delivery state no longer creates the state directory or
-  an empty runtime store. The SQLite runtime store's delivery reads (delivery
-  authorities and inbox records, continuation key bindings and admissions,
-  and the delivery generation) opened a create-capable connection, so a read
-  over a store whose file or directory was gone (a released, moved or removed
-  state directory, read by a delivery owner or a health tick that outlived
-  it) re-created the directory and an empty `runtime.sqlite`. They now open
-  an existing file without create and answer "not provisioned" when it is
-  missing, unless another holder's maintenance fence covers the missing file
-  (an archive by rename), which still fails typed; among delivery
-  operations, only a write creates the store. No schema change.
-- Detached callback tools work in ordinary RPC turns. A callback tool
-  registered with `execution.mode: "detached"` refused every call with
-  "requires runtime-owned interaction lineage" unless the turn carried a
-  transient turn context: a plain `turn/start`, the first turn of a
-  deferred session, the immediate turn of `session/create` and a mob
-  member's `mob/turn_start` gave the turn no interaction. Such a call now
-  queues its job. A turn that merges inputs of several interactions, or
-  whose input names none (for example a flow step without a correlation
-  id), still refuses typed, and the refusal now says so.
-- A host started where its thread limit (a container pids limit,
-  `RLIMIT_NPROC`) is below its CPU count failed with only "failed to spawn
-  the rkat-rpc main thread: Resource temporarily unavailable (os error 11)"
-  (#1799). Tokio launches one worker per CPU and silently queues the ones it
-  cannot spawn, so the main thread was the first refusal anyone saw. The
-  error now names the worker count and where it came from, the cgroup
-  `pids.max` and `RLIMIT_NPROC` that Linux reports, the variable to lower
-  (the one that set the count, else `RKAT_WORKER_THREADS`), and, when
-  `RKAT_WORKER_STACK_BYTES` overrode the stack, its size, since mapping an
-  oversized stack fails with the same EAGAIN. A fatal error whose chain holds
-  an `std::io::Error` of kind `WouldBlock` (EAGAIN) now ends with a `hint:`
-  line naming the usual causes and the variable that set the worker count,
-  in `rkat`, `rkat-rpc`, `rkat-rest`, `rkat-mcp` and `rkat-mob-mcp`.
-- The fork_off re-link after a restart no longer only logs a failed
-  retirement of a child whose settled outcome retires it (its own turn
-  failed, or it ran past its `max_run`). It retries the retirement for up to
-  about ten seconds, in that child's own settlement, and reports the result
-  typed (`ChildRetirement`) in each report and outcome; a child whose
-  retirement still fails is reported `Failed`, logged, and retired by the
-  next pass (a restart, or `MobMcpState::relink_restored_fork_children`).
-- Destroying a mob no longer hangs when one of its members lost a boundary
-  commit: the commit failed after the member's run consumed its input in
-  memory, so the member's runtime requires a durability reload. The member's
-  exited runtime loop keeps the session's mutation gate until a reload
-  releases it, and the destroy waited on that gate in the member's ingress
-  detach forever, because nothing performed the reload. The destroy now
-  reloads such a member first, as retirement already did: its runtime is
-  replaced by one recovered from the durable store, where the consumed input
-  is pending again, and the member's retirement records that input as
-  abandoned (`Retired`) instead of losing it with the in-memory run. The
-  reload runs before the destroy writes anything, and again just before each
-  member's ingress detach. A reload that fails or overruns the member retire
-  budget makes the destroy a typed `MobDestroyError::Incomplete` whose report
-  names the member and the reload error; when that happens before the destroy
-  started, the mob is left as it was, and the destroy can be retried.
-- A detached job a mob member's session submitted delivered its
-  notifications and terminal to that session's runtime, and an
-  explicit-resume repoint moves the member to a successor session without
-  migrating delivery rows, so after a repoint they stranded on the
-  superseded session (#1790). The job store the persistence bundle hands
-  producers (`PersistenceBundle::producer_job_store`, which the RPC host and
-  the runtime-backed surfaces use) now records the delivery address of the
-  member whose current session submits a job
-  (`rt:member:{mob}:{identity}:{generation}`, as the host's continuation
-  resolver reports it) as the job's origin member (`JobSpec::origin_member_id`),
-  and the delivery owner applies such a job's rows in the session serving the
-  member when they are delivered; other sessions' subscriptions are
-  unchanged. A replay of the same call from the superseded session joins the
-  admitted job: the callback and shell producers adopt its origin member. A
-  member respawned under its identity is a new generation that never receives
-  an earlier generation's rows, which stay pending. Jobs submitted before
-  0.9.3, and jobs of sessions no member serves, keep their session's
-  address; a replay keeps what its admitted job recorded. A host that builds
-  its own job producers from `PersistenceBundle::job_store()` keeps session
-  addressing; give them `producer_job_store()` for member addressing. Not
-  yet covered: the terminal a background shell job applies itself, in the
-  session that ran it.
-- One failing delivery no longer holds back the rest of a schedule driver
-  tick. When handling one claimed occurrence failed with an error (for
-  example, a delivery adapter returned a dispatch inconsistent with its
-  occurrence), a `ScheduleDriver` tick returned that error at once. Every
-  occurrence the tick had claimed after it stayed claimed and undelivered
-  until its lease expired (60 seconds in the schedule host), then fired late
-  or misfired. The tick now handles every occurrence it claimed, unless the
-  claim scan breaks the store contract, which still fails the tick at once.
-  It returns the first handling error, or that contract violation, and logs
-  every error it does not return, so the schedule host still records the
-  failed tick.
+- `meerkat` built without its `session-store` feature (its default feature
+  set included) no longer warns that `ConsentAwareJobSource` is never
+  constructed. The crate-private consent-aware job source is now compiled
+  only with the session-store runtime delivery host that builds it.
+- A governed web_search helper whose owner rates its model request R2 or R3
+  now gives the model the same typed review feedback as any other tool:
+  `review_unavailable` with kind `unsupported_entry` (R2) or
+  `review_unsatisfied` with kind `human_consent_required` (R3), carrying only
+  that `kind`. The request still settles at its model entry with nothing
+  sent, but the Anthropic, OpenAI and Gemini web_search executors
+  (`AnthropicWebSearchExecutor`, `OpenAiWebSearchExecutor`,
+  `GeminiWebSearchExecutor`) dropped the typed settlement at their provider
+  seam and returned `LlmError::OperationAuthorizationUnavailable`, so the
+  model saw `operation_authorization_unavailable` (as the 0.9.2 notes
+  described). They now return `LlmError::OperationReviewRefused`, which the
+  builtin web_search tool already reports as review feedback. web_search
+  gains no review support: its review entry stays unsupported and the
+  installed reviewer is never asked. An owner that cannot decide the helper
+  still gives `operation_authorization_unavailable`.
+- The live host gives the live model the same typed review feedback when a
+  session fails a live tool call with a model request's settled review (R2
+  `unsupported_entry`, R3 `human_consent_required`, carried in the
+  authority-unavailable model error's details).
+  `LiveToolDispatchError::from_session_error` classified every such error as
+  `ToolError::OperationAuthorizationUnavailable`; it now decodes the
+  settlement with core's `AgentError::operation_review_refusal` and gives
+  `ToolError::ReviewUnavailable` or `ToolError::ReviewUnsatisfied`. Plain
+  authority unavailability, and a review detail that does not decode, still
+  give `operation_authorization_unavailable`.
+- `LiveToolDispatchError::from_session_error` now also classifies a model
+  failure that its session reports with settlement diagnostics. Core keeps
+  such a failure inside `AgentError::WithSettlementFailures`, and the
+  classifier matched only an unwrapped model error, so a settled review,
+  authority unavailability or observation unavailability with diagnostics
+  fell through to `LiveToolDispatchError::Session` (code `AGENT_ERROR`) and
+  reached the live model as a prose tool error. The classifier now reads the
+  primary error: a settled review and authority unavailability give the same
+  typed tool feedback as without diagnostics, and the diagnostics travel in
+  the live tool result's `settlement_failures`; observation unavailability
+  leaves the tool feedback path as
+  `LiveAdapterHostError::OperationObservationUnavailable` carrying them. An
+  operation refusal keeps its classification and is never read as review
+  feedback, also when its details carry a review.
+- A GPT Live barge-in duck (`live/assistant_playback_hint`) over an answer now
+  ends once the user has been quiet for 1.6 s, the floor guard's release
+  length, even while the answer is still talking. Since 0.8.51 every duck
+  waited for a 600 ms gap in the assistant's output after the user went quiet,
+  so an answer that started into the user's speech and never paused stayed
+  muted until it ended: in Turbo S S107 the duck ran from 3289 ms to 19205 ms
+  over a 12.8 s answer, and the user heard none of it. The broker now keys the
+  restore on what the duck covers, by onset order on the provider audio clock
+  (gpt-live-1 output frames carry no response id). A burst the assistant was
+  voicing when the user started speaking is the one the user interrupted: it
+  keeps the 0.8.51 rule (once the user is quiet, ducked to its next 600 ms
+  output pause or its end, so the stale tail of Turbo S S103 R3 stays silent),
+  and it ends at its first 600 ms pause. Audio after that pause, and any
+  response that starts into or after the user's speech, is an answer and
+  restores on the user's quiet, mid-sentence if need be. So does an answer
+  that follows an early yield within the 1.6 s that would end the interrupted
+  response, and one that follows a user onset within 1.6 s of an answer that
+  had ended at least 600 ms before. The duck still holds while the user
+  speaks, and pauses inside the user's speech (under 1.6 s) never restore it.
+  By design, an answer spoken entirely while the user is still talking stays
+  ducked to its end (Turbo S S106): the user held the floor for all of it.
 - Live channels: rows a close took behind a running member turn (the user's
   finalized speech, the assistant's spoken segments) are no longer dropped
   when the close's deferred settlement gives up because the member turn ended
@@ -1840,17 +1815,50 @@ them.
   being abandoned with its captions retracted. The segment's release follows
   its start to the close, and the close keeps the channel's generated outputs
   addressable until its deferred settlement has replayed both. (#1821)
-- Guard writes no longer overwrite a poisoned authorization publication. A
-  poison that lands while an owner change holds the publication's writer
-  stands when that change publishes or completes, instead of becoming current
-  again. `begin_owner_change` and `try_begin_owner_change` return
-  `Unavailable` when the publication was poisoned before the change published,
-  and `LocalGrantAuthority::reconstruct` returns
-  `ReplacementPublicationUnavailable`, installing nothing, when its
-  replacement publication is poisoned during the reconstruction.
+- An idle session recovered after an abrupt host stop records its typed
+  interrupted-run notice at attach even when its runtime loop checks for
+  owed notices before the attachment hands them over. The attach woke the
+  loop when it published and handed the notices to the session just after;
+  the loop runs on its own runtime, so it could spend that wake on a check
+  that found nothing and wait for the next input (the notice still reached
+  the model on that turn). The attachment now wakes the exact attached loop
+  again after the hand-off. `tool_process_custody_restart` forces that order
+  with two test-support gates (meerkat-runtime
+  `MeerkatMachine::arm_attachment_interrupted_notice_handoff_test_hook` and
+  `MeerkatMachine::arm_runtime_loop_after_empty_interrupted_notice_check_test_hook`,
+  doc-hidden). (#1696)
+- The same notice is recorded at attach when the attachment replaces a
+  predecessor whose queued inputs it fences. Fencing them left the
+  replacement no queued work, so it published without waking its loop and
+  skipped the wake after the hand-off as well; the hand-off now wakes the
+  exact attached loop whenever it hands notices over.
+- A host started where its thread limit (a container pids limit,
+  `RLIMIT_NPROC`) is below its CPU count failed with only "failed to spawn
+  the rkat-rpc main thread: Resource temporarily unavailable (os error 11)"
+  (#1799). Tokio launches one worker per CPU and silently queues the ones it
+  cannot spawn, so the main thread was the first refusal anyone saw. The
+  error now names the worker count and where it came from, the cgroup
+  `pids.max` and `RLIMIT_NPROC` that Linux reports, the variable to lower
+  (the one that set the count, else `RKAT_WORKER_THREADS`), and, when
+  `RKAT_WORKER_STACK_BYTES` overrode the stack, its size, since mapping an
+  oversized stack fails with the same EAGAIN. A fatal error whose chain holds
+  an `std::io::Error` of kind `WouldBlock` (EAGAIN) now ends with a `hint:`
+  line naming the usual causes and the variable that set the worker count,
+  in `rkat`, `rkat-rpc`, `rkat-rest`, `rkat-mcp` and `rkat-mob-mcp`.
 
-### Known issues
+### Known limitations
 
+- An in-process sender that holds a peer request id can tell from its send
+  result whether this session holds that request for another peer (dropped) or
+  does not hold it (admitted, then refused); the id is only ever sent to the
+  addressee, so a sender that holds it already sees the exchange.
+- A member whose boundary commit fails while the destroy is already waiting
+  on that member's ingress detach still holds the destroy: the detach waits
+  on the session's mutation gate before it can see that the runtime needs a
+  reload.
+- `MobHandle::force_cancel_member` cannot cancel a member whose runtime
+  requires a durability reload: it fails with the runtime's repair-blocked
+  error. Retiring the member, or destroying the mob, reloads it first.
 - No governed runtime runs scheduled agent work yet, whether it is a
   stock-governed realm or an embedder's native grant configuration (a
   `NativeGrantWorkConfiguration` installed with
@@ -1865,9 +1873,13 @@ them.
   still materializes the fire's session and then fails the fire late: the
   fire never runs, and its failure class names the step that refused it,
   not the missing mandate.
-
-### Known limitations
-
+- A mob member repointed between applying a job delivery row in one session
+  and acknowledging it can see the row applied again in the successor
+  session: each session keeps its own idempotency ledger. Continuation rows
+  already have the same window.
+- A background shell job's terminal, which the job applies itself, still lands
+  in the session that ran it, not in the session now serving the member that
+  submitted it (#1790).
 - A run that stops with `pause_turn` ends there: Meerkat does not yet continue
   a paused turn automatically (#1881).
 - A context-window stop fails the run; the loop does not compact and retry the
@@ -1892,17 +1904,6 @@ them.
   request that sets no effort relies on their documented default efforts
   (`high` and `medium`); set the effort explicitly at `high` or below on
   those two models to be certain.
-- A member whose boundary commit fails while the destroy is already waiting
-  on that member's ingress detach still holds the destroy: the detach waits
-  on the session's mutation gate before it can see that the runtime needs a
-  reload.
-- `MobHandle::force_cancel_member` cannot cancel a member whose runtime
-  requires a durability reload: it fails with the runtime's repair-blocked
-  error. Retiring the member, or destroying the mob, reloads it first.
-- A mob member repointed between applying a job delivery row in one session
-  and acknowledging it can see the row applied again in the successor
-  session: each session keeps its own idempotency ledger. Continuation rows
-  already have the same window.
 - Live transcript rows commit one at a time, in arrival order, and each waits
   for the session's turn boundary. While a member turn runs (for example
   voice-delegated work in the existing member), later rows wait behind it, so
@@ -1933,6 +1934,13 @@ them.
   recorded only after the item before it in the transcript, so text whose
   earlier item has not landed waits while its start is not reported; if that
   item never lands, the text is lost without a notice. (#1821)
+- GPT Live barge-in duck: without a response id the broker cannot tell a
+  resumed interrupted response from a new answer. If the interrupted response
+  pauses for 600 ms or more while the user is still talking and then resumes,
+  or the user starts speaking inside a 600 ms to 1.6 s pause of a response
+  that then resumes, the resumed audio counts as an answer: it stays ducked
+  while the user speaks and is restored once the user has been quiet for
+  1.6 s, mid-sentence if need be.
 
 ## [0.9.2] - 2026-10-16
 
