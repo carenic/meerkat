@@ -313,4 +313,23 @@ set -e
 [[ "${status}" -eq 2 ]] || fail "malformed commit: expected status 2, got ${status}"
 echo "ok: malformed-commit"
 
+# 12. Every CRITICAL_JOBS pattern of the lookup names a job of release.yml: a
+#     renamed job would silently stop the lookup from giving up on a prebuild
+#     whose gate can no longer pass.
+job_names="$(sed -n 's/^    name: //p' "${REPO_ROOT}/.github/workflows/release.yml" | sed 's/^"\(.*\)"$/\1/')"
+patterns="$(sed -n '/^CRITICAL_JOBS=(/,/^)/s/^  "\(.*\)"$/\1/p' "${LOOKUP}")"
+[[ -n "${patterns}" ]] || fail "critical-job-names: no CRITICAL_JOBS patterns in ${LOOKUP}"
+while IFS= read -r pattern; do
+  matched=false
+  while IFS= read -r job_name; do
+    # shellcheck disable=SC2053 # the pattern is a glob
+    if [[ "${job_name}" == ${pattern} ]]; then
+      matched=true
+      break
+    fi
+  done <<<"${job_names}"
+  [[ "${matched}" == true ]] || fail "critical-job-names: CRITICAL_JOBS pattern '${pattern}' names no job of release.yml"
+done <<<"${patterns}"
+echo "ok: critical-job-names"
+
 echo "release-find-prebuild contract holds"
