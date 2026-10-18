@@ -4069,6 +4069,46 @@ mod tests {
             );
         }
 
+        /// The online writer's check reads the ledger version and the catalog
+        /// it compares in one snapshot: an upgrade that a newer binary
+        /// commits between those reads is never judged as a damaged current
+        /// schema.
+        #[test]
+        fn an_online_check_never_judges_a_version_against_a_later_catalog() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir.path().join("db.sqlite3");
+            let mut seed = open(&path, ConnectionProfile::PRIMARY).expect("WAL file");
+            apply_domain_migrations(&mut seed, &DOMAIN_V1).expect("current domain");
+            drop(seed);
+            // An ordinary open prepares the expected catalog that the online
+            // check compares against.
+            drop(
+                open_preflighted(&path, ConnectionProfile::Primary { create: false })
+                    .expect("ordinary open"),
+            );
+            let ran = Rc::new(Cell::new(false));
+            let seen = Rc::clone(&ran);
+            let upgrade_path = path.clone();
+            arm_preflight_probe_for_test(move || {
+                let mut writer =
+                    open(&upgrade_path, ConnectionProfile::PRIMARY).expect("concurrent writer");
+                let report = apply_domain_migrations(&mut writer, &DOMAIN_V2)
+                    .expect("a newer binary upgrades the domain");
+                assert!(report.migrated(), "the concurrent writer upgrades");
+                seen.set(true);
+            });
+
+            let conn = open_preflighted(&path, ConnectionProfile::OnlineExistingWriter)
+                .expect("the online check sees one version with its own catalog");
+
+            assert!(ran.get(), "the probe committed inside the online check");
+            assert_eq!(
+                domain_version(&conn, DOMAIN_V1.name).expect("ledger"),
+                Some(2),
+                "the upgrade is visible once the check's snapshot ends"
+            );
+        }
+
         #[test]
         fn a_preflight_inside_a_callers_transaction_reads_that_transaction() {
             let dir = tempfile::tempdir().expect("tempdir");
