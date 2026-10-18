@@ -18016,9 +18016,13 @@ impl MeerkatMachine {
 
     /// Wait for the input lifecycle step committed after `input_transitions`
     /// was subscribed: that step, not a timer, orders the caller's next read
-    /// of an input caught between steps. `deadline` only bounds a step that
-    /// never commits (`false`). A closed signal (the driver was torn down or
-    /// rebuilt) is also an answer: the next read resolves the session again.
+    /// of an input caught between steps. Callers subscribe under the driver
+    /// lock before they read the input. The publisher bumps from
+    /// `EphemeralRuntimeDriver::absorb_dsl_effects` while it holds that lock,
+    /// so no bump can fall between the read and the subscribe. `deadline`
+    /// only bounds a step that never commits (`false`). A closed signal (the
+    /// driver was torn down or rebuilt) is also an answer: the next read
+    /// resolves the session again.
     async fn await_input_transition(
         input_transitions: &mut crate::tokio::sync::watch::Receiver<u64>,
         deadline: Instant,
