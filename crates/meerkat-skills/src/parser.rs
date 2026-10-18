@@ -361,4 +361,195 @@ body";
         let result = parse_skill_md(test_key("test-skill"), SkillScope::Builtin, content, None);
         assert!(result.is_err());
     }
+
+    fn parse_with_frontmatter(extra: &str) -> Result<SkillDocument, SkillError> {
+        let content = format!("---\nname: test-skill\ndescription: d\n{extra}---\nbody");
+        parse_skill_md(test_key("test-skill"), SkillScope::Builtin, &content, None)
+    }
+
+    fn extension_value<'a>(doc: &'a SkillDocument, key: &str) -> Option<&'a str> {
+        doc.extensions
+            .iter()
+            .find(|(candidate, _)| candidate.as_str() == key)
+            .map(|(_, value)| value.as_str())
+    }
+
+    /// Unquoted scalars in string fields keep their source text: no YAML type
+    /// resolution reaches them.
+    #[test]
+    fn test_string_fields_keep_unquoted_scalar_source_text() {
+        let doc = parse_with_frontmatter(
+            "version: 1.10\nmetadata:\n  float: 1.10\n  hex: 0x1F\n  word: yes\n  flag: true\n  exp: 1e3\n",
+        )
+        .unwrap();
+        let metadata = &doc.descriptor.metadata;
+        for (key, expected) in [
+            ("version", "1.10"),
+            ("float", "1.10"),
+            ("hex", "0x1F"),
+            ("word", "yes"),
+            ("flag", "true"),
+            ("exp", "1e3"),
+        ] {
+            assert_eq!(
+                metadata.get(key).map(String::as_str),
+                Some(expected),
+                "{key}"
+            );
+        }
+    }
+
+    /// Extension scalars resolve booleans as YAML 1.2 does: only
+    /// true/True/TRUE and false/False/FALSE, so YAML 1.1 words stay strings.
+    #[test]
+    fn test_extension_scalars_resolve_booleans_as_yaml_1_2() {
+        let doc = parse_with_frontmatter(
+            "vendor.yes: yes\nvendor.on: on\nvendor.off: off\nvendor.y: y\nvendor.n: n\nvendor.no: No\nvendor.lower: true\nvendor.title: True\nvendor.upper: TRUE\nvendor.false: false\n",
+        )
+        .unwrap();
+        for (key, expected) in [
+            ("vendor.yes", "yes"),
+            ("vendor.on", "on"),
+            ("vendor.off", "off"),
+            ("vendor.y", "y"),
+            ("vendor.n", "n"),
+            ("vendor.no", "No"),
+            ("vendor.lower", "true"),
+            ("vendor.title", "true"),
+            ("vendor.upper", "true"),
+            ("vendor.false", "false"),
+        ] {
+            assert_eq!(extension_value(&doc, key), Some(expected), "{key}");
+        }
+    }
+
+    /// A non-string extension scalar is stored as the YAML text of its
+    /// resolved value, not its source text: `1.10` is the float 1.1.
+    #[test]
+    fn test_extension_non_string_scalars_store_resolved_value_text() {
+        let doc = parse_with_frontmatter(
+            "vendor.float: 1.10\nvendor.hex: 0x1F\nvendor.octal: 0o17\nvendor.exp: 1e3\nvendor.frac: .5\nvendor.plus: +12\nvendor.minus: -12\nvendor.whole: 1.0\nvendor.max: 18446744073709551615\nvendor.inf: .inf\nvendor.neginf: -.inf\nvendor.nan: .nan\nvendor.tilde: ~\nvendor.empty:\nvendor.null: null\n",
+        )
+        .unwrap();
+        for (key, expected) in [
+            ("vendor.float", "1.1"),
+            ("vendor.hex", "31"),
+            ("vendor.octal", "15"),
+            ("vendor.exp", "1000.0"),
+            ("vendor.frac", "0.5"),
+            ("vendor.plus", "12"),
+            ("vendor.minus", "-12"),
+            ("vendor.whole", "1.0"),
+            ("vendor.max", "18446744073709551615"),
+            ("vendor.inf", ".inf"),
+            ("vendor.neginf", "-.inf"),
+            ("vendor.nan", ".nan"),
+            ("vendor.tilde", "null"),
+            ("vendor.empty", "null"),
+            ("vendor.null", "null"),
+        ] {
+            assert_eq!(extension_value(&doc, key), Some(expected), "{key}");
+        }
+    }
+
+    /// A structured extension value is stored as block YAML, keys in source
+    /// order, aliases expanded.
+    #[test]
+    fn test_structured_extension_stores_block_yaml_in_source_order() {
+        let doc = parse_with_frontmatter(concat!(
+            "vendor.version: '1'\n",
+            "vendor.policy:\n",
+            "  rules:\n",
+            "    - name: r1\n",
+            "      paths: [a, b]\n",
+            "    - name: r2\n",
+            "      when: {x: 1}\n",
+            "  empty_map: {}\n",
+            "  empty_seq: []\n",
+            "  nothing: ~\n",
+            "  enabled: true\n",
+            "  ratio: 1.5\n",
+            "  note: |\n",
+            "    line one\n",
+            "    line two\n",
+            "vendor.list: &shared [a, 1, true]\n",
+            "vendor.alias: *shared\n",
+        ))
+        .unwrap();
+        assert_eq!(
+            extension_value(&doc, "vendor.policy"),
+            Some(concat!(
+                "rules:\n",
+                "- name: r1\n",
+                "  paths:\n",
+                "  - a\n",
+                "  - b\n",
+                "- name: r2\n",
+                "  when:\n",
+                "    x: 1\n",
+                "empty_map: {}\n",
+                "empty_seq: []\n",
+                "nothing: null\n",
+                "enabled: true\n",
+                "ratio: 1.5\n",
+                "note: |\n",
+                "  line one\n",
+                "  line two",
+            ))
+        );
+        assert_eq!(
+            extension_value(&doc, "vendor.list"),
+            Some("- a\n- 1\n- true")
+        );
+        assert_eq!(
+            extension_value(&doc, "vendor.alias"),
+            Some("- a\n- 1\n- true")
+        );
+    }
+
+    /// Frontmatter the parser refuses outright: a custom tag, a duplicated
+    /// known field or nested key, a second YAML document, and an alias
+    /// expansion bomb.
+    #[test]
+    fn test_rejects_tags_duplicates_documents_and_alias_bombs() {
+        let bomb = concat!(
+            "vendor.version: '1'\n",
+            "vendor.a: &a [x, x, x, x, x, x, x, x, x]\n",
+            "vendor.b: &b [*a, *a, *a, *a, *a, *a, *a, *a, *a]\n",
+            "vendor.c: &c [*b, *b, *b, *b, *b, *b, *b, *b, *b]\n",
+            "vendor.d: &d [*c, *c, *c, *c, *c, *c, *c, *c, *c]\n",
+            "vendor.e: &e [*d, *d, *d, *d, *d, *d, *d, *d, *d]\n",
+            "vendor.f: &f [*e, *e, *e, *e, *e, *e, *e, *e, *e]\n",
+            "vendor.g: &g [*f, *f, *f, *f, *f, *f, *f, *f, *f]\n",
+            "vendor.h: &h [*g, *g, *g, *g, *g, *g, *g, *g, *g]\n",
+            "vendor.i: &i [*h, *h, *h, *h, *h, *h, *h, *h, *h]\n",
+        );
+        for (case, extra) in [
+            ("custom tag", "vendor.tagged: !custom value\n"),
+            (
+                "custom tag on a mapping",
+                "vendor.version: '1'\nvendor.tagged: !custom {x: 1}\n",
+            ),
+            ("duplicate known field", "description: again\n"),
+            (
+                "duplicate nested key",
+                "vendor.version: '1'\nvendor.policy:\n  a: 1\n  a: 2\n",
+            ),
+            ("second document", "--- extra: 1\n"),
+            ("alias bomb", bomb),
+        ] {
+            assert!(parse_with_frontmatter(extra).is_err(), "{case}");
+        }
+    }
+
+    /// `<<` is an ordinary key, never a merge: at the top level it reaches the
+    /// extension-key parse and fails there.
+    #[test]
+    fn test_merge_key_is_an_ordinary_key() {
+        let error = parse_with_frontmatter("<<: {vendor.merged: 1}\n").unwrap_err();
+        assert!(
+            error.to_string().contains("invalid extension key '<<'"),
+            "{error}"
+        );
+    }
 }
