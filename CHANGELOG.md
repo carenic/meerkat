@@ -37,7 +37,13 @@ them.
 
 ### Breaking
 
-- `meerkat-runtime`: `ConfiguredMcpAttachmentProvider::configured` and
+- `meerkat-mob`: `MemberRuntimeBuildIdentity` is no longer `UnwindSafe` or
+  `RefUnwindSafe`: it now carries the member's exact
+  `RuntimeSessionRegistrationWitness` (see `registration()` under Added),
+  which is neither. A host that moves an identity into `catch_unwind` wraps
+  it in `std::panic::AssertUnwindSafe`.
+- Not measured by the gate (a parameter type change): `meerkat-runtime`:
+  `ConfiguredMcpAttachmentProvider::configured` and
   `NativeWorkAuthorizationHost::configured_mcp_attachment_for_agent` take the
   session's exact `RuntimeSessionRegistrationWitness` instead of its
   `SessionId`, so a provider decides for one exact registration, not for
