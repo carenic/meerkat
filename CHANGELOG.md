@@ -35,6 +35,19 @@ them.
 
 ## [Unreleased]
 
+### Fixed
+
+- `make check-rust-release-packaging` no longer checks an archive left by an
+  earlier run. With a persistent `CARGO_TARGET_DIR`, each crate's
+  `package/` directory kept the `.crate` files of earlier runs, so a crate
+  whose `cargo package` wrote no archive at the workspace version was
+  checked (license texts, internal requirements, the facade link smoke)
+  against an earlier run's archive. Each package job now removes its
+  crate's earlier archives first, and such a crate fails as a missing
+  archive. `scripts/test-release-packaging-isolation.sh` reruns the check
+  over a persistent target with one crate writing no archive. Release
+  tooling only.
+
 ## [0.9.3] - 2026-10-18
 
 ### Breaking

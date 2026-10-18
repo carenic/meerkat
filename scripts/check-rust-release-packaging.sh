@@ -31,6 +31,9 @@ run_package() {
     lane_id="$LANE_PREFIX-$crate"
 
     mkdir -p "$target_dir/package"
+    # A persistent CARGO_TARGET_DIR keeps the archives of earlier runs. Remove
+    # them, so the archive checks below read only what this run packaged.
+    rm -f "$target_dir/package/$crate"-[0-9]*.crate
     rm -f "$target_dir/package/meerkat-core"
     ln -s "$ROOT/crates/meerkat-core" "$target_dir/package/meerkat-core"
 
