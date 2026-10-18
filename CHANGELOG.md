@@ -54,6 +54,11 @@ them.
   decides from the version its own check verified whether that domain
   exists and which of its tables to read, so a domain stamped after the read
   opened, possibly by a newer binary, is checked before it is read.
+- A job delivery whose projection into the runtime inbox failed is retried
+  on the delivery owner's next wake of any kind, still never in a loop.
+  Before, only a job commit or a delivery generation change retried it, so
+  it could stay pending until the process restarted. This was the retry
+  half of the 0.9.3 known issue "First concurrent durable delivery".
 
 ## [0.9.3] - 2026-10-18
 

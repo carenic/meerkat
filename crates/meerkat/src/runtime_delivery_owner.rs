@@ -936,6 +936,11 @@ async fn run_pass(
                             skipped.job_id, skipped.delivery_sequence, skipped.error
                         ));
                     }
+                    // A skipped entry stays pending and nothing announces
+                    // it again: its retry is owed to the next wake.
+                    if !projection.skipped.is_empty() {
+                        reconcile_failed = true;
+                    }
                     if projection.projected.is_empty() {
                         break;
                     }

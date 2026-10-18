@@ -613,6 +613,10 @@ pub struct RuntimeDeliveryInbox {
     /// Whether a [`RuntimeDeliveryOwnership`] is outstanding, shared by all
     /// clones.
     owner_claimed: Arc<AtomicBool>,
+    /// Test support: fail the next submit through any clone, shared by all
+    /// clones.
+    #[cfg(any(test, feature = "test-support"))]
+    fail_next_submit: Arc<AtomicBool>,
 }
 
 /// The generated authority's verdict for one delivery id.
@@ -810,7 +814,18 @@ impl RuntimeDeliveryInbox {
             commits: Arc::new(commits),
             committed_runtimes: Arc::new(Mutex::new(HashSet::new())),
             owner_claimed: Arc::new(AtomicBool::new(false)),
+            #[cfg(any(test, feature = "test-support"))]
+            fail_next_submit: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Test support: the next submit through this inbox or any clone fails
+    /// with a store write error before it touches the store, as a failed
+    /// delivery write does.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn fail_next_submit_for_test(&self) {
+        self.fail_next_submit.store(true, Ordering::Release);
     }
 
     /// Claim exclusive delivery ownership of this inbox.
@@ -914,6 +929,13 @@ impl RuntimeDeliveryInbox {
         submission: RuntimeDeliverySubmission,
         acknowledge: bool,
     ) -> Result<RuntimeDeliveryReceipt, RuntimeDeliveryError> {
+        #[cfg(any(test, feature = "test-support"))]
+        if self.fail_next_submit.swap(false, Ordering::AcqRel) {
+            return Err(RuntimeStoreError::WriteFailed(
+                "injected delivery write failure (test support)".to_string(),
+            )
+            .into());
+        }
         for _ in 0..MAX_CAS_ATTEMPTS {
             let observed = self
                 .store

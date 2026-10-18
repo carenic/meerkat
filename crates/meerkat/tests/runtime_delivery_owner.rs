@@ -1171,6 +1171,52 @@ async fn an_unreadable_owed_enumeration_is_retried_on_the_next_wake_never_in_a_l
     ));
 }
 
+/// A job delivery whose projection into the runtime inbox failed stays
+/// pending and is retried on the next wake of any kind, not only on a job
+/// commit or a reconcile, and never in a loop.
+#[tokio::test(start_paused = true)]
+async fn a_skipped_projection_is_retried_on_the_next_wake_never_in_a_loop() {
+    let fixture = Fixture::new();
+    let (settlements, run_settlements) = watch::channel(0_u64);
+    let handle = fixture
+        .owner()
+        .with_run_settlements(run_settlements)
+        .arm(fixture.host())
+        .expect("arm owner");
+    let mut passes = handle.subscribe_passes();
+    wait_for_pass(&mut passes, "the reconcile pass", |pass| {
+        pass.generation >= 1
+    })
+    .await;
+
+    fixture.inbox.fail_next_submit_for_test();
+    let job = completed_job(&fixture.jobs, "default", SessionId::new(), "skipped-once").await;
+    let failed = wait_for_pass(&mut passes, "the failed projection", |pass| {
+        !pass.failures.is_empty()
+    })
+    .await;
+    assert_eq!(failed.projected, 0, "{failed:?}");
+
+    passes.borrow_and_update();
+    idle_for_an_hour().await;
+    assert!(
+        !passes.has_changed().expect("owner pass channel open"),
+        "the failed projection is not retried in a loop"
+    );
+    assert!(fixture.sink.applied().await.is_empty());
+
+    // Any wake retries it: here a run settlement, which on its own never
+    // projects.
+    settlements.send_modify(|generation| *generation += 1);
+    let retried = wait_for_pass(&mut passes, "the retry pass", |pass| {
+        pass.generation > failed.generation
+    })
+    .await;
+    assert_eq!(retried.projected, 1, "{retried:?}");
+    assert!(retried.failures.is_empty(), "{retried:?}");
+    wait_for_applied(&fixture.sink, &job, &mut passes).await;
+}
+
 /// A host that owes no continuations keeps the old path: a source change
 /// with nothing blocked runs no pass.
 #[tokio::test]
