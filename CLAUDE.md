@@ -531,10 +531,10 @@ and its CI must be green before a release tag (`require_ci_green`):
   that touches a lane's own inputs, `GUARD_LANE_INPUTS` in
   `scripts/ci-cargo-lanes.mjs`, runs that lane, and
   `scripts/ci-guard-lane-inputs-selftest.mjs` keeps those inputs covering
-  every case the lanes select): the three
-  non-MCP governed JSONL tests of meerkat-rpc, and the Linux positive
-  confinement cases (`make test-mcp-confinement-positive`), on every Rust
-  change.
+  every case the lanes select): exactly the non-MCP governed JSONL tests
+  of meerkat-rpc that the step's expected list names, and exactly the
+  Linux positive confinement cases of `make test-mcp-confinement-positive`
+  (its CONFINEMENT_* filters and counts), on every Rust change.
 - `feature-check` (push only; two jobs per clippy shard, Bazel set and matrix): compile-only checks of the
   shard's packages under the feature sets the Bazel graph builds them with
   (`--no-default-features` plus exactly the set their generated

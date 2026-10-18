@@ -73,10 +73,11 @@ name: CI
 #                     shard's packages under their Bazel feature sets (tests
 #                     included) and the `make test-minimal` /
 #                     `test-feature-matrix-lib` check rows
-#   governed-jsonl  - exact three non-MCP native-authorized JSONL tests on Rust changes
-#   mcp-confinement-positive - the Linux positive confinement cases: 6 MCP,
-#                     2 command-hook, 21 sandbox and 4 shell
-#                     (make test-mcp-confinement-positive) on Rust changes
+#   governed-jsonl  - exactly the non-MCP native-authorized JSONL tests its
+#                     step's expected list names, on Rust changes
+#   mcp-confinement-positive - exactly the Linux positive confinement cases
+#                     of `make test-mcp-confinement-positive` (its
+#                     CONFINEMENT_* filters and counts), on Rust changes
 #
 # Release projections: a push or pull request whose diff from its first
 # parent is only the forward patch projection scripts/release-hook.sh writes
@@ -1097,10 +1098,11 @@ jobs:
   governed-jsonl:
     name: Governed JSONL
     needs: [changes, stagger]
-    # Default RPC features enable MCP and compile the three governed JSONL
-    # cases away; this profile runs them with the two schedule-composition
-    # cases of the same test module (which the default-feature unit lane
-    # also runs), five tests in all.
+    # Default RPC features enable MCP and compile the governed JSONL cases
+    # away; this profile runs them with the schedule-composition cases of
+    # the same test module (which the default-feature unit lane also runs).
+    # The step's expected list is the one record of the selection; every
+    # count it checks derives from that list.
     # Native dependency changes must retain this positive non-MCP profile.
     # The push runs it on every Rust change; a pull request leaves it there
     # (it compiles meerkat-rpc's lib test and the meerkat-mob chain: 866 s on
@@ -1194,8 +1196,8 @@ jobs:
           names = re.findall(r"^(\S+): test$", listing, re.MULTILINE)
           if sorted(names) != expected or re.findall(
               r"^\d+ tests?, \d+ benchmarks?$", listing, re.MULTILINE
-          ) != ["5 tests, 0 benchmarks"]:
-              sys.exit(f"governed JSONL list must contain exactly the five required tests: {names!r}")
+          ) != [f"{len(expected)} test{'' if len(expected) == 1 else 's'}, 0 benchmarks"]:
+              sys.exit(f"governed JSONL list must contain exactly the {len(expected)} expected tests: {names!r}")
 
           # No --nocapture: libtest captures each test's output, so every
           # outcome is its own `test NAME ... ok` line (a test that prints
@@ -1208,8 +1210,8 @@ jobs:
               r"^test result: (\w+)\. (\d+) passed; (\d+) failed; (\d+) ignored; "
               r"(\d+) measured; \d+ filtered out; finished in .+$", result, re.MULTILINE,
           )
-          if summaries != [("ok", "5", "0", "0", "0")]:
-              sys.exit(f"governed JSONL requires exactly 5 passed, 0 failed, 0 ignored: {summaries!r}")
+          if summaries != [("ok", str(len(expected)), "0", "0", "0")]:
+              sys.exit(f"governed JSONL requires exactly {len(expected)} passed, 0 failed, 0 ignored: {summaries!r}")
           PYTHON
 
       - name: Upload governed JSONL logs
@@ -1234,9 +1236,11 @@ jobs:
   mcp-confinement-positive:
     name: MCP confinement positive (Linux)
     needs: changes
-    # The Linux positive confinement cases (7 MCP supported-native, 2
-    # command-hook, 21 sandbox and 4 shell) are ignored on Linux in the unit
-    # lanes; this lane selects exactly them. A backend refusal fails it,
+    # The Linux positive confinement cases (the MCP supported-native,
+    # command-hook, sandbox and shell suites of
+    # `make test-mcp-confinement-positive`, whose CONFINEMENT_* counts it
+    # enforces) are ignored on Linux in the unit lanes; this lane selects
+    # exactly them. A backend refusal fails it,
     # and so does a selection of zero tests. On ubuntu-24.04 the native
     # backend's probe needs an unprivileged user+mount+IPC namespace that
     # AppArmor restricts by default. On a GitHub-hosted runner only, the
