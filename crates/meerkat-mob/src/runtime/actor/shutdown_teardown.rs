@@ -32,11 +32,13 @@ pub(in crate::runtime) enum ShutdownUnregisterOutcome {
     Unregistered,
     /// The unregister is not complete: `stage` names where it stands. The
     /// runtime coordinator, when one was admitted, keeps running on its own
-    /// and its observer is retained.
+    /// and its observer is retained; `settlement` follows the exact
+    /// registration for the report.
+    #[cfg(feature = "runtime-adapter")]
     Pending {
         stage: &'static str,
-        #[cfg(feature = "runtime-adapter")]
         observer: Option<meerkat_runtime::RuntimeSessionUnregisterObserver>,
+        settlement: crate::runtime::MemberUnregisterSettlement,
     },
     /// The unregister failed or its exact registration changed.
     Failed(String),
@@ -94,13 +96,21 @@ impl MobActor {
             });
             let command_tx = self.command_tx.clone();
             let mob_id = self.definition.id.clone();
+            let ops_adapter = Arc::clone(&self.session_ops_adapter);
             self.actor_io_tasks.spawn(async move {
                 let outcomes = futures::future::join_all(targets.into_iter().map(
                     |(session_id, retained)| {
                         let adapter = Arc::clone(&adapter);
+                        let ops_adapter = Arc::clone(&ops_adapter);
                         async move {
-                            let outcome =
-                                teardown_session(&adapter, &session_id, retained, deadline).await;
+                            let outcome = teardown_session(
+                                &adapter,
+                                &ops_adapter,
+                                &session_id,
+                                retained,
+                                deadline,
+                            )
+                            .await;
                             (session_id, outcome)
                         }
                     },
@@ -215,13 +225,13 @@ impl MobActor {
                 ShutdownUnregisterOutcome::Unregistered => {
                     self.record_shutdown_unregistered(member);
                 }
+                #[cfg(feature = "runtime-adapter")]
                 ShutdownUnregisterOutcome::Pending {
                     stage,
-                    #[cfg(feature = "runtime-adapter")]
                     observer,
+                    settlement,
                 } => {
-                    self.record_shutdown_unregister_pending(member, stage);
-                    #[cfg(feature = "runtime-adapter")]
+                    self.record_shutdown_unregister_pending(member, stage, settlement);
                     if let Some(observer) = observer {
                         self.shutdown_runtime_unregister_observers
                             .insert(session_id, observer);
@@ -247,15 +257,37 @@ impl MobActor {
 
 /// Unregister one session through its exact-registration runtime authority,
 /// within `deadline`. Never forces an unregister the runtime refuses or has
-/// not completed: that is reported `Pending` with the stage it stands at.
+/// not completed: that is reported `Pending` with the stage it stands at,
+/// and with a settlement that follows the exact registration afterwards. A
+/// durability-degraded registration goes through the runtime's
+/// reload-required discard first, as retire and destroy do, and the cold
+/// successor the discard publishes is the registration unregistered.
 #[cfg(feature = "runtime-adapter")]
-async fn teardown_session(
+pub(in crate::runtime) async fn teardown_session(
     adapter: &Arc<meerkat_runtime::MeerkatMachine>,
+    ops_adapter: &Arc<super::super::ops_adapter::MobOpsAdapter>,
     session_id: &SessionId,
     retained: Option<meerkat_runtime::RuntimeSessionUnregisterObserver>,
     deadline: Instant,
 ) -> ShutdownUnregisterOutcome {
+    use super::super::provisioner::{DegradedUnregisterStep, MemberSessionDisposalArc};
+
     let remaining = || deadline.saturating_duration_since(Instant::now());
+    let pending =
+        |stage: &'static str,
+         registration: meerkat_runtime::RuntimeSessionRegistrationWitness,
+         observer: Option<meerkat_runtime::RuntimeSessionUnregisterObserver>| {
+            ShutdownUnregisterOutcome::Pending {
+                stage,
+                settlement: crate::runtime::MemberUnregisterSettlement::new(
+                    registration,
+                    observer.clone(),
+                    adapter,
+                    Some(ops_adapter),
+                ),
+                observer,
+            }
+        };
     let mut observer = match retained {
         Some(observer) => observer,
         None => {
@@ -264,6 +296,29 @@ async fn teardown_session(
                 .await
             else {
                 return ShutdownUnregisterOutcome::Unregistered;
+            };
+            // A degraded registration's exited runtime loop can hold the
+            // session's mutation fence, which only the reload-required
+            // discard releases: the exact unregister below would wait on it.
+            let registration = match MemberSessionDisposalArc::discard_degraded_registration_first(
+                adapter,
+                Some(ops_adapter),
+                &registration,
+                deadline,
+            )
+            .await
+            {
+                DegradedUnregisterStep::Unchanged => registration,
+                DegradedUnregisterStep::Replaced(successor) => successor,
+                DegradedUnregisterStep::Gone => return ShutdownUnregisterOutcome::Unregistered,
+                DegradedUnregisterStep::TimedOut => {
+                    return pending("durability_reload_discard", registration, None);
+                }
+                DegradedUnregisterStep::Failed(failure) => {
+                    return ShutdownUnregisterOutcome::Failed(format!(
+                        "failed to unregister runtime session {session_id} during mob teardown: {failure}"
+                    ));
+                }
             };
             // Exact-current unregister runs the two-phase drain internally;
             // the witness keeps a same-SessionId replacement out of reach.
@@ -276,10 +331,12 @@ async fn teardown_session(
             .await;
             match admitted {
                 Err(_) => {
-                    return ShutdownUnregisterOutcome::Pending {
-                        stage: "registration_transaction_admission",
-                        observer: None,
-                    };
+                    return pending("registration_transaction_admission", registration, None);
+                }
+                // Refused until the registration's durability is repaired:
+                // the settlement runs the discard and admits it again.
+                Ok(Err(error)) if crate::runtime::unregister_refused_until_repair(&error) => {
+                    return pending("durability_reload_discard", registration, None);
                 }
                 Ok(Err(error)) => {
                     return ShutdownUnregisterOutcome::Failed(format!(
@@ -311,10 +368,13 @@ async fn teardown_session(
     let registration = observer.registration().clone();
     let waited = crate::tokio::time::timeout(remaining(), observer.wait_for_result()).await;
     match waited {
-        Err(_) => ShutdownUnregisterOutcome::Pending {
-            stage: "shutdown_runtime_unregister",
-            observer: Some(observer),
-        },
+        Err(_) => pending("shutdown_runtime_unregister", registration, Some(observer)),
+        // The coordinator ended without unregistering and released the
+        // registration for the discard: the settlement runs it and admits the
+        // unregister again.
+        Ok(Err(error)) if crate::runtime::unregister_refused_until_repair(&error) => {
+            pending("durability_reload_discard", registration, None)
+        }
         Ok(Err(error)) => ShutdownUnregisterOutcome::Failed(format!(
             "failed to unregister runtime session {session_id} during mob teardown: {error}"
         )),

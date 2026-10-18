@@ -9,7 +9,10 @@
 //! it per member.
 
 use super::*;
-use crate::runtime::{MemberShutdownOutcome, RetirementSettlement, ShutdownOptions};
+use crate::runtime::{
+    MemberShutdownOutcome, MemberUnregisterSettlement, MemberUnregisterState, RetirementSettlement,
+    ShutdownOptions,
+};
 
 /// Bound for test steps that must happen promptly; it only turns a hang into
 /// a failure.
@@ -448,6 +451,92 @@ async fn a_shutdown_deadline_reports_a_held_unregister_as_pending() {
     service.release_runtime_turns.notify_waiters();
 }
 
+/// The pending unregister a Shutdown deadline reports carries the member's
+/// exact registration's settlement, and the settlement outlives the mob's
+/// actor: while the held turn runs it stays pending; once the turn ends,
+/// settling it joins the runtime's coordinator for that registration and
+/// proves the registration gone.
+#[tokio::test]
+async fn a_pending_unregister_settles_after_the_shutdown_returns() {
+    let (handle, service) = turn_driven_mob().await;
+    let (busy, session) = spawn_member(&handle, "held-turn").await;
+    service.set_block_runtime_turns(true);
+    // Register before the turn starts: the start is a `notify_waiters` signal.
+    let turn_started = service.runtime_turn_started.notified();
+    tokio::pin!(turn_started);
+    turn_started.as_mut().enable();
+    let _turn = handle
+        .member(&busy)
+        .await
+        .expect("member handle")
+        .start_turn(
+            ContentInput::Text("a turn that holds its runtime loop".into()),
+            HandlingMode::Queue,
+            crate::MemberTurnOptions::default(),
+            None,
+        )
+        .await
+        .expect("turn admitted");
+    tokio::time::timeout(STEP, turn_started)
+        .await
+        .expect("the turn is running");
+
+    let report = tokio::time::timeout(
+        STEP,
+        handle.shutdown_with_report(
+            ShutdownOptions::default().with_deadline(Instant::now() + Duration::from_secs(1)),
+        ),
+    )
+    .await
+    .expect("shutdown returns at the caller's deadline")
+    .expect("shutdown succeeds");
+    let mut settlement = match report.members.get(&busy) {
+        Some(MemberShutdownOutcome::UnregisterPending {
+            stage, settlement, ..
+        }) => {
+            assert_eq!(stage, "shutdown_runtime_unregister");
+            settlement.clone()
+        }
+        other => panic!("expected the held member's unregister pending, got {other:?}"),
+    };
+    assert_eq!(settlement.try_state(), MemberUnregisterState::Pending);
+    assert!(
+        service
+            .runtime_adapter
+            .current_session_registration_witness(&session)
+            .await
+            .is_some(),
+        "the held turn keeps the member's registration current"
+    );
+    assert_eq!(
+        settlement
+            .settle_within(Instant::now() + Duration::from_millis(200))
+            .await,
+        MemberUnregisterState::Pending,
+        "the unregister stays pending while the turn holds it"
+    );
+
+    service.set_block_runtime_turns(false);
+    service.release_runtime_turns();
+    assert_eq!(
+        settlement.settle_within(Instant::now() + STEP).await,
+        MemberUnregisterState::Settled
+    );
+    assert!(
+        service
+            .runtime_adapter
+            .current_session_registration_witness(&session)
+            .await
+            .is_none(),
+        "the member's registration is gone"
+    );
+    assert_eq!(
+        settlement.try_state(),
+        MemberUnregisterState::Settled,
+        "the settled state is kept"
+    );
+}
+
 /// Each member's Shutdown outcome is logged as it settles, so a process killed
 /// mid-Shutdown still leaves a per-member record.
 #[tokio::test]
@@ -635,11 +724,112 @@ async fn shutdown_teardown_progresses_past_a_held_registration_transaction() {
         "{report:?}"
     );
     match report.members.get(&held) {
-        Some(MemberShutdownOutcome::UnregisterPending { stage }) => {
+        Some(MemberShutdownOutcome::UnregisterPending { stage, .. }) => {
             assert_eq!(stage, "registration_transaction_admission");
         }
         other => panic!("expected the held session pending at admission, got {other:?}"),
     }
+}
+
+/// When Shutdown's deadline passes before the member's exact unregister is
+/// admitted, its settlement admits that unregister itself, through the same
+/// exact registration, once the registration transaction is free, and
+/// proves the registration gone.
+#[tokio::test]
+async fn a_pending_unregister_admission_settles_once_the_registration_is_free() {
+    let (handle, service) = turn_driven_mob().await;
+    let (held, held_session) = spawn_member(&handle, "held-registration").await;
+    let guard = service
+        .runtime_adapter
+        .hold_session_registration_transaction_for_test(&held_session)
+        .await;
+    let report = tokio::time::timeout(
+        STEP,
+        handle.shutdown_with_report(
+            ShutdownOptions::default().with_deadline(Instant::now() + Duration::from_secs(1)),
+        ),
+    )
+    .await
+    .expect("shutdown returns at the caller's deadline")
+    .expect("shutdown succeeds");
+    let mut settlement = match report.members.get(&held) {
+        Some(MemberShutdownOutcome::UnregisterPending {
+            stage, settlement, ..
+        }) => {
+            assert_eq!(stage, "registration_transaction_admission");
+            settlement.clone()
+        }
+        other => panic!("expected the held session pending at admission, got {other:?}"),
+    };
+    assert_eq!(settlement.try_state(), MemberUnregisterState::Pending);
+    assert_eq!(
+        settlement
+            .settle_within(Instant::now() + Duration::from_millis(200))
+            .await,
+        MemberUnregisterState::Pending,
+        "the held registration transaction keeps the admission pending"
+    );
+
+    drop(guard);
+    assert_eq!(
+        settlement.settle_within(Instant::now() + STEP).await,
+        MemberUnregisterState::Settled
+    );
+    assert!(
+        service
+            .runtime_adapter
+            .current_session_registration_witness(&held_session)
+            .await
+            .is_none(),
+        "the member's registration is gone"
+    );
+}
+
+/// A settlement holds the mob's runtime handle only weakly. Dropping that
+/// handle ends nothing: the runtime and an unregister coordinator can still
+/// run through another handle, and the registration stays current there. So
+/// the settlement stays pending until the exact registration has ended, and
+/// settles only then.
+#[tokio::test]
+async fn a_dropped_runtime_handle_settles_only_once_the_registration_has_ended() {
+    let runtime = Arc::new(meerkat_runtime::MeerkatMachine::ephemeral());
+    let session = SessionId::new();
+    runtime
+        .register_session(session.clone())
+        .await
+        .expect("register");
+    let registration = runtime
+        .current_session_registration_witness(&session)
+        .await
+        .expect("current registration");
+    let mut settlement = MemberUnregisterSettlement::new(registration, None, &runtime, None);
+    let other_handle = (*runtime).clone();
+    drop(runtime);
+
+    assert_eq!(settlement.try_state(), MemberUnregisterState::Pending);
+    assert_eq!(
+        settlement
+            .settle_within(Instant::now() + Duration::from_millis(200))
+            .await,
+        MemberUnregisterState::Pending,
+        "a dropped handle is no evidence that the registration ended"
+    );
+    assert!(
+        other_handle
+            .current_session_registration_witness(&session)
+            .await
+            .is_some(),
+        "the registration is still current through the other handle"
+    );
+
+    other_handle
+        .unregister_session(&session)
+        .await
+        .expect("unregister through the other handle");
+    assert_eq!(
+        settlement.settle_within(Instant::now() + STEP).await,
+        MemberUnregisterState::Settled
+    );
 }
 
 /// The Shutdown admission check fails closed, as the Stop arm's does: every

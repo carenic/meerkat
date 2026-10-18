@@ -27,6 +27,8 @@ mod resume_topology_control;
 mod retirement_io;
 mod shutdown_teardown;
 pub(in crate::runtime) use shutdown_teardown::ShutdownUnregisterOutcome;
+#[cfg(all(test, feature = "runtime-adapter"))]
+pub(in crate::runtime) use shutdown_teardown::teardown_session;
 pub(super) mod spawn_activation;
 mod spawn_admission_io;
 pub(super) mod spawn_preparation;
@@ -16193,16 +16195,19 @@ impl MobActor {
         }
     }
 
+    #[cfg(feature = "runtime-adapter")]
     pub(super) fn record_shutdown_unregister_pending(
         &mut self,
         member: Option<&AgentIdentity>,
         stage: &'static str,
+        settlement: super::MemberUnregisterSettlement,
     ) {
         if let Some(member) = member {
             self.record_shutdown_outcome(
                 member.clone(),
                 super::MemberShutdownOutcome::UnregisterPending {
                     stage: stage.to_string(),
+                    settlement,
                 },
             );
         }

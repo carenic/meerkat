@@ -2837,6 +2837,27 @@ pub struct MemberSessionDisposalArc {
     runtime_sessions: Arc<RwLock<HashMap<SessionId, Arc<RuntimeSessionState>>>>,
 }
 
+/// What a durability-degraded registration became ahead of its exact
+/// unregister ([`MemberSessionDisposalArc::discard_degraded_registration_first`]).
+#[cfg(feature = "runtime-adapter")]
+pub(super) enum DegradedUnregisterStep {
+    /// Not degraded, or no longer this exact registration: its exact
+    /// unregister proceeds unchanged. Also when the discard is refused until
+    /// a repair (another owner still holds the registration's teardown or
+    /// interrupt dispatch, or its cold recovery cannot run yet): the exact
+    /// unregister then joins that owner or waits within its own deadline.
+    Unchanged,
+    /// The discard replaced the degraded process shell with this cold
+    /// successor, whose exact unregister follows.
+    Replaced(RuntimeSessionRegistrationWitness),
+    /// The discard ran and no registration of the session is current.
+    Gone,
+    /// The deadline passed before the discard settled.
+    TimedOut,
+    /// The discard failed.
+    Failed(String),
+}
+
 #[cfg(feature = "runtime-adapter")]
 struct PendingTurnFinalizationBoundary {
     completed: Arc<tokio::sync::Notify>,
@@ -4075,6 +4096,75 @@ impl MemberSessionDisposalArc {
                 "durability-reload disposal failed for {session_id}: {error}"
             ))
         })
+    }
+
+    /// Before an exact unregister: discard `registration` first when its
+    /// session is durability-degraded, bounded by `deadline`.
+    ///
+    /// A failed boundary commit leaves the session `ReloadRequired`, and its
+    /// exited runtime loop can keep the session's mutation fence in its
+    /// published handoff. Only the reload-required discard releases that
+    /// fence; an exact unregister admitted first waits on it for good. The
+    /// discard replaces the degraded process shell with a cold successor
+    /// recovered from durable authority, retaining the member's bound
+    /// operation as retire's discard does, and the caller unregisters that
+    /// successor. It is read once, right after the discard published it, as
+    /// retire reads it.
+    pub(super) async fn discard_degraded_registration_first(
+        adapter: &Arc<MeerkatMachine>,
+        ops_adapter: Option<&Arc<super::ops_adapter::MobOpsAdapter>>,
+        registration: &RuntimeSessionRegistrationWitness,
+        deadline: Instant,
+    ) -> DegradedUnregisterStep {
+        let session_id = registration.session_id();
+        if adapter
+            .durability_reload_required(session_id)
+            .await
+            .is_none()
+        {
+            return DegradedUnregisterStep::Unchanged;
+        }
+        let prior_ops_binding = match Self::recoverable_ops_binding_witness(ops_adapter, session_id)
+        {
+            Ok(binding) => binding,
+            Err(error) => {
+                return DegradedUnregisterStep::Failed(format!(
+                    "durability-reload discard of runtime session {session_id} could not capture its bound operation: {error}"
+                ));
+            }
+        };
+        let discarded = tokio::time::timeout(
+            deadline.saturating_duration_since(Instant::now()),
+            adapter.recover_or_discard_reload_required_registration_with_operation_if_current(
+                registration,
+                prior_ops_binding
+                    .as_ref()
+                    .map(|witness| witness.retention_request()),
+            ),
+        )
+        .await;
+        match discarded {
+            Err(_) => DegradedUnregisterStep::TimedOut,
+            Ok(Ok(meerkat_runtime::ReloadRequiredRegistrationDisposition::Discarded)) => {
+                match adapter
+                    .current_session_registration_witness(session_id)
+                    .await
+                {
+                    Some(successor) => DegradedUnregisterStep::Replaced(successor),
+                    None => DegradedUnregisterStep::Gone,
+                }
+            }
+            Ok(Ok(
+                meerkat_runtime::ReloadRequiredRegistrationDisposition::NotDegraded
+                | meerkat_runtime::ReloadRequiredRegistrationDisposition::NotCurrent,
+            ))
+            | Ok(Err(meerkat_runtime::RuntimeDriverError::RecoveryRepairBlocked { .. })) => {
+                DegradedUnregisterStep::Unchanged
+            }
+            Ok(Err(error)) => DegradedUnregisterStep::Failed(format!(
+                "durability-reload discard of runtime session {session_id} failed: {error}"
+            )),
+        }
     }
 
     pub(super) async fn cancel_active_runtime_turn_before_retire_with_adapter_until(

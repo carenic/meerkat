@@ -10,7 +10,9 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
+
+use meerkat_core::time_compat::{Duration, Instant};
 
 use crate::error::MobError;
 use crate::ids::{AgentIdentity, Generation};
@@ -248,8 +250,14 @@ pub enum MemberShutdownOutcome {
         cause: Arc<MobError>,
     },
     /// The runtime refused or has not yet completed the unregister; `stage`
-    /// names the unregister step.
-    UnregisterPending { stage: String },
+    /// names the unregister step. `settlement` follows the member's exact
+    /// registration after Shutdown returned, also after the mob's actor
+    /// exited.
+    #[non_exhaustive]
+    UnregisterPending {
+        stage: String,
+        settlement: MemberUnregisterSettlement,
+    },
     /// An effect owned by the member did not settle before teardown and its
     /// custody is retained.
     EffectCustodyRetained { context: &'static str },
@@ -259,6 +267,282 @@ impl MemberShutdownOutcome {
     /// Whether Shutdown left nothing outstanding for the member.
     pub fn is_clean(&self) -> bool {
         matches!(self, Self::Unregistered)
+    }
+}
+
+/// How often a [`MemberUnregisterSettlement`] whose mob runtime handle is
+/// gone re-reads whether its registration has ended: nothing announces it.
+const ENDED_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+/// Where a member's runtime unregister that a Shutdown reported pending
+/// stands ([`MemberUnregisterSettlement`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum MemberUnregisterState {
+    /// The member's registration is gone: its exact runtime unregister
+    /// completed and no registration of the session is current, or the
+    /// registration has ended for good.
+    Settled,
+    /// The unregister has not completed yet.
+    Pending,
+    /// The unregister failed. Nothing settles it later.
+    Failed(String),
+}
+
+/// The settlement of one member's runtime unregister that a mob Shutdown
+/// reported as [`MemberShutdownOutcome::UnregisterPending`]. It follows the
+/// member's exact registration after Shutdown returned, also after the mob's
+/// actor exited.
+///
+/// It owns no teardown. It joins the runtime's unregister coordinator for
+/// that exact registration. When Shutdown's deadline passed before that
+/// unregister was admitted, it admits it through the same exact-registration
+/// path Shutdown uses, which never forces and never reaches a registration
+/// the session gains later. A durability-degraded registration first goes
+/// through the runtime's reload-required discard, as in Shutdown's own
+/// teardown, and the cold successor that discard publishes is the
+/// registration then unregistered and followed. It holds the mob's runtime
+/// handle only weakly, so it keeps nothing alive.
+#[derive(Clone)]
+pub struct MemberUnregisterSettlement {
+    /// The exact registration followed: the member's own, or the cold
+    /// successor a reload-required discard replaced it with.
+    registration: meerkat_runtime::RuntimeSessionRegistrationWitness,
+    /// The coordinator's observer, once the unregister was admitted.
+    observer: Option<meerkat_runtime::RuntimeSessionUnregisterObserver>,
+    runtime: Weak<meerkat_runtime::MeerkatMachine>,
+    /// The mob's session-operation bindings, so a reload-required discard
+    /// retains the member's bound operation as Shutdown's does.
+    #[cfg(feature = "runtime-adapter")]
+    ops_adapter: Weak<super::ops_adapter::MobOpsAdapter>,
+    /// `Settled` or `Failed`, once reached.
+    terminal: Option<MemberUnregisterState>,
+}
+
+impl MemberUnregisterSettlement {
+    #[cfg(feature = "runtime-adapter")]
+    pub(crate) fn new(
+        registration: meerkat_runtime::RuntimeSessionRegistrationWitness,
+        observer: Option<meerkat_runtime::RuntimeSessionUnregisterObserver>,
+        runtime: &Arc<meerkat_runtime::MeerkatMachine>,
+        ops_adapter: Option<&Arc<super::ops_adapter::MobOpsAdapter>>,
+    ) -> Self {
+        Self {
+            registration,
+            observer,
+            runtime: Arc::downgrade(runtime),
+            ops_adapter: ops_adapter.map_or_else(Weak::new, Arc::downgrade),
+            terminal: None,
+        }
+    }
+
+    /// The state as known now, without waiting: the terminal state
+    /// [`Self::settle_within`] reached, `Failed` once the coordinator
+    /// published a failure, `Settled` once the registration has provably
+    /// ended, `Pending` otherwise. A completed unregister reads `Settled`
+    /// here only when the registration's own end proves it;
+    /// `settle_within` verifies it through the runtime.
+    pub fn try_state(&self) -> MemberUnregisterState {
+        if let Some(terminal) = &self.terminal {
+            return terminal.clone();
+        }
+        if let Some(observer) = &self.observer {
+            match observer.try_result() {
+                // Refused until a durability repair: `settle_within` runs the
+                // discard and admits the unregister again.
+                Ok(Some(Err(error))) if unregister_refused_until_repair(&error) => {}
+                Ok(Some(Err(error))) | Err(error) => return self.failed(&error),
+                Ok(Some(Ok(()))) | Ok(None) => {}
+            }
+        }
+        self.ended_or_pending()
+    }
+
+    /// Wait until `deadline` for the unregister to settle: join the exact
+    /// registration's coordinator (admitting its unregister first when none
+    /// was admitted yet), then prove the registration gone the way Shutdown's
+    /// own teardown does. Dropping the future cancels only this wait, never
+    /// the unregister. `Pending` at the deadline; a later call continues. A
+    /// terminal state is kept.
+    pub async fn settle_within(&mut self, deadline: Instant) -> MemberUnregisterState {
+        if let Some(terminal) = &self.terminal {
+            return terminal.clone();
+        }
+        let state = self.settle(deadline).await;
+        if state != MemberUnregisterState::Pending {
+            self.terminal = Some(state.clone());
+        }
+        state
+    }
+
+    async fn settle(&mut self, deadline: Instant) -> MemberUnregisterState {
+        let remaining = || deadline.saturating_duration_since(Instant::now());
+        // A refusal until a durability repair, from the admission or from the
+        // coordinator, is followed by the discard and a fresh admission once
+        // per call; a second one waits for a later call.
+        let mut repair_retried = false;
+        loop {
+            if let Some(observer) = self.observer.as_mut() {
+                match crate::tokio::time::timeout(remaining(), observer.wait_for_result()).await {
+                    Err(_) => return MemberUnregisterState::Pending,
+                    Ok(Ok(())) => return self.verify_ended(deadline).await,
+                    // The coordinator ended without unregistering and released
+                    // the registration for the discard.
+                    Ok(Err(error)) if unregister_refused_until_repair(&error) => {
+                        self.observer = None;
+                    }
+                    Ok(Err(error)) => return self.failed(&error),
+                }
+            } else {
+                // Shutdown's deadline passed before the unregister was
+                // admitted. Admit it now, or join the coordinator already
+                // running for exactly this registration.
+                let Some(runtime) = self.runtime.upgrade() else {
+                    return self.ended_within(deadline).await;
+                };
+                #[cfg(feature = "runtime-adapter")]
+                if let Some(state) = self.discard_degraded_first(&runtime, deadline).await {
+                    return state;
+                }
+                let admitted = crate::tokio::time::timeout(
+                    remaining(),
+                    runtime.observe_unregister_session_registration_if_current(&self.registration),
+                )
+                .await;
+                match admitted {
+                    Err(_) => return MemberUnregisterState::Pending,
+                    Ok(Ok(
+                        meerkat_runtime::RuntimeSessionUnregisterAdmission::Completed
+                        | meerkat_runtime::RuntimeSessionUnregisterAdmission::NotCurrent,
+                    )) => return self.verify_ended(deadline).await,
+                    Ok(Ok(meerkat_runtime::RuntimeSessionUnregisterAdmission::Pending(
+                        observer,
+                    ))) => {
+                        self.observer = Some(observer);
+                        continue;
+                    }
+                    Ok(Err(error)) if unregister_refused_until_repair(&error) => {}
+                    Ok(Err(error)) => return self.failed(&error),
+                }
+            }
+            if repair_retried {
+                return MemberUnregisterState::Pending;
+            }
+            repair_retried = true;
+        }
+    }
+
+    /// Before its exact unregister is admitted, a durability-degraded
+    /// registration goes through the runtime's reload-required discard: its
+    /// exited runtime loop can hold the session's mutation fence, which only
+    /// that discard releases. After a discard the cold successor is the
+    /// registration followed. `Some` ends this call with that state.
+    #[cfg(feature = "runtime-adapter")]
+    async fn discard_degraded_first(
+        &mut self,
+        runtime: &Arc<meerkat_runtime::MeerkatMachine>,
+        deadline: Instant,
+    ) -> Option<MemberUnregisterState> {
+        use super::provisioner::{DegradedUnregisterStep, MemberSessionDisposalArc};
+
+        let ops_adapter = self.ops_adapter.upgrade();
+        match MemberSessionDisposalArc::discard_degraded_registration_first(
+            runtime,
+            ops_adapter.as_ref(),
+            &self.registration,
+            deadline,
+        )
+        .await
+        {
+            DegradedUnregisterStep::Unchanged => None,
+            DegradedUnregisterStep::Replaced(successor) => {
+                self.registration = successor;
+                None
+            }
+            DegradedUnregisterStep::Gone => Some(MemberUnregisterState::Settled),
+            DegradedUnregisterStep::TimedOut => Some(MemberUnregisterState::Pending),
+            DegradedUnregisterStep::Failed(failure) => Some(MemberUnregisterState::Failed(failure)),
+        }
+    }
+
+    /// The exact unregister completed, or its registration is no longer
+    /// current: prove the registration gone, as Shutdown's own teardown
+    /// does. The registration still current after its coordinator completed
+    /// is a failure. A later registration of the session is not this
+    /// settlement's: it settles once the exact one has provably ended.
+    async fn verify_ended(&self, deadline: Instant) -> MemberUnregisterState {
+        let Some(runtime) = self.runtime.upgrade() else {
+            return self.ended_within(deadline).await;
+        };
+        let session_id = self.registration.session_id();
+        match runtime
+            .current_session_registration_witness(session_id)
+            .await
+        {
+            None => MemberUnregisterState::Settled,
+            Some(current) if current == self.registration => {
+                MemberUnregisterState::Failed(format!(
+                    "runtime unregister coordinator for session {session_id} completed while its exact registration remained current"
+                ))
+            }
+            Some(_) => self.ended_within(deadline).await,
+        }
+    }
+
+    /// Without the mob's runtime handle, only the registration's own end
+    /// proves the unregister settled. Dropping that handle ends nothing: the
+    /// runtime lives on in every other handle, its unregister coordinator
+    /// among them (the coordinator runs on a clone, so dropping a caller's
+    /// handle never cancels a teardown), and the registration can still be
+    /// current there. So a dropped handle settles only once the registration
+    /// has ended for good, which no current entry anywhere allows; until
+    /// then the unregister stays pending.
+    fn ended_or_pending(&self) -> MemberUnregisterState {
+        if self.registration.has_ended() {
+            MemberUnregisterState::Settled
+        } else {
+            MemberUnregisterState::Pending
+        }
+    }
+
+    /// [`Self::ended_or_pending`], watched until `deadline`: nothing
+    /// announces the end, so it is polled.
+    async fn ended_within(&self, deadline: Instant) -> MemberUnregisterState {
+        loop {
+            let state = self.ended_or_pending();
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if state != MemberUnregisterState::Pending || remaining.is_zero() {
+                return state;
+            }
+            crate::tokio::time::sleep(remaining.min(ENDED_POLL_INTERVAL)).await;
+        }
+    }
+
+    fn failed(&self, error: &impl fmt::Display) -> MemberUnregisterState {
+        MemberUnregisterState::Failed(format!(
+            "runtime unregister of session {} failed: {error}",
+            self.registration.session_id()
+        ))
+    }
+}
+
+/// Whether the runtime refused a member's unregister only until its
+/// registration's durability is repaired: the reload-required discard
+/// releases it, so the unregister is pending, not failed.
+pub(crate) fn unregister_refused_until_repair(error: &meerkat_runtime::RuntimeDriverError) -> bool {
+    matches!(
+        error,
+        meerkat_runtime::RuntimeDriverError::RecoveryRepairBlocked { .. }
+    )
+}
+
+impl fmt::Debug for MemberUnregisterSettlement {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MemberUnregisterSettlement")
+            .field("session_id", self.registration.session_id())
+            .field("coordinator_admitted", &self.observer.is_some())
+            .field("terminal", &self.terminal)
+            .finish_non_exhaustive()
     }
 }
 

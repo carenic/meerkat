@@ -2197,6 +2197,21 @@ impl RuntimeSessionRegistrationWitness {
         &self.epoch_id
     }
 
+    /// Whether this exact registration has ended for good: its runtime entry
+    /// is gone and nothing holds the entry's private incarnation identity,
+    /// so no machine can have it current, now or later. Read-only and
+    /// one-directional: `false` does not mean the registration is current
+    /// (an ended entry's identity can still be held while a task finishes
+    /// with it). Grants nothing and starts nothing.
+    #[must_use]
+    pub fn has_ended(&self) -> bool {
+        // A live entry holds its mutation gate strongly for its whole
+        // lifetime, and a rebuilt entry gets a gate of its own, so no strong
+        // reference left means this incarnation's entry exists nowhere. A
+        // dropped allocation can never gain a strong reference again.
+        self.registration_gate.strong_count() == 0
+    }
+
     fn belongs_to(&self, machine: &MeerkatMachine) -> bool {
         std::ptr::eq(self.machine.as_ptr(), Arc::as_ptr(&machine.shared))
     }
