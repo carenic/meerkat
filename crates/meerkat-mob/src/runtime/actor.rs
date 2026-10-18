@@ -28841,7 +28841,6 @@ impl MobActor {
         true
     }
 
-    /// Main actor loop: process commands sequentially until Shutdown.
     /// Close the command channel, then receive until it is empty.
     ///
     /// A sender that reserved capacity before the close still writes its
@@ -28857,6 +28856,7 @@ impl MobActor {
         while command_rx.recv().await.is_some() {}
     }
 
+    /// Main actor loop: process commands sequentially until Shutdown.
     pub(super) async fn run(mut self, mut command_rx: mpsc::Receiver<RoutedMobCommand>) {
         self.inline_step_watchdog
             .start_checker(self.definition.id.clone());
