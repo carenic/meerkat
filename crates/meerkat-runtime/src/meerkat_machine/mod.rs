@@ -12960,6 +12960,9 @@ mod durable_steer_tests;
 #[cfg(test)]
 mod terminal_receipt_tests;
 
+#[cfg(test)]
+mod input_transition_wait_tests;
+
 #[cfg(all(test, feature = "live", feature = "test-support"))]
 mod live_bridge_original_work_tests;
 

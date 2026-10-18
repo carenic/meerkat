@@ -197,6 +197,11 @@ pub struct EphemeralRuntimeDriver {
     /// admission (see `MeerkatMachine::wait_input_admitted_by_idempotency_key`)
     /// is woken by the admission itself rather than re-reading on a timer.
     admissions: Arc<crate::tokio::sync::watch::Sender<u64>>,
+    /// Bumped on every committed step of an admitted input's lifecycle (its
+    /// run association, a phase step or its terminal), so a waiter for an
+    /// input's next step (see `MeerkatMachine::cancel_input_if_present`) is
+    /// woken by the commit itself rather than re-reading on a timer.
+    input_transitions: Arc<crate::tokio::sync::watch::Sender<u64>>,
     /// Typed post-admission signal replacing boolean wake/process flags.
     ///
     /// Accumulates the strongest signal across all ingress effects since last
@@ -338,6 +343,7 @@ impl EphemeralRuntimeDriver {
             ledger: InputLedger::new(),
             events: Vec::new(),
             admissions: Arc::new(crate::tokio::sync::watch::Sender::new(0)),
+            input_transitions: Arc::new(crate::tokio::sync::watch::Sender::new(0)),
             post_admission_signal: PostAdmissionSignal::None,
             dsl: DslAuthority(dsl),
             run_start_window: crate::run_progress::SharedRunStartWindowCell::default(),
@@ -1293,7 +1299,14 @@ impl EphemeralRuntimeDriver {
     /// the DSL decided (WakeLoop / InterruptYielding / RequestImmediateProcessing)
     /// so the runtime loop's `take_post_admission_signal` / `take_wake_requested`
     /// observe exactly what the machine authorized.
+    ///
+    /// Every transition this driver commits passes its effects through here,
+    /// which makes this the single commit point of the input lifecycle: a
+    /// transition that associates an input with a run, steps its phase or
+    /// records its terminal emits one of the lifecycle effects below, and
+    /// waiters for an input's next step are told once per such commit.
     fn absorb_dsl_effects(&mut self, effects: &[mm_dsl::MeerkatMachineEffect]) {
+        let mut input_transition = false;
         for effect in effects {
             if let mm_dsl::MeerkatMachineEffect::PostAdmissionSignal { signal } = effect {
                 let new_signal = match signal {
@@ -1309,7 +1322,52 @@ impl EphemeralRuntimeDriver {
                     self.post_admission_signal = new_signal;
                 }
             }
+            input_transition |= matches!(
+                effect,
+                mm_dsl::MeerkatMachineEffect::RecordRunAssociation
+                    | mm_dsl::MeerkatMachineEffect::InputLifecycleNotice
+                    | mm_dsl::MeerkatMachineEffect::RecordTerminalOutcome
+            );
         }
+        if input_transition {
+            self.publish_input_transition();
+        }
+    }
+
+    /// Tell the waiters subscribed through
+    /// [`Self::subscribe_input_transitions`] that an input lifecycle step
+    /// committed.
+    fn publish_input_transition(&self) {
+        self.input_transitions
+            .send_modify(|transitions| *transitions = transitions.wrapping_add(1));
+    }
+
+    /// Subscribe to committed input lifecycle steps. Subscribe while holding
+    /// the driver before reading an input, so a step committed after the read
+    /// is a change on this receiver.
+    pub(crate) fn subscribe_input_transitions(&self) -> crate::tokio::sync::watch::Receiver<u64> {
+        self.input_transitions.subscribe()
+    }
+
+    /// Step a queued input to `AppliedPendingConsumption` with no run
+    /// association: an input caught between steps, neither queued nor
+    /// terminal, with no run to cancel.
+    #[cfg(test)]
+    pub(crate) fn apply_without_run_for_test(
+        &mut self,
+        input_id: &InputId,
+    ) -> Result<(), RuntimeDriverError> {
+        let key = Self::dsl_key(input_id);
+        self.dsl_apply(
+            mm_dsl::MeerkatMachineInput::MarkApplied {
+                input_id: key.clone(),
+            },
+            "MarkApplied(test)",
+        )?;
+        self.dsl_apply(
+            mm_dsl::MeerkatMachineInput::MarkAppliedPendingConsumption { input_id: key },
+            "MarkAppliedPendingConsumption(test)",
+        )
     }
 
     pub(crate) fn absorb_post_admission_effects(

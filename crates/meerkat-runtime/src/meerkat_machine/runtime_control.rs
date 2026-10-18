@@ -17519,7 +17519,6 @@ impl MeerkatMachine {
         use crate::input_state::{InputAbandonReason, InputLifecycleState};
 
         const SETTLE: std::time::Duration = std::time::Duration::from_secs(5);
-        const RETRY: std::time::Duration = std::time::Duration::from_millis(25);
         let deadline = Instant::now() + SETTLE;
         loop {
             enum Action {
@@ -17561,12 +17560,15 @@ impl MeerkatMachine {
                     entry.publication_handle(),
                 )
             };
-            let action = {
+            let (action, mut input_transitions) = {
                 let mut driver_guard = driver.lock().await;
+                // Subscribed under the driver before the read: a lifecycle
+                // step committed after it is a change on this receiver.
+                let input_transitions = driver_guard.subscribe_input_transitions();
                 let input_id = driver_guard
                     .as_driver()
                     .input_id_for_idempotency_key(idempotency_key);
-                match input_id {
+                let action = match input_id {
                     None => Action::Done,
                     Some(input_id) => {
                         let stored = driver_guard.as_driver().stored_input_state(&input_id);
@@ -17607,7 +17609,8 @@ impl MeerkatMachine {
                                 .map_or(Action::Retry, Action::CancelRun),
                         }
                     }
-                }
+                };
+                (action, input_transitions)
             };
             match action {
                 Action::Done => return Ok(()),
@@ -17692,12 +17695,14 @@ impl MeerkatMachine {
                 }
                 Action::Retry => drop(authority),
             }
-            if Instant::now() >= deadline {
+            // Park without the driver, so teardown can drop it and close the
+            // step signal.
+            drop(driver);
+            if !Self::await_input_transition(&mut input_transitions, deadline).await {
                 return Err(RuntimeDriverError::Internal(format!(
                     "tracked input '{idempotency_key}' did not reach a runtime terminal before the cancellation settle deadline"
                 )));
             }
-            crate::tokio::time::sleep(RETRY).await;
         }
     }
 
@@ -17737,7 +17742,7 @@ impl MeerkatMachine {
         })?
     }
 
-    async fn cancel_input_if_present_owned(
+    pub(super) async fn cancel_input_if_present_owned(
         &self,
         session_id: &SessionId,
         input_id: &meerkat_core::lifecycle::InputId,
@@ -17763,14 +17768,15 @@ impl MeerkatMachine {
     ) -> Result<bool, RuntimeDriverError> {
         use crate::input_state::{InputAbandonReason, InputLifecycleState};
 
-        const RETRY: std::time::Duration = std::time::Duration::from_millis(25);
-
-        let driver = {
+        // Each pass holds the driver only while it reads and acts. A pass
+        // that waits for the input's next lifecycle step parks without it,
+        // so teardown can drop the driver and close the step signal.
+        let attached_driver = {
             let sessions = self.sessions.read().await;
             let Some(entry) = sessions.get(session_id) else {
                 return Ok(false);
             };
-            entry.driver.clone()
+            Arc::downgrade(&entry.driver)
         };
         loop {
             enum Action {
@@ -17792,6 +17798,9 @@ impl MeerkatMachine {
                 Retry,
             }
 
+            let Some(driver) = attached_driver.upgrade() else {
+                return Ok(false);
+            };
             // Bound before the driver gate so that it drops after it: a
             // committed cancellation is told once M is released, even if a
             // later step fails.
@@ -17823,9 +17832,12 @@ impl MeerkatMachine {
                     Arc::clone(&entry.mutation_gate),
                 )
             };
-            let action = {
+            let (action, mut input_transitions) = {
                 let mut driver_guard = driver.lock().await;
-                match driver_guard.as_driver().stored_input_state(input_id) {
+                // Subscribed under the driver before the read: a lifecycle
+                // step committed after it is a change on this receiver.
+                let input_transitions = driver_guard.subscribe_input_transitions();
+                let action = match driver_guard.as_driver().stored_input_state(input_id) {
                     None => Action::Missing,
                     Some(stored) if stored.seed.terminal_outcome.is_some() => {
                         Action::DrainTerminal {
@@ -17859,7 +17871,8 @@ impl MeerkatMachine {
                         .seed
                         .last_run_id
                         .map_or(Action::Retry, Action::CancelRun),
-                }
+                };
+                (action, input_transitions)
             };
 
             match action {
@@ -17992,13 +18005,28 @@ impl MeerkatMachine {
                 }
             }
 
-            if Instant::now() >= deadline {
+            drop(driver);
+            if !Self::await_input_transition(&mut input_transitions, deadline).await {
                 return Err(RuntimeDriverError::Internal(format!(
                     "input '{input_id}' did not reach a runtime terminal before the cancellation settle deadline"
                 )));
             }
-            crate::tokio::time::sleep(RETRY).await;
         }
+    }
+
+    /// Wait for the input lifecycle step committed after `input_transitions`
+    /// was subscribed: that step, not a timer, orders the caller's next read
+    /// of an input caught between steps. `deadline` only bounds a step that
+    /// never commits (`false`). A closed signal (the driver was torn down or
+    /// rebuilt) is also an answer: the next read resolves the session again.
+    async fn await_input_transition(
+        input_transitions: &mut crate::tokio::sync::watch::Receiver<u64>,
+        deadline: Instant,
+    ) -> bool {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        crate::tokio::time::timeout(remaining, input_transitions.changed())
+            .await
+            .is_ok()
     }
 
     pub fn accept_input_with_completion_boxed<'a>(

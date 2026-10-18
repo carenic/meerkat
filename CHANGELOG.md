@@ -35,6 +35,16 @@ them.
 
 ## [Unreleased]
 
+### Changed
+
+- `meerkat-runtime`: `MeerkatMachine::cancel_input_if_present` and
+  `cancel_tracked_input_for_member_incarnation` no longer re-read an input
+  caught between lifecycle steps (neither queued nor terminal, with no run
+  yet) every 25 ms. They wait for that input's next committed lifecycle step
+  (its run association, a phase step or its terminal), which the runtime
+  driver signals at its single commit point, and re-read then; the
+  5-second settle bound remains only as a hang guard (#1655).
+
 ### Fixed
 
 - `meerkat-runtime`: in-memory runtime store execution custody no longer
