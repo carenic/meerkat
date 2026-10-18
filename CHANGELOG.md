@@ -46,6 +46,10 @@ them.
     already;
   - a null (`~` or an empty value) as the `description` or a `metadata`
     value, which serde_yaml stored as the text `~` or an empty string;
+  - an unrecognized tag (`!custom`) anywhere: on a typed field (`name`,
+    `description`, `version`, a `metadata` value, a capability) serde_yaml
+    dropped the tag and kept the value; on an extension value it was refused
+    already;
   - nesting deeper than 64 levels, the parser's default budget;
   - a `...` document end marker line, because serde-saphyr 2.0.0 ignores
     whatever follows one (malformed text included).
@@ -55,7 +59,7 @@ them.
   the frontmatter: the frontmatter was cut before that line break, so a
   `description: |` written last lost its trailing newline. Unchanged: YAML
   1.2 booleans (`yes`, `on` and `off` stay strings), `<<` as an ordinary key,
-  and refusal of custom tags, a second document and alias expansion bombs.
+  and refusal of a second document and alias expansion bombs.
 
 ### Changed
 

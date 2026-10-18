@@ -839,6 +839,43 @@ body";
         );
     }
 
+    /// An unrecognized tag is refused on a typed field too, where serde_yaml
+    /// 0.9 dropped the tag and kept the value. A standard tag still applies.
+    #[test]
+    fn test_rejects_custom_tags_on_typed_fields() {
+        let parse = |frontmatter: &str| {
+            let content = format!("---\n{frontmatter}---\nbody");
+            parse_skill_md(test_key("test-skill"), SkillScope::Builtin, &content, None)
+        };
+        let accepted: Vec<&str> = [
+            ("name", "name: !custom test-skill\ndescription: d\n"),
+            (
+                "description",
+                "name: test-skill\ndescription: !custom text\n",
+            ),
+            (
+                "version",
+                "name: test-skill\ndescription: d\nversion: !custom 1.0\n",
+            ),
+            (
+                "metadata value",
+                "name: test-skill\ndescription: d\nmetadata:\n  owner: !custom team\n",
+            ),
+            (
+                "capability",
+                "name: test-skill\ndescription: d\nrequires_capabilities: [!custom shell]\n",
+            ),
+        ]
+        .into_iter()
+        .filter(|(_, frontmatter)| parse(frontmatter).is_ok())
+        .map(|(case, _)| case)
+        .collect();
+        assert!(accepted.is_empty(), "accepted: {accepted:?}");
+
+        let standard = parse("name: test-skill\ndescription: !!str 123\n").unwrap();
+        assert_eq!(standard.descriptor.description, "123");
+    }
+
     /// Nesting deeper than the parser budget's 64 levels (the frontmatter
     /// mapping included) is refused.
     #[test]
